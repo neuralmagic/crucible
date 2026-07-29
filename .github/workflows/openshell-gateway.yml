@@ -58,7 +58,7 @@ jobs:
       - name: Resolve OpenShell rev from Cargo.lock
         id: rev
         run: |
-          rev=$(cargo xtask openshell-rev)
+          rev=$(cargo run --quiet -p xtask -- openshell-rev)
           echo "rev=$rev" >> "$GITHUB_OUTPUT"
           echo "OpenShell rev: $rev"
 

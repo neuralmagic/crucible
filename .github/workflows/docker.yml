@@ -104,7 +104,7 @@ jobs:
       - name: Resolve OpenShell rev from Cargo.lock
         id: openshell
         run: |
-          rev=$(cargo xtask openshell-rev)
+          rev=$(cargo run --quiet -p xtask -- openshell-rev)
           echo "rev=$rev" >> "$GITHUB_OUTPUT"
           if ! docker manifest inspect "ghcr.io/neuralmagic/openshell-gateway:sha-$rev" >/dev/null 2>&1; then
             echo "ghcr.io/neuralmagic/openshell-gateway:sha-$rev does not exist yet." >&2
