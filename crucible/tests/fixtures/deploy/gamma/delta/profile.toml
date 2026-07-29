@@ -1,0 +1,35 @@
+# Synthetic deploy profile for the delta overlay: kubernetes sandbox driver, publish-on-keep
+# S3 + IRSA, registry authfile secrets, a secret env, and generic pod env. Mirrors the shape of
+# a real per-cluster profile without naming one.
+
+[cluster]
+loop_namespace  = "loop-ns"
+rig_namespace   = "rig-ns"
+service_account = "autoresearch-publisher"
+supervisor_image = "registry.example.com/openshell-supervisor:latest"
+results_bucket = "s3://example-artifacts/autoresearch"
+aws_role_arn   = "arn:aws:iam::000000000000:role/example-autoresearch"
+sandbox_driver = "kubernetes"
+aws_sandbox_role_arn = "arn:aws:iam::000000000000:role/example-sandbox-ro"
+
+[image]
+loop        = "registry.example.com/gamma-loop:latest"
+pull_secret = "example-pull"
+
+[secrets]
+pull_authfile = "example-authfile"
+push_authfile = "example-push"
+
+[[secret_env]]
+name   = "GCLOUD_CREDENTIALS"
+secret = "gcloud-adc"
+key    = "adc.json"
+
+[env]
+ANTHROPIC_VERTEX_PROJECT_ID = "example-project"
+CLOUD_ML_REGION             = "global"
+RIG_NAMESPACE               = "rig-ns"
+RIG_ENDPOINT                = "http://gamma-alpha.rig-ns.svc.cluster.local:80"
+BENCH_MODEL                 = "example/tiny-model"
+BENCH_NUM_PROMPTS           = "100"
+AWS_DEFAULT_REGION          = "us-east-1"

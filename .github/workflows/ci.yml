@@ -1,0 +1,84 @@
+name: CI
+
+# Public-repo CI: plain pull_request validation plus merge_group and the main line. Everything
+# on the pull_request path runs from public sources with no org registries or org-pinned
+# images required.
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref so pushes don't pile up.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental compilation is a loss in CI (no warm incremental dir); off shrinks the
+  # cached target/ and speeds cold builds.
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  # Harden cargo against flaky crates.io fetches: HTTP/2 multiplexing is what throws the
+  # intermittent "curl [16] Error in the HTTP2 framing layer" during crate downloads;
+  # force HTTP/1.1 to dodge that class, and retry the other transient blips.
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  # One job, ordered fail-fast: fmt is instant, then the compile-heavy steps share a single
+  # warm target/ (setup-rust-toolchain caches the cargo registry + target dir).
+  build-and-test:
+    timeout-minutes: 25
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          components: rustfmt, clippy
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      # Guard against the http/tls dependency cluster (reqwest/rustls/hyper/ring/h2) silently
+      # growing more duplicate resolved-version generations than it has today, and against a
+      # heavy dep leaking into a crate that isn't on its allow-list. Both are deterministic
+      # snapshots of current state, see the comments in each script for how to update them
+      # when a change is deliberate.
+      - name: Dependency guardrails
+        run: |
+          ./tools/check-dep-dups.sh
+          ./tools/check-heavy-dep-allowlist.sh
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked --no-deps -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --all-features --locked
+
+  # Supply-chain checks, independent of the build: known-vulnerability audit over Cargo.lock
+  # (policy in .cargo/audit.toml) plus the cargo-deny policy (licenses, sources, advisories;
+  # see deny.toml, the two ignore lists mirror each other).
+  audit:
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install cargo-audit + cargo-deny
+        uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2.82.2
+        with:
+          tool: cargo-audit,cargo-deny
+      - name: cargo audit
+        run: cargo audit
+      - name: cargo deny
+        run: cargo deny check

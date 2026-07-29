@@ -1,0 +1,142 @@
+name: Docker
+
+# Build the domain-neutral runtime image (Containerfile.runtime: crucible engine +
+# crucible-broker + forge bins on the UBI/OpenShell runtime) and push it to GHCR. Runs on the
+# main line, release tags, and manual dispatch (trusted refs only, never on pull_request).
+#
+# The Rust workspace compiles ON THE RUNNER (setup-rust-toolchain's cargo/target cache) and
+# the Containerfile only packages the prebuilt binaries: in-docker compiles recompile the
+# workspace nearly every run once the Rust layers outgrow the GHA buildx cache, while the
+# runner's cargo cache rebuilds in minutes. The buildx cache stays for the remaining docker
+# layers (runtime dnf, tool installs), which are small enough to survive eviction.
+#
+# Tags (ghcr.io/<owner>/crucible):
+#   latest        the default branch's head
+#   sha-<short>   every build, immutable
+#   v<x.y.z>      release tags
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: docker-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read the repo; write packages so we can push to GHCR with the built-in GITHUB_TOKEN.
+permissions:
+  contents: read
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Harden cargo against flaky crates.io fetches (see ci.yml).
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  build-push:
+    # Pinned, not ubuntu-latest: the runner's glibc must not exceed the runtime base's
+    # (UBI10 = 2.39; ubuntu-24.04 = 2.39). When -latest moves to a newer glibc, binaries built
+    # there would fail to load on the base, the smoke step below catches that before a push.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # The hosted runner ships ~14GB of preinstalled toolchains this job never touches; the
+      # release target/ plus the docker build's base-image extraction want the headroom.
+      - name: Free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          df -h /
+
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+
+      # The crates the image ships, staged the same way release.yml packages its assets:
+      # every top-level target/release executable into prebuilt/bin/, where the Containerfile
+      # picks them up. crucible (the engine) + crucible-broker (the mediated-provisioning MCP
+      # the loop pod runs) + forge (engine-side build/deploy bins).
+      - name: Build release binaries
+        run: |
+          cargo build --release --locked -p crucible -p crucible-broker -p forge --bins
+          mkdir -p prebuilt/bin
+          find target/release -maxdepth 1 -type f -executable -exec cp {} prebuilt/bin/ \;
+          echo "staged binaries:" && ls -la prebuilt/bin/
+          # The docker build only needs prebuilt/bin; target/ otherwise starves the docker step of disk.
+          rm -rf target
+
+      # Prove the runner-built binaries actually load on the runtime base BEFORE baking the
+      # image: every dynamic dep must resolve (the glibc/zlib compatibility gate) and the
+      # engine must run.
+      - name: Smoke binaries on the runtime base
+        run: |
+          docker run --rm -v "$PWD/prebuilt/bin:/art/bin:ro" \
+            registry.access.redhat.com/ubi10/ubi:10.2 \
+            sh -euc '
+              for b in /art/bin/*; do
+                if ldd "$b" | grep "not found"; then
+                  echo "$b: unresolved shared libs" >&2; exit 1
+                fi
+              done
+              /art/bin/crucible --help >/dev/null
+              echo "smoke ok"
+            '
+
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The gateway/CLI the image ships must be the exact fork rev crucible's gRPC client
+      # compiled against: derive it from Cargo.lock and inject it (never hand-pin the
+      # Containerfile). The sha-tagged distribution image (ghcr.io/neuralmagic/openshell-gateway)
+      # is published by the OpenShell distribution workflow; fail fast with the fix if the rev
+      # was bumped before that image exists.
+      - name: Resolve OpenShell rev from Cargo.lock
+        id: openshell
+        run: |
+          rev=$(cargo xtask openshell-rev)
+          echo "rev=$rev" >> "$GITHUB_OUTPUT"
+          if ! docker manifest inspect "ghcr.io/neuralmagic/openshell-gateway:sha-$rev" >/dev/null 2>&1; then
+            echo "ghcr.io/neuralmagic/openshell-gateway:sha-$rev does not exist yet." >&2
+            echo "Publish the OpenShell gateway distribution image for this rev first, then re-run." >&2
+            exit 1
+          fi
+          echo "OpenShell rev: $rev (dist image present)"
+
+      - name: Image metadata (tags + labels)
+        id: meta
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=sha,format=short
+            type=ref,event=tag
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # amd64 only: the runtime base + payload are amd64. The buildx GHA cache reuses the
+      # non-Rust layers across runs.
+      - name: Build and push
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: Containerfile.runtime
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            OPENSHELL_REV=${{ steps.openshell.outputs.rev }}
+            VERSION=${{ steps.meta.outputs.version }}
+            REVISION=${{ github.sha }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

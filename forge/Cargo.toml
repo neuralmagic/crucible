@@ -1,0 +1,57 @@
+[package]
+name = "forge"
+description = "Engine-side workspace build + deploy: buildah-build a source tree into an image and roll a live deployment onto it. Domain-agnostic (config-driven); used by crucible domains that need in-loop code rebuilds (engine-side in-loop rebuilds)."
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+base64 = "0.22"
+clap.workspace = true
+flate2 = "1.1.9"
+futures-util = "0.3.32"
+git2.workspace = true
+# Watched-path globbing for the build-needed content digest (Declarative builds): ripgrep's glob matcher +
+# recursive walker, already in the tree as transitive deps.
+globset = "0.4"
+walkdir = "2"
+hex = "0.4.3"
+# Direct syscalls for the diff-capture execution mechanism (overlay/bind `mount`, `chroot`, `umount2`)
+# and for reading overlayfs whiteout xattrs / setting extracted-file ownership (`lgetxattr`, `lchown`).
+# std exposes none of these, and shelling out to `mount`/`chroot` would add a runtime PATH dependency.
+libc = "0.2"
+oci-client = "0.17.0"
+# GitHub REST client for the workflow_dispatch build backend (Declarative builds M2): dispatch, run
+# correlation/poll, and the contents-API workflow fetch for introspection. Async + rustls, matching
+# crucible-broker/-controller's feature set (already in the workspace tree).
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+serde.workspace = true
+serde_json.workspace = true
+serde_norway = "0.9"
+# Correlation ids for workflow_dispatch (workflow_dispatch returns 204 with no run id, so a unique id
+# echoed into the run name is how we find our run). v4 = random; uuid is already a workspace dep.
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.11.0"
+tar = "0.4.46"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
+# Structured logging for the capture/derive flows: leveled events an operator filters with RUST_LOG;
+# the bins install the fmt subscriber on stderr so stdout stays the machine-readable ref.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# Typed Kubernetes client (Rendered deployments): the engine talks to the API server directly — no `kubectl`
+# shell-out. `ws` enables pod exec (the rig-invariant metric check); rustls avoids an OpenSSL build dep.
+kube = { version = "4.0", default-features = false, features = ["client", "rustls-tls", "ws", "jsonpatch"] }
+k8s-openapi = { version = "0.28", features = ["v1_32"] }
+# JSON Patch (RFC 6902) for a targeted array-index replace (a container's `env` list) that a JSON
+# Merge Patch can't express without re-specifying the whole container. Already in the tree via kube-core.
+json-patch = "4.2"
+# Human duration parsing for kubectl-style rollout timeouts (`300s`, `10m`).
+jiff = "0.2"
+# rustls 0.23 needs a process-level CryptoProvider chosen explicitly when several are in the dep tree
+# (aws-lc-rs is, via aws-sdk); we install the aws-lc-rs provider before the first kube client connect.
+rustls = "0.23"
+
+[dev-dependencies]
+# Spec tests parse `[build.<name>]` TOML fixtures.
+toml = "0.8"

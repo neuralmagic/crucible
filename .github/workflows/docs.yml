@@ -1,0 +1,92 @@
+name: Docs
+
+# Build the mdBook doc site and deploy it to GitHub Pages.
+#
+#   * Pull requests: build the book and attach it as an artifact + sticky preview comment.
+#   * Push to main / manual: build and deploy to Pages.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'book.toml'
+      - '.github/workflows/docs.yml'
+  pull_request:
+    paths:
+      - 'docs/**'
+      - 'book.toml'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MDBOOK_VERSION: "0.4.52"
+  MDBOOK_MERMAID_VERSION: "0.15.0"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write # post the sticky docs-preview comment on PRs
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install mdBook
+        uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2.82.2
+        with:
+          tool: mdbook@${{ env.MDBOOK_VERSION }},mdbook-mermaid@${{ env.MDBOOK_MERMAID_VERSION }}
+      - name: Build the book
+        run: mdbook build
+
+      # ---- PR preview: attach this PR's rendered book ----
+      - name: Upload PR preview artifact
+        id: preview
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: docs-preview
+          path: book
+      # Fork PRs get a read-only GITHUB_TOKEN, so the sticky comment would hard-fail there;
+      # same-repo PRs only. Fork contributors still get the artifact from the step above.
+      - name: Comment the preview link
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+        uses: marocchino/sticky-pull-request-comment@0ea0beb66eb9baf113663a64ec522f60e49231c0 # v3.0.4
+        with:
+          header: docs-preview
+          message: |
+            **Docs preview** for this PR is built and attached as the `docs-preview` artifact.
+
+            **[Download `docs-preview`](${{ steps.preview.outputs.artifact-url }})**, unzip, and open `index.html` in a browser.
+
+            _Rebuilt for ${{ github.event.pull_request.head.sha }}._
+
+      # ---- Hand the book to the deploy job on non-PR runs ----
+      - name: Upload Pages artifact
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+        with:
+          path: book
+
+  # Deploy the book to GitHub Pages. Only on main / manual.
+  deploy:
+    if: ${{ github.event_name != 'pull_request' }}
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4

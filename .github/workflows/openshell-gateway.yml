@@ -1,0 +1,206 @@
+name: OpenShell gateway image
+
+# Build the OpenShell gateway + CLI distribution image (and the matching supervisor image)
+# from the EXACT fork rev Cargo.lock pins for openshell-core, tagged sha-<rev>. The loop
+# images COPY the binaries out of the sha-tagged image, and docker.yml passes the same rev
+# as OPENSHELL_REV — so the gateway crucible ships is always the rev its gRPC client
+# compiled against.
+#
+# Runs rarely: on Cargo.lock changes (a rev bump) and manual dispatch. The build is heavy
+# (bundled-z3 is a C++ compile; the OpenShell workspace is large), which is why it lives
+# here instead of inside the loop-image build — the cost amortizes to once per rev bump.
+#
+# FIRST-RUN ORDERING: docker.yml fails fast if ghcr.io/neuralmagic/openshell-gateway:sha-<rev>
+# does not exist. After bumping the openshell-core rev, this workflow must complete before
+# docker.yml can build the loop image.
+on:
+  push:
+    branches: [main]
+    paths: ['Cargo.lock']
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild and push even if the sha-tagged images already exist
+        type: boolean
+        default: false
+
+concurrency:
+  group: openshell-gateway-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  build-push:
+    # Pinned like docker.yml: binaries spliced onto UBI10 (glibc 2.39) must not be built on a
+    # newer glibc; ubuntu-24.04 matches. The supervisor is musl-static, unaffected.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # A plain uncached toolchain just for the xtask. The fork build below does NOT run on
+      # this toolchain: openshell-src carries a rust-toolchain.toml, so rustup's directory
+      # override auto-installs and selects that channel for every cargo run in there — which
+      # is why the musl target is added inside the supervisor step, not here.
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          cache: false
+
+      - name: Resolve OpenShell rev from Cargo.lock
+        id: rev
+        run: |
+          rev=$(cargo xtask openshell-rev)
+          echo "rev=$rev" >> "$GITHUB_OUTPUT"
+          echo "OpenShell rev: $rev"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # sha-<rev> tags are immutable by construction; if both images exist this run is a no-op.
+      - name: Check whether the sha-tagged images already exist
+        id: exists
+        run: |
+          rev='${{ steps.rev.outputs.rev }}'
+          have_gateway=false; have_supervisor=false
+          docker manifest inspect "ghcr.io/neuralmagic/openshell-gateway:sha-$rev" >/dev/null 2>&1 && have_gateway=true
+          docker manifest inspect "ghcr.io/neuralmagic/openshell-supervisor:sha-$rev" >/dev/null 2>&1 && have_supervisor=true
+          if [ '${{ inputs.force }}' = 'true' ]; then
+            echo "force rebuild requested — ignoring existing sha-$rev images"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          elif $have_gateway && $have_supervisor; then
+            echo "both images exist for sha-$rev — skipping the build"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The hosted runner needs disk headroom: the OpenShell workspace target/ plus
+      # bundled-z3's C++ objects are large.
+      - name: Free runner disk
+        if: steps.exists.outputs.skip != 'true'
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          df -h /
+
+      - name: Check out the OpenShell fork at the pinned rev
+        if: steps.exists.outputs.skip != 'true'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: wseaton/OpenShell
+          ref: ${{ steps.rev.outputs.rev }}
+          path: openshell-src
+          persist-credentials: false
+          # The gateway stamps its version in openshell-core's build.rs via
+          # `git describe --tags --long`; --long needs the full history for the
+          # commit count, and a shallow clone makes describe fail so the binary
+          # falls back to the workspace's 0.0.0.
+          fetch-depth: 0
+
+      # The release tags describe needs live on UPSTREAM nvidia/OpenShell; the fork's own tags
+      # are stale, so actions/checkout's fetch-tags would not help. Refspecs only support `*`
+      # globs (no character classes), so fetch all v* tags; build.rs's
+      # `git describe --match 'v[0-9]*'` still excludes non-release tags at describe time.
+      - name: Fetch upstream release tags for the version stamp
+        if: steps.exists.outputs.skip != 'true'
+        run: |
+          git -C openshell-src fetch --no-tags https://github.com/nvidia/OpenShell \
+            'refs/tags/v*:refs/tags/v*'
+
+      # Cache only. The toolchain the fork build actually uses is its rust-toolchain.toml pin,
+      # auto-installed by rustup on the first cargo run in openshell-src; a `target:` here
+      # would add musl to THIS step's toolchain, not the pinned one.
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        if: steps.exists.outputs.skip != 'true'
+        with:
+          # Cache keyed on the fork's lockfile, not this repo's.
+          cache-workspaces: openshell-src
+
+      - name: Build gateway + CLI (glibc, bundled z3)
+        if: steps.exists.outputs.skip != 'true'
+        working-directory: openshell-src
+        run: |
+          # bundled-z3 statically compiles z3 into the server binary, so the loop image needs no
+          # libz3 at runtime (UBI10 does not ship one). protoc comes bundled via protobuf-src.
+          cargo build --release --locked \
+            -p openshell-cli -p openshell-server \
+            --features openshell-server/bundled-z3
+          mkdir -p ../dist/bin
+          cp target/release/openshell target/release/openshell-gateway ../dist/bin/
+
+      - name: Build supervisor (musl static)
+        if: steps.exists.outputs.skip != 'true'
+        working-directory: openshell-src
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q musl-tools
+          # Running from openshell-src, rustup's directory override resolves the fork's pinned
+          # toolchain (rust-toolchain.toml), so the musl target lands on THAT toolchain.
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --release --locked --target x86_64-unknown-linux-musl -p openshell-sandbox
+          # Stage where the fork's own Dockerfile.supervisor expects the binary.
+          mkdir -p deploy/docker/.build/prebuilt-binaries/amd64
+          cp target/x86_64-unknown-linux-musl/release/openshell-sandbox \
+             deploy/docker/.build/prebuilt-binaries/amd64/
+          # target/ otherwise starves the docker steps of disk.
+          rm -rf target
+
+      # Prove the glibc binaries load on the loop image's runtime base BEFORE pushing: every
+      # dynamic dep must resolve (bundled-z3 done right leaves no libz3 dep).
+      - name: Smoke binaries on the runtime base
+        if: steps.exists.outputs.skip != 'true'
+        run: |
+          docker run --rm -v "$PWD/dist/bin:/art/bin:ro" \
+            registry.access.redhat.com/ubi10/ubi:10.2 \
+            sh -euc '
+              for b in /art/bin/*; do
+                if ldd "$b" | grep "not found"; then
+                  echo "$b: unresolved shared libs" >&2; exit 1
+                fi
+              done
+              /art/bin/openshell --version || /art/bin/openshell --help >/dev/null
+              # A 0.0.0 gateway means the git-describe version stamp failed (missing
+              # upstream tags at build time); crucible rejects it at runtime, so
+              # fail here instead of shipping it.
+              ver=$(/art/bin/openshell-gateway --version)
+              echo "gateway version: $ver"
+              case "${ver##* }" in
+                0.0.0*) echo "gateway version fell back to 0.0.0 — check the upstream tag fetch step" >&2; exit 1 ;;
+              esac
+              echo "smoke ok"
+            '
+
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        if: steps.exists.outputs.skip != 'true'
+
+      - name: Build and push the gateway dist image
+        if: steps.exists.outputs.skip != 'true'
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: dist/bin
+          file: Containerfile.openshell-dist
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/neuralmagic/openshell-gateway:sha-${{ steps.rev.outputs.rev }}
+
+      - name: Build and push the supervisor image
+        if: steps.exists.outputs.skip != 'true'
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: openshell-src
+          file: openshell-src/deploy/docker/Dockerfile.supervisor
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/neuralmagic/openshell-supervisor:sha-${{ steps.rev.outputs.rev }}

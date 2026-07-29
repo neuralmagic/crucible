@@ -1,0 +1,131 @@
+# produces: ghcr.io/neuralmagic/crucible
+# Domain-neutral runtime image: the crucible engine + crucible-broker + forge bins on a
+# self-contained UBI10/OpenShell runtime. Crucible drives the agent directly over OpenShell
+# (podman as the compute driver), the agent runs inside the sandbox image OpenShell launches
+# at runtime, NOT in this image. No domain pack is baked in: mount one at /opt/crucible/domains
+# (or anywhere) and point `crucible --manifest` at it.
+#
+# The Rust workspace compiles ON THE CI RUNNER (.github/workflows/docker.yml stages the
+# release bins into prebuilt/bin/ before this build), this file only packages them. glibc:
+# compile on a host whose glibc <= the runtime base's (UBI10 = 2.39; ubuntu-24.04 matches);
+# docker.yml pins the runner and smoke-runs the bins on the base before building.
+
+# The OpenShell fork rev the gateway/CLI binaries come from. INJECTED, never hand-pinned: the
+# builder extracts it from Cargo.lock (`just openshell-rev`) and passes
+# --build-arg OPENSHELL_REV=<40-char sha>, so the gateway always matches the rev crucible's
+# gRPC client compiled against (crucible re-checks at runtime). The sentinel default makes a
+# bare build fail at the FROM below with the missing build-arg in the error.
+ARG OPENSHELL_REV=unset--pass-build-arg-OPENSHELL_REV-from-Cargo.lock
+
+# The sha-tagged OpenShell distribution image (built from the same rev): carries
+# /usr/local/bin/{openshell-gateway,openshell}, both from ONE rev.
+FROM ghcr.io/neuralmagic/openshell-gateway:sha-${OPENSHELL_REV} AS openshell-dist
+
+# --- final: self-contained OpenShell runtime (UBI10 + Copr openshell + podman) + crucible ---
+FROM registry.access.redhat.com/ubi10/ubi:10.2
+ARG NU_VERSION=0.113.0
+ARG GH_VERSION=2.94.0
+ARG GH_SHA256=a757f1ba6db18f4de8cbadb244843a5f89bc75b5e7c6fc127d2bd77fbd12ed62
+ARG VERSION=dev
+ARG REVISION=unknown
+
+LABEL org.opencontainers.image.title="crucible" \
+      org.opencontainers.image.description="Domain-neutral crucible runtime: engine + broker + forge on a self-contained OpenShell/podman base" \
+      org.opencontainers.image.source="https://github.com/neuralmagic/crucible" \
+      org.opencontainers.image.licenses="MIT OR Apache-2.0" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${REVISION}"
+
+USER root
+
+# Runtime deps: podman + fuse-overlayfs are the OpenShell compute driver; buildah is the
+# engine-side image builder (forge build-candidate, rootless, its own storage root so it
+# can't race podman); python3 + git + openssl + ca-certs back domain measure clients and the
+# broker's git/PR work; tar/gzip/jq drive the binary installs below.
+# gcc + openssl-devel + pkgconfig are the linker/native-build deps a Rust pack's measure_cmd
+# needs: the toolchain is a domain concern, but `cc` + the openssl headers are the two things
+# every native build dies without.
+RUN dnf install -y --nodocs \
+        podman buildah fuse-overlayfs \
+        python3 git curl jq tar gzip \
+        openssl ca-certificates \
+        gcc openssl-devel pkgconfig \
+    && dnf clean all
+
+# OpenShell RPMs from the public Copr (rhel+epel-10). BOTH binaries are overridden below by the
+# rev-pinned fork build (openshell-dist stage), so this install only provides the packaging
+# side-effects (deps, dirs); it is not the gateway or CLI the loop runs. If Copr has GC'd this
+# exact NVR the dnf install fails, bump to the current build in that repo.
+RUN printf '[copr:maxamillion:nvidia-openshell]\n\
+name=Copr repo for nvidia-openshell owned by maxamillion\n\
+baseurl=https://download.copr.fedorainfracloud.org/results/maxamillion/nvidia-openshell/rhel+epel-10-$basearch/\n\
+type=rpm-md\n\
+skip_if_unavailable=True\n\
+gpgcheck=0\n\
+repo_gpgcheck=0\n\
+enabled=1\n' > /etc/yum.repos.d/copr-nvidia-openshell.repo \
+    && dnf install -y --nodocs \
+        openshell-gateway-0.0.55-1.20260605134545513516.devrobertsturlagce.metadata.emulator.11.gaada3da8.el10 \
+        openshell-0.0.55-1.20260605134545513516.devrobertsturlagce.metadata.emulator.11.gaada3da8.el10 \
+    && dnf clean all
+
+# Rootless podman: overlay via fuse-overlayfs + subordinate UID/GID maps so nested podman can
+# pull images with mixed file ownership.
+RUN mkdir -p /etc/containers \
+    && printf '[storage]\ndriver = "overlay"\n[storage.options.overlay]\nmount_program = "/usr/bin/fuse-overlayfs"\n' \
+        > /etc/containers/storage.conf \
+    && echo "root:100000:65536" >> /etc/subuid \
+    && echo "root:100000:65536" >> /etc/subgid
+
+# GitHub CLI (pinned + sha-checked): the broker opens draft PRs via `gh`.
+RUN curl -fsSL -o /tmp/gh.tar.gz \
+        "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" \
+    && echo "${GH_SHA256}  /tmp/gh.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/gh.tar.gz -C /tmp \
+    && mv /tmp/gh_${GH_VERSION}_linux_amd64/bin/gh /usr/local/bin/gh \
+    && chmod +x /usr/local/bin/gh \
+    && rm -rf /tmp/gh.tar.gz /tmp/gh_${GH_VERSION}_linux_amd64
+
+# nushell: the generic control-plane tools (steer/stop/session/escalate) are .nu scripts that
+# run engine-side, so the runtime needs `nu` on PATH; domain packs commonly ship .nu contract
+# commands too.
+RUN curl -fsSL "https://github.com/nushell/nushell/releases/download/${NU_VERSION}/nu-${NU_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+        | tar -xz -C /tmp \
+    && cp /tmp/nu-${NU_VERSION}-x86_64-unknown-linux-gnu/nu /usr/local/bin/nu \
+    && chmod +x /usr/local/bin/nu \
+    && rm -rf /tmp/nu-${NU_VERSION}-x86_64-unknown-linux-gnu
+
+# crucible (engine) + crucible-broker + forge bins on PATH (staged by docker.yml).
+COPY prebuilt/bin/ /usr/local/bin/
+
+# Override the Copr gateway AND CLI with the rev-pinned fork build (the openshell-dist stage,
+# tag derived from Cargo.lock's openshell-core rev, see the OPENSHELL_REV arg at the top).
+# Both binaries from one rev, the same rev crucible's gRPC client compiled against;
+# /usr/local/bin shadows the Copr /usr/bin installs on PATH. Built glibc-on-ubuntu-24.04 with
+# bundled z3, so it is self-contained on this UBI10 base (no libz3; glibc 2.39 matches).
+COPY --from=openshell-dist /usr/local/bin/openshell-gateway /usr/local/bin/openshell-gateway
+COPY --from=openshell-dist /usr/local/bin/openshell /usr/local/bin/openshell
+
+# The generic control-plane nu tools, exposed as bare names so an operator (or the engine) can
+# call steer/stop/session/escalate/goal-from-issue without a path. A content-bearing wrapper
+# (not a symlink + chmod): some builders drop mode-only changes from layer snapshots, so a
+# chmod'd symlink target can ship non-executable; the wrapper sidesteps that, and `nu` reads
+# the script as an arg so the .nu needn't be +x.
+COPY tools/*.nu /opt/crucible/tools/
+RUN for f in /opt/crucible/tools/*.nu; do \
+        n="$(basename "$f" .nu)"; \
+        printf '#!/bin/sh\nexec nu "%s" "$@"\n' "$f" > "/usr/local/bin/$n"; \
+        chmod +x "/usr/local/bin/$n"; \
+    done
+
+# The domain mount point. Empty on purpose: this image is domain-neutral, a deployment mounts
+# (or a derived image bakes) its domain pack here.
+RUN mkdir -p /opt/crucible/domains \
+    && printf '%s\n' \
+        'Domain packs go here. This runtime bakes none in.' \
+        '' \
+        'Mount a domain pack (crucible.toml + goals/prompts/tools) at /opt/crucible/domains/<name>' \
+        'and run:  crucible --manifest /opt/crucible/domains/<name>/crucible.toml' \
+        > /opt/crucible/domains/README.md
+
+WORKDIR /opt/crucible

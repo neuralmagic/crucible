@@ -1,0 +1,64 @@
+[package]
+name = "crucible-broker"
+description = "Domain-agnostic mediated-provisioning broker: the loop-pod MCP that admits the agent's resource requests server-side. The concrete trace-cache resolver is injected by a per-domain broker binary."
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+
+# The broker CORE is transport-agnostic and dependency-light on purpose (logic before wire). The
+# concrete trace-resolve backend is a trait the domain binary injects, so this crate carries NO
+# domain dependency: the resolver, admission, and approval are all boxed boundaries.
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Generic engine-side workspace build+deploy (brokered to the agent over MCP): the broker pulls the
+# agent's mid-turn edits out of the sandbox and runs forge's buildah-build + kubectl-deploy on the loop pod.
+forge = { path = "../forge" }
+# MCP wire: the official Rust SDK (rmcp) over the streamable-http transport (network-reachable from the
+# sandbox, egress-allowlisted at `host.containers.internal:8849`).
+# The tool/handler code is transport-independent; only the domain binary's `main` binds the listener.
+rmcp = { version = "0.16", features = [
+  "server",
+  "macros",
+  "transport-streamable-http-server",
+] }
+# axum hosts the streamable-http tower service (`StreamableHttpService` is a `tower::Service`).
+# Pinned to rmcp's own axum (0.8, http1+tokio) so the body/Service bounds line up.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "signal"] }
+# The gateway's native gRPC API for sandbox exec (tree hashing). Workspace pin — shared with the
+# engine; the broker builds its own channel from the in-pod certs. Upload/download have no RPC.
+openshell-core.workspace = true
+tonic.workspace = true
+thiserror.workspace = true
+# JIRA Cloud client + token-frugal renderers, shared with the standalone `jira-mcp` server so there
+# is ONE curation/field map instead of a fork of it here. We keep our OWN three-tool surface: that
+# crate's nine tools include create/transition/link, which the sandboxed agent must never reach.
+jira-mcp = { git = "https://github.com/wseaton/jira-mcp", tag = "v0.2.0" }
+schemars = "0.8"
+# A profile trace is a binary (gzip) artifact; it leaves the GPU pod base64'd on the job log and is
+# handed back to the agent base64'd by `fetch_trace` (the text `fetch_log` would corrupt it).
+base64 = "0.22"
+# Server observability: rmcp emits `tracing` events for each MCP request; a subscriber turns
+# them into pod-log lines (set RUST_LOG to tune). Without this the broker is a black box.
+tracing = "0.1"
+# Both binaries install the subscriber through `telemetry::init`: always the stderr fmt layer,
+# plus the OTLP span layer when an endpoint is set.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# MCP tool spans exported over OTLP, only when an endpoint is set — the same opentelemetry 0.31
+# stack + grpc-tonic transport the engine and controller already run, aimed at the in-cluster
+# Tempo through the loop pod's OTEL_EXPORTER_OTLP_ENDPOINT.
+tracing-opentelemetry = "0.32"
+opentelemetry = { version = "0.31", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = [
+  "trace",
+  "grpc-tonic",
+  "tls-ring",
+] }
+
+[dev-dependencies]
+# tests/description_pins.rs reads the internal deploy profiles' [env] tables to keep the pinned
+# tool-description values honest against the files that actually set them.
+toml = "0.8"

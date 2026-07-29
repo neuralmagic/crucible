@@ -1,0 +1,24 @@
+//! Render a domain's run deployment (Rendered deployments): the loop `Pod`, the cross-namespace `RoleBinding`,
+//! and a deny-all-ingress `NetworkPolicy` on the loop pod, projected from the manifest (the source
+//! of truth) + the per-cluster [`DeployProfile`], as real
+//! `k8s-openapi` objects (so the rendered spec stays honest to the Kubernetes API). A composite
+//! manifest and a plain single-domain manifest both project into a [`RenderInput`], a single domain
+//! is a degenerate composite of one component, so everything below reads one shape.
+//!
+//! The split this enforces: the *manifest* owns the run (components, `[agent.broker]`, `[judge]`,
+//! `[world]`, `[deploy]` targets) and the *profile* owns the environment (namespaces, secret names,
+//! resources, the loop image, generic hook/gate env). Nothing domain-specific is hardcoded here, the
+//! engine projects only the env it itself consumes (`BROKER_*`, forge's `FORGE_*`, mount-path consts)
+//! and passes everything else through generic maps. Image refs are resolved to `@sha256:…` via the
+//! in-process registry client, so the stale-cached-layer footgun (forget to re-pin) is gone.
+//!
+//! Split into [`kube`] (the loop `Pod`/RBAC/`NetworkPolicy` renderer) and [`turn`] (the one-shot
+//! WorkPod turn renderer), the two share only the profile-derived helpers (`resources`,
+//! `secret_env_vars`, `node_avoid_affinity`) and a handful of mount-path consts.
+
+mod kube;
+mod turn;
+
+pub use kube::{MANAGED_BY_LABEL, PackDelivery, RenderInput, RenderOpts, render};
+pub(in crate::deploy) use kube::{node_avoid_affinity, role_binding};
+pub use turn::{TurnKind, TurnOpts, render_turn};

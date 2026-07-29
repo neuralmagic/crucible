@@ -1,0 +1,13 @@
+[package]
+name = "crucible-contract"
+description = "The turn-result wire contract: the Tier 1 termination-message envelope, the artifact-kind enum + caps, the ingest request/response types, the shared env-var names + labels + marker literals, and the AgentEvent NDJSON types. Serde only, no async, no kube. Both crucible and crucible-controller serde-round-trip these, so schema drift is a compile error."
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+# Tier 2 content-addressing: engine and controller MUST compute the same `sha256:<hex>` digest,
+# so the one spelling lives here where both sides call it.
+sha2 = "0.10"

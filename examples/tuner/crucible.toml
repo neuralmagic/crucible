@@ -1,0 +1,30 @@
+# tuner — the crucible DEMO domain. A real agent tunes the knobs of a python serving-pipeline
+# simulator to cut p99 latency, the classic serving story (lower a latency by tuning params) with no
+# cluster, pure stdlib, deterministic. Counterpart to examples/counter (the deterministic test):
+# this one is meant to be watched.
+#
+#   crucible --manifest examples/tuner/crucible.toml --iterations 8
+
+[repo]
+path = "."
+
+[workspace]
+dir = "workspace"
+# setup runs with cwd = manifest dir. Seed a git repo with the program + its knobs.
+setup_cmd = "mkdir -p workspace && cp params.py sim.py workspace/ && git -C workspace init -q && git -C workspace -c user.email=crucible@local -c user.name=crucible add -A && git -C workspace -c user.email=crucible@local -c user.name=crucible -c commit.gpgsign=false commit -qm baseline"
+
+[agent]
+backend       = "local"        # a real agent turn (counter uses the deterministic `command` backend)
+model         = "claude-opus-4-6"
+method_prompt = "method.md"
+goal          = "Minimize the simulated p99 latency by editing the knobs in params.py. Target: under 13 ms."
+[agent.env]
+ANTHROPIC_VERTEX_PROJECT_ID = "my-gcp-project"   # set to your Vertex project
+CLOUD_ML_REGION             = "global"
+
+[judge]
+measure_cmd = "python3 sim.py"
+direction   = "lower"          # lower p99 wins
+objective   = "p99_ms"
+
+# No [world] block  ->  GitWorld: each improvement is a commit, regressions reset --hard.

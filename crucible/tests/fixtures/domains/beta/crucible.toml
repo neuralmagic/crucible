@@ -1,0 +1,28 @@
+# Synthetic config-only fixture: satisfies the onboarding contract from config alone — parse,
+# a higher-is-better gate, a resolvable goal + method prompt, and no [world] (GitWorld). Broker
+# stays off. Stands in for a real skeleton domain pack in the core test suite.
+
+[repo]
+url = "https://github.com/example/beta.git"
+ref = "main"
+
+[workspace]
+dir = "workspace/beta"
+
+[agent]
+model         = "claude-opus-4-6"
+method_prompt = "prompts/research.md"
+goal_file     = "goals/beta.md"
+backend       = "openshell"
+sandbox_image = "registry.example.com/beta-sandbox:dev"
+[agent.env]
+CLAUDE_CODE_USE_VERTEX      = "1"
+CLOUD_ML_REGION             = "global"
+ANTHROPIC_VERTEX_PROJECT_ID = "example-project"
+
+[judge]
+measure_cmd = "beta-throughput --json"
+direction   = "higher"
+objective   = "throughput"
+
+# No [world] block -> GitWorld (git memory only).

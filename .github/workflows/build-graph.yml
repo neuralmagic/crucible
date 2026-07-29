@@ -1,0 +1,40 @@
+name: Build graph
+
+# Guard the container build graph: no personal-namespace image (quay.io/wseaton/*) may enter it except
+# the ones on the migration allowlist (tools/personal-namespace-allowlist.txt). Pure-stdlib python, no
+# graphviz needed. Runs whenever a Containerfile, the generator, or the allowlist changes, and on the
+# default branch / manually.
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**/Containerfile*'
+      - '**/Dockerfile*'
+      - 'tools/build_graph.py'
+      - 'tools/personal-namespace-allowlist.txt'
+      - '.github/workflows/build-graph.yml'
+  pull_request:
+    paths:
+      - '**/Containerfile*'
+      - '**/Dockerfile*'
+      - 'tools/build_graph.py'
+      - 'tools/personal-namespace-allowlist.txt'
+      - '.github/workflows/build-graph.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-graph-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: No un-allowlisted personal-namespace deps
+        run: python3 tools/build_graph.py --lint-personal

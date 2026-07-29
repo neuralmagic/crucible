@@ -1,0 +1,134 @@
+[package]
+name = "crucible"
+description = "propose→apply→measure→accept/reject→remember loop: an LLM agent proposes, a frozen judge evaluates, over a reversible world. A domain is a crucible.toml manifest."
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "crucible"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+# Manifest parsing: crucible.toml -> the domain config (the standard TOML crate).
+toml = "0.8"
+# Comment-preserving TOML surgery for the pack freeze rewrite (pin [repo], inject [deploy], pin the
+# sandboxed [agent] backend); the deserialize-only `Manifest` can't round-trip, so a targeted edit
+# keeps the agent's authored comments. Already in the tree as `toml`'s own backing crate.
+toml_edit = "0.22"
+ctrlc = "3"
+git2.workspace = true
+fs_extra = "1.3.0"
+nix = { version = "0.31.3", features = ["signal"] }
+# Publish-on-keep: S3 run records via IRSA web-identity (creds auto-discovered from
+# AWS_ROLE_ARN + the projected token). The loop is sync, so `publish` owns a small
+# block_on runtime; the rest of the loop never touches tokio.
+aws-config = "1"
+aws-sdk-s3 = "1"
+# `sync` (Notify) backs the autopilot daemon's graceful-shutdown signal. `process` runs the
+# surviving openshell CLI upload/download as cancellable async children inside the turn.
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "time",
+    "io-util",
+    "sync",
+    "process",
+] }
+# `CancellationToken`: the openshell exec (and its upload/download siblings) `select!` it against
+# stream/child progress; a per-turn bridge task trips it from `crate::STOP` on Ctrl-C.
+tokio-util = "0.7"
+jiff = "0.2"
+# Turn-trace span hints: parse a candidate URL to scrub `user:pass@` userinfo without hand-rolling
+# authority slicing.
+url = "2"
+# Host-side temp staging: the 0600 upload files (env/prompt/mcp/cred) and the scratch dir the
+# sandbox transcript downloads into, both auto-unlinked on drop instead of a hand-rolled guard.
+tempfile = "3"
+# Credential relay: base64 for embedding a CA into a relayed kubeconfig (`${file64:}`).
+base64 = "0.22"
+# Scope-turn transcript delivery: the preserved session NDJSON is gzipped before it rides a pod-log
+# marker line (base64) or `--transcript-out` file back to the controller.
+flate2 = "1"
+# A surviving scope pack rides the pod logs home as a gzip'd tar on its own marker line.
+tar = "0.4"
+# Deploy render: real Kubernetes object types (the rendered Pod/RoleBinding stay honest to the API)
+# serialized to YAML, plus forge's in-process registry digest resolver (no crane shell-out).
+k8s-openapi = { version = "0.28", features = ["v1_32"] }
+serde_norway = "0.9"
+# The hermes harness's post-turn parity reader: hermes has no live event stream, so its result +
+# cost + tool spans are reconstructed from its SQLite `state.db`. Pinned to 0.32 so its
+# libsqlite3-sys (0.30) unifies with sqlx-sqlite 0.8's; cargo links exactly one, `bundled` so both
+# share the vendored sqlite (no system-lib probe). Verify with `cargo tree -i libsqlite3-sys`.
+rusqlite = { version = "0.32", features = ["bundled"] }
+forge = { path = "../forge" }
+# The shared turn-result wire contract: the AgentEvent NDJSON types, the marker literals, the
+# managed-by label, and the kubelet-captured envelope, one source, no cross-crate drift.
+crucible-contract = { path = "../crucible-contract" }
+# Git-as-memory for the loop workspace (stage/commit/reset/clean via libgit2). git2 stays a direct
+# dep here too, selftest.rs/publish.rs/identity.rs/manifest.rs use it directly for other work.
+crucible-vcs = { path = "../crucible-vcs" }
+# The agent harness: the stream-json decoder and the in-process OTLP collector (live token rate +
+# otel_summary rollup + OTEL env injection). The controller must NOT depend on this; it is
+# engine-local.
+crucible-harness = { path = "../crucible-harness" }
+# OpenShell backend (in-Rust driver): gcp_auth mints Vertex
+# access tokens from ADC (user refresh-token or SA-JWT), minted fresh per turn and served via
+# a static openshell provider credential. The gateway/podman daemons are spawned detached and
+# reaped by the pod runtime when crucible (the entrypoint) exits.
+gcp_auth = "0.12"
+# The gateway's native gRPC API: crucible links the generated `openshell.v1` tonic clients and
+# drives Health/sandbox/provider/policy/exec/logs RPCs directly instead of scraping the
+# `openshell` CLI's human output. `sandbox exec` streams over gRPC (no local child, so no
+# CHILD_PID registration, a Ctrl-C drops the stream and cancels the RPC server-side). Boot and
+# file upload/download stay on the CLI. default-features=false drops the crate's telemetry HTTP
+# client, unused here.
+openshell-core.workspace = true
+# `tls-ring` is load-bearing: without an explicit provider feature tonic relies on the
+# process-default rustls CryptoProvider, which is ambiguous in this dep graph (both ring and
+# aws-lc-rs are compiled in) and panics at channel construction.
+tonic.workspace = true
+# The gateway version gate parses the Health-reported git-describe string with the same semver
+# crate cargo uses (dtolnay's); already in the dependency graph, so this adds no new code.
+semver = "1"
+# `crucible scope --issue`: fetch the goal straight from the GitHub REST API, no PATH tool, so
+# the standalone binary works outside this repo. Blocking client: scope is a sync pipeline.
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
+# Engine self-telemetry: openshell turn spans exported over OTLP, only when an endpoint is set.
+# Same opentelemetry 0.31 stack the controller already runs against tonic 0.14, here over the
+# grpc-tonic transport (opentelemetry-otlp 0.31.1 depends on tonic 0.14.1, so no conflict), aimed
+# at the in-cluster Tempo. `tracing` macros compile to no-ops when no subscriber is installed.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-opentelemetry = "0.32"
+opentelemetry = { version = "0.31", default-features = false, features = [
+    "trace",
+    "logs",
+] }
+opentelemetry_sdk = { version = "0.31", default-features = false, features = [
+    "trace",
+    "logs",
+] }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = [
+    "trace",
+    "logs",
+    "grpc-tonic",
+    "tls-ring",
+    # Content logs go to Loki, whose native OTLP ingest is HTTP-only; traces stay grpc-tonic → Tempo.
+    "http-proto",
+    "reqwest-blocking-client",
+] }
+
+[dev-dependencies]
+# The in-memory log exporter (behind `testing`) drives the gen_ai log mapping through the real SDK
+# export path in unit tests, no mock logger.
+opentelemetry_sdk = { version = "0.31", default-features = false, features = [
+    "trace",
+    "logs",
+    "testing",
+] }

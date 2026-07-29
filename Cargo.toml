@@ -1,0 +1,31 @@
+[workspace]
+members = ["crucible", "crucible-contract", "crucible-vcs", "crucible-harness", "crucible-broker", "forge", "xtask"]
+resolver = "3"
+
+[workspace.package]
+version = "0.2.0"
+# Dual-licensed like the repo (LICENSE-MIT / LICENSE-APACHE); the public export's cargo-deny
+# licenses check requires every workspace crate to declare it.
+license = "MIT OR Apache-2.0"
+edition = "2024"
+rust-version = "1.85"
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive", "env"] }
+git2 = "0.21"
+jiff = "0.2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }
+# Scenario issue keys (`scenario:{uuidv7}`, controller adopt endpoint): v7 is lexicographically
+# sortable and timestamp-derived, unlike v4's pure randomness.
+uuid = { version = "1", features = ["v7"] }
+# The OpenShell gateway's native gRPC clients + auth interceptor — one pin for every crate that
+# talks to the gateway (engine + broker), so the two can never link different protos.
+openshell-core = { git = "https://github.com/wseaton/OpenShell.git", rev = "591580c98179dda75a2e7f0cc034f3fa0d266520", default-features = false }
+tonic = { version = "0.14", features = ["channel", "tls-native-roots", "tls-ring"] }
+thiserror = "2"
+
+[profile.release]
+opt-level = 2

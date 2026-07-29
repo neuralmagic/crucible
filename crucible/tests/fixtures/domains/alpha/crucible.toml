@@ -1,0 +1,36 @@
+# Synthetic single-domain fixture (a CommandWorld pack): parse, name a CommandWorld
+# (rig snapshot/restore), and a lower-is-better CommandJudge. Stands in for a real live-rig
+# domain pack in the core test suite.
+
+[repo]
+url = "https://github.com/example/alpha.git"
+ref = "main"
+
+[workspace]
+dir = "workspace/alpha"
+setup_cmd = "setup --workspace workspace/alpha"
+
+[agent]
+model       = "claude-opus-4-6"
+goal_file   = "goals/alpha.md"
+backend     = "local"
+[agent.env]
+CLAUDE_CODE_USE_VERTEX      = "1"
+CLOUD_ML_REGION             = "global"
+ANTHROPIC_VERTEX_PROJECT_ID = "example-project"
+
+[judge]
+measure_cmd = "alpha-bench --json"
+direction   = "lower"
+objective   = "alpha"
+
+[world]
+snapshot_cmd = "rig-snapshot"
+restore_cmd  = "rig-restore"
+
+# A base [deploy] the composite overlay's [deploy.alpha] must OVERRIDE (never win over).
+[deploy]
+deploy_name = "alpha"
+[deploy.buildah]
+registry   = "registry.example.com/alpha-default"
+dockerfile = "Dockerfile.alpha"

@@ -1,0 +1,53 @@
+# A second issue overlay on the gamma composite: reuses the base combined gate, swaps in its
+# own goal / prompt / apply hook, and names deploy targets for BOTH components.
+
+[composite]
+name = "omega"
+
+[[component]]
+domain  = "alpha"
+pr_repo = "example/alpha-fork"
+[[component]]
+domain  = "beta"
+pr_repo = "example/beta-fork"
+
+[agent]
+model         = "claude-opus-4-6"
+method_prompt = "prompts/omega.md"
+goal_file     = "goals/omega.md"
+backend       = "openshell"
+sandbox_image = "registry.example.com/gamma-sandbox:pinned"
+[agent.env]
+CLAUDE_CODE_USE_VERTEX      = "1"
+CLOUD_ML_REGION             = "global"
+ANTHROPIC_VERTEX_PROJECT_ID = "example-project"
+
+[agent.openshell]
+
+[agent.broker]
+enabled = true
+bin     = "crucible-broker"
+name    = "omega-broker"
+build   = true
+
+[judge]
+measure_cmd = "gamma-bench"
+direction   = "higher"
+objective   = "omega"
+
+[world]
+apply_cmd    = "omega-apply"
+snapshot_cmd = "omega-snapshot"
+restore_cmd  = "omega-restore"
+
+[deploy.alpha]
+[deploy.alpha.buildah]
+registry   = "registry.example.com/alpha-candidate"
+dockerfile = "Dockerfile.alpha"
+[deploy.alpha.env]
+ALPHA_DEPLOY = "gamma-alpha"
+
+[deploy.beta.env]
+BETA_CANDIDATE_REPO = "registry.example.com/beta-candidate"
+BETA_SITE_PACKAGES  = "usr/local/lib/python3.12/dist-packages"
+BETA_DEPLOY         = "gamma-beta"

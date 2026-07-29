@@ -1,0 +1,42 @@
+# Synthetic deploy profile for the omega overlay: podman sandbox driver (the default), plus the
+# broker's native JIRA Cloud client env (token from a secretKeyRef, never a literal) and the
+# overlay's frozen-workload knob.
+
+[cluster]
+loop_namespace  = "loop-ns"
+rig_namespace   = "rig-ns"
+service_account = "autoresearch-publisher"
+supervisor_image = "registry.example.com/openshell-supervisor:latest"
+results_bucket = "s3://example-artifacts/autoresearch"
+aws_role_arn   = "arn:aws:iam::000000000000:role/example-autoresearch"
+
+[image]
+loop        = "registry.example.com/gamma-loop:latest"
+pull_secret = "example-pull"
+
+[secrets]
+pull_authfile = "example-authfile"
+push_authfile = "example-push"
+
+[[secret_env]]
+name   = "GCLOUD_CREDENTIALS"
+secret = "gcloud-adc"
+key    = "adc.json"
+
+[[secret_env]]
+name   = "JIRA_API_TOKEN"
+secret = "jira-cloud"
+key    = "token"
+
+[env]
+ANTHROPIC_VERTEX_PROJECT_ID = "example-project"
+CLOUD_ML_REGION             = "global"
+RIG_NAMESPACE               = "rig-ns"
+RIG_ENDPOINT                = "http://gamma-alpha.rig-ns.svc.cluster.local:80"
+BENCH_MODEL                 = "example/tiny-model"
+AWS_DEFAULT_REGION          = "us-east-1"
+# The overlay's frozen-workload knob the gate reads.
+BENCH_ADAPTER_MIX           = "tool,summarize,math"
+# Native JIRA Cloud client config; the token rides the jira-cloud secret above.
+JIRA_URL                    = "https://example.atlassian.net"
+JIRA_USERNAME               = "bot@example.com"

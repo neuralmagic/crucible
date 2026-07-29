@@ -1,0 +1,8 @@
+# Image bases in the build graph that are neither ours (ghcr.io/neuralmagic/*) nor a known-public
+# upstream. `tools/build_graph.py --lint-bases` reads this: a key here is tolerated, anything NOT here
+# fails CI. Keep it near-empty — every line is a base a fork of this repo has to be able to pull.
+#
+# Format: one image key (registry/repo, no tag/digest) per line. `# ...` comments allowed.
+#
+# Example:
+#   ghcr.io/some-org/some-base   # third-party base for X, public, pinned by digest in Containerfile.y

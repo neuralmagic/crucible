@@ -1,0 +1,72 @@
+# crucible build contract, v1.
+#
+# The reference workflow crucible's GithubActions build backend dispatches. A conforming workflow
+# honors exactly two behaviors:
+#   1. echo the `correlation_id` input into the run name — workflow_dispatch returns 204 with no run
+#      id, so the run name is how crucible finds its dispatch;
+#   2. push the built image to the `image` input's tag.
+# crucible resolves the pushed digest itself from the registry (the single source of truth), so this
+# workflow reports nothing back: no artifact, no job output.
+#
+# Inputs (the only values crucible forwards, after closed-vocabulary template expansion):
+#   containerfile   Containerfile path, relative to the checked-out context.
+#   context-ref     git ref (branch/tag/SHA) to build.
+#   image           full destination `registry/repo:tag` to push.
+#   correlation_id  opaque id crucible generated for this dispatch.
+run-name: crucible-build ${{ inputs.correlation_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      containerfile:
+        description: Containerfile path relative to the context checkout.
+        required: true
+        type: string
+      context-ref:
+        description: git ref (branch, tag, or SHA) to build.
+        required: true
+        type: string
+      image:
+        description: Full destination image ref to push (registry/repo:tag).
+        required: true
+        type: string
+      correlation_id:
+        description: Opaque dispatch id crucible correlates the run by (echoed into run-name).
+        required: true
+        type: string
+
+# Read the repo; write packages so the built-in GITHUB_TOKEN can push to GHCR. A workflow pushing
+# elsewhere swaps the login step's credentials for its own repo secrets — crucible never passes any.
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.context-ref }}
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Push to the tag crucible handed us; it re-resolves the digest from the registry after.
+      - name: Build and push
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: ${{ inputs.containerfile }}
+          platforms: linux/amd64
+          push: true
+          tags: ${{ inputs.image }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -1,0 +1,28 @@
+# The overlay variant of the alpha fixture: same rig world, an inline goal instead of a
+# goal_file, still a lower-is-better gate.
+
+[repo]
+url = "https://github.com/example/alpha.git"
+ref = "main"
+
+[workspace]
+dir = "workspace/alpha"
+setup_cmd = "setup --workspace workspace/alpha"
+
+[agent]
+model   = "claude-opus-4-6"
+goal    = "Reproduce the reported bug as a failing test, then fix the code."
+backend = "local"
+[agent.env]
+CLAUDE_CODE_USE_VERTEX      = "1"
+CLOUD_ML_REGION             = "global"
+ANTHROPIC_VERTEX_PROJECT_ID = "example-project"
+
+[judge]
+measure_cmd = "alpha-test"
+direction   = "lower"
+objective   = "test"
+
+[world]
+snapshot_cmd = "rig-snapshot"
+restore_cmd  = "rig-restore"

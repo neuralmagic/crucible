@@ -1,0 +1,16 @@
+# cargo-audit policy for the public repo (ci.yml's audit job). Mirrors deny.toml's triaged
+# advisory baseline, cargo-audit does not read deny.toml, so the ignore list lives twice;
+# keep the two in sync and shrink both on dep bumps.
+[advisories]
+ignore = [
+    # rustls-webpki 0.101.x via the aws-sdk legacy hyper-rustls 0.24 stack (fixed-endpoint S3
+    # client, not a general TLS verifier).
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0104",
+    # rmcp streamable-http DNS rebinding: broker listener is pod-internal behind the sandbox
+    # egress allowlist.
+    "RUSTSEC-2026-0189",
+    # anyhow Error::downcast_mut unsoundness; not called in this workspace.
+    "RUSTSEC-2026-0190",
+]

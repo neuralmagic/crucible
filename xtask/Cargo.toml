@@ -1,0 +1,11 @@
+[package]
+name = "xtask"
+description = "Repo automation (`cargo xtask …`): tasks CI and the justfile shell out to. Never shipped: not in any release/image `-p` list, and `cargo xtask` builds the dev profile."
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+toml = "0.8"

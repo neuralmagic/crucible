@@ -1,0 +1,19 @@
+# Rust build output.
+target/
+# Runtime loop state + results logs.
+/workspace/
+/state/
+*.log
+# Example domains: the engine creates a workspace + state under each example's manifest dir.
+examples/*/workspace/
+examples/*/state/
+# Python noise.
+__pycache__/
+*.pyc
+.venv/
+# mdBook render output.
+/book/
+# Operator steer scratch (consumed at runtime).
+/STEER.md
+# macOS Finder droppings.
+.DS_Store

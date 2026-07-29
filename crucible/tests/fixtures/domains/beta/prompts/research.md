@@ -1,0 +1,3 @@
+# Method
+
+Research, propose, measure.

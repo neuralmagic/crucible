@@ -1,0 +1,10 @@
+# Personal-namespace images still in the build graph, pending migration to ghcr.io/neuralmagic/*.
+# `tools/build_graph.py --lint-personal` reads this: a key here is tolerated, anything NOT here fails CI.
+# This file IS the migration checklist — delete a line the moment that image is built/mirrored to the
+# org registry and its refs are repointed. When this file is empty (only comments), the "no personal
+# deps" invariant is fully enforced and the graph can never regress.
+#
+# Format: one image key (registry/repo, no tag/digest) per line. `# ...` comments allowed.
+
+# EMPTY — every build-graph image is on ghcr.io/neuralmagic. The "no personal-namespace deps"
+# invariant is now fully enforced: any quay.io/wseaton/* base re-entering a Containerfile fails CI.

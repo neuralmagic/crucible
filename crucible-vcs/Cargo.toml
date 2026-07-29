@@ -1,0 +1,10 @@
+[package]
+name = "crucible-vcs"
+description = "Git-as-memory for the loop's workspace: stage/commit/reset/clean via libgit2 (no `git` subprocess). Confines the git2 dependency off the main engine crate."
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+git2.workspace = true

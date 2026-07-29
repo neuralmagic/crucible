@@ -1,0 +1,24 @@
+[book]
+title = "crucible"
+description = "A goal-driven, gated, keep/discard autoresearch loop for letting an agent improve a codebase against a frozen objective."
+authors = ["crucible contributors"]
+src = "docs"
+language = "en"
+
+[output.html]
+theme = "docs/theme"
+git-repository-url = "https://github.com/neuralmagic/crucible"
+edit-url-template = "https://github.com/neuralmagic/crucible/edit/main/{path}"
+default-theme = "rust"
+preferred-dark-theme = "ayu"
+additional-css = ["docs/theme/crucible.css"]
+additional-js = ["mermaid-init.js"]
+
+[output.html.fold]
+enable = true
+level = 0
+
+[preprocessor]
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"

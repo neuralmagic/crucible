@@ -1,0 +1,29 @@
+# An issue-overlay fixture with a frozen judge harness delivered via the engine's generic
+# [[workspace.inject]] primitive: the baked file (outside the clone target) is copied into the
+# workspace after setup AND re-copied before every scored measure (frozen = true).
+
+[repo]
+url = "https://github.com/example/alpha.git"
+ref = "main"
+
+[workspace]
+dir = "workspace/alpha"
+
+[[workspace.inject]]
+src = "judges/issue/judge_harness_test.go"
+dst = "pkg/alpha/judge_harness_test.go"
+frozen = true
+
+[agent]
+model     = "claude-opus-4-6"
+goal_file = "goals/issue.md"
+backend   = "local"
+[agent.env]
+CLAUDE_CODE_USE_VERTEX      = "1"
+CLOUD_ML_REGION             = "global"
+ANTHROPIC_VERTEX_PROJECT_ID = "example-project"
+
+[judge]
+measure_cmd = "measure-issue"
+direction   = "higher"
+objective   = "issue"

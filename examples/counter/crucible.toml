@@ -1,0 +1,31 @@
+# counter — crucible's litmus domain. The engine's whole generic path (manifest -> setup ->
+# propose -> measure -> keep/discard -> git memory) with NO cluster and NO LLM.
+#
+# The "repo under test" is a git tree whose entire code is an integer in value.txt. The score
+# IS that integer; the agent's job is to raise it. GitWorld gives reversibility (kept = commit,
+# discard = reset --hard). The deterministic `command` backend (bump.nu) stands in for an LLM,
+# so this runs in milliseconds for free and is a real e2e (not a mock).
+#
+#   crucible --manifest examples/counter/crucible.toml --iterations 6
+
+[repo]
+path = "."
+
+[workspace]
+dir = "workspace"
+# setup runs with cwd = manifest dir (the workspace does not exist yet). Seed a fresh git repo
+# carrying only the files the candidate needs at runtime.
+setup_cmd = "mkdir -p workspace && cp value.txt measure.nu bump.nu workspace/ && git -C workspace init -q && git -C workspace add -A && git -C workspace -c user.email=crucible@local -c user.name=crucible -c commit.gpgsign=false commit -qm baseline"
+
+[agent]
+backend       = "command"
+agent_cmd     = "./bump.nu"     # deterministic proposer: value.txt += 1
+method_prompt = "method.md"     # only used if you switch backend = "local"
+goal          = "Raise the integer in value.txt as high as you can (target: 5)."
+
+[judge]
+measure_cmd = "./measure.nu"
+direction   = "higher"
+objective   = "value"
+
+# No [world] block  ->  GitWorld: kept iterations are commits, discards reset --hard + clean.

@@ -1,0 +1,229 @@
+:root {
+  --content-max-width: 920px;
+  --page-padding: 28px;
+  --cru-accent: #b45309;
+  --cru-accent-2: #2563eb;
+  --cru-border: color-mix(in srgb, var(--fg) 16%, transparent);
+  --cru-muted: color-mix(in srgb, var(--fg) 68%, var(--bg));
+  --cru-surface: color-mix(in srgb, var(--bg) 94%, var(--fg));
+  --cru-code-bg: color-mix(in srgb, var(--bg) 88%, var(--fg));
+}
+
+.light,
+.rust,
+html:not(.js) {
+  --links: #b04a08;
+  --sidebar-active: #b45309;
+  --table-header-bg: #f6eee4;
+  --table-alternate-bg: #fbf7f1;
+  --quote-bg: #fbf4ea;
+  --quote-border: #e6cba6;
+}
+
+.ayu,
+.coal,
+.navy {
+  --cru-border: color-mix(in srgb, var(--fg) 22%, transparent);
+  --cru-surface: color-mix(in srgb, var(--bg) 86%, var(--fg));
+  --cru-code-bg: color-mix(in srgb, var(--bg) 80%, var(--fg));
+}
+
+.content main {
+  padding-block-start: 22px;
+}
+
+.content p,
+.content li {
+  line-height: 1.62;
+}
+
+.content h1,
+.content h2,
+.content h3 {
+  letter-spacing: 0;
+}
+
+.content h1 {
+  margin-block: 0.55em 0.65em;
+  font-size: 3.4rem;
+  line-height: 1.12;
+}
+
+.content h2 {
+  margin-block-start: 2.25em;
+  padding-block-start: 0.35em;
+  border-block-start: 1px solid var(--cru-border);
+  font-size: 2.35rem;
+}
+
+.content h3 {
+  font-size: 1.78rem;
+}
+
+.content a {
+  text-underline-offset: 0.18em;
+}
+
+.content a:hover {
+  text-decoration-thickness: 0.08em;
+}
+
+.content code {
+  padding: 0.08em 0.28em;
+  border-radius: 4px;
+  background: var(--cru-code-bg);
+}
+
+.content pre code {
+  padding: 0;
+  background: transparent;
+}
+
+.content pre {
+  border: 1px solid var(--cru-border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px color-mix(in srgb, #000 8%, transparent);
+}
+
+.table-wrapper {
+  margin-block: 1.25em;
+  border: 1px solid var(--cru-border);
+  border-radius: 8px;
+}
+
+table {
+  width: 100%;
+}
+
+table th,
+table td {
+  padding: 0.68em 0.9em;
+  vertical-align: top;
+}
+
+blockquote {
+  border-block: 0;
+  border-inline-start: 4px solid var(--quote-border);
+  border-radius: 0 8px 8px 0;
+}
+
+.sidebar-scrollbox {
+  padding-block-start: 0.65rem;
+}
+
+.chapter li {
+  margin-block: 0.18rem;
+}
+
+.chapter li.part-title {
+  margin-block-start: 1.25rem;
+  color: var(--cru-muted);
+  font-size: 1.15rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.menu-title {
+  font-weight: 700;
+}
+
+.cru-hero {
+  margin-block: 0 2rem;
+  padding: 1.45rem 1.6rem;
+  border: 1px solid var(--cru-border);
+  border-radius: 8px;
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--cru-accent) 14%, transparent), transparent 52%),
+    var(--cru-surface);
+}
+
+.cru-hero .eyebrow {
+  margin: 0 0 0.45rem;
+  color: var(--cru-accent);
+  font-size: 1.2rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.cru-hero .lead {
+  margin: 0;
+  max-width: 72ch;
+  font-size: 1.82rem;
+  line-height: 1.5;
+}
+
+.cru-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 1rem;
+  margin-block: 1.25rem;
+}
+
+.cru-card {
+  padding: 1rem 1.1rem;
+  border: 1px solid var(--cru-border);
+  border-radius: 8px;
+  background: var(--cru-surface);
+}
+
+.cru-card h3 {
+  margin-block: 0 0.35rem;
+}
+
+.cru-card p {
+  margin-block: 0;
+  color: var(--cru-muted);
+}
+
+.cru-callout {
+  margin-block: 1.2rem;
+  padding: 0.95rem 1.1rem;
+  border-inline-start: 4px solid var(--cru-accent-2);
+  border-radius: 0 8px 8px 0;
+  background: var(--cru-surface);
+}
+
+.cru-callout p {
+  margin-block: 0;
+}
+
+/* Mermaid diagrams: a bordered viewport that svg-pan-zoom drives. Fixed height +
+   hidden overflow so the wide flowchart pans/zooms inside the box instead of
+   blowing past the content column. */
+.mermaid {
+  border: 1px solid var(--cru-border, rgba(128, 128, 128, 0.3));
+  border-radius: 8px;
+  background: var(--cru-surface, rgba(128, 128, 128, 0.04));
+  overflow: hidden;
+  margin-block: 1.2rem;
+}
+
+.mermaid > svg {
+  display: block;
+}
+
+/* svg-pan-zoom's on-screen zoom controls */
+.mermaid .svg-pan-zoom-control {
+  opacity: 0.55;
+  transition: opacity 0.15s ease;
+}
+
+.mermaid:hover .svg-pan-zoom-control {
+  opacity: 1;
+}
+
+@media (max-width: 700px) {
+  :root {
+    --page-padding: 18px;
+  }
+
+  .content h1 {
+    font-size: 2.7rem;
+  }
+
+  .cru-hero {
+    padding: 1.1rem 1.2rem;
+  }
+}

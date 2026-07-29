@@ -1,0 +1,84 @@
+name: Release
+
+# Publish the standalone binaries (crucible engine + the forge build/deploy bins) as GitHub
+# Release assets for users who want the engine without pulling the runtime image.
+# Matrix: linux x86_64 / glibc (the deploy target, the binaries link libgit2 + openssl, so a
+# static musl build is more trouble than it's worth) and macOS arm64 (the BYO-laptop on-ramp:
+# install one binary, `crucible init` on your repo).
+#
+# Tag a release (v*) to publish. workflow_dispatch: build-only smoke by default, or pass an
+# existing release tag as `tag` to build from it and backfill its assets (how a new matrix
+# target gets onto an already-cut release without re-tagging).
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to build from and upload assets to (empty = smoke only)'
+        required: false
+        default: ''
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false # never interrupt an in-progress release upload
+
+permissions:
+  contents: write # create the release + upload assets
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest] # x86_64-unknown-linux-gnu, aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          # Backfill mode builds the tagged source, not whatever main has moved to.
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+
+      # The same crates the runtime image builds: crucible (engine) + forge (engine-side
+      # build/deploy bins).
+      - name: Build release binaries
+        run: cargo build --release --locked -p crucible -p forge --bins
+
+      # Collect every top-level executable from target/release (same pattern the Containerfile
+      # uses to stage /art/bin) into one tarball + a no-tooling sha256 integrity file.
+      # `-perm -u+x`, not GNU-only `-executable`: this step runs on BSD find too (macOS).
+      - name: Package
+        id: pkg
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          triple="$(rustc -vV | sed -n 's/^host: //p')"
+          name="crucible-${tag}-${triple}"
+          mkdir -p dist staging
+          find target/release -maxdepth 1 -type f -perm -u+x -exec cp {} staging/ \;
+          echo "staged binaries:" && ls -la staging/
+          tar -C staging -czf "dist/${name}.tar.gz" .
+          ( cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+          ls -la dist/
+
+      # On a tag push or a `tag`-input dispatch: publish to that release. On a bare dispatch:
+      # smoke only (the build above is the test). `gh release create || true` is idempotent if
+      # the release already exists (always the case in backfill mode).
+      - name: Upload to release
+        if: ${{ github.ref_type == 'tag' || inputs.tag != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          gh release create "$tag" \
+            --title "$tag" --generate-notes --verify-tag 2>/dev/null || true
+          gh release upload "$tag" dist/* --clobber

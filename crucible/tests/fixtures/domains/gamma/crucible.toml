@@ -1,0 +1,31 @@
+# Synthetic composite fixture: two sibling components (alpha + beta) co-located under one base
+# workspace, a combined higher-is-better gate, and a combined rig world. Stands in for a real
+# multi-component composite domain pack in the core test suite.
+
+[composite]
+name = "gamma"
+
+[[component]]
+domain = "alpha"
+[[component]]
+domain = "beta"
+
+[agent]
+model         = "claude-opus-4-6"
+method_prompt = "prompts/gamma.md"
+goal_file     = "goals/gamma.md"
+backend       = "openshell"
+sandbox_image = "registry.example.com/gamma-sandbox:dev"
+[agent.env]
+CLAUDE_CODE_USE_VERTEX      = "1"
+CLOUD_ML_REGION             = "global"
+ANTHROPIC_VERTEX_PROJECT_ID = "example-project"
+
+[judge]
+measure_cmd = "gamma-bench"
+direction   = "higher"
+objective   = "serving"
+
+[world]
+snapshot_cmd = "gamma-rig-snapshot"
+restore_cmd  = "gamma-rig-restore"

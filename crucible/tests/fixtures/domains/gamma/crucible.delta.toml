@@ -1,0 +1,54 @@
+# An issue overlay on the gamma composite: same components, its own goal / prompt / gate /
+# apply hook, per-component pr_repo forks, a broker with build=true, and [deploy.<component>]
+# overrides for the issue-specific candidate repos.
+
+[composite]
+name = "delta"
+
+[[component]]
+domain  = "alpha"
+pr_repo = "example/alpha-fork"
+[[component]]
+domain  = "beta"
+pr_repo = "example/beta-fork"
+
+[agent]
+model         = "claude-opus-4-6"
+method_prompt = "prompts/delta.md"
+goal_file     = "goals/delta.md"
+backend       = "openshell"
+sandbox_image = "registry.example.com/gamma-sandbox:pinned"
+[agent.env]
+CLAUDE_CODE_USE_VERTEX      = "1"
+CLOUD_ML_REGION             = "global"
+ANTHROPIC_VERTEX_PROJECT_ID = "example-project"
+
+[agent.openshell]
+
+[agent.broker]
+enabled = true
+bin     = "crucible-broker"
+name    = "delta-broker"
+build   = true
+
+[judge]
+measure_cmd = "delta-bench"
+direction   = "higher"
+objective   = "delta"
+
+[world]
+apply_cmd    = "delta-apply"
+snapshot_cmd = "delta-snapshot"
+restore_cmd  = "delta-restore"
+
+# Overrides alpha's own [deploy] (the issue-specific candidate repo, not the base default).
+[deploy.alpha]
+[deploy.alpha.buildah]
+registry   = "registry.example.com/alpha-candidate"
+dockerfile = "Dockerfile.alpha"
+[deploy.alpha.env]
+ALPHA_DEPLOY = "gamma-alpha"
+
+[deploy.beta.env]
+BETA_CANDIDATE_REPO = "registry.example.com/beta-candidate"
+BETA_SITE_PACKAGES  = "usr/local/lib/python3.12/dist-packages"
