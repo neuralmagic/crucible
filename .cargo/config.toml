@@ -1,0 +1,5 @@
+[alias]
+# The standard cargo-xtask pattern: `cargo xtask <task>` runs the workspace's automation bin.
+# --quiet keeps cargo's own progress off stdout so `$(cargo xtask openshell-rev)` captures
+# exactly the task's output.
+xtask = "run --quiet --package xtask --"
