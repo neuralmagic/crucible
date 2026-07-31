@@ -39,6 +39,42 @@ pub async fn require_bearer(
         .into_response()
 }
 
+/// The sandbox-facing hostnames the compute drivers hand the agent (podman bridge / openshell
+/// cluster alias). rmcp's DNS-rebinding guard allowlists loopback only, and neither of these is
+/// loopback, so without them every tool call dies at the transport with a 403.
+const SANDBOX_HOSTS: [&str; 2] = ["host.containers.internal", "host.openshell.internal"];
+
+/// The `Host` values rmcp's streamable-http transport will accept, layered on top of its
+/// loopback default (`loopback`): the two driver hostnames, plus whatever a deployment adds
+/// through `BROKER_ALLOWED_HOSTS` (comma-separated). An entry may be a bare `host`, which matches
+/// that host on ANY port, or an exact `host:port`. A deployment needs the env only when it fronts
+/// the broker under some other name, e.g. an in-cluster Service DNS name or an explicit
+/// `[broker].url` override in the domain manifest.
+pub fn allowed_hosts(loopback: Vec<String>) -> Vec<String> {
+    extra_hosts(
+        loopback,
+        std::env::var("BROKER_ALLOWED_HOSTS").ok().as_deref(),
+    )
+}
+
+/// The pure half of [`allowed_hosts`], with the env value passed in.
+fn extra_hosts(mut hosts: Vec<String>, env: Option<&str>) -> Vec<String> {
+    let extra = SANDBOX_HOSTS.iter().copied().chain(
+        env.unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|h| !h.is_empty()),
+    );
+    for host in extra {
+        // Order-preserving, so the loopback defaults stay first. `Vec::dedup` would only catch
+        // adjacent repeats, and a deployment re-listing a driver host is not adjacent to it.
+        if !hosts.iter().any(|h| h == host) {
+            hosts.push(host.to_string());
+        }
+    }
+    hosts
+}
+
 /// The pure check: pass when no token is expected, else require an exact `Bearer <token>` match.
 fn authorized(header: Option<&str>, expected: Option<&str>) -> bool {
     let Some(want) = expected else { return true };
@@ -55,6 +91,45 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// rmcp's loopback-only default 403s the sandbox, which reaches us on the driver hostname.
+    /// Both driver names must survive with no deployment config at all.
+    #[test]
+    fn sandbox_driver_hosts_are_allowed_without_any_env() {
+        let hosts = extra_hosts(vec!["localhost".into(), "127.0.0.1".into()], None);
+        assert!(hosts.iter().any(|h| h == "host.containers.internal"));
+        assert!(hosts.iter().any(|h| h == "host.openshell.internal"));
+        assert!(hosts.iter().any(|h| h == "localhost"), "keeps loopback");
+    }
+
+    #[test]
+    fn env_adds_deployment_hosts_and_ignores_blanks() {
+        let hosts = extra_hosts(
+            vec!["localhost".into()],
+            Some(" broker.crucible.svc , broker.crucible.svc:8849 ,, "),
+        );
+        assert!(hosts.iter().any(|h| h == "broker.crucible.svc"));
+        assert!(hosts.iter().any(|h| h == "broker.crucible.svc:8849"));
+        assert!(!hosts.iter().any(|h| h.is_empty()));
+        assert!(hosts.iter().any(|h| h == "host.containers.internal"));
+    }
+
+    /// A deployment re-listing a host we already add must not double it up.
+    #[test]
+    fn repeated_hosts_collapse() {
+        let hosts = extra_hosts(
+            vec!["localhost".into()],
+            Some("host.containers.internal,localhost"),
+        );
+        assert_eq!(
+            hosts,
+            vec![
+                "localhost",
+                "host.containers.internal",
+                "host.openshell.internal"
+            ]
+        );
+    }
 
     #[test]
     fn no_expected_token_means_open() {

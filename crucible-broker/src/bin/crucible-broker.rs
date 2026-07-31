@@ -147,10 +147,11 @@ async fn main() -> anyhow::Result<()> {
 
     let bind = std::env::var("BROKER_BIND").unwrap_or_else(|_| DEFAULT_BIND.into());
     let stateful = std::env::var("BROKER_STATEFUL").is_ok_and(|v| v == "1" || v == "true");
-    let config = StreamableHttpServerConfig {
-        stateful_mode: stateful,
-        ..Default::default()
-    };
+    // `StreamableHttpServerConfig` is `#[non_exhaustive]`, so build it from `Default` and assign
+    // (a struct literal will not compile, `..Default::default()` included).
+    let mut config = StreamableHttpServerConfig::default();
+    config.stateful_mode = stateful;
+    config.allowed_hosts = crucible_broker::auth::allowed_hosts(config.allowed_hosts);
     let degraded = std::env::var("BROKER_DEGRADED").is_ok_and(|v| v == "1" || v == "true");
 
     // One JIRA client shared across sessions. `None` (off / misconfigured) just means the

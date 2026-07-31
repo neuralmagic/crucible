@@ -19,9 +19,6 @@ ignore = [
     { id = "RUSTSEC-2026-0098", reason = "legacy aws-sdk rustls stack; fixed-endpoint S3 client, not a general TLS verifier" },
     { id = "RUSTSEC-2026-0099", reason = "legacy aws-sdk rustls stack; fixed-endpoint S3 client, not a general TLS verifier" },
     { id = "RUSTSEC-2026-0104", reason = "legacy aws-sdk rustls stack; fixed-endpoint S3 client, not a general TLS verifier" },
-    # rmcp streamable-http DNS rebinding: the broker binds loopback/pod-internal and is fronted
-    # by the sandbox egress allowlist; revisit on the next rmcp bump.
-    { id = "RUSTSEC-2026-0189", reason = "broker MCP listener is pod-internal behind the sandbox egress allowlist" },
     # anyhow Error::downcast_mut unsoundness; no downcast_mut use in this workspace.
     { id = "RUSTSEC-2026-0190", reason = "workspace does not call Error::downcast_mut" },
 ]
