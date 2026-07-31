@@ -8,13 +8,11 @@
 //! `CreateContainerConfigError` later.
 
 use crate::openshell::gateway::ComputeDriver;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
+use forge::fleet::{ClusterEntry, FleetFile};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
-
-/// The fleet file's default name, resolved in the profile's own directory.
-const FLEET_FILE_NAME: &str = "clusters.toml";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -49,80 +47,6 @@ pub struct DeployProfile {
     /// (`clusters.toml` beside the profile); a local block overrides the fleet file on conflict.
     #[serde(default)]
     pub clusters: BTreeMap<String, ClusterEntry>,
-}
-
-/// One remote spoke cluster the broker can delegate jobs to. The hub holds the spoke's
-/// credential: a named Secret carrying a scoped-SA kubeconfig under the `kubeconfig` key,
-/// mounted on the loop pod (never reachable from the sandbox, `crucible check` asserts it).
-#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ClusterEntry {
-    /// Hub Secret holding the spoke kubeconfig (key `kubeconfig`). Reference-only.
-    pub kubeconfig_secret: String,
-    /// hostname -> IP, rendered as pod-spec `hostAliases` on the loop pod (the routable but
-    /// DNS-dark tier; TLS stays intact because the hostname is preserved).
-    #[serde(default)]
-    pub host_aliases: BTreeMap<String, String>,
-    /// HTTP CONNECT proxy fronting the spoke API server (the proxy-reachable tier, e.g. squid:
-    /// `http://10.x.x.x:3128`). Honored by the broker's spoke client; no tunnel involved.
-    #[serde(default)]
-    pub proxy_url: Option<String>,
-    /// SSH bastion for the non-routable tier. Accepted by the schema, not implemented yet:
-    /// selecting a bastioned cluster is a render/check error until the tunnel lands.
-    #[serde(default)]
-    pub bastion: Option<BastionCfg>,
-}
-
-/// The `[clusters.<name>.bastion]` block (schema only until the tunnel is implemented).
-#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct BastionCfg {
-    pub host: String,
-    pub user: String,
-    /// Hub Secret holding the SSH private key. Reference-only.
-    pub key_secret: String,
-}
-
-/// A spoke's reachability tier, derived from its entry (named in unreachable-spoke tool errors).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClusterTier {
-    Public,
-    DnsDark,
-    Proxy,
-    Bastion,
-}
-
-impl ClusterTier {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Public => "public",
-            Self::DnsDark => "dns-dark",
-            Self::Proxy => "proxy",
-            Self::Bastion => "bastion",
-        }
-    }
-}
-
-impl ClusterEntry {
-    pub fn tier(&self) -> ClusterTier {
-        if self.bastion.is_some() {
-            ClusterTier::Bastion
-        } else if self.proxy_url.is_some() {
-            ClusterTier::Proxy
-        } else if !self.host_aliases.is_empty() {
-            ClusterTier::DnsDark
-        } else {
-            ClusterTier::Public
-        }
-    }
-}
-
-/// The fleet file: `[clusters.<name>]` tables shared by every profile in the directory.
-#[derive(Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-struct FleetFile {
-    #[serde(default)]
-    clusters: BTreeMap<String, ClusterEntry>,
 }
 
 /// Per-cluster substrate facts for the codegen measure jobs: the namespace/queue/PVCs/ceiling the
@@ -367,30 +291,8 @@ impl DeployProfile {
     /// must then exist); a profile-local `[clusters.<name>]` wins on conflict.
     pub fn load_with_fleet(path: &Path, clusters_override: Option<&Path>) -> Result<Self> {
         let mut profile = Self::load(path)?;
-        let fleet_path = match clusters_override {
-            Some(p) => {
-                if !p.exists() {
-                    bail!("--clusters {} does not exist", p.display());
-                }
-                Some(p.to_path_buf())
-            }
-            None => {
-                let sibling = path
-                    .parent()
-                    .filter(|d| !d.as_os_str().is_empty())
-                    .unwrap_or_else(|| Path::new("."))
-                    .join(FLEET_FILE_NAME);
-                sibling.exists().then_some(sibling)
-            }
-        };
-        if let Some(fleet_path) = fleet_path {
-            let text = std::fs::read_to_string(&fleet_path)
-                .with_context(|| format!("reading fleet file {}", fleet_path.display()))?;
-            let fleet: FleetFile = toml::from_str(&text)
-                .with_context(|| format!("parsing fleet file {}", fleet_path.display()))?;
-            for (name, entry) in fleet.clusters {
-                profile.clusters.entry(name).or_insert(entry);
-            }
+        if let Some(fleet_path) = FleetFile::resolve_path(path, clusters_override)? {
+            FleetFile::load(&fleet_path)?.merge_into(&mut profile.clusters);
         }
         Ok(profile)
     }
@@ -407,16 +309,7 @@ impl DeployProfile {
                  profile or its fleet file (clusters.toml)"
             )
         })?;
-        if entry.kubeconfig_secret.trim().is_empty() {
-            bail!("[clusters.{name}].kubeconfig_secret must be a non-empty Secret name");
-        }
-        // kube's client builder supports exactly these proxy schemes; catch a typo at render/check
-        // time instead of at job submit.
-        if let Some(proxy) = &entry.proxy_url
-            && !(proxy.starts_with("http://") || proxy.starts_with("socks5://"))
-        {
-            bail!("[clusters.{name}].proxy_url must be an http:// or socks5:// URL, got {proxy:?}");
-        }
+        entry.validate(name)?;
         Ok(Some((name, entry)))
     }
 }
@@ -563,26 +456,6 @@ mod tests {
         let p: DeployProfile = toml::from_str(&text).expect("parses");
         let err = p.measure_cluster().expect_err("empty secret name");
         assert!(err.to_string().contains("non-empty"), "{err:#}");
-    }
-
-    #[test]
-    fn tier_derives_from_the_entry_shape() {
-        let public: ClusterEntry = toml::from_str("kubeconfig_secret = \"s\"").expect("parses");
-        assert_eq!(public.tier(), ClusterTier::Public);
-        let dark: ClusterEntry = toml::from_str(
-            "kubeconfig_secret = \"s\"\nhost_aliases = { \"api.spoke.example\" = \"10.0.0.1\" }",
-        )
-        .expect("parses");
-        assert_eq!(dark.tier(), ClusterTier::DnsDark);
-        let proxied: ClusterEntry =
-            toml::from_str("kubeconfig_secret = \"s\"\nproxy_url = \"http://10.0.0.1:3128\"")
-                .expect("parses");
-        assert_eq!(proxied.tier(), ClusterTier::Proxy);
-        let bastioned: ClusterEntry = toml::from_str(
-            "kubeconfig_secret = \"s\"\n[bastion]\nhost = \"jump\"\nuser = \"u\"\nkey_secret = \"k\"",
-        )
-        .expect("the bastion block is accepted by the schema");
-        assert_eq!(bastioned.tier(), ClusterTier::Bastion);
     }
 
     #[test]

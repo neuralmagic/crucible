@@ -35,6 +35,10 @@ pub mod capture;
 /// server-side apply, so the engine never shells `kubectl`.
 pub mod kube;
 
+/// The fleet file: the `[clusters.<name>]` spoke entries a hub delegates work to, their
+/// reachability tiers, and the profile-side load/merge.
+pub mod fleet;
+
 /// Declarative image-build schema: the `[build.<name>]` manifest types, validation, the
 /// closed-vocabulary template expander, and the watched-path content digest.
 pub mod spec;
