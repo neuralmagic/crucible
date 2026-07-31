@@ -8,9 +8,6 @@ ignore = [
     "RUSTSEC-2026-0098",
     "RUSTSEC-2026-0099",
     "RUSTSEC-2026-0104",
-    # rmcp streamable-http DNS rebinding: broker listener is pod-internal behind the sandbox
-    # egress allowlist.
-    "RUSTSEC-2026-0189",
     # anyhow Error::downcast_mut unsoundness; not called in this workspace.
     "RUSTSEC-2026-0190",
 ]

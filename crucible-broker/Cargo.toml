@@ -20,7 +20,7 @@ forge = { path = "../forge" }
 # MCP wire: the official Rust SDK (rmcp) over the streamable-http transport (network-reachable from the
 # sandbox, egress-allowlisted at `host.containers.internal:8849`).
 # The tool/handler code is transport-independent; only the domain binary's `main` binds the listener.
-rmcp = { version = "0.16", features = [
+rmcp = { version = "1.8", features = [
   "server",
   "macros",
   "transport-streamable-http-server",
@@ -37,7 +37,7 @@ thiserror.workspace = true
 # JIRA Cloud client + token-frugal renderers, shared with the standalone `jira-mcp` server so there
 # is ONE curation/field map instead of a fork of it here. We keep our OWN three-tool surface: that
 # crate's nine tools include create/transition/link, which the sandboxed agent must never reach.
-jira-mcp = { git = "https://github.com/wseaton/jira-mcp", tag = "v0.2.0" }
+jira-mcp = { git = "https://github.com/wseaton/jira-mcp", tag = "v0.4.0" }
 schemars = "0.8"
 # A profile trace is a binary (gzip) artifact; it leaves the GPU pod base64'd on the job log and is
 # handed back to the agent base64'd by `fetch_trace` (the text `fetch_log` would corrupt it).
