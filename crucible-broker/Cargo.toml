@@ -48,13 +48,13 @@ tracing = "0.1"
 # Both binaries install the subscriber through `telemetry::init`: always the stderr fmt layer,
 # plus the OTLP span layer when an endpoint is set.
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-# MCP tool spans exported over OTLP, only when an endpoint is set — the same opentelemetry 0.31
+# MCP tool spans exported over OTLP, only when an endpoint is set — the same opentelemetry 0.32
 # stack + grpc-tonic transport the engine and controller already run, aimed at the in-cluster
 # Tempo through the loop pod's OTEL_EXPORTER_OTLP_ENDPOINT.
-tracing-opentelemetry = "0.32"
-opentelemetry = { version = "0.31", default-features = false, features = ["trace"] }
-opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace"] }
-opentelemetry-otlp = { version = "0.31", default-features = false, features = [
+tracing-opentelemetry = "0.33"
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = [
   "trace",
   "grpc-tonic",
   "tls-ring",
