@@ -349,6 +349,7 @@ mod tests {
                 pin_digests: false,
                 pr_repo: None,
                 pack: None,
+                clusters_file: None,
             },
         )
         .expect("render");
@@ -425,6 +426,7 @@ mod tests {
                 pin_digests: false,
                 pr_repo: None,
                 pack: None,
+                clusters_file: None,
             },
         )
         .expect("render");
@@ -464,6 +466,7 @@ mod tests {
                 pin_digests: false,
                 pr_repo: None,
                 pack: None,
+                clusters_file: None,
             },
         ) {
             Ok(_) => panic!("expected an error: no [controller] table"),

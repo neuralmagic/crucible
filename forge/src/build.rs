@@ -326,7 +326,7 @@ pub fn dispatch_cluster(req: &ClusterBuildRequest, authfile: &Path) -> Result<Bu
 
     let job = render_job(req);
     let job_name = req.job_name();
-    let uid = kube::create_job(&req.namespace, &job)?;
+    let uid = kube::create_job(&kube::KubeTarget::Ambient, &req.namespace, &job)?;
     kube::create_build_secret(
         &req.namespace,
         &req.secret_name(),
@@ -351,7 +351,12 @@ pub fn dispatch_cluster(req: &ClusterBuildRequest, authfile: &Path) -> Result<Bu
         )?;
     }
 
-    match kube::wait_for_job(&req.namespace, &job_name, req.timeout)? {
+    match kube::wait_for_job(
+        &kube::KubeTarget::Ambient,
+        &req.namespace,
+        &job_name,
+        req.timeout,
+    )? {
         JobResult::Succeeded => {
             let image_ref = req.image_ref();
             let digest_ref = oci::pin_digest(&image_ref, Some(authfile))
@@ -362,8 +367,14 @@ pub fn dispatch_cluster(req: &ClusterBuildRequest, authfile: &Path) -> Result<Bu
             })
         }
         JobResult::Failed => {
-            let log = kube::job_logs(&req.namespace, &job_name, BUILD_CONTAINER, Some(200))
-                .unwrap_or_default();
+            let log = kube::job_logs(
+                &kube::KubeTarget::Ambient,
+                &req.namespace,
+                &job_name,
+                BUILD_CONTAINER,
+                Some(200),
+            )
+            .unwrap_or_default();
             bail!(
                 "build Job {job_name} failed (namespace {}). Build log tail:\n{log}",
                 req.namespace
@@ -372,9 +383,16 @@ pub fn dispatch_cluster(req: &ClusterBuildRequest, authfile: &Path) -> Result<Bu
         JobResult::TimedOut => {
             // Reap the wedged Job (and its pod) so it can't hold cluster resources past the deadline.
             // TTL only reaps FINISHED jobs, and a Pending pod never finishes on its own.
-            let log = kube::job_logs(&req.namespace, &job_name, BUILD_CONTAINER, Some(200))
-                .unwrap_or_default();
-            if let Err(e) = kube::delete_job(&req.namespace, &job_name) {
+            let log = kube::job_logs(
+                &kube::KubeTarget::Ambient,
+                &req.namespace,
+                &job_name,
+                BUILD_CONTAINER,
+                Some(200),
+            )
+            .unwrap_or_default();
+            if let Err(e) = kube::delete_job(&kube::KubeTarget::Ambient, &req.namespace, &job_name)
+            {
                 eprintln!("warning: failed to delete timed-out build Job {job_name}: {e:#}");
             }
             bail!(

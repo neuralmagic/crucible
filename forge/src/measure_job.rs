@@ -1,7 +1,7 @@
 //! Kueue-admitted GPU measure jobs: render a `batch/v1` Job that runs a digest-pinned candidate on
 //! the GPU, drive it to a terminal state, and collect its logs.
 
-use crate::kube::{self, JobResult};
+use crate::kube::{self, JobResult, KubeTarget};
 use anyhow::{Context, Result};
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1 as core;
@@ -66,15 +66,17 @@ impl GpuJobSpec {
     }
 
     fn container(&self) -> core::Container {
-        let requests = BTreeMap::from([
-            (GPU_RESOURCE.to_string(), Quantity(self.gpus.to_string())),
+        // gpus == 0 omits the GPU resource entirely (a CPU-only job, e.g. the spoke smoketest):
+        // an explicit `nvidia.com/gpu: 0` still demands a GPU-quota'd Kueue flavor.
+        let mut requests = BTreeMap::from([
             ("cpu".to_string(), Quantity(self.cpu.clone())),
             ("memory".to_string(), Quantity(self.mem_request.clone())),
         ]);
-        let limits = BTreeMap::from([
-            (GPU_RESOURCE.to_string(), Quantity(self.gpus.to_string())),
-            ("memory".to_string(), Quantity(self.mem_limit.clone())),
-        ]);
+        let mut limits = BTreeMap::from([("memory".to_string(), Quantity(self.mem_limit.clone()))]);
+        if self.gpus > 0 {
+            requests.insert(GPU_RESOURCE.to_string(), Quantity(self.gpus.to_string()));
+            limits.insert(GPU_RESOURCE.to_string(), Quantity(self.gpus.to_string()));
+        }
 
         let mut volume_mounts: Vec<core::VolumeMount> = self
             .pvc_mounts
@@ -190,13 +192,14 @@ const LIVE_LOG_POLL: Duration = Duration::from_secs(15);
 /// guarded the same way. `queue_slack` extends the wait for time spent suspended in the queue (which
 /// doesn't tick the deadline). A timed-out Job is deleted (TTL only reaps finished jobs).
 pub fn run_gpu_job_with(
+    target: &KubeTarget,
     spec: &GpuJobSpec,
     queue_slack: Duration,
     mut on_logs: impl FnMut(&str),
 ) -> Result<GpuJobRun> {
     let job = render_gpu_job(spec);
     let started = Instant::now();
-    kube::create_job(&spec.namespace, &job)
+    kube::create_job(target, &spec.namespace, &job)
         .with_context(|| format!("submitting measure Job {}", spec.name))?;
     tracing::info!(
         job = %spec.name,
@@ -213,8 +216,9 @@ pub fn run_gpu_job_with(
             break JobResult::TimedOut;
         }
         // A short wait slice: `TimedOut` here just means "still running after the slice".
-        let step = kube::wait_for_job(&spec.namespace, &spec.name, slice)?;
-        if let Ok(snapshot) = kube::job_logs(&spec.namespace, &spec.name, MEASURE_CONTAINER, None)
+        let step = kube::wait_for_job(target, &spec.namespace, &spec.name, slice)?;
+        if let Ok(snapshot) =
+            kube::job_logs(target, &spec.namespace, &spec.name, MEASURE_CONTAINER, None)
             && snapshot.len() > longest.len()
         {
             on_logs(&snapshot);
@@ -230,12 +234,12 @@ pub fn run_gpu_job_with(
         elapsed_s = started.elapsed().as_secs(),
         "gpu job reached a terminal state"
     );
-    let logs = match kube::job_logs(&spec.namespace, &spec.name, MEASURE_CONTAINER, None) {
+    let logs = match kube::job_logs(target, &spec.namespace, &spec.name, MEASURE_CONTAINER, None) {
         Ok(finale) if finale.len() >= longest.len() => finale,
         _ => longest,
     };
     if result == JobResult::TimedOut
-        && let Err(e) = kube::delete_job(&spec.namespace, &spec.name)
+        && let Err(e) = kube::delete_job(target, &spec.namespace, &spec.name)
     {
         eprintln!(
             "warning: failed to delete timed-out measure Job {}: {e:#}",
@@ -339,6 +343,20 @@ mod tests {
             lim.0, "2",
             "GPU limit must equal request or k8s rejects the pod"
         );
+    }
+
+    #[test]
+    fn zero_gpus_omits_the_gpu_resource_entirely() {
+        // The spoke smoketest submits CPU-only; an explicit `nvidia.com/gpu: 0` would still
+        // demand a GPU-quota'd Kueue flavor and wedge Inadmissible.
+        let mut s = spec();
+        s.gpus = 0;
+        let job = render_gpu_job(&s);
+        let c = &job.spec.unwrap().template.spec.unwrap().containers[0];
+        let res = c.resources.as_ref().unwrap();
+        assert!(res.requests.as_ref().unwrap().get(GPU_RESOURCE).is_none());
+        assert!(res.limits.as_ref().unwrap().get(GPU_RESOURCE).is_none());
+        assert!(res.requests.as_ref().unwrap().contains_key("cpu"));
     }
 
     #[test]

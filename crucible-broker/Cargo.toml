@@ -10,6 +10,8 @@ edition.workspace = true
 # domain dependency: the resolver, admission, and approval are all boxed boundaries.
 [dependencies]
 anyhow.workspace = true
+# The bin's `spoke-smoke` subcommand (the default no-subcommand path stays the serve loop).
+clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # Generic engine-side workspace build+deploy (brokered to the agent over MCP): the broker pulls the

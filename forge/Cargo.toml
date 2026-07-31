@@ -41,7 +41,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # Typed Kubernetes client (Rendered deployments): the engine talks to the API server directly — no `kubectl`
 # shell-out. `ws` enables pod exec (the rig-invariant metric check); rustls avoids an OpenSSL build dep.
-kube = { version = "4.0", default-features = false, features = ["client", "rustls-tls", "ws", "jsonpatch"] }
+kube = { version = "4.0", default-features = false, features = ["client", "rustls-tls", "ws", "jsonpatch", "http-proxy"] }
+# `kube::Config::proxy_url` is typed `http::Uri`; the proxy-reachable spoke tier parses its
+# fleet-file `proxy_url` into it. Already transitive via kube/hyper.
+http = "1"
 k8s-openapi = { version = "0.28", features = ["v1_32"] }
 # JSON Patch (RFC 6902) for a targeted array-index replace (a container's `env` list) that a JSON
 # Merge Patch can't express without re-specifying the whole container. Already in the tree via kube-core.

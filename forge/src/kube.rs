@@ -36,6 +36,28 @@ fn block_on<F: Future>(fut: F) -> Result<F::Output> {
     }
 }
 
+/// Which cluster a delegated-job call targets. `Ambient` is the client every hub-side path uses
+/// (in-cluster SA in a pod, else the ambient kubeconfig); `Kubeconfig` is a per-call remote spoke
+/// (a mounted spoke-kubeconfig Secret on the loop pod, or a kubeconfig/context on a laptop).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum KubeTarget {
+    #[default]
+    Ambient,
+    Kubeconfig {
+        /// Kubeconfig file path; `None` = the default `$KUBECONFIG`/`~/.kube/config` resolution.
+        path: Option<std::path::PathBuf>,
+        /// Context to select; `None` = the kubeconfig's current-context.
+        context: Option<String>,
+        /// HTTP CONNECT proxy for the API server (the proxy-reachable spoke tier). Wins over any
+        /// `proxy-url` inside the kubeconfig; `None` keeps the kubeconfig's own.
+        proxy_url: Option<String>,
+    },
+}
+
+/// Connect budget for a remote spoke: an unreachable spoke must become a typed error, never a hang
+/// on kernel TCP timeouts.
+const SPOKE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// A connected client (in-cluster SA token when running in a pod, else the kubeconfig `kube-rs` resolves
 /// from `$KUBECONFIG`/`~/.kube/config`, the same precedence `kubectl` uses).
 async fn client() -> Result<Client> {
@@ -47,6 +69,70 @@ async fn client() -> Result<Client> {
     Client::try_default()
         .await
         .context("connecting to the Kubernetes API (in-cluster SA or kubeconfig)")
+}
+
+/// What the ambient client (see [`client`]) points at, for callers that need to tell a human which
+/// cluster a probe actually ran against: the in-cluster SA when running in a pod, else the
+/// kubeconfig's current context and cluster.
+pub fn ambient_context_description() -> String {
+    if std::env::var("KUBERNETES_SERVICE_HOST").is_ok() {
+        return "the in-cluster service account".to_string();
+    }
+    match kube::config::Kubeconfig::read() {
+        Ok(kc) => {
+            let ctx = match &kc.current_context {
+                Some(c) => c.clone(),
+                None => return "the default kubeconfig (no current-context)".to_string(),
+            };
+            let cluster = kc
+                .contexts
+                .iter()
+                .find(|c| c.name == ctx)
+                .and_then(|c| c.context.as_ref())
+                .map(|c| c.cluster.clone())
+                .unwrap_or_else(|| "<unknown>".to_string());
+            format!("kubeconfig context {ctx} (cluster {cluster})")
+        }
+        Err(e) => format!("the default kubeconfig (unreadable: {e})"),
+    }
+}
+
+/// A connected client for `target`: [`client`] for `Ambient`, else a per-call client built from
+/// the named kubeconfig (never a global), with a bounded connect timeout.
+async fn client_for(target: &KubeTarget) -> Result<Client> {
+    let KubeTarget::Kubeconfig {
+        path,
+        context,
+        proxy_url,
+    } = target
+    else {
+        return client().await;
+    };
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+    let kubeconfig = match path {
+        Some(p) => kube::config::Kubeconfig::read_from(p)
+            .with_context(|| format!("reading kubeconfig {}", p.display()))?,
+        None => kube::config::Kubeconfig::read().context("reading the default kubeconfig")?,
+    };
+    let options = kube::config::KubeConfigOptions {
+        context: context.clone(),
+        cluster: None,
+        user: None,
+    };
+    let mut config = kube::Config::from_custom_kubeconfig(kubeconfig, &options)
+        .await
+        .context("resolving the spoke kubeconfig")?;
+    config.connect_timeout = Some(SPOKE_CONNECT_TIMEOUT);
+    if let Some(proxy) = proxy_url {
+        config.proxy_url = Some(
+            proxy
+                .parse::<http::Uri>()
+                .with_context(|| format!("parsing spoke proxy_url {proxy}"))?,
+        );
+    }
+    Client::try_from(config).context("building the spoke client")
 }
 
 /// `kubectl set image deploy/<name> <container>=<image>`: a strategic-merge patch on the one container.
@@ -644,9 +730,9 @@ pub enum JobResult {
 /// Create a detached build Job and return its UID (so a per-build push secret can be owner-ref'd
 /// to it and cascade on TTL-reap). The controller never streams a build context; the Job clones
 /// its own source.
-pub(crate) fn create_job(ns: &str, job: &Job) -> Result<String> {
+pub(crate) fn create_job(target: &KubeTarget, ns: &str, job: &Job) -> Result<String> {
     block_on(async {
-        let api: Api<Job> = Api::namespaced(client().await?, ns);
+        let api: Api<Job> = Api::namespaced(client_for(target).await?, ns);
         let created = api
             .create(&PostParams::default(), job)
             .await
@@ -701,43 +787,106 @@ pub(crate) fn create_build_secret(
     })?
 }
 
+/// Base/ceiling for the status-poll retry backoff on transient `api.get` errors.
+const JOB_POLL_INTERVAL: Duration = Duration::from_secs(3);
+const JOB_POLL_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// How a failed Job status poll should be handled: `AuthRejected`/`JobGone` are permanent (retrying
+/// until the deadline would only bury the real cause under a generic TimedOut), everything else
+/// (timeouts, connection resets, 5xx, 429) is worth the backoff retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollFailure {
+    AuthRejected(u16),
+    JobGone,
+    Transient,
+}
+
+fn classify_poll_error(e: &kube::Error) -> PollFailure {
+    match e {
+        kube::Error::Api(resp) => match resp.code {
+            401 | 403 => PollFailure::AuthRejected(resp.code),
+            404 => PollFailure::JobGone,
+            _ => PollFailure::Transient,
+        },
+        _ => PollFailure::Transient,
+    }
+}
+
 /// Poll a build Job to a terminal condition or `timeout`. On timeout returns [`JobResult::TimedOut`]
 /// (not an error) so the caller can reap the wedged Job before failing. A single `block_on` owns the
-/// whole wait, like [`rollout_status`].
-pub(crate) fn wait_for_job(ns: &str, name: &str, timeout: Duration) -> Result<JobResult> {
+/// whole wait, like [`rollout_status`]. A transient `api.get` failure (WAN blip, tunnel reconnect on
+/// a remote spoke) is retried with backoff instead of aborting a wait whose job is still running;
+/// the deadline stays the backstop. Permanent failures (auth rejection, Job deleted out from under
+/// the wait) fail fast with the actual cause instead of grinding to a generic timeout.
+pub(crate) fn wait_for_job(
+    target: &KubeTarget,
+    ns: &str,
+    name: &str,
+    timeout: Duration,
+) -> Result<JobResult> {
     block_on(async {
-        let api: Api<Job> = Api::namespaced(client().await?, ns);
+        let api: Api<Job> = Api::namespaced(client_for(target).await?, ns);
         let deadline = Instant::now() + timeout;
+        let mut backoff = JOB_POLL_INTERVAL;
         loop {
-            let job = api
-                .get(name)
-                .await
-                .with_context(|| format!("getting build Job {name} for status"))?;
-            if let Some(conditions) = job.status.as_ref().and_then(|s| s.conditions.as_ref()) {
-                for c in conditions {
-                    if c.status != "True" {
-                        continue;
-                    }
-                    match c.type_.as_str() {
-                        "Complete" => return Ok(JobResult::Succeeded),
-                        "Failed" => return Ok(JobResult::Failed),
-                        _ => {}
+            match api.get(name).await {
+                Ok(job) => {
+                    backoff = JOB_POLL_INTERVAL;
+                    if let Some(conditions) =
+                        job.status.as_ref().and_then(|s| s.conditions.as_ref())
+                    {
+                        for c in conditions {
+                            if c.status != "True" {
+                                continue;
+                            }
+                            match c.type_.as_str() {
+                                "Complete" => return Ok(JobResult::Succeeded),
+                                "Failed" => return Ok(JobResult::Failed),
+                                _ => {}
+                            }
+                        }
                     }
                 }
+                Err(e) => match classify_poll_error(&e) {
+                    PollFailure::AuthRejected(code) => {
+                        return Err(e).with_context(|| format!(
+                            "polling Job {name} in {ns}: the API server rejected the credentials \
+                             (HTTP {code}); on a delegated spoke this usually means the spoke SA \
+                             token expired — mint a long-lived Secret-based token, not `kubectl \
+                             create token`"
+                        ));
+                    }
+                    PollFailure::JobGone => {
+                        return Err(e).with_context(|| {
+                            format!(
+                                "polling Job {name} in {ns}: the Job is gone (deleted externally?)"
+                            )
+                        });
+                    }
+                    PollFailure::Transient => {
+                        tracing::warn!(
+                            job = %name,
+                            error = %format!("{e:#}"),
+                            "job status poll failed; retrying until the deadline"
+                        );
+                        backoff = (backoff * 2).min(JOB_POLL_BACKOFF_MAX);
+                    }
+                },
             }
-            if Instant::now() >= deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 return Ok(JobResult::TimedOut);
             }
-            tokio::time::sleep(Duration::from_secs(3)).await;
+            tokio::time::sleep(backoff.min(remaining)).await;
         }
     })?
 }
 
 /// Delete a build Job and its pods (propagation `Background`), ignoring a not-found. Used to reap a
 /// wedged Job when the wait times out so it can't hold cluster resources past its deadline.
-pub(crate) fn delete_job(ns: &str, name: &str) -> Result<()> {
+pub(crate) fn delete_job(target: &KubeTarget, ns: &str, name: &str) -> Result<()> {
     block_on(async {
-        let api: Api<Job> = Api::namespaced(client().await?, ns);
+        let api: Api<Job> = Api::namespaced(client_for(target).await?, ns);
         let dp = DeleteParams {
             propagation_policy: Some(kube::api::PropagationPolicy::Background),
             ..Default::default()
@@ -761,13 +910,14 @@ const FULL_LOG_BYTE_BUDGET: i64 = 64 * 1024 * 1024;
 /// sliding window would tear a concurrent reader's offset. Best-effort per pod: a per-pod log error
 /// is skipped rather than fatal.
 pub(crate) fn job_logs(
+    target: &KubeTarget,
     ns: &str,
     job_name: &str,
     container: &str,
     tail: Option<i64>,
 ) -> Result<String> {
     block_on(async {
-        let api: Api<Pod> = Api::namespaced(client().await?, ns);
+        let api: Api<Pod> = Api::namespaced(client_for(target).await?, ns);
         let pods = api
             .list(&ListParams::default().labels(&format!("job-name={job_name}")))
             .await
@@ -808,7 +958,10 @@ pub struct KueueStatus {
 /// Every Kueue Workload status in `ns`, keyed by the OWNING Job's name. ONE list per call, so a
 /// poller with K in-flight jobs costs one Workload list instead of K. Read-only; reports queue
 /// state back to the jobs' own submitter.
-pub fn workload_statuses(ns: &str) -> Result<std::collections::HashMap<String, KueueStatus>> {
+pub fn workload_statuses(
+    target: &KubeTarget,
+    ns: &str,
+) -> Result<std::collections::HashMap<String, KueueStatus>> {
     block_on(async {
         let gvk = GroupVersionKind {
             group: "kueue.x-k8s.io".to_string(),
@@ -816,7 +969,7 @@ pub fn workload_statuses(ns: &str) -> Result<std::collections::HashMap<String, K
             kind: "Workload".to_string(),
         };
         let ar = kube::core::ApiResource::from_gvk(&gvk);
-        let api: Api<DynamicObject> = Api::namespaced_with(client().await?, ns, &ar);
+        let api: Api<DynamicObject> = Api::namespaced_with(client_for(target).await?, ns, &ar);
         let workloads = api
             .list(&ListParams::default())
             .await
@@ -892,9 +1045,9 @@ pub struct PodStatus {
 
 /// The pod phase/start of a Job's pod (by the standard `job-name` label); `None` fields until one
 /// is scheduled. Read-only; no pod names leave this boundary.
-pub fn job_pod_status(ns: &str, job_name: &str) -> Result<PodStatus> {
+pub fn job_pod_status(target: &KubeTarget, ns: &str, job_name: &str) -> Result<PodStatus> {
     block_on(async {
-        let api: Api<Pod> = Api::namespaced(client().await?, ns);
+        let api: Api<Pod> = Api::namespaced(client_for(target).await?, ns);
         let pods = api
             .list(&ListParams::default().labels(&format!("job-name={job_name}")))
             .await
@@ -910,6 +1063,51 @@ pub fn job_pod_status(ns: &str, job_name: &str) -> Result<PodStatus> {
             })
             .unwrap_or_default();
         Ok(st)
+    })?
+}
+
+/// Whether `system:serviceaccount:<ns>:<sa>` can read the named Secret in `ns`, via
+/// SubjectAccessReview: `get` on the Secret by name, or `list`/`watch` on secrets in the namespace
+/// (either exposes contents just the same). The `crucible check` isolation probe for the spoke
+/// kubeconfig Secret mounted on the loop pod. Necessary but not sufficient: an SA with
+/// `pods/create` in the namespace can mount the Secret into a pod of its own without any secrets
+/// RBAC.
+pub fn sa_can_read_secret(ns: &str, sa: &str, secret: &str) -> Result<bool> {
+    use k8s_openapi::api::authorization::v1::{
+        ResourceAttributes, SubjectAccessReview, SubjectAccessReviewSpec,
+    };
+    block_on(async {
+        let api: Api<SubjectAccessReview> = Api::all(client().await?);
+        let user = format!("system:serviceaccount:{ns}:{sa}");
+        for (verb, name) in [
+            ("get", Some(secret.to_string())),
+            ("list", None),
+            ("watch", None),
+        ] {
+            let sar = SubjectAccessReview {
+                metadata: ObjectMeta::default(),
+                spec: SubjectAccessReviewSpec {
+                    user: Some(user.clone()),
+                    resource_attributes: Some(ResourceAttributes {
+                        namespace: Some(ns.to_string()),
+                        verb: Some(verb.to_string()),
+                        resource: Some("secrets".to_string()),
+                        name,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                status: None,
+            };
+            let created = api
+                .create(&PostParams::default(), &sar)
+                .await
+                .with_context(|| format!("creating a SubjectAccessReview ({verb} secrets)"))?;
+            if created.status.map(|s| s.allowed).unwrap_or(false) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     })?
 }
 
@@ -1000,6 +1198,33 @@ mod tests {
             {"type": "QuotaReserved", "status": "True"}
         ]);
         assert!(parse_workload_conditions(&extra).quota_reserved);
+    }
+
+    #[test]
+    fn poll_errors_classify_fatal_vs_transient() {
+        let api_err = |code: u16| {
+            let mut status = kube::core::Status::failure("m", "r");
+            status.code = code;
+            kube::Error::Api(Box::new(status))
+        };
+        // Auth rejections and a vanished Job are permanent: retrying until the deadline would
+        // only rebrand the real cause as TimedOut.
+        assert_eq!(
+            classify_poll_error(&api_err(401)),
+            PollFailure::AuthRejected(401)
+        );
+        assert_eq!(
+            classify_poll_error(&api_err(403)),
+            PollFailure::AuthRejected(403)
+        );
+        assert_eq!(classify_poll_error(&api_err(404)), PollFailure::JobGone);
+        // Server-side hiccups and throttling keep the backoff retry.
+        for code in [429, 500, 502, 503, 504] {
+            assert_eq!(classify_poll_error(&api_err(code)), PollFailure::Transient);
+        }
+        // Non-API transport errors (timeouts, resets) are transient by construction.
+        let transport = kube::Error::LinesCodecMaxLineLengthExceeded;
+        assert_eq!(classify_poll_error(&transport), PollFailure::Transient);
     }
 
     #[test]
