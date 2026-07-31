@@ -54,7 +54,5 @@ jiff = "0.2"
 # rustls 0.23 needs a process-level CryptoProvider chosen explicitly when several are in the dep tree
 # (aws-lc-rs is, via aws-sdk); we install the aws-lc-rs provider before the first kube client connect.
 rustls = "0.23"
-
-[dev-dependencies]
-# Spec tests parse `[build.<name>]` TOML fixtures.
+# The fleet file (`clusters.toml`) and the `[build.<name>]` spec fixtures are TOML.
 toml = "0.8"

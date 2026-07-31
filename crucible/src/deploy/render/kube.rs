@@ -1,7 +1,8 @@
-use crate::deploy::profile::{ClusterEntry, DeployProfile};
+use crate::deploy::profile::DeployProfile;
 use crate::manifest::{AgentCfg, CompositeManifest, DeployCfg, Manifest, MeasureCfg};
 use crate::openshell::gateway::{CLIENT_TLS_SECRET, ComputeDriver, GATEWAY_PORT};
 use anyhow::{Context, Result};
+use forge::fleet::ClusterEntry;
 use k8s_openapi::api::core::v1 as core;
 use k8s_openapi::api::networking::v1 as networking;
 use k8s_openapi::api::rbac::v1 as rbac;

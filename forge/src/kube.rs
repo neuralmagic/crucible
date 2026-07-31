@@ -97,42 +97,51 @@ pub fn ambient_context_description() -> String {
     }
 }
 
-/// A connected client for `target`: [`client`] for `Ambient`, else a per-call client built from
-/// the named kubeconfig (never a global), with a bounded connect timeout.
-async fn client_for(target: &KubeTarget) -> Result<Client> {
-    let KubeTarget::Kubeconfig {
-        path,
-        context,
-        proxy_url,
-    } = target
-    else {
-        return client().await;
-    };
-    if rustls::crypto::CryptoProvider::get_default().is_none() {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+impl KubeTarget {
+    /// A connected client for this target: [`client`] for `Ambient`, else a per-call client built
+    /// from the named kubeconfig (never a global), with a bounded connect timeout.
+    ///
+    /// Token auth must be expressed as a kubeconfig `token_file`, not an inline `token`. The
+    /// kubeconfig is handed to `kube` intact, so a `token_file` goes down kube-client's refreshable
+    /// path: the token is re-read from disk at least once a minute, which is what keeps a projected
+    /// ServiceAccount token (rotated well inside its expiry) working on a long-lived client. Never
+    /// read the token yourself into a `String` and inline it, that client dies at the first
+    /// rotation.
+    pub async fn client(&self) -> Result<Client> {
+        let KubeTarget::Kubeconfig {
+            path,
+            context,
+            proxy_url,
+        } = self
+        else {
+            return client().await;
+        };
+        if rustls::crypto::CryptoProvider::get_default().is_none() {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        }
+        let kubeconfig = match path {
+            Some(p) => kube::config::Kubeconfig::read_from(p)
+                .with_context(|| format!("reading kubeconfig {}", p.display()))?,
+            None => kube::config::Kubeconfig::read().context("reading the default kubeconfig")?,
+        };
+        let options = kube::config::KubeConfigOptions {
+            context: context.clone(),
+            cluster: None,
+            user: None,
+        };
+        let mut config = kube::Config::from_custom_kubeconfig(kubeconfig, &options)
+            .await
+            .context("resolving the spoke kubeconfig")?;
+        config.connect_timeout = Some(SPOKE_CONNECT_TIMEOUT);
+        if let Some(proxy) = proxy_url {
+            config.proxy_url = Some(
+                proxy
+                    .parse::<http::Uri>()
+                    .with_context(|| format!("parsing spoke proxy_url {proxy}"))?,
+            );
+        }
+        Client::try_from(config).context("building the spoke client")
     }
-    let kubeconfig = match path {
-        Some(p) => kube::config::Kubeconfig::read_from(p)
-            .with_context(|| format!("reading kubeconfig {}", p.display()))?,
-        None => kube::config::Kubeconfig::read().context("reading the default kubeconfig")?,
-    };
-    let options = kube::config::KubeConfigOptions {
-        context: context.clone(),
-        cluster: None,
-        user: None,
-    };
-    let mut config = kube::Config::from_custom_kubeconfig(kubeconfig, &options)
-        .await
-        .context("resolving the spoke kubeconfig")?;
-    config.connect_timeout = Some(SPOKE_CONNECT_TIMEOUT);
-    if let Some(proxy) = proxy_url {
-        config.proxy_url = Some(
-            proxy
-                .parse::<http::Uri>()
-                .with_context(|| format!("parsing spoke proxy_url {proxy}"))?,
-        );
-    }
-    Client::try_from(config).context("building the spoke client")
 }
 
 /// `kubectl set image deploy/<name> <container>=<image>`: a strategic-merge patch on the one container.
@@ -732,7 +741,7 @@ pub enum JobResult {
 /// its own source.
 pub(crate) fn create_job(target: &KubeTarget, ns: &str, job: &Job) -> Result<String> {
     block_on(async {
-        let api: Api<Job> = Api::namespaced(client_for(target).await?, ns);
+        let api: Api<Job> = Api::namespaced(target.client().await?, ns);
         let created = api
             .create(&PostParams::default(), job)
             .await
@@ -825,7 +834,7 @@ pub(crate) fn wait_for_job(
     timeout: Duration,
 ) -> Result<JobResult> {
     block_on(async {
-        let api: Api<Job> = Api::namespaced(client_for(target).await?, ns);
+        let api: Api<Job> = Api::namespaced(target.client().await?, ns);
         let deadline = Instant::now() + timeout;
         let mut backoff = JOB_POLL_INTERVAL;
         loop {
@@ -886,7 +895,7 @@ pub(crate) fn wait_for_job(
 /// wedged Job when the wait times out so it can't hold cluster resources past its deadline.
 pub(crate) fn delete_job(target: &KubeTarget, ns: &str, name: &str) -> Result<()> {
     block_on(async {
-        let api: Api<Job> = Api::namespaced(client_for(target).await?, ns);
+        let api: Api<Job> = Api::namespaced(target.client().await?, ns);
         let dp = DeleteParams {
             propagation_policy: Some(kube::api::PropagationPolicy::Background),
             ..Default::default()
@@ -917,7 +926,7 @@ pub(crate) fn job_logs(
     tail: Option<i64>,
 ) -> Result<String> {
     block_on(async {
-        let api: Api<Pod> = Api::namespaced(client_for(target).await?, ns);
+        let api: Api<Pod> = Api::namespaced(target.client().await?, ns);
         let pods = api
             .list(&ListParams::default().labels(&format!("job-name={job_name}")))
             .await
@@ -969,7 +978,7 @@ pub fn workload_statuses(
             kind: "Workload".to_string(),
         };
         let ar = kube::core::ApiResource::from_gvk(&gvk);
-        let api: Api<DynamicObject> = Api::namespaced_with(client_for(target).await?, ns, &ar);
+        let api: Api<DynamicObject> = Api::namespaced_with(target.client().await?, ns, &ar);
         let workloads = api
             .list(&ListParams::default())
             .await
@@ -1047,7 +1056,7 @@ pub struct PodStatus {
 /// is scheduled. Read-only; no pod names leave this boundary.
 pub fn job_pod_status(target: &KubeTarget, ns: &str, job_name: &str) -> Result<PodStatus> {
     block_on(async {
-        let api: Api<Pod> = Api::namespaced(client_for(target).await?, ns);
+        let api: Api<Pod> = Api::namespaced(target.client().await?, ns);
         let pods = api
             .list(&ListParams::default().labels(&format!("job-name={job_name}")))
             .await
