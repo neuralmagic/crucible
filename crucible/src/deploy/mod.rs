@@ -10,7 +10,7 @@
 //! naming that one target (see [`render::RenderInput::from_manifest`]).
 
 mod controller;
-mod profile;
+pub(crate) mod profile;
 mod render;
 
 pub use render::{MANAGED_BY_LABEL, PackDelivery, RenderOpts, TurnKind, TurnOpts};
@@ -31,7 +31,7 @@ pub fn render_yaml(manifest_path: &Path, profile_path: &Path, opts: &RenderOpts)
         .file_name()
         .and_then(|n| n.to_str())
         .context("manifest path has a file name")?;
-    let profile = DeployProfile::load(profile_path)?;
+    let profile = DeployProfile::load_with_fleet(profile_path, opts.clusters_file.as_deref())?;
 
     if manifest::is_composite(manifest_path) {
         let composite = CompositeManifest::load(manifest_path)?;

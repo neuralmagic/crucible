@@ -192,6 +192,14 @@ pub(crate) enum Cmd {
         /// resolution, workspace setup, measure probe, or gate self-test. Runs anywhere (CI).
         #[arg(long)]
         parse_only: bool,
+        /// Also validate a deploy profile's cluster wiring: the named [measure].cluster resolves
+        /// against the fleet file, its secret name is non-empty, no bastion (not implemented yet),
+        /// and, live, the sandbox SA cannot read the spoke kubeconfig Secret in the loop namespace.
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        /// Explicit fleet-file path, overriding the `clusters.toml` sibling of `--profile`.
+        #[arg(long)]
+        clusters: Option<PathBuf>,
     },
     /// The scoping pipeline: ingest the goal, optionally `--propose` a fresh
     /// pack via one agent turn, validate the manifest (`crucible check`), and freeze a `SCOPE.md`
@@ -390,6 +398,10 @@ pub(crate) struct DeployArgs {
     /// push PAT rides the profile's secret env (`AUTORESEARCH_PR_TOKEN`).
     #[arg(long)]
     pub pr_repo: Option<String>,
+    /// Explicit fleet-file path (`[clusters.<name>]` tables), overriding the `clusters.toml`
+    /// sibling of `--profile`.
+    #[arg(long)]
+    pub clusters: Option<PathBuf>,
 }
 
 #[derive(clap::Args, Clone)]

@@ -1,4 +1,4 @@
-use crate::deploy::profile::DeployProfile;
+use crate::deploy::profile::{ClusterEntry, DeployProfile};
 use crate::manifest::{AgentCfg, CompositeManifest, DeployCfg, Manifest, MeasureCfg};
 use crate::openshell::gateway::{CLIENT_TLS_SECRET, ComputeDriver, GATEWAY_PORT};
 use anyhow::{Context, Result};
@@ -33,6 +33,10 @@ const ARTIFACTS_MOUNT: &str = "/artifacts";
 /// Mount + file for the IRSA web-identity token (publish-on-keep).
 const AWS_TOKEN_DIR: &str = "/var/run/secrets/aws";
 const AWS_TOKEN_PATH: &str = "/var/run/secrets/aws/token";
+/// Mount + file for the spoke kubeconfig Secret (key `kubeconfig`) named by the selected
+/// `[clusters.<name>]` entry; the in-pod broker reads it via BROKER_CODEGEN_KUBECONFIG.
+const SPOKE_KUBECONFIG_DIR: &str = "/etc/crucible/spoke";
+const SPOKE_KUBECONFIG_PATH: &str = "/etc/crucible/spoke/kubeconfig";
 /// The label the OpenShell kubernetes driver sets on sandbox pods
 /// (`openshell-core::driver_utils::LABEL_MANAGED_BY`). The NetworkPolicy uses it to allow
 /// ingress from sandbox pods only.
@@ -73,6 +77,9 @@ pub struct RenderOpts {
     /// path-sniff, so the ONLY caller that gets pack delivery is the one that means it (the controller's
     /// run dispatch); a human `crucible deploy render` of a baked domain stays unchanged.
     pub pack: Option<PackDelivery>,
+    /// Explicit fleet-file path (`--clusters`), overriding the `clusters.toml` sibling of the
+    /// profile. `None` = the sibling, when it exists.
+    pub clusters_file: Option<std::path::PathBuf>,
 }
 
 /// The knobs the controller supplies for a pack render (see [`RenderOpts::pack`]).
@@ -196,6 +203,22 @@ pub fn render(
     let sandbox_image = input.agent.sandbox_image.clone().context(
         "the openshell-loop deploy template needs [agent].sandbox_image (the agent's sandbox)",
     )?;
+    // Delegated GPU jobs: the [measure].cluster spoke, resolved + validated up front. Only a
+    // measuring domain reads it; a bastioned spoke has no tunnel yet, so refuse it loudly.
+    let spoke = match input.measure {
+        Some(_) => profile
+            .measure_cluster()?
+            .map(|(name, entry)| (name.to_string(), entry.clone())),
+        None => None,
+    };
+    if let Some((name, entry)) = &spoke
+        && entry.bastion.is_some()
+    {
+        anyhow::bail!(
+            "[clusters.{name}] has a bastion block, but the SSH tunnel is not implemented yet; \
+             remove the bastion block or target a routable spoke"
+        );
+    }
     let r = Renderer {
         input,
         domain,
@@ -206,6 +229,7 @@ pub fn render(
         image,
         sandbox_image,
         driver: profile.cluster.sandbox_driver,
+        spoke,
     };
 
     let pod_yaml = serde_norway::to_string(&r.pod()?).context("serializing the loop pod")?;
@@ -389,6 +413,8 @@ struct Renderer<'a> {
     sandbox_image: String,
     /// The compute driver governing sandbox scheduling.
     driver: ComputeDriver,
+    /// The resolved `[measure].cluster` spoke (name + entry), when the domain measures remotely.
+    spoke: Option<(String, ClusterEntry)>,
 }
 
 /// The agent pod's security context, shared by the loop pod and the turn pods: privileged ONLY
@@ -445,6 +471,7 @@ impl Renderer<'_> {
                 automount_service_account_token: Some(false),
                 restart_policy: Some("Never".to_string()),
                 affinity: node_avoid_affinity(self.profile),
+                host_aliases: self.host_aliases(),
                 init_containers: self.init_containers(),
                 containers: vec![container],
                 volumes: Some(self.volumes()),
@@ -580,6 +607,21 @@ impl Renderer<'_> {
                     env.push(plain(&k, v));
                 }
             }
+            // Delegated spoke: the mounted kubeconfig path + the tier (named in unreachable-spoke
+            // tool errors). BROKER_CODEGEN_CLUSTER itself rides broker_env() above.
+            if let Some((_, entry)) = &self.spoke {
+                env.push(plain(
+                    "BROKER_CODEGEN_KUBECONFIG",
+                    SPOKE_KUBECONFIG_PATH.to_string(),
+                ));
+                env.push(plain(
+                    "BROKER_CODEGEN_CLUSTER_TIER",
+                    entry.tier().as_str().to_string(),
+                ));
+                if let Some(proxy) = &entry.proxy_url {
+                    env.push(plain("BROKER_CODEGEN_PROXY_URL", proxy.clone()));
+                }
+            }
         }
 
         // Publish-on-keep AWS auth (IRSA): the role + the projected sts-token path (region from profile env).
@@ -709,6 +751,9 @@ exit $rc
         if self.profile.secrets.push_authfile.is_some() {
             mounts.push(ro("quay-push", PUSH_AUTHFILE_DIR, None));
         }
+        if self.spoke.is_some() {
+            mounts.push(ro("spoke-kubeconfig", SPOKE_KUBECONFIG_DIR, None));
+        }
         if self.profile.cluster.aws_role_arn.is_some()
             || self.profile.cluster.aws_sandbox_role_arn.is_some()
         {
@@ -826,6 +871,19 @@ exit $rc
             });
         }
 
+        // The spoke kubeconfig Secret (key `kubeconfig`), mounted read-only on the loop pod only;
+        // the sandbox never sees it (crucible check asserts the sandbox SA has no Secret read).
+        if let Some((_, entry)) = &self.spoke {
+            volumes.push(core::Volume {
+                name: "spoke-kubeconfig".to_string(),
+                secret: Some(core::SecretVolumeSource {
+                    secret_name: Some(entry.kubeconfig_secret.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
+
         // Projected SA token audience'd to AWS STS (the role trust requires aud=sts.amazonaws.com).
         if self.profile.cluster.aws_role_arn.is_some()
             || self.profile.cluster.aws_sandbox_role_arn.is_some()
@@ -926,6 +984,28 @@ exit $rc
 
     fn resources(&self) -> core::ResourceRequirements {
         resources(self.profile)
+    }
+
+    /// The spoke's `host_aliases` (hostname -> IP) as pod-spec hostAliases, grouped by IP with
+    /// hostnames sorted (BTreeMap order) so the render is deterministic. The DNS-dark tier.
+    fn host_aliases(&self) -> Option<Vec<core::HostAlias>> {
+        let (_, entry) = self.spoke.as_ref()?;
+        if entry.host_aliases.is_empty() {
+            return None;
+        }
+        let mut by_ip: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+        for (hostname, ip) in &entry.host_aliases {
+            by_ip.entry(ip.as_str()).or_default().push(hostname.clone());
+        }
+        Some(
+            by_ip
+                .into_iter()
+                .map(|(ip, hostnames)| core::HostAlias {
+                    ip: ip.to_string(),
+                    hostnames: Some(hostnames),
+                })
+                .collect(),
+        )
     }
 
     /// NetworkPolicy on the loop pod. Under `podman` the sandbox is nested inside the loop pod and
@@ -1374,6 +1454,7 @@ mod tests {
                 pin_digests: false,
                 pr_repo: None,
                 pack: None,
+                clusters_file: None,
             },
         )
         .expect("render");
@@ -1529,6 +1610,7 @@ mod tests {
                     pin_digests: false,
                     pr_repo: pr_repo.map(str::to_string),
                     pack: None,
+                    clusters_file: None,
                 },
             )
             .expect("render")
@@ -1571,6 +1653,7 @@ mod tests {
                 pin_digests: false,
                 pr_repo: None,
                 pack: None,
+                clusters_file: None,
             },
         )
         .expect("render");
@@ -1682,6 +1765,7 @@ mod tests {
                 pin_digests: false,
                 pr_repo: None,
                 pack: None,
+                clusters_file: None,
             },
         )
         .expect("render");
@@ -1790,6 +1874,7 @@ mod tests {
                 pin_digests: false,
                 pr_repo: None,
                 pack: None,
+                clusters_file: None,
             },
         )
         .expect("render")
@@ -1978,6 +2063,7 @@ mod tests {
                 pack: Some(PackDelivery {
                     configmap_name: "crucible-run-llm-d-1650-pack".to_string(),
                 }),
+                clusters_file: None,
             },
         )
         .expect("render");
@@ -2051,6 +2137,7 @@ mod tests {
                 pack: Some(PackDelivery {
                     configmap_name: "pack-cm-name".to_string(),
                 }),
+                clusters_file: None,
             },
         )
         .expect("render");
@@ -2133,6 +2220,7 @@ mod tests {
                 pin_digests: false,
                 pr_repo: None,
                 pack: None,
+                clusters_file: None,
             },
         )
         .expect("render");
@@ -2220,6 +2308,7 @@ mod tests {
                 pin_digests: false,
                 pr_repo: None,
                 pack: None,
+                clusters_file: None,
             },
         )
         .expect("render");
@@ -2326,6 +2415,7 @@ mod tests {
                 pin_digests: false,
                 pr_repo: None,
                 pack: None,
+                clusters_file: None,
             },
         )
         .expect("render");
@@ -2363,6 +2453,135 @@ mod tests {
             !yaml.contains("BROKER_CODEGEN_WORKSPACE_PVC"),
             "the workspace PVC is deliberately never projected"
         );
+        // No [measure].cluster: no spoke mount, env, or hostAliases.
+        assert!(!yaml.contains("BROKER_CODEGEN_KUBECONFIG"));
+        assert!(!yaml.contains("spoke-kubeconfig"));
+        assert!(!yaml.contains("hostAliases"));
+    }
+
+    fn spoke_manifest() -> Manifest {
+        toml::from_str(
+            r#"
+            [repo]
+            path = "."
+            [agent]
+            backend = "openshell"
+            goal = "make the kernel faster"
+            sandbox_image = "ghcr.io/neuralmagic/kappa-sandbox:latest"
+            [judge]
+            measure_cmd = "./gate.py"
+            direction = "higher"
+            [deploy]
+            deploy_name = "kappa"
+            [measure]
+            gpus = 2
+            [measure.build]
+            base_image = "ghcr.io/neuralmagic/kappa-base:latest"
+            [measure.benchmark]
+            cmd = "./bench.sh"
+        "#,
+        )
+        .expect("manifest parses")
+    }
+
+    const SPOKE_PROFILE_BASE: &str = r#"
+        [cluster]
+        loop_namespace = "autoresearch"
+        rig_namespace = "rig"
+        service_account = "autoresearch-publisher"
+        supervisor_image = "registry.example.com/openshell-supervisor:latest"
+        [image]
+        loop = "registry.example.com/crucible-loop:latest"
+        pull_secret = "quay-pull"
+        [measure]
+        namespace = "crucible-gpu"
+        queue = "crucible-measure"
+        cluster = "gpu-east"
+    "#;
+
+    /// A `[measure].cluster` spoke projects the kubeconfig Secret mount, the spoke env
+    /// (BROKER_CODEGEN_KUBECONFIG/CLUSTER/CLUSTER_TIER/PROXY_URL), and the entry's
+    /// `host_aliases` as pod-spec hostAliases on the loop pod.
+    #[test]
+    fn measure_cluster_projects_spoke_mount_env_and_host_aliases() {
+        let profile: DeployProfile = toml::from_str(&format!(
+            r#"{SPOKE_PROFILE_BASE}
+            [clusters.gpu-east]
+            kubeconfig_secret = "spoke-gpu-east-kubeconfig"
+            proxy_url = "http://10.0.0.9:3128"
+            host_aliases = {{ "api.spoke.example" = "10.0.0.1" }}
+        "#
+        ))
+        .expect("profile parses");
+
+        let manifest = spoke_manifest();
+        let input = RenderInput::from_manifest(&manifest, "kappa").expect("render input");
+        let yaml = render(
+            input,
+            std::path::Path::new("/opt/crucible/domains/kappa"),
+            "crucible.toml",
+            &profile,
+            &RenderOpts {
+                iterations: 1,
+                max_cost: 0.0,
+                pin_digests: false,
+                pr_repo: None,
+                pack: None,
+                clusters_file: None,
+            },
+        )
+        .expect("render");
+
+        assert!(yaml.contains("name: BROKER_CODEGEN_CLUSTER"), "{yaml}");
+        assert!(yaml.contains("value: gpu-east"));
+        assert!(yaml.contains("name: BROKER_CODEGEN_KUBECONFIG"));
+        assert!(yaml.contains("value: /etc/crucible/spoke/kubeconfig"));
+        assert!(yaml.contains("name: BROKER_CODEGEN_CLUSTER_TIER"));
+        assert!(yaml.contains("value: proxy"), "proxy_url wins the tier");
+        assert!(yaml.contains("name: BROKER_CODEGEN_PROXY_URL"));
+        assert!(yaml.contains("value: http://10.0.0.9:3128"));
+        assert!(yaml.contains("secretName: spoke-gpu-east-kubeconfig"));
+        assert!(yaml.contains("mountPath: /etc/crucible/spoke"));
+        assert!(yaml.contains("hostAliases"));
+        assert!(yaml.contains("ip: 10.0.0.1"));
+        assert!(yaml.contains("- api.spoke.example"));
+    }
+
+    /// A bastioned spoke is schema-accepted but refused at render until the tunnel exists.
+    #[test]
+    fn bastioned_spoke_is_refused_at_render() {
+        let profile: DeployProfile = toml::from_str(&format!(
+            r#"{SPOKE_PROFILE_BASE}
+            [clusters.gpu-east]
+            kubeconfig_secret = "spoke-gpu-east-kubeconfig"
+            [clusters.gpu-east.bastion]
+            host = "jump.example"
+            user = "crucible"
+            key_secret = "bastion-key"
+        "#
+        ))
+        .expect("profile parses");
+
+        let manifest = spoke_manifest();
+        let input = RenderInput::from_manifest(&manifest, "kappa").expect("render input");
+        let err = match render(
+            input,
+            std::path::Path::new("/opt/crucible/domains/kappa"),
+            "crucible.toml",
+            &profile,
+            &RenderOpts {
+                iterations: 1,
+                max_cost: 0.0,
+                pin_digests: false,
+                pr_repo: None,
+                pack: None,
+                clusters_file: None,
+            },
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("a bastioned spoke must refuse to render"),
+        };
+        assert!(err.to_string().contains("not implemented"), "{err:#}");
     }
 
     /// A domain WITHOUT `[measure]` (the common config-tuning / live-deployment case) emits NO BROKER_CODEGEN_*
@@ -2432,6 +2651,7 @@ mod tests {
                 pin_digests: false,
                 pr_repo: None,
                 pack: None,
+                clusters_file: None,
             },
         )
         .expect("render")

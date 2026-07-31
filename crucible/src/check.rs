@@ -73,6 +73,63 @@ pub fn run_parse_only(manifest_path: &Path) -> Result<CheckOutcome> {
     })
 }
 
+/// Validate a deploy profile's spoke-cluster wiring: the named `[measure].cluster` resolves
+/// against the merged fleet file, its secret name is non-empty, and no bastion block is selected
+/// (schema-accepted, not implemented yet). With `live`, also assert the deployment's isolation
+/// claim: the sandbox SA (sandbox pods run as the loop SA, see `kubernetes_sandbox_env`) must NOT
+/// be able to read the spoke kubeconfig Secret in the loop namespace; an unreachable API server
+/// degrades that probe to a warning, an "allowed" verdict is a finding.
+pub fn check_profile(
+    profile_path: &Path,
+    clusters_override: Option<&Path>,
+    live: bool,
+) -> CheckOutcome {
+    let mut out = CheckOutcome::default();
+    let profile = match crate::deploy::profile::DeployProfile::load_with_fleet(
+        profile_path,
+        clusters_override,
+    ) {
+        Ok(p) => p,
+        Err(e) => return CheckOutcome::fail(format!("deploy profile failed to load: {e:#}")),
+    };
+    let (name, entry) = match profile.measure_cluster() {
+        Ok(Some(pair)) => pair,
+        Ok(None) => return out,
+        Err(e) => return CheckOutcome::fail(format!("cluster wiring: {e:#}")),
+    };
+    if entry.bastion.is_some() {
+        out.findings.push(format!(
+            "[clusters.{name}] has a bastion block, but the SSH tunnel is not implemented yet; \
+             remove the bastion block or target a routable spoke"
+        ));
+    }
+    if !live {
+        return out;
+    }
+    let ns = &profile.cluster.loop_namespace;
+    let sa = &profile.cluster.service_account;
+    let secret = &entry.kubeconfig_secret;
+    // The probe uses the ambient client; name what that points at, so a laptop run can't silently
+    // validate the wrong cluster.
+    eprintln!(
+        "[crucible check] live sandbox-SA probe via {}",
+        forge::kube::ambient_context_description()
+    );
+    match forge::kube::sa_can_read_secret(ns, sa, secret) {
+        Ok(true) => out.findings.push(format!(
+            "sandbox SA {ns}/{sa} CAN read Secret {secret} in the loop namespace — the spoke \
+             kubeconfig mounts on the loop pod and must be unreachable from the sandbox; tighten \
+             the RBAC (no unpinned secrets get/list/watch for this SA)"
+        )),
+        Ok(false) => {}
+        Err(e) => out.warnings.push(format!(
+            "could not verify the sandbox-SA-cannot-read-Secrets assertion for {ns}/{sa} \
+             (cluster unreachable?): {e:#}"
+        )),
+    }
+    out
+}
+
 fn manifest_dir_of(manifest_path: &Path) -> PathBuf {
     manifest_path
         .parent()

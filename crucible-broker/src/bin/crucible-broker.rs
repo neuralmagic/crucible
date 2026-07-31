@@ -10,12 +10,14 @@
 //! config, `BROKER_BIND`); the tool/handler code lives in `crucible_broker::server`.
 
 use anyhow::Context;
+use clap::Parser;
 use crucible_broker::NullResolver;
 use crucible_broker::server::McpServer;
 use crucible_broker::types::TraceParams;
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
+use std::path::PathBuf;
 
 /// Where the broker listens. The sandbox reaches it via `host.containers.internal:8849` through the
 /// openshell egress proxy; binding `0.0.0.0` puts it on the podman bridge rather than loopback only.
@@ -23,8 +25,111 @@ const DEFAULT_BIND: &str = "0.0.0.0:8849";
 /// The MCP endpoint path. The sandbox's `.mcp.json` points at `http://host.containers.internal:8849/mcp`.
 const MCP_PATH: &str = "/mcp";
 
+#[derive(Parser)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Cmd>,
+}
+
+#[derive(clap::Subcommand)]
+enum Cmd {
+    /// Submit a CPU-only sentinel job to a spoke through the full production submit/stream/parse
+    /// path and print the typed result JSON. The standing hub-spoke acceptance probe.
+    SpokeSmoke {
+        /// The spoke's name (quoted in the sentinel result and in errors).
+        cluster: String,
+        /// Kubeconfig file path (a mounted spoke Secret in a pod, a file on a laptop). Unset with
+        /// no --context = the ambient client.
+        #[arg(long)]
+        kubeconfig: Option<PathBuf>,
+        /// Kubeconfig context to select (laptop parity; default kubeconfig resolution when
+        /// --kubeconfig is unset).
+        #[arg(long)]
+        context: Option<String>,
+        /// Namespace the smoke Job runs in on the spoke.
+        #[arg(long)]
+        namespace: String,
+        /// Kueue LocalQueue on the spoke (must quota cpu/memory flavors).
+        #[arg(long, default_value = "crucible-measure")]
+        queue: String,
+        /// Busybox-class image whose shell prints the sentinel result.
+        #[arg(long, default_value = "busybox:1.37")]
+        image: String,
+        /// The Job's activeDeadlineSeconds (queue wait gets extra slack on top).
+        #[arg(long, default_value_t = 300)]
+        deadline_secs: i64,
+        /// HTTP CONNECT proxy for the spoke API server (the proxy-reachable tier, e.g.
+        /// http://10.x.x.x:3128). Wins over any proxy-url inside the kubeconfig.
+        #[arg(long)]
+        proxy_url: Option<String>,
+        /// The spoke's reachability tier, quoted in errors (matches the MCP error contract).
+        #[arg(long, default_value = "public")]
+        tier: String,
+    },
+}
+
+fn run_spoke_smoke(opts: crucible_broker::codegen::SpokeSmoke, tier: &str) -> anyhow::Result<()> {
+    match crucible_broker::codegen::spoke_smoke(&opts) {
+        Ok(result) => {
+            println!("{result}");
+            Ok(())
+        }
+        Err(e) => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "status": "error",
+                    "spoke": opts.cluster,
+                    "tier": tier,
+                    "error": e,
+                })
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if let Some(Cmd::SpokeSmoke {
+        cluster,
+        kubeconfig,
+        context,
+        namespace,
+        queue,
+        image,
+        deadline_secs,
+        proxy_url,
+        tier,
+    }) = Cli::parse().command
+    {
+        let _telemetry = crucible_broker::telemetry::init("crucible-broker");
+        let target = if kubeconfig.is_none() && context.is_none() && proxy_url.is_none() {
+            forge::kube::KubeTarget::Ambient
+        } else {
+            forge::kube::KubeTarget::Kubeconfig {
+                path: kubeconfig,
+                context,
+                proxy_url,
+            }
+        };
+        // run_gpu_job_with is a sync boundary; keep it off the async runtime's core thread.
+        return tokio::task::spawn_blocking(move || {
+            run_spoke_smoke(
+                crucible_broker::codegen::SpokeSmoke {
+                    cluster,
+                    target,
+                    namespace,
+                    queue,
+                    image,
+                    deadline_secs,
+                },
+                &tier,
+            )
+        })
+        .await
+        .context("joining the spoke-smoke task")?;
+    }
     // stderr fmt always; OTLP span export only when OTEL_EXPORTER_OTLP_ENDPOINT is set (the
     // engine's gRPC convention). The guard flushes spans on exit.
     let _telemetry = crucible_broker::telemetry::init("crucible-broker");

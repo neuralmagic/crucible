@@ -8,10 +8,13 @@
 //! `CreateContainerConfigError` later.
 
 use crate::openshell::gateway::ComputeDriver;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
+
+/// The fleet file's default name, resolved in the profile's own directory.
+const FLEET_FILE_NAME: &str = "clusters.toml";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -42,6 +45,84 @@ pub struct DeployProfile {
     /// BROKER_CODEGEN_* substrate env the broker reads.
     #[serde(default)]
     pub measure: Option<MeasureSubstrate>,
+    /// Profile-local `[clusters.<name>]` spoke entries. Normally these live in the fleet file
+    /// (`clusters.toml` beside the profile); a local block overrides the fleet file on conflict.
+    #[serde(default)]
+    pub clusters: BTreeMap<String, ClusterEntry>,
+}
+
+/// One remote spoke cluster the broker can delegate jobs to. The hub holds the spoke's
+/// credential: a named Secret carrying a scoped-SA kubeconfig under the `kubeconfig` key,
+/// mounted on the loop pod (never reachable from the sandbox, `crucible check` asserts it).
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterEntry {
+    /// Hub Secret holding the spoke kubeconfig (key `kubeconfig`). Reference-only.
+    pub kubeconfig_secret: String,
+    /// hostname -> IP, rendered as pod-spec `hostAliases` on the loop pod (the routable but
+    /// DNS-dark tier; TLS stays intact because the hostname is preserved).
+    #[serde(default)]
+    pub host_aliases: BTreeMap<String, String>,
+    /// HTTP CONNECT proxy fronting the spoke API server (the proxy-reachable tier, e.g. squid:
+    /// `http://10.x.x.x:3128`). Honored by the broker's spoke client; no tunnel involved.
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+    /// SSH bastion for the non-routable tier. Accepted by the schema, not implemented yet:
+    /// selecting a bastioned cluster is a render/check error until the tunnel lands.
+    #[serde(default)]
+    pub bastion: Option<BastionCfg>,
+}
+
+/// The `[clusters.<name>.bastion]` block (schema only until the tunnel is implemented).
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BastionCfg {
+    pub host: String,
+    pub user: String,
+    /// Hub Secret holding the SSH private key. Reference-only.
+    pub key_secret: String,
+}
+
+/// A spoke's reachability tier, derived from its entry (named in unreachable-spoke tool errors).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterTier {
+    Public,
+    DnsDark,
+    Proxy,
+    Bastion,
+}
+
+impl ClusterTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::DnsDark => "dns-dark",
+            Self::Proxy => "proxy",
+            Self::Bastion => "bastion",
+        }
+    }
+}
+
+impl ClusterEntry {
+    pub fn tier(&self) -> ClusterTier {
+        if self.bastion.is_some() {
+            ClusterTier::Bastion
+        } else if self.proxy_url.is_some() {
+            ClusterTier::Proxy
+        } else if !self.host_aliases.is_empty() {
+            ClusterTier::DnsDark
+        } else {
+            ClusterTier::Public
+        }
+    }
+}
+
+/// The fleet file: `[clusters.<name>]` tables shared by every profile in the directory.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct FleetFile {
+    #[serde(default)]
+    clusters: BTreeMap<String, ClusterEntry>,
 }
 
 /// Per-cluster substrate facts for the codegen measure jobs: the namespace/queue/PVCs/ceiling the
@@ -69,6 +150,10 @@ pub struct MeasureSubstrate {
     /// Where the agent's edits live in the sandbox; the broker pulls this tree to build (BROKER_CODEGEN_SANDBOX_WORKDIR).
     #[serde(default)]
     pub sandbox_workdir: Option<String>,
+    /// Named `[clusters.<name>]` spoke the GPU jobs are delegated to (BROKER_CODEGEN_CLUSTER).
+    /// Unset = the broker's ambient client, exactly as before.
+    #[serde(default)]
+    pub cluster: Option<String>,
 }
 
 impl MeasureSubstrate {
@@ -95,6 +180,9 @@ impl MeasureSubstrate {
         }
         if let Some(w) = &self.sandbox_workdir {
             env.push(("BROKER_CODEGEN_SANDBOX_WORKDIR".to_string(), w.clone()));
+        }
+        if let Some(c) = &self.cluster {
+            env.push(("BROKER_CODEGEN_CLUSTER".to_string(), c.clone()));
         }
         env
     }
@@ -273,6 +361,64 @@ impl DeployProfile {
             .with_context(|| format!("reading deploy profile {}", path.display()))?;
         toml::from_str(&text).with_context(|| format!("parsing deploy profile {}", path.display()))
     }
+
+    /// Load the profile and fold in the fleet file's `[clusters.<name>]` entries. The fleet file
+    /// is `clusters.toml` in the profile's own directory, overridable with an explicit path (which
+    /// must then exist); a profile-local `[clusters.<name>]` wins on conflict.
+    pub fn load_with_fleet(path: &Path, clusters_override: Option<&Path>) -> Result<Self> {
+        let mut profile = Self::load(path)?;
+        let fleet_path = match clusters_override {
+            Some(p) => {
+                if !p.exists() {
+                    bail!("--clusters {} does not exist", p.display());
+                }
+                Some(p.to_path_buf())
+            }
+            None => {
+                let sibling = path
+                    .parent()
+                    .filter(|d| !d.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(FLEET_FILE_NAME);
+                sibling.exists().then_some(sibling)
+            }
+        };
+        if let Some(fleet_path) = fleet_path {
+            let text = std::fs::read_to_string(&fleet_path)
+                .with_context(|| format!("reading fleet file {}", fleet_path.display()))?;
+            let fleet: FleetFile = toml::from_str(&text)
+                .with_context(|| format!("parsing fleet file {}", fleet_path.display()))?;
+            for (name, entry) in fleet.clusters {
+                profile.clusters.entry(name).or_insert(entry);
+            }
+        }
+        Ok(profile)
+    }
+
+    /// The `[measure].cluster` entry resolved against the merged clusters map, validated:
+    /// the name resolves and its secret name is non-empty. `None` when no cluster is named.
+    pub fn measure_cluster(&self) -> Result<Option<(&str, &ClusterEntry)>> {
+        let Some(name) = self.measure.as_ref().and_then(|m| m.cluster.as_deref()) else {
+            return Ok(None);
+        };
+        let entry = self.clusters.get(name).with_context(|| {
+            format!(
+                "[measure].cluster = {name:?} does not resolve: no [clusters.{name}] in the \
+                 profile or its fleet file (clusters.toml)"
+            )
+        })?;
+        if entry.kubeconfig_secret.trim().is_empty() {
+            bail!("[clusters.{name}].kubeconfig_secret must be a non-empty Secret name");
+        }
+        // kube's client builder supports exactly these proxy schemes; catch a typo at render/check
+        // time instead of at job submit.
+        if let Some(proxy) = &entry.proxy_url
+            && !(proxy.starts_with("http://") || proxy.starts_with("socks5://"))
+        {
+            bail!("[clusters.{name}].proxy_url must be an http:// or socks5:// URL, got {proxy:?}");
+        }
+        Ok(Some((name, entry)))
+    }
 }
 
 #[cfg(test)]
@@ -305,5 +451,153 @@ mod tests {
         );
         let profile: DeployProfile = toml::from_str(&text).expect("profile parses");
         assert_eq!(profile.cluster.avoid_nodes, vec!["g12e022", "g12e099"]);
+    }
+
+    fn tempdir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "crucible-profile-test-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir tmp");
+        dir
+    }
+
+    const MEASURE_GPU_EAST: &str = "\n[measure]\nnamespace = \"ns\"\ncluster = \"gpu-east\"\n";
+
+    #[test]
+    fn fleet_file_clusters_resolve_and_profile_local_wins() {
+        let dir = tempdir("fleet-merge");
+        std::fs::write(
+            dir.join("clusters.toml"),
+            "[clusters.gpu-east]\nkubeconfig_secret = \"fleet-secret\"\n\
+             [clusters.pirate]\nkubeconfig_secret = \"pirate-secret\"\n",
+        )
+        .expect("write fleet");
+        let profile_path = dir.join("profile.toml");
+        std::fs::write(
+            &profile_path,
+            format!(
+                "{BASE}{MEASURE_GPU_EAST}[clusters.gpu-east]\nkubeconfig_secret = \"local-secret\"\n"
+            ),
+        )
+        .expect("write profile");
+
+        let p = DeployProfile::load_with_fleet(&profile_path, None).expect("loads");
+        let (name, entry) = p.measure_cluster().expect("resolves").expect("named");
+        assert_eq!(name, "gpu-east");
+        assert_eq!(
+            entry.kubeconfig_secret, "local-secret",
+            "the profile-local block must win over the fleet file"
+        );
+        assert_eq!(
+            p.clusters
+                .get("pirate")
+                .map(|c| c.kubeconfig_secret.as_str()),
+            Some("pirate-secret"),
+            "fleet-only entries still merge in"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explicit_clusters_override_replaces_the_sibling_and_must_exist() {
+        let dir = tempdir("fleet-override");
+        std::fs::write(
+            dir.join("clusters.toml"),
+            "[clusters.gpu-east]\nkubeconfig_secret = \"sibling\"\n",
+        )
+        .expect("write sibling");
+        let other = dir.join("other-clusters.toml");
+        std::fs::write(
+            &other,
+            "[clusters.gpu-east]\nkubeconfig_secret = \"explicit\"\n",
+        )
+        .expect("write override");
+        let profile_path = dir.join("profile.toml");
+        std::fs::write(&profile_path, format!("{BASE}{MEASURE_GPU_EAST}")).expect("write profile");
+
+        let p = DeployProfile::load_with_fleet(&profile_path, Some(&other)).expect("loads");
+        let (_, entry) = p.measure_cluster().expect("resolves").expect("named");
+        assert_eq!(entry.kubeconfig_secret, "explicit");
+
+        let err =
+            match DeployProfile::load_with_fleet(&profile_path, Some(&dir.join("missing.toml"))) {
+                Err(e) => e,
+                Ok(_) => panic!("a missing explicit fleet file must be an error"),
+            };
+        assert!(err.to_string().contains("does not exist"), "{err:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_sibling_fleet_file_is_fine_but_unresolved_cluster_errors() {
+        let dir = tempdir("fleet-missing");
+        let profile_path = dir.join("profile.toml");
+        std::fs::write(&profile_path, format!("{BASE}{MEASURE_GPU_EAST}")).expect("write profile");
+        let p = DeployProfile::load_with_fleet(&profile_path, None).expect("loads without fleet");
+        let err = p.measure_cluster().expect_err("gpu-east can't resolve");
+        assert!(err.to_string().contains("does not resolve"), "{err:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_cluster_key_reads_nothing() {
+        let profile: DeployProfile = toml::from_str(BASE).expect("profile parses");
+        assert!(profile.measure_cluster().expect("ok").is_none());
+        assert!(profile.clusters.is_empty());
+    }
+
+    #[test]
+    fn cluster_entry_rejects_unknown_fields_and_empty_secret() {
+        let text = format!(
+            "{BASE}{MEASURE_GPU_EAST}[clusters.gpu-east]\nkubeconfig_secret = \"s\"\ntypo = 1\n"
+        );
+        assert!(toml::from_str::<DeployProfile>(&text).is_err());
+
+        let text =
+            format!("{BASE}{MEASURE_GPU_EAST}[clusters.gpu-east]\nkubeconfig_secret = \"\"\n");
+        let p: DeployProfile = toml::from_str(&text).expect("parses");
+        let err = p.measure_cluster().expect_err("empty secret name");
+        assert!(err.to_string().contains("non-empty"), "{err:#}");
+    }
+
+    #[test]
+    fn tier_derives_from_the_entry_shape() {
+        let public: ClusterEntry = toml::from_str("kubeconfig_secret = \"s\"").expect("parses");
+        assert_eq!(public.tier(), ClusterTier::Public);
+        let dark: ClusterEntry = toml::from_str(
+            "kubeconfig_secret = \"s\"\nhost_aliases = { \"api.spoke.example\" = \"10.0.0.1\" }",
+        )
+        .expect("parses");
+        assert_eq!(dark.tier(), ClusterTier::DnsDark);
+        let proxied: ClusterEntry =
+            toml::from_str("kubeconfig_secret = \"s\"\nproxy_url = \"http://10.0.0.1:3128\"")
+                .expect("parses");
+        assert_eq!(proxied.tier(), ClusterTier::Proxy);
+        let bastioned: ClusterEntry = toml::from_str(
+            "kubeconfig_secret = \"s\"\n[bastion]\nhost = \"jump\"\nuser = \"u\"\nkey_secret = \"k\"",
+        )
+        .expect("the bastion block is accepted by the schema");
+        assert_eq!(bastioned.tier(), ClusterTier::Bastion);
+    }
+
+    #[test]
+    fn proxy_url_must_be_a_supported_scheme() {
+        let text = format!(
+            "{BASE}{MEASURE_GPU_EAST}[clusters.gpu-east]\nkubeconfig_secret = \"s\"\nproxy_url = \"squid.example:3128\"\n"
+        );
+        let p: DeployProfile = toml::from_str(&text).expect("parses");
+        let err = p.measure_cluster().expect_err("schemeless proxy_url");
+        assert!(err.to_string().contains("http:// or socks5://"), "{err:#}");
+
+        let text = format!(
+            "{BASE}{MEASURE_GPU_EAST}[clusters.gpu-east]\nkubeconfig_secret = \"s\"\nproxy_url = \"http://10.0.0.1:3128\"\n"
+        );
+        let p: DeployProfile = toml::from_str(&text).expect("parses");
+        assert!(p.measure_cluster().expect("valid").is_some());
     }
 }

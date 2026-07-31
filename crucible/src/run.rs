@@ -26,13 +26,21 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
     if let Some(Cmd::Check {
         manifest,
         parse_only,
+        profile,
+        clusters,
     }) = &cli.command
     {
-        let outcome = if *parse_only {
+        let mut outcome = if *parse_only {
             check::run_parse_only(manifest)?
         } else {
             check::run(manifest)?
         };
+        if let Some(profile) = profile {
+            // Static wiring always; the live sandbox-SA Secret probe only on a full check.
+            let p = check::check_profile(profile, clusters.as_deref(), !*parse_only);
+            outcome.findings.extend(p.findings);
+            outcome.warnings.extend(p.warnings);
+        }
         for w in &outcome.warnings {
             eprintln!("[crucible check] WARNING: {w}");
         }
@@ -167,6 +175,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
             pin_digests: !args.no_pin,
             pr_repo: args.pr_repo.clone(),
             pack,
+            clusters_file: args.clusters.clone(),
         };
         if args.controller {
             // Deprecated in favor of the `crucible-controller` Helm chart (the one packaging path).

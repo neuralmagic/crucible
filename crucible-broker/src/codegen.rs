@@ -8,7 +8,7 @@ use base64::Engine;
 pub(crate) use config::{
     BuildMode, Objective, ProfileCfg, ToolsConfig, ToolsOverlay, resolve_int_kwarg,
 };
-use forge::kube::{JobResult, KueueStatus, PodStatus};
+use forge::kube::{JobResult, KubeTarget, KueueStatus, PodStatus};
 use forge::measure_job::{GpuJobRun, GpuJobSpec, PvcMount, run_gpu_job_with};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -181,6 +181,14 @@ pub enum CodegenReply {
     Disabled {
         reason: String,
     },
+    /// A delegated spoke could not be reached at submit. Serialized with the plain `error` status
+    /// tag (the agent's contract), but naming the spoke and its reachability tier.
+    #[serde(rename = "error")]
+    SpokeUnreachable {
+        spoke: String,
+        tier: String,
+        error: String,
+    },
     Error {
         error: String,
     },
@@ -201,6 +209,34 @@ struct JobEnv {
     /// Output-only trace transport for profile jobs; NOT mounted on benchmark/lm_eval jobs (the
     /// measured jobs' spec stays minimal, and measurement inputs stay digest-only).
     artifacts: Option<ArtifactsPvc>,
+    /// The delegated spoke cluster, when BROKER_CODEGEN_KUBECONFIG is set. `None` = the ambient
+    /// client, exactly as before.
+    spoke: Option<SpokeEnv>,
+}
+
+/// A delegated spoke as the broker env names it: the kube target plus the name/tier quoted in
+/// unreachable-spoke tool errors.
+#[derive(Clone)]
+struct SpokeEnv {
+    name: String,
+    tier: String,
+    target: KubeTarget,
+}
+
+/// The spoke env the renderer projects next to the substrate: BROKER_CODEGEN_KUBECONFIG gates the
+/// feature (the mounted spoke-kubeconfig Secret in a pod, a kubeconfig file path on a laptop);
+/// BROKER_CODEGEN_KUBE_CONTEXT is the laptop-parity context selector.
+fn spoke_from_env() -> Option<SpokeEnv> {
+    let path = env_nonempty("BROKER_CODEGEN_KUBECONFIG")?;
+    Some(SpokeEnv {
+        name: env_or("BROKER_CODEGEN_CLUSTER", "spoke"),
+        tier: env_or("BROKER_CODEGEN_CLUSTER_TIER", "public"),
+        target: KubeTarget::Kubeconfig {
+            path: Some(PathBuf::from(path)),
+            context: env_nonempty("BROKER_CODEGEN_KUBE_CONTEXT"),
+            proxy_url: env_nonempty("BROKER_CODEGEN_PROXY_URL"),
+        },
+    })
 }
 
 /// A PVC shared by the profile job and the loop pod: the job writes the trace under `mount_path`,
@@ -250,8 +286,57 @@ impl JobEnv {
                 env_nonempty("BROKER_CODEGEN_ARTIFACTS_MOUNT"),
                 env_nonempty("BROKER_CODEGEN_ARTIFACTS_DIR"),
             ),
+            spoke: spoke_from_env(),
         })
     }
+
+    /// The kube target the GPU jobs go to: the spoke's, else ambient.
+    fn target(&self) -> KubeTarget {
+        self.spoke
+            .as_ref()
+            .map(|s| s.target.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// A reachability-class submission failure on a delegated spoke becomes the typed
+/// unreachable-spoke reply naming the spoke and its reachability tier. Any other spoke failure
+/// (a job failing, bad RBAC, a rejected spec) names the spoke but claims nothing about
+/// reachability; hub-local failures stay plain errors.
+fn submit_failure_reply(spoke: Option<&SpokeEnv>, error: String) -> CodegenReply {
+    match spoke {
+        Some(s) if is_reachability_failure(&error) => CodegenReply::SpokeUnreachable {
+            spoke: s.name.clone(),
+            tier: s.tier.clone(),
+            error,
+        },
+        Some(s) => CodegenReply::Error {
+            error: format!("spoke {}: {error}", s.name),
+        },
+        None => CodegenReply::Error { error },
+    }
+}
+
+/// Whether a submit/poll failure looks like the spoke could not be REACHED (connect, timeout, DNS,
+/// TLS, proxy), as opposed to a reachable spoke rejecting or failing the work. String-matched
+/// because the error already crossed the stringly tool boundary by the time it gets here.
+fn is_reachability_failure(error: &str) -> bool {
+    let e = error.to_ascii_lowercase();
+    [
+        "connect",
+        "connection refused",
+        "connection reset",
+        "timed out",
+        "timeout",
+        "dns",
+        "failed to lookup",
+        "tls",
+        "certificate",
+        "handshake",
+        "proxy",
+    ]
+    .iter()
+    .any(|n| e.contains(n))
 }
 
 /// `pvc` gates the whole feature; `mount` defaults to `/artifacts` and `dir` to the mount path
@@ -356,12 +441,15 @@ fn live_views(jobs: &[TrackedJob]) -> HashMap<String, LiveJobStatus> {
     }
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
+        // The jobs this broker submits all go to one target (spoke or ambient), so one lookup
+        // target serves the whole batch.
+        let target = spoke_from_env().map(|s| s.target).unwrap_or_default();
         let mut kueue_by_ns: HashMap<String, HashMap<String, KueueStatus>> = HashMap::new();
         for (_, ns) in &inflight {
             if !kueue_by_ns.contains_key(ns) {
                 kueue_by_ns.insert(
                     ns.clone(),
-                    forge::kube::workload_statuses(ns).unwrap_or_default(),
+                    forge::kube::workload_statuses(&target, ns).unwrap_or_default(),
                 );
             }
         }
@@ -371,7 +459,7 @@ fn live_views(jobs: &[TrackedJob]) -> HashMap<String, LiveJobStatus> {
                 .get(&ns)
                 .and_then(|by_job| by_job.get(&name))
                 .cloned();
-            let pod = forge::kube::job_pod_status(&ns, &name).unwrap_or_default();
+            let pod = forge::kube::job_pod_status(&target, &ns, &name).unwrap_or_default();
             out.insert(name, LiveJobStatus { kueue, pod });
         }
         let _ = tx.send(out);
@@ -899,6 +987,7 @@ fn do_profile(
                 read_only: false,
             }];
             submit(
+                &env.target(),
                 &job_spec(
                     &env,
                     cfg.gpus,
@@ -912,6 +1001,7 @@ fn do_profile(
             )
         }
         None => submit(
+            &env.target(),
             &job_spec(
                 &env,
                 cfg.gpus,
@@ -923,9 +1013,15 @@ fn do_profile(
             ),
             live,
         ),
-    }
-    // A failed submission must not leave the tracked job "in flight" forever.
-    .inspect_err(|_| state.finish_job(&name, JobResult::Failed))?;
+    };
+    let run = match run {
+        Ok(run) => run,
+        // A failed submission must not leave the tracked job "in flight" forever.
+        Err(e) => {
+            state.finish_job(&name, JobResult::Failed);
+            return Ok(submit_failure_reply(env.spoke.as_ref(), e));
+        }
+    };
     state.finish_job(&name, run.result);
     state
         .budget
@@ -1058,7 +1154,8 @@ fn measure(
         log: handle.clone(),
         result: None,
     });
-    let run = submit(
+    let run = match submit(
+        &env.target(),
         &job_spec(
             &env,
             cfg.gpus,
@@ -1071,9 +1168,14 @@ fn measure(
         |snapshot| {
             let _ = std::fs::write(&log_path, snapshot);
         },
-    )
-    // A failed submission must not leave the tracked job "in flight" forever.
-    .inspect_err(|_| state.finish_job(&name, JobResult::Failed))?;
+    ) {
+        Ok(run) => run,
+        // A failed submission must not leave the tracked job "in flight" forever.
+        Err(e) => {
+            state.finish_job(&name, JobResult::Failed);
+            return Ok(submit_failure_reply(env.spoke.as_ref(), e));
+        }
+    };
     state.finish_job(&name, run.result);
     state
         .budget
@@ -1147,16 +1249,101 @@ fn job_spec(
     }
 }
 
-fn submit(spec: &GpuJobSpec, on_logs: impl FnMut(&str)) -> Result<GpuJobRun, String> {
+fn submit(
+    target: &KubeTarget,
+    spec: &GpuJobSpec,
+    on_logs: impl FnMut(&str),
+) -> Result<GpuJobRun, String> {
     // Ride the MCP tool span (entered on this blocking thread by telemetry::spawn_blocking): the
     // job name + queue identify the Kueue job on the trace, gpu_minutes is the recorded cost.
     let span = tracing::Span::current();
     span.record("job", spec.name.as_str());
     span.record("queue", spec.queue_name.as_str());
-    let run = run_gpu_job_with(spec, QUEUE_SLACK, on_logs)
+    let run = run_gpu_job_with(target, spec, QUEUE_SLACK, on_logs)
         .map_err(|e| format!("running measure job: {e:#}"))?;
     span.record("gpu_minutes", gpu_minutes(run.elapsed, spec.gpus));
     Ok(run)
+}
+
+/// The spoke smoketest's inputs: a CPU-only sentinel job (gpus 0, EMPTY pvc_mounts, busybox-class
+/// image) submitted through the exact production submit/stream/parse path. The standing acceptance
+/// probe for hub-spoke delegation; costs cents, finishes in seconds.
+pub struct SpokeSmoke {
+    pub cluster: String,
+    pub target: KubeTarget,
+    pub namespace: String,
+    pub queue: String,
+    pub image: String,
+    pub deadline_secs: i64,
+}
+
+/// Extra wait beyond the smoke job's deadline for time spent suspended in the Kueue queue.
+const SMOKE_QUEUE_SLACK: Duration = Duration::from_secs(600);
+
+/// A cluster name safe to interpolate into the sentinel shell command and its JSON: the fleet-file
+/// name character class, validated at entry instead of escaped ad hoc downstream.
+fn valid_cluster_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Run the spoke smoketest and return the typed result (the parsed sentinel JSON plus job
+/// metadata). Errors name the spoke; the caller decides how to print.
+pub fn spoke_smoke(opts: &SpokeSmoke) -> Result<Value, String> {
+    if !valid_cluster_name(&opts.cluster) {
+        return Err(format!(
+            "invalid cluster name {:?}: must match [A-Za-z0-9_-]+",
+            opts.cluster
+        ));
+    }
+    let name = format!("crucible-smoke-{}", nonce());
+    let sentinel = format!(
+        "printf '%s' '{{\"pass\": true, \"cluster\": \"{}\"}}' > \"$OUT\"",
+        opts.cluster
+    );
+    let spec = GpuJobSpec {
+        name: name.clone(),
+        namespace: opts.namespace.clone(),
+        image: opts.image.clone(),
+        queue_name: opts.queue.clone(),
+        pull_secret: None,
+        command: wrap_command(&sentinel),
+        env: Vec::new(),
+        gpus: 0,
+        cpu: "500m".to_string(),
+        mem_request: "128Mi".to_string(),
+        mem_limit: "256Mi".to_string(),
+        shm_size_gi: 1,
+        active_deadline_seconds: opts.deadline_secs.max(1),
+        ttl_seconds: 600,
+        pvc_mounts: Vec::new(),
+    };
+    eprintln!(
+        "submitting spoke smoke Job {name} to {} (namespace {}, queue {})",
+        opts.cluster, opts.namespace, opts.queue
+    );
+    let run = run_gpu_job_with(&opts.target, &spec, SMOKE_QUEUE_SLACK, |snapshot| {
+        eprintln!("--- {name} log snapshot ---\n{}", snapshot.trim_end());
+    })
+    .map_err(|e| format!("spoke {}: submit/poll failed: {e:#}", opts.cluster))?;
+    if run.result != JobResult::Succeeded {
+        return Err(format!(
+            "spoke {} smoke Job {name}: {}\nlogs:\n{}",
+            opts.cluster,
+            job_failure_reason(run.result),
+            run.logs.trim_end()
+        ));
+    }
+    let result = parse_result_json(&run.logs)?;
+    Ok(json!({
+        "status": "smoke",
+        "cluster": opts.cluster,
+        "job": name,
+        "elapsed_s": run.elapsed.as_secs(),
+        "result": result,
+    }))
 }
 
 /// `set -eu` fails the Job on any step; the sentinel lets the broker find the `$OUT` JSON in the logs.
@@ -1732,6 +1919,63 @@ mod tests {
     }
 
     #[test]
+    fn spoke_failures_split_unreachable_from_other_errors() {
+        let spoke = SpokeEnv {
+            name: "gpu-east".into(),
+            tier: "public".into(),
+            target: KubeTarget::Ambient,
+        };
+        // Reachability-class failures get the typed unreachable reply.
+        for msg in [
+            "running measure job: error trying to connect: tcp connect error",
+            "running measure job: operation timed out",
+            "running measure job: dns error: failed to lookup address",
+            "running measure job: invalid peer certificate: UnknownIssuer",
+            "running measure job: proxy CONNECT failed",
+        ] {
+            match submit_failure_reply(Some(&spoke), msg.into()) {
+                CodegenReply::SpokeUnreachable { spoke: s, tier, .. } => {
+                    assert_eq!(s, "gpu-east");
+                    assert_eq!(tier, "public");
+                }
+                other => panic!("{msg:?} must map to SpokeUnreachable, got {other:?}"),
+            }
+        }
+        // A reachable spoke rejecting the work names the spoke but claims nothing about reachability.
+        match submit_failure_reply(
+            Some(&spoke),
+            "running measure job: jobs.batch is forbidden: cannot create resource".into(),
+        ) {
+            CodegenReply::Error { error } => assert!(error.starts_with("spoke gpu-east: ")),
+            other => panic!("expected a plain spoke-named error, got {other:?}"),
+        }
+        // Hub-local failures stay plain.
+        match submit_failure_reply(None, "boom".into()) {
+            CodegenReply::Error { error } => assert_eq!(error, "boom"),
+            other => panic!("expected a plain error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cluster_names_validate_at_entry() {
+        assert!(valid_cluster_name("gpu-east"));
+        assert!(valid_cluster_name("b200_lab-2"));
+        for bad in ["", "wal dorf", "x\"y", "a;rm -rf", "cl$us", "wald'orf"] {
+            assert!(!valid_cluster_name(bad), "{bad:?} must be rejected");
+        }
+        let opts = SpokeSmoke {
+            cluster: "bad\"name".into(),
+            target: KubeTarget::Ambient,
+            namespace: "ns".into(),
+            queue: "q".into(),
+            image: "busybox".into(),
+            deadline_secs: 1,
+        };
+        let err = spoke_smoke(&opts).expect_err("invalid name must fail before any submit");
+        assert!(err.contains("invalid cluster name"), "{err}");
+    }
+
+    #[test]
     fn disabled_without_the_gate() {
         if std::env::var("BROKER_CODEGEN").is_ok() {
             return;
@@ -2238,6 +2482,7 @@ mod tests {
                 read_only: true,
             }],
             artifacts,
+            spoke: None,
         }
     }
 

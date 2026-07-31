@@ -46,6 +46,15 @@ lint:
 forge-capture-e2e:
     scripts/forge-capture-e2e.sh
 
+# Spoke smoketest (hub-spoke delegated jobs): submit a CPU-only sentinel Job to <cluster> through
+# the full production submit/stream/parse path and print the typed result JSON. `cluster` is a
+# [clusters.<name>] entry in the deploy profile; pass `context` to run it against a local
+# kubecontext instead of the in-cluster fleet secret:
+#   just spoke-smoke gpu-east crucible-system crucible-measure my-kubecontext
+spoke-smoke cluster namespace="crucible-system" queue="crucible-measure" context="":
+    cargo run -q -p crucible-broker --bin crucible-broker -- spoke-smoke {{cluster}} \
+      --namespace {{namespace}} --queue {{queue}} {{ if context != "" { "--context " + context } else { "" } }}
+
 # Steer a running loop: append guidance picked up before the next iteration (audited).
 steer text source="operator": install-tools
     steer "{{text}}" --source {{source}}
