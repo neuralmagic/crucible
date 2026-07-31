@@ -51,20 +51,27 @@ const SANDBOX_HOSTS: [&str; 2] = ["host.containers.internal", "host.openshell.in
 /// the broker under some other name, e.g. an in-cluster Service DNS name or an explicit
 /// `[broker].url` override in the domain manifest.
 pub fn allowed_hosts(loopback: Vec<String>) -> Vec<String> {
-    extra_hosts(loopback, std::env::var("BROKER_ALLOWED_HOSTS").ok().as_deref())
+    extra_hosts(
+        loopback,
+        std::env::var("BROKER_ALLOWED_HOSTS").ok().as_deref(),
+    )
 }
 
 /// The pure half of [`allowed_hosts`], with the env value passed in.
 fn extra_hosts(mut hosts: Vec<String>, env: Option<&str>) -> Vec<String> {
-    hosts.extend(SANDBOX_HOSTS.iter().map(|h| (*h).to_string()));
-    hosts.extend(
+    let extra = SANDBOX_HOSTS.iter().copied().chain(
         env.unwrap_or_default()
             .split(',')
             .map(str::trim)
-            .filter(|h| !h.is_empty())
-            .map(str::to_string),
+            .filter(|h| !h.is_empty()),
     );
-    hosts.dedup();
+    for host in extra {
+        // Order-preserving, so the loopback defaults stay first. `Vec::dedup` would only catch
+        // adjacent repeats, and a deployment re-listing a driver host is not adjacent to it.
+        if !hosts.iter().any(|h| h == host) {
+            hosts.push(host.to_string());
+        }
+    }
     hosts
 }
 
@@ -105,6 +112,23 @@ mod tests {
         assert!(hosts.iter().any(|h| h == "broker.crucible.svc:8849"));
         assert!(!hosts.iter().any(|h| h.is_empty()));
         assert!(hosts.iter().any(|h| h == "host.containers.internal"));
+    }
+
+    /// A deployment re-listing a host we already add must not double it up.
+    #[test]
+    fn repeated_hosts_collapse() {
+        let hosts = extra_hosts(
+            vec!["localhost".into()],
+            Some("host.containers.internal,localhost"),
+        );
+        assert_eq!(
+            hosts,
+            vec![
+                "localhost",
+                "host.containers.internal",
+                "host.openshell.internal"
+            ]
+        );
     }
 
     #[test]
