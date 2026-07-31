@@ -100,21 +100,21 @@ semver = "1"
 # the standalone binary works outside this repo. Blocking client: scope is a sync pipeline.
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
 # Engine self-telemetry: openshell turn spans exported over OTLP, only when an endpoint is set.
-# Same opentelemetry 0.31 stack the controller already runs against tonic 0.14, here over the
-# grpc-tonic transport (opentelemetry-otlp 0.31.1 depends on tonic 0.14.1, so no conflict), aimed
+# Same opentelemetry 0.32 stack the controller already runs against tonic 0.14, here over the
+# grpc-tonic transport (opentelemetry-otlp 0.32.0 depends on tonic 0.14, so no conflict), aimed
 # at the in-cluster Tempo. `tracing` macros compile to no-ops when no subscriber is installed.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-opentelemetry = "0.32"
-opentelemetry = { version = "0.31", default-features = false, features = [
+tracing-opentelemetry = "0.33"
+opentelemetry = { version = "0.32", default-features = false, features = [
     "trace",
     "logs",
 ] }
-opentelemetry_sdk = { version = "0.31", default-features = false, features = [
+opentelemetry_sdk = { version = "0.32", default-features = false, features = [
     "trace",
     "logs",
 ] }
-opentelemetry-otlp = { version = "0.31", default-features = false, features = [
+opentelemetry-otlp = { version = "0.32", default-features = false, features = [
     "trace",
     "logs",
     "grpc-tonic",
@@ -127,7 +127,7 @@ opentelemetry-otlp = { version = "0.31", default-features = false, features = [
 [dev-dependencies]
 # The in-memory log exporter (behind `testing`) drives the gen_ai log mapping through the real SDK
 # export path in unit tests, no mock logger.
-opentelemetry_sdk = { version = "0.31", default-features = false, features = [
+opentelemetry_sdk = { version = "0.32", default-features = false, features = [
     "trace",
     "logs",
     "testing",

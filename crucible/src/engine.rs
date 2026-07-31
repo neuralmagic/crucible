@@ -233,21 +233,21 @@ pub(crate) fn synthesize_tool_spans(
         // between the two can never mint a negative-duration span.
         let end = inv.end.unwrap_or(turn_end).max(inv.start);
 
-        let mut builder = tracer
+        let builder = tracer
             .span_builder(inv.name.clone())
             .with_kind(opentelemetry::trace::SpanKind::Internal)
             .with_start_time(inv.start)
             .with_attributes(attrs);
+        // `build_with_context` starts the span at `with_start_time`; end it at the result time.
+        let mut span = tracer.build_with_context(builder, &cx);
         if errored {
             let msg = if unfinished {
                 "no tool_result before turn end"
             } else {
                 "tool reported an error"
             };
-            builder = builder.with_status(opentelemetry::trace::Status::error(msg));
+            span.set_status(opentelemetry::trace::Status::error(msg));
         }
-        // `build_with_context` starts the span at `with_start_time`; end it at the result time.
-        let mut span = tracer.build_with_context(builder, &cx);
         span.end_with_timestamp(end);
     }
 }
