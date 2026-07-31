@@ -110,7 +110,7 @@ opentelemetry = { version = "0.31", default-features = false, features = [
     "trace",
     "logs",
 ] }
-opentelemetry_sdk = { version = "0.31", default-features = false, features = [
+opentelemetry_sdk = { version = "0.32", default-features = false, features = [
     "trace",
     "logs",
 ] }
@@ -127,7 +127,7 @@ opentelemetry-otlp = { version = "0.31", default-features = false, features = [
 [dev-dependencies]
 # The in-memory log exporter (behind `testing`) drives the gen_ai log mapping through the real SDK
 # export path in unit tests, no mock logger.
-opentelemetry_sdk = { version = "0.31", default-features = false, features = [
+opentelemetry_sdk = { version = "0.32", default-features = false, features = [
     "trace",
     "logs",
     "testing",
