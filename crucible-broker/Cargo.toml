@@ -20,7 +20,7 @@ forge = { path = "../forge" }
 # MCP wire: the official Rust SDK (rmcp) over the streamable-http transport (network-reachable from the
 # sandbox, egress-allowlisted at `host.containers.internal:8849`).
 # The tool/handler code is transport-independent; only the domain binary's `main` binds the listener.
-rmcp = { version = "0.16", features = [
+rmcp = { version = "1.4", features = [
   "server",
   "macros",
   "transport-streamable-http-server",
