@@ -75,6 +75,12 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
         measured: None,
         decided: None,
         fatal: None,
+        workflow_runner: crate::plan::harness::HarnessRunner {
+            args: cx.args.clone(),
+            paths: cx.p.clone(),
+            frozen_injects: cx.args.workflow_frozen_injects.clone(),
+            toolbox_exclude: cx.args.workflow_toolbox_exclude.clone(),
+        },
     };
     // The runner and the on_result hook both need the reporter; collect the wire lines
     // here and append them after the executor returns (they're additive either way).
@@ -231,6 +237,7 @@ struct LoopTaskRunner<'a, R: Reporter> {
     measured: Option<Measured>,
     decided: Option<Decided>,
     fatal: Option<anyhow::Error>,
+    workflow_runner: crate::plan::harness::HarnessRunner,
 }
 
 impl<R: Reporter> LoopTaskRunner<'_, R> {
@@ -323,15 +330,16 @@ impl<R: Reporter> LoopTaskRunner<'_, R> {
 }
 
 impl<R: Reporter> TaskRunner for LoopTaskRunner<'_, R> {
-    fn run(&mut self, task: &Task, _attempt: u32, _inputs: &BTreeMap<TaskName, Value>) -> Attempt {
+    fn run(&mut self, task: &Task, attempt: u32, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
         match &task.task {
-            TaskKind::Agent { prompt, .. } => self.propose(prompt),
+            TaskKind::Agent { prompt, .. } if task.name.0 == "propose" => self.propose(prompt),
+            TaskKind::Agent { .. } | TaskKind::Command { .. } => {
+                self.workflow_runner.run(task, attempt, inputs)
+            }
             TaskKind::Engine(EngineOp::Apply) => self.apply(),
             TaskKind::Engine(EngineOp::Measure) => self.measure(),
             TaskKind::Engine(EngineOp::Decide) => self.decide(),
-            TaskKind::Engine(EngineOp::MeasureDiff)
-            | TaskKind::Command { .. }
-            | TaskKind::TopK { .. } => fail(
+            TaskKind::Engine(EngineOp::MeasureDiff) | TaskKind::TopK { .. } => fail(
                 0.0,
                 format!(
                     "unexpected task kind in the loop template: {}",
@@ -339,6 +347,10 @@ impl<R: Reporter> TaskRunner for LoopTaskRunner<'_, R> {
                 ),
             ),
         }
+    }
+
+    fn run_many(&mut self, batch: &[BatchItem<'_>]) -> Vec<Attempt> {
+        self.workflow_runner.run_many(batch)
     }
 }
 
@@ -932,11 +944,18 @@ mod tests {
             describe(&trace)
         );
         assert!(
+            trace.notes.iter().any(|n| n.contains("review")
+                && n.contains("rejected the candidate")
+                && n.contains("exit 1")),
+            "the discard names the task that rejected it: {:?}",
+            trace.notes
+        );
+        assert!(
             trace
                 .notes
                 .iter()
-                .any(|n| n.contains("review") && n.contains("rejected the candidate")),
-            "the discard names the task that rejected it: {:?}",
+                .all(|n| !n.contains("unexpected task kind")),
+            "the command must execute rather than fail runner dispatch: {:?}",
             trace.notes
         );
         assert_eq!(trace.shutdown, "finished", "a rejection is not a run error");

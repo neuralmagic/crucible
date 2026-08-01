@@ -1787,6 +1787,8 @@ mod tests {
             component_pr_repos: Vec::new(),
             search: None,
             workflow: None,
+            workflow_frozen_injects: Vec::new(),
+            workflow_toolbox_exclude: Vec::new(),
             watch_feedback: false,
         };
         let paths = Paths {

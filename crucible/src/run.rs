@@ -424,6 +424,14 @@ fn run_from_manifest(args: Args) -> Result<()> {
         .collect();
     args.search = m.search.clone();
     args.workflow = m.workflow.clone();
+    args.workflow_frozen_injects = m
+        .workspace
+        .inject
+        .iter()
+        .filter(|inject| inject.frozen)
+        .map(|inject| (manifest_dir.join(&inject.src), PathBuf::from(&inject.dst)))
+        .collect();
+    args.workflow_toolbox_exclude = m.agent.toolbox_exclude.clone();
     let world = m.build_world(workspace.clone());
     let judge = m.build_judge(workspace, frozen_injects)?;
 
@@ -504,6 +512,8 @@ fn run_composite(args: Args, manifest_path: PathBuf) -> Result<()> {
 
     args.search = m.search.clone();
     args.workflow = m.workflow.clone();
+    args.workflow_frozen_injects = Vec::new();
+    args.workflow_toolbox_exclude = m.agent.toolbox_exclude.clone();
     let world = m.build_world(&manifest_dir)?;
     let judge = m.build_judge(&manifest_dir)?;
     drive_loop(args, p, prep, world, judge)
