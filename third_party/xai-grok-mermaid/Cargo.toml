@@ -1,0 +1,37 @@
+# Vendored from https://github.com/xai-org/grok-build
+# (crates/codegen/xai-grok-mermaid) @ 8d69c91f02bcacf01e98d5aebbf2f92547c45738.
+# Apache-2.0, Copyright 2023-2026 SpaceXAI — see LICENSE in this directory and
+# third_party/NOTICE.
+#
+# Local modifications:
+#   - src/mmdc.rs and src/subprocess.rs dropped (mmdc fallback engine and the
+#     out-of-process render child), with their lib.rs mods/re-exports; this cuts
+#     the which/wait-timeout/tempfile/xai-tty-utils dependency tree. Only the
+#     pure-Rust engine + rasterizer are retained.
+#   - This Cargo.toml rewritten standalone (upstream inherits workspace keys).
+[package]
+name = "xai-grok-mermaid"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Render Mermaid diagram source to a rasterized PNG behind a swappable engine trait"
+publish = false
+
+[lib]
+doctest = false
+
+[dependencies]
+resvg = { version = "0.47", default-features = false, features = ["text"] }
+tiny-skia = "0.12"
+fontdb = "0.23"
+thiserror = "2"
+tracing = "0.1"
+mermaid-to-svg = { path = "../mermaid-to-svg" }
+
+# Upstream convention for this tree: vendored third-party code is not restyled,
+# so clippy is allowed here; first-party crates stay fully linted.
+[lints.clippy]
+all = { level = "allow", priority = -1 }
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }

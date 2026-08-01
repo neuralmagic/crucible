@@ -1,5 +1,9 @@
 [workspace]
 members = ["crucible", "crucible-contract", "crucible-vcs", "crucible-harness", "crucible-broker", "forge", "xtask"]
+# Vendored upstream sources (see third_party/NOTICE). Excluded from the workspace so
+# `cargo fmt --all` / clippy lint our code and leave theirs byte-identical to upstream;
+# they are still consumed as path dependencies.
+exclude = ["third_party/dagre_rust", "third_party/graphlib_rust", "third_party/mermaid-to-svg", "third_party/ordered_hashmap", "third_party/xai-grok-mermaid"]
 resolver = "3"
 
 [workspace.package]
