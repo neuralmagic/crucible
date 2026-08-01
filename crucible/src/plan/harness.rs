@@ -1,5 +1,5 @@
-//! The real-harness runner: `Agent` tasks execute through [`crate::agent::run_turn`] — the
-//! same path the loop uses (local claude, hermes, openshell, or the free `command` backend) —
+//! The real-harness runner. `Agent` tasks execute through [`crate::agent::run_turn`], the
+//! same path the loop uses (local claude, hermes, openshell, or the free `command` backend),
 //! with the task's harness/model/effort overriding the manifest's `[agent]` defaults.
 //! `Command` tasks run in the workspace via the shell runner.
 //!
@@ -76,7 +76,7 @@ fn run_task(
     let Some(Isolation::Worktree) = task.isolation else {
         return run_in(args, paths, task, attempt, inputs);
     };
-    // A private clone of the workspace. Its edits are discarded on cleanup — what leaves an
+    // A private clone of the workspace. Its edits are discarded on cleanup: what leaves an
     // isolated task is its declared output, so this is for review/analysis work, not for
     // coding tasks whose diff has to survive (the wide tournament carries those out itself).
     let root = paths.state.join("plan-iso");
@@ -141,7 +141,7 @@ fn run_in(
     };
 
     // Per-task knob overrides on a cloned Args: the heterogeneity axis. Unknown values
-    // are a measured failure — a plan naming a harness we can't parse is wrong, not
+    // are a measured failure: a plan naming a harness we can't parse is wrong, not
     // unlucky.
     let mut args = args.clone();
     if let Some(h) = harness {
@@ -213,7 +213,7 @@ mod tests {
     use crate::plan::ir::{Join, Plan};
 
     /// The counter litmus, plan-shaped: agent tasks run through the REAL `run_turn` path
-    /// (`command` backend — real subprocess, no LLM, no mock), mutating a real git
+    /// (`command` backend: real subprocess, no LLM, no mock), mutating a real git
     /// workspace; the command task measures the real state. Proves the whole harness
     /// runner: manifest prep, per-turn spawn, result-file drain, edges.
     #[test]
@@ -296,7 +296,7 @@ mod tests {
             out.results[&"measure".into()].output.as_ref().unwrap()["score"],
             3
         );
-        // The result file is drained per turn — a stale pass can't leak into the next task.
+        // The result file is drained per turn: a stale pass can't leak into the next task.
         assert!(!dir.join("workspace").join(RESULT_FILE).exists());
         assert_eq!(
             std::fs::read_to_string(dir.join("workspace/value.txt"))
@@ -349,14 +349,9 @@ mod tests {
         )
     }
 
-    /// An adversarial review pass injected between the code node and the expensive gate.
-    /// Both agent tasks run through the REAL `run_turn` path (command backend — real
-    /// subprocesses, no LLM), the reviewer reads the file the coder actually wrote, and a
-    /// deterministic task turns its verdict into a stop.
-    ///
-    /// The load-bearing claim: the reward-hacked implementation PASSES the frozen
-    /// functional gate, so only the review can catch it — and when it does, the expensive
-    /// downstream task is never dispatched.
+    /// A review pass between the code node and the gate. The reward-hacked implementation
+    /// passes the frozen functional gate, so only the review can reject it; when it does,
+    /// the expensive downstream task must never dispatch.
     #[test]
     fn adversarial_review_gates_a_reward_hack_the_frozen_gate_cannot_see() {
         // 1. Clean implementation: the review approves and the whole chain runs.
@@ -394,7 +389,7 @@ mod tests {
             }
         );
 
-        // The reviewer ran successfully and returned a NEGATIVE opinion — a passed task
+        // The reviewer ran successfully and returned a NEGATIVE opinion: a passed task
         // carrying a rejection, not a failed task. Interpreting it is the gate's job.
         let review = &out.results[&"review".into()];
         assert_eq!(
@@ -442,13 +437,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&hacked);
     }
 
-    /// The panel shape: one code node splits into two isolated reviewers with different
-    /// jobs, rejoined by a deterministic policy gate. Runs the SHIPPED panel plan against
-    /// the stand-in manifest, so the same file the live smoke uses is exercised for free.
-    ///
-    /// The case is the mirror of the reward hack: correct code, sloppy prose. It pins the
-    /// property that makes the join a policy rather than an AND — the advisory reviewer
-    /// reports five defects and the run proceeds to `measure` anyway.
+    /// One code node splitting into two isolated reviewers, rejoined by a policy gate.
+    /// Runs the shipped panel plan against the stand-in manifest. Correct code with sloppy
+    /// prose: the advisory reviewer reports defects and the run still reaches `measure`,
+    /// which is what makes the join a policy rather than an AND.
     #[test]
     fn panel_splits_into_two_isolated_reviewers_joined_by_policy() {
         let dir = stage_review_example("panel");

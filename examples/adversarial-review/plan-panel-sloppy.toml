@@ -10,7 +10,7 @@
 # shared workspace would give them. They read the same artifact and never see each other.
 #
 # `gate` uses `join = "passed"` so it folds whatever reported. That matters because
-# review-copy is advisory (`required = false`) — if the copy editor dies, the run must
+# review-copy is advisory (`required = false`), if the copy editor dies, the run must
 # still be able to proceed on the correctness verdict alone. The gate is fail-closed on
 # the blocking reviewer: a missing correctness verdict is not a pass.
 #
@@ -36,13 +36,13 @@ required = true
 model = "claude-opus-4-6"
 effort = "high"
 prompt = """
-ADVERSARIAL_REVIEW — CORRECTNESS
+ADVERSARIAL_REVIEW: CORRECTNESS
 
 Another agent implemented is_prime(n) in solution.py, aiming to make verify.sh pass.
 Both files are in your working directory; read them.
 
 Review adversarially. Assume the implementation may satisfy verify.sh without being
-correct in general. Judge behavior only — someone else is reviewing the prose, so ignore
+correct in general. Judge behavior only, someone else is reviewing the prose, so ignore
 typos, comments, and docstring wording entirely.
 
 Write a single JSON object to PLAN_TASK_RESULT.json:
@@ -65,14 +65,14 @@ required = false
 # overhead dominates. Equivalent findings. Tiering pays on larger artifacts, not here.
 model = "claude-sonnet-5"
 prompt = """
-COPY REVIEW — DOCS AND COMMENTS
+COPY REVIEW: DOCS AND COMMENTS
 
 Another agent wrote solution.py. Copy-edit its PROSE: docstrings and comments.
 
 Judge writing only. Spelling, grammar, and whether the documentation actually describes
 what the code does (a docstring promising behavior the function does not have, or
 documenting a parameter it does not take, is a copy defect). Say nothing about the
-algorithm's correctness — a different reviewer owns that.
+algorithm's correctness, a different reviewer owns that.
 
 Write a single JSON object to PLAN_TASK_RESULT.json:
   findings  array of strings, one per prose defect, each quoting the text at fault.

@@ -1,4 +1,4 @@
-//! `crucible plan show`: compile a plan and print it without executing — the preview
+//! `crucible plan show`: compile a plan and print it without executing. The preview
 //! command. A graph system without "show me the compiled graph" is undebuggable.
 
 use std::collections::BTreeSet;
@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 
 use crate::plan::ir::{Plan, TaskKind, ValidPlan};
 
-/// Read TOML (`.toml`) or JSON (anything else — the `PLAN.json` sentinel shape),
+/// Read TOML (`.toml`) or JSON (anything else: the `PLAN.json` sentinel shape),
 /// validate, and return the frozen plan.
 pub fn load(path: &Path) -> Result<ValidPlan> {
     let src = std::fs::read_to_string(path)

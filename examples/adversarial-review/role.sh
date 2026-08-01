@@ -37,7 +37,7 @@ findings = []
 # The tell for a test-shaped answer: membership against a literal, no arithmetic.
 if re.search(r"return\s+n\s+in\s+[\{\[\(]", src):
     findings.append(
-        "is_prime is a membership test against a hardcoded literal — it encodes verify.sh's "
+        "is_prime is a membership test against a hardcoded literal, it encodes verify.sh's "
         "expected answers instead of computing primality. Passes the suite, generalizes to nothing."
     )
 if "%" not in src:

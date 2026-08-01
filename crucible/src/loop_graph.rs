@@ -1,14 +1,9 @@
-//! The loop's work-graph templates (ADR-0025): the canonical iteration
-//! (`propose(agent) → apply → measure → decide`, instantiated per round) and the wide
-//! tournament (N isolated parallel proposes → serial diff scoring → engine `top_k`),
-//! both handed to the shared executor in [`crate::plan::exec`]. The runners adapt the
-//! executor's task contract onto the loop's `World`/`Judge`/`Reporter` trait objects;
-//! cross-round state, keep/discard, and every between-round drain stay in
-//! [`crate::loop_driver`].
+//! The loop's work-graph templates and the runners that adapt the executor's task
+//! contract onto the loop's `World`/`Judge`/`Reporter`. Cross-round state, keep/discard,
+//! and every between-round drain stay in [`crate::loop_driver`].
 //!
-//! The templates carry no budget of their own (`f64::MAX`): the driver owns the run
-//! budget and checks it between rounds, so a turn that blows the cap is still measured
-//! and decided, exactly like the typestate path.
+//! The templates carry no budget of their own (`f64::MAX`): the driver owns the run budget
+//! and checks it between rounds, so a turn that blows the cap is still measured and decided.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -119,7 +114,7 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
 }
 
 /// The canonical iteration template: `propose → apply → measure → decide`, all required,
-/// so a failed stage short-circuits the rest — the same "nothing runs on top of a
+/// so a failed stage short-circuits the rest: the same "nothing runs on top of a
 /// failure" the typestate chain encoded in types.
 fn iteration_template(prompt: &str) -> Result<ValidPlan> {
     let engine = |name: &str, op: EngineOp, dep: &str| Task {
@@ -483,9 +478,9 @@ pub(crate) fn run_wide_tournament<R: Reporter>(
 }
 
 /// The wide tournament template: `propose-{i} (isolated, advisory) → measure-{i}
-/// (advisory) → pick (top_k over whatever passed)`. Everything is advisory — a dead
-/// candidate never gates the tournament, matching the bespoke loop's skip/fail rows —
-/// and the budget stays driver-owned like the iteration template's.
+/// (advisory) → pick (top_k over whatever passed)`. Everything is advisory: a dead
+/// candidate never gates the tournament, matching the loop's skip/fail rows. The budget
+/// stays driver-owned, like the iteration template's.
 fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Result<ValidPlan> {
     let mut tasks: Vec<Task> = Vec::new();
     for id in 0..cfg.n {
@@ -760,7 +755,7 @@ impl<R: Reporter> TaskRunner for WideRunner<'_, R> {
 /// One candidate's PROPOSE turn in a private worktree: clone, run the turn, capture the
 /// staged diff as the task output, clean up. The diff TEXT is the only thing that leaves
 /// the worktree. Wide turns stream nowhere and their cost is not booked against the run
-/// budget — the pre-S3 behavior, kept for wire/budget parity; booking wide spend is a
+/// budget: the pre-S3 behavior, kept for wire/budget parity; booking wide spend is a
 /// deliberate follow-up.
 fn wide_propose(
     args: &Args,
@@ -869,7 +864,7 @@ mod tests {
          if [ \"$n\" -eq 2 ]; then echo $((v - 1)) > value.txt; else echo $((v + 1)) > value.txt; fi\n";
 
     /// The parity harness: the counter domain end-to-end through `run_loop` with a real
-    /// git workspace, a real command-backend turn, and a real measure subprocess — once per
+    /// git workspace, a real command-backend turn, and a real measure subprocess: once per
     /// path. sh stands in for nu so the fixture is self-contained. The measure declares
     /// solved at value >= 3, so a multi-iteration run exercises the early stop.
     fn run_counter(graph_loop: bool, iterations: u32, bump: &str) -> RunTrace {
@@ -1027,8 +1022,8 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
     }
 
-    /// S1's gate: the counter domain produces identical rows, decisions, best score, kept
-    /// commits, and session-event kind sequence under both paths — the graph run's only
+    /// The counter domain produces identical rows, decisions, best score, kept
+    /// commits, and session-event kind sequence under both paths: the graph run's only
     /// wire difference is the additive plan lines.
     /// Diff two traces: rows, best, commits, shutdown outcome, and the event kind
     /// sequence with the graph run's additive plan lines filtered out.
@@ -1059,7 +1054,7 @@ mod tests {
         );
     }
 
-    /// S1's gate: one iteration, identical under both paths.
+    /// One iteration, identical under both paths.
     #[test]
     fn counter_parity_between_typestate_and_graph_paths() {
         let legacy = run_counter(false, 1, BUMP);
@@ -1078,8 +1073,8 @@ mod tests {
         );
     }
 
-    /// S3's gate: the wide tournament as a template — parallel isolated proposes, serial
-    /// diff scoring, top_k, winner seed — produces the same rows, notes order, seed
+    /// The wide tournament as a template: parallel isolated proposes, serial
+    /// diff scoring, top_k, winner seed: produces the same rows, notes order, seed
     /// state, and event sequence as the bespoke tournament, then the deep loop runs on
     /// top of the seeded workspace under both paths.
     #[test]
@@ -1134,9 +1129,9 @@ mod tests {
         );
     }
 
-    /// S2's gate: the full round loop under the graph path — keep, a regression that
+    /// The full round loop under the graph path: keep, a regression that
     /// exercises discard/restore, then the solve that stops the run early (3 of 5
-    /// budgeted iterations) — identical to the typestate path.
+    /// budgeted iterations): identical to the typestate path.
     #[test]
     fn counter_parity_multi_iteration_with_discard_restore_and_early_stop() {
         let legacy = run_counter(false, 5, ZIGZAG);

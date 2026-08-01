@@ -1,5 +1,5 @@
 //! Workspace isolation for plan tasks: a private clone per task, and the diff plumbing to
-//! carry work out of one. An isolated task's edits never touch the shared workspace — what
+//! carry work out of one. An isolated task's edits never touch the shared workspace: what
 //! leaves is its structured output (and, where the runner asks for it, a captured diff).
 //!
 //! Used by the wide tournament's parallel proposers and by any plan task marked
@@ -44,7 +44,7 @@ pub(crate) fn setup(workspace: &Path, dest: &Path) -> Result<()> {
         );
     }
     // A clone only carries committed state, but isolation has to mean "the workspace as it
-    // stands right now" — an upstream task's uncommitted edits are exactly what the isolated
+    // stands right now": an upstream task's uncommitted edits are exactly what the isolated
     // task is usually there to look at. Carry the working tree over as a patch.
     // Side effect worth knowing: capturing the diff stages the source workspace (`git add -A`),
     // which is what every snapshot does a moment later anyway.

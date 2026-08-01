@@ -30,7 +30,7 @@ pub enum Direction {
 }
 
 /// The canonical loop's engine-owned stages: the driver's `World`/`Judge` calls as tasks.
-/// Propose is not here — it's a plain `Agent` task; the executor never touches git or the
+/// Propose is not here: it's a plain `Agent` task; the executor never touches git or the
 /// judge itself, the loop runner does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EngineOp {
@@ -47,7 +47,7 @@ pub enum EngineOp {
 }
 
 /// Where a task executes. Authorable (`isolation = "worktree"`); a runner that cannot
-/// honor it must refuse the task loudly rather than silently ignore it — see
+/// honor it must refuse the task loudly rather than silently ignore it: see
 /// [`crate::plan::runner::ShellRunner`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -65,7 +65,7 @@ pub enum Join {
     /// only pre-S3 behavior).
     #[default]
     All,
-    /// Dispatch once every dependency is terminal, folding only the passing outputs — a
+    /// Dispatch once every dependency is terminal, folding only the passing outputs: a
     /// reducer over a lossy fan-out (the wide `top_k`: skipped/failed candidates just
     /// don't rank), or a join over reviewers where one being advisory must not stop the run.
     Passed,
@@ -78,7 +78,7 @@ pub enum Join {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TaskKind {
-    /// An agent turn. Harness, model family, and effort are per-task knobs — the openshell
+    /// An agent turn. Harness, model family, and effort are per-task knobs: the openshell
     /// heterogeneity axis. `None` inherits the manifest's `[agent]` defaults.
     Agent {
         prompt: String,
@@ -94,7 +94,7 @@ pub enum TaskKind {
     /// Engine-builtin deterministic fold: keep the k best upstream outputs by `score`.
     TopK { k: u32, direction: Direction },
     /// An engine-owned loop stage. Engine-constructable only: the variant is serde-skipped,
-    /// so no TOML/JSON front-end can author one — packs and agent plans never sequence the
+    /// so no TOML/JSON front-end can author one: packs and agent plans never sequence the
     /// `World`/`Judge` directly.
     #[serde(skip)]
     Engine(EngineOp),
@@ -122,7 +122,7 @@ fn default_required() -> bool {
     true
 }
 
-/// One unit of work in a plan (vocabulary per ADR-0022: task, never node/stage/step/rung).
+/// One unit of work in a plan. Always "task", never node/stage/step/rung.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Task {
     pub name: TaskName,
@@ -144,7 +144,7 @@ pub struct Task {
     pub join: Join,
 }
 
-/// Executor-enforced ceiling. Spending past it fails closed — it is not advice.
+/// Executor-enforced ceiling. Spending past it fails closed: it is not advice.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct PlanBudget {
     pub usd: f64,
@@ -163,7 +163,7 @@ pub struct Plan {
 }
 
 /// A plan that passed structural validation, carrying its topological order.
-/// The executor only accepts this type — an unvalidated `Plan` cannot run.
+/// The executor only accepts this type: an unvalidated `Plan` cannot run.
 #[derive(Debug)]
 pub struct ValidPlan {
     plan: Plan,
@@ -188,7 +188,7 @@ impl ValidPlan {
 }
 
 impl Plan {
-    /// Parse the agent-emitted `PLAN.json` sentinel body. Parsing is not admission —
+    /// Parse the agent-emitted `PLAN.json` sentinel body. Parsing is not admission:
     /// call `validate` then `AdmissionCaps::admit` before anything runs.
     pub fn from_json_str(s: &str) -> Result<Plan> {
         serde_json::from_str(s).context("PLAN.json does not parse as a plan")
@@ -255,7 +255,7 @@ impl Plan {
             }
         }
         // Kahn's algorithm; leftovers mean a cycle. The ready set is a min-heap on the
-        // declaration index so the order is deterministic and declaration-stable — ties
+        // declaration index so the order is deterministic and declaration-stable: ties
         // dispatch in the order the author wrote them, which the UI, the cache, and the
         // budget cutoff all depend on.
         let n = self.tasks.len();
