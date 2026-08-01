@@ -21,6 +21,11 @@ ignore = [
     { id = "RUSTSEC-2026-0104", reason = "legacy aws-sdk rustls stack; fixed-endpoint S3 client, not a general TLS verifier" },
     # anyhow Error::downcast_mut unsoundness; no downcast_mut use in this workspace.
     { id = "RUSTSEC-2026-0190", reason = "workspace does not call Error::downcast_mut" },
+    # Font parsing reached only through the vendored mermaid renderer (third_party/,
+    # xai-grok-mermaid -> resvg -> usvg). Unmaintained, no fix available upstream. It parses
+    # fonts we ship to rasterize our own generated SVG, never untrusted input.
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser via the vendored mermaid renderer; renders our own SVG, no untrusted input" },
+    { id = "RUSTSEC-2026-0206", reason = "rustybuzz via the vendored mermaid renderer; renders our own SVG, no untrusted input" },
 ]
 
 [licenses]
