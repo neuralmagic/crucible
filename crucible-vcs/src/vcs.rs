@@ -269,6 +269,26 @@ mod tests {
         ensure_repo(ws).expect("idempotent");
     }
 
+    /// A same-size edit landing in the same second as the previous index write. libgit2
+    /// compares mtime at one-second granularity unless built with USE_NSEC, so a stat-cache
+    /// hit here would skip re-hashing and the edit would be staged as nothing.
+    #[test]
+    fn same_size_edit_in_the_same_second_is_still_staged() {
+        let tmp = tempdir();
+        let ws = tmp.as_path();
+        fs::write(ws.join("value.txt"), "1\n").expect("write");
+        ensure_repo(ws).expect("baseline commit");
+        for want in ["2", "3", "4", "5"] {
+            fs::write(ws.join("value.txt"), format!("{want}\n")).expect("edit");
+            stage_all(ws).expect("stage");
+            assert!(
+                has_staged_changes(ws).expect("dirty check"),
+                "a same-size edit to {want} must be seen as a staged change"
+            );
+            commit_all(ws, "keep").expect("commit");
+        }
+    }
+
     #[test]
     fn has_staged_changes_is_false_on_a_clean_tree() {
         let tmp = tempdir();
