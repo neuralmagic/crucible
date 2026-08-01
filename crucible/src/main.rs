@@ -41,8 +41,10 @@ mod identity;
 mod ingest_client;
 mod init;
 mod loop_driver;
+mod loop_graph;
 mod manifest;
 mod openshell;
+mod plan;
 mod pr_watch;
 mod provisioning;
 mod ps;
@@ -59,7 +61,6 @@ mod session;
 mod stream;
 mod turn_trace;
 pub(crate) use crucible_harness::stream_json;
-mod wide;
 
 use anyhow::Result;
 use clap::Parser;
@@ -226,6 +227,11 @@ pub(crate) enum Cmd {
         #[command(subcommand)]
         action: DeployAction,
     },
+    /// Work-graph plans (ADR-0025): compile and inspect a plan without executing it.
+    Plan {
+        #[command(subcommand)]
+        action: PlanAction,
+    },
     /// Watch one or more draft PRs' review comments and either steer a live run or reseed the next
     /// one: each NEW human comment is delivered either to a live run's control bridge as a `steer`,
     /// or appended to a reseed file that the next run's first turn reads, exactly one of
@@ -288,6 +294,48 @@ pub(crate) enum Cmd {
 }
 
 /// `crucible deploy <render|apply>`: emit the deployment YAML, or render-and-`kubectl apply`.
+#[derive(clap::Subcommand)]
+pub(crate) enum PlanAction {
+    /// Print the compiled plan (tasks in dependency-first order) and the truncation verdict
+    /// for the given substrate caps. TOML by `.toml` extension, JSON otherwise.
+    Show {
+        /// The plan file to compile.
+        #[arg(long)]
+        file: PathBuf,
+        /// Substrate capabilities to preview against (repeatable). `any`-needs tasks always run.
+        #[arg(long = "cap")]
+        caps: Vec<String>,
+        /// Emit mermaid flowchart source instead of the table (pipe to a mermaid renderer,
+        /// or paste into any markdown surface that renders it).
+        #[arg(long, conflicts_with = "render")]
+        mermaid: bool,
+        /// Render the graph to an image: inline in the terminal (iTerm2/WezTerm/kitty/ghostty
+        /// image protocols) or, elsewhere, a PNG next to the plan file. Fully offline.
+        #[arg(long)]
+        render: bool,
+    },
+    /// Execute a plan with the shell runner: `command` tasks run as real subprocesses,
+    /// `agent` tasks run `--agent-cmd` (the command-backend stand-in). Exits nonzero when
+    /// the plan does not reach a valid verdict.
+    Run {
+        /// The plan file to execute.
+        #[arg(long)]
+        file: PathBuf,
+        /// Substrate capabilities (repeatable). `any`-needs tasks always run.
+        #[arg(long = "cap")]
+        caps: Vec<String>,
+        /// Stand-in command for agent tasks; receives CRUCIBLE_PROMPT / _HARNESS / _MODEL /
+        /// _EFFORT in env. Without it, agent tasks are refused.
+        #[arg(long, conflicts_with = "manifest")]
+        agent_cmd: Option<String>,
+        /// Run agent tasks through the real harness path using this manifest's `[agent]`
+        /// config (workspace set up exactly as a loop run). Command tasks run in the
+        /// workspace.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+    },
+}
+
 #[derive(clap::Subcommand)]
 pub(crate) enum DeployAction {
     /// Emit the rendered loop-pod + RBAC YAML to stdout (review / gitops / `kubectl apply -f -`).
@@ -430,6 +478,12 @@ pub(crate) struct Args {
     /// meaningful when `--wide > 0`. Overrides `[search].policy_k`.
     #[arg(long, default_value_t = 1)]
     pub wide_keep: u32,
+    /// Run each iteration as a canonical work-graph plan (propose → apply → measure → decide)
+    /// through the shared plan executor instead of the hand-sequenced stages. Same events,
+    /// same decisions (parity-gated), plus additive plan lines on the session log.
+    /// Default off while the rollout soaks.
+    #[arg(long)]
+    pub graph_loop: bool,
     /// Don't stop early when an iteration solves the gate, run the full `--iterations` budget.
     /// For ablations: observe what each effort tier does with extra shots *after* solving
     /// (does it keep gold-plating, find more, or regress?). Default: stop on the first solve.

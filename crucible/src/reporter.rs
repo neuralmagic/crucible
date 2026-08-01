@@ -155,6 +155,10 @@ pub trait Reporter {
             esc.category, esc.reason
         ));
     }
+    /// An additive work-graph wire line (`PlanAdmitted` / `TaskResult`) from a graph-loop
+    /// iteration. Default no-op: only the session reporter persists them; the console
+    /// front-end has no plan rendering, and the legacy sequencing path never emits one.
+    fn plan_event(&mut self, _ev: &crate::session::SessionEvent) {}
     /// The draft PR(s) publish-on-keep opened, reported once after publish so the durable session
     /// log carries them (the controller's pull-ingest folds them onto the kept candidates' `pr_url`).
     /// The default is a no-op, the console already prints each URL via `note`; only the session

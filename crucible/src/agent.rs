@@ -106,7 +106,7 @@ impl AgentSource {
     ) -> std::io::Result<Spawned> {
         match self {
             AgentSource::LocalClaude => spawn_local(args, p, prompt, extra_env),
-            AgentSource::Command(cmd) => spawn_command(cmd, p),
+            AgentSource::Command(cmd) => spawn_command(cmd, p, prompt),
             // The openshell driver runs a multi-step flow, not a single child; `run_turn`
             // intercepts it before `spawn`, so this is never reached.
             AgentSource::OpenshellDriver => Err(std::io::Error::other(
@@ -118,11 +118,15 @@ impl AgentSource {
 
 /// Spawn the `command` backend's proposal: `sh -c <cmd>` in the workspace. Deterministic;
 /// its output is echoed through the sink like any other turn.
-fn spawn_command(cmd: &str, p: &Paths) -> std::io::Result<Spawned> {
+fn spawn_command(cmd: &str, p: &Paths, prompt: &str) -> std::io::Result<Spawned> {
     let mut c = Command::new("sh");
     c.arg("-c")
         .arg(cmd)
         .current_dir(&p.workspace)
+        // The turn's prompt, so a deterministic stand-in can play more than one role
+        // (a plan's coder vs its reviewer) by branching on it — the same env contract
+        // as the shell runner's `--agent-cmd` stand-in.
+        .env("CRUCIBLE_PROMPT", prompt)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // Same rule as `spawn_claude`: this child inherits the engine's process env, which under a

@@ -49,6 +49,22 @@ pub struct PrLinkWire {
     pub branch: String,
 }
 
+/// One task of an admitted work-graph plan, on the wire so a viewer can draw the graph
+/// without the manifest. Mirrors the engine's validated plan task the way [`RowWire`]
+/// mirrors `Row`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanTaskWire {
+    pub name: String,
+    /// Task kind label: `agent`, `command`, or a reducer name like `top_k`.
+    pub kind: String,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    #[serde(default)]
+    pub needs: String,
+    #[serde(default)]
+    pub required: bool,
+}
+
 /// One event in the session log. Mirrors the `crucible::reporter::Reporter` calls so the
 /// viewer can rebuild identical state by folding the sequence (the same fold `App` does
 /// over `UiMsg`).
@@ -123,6 +139,52 @@ pub enum SessionEvent {
         links: Vec<PrLinkWire>,
     },
     Finished,
+    /// A work-graph plan was validated and admitted for execution: version, ledgered replan
+    /// reason, executor-enforced budget, and the full task graph so a viewer can draw it.
+    /// Plans are frozen per version; a replan emits a new `PlanAdmitted` with `plan_version + 1`.
+    PlanAdmitted {
+        plan_version: u32,
+        #[serde(default)]
+        reason: String,
+        budget_usd: f64,
+        tasks: Vec<PlanTaskWire>,
+    },
+    /// One work-graph task attempt reached a terminal status. Covers both the plan executor
+    /// (`plan_version` + `kind` + `output`) and measure-DAG walks (`iter` + `digest` + `job` +
+    /// `metric`); fields outside the emitting context default to empty. `status` is one of
+    /// `pass`/`fail`/`transport`/`skipped`/`blocked`/`truncated`. `trace_id`/`span_id`
+    /// cross-link the ledger row to the task's OTLP span in either direction.
+    TaskResult {
+        task: String,
+        status: String,
+        #[serde(default)]
+        plan_version: u32,
+        /// Task kind label (`agent`/`command`/`top_k`); named to dodge the envelope's `kind` tag.
+        #[serde(default)]
+        task_kind: String,
+        #[serde(default)]
+        iter: u32,
+        #[serde(default)]
+        digest: String,
+        #[serde(default)]
+        job: String,
+        #[serde(default)]
+        attempts: u32,
+        #[serde(default)]
+        cost_usd: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metric: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<serde_json::Value>,
+        #[serde(default)]
+        note: String,
+        #[serde(default)]
+        secs: f64,
+        #[serde(default)]
+        trace_id: String,
+        #[serde(default)]
+        span_id: String,
+    },
     /// The loop is exiting, emitted exactly once as the LAST line of the session log. `outcome` is
     /// one of `finished`/`solved`/`budget`/`stopped`/`escalated`/`error`. The viewer keys its
     /// terminal state off this line: a dead stream with no `Shutdown` line means the pod died
@@ -331,6 +393,62 @@ mod tests {
             },
         ] {
             assert_round_trips(SessionEvent::Agent { event });
+        }
+    }
+
+    #[test]
+    fn plan_admitted_round_trips() {
+        assert_round_trips(SessionEvent::PlanAdmitted {
+            plan_version: 2,
+            reason: "verifier refuted candidate".into(),
+            budget_usd: 5.0,
+            tasks: vec![PlanTaskWire {
+                name: "propose-a".into(),
+                kind: "agent".into(),
+                depends_on: vec![],
+                needs: "any".into(),
+                required: true,
+            }],
+        });
+    }
+
+    #[test]
+    fn task_result_round_trips_with_output_and_defaults() {
+        assert_round_trips(SessionEvent::TaskResult {
+            task: "measure-a".into(),
+            status: "pass".into(),
+            plan_version: 1,
+            task_kind: "command".into(),
+            iter: 0,
+            digest: String::new(),
+            job: String::new(),
+            attempts: 1,
+            cost_usd: 0.3,
+            metric: None,
+            output: Some(serde_json::json!({"score": 234.0})),
+            note: String::new(),
+            secs: 0.0,
+            trace_id: String::new(),
+            span_id: String::new(),
+        });
+        // A minimal line (old writers, other contexts) still decodes: every field but
+        // task/status defaults.
+        let ev = decode(r#"{"v":1,"kind":"task_result","task":"t","status":"fail"}"#)
+            .expect("minimal task_result decodes");
+        match ev {
+            SessionEvent::TaskResult {
+                task,
+                status,
+                attempts,
+                output,
+                ..
+            } => {
+                assert_eq!(task, "t");
+                assert_eq!(status, "fail");
+                assert_eq!(attempts, 0);
+                assert!(output.is_none());
+            }
+            other => panic!("wrong variant: {other:?}"),
         }
     }
 
