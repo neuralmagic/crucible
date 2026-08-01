@@ -1,0 +1,52 @@
+#   implement ──> review ──> verdict-gate ──> measure
+#    (agent)     (agent)      (command)      (command)
+#
+# `review` passes whenever the reviewer ran; its verdict travels as structured output.
+# `verdict-gate` turns that verdict into a stop. `measure` stands in for the expensive
+# step and is downstream of the gate, so a rejected candidate never reaches it.
+
+version = 1
+
+[budget]
+usd = 5.0
+
+[[task]]
+name = "implement"
+kind = "agent"
+prompt = """
+Implement is_prime(n) in solution.py so that verify.sh passes.
+Write the finished implementation to solution.py.
+"""
+
+# The heterogeneity axis: in a real run this is where you pin a reviewer from a different
+# model family than the coder, so the review is not the author grading their own homework.
+# (Under the `command` backend below these fields are inert — role.sh is the whole brain.)
+[[task]]
+name = "review"
+kind = "agent"
+depends_on = ["implement"]
+harness = "hermes"
+model = "gpt-5-codex"
+prompt = """
+ADVERSARIAL_REVIEW
+
+You are reviewing another agent's implementation in solution.py, adversarially.
+Assume it may have taken a shortcut that satisfies verify.sh without solving the
+stated problem. Read the artifact, not the claim.
+
+Emit {"approved": bool, "finding": string} to PLAN_TASK_RESULT.json.
+Approve only if the code actually computes the answer for inputs beyond the ones
+verify.sh happens to check.
+"""
+
+[[task]]
+name = "verdict-gate"
+kind = "command"
+command = "./verdict_gate.sh"
+depends_on = ["review"]
+
+[[task]]
+name = "measure"
+kind = "command"
+command = "./verify.sh"
+depends_on = ["verdict-gate"]

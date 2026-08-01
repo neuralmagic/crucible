@@ -1,0 +1,96 @@
+# A review PANEL: one code node splits into two reviewers with different jobs, running
+# concurrently in isolated worktrees, rejoined by a deterministic gate.
+#
+#            ┌─> review-correctness (blocking) ─┐
+#   implement┤                                  ├─> gate ─> measure
+#            └─> review-copy       (advisory) ──┘
+#
+# Both reviewers are `isolation = "worktree"`: each gets a private clone of the workspace,
+# so they run at the same time without racing on the single PLAN_TASK_RESULT.json the
+# shared workspace would give them. They read the same artifact and never see each other.
+#
+# `gate` uses `join = "passed"` so it folds whatever reported. That matters because
+# review-copy is advisory (`required = false`) — if the copy editor dies, the run must
+# still be able to proceed on the correctness verdict alone. The gate is fail-closed on
+# the blocking reviewer: a missing correctness verdict is not a pass.
+#
+# Plants the mirror case: correct code, sloppy prose. Correctness approves, copy-edit
+# reports findings, the run proceeds to measure carrying them as advisory.
+
+version = 1
+
+[budget]
+usd = 4.0
+
+[[task]]
+name = "implement"
+kind = "command"
+command = "./plant.sh sloppy"
+
+[[task]]
+name = "review-correctness"
+kind = "agent"
+depends_on = ["implement"]
+isolation = "worktree"
+required = true
+model = "claude-opus-4-6"
+effort = "high"
+prompt = """
+ADVERSARIAL_REVIEW — CORRECTNESS
+
+Another agent implemented is_prime(n) in solution.py, aiming to make verify.sh pass.
+Both files are in your working directory; read them.
+
+Review adversarially. Assume the implementation may satisfy verify.sh without being
+correct in general. Judge behavior only — someone else is reviewing the prose, so ignore
+typos, comments, and docstring wording entirely.
+
+Write a single JSON object to PLAN_TASK_RESULT.json:
+  approved       true only if is_prime is correct for ALL n, not merely the cases verify.sh
+                 happens to test
+  finding        one or two sentences naming the defect, or "" if approved
+  counterexample an integer n that is_prime answers incorrectly, or null if approved
+
+Do not edit any file. Review only.
+"""
+
+[[task]]
+name = "review-copy"
+kind = "agent"
+depends_on = ["implement"]
+isolation = "worktree"
+required = false
+# Measured on this artifact: Sonnet $0.4348, Opus (correctness seat) $0.3224. Sonnet's unit
+# price is lower (3/15 vs 5/25 per MTok) but solution.py is 20 lines, so fixed per-turn
+# overhead dominates. Equivalent findings. Tiering pays on larger artifacts, not here.
+model = "claude-sonnet-5"
+prompt = """
+COPY REVIEW — DOCS AND COMMENTS
+
+Another agent wrote solution.py. Copy-edit its PROSE: docstrings and comments.
+
+Judge writing only. Spelling, grammar, and whether the documentation actually describes
+what the code does (a docstring promising behavior the function does not have, or
+documenting a parameter it does not take, is a copy defect). Say nothing about the
+algorithm's correctness — a different reviewer owns that.
+
+Write a single JSON object to PLAN_TASK_RESULT.json:
+  findings  array of strings, one per prose defect, each quoting the text at fault.
+            Empty array if the prose is clean.
+  summary   one sentence on the overall state of the documentation
+
+Do not edit any file. Review only.
+"""
+
+[[task]]
+name = "gate"
+kind = "command"
+command = "./join_gate.sh"
+depends_on = ["review-correctness", "review-copy"]
+join = "passed"
+
+[[task]]
+name = "measure"
+kind = "command"
+command = "./verify.sh"
+depends_on = ["gate"]

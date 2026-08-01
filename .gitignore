@@ -17,3 +17,5 @@ __pycache__/
 /STEER.md
 # macOS Finder droppings.
 .DS_Store
+# Live example variants (real-model smokes) keep their own workspace dir.
+examples/*/workspace-*/
