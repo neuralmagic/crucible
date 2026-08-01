@@ -1,6 +1,6 @@
 //! Inline terminal image emission for `plan show --render`: PNG bytes onto the tty via the
 //! iTerm2 (OSC 1337) or kitty graphics protocol, detected from the environment. Terminals
-//! speaking neither get a PNG file instead — the caller handles that fallback.
+//! speaking neither get a PNG file instead; the caller handles that fallback.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;

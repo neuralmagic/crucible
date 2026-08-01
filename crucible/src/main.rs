@@ -227,7 +227,7 @@ pub(crate) enum Cmd {
         #[command(subcommand)]
         action: DeployAction,
     },
-    /// Work-graph plans (ADR-0025): compile and inspect a plan without executing it.
+    /// Work-graph plans: compile and inspect a plan without executing it.
     Plan {
         #[command(subcommand)]
         action: PlanAction,

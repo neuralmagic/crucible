@@ -1,6 +1,6 @@
 //! A real runner: tasks execute as subprocesses, nothing is simulated. `Command` tasks run
 //! their frozen command; `Agent` tasks run the command-backend stand-in supplied by the
-//! caller (the same trick as `AgentBackend::Command` — real process, scripted brain). The
+//! caller (the same trick as `AgentBackend::Command`: real process, scripted brain). The
 //! full harness/broker runners replace this one; the executor contract is identical.
 //!
 //! Output contract, mirroring `measure_cmd`: the last non-empty stdout line is the task's
@@ -18,7 +18,7 @@ use crate::plan::ir::{Task, TaskKind, TaskName};
 pub struct ShellRunner {
     pub workdir: PathBuf,
     /// Stand-in command for `Agent` tasks (receives the prompt and knobs via env). `None`
-    /// means agent tasks are refused — `plan run` without `--agent-cmd` is command-only.
+    /// means agent tasks are refused: `plan run` without `--agent-cmd` is command-only.
     pub agent_cmd: Option<String>,
 }
 

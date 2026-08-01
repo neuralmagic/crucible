@@ -1,8 +1,8 @@
 //! The deterministic plan executor. Readiness is visibility: a task with an unmet dependency
 //! does not exist to the dispatcher. Retry ≠ check: transport failures get bounded retries,
-//! measured failures never rerun. Semantics inherited from ADR-0022: fail-closed truncation
-//! before any dispatch, advisory failures block dependents but not validity, short-circuit on
-//! required failure, budget fails closed.
+//! measured failures never rerun. Truncation is fail-closed and happens before any
+//! dispatch; advisory failures block dependents but not validity; a required failure
+//! short-circuits; budget fails closed.
 //!
 //! Dispatch is serial in topo order, with one exception: simultaneously-ready
 //! isolation-marked tasks go to the runner as a single [`TaskRunner::run_many`] batch
@@ -32,7 +32,7 @@ impl Substrate {
 pub enum AttemptOutcome {
     /// Measured success with the task's structured output (the edge payload).
     Pass(Value),
-    /// Measured failure. Never retried — a task that failed, failed.
+    /// Measured failure. Never retried: a task that failed, failed.
     Fail(String),
     /// Transport failure (infra, not the work). Retried, bounded, every attempt visible.
     Transport(String),
@@ -51,7 +51,7 @@ pub struct BatchItem<'a> {
 }
 
 /// Runs one attempt of an `Agent` or `Command` task. The engine implements this against the
-/// harness and broker; tests program it directly. `TopK` never reaches the runner — reducers
+/// harness and broker; tests program it directly. `TopK` never reaches the runner: reducers
 /// are engine-owned, exactly as control tasks are orchestrator-owned in every system that
 /// survived contact with production.
 pub trait TaskRunner {
@@ -83,7 +83,7 @@ impl Default for ExecCfg {
     }
 }
 
-/// Terminal task states, ADR-0022 vocabulary.
+/// Terminal task states.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
@@ -155,7 +155,7 @@ pub struct PlanOutcome {
 }
 
 /// Execute a validated, admitted plan to completion. `on_result` fires once per task as it
-/// reaches a terminal status, in dispatch order — the live-progress hook the session log
+/// reaches a terminal status, in dispatch order: the live-progress hook the session log
 /// (and any tailer) hangs off; the returned `PlanOutcome` carries the same results folded.
 pub fn execute(
     plan: &ValidPlan,
@@ -202,7 +202,7 @@ pub fn execute(
 
     // Readiness scan: repeated topo passes. Each pass settles everything decidable
     // without dispatch (halt-blocked, skipped, dep-failed, over-budget), then dispatches
-    // the first ready task and restarts — or, when the first ready task is
+    // the first ready task and restarts, or, when the first ready task is
     // isolation-marked, the whole simultaneously-ready isolated set as one batch. For a
     // plan with no isolated tasks this reproduces the serial topo walk exactly.
     let mut record = |t: &Task,
@@ -386,7 +386,7 @@ fn run_with_retries(
 }
 
 /// Run a concurrent batch through [`TaskRunner::run_many`], re-batching the
-/// transport-failed subset until everything is terminal or retries are exhausted —
+/// transport-failed subset until everything is terminal or retries are exhausted:
 /// the same bounded-retry semantics as the serial path, one wave per attempt number.
 /// Returns results paired with their tasks in the batch's (declaration) order.
 fn run_batch_with_retries<'a>(
