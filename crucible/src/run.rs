@@ -119,6 +119,28 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
         return crate::rank_grounded::run(args);
     }
 
+    if let Some(Cmd::Plan { action }) = &cli.command {
+        return match action {
+            crate::PlanAction::Show {
+                file,
+                caps,
+                mermaid,
+                render,
+            } => crate::plan::cli::show(file, &caps.iter().cloned().collect(), *mermaid, *render),
+            crate::PlanAction::Run {
+                file,
+                caps,
+                agent_cmd,
+                manifest,
+            } => crate::plan::cli::run(
+                file,
+                &caps.iter().cloned().collect(),
+                agent_cmd.clone(),
+                manifest.as_deref(),
+            ),
+        };
+    }
+
     if let Some(Cmd::Deploy { action }) = cli.command {
         // The WorkPod turn renderer has no manifest/controller shape, so it dispatches before the
         // render/apply split below.
@@ -267,6 +289,43 @@ pub(crate) fn clone_repo(src: &str, git_ref: Option<&str>, dest: &Path) -> Resul
 /// Load a `crucible.toml`, build the World + Judge from it, and drive the loop. The one run
 /// path: every domain flows through here. Front-ends: headless / jsonl / stream,
 /// plus `--resume`.
+/// Build a plan runner over a manifest's agent config: the workspace is set up (or reused)
+/// exactly as a loop run would, and `Agent` tasks run through the real harness path with the
+/// manifest's `[agent]` defaults. Shares the loop's setup helpers so a plan run and a loop
+/// run see the same world.
+pub(crate) fn prep_plan_runner(
+    manifest_path: &Path,
+) -> Result<crate::plan::harness::HarnessRunner> {
+    let m = manifest::Manifest::load_frozen(manifest_path)?;
+    let manifest_dir = manifest_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let workspace = manifest_dir.join(&m.workspace.dir);
+    let state = manifest_dir.join("state");
+    let skills = m.agent.toolbox_dir.as_ref().map(|d| manifest_dir.join(d));
+    let p = crate::Paths::for_manifest(workspace.clone(), state, &manifest_dir, skills);
+    if !workspace.exists() {
+        manifest_setup(&m, &manifest_dir, &workspace)?;
+        for (src, dst, _frozen) in m.resolved_injects(&manifest_dir, &workspace) {
+            manifest::apply_inject(&src, &dst)
+                .context("applying [workspace].inject after setup")?;
+        }
+    }
+    vcs::ensure_repo(&workspace).context("ensuring workspace is a git repo")?;
+    std::fs::create_dir_all(&p.state)
+        .with_context(|| format!("creating state dir {}", p.state.display()))?;
+    // Default Args (as if `crucible` ran flagless), then the manifest's [agent] folded on top —
+    // the same resolution a loop run does.
+    let mut args = <Cli as clap::Parser>::try_parse_from(["crucible"])
+        .context("constructing default args")?
+        .run;
+    args.manifest = Some(manifest_path.to_path_buf());
+    apply_agent_cfg(&mut args, &m.agent, &p.workspace)?;
+    Ok(crate::plan::harness::HarnessRunner { args, paths: p })
+}
+
 fn run_from_manifest(args: Args) -> Result<()> {
     let manifest_path = args.manifest.clone().context(
         "crucible needs a manifest: pass --manifest <crucible.toml> (see docs/crucible-contract.md)",

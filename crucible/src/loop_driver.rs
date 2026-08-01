@@ -6,7 +6,7 @@
 //! workspace prep, front-end choice) lives in [`crate::run`]; this module is just the loop and
 //! its helpers.
 
-use crate::reporter::{Outcome, Phase, Reporter, Row, Stop};
+use crate::reporter::{AgentTurn, Outcome, Phase, Reporter, Row, Stop};
 use crate::{Args, Paths, Prepared, STOP};
 use crate::{control, crucible, escalation, provisioning, publish, session};
 use anyhow::{Context, Result};
@@ -177,19 +177,177 @@ struct Proposed;
 struct Applied;
 /// The judge measured the live candidate. Holds everything the decision and the results row need,
 /// so a kept row carries its reading by construction.
-struct Measured {
-    reading: crucible::Reading,
-    note: String,
-    diff: String,
-    diffstat: String,
+pub(crate) struct Measured {
+    pub(crate) reading: crucible::Reading,
+    pub(crate) note: String,
+    pub(crate) diff: String,
+    pub(crate) diffstat: String,
 }
 
-/// The outcome of [`Iteration::decide`]: the results row, the keep/discard verdict, and the reading
+/// The outcome of [`decide_row`]: the results row, the keep/discard verdict, and the reading
 /// the keep path commits (its score becomes `best_score`, its note labels the snapshot).
-struct Decided {
-    row: Row,
-    verdict: crucible::Decision,
-    reading: crucible::Reading,
+pub(crate) struct Decided {
+    pub(crate) row: Row,
+    pub(crate) verdict: crucible::Decision,
+    pub(crate) reading: crucible::Reading,
+}
+
+/// One iteration's outcome in driver vocabulary, produced by either path (the typestate
+/// chain or the graph template) and folded by the shared keep/discard tail in
+/// [`run_loop_body`].
+pub(crate) enum IterStep {
+    Decided(Box<Decided>),
+    /// Discard and move on (failed turn or failed apply); the reason is already noted.
+    Discarded,
+    /// Halt for human review (the escalation is already reported).
+    Escalated,
+    /// Park at the next iteration head on a blocking approval.
+    Parked(provisioning::PendingProvisioning),
+    /// Stop signal at the post-turn checkpoint.
+    Stopped,
+}
+
+/// What the post-turn sentinel drains decided, in the exact order the loop checks them.
+/// Notes and the structured escalation event are emitted in here; the caller owns the
+/// world rollback and the loop control that follows. Shared by the typestate path and the
+/// graph runner so both react to a turn identically.
+pub(crate) enum TurnVerdict {
+    Proceed,
+    /// The turn failed (`is_error`): discard the iteration.
+    Discard,
+    /// The agent escalated: halt for human review.
+    Escalate,
+    /// The agent blocked on a pending approval with no fallback.
+    Park(provisioning::PendingProvisioning),
+    Stop,
+}
+
+pub(crate) fn drain_turn_markers<R: Reporter>(
+    r: &mut R,
+    p: &Paths,
+    control: Option<&control::ControlState>,
+    it: u32,
+    turn: &AgentTurn,
+    rows: &[Row],
+) -> TurnVerdict {
+    // A failed agent turn (the CLI reported is_error, e.g. a credential-less
+    // "Not logged in" no-op with subtype "success", cost 0) left the workspace
+    // untouched. Discard the iteration with the reason instead of measuring an
+    // unchanged workspace and logging the no-op as a keep/discard "success", the
+    // same restore-and-continue an unscoreable (apply-failed) candidate takes.
+    if turn.is_error {
+        let why = turn.error.as_deref().unwrap_or("agent reported an error");
+        r.note(&format!("agent turn failed (discarding iter {it}): {why}"));
+        return TurnVerdict::Discard;
+    }
+
+    // The agent's sanctioned move against a frozen judge: if it declared the harness
+    // inadequate this turn, restore the world and halt for human review, never measure
+    // or keep on top of an escalation. A malformed marker is surfaced but ignored, so
+    // a stray/garbled file can't wedge a paid run.
+    match escalation::take(&p.escalation) {
+        Some(Ok(esc)) => {
+            r.escalation(&esc);
+            return TurnVerdict::Escalate;
+        }
+        Some(Err(msg)) => r.note(&format!("ignoring malformed ESCALATION.json: {msg}")),
+        None => {}
+    }
+
+    // The agent opened a mediated-provisioning approval and recorded how to wait. `block`
+    // means it has no frozen-regime fallback, so skip the (empty) measure and park at the
+    // next iteration head; `continue` means it left a fallback candidate, so fall through
+    // and measure it while the re-scope lands asynchronously.
+    match provisioning::take(&p.provisioning) {
+        Some(Ok(pp)) => {
+            // Record the regime the approval would grant so an operator `approve` over the
+            // control bridge can resolve it (the attended path). The forge path sends its
+            // own `rescope`; both converge on the iteration-head drain.
+            if let Some(control) = control {
+                control.set_pending_regime(pp.trace_id.clone());
+            }
+            match pp.mode {
+                provisioning::WaitMode::Block => {
+                    r.note(&format!(
+                        "parked: blocked on approval {} — nothing else to try, awaiting the re-scope",
+                        pp.handle
+                    ));
+                    return TurnVerdict::Park(pp);
+                }
+                provisioning::WaitMode::Continue => r.note(&format!(
+                    "awaiting approval {} — continuing in the frozen regime",
+                    pp.handle
+                )),
+            }
+        }
+        Some(Err(msg)) => r.note(&format!(
+            "ignoring malformed PROVISIONING_PENDING.json: {msg}"
+        )),
+        None => {}
+    }
+
+    if matches!(r.check_interrupt(p, rows), Stop::Quit) {
+        return TurnVerdict::Stop;
+    }
+    TurnVerdict::Proceed
+}
+
+/// Measure the live candidate: the judge's reading, the note (the agent's CANDIDATE.md
+/// summary when it wrote one, else the measure's note), and the staged diff captured before
+/// keep/discard commits or resets it. Shared by the typestate path and the graph runner so
+/// both measure identically.
+pub(crate) fn measure_candidate(
+    judge: &dyn Judge,
+    ctx: &crucible::MeasureCtx,
+    p: &Paths,
+    world: &dyn World,
+) -> Result<Measured> {
+    let reading = judge.measure(ctx)?;
+    let note = {
+        let c = candidate_note(p);
+        if c.is_empty() {
+            reading.note.clone()
+        } else {
+            c
+        }
+    };
+    let (diff, diffstat) = capture_diff(world);
+    Ok(Measured {
+        reading,
+        note,
+        diff,
+        diffstat,
+    })
+}
+
+/// Rule keep/discard on a measured candidate and build its results row: the one
+/// decision+row constructor, shared by the typestate path and the graph runner. The
+/// reading the row reports and the keep path commits is the one that was actually
+/// measured (`Measured` is consumed).
+pub(crate) fn decide_row(judge: &dyn Judge, best_score: f64, it: u32, m: Measured) -> Decided {
+    let Measured {
+        reading,
+        note,
+        diff,
+        diffstat,
+    } = m;
+    let verdict = judge.decide(&reading, best_score);
+    let row = Row {
+        iter: it,
+        decision: if verdict.keep { "keep" } else { "discard" }.into(),
+        note,
+        detail: judge.detail(&reading),
+        diff,
+        diffstat,
+        score: reading.score,
+        total: reading_total(&reading),
+        phase: None,
+    };
+    Decided {
+        row,
+        verdict,
+        reading,
+    }
 }
 
 impl Iteration<Proposed> {
@@ -221,25 +379,9 @@ impl Iteration<Applied> {
         p: &Paths,
         world: &dyn World,
     ) -> Result<Iteration<Measured>> {
-        let reading = judge.measure(ctx)?;
-        // The agent's CANDIDATE.md summary when it wrote one, else the measure's note.
-        let note = {
-            let c = candidate_note(p);
-            if c.is_empty() {
-                reading.note.clone()
-            } else {
-                c
-            }
-        };
-        let (diff, diffstat) = capture_diff(world);
         Ok(Iteration {
             it: self.it,
-            state: Measured {
-                reading,
-                note,
-                diff,
-                diffstat,
-            },
+            state: measure_candidate(judge, ctx, p, world)?,
         })
     }
 }
@@ -248,29 +390,7 @@ impl Iteration<Measured> {
     /// Rule keep/discard and build the results row. Consumes the `Measured`, so the reading the row
     /// reports and the keep path commits is the one that was actually measured.
     fn decide(self, judge: &dyn Judge, best_score: f64) -> Decided {
-        let Measured {
-            reading,
-            note,
-            diff,
-            diffstat,
-        } = self.state;
-        let verdict = judge.decide(&reading, best_score);
-        let row = Row {
-            iter: self.it,
-            decision: if verdict.keep { "keep" } else { "discard" }.into(),
-            note,
-            detail: judge.detail(&reading),
-            diff,
-            diffstat,
-            score: reading.score,
-            total: reading_total(&reading),
-            phase: None,
-        };
-        Decided {
-            row,
-            verdict,
-            reading,
-        }
+        decide_row(judge, best_score, self.it, self.state)
     }
 }
 
@@ -418,10 +538,14 @@ fn run_loop_body<R: Reporter>(
     // seeds the deep loop's workspace. Skipped on resume (the wide rows already live in the
     // session log).
     if !is_resume
-        && let Some(wide_cfg) =
-            crate::wide::WideConfig::resolve(args, args.search.as_ref(), &judge.objective())
+        && let Some(wide_cfg) = crate::loop_graph::WideConfig::resolve(args, args.search.as_ref())
     {
-        let result = crate::wide::run_tournament(
+        // The tournament runs as a work-graph template (parallel isolated proposes,
+        // serial diff scoring, engine top_k) on both loop paths — the bespoke wide
+        // sequencer is gone. The winner diff travels as TEXT because the candidate
+        // worktrees are gone by seed time — re-deriving from a worktree is how the seed
+        // used to silently no-op.
+        let result = crate::loop_graph::run_wide_tournament(
             &wide_cfg,
             args,
             p,
@@ -431,18 +555,25 @@ fn run_loop_body<R: Reporter>(
             judge,
             run.segment.baseline_score,
         )?;
+        let winner = result.winners.first().copied();
+        let winner_diff = winner.and_then(|id| result.diffs.get(&id).cloned());
+        let rows = result.rows;
 
-        for row in &result.rows {
+        for row in &rows {
             r.row(row, false);
             run.rows.push(row.clone());
         }
         write_results(p, &prep.goal, &prep.prior, &run.rows)?;
 
-        if let Some(&winner_id) = result.winners.first() {
+        if let Some(winner_id) = winner {
             r.note(&format!(
                 "wide round complete: seeding deep loop with candidate {winner_id}"
             ));
-            if let Err(e) = crate::wide::apply_winner(&p.workspace, &result.candidates, winner_id) {
+            let applied = winner_diff
+                .filter(|d| !d.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("winner produced no diff"))
+                .and_then(|d| crate::plan::worktree::apply(&p.workspace, &d));
+            if let Err(e) = applied {
                 r.note(&format!(
                     "failed to apply winner diff: {e:#} — deep loop starts from baseline"
                 ));
@@ -542,111 +673,97 @@ fn run_loop_body<R: Reporter>(
             r.note("injected operator steer");
         }
         let prompt = render_prompt(&prep.template, &prep.goal, &status, steer);
-        let turn = r.run_agent(args, p, it, &prompt);
-        run.spent += turn.cost;
-        if let Some(control) = control {
-            control.set_spend(run.spent);
-        }
-        r.budget(run.spent, started.elapsed());
 
-        // A failed agent turn (the CLI reported is_error, e.g. a credential-less
-        // "Not logged in" no-op with subtype "success", cost 0) left the workspace
-        // untouched. Discard the iteration with the reason instead of measuring an
-        // unchanged workspace and logging the no-op as a keep/discard "success", the
-        // same restore-and-continue an unscoreable (apply-failed) candidate takes.
-        if turn.is_error {
-            let why = turn.error.as_deref().unwrap_or("agent reported an error");
-            r.note(&format!("agent turn failed (discarding iter {it}): {why}"));
-            world.restore(run.segment.best_snap.as_str())?;
-            continue;
-        }
+        let step = if args.graph_loop {
+            // One canonical-template plan per iteration through the shared executor.
+            // Between-round control (park, steer, re-scope, budget) stays right here in
+            // the driver; the runner emits the same notes/events at the same points.
+            let (step, cost) = crate::loop_graph::run_iteration(
+                crate::loop_graph::IterCtx {
+                    args,
+                    p,
+                    world,
+                    judge,
+                    control,
+                    it,
+                    prompt: &prompt,
+                    rows: &run.rows,
+                    baseline_score: run.segment.baseline_score,
+                    baseline_total: run.segment.baseline_total,
+                    best_score: run.segment.best_score,
+                    spent_before: run.spent,
+                    started,
+                },
+                r,
+            )?;
+            run.spent += cost;
+            step
+        } else {
+            let turn = r.run_agent(args, p, it, &prompt);
+            run.spent += turn.cost;
+            if let Some(control) = control {
+                control.set_spend(run.spent);
+            }
+            r.budget(run.spent, started.elapsed());
 
-        // The agent's sanctioned move against a frozen judge: if it declared the harness
-        // inadequate this turn, restore the world and halt for human review, never measure
-        // or keep on top of an escalation. A malformed marker is surfaced but ignored, so
-        // a stray/garbled file can't wedge a paid run.
-        match escalation::take(&p.escalation) {
-            Some(Ok(esc)) => {
-                r.escalation(&esc);
+            match drain_turn_markers(r, p, control, it, &turn, &run.rows) {
+                TurnVerdict::Proceed => {
+                    // Make the candidate live (deploy domains build+push+set-image); a no-op
+                    // for the agent-edit/git worlds where the edit IS the candidate. A failed
+                    // apply is an unscoreable candidate: roll back to best and move on.
+                    match Iteration::proposed(it).apply(world) {
+                        Ok(applied) => {
+                            let ctx = crucible::MeasureCtx {
+                                baseline_score: Some(run.segment.baseline_score),
+                                baseline_total: Some(run.segment.baseline_total),
+                                best_score: Some(run.segment.best_score),
+                            };
+                            IterStep::Decided(Box::new(
+                                applied
+                                    .measure(judge, &ctx, p, world)?
+                                    .decide(judge, run.segment.best_score),
+                            ))
+                        }
+                        Err(e) => {
+                            r.note(&format!("apply failed (discarding iter {it}): {e:#}"));
+                            IterStep::Discarded
+                        }
+                    }
+                }
+                TurnVerdict::Discard => IterStep::Discarded,
+                TurnVerdict::Escalate => IterStep::Escalated,
+                TurnVerdict::Park(pp) => IterStep::Parked(pp),
+                TurnVerdict::Stop => IterStep::Stopped,
+            }
+        };
+
+        let Decided {
+            row,
+            verdict,
+            reading,
+        } = match step {
+            IterStep::Decided(d) => *d,
+            IterStep::Discarded => {
+                world.restore(run.segment.best_snap.as_str())?;
+                continue;
+            }
+            IterStep::Escalated => {
                 update_control_status(control, "escalated", it, run.segment.best_score, run.spent);
                 world.restore(run.segment.best_snap.as_str())?;
                 exit = LoopExit::Escalated;
                 break;
             }
-            Some(Err(msg)) => r.note(&format!("ignoring malformed ESCALATION.json: {msg}")),
-            None => {}
-        }
-
-        // The agent opened a mediated-provisioning approval and recorded how to wait. `block`
-        // means it has no frozen-regime fallback, so skip the (empty) measure and park at the
-        // next iteration head; `continue` means it left a fallback candidate, so fall through
-        // and measure it while the re-scope lands asynchronously.
-        match provisioning::take(&p.provisioning) {
-            Some(Ok(pp)) => {
-                // Record the regime the approval would grant so an operator `approve` over the
-                // control bridge can resolve it (the attended path). The forge path sends its
-                // own `rescope`; both converge on the iteration-head drain.
-                if let Some(control) = control {
-                    control.set_pending_regime(pp.trace_id.clone());
-                }
-                match pp.mode {
-                    provisioning::WaitMode::Block => {
-                        r.note(&format!(
-                            "parked: blocked on approval {} — nothing else to try, awaiting the re-scope",
-                            pp.handle
-                        ));
-                        update_control_status(
-                            control,
-                            "parked",
-                            it,
-                            run.segment.best_score,
-                            run.spent,
-                        );
-                        run.pending_block = Some(pp);
-                        write_results(p, &prep.goal, &prep.prior, &run.rows)?;
-                        continue;
-                    }
-                    provisioning::WaitMode::Continue => r.note(&format!(
-                        "awaiting approval {} — continuing in the frozen regime",
-                        pp.handle
-                    )),
-                }
-            }
-            Some(Err(msg)) => r.note(&format!(
-                "ignoring malformed PROVISIONING_PENDING.json: {msg}"
-            )),
-            None => {}
-        }
-
-        if matches!(r.check_interrupt(p, &run.rows), Stop::Quit) {
-            exit = LoopExit::Stopped;
-            break;
-        }
-
-        // Make the candidate live (deploy domains build+push+set-image); a no-op for the
-        // agent-edit/git worlds where the edit IS the candidate. A failed apply is an
-        // unscoreable candidate: roll back to best and move to the next iteration.
-        let applied = match Iteration::proposed(it).apply(world) {
-            Ok(applied) => applied,
-            Err(e) => {
-                r.note(&format!("apply failed (discarding iter {it}): {e:#}"));
-                world.restore(run.segment.best_snap.as_str())?;
+            IterStep::Parked(pp) => {
+                update_control_status(control, "parked", it, run.segment.best_score, run.spent);
+                run.pending_block = Some(pp);
+                write_results(p, &prep.goal, &prep.prior, &run.rows)?;
                 continue;
             }
+            IterStep::Stopped => {
+                exit = LoopExit::Stopped;
+                break;
+            }
         };
-
-        let ctx = crucible::MeasureCtx {
-            baseline_score: Some(run.segment.baseline_score),
-            baseline_total: Some(run.segment.baseline_total),
-            best_score: Some(run.segment.best_score),
-        };
-        let Decided {
-            row,
-            verdict,
-            reading,
-        } = applied
-            .measure(judge, &ctx, p, world)?
-            .decide(judge, run.segment.best_score);
 
         if verdict.keep {
             if let Some(s) = reading.score {
@@ -1642,6 +1759,7 @@ mod tests {
             iterations,
             wide: 0,
             wide_keep: 1,
+            graph_loop: false,
             no_early_stop,
             ui: crate::Ui::Headless,
             goal: None,
@@ -1903,6 +2021,155 @@ mod tests {
             "the discard note carries the CLI's reason: {:?}",
             r.notes
         );
+    }
+
+    // --- the same exit paths through the graph loop (--graph-loop): the template + runner
+    // must preserve every LoopExit the typestate path produces ---
+
+    fn graph_fixture(iterations: u32, max_cost: f64) -> Fixture {
+        let mut f = fixture(iterations, max_cost, false);
+        f.args.graph_loop = true;
+        f
+    }
+
+    #[test]
+    fn graph_loop_shutdown_once_on_a_clean_finish() {
+        let f = graph_fixture(1, 0.0);
+        let judge = FakeJudge {
+            keep: false,
+            solved: false,
+            fail_baseline: false,
+        };
+        let mut r = RecordingReporter::default();
+        let outcome = run_loop(
+            &f.args,
+            &f.paths,
+            &f.prepared,
+            &mut r,
+            &FakeWorld,
+            &judge,
+            LoopRuntime::default(),
+        )
+        .expect("graph loop should finish cleanly");
+        assert!(!outcome.solved);
+        assert_eq!(
+            r.shutdowns,
+            vec![("finished".into(), "all iterations completed".into())]
+        );
+    }
+
+    #[test]
+    fn graph_loop_stops_early_on_solved() {
+        let f = graph_fixture(3, 0.0);
+        let judge = FakeJudge {
+            keep: true,
+            solved: true,
+            fail_baseline: false,
+        };
+        let mut r = RecordingReporter::default();
+        let outcome = run_loop(
+            &f.args,
+            &f.paths,
+            &f.prepared,
+            &mut r,
+            &FakeWorld,
+            &judge,
+            LoopRuntime::default(),
+        )
+        .expect("graph loop should stop early on the solve");
+        assert!(outcome.solved);
+        assert_eq!(r.shutdowns.len(), 1, "one shutdown: {:?}", r.shutdowns);
+        assert_eq!(r.shutdowns[0].0, "solved");
+    }
+
+    #[test]
+    fn graph_loop_discards_an_is_error_turn_before_measuring() {
+        let f = graph_fixture(1, 0.0);
+        let judge = FakeJudge {
+            keep: true,
+            solved: true,
+            fail_baseline: false,
+        };
+        let mut r = RecordingReporter {
+            agent_is_error: true,
+            agent_error: Some("Not logged in".into()),
+            ..Default::default()
+        };
+        let outcome = run_loop(
+            &f.args,
+            &f.paths,
+            &f.prepared,
+            &mut r,
+            &FakeWorld,
+            &judge,
+            LoopRuntime::default(),
+        )
+        .expect("a failed turn is a discarded iteration, not a run error");
+        assert!(!outcome.solved, "an is_error turn must never be measured");
+        assert_eq!(r.shutdowns[0].0, "finished");
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n.contains("agent turn failed") && n.contains("Not logged in")),
+            "the discard note carries the CLI's reason: {:?}",
+            r.notes
+        );
+    }
+
+    #[test]
+    fn graph_loop_budget_stop_still_measures_the_over_cap_turn() {
+        // The iteration template carries no plan-level budget (f64::MAX) by design: the
+        // driver owns the cap and checks it between rounds, so a turn that blows the cap
+        // is still measured and decided (a keep!) before the run stops on budget.
+        let f = graph_fixture(3, 1.0);
+        let judge = FakeJudge {
+            keep: true,
+            solved: false,
+            fail_baseline: false,
+        };
+        let mut r = RecordingReporter {
+            agent_cost: 5.0, // over the 1.0 cap after the first turn
+            ..Default::default()
+        };
+        run_loop(
+            &f.args,
+            &f.paths,
+            &f.prepared,
+            &mut r,
+            &FakeWorld,
+            &judge,
+            LoopRuntime::default(),
+        )
+        .expect("a budget stop is a clean exit, not an error");
+        assert_eq!(r.shutdowns.len(), 1, "one shutdown: {:?}", r.shutdowns);
+        assert_eq!(r.shutdowns[0].0, "budget");
+    }
+
+    #[test]
+    fn graph_loop_escalation_halts_for_review() {
+        let f = graph_fixture(3, 0.0);
+        let judge = FakeJudge {
+            keep: false,
+            solved: false,
+            fail_baseline: false,
+        };
+        let mut r = RecordingReporter {
+            escalation_path: Some(f.paths.escalation.clone()),
+            ..Default::default()
+        };
+        let outcome = run_loop(
+            &f.args,
+            &f.paths,
+            &f.prepared,
+            &mut r,
+            &FakeWorld,
+            &judge,
+            LoopRuntime::default(),
+        )
+        .expect("an escalation is a clean exit, not an error");
+        assert!(outcome.escalated);
+        assert_eq!(r.shutdowns.len(), 1, "one shutdown: {:?}", r.shutdowns);
+        assert_eq!(r.shutdowns[0].0, "escalated");
     }
 
     #[test]

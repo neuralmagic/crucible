@@ -52,6 +52,9 @@ url = "2"
 tempfile = "3"
 # Credential relay: base64 for embedding a CA into a relayed kubeconfig (`${file64:}`).
 base64 = "0.22"
+# `crucible plan show --render`: mermaid -> PNG, fully offline (vendored dagre layout +
+# resvg raster; see third_party/NOTICE).
+xai-grok-mermaid = { path = "../third_party/xai-grok-mermaid" }
 # Scope-turn transcript delivery: the preserved session NDJSON is gzipped before it rides a pod-log
 # marker line (base64) or `--transcript-out` file back to the controller.
 flate2 = "1"

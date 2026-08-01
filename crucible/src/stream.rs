@@ -208,6 +208,10 @@ impl Reporter for SessionReporter {
         });
     }
 
+    fn plan_event(&mut self, ev: &SessionEvent) {
+        self.emit(ev);
+    }
+
     fn pr_links(&mut self, links: &[crate::session::PrLinkWire]) {
         if links.is_empty() {
             return;
