@@ -592,6 +592,14 @@ pub(crate) struct Args {
     /// `run_from_manifest`.
     #[arg(skip)]
     pub workflow: Option<manifest::WorkflowCfg>,
+    /// Frozen manifest injects restored before pack workflow tasks. Sources are manifest-relative
+    /// artifacts resolved at load; destinations stay workspace-relative so isolated tasks can
+    /// receive the same files. Runtime config, not a CLI surface.
+    #[arg(skip)]
+    pub workflow_frozen_injects: Vec<(PathBuf, PathBuf)>,
+    /// Toolbox exclusions retained for per-task harness overrides in pack workflows.
+    #[arg(skip)]
+    pub workflow_toolbox_exclude: Vec<String>,
     /// Opt-in: when publish-on-keep opens draft PR(s), spawn a detached `crucible watch-pr` pointed
     /// at them, reseeding this run's `STEER.md` from review comments so the NEXT run picks up feedback
     /// without a human running `watch-pr` by hand. Best-effort: spawn failure only logs (the PR still
