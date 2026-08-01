@@ -843,6 +843,8 @@ mod tests {
         commits: u32,
         /// The shutdown event's outcome token.
         shutdown: String,
+        /// Note messages, in order. A run that misbehaves usually says why in one.
+        notes: Vec<String>,
         /// `iter` values on the task_result lines, in emission order (graph runs only).
         task_iters: Vec<u32>,
     }
@@ -976,6 +978,7 @@ mod tests {
         let mut best = f64::NAN;
         let mut shutdown = String::new();
         let mut task_iters = Vec::new();
+        let mut notes: Vec<String> = Vec::new();
         for line in log.lines() {
             let v: serde_json::Value = serde_json::from_str(line).unwrap();
             let kind = v["kind"].as_str().unwrap().to_string();
@@ -987,6 +990,7 @@ mod tests {
                 )),
                 "summary" => best = v["best_score"].as_f64().unwrap(),
                 "shutdown" => shutdown = v["outcome"].as_str().unwrap().to_string(),
+                "note" => notes.push(v["msg"].as_str().unwrap_or("").to_string()),
                 "task_result" => task_iters.push(v["iter"].as_u64().unwrap() as u32),
                 _ => {}
             }
@@ -1001,7 +1005,26 @@ mod tests {
             commits,
             shutdown,
             task_iters,
+            notes,
         }
+    }
+
+    /// Everything a failed shape assertion needs to explain itself, since these runs are
+    /// reproducible on some machines and not others.
+    fn describe(t: &RunTrace) -> String {
+        let rows: Vec<String> = t
+            .rows
+            .iter()
+            .map(|(i, d, s)| format!("  iter {i} {d} score={s:?}"))
+            .collect();
+        format!(
+            "\nrows:\n{}\ncommits={} best={} shutdown={}\nnotes:\n  {}",
+            rows.join("\n"),
+            t.commits,
+            t.best,
+            t.shutdown,
+            t.notes.join("\n  ")
+        )
     }
 
     fn commit_count(workspace: &Path) -> u32 {
@@ -1133,7 +1156,12 @@ mod tests {
         // The intended shape, pinned on the legacy path first so a bug in BOTH paths
         // can't slide through as "parity".
         let decisions: Vec<&str> = legacy.rows.iter().map(|(_, d, _)| d.as_str()).collect();
-        assert_eq!(decisions, ["baseline", "keep", "discard", "keep"]);
+        assert_eq!(
+            decisions,
+            ["baseline", "keep", "discard", "keep"],
+            "legacy path: {}",
+            describe(&legacy)
+        );
         let scores: Vec<Option<f64>> = legacy.rows.iter().map(|(_, _, s)| *s).collect();
         assert_eq!(
             scores,
