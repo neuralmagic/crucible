@@ -1,0 +1,25 @@
+# Live manifest: reviewers are real turns. Costs money; the plan's budget fails closed.
+# Uses its own workspace dir so it does not collide with the stand-in manifest's.
+
+[repo]
+path = "."
+
+[workspace]
+dir = "workspace-live"
+setup_cmd = "mkdir -p workspace-live && cp solution.py plant.sh verdict_gate.sh join_gate.sh verify.sh workspace-live/ && git -C workspace-live init -q && git -C workspace-live add -A && git -C workspace-live -c user.email=crucible@local -c user.name=crucible -c commit.gpgsign=false commit -qm baseline"
+
+[agent]
+backend = "local"
+model   = "claude-opus-4-6"
+goal    = "Review the implementation in solution.py."
+
+# Headless Claude authenticates through Vertex, never a personal account.
+[agent.env]
+CLAUDE_CODE_USE_VERTEX      = "1"
+CLOUD_ML_REGION             = "global"
+ANTHROPIC_VERTEX_PROJECT_ID = "itpc-gcp-ai-eng-claude"
+
+[judge]
+measure_cmd = "./verify.sh"
+direction   = "higher"
+objective   = "cases_passed"

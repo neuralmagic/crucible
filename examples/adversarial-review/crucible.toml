@@ -1,0 +1,19 @@
+# Stand-in manifest: agent tasks run the `command` backend (role.sh), which branches on the
+# turn's prompt. No LLM, no cost. See crucible.live.toml for the real-model variant.
+
+[repo]
+path = "."
+
+[workspace]
+dir = "workspace"
+setup_cmd = "mkdir -p workspace && cp solution.py role.sh plant.sh verdict_gate.sh join_gate.sh verify.sh workspace/ && git -C workspace init -q && git -C workspace add -A && git -C workspace -c user.email=crucible@local -c user.name=crucible -c commit.gpgsign=false commit -qm baseline"
+
+[agent]
+backend   = "command"
+agent_cmd = "./role.sh"
+goal      = "Implement is_prime correctly."
+
+[judge]
+measure_cmd = "./verify.sh"
+direction   = "higher"
+objective   = "cases_passed"
