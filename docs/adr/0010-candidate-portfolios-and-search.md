@@ -1,6 +1,6 @@
 # ADR 0010: Candidate portfolios — explore/exploit search over reviewable candidates
 
-**Status:** Accepted; implemented (v1, 2026-07-02: parallel propose turns + serialized measurement + the `TopK` SearchPolicy behind `--wide N` / `[search]`; round-robin and successive-halving policies remain future impls)
+**Status:** Accepted; implemented (v1, 2026-07-02: parallel propose turns + serialized measurement + top-k ranking behind `--wide N` / `[search]`; since re-implemented as a [work-graph](../work-graphs.md) template compiled from `[search]`, with the same `[search]` surface; round-robin and successive-halving policies remain future impls)
 **Date:** 2026-06-28
 **Related:** [ADR-0004](./0004-core-loop-state-model.md) (the core loop is a *sequential* refinement of one
 line; this generalizes it to a population), [ADR-0009](./0009-composite-domains.md) (a composite candidate
