@@ -60,9 +60,6 @@ kind = "agent"
 depends_on = ["implement"]
 isolation = "worktree"
 required = false
-# Measured on this artifact: Sonnet $0.4348, Opus (correctness seat) $0.3224. Sonnet's unit
-# price is lower (3/15 vs 5/25 per MTok) but solution.py is 20 lines, so fixed per-turn
-# overhead dominates. Equivalent findings. Tiering pays on larger artifacts, not here.
 model = "claude-sonnet-5"
 prompt = """
 COPY REVIEW: DOCS AND COMMENTS

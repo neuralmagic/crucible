@@ -286,9 +286,6 @@ pub(crate) fn clone_repo(src: &str, git_ref: Option<&str>, dest: &Path) -> Resul
     Ok(())
 }
 
-/// Load a `crucible.toml`, build the World + Judge from it, and drive the loop. The one run
-/// path: every domain flows through here. Front-ends: headless / jsonl / stream,
-/// plus `--resume`.
 /// Build a plan runner over a manifest's agent config: the workspace is set up (or reused)
 /// exactly as a loop run would, and `Agent` tasks run through the real harness path with the
 /// manifest's `[agent]` defaults. Shares the loop's setup helpers so a plan run and a loop
@@ -326,6 +323,9 @@ pub(crate) fn prep_plan_runner(
     Ok(crate::plan::harness::HarnessRunner { args, paths: p })
 }
 
+/// Load a `crucible.toml`, build the World + Judge from it, and drive the loop. The one run
+/// path: every domain flows through here. Front-ends: headless / jsonl / stream,
+/// plus `--resume`.
 fn run_from_manifest(args: Args) -> Result<()> {
     let manifest_path = args.manifest.clone().context(
         "crucible needs a manifest: pass --manifest <crucible.toml> (see docs/crucible-contract.md)",

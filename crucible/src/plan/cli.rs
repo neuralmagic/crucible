@@ -1,5 +1,5 @@
 //! `crucible plan show`: compile a plan and print it without executing. The preview
-//! command. A graph system without "show me the compiled graph" is undebuggable.
+//! command.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -158,10 +158,8 @@ pub(crate) fn plan_admitted_event(plan: &ValidPlan) -> crate::session::SessionEv
     }
 }
 
-/// One terminal task result on the wire. Trace ids stay empty until the traceparent
-/// injection lands; `iter` is the loop round for a graph-loop iteration (0 for a
-/// standalone `plan run`); the other measure-DAG fields (digest/job/metric) stay at
-/// defaults here.
+/// One terminal task result on the wire. `iter` is the loop round (0 for a standalone
+/// `plan run`); fields belonging to other emitters stay at their defaults.
 pub(crate) fn task_result_event(
     plan_version: u32,
     iter: u32,

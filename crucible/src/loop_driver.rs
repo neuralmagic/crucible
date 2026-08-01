@@ -541,10 +541,9 @@ fn run_loop_body<R: Reporter>(
         && let Some(wide_cfg) = crate::loop_graph::WideConfig::resolve(args, args.search.as_ref())
     {
         // The tournament runs as a work-graph template (parallel isolated proposes,
-        // serial diff scoring, engine top_k) on both loop paths — the bespoke wide
-        // sequencer is gone. The winner diff travels as TEXT because the candidate
-        // worktrees are gone by seed time — re-deriving from a worktree is how the seed
-        // used to silently no-op.
+        // serial diff scoring, engine top_k) on both loop paths. The winner diff travels
+        // as text: the candidate worktrees are removed before seed time, so re-deriving a
+        // diff from one silently yields nothing.
         let result = crate::loop_graph::run_wide_tournament(
             &wide_cfg,
             args,
