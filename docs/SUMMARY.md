@@ -14,6 +14,7 @@
 # Reference
 
 - [Implementation contract](./crucible-contract.md)
+- [Work graphs](./work-graphs.md)
 - [The OpenShell fork](./openshell-fork.md)
 - [JIRA tools (mediated)](./jira-proxy.md)
 
