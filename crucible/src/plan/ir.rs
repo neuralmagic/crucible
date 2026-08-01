@@ -62,7 +62,7 @@ pub enum Isolation {
 #[serde(rename_all = "snake_case")]
 pub enum Join {
     /// Every dependency must pass; anything else blocks the task (the default, and the
-    /// only pre-S3 behavior).
+    /// only behavior before isolated fan-out).
     #[default]
     All,
     /// Dispatch once every dependency is terminal, folding only the passing outputs: a

@@ -309,7 +309,7 @@ fn fail(cost_usd: f64, note: String) -> Attempt {
 }
 
 // ---------------------------------------------------------------------------
-// The wide tournament as a template (S3): N isolated propose tasks fan out in
+// The wide tournament as a template: N isolated propose tasks fan out in
 // parallel worktrees, their diffs are scored serially on the shared deployment
 // by MeasureDiff tasks, and an engine top_k with a lossy join ranks whatever
 // survived. The driver seeds the deep loop from the winner's diff text.
@@ -357,8 +357,7 @@ pub(crate) struct WideOutcome {
     pub diffs: BTreeMap<u32, String>,
 }
 
-/// Run the wide tournament as a plan. Same notes, rows, and world choreography as the
-/// bespoke tournament it replaced; the additive plan wire lines ride alongside.
+/// Run the wide tournament as a plan.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_wide_tournament<R: Reporter>(
     cfg: &WideConfig,
@@ -427,7 +426,7 @@ pub(crate) fn run_wide_tournament<R: Reporter>(
         return Err(e);
     }
 
-    // Winners from the reducer's output; ranked notes match the bespoke tournament's.
+    // Winners from the reducer's output.
     let mut winners: Vec<u32> = Vec::new();
     if let Some(kept) = outcome
         .results
@@ -539,7 +538,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
 }
 
 /// [`TaskRunner`] for the wide template. Propose batches run threaded (one worktree per
-/// candidate, like the bespoke fan-out); MeasureDiff serializes on the main workspace.
+/// candidate); MeasureDiff serializes on the main workspace.
 struct WideRunner<'a, R: Reporter> {
     args: &'a Args,
     p: &'a Paths,
@@ -663,9 +662,8 @@ impl<R: Reporter> WideRunner<'_, R> {
                 }
                 match reading.score {
                     Some(s) if s.is_finite() => pass(serde_json::json!({ "score": s })),
-                    // The bespoke tournament ranked a scoreless reading at the worst
-                    // possible value; the reducer needs a finite number, so a scoreless
-                    // candidate simply does not rank.
+                    // The reducer needs a finite number, so a scoreless candidate
+                    // does not rank.
                     _ => fail(0.0, "no finite score to rank".to_string()),
                 }
             }
@@ -753,10 +751,9 @@ impl<R: Reporter> TaskRunner for WideRunner<'_, R> {
 }
 
 /// One candidate's PROPOSE turn in a private worktree: clone, run the turn, capture the
-/// staged diff as the task output, clean up. The diff TEXT is the only thing that leaves
-/// the worktree. Wide turns stream nowhere and their cost is not booked against the run
-/// budget: the pre-S3 behavior, kept for wire/budget parity; booking wide spend is a
-/// deliberate follow-up.
+/// staged diff as the task output, clean up. The diff text is the only thing that leaves
+/// the worktree. Wide turns are not streamed and their cost is not booked against the run
+/// budget.
 fn wide_propose(
     args: &Args,
     workspace: &Path,
@@ -805,7 +802,6 @@ fn render_wide_prompt(template: &str, goal: &str, approach: &str) -> String {
     if out.contains("{{STEER}}") {
         out = out.replace("{{STEER}}", "");
     }
-    // Prepend the approach bias.
     format!(
         "## Approach constraint (MANDATORY)\n\
          You MUST use this specific approach: {approach}\n\
@@ -1022,9 +1018,6 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
     }
 
-    /// The counter domain produces identical rows, decisions, best score, kept
-    /// commits, and session-event kind sequence under both paths: the graph run's only
-    /// wire difference is the additive plan lines.
     /// Diff two traces: rows, best, commits, shutdown outcome, and the event kind
     /// sequence with the graph run's additive plan lines filtered out.
     fn assert_parity(legacy: &RunTrace, graph: &RunTrace) {
@@ -1075,7 +1068,7 @@ mod tests {
 
     /// The wide tournament as a template: parallel isolated proposes, serial
     /// diff scoring, top_k, winner seed: produces the same rows, notes order, seed
-    /// state, and event sequence as the bespoke tournament, then the deep loop runs on
+    /// state, and event sequence under both paths, then the deep loop runs on
     /// top of the seeded workspace under both paths.
     #[test]
     fn counter_parity_wide_tournament() {
@@ -1161,8 +1154,6 @@ mod tests {
             "task_result lines carry their loop round"
         );
     }
-
-    // --- moved from the deleted wide/mod.rs: config resolution + prompt rendering ---
 
     fn default_args() -> crate::Args {
         crate::Cli::parse_from(["crucible"]).run

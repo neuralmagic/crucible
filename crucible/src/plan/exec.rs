@@ -52,8 +52,7 @@ pub struct BatchItem<'a> {
 
 /// Runs one attempt of an `Agent` or `Command` task. The engine implements this against the
 /// harness and broker; tests program it directly. `TopK` never reaches the runner: reducers
-/// are engine-owned, exactly as control tasks are orchestrator-owned in every system that
-/// survived contact with production.
+/// are engine-owned.
 pub trait TaskRunner {
     fn run(&mut self, task: &Task, attempt: u32, inputs: &BTreeMap<TaskName, Value>) -> Attempt;
 
@@ -241,7 +240,6 @@ pub fn execute(
                 continue;
             }
             if t.depends_on.iter().any(|d| !results.contains_key(d)) {
-                // A dependency hasn't reached a terminal status yet.
                 continue;
             }
             let deps_ok = match t.join {
@@ -954,10 +952,7 @@ mod tests {
             fn run_many(&mut self, batch: &[BatchItem<'_>]) -> Vec<Attempt> {
                 self.batches
                     .push(batch.iter().map(|b| b.task.name.0.clone()).collect());
-                // Answer in reverse to prove recording order is declaration order,
-                // not completion order... the executor zips by position, so reversing
-                // here would misattribute; instead just answer in order (position is
-                // the contract, the runner must honor it).
+                // The executor zips results by position; the runner must answer in order.
                 batch
                     .iter()
                     .map(|_| Attempt {
@@ -997,7 +992,7 @@ mod tests {
             task("m-ok", &[], "any", false),
             task("m-bad", &[], "any", false),
         ];
-        let mut pick = Task {
+        let pick = Task {
             name: "pick".into(),
             task: TaskKind::TopK {
                 k: 1,
@@ -1009,7 +1004,6 @@ mod tests {
             isolation: None,
             join: Join::Passed,
         };
-        pick.join = Join::Passed;
         tasks.push(pick);
         let plan = valid(tasks, 10.0);
         let mut r = ScriptRunner::new();
