@@ -1,5 +1,5 @@
 //! A real runner: tasks execute as subprocesses, nothing is simulated. `Command` tasks run
-//! their frozen command; `Agent` tasks run the command-backend stand-in supplied by the
+//! their plan-authored command; `Agent` tasks run the command-backend stand-in supplied by the
 //! caller (the same trick as `AgentBackend::Command`: real process, scripted brain). The
 //! full harness/broker runners replace this one; the executor contract is identical.
 //!

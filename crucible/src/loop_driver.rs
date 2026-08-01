@@ -692,6 +692,7 @@ fn run_loop_body<R: Reporter>(
                     best_score: run.segment.best_score,
                     spent_before: run.spent,
                     started,
+                    workflow: args.workflow.as_ref(),
                 },
                 r,
             )?;
@@ -1785,6 +1786,7 @@ mod tests {
             pr_repo: String::new(),
             component_pr_repos: Vec::new(),
             search: None,
+            workflow: None,
             watch_feedback: false,
         };
         let paths = Paths {

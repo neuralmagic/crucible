@@ -89,7 +89,8 @@ pub enum TaskKind {
         #[serde(default)]
         effort: Option<String>,
     },
-    /// A frozen deterministic command (the `measure_cmd` shape, generalized).
+    /// A plan-authored command (the `measure_cmd` shape, generalized). Scripts are trusted
+    /// only when their files are supplied as frozen manifest injects.
     Command { command: String },
     /// Engine-builtin deterministic fold: keep the k best upstream outputs by `score`.
     TopK { k: u32, direction: Direction },
@@ -144,14 +145,15 @@ pub struct Task {
     pub join: Join,
 }
 
-/// Executor-enforced ceiling. Spending past it fails closed: it is not advice.
+/// Executor-enforced accounting limit. An in-flight attempt can overrun it; any overrun
+/// fails the plan closed.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct PlanBudget {
     pub usd: f64,
 }
 
-/// A versioned work graph. Frozen once validated; a replan is a new `Plan` with
-/// `version + 1` and a recorded `reason`, never a mutation.
+/// A versioned work graph. Version 1 is the only executable format today; `reason` is
+/// reserved for a future replan protocol.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Plan {
     pub version: u32,
@@ -187,8 +189,8 @@ impl ValidPlan {
 }
 
 impl Plan {
-    /// Parse the agent-emitted `PLAN.json` sentinel body. Parsing is not admission:
-    /// call `validate` then `AdmissionCaps::admit` before anything runs.
+    /// Parse the JSON form. Parsing is not validation: call [`Plan::validate`] before
+    /// anything runs.
     pub fn from_json_str(s: &str) -> Result<Plan> {
         serde_json::from_str(s).context("PLAN.json does not parse as a plan")
     }
@@ -198,15 +200,12 @@ impl Plan {
         toml::from_str(s).context("plan TOML does not parse")
     }
 
-    /// Structural validation: unique names, edges resolve, acyclic, budget declared,
-    /// replans carry a reason. Returns the frozen, topologically ordered plan.
+    /// Structural validation: supported format version, unique names, resolved edges,
+    /// acyclic graph, and a declared budget. Returns the topologically ordered plan.
     pub fn validate(self) -> Result<ValidPlan> {
-        if self.version == 0 {
-            bail!("plan version must be >= 1");
-        }
-        if self.version > 1 && self.reason.as_deref().unwrap_or("").trim().is_empty() {
+        if self.version != 1 {
             bail!(
-                "plan version {} is a replan and must record a reason",
+                "unsupported plan version {}; this build supports only version 1",
                 self.version
             );
         }
@@ -291,38 +290,6 @@ impl Plan {
             );
         }
         Ok(ValidPlan { plan: self, topo })
-    }
-}
-
-/// The authorship/admission split: an agent may *write* any plan; what *runs* is capped by
-/// grants the manifest or a human already made. A plan cannot raise its own ceiling.
-// Test-only until the PLAN.json sentinel drain lands and admits through this.
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug)]
-pub struct AdmissionCaps {
-    pub max_usd: f64,
-    pub max_tasks: usize,
-}
-
-impl AdmissionCaps {
-    #[allow(dead_code)] // see the struct note
-    pub fn admit(&self, plan: &ValidPlan) -> Result<()> {
-        let p = plan.plan();
-        if p.budget.usd > self.max_usd {
-            bail!(
-                "plan budget ${} exceeds the admitted cap ${} — plans cannot self-authorize spend",
-                p.budget.usd,
-                self.max_usd
-            );
-        }
-        if p.tasks.len() > self.max_tasks {
-            bail!(
-                "plan declares {} tasks, cap is {} — plans cannot self-authorize scope",
-                p.tasks.len(),
-                self.max_tasks
-            );
-        }
-        Ok(())
     }
 }
 
@@ -413,11 +380,13 @@ mod tests {
     }
 
     #[test]
-    fn replan_without_reason_rejected() {
-        let mut p = plan(vec![agent("a", &[])]);
-        p.version = 2;
-        let err = p.validate().unwrap_err();
-        assert!(err.to_string().contains("must record a reason"));
+    fn unsupported_plan_versions_are_rejected() {
+        for version in [0, 2, u32::MAX] {
+            let mut p = plan(vec![agent("a", &[])]);
+            p.version = version;
+            let err = p.validate().unwrap_err();
+            assert!(err.to_string().contains("supports only version 1"));
+        }
     }
 
     #[test]
@@ -445,40 +414,6 @@ mod tests {
         };
         let err = plan(vec![t]).validate().unwrap_err();
         assert!(err.to_string().contains("at least one dependency"));
-    }
-
-    #[test]
-    fn admission_caps_budget() {
-        let v = plan(vec![agent("a", &[])]).validate().unwrap();
-        let err = AdmissionCaps {
-            max_usd: 1.0,
-            max_tasks: 10,
-        }
-        .admit(&v)
-        .unwrap_err();
-        assert!(err.to_string().contains("cannot self-authorize spend"));
-        assert!(
-            AdmissionCaps {
-                max_usd: 5.0,
-                max_tasks: 10
-            }
-            .admit(&v)
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn admission_caps_task_count() {
-        let v = plan(vec![agent("a", &[]), agent("b", &[])])
-            .validate()
-            .unwrap();
-        let err = AdmissionCaps {
-            max_usd: 100.0,
-            max_tasks: 1,
-        }
-        .admit(&v)
-        .unwrap_err();
-        assert!(err.to_string().contains("cannot self-authorize scope"));
     }
 
     #[test]

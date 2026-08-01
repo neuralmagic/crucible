@@ -18,15 +18,13 @@ Implement is_prime(n) in solution.py so that verify.sh passes.
 Write the finished implementation to solution.py.
 """
 
-# The heterogeneity axis: in a real run this is where you pin a reviewer from a different
-# model family than the coder, so the review is not the author grading their own homework.
-# (Under the `command` backend below these fields are inert, role.sh is the whole brain.)
+# The heterogeneity axis: when the selected harness supports it, this is where you can pin a
+# different reviewer. This portable example inherits the manifest defaults; under the
+# `command` backend, role.sh is the whole brain.
 [[task]]
 name = "review"
 kind = "agent"
 depends_on = ["implement"]
-harness = "hermes"
-model = "gpt-5-codex"
 prompt = """
 ADVERSARIAL_REVIEW
 

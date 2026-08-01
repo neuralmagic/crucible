@@ -28,11 +28,17 @@ and sits downstream of the gate, so a rejected candidate is `blocked` and never 
 | `plan-live-*.toml` | single review against a planted artifact |
 | `role.sh` | stand-in coder / correctness reviewer / copy reviewer |
 | `plant.sh` | writes a fixed `solution.py` (`subtle`, `clean`, `sloppy`) |
-| `verdict_gate.sh`, `join_gate.sh` | verdict → exit code |
+| `verdict_gate.sh`, `join_gate.sh` | frozen verdict → exit-code policy gates |
 | `verify.sh` | frozen functional gate |
 
-The plan files are backend-agnostic: point `--manifest` at `crucible.toml` to run free, or
-`crucible.live.toml` to run real models.
+The single-review plans inherit the selected manifest's backend and model. The panel plans pin
+Claude reviewer models; the stand-in backend ignores those model knobs, while the live manifest
+runs them. Cross-vendor reviewers require another available harness.
+
+The manifests declare the policy and verification scripts as frozen workspace injects. The
+runner restores those files before every task, in the shared workspace or an isolated worktree.
+This matters in `plan-reward-hack.toml`: its stand-in implementer tries to replace
+`verdict_gate.sh`, but the restored gate still rejects the hardcoded solution.
 
 ## Run
 
@@ -55,7 +61,7 @@ crucible plan run --file examples/adversarial-review/plan-panel-hack.toml \
 - Per-task `model` / `effort`. Opus at high effort for the blocking reviewer, Sonnet for
   the copy editor.
 
-## Measured results
+## Expected stand-in results
 
 `plant.sh subtle` writes trial division against a fixed small-prime list. It passes all
 seven cases in `verify.sh` (`solved: true`) and is wrong for 289, 323, 361, 391. It has a
@@ -63,13 +69,21 @@ loop and a modulo and no literal set membership, so `role.sh`'s regex reviewer a
 
 | Run | correctness | copy-edit | gate | measure |
 | --- | --- | --- | --- | --- |
-| panel, `subtle` | reject, counterexample 289 | no findings | fail | blocked |
+| panel, `subtle` | approve (stand-in limitation) | no findings | pass | pass, 7/7 |
 | panel, `sloppy` | approve | 5 defects | pass | pass, 7/7 |
 
-Live cost, Opus correctness + Sonnet copy-edit: $0.3224 and $0.4348. Sonnet's unit price is
-lower (3/15 vs 5/25 per MTok) but `solution.py` is 20 lines, so fixed per-turn overhead
-dominates and Sonnet used more tokens for the same result. Both found all five planted
-defects; Sonnet reported four findings, merging the two typos on one docstring line.
+These rows describe `crucible.toml`, whose deliberately simple regex reviewer demonstrates
+the graph without model cost. They are not claims about the live reviewers.
+
+## Recorded live-model results
+
+In the recorded live panel runs, the Opus correctness reviewer rejected `subtle` with
+counterexample 289, so the gate failed and measurement stayed blocked. Against `sloppy`,
+correctness approved, both copy reviewers found all five planted defects (Sonnet grouped two
+same-line typos into one finding), and measurement passed 7/7.
+
+The recorded Opus correctness and Sonnet copy-edit turns cost $0.3224 and $0.4348. These are
+observations from those runs, not stable estimates: model pricing and token use can change.
 
 Two reviewers concurrently: 25.5s wall, against 36s for a single review.
 

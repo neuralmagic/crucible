@@ -11,6 +11,7 @@ mod relay;
 mod search;
 mod selftest;
 mod wiring;
+mod workflow;
 mod world;
 
 pub use broker::{BrokerCfg, broker_endpoint_from_url, broker_port, resolve_broker_url};
@@ -21,6 +22,7 @@ pub use openshell::OpenshellCfg;
 pub use relay::RelayFile;
 pub use search::SearchCfg;
 pub use selftest::SelftestCfg;
+pub use workflow::WorkflowCfg;
 pub use world::WorldCfg;
 
 use crate::command_judge::Direction;
@@ -161,6 +163,10 @@ pub struct Manifest {
     /// Wide-round search config. Optional, most domains run pure-deep.
     #[serde(default)]
     pub search: Option<SearchCfg>,
+    /// Pack-authored tasks spliced into each iteration between the agent's turn and the
+    /// gate. Absent means the engine's own four-stage iteration, unchanged.
+    #[serde(default)]
+    pub workflow: Option<WorkflowCfg>,
     /// Publish-on-keep target for a single-repo run. Optional, a run with no `[publish]` (or no
     /// `pr_repo` in it) records to S3 but opens no draft PR. Composite runs carry their forks
     /// per-component in `[[component]].pr_repo` instead, so this is the single-repo analogue.
@@ -255,6 +261,33 @@ pub fn apply_inject(src: &Path, dst: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating inject dir {}", parent.display()))?;
     }
+    // Replace the directory entry rather than copying through it. An agent can replace a
+    // frozen file with a symlink; `fs::copy(src, dst)` would follow that symlink and write
+    // outside the intended destination instead of restoring the frozen file.
+    let dst_meta = std::fs::symlink_metadata(dst);
+    let same_file = matches!(
+        (std::fs::canonicalize(src), std::fs::canonicalize(dst)),
+        (Ok(src), Ok(dst)) if src == dst
+    );
+    if dst_meta
+        .as_ref()
+        .is_ok_and(|meta| !meta.file_type().is_symlink())
+        && same_file
+    {
+        return Ok(());
+    }
+    match dst_meta {
+        Ok(meta) if meta.file_type().is_dir() && !meta.file_type().is_symlink() => {
+            bail!("inject destination {} is a directory", dst.display());
+        }
+        Ok(_) => std::fs::remove_file(dst)
+            .with_context(|| format!("removing old inject destination {}", dst.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("inspecting inject destination {}", dst.display()));
+        }
+    }
     std::fs::copy(src, dst)
         .with_context(|| format!("inject {} -> {}", src.display(), dst.display()))?;
     Ok(())
@@ -342,6 +375,7 @@ fn validate_common(
     agent: &AgentCfg,
     judge: &JudgeCfg,
     search: &Option<SearchCfg>,
+    workflow: &Option<WorkflowCfg>,
     build: &BTreeMap<String, forge::spec::BuildSpec>,
 ) -> Result<()> {
     if agent.broker.enabled && agent.broker.bin.is_empty() {
@@ -350,6 +384,9 @@ fn validate_common(
         );
     }
     search::validate_search(search)?;
+    if let Some(w) = workflow {
+        w.validate()?;
+    }
     selftest::validate_selftest(&judge.selftest)?;
     forge::spec::validate_builds(build)?;
     Ok(())
@@ -397,7 +434,13 @@ impl Manifest {
 
     /// Cross-field checks the type system + `deny_unknown_fields` can't express. Run at load.
     fn validate(&self) -> Result<()> {
-        validate_common(&self.agent, &self.judge, &self.search, &self.build)
+        validate_common(
+            &self.agent,
+            &self.judge,
+            &self.search,
+            &self.workflow,
+            &self.build,
+        )
     }
 
     pub fn direction(&self) -> Result<Direction> {
@@ -451,6 +494,10 @@ pub struct CompositeManifest {
     /// Wide-round search config. Optional.
     #[serde(default)]
     pub search: Option<SearchCfg>,
+    /// Pack-authored tasks spliced into each iteration between the agent's turn and the
+    /// gate. Absent means the engine's own four-stage iteration, unchanged.
+    #[serde(default)]
+    pub workflow: Option<WorkflowCfg>,
     /// Declarative image builds: named `[build.<name>]` targets (e.g. a composite's assembled
     /// sandbox image, which `needs` its component images). Absent means no declared builds.
     #[serde(default)]
@@ -546,7 +593,13 @@ impl CompositeManifest {
                 bail!("duplicate component domain `{}`", c.domain);
             }
         }
-        validate_common(&self.agent, &self.judge, &self.search, &self.build)
+        validate_common(
+            &self.agent,
+            &self.judge,
+            &self.search,
+            &self.workflow,
+            &self.build,
+        )
     }
 
     pub fn direction(&self) -> Result<Direction> {
@@ -758,6 +811,34 @@ mod tests {
         std::fs::write(&src, b"frozen-judge").unwrap();
         apply_inject(&src, &dst).unwrap();
         assert_eq!(std::fs::read(&dst).unwrap(), b"frozen-judge");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_inject_replaces_a_destination_symlink_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = std::env::temp_dir().join(format!("inject-symlink-test-{}", std::process::id()));
+        let src = tmp.join("src.txt");
+        let outside = tmp.join("outside.txt");
+        let dst = tmp.join("dst.txt");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(&src, b"frozen-judge").unwrap();
+        std::fs::write(&outside, b"do-not-touch").unwrap();
+        symlink(&outside, &dst).unwrap();
+
+        apply_inject(&src, &dst).unwrap();
+
+        assert!(
+            !std::fs::symlink_metadata(&dst)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&dst).unwrap(), b"frozen-judge");
+        assert_eq!(std::fs::read(&outside).unwrap(), b"do-not-touch");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

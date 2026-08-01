@@ -1,8 +1,7 @@
 //! A plan is a versioned DAG of tasks; a deterministic executor runs it.
 //!
-//! Authoring a plan and being allowed to run it are separate steps: `validate` checks
-//! structure (unique names, edges resolve, acyclic), `admit` checks the plan against caps
-//! the manifest or a human already granted. A plan cannot raise its own ceiling.
+//! Plans are currently built from engine templates or loaded from human/pack-authored TOML
+//! and JSON. `validate` checks the supported version and graph structure before execution.
 pub mod cli;
 pub mod exec;
 pub mod harness;
