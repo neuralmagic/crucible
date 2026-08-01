@@ -15,6 +15,7 @@ use serde_json::Value;
 
 use crate::crucible::{Judge, MeasureCtx, World};
 use crate::loop_driver::{self, Decided, IterStep, Measured, TurnVerdict};
+use crate::manifest::WorkflowCfg;
 use crate::plan::exec::{
     Attempt, AttemptOutcome, BatchItem, ExecCfg, Substrate, TaskRunner, execute,
 };
@@ -42,13 +43,15 @@ pub(crate) struct IterCtx<'a> {
     /// the typestate path would after the turn.
     pub spent_before: f64,
     pub started: Instant,
+    /// Pack-authored tasks to splice ahead of the gate, if the manifest declared any.
+    pub workflow: Option<&'a crate::manifest::WorkflowCfg>,
 }
 
 /// Run one iteration as the canonical template. Returns the driver-vocabulary step plus
 /// the iteration's cost to fold into the run's spend. A measure error propagates as
 /// `Err`, exactly like the typestate path's `?`.
 pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(IterStep, f64)> {
-    let plan = iteration_template(cx.prompt)?;
+    let plan = iteration_template(cx.prompt, cx.workflow)?;
     r.plan_event(&crate::plan::cli::plan_admitted_event(&plan));
 
     let mut runner = LoopTaskRunner {
@@ -97,6 +100,7 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
     if let Some(e) = runner.fatal.take() {
         return Err(e);
     }
+    let mut r_note: Option<String> = None;
     let step = match runner.signal.take() {
         Some(Signal::Discard) => IterStep::Discarded,
         Some(Signal::Escalate) => IterStep::Escalated,
@@ -104,54 +108,98 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
         Some(Signal::Stop) => IterStep::Stopped,
         None => match runner.decided.take() {
             Some(d) => IterStep::Decided(Box::new(d)),
-            None => anyhow::bail!(
-                "graph iteration ended with neither a decision nor a control signal (exit: {:?})",
-                outcome.exit
-            ),
+            // A pack task rejected the candidate before it reached the gate. That is the
+            // point of allowing them, so it is a discard, not a run error.
+            None => match &outcome.exit {
+                crate::plan::exec::PlanExit::ShortCircuit { task } => {
+                    let why = outcome
+                        .results
+                        .get(task)
+                        .and_then(|r| r.note.clone())
+                        .unwrap_or_default();
+                    r_note = Some(format!(
+                        "workflow task {task} rejected the candidate (discarding iter {}): {why}",
+                        cx.it
+                    ));
+                    IterStep::Discarded
+                }
+                exit => anyhow::bail!(
+                    "graph iteration ended with neither a decision nor a control signal (exit: {exit:?})"
+                ),
+            },
         },
     };
+    if let Some(msg) = r_note {
+        runner.r.note(&msg);
+    }
     Ok((step, outcome.spent_usd))
 }
 
 /// The canonical iteration template: `propose → apply → measure → decide`, all required,
 /// so a failed stage short-circuits the rest: the same "nothing runs on top of a
 /// failure" the typestate chain encoded in types.
-fn iteration_template(prompt: &str) -> Result<ValidPlan> {
-    let engine = |name: &str, op: EngineOp, dep: &str| Task {
+fn iteration_template(prompt: &str, workflow: Option<&WorkflowCfg>) -> Result<ValidPlan> {
+    let engine = |name: &str, op: EngineOp, deps: Vec<TaskName>| Task {
         name: name.into(),
         task: TaskKind::Engine(op),
-        depends_on: vec![dep.into()],
+        depends_on: deps,
         needs: "any".to_string(),
         required: true,
         isolation: None,
         join: Join::default(),
     };
+    let mut tasks = vec![Task {
+        name: "propose".into(),
+        task: TaskKind::Agent {
+            prompt: prompt.to_string(),
+            harness: None,
+            model: None,
+            effort: None,
+        },
+        depends_on: vec![],
+        needs: "any".to_string(),
+        required: true,
+        isolation: None,
+        join: Join::default(),
+    }];
+
+    // Pack tasks sit between the turn and the gate. An unattached one hangs off `propose`,
+    // and `apply` waits on every sink, so nothing a pack declares can end up beside or after
+    // the gate no matter how it wired its own edges.
+    let mut apply_deps = vec![TaskName("propose".to_string())];
+    if let Some(w) = workflow.filter(|w| !w.tasks.is_empty()) {
+        for t in &w.tasks {
+            let mut t = t.clone();
+            if t.depends_on.is_empty() {
+                t.depends_on = vec![TaskName("propose".to_string())];
+            }
+            tasks.push(t);
+        }
+        let sinks = w.sinks();
+        if !sinks.is_empty() {
+            apply_deps = sinks;
+        }
+    }
+
+    tasks.push(engine("apply", EngineOp::Apply, apply_deps));
+    tasks.push(engine(
+        "measure",
+        EngineOp::Measure,
+        vec![TaskName("apply".to_string())],
+    ));
+    tasks.push(engine(
+        "decide",
+        EngineOp::Decide,
+        vec![TaskName("measure".to_string())],
+    ));
     Plan {
         version: 1,
         reason: None,
         budget: PlanBudget { usd: f64::MAX },
-        tasks: vec![
-            Task {
-                name: "propose".into(),
-                task: TaskKind::Agent {
-                    prompt: prompt.to_string(),
-                    harness: None,
-                    model: None,
-                    effort: None,
-                },
-                depends_on: vec![],
-                needs: "any".to_string(),
-                required: true,
-                isolation: None,
-                join: Join::default(),
-            },
-            engine("apply", EngineOp::Apply, "propose"),
-            engine("measure", EngineOp::Measure, "apply"),
-            engine("decide", EngineOp::Decide, "measure"),
-        ],
+        tasks,
     }
     .validate()
-    .context("building the canonical iteration template")
+    .context("building the iteration template")
 }
 
 /// What the propose task's post-turn drains decided, parked here for the driver: the
@@ -826,9 +874,77 @@ mod tests {
     use clap::Parser;
     use std::path::Path;
 
+    /// A pack task lands between the turn and the gate, and `apply` waits on it. The
+    /// engine's four stages keep their order no matter what the pack declared.
+    #[test]
+    fn pack_tasks_splice_between_the_turn_and_the_gate() {
+        let w: crate::manifest::WorkflowCfg = toml::from_str(
+            "[[task]]\nname = \"review\"\nkind = \"command\"\ncommand = \"true\"\n             [[task]]\nname = \"lint\"\nkind = \"command\"\ncommand = \"true\"\ndepends_on = [\"review\"]\n",
+        )
+        .unwrap();
+        w.validate().unwrap();
+        let plan = iteration_template("go", Some(&w)).unwrap();
+        let names: Vec<&str> = plan.tasks_topo().map(|t| t.name.0.as_str()).collect();
+        assert_eq!(
+            names,
+            ["propose", "review", "lint", "apply", "measure", "decide"]
+        );
+        let dep = |n: &str| {
+            plan.get(&n.into())
+                .unwrap()
+                .depends_on
+                .iter()
+                .map(|d| d.0.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            dep("review"),
+            ["propose"],
+            "an unattached task hangs off propose"
+        );
+        assert_eq!(
+            dep("apply"),
+            ["lint"],
+            "apply waits on the sink, not on propose"
+        );
+        assert_eq!(dep("measure"), ["apply"]);
+        assert_eq!(dep("decide"), ["measure"]);
+    }
+
+    /// The point of allowing pack tasks: a rejection before the gate discards the iteration
+    /// without measuring, and the loop keeps going rather than erroring out.
+    #[test]
+    fn a_rejecting_pack_task_discards_the_iteration_before_measuring() {
+        let trace = run_counter_cfg(
+            true,
+            2,
+            BUMP,
+            false,
+            Some(
+                "\n[[workflow.task]]\nname = \"review\"\nkind = \"command\"\ncommand = \"exit 1\"\n",
+            ),
+        );
+        let decisions: Vec<&str> = trace.rows.iter().map(|(_, d, _)| d.as_str()).collect();
+        assert_eq!(
+            decisions,
+            ["baseline"],
+            "every iteration is discarded before it can be measured: {}",
+            describe(&trace)
+        );
+        assert!(
+            trace
+                .notes
+                .iter()
+                .any(|n| n.contains("review") && n.contains("rejected the candidate")),
+            "the discard names the task that rejected it: {:?}",
+            trace.notes
+        );
+        assert_eq!(trace.shutdown, "finished", "a rejection is not a run error");
+    }
+
     #[test]
     fn template_is_the_canonical_chain() {
-        let plan = iteration_template("go").unwrap();
+        let plan = iteration_template("go", None).unwrap();
         let names: Vec<&str> = plan.tasks_topo().map(|t| t.name.0.as_str()).collect();
         assert_eq!(names, ["propose", "apply", "measure", "decide"]);
         assert!(plan.tasks_topo().all(|t| t.required));
@@ -874,10 +990,16 @@ mod tests {
     /// path. sh stands in for nu so the fixture is self-contained. The measure declares
     /// solved at value >= 3, so a multi-iteration run exercises the early stop.
     fn run_counter(graph_loop: bool, iterations: u32, bump: &str) -> RunTrace {
-        run_counter_cfg(graph_loop, iterations, bump, false)
+        run_counter_cfg(graph_loop, iterations, bump, false, None)
     }
 
-    fn run_counter_cfg(graph_loop: bool, iterations: u32, bump: &str, wide: bool) -> RunTrace {
+    fn run_counter_cfg(
+        graph_loop: bool,
+        iterations: u32,
+        bump: &str,
+        wide: bool,
+        workflow: Option<&str>,
+    ) -> RunTrace {
         // A counter, not a timestamp: two tests starting in the same microsecond would get
         // the same name, and the first thing this does is remove_dir_all.
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -906,6 +1028,7 @@ mod tests {
             }
         }
         let manifest_path = dir.join("crucible.toml");
+        let workflow_block = workflow.unwrap_or("");
         let search_block = if wide {
             "\n[search]\nwide = 3\napproaches = [\"plus one\", \"add a unit\", \"increment\"]\npolicy_k = 1\n"
         } else {
@@ -928,7 +1051,7 @@ mod tests {
             measure_cmd = "./measure.sh"
             direction = "higher"
             objective = "value"
-            {search_block}"#
+            {search_block}{workflow_block}"#
             ),
         )
         .unwrap();
@@ -951,6 +1074,7 @@ mod tests {
         args.iterations = iterations;
         args.graph_loop = graph_loop;
         args.search = m.search.clone();
+        args.workflow = m.workflow.clone();
 
         let prep = Prepared {
             goal: "raise the value".into(),
@@ -982,7 +1106,11 @@ mod tests {
             LoopRuntime::default(),
         )
         .unwrap();
-        assert!(outcome.improved, "the counter bump must be kept");
+        // The bump always wins unless a pack task rejects it, which is the one case a
+        // caller passes a workflow for.
+        if workflow.is_none() {
+            assert!(outcome.improved, "the counter bump must be kept");
+        }
 
         let log = std::fs::read_to_string(&p.session_log).unwrap();
         let mut kinds = Vec::new();
@@ -1107,8 +1235,8 @@ mod tests {
     /// top of the seeded workspace under both paths.
     #[test]
     fn counter_parity_wide_tournament() {
-        let legacy = run_counter_cfg(false, 2, BUMP, true);
-        let graph = run_counter_cfg(true, 2, BUMP, true);
+        let legacy = run_counter_cfg(false, 2, BUMP, true, None);
+        let graph = run_counter_cfg(true, 2, BUMP, true, None);
 
         // Shape pinned on the legacy path first: 3 measured candidates at value 2 (each
         // row appears twice on the wire: once at measure time, once in the driver's

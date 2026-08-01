@@ -1,12 +1,12 @@
 # Work graphs
 
 A **plan** is a versioned DAG of **tasks** that a deterministic executor runs. Tasks are agent
-turns, frozen commands, or engine-owned reducers. The executor owns advancement: a task never
+turns, plan-authored commands, or engine-owned reducers. The executor owns advancement: a task never
 decides what runs next.
 
-Plans come from three places. The engine builds them from templates (the loop iteration, the
-wide tournament). A human or a pack authors them as TOML. An agent emits one as JSON, which is
-validated and admitted before anything runs.
+Today, the engine builds plans from templates (the loop iteration and wide tournament), and a
+human or pack can supply TOML or JSON through the `plan` CLI. Agent-emitted plans, replanning,
+and a separate policy-admission layer are not implemented yet.
 
 ## Running a plan
 
@@ -30,11 +30,11 @@ crucible plan run --file plan.toml --agent-cmd ./role.sh
 ## File format
 
 ```toml
-version = 1                 # >= 1. A replan is a new version and must set `reason`.
-# reason = "..."            # required when version > 1
+version = 1                 # the only format version accepted today
+# reason = "..."            # reserved for a future replan protocol
 
 [budget]
-usd = 5.0                   # required, positive. Enforced, not advisory.
+usd = 5.0                   # required, positive; execution fails closed on overrun
 
 [[task]]
 name = "propose"            # unique within the plan
@@ -67,11 +67,16 @@ depends_on = ["measure"]
 | Kind | What it runs |
 | --- | --- |
 | `agent` | One agent turn. `harness` / `model` / `effort` override the manifest's `[agent]` defaults per task. |
-| `command` | A frozen command, same output contract as `measure_cmd`. |
+| `command` | A plan-authored command, with the same output contract as `measure_cmd`. |
 | `top_k` | Engine-owned reducer: keep the `k` best inputs by their `score` field. Needs at least one dependency. |
 
 The loop's own stages (`apply`, `measure`, `decide`) are engine-constructed and cannot be
-authored. Packs and agents never sequence the `World` or the `Judge` directly.
+authored. Packs never sequence the `World` or the `Judge` directly.
+
+A command string is not a trust boundary by itself. If it invokes a script that must remain
+trusted after an agent task edits the workspace, declare that script as a frozen
+`[[workspace.inject]]` in the manifest. The plan runner restores frozen injects in the task's
+actual workspace before every task, including isolated worktrees.
 
 ### Task output
 
@@ -81,7 +86,8 @@ A task's output is JSON and becomes its dependents' input.
   failure is a transport failure. Upstream outputs arrive as `CRUCIBLE_INPUTS` (a JSON object
   keyed by task name), plus `CRUCIBLE_TASK`.
 - `agent` under `--manifest`: the turn writes a single JSON object to `PLAN_TASK_RESULT.json`
-  in the workspace root. No file, no pass.
+  in the workspace root. A missing file after a normal turn is a measured failure; an explicit
+  spawn, harness, or stream error is a transport failure and follows the retry policy.
 - `agent` under `--agent-cmd`: the stand-in receives `CRUCIBLE_PROMPT`, `CRUCIBLE_HARNESS`,
   `CRUCIBLE_MODEL`, `CRUCIBLE_EFFORT`, and returns JSON on its last stdout line.
 
@@ -104,8 +110,9 @@ blocked. An advisory failure blocks only its dependents.
 **Retry is not recheck.** Transport failures retry, bounded (2 by default). A measured failure
 never reruns: a task that failed, failed.
 
-**Budget.** Spending past `budget.usd` blocks the remaining tasks. It is a ceiling, not a
-target.
+**Budget.** Cost is known only after an attempt completes, so an in-flight attempt may report a
+total above `budget.usd`. Any overrun invalidates the plan and blocks all further dispatch and
+retries. Reaching the budget exactly is valid only when no further retry or task is needed.
 
 ### `needs`
 

@@ -169,7 +169,7 @@ pub(crate) fn runnable_set<'a>(
     runnable
 }
 
-/// Execute a validated, admitted plan to completion. `on_result` fires once per task as it
+/// Execute a validated plan to completion. `on_result` fires once per task as it
 /// reaches a terminal status, in dispatch order: the live-progress hook the session log
 /// (and any tailer) hangs off; the returned `PlanOutcome` carries the same results folded.
 pub fn execute(
@@ -283,6 +283,10 @@ pub fn execute(
                 // Isolated: keep scanning for other ready isolated tasks to batch.
             } else if t.isolation.is_some() {
                 dispatch.push(t);
+            } else {
+                // A ready serial task is a declaration-order barrier. Dispatch the
+                // isolated prefix now; later isolated tasks wait behind the serial one.
+                break;
             }
         }
         let Some(first) = dispatch.first() else {
@@ -305,12 +309,15 @@ pub fn execute(
         if dispatch.len() == 1 {
             let t = first;
             let inputs = inputs_for(t, &results);
-            let result = match &t.task {
-                TaskKind::TopK { k, direction } => reduce_top_k(&inputs, *k, *direction),
+            let (result, budget_exceeded) = match &t.task {
+                TaskKind::TopK { k, direction } => (reduce_top_k(&inputs, *k, *direction), false),
                 TaskKind::Agent { .. } | TaskKind::Command { .. } | TaskKind::Engine(_) => {
-                    run_with_retries(t, &inputs, cfg, runner, &mut spent)
+                    run_with_retries(t, &inputs, cfg, runner, &mut spent, budget)
                 }
             };
+            if budget_exceeded {
+                halted = Some(PlanExit::BudgetExceeded);
+            }
             record(t, result, &mut results, &mut halted);
         } else {
             // A concurrent batch of independent isolated tasks; results are recorded in
@@ -324,7 +331,12 @@ pub fn execute(
                     inputs: inputs_for(t, &results),
                 })
                 .collect();
-            for (t, result) in run_batch_with_retries(batch, cfg, runner, &mut spent) {
+            let (batch_results, budget_exceeded) =
+                run_batch_with_retries(batch, cfg, runner, &mut spent, budget);
+            if budget_exceeded {
+                halted = Some(PlanExit::BudgetExceeded);
+            }
+            for (t, result) in batch_results {
                 record(t, result, &mut results, &mut halted);
             }
         }
@@ -350,7 +362,8 @@ fn run_with_retries(
     cfg: ExecCfg,
     runner: &mut dyn TaskRunner,
     spent: &mut f64,
-) -> TaskResult {
+    budget: f64,
+) -> (TaskResult, bool) {
     let max_attempts = 1 + cfg.transport_retries;
     let mut attempts = 0;
     let mut cost = 0.0;
@@ -362,35 +375,60 @@ fn run_with_retries(
         *spent += a.cost_usd;
         match a.outcome {
             AttemptOutcome::Pass(output) => {
-                return TaskResult {
-                    status: TaskStatus::Pass,
-                    attempts,
-                    cost_usd: cost,
-                    output: Some(output),
-                    note: None,
-                };
+                return (
+                    TaskResult {
+                        status: TaskStatus::Pass,
+                        attempts,
+                        cost_usd: cost,
+                        output: Some(output),
+                        note: None,
+                    },
+                    *spent > budget,
+                );
             }
             AttemptOutcome::Fail(note) => {
-                return TaskResult {
-                    status: TaskStatus::Fail,
-                    attempts,
-                    cost_usd: cost,
-                    output: None,
-                    note: Some(note),
-                };
+                return (
+                    TaskResult {
+                        status: TaskStatus::Fail,
+                        attempts,
+                        cost_usd: cost,
+                        output: None,
+                        note: Some(note),
+                    },
+                    *spent > budget,
+                );
             }
-            AttemptOutcome::Transport(note) => last_transport_note = note,
+            AttemptOutcome::Transport(note) => {
+                last_transport_note = note;
+                if *spent > budget || (*spent >= budget && attempts < max_attempts) {
+                    return (
+                        TaskResult {
+                            status: TaskStatus::Transport,
+                            attempts,
+                            cost_usd: cost,
+                            output: None,
+                            note: Some(format!(
+                                "budget ceiling reached after transport attempt: {last_transport_note}"
+                            )),
+                        },
+                        true,
+                    );
+                }
+            }
         }
     }
-    TaskResult {
-        status: TaskStatus::Transport,
-        attempts,
-        cost_usd: cost,
-        output: None,
-        note: Some(format!(
-            "transport retries exhausted ({max_attempts} attempts): {last_transport_note}"
-        )),
-    }
+    (
+        TaskResult {
+            status: TaskStatus::Transport,
+            attempts,
+            cost_usd: cost,
+            output: None,
+            note: Some(format!(
+                "transport retries exhausted ({max_attempts} attempts): {last_transport_note}"
+            )),
+        },
+        *spent > budget,
+    )
 }
 
 /// Run a concurrent batch through [`TaskRunner::run_many`], re-batching the
@@ -402,13 +440,15 @@ fn run_batch_with_retries<'a>(
     cfg: ExecCfg,
     runner: &mut dyn TaskRunner,
     spent: &mut f64,
-) -> Vec<(&'a Task, TaskResult)> {
+    budget: f64,
+) -> (Vec<(&'a Task, TaskResult)>, bool) {
     let max_attempts = 1 + cfg.transport_retries;
     // (batch position, accumulated cost) so the final fold restores declaration order.
     let mut done: BTreeMap<usize, TaskResult> = BTreeMap::new();
     let mut cost_so_far: Vec<f64> = vec![0.0; batch.len()];
     let order: Vec<&'a Task> = batch.iter().map(|b| b.task).collect();
     let mut wave: Vec<(usize, BatchItem<'a>)> = batch.into_iter().enumerate().collect();
+    let mut budget_exceeded = false;
 
     while !wave.is_empty() {
         let items: Vec<BatchItem<'_>> = wave
@@ -420,11 +460,17 @@ fn run_batch_with_retries<'a>(
             })
             .collect();
         let attempts = runner.run_many(&items);
-        let mut next: Vec<(usize, BatchItem<'a>)> = Vec::new();
+        let mut attempted = Vec::new();
         for ((idx, item), a) in wave.into_iter().zip(attempts) {
             *spent += a.cost_usd;
             cost_so_far[idx] += a.cost_usd;
-            match a.outcome {
+            attempted.push((idx, item, a.outcome));
+        }
+        let retry_budget_blocked = *spent >= budget;
+        budget_exceeded |= *spent > budget;
+        let mut next: Vec<(usize, BatchItem<'a>)> = Vec::new();
+        for (idx, item, outcome) in attempted {
+            match outcome {
                 AttemptOutcome::Pass(output) => {
                     done.insert(
                         idx,
@@ -450,7 +496,7 @@ fn run_batch_with_retries<'a>(
                     );
                 }
                 AttemptOutcome::Transport(note) => {
-                    if item.attempt < max_attempts {
+                    if item.attempt < max_attempts && !retry_budget_blocked {
                         next.push((
                             idx,
                             BatchItem {
@@ -460,6 +506,9 @@ fn run_batch_with_retries<'a>(
                             },
                         ));
                     } else {
+                        if item.attempt < max_attempts && retry_budget_blocked {
+                            budget_exceeded = true;
+                        }
                         done.insert(
                             idx,
                             TaskResult {
@@ -467,9 +516,15 @@ fn run_batch_with_retries<'a>(
                                 attempts: item.attempt,
                                 cost_usd: cost_so_far[idx],
                                 output: None,
-                                note: Some(format!(
-                                    "transport retries exhausted ({max_attempts} attempts): {note}"
-                                )),
+                                note: Some(if item.attempt < max_attempts {
+                                    format!(
+                                        "budget ceiling reached after transport attempt: {note}"
+                                    )
+                                } else {
+                                    format!(
+                                        "transport retries exhausted ({max_attempts} attempts): {note}"
+                                    )
+                                }),
                             },
                         );
                     }
@@ -478,7 +533,10 @@ fn run_batch_with_retries<'a>(
         }
         wave = next;
     }
-    done.into_iter().map(|(idx, r)| (order[idx], r)).collect()
+    (
+        done.into_iter().map(|(idx, r)| (order[idx], r)).collect(),
+        budget_exceeded,
+    )
 }
 
 /// Engine-built-in fold: keep the k best inputs by their `score` field.
@@ -810,6 +868,56 @@ mod tests {
     }
 
     #[test]
+    fn final_task_overspend_fails_closed() {
+        let plan = valid(vec![task("a", &[], "any", true)], 0.5);
+        let mut r = ScriptRunner::new();
+        r.on("a", 1, || AttemptOutcome::Pass(serde_json::json!({})), 0.6);
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        assert!(!out.valid);
+        assert_eq!(out.exit, PlanExit::BudgetExceeded);
+        assert_eq!(out.results[&"a".into()].status, TaskStatus::Pass);
+    }
+
+    #[test]
+    fn exact_budget_on_the_final_task_is_valid() {
+        let plan = valid(vec![task("a", &[], "any", true)], 0.5);
+        let mut r = ScriptRunner::new();
+        r.on("a", 1, || AttemptOutcome::Pass(serde_json::json!({})), 0.5);
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        assert!(out.valid);
+        assert_eq!(out.exit, PlanExit::Completed);
+    }
+
+    #[test]
+    fn transport_retry_stops_when_the_budget_is_consumed() {
+        let plan = valid(vec![task("a", &[], "any", true)], 0.5);
+        let mut r = ScriptRunner::new();
+        r.on("a", 1, || AttemptOutcome::Transport("blip".into()), 0.5);
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        assert_eq!(out.exit, PlanExit::BudgetExceeded);
+        assert_eq!(out.results[&"a".into()].attempts, 1);
+        assert_eq!(r.dispatched, [("a".to_string(), 1)]);
+    }
+
+    #[test]
     fn top_k_reduces_upstream_scores() {
         let mut tasks = vec![
             task("m-a", &[], "any", true),
@@ -993,6 +1101,57 @@ mod tests {
             "isolated roots batch together; the serial collector dispatches alone"
         );
         assert_eq!(seen, ["p-a", "p-b", "p-c", "collect"]);
+    }
+
+    #[test]
+    fn ready_serial_task_is_a_barrier_between_isolated_batches() {
+        let mut a = task("a", &[], "any", false);
+        a.isolation = Some(crate::plan::ir::Isolation::Worktree);
+        let b = task("b", &[], "any", false);
+        let mut c = task("c", &[], "any", false);
+        c.isolation = Some(crate::plan::ir::Isolation::Worktree);
+        let plan = valid(vec![a, b, c], 10.0);
+        let mut r = ScriptRunner::new();
+        let mut seen = Vec::new();
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |t, _| seen.push(t.name.0.clone()),
+        );
+        assert!(out.valid);
+        assert_eq!(seen, ["a", "b", "c"]);
+        assert_eq!(
+            r.dispatched,
+            [
+                ("a".to_string(), 1),
+                ("b".to_string(), 1),
+                ("c".to_string(), 1)
+            ]
+        );
+    }
+
+    #[test]
+    fn concurrent_batch_aggregate_overspend_fails_closed() {
+        let mut a = task("a", &[], "any", true);
+        a.isolation = Some(crate::plan::ir::Isolation::Worktree);
+        let mut b = task("b", &[], "any", true);
+        b.isolation = Some(crate::plan::ir::Isolation::Worktree);
+        let plan = valid(vec![a, b], 0.5);
+        let mut r = ScriptRunner::new();
+        r.on("a", 1, || AttemptOutcome::Pass(serde_json::json!({})), 0.4);
+        r.on("b", 1, || AttemptOutcome::Pass(serde_json::json!({})), 0.4);
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        assert!(!out.valid);
+        assert_eq!(out.exit, PlanExit::BudgetExceeded);
+        assert!((out.spent_usd - 0.8).abs() < 1e-9);
     }
 
     #[test]

@@ -8,6 +8,31 @@ path = "."
 dir = "workspace"
 setup_cmd = "mkdir -p workspace && cp solution.py role.sh plant.sh verdict_gate.sh join_gate.sh verify.sh workspace/ && git -C workspace init -q && git -C workspace add -A && git -C workspace -c user.email=crucible@local -c user.name=crucible -c commit.gpgsign=false commit -qm baseline"
 
+[[workspace.inject]]
+src = "role.sh"
+dst = "role.sh"
+frozen = true
+
+[[workspace.inject]]
+src = "plant.sh"
+dst = "plant.sh"
+frozen = true
+
+[[workspace.inject]]
+src = "verdict_gate.sh"
+dst = "verdict_gate.sh"
+frozen = true
+
+[[workspace.inject]]
+src = "join_gate.sh"
+dst = "join_gate.sh"
+frozen = true
+
+[[workspace.inject]]
+src = "verify.sh"
+dst = "verify.sh"
+frozen = true
+
 [agent]
 backend   = "command"
 agent_cmd = "./role.sh"

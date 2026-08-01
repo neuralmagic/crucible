@@ -8,6 +8,26 @@ path = "."
 dir = "workspace-live"
 setup_cmd = "mkdir -p workspace-live && cp solution.py plant.sh verdict_gate.sh join_gate.sh verify.sh workspace-live/ && git -C workspace-live init -q && git -C workspace-live add -A && git -C workspace-live -c user.email=crucible@local -c user.name=crucible -c commit.gpgsign=false commit -qm baseline"
 
+[[workspace.inject]]
+src = "plant.sh"
+dst = "plant.sh"
+frozen = true
+
+[[workspace.inject]]
+src = "verdict_gate.sh"
+dst = "verdict_gate.sh"
+frozen = true
+
+[[workspace.inject]]
+src = "join_gate.sh"
+dst = "join_gate.sh"
+frozen = true
+
+[[workspace.inject]]
+src = "verify.sh"
+dst = "verify.sh"
+frozen = true
+
 [agent]
 backend = "local"
 model   = "claude-opus-4-6"

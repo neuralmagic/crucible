@@ -18,8 +18,6 @@ Write the finished implementation to solution.py.
 name = "review"
 kind = "agent"
 depends_on = ["implement"]
-harness = "hermes"
-model = "gpt-5-codex"
 prompt = """
 ADVERSARIAL_REVIEW
 
