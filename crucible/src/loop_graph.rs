@@ -870,13 +870,13 @@ mod tests {
     }
 
     fn run_counter_cfg(graph_loop: bool, iterations: u32, bump: &str, wide: bool) -> RunTrace {
+        // A counter, not a timestamp: two tests starting in the same microsecond would get
+        // the same name, and the first thing this does is remove_dir_all.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "crucible-graph-parity-{}-{}-{graph_loop}",
+            "crucible-graph-parity-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default()
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -928,6 +928,10 @@ mod tests {
         let m = manifest::Manifest::load_frozen(&manifest_path).unwrap();
         let workspace = dir.join("workspace");
         run::manifest_setup(&m, &dir, &workspace).unwrap();
+        // The real run path does this right after setup. Without it the workspace has no
+        // committer identity of its own, so every keep's snapshot fails on a machine with
+        // no global git config and the run silently stops ratcheting.
+        crucible_vcs::vcs::ensure_repo(&workspace).unwrap();
         let state = dir.join("state");
         std::fs::create_dir_all(&state).unwrap();
         let p = crate::Paths::for_manifest(workspace.clone(), state, &dir, None);
