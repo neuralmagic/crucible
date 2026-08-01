@@ -1,0 +1,43 @@
+{
+  "task": [
+    {
+      "name": "review-correctness",
+      "kind": "agent",
+      "prompt": "ADVERSARIAL_REVIEW: CORRECTNESS\n\nAnother agent implemented is_prime(n) in solution.py, aiming to make verify.sh pass.\nBoth files are in your working directory; read them.\n\nReview adversarially. Assume the implementation may satisfy verify.sh without being\ncorrect in general. Judge behavior only; another reviewer owns prose, so ignore typos,\ncomments, and docstring wording entirely.\n\nWrite a single JSON object to PLAN_TASK_RESULT.json:\n\n- `approved`: true only if is_prime is correct for all n, not merely the cases verify.sh tests\n- `finding`: one or two sentences naming the defect, or \"\" if approved\n- `counterexample`: an integer n that is_prime answers incorrectly, or null if approved\n\nDo not edit any file. Review only.\n",
+      "harness": null,
+      "model": "claude-opus-4-6",
+      "effort": "high",
+      "depends_on": [],
+      "needs": "any",
+      "required": true,
+      "isolation": "worktree",
+      "join": "all"
+    },
+    {
+      "name": "review-copy",
+      "kind": "agent",
+      "prompt": "COPY REVIEW: DOCS AND COMMENTS\n\nAnother agent wrote solution.py. Copy-edit its prose: docstrings and comments.\n\nJudge writing only. Check spelling, grammar, and whether the documentation describes what\nthe code actually does. Say nothing about algorithmic correctness; another reviewer owns it.\n\nWrite a single JSON object to PLAN_TASK_RESULT.json:\n\n- `findings`: an array of strings, one per prose defect, empty if the prose is clean\n- `summary`: one sentence on the overall state of the documentation\n\nDo not edit any file. Review only.\n",
+      "harness": null,
+      "model": "claude-sonnet-5",
+      "effort": null,
+      "depends_on": [],
+      "needs": "any",
+      "required": false,
+      "isolation": "worktree",
+      "join": "all"
+    },
+    {
+      "name": "gate",
+      "kind": "command",
+      "command": "./join_gate.sh",
+      "depends_on": [
+        "review-correctness",
+        "review-copy"
+      ],
+      "needs": "any",
+      "required": true,
+      "isolation": null,
+      "join": "passed"
+    }
+  ]
+}

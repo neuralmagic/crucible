@@ -67,6 +67,8 @@ The pack is on disk at `{{OUT_DIR}}`, relative to your current working directory
 read every file there and edit it in place:
 
 - `crucible.toml` — the manifest (`[repo]`, `[judge]`, `[judge.selftest]`, `[agent]`).
+- `workflow.star` and its `prompts/` files, when present. Edit the Starlark source, not the
+  generated `[[workflow.task]]` block; validation recompiles it.
 - the measure script the `measure_cmd` points at.
 - `goal.md` (if the goal is a file).
 

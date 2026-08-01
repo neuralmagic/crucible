@@ -121,6 +121,9 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
 
     if let Some(Cmd::Plan { action }) = &cli.command {
         return match action {
+            crate::PlanAction::CompileWorkflow { file, manifest } => {
+                crate::plan::cli::compile_workflow(file, manifest.as_deref())
+            }
             crate::PlanAction::Show {
                 file,
                 caps,

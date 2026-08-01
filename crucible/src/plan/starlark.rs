@@ -1,0 +1,632 @@
+//! Deterministic, scope-time Starlark frontend for pack workflows.
+//!
+//! Starlark is authoring syntax only: this compiler returns the existing [`WorkflowCfg`]
+//! IR. Scope freeze materializes that IR into `crucible.toml`, so runtime execution never
+//! depends on evaluating the source again. The DSL is data constructors plus the
+//! deliberately narrow `prompt_file` reader; there is no general filesystem, process,
+//! environment, network, clock, or randomness API.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Component, Path, PathBuf};
+
+use anyhow::{Context, Result, bail};
+use starlark_syntax::lexer::TokenInt;
+use starlark_syntax::syntax::ast::{
+    Argument, AssignTarget, AstLiteral, AstStmt, BinOp, CallArgsP, Expr, Stmt,
+};
+use starlark_syntax::syntax::{AstModule, Dialect};
+
+use crate::manifest::WorkflowCfg;
+use crate::plan::ir::{Direction, Isolation, Join, Task, TaskKind, TaskName};
+
+const MAX_SOURCE_BYTES: usize = 256 * 1024;
+const MAX_PROMPT_BYTES: usize = 256 * 1024;
+const MAX_TOTAL_PROMPT_BYTES: usize = 1024 * 1024;
+const MAX_TASKS: usize = 128;
+const MAX_EVAL_STEPS: usize = 10_000;
+
+#[derive(Debug)]
+pub struct CompiledWorkflow {
+    pub workflow: WorkflowCfg,
+    /// Pack-relative prompt files whose contents were embedded into the task IR.
+    pub prompt_files: Vec<PathBuf>,
+    /// Stable, pretty JSON used by golden tests and review tooling.
+    pub canonical_json: String,
+}
+
+#[derive(Debug)]
+struct CompileContext {
+    pack_dir: PathBuf,
+    prompt_files: BTreeSet<PathBuf>,
+    total_prompt_bytes: usize,
+    eval_steps: usize,
+}
+
+impl CompileContext {
+    fn prompt_file(&mut self, raw: &str) -> Result<String> {
+        let relative = safe_relative_path(raw)?;
+        let root = std::fs::canonicalize(&self.pack_dir)
+            .with_context(|| format!("resolving pack directory {}", self.pack_dir.display()))?;
+        let mut path = self.pack_dir.clone();
+        let mut metadata = None;
+        for component in relative.components() {
+            let Component::Normal(component) = component else {
+                continue;
+            };
+            path.push(component);
+            let current = std::fs::symlink_metadata(&path)
+                .with_context(|| format!("reading prompt metadata {}", path.display()))?;
+            if current.file_type().is_symlink() {
+                bail!("prompt_file({raw:?}) may not traverse symlinks");
+            }
+            metadata = Some(current);
+        }
+        if !metadata.is_some_and(|metadata| metadata.is_file()) {
+            bail!("prompt_file({raw:?}) must name a regular, non-symlink file");
+        }
+        let canonical = std::fs::canonicalize(&path)
+            .with_context(|| format!("resolving prompt file {}", path.display()))?;
+        if !canonical.starts_with(&root) {
+            bail!("prompt_file({raw:?}) escapes the pack directory");
+        }
+        let bytes = std::fs::read(&canonical)
+            .with_context(|| format!("reading prompt file {}", canonical.display()))?;
+        if bytes.len() > MAX_PROMPT_BYTES {
+            bail!(
+                "prompt_file({raw:?}) is {} bytes; maximum is {MAX_PROMPT_BYTES}",
+                bytes.len()
+            );
+        }
+        self.total_prompt_bytes = self.total_prompt_bytes.saturating_add(bytes.len());
+        if self.total_prompt_bytes > MAX_TOTAL_PROMPT_BYTES {
+            bail!("workflow embeds more than {MAX_TOTAL_PROMPT_BYTES} bytes of prompt files");
+        }
+        self.prompt_files.insert(relative);
+        String::from_utf8(bytes).context("prompt files must be UTF-8")
+    }
+
+    fn step(&mut self) -> Result<()> {
+        self.eval_steps += 1;
+        if self.eval_steps > MAX_EVAL_STEPS {
+            bail!("workflow evaluation exceeds {MAX_EVAL_STEPS} expression steps");
+        }
+        Ok(())
+    }
+}
+
+fn safe_relative_path(raw: &str) -> Result<PathBuf> {
+    let path = Path::new(raw);
+    if raw.trim().is_empty() || path.is_absolute() {
+        bail!("prompt_file path must be a non-empty pack-relative path");
+    }
+    if path.components().any(|part| {
+        matches!(
+            part,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        bail!("prompt_file path may not contain `..` or escape the pack");
+    }
+    Ok(path.to_path_buf())
+}
+
+#[derive(Clone, Debug)]
+enum Value {
+    None,
+    Bool(bool),
+    Int(i32),
+    String(String),
+    List(Vec<Value>),
+    Task(Task),
+    Workflow(WorkflowCfg),
+}
+
+struct Compiler {
+    context: CompileContext,
+    variables: BTreeMap<String, Value>,
+}
+
+impl Compiler {
+    fn statement(&mut self, statement: &AstStmt) -> Result<Option<Value>> {
+        self.context.step()?;
+        match &statement.node {
+            Stmt::Statements(statements) => {
+                let mut last = None;
+                for statement in statements {
+                    last = self.statement(statement)?;
+                }
+                Ok(last)
+            }
+            Stmt::Assign(assign) => {
+                let AssignTarget::Identifier(name) = &assign.lhs.node else {
+                    bail!("workflow assignments must target a single variable name");
+                };
+                let value = self.expression(&assign.rhs)?;
+                self.variables.insert(name.node.ident.clone(), value);
+                Ok(None)
+            }
+            Stmt::Expression(expression) => self.expression(expression).map(Some),
+            Stmt::Load(_) => bail!(
+                "workflow Starlark may not use load(); use pack-local prompt_file() for prompts"
+            ),
+            _ => bail!(
+                "workflow Starlark is declarative: use assignments, lists, list concatenation, and DSL calls"
+            ),
+        }
+    }
+
+    fn expression(&mut self, expression: &starlark_syntax::syntax::ast::AstExpr) -> Result<Value> {
+        self.context.step()?;
+        match &expression.node {
+            Expr::Identifier(identifier) => match identifier.node.ident.as_str() {
+                "True" => Ok(Value::Bool(true)),
+                "False" => Ok(Value::Bool(false)),
+                "None" => Ok(Value::None),
+                name => self
+                    .variables
+                    .get(name)
+                    .cloned()
+                    .with_context(|| format!("unknown workflow variable {name:?}")),
+            },
+            Expr::Literal(AstLiteral::String(value)) => Ok(Value::String(value.node.clone())),
+            Expr::Literal(AstLiteral::Int(value)) => match &value.node {
+                TokenInt::I32(value) => Ok(Value::Int(*value)),
+                TokenInt::BigInt(_) => bail!("workflow integers must fit in 32 bits"),
+            },
+            Expr::List(items) | Expr::Tuple(items) => items
+                .iter()
+                .map(|item| self.expression(item))
+                .collect::<Result<Vec<_>>>()
+                .map(Value::List),
+            Expr::Op(left, BinOp::Add, right) => {
+                let (Value::List(mut left), Value::List(right)) =
+                    (self.expression(left)?, self.expression(right)?)
+                else {
+                    bail!("workflow `+` is supported only for task or dependency lists");
+                };
+                left.extend(right);
+                Ok(Value::List(left))
+            }
+            Expr::Call(function, args) => {
+                let Expr::Identifier(function) = &function.node else {
+                    bail!("workflow calls must name a DSL constructor directly");
+                };
+                self.call(&function.node.ident, args)
+            }
+            _ => bail!(
+                "unsupported workflow expression; use strings, integers, booleans, lists, list concatenation, and DSL calls"
+            ),
+        }
+    }
+
+    fn call(
+        &mut self,
+        function: &str,
+        args: &CallArgsP<starlark_syntax::syntax::ast::AstNoPayload>,
+    ) -> Result<Value> {
+        if matches!(function, "prompt_file" | "deps" | "workflow") {
+            let [argument] = args.args.as_slice() else {
+                bail!("{function}() takes exactly one positional argument");
+            };
+            let Argument::Positional(argument) = &argument.node else {
+                bail!("{function}() takes exactly one positional argument");
+            };
+            let value = self.expression(argument)?;
+            return match (function, value) {
+                ("prompt_file", Value::String(path)) => {
+                    self.context.prompt_file(&path).map(Value::String)
+                }
+                ("deps", Value::List(tasks)) => tasks
+                    .into_iter()
+                    .map(|task| match task {
+                        Value::Task(task) => Ok(Value::String(task.name.0)),
+                        _ => bail!("deps() entries must be task constructor values"),
+                    })
+                    .collect::<Result<Vec<_>>>()
+                    .map(Value::List),
+                ("workflow", Value::List(tasks)) => {
+                    if tasks.len() > MAX_TASKS {
+                        bail!(
+                            "workflow expands to {} tasks; maximum is {MAX_TASKS}",
+                            tasks.len()
+                        );
+                    }
+                    let tasks = tasks
+                        .into_iter()
+                        .map(|task| match task {
+                            Value::Task(task) => Ok(task),
+                            _ => bail!("workflow() entries must be task constructor values"),
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let workflow = WorkflowCfg { tasks };
+                    workflow.validate()?;
+                    Ok(Value::Workflow(workflow))
+                }
+                _ => bail!("{function}() received the wrong value type"),
+            };
+        }
+
+        let mut named = BTreeMap::new();
+        for argument in &args.args {
+            let Argument::Named(name, value) = &argument.node else {
+                bail!("{function}() task constructor arguments must be named");
+            };
+            let value = self.expression(value)?;
+            if named.insert(name.node.clone(), value).is_some() {
+                bail!("{function}() repeats argument {:?}", name.node);
+            }
+        }
+        let task = match function {
+            "agent" => Task {
+                name: TaskName(take_string(&mut named, "name")?),
+                task: TaskKind::Agent {
+                    prompt: take_string(&mut named, "prompt")?,
+                    harness: take_optional_string(&mut named, "harness")?,
+                    model: take_optional_string(&mut named, "model")?,
+                    effort: take_optional_string(&mut named, "effort")?,
+                },
+                depends_on: take_task_names(&mut named)?,
+                needs: take_string_default(&mut named, "needs", "any")?,
+                required: take_bool_default(&mut named, "required", true)?,
+                isolation: isolation(take_bool_default(&mut named, "isolated", false)?),
+                join: parse_join(&take_string_default(&mut named, "join", "all")?)?,
+            },
+            "command" => Task {
+                name: TaskName(take_string(&mut named, "name")?),
+                task: TaskKind::Command {
+                    command: take_string(&mut named, "run")?,
+                },
+                depends_on: take_task_names(&mut named)?,
+                needs: take_string_default(&mut named, "needs", "any")?,
+                required: take_bool_default(&mut named, "required", true)?,
+                isolation: isolation(take_bool_default(&mut named, "isolated", false)?),
+                join: parse_join(&take_string_default(&mut named, "join", "all")?)?,
+            },
+            "top_k" => {
+                let k = take_int(&mut named, "k")?;
+                if k <= 0 {
+                    bail!("top_k k must be >= 1");
+                }
+                let direction = match take_string(&mut named, "direction")?.as_str() {
+                    "lower" => Direction::Lower,
+                    "higher" => Direction::Higher,
+                    other => bail!("top_k direction must be `lower` or `higher`, got {other:?}"),
+                };
+                if !named.contains_key("depends_on") {
+                    bail!("missing required argument \"depends_on\"");
+                }
+                Task {
+                    name: TaskName(take_string(&mut named, "name")?),
+                    task: TaskKind::TopK {
+                        k: k as u32,
+                        direction,
+                    },
+                    depends_on: take_task_names(&mut named)?,
+                    needs: "any".to_owned(),
+                    required: take_bool_default(&mut named, "required", true)?,
+                    isolation: None,
+                    join: Join::Passed,
+                }
+            }
+            _ => bail!("unknown workflow DSL function {function:?}"),
+        };
+        if !named.is_empty() {
+            bail!(
+                "{function}() has unknown argument(s): {}",
+                named.keys().cloned().collect::<Vec<_>>().join(", ")
+            );
+        }
+        Ok(Value::Task(task))
+    }
+}
+
+fn take_value(named: &mut BTreeMap<String, Value>, name: &str) -> Result<Value> {
+    named
+        .remove(name)
+        .with_context(|| format!("missing required argument {name:?}"))
+}
+
+fn take_string(named: &mut BTreeMap<String, Value>, name: &str) -> Result<String> {
+    match take_value(named, name)? {
+        Value::String(value) => Ok(value),
+        _ => bail!("argument {name:?} must be a string"),
+    }
+}
+
+fn take_optional_string(named: &mut BTreeMap<String, Value>, name: &str) -> Result<Option<String>> {
+    match named.remove(name).unwrap_or(Value::None) {
+        Value::None => Ok(None),
+        Value::String(value) => Ok(Some(value)),
+        _ => bail!("argument {name:?} must be a string or None"),
+    }
+}
+
+fn take_string_default(
+    named: &mut BTreeMap<String, Value>,
+    name: &str,
+    default: &str,
+) -> Result<String> {
+    match named.remove(name) {
+        None => Ok(default.to_owned()),
+        Some(Value::String(value)) => Ok(value),
+        Some(_) => bail!("argument {name:?} must be a string"),
+    }
+}
+
+fn take_bool_default(
+    named: &mut BTreeMap<String, Value>,
+    name: &str,
+    default: bool,
+) -> Result<bool> {
+    match named.remove(name) {
+        None => Ok(default),
+        Some(Value::Bool(value)) => Ok(value),
+        Some(_) => bail!("argument {name:?} must be True or False"),
+    }
+}
+
+fn take_int(named: &mut BTreeMap<String, Value>, name: &str) -> Result<i32> {
+    match take_value(named, name)? {
+        Value::Int(value) => Ok(value),
+        _ => bail!("argument {name:?} must be an integer"),
+    }
+}
+
+fn take_task_names(named: &mut BTreeMap<String, Value>) -> Result<Vec<TaskName>> {
+    match named.remove("depends_on") {
+        None => Ok(Vec::new()),
+        Some(Value::List(names)) => names
+            .into_iter()
+            .map(|name| match name {
+                Value::String(name) => Ok(TaskName(name)),
+                _ => bail!("depends_on entries must be task-name strings"),
+            })
+            .collect(),
+        Some(_) => bail!("depends_on must be a list of task-name strings"),
+    }
+}
+
+fn isolation(isolated: bool) -> Option<Isolation> {
+    isolated.then_some(Isolation::Worktree)
+}
+
+fn parse_join(join: &str) -> Result<Join> {
+    match join {
+        "all" => Ok(Join::All),
+        "passed" => Ok(Join::Passed),
+        other => bail!("join must be `all` or `passed`, got {other:?}"),
+    }
+}
+
+pub fn compile_file(path: &Path, pack_dir: &Path) -> Result<CompiledWorkflow> {
+    let source = std::fs::read_to_string(path)
+        .with_context(|| format!("reading workflow source {}", path.display()))?;
+    compile_source(&source, path, pack_dir)
+}
+
+/// Compile `workflow.star` and replace the manifest's generated `[workflow]` block. The
+/// Starlark remains reviewable source; `crucible.toml` is the frozen runtime authority.
+pub fn materialize_manifest(source_path: &Path, manifest_path: &Path) -> Result<CompiledWorkflow> {
+    use toml_edit::{DocumentMut, Item, Table};
+
+    let pack_dir = manifest_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let compiled = compile_file(source_path, pack_dir)?;
+    let manifest = std::fs::read_to_string(manifest_path)
+        .with_context(|| format!("reading manifest {}", manifest_path.display()))?;
+    let mut document: DocumentMut = manifest
+        .parse()
+        .with_context(|| format!("parsing manifest {}", manifest_path.display()))?;
+    let workflow_toml = toml::to_string(&compiled.workflow)?;
+    let mut workflow_document: DocumentMut = workflow_toml
+        .parse()
+        .context("rendering compiled workflow as TOML")?;
+    let mut table = Table::new();
+    table.decor_mut().set_prefix(
+        "\n# Generated from workflow.star. Edit the Starlark source; scope recompiles it.\n",
+    );
+    if let Some(tasks) = workflow_document.remove("task") {
+        table.insert("task", tasks);
+    }
+    document.remove("workflow");
+    document.insert("workflow", Item::Table(table));
+    std::fs::write(manifest_path, document.to_string())
+        .with_context(|| format!("writing manifest {}", manifest_path.display()))?;
+    Ok(compiled)
+}
+
+/// Compile a conventional sibling `workflow.star` when one is present.
+pub fn materialize_sibling_manifest(manifest_path: &Path) -> Result<Option<CompiledWorkflow>> {
+    let pack_dir = manifest_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let source_path = pack_dir.join("workflow.star");
+    source_path
+        .exists()
+        .then(|| materialize_manifest(&source_path, manifest_path))
+        .transpose()
+}
+
+pub fn compile_source(source: &str, filename: &Path, pack_dir: &Path) -> Result<CompiledWorkflow> {
+    if source.len() > MAX_SOURCE_BYTES {
+        bail!(
+            "workflow source is {} bytes; maximum is {MAX_SOURCE_BYTES}",
+            source.len()
+        );
+    }
+    let ast = AstModule::parse(
+        &filename.display().to_string(),
+        source.to_owned(),
+        &Dialect::Standard,
+    )
+    .map_err(|error| anyhow::anyhow!("parsing workflow Starlark: {error}"))?;
+    let mut compiler = Compiler {
+        context: CompileContext {
+            pack_dir: pack_dir.to_path_buf(),
+            prompt_files: BTreeSet::new(),
+            total_prompt_bytes: 0,
+            eval_steps: 0,
+        },
+        variables: BTreeMap::new(),
+    };
+    let Some(Value::Workflow(workflow)) = compiler.statement(ast.statement())? else {
+        bail!("workflow source must end with workflow([...])");
+    };
+    workflow.validate()?;
+    let canonical_json = serde_json::to_string_pretty(&workflow)? + "\n";
+    Ok(CompiledWorkflow {
+        workflow,
+        prompt_files: compiler.context.prompt_files.into_iter().collect(),
+        canonical_json,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_pack(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("crucible-starlark-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("prompts")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn compiles_a_panel_and_embeds_pack_relative_prompts() {
+        let pack = temp_pack("panel");
+        std::fs::write(pack.join("prompts/correctness.md"), "Check correctness.\n").unwrap();
+        let source = r#"
+reviews = [
+    agent(
+        name = "review-correctness",
+        prompt = prompt_file("prompts/correctness.md"),
+        model = "claude-opus-4-6",
+        effort = "high",
+        isolated = True,
+    ),
+    agent(
+        name = "review-copy",
+        prompt = "Review prose.",
+        model = "claude-sonnet-5",
+        required = False,
+        isolated = True,
+    ),
+]
+workflow(reviews + [
+    command(
+        name = "gate",
+        run = "./join_gate.sh",
+        depends_on = deps(reviews),
+        join = "passed",
+    ),
+])
+"#;
+        let compiled = compile_source(source, &pack.join("workflow.star"), &pack).unwrap();
+        assert_eq!(compiled.workflow.tasks.len(), 3);
+        assert_eq!(
+            compiled.prompt_files,
+            [PathBuf::from("prompts/correctness.md")]
+        );
+        let TaskKind::Agent { prompt, .. } = &compiled.workflow.tasks[0].task else {
+            panic!("expected agent task")
+        };
+        assert_eq!(prompt, "Check correctness.\n");
+        assert!(compiled.canonical_json.contains("review-copy"));
+
+        std::fs::write(
+            pack.join("crucible.toml"),
+            "# preserved\n[repo]\npath = \".\"\n\n[[workflow.task]]\nname = \"stale\"\nkind = \"command\"\ncommand = \"false\"\n",
+        )
+        .unwrap();
+        std::fs::write(pack.join("workflow.star"), source).unwrap();
+        materialize_manifest(&pack.join("workflow.star"), &pack.join("crucible.toml")).unwrap();
+        let manifest = std::fs::read_to_string(pack.join("crucible.toml")).unwrap();
+        assert!(manifest.contains("# preserved"));
+        assert!(manifest.contains("Generated from workflow.star"));
+        assert!(manifest.contains("[[workflow.task]]"));
+        assert!(!manifest.contains("name = \"stale\""));
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn prompt_file_refuses_escape_symlink_and_oversize_content() {
+        let pack = temp_pack("paths");
+        let source = |path: &str| {
+            format!("workflow([agent(name = \"r\", prompt = prompt_file({path:?}))])\n")
+        };
+        assert!(
+            compile_source(&source("../secret.md"), &pack.join("workflow.star"), &pack)
+                .unwrap_err()
+                .to_string()
+                .contains("may not contain")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            std::fs::write(pack.join("real.md"), "secret").unwrap();
+            symlink(pack.join("real.md"), pack.join("prompts/link.md")).unwrap();
+            assert!(
+                compile_source(
+                    &source("prompts/link.md"),
+                    &pack.join("workflow.star"),
+                    &pack
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("symlink")
+            );
+        }
+        std::fs::write(
+            pack.join("prompts/huge.md"),
+            vec![b'x'; MAX_PROMPT_BYTES + 1],
+        )
+        .unwrap();
+        assert!(
+            compile_source(
+                &source("prompts/huge.md"),
+                &pack.join("workflow.star"),
+                &pack
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("maximum")
+        );
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn rejects_loads_and_runaway_evaluation() {
+        let pack = temp_pack("bounds");
+        let load = "load(\"x.star\", \"x\")\nworkflow([])\n";
+        assert!(
+            compile_source(load, &pack.join("workflow.star"), &pack)
+                .unwrap_err()
+                .to_string()
+                .contains("may not use load")
+        );
+        let runaway = "xs = []\nfor i in range(1000000):\n    xs.append(i)\nworkflow([])\n";
+        assert!(compile_source(runaway, &pack.join("workflow.star"), &pack).is_err());
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn adversarial_example_matches_its_golden_and_materialized_manifest() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let pack = root.join("examples/adversarial-review");
+        let compiled = compile_file(&pack.join("workflow.star"), &pack).unwrap();
+        assert_eq!(
+            compiled.canonical_json,
+            std::fs::read_to_string(pack.join("expected-workflow.json")).unwrap()
+        );
+        let manifest = crate::manifest::Manifest::load(&pack.join("crucible.toml")).unwrap();
+        assert_eq!(
+            serde_json::to_value(&compiled.workflow).unwrap(),
+            serde_json::to_value(&manifest.workflow).unwrap()
+        );
+    }
+}

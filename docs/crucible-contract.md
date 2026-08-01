@@ -118,6 +118,83 @@ never runs concurrently, only proposal does). The scored set is ranked by `[sear
 normal. Session rows from the wide round carry an additive `phase: "wide"` field (§7) so a
 consumer can tell a wide-round row from a deep-loop row without a wire-shape change.
 
+### 1.3 Scope-authored workflows (`workflow.star`)
+
+A scoped pack may include `workflow.star` beside `crucible.toml`. It is authoring syntax, not a
+runtime interpreter: scope compiles it to the existing `[[workflow.task]]` manifest IR before
+validation and again before freeze. The generated TOML is the runtime authority. This keeps plan
+authorship readable without moving the frozen judge or execution semantics into Starlark.
+
+The engine always owns the outer autoresearch loop:
+
+```text
+propose → <pack workflow> → apply → measure → decide
+```
+
+Tasks with no explicit dependencies attach to `propose`; `apply` waits for every workflow sink.
+A workflow can add critique, refinement, lint, or an early deterministic rejection, but it cannot
+replace, reorder, or run after the frozen measurement and decision stages.
+
+The DSL is deliberately small:
+
+```python
+critics = [
+    agent(
+        name = "correctness",
+        prompt = prompt_file("prompts/correctness.md"),
+        model = "claude-opus-4-6",
+        effort = "high",
+        isolated = True,
+    ),
+    agent(
+        name = "novelty",
+        prompt = prompt_file("prompts/novelty.md"),
+        required = False,
+        isolated = True,
+    ),
+]
+
+workflow(critics + [
+    agent(
+        name = "synthesize",
+        prompt = prompt_file("prompts/synthesize.md"),
+        depends_on = deps(critics),
+        join = "passed",
+    ),
+    command(
+        name = "smoke",
+        run = "./smoke.sh",
+        depends_on = ["synthesize"],
+    ),
+])
+```
+
+This is a declarative Starlark subset: assignments, strings, integers, booleans, lists, list
+concatenation, and direct calls to the functions below. Control flow, function definitions,
+comprehensions, mutation, arbitrary operators, and `load()` are rejected. Task values are opaque,
+so authored source cannot forge engine-owned stages.
+
+- `agent(...)` creates an agent task. `isolated = True` gives it a disposable worktree, ideal for
+  concurrent read-only critics; leave it false for a synthesizer whose edits must survive.
+- `command(...)` creates a deterministic shell task in the candidate workspace.
+- `top_k(...)` creates a reducer for wider authored graphs.
+- `deps(tasks)` returns constructor task names, avoiding repeated string wiring.
+- `prompt_file(path)` reads a regular UTF-8 file below the pack directory and embeds its contents
+  in the generated manifest. Absolute paths, `..`, symlinks, non-files, and oversized inputs are
+  rejected.
+- `workflow(tasks)` is the required final expression. Duplicate/reserved names, unknown
+  dependencies, and edges toward `apply`, `measure`, or `decide` are rejected.
+
+Agent tasks receive upstream structured results in their prompt and must write one JSON object to
+`PLAN_TASK_RESULT.json`. A required task failure discards the candidate before measurement; an
+advisory task uses `required = False`. `join = "passed"` lets a downstream task receive only
+successful results after all dependencies become terminal.
+
+For local review, `crucible plan compile-workflow --file workflow.star` prints stable canonical
+JSON. Add `--manifest crucible.toml` to also replace the generated `[workflow]` block. Compilation
+applies source, task-count, evaluation-step, and prompt-size ceilings. The compiler exposes no
+filesystem API except `prompt_file`, and no process, environment, network, clock, or randomness API.
+
 ---
 
 ## 2. Path resolution (portable, never `CARGO_MANIFEST_DIR`)
