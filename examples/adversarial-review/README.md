@@ -1,6 +1,17 @@
 # adversarial-review
 
-Review tasks between a code node and the gate below it. Two shapes:
+Review tasks between a code node and the gate below it. The pack-level Starlark source shows the
+basic autoresearch shape directly:
+
+```text
+                         ┌─> review-correctness (blocking) ─┐
+engine propose (edit) ───┤                                  ├─> gate ─> engine measure/decide
+                         └─> review-copy       (advisory) ──┘
+```
+
+`workflow.star` declares only the middle. Crucible owns proposal, application, frozen
+measurement, and keep/discard. The older standalone plan fixtures below exercise the general plan
+runner with the same tasks:
 
 ```
 plan.toml / plan-reward-hack.toml
@@ -22,6 +33,9 @@ and sits downstream of the gate, so a rejected candidate is `blocked` and never 
 | --- | --- |
 | `crucible.toml` | stand-in manifest, `command` backend via `role.sh`, no cost |
 | `crucible.live.toml` | live manifest, `local` backend, Vertex auth |
+| `workflow.star` | readable pack workflow compiled during scope |
+| `prompts/*.md` | reviewer prompts embedded with `prompt_file(...)` |
+| `expected-workflow.json` | canonical compiler golden |
 | `plan.toml` | single review, clean coder |
 | `plan-reward-hack.toml` | single review, coder told to pass "by any means" |
 | `plan-panel-*.toml` | two-reviewer panel, isolated and concurrent |
@@ -43,11 +57,26 @@ This matters in `plan-reward-hack.toml`: its stand-in implementer tries to repla
 ## Run
 
 ```sh
+crucible plan compile-workflow \
+  --file examples/adversarial-review/workflow.star
+
+# The normal autoresearch loop consumes the generated [[workflow.task]] block.
+crucible --manifest examples/adversarial-review/crucible.toml --iterations 1
+
+# The standalone plan-runner fixture remains useful for inspecting the graph itself.
 crucible plan show --file examples/adversarial-review/plan-panel-hack.toml
 
 crucible plan run --file examples/adversarial-review/plan-panel-hack.toml \
                   --manifest examples/adversarial-review/crucible.toml
 ```
+
+The compiled prompt text lives in `crucible.toml`, so runtime execution never needs to evaluate
+Starlark or read the prompt files. During scoping, editing `workflow.star` or a referenced prompt
+causes validation to regenerate that manifest block before checking and freezing the pack.
+
+For a more creative loop, put a non-isolated `synthesize` agent after the parallel reviewers. It
+receives their JSON results, edits the shared candidate, and writes its own result; a deterministic
+smoke command then gates the engine's expensive measurement. See contract §1.3 for that recipe.
 
 ## Task semantics used here
 

@@ -7,5 +7,6 @@ pub mod exec;
 pub mod harness;
 pub mod ir;
 pub mod runner;
+pub mod starlark;
 pub mod term_img;
 pub mod worktree;

@@ -178,6 +178,9 @@ turn ends. What goes in:
      missing self-test.
    - `[agent]` with a `goal` (or `goal_file`) describing the fix for the optimizing loop that
      runs later.
+   - Do not hand-write `[[workflow.task]]` when authoring a workflow. Put the readable source in
+     sibling `workflow.star`; the host compiler replaces the generated manifest block before
+     validation and freeze.
    - **Choose a build mode deliberately** (contract §3.1). Ask: between the agent's edit and your
      `measure_cmd`, what has to happen for the edit to be the thing measured? If the gate compiles
      and runs the workspace in place (a `go test` subset — the T0 case, and most T1 cases), the
@@ -189,6 +192,14 @@ turn ends. What goes in:
    shaped stdout, and every file it touches frozen-injected (see above).
 3. **`goal.md`** (or inline `goal` in `[agent]`) — the goal for the solver, written to the
    **`goal.md` contract above**.
+4. **Optional `workflow.star` and prompt files** — use this only when the domain benefits from
+   extra agent or command work between proposal and measurement (parallel critics, synthesis,
+   lint, or an early rejection gate). The engine still owns `propose → apply → measure → decide`.
+   Available constructors are `agent`, `command`, `top_k`, `deps`, `prompt_file`, and the final
+   `workflow([...])`. `prompt_file("prompts/x.md")` embeds a regular UTF-8 pack-relative file;
+   paths may not be absolute, contain `..`, or be symlinks. Isolated agents are concurrent,
+   read-only worktrees; a synthesizer that edits the candidate must not be isolated. Every agent
+   task must write one JSON object to `PLAN_TASK_RESULT.json`.
 
 ## Test your own draft before you submit it
 
@@ -205,5 +216,6 @@ exercised by the host-side validator, which does have it.
 ## Done
 
 Either `{{OUT_DIR}}` holds a complete pack (`crucible.toml` with `[judge.selftest]`, the measure
-script, the goal), or `{{OUT_DIR}}/REJECTED.md` explains why this issue can't be fairly gated this
-way. Nothing else is a valid outcome of this turn.
+script, the goal, and any authored `workflow.star` plus prompt files), or
+`{{OUT_DIR}}/REJECTED.md` explains why this issue can't be fairly gated this way. Nothing else is
+a valid outcome of this turn.

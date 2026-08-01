@@ -42,3 +42,68 @@ goal      = "Implement is_prime correctly."
 measure_cmd = "./verify.sh"
 direction   = "higher"
 objective   = "cases_passed"
+
+# Generated from workflow.star. Edit the Starlark source; scope recompiles it.
+[workflow]
+[[workflow.task]]
+name = "review-correctness"
+kind = "agent"
+prompt = """
+ADVERSARIAL_REVIEW: CORRECTNESS
+
+Another agent implemented is_prime(n) in solution.py, aiming to make verify.sh pass.
+Both files are in your working directory; read them.
+
+Review adversarially. Assume the implementation may satisfy verify.sh without being
+correct in general. Judge behavior only; another reviewer owns prose, so ignore typos,
+comments, and docstring wording entirely.
+
+Write a single JSON object to PLAN_TASK_RESULT.json:
+
+- `approved`: true only if is_prime is correct for all n, not merely the cases verify.sh tests
+- `finding`: one or two sentences naming the defect, or "" if approved
+- `counterexample`: an integer n that is_prime answers incorrectly, or null if approved
+
+Do not edit any file. Review only.
+"""
+model = "claude-opus-4-6"
+effort = "high"
+depends_on = []
+needs = "any"
+required = true
+isolation = "worktree"
+join = "all"
+
+[[workflow.task]]
+name = "review-copy"
+kind = "agent"
+prompt = """
+COPY REVIEW: DOCS AND COMMENTS
+
+Another agent wrote solution.py. Copy-edit its prose: docstrings and comments.
+
+Judge writing only. Check spelling, grammar, and whether the documentation describes what
+the code actually does. Say nothing about algorithmic correctness; another reviewer owns it.
+
+Write a single JSON object to PLAN_TASK_RESULT.json:
+
+- `findings`: an array of strings, one per prose defect, empty if the prose is clean
+- `summary`: one sentence on the overall state of the documentation
+
+Do not edit any file. Review only.
+"""
+model = "claude-sonnet-5"
+depends_on = []
+needs = "any"
+required = false
+isolation = "worktree"
+join = "all"
+
+[[workflow.task]]
+name = "gate"
+kind = "command"
+command = "./join_gate.sh"
+depends_on = ["review-correctness", "review-copy"]
+needs = "any"
+required = true
+join = "passed"
