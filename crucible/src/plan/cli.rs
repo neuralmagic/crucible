@@ -14,11 +14,7 @@ pub fn compile_workflow(file: &Path, manifest: Option<&Path>) -> Result<()> {
     let compiled = match manifest {
         Some(manifest) => crate::plan::starlark::materialize_manifest(file, manifest)?,
         None => {
-            let pack_dir = file
-                .parent()
-                .filter(|path| !path.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."));
-            crate::plan::starlark::compile_file(file, pack_dir)?
+            crate::plan::starlark::compile_file(file, crate::plan::starlark::parent_or_cwd(file))?
         }
     };
     for prompt_file in &compiled.prompt_files {
