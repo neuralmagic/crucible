@@ -26,6 +26,11 @@ ignore = [
     # fonts we ship to rasterize our own generated SVG, never untrusted input.
     { id = "RUSTSEC-2026-0192", reason = "ttf-parser via the vendored mermaid renderer; renders our own SVG, no untrusted input" },
     { id = "RUSTSEC-2026-0206", reason = "rustybuzz via the vendored mermaid renderer; renders our own SVG, no untrusted input" },
+    # Unmaintained crates internal to starlark-rust (starlark_map/starlark_syntax); no upstream
+    # fix. They serve interpreter-internal hashing and derives, not a security boundary.
+    { id = "RUSTSEC-2025-0057", reason = "fxhash via starlark_map; interpreter-internal hashing, not a security boundary" },
+    { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill via starlark_syntax's postcard/heapless; interpreter-internal" },
+    { id = "RUSTSEC-2024-0388", reason = "derivative proc-macro via starlark_syntax; compile-time only" },
 ]
 
 [licenses]
