@@ -192,9 +192,10 @@ what it learned. Tasks sharing a session must be dependency-ordered and cannot b
 parallel critics should stay fresh or use distinct sessions. Admission requires
 `agent.session.persist`. A missing `session` preserves the historical fresh-turn behavior.
 
-Crucible's public ledger contains only the logical name, an opaque harness cursor, and a
-completed-turn count. It never copies private reasoning into `session.jsonl`. Claude Code implements
-native start/resume for both the local and Vertex/OpenShell paths. Because OpenShell sandboxes are
+Crucible's private ledger contains only the logical name, an opaque harness cursor, and a
+completed-turn count. It never copies that cursor or Claude's native transcript into
+`session.jsonl`; the existing live harness event policy, including streamed thinking events, is
+unchanged. Claude Code implements native start/resume for both the local and Vertex/OpenShell paths. Because OpenShell sandboxes are
 per-turn-fresh, Crucible saves Claude's native transcript as mode-0600 private engine state and
 restores it at the exact pinned config path in the next sandbox; that file is never included in the
 published run record. Hermes fails closed for a persistent binding until it has an equivalent
@@ -504,7 +505,7 @@ Additive event kinds beyond the compat set include:
   stream with **no** `shutdown` line means the pod likely died mid-run, not a clean exit.
 - **`agent_session`**: `{ session, action, turn }`, emitted before a persistent agent turn so a
   viewer can draw continuation lanes and distinguish `started` from `resumed`. It deliberately
-  contains neither the provider cursor nor private reasoning.
+  contains neither the provider cursor nor native transcript content.
 
 **`RunIdentity`** (`crucible/src/identity.rs`) is the comparability key: two runs' scores are
 comparable only if it matches. It's a hash-of-hashes (`v1:<hex>`) over, per component (one

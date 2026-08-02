@@ -84,9 +84,10 @@ trusted after an agent task edits the workspace, declare that script as a frozen
 actual workspace before every task, including isolated worktrees.
 
 A logical `session` is serial state, so every pair of tasks sharing one must have a dependency
-path between them. A session task cannot use disposable worktree isolation. The public ledger keeps
-only an opaque harness cursor and completed-turn count; private reasoning is never copied into the
-plan or public session log. Claude Code's native transcript remains in its private local store or a
+path between them. A session task cannot use disposable worktree isolation. The private ledger keeps
+only an opaque harness cursor and completed-turn count; neither that cursor nor Claude's native
+transcript is copied into the plan or public session log. Normal streamed harness events retain
+their existing visibility. Claude Code's native transcript remains in its private local store or a
 mode-0600 engine store restored into each fresh OpenShell sandbox. Omit the field for the historical
 fresh-turn behavior.
 
