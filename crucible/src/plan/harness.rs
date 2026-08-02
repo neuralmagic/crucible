@@ -454,8 +454,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A clean turn that writes no result is graded a failure but still advances the cursor.
-    /// Deliberate, and easy to "fix" into commit-only-on-pass, so pinned.
+    /// Missing task output fails grading but still advances the session.
     #[test]
     fn a_turn_that_writes_no_result_fails_but_still_advances_the_session() {
         let dir = std::env::temp_dir().join(format!(

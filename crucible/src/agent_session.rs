@@ -1,14 +1,7 @@
-//! Durable logical agent sessions.
-//!
-//! The ledger stores only a logical name, an opaque harness continuation id, and a turn count.
-//! It never copies the provider cursor or native transcript into Crucible's run log. The normal
-//! live harness event stream is unchanged. World rollback and agent learning therefore have
-//! independent lifetimes: a discarded candidate can restore the checkout while the next turn
-//! resumes the solver that learned why it failed.
-//!
-//! The cursor advances on any turn that returned without an agent or transport error, even one
-//! graded a failure for writing no result: the conversation happened, and resuming it lets the
-//! next turn see its own botched attempt.
+//! Durable logical agent sessions. The ledger stores only a logical name, opaque continuation id,
+//! and turn count; provider transcripts remain private. World rollback and agent context have
+//! independent lifetimes. The cursor advances after any turn without an agent or transport error,
+//! including one graded as a failure for omitting its result.
 
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
@@ -34,7 +27,7 @@ struct Ledger {
     sessions: BTreeMap<String, Entry>,
 }
 
-/// One prepared turn. `provider_id` is deliberately opaque outside the harness boundary.
+/// A prepared turn with an opaque provider continuation.
 #[derive(Clone, Debug)]
 pub(crate) struct SessionTurn {
     pub logical_name: String,
@@ -77,8 +70,7 @@ fn read(state: &Path) -> Result<Ledger> {
     }
 }
 
-/// Resolve a logical session without mutating the ledger. A new continuation id is committed only
-/// after a successful turn, so a failed spawn cannot poison every later turn with a missing resume.
+/// Resolve a session without mutating its ledger.
 pub(crate) fn prepare(state: &Path, logical_name: &str) -> Result<SessionTurn> {
     let _guard = lock().lock().unwrap_or_else(|e| e.into_inner());
     let ledger = read(state)?;
@@ -92,8 +84,7 @@ pub(crate) fn prepare(state: &Path, logical_name: &str) -> Result<SessionTurn> {
     })
 }
 
-/// Advance the cursor after a turn that returned without an agent or transport error. The
-/// private 0600 file is replaced atomically; runtime state, not part of the event stream.
+/// Atomically advance the private cursor after successful transport.
 pub(crate) fn commit(state: &Path, turn: &SessionTurn) -> Result<()> {
     let _guard = lock().lock().unwrap_or_else(|e| e.into_inner());
     std::fs::create_dir_all(state)

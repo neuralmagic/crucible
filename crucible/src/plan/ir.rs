@@ -136,8 +136,7 @@ pub struct Task {
     pub task: TaskKind,
     #[serde(default)]
     pub depends_on: Vec<TaskName>,
-    /// Logical durable agent session. Tasks that share a name resume the same opaque harness
-    /// continuation and therefore must be dependency-ordered. Absent means a fresh turn.
+    /// Durable logical session; shared names must be dependency-ordered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
     /// Substrate capability this task needs; `"any"` runs everywhere.
@@ -328,9 +327,7 @@ impl Plan {
                 stuck.join(", ")
             );
         }
-        // A native conversation is serial. Two concurrently-ready tasks must never race the same
-        // provider cursor, so every pair sharing a logical session needs a dependency path in one
-        // direction. Different sessions remain freely parallelizable.
+        // One native conversation is serial, so shared sessions require an ordering path.
         let reaches = |from: usize, to: usize| {
             let mut stack = vec![from];
             let mut seen = BTreeSet::new();

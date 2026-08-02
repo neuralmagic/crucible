@@ -107,8 +107,7 @@ impl Harness {
         }
     }
 
-    /// A continuing local turn. Only harnesses with an explicit, opaque resume cursor may
-    /// implement this; callers fail closed instead of silently starting a fresh conversation.
+    /// Continue a local turn using an explicit opaque cursor.
     pub(crate) fn local_session_argv(
         self,
         args: &Args,
@@ -143,8 +142,7 @@ impl Harness {
         }
     }
 
-    /// The sandbox counterpart of [`Harness::local_session_argv`]. Claude's transcript is
-    /// restored into its private config directory before this argv executes.
+    /// Sandbox counterpart of [`Harness::local_session_argv`].
     pub(crate) fn sandbox_session_argv(
         self,
         args: &Args,
