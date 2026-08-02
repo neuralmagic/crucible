@@ -910,4 +910,20 @@ default_autoresearch([review])
         assert!(strays.is_empty(), "left temp files: {strays:?}");
         let _ = std::fs::remove_dir_all(&pack);
     }
+
+    #[test]
+    fn counter_smoke_workflow_matches_its_materialized_manifest() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let pack = root.join("examples/counter");
+        let compiled = compile_file(&pack.join("workflow.star"), &pack).unwrap();
+        let manifest = crate::manifest::Manifest::load(&pack.join("crucible.toml")).unwrap();
+        assert_eq!(
+            serde_json::to_value(&compiled.workflow).unwrap(),
+            serde_json::to_value(&manifest.workflow).unwrap()
+        );
+        assert_eq!(
+            compiled.workflow.tasks[0].session.as_deref(),
+            Some("solver")
+        );
+    }
 }
