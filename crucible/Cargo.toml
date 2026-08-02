@@ -20,9 +20,7 @@ toml = "0.8"
 # sandboxed [agent] backend); the deserialize-only `Manifest` can't round-trip, so a targeted edit
 # keeps the agent's authored comments. Already in the tree as `toml`'s own backing crate.
 toml_edit = "0.22"
-# Scope-time workflow authoring: parse a deliberately declarative Starlark subset into the
-# existing workflow IR. Using syntax only keeps the compiler bounded and leaves serde_json's
-# wire-format features untouched.
+# Parse the scope-time Starlark subset without a runtime evaluator.
 starlark_syntax = "0.14.2"
 ctrlc = "3"
 git2.workspace = true
