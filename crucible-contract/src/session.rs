@@ -57,6 +57,9 @@ pub struct PlanTaskWire {
     pub kind: String,
     #[serde(default)]
     pub depends_on: Vec<String>,
+    /// Logical durable agent session; empty means a fresh turn.
+    #[serde(default)]
+    pub session: String,
     #[serde(default)]
     pub needs: String,
     #[serde(default)]
@@ -94,6 +97,15 @@ pub enum SessionEvent {
     },
     AgentStart {
         iter: u32,
+    },
+    /// A logical agent session is about to start or resume. The provider cursor and private
+    /// reasoning are intentionally absent from the public event stream.
+    AgentSession {
+        session: String,
+        /// `started` or `resumed`.
+        action: String,
+        /// Number of successfully completed turns before this one.
+        turn: u32,
     },
     /// One agent event, nested so its own `kind` tag doesn't collide with ours.
     Agent {
@@ -291,6 +303,11 @@ mod tests {
                 solved: false,
             },
             SessionEvent::AgentStart { iter: 1 },
+            SessionEvent::AgentSession {
+                session: "solver".into(),
+                action: "resumed".into(),
+                turn: 2,
+            },
             SessionEvent::AgentDone,
             SessionEvent::Budget {
                 spent: 1.23,
@@ -402,6 +419,7 @@ mod tests {
                 name: "propose-a".into(),
                 kind: "agent".into(),
                 depends_on: vec![],
+                session: "solver".into(),
                 needs: "any".into(),
                 required: true,
             }],

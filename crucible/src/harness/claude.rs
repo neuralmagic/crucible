@@ -72,6 +72,26 @@ pub(crate) fn local_argv(args: &Args, prompt: &str) -> Vec<String> {
     a
 }
 
+/// Start or resume one Crucible-owned logical session. The provider cursor stays in Claude's
+/// private config store; Crucible persists only this opaque UUID and never copies the transcript.
+pub(crate) fn local_session_argv(
+    args: &Args,
+    prompt: &str,
+    session: &crate::agent_session::SessionTurn,
+) -> Vec<String> {
+    let mut a = claude_base_args(args);
+    let at = a.len().saturating_sub(1); // before `-p`
+    if session.is_resume() {
+        a.insert(at, session.provider_id.clone());
+        a.insert(at, "--resume".to_string());
+    } else {
+        a.insert(at, session.provider_id.clone());
+        a.insert(at, "--session-id".to_string());
+    }
+    a.push(prompt.to_string());
+    a
+}
+
 /// The claude argv (program name first) for a sandbox turn: the shared base args, plus
 /// `--mcp-config <path>` when an MCP config was seeded, so the agent sees the broker's
 /// `request_trace` / `check_capture` tools. The flag goes just before the trailing `-p`, the
@@ -82,6 +102,25 @@ pub(crate) fn sandbox_argv(args: &Args, mcp_seeded: bool) -> Vec<String> {
         let at = a.len().saturating_sub(1); // before the trailing `-p`
         a.insert(at, MCP_CONFIG.to_string());
         a.insert(at, "--mcp-config".to_string());
+    }
+    a
+}
+
+/// Start or resume a Claude session inside an OpenShell sandbox. The prompt still arrives over
+/// stdin; session flags stay before the trailing `-p` for the same reason as MCP config.
+pub(crate) fn sandbox_session_argv(
+    args: &Args,
+    mcp_seeded: bool,
+    session: &crate::agent_session::SessionTurn,
+) -> Vec<String> {
+    let mut a = sandbox_argv(args, mcp_seeded);
+    let at = a.len().saturating_sub(1);
+    if session.is_resume() {
+        a.insert(at, session.provider_id.clone());
+        a.insert(at, "--resume".to_string());
+    } else {
+        a.insert(at, session.provider_id.clone());
+        a.insert(at, "--session-id".to_string());
     }
     a
 }
@@ -194,6 +233,43 @@ mod tests {
         // sandbox path can still insert `--mcp-config` before it).
         let v = claude_base_args(&args(&["--effort", "xhigh"]));
         assert_eq!(&v[v.len() - 3..], &["--effort", "xhigh", "-p"]);
+    }
+
+    #[test]
+    fn logical_sessions_start_then_resume_by_opaque_id() {
+        let first = crate::agent_session::SessionTurn {
+            logical_name: "solver".into(),
+            provider_id: "018f47a0-0000-7000-8000-000000000000".into(),
+            completed_turns: 0,
+        };
+        let started = local_session_argv(&args(&[]), "try one", &first);
+        assert!(
+            started
+                .windows(2)
+                .any(|w| w == ["--session-id", first.provider_id.as_str()])
+        );
+        assert!(!started.iter().any(|arg| arg == "--resume"));
+
+        let resumed = crate::agent_session::SessionTurn {
+            completed_turns: 1,
+            ..first
+        };
+        let continued = local_session_argv(&args(&[]), "try two", &resumed);
+        assert!(
+            continued
+                .windows(2)
+                .any(|w| w == ["--resume", resumed.provider_id.as_str()])
+        );
+        assert!(!continued.iter().any(|arg| arg == "--session-id"));
+
+        let sandbox = sandbox_session_argv(&args(&[]), true, &resumed);
+        assert!(
+            sandbox
+                .windows(2)
+                .any(|w| w == ["--resume", resumed.provider_id.as_str()])
+        );
+        assert!(sandbox.iter().any(|arg| arg == "--mcp-config"));
+        assert_eq!(sandbox.last().map(String::as_str), Some("-p"));
     }
 
     #[test]

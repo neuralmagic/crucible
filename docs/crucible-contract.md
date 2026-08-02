@@ -129,7 +129,9 @@ Topology is authorable; authority is not. A workflow declares `type = "autoresea
 `type = "custom"`, and an engine or outer orchestrator admits it only when it advertises the
 matching workflow capability. Each `engine` task also requires its own capability. Crucible's loop
 advertises `workflow.autoresearch` plus propose/apply/measure/decide, while its generic plan runner
-does not. Serializing an engine task never grants access to the `World` or frozen `Judge`.
+does not. It adds `agent.session.persist` only when the selected backend and harness can honor an
+opaque continuation. Serializing an engine task never grants access to the `World` or frozen
+`Judge`.
 
 An autoresearch workflow is checked by semantics rather than reserved task names. Its selected
 result must be a `decide` task sourced from a frozen `measure`, with `apply` and `propose` ancestors.
@@ -140,7 +142,7 @@ source-typing, and operation-capability rules still apply.
 The basic autoresearch flow is explicit and editable:
 
 ```python
-candidate = propose(name = "invent")
+candidate = propose(name = "invent", session = "solver")
 
 critics = [
     agent(
@@ -163,6 +165,7 @@ critics = [
 synthesize = agent(
     name = "synthesize",
     prompt = prompt_file("prompts/synthesize.md"),
+    session = "solver",
     depends_on = deps(critics),
     join = "passed",
 )
@@ -182,6 +185,25 @@ workflow(
 ordinary propose/apply/measure/decide tasks, attaching unconnected extras after proposal and before
 apply. A missing `workflow.star` retains the historical default loop behavior. The old positional
 `workflow(tasks)` form remains accepted as a splice adapter while packs migrate.
+
+`session = "solver"` binds agent-producing tasks to a durable logical conversation. The checkout
+may roll back after a discarded candidate while the solver session continues forward and retains
+what it learned. Tasks sharing a session must be dependency-ordered and cannot be isolated;
+parallel critics should stay fresh or use distinct sessions. Admission requires
+`agent.session.persist`. A missing `session` preserves the historical fresh-turn behavior.
+
+Crucible's public ledger contains only the logical name, an opaque harness cursor, and a
+completed-turn count. It never copies private reasoning into `session.jsonl`. Claude Code implements
+native start/resume for both the local and Vertex/OpenShell paths. Because OpenShell sandboxes are
+per-turn-fresh, Crucible saves Claude's native transcript as mode-0600 private engine state and
+restores it at the exact pinned config path in the next sandbox; that file is never included in the
+published run record. Hermes fails closed for a persistent binding until it has an equivalent
+continuation store; it never silently degrades the binding to a fresh prompt.
+
+The first turn receives the complete method and goal prompt. A resumed proposer receives only the
+new authoritative delta: current regime, current-best status, and new steering. Its retained
+session already holds the stable instructions and hypotheses, while the current checkout and
+`RESULTS.md` remain authoritative after any world rollback.
 
 A custom orchestrator can admit a graph with no research lifecycle at all—for example, a creative
 studio that fans out three treatments, curates them, and publishes a contact sheet:
@@ -215,6 +237,7 @@ names.
   tasks. `decide(measurement = score)` explicitly selects the frozen measurement it consumes.
 - `agent(...)` creates an agent task. `isolated = True` gives it a disposable worktree, ideal for
   concurrent read-only critics; leave it false for a synthesizer whose edits must survive.
+  `session = "name"` opts into an engine-managed durable conversation.
 - `command(...)` creates a deterministic shell task in the candidate workspace.
 - `top_k(...)` creates a reducer for wider authored graphs.
 - `deps(tasks)` returns constructor task names, avoiding repeated string wiring.
@@ -470,7 +493,7 @@ A `row` event's wire record (`RowWire`) carries an additive, optional `phase` fi
 = "Option::is_none"`, so a deep-only run's wire bytes are unchanged from before wide rounds
 existed.
 
-Two event kinds beyond the compat set:
+Additive event kinds beyond the compat set include:
 
 - **`identity`**: the run's `RunIdentity` (below), emitted once at setup and again on
   `--resume` (the freshly recomputed identity). A mismatch against the original run's identity is
@@ -479,6 +502,9 @@ Two event kinds beyond the compat set:
   run (after `finished`/`summary`). `outcome` is one of `finished`/`solved`/`budget`/`stopped`/
   `escalated`/`error`. Session-log consumers key a run's terminal state off this line; a dead
   stream with **no** `shutdown` line means the pod likely died mid-run, not a clean exit.
+- **`agent_session`**: `{ session, action, turn }`, emitted before a persistent agent turn so a
+  viewer can draw continuation lanes and distinguish `started` from `resumed`. It deliberately
+  contains neither the provider cursor nor private reasoning.
 
 **`RunIdentity`** (`crucible/src/identity.rs`) is the comparability key: two runs' scores are
 comparable only if it matches. It's a hash-of-hashes (`v1:<hex>`) over, per component (one

@@ -4,9 +4,9 @@
 //! Per turn: ensure the gateway is up → mint a Vertex token and create/update the provider →
 //! create the sandbox (attaching that provider) → apply the egress policy → upload the
 //! workspace → targeted-upload each relayed cred to its sandbox path → upload the env script
-//! and the prompt → exec claude (prompt over stdin), streaming its `stream-json` into the shared
+//! and the prompt → optionally restore a private Claude session → exec claude (prompt over stdin), streaming its `stream-json` into the shared
 //! [`crate::agent::StreamPump`] → sweep the sandbox log for egress denials
-//! (blocked-connection attempts are turn telemetry) → download the workspace back → delete
+//! (blocked-connection attempts are turn telemetry) → download the workspace and private session back → delete
 //! the sandbox (per-turn-fresh, so a discarded iteration leaves no residue).
 //!
 //! The sandbox name is derived per (process, workspace), so parallel wide-round candidates and parallel
@@ -34,6 +34,7 @@ pub fn turn(
     p: &Paths,
     prompt: &str,
     json: bool,
+    session: Option<&crate::agent_session::SessionTurn>,
     mut sink: impl FnMut(&str, RawStream, Option<&AgentEvent>),
 ) -> f64 {
     // The whole turn is async; the engine runtime drives it. The one `block_on` in the openshell
@@ -51,7 +52,7 @@ pub fn turn(
             return 0.0;
         }
     };
-    match handle.block_on(try_turn(args, p, prompt, json, &mut sink)) {
+    match handle.block_on(try_turn(args, p, prompt, json, session, &mut sink)) {
         Ok(cost) => cost,
         Err(e) => {
             let ev = AgentEvent::Error {
@@ -116,6 +117,7 @@ async fn try_turn(
     p: &Paths,
     prompt: &str,
     json: bool,
+    session: Option<&crate::agent_session::SessionTurn>,
     sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
 ) -> Result<f64> {
     // Ctrl-C plumbing for the whole turn: STOP → this token, tripped by a bridge task; the exec
@@ -349,10 +351,24 @@ async fn try_turn(
             .await?;
         }
 
+        // The sandbox itself is intentionally per-turn-fresh. A continuing Claude solver gets
+        // only its private native transcript restored outside the uploaded workspace; world state
+        // still comes exclusively from Crucible's retain/restore decision.
+        if let Some(session) = session
+            && session.is_resume()
+        {
+            restore_private_session(p, session, &gw, &name, &cancel).await?;
+        }
+
         // 8. Exec the agent (prompt over stdin), streaming its stdout through the harness decoder.
         stage(sink, "sandbox ready — starting the agent");
-        let wrapper =
-            crate::harness::exec_wrapper(&basename, &harness.sandbox_argv(args, !seeds.is_empty()));
+        let argv = match session {
+            Some(session) => harness
+                .sandbox_session_argv(args, !seeds.is_empty(), session)
+                .context("building continuing sandbox harness argv")?,
+            None => harness.sandbox_argv(args, !seeds.is_empty()),
+        };
+        let wrapper = crate::harness::exec_wrapper(&basename, &argv);
         let exec_opts = ExecOpts {
             model: &args.model,
             json,
@@ -410,6 +426,12 @@ async fn try_turn(
             &cancel,
         )
         .await?;
+
+        // Save the updated native transcript before telemetry parsing and teardown. It is private
+        // 0600 runtime state, never appended to session.jsonl or published with the run record.
+        if let Some(session) = session {
+            persist_private_session(p, session, &gw, &name, &cancel).await?;
+        }
 
         // The post-turn transcript fetch: pure telemetry garnish for claude (export-gated), but
         // a backfill harness's ONLY source of result events + cost, so for those it runs
@@ -710,6 +732,119 @@ async fn graft_turn_telemetry(
     cost
 }
 
+const PRIVATE_SESSION_DIR: &str = "agent-session-private";
+
+fn private_session_paths(
+    p: &Paths,
+    session: &crate::agent_session::SessionTurn,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let root = p.state.join(PRIVATE_SESSION_DIR).join(&session.provider_id);
+    (root.join("locator"), root.join("transcript.jsonl"))
+}
+
+fn valid_private_remote(remote: &str, session: &crate::agent_session::SessionTurn) -> bool {
+    remote.starts_with(&format!("{}/", crate::harness::claude::CLAUDE_PROJECTS))
+        && remote.ends_with(&format!("/{}.jsonl", session.provider_id))
+        && !remote.contains("..")
+        && std::path::Path::new(remote).is_absolute()
+}
+
+/// Restore one Claude Code transcript into a new sandbox at the exact private path where the
+/// previous sandbox wrote it. The locator is validated against the pinned config root and opaque
+/// session UUID before it is used as an upload target.
+async fn restore_private_session(
+    p: &Paths,
+    session: &crate::agent_session::SessionTurn,
+    gw: &Gateway,
+    name: &str,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    let (locator_path, transcript_path) = private_session_paths(p, session);
+    let remote = fs::read_to_string(&locator_path)
+        .await
+        .with_context(|| format!("reading private session locator {}", locator_path.display()))?;
+    let remote = remote.trim();
+    if !valid_private_remote(remote, session) {
+        bail!("private session locator is outside Claude's pinned config directory");
+    }
+    let parent = std::path::Path::new(remote)
+        .parent()
+        .context("private session locator has no parent")?
+        .to_string_lossy()
+        .to_string();
+    gw.exec(
+        name,
+        &["mkdir".to_string(), "-p".to_string(), parent],
+        cancel,
+        |_| {},
+    )
+    .await
+    .context("creating Claude's private session directory")?;
+    run_os(
+        &sandbox::file_upload_args(name, &transcript_path.to_string_lossy(), remote),
+        "private session restore",
+        cancel,
+    )
+    .await
+}
+
+/// Persist the updated Claude transcript outside the disposable sandbox. This is deliberately a
+/// private engine file, mode 0600, and is never part of the public session-event/publish contract.
+async fn persist_private_session(
+    p: &Paths,
+    session: &crate::agent_session::SessionTurn,
+    gw: &Gateway,
+    name: &str,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    let remote = newest_transcript_path(gw, name, crate::harness::claude::CLAUDE_PROJECTS, cancel)
+        .await
+        .context("Claude turn produced no resumable private transcript")?;
+    if !valid_private_remote(&remote, session) {
+        bail!("Claude transcript path does not match the admitted session id");
+    }
+
+    let scratch = tempfile::tempdir().context("creating private session download scratch")?;
+    run_os(
+        &sandbox::download_args(name, &remote, &scratch.path().to_string_lossy()),
+        "private session save",
+        cancel,
+    )
+    .await?;
+    let downloaded = newest_jsonl(scratch.path())
+        .await
+        .context("private session download contained no transcript")?;
+    let bytes = fs::read(&downloaded)
+        .await
+        .context("reading downloaded private session transcript")?;
+
+    let (locator_path, transcript_path) = private_session_paths(p, session);
+    let root = locator_path
+        .parent()
+        .context("private session destination has no parent")?;
+    fs::create_dir_all(root)
+        .await
+        .with_context(|| format!("creating private session directory {}", root.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).await?;
+    }
+    let locator_tmp = root.join(".locator.tmp");
+    let transcript_tmp = root.join(".transcript.tmp");
+    fs::write(&locator_tmp, remote.as_bytes()).await?;
+    fs::write(&transcript_tmp, bytes).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&locator_tmp, std::fs::Permissions::from_mode(0o600)).await?;
+        fs::set_permissions(&transcript_tmp, std::fs::Permissions::from_mode(0o600)).await?;
+    }
+    fs::rename(&locator_tmp, &locator_path).await?;
+    fs::rename(&transcript_tmp, &transcript_path).await?;
+    Ok(())
+}
+
 /// Locate the harness's transcript IN the sandbox, download just that one file (not a whole
 /// directory, whose size is unbounded), and read it into memory ONCE (async, a long session's
 /// jsonl runs to a few MB, a backfill db likewise). Returns the raw bytes; `None` on any failure.
@@ -856,6 +991,35 @@ mod tests {
         // Region falls back to "global" when unset.
         let (_, region2) = vertex_config(&[]);
         assert_eq!(region2, "global");
+    }
+
+    #[test]
+    fn private_session_locator_is_pinned_to_claude_and_the_opaque_id() {
+        let session = crate::agent_session::SessionTurn {
+            logical_name: "solver".into(),
+            provider_id: "018f47a0-0000-7000-8000-000000000000".into(),
+            completed_turns: 1,
+        };
+        assert!(valid_private_remote(
+            "/sandbox/.claude/projects/-sandbox-work/018f47a0-0000-7000-8000-000000000000.jsonl",
+            &session
+        ));
+        assert!(!valid_private_remote(
+            "/sandbox/.claude/projects/-sandbox-work/other.jsonl",
+            &session
+        ));
+        assert!(!valid_private_remote(
+            "/sandbox/.claude/projects/../../etc/018f47a0-0000-7000-8000-000000000000.jsonl",
+            &session
+        ));
+        assert!(!valid_private_remote(
+            "/tmp/018f47a0-0000-7000-8000-000000000000.jsonl",
+            &session
+        ));
+        assert!(!valid_private_remote(
+            "/sandbox/.claude/projects-evil/018f47a0-0000-7000-8000-000000000000.jsonl",
+            &session
+        ));
     }
 
     /// A non-recording turn CLEARS the per-turn traceparent channel, a stale file would parent

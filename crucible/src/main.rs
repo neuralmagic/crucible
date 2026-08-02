@@ -23,6 +23,7 @@
 //! - Steering: drop guidance in STEER.md (or via the prompt) and it is injected into the next iteration's prompt, the lever for when the agent goes off the rails.
 
 mod agent;
+mod agent_session;
 mod broker;
 mod build;
 mod check;

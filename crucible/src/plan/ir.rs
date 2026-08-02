@@ -136,6 +136,10 @@ pub struct Task {
     pub task: TaskKind,
     #[serde(default)]
     pub depends_on: Vec<TaskName>,
+    /// Logical durable agent session. Tasks that share a name resume the same opaque harness
+    /// continuation and therefore must be dependency-ordered. Absent means a fresh turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
     /// Substrate capability this task needs; `"any"` runs everywhere.
     #[serde(default = "default_needs")]
     pub needs: String,
@@ -252,6 +256,40 @@ impl Plan {
                     );
                 }
             }
+            if let Some(session) = &t.session {
+                if session.is_empty()
+                    || session.len() > 64
+                    || !session
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+                {
+                    bail!(
+                        "task {:?} has invalid session {:?}; use 1-64 ASCII letters, digits, `.`, `_`, or `-`",
+                        t.name.0,
+                        session
+                    );
+                }
+                if !matches!(
+                    t.task,
+                    TaskKind::Agent { .. }
+                        | TaskKind::Engine {
+                            op: EngineOp::Propose,
+                            ..
+                        }
+                ) {
+                    bail!(
+                        "task {:?} sets session, but only agent and engine propose tasks can resume an agent",
+                        t.name.0
+                    );
+                }
+                if t.isolation.is_some() {
+                    bail!(
+                        "task {:?} sets session {:?}, but durable sessions cannot use disposable isolation",
+                        t.name.0,
+                        session
+                    );
+                }
+            }
         }
         // Kahn's algorithm; leftovers mean a cycle. The ready set is a min-heap on the
         // declaration index so the order is deterministic and declaration-stable: ties
@@ -290,6 +328,45 @@ impl Plan {
                 stuck.join(", ")
             );
         }
+        // A native conversation is serial. Two concurrently-ready tasks must never race the same
+        // provider cursor, so every pair sharing a logical session needs a dependency path in one
+        // direction. Different sessions remain freely parallelizable.
+        let reaches = |from: usize, to: usize| {
+            let mut stack = vec![from];
+            let mut seen = BTreeSet::new();
+            while let Some(i) = stack.pop() {
+                if !seen.insert(i) {
+                    continue;
+                }
+                for dependent in &dependents[i] {
+                    if *dependent == to {
+                        return true;
+                    }
+                    stack.push(*dependent);
+                }
+            }
+            false
+        };
+        let mut sessions: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+        for (i, task) in self.tasks.iter().enumerate() {
+            if let Some(session) = task.session.as_deref() {
+                sessions.entry(session).or_default().push(i);
+            }
+        }
+        for (session, tasks) in sessions {
+            for (offset, left) in tasks.iter().enumerate() {
+                for right in &tasks[offset + 1..] {
+                    if !reaches(*left, *right) && !reaches(*right, *left) {
+                        bail!(
+                            "tasks {:?} and {:?} share session {:?} but are not dependency-ordered",
+                            self.tasks[*left].name.0,
+                            self.tasks[*right].name.0,
+                            session
+                        );
+                    }
+                }
+            }
+        }
         Ok(ValidPlan { plan: self, topo })
     }
 }
@@ -308,6 +385,7 @@ mod tests {
                 effort: None,
             },
             depends_on: deps.iter().map(|d| (*d).into()).collect(),
+            session: None,
             needs: "any".into(),
             required: true,
             isolation: None,
@@ -391,6 +469,24 @@ mod tests {
     }
 
     #[test]
+    fn shared_sessions_must_be_serial_and_nonisolated() {
+        let mut first = agent("first", &[]);
+        first.session = Some("solver".into());
+        let mut next = agent("next", &["first"]);
+        next.session = Some("solver".into());
+        assert!(plan(vec![first.clone(), next]).validate().is_ok());
+
+        let mut racing = agent("racing", &[]);
+        racing.session = Some("solver".into());
+        let err = plan(vec![first.clone(), racing]).validate().unwrap_err();
+        assert!(err.to_string().contains("not dependency-ordered"));
+
+        first.isolation = Some(Isolation::Worktree);
+        let err = plan(vec![first]).validate().unwrap_err();
+        assert!(err.to_string().contains("cannot use disposable isolation"));
+    }
+
+    #[test]
     fn zero_or_negative_budget_rejected() {
         for usd in [0.0, -1.0, f64::NAN] {
             let mut p = plan(vec![agent("a", &[])]);
@@ -408,6 +504,7 @@ mod tests {
                 direction: Direction::Lower,
             },
             depends_on: vec![],
+            session: None,
             needs: "any".into(),
             required: true,
             isolation: None,

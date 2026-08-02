@@ -1,6 +1,6 @@
 # The complete autoresearch iteration; its type enforces the engine lifecycle.
 
-candidate = propose(name = "propose")
+candidate = propose(name = "propose", session = "solver")
 
 reviewers = [
     agent(

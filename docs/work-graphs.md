@@ -44,6 +44,7 @@ prompt = "..."
 model = "claude-opus-4-6"   # optional per-task overrides of the manifest's [agent]
 harness = "claude"
 effort = "high"
+session = "solver"         # optional durable logical conversation
 
 [[task]]
 name = "measure"
@@ -67,7 +68,7 @@ depends_on = ["measure"]
 
 | Kind | What it runs |
 | --- | --- |
-| `agent` | One agent turn. `harness` / `model` / `effort` override the manifest's `[agent]` defaults per task. |
+| `agent` | One agent turn. `harness` / `model` / `effort` override the manifest's `[agent]` defaults per task; `session` opts into durable continuation. |
 | `command` | A plan-authored command, with the same output contract as `measure_cmd`. |
 | `top_k` | Engine-owned reducer: keep the `k` best inputs by their `score` field. Needs at least one dependency. |
 | `engine` | Capability-owned operation (`propose`, `apply`, `measure`, `decide`, or `measure_diff`). Only an admitting orchestrator can execute it. |
@@ -81,6 +82,13 @@ A command string is not a trust boundary by itself. If it invokes a script that 
 trusted after an agent task edits the workspace, declare that script as a frozen
 `[[workspace.inject]]` in the manifest. The plan runner restores frozen injects in the task's
 actual workspace before every task, including isolated worktrees.
+
+A logical `session` is serial state, so every pair of tasks sharing one must have a dependency
+path between them. A session task cannot use disposable worktree isolation. The public ledger keeps
+only an opaque harness cursor and completed-turn count; private reasoning is never copied into the
+plan or public session log. Claude Code's native transcript remains in its private local store or a
+mode-0600 engine store restored into each fresh OpenShell sandbox. Omit the field for the historical
+fresh-turn behavior.
 
 ### Task output
 
@@ -165,6 +173,7 @@ result = "keep-if-better"
 name = "invent"
 kind = "engine"
 op = "propose"
+session = "solver"
 
 [[workflow.task]]
 name = "review"
@@ -193,7 +202,7 @@ depends_on = ["benchmark"]
 ```
 
 The corresponding admission needs `workflow.autoresearch`, `engine.propose`, `engine.apply`,
-`engine.measure`, and `engine.decide`. A custom orchestrator can instead admit `type = "custom"`
+`engine.measure`, `engine.decide`, and—because it binds `solver`—`agent.session.persist`. A custom orchestrator can instead admit `type = "custom"`
 and any subset of operations it implements. Task-level `needs` still controls where an admitted
 task can run; workflow capabilities control what the orchestrator is authorized to mean.
 

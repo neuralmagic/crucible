@@ -219,14 +219,36 @@ fn run_in(
 
     let name = task.name.0.clone();
     let mut transport_error: Option<String> = None;
-    let cost = crate::agent::run_turn(&args, paths, &full_prompt, false, |line, stream, ev| {
-        if !line.trim().is_empty() && stream == RawStream::Stderr {
-            eprintln!("[{name}] {line}");
-        }
-        if let Some(note) = ev.and_then(agent_transport_error) {
-            transport_error = Some(note);
-        }
-    });
+    let prepared = match task
+        .session
+        .as_deref()
+        .map(|name| crate::agent_session::prepare(&paths.state, name))
+    {
+        Some(Ok(turn)) => Some(turn),
+        Some(Err(e)) => return transport(format!("preparing agent session failed: {e:#}")),
+        None => None,
+    };
+    let cost = crate::agent::run_turn_with_session(
+        &args,
+        paths,
+        &full_prompt,
+        false,
+        prepared.as_ref(),
+        |line, stream, ev| {
+            if !line.trim().is_empty() && stream == RawStream::Stderr {
+                eprintln!("[{name}] {line}");
+            }
+            if let Some(note) = ev.and_then(agent_transport_error) {
+                transport_error = Some(note);
+            }
+        },
+    );
+    if transport_error.is_none()
+        && let Some(turn) = &prepared
+        && let Err(e) = crate::agent_session::commit(&paths.state, turn)
+    {
+        transport_error = Some(format!("committing agent session failed: {e:#}"));
+    }
 
     match std::fs::read_to_string(&result_path) {
         Ok(body) => {
@@ -644,6 +666,7 @@ mod tests {
                 effort: None,
             },
             depends_on: vec![],
+            session: None,
             needs: "any".into(),
             required: true,
             isolation: None,
