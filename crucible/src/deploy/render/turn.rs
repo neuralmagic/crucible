@@ -56,6 +56,9 @@ pub struct TurnOpts {
     pub goal_text: Option<String>,
     /// The clone URL of the repo under test (the wrapper clones it fresh into the pod).
     pub repo_url: String,
+    /// Branch or tag to check out, rendered as the clone's `--branch`. `None` clones the remote's
+    /// default branch. A bare commit SHA is not supported: `git clone --branch` only takes a ref.
+    pub repo_ref: Option<String>,
     /// The agent sandbox image carrying the claude CLI the loop/crucible image does not (the
     /// `openshell` backend pulls it via `REGISTRY_AUTH_FILE` pointing at the mounted authfile).
     pub sandbox_image: String,
@@ -78,6 +81,32 @@ pub struct TurnOpts {
     /// The goal is an authoritative brief, rendered into the scope wrapper as
     /// `crucible scope --propose --authoritative`. Ignored by a rank turn.
     pub authoritative: bool,
+}
+
+/// Validate a [`TurnOpts::repo_ref`] before it is interpolated, unquoted, into the wrapper shell
+/// script. Whitelist only: ASCII alphanumerics plus `.`, `_`, `-`, `/`, which rules out shell
+/// metacharacters and whitespace. A leading `-` would be read by `git clone` as an option
+/// (`-oProxyCommand=…` is remote code execution), and `..` is rejected because git refuses it
+/// anyway (`git check-ref-format`).
+fn validate_repo_ref(repo_ref: &str) -> Result<()> {
+    if repo_ref.is_empty() {
+        anyhow::bail!("--repo-ref must not be empty");
+    }
+    if repo_ref.starts_with('-') {
+        anyhow::bail!("--repo-ref `{repo_ref}` must not start with `-`");
+    }
+    if repo_ref.contains("..") {
+        anyhow::bail!("--repo-ref `{repo_ref}` must not contain `..`");
+    }
+    if let Some(bad) = repo_ref
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/')))
+    {
+        anyhow::bail!(
+            "--repo-ref `{repo_ref}` contains `{bad}`; only ASCII alphanumerics and `. _ - /` are allowed"
+        );
+    }
+    Ok(())
 }
 
 /// The `crucible.io/work-kind` label value a grounded-rank turn pod carries, the selector a
@@ -173,6 +202,7 @@ pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
         issue,
         goal_text,
         repo_url,
+        repo_ref,
         max_cost,
         tier,
         gaming_refine_rounds,
@@ -184,6 +214,13 @@ pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
     // subcommand synthesizes a fresh `Args` (`Cli::parse_from(["crucible"])`) that always defaults
     // to the podman compute driver, so the gateway resolves `sandbox_image` through the nested
     // podman/authfile path instead of the kubelet's `imagePullSecrets` and never creates a Sandbox.
+    let branch_flag = match repo_ref {
+        Some(r) => {
+            validate_repo_ref(r)?;
+            format!(" --branch {r}")
+        }
+        None => String::new(),
+    };
     let compute_driver_flag = match profile.cluster.sandbox_driver {
         ComputeDriver::Kubernetes => " --compute-driver=kubernetes",
         ComputeDriver::Podman => "",
@@ -193,7 +230,7 @@ pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
             r#"set -e
 CHECKOUT=/tmp/crucible-turn-checkout
 rm -rf "$CHECKOUT"
-git clone --depth 50 {repo_url} "$CHECKOUT"
+git clone --depth 50{branch_flag} {repo_url} "$CHECKOUT"
 crucible rank-grounded --issue {issue} --workspace "$CHECKOUT" --max-cost {max_cost} \
   --json --marker --agent-backend openshell --sandbox-image {sandbox_image}{compute_driver_flag}
 "#
@@ -242,7 +279,7 @@ crucible rank-grounded --issue {issue} --workspace "$CHECKOUT" --max-cost {max_c
                 r#"set -e
 CHECKOUT=/tmp/crucible-turn-checkout
 rm -rf "$CHECKOUT"
-git clone --depth 50 {repo_url} "$CHECKOUT"
+git clone --depth 50{branch_flag} {repo_url} "$CHECKOUT"
 SCOPE_OUT=/tmp/crucible-scope-out
 rm -rf "$SCOPE_OUT"
 {goal_source}crucible scope --propose --json --force --marker {goal_flag}{goal_arg} \
@@ -409,6 +446,7 @@ mod tests {
                 issue: "owner/repo#42".to_string(),
                 goal_text: None,
                 repo_url: "https://github.com/owner/repo.git".to_string(),
+                repo_ref: None,
                 sandbox_image: "registry.example.com/epp-sandbox:latest".to_string(),
                 max_cost: 5.0,
                 pin_digests: false,
@@ -503,6 +541,7 @@ mod tests {
                 issue: "owner/repo#42".to_string(),
                 goal_text: None,
                 repo_url: "https://github.com/owner/repo.git".to_string(),
+                repo_ref: None,
                 sandbox_image: "registry.example.com/epp-sandbox:latest".to_string(),
                 max_cost: 5.0,
                 pin_digests: false,
@@ -580,6 +619,7 @@ mod tests {
                 issue: "owner/repo#42".to_string(),
                 goal_text: None,
                 repo_url: "https://github.com/owner/repo.git".to_string(),
+                repo_ref: None,
                 sandbox_image: "registry.example.com/epp-sandbox:latest".to_string(),
                 max_cost: 5.0,
                 pin_digests: false,
@@ -639,6 +679,7 @@ mod tests {
                 issue: "owner/repo#42".to_string(),
                 goal_text: None,
                 repo_url: "https://github.com/owner/repo.git".to_string(),
+                repo_ref: None,
                 sandbox_image: "registry.example.com/epp-sandbox:latest".to_string(),
                 max_cost: 8.0,
                 pin_digests: false,
@@ -727,6 +768,7 @@ mod tests {
                 issue: "scenario:deadbeef".to_string(),
                 goal_text: Some("fix the reticulator".to_string()),
                 repo_url: "https://github.com/owner/repo.git".to_string(),
+                repo_ref: None,
                 sandbox_image: "registry.example.com/epp-sandbox:latest".to_string(),
                 max_cost: 8.0,
                 pin_digests: false,
@@ -780,6 +822,7 @@ mod tests {
                 issue: "owner/repo#43".to_string(),
                 goal_text: None,
                 repo_url: "https://github.com/owner/repo.git".to_string(),
+                repo_ref: None,
                 sandbox_image: "registry.example.com/epp-sandbox:latest".to_string(),
                 max_cost: 8.0,
                 pin_digests: false,
@@ -823,6 +866,7 @@ mod tests {
                 issue: "owner/repo#44".to_string(),
                 goal_text: None,
                 repo_url: "https://github.com/owner/repo.git".to_string(),
+                repo_ref: None,
                 sandbox_image: "registry.example.com/epp-sandbox:latest".to_string(),
                 max_cost: 8.0,
                 pin_digests: false,
@@ -845,5 +889,89 @@ mod tests {
             yaml.contains("--authoritative"),
             "the authoritative flag is forwarded: {yaml}"
         );
+    }
+
+    /// A minimal profile for the clone-line tests below.
+    fn clone_test_profile() -> DeployProfile {
+        toml::from_str(
+            r#"
+            [cluster]
+            loop_namespace = "autoresearch"
+            rig_namespace = "rig"
+            service_account = "autoresearch-publisher"
+            supervisor_image = "registry.example.com/openshell-supervisor:latest"
+            [image]
+            loop = "ghcr.io/neuralmagic/crucible:latest"
+            pull_secret = "example-pull"
+        "#,
+        )
+        .expect("profile parses")
+    }
+
+    fn render_with_repo_ref(kind: TurnKind, repo_ref: Option<&str>) -> Result<String> {
+        render_turn(
+            &clone_test_profile(),
+            &TurnOpts {
+                kind,
+                name: "crucible-turn-owner-repo-42-abcd".to_string(),
+                issue: "owner/repo#42".to_string(),
+                goal_text: None,
+                repo_url: "https://github.com/owner/repo.git".to_string(),
+                repo_ref: repo_ref.map(str::to_string),
+                sandbox_image: "registry.example.com/epp-sandbox:latest".to_string(),
+                max_cost: 5.0,
+                pin_digests: false,
+                tier: None,
+                gaming_refine_rounds: 1,
+                skip_gaming_review: false,
+                authoritative: false,
+            },
+        )
+    }
+
+    /// `repo_ref` reaches both wrapper flavours' clone as `--branch`, so a turn can run against a
+    /// non-default branch or tag of the repo under test.
+    #[test]
+    fn turn_pod_with_repo_ref_clones_that_branch() {
+        for kind in [TurnKind::Rank, TurnKind::Scope] {
+            let yaml = render_with_repo_ref(kind, Some("nv_dev")).expect("render turn");
+            assert!(
+                yaml.contains(
+                    "git clone --depth 50 --branch nv_dev https://github.com/owner/repo.git"
+                ),
+                "the ref lands on the clone: {yaml}"
+            );
+        }
+    }
+
+    /// No `repo_ref`, no `--branch`: the clone line is byte-for-byte the pre-existing one and the
+    /// remote's default branch wins.
+    #[test]
+    fn turn_pod_without_repo_ref_clones_the_default_branch() {
+        for kind in [TurnKind::Rank, TurnKind::Scope] {
+            let yaml = render_with_repo_ref(kind, None).expect("render turn");
+            assert!(
+                yaml.contains("git clone --depth 50 https://github.com/owner/repo.git"),
+                "the clone line is unchanged: {yaml}"
+            );
+            assert!(!yaml.contains("--branch"), "no ref, no flag: {yaml}");
+        }
+    }
+
+    /// The ref is interpolated unquoted into a shell script, so the render fails closed on anything
+    /// outside the whitelist rather than sanitizing it into something the operator didn't ask for.
+    #[test]
+    fn turn_pod_rejects_a_hostile_repo_ref() {
+        for bad in ["-oProxyCommand=x", "foo bar", "a;b", "..", "a/../b", ""] {
+            let err = render_with_repo_ref(TurnKind::Rank, Some(bad))
+                .expect_err("hostile ref must be rejected");
+            assert!(
+                err.to_string().contains("--repo-ref"),
+                "the error names the flag: {err}"
+            );
+        }
+        for good in ["nv_dev", "release/1.2", "v1.2.3"] {
+            validate_repo_ref(good).expect("a plain branch/tag name is accepted");
+        }
     }
 }
