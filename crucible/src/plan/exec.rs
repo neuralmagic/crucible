@@ -396,7 +396,6 @@ fn run_with_retries(
                 );
             }
             AttemptOutcome::Transport(note) => {
-                last_transport_note = note;
                 if *spent > budget || (*spent >= budget && attempts < max_attempts) {
                     return (
                         TaskResult {
@@ -405,12 +404,13 @@ fn run_with_retries(
                             cost_usd: cost,
                             output: None,
                             note: Some(format!(
-                                "budget ceiling reached after transport attempt: {last_transport_note}"
+                                "budget ceiling reached after transport attempt: {note}"
                             )),
                         },
                         true,
                     );
                 }
+                last_transport_note = note;
             }
         }
     }

@@ -309,16 +309,14 @@ impl WorkflowCfg {
 
     /// Terminal tasks used by the compatibility splice adapter.
     pub fn sinks(&self) -> Vec<TaskName> {
+        let depended: BTreeSet<&TaskName> = self
+            .tasks
+            .iter()
+            .flat_map(|task| &task.depends_on)
+            .collect();
         self.tasks
             .iter()
-            .filter(|task| {
-                !self.tasks.iter().any(|other| {
-                    other
-                        .depends_on
-                        .iter()
-                        .any(|dependency| dependency == &task.name)
-                })
-            })
+            .filter(|task| !depended.contains(&task.name))
             .map(|task| task.name.clone())
             .collect()
     }

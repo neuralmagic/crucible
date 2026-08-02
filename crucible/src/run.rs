@@ -321,19 +321,9 @@ pub(crate) fn prep_plan_runner(
         .run;
     args.manifest = Some(manifest_path.to_path_buf());
     apply_agent_cfg(&mut args, &m.agent, &p.workspace)?;
-    let frozen_injects = m
-        .workspace
-        .inject
-        .iter()
-        .filter(|i| i.frozen)
-        .map(|i| (manifest_dir.join(&i.src), PathBuf::from(&i.dst)))
-        .collect();
-    Ok(crate::plan::harness::HarnessRunner {
-        args,
-        paths: p,
-        frozen_injects,
-        toolbox_exclude: m.agent.toolbox_exclude.clone(),
-    })
+    args.workflow_frozen_injects = m.frozen_inject_pairs(&manifest_dir);
+    args.workflow_toolbox_exclude = m.agent.toolbox_exclude.clone();
+    Ok(crate::plan::harness::HarnessRunner { args, paths: p })
 }
 
 /// Load a `crucible.toml`, build the World + Judge from it, and drive the loop. The one run
@@ -424,13 +414,7 @@ fn run_from_manifest(args: Args) -> Result<()> {
         .collect();
     args.search = m.search.clone();
     args.workflow = m.workflow.clone();
-    args.workflow_frozen_injects = m
-        .workspace
-        .inject
-        .iter()
-        .filter(|inject| inject.frozen)
-        .map(|inject| (manifest_dir.join(&inject.src), PathBuf::from(&inject.dst)))
-        .collect();
+    args.workflow_frozen_injects = m.frozen_inject_pairs(&manifest_dir);
     args.workflow_toolbox_exclude = m.agent.toolbox_exclude.clone();
     let world = m.build_world(workspace.clone());
     let judge = m.build_judge(workspace, frozen_injects)?;

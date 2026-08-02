@@ -110,26 +110,13 @@ impl TaskKind {
             TaskKind::Agent { .. } => "agent",
             TaskKind::Command { .. } => "command",
             TaskKind::TopK { .. } => "top_k",
-            TaskKind::Engine {
-                op: EngineOp::Propose,
-                ..
-            } => "engine_propose",
-            TaskKind::Engine {
-                op: EngineOp::Apply,
-                ..
-            } => "engine_apply",
-            TaskKind::Engine {
-                op: EngineOp::Measure,
-                ..
-            } => "engine_measure",
-            TaskKind::Engine {
-                op: EngineOp::Decide,
-                ..
-            } => "engine_decide",
-            TaskKind::Engine {
-                op: EngineOp::MeasureDiff,
-                ..
-            } => "engine_measure_diff",
+            TaskKind::Engine { op, .. } => match op {
+                EngineOp::Propose => "engine_propose",
+                EngineOp::Apply => "engine_apply",
+                EngineOp::Measure => "engine_measure",
+                EngineOp::Decide => "engine_decide",
+                EngineOp::MeasureDiff => "engine_measure_diff",
+            },
         }
     }
 }
