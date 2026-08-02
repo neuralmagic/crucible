@@ -3,7 +3,9 @@
 //! cluster pod, so this encodes a known-good boot, not a guess.
 //!
 //! The fiddly bits, all confirmed in-pod:
-//!   - `XDG_RUNTIME_DIR` can be empty in a pod → fall back to `/run/user/<uid>`.
+//!   - an externally managed Podman API socket can be supplied through
+//!     `OPENSHELL_PODMAN_SOCKET` (Podman Desktop on macOS exposes one); otherwise
+//!     `XDG_RUNTIME_DIR` can be empty in a pod → fall back to `/run/user/<uid>`.
 //!   - under the **podman** compute driver the gateway must launch with
 //!     `KUBERNETES_SERVICE_HOST`/`PORT` **scrubbed**: it auto-detects the in-cluster
 //!     client-go signal and then demands a kubernetes driver config, conflicting with the
@@ -243,14 +245,52 @@ pub fn register_args(port: u16) -> Vec<String> {
     ]
 }
 
-/// The rootless podman API socket path, honoring `XDG_RUNTIME_DIR` with the `/run/user/<uid>`
-/// fallback (empty/unset in a pod, as seen live).
-fn podman_socket() -> PathBuf {
-    let xdg = std::env::var("XDG_RUNTIME_DIR")
+fn registration_matches(body: &[u8], port: u16) -> bool {
+    let Ok(rows) = serde_json::from_slice::<Vec<serde_json::Value>>(body) else {
+        return false;
+    };
+    let endpoint = format!("https://localhost:{port}");
+    rows.iter().any(|row| {
+        row.get("name").and_then(serde_json::Value::as_str) == Some(GATEWAY_NAME)
+            && row.get("endpoint").and_then(serde_json::Value::as_str) == Some(endpoint.as_str())
+            && row.get("type").and_then(serde_json::Value::as_str) == Some("local")
+            && row.get("auth").and_then(serde_json::Value::as_str) == Some("mtls")
+    })
+}
+
+fn registration_exists(port: u16) -> bool {
+    Command::new("openshell")
+        .args(["gateway", "list", "--output", "json"])
+        .output()
         .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| format!("/run/user/{}", libc_getuid()));
-    PathBuf::from(xdg).join("podman/podman.sock")
+        .filter(|output| output.status.success())
+        .is_some_and(|output| registration_matches(&output.stdout, port))
+}
+
+/// The Podman API socket path. An explicit `OPENSHELL_PODMAN_SOCKET` names a socket managed
+/// outside Crucible (notably Podman Desktop's host-forwarded API socket); otherwise Crucible
+/// owns a rootless service socket beneath `XDG_RUNTIME_DIR`, with the in-pod Linux fallback.
+fn podman_socket_from(override_socket: Option<&str>, xdg: Option<&str>, uid: u32) -> PathBuf {
+    if let Some(socket) = override_socket.filter(|socket| !socket.is_empty()) {
+        return PathBuf::from(socket);
+    }
+    let runtime = xdg
+        .filter(|runtime| !runtime.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("/run/user/{uid}"));
+    PathBuf::from(runtime).join("podman/podman.sock")
+}
+
+fn external_podman_socket() -> Option<String> {
+    std::env::var("OPENSHELL_PODMAN_SOCKET")
+        .ok()
+        .filter(|socket| !socket.is_empty())
+}
+
+fn podman_socket() -> PathBuf {
+    let override_socket = external_podman_socket();
+    let xdg = std::env::var("XDG_RUNTIME_DIR").ok();
+    podman_socket_from(override_socket.as_deref(), xdg.as_deref(), libc_getuid())
 }
 
 /// `getuid()` without pulling a crate: crucible already depends on `nix`, but a tiny extern
@@ -333,22 +373,32 @@ async fn boot(driver: ComputeDriver, supervisor_image: Option<&str>) -> Result<(
     // where the sandbox is a sibling pod and there is no local daemon to boot.
     if needs_podman_socket(driver) {
         let sock = podman_socket();
-        if let Some(parent) = sock.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating podman socket dir {}", parent.display()))?;
-        }
+        if external_podman_socket().is_none() {
+            if let Some(parent) = sock.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating podman socket dir {}", parent.display()))?;
+            }
 
-        // `--time=0` => never self-exits. Spawned detached (not waited): it must outlive this
-        // call and live for the run.
-        Command::new("podman")
-            .args(["system", "service", "--time=0"])
-            .arg(format!("unix://{}", sock.display()))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("spawn `podman system service`")?;
+            // `--time=0` => never self-exits. Spawned detached (not waited): it must outlive this
+            // call and live for the run.
+            Command::new("podman")
+                .args(["system", "service", "--time=0"])
+                .arg(format!("unix://{}", sock.display()))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .context("spawn `podman system service`")?;
+        }
         if !wait_for(Duration::from_secs(15), || sock.exists()) {
-            bail!("podman API socket did not appear at {}", sock.display());
+            bail!(
+                "{} podman API socket did not appear at {}",
+                if external_podman_socket().is_some() {
+                    "configured"
+                } else {
+                    "managed"
+                },
+                sock.display()
+            );
         }
     }
 
@@ -401,22 +451,23 @@ async fn boot(driver: ComputeDriver, supervisor_image: Option<&str>) -> Result<(
 
     // 5. register, retrying until the gateway is listening; 6. wait healthy.
     let mut last = String::new();
-    let registered = wait_for(Duration::from_secs(30), || {
-        match Command::new("openshell")
-            .args(register_args(GATEWAY_PORT))
-            .output()
-        {
-            Ok(o) if o.status.success() => true,
-            Ok(o) => {
-                last = String::from_utf8_lossy(&o.stderr).trim().to_string();
-                false
+    let registered = registration_exists(GATEWAY_PORT)
+        || wait_for(Duration::from_secs(30), || {
+            match Command::new("openshell")
+                .args(register_args(GATEWAY_PORT))
+                .output()
+            {
+                Ok(o) if o.status.success() => true,
+                Ok(o) => {
+                    last = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                    false
+                }
+                Err(e) => {
+                    last = e.to_string();
+                    false
+                }
             }
-            Err(e) => {
-                last = e.to_string();
-                false
-            }
-        }
-    });
+        });
     if !registered {
         bail!(
             "gateway register failed within 30s: {last}\n{}",
@@ -769,6 +820,26 @@ mod tests {
     }
 
     #[test]
+    fn explicit_podman_socket_wins_over_linux_runtime_defaults() {
+        assert_eq!(
+            podman_socket_from(
+                Some("/tmp/podman-desktop-api.sock"),
+                Some("/run/user/501"),
+                501
+            ),
+            PathBuf::from("/tmp/podman-desktop-api.sock")
+        );
+        assert_eq!(
+            podman_socket_from(None, Some("/runtime"), 501),
+            PathBuf::from("/runtime/podman/podman.sock")
+        );
+        assert_eq!(
+            podman_socket_from(None, None, 501),
+            PathBuf::from("/run/user/501/podman/podman.sock")
+        );
+    }
+
+    #[test]
     fn register_targets_local_named_gateway() {
         assert_eq!(
             register_args(17670),
@@ -781,6 +852,16 @@ mod tests {
                 "ci"
             ]
         );
+    }
+
+    #[test]
+    fn exact_existing_registration_is_idempotent_but_wrong_endpoint_is_not() {
+        let exact =
+            br#"[{"name":"ci","endpoint":"https://localhost:17670","type":"local","auth":"mtls"}]"#;
+        assert!(registration_matches(exact, 17670));
+        let wrong = br#"[{"name":"ci","endpoint":"https://remote.example:17670","type":"local","auth":"mtls"}]"#;
+        assert!(!registration_matches(wrong, 17670));
+        assert!(!registration_matches(b"not json", 17670));
     }
 
     #[test]
