@@ -1,5 +1,7 @@
-# Scope-time authoring source for the tasks inserted after the engine's proposer and
-# before its frozen apply/measure/decide stages.
+# Scope-time authoring source for the complete autoresearch iteration. Engine operations
+# are ordinary task values; the autoresearch workflow type enforces their safe lifecycle.
+
+candidate = propose(name = "propose")
 
 reviewers = [
     agent(
@@ -8,6 +10,7 @@ reviewers = [
         model = "claude-opus-4-6",
         effort = "high",
         isolated = True,
+        depends_on = [candidate],
     ),
     agent(
         name = "review-copy",
@@ -15,14 +18,23 @@ reviewers = [
         model = "claude-sonnet-5",
         required = False,
         isolated = True,
+        depends_on = [candidate],
     ),
 ]
 
-workflow(reviewers + [
-    command(
-        name = "gate",
-        run = "./join_gate.sh",
-        depends_on = deps(reviewers),
-        join = "passed",
-    ),
-])
+gate = command(
+    name = "gate",
+    run = "./join_gate.sh",
+    depends_on = deps(reviewers),
+    join = "passed",
+)
+
+deployed = apply(name = "apply", depends_on = [gate])
+score = measure(name = "measure", depends_on = [deployed])
+decision = decide(name = "decide", measurement = score)
+
+workflow(
+    type = "autoresearch",
+    tasks = [candidate] + reviewers + [gate, deployed, score, decision],
+    result = decision,
+)

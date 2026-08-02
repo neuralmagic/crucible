@@ -192,11 +192,14 @@ turn ends. What goes in:
    shaped stdout, and every file it touches frozen-injected (see above).
 3. **`goal.md`** (or inline `goal` in `[agent]`) — the goal for the solver, written to the
    **`goal.md` contract above**.
-4. **Optional `workflow.star` and prompt files** — use this only when the domain benefits from
-   extra agent or command work between proposal and measurement (parallel critics, synthesis,
-   lint, or an early rejection gate). The engine still owns `propose → apply → measure → decide`.
-   Available constructors are `agent`, `command`, `top_k`, `deps`, `prompt_file`, and the final
-   `workflow([...])`. `prompt_file("prompts/x.md")` embeds a regular UTF-8 pack-relative file;
+4. **Optional `workflow.star` and prompt files** — use this when the domain benefits from an
+   authored task graph (parallel critics, synthesis, lint, early rejection, or a custom flow).
+   Topology is explicit: `propose`, `apply`, `measure`, and `decide` are task constructors, while
+   the engine retains the capabilities behind them. Finish with
+   `workflow(type = "autoresearch", tasks = [...], result = decision)`; use `type = "custom"`
+   only for an outer orchestrator that advertises that capability. `default_autoresearch([...])`
+   expands the historical four-stage shape. Other constructors are `agent`, `command`, `top_k`,
+   `deps`, and `prompt_file`. `prompt_file("prompts/x.md")` embeds a regular UTF-8 pack-relative file;
    paths may not be absolute, contain `..`, or be symlinks. Isolated agents are concurrent,
    read-only worktrees; a synthesizer that edits the candidate must not be isolated. Every agent
    task must write one JSON object to `PLAN_TASK_RESULT.json`.

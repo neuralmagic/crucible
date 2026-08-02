@@ -9,9 +9,10 @@ engine propose (edit) ───┤                                  ├─> gate
                          └─> review-copy       (advisory) ──┘
 ```
 
-`workflow.star` declares only the middle. Crucible owns proposal, application, frozen
-measurement, and keep/discard. The older standalone plan fixtures below exercise the general plan
-runner with the same tasks:
+`workflow.star` declares the entire iteration, including proposal, application, frozen measurement,
+and keep/discard as editable task nodes. Crucible still owns the capabilities behind those
+operations and admits the graph under the `autoresearch` workflow contract. The older standalone
+plan fixtures below exercise the general plan runner with the same tasks:
 
 ```
 plan.toml / plan-reward-hack.toml
@@ -60,7 +61,7 @@ This matters in `plan-reward-hack.toml`: its stand-in implementer tries to repla
 crucible plan compile-workflow \
   --file examples/adversarial-review/workflow.star
 
-# The normal autoresearch loop consumes the generated [[workflow.task]] block.
+# The normal autoresearch loop capability-admits the generated workflow graph.
 crucible --manifest examples/adversarial-review/crucible.toml --iterations 1
 
 # The standalone plan-runner fixture remains useful for inspecting the graph itself.
@@ -76,7 +77,7 @@ causes validation to regenerate that manifest block before checking and freezing
 
 For a more creative loop, put a non-isolated `synthesize` agent after the parallel reviewers. It
 receives their JSON results, edits the shared candidate, and writes its own result; a deterministic
-smoke command then gates the engine's expensive measurement. See contract §1.3 for that recipe.
+smoke command then gates the expensive measurement node. See contract §1.3 for that recipe.
 
 ## Task semantics used here
 
