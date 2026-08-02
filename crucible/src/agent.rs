@@ -86,9 +86,7 @@ pub enum AgentSource {
     Command(String),
 }
 
-/// Whether this concrete turn configuration can honor a durable logical session. Capability
-/// admission uses this before execution; incompatible backends still fail closed at the harness
-/// boundary as defense in depth.
+/// Whether this turn configuration supports durable sessions.
 pub(crate) fn supports_persistent_sessions(args: &Args) -> bool {
     match args.agent_source() {
         AgentSource::Command(_) => true,
@@ -246,8 +244,7 @@ pub fn run_turn(
     run_turn_with_session(args, p, prompt, json, None, sink)
 }
 
-/// Run a turn attached to a prepared logical session. The caller commits the cursor only once
-/// the turn returns without an agent or transport error, so a failed spawn cannot poison resumes.
+/// Run a turn using a prepared session; the caller commits successful transport afterward.
 pub(crate) fn run_turn_with_session(
     args: &Args,
     p: &Paths,

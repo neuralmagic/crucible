@@ -1178,10 +1178,7 @@ fn render_prompt(template: &str, goal: &str, status: &str, steer: Option<String>
     out
 }
 
-/// A resumed solver already holds the stable method, goal, and its own hypotheses. Send only the
-/// new authoritative delta so context growth comes from learning rather than repeated scaffolding.
-/// Cognitive state moves forward even when the world rolled back; the checkout + RESULTS.md remain
-/// the source of truth for which candidate is currently live.
+/// Send a resumed solver only the authoritative world-state delta.
 fn render_resume_prompt(status: &str, regime: &str, steer: Option<&str>) -> String {
     let mut out = format!(
         "Continue the existing autoresearch session from your current plan and hypotheses.\n\n\

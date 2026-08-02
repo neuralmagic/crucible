@@ -72,8 +72,7 @@ pub(crate) fn local_argv(args: &Args, prompt: &str) -> Vec<String> {
     a
 }
 
-/// Start or resume one Crucible-owned logical session. The provider cursor stays in Claude's
-/// private config store; Crucible persists only this opaque UUID and never copies the transcript.
+/// Start or resume a local Claude session with an opaque UUID.
 pub(crate) fn local_session_argv(
     args: &Args,
     prompt: &str,
@@ -106,8 +105,7 @@ pub(crate) fn sandbox_argv(args: &Args, mcp_seeded: bool) -> Vec<String> {
     a
 }
 
-/// Start or resume a Claude session inside an OpenShell sandbox. The prompt still arrives over
-/// stdin; session flags stay before the trailing `-p` for the same reason as MCP config.
+/// Start or resume a sandbox session; the prompt still arrives over stdin.
 pub(crate) fn sandbox_session_argv(
     args: &Args,
     mcp_seeded: bool,
