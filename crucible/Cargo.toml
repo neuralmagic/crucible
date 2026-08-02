@@ -58,6 +58,9 @@ base64 = "0.22"
 # `crucible plan show --render`: mermaid -> PNG, fully offline (vendored dagre layout +
 # resvg raster; see third_party/NOTICE).
 xai-grok-mermaid = { path = "../third_party/xai-grok-mermaid" }
+# `plan show --render` sizes the raster to the tty: TIOCGWINSZ for the cell grid and, when the
+# terminal reports it, its pixel width. Already in the tree under clap/tempfile.
+rustix = { version = "1", features = ["termios"] }
 # Scope-turn transcript delivery: the preserved session NDJSON is gzipped before it rides a pod-log
 # marker line (base64) or `--transcript-out` file back to the controller.
 flate2 = "1"
