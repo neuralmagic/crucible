@@ -69,9 +69,10 @@ depends_on = ["measure"]
 | Kind | What it runs |
 | --- | --- |
 | `agent` | One agent turn. `harness` / `model` / `effort` override the manifest's `[agent]` defaults per task; `session` opts into durable continuation. |
-| `command` | A plan-authored command, with the same output contract as `measure_cmd`. |
+| `command` | A plan-authored command returning JSON on its last stdout line. |
+| `evaluate` | A frozen measurement command. An explicit `pass` wins; otherwise `threshold` + `direction` grade its numeric `score`. |
 | `top_k` | Engine-owned reducer: keep the `k` best inputs by their `score` field. Needs at least one dependency. |
-| `engine` | Capability-owned operation (`propose`, `apply`, `measure`, `decide`, or `measure_diff`). Only an admitting orchestrator can execute it. |
+| `engine` | Capability-owned operation (`propose`, `apply`, `measure`, `grade`, `decide`, or `measure_diff`). Only an admitting orchestrator can execute it. |
 
 Serialization is not authority. A workflow may author and sequence engine nodes, but admission
 requires matching capabilities such as `workflow.autoresearch`, `engine.apply`, and
@@ -103,6 +104,10 @@ A task's output is JSON and becomes its dependents' input.
   spawn, harness, or stream error is a transport failure and follows the retry policy.
 - `agent` under `--agent-cmd`: the stand-in receives `CRUCIBLE_PROMPT`, `CRUCIBLE_HARNESS`,
   `CRUCIBLE_MODEL`, `CRUCIBLE_EFFORT`, and returns JSON on its last stdout line.
+- `evaluate`: the command contract plus measurement grading. Its JSON must be an object. An
+  explicit boolean `pass` is authoritative. With `threshold` and `direction`, the engine compares
+  `score` (`lower` means `score <= threshold`; `higher` means `score >= threshold`). With neither,
+  a successful command passes and its evidence flows downstream.
 
 `top_k` reads a finite numeric `score` from each input, so an upstream task that wants to rank
 must emit one.
@@ -214,6 +219,65 @@ from `[search]` on both paths.
 
 The templates carry no budget of their own: the run budget is the driver's, checked between
 rounds, so a turn that overruns the cap is still measured and decided.
+
+### Authored measurement subgraphs
+
+The opaque `measure()` node remains the backwards-compatible path. A workflow that needs visible
+measurement tasks uses `evaluate()` and `grade()` instead. Dependency layers are the rungs; tasks
+on the same layer can run concurrently when isolated. `grade()` waits for the evidence graph,
+selects one evaluator as its score source, and produces the same typed measurement that `decide()`
+already consumes.
+
+```python
+candidate = propose(name = "invent")
+live = apply(name = "deploy", depends_on = [candidate])
+
+refcheck = evaluate(
+    name = "cpu-reference",
+    run = "./refcheck.sh",
+    depends_on = [live],
+)
+diff = evaluate(
+    name = "single-gpu-diff",
+    run = "./diff.sh",
+    depends_on = [refcheck],
+    threshold = 0.001,
+    direction = "lower",
+    needs = "gpu",
+    isolated = True,
+)
+latency = evaluate(
+    name = "latency",
+    run = "./latency.sh",
+    depends_on = [diff],
+    direction = "lower",
+    threshold = 12.5,
+    isolated = True,
+)
+racecheck = evaluate(
+    name = "racecheck",
+    run = "./racecheck.sh",
+    depends_on = [diff],
+    required = False,
+    isolated = True,
+)
+measurement = grade(
+    name = "final-grade",
+    evidence = [diff, latency, racecheck],
+    score = latency,
+)
+decision = decide(name = "choose", measurement = measurement)
+workflow(
+    type = "autoresearch",
+    tasks = [candidate, live, refcheck, diff, latency, racecheck, measurement, decision],
+    result = decision,
+)
+```
+
+The renderer groups `evaluate` and `grade` nodes as **Measurement**, with evaluator fanout and
+joins left visible. During `crucible scope`, the trusted validation pipeline renders the admitted
+graph to `WORKFLOW.png` before freeze. The PNG is therefore part of the scope pack/PR; the agent
+authors the graph, but cannot substitute a misleading picture.
 
 Default off while it soaks.
 

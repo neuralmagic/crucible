@@ -13,7 +13,7 @@ use std::process::Command;
 use serde_json::Value;
 
 use crate::plan::exec::{Attempt, AttemptOutcome, TaskRunner};
-use crate::plan::ir::{Task, TaskKind, TaskName};
+use crate::plan::ir::{Direction, Task, TaskKind, TaskName};
 
 pub struct ShellRunner {
     pub workdir: PathBuf,
@@ -45,7 +45,7 @@ impl TaskRunner for ShellRunner {
             }
         }
         match &task.task {
-            TaskKind::Command { command } => {
+            TaskKind::Command { command } | TaskKind::Evaluate { command, .. } => {
                 cmd.arg(command);
             }
             TaskKind::Agent {
@@ -104,15 +104,59 @@ impl TaskRunner for ShellRunner {
             return fail("no output: expected a JSON result on the last stdout line".to_string());
         };
         match serde_json::from_str::<Value>(last.trim()) {
-            Ok(v) => Attempt {
-                outcome: AttemptOutcome::Pass(v),
-                cost_usd: 0.0,
-            },
+            Ok(v) => evaluation_attempt(task, v),
             Err(e) => fail(format!(
                 "last stdout line is not JSON ({e}): {}",
                 last.trim()
             )),
         }
+    }
+}
+
+fn evaluation_attempt(task: &Task, mut value: Value) -> Attempt {
+    let TaskKind::Evaluate {
+        threshold,
+        direction,
+        ..
+    } = task.task
+    else {
+        return Attempt {
+            outcome: AttemptOutcome::Pass(value),
+            cost_usd: 0.0,
+        };
+    };
+    let Some(object) = value.as_object_mut() else {
+        return fail("evaluate result must be a JSON object".to_string());
+    };
+    let passed = match object.get("pass").and_then(Value::as_bool) {
+        Some(passed) => passed,
+        None => match (threshold, direction) {
+            (Some(threshold), Some(Direction::Lower)) => object
+                .get("score")
+                .and_then(Value::as_f64)
+                .is_some_and(|score| score <= threshold),
+            (Some(threshold), Some(Direction::Higher)) => object
+                .get("score")
+                .and_then(Value::as_f64)
+                .is_some_and(|score| score >= threshold),
+            (None, None) => true,
+            _ => false,
+        },
+    };
+    object.insert("pass".to_string(), Value::Bool(passed));
+    if passed {
+        Attempt {
+            outcome: AttemptOutcome::Pass(value),
+            cost_usd: 0.0,
+        }
+    } else {
+        fail(format!(
+            "evaluation {} did not pass{}",
+            task.name,
+            threshold
+                .map(|threshold| format!(" threshold {threshold}"))
+                .unwrap_or_default()
+        ))
     }
 }
 
@@ -211,6 +255,52 @@ mod tests {
         let r = &out.results[&"chatty".into()];
         assert_eq!(r.status, TaskStatus::Fail);
         assert!(r.note.as_ref().unwrap().contains("not JSON"));
+    }
+
+    #[test]
+    fn evaluate_enforces_threshold_and_normalizes_pass() {
+        let evaluate = |name: &str, score: f64| Task {
+            name: name.into(),
+            task: TaskKind::Evaluate {
+                command: format!("echo '{{\"score\": {score}}}'"),
+                threshold: Some(10.0),
+                direction: Some(Direction::Lower),
+            },
+            depends_on: vec![],
+            session: None,
+            needs: "any".into(),
+            required: true,
+            isolation: None,
+            join: Join::All,
+        };
+        let passed = run_plan(vec![evaluate("latency", 9.5)], None);
+        assert_eq!(passed.results[&"latency".into()].status, TaskStatus::Pass);
+        assert_eq!(
+            passed.results[&"latency".into()].output.as_ref().unwrap()["pass"],
+            true
+        );
+        let failed = run_plan(vec![evaluate("latency", 10.5)], None);
+        assert_eq!(failed.results[&"latency".into()].status, TaskStatus::Fail);
+    }
+
+    #[test]
+    fn explicit_evaluation_pass_overrides_threshold() {
+        let task = Task {
+            name: "quality".into(),
+            task: TaskKind::Evaluate {
+                command: r#"echo '{"score": 100, "pass": true}'"#.into(),
+                threshold: Some(1.0),
+                direction: Some(Direction::Lower),
+            },
+            depends_on: vec![],
+            session: None,
+            needs: "any".into(),
+            required: true,
+            isolation: None,
+            join: Join::All,
+        };
+        let out = run_plan(vec![task], None);
+        assert_eq!(out.results[&"quality".into()].status, TaskStatus::Pass);
     }
 
     #[test]

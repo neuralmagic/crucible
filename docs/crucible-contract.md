@@ -128,13 +128,14 @@ authorship readable without moving the frozen judge or execution semantics into 
 Topology is authorable; authority is not. A workflow declares `type = "autoresearch"` or
 `type = "custom"`, and an engine or outer orchestrator admits it only when it advertises the
 matching workflow capability. Each `engine` task also requires its own capability. Crucible's loop
-advertises `workflow.autoresearch` plus propose/apply/measure/decide, while its generic plan runner
+advertises `workflow.autoresearch` plus propose/apply/measure/grade/decide, while its generic plan runner
 does not. It adds `agent.session.persist` only when the selected backend and harness can honor an
 opaque continuation. Serializing an engine task never grants access to the `World` or frozen
 `Judge`.
 
 An autoresearch workflow is checked by semantics rather than reserved task names. Its selected
-result must be a `decide` task sourced from a frozen `measure`, with `apply` and `propose` ancestors.
+result must be a `decide` task sourced from a frozen `measure` or authored `grade`, with `apply`
+and `propose` ancestors.
 Tasks may be inserted anywhere, operations may be renamed, and multiple candidate or measurement
 branches may exist. A custom workflow has no autoresearch-shape requirement; universal DAG,
 source-typing, and operation-capability rules still apply.
@@ -186,6 +187,46 @@ ordinary propose/apply/measure/decide tasks, attaching unconnected extras after 
 apply. A missing `workflow.star` retains the historical default loop behavior. The old positional
 `workflow(tasks)` form remains accepted as a splice adapter while packs migrate.
 
+Measurement can remain the historical opaque `measure()` call, or be authored as a visible DAG:
+
+```python
+live = apply(name = "deploy", depends_on = [candidate])
+correctness = evaluate(
+    name = "correctness",
+    run = "./correctness.sh",
+    depends_on = [live],
+    isolated = True,
+)
+latency = evaluate(
+    name = "latency",
+    run = "./latency.sh",
+    depends_on = [correctness],
+    threshold = 12.5,
+    direction = "lower",
+    isolated = True,
+)
+racecheck = evaluate(
+    name = "racecheck",
+    run = "./racecheck.sh",
+    depends_on = [correctness],
+    required = False,
+    isolated = True,
+)
+measurement = grade(
+    name = "grade",
+    evidence = [correctness, latency, racecheck],
+    score = latency,
+)
+decision = decide(name = "choose", measurement = measurement)
+```
+
+Dependencies express measurement rungs. Ready isolated siblings run concurrently. `evaluate()`
+expects a JSON object on its command's last stdout line: an explicit boolean `pass` wins;
+otherwise paired `threshold`/`direction` fields compare numeric `score`; with neither, a successful
+command passes. `grade()` joins passing evidence, requires its selected `score` evaluator to have
+passed, and assembles the typed reading consumed by the existing decision engine. The legacy
+`measure()` path and missing-workflow default are unchanged.
+
 `session = "solver"` binds agent-producing tasks to a durable logical conversation. The checkout
 may roll back after a discarded candidate while the solver session continues forward and retains
 what it learned. Tasks sharing a session must be dependency-ordered and cannot be isolated;
@@ -228,18 +269,19 @@ workflow(type = "custom", tasks = treatments + [curate, publish], result = publi
 That graph requires `workflow.custom`; it does not pretend to satisfy autoresearch just because it
 uses agents and commands.
 
-This is a declarative Starlark subset: assignments, strings, integers, booleans, lists, list
+This is a declarative Starlark subset: assignments, strings, numbers, booleans, lists, list
 concatenation, and direct calls to the functions below. Control flow, function definitions,
 comprehensions, mutation, arbitrary operators, and `load()` are rejected. Task values are opaque;
 they can be referenced directly in `depends_on`, `measurement`, and `result` without repeating
 names.
 
-- `propose(...)`, `apply(...)`, `measure(...)`, and `decide(...)` create capability-owned engine
+- `propose(...)`, `apply(...)`, `measure(...)`, `grade(...)`, and `decide(...)` create capability-owned engine
   tasks. `decide(measurement = score)` explicitly selects the frozen measurement it consumes.
 - `agent(...)` creates an agent task. `isolated = True` gives it a disposable worktree, ideal for
   concurrent read-only critics; leave it false for a synthesizer whose edits must survive.
   `session = "name"` opts into an engine-managed durable conversation.
 - `command(...)` creates a deterministic shell task in the candidate workspace.
+- `evaluate(...)` creates a typed measurement command with optional threshold grading.
 - `top_k(...)` creates a reducer for wider authored graphs.
 - `deps(tasks)` returns constructor task names, avoiding repeated string wiring.
 - `prompt_file(path)` reads a regular UTF-8 file below the pack directory and embeds its contents
@@ -257,6 +299,9 @@ For local review, `crucible plan compile-workflow --file workflow.star` prints s
 JSON. Add `--manifest crucible.toml` to also replace the generated `[workflow]` block. Compilation
 applies source, task-count, evaluation-step, and prompt-size ceilings. The compiler exposes no
 filesystem API except `prompt_file`, and no process, environment, network, clock, or randomness API.
+Successful scope validation also renders the admitted graph to `WORKFLOW.png`. Scope PR tooling
+should commit that trusted artifact and embed it in the PR body; the renderer visually groups
+`evaluate`/`grade` as the measurement subgraph.
 
 ---
 

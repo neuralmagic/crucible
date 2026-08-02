@@ -1,6 +1,6 @@
 # ADR 0022: Measure task DAGs — the engine walks the ladder
 
-**Status:** Proposed
+**Status:** Partially implemented
 **Date:** 2026-07-18
 **Related:** [ADR-0001](./0001-adaptive-harness.md) (the frozen judge this walker becomes part of),
 [ADR-0005](./0005-engine-side-builds.md) (the brokered codegen tools the walker dispatches),
@@ -39,6 +39,13 @@ the single-GPU diff; on two GPUs they could run concurrently. A ladder is a smal
 wrote down as one.
 
 ## Decision
+
+Implementation note (2026-08-02): the first slice landed as typed `evaluate` tasks and an
+engine-owned `grade` node in the main authored work graph. This avoids a second nested DAG
+executor: dependencies are the measurement rungs, ready isolated evaluators use the generic
+executor's parallel batches, and `grade` produces the same reading consumed by `decide`. The
+legacy opaque `measure_cmd` path remains backwards compatible. Named broker job templates,
+digest/task caching, and targeted regrade described below remain follow-up work.
 
 The manifest declares the DAG as data. The engine walks it. The domain keeps exactly one thing:
 the frozen per-task command baked into the sandbox image.

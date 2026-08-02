@@ -35,6 +35,7 @@ impl EngineOp {
             EngineOp::Propose => "engine.propose",
             EngineOp::Apply => "engine.apply",
             EngineOp::Measure => "engine.measure",
+            EngineOp::Grade => "engine.grade",
             EngineOp::Decide => "engine.decide",
             EngineOp::MeasureDiff => "engine.measure_diff",
         }
@@ -61,6 +62,7 @@ impl WorkflowCaps {
             "engine.propose",
             "engine.apply",
             "engine.measure",
+            "engine.grade",
             "engine.decide",
         ])
     }
@@ -121,14 +123,14 @@ impl WorkflowCfg {
                         task.name.0
                     );
                 }
-                if task.join != Join::All {
+                if task.join != Join::All && *op != EngineOp::Grade {
                     bail!("engine task {:?} must use join = \"all\"", task.name.0);
                 }
                 match (op, source) {
-                    (EngineOp::Decide, None) => {
-                        bail!("engine decide task {:?} requires source", task.name.0)
+                    (EngineOp::Decide | EngineOp::Grade, None) => {
+                        bail!("engine {op:?} task {:?} requires source", task.name.0)
                     }
-                    (EngineOp::Decide, Some(_)) | (_, None) => {}
+                    (EngineOp::Decide | EngineOp::Grade, Some(_)) | (_, None) => {}
                     (_, Some(_)) => bail!(
                         "engine {:?} task {:?} does not accept source",
                         op,
@@ -136,13 +138,13 @@ impl WorkflowCfg {
                     ),
                 }
                 if let Some(source) = source {
-                    if !tasks.contains_key(source) {
+                    let Some(source_task) = tasks.get(source) else {
                         bail!(
                             "engine task {:?} names unknown source {:?}",
                             task.name.0,
                             source.0
                         );
-                    }
+                    };
                     if !is_ancestor(&tasks, source, &task.name) {
                         bail!(
                             "engine task source {:?} must be an ancestor of {:?}",
@@ -160,6 +162,17 @@ impl WorkflowCfg {
                             task.name.0,
                             source.0
                         );
+                    }
+                    if *op == EngineOp::Grade
+                        && !matches!(source_task.task, TaskKind::Evaluate { .. })
+                    {
+                        bail!(
+                            "engine grade source {:?} must be an evaluate task",
+                            source.0
+                        );
+                    }
+                    if *op == EngineOp::Grade && !source_task.required {
+                        bail!("engine grade score source {:?} must be required", source.0);
                     }
                 }
             }
@@ -261,12 +274,12 @@ impl WorkflowCfg {
         if !matches!(
             measured.task,
             TaskKind::Engine {
-                op: EngineOp::Measure,
+                op: EngineOp::Measure | EngineOp::Grade,
                 ..
             }
         ) {
             bail!(
-                "autoresearch decision source {:?} must be an engine measure task",
+                "autoresearch decision source {:?} must be an engine measure or grade task",
                 measurement.0
             );
         }
@@ -468,6 +481,34 @@ mod tests {
             elapsed < std::time::Duration::from_secs(5),
             "ancestry walk took {elapsed:?}; it is re-exploring paths instead of visited nodes"
         );
+    }
+
+    #[test]
+    fn autoresearch_accepts_a_typed_measurement_subgraph() {
+        let workflow = parse(
+            "type = \"autoresearch\"\nresult = \"choose\"\n\
+             [[task]]\nname = \"invent\"\nkind = \"engine\"\nop = \"propose\"\n\
+             [[task]]\nname = \"deploy\"\nkind = \"engine\"\nop = \"apply\"\ndepends_on = [\"invent\"]\n\
+             [[task]]\nname = \"correctness\"\nkind = \"evaluate\"\ncommand = \"./correctness.sh\"\ndepends_on = [\"deploy\"]\nisolation = \"worktree\"\n\
+             [[task]]\nname = \"latency\"\nkind = \"evaluate\"\ncommand = \"./latency.sh\"\ndepends_on = [\"correctness\"]\nisolation = \"worktree\"\nthreshold = 10.0\ndirection = \"lower\"\n\
+             [[task]]\nname = \"grade\"\nkind = \"engine\"\nop = \"grade\"\nsource = \"latency\"\ndepends_on = [\"correctness\", \"latency\"]\njoin = \"passed\"\n\
+             [[task]]\nname = \"choose\"\nkind = \"engine\"\nop = \"decide\"\nsource = \"grade\"\ndepends_on = [\"grade\"]\n",
+        );
+        workflow.validate().unwrap();
+        workflow
+            .admit(&WorkflowCaps::autoresearch_engine())
+            .unwrap();
+    }
+
+    #[test]
+    fn grade_requires_an_evaluation_score_source() {
+        let mut workflow = full_autoresearch();
+        workflow.tasks[2].task = TaskKind::Engine {
+            op: EngineOp::Grade,
+            source: Some("deploy".into()),
+        };
+        let error = workflow.validate().unwrap_err().to_string();
+        assert!(error.contains("must be an evaluate task"), "{error}");
     }
 
     fn full_autoresearch() -> WorkflowCfg {
