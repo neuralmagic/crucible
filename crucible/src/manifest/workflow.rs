@@ -110,6 +110,8 @@ impl WorkflowCfg {
 
         let tasks: BTreeMap<&TaskName, &Task> =
             self.tasks.iter().map(|task| (&task.name, task)).collect();
+        // A measurement is taken when it is graded, so only one decision may claim it.
+        let mut decided_sources: BTreeMap<&TaskName, &TaskName> = BTreeMap::new();
         for task in &self.tasks {
             if let TaskKind::Engine { op, source } = &task.task {
                 if !task.required {
@@ -148,6 +150,17 @@ impl WorkflowCfg {
                             "engine task source {:?} must be an ancestor of {:?}",
                             source.0,
                             task.name.0
+                        );
+                    }
+                    if *op == EngineOp::Decide
+                        && let Some(first) = decided_sources.insert(source, &task.name)
+                    {
+                        bail!(
+                            "engine decide tasks {:?} and {:?} share measurement source {:?}; a \
+                             measurement can be graded once",
+                            first.0,
+                            task.name.0,
+                            source.0
                         );
                     }
                 }
@@ -318,13 +331,28 @@ impl WorkflowCfg {
     }
 }
 
+/// Iterative with a visited set; the recursive form was exponential in path count. Already
+/// known acyclic here, `Plan::validate` runs Kahn's first.
+/// Iterative with a visited set; the recursive form was exponential in path count. Already
+/// known acyclic here, `Plan::validate` runs Kahn's first.
 fn is_ancestor(tasks: &BTreeMap<&TaskName, &Task>, ancestor: &TaskName, node: &TaskName) -> bool {
-    let Some(task) = tasks.get(node) else {
-        return false;
-    };
-    task.depends_on
-        .iter()
-        .any(|dependency| dependency == ancestor || is_ancestor(tasks, ancestor, dependency))
+    let mut stack = vec![node];
+    let mut seen = BTreeSet::new();
+    while let Some(current) = stack.pop() {
+        if !seen.insert(current) {
+            continue;
+        }
+        let Some(task) = tasks.get(current) else {
+            continue;
+        };
+        for dependency in &task.depends_on {
+            if dependency == ancestor {
+                return true;
+            }
+            stack.push(dependency);
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -371,6 +399,60 @@ mod tests {
     #[test]
     fn autoresearch_shape_is_semantic_not_name_based() {
         full_autoresearch().validate().unwrap();
+    }
+
+    /// A second decision on one measurement finds nothing to grade, mid-run.
+    #[test]
+    fn two_decisions_may_not_share_one_measurement() {
+        let workflow = parse(
+            "type = \"autoresearch\"\nresult = \"choose\"\n\
+             [[task]]\nname = \"invent\"\nkind = \"engine\"\nop = \"propose\"\n\
+             [[task]]\nname = \"deploy\"\nkind = \"engine\"\nop = \"apply\"\ndepends_on = [\"invent\"]\n\
+             [[task]]\nname = \"score\"\nkind = \"engine\"\nop = \"measure\"\ndepends_on = [\"deploy\"]\n\
+             [[task]]\nname = \"choose\"\nkind = \"engine\"\nop = \"decide\"\nsource = \"score\"\ndepends_on = [\"score\"]\n\
+             [[task]]\nname = \"second-guess\"\nkind = \"engine\"\nop = \"decide\"\nsource = \"score\"\ndepends_on = [\"choose\"]\n",
+        );
+        let error = workflow.validate().unwrap_err().to_string();
+        assert!(error.contains("share measurement source"), "{error}");
+        assert!(error.contains("score"), "{error}");
+    }
+
+    /// N diamonds means 2^N paths. `off-path` forces an ancestry question whose answer is
+    /// false, since `.any()` short-circuits on a true one and never fans out.
+    #[test]
+    fn ancestry_does_not_blow_up_on_a_diamond_chain() {
+        const DIAMONDS: usize = 26;
+        let mut source = String::from("type = \"autoresearch\"\nresult = \"choose\"\n");
+        source.push_str("[[task]]\nname = \"invent\"\nkind = \"engine\"\nop = \"propose\"\n");
+        let mut previous = "invent".to_string();
+        for i in 0..DIAMONDS {
+            for side in ["l", "r"] {
+                source.push_str(&format!(
+                    "[[task]]\nname = \"{side}{i}\"\nkind = \"command\"\ncommand = \"true\"\ndepends_on = [\"{previous}\"]\n"
+                ));
+            }
+            previous = format!("join{i}");
+            source.push_str(&format!(
+                "[[task]]\nname = \"{previous}\"\nkind = \"command\"\ncommand = \"true\"\ndepends_on = [\"l{i}\", \"r{i}\"]\n"
+            ));
+        }
+        source.push_str(&format!(
+            "[[task]]\nname = \"deploy\"\nkind = \"engine\"\nop = \"apply\"\ndepends_on = [\"{previous}\"]\n"
+        ));
+        source.push_str("[[task]]\nname = \"score\"\nkind = \"engine\"\nop = \"measure\"\ndepends_on = [\"deploy\"]\n");
+        source.push_str("[[task]]\nname = \"choose\"\nkind = \"engine\"\nop = \"decide\"\nsource = \"score\"\ndepends_on = [\"score\"]\n");
+        source.push_str(
+            "[[task]]\nname = \"off-path\"\nkind = \"engine\"\nop = \"apply\"\ndepends_on = [\"invent\"]\n",
+        );
+        let workflow = parse(&source);
+
+        let started = std::time::Instant::now();
+        workflow.validate().unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "ancestry walk took {elapsed:?}; it is re-exploring paths instead of visited nodes"
+        );
     }
 
     fn full_autoresearch() -> WorkflowCfg {
