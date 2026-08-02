@@ -11,8 +11,7 @@ pub enum ImageProtocol {
     Kitty,
 }
 
-/// Fallbacks for terminals reporting zero pixel geometry (tmux, screen). Sized for a HiDPI
-/// cell, since guessing low renders blurry.
+/// HiDPI fallback for terminals that omit pixel geometry.
 const ASSUMED_CELL_WIDTH_PX: u32 = 16;
 const ASSUMED_CELL_HEIGHT_PX: f32 = 32.0;
 
@@ -24,14 +23,12 @@ pub struct Geometry {
     pub cell_height_px: f32,
 }
 
-/// Query stdout's window size. Returns `None` when stdout is not a tty (piped output) or the
-/// terminal reports no columns, which is the caller's signal to write a file instead.
+/// Query stdout geometry, or return `None` for non-TTY output.
 pub fn geometry() -> Option<Geometry> {
     let ws = rustix::termios::tcgetwinsize(std::io::stdout()).ok()?;
     if ws.ws_col == 0 {
         return None;
     }
-    // Physical pixels, so already HiDPI-scaled. Both are optional in the ioctl.
     let width_px = if ws.ws_xpixel > 0 {
         u32::from(ws.ws_xpixel)
     } else {
@@ -141,8 +138,6 @@ mod tests {
 
     #[test]
     fn placement_pins_width_only_so_tall_graphs_scroll() {
-        // No `height=` / `r=` key in either payload: the terminal derives the row count from
-        // the aspect ratio instead of squashing a deep DAG into the viewport.
         let iterm = emit(ImageProtocol::Iterm, b"x", Some(120));
         assert!(!iterm.contains("height="));
         let kitty = emit(ImageProtocol::Kitty, b"x", Some(120));
@@ -151,8 +146,6 @@ mod tests {
 
     #[test]
     fn a_diagram_that_fits_is_emitted_at_native_size() {
-        // No placement keys at all, so the terminal draws the raster 1:1 instead of blowing a
-        // small graph up to the full window width.
         let iterm = emit(ImageProtocol::Iterm, b"x", None);
         assert!(!iterm.contains("width="), "no width in {iterm:?}");
         let kitty = emit(ImageProtocol::Kitty, b"x", None);

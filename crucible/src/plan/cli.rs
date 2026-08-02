@@ -262,8 +262,7 @@ const PREVIEW_FONT_PX: f32 = 12.0;
 /// Roughly how much of a cell's height a terminal glyph occupies.
 const GLYPH_FRACTION_OF_CELL: f32 = 0.8;
 
-/// Layout metrics for the raster only; the engine's defaults are tuned for a full page and
-/// look oversized at terminal scale. `--mermaid` stays clean source for pasting.
+/// Compact layout used only for raster previews.
 const PREVIEW_LAYOUT_FRONTMATTER: &str = "\
 ---
 config:
@@ -291,9 +290,7 @@ fn show_rendered(path: &Path, plan: &ValidPlan, caps: &BTreeSet<String>) -> Resu
     let engine = default_engine();
     let inline = crate::plan::term_img::detect().zip(crate::plan::term_img::geometry());
 
-    // Oversample rather than target a width: stretching a few nodes across the window is what
-    // made them look enormous. The factor matches diagram text to the terminal's own glyphs.
-    // `max_height_px: 0` lets a deep DAG scroll instead of being squashed.
+    // Match diagram text to terminal glyphs; let deep graphs scroll.
     let params = match inline {
         Some((_, geo)) => RenderParams {
             theme: THEME,
@@ -309,7 +306,7 @@ fn show_rendered(path: &Path, plan: &ValidPlan, caps: &BTreeSet<String>) -> Resu
 
     match inline {
         Some((proto, geo)) => {
-            // Only fit to cells when the graph overflows; otherwise it gets scaled back up.
+            // Fit only graphs wider than the viewport.
             let fit_cols = (diagram.width_px > geo.width_px).then_some(geo.cols);
             print!(
                 "{}",
@@ -511,8 +508,6 @@ mod tests {
 
     #[test]
     fn per_node_styling_drops_the_suffix_the_preview_engine_cannot_parse() {
-        // The vendored engine renders a `:::class` node as its bare id, losing the label, so
-        // the raster path must emit neither `:::` nor `classDef`.
         let plan = Plan::from_toml_str(SRC).unwrap().validate().unwrap();
         let out = render_mermaid_styled(&plan, &BTreeSet::new(), Styling::PerNode);
         assert!(!out.contains(":::"), "no class suffix: {out}");
@@ -526,7 +521,6 @@ mod tests {
 
     #[test]
     fn both_styling_forms_agree_on_nodes_and_edges() {
-        // Only the styling lines may differ; the graph itself must be identical.
         let plan = Plan::from_toml_str(SRC).unwrap().validate().unwrap();
         let strip = |s: String| {
             s.lines()
