@@ -154,8 +154,9 @@ workspace.
 ### `join`
 
 `join = "all"` (default) requires every dependency to pass. `join = "passed"` dispatches once
-every dependency is terminal and folds only the ones that passed. Use it for a reducer over a
-lossy fan-out, or for a gate over reviewers where one being advisory must not stop the run.
+every dependency is terminal and folds the non-empty set that passed. If none can run or none
+passes, the join fails closed. Use it for a reducer over a lossy fan-out, or for a gate over
+reviewers where one being advisory must not stop the run.
 
 ## The loop as a plan
 

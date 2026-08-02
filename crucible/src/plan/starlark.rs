@@ -356,7 +356,7 @@ impl Compiler {
                     Some(source),
                     evidence,
                 );
-                task.join = Join::Passed;
+                task.join = parse_join(&take_string_default(&mut named, "join", "passed")?)?;
                 task
             }
             "decide" => {
@@ -922,6 +922,21 @@ workflow(
                 source: Some(ref source),
             } if source == &TaskName("latency".to_string())
         ));
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn grade_join_is_authorable_with_passed_as_the_default() {
+        let pack = temp_pack("grade-join");
+        let source = r#"
+score = evaluate(name = "score", run = "./score.sh")
+strict = grade(name = "strict", evidence = [score], score = score, join = "all")
+lossy = grade(name = "lossy", evidence = [score], score = score)
+workflow(type = "custom", tasks = [score, strict, lossy], result = strict)
+"#;
+        let compiled = compile_source(source, &pack.join("workflow.star"), &pack).unwrap();
+        assert_eq!(compiled.workflow.tasks[1].join, Join::All);
+        assert_eq!(compiled.workflow.tasks[2].join, Join::Passed);
         let _ = std::fs::remove_dir_all(&pack);
     }
 

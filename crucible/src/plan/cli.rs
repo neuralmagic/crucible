@@ -140,13 +140,26 @@ enum Styling {
     PerNode,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Metadata {
+    /// Stable, pasteable graph source: task commands are intentionally omitted.
+    Public,
+    /// Scope/terminal preview: show a bounded command summary inside runnable nodes.
+    Preview,
+}
+
 /// Render the compiled plan as mermaid flowchart source: pipeable into a terminal mermaid
 /// renderer, pasteable into GitHub markdown, and the same source a UI graph view consumes.
 pub fn render_mermaid(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
-    render_mermaid_styled(plan, caps, Styling::ClassDef)
+    render_mermaid_styled(plan, caps, Styling::ClassDef, Metadata::Public)
 }
 
-fn render_mermaid_styled(plan: &ValidPlan, caps: &BTreeSet<String>, styling: Styling) -> String {
+fn render_mermaid_styled(
+    plan: &ValidPlan,
+    caps: &BTreeSet<String>,
+    styling: Styling,
+    metadata: Metadata,
+) -> String {
     let runnable = runnable_set(plan, &Substrate { caps: caps.clone() });
     let mut out = String::from("flowchart TD\n");
     let mut styles = String::new();
@@ -177,14 +190,14 @@ fn render_mermaid_styled(plan: &ValidPlan, caps: &BTreeSet<String>, styling: Sty
                 mermaid_label(harness.as_deref().unwrap_or("default")),
                 mermaid_label(model.as_deref().unwrap_or("default"))
             ),
-            TaskKind::Command { command } => {
+            TaskKind::Command { command } if metadata == Metadata::Preview => {
                 format!("<br/>run: {}", mermaid_command_preview(command))
             }
             TaskKind::Evaluate {
                 command,
                 threshold,
                 direction,
-            } => {
+            } if metadata == Metadata::Preview => {
                 let mut detail = format!("<br/>run: {}", mermaid_command_preview(command));
                 if let (Some(threshold), Some(direction)) = (threshold, direction) {
                     let comparison = match direction {
@@ -195,7 +208,9 @@ fn render_mermaid_styled(plan: &ValidPlan, caps: &BTreeSet<String>, styling: Sty
                 }
                 detail
             }
-            TaskKind::Engine { .. } => String::new(),
+            TaskKind::Command { .. } | TaskKind::Evaluate { .. } | TaskKind::Engine { .. } => {
+                String::new()
+            }
             TaskKind::TopK { k, .. } => format!("<br/>k={k}"),
         };
         if let Some(session) = &t.session {
@@ -407,7 +422,7 @@ config:
     wrappingWidth: 180
 ---
 {}",
-        render_mermaid_styled(plan, caps, Styling::PerNode)
+        render_mermaid_styled(plan, caps, Styling::PerNode, Metadata::Preview)
     );
     render_checked(
         default_engine().as_ref(),
@@ -593,8 +608,9 @@ mod tests {
         "#;
         let plan = Plan::from_toml_str(src).unwrap().validate().unwrap();
         let out = render_mermaid(&plan, &BTreeSet::new());
-        assert!(out.contains("t0[\"review/a<br/>run: true\"]"));
-        assert!(out.contains("t1[\"review-a<br/>run: true\"]"));
+        assert!(out.contains("t0[\"review/a\"]"));
+        assert!(out.contains("t1[\"review-a\"]"));
+        assert!(!out.contains("run:"), "public source omits commands: {out}");
     }
 
     #[test]
@@ -612,7 +628,8 @@ mod tests {
     #[test]
     fn per_node_styling_drops_the_suffix_the_preview_engine_cannot_parse() {
         let plan = Plan::from_toml_str(SRC).unwrap().validate().unwrap();
-        let out = render_mermaid_styled(&plan, &BTreeSet::new(), Styling::PerNode);
+        let out =
+            render_mermaid_styled(&plan, &BTreeSet::new(), Styling::PerNode, Metadata::Preview);
         assert!(!out.contains(":::"), "no class suffix: {out}");
         assert!(!out.contains("classDef"), "no classDef trailer: {out}");
         assert!(out.contains(r#"t0(["propose"#), "label survives: {out}");
@@ -640,7 +657,8 @@ mod tests {
             strip(render_mermaid_styled(
                 &plan,
                 &BTreeSet::new(),
-                Styling::PerNode
+                Styling::PerNode,
+                Metadata::Public,
             ))
         );
     }
@@ -693,15 +711,20 @@ mod tests {
             mermaid.contains("classDef evaluate fill:#076678"),
             "{mermaid}"
         );
-        assert!(mermaid.contains("correctness<br/>run: ./correctness.sh"));
-        assert!(mermaid.contains("latency<br/>run: ./latency.sh<br/>pass: score &lt;= 12.5"));
+        assert!(
+            !mermaid.contains("run:"),
+            "public source omits commands: {mermaid}"
+        );
         assert!(mermaid.contains("t1 --> t2"), "rung edge: {mermaid}");
         assert!(mermaid.contains("t1 --> t3"), "parallel fanout: {mermaid}");
 
-        let raster = render_mermaid_styled(&plan, &BTreeSet::new(), Styling::PerNode);
+        let raster =
+            render_mermaid_styled(&plan, &BTreeSet::new(), Styling::PerNode, Metadata::Preview);
         assert!(!raster.contains(":::"), "{raster}");
         assert!(raster.contains("style t1 fill:#076678"), "{raster}");
         assert!(raster.contains("style t4 fill:#d65d0e"), "{raster}");
+        assert!(raster.contains("correctness<br/>run: ./correctness.sh"));
+        assert!(raster.contains("latency<br/>run: ./latency.sh<br/>pass: score &lt;= 12.5"));
 
         let output = std::env::temp_dir().join(format!(
             "crucible-measurement-render-{}.png",

@@ -258,6 +258,12 @@ impl Plan {
                     bail!("task {:?} lists dependency {:?} twice", t.name.0, d.0);
                 }
             }
+            if t.join == Join::Passed && t.depends_on.is_empty() {
+                bail!(
+                    "task {:?}: join = \"passed\" needs at least one dependency",
+                    t.name.0
+                );
+            }
             if let TaskKind::TopK { k, .. } = &t.task {
                 if *k == 0 {
                     bail!("task {:?}: top_k k must be >= 1", t.name.0);

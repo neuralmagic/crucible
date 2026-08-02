@@ -87,12 +87,15 @@ pub enum AgentSource {
 }
 
 pub(crate) fn supports_persistent_sessions(args: &Args) -> bool {
-    match args.agent_source() {
-        AgentSource::Command(_) => true,
-        AgentSource::LocalClaude | AgentSource::OpenshellDriver => {
-            args.harness() == crate::harness::Harness::Claude
-        }
-    }
+    backend_supports_persistent_sessions(args.agent_backend, args.harness())
+}
+
+/// Capability predicate shared by runtime admission and scope's manifest-based preview.
+pub(crate) fn backend_supports_persistent_sessions(
+    backend: AgentBackend,
+    harness: crate::harness::Harness,
+) -> bool {
+    backend == AgentBackend::Command || harness == crate::harness::Harness::Claude
 }
 
 /// A spawned transport: a child process plus the streams a turn reads from it.

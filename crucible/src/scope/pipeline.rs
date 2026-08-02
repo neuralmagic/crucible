@@ -15,7 +15,7 @@ use crate::scope::pack::{
 use crate::scope::progress::{ActivityFeed, emit_progress};
 use crate::scope::transcript::{transcript_event, transcript_note, write_seed_context};
 use anyhow::{Context, Result, bail};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
@@ -955,6 +955,15 @@ impl Stage for Validate {
 /// scope PR and embed it in the body.
 fn render_workflow_preview(manifest_path: &Path, pack: &Path) -> Result<(u32, u32)> {
     let manifest = manifest::Manifest::load(manifest_path)?;
+    let mut workflow_caps = manifest::WorkflowCaps::autoresearch_engine();
+    if AgentBackend::from_str(&manifest.agent.backend, true)
+        .ok()
+        .is_some_and(|backend| {
+            agent::backend_supports_persistent_sessions(backend, manifest.agent.harness)
+        })
+    {
+        workflow_caps = workflow_caps.with_persistent_sessions();
+    }
     let plan = match manifest.workflow.as_ref() {
         Some(workflow) if workflow.workflow_type == manifest::WorkflowType::Custom => {
             workflow.validate()?;
@@ -966,10 +975,7 @@ fn render_workflow_preview(manifest_path: &Path, pack: &Path) -> Result<(u32, u3
             }
             .validate()?
         }
-        workflow => crate::loop_graph::iteration_template(
-            workflow,
-            &manifest::WorkflowCaps::autoresearch_engine().with_persistent_sessions(),
-        )?,
+        workflow => crate::loop_graph::iteration_template(workflow, &workflow_caps)?,
     };
     // Preview graph capability markings describe the authored requirements, not whichever
     // machine happened to run scope. Admission still checks the real substrate at execution.
@@ -1864,7 +1870,7 @@ mod tests {
         fs::write(
             dir.join("workflow.star"),
             r#"
-candidate = propose(name = "invent")
+candidate = propose(name = "invent", session = "solver")
 live = apply(name = "apply", depends_on = [candidate])
 score = evaluate(name = "score", run = "echo '{\"score\": 2}'", depends_on = [live], isolated = True)
 trace = evaluate(name = "trace", run = "echo '{\"pass\": true}'", depends_on = [live], required = False, isolated = True)
@@ -1887,6 +1893,43 @@ workflow(type = "autoresearch", tasks = [candidate, live, score, trace, measurem
             png.len() > 10_000,
             "rendered graph should not be a placeholder"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scope_does_not_grant_sessions_to_an_incompatible_manifest() {
+        let dir = tempdir("workflow-session-cap");
+        scaffold_pack(&dir);
+        let manifest_path = dir.join(MANIFEST_FILE);
+        let manifest = fs::read_to_string(&manifest_path).unwrap().replace(
+            "backend = \"command\"",
+            "backend = \"local\"\n            harness = \"hermes\"",
+        );
+        fs::write(&manifest_path, manifest).unwrap();
+        fs::write(
+            dir.join("workflow.star"),
+            r#"
+candidate = propose(name = "invent", session = "solver")
+live = apply(name = "apply", depends_on = [candidate])
+measurement = measure(name = "measure", depends_on = [live])
+decision = decide(name = "choose", measurement = measurement)
+workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision], result = decision)
+"#,
+        )
+        .unwrap();
+
+        let report = execute(&dir, None, None, false, None);
+        let validate = report
+            .stages
+            .iter()
+            .find(|stage| stage.name == "validate")
+            .expect("validate stage");
+        assert!(!validate.passed, "Hermes cannot resume Claude sessions");
+        assert!(
+            validate.detail.contains("agent.session.persist"),
+            "{validate:?}"
+        );
+        assert!(!dir.join("WORKFLOW.png").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 

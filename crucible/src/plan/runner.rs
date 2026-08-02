@@ -33,6 +33,29 @@ impl TaskRunner for ShellRunner {
                 task.name
             ));
         }
+        self.run_in_workdir(task, inputs)
+    }
+}
+
+impl ShellRunner {
+    /// Run after an outer runner has prepared the task's declared private worktree. Keeping
+    /// the marker on `task` makes that trust transition explicit instead of cloning the task
+    /// and erasing its isolation requirement.
+    pub(crate) fn run_in_prepared_worktree(
+        &mut self,
+        task: &Task,
+        inputs: &BTreeMap<TaskName, Value>,
+    ) -> Attempt {
+        if task.isolation != Some(crate::plan::ir::Isolation::Worktree) {
+            return fail(format!(
+                "task {} was not declared for worktree isolation",
+                task.name
+            ));
+        }
+        self.run_in_workdir(task, inputs)
+    }
+
+    fn run_in_workdir(&mut self, task: &Task, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").current_dir(&self.workdir);
         cmd.env("CRUCIBLE_TASK", &task.name.0);
@@ -142,7 +165,12 @@ fn evaluation_attempt(task: &Task, mut value: Value) -> Attempt {
         // Validation rejects one without the other.
         _ => false,
     };
-    let passed = within_threshold && object.get("pass").and_then(Value::as_bool).unwrap_or(true);
+    let declared_pass = match object.get("pass") {
+        None => true,
+        Some(Value::Bool(passed)) => *passed,
+        Some(_) => return fail("evaluate result `pass` must be a boolean".to_string()),
+    };
+    let passed = within_threshold && declared_pass;
     object.insert("pass".to_string(), Value::Bool(passed));
     if passed {
         Attempt {
@@ -337,6 +365,35 @@ mod tests {
         assert_eq!(green.results[&"green".into()].status, TaskStatus::Pass);
         let red = run_plan(vec![evaluate("red", r#"{"pass": false}"#)], None);
         assert_eq!(red.results[&"red".into()].status, TaskStatus::Fail);
+    }
+
+    #[test]
+    fn malformed_evaluation_pass_fails_closed() {
+        let task = Task {
+            name: "malformed".into(),
+            task: TaskKind::Evaluate {
+                command: r#"echo '{"pass": "false"}'"#.into(),
+                threshold: None,
+                direction: None,
+            },
+            depends_on: vec![],
+            session: None,
+            needs: "any".into(),
+            required: false,
+            isolation: None,
+            join: Join::All,
+        };
+        let out = run_plan(vec![task], None);
+        let result = &out.results[&"malformed".into()];
+        assert_eq!(result.status, TaskStatus::Fail);
+        assert!(
+            result
+                .note
+                .as_deref()
+                .unwrap_or_default()
+                .contains("boolean"),
+            "failure explains the contract: {result:?}"
+        );
     }
 
     #[test]
