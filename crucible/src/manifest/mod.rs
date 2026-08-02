@@ -163,8 +163,7 @@ pub struct Manifest {
     /// Wide-round search config. Optional, most domains run pure-deep.
     #[serde(default)]
     pub search: Option<SearchCfg>,
-    /// Pack-authored iteration graph. Absent means the legacy four-stage autoresearch
-    /// graph; the workflow type and engine operations are capability-admitted.
+    /// Authored iteration graph; absent uses the default workflow.
     #[serde(default)]
     pub workflow: Option<WorkflowCfg>,
     /// Publish-on-keep target for a single-repo run. Optional, a run with no `[publish]` (or no
@@ -261,9 +260,7 @@ pub fn apply_inject(src: &Path, dst: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating inject dir {}", parent.display()))?;
     }
-    // Replace the directory entry rather than copying through it. An agent can replace a
-    // frozen file with a symlink; `fs::copy(src, dst)` would follow that symlink and write
-    // outside the intended destination instead of restoring the frozen file.
+    // Replace the entry: copying through an agent-created symlink could escape `dst`.
     let dst_meta = std::fs::symlink_metadata(dst);
     let same_file = matches!(
         (std::fs::canonicalize(src), std::fs::canonicalize(dst)),
@@ -494,8 +491,7 @@ pub struct CompositeManifest {
     /// Wide-round search config. Optional.
     #[serde(default)]
     pub search: Option<SearchCfg>,
-    /// Pack-authored iteration graph. Absent means the legacy four-stage autoresearch
-    /// graph; the workflow type and engine operations are capability-admitted.
+    /// Authored iteration graph; absent uses the default workflow.
     #[serde(default)]
     pub workflow: Option<WorkflowCfg>,
     /// Declarative image builds: named `[build.<name>]` targets (e.g. a composite's assembled

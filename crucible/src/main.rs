@@ -588,16 +588,13 @@ pub(crate) struct Args {
     /// Wide-round search config (from `[search]`). No CLI flag, set by `run_from_manifest`.
     #[arg(skip)]
     pub search: Option<manifest::SearchCfg>,
-    /// Pack-authored iteration tasks (from `[[workflow.task]]`). No CLI flag, set by
-    /// `run_from_manifest`.
+    /// Manifest-only authored workflow.
     #[arg(skip)]
     pub workflow: Option<manifest::WorkflowCfg>,
-    /// Frozen manifest injects restored before pack workflow tasks. Sources are manifest-relative
-    /// artifacts resolved at load; destinations stay workspace-relative so isolated tasks can
-    /// receive the same files. Runtime config, not a CLI surface.
+    /// Manifest injects restored in each task workspace.
     #[arg(skip)]
     pub workflow_frozen_injects: Vec<(PathBuf, PathBuf)>,
-    /// Toolbox exclusions retained for per-task harness overrides in pack workflows.
+    /// Toolbox exclusions for per-task harness overrides.
     #[arg(skip)]
     pub workflow_toolbox_exclude: Vec<String>,
     /// Opt-in: when publish-on-keep opens draft PR(s), spawn a detached `crucible watch-pr` pointed

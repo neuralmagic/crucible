@@ -29,13 +29,11 @@ pub enum Direction {
     Higher,
 }
 
-/// Capability-owned operations supplied by an engine or outer orchestrator. These are
-/// authorable graph nodes; serialization grants no authority to execute them.
+/// Authorable operations that require orchestrator capabilities to execute.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EngineOp {
-    /// Run the loop's candidate-producing agent turn. The task name is author-defined;
-    /// the current iteration prompt is supplied by the admitting autoresearch engine.
+    /// Run the loop's candidate-producing turn.
     Propose,
     /// `World::apply`: make the candidate live (a failure = unscoreable, discard).
     Apply,
@@ -92,17 +90,14 @@ pub enum TaskKind {
         #[serde(default)]
         effort: Option<String>,
     },
-    /// A plan-authored command (the `measure_cmd` shape, generalized). Scripts are trusted
-    /// only when their files are supplied as frozen manifest injects.
+    /// A plan-authored command. Trusted scripts require frozen manifest injects.
     Command { command: String },
     /// Engine-builtin deterministic fold: keep the k best upstream outputs by `score`.
     TopK { k: u32, direction: Direction },
-    /// A capability-owned engine operation. It is authorable graph data, but only an
-    /// orchestrator advertising the matching capability may admit and execute it.
+    /// A capability-owned engine operation.
     Engine {
         op: EngineOp,
-        /// Explicit input selected by operations such as `decide`. Dependencies express
-        /// scheduling; `source` identifies the typed value the operation consumes.
+        /// Typed input; dependencies still control scheduling.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<TaskName>,
     },
@@ -168,15 +163,13 @@ pub struct Task {
     pub join: Join,
 }
 
-/// Executor-enforced accounting limit. An in-flight attempt can overrun it; any overrun
-/// fails the plan closed.
+/// Executor-enforced accounting limit; overruns fail the plan.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct PlanBudget {
     pub usd: f64,
 }
 
-/// A versioned work graph. Version 1 is the only executable format today; `reason` is
-/// reserved for a future replan protocol.
+/// A versioned work graph. `reason` is reserved for replanning.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Plan {
     pub version: u32,
@@ -205,15 +198,14 @@ impl ValidPlan {
         self.topo.iter().map(|&i| &self.plan.tasks[i])
     }
 
-    #[allow(dead_code)] // test-only until the judge wiring consumes plans by task name
+    #[allow(dead_code)]
     pub fn get(&self, name: &TaskName) -> Option<&Task> {
         self.plan.tasks.iter().find(|t| &t.name == name)
     }
 }
 
 impl Plan {
-    /// Parse the JSON form. Parsing is not validation: call [`Plan::validate`] before
-    /// anything runs.
+    /// Parse JSON without validating it.
     pub fn from_json_str(s: &str) -> Result<Plan> {
         serde_json::from_str(s).context("PLAN.json does not parse as a plan")
     }
@@ -223,8 +215,7 @@ impl Plan {
         toml::from_str(s).context("plan TOML does not parse")
     }
 
-    /// Structural validation: supported format version, unique names, resolved edges,
-    /// acyclic graph, and a declared budget. Returns the topologically ordered plan.
+    /// Validate structure and compute dependency order.
     pub fn validate(self) -> Result<ValidPlan> {
         if self.version != 1 {
             bail!(

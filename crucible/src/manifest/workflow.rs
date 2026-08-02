@@ -1,8 +1,4 @@
-//! Pack-authored workflow graphs and their admission contract.
-//!
-//! Topology is data. Safety comes from two independent checks: a workflow type chooses
-//! the semantic invariants the graph must satisfy, and the admitting orchestrator must
-//! advertise capabilities for that type and every engine operation it will execute.
+//! Pack-authored graphs. Workflow invariants and orchestrator capabilities are checked separately.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -11,17 +7,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::plan::ir::{EngineOp, Join, Plan, PlanBudget, Task, TaskKind, TaskName};
 
-/// Task names used by the compatibility template. Fully-authored workflows may reuse
-/// these names; they are not engine-owned identities.
+/// Names used only by the compatibility template.
 const LEGACY_NAMES: [&str; 4] = ["propose", "apply", "measure", "decide"];
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowType {
-    /// A repeating candidate/apply/measure/decision protocol.
+    /// The candidate/apply/measure/decision protocol.
     #[default]
     Autoresearch,
-    /// An arbitrary DAG. Only universal graph and operation-authority rules apply.
+    /// An arbitrary capability-admitted DAG.
     Custom,
 }
 
@@ -81,11 +76,10 @@ impl WorkflowCaps {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowCfg {
-    /// The semantic contract an admitting orchestrator promises to enforce.
+    /// Invariants enforced by the admitting orchestrator.
     #[serde(rename = "type", default)]
     pub workflow_type: WorkflowType,
-    /// The task whose typed output completes the workflow. Required for fully-authored
-    /// autoresearch graphs; absent preserves the original splice-only manifest format.
+    /// Result task; absent selects the compatibility splice format.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<TaskName>,
     #[serde(rename = "task", default)]
@@ -93,8 +87,7 @@ pub struct WorkflowCfg {
 }
 
 impl WorkflowCfg {
-    /// Validate graph structure plus the invariants selected by `type`. This does not
-    /// grant execution authority; call [`WorkflowCfg::admit`] at the orchestrator edge.
+    /// Validate structure and type-specific invariants, without granting authority.
     pub fn validate(&self) -> Result<()> {
         if self.is_legacy_splice() {
             return self.validate_legacy_splice();
@@ -110,7 +103,7 @@ impl WorkflowCfg {
 
         let tasks: BTreeMap<&TaskName, &Task> =
             self.tasks.iter().map(|task| (&task.name, task)).collect();
-        // A measurement is taken when it is graded, so only one decision may claim it.
+        // A measurement source may feed only one decision.
         let mut decided_sources: BTreeMap<&TaskName, &TaskName> = BTreeMap::new();
         for task in &self.tasks {
             if let TaskKind::Engine { op, source } = &task.task {
@@ -180,7 +173,7 @@ impl WorkflowCfg {
         Ok(())
     }
 
-    /// Validate and prove that the admitting orchestrator owns every requested authority.
+    /// Require orchestrator authority for the workflow and its engine operations.
     pub fn admit(&self, caps: &WorkflowCaps) -> Result<()> {
         self.validate()?;
         caps.require(self.workflow_type.capability())?;
@@ -314,7 +307,7 @@ impl WorkflowCfg {
         Ok(())
     }
 
-    /// The tasks nothing else depends on, used only by the legacy splice adapter.
+    /// Terminal tasks used by the compatibility splice adapter.
     pub fn sinks(&self) -> Vec<TaskName> {
         self.tasks
             .iter()
@@ -331,10 +324,7 @@ impl WorkflowCfg {
     }
 }
 
-/// Iterative with a visited set; the recursive form was exponential in path count. Already
-/// known acyclic here, `Plan::validate` runs Kahn's first.
-/// Iterative with a visited set; the recursive form was exponential in path count. Already
-/// known acyclic here, `Plan::validate` runs Kahn's first.
+/// Iterative to remain linear across diamond-shaped DAGs.
 fn is_ancestor(tasks: &BTreeMap<&TaskName, &Task>, ancestor: &TaskName, node: &TaskName) -> bool {
     let mut stack = vec![node];
     let mut seen = BTreeSet::new();

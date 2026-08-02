@@ -25,9 +25,7 @@ const RESULT_FILE: &str = "PLAN_TASK_RESULT.json";
 pub struct HarnessRunner {
     pub args: Args,
     pub paths: Paths,
-    /// Manifest-owned files that must be restored inside the task's actual workspace
-    /// before it runs. Destinations are workspace-relative so isolated clones get the
-    /// same protection as the shared workspace.
+    /// Manifest-owned files restored in each task workspace.
     pub frozen_injects: Vec<(PathBuf, PathBuf)>,
     pub toolbox_exclude: Vec<String>,
 }
@@ -520,9 +518,6 @@ mod tests {
         )
     }
 
-    /// A review pass between the code node and the gate. The reward-hacked implementation
-    /// passes the frozen functional gate and tries to replace the policy gate. The runner
-    /// must restore that gate before dispatch, then keep the expensive task blocked.
     #[test]
     fn adversarial_review_gates_a_reward_hack_the_frozen_gate_cannot_see() {
         // 1. Clean implementation: the review approves and the whole chain runs.
