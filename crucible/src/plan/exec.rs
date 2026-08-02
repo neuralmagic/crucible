@@ -153,6 +153,22 @@ pub struct PlanOutcome {
     pub results: BTreeMap<TaskName, TaskResult>,
 }
 
+/// The tasks that can run on this substrate. Runnability is transitive: `needs` satisfied and
+/// every dependency runnable. Computed for the whole plan before anything dispatches, so
+/// truncation costs zero spend; the CLI preview folds the same set so it can't drift.
+pub(crate) fn runnable_set<'a>(
+    plan: &'a ValidPlan,
+    substrate: &Substrate,
+) -> BTreeSet<&'a TaskName> {
+    let mut runnable: BTreeSet<&TaskName> = BTreeSet::new();
+    for t in plan.tasks_topo() {
+        if substrate.supports(&t.needs) && t.depends_on.iter().all(|d| runnable.contains(d)) {
+            runnable.insert(&t.name);
+        }
+    }
+    runnable
+}
+
 /// Execute a validated, admitted plan to completion. `on_result` fires once per task as it
 /// reaches a terminal status, in dispatch order: the live-progress hook the session log
 /// (and any tailer) hangs off; the returned `PlanOutcome` carries the same results folded.
@@ -163,17 +179,11 @@ pub fn execute(
     runner: &mut dyn TaskRunner,
     mut on_result: impl FnMut(&Task, &TaskResult),
 ) -> PlanOutcome {
-    // Runnability is transitive: needs satisfied and every dependency runnable. Computed for
-    // the whole plan before anything dispatches, so truncation costs zero spend.
-    let mut runnable: BTreeMap<&TaskName, bool> = BTreeMap::new();
-    for t in plan.tasks_topo() {
-        let ok = substrate.supports(&t.needs)
-            && t.depends_on
-                .iter()
-                .all(|d| runnable.get(d).copied().unwrap_or(false));
-        runnable.insert(&t.name, ok);
-    }
-    if let Some(t) = plan.tasks_topo().find(|t| t.required && !runnable[&t.name]) {
+    let runnable = runnable_set(plan, substrate);
+    if let Some(t) = plan
+        .tasks_topo()
+        .find(|t| t.required && !runnable.contains(&t.name))
+    {
         // A truncated DAG can never produce an honest pass: fail fast, dispatch nothing.
         let mut results = BTreeMap::new();
         for task in plan.tasks_topo() {
@@ -233,7 +243,7 @@ pub fn execute(
                 record(t, r, &mut results, &mut halted);
                 continue;
             }
-            if !runnable[&t.name] {
+            if !runnable.contains(&t.name) {
                 let r =
                     TaskResult::undispatched(TaskStatus::Skipped, "unrunnable on this substrate");
                 record(t, r, &mut results, &mut halted);

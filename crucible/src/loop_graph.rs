@@ -357,7 +357,6 @@ pub(crate) struct WideOutcome {
     pub diffs: BTreeMap<u32, String>,
 }
 
-/// Run the wide tournament as a plan.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_wide_tournament<R: Reporter>(
     cfg: &WideConfig,
@@ -426,7 +425,6 @@ pub(crate) fn run_wide_tournament<R: Reporter>(
         return Err(e);
     }
 
-    // Winners from the reducer's output.
     let mut winners: Vec<u32> = Vec::new();
     if let Some(kept) = outcome
         .results
@@ -694,6 +692,12 @@ impl<R: Reporter> TaskRunner for WideRunner<'_, R> {
                 let Some(id) = candidate_id(&task.name) else {
                     return fail(0.0, format!("task {} has no candidate id", task.name));
                 };
+                let pending = match crate::plan::worktree::capture_diff(&self.p.workspace) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return fail(0.0, format!("capturing the workspace state failed: {e:#}"));
+                    }
+                };
                 wide_propose(
                     self.args,
                     &self.p.workspace,
@@ -701,6 +705,7 @@ impl<R: Reporter> TaskRunner for WideRunner<'_, R> {
                     self.p.skills.clone(),
                     id,
                     prompt,
+                    &pending,
                 )
             }
             TaskKind::Engine(EngineOp::MeasureDiff) => self.measure_diff(task, inputs),
@@ -719,6 +724,15 @@ impl<R: Reporter> TaskRunner for WideRunner<'_, R> {
         let wide_dir = self.wide_dir.clone();
         let skills = self.p.skills.clone();
         let args = self.args;
+        // Every candidate clones the same workspace, so its pending state is captured once
+        // here: concurrent `git add -A` in one repo races on `.git/index.lock`.
+        let pending = match crate::plan::worktree::capture_diff(&workspace) {
+            Ok(p) => p,
+            Err(e) => {
+                let note = format!("capturing the workspace state failed: {e:#}");
+                return batch.iter().map(|_| fail(0.0, note.clone())).collect();
+            }
+        };
         std::thread::scope(|s| {
             let handles: Vec<_> = batch
                 .iter()
@@ -727,15 +741,16 @@ impl<R: Reporter> TaskRunner for WideRunner<'_, R> {
                     let wide_dir = wide_dir.clone();
                     let skills = skills.clone();
                     let args = args.clone();
-                    let (id, prompt) = match (&b.task.task, candidate_id(&b.task.name)) {
-                        (TaskKind::Agent { prompt, .. }, Some(id)) => (id, prompt.clone()),
-                        _ => (u32::MAX, String::new()),
+                    let pending = pending.as_str();
+                    let parsed = match (&b.task.task, candidate_id(&b.task.name)) {
+                        (TaskKind::Agent { prompt, .. }, Some(id)) => Some((id, prompt.clone())),
+                        _ => None,
                     };
-                    s.spawn(move || {
-                        if id == u32::MAX {
-                            return fail(0.0, "non-agent task in a propose batch".to_string());
+                    s.spawn(move || match parsed {
+                        Some((id, prompt)) => {
+                            wide_propose(&args, &workspace, &wide_dir, skills, id, &prompt, pending)
                         }
-                        wide_propose(&args, &workspace, &wide_dir, skills, id, &prompt)
+                        None => fail(0.0, "non-agent task in a propose batch".to_string()),
                     })
                 })
                 .collect();
@@ -761,29 +776,24 @@ fn wide_propose(
     skills: Option<PathBuf>,
     id: u32,
     prompt: &str,
+    pending: &str,
 ) -> Attempt {
     if STOP.load(Ordering::SeqCst) {
         return pass(serde_json::json!({ "diff": "" }));
     }
     let worktree = wide_dir.join(format!("candidate-{id}"));
-    if let Err(e) = crate::plan::worktree::setup(workspace, &worktree) {
+    if let Err(e) = crate::plan::worktree::setup(workspace, &worktree, pending) {
         return fail(0.0, format!("worktree setup failed: {e:#}"));
     }
-    let cand_paths = Paths {
-        workspace: worktree.clone(),
-        skills,
-        steer: worktree.join("STEER.md"),
-        state: worktree.join("state"),
-        session_log: worktree.join("state/session.jsonl"),
-        control: worktree.join("state/control.json"),
-        escalation: worktree.join("ESCALATION.json"),
-        provisioning: worktree.join("PROVISIONING_PENDING.json"),
-    };
+    let cand_paths = Paths::for_worktree(worktree.clone(), skills);
     let _ = std::fs::create_dir_all(&cand_paths.state);
     let _cost = agent::run_turn(args, &cand_paths, prompt, false, |_line, _stream, _ev| {});
     let diff = crate::plan::worktree::capture_diff(&worktree);
     let _ = std::fs::remove_dir_all(&worktree);
-    pass(serde_json::json!({ "diff": diff }))
+    match diff {
+        Ok(diff) => pass(serde_json::json!({ "diff": diff })),
+        Err(e) => fail(0.0, format!("capturing the candidate diff failed: {e:#}")),
+    }
 }
 
 /// The numeric suffix of `propose-{id}` / `measure-{id}` task names.
@@ -795,13 +805,11 @@ fn candidate_id(name: &TaskName) -> Option<u32> {
 /// the domain's structure. The status is omitted (no prior score in the wide round).
 fn render_wide_prompt(template: &str, goal: &str, approach: &str) -> String {
     let status = "no prior score (wide round, first attempt)";
-    let mut out = template
+    let out = template
         .replace("{{GOAL}}", goal.trim())
         .replace("{{STATUS}}", status)
-        .replace("{{BEST_SCORE}}", status);
-    if out.contains("{{STEER}}") {
-        out = out.replace("{{STEER}}", "");
-    }
+        .replace("{{BEST_SCORE}}", status)
+        .replace("{{STEER}}", "");
     format!(
         "## Approach constraint (MANDATORY)\n\
          You MUST use this specific approach: {approach}\n\

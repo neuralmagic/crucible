@@ -176,7 +176,6 @@ impl ValidPlan {
         &self.plan
     }
 
-    /// Tasks in dependency-first order.
     pub fn tasks_topo(&self) -> impl Iterator<Item = &Task> {
         self.topo.iter().map(|&i| &self.plan.tasks[i])
     }
