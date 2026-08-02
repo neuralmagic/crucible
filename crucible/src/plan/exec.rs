@@ -165,9 +165,9 @@ pub(crate) fn runnable_set<'a>(
         let deps_runnable = match t.join {
             Join::All => t.depends_on.iter().all(|d| runnable.contains(d)),
             // A lossy join is specifically allowed to run without advisory branches that this
-            // substrate cannot provide. Required dependencies independently trigger the
-            // fail-closed check in `execute`.
-            Join::Passed => true,
+            // substrate cannot provide, but at least one branch must remain. Required
+            // dependencies independently trigger the fail-closed check in `execute`.
+            Join::Passed => t.depends_on.iter().any(|d| runnable.contains(d)),
         };
         if substrate.supports(&t.needs) && deps_runnable {
             runnable.insert(&t.name);
@@ -262,9 +262,12 @@ pub fn execute(
                     .depends_on
                     .iter()
                     .all(|d| results.get(d).map(|r| r.status) == Some(TaskStatus::Pass)),
-                // Lossy join: dispatch over whatever passed (a Fail dep just contributes
-                // no input; the inputs collection below filters on output presence).
-                Join::Passed => true,
+                // Lossy join: dispatch over the non-empty set that passed (a Fail dep just
+                // contributes no input; the inputs collection below filters outputs).
+                Join::Passed => t
+                    .depends_on
+                    .iter()
+                    .any(|d| results.get(d).map(|r| r.status) == Some(TaskStatus::Pass)),
             };
             if !deps_ok {
                 // Nothing runs on top of a failure (or a skip): advisory failures gate
@@ -768,6 +771,64 @@ mod tests {
         assert_eq!(out.results[&"racecheck".into()].status, TaskStatus::Skipped);
         assert_eq!(out.results[&"grade".into()].status, TaskStatus::Pass);
         assert_eq!(runner.seen_inputs["grade"], vec!["score".to_string()]);
+    }
+
+    #[test]
+    fn passed_join_truncates_when_no_dependency_can_run() {
+        let mut tasks = vec![
+            task("trace", &[], "ncu", false),
+            task("racecheck", &[], "gpu", false),
+        ];
+        let mut grade = task("grade", &["trace", "racecheck"], "any", true);
+        grade.join = Join::Passed;
+        tasks.push(grade);
+        let plan = valid(tasks, 10.0);
+        let mut runner = ScriptRunner::new();
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut runner,
+            |_, _| {},
+        );
+
+        assert!(!out.valid);
+        assert_eq!(
+            out.exit,
+            PlanExit::Truncated {
+                task: "grade".into()
+            }
+        );
+        assert!(runner.dispatched.is_empty(), "preflight must fail closed");
+    }
+
+    #[test]
+    fn passed_join_blocks_when_no_dependency_passes() {
+        let mut tasks = vec![
+            task("trace", &[], "any", false),
+            task("racecheck", &[], "any", false),
+        ];
+        let mut grade = task("grade", &["trace", "racecheck"], "any", true);
+        grade.join = Join::Passed;
+        tasks.push(grade);
+        let plan = valid(tasks, 10.0);
+        let mut runner = ScriptRunner::new();
+        runner.on("trace", 1, || AttemptOutcome::Fail("no trace".into()), 0.0);
+        runner.on("racecheck", 1, || AttemptOutcome::Fail("race".into()), 0.0);
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut runner,
+            |_, _| {},
+        );
+
+        assert!(!out.valid);
+        assert_eq!(out.results[&"grade".into()].status, TaskStatus::Blocked);
+        assert_eq!(
+            runner.dispatched,
+            vec![("trace".to_string(), 1), ("racecheck".to_string(), 1)]
+        );
     }
 
     #[test]

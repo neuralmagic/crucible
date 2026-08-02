@@ -221,10 +221,12 @@ decision = decide(name = "choose", measurement = measurement)
 ```
 
 Dependencies express measurement rungs. Ready isolated siblings run concurrently. `evaluate()`
-expects a JSON object on its command's last stdout line: an explicit boolean `pass` wins;
-otherwise paired `threshold`/`direction` fields compare numeric `score`; with neither, a successful
-command passes. `grade()` joins passing evidence, requires its selected `score` evaluator to have
-passed, and assembles the typed reading consumed by the existing decision engine. The legacy
+expects a JSON object on its command's last stdout line. An explicit boolean `pass = false` vetoes
+the result; paired `threshold`/`direction` fields must also accept numeric `score`. Malformed
+`pass` values fail closed. With no threshold, the script's `pass` decides, defaulting to success
+when omitted. `grade()` defaults to joining passing evidence; set `join = "all"` for a strict
+join. It requires its selected `score` evaluator to have passed and assembles the typed reading
+consumed by the existing decision engine. The legacy
 `measure()` path and missing-workflow default are unchanged.
 
 `session = "solver"` binds agent-producing tasks to a durable logical conversation. The checkout
@@ -292,8 +294,9 @@ names.
 
 Agent tasks receive upstream structured results in their prompt and must write one JSON object to
 `PLAN_TASK_RESULT.json`. A required task failure discards the candidate before measurement; an
-advisory task uses `required = False`. `join = "passed"` lets a downstream task receive only
-successful results after all dependencies become terminal.
+advisory task uses `required = False`. `join = "passed"` lets a downstream task receive a
+non-empty set of successful results after all dependencies become terminal; it blocks rather than
+dispatching with no passing input.
 
 For local review, `crucible plan compile-workflow --file workflow.star` prints stable canonical
 JSON. Add `--manifest crucible.toml` to also replace the generated `[workflow]` block. Compilation

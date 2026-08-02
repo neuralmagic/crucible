@@ -166,12 +166,12 @@ fn run_in(
                 workdir: paths.workspace.clone(),
                 agent_cmd: None,
             };
-            // `HarnessRunner` already created the private worktree above. Clear the marker
-            // for the inner shell runner, whose refusal protects direct callers that have
-            // not honored isolation.
-            let mut honored = task.clone();
-            honored.isolation = None;
-            return shell.run(&honored, attempt, inputs);
+            return if task.isolation == Some(Isolation::Worktree) {
+                // `run_task` prepared this private worktree before selecting `paths`.
+                shell.run_in_prepared_worktree(task, inputs)
+            } else {
+                shell.run(task, attempt, inputs)
+            };
         }
         TaskKind::TopK { .. } => {
             return fail(0.0, "reducer task reached the runner".to_string());
