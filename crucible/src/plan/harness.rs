@@ -8,7 +8,6 @@
 //! its sentinel files. No file, no pass.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 
 use clap::ValueEnum;
 
@@ -25,23 +24,11 @@ const RESULT_FILE: &str = "PLAN_TASK_RESULT.json";
 pub struct HarnessRunner {
     pub args: Args,
     pub paths: Paths,
-    /// Manifest-owned files restored in each task workspace.
-    pub frozen_injects: Vec<(PathBuf, PathBuf)>,
-    pub toolbox_exclude: Vec<String>,
 }
 
 impl TaskRunner for HarnessRunner {
     fn run(&mut self, task: &Task, attempt: u32, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
-        run_task(
-            &self.args,
-            &self.paths,
-            &self.frozen_injects,
-            &self.toolbox_exclude,
-            task,
-            attempt,
-            inputs,
-            None,
-        )
+        run_task(&self.args, &self.paths, task, attempt, inputs, None)
     }
 
     /// Isolated tasks that are ready together run concurrently, each in its own worktree.
@@ -53,8 +40,6 @@ impl TaskRunner for HarnessRunner {
             return vec![run_task(
                 &self.args,
                 &self.paths,
-                &self.frozen_injects,
-                &self.toolbox_exclude,
                 b.task,
                 b.attempt,
                 &b.inputs,
@@ -77,19 +62,8 @@ impl TaskRunner for HarnessRunner {
                     let args = self.args.clone();
                     let paths = self.paths.clone();
                     let pending = pending.as_str();
-                    let frozen_injects = &self.frozen_injects;
-                    let toolbox_exclude = &self.toolbox_exclude;
                     scope.spawn(move || {
-                        run_task(
-                            &args,
-                            &paths,
-                            frozen_injects,
-                            toolbox_exclude,
-                            b.task,
-                            b.attempt,
-                            &b.inputs,
-                            Some(pending),
-                        )
+                        run_task(&args, &paths, b.task, b.attempt, &b.inputs, Some(pending))
                     })
                 })
                 .collect();
@@ -110,23 +84,13 @@ impl TaskRunner for HarnessRunner {
 fn run_task(
     args: &Args,
     paths: &Paths,
-    frozen_injects: &[(PathBuf, PathBuf)],
-    toolbox_exclude: &[String],
     task: &Task,
     attempt: u32,
     inputs: &BTreeMap<TaskName, Value>,
     pending: Option<&str>,
 ) -> Attempt {
     let Some(Isolation::Worktree) = task.isolation else {
-        return prepare_and_run(
-            args,
-            paths,
-            frozen_injects,
-            toolbox_exclude,
-            task,
-            attempt,
-            inputs,
-        );
+        return prepare_and_run(args, paths, task, attempt, inputs);
     };
     // A private clone of the workspace. Its edits are discarded on cleanup: what leaves an
     // isolated task is its declared output, so this is for review/analysis work, not for
@@ -157,15 +121,7 @@ fn run_task(
     }
     let iso = Paths::for_worktree(worktree.clone(), paths.skills.clone());
     let _ = std::fs::create_dir_all(&iso.state);
-    let attempt_out = prepare_and_run(
-        args,
-        &iso,
-        frozen_injects,
-        toolbox_exclude,
-        task,
-        attempt,
-        inputs,
-    );
+    let attempt_out = prepare_and_run(args, &iso, task, attempt, inputs);
     let _ = std::fs::remove_dir_all(&worktree);
     attempt_out
 }
@@ -173,13 +129,11 @@ fn run_task(
 fn prepare_and_run(
     args: &Args,
     paths: &Paths,
-    frozen_injects: &[(PathBuf, PathBuf)],
-    toolbox_exclude: &[String],
     task: &Task,
     attempt: u32,
     inputs: &BTreeMap<TaskName, Value>,
 ) -> Attempt {
-    for (src, dst) in frozen_injects {
+    for (src, dst) in &args.workflow_frozen_injects {
         if let Err(e) = crate::manifest::apply_inject(src, &paths.workspace.join(dst)) {
             return transport(format!(
                 "restoring frozen inject {} -> {} failed: {e:#}",
@@ -188,7 +142,7 @@ fn prepare_and_run(
             ));
         }
     }
-    run_in(args, paths, toolbox_exclude, task, attempt, inputs)
+    run_in(args, paths, task, attempt, inputs)
 }
 
 /// One task against a specific workspace. `Command` tasks go to the shell runner; `Agent`
@@ -196,7 +150,6 @@ fn prepare_and_run(
 fn run_in(
     args: &Args,
     paths: &Paths,
-    toolbox_exclude: &[String],
     task: &Task,
     attempt: u32,
     inputs: &BTreeMap<TaskName, Value>,
@@ -242,8 +195,11 @@ fn run_in(
             Err(err) => return fail(0.0, format!("task names unknown effort {e:?}: {err}")),
         }
     }
-    if let Err(e) = crate::run::install_toolbox(paths, toolbox_exclude, args.harness().skills_dir())
-    {
+    if let Err(e) = crate::run::install_toolbox(
+        paths,
+        &args.workflow_toolbox_exclude,
+        args.harness().skills_dir(),
+    ) {
         return transport(format!("installing the task toolbox failed: {e:#}"));
     }
 
@@ -703,8 +659,6 @@ mod tests {
                 &std::env::temp_dir(),
                 None,
             ),
-            frozen_injects: Vec::new(),
-            toolbox_exclude: Vec::new(),
         };
         let a = runner.run(&t, 1, &BTreeMap::new());
         match a.outcome {

@@ -43,12 +43,12 @@ pub(crate) struct IterCtx<'a> {
     /// the typestate path would after the turn.
     pub spent_before: f64,
     pub started: Instant,
-    pub workflow: Option<&'a crate::manifest::WorkflowCfg>,
+    pub workflow: Option<&'a WorkflowCfg>,
 }
 
 /// Run one admitted autoresearch iteration and return its step and cost.
 pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(IterStep, f64)> {
-    let plan = iteration_template(cx.prompt, cx.workflow)?;
+    let plan = iteration_template(cx.workflow)?;
     let result_task = cx
         .workflow
         .filter(|workflow| !workflow.is_legacy_splice())
@@ -81,8 +81,6 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
         workflow_runner: crate::plan::harness::HarnessRunner {
             args: cx.args.clone(),
             paths: cx.p.clone(),
-            frozen_injects: cx.args.workflow_frozen_injects.clone(),
-            toolbox_exclude: cx.args.workflow_toolbox_exclude.clone(),
         },
     };
     // The runner and the on_result hook both need the reporter; collect the wire lines
@@ -109,7 +107,6 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
     if let Some(e) = runner.fatal.take() {
         return Err(e);
     }
-    let mut r_note: Option<String> = None;
     let step = match runner.signal.take() {
         Some(Signal::Discard) => IterStep::Discarded,
         Some(Signal::Escalate) => IterStep::Escalated,
@@ -125,7 +122,7 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
                         .get(task)
                         .and_then(|r| r.note.clone())
                         .unwrap_or_default();
-                    r_note = Some(format!(
+                    runner.r.note(&format!(
                         "workflow task {task} rejected the candidate (discarding iter {}): {why}",
                         cx.it
                     ));
@@ -137,14 +134,11 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
             },
         },
     };
-    if let Some(msg) = r_note {
-        runner.r.note(&msg);
-    }
     Ok((step, outcome.spent_usd))
 }
 
 /// Build and admit the default or authored iteration graph.
-fn iteration_template(_prompt: &str, workflow: Option<&WorkflowCfg>) -> Result<ValidPlan> {
+fn iteration_template(workflow: Option<&WorkflowCfg>) -> Result<ValidPlan> {
     if let Some(workflow) = workflow.filter(|workflow| !workflow.is_legacy_splice()) {
         workflow
             .admit(&WorkflowCaps::autoresearch_engine())
@@ -929,12 +923,12 @@ mod tests {
 
     #[test]
     fn pack_tasks_splice_between_the_turn_and_the_gate() {
-        let w: crate::manifest::WorkflowCfg = toml::from_str(
+        let w: WorkflowCfg = toml::from_str(
             "[[task]]\nname = \"review\"\nkind = \"command\"\ncommand = \"true\"\n             [[task]]\nname = \"lint\"\nkind = \"command\"\ncommand = \"true\"\ndepends_on = [\"review\"]\n",
         )
         .unwrap();
         w.validate().unwrap();
-        let plan = iteration_template("go", Some(&w)).unwrap();
+        let plan = iteration_template(Some(&w)).unwrap();
         let names: Vec<&str> = plan.tasks_topo().map(|t| t.name.0.as_str()).collect();
         assert_eq!(
             names,
@@ -1000,7 +994,7 @@ mod tests {
 
     #[test]
     fn template_is_the_canonical_chain() {
-        let plan = iteration_template("go", None).unwrap();
+        let plan = iteration_template(None).unwrap();
         let names: Vec<&str> = plan.tasks_topo().map(|t| t.name.0.as_str()).collect();
         assert_eq!(names, ["propose", "apply", "measure", "decide"]);
         assert!(plan.tasks_topo().all(|t| t.required));
@@ -1028,7 +1022,7 @@ mod tests {
              [[task]]\nname = \"keep-if-better\"\nkind = \"engine\"\nop = \"decide\"\nsource = \"benchmark-a\"\ndepends_on = [\"benchmark-a\", \"explain-score\"]\n",
         )
         .unwrap();
-        let plan = iteration_template("dynamic prompt", Some(&workflow)).unwrap();
+        let plan = iteration_template(Some(&workflow)).unwrap();
         let names: Vec<&str> = plan.tasks_topo().map(|task| task.name.0.as_str()).collect();
         assert_eq!(
             names,

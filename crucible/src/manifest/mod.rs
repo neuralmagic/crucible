@@ -457,6 +457,18 @@ impl Manifest {
             .map(|i| (manifest_dir.join(&i.src), workspace.join(&i.dst), i.frozen))
             .collect()
     }
+
+    /// Frozen injects as `(absolute src, workspace-relative dst)`. Unlike
+    /// [`Manifest::resolved_injects`] the destination stays relative: a plan task may run in an
+    /// isolated worktree, so the workspace root is only known at dispatch.
+    pub fn frozen_inject_pairs(&self, manifest_dir: &Path) -> Vec<(PathBuf, PathBuf)> {
+        self.workspace
+            .inject
+            .iter()
+            .filter(|i| i.frozen)
+            .map(|i| (manifest_dir.join(&i.src), PathBuf::from(&i.dst)))
+            .collect()
+    }
 }
 
 /// A composite domain: N component domains assembled into one run with a multi-workspace world +
