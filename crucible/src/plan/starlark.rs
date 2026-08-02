@@ -594,9 +594,31 @@ pub fn materialize_manifest(source_path: &Path, manifest_path: &Path) -> Result<
         "\n# Generated from workflow.star. Edit the Starlark source; scope recompiles it.\n",
     );
     materialized.push_str(&workflow_toml);
-    std::fs::write(manifest_path, materialized)
+    write_atomically(manifest_path, &materialized)
         .with_context(|| format!("writing manifest {}", manifest_path.display()))?;
     Ok(compiled)
+}
+
+/// Replace `path` atomically; a truncating write that dies partway would leave the frozen
+/// manifest unloadable.
+fn write_atomically(path: &Path, body: &str) -> Result<()> {
+    let dir = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut file = tempfile::NamedTempFile::new_in(dir)
+        .with_context(|| format!("creating temp file beside {}", path.display()))?;
+    // NamedTempFile is 0600 and persist renames it in, so carry the original mode across.
+    if let Ok(existing) = std::fs::metadata(path) {
+        file.as_file()
+            .set_permissions(existing.permissions())
+            .with_context(|| format!("preserving permissions on {}", path.display()))?;
+    }
+    std::io::Write::write_all(file.as_file_mut(), body.as_bytes())?;
+    file.as_file().sync_all()?;
+    file.persist(path)
+        .map_err(|e| anyhow::anyhow!("installing {}: {e}", path.display()))?;
+    Ok(())
 }
 
 /// Compile a conventional sibling `workflow.star` when one is present.
@@ -834,5 +856,43 @@ default_autoresearch([review])
             serde_json::to_value(&compiled.workflow).unwrap(),
             serde_json::to_value(&manifest.workflow).unwrap()
         );
+    }
+
+    /// Temp file plus rename, and the mode survives it.
+    #[cfg(unix)]
+    #[test]
+    fn materializing_is_atomic_and_keeps_the_manifest_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let pack = temp_pack("atomic");
+        std::fs::write(pack.join("prompts/review.md"), "Review it.\n").unwrap();
+        std::fs::write(
+            pack.join("workflow.star"),
+            "workflow([agent(name = \"review\", prompt = prompt_file(\"prompts/review.md\"))])\n",
+        )
+        .unwrap();
+        let manifest_path = pack.join("crucible.toml");
+        std::fs::write(&manifest_path, "# preserved\n[repo]\npath = \".\"\n").unwrap();
+        std::fs::set_permissions(&manifest_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        materialize_manifest(&pack.join("workflow.star"), &manifest_path).unwrap();
+
+        let mode = std::fs::metadata(&manifest_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o644, "materializing must not narrow the mode");
+        let body = std::fs::read_to_string(&manifest_path).unwrap();
+        assert!(body.contains("# preserved"), "{body}");
+        assert!(body.contains("[[workflow.task]]"), "{body}");
+        // No temp file left beside the manifest.
+        let strays: Vec<_> = std::fs::read_dir(&pack)
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+            .filter(|name| name.to_string_lossy().starts_with(".tmp"))
+            .collect();
+        assert!(strays.is_empty(), "left temp files: {strays:?}");
+        let _ = std::fs::remove_dir_all(&pack);
     }
 }

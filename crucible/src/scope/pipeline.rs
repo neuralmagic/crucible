@@ -299,7 +299,7 @@ impl Propose {
             }
 
             let judge_block = read_judge_block(&ctx.manifest_path);
-            match validate_round(&ctx.manifest_path) {
+            match compile_and_validate_round(&ctx.manifest_path) {
                 RoundVerdict::Passed(outcome) => {
                     ctx.refine_rounds.push(RoundRecord {
                         round,
@@ -392,7 +392,7 @@ impl Propose {
         // Re-validate WHILE the check-populated workspace still exists, so the probe reuses it
         // instead of cloning the freshly-pinned remote `[repo]` (a network round-trip the freeze
         // doesn't need). A failure here is a rewrite bug, fail the scope loudly, never ship it.
-        match validate_round(&ctx.manifest_path) {
+        match compile_and_validate_round(&ctx.manifest_path) {
             RoundVerdict::Passed(outcome) => ctx.check_outcome = Some(outcome),
             RoundVerdict::Failed(evidence) => bail!(
                 "the frozen pack failed re-validation after the freeze rewrite for {}: {}",
@@ -524,7 +524,7 @@ impl Propose {
             }
 
             let judge_block = read_judge_block(&ctx.manifest_path);
-            match validate_round(&ctx.manifest_path) {
+            match compile_and_validate_round(&ctx.manifest_path) {
                 RoundVerdict::Failed(ev) => {
                     ctx.refine_rounds.push(RoundRecord {
                         round: refine_round,
@@ -706,11 +706,12 @@ enum RoundVerdict {
     Failed(FailureEvidence),
 }
 
-/// Validate a proposed pack for one refine round: the structural preconditions first (a parseable
-/// manifest with a `[judge.selftest]` whose `runs` meets the pipeline floor), then the full
-/// `crucible check` (contract probe + self-test discrimination). Classifies any failure into the
-/// stage-tagged [`FailureEvidence`] the refine turn is handed.
-fn validate_round(manifest_path: &Path) -> RoundVerdict {
+/// Validate a proposed pack for one refine round: structural preconditions, then the full
+/// `crucible check`. Failures are classified into the stage-tagged [`FailureEvidence`].
+///
+/// Writes to the pack: a sibling `workflow.star` is compiled into `[[workflow.task]]` first,
+/// since there is nothing to validate until it is. That happens even for rounds that fail.
+fn compile_and_validate_round(manifest_path: &Path) -> RoundVerdict {
     if !manifest_path.exists() {
         return RoundVerdict::Failed(FailureEvidence::Structure {
             detail: format!(
@@ -1851,7 +1852,7 @@ mod tests {
         .unwrap();
 
         let RoundVerdict::Failed(FailureEvidence::Structure { detail }) =
-            validate_round(&dir.join(MANIFEST_FILE))
+            compile_and_validate_round(&dir.join(MANIFEST_FILE))
         else {
             panic!("bad workflow source must be structure evidence")
         };
