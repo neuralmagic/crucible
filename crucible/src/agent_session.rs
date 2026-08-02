@@ -1,9 +1,10 @@
 //! Durable logical agent sessions.
 //!
 //! The ledger stores only a logical name, an opaque harness continuation id, and a turn count.
-//! It never copies private reasoning or a provider transcript into Crucible's run log. World
-//! rollback and agent learning therefore have independent lifetimes: a discarded candidate can
-//! restore the checkout while the next turn resumes the solver that learned why it failed.
+//! It never copies the provider cursor or native transcript into Crucible's run log. The normal
+//! live harness event stream is unchanged. World rollback and agent learning therefore have
+//! independent lifetimes: a discarded candidate can restore the checkout while the next turn
+//! resumes the solver that learned why it failed.
 
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
