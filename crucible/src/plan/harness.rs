@@ -8,6 +8,8 @@
 //! its sentinel files. No file, no pass.
 
 use std::collections::BTreeMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 use clap::ValueEnum;
 
@@ -28,7 +30,7 @@ pub struct HarnessRunner {
 
 impl TaskRunner for HarnessRunner {
     fn run(&mut self, task: &Task, attempt: u32, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
-        run_task(&self.args, &self.paths, task, attempt, inputs)
+        run_task(&self.args, &self.paths, task, attempt, inputs, None)
     }
 
     /// Isolated tasks that are ready together run concurrently, each in its own worktree.
@@ -43,15 +45,28 @@ impl TaskRunner for HarnessRunner {
                 b.task,
                 b.attempt,
                 &b.inputs,
+                None,
             )];
         }
+        // Every item clones the same workspace, so its pending state is captured once here:
+        // concurrent `git add -A` in one repo races on `.git/index.lock`.
+        let pending = match crate::plan::worktree::capture_diff(&self.paths.workspace) {
+            Ok(p) => p,
+            Err(e) => {
+                let note = format!("capturing the workspace's uncommitted state failed: {e:#}");
+                return batch.iter().map(|_| fail(0.0, note.clone())).collect();
+            }
+        };
         std::thread::scope(|scope| {
             let handles: Vec<_> = batch
                 .iter()
                 .map(|b| {
                     let args = self.args.clone();
                     let paths = self.paths.clone();
-                    scope.spawn(move || run_task(&args, &paths, b.task, b.attempt, &b.inputs))
+                    let pending = pending.as_str();
+                    scope.spawn(move || {
+                        run_task(&args, &paths, b.task, b.attempt, &b.inputs, Some(pending))
+                    })
                 })
                 .collect();
             handles
@@ -65,13 +80,16 @@ impl TaskRunner for HarnessRunner {
     }
 }
 
-/// Dispatch one task, in the shared workspace or in a private worktree.
+/// Dispatch one task, in the shared workspace or in a private worktree. `pending` is the
+/// shared workspace's uncommitted patch when a concurrent caller already captured it for
+/// the whole batch; `None` means capture it here.
 fn run_task(
     args: &Args,
     paths: &Paths,
     task: &Task,
     attempt: u32,
     inputs: &BTreeMap<TaskName, Value>,
+    pending: Option<&str>,
 ) -> Attempt {
     let Some(Isolation::Worktree) = task.isolation else {
         return run_in(args, paths, task, attempt, inputs);
@@ -89,20 +107,32 @@ fn run_task(
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
-    let worktree = root.join(slug);
-    if let Err(e) = crate::plan::worktree::setup(&paths.workspace, &worktree) {
+    // The slug alone is not injective ("a b" and "a-b" collide), and setup() starts by
+    // deleting the destination: colliding names in one concurrent batch would wipe each
+    // other's clone. The hash of the raw name makes the directory unique.
+    let mut hasher = DefaultHasher::new();
+    task.name.0.hash(&mut hasher);
+    let worktree = root.join(format!("{slug}-{:08x}", hasher.finish() as u32));
+    let captured;
+    let pending = match pending {
+        Some(p) => p,
+        None => match crate::plan::worktree::capture_diff(&paths.workspace) {
+            Ok(p) => {
+                captured = p;
+                &captured
+            }
+            Err(e) => {
+                return fail(
+                    0.0,
+                    format!("capturing the workspace's uncommitted state failed: {e:#}"),
+                );
+            }
+        },
+    };
+    if let Err(e) = crate::plan::worktree::setup(&paths.workspace, &worktree, pending) {
         return fail(0.0, format!("worktree setup failed: {e:#}"));
     }
-    let iso = Paths {
-        workspace: worktree.clone(),
-        skills: paths.skills.clone(),
-        steer: worktree.join("STEER.md"),
-        state: worktree.join("state"),
-        session_log: worktree.join("state/session.jsonl"),
-        control: worktree.join("state/control.json"),
-        escalation: worktree.join("ESCALATION.json"),
-        provisioning: worktree.join("PROVISIONING_PENDING.json"),
-    };
+    let iso = Paths::for_worktree(worktree.clone(), paths.skills.clone());
     let _ = std::fs::create_dir_all(&iso.state);
     let attempt_out = run_in(args, &iso, task, attempt, inputs);
     let _ = std::fs::remove_dir_all(&worktree);

@@ -293,7 +293,7 @@ pub(crate) enum Cmd {
     Build(build::BuildArgs),
 }
 
-/// `crucible deploy <render|apply>`: emit the deployment YAML, or render-and-`kubectl apply`.
+/// `crucible plan <show|run>`: compile and inspect a plan, or execute one.
 #[derive(clap::Subcommand)]
 pub(crate) enum PlanAction {
     /// Print the compiled plan (tasks in dependency-first order) and the truncation verdict
@@ -336,6 +336,7 @@ pub(crate) enum PlanAction {
     },
 }
 
+/// `crucible deploy <render|apply>`: emit the deployment YAML, or render-and-`kubectl apply`.
 #[derive(clap::Subcommand)]
 pub(crate) enum DeployAction {
     /// Emit the rendered loop-pod + RBAC YAML to stdout (review / gitops / `kubectl apply -f -`).
@@ -686,6 +687,21 @@ impl Paths {
             escalation,
             provisioning,
             state,
+        }
+    }
+
+    /// Paths for an isolated task worktree: everything (state, steer, markers) lives inside
+    /// the clone so a task cannot touch the parent run's state.
+    fn for_worktree(worktree: PathBuf, skills: Option<PathBuf>) -> Self {
+        Self {
+            skills,
+            steer: worktree.join("STEER.md"),
+            state: worktree.join("state"),
+            session_log: worktree.join("state/session.jsonl"),
+            control: worktree.join("state/control.json"),
+            escalation: worktree.join("ESCALATION.json"),
+            provisioning: worktree.join("PROVISIONING_PENDING.json"),
+            workspace: worktree,
         }
     }
 }

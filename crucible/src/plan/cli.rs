@@ -1,11 +1,11 @@
-//! `crucible plan show`: compile a plan and print it without executing. The preview
-//! command.
+//! The `crucible plan` CLI: `show` compiles and prints a plan; `run` executes one.
 
 use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 
+use crate::plan::exec::{Substrate, runnable_set};
 use crate::plan::ir::{Plan, TaskKind, ValidPlan};
 
 /// Read TOML (`.toml`) or JSON (anything else: the `PLAN.json` sentinel shape),
@@ -34,13 +34,9 @@ pub fn render(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
     if let Some(reason) = &p.reason {
         out.push_str(&format!("replan reason: {reason}\n"));
     }
-    let mut runnable: BTreeSet<&str> = BTreeSet::new();
+    let runnable = runnable_set(plan, &Substrate { caps: caps.clone() });
     for t in plan.tasks_topo() {
-        let ok = (t.needs == "any" || caps.contains(&t.needs))
-            && t.depends_on.iter().all(|d| runnable.contains(d.0.as_str()));
-        if ok {
-            runnable.insert(&t.name.0);
-        }
+        let ok = runnable.contains(&t.name);
         let deps = if t.depends_on.is_empty() {
             "-".to_string()
         } else {
@@ -72,7 +68,7 @@ pub fn render(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
     }
     match plan
         .tasks_topo()
-        .find(|t| t.required && !runnable.contains(t.name.0.as_str()))
+        .find(|t| t.required && !runnable.contains(&t.name))
     {
         Some(t) => out.push_str(&format!(
             "verdict: TRUNCATED — required task {} unrunnable with caps [{}]; execute would \
@@ -88,14 +84,10 @@ pub fn render(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
 /// Render the compiled plan as mermaid flowchart source: pipeable into a terminal mermaid
 /// renderer, pasteable into GitHub markdown, and the same source a UI graph view consumes.
 pub fn render_mermaid(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
-    let mut runnable: BTreeSet<&str> = BTreeSet::new();
+    let runnable = runnable_set(plan, &Substrate { caps: caps.clone() });
     let mut out = String::from("flowchart TD\n");
     for t in plan.tasks_topo() {
-        let ok = (t.needs == "any" || caps.contains(&t.needs))
-            && t.depends_on.iter().all(|d| runnable.contains(d.0.as_str()));
-        if ok {
-            runnable.insert(&t.name.0);
-        }
+        let ok = runnable.contains(&t.name);
         let (shape_open, shape_close, class) = match &t.task {
             TaskKind::Agent { .. } => ("([", "])", "agent"),
             TaskKind::Command { .. } => ("[", "]", "command"),
@@ -251,7 +243,7 @@ pub fn run(
     agent_cmd: Option<String>,
     manifest: Option<&Path>,
 ) -> Result<()> {
-    use crate::plan::exec::{ExecCfg, PlanExit, Substrate, TaskRunner, execute};
+    use crate::plan::exec::{ExecCfg, PlanExit, TaskRunner, execute};
     use crate::plan::runner::ShellRunner;
 
     let plan = load(path)?;
@@ -300,7 +292,7 @@ pub fn run(
             println!(
                 "  {:<20} {:<10} attempts={} cost=${:.4}{}{}",
                 t.name.0,
-                format!("{:?}", r.status).to_lowercase(),
+                r.status.as_str(),
                 r.attempts,
                 r.cost_usd,
                 r.output
