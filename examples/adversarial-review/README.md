@@ -63,8 +63,9 @@ This matters in `plan-reward-hack.toml`: its stand-in implementer tries to repla
 crucible plan compile-workflow \
   --file examples/adversarial-review/workflow.star
 
-# The normal autoresearch loop capability-admits the generated workflow graph.
-crucible --manifest examples/adversarial-review/crucible.toml --iterations 1
+# The graph loop capability-admits and executes the generated workflow.
+crucible --manifest examples/adversarial-review/crucible.toml \
+  --graph-loop --iterations 2 --no-early-stop
 
 # The standalone plan-runner fixture remains useful for inspecting the graph itself.
 crucible plan show --file examples/adversarial-review/plan-panel-hack.toml

@@ -29,3 +29,46 @@ direction   = "higher"
 objective   = "value"
 
 # No [world] block  ->  GitWorld: kept iterations are commits, discards reset --hard + clean.
+
+# Generated from workflow.star. Edit the Starlark source; scope recompiles it.
+[workflow]
+type = "autoresearch"
+result = "decide"
+
+[[workflow.task]]
+name = "propose"
+kind = "engine"
+op = "propose"
+depends_on = []
+session = "solver"
+needs = "any"
+required = true
+join = "all"
+
+[[workflow.task]]
+name = "apply"
+kind = "engine"
+op = "apply"
+depends_on = ["propose"]
+needs = "any"
+required = true
+join = "all"
+
+[[workflow.task]]
+name = "measure"
+kind = "engine"
+op = "measure"
+depends_on = ["apply"]
+needs = "any"
+required = true
+join = "all"
+
+[[workflow.task]]
+name = "decide"
+kind = "engine"
+op = "decide"
+source = "measure"
+depends_on = ["measure"]
+needs = "any"
+required = true
+join = "all"
