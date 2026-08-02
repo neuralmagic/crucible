@@ -219,14 +219,10 @@ fn run_in(
 
     let name = task.name.0.clone();
     let mut transport_error: Option<String> = None;
-    let prepared = match task
-        .session
-        .as_deref()
-        .map(|name| crate::agent_session::prepare(&paths.state, name))
+    let prepared = match crate::agent_session::prepare_named(&paths.state, task.session.as_deref())
     {
-        Some(Ok(turn)) => Some(turn),
-        Some(Err(e)) => return transport(format!("preparing agent session failed: {e:#}")),
-        None => None,
+        Ok(prepared) => prepared,
+        Err(note) => return transport(note),
     };
     let cost = crate::agent::run_turn_with_session(
         &args,
@@ -243,11 +239,12 @@ fn run_in(
             }
         },
     );
-    if transport_error.is_none()
-        && let Some(turn) = &prepared
-        && let Err(e) = crate::agent_session::commit(&paths.state, turn)
-    {
-        transport_error = Some(format!("committing agent session failed: {e:#}"));
+    if let Some(note) = crate::agent_session::commit_if_ok(
+        &paths.state,
+        prepared.as_ref(),
+        transport_error.is_none(),
+    ) {
+        transport_error = Some(note);
     }
 
     match std::fs::read_to_string(&result_path) {
@@ -454,7 +451,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Missing task output fails grading but still advances the session.
     #[test]
     fn a_turn_that_writes_no_result_fails_but_still_advances_the_session() {
         let dir = std::env::temp_dir().join(format!(

@@ -65,7 +65,6 @@ impl WorkflowCaps {
         ])
     }
 
-    /// Advertise a private continuation store in addition to the core loop operations.
     pub fn with_persistent_sessions(mut self) -> Self {
         self.names.insert("agent.session.persist".to_string());
         self

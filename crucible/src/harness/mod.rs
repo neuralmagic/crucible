@@ -107,7 +107,6 @@ impl Harness {
         }
     }
 
-    /// Continue a local turn using an explicit opaque cursor.
     pub(crate) fn local_session_argv(
         self,
         args: &Args,
