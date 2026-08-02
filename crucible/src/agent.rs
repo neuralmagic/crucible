@@ -90,7 +90,7 @@ pub(crate) fn supports_persistent_sessions(args: &Args) -> bool {
     backend_supports_persistent_sessions(args.agent_backend, args.harness())
 }
 
-/// Capability predicate shared by runtime admission and scope's manifest-based preview.
+/// Capability predicate used by runtime admission and scope preview.
 pub(crate) fn backend_supports_persistent_sessions(
     backend: AgentBackend,
     harness: crate::harness::Harness,

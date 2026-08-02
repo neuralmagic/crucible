@@ -104,8 +104,8 @@ than writing them from scratch. Once you've pointed `[judge].measure_cmd` at the
 resolves, `measure_cmd` runs once and prints the contract shape, and it warns if the gate sits
 unprotected inside the workspace the agent edits) before you spend a real agent turn on it.
 `crucible scope --pack <dir>` chains ingest (resolve the goal) → `check` → render
-(`WORKFLOW.png`) → freeze (`SCOPE.md`
-with a `RunIdentity` digest) into one pipeline (ADR-0014 S0); add `--issue owner/repo#N` to
+`WORKFLOW.png` → freeze (`SCOPE.md` with a `RunIdentity` digest) into one pipeline (ADR-0014 S0);
+add `--issue owner/repo#N` to
 ground the goal in a GitHub issue (native API fetch, honors `GITHUB_TOKEN`/`GH_TOKEN`).
 
 ### The manifest

@@ -950,9 +950,7 @@ impl Stage for Validate {
     }
 }
 
-/// Render the exact validated workflow the loop will admit. This is trusted pipeline output,
-/// not an image an agent can forge; the controller only has to include the pack artifact in the
-/// scope PR and embed it in the body.
+/// Render the validated workflow; agents cannot supply this artifact.
 fn render_workflow_preview(manifest_path: &Path, pack: &Path) -> Result<(u32, u32)> {
     let manifest = manifest::Manifest::load(manifest_path)?;
     let mut workflow_caps = manifest::WorkflowCaps::autoresearch_engine();
@@ -977,8 +975,7 @@ fn render_workflow_preview(manifest_path: &Path, pack: &Path) -> Result<(u32, u3
         }
         workflow => crate::loop_graph::iteration_template(workflow, &workflow_caps)?,
     };
-    // Preview graph capability markings describe the authored requirements, not whichever
-    // machine happened to run scope. Admission still checks the real substrate at execution.
+    // Preview authored capabilities; execution still admits against the real substrate.
     let caps = plan
         .tasks_topo()
         .filter(|task| task.needs != "any")

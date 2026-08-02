@@ -167,7 +167,6 @@ fn run_in(
                 agent_cmd: None,
             };
             return if task.isolation == Some(Isolation::Worktree) {
-                // `run_task` prepared this private worktree before selecting `paths`.
                 shell.run_in_prepared_worktree(task, inputs)
             } else {
                 shell.run(task, attempt, inputs)

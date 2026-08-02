@@ -142,9 +142,9 @@ enum Styling {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Metadata {
-    /// Stable, pasteable graph source: task commands are intentionally omitted.
+    /// Omit task commands from pasteable Mermaid.
     Public,
-    /// Scope/terminal preview: show a bounded command summary inside runnable nodes.
+    /// Include bounded command summaries in previews.
     Preview,
 }
 
@@ -233,7 +233,6 @@ fn render_mermaid_styled(
         if styling == Styling::PerNode {
             styles.push_str(&format!("    style {id} {props}\n"));
         }
-        // The measurement region is structural: both styling forms get it.
         if matches!(
             t.task,
             TaskKind::Evaluate { .. }
@@ -402,8 +401,7 @@ fn show_rendered(path: &Path, plan: &ValidPlan, caps: &BTreeSet<String>) -> Resu
     Ok(())
 }
 
-/// Rasterize the graph. Both callers come through here so neither drifts onto
-/// `render_mermaid`'s `classDef` form, which the vendored engine cannot parse.
+/// Rasterize with per-node styles supported by the vendored engine.
 fn render_png(
     plan: &ValidPlan,
     caps: &BTreeSet<String>,
@@ -433,7 +431,7 @@ config:
     .map_err(|e| anyhow::anyhow!("mermaid render failed: {e}"))
 }
 
-/// Render a validated graph to a deterministic PNG artifact for scope review.
+/// Render a validated graph to PNG.
 pub fn render_png_to(
     plan: &ValidPlan,
     caps: &BTreeSet<String>,
@@ -703,7 +701,6 @@ mod tests {
         "#;
         let plan = Plan::from_toml_str(src).unwrap().validate().unwrap();
         let mermaid = render_mermaid(&plan, &BTreeSet::new());
-        // The region and its edges are structural; only the fills are spelled differently.
         assert!(mermaid.contains("subgraph measurement[\"Measurement\"]"));
         assert!(mermaid.contains(":::evaluate"), "{mermaid}");
         assert!(mermaid.contains(":::grade"), "{mermaid}");

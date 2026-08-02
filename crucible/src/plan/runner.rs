@@ -38,9 +38,7 @@ impl TaskRunner for ShellRunner {
 }
 
 impl ShellRunner {
-    /// Run after an outer runner has prepared the task's declared private worktree. Keeping
-    /// the marker on `task` makes that trust transition explicit instead of cloning the task
-    /// and erasing its isolation requirement.
+    /// Run in a worktree prepared by the outer runner without clearing its isolation marker.
     pub(crate) fn run_in_prepared_worktree(
         &mut self,
         task: &Task,
@@ -151,7 +149,7 @@ fn evaluation_attempt(task: &Task, mut value: Value) -> Attempt {
     let Some(object) = value.as_object_mut() else {
         return fail("evaluate result must be a JSON object".to_string());
     };
-    // A declared threshold is the graph's gate, so `pass` can only narrow it, never widen it.
+    // `pass` may narrow a threshold gate, never widen it.
     let within_threshold = match (threshold, direction) {
         (Some(threshold), Some(Direction::Lower)) => object
             .get("score")
@@ -162,7 +160,6 @@ fn evaluation_attempt(task: &Task, mut value: Value) -> Attempt {
             .and_then(Value::as_f64)
             .is_some_and(|score| score >= threshold),
         (None, None) => true,
-        // Validation rejects one without the other.
         _ => false,
     };
     let declared_pass = match object.get("pass") {
@@ -344,7 +341,6 @@ mod tests {
         assert_eq!(ok.results[&"ok".into()].status, TaskStatus::Pass);
     }
 
-    /// With no threshold there is no graph-level gate, so the script decides.
     #[test]
     fn an_unthresholded_evaluation_is_decided_by_its_script() {
         let evaluate = |name: &str, output: &str| Task {
