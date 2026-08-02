@@ -54,7 +54,7 @@ pub fn render(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
             ),
             TaskKind::Command { command } => format!("command[{command}]"),
             TaskKind::TopK { k, .. } => format!("top_k[k={k}]"),
-            TaskKind::Engine(_) => t.task.label().to_string(),
+            TaskKind::Engine { .. } => t.task.label().to_string(),
         };
         out.push_str(&format!(
             "  {:<20} {:<28} needs={:<8} {} deps: {}{}\n",
@@ -97,7 +97,7 @@ pub fn render_mermaid(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
             TaskKind::Agent { .. } => ("([", "])", "agent"),
             TaskKind::Command { .. } => ("[", "]", "command"),
             TaskKind::TopK { .. } => ("{{", "}}", "reduce"),
-            TaskKind::Engine(_) => ("[[", "]]", "engine"),
+            TaskKind::Engine { .. } => ("[[", "]]", "engine"),
         };
         let detail = match &t.task {
             TaskKind::Agent { harness, model, .. } => format!(
@@ -105,7 +105,7 @@ pub fn render_mermaid(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
                 mermaid_label(harness.as_deref().unwrap_or("default")),
                 mermaid_label(model.as_deref().unwrap_or("default"))
             ),
-            TaskKind::Command { .. } | TaskKind::Engine(_) => String::new(),
+            TaskKind::Command { .. } | TaskKind::Engine { .. } => String::new(),
             TaskKind::TopK { k, .. } => format!("<br/>k={k}"),
         };
         let marks = format!(

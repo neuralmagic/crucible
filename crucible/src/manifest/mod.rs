@@ -22,7 +22,7 @@ pub use openshell::OpenshellCfg;
 pub use relay::RelayFile;
 pub use search::SearchCfg;
 pub use selftest::SelftestCfg;
-pub use workflow::WorkflowCfg;
+pub use workflow::{WorkflowCaps, WorkflowCfg, WorkflowType};
 pub use world::WorldCfg;
 
 use crate::command_judge::Direction;
@@ -163,8 +163,8 @@ pub struct Manifest {
     /// Wide-round search config. Optional, most domains run pure-deep.
     #[serde(default)]
     pub search: Option<SearchCfg>,
-    /// Pack-authored tasks spliced into each iteration between the agent's turn and the
-    /// gate. Absent means the engine's own four-stage iteration, unchanged.
+    /// Pack-authored iteration graph. Absent means the legacy four-stage autoresearch
+    /// graph; the workflow type and engine operations are capability-admitted.
     #[serde(default)]
     pub workflow: Option<WorkflowCfg>,
     /// Publish-on-keep target for a single-repo run. Optional, a run with no `[publish]` (or no
@@ -494,8 +494,8 @@ pub struct CompositeManifest {
     /// Wide-round search config. Optional.
     #[serde(default)]
     pub search: Option<SearchCfg>,
-    /// Pack-authored tasks spliced into each iteration between the agent's turn and the
-    /// gate. Absent means the engine's own four-stage iteration, unchanged.
+    /// Pack-authored iteration graph. Absent means the legacy four-stage autoresearch
+    /// graph; the workflow type and engine operations are capability-admitted.
     #[serde(default)]
     pub workflow: Option<WorkflowCfg>,
     /// Declarative image builds: named `[build.<name>]` targets (e.g. a composite's assembled

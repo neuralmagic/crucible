@@ -76,7 +76,7 @@ impl TaskRunner for ShellRunner {
                 // The executor owns reducers; reaching the runner is an executor bug.
                 return fail("reducer task reached the runner".to_string());
             }
-            TaskKind::Engine(_) => {
+            TaskKind::Engine { .. } => {
                 // Engine ops only exist in the loop's canonical template; its runner
                 // handles them, this one can't.
                 return fail("engine task reached a non-loop runner".to_string());

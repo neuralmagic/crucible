@@ -1,73 +1,205 @@
-//! `[[workflow.task]]`: pack-authored tasks spliced into each loop iteration.
+//! Pack-authored workflow graphs and their admission contract.
 //!
-//! A pack may add work between the agent's turn and the gate, and only there. The engine
-//! always appends `apply -> measure -> decide` after whatever the pack declares, so a pack
-//! can reject its own candidate early but can never remove, reorder, or precede the gate it
-//! is scored by. The agent gets a World, never the Judge, and this keeps that true when the
-//! agent is also the one authoring the harness.
-//!
-//! The useful shape is a check that is cheaper than measuring: a reviewer, a linter, a
-//! static analysis. A required task that fails discards the iteration before any measurement
-//! spend.
+//! Topology is data. Safety comes from two independent checks: a workflow type chooses
+//! the semantic invariants the graph must satisfy, and the admitting orchestrator must
+//! advertise capabilities for that type and every engine operation it will execute.
+
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-use crate::plan::ir::{Task, TaskName};
+use crate::plan::ir::{EngineOp, Join, Plan, PlanBudget, Task, TaskKind, TaskName};
 
-/// Task names the engine owns. A pack task may depend on `propose`; it may not take any of
-/// these names, because the engine constructs them itself.
-pub const RESERVED: [&str; 4] = ["propose", "apply", "measure", "decide"];
+/// Task names used by the compatibility template. Fully-authored workflows may reuse
+/// these names; they are not engine-owned identities.
+const LEGACY_NAMES: [&str; 4] = ["propose", "apply", "measure", "decide"];
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowType {
+    /// A repeating candidate/apply/measure/decision protocol.
+    #[default]
+    Autoresearch,
+    /// An arbitrary DAG. Only universal graph and operation-authority rules apply.
+    Custom,
+}
+
+impl WorkflowType {
+    pub fn capability(self) -> &'static str {
+        match self {
+            WorkflowType::Autoresearch => "workflow.autoresearch",
+            WorkflowType::Custom => "workflow.custom",
+        }
+    }
+}
+
+impl EngineOp {
+    pub fn capability(self) -> &'static str {
+        match self {
+            EngineOp::Propose => "engine.propose",
+            EngineOp::Apply => "engine.apply",
+            EngineOp::Measure => "engine.measure",
+            EngineOp::Decide => "engine.decide",
+            EngineOp::MeasureDiff => "engine.measure_diff",
+        }
+    }
+}
+
+/// Capabilities advertised by an engine or outer orchestrator at admission time.
+#[derive(Debug, Clone, Default)]
+pub struct WorkflowCaps {
+    names: BTreeSet<String>,
+}
+
+impl WorkflowCaps {
+    pub fn new(names: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            names: names.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    /// Capabilities implemented by Crucible's repeating autoresearch loop.
+    pub fn autoresearch_engine() -> Self {
+        Self::new([
+            "workflow.autoresearch",
+            "engine.propose",
+            "engine.apply",
+            "engine.measure",
+            "engine.decide",
+        ])
+    }
+
+    fn require(&self, capability: &str) -> Result<()> {
+        if !self.names.contains(capability) {
+            bail!("workflow requires unavailable orchestrator capability {capability:?}");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowCfg {
-    /// Tasks in dependency order-independent form; the engine wires the ends.
+    /// The semantic contract an admitting orchestrator promises to enforce.
+    #[serde(rename = "type", default)]
+    pub workflow_type: WorkflowType,
+    /// The task whose typed output completes the workflow. Required for fully-authored
+    /// autoresearch graphs; absent preserves the original splice-only manifest format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<TaskName>,
     #[serde(rename = "task", default)]
     pub tasks: Vec<Task>,
 }
 
 impl WorkflowCfg {
-    /// Reject anything the splice cannot wire safely. Runs at manifest load, so a bad
-    /// workflow is a config error rather than a failure a paid run discovers.
+    /// Validate graph structure plus the invariants selected by `type`. This does not
+    /// grant execution authority; call [`WorkflowCfg::admit`] at the orchestrator edge.
     pub fn validate(&self) -> Result<()> {
-        let mut seen: Vec<&str> = Vec::new();
-        for t in &self.tasks {
-            let name = t.name.0.as_str();
+        if self.is_legacy_splice() {
+            return self.validate_legacy_splice();
+        }
+
+        let plan = Plan {
+            version: 1,
+            reason: None,
+            budget: PlanBudget { usd: f64::MAX },
+            tasks: self.tasks.clone(),
+        };
+        plan.validate()?;
+
+        let tasks: BTreeMap<&TaskName, &Task> =
+            self.tasks.iter().map(|task| (&task.name, task)).collect();
+        for task in &self.tasks {
+            if let TaskKind::Engine { source, .. } = &task.task {
+                if !task.required {
+                    bail!("engine task {:?} must be required", task.name.0);
+                }
+                if task.isolation.is_some() {
+                    bail!(
+                        "engine task {:?} cannot run in an isolated worktree",
+                        task.name.0
+                    );
+                }
+                if task.join != Join::All {
+                    bail!("engine task {:?} must use join = \"all\"", task.name.0);
+                }
+                if let Some(source) = source {
+                    if !tasks.contains_key(source) {
+                        bail!(
+                            "engine task {:?} names unknown source {:?}",
+                            task.name.0,
+                            source.0
+                        );
+                    }
+                    if !is_ancestor(&tasks, source, &task.name) {
+                        bail!(
+                            "engine task source {:?} must be an ancestor of {:?}",
+                            source.0,
+                            task.name.0
+                        );
+                    }
+                }
+            }
+        }
+
+        if self.workflow_type == WorkflowType::Autoresearch {
+            self.validate_autoresearch()?;
+        } else if let Some(result) = &self.result
+            && !self.tasks.iter().any(|task| &task.name == result)
+        {
+            bail!(
+                "custom workflow result {:?} names an unknown task",
+                result.0
+            );
+        }
+        Ok(())
+    }
+
+    /// Validate and prove that the admitting orchestrator owns every requested authority.
+    pub fn admit(&self, caps: &WorkflowCaps) -> Result<()> {
+        self.validate()?;
+        caps.require(self.workflow_type.capability())?;
+        for task in &self.tasks {
+            if let TaskKind::Engine { op, .. } = task.task {
+                caps.require(op.capability())?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn is_legacy_splice(&self) -> bool {
+        self.workflow_type == WorkflowType::Autoresearch
+            && self.result.is_none()
+            && self
+                .tasks
+                .iter()
+                .all(|task| !matches!(task.task, TaskKind::Engine { .. }))
+    }
+
+    fn validate_legacy_splice(&self) -> Result<()> {
+        let mut seen = BTreeSet::new();
+        for task in &self.tasks {
+            let name = task.name.0.as_str();
             if name.trim().is_empty() {
                 bail!("[[workflow.task]] has an empty name");
             }
-            if RESERVED.contains(&name) {
+            if LEGACY_NAMES.contains(&name) {
                 bail!(
-                    "[[workflow.task]] name {name:?} is reserved for the engine's own stages \
-                     ({})",
-                    RESERVED.join(", ")
+                    "legacy [[workflow.task]] name {name:?} collides with its compatibility template"
                 );
             }
-            if seen.contains(&name) {
+            if !seen.insert(name) {
                 bail!("duplicate [[workflow.task]] name {name:?}");
             }
-            seen.push(name);
         }
-        // Edges may point at another workflow task or at `propose`, nothing else: depending
-        // on `measure` or `decide` would put pack work after the gate.
-        for t in &self.tasks {
-            for d in &t.depends_on {
-                let dep = d.0.as_str();
-                if dep == "propose" {
-                    continue;
-                }
-                if RESERVED.contains(&dep) {
+        for task in &self.tasks {
+            for dependency in &task.depends_on {
+                let name = dependency.0.as_str();
+                if name != "propose" && !seen.contains(name) {
                     bail!(
-                        "[[workflow.task]] {:?} depends on {dep:?}; pack tasks run before the \
-                         gate, so they may only depend on `propose` or on each other",
-                        t.name.0
-                    );
-                }
-                if !seen.contains(&dep) {
-                    bail!(
-                        "[[workflow.task]] {:?} depends on unknown task {dep:?}",
-                        t.name.0
+                        "legacy [[workflow.task]] {:?} depends on unknown task {name:?}",
+                        task.name.0
                     );
                 }
             }
@@ -75,91 +207,168 @@ impl WorkflowCfg {
         Ok(())
     }
 
-    /// The tasks nothing else depends on. `apply` waits on these, so every declared task is
-    /// upstream of the gate whether or not the author wired it explicitly.
+    fn validate_autoresearch(&self) -> Result<()> {
+        let result = self.result.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("fully-authored autoresearch workflow requires result")
+        })?;
+        let tasks: BTreeMap<&TaskName, &Task> =
+            self.tasks.iter().map(|task| (&task.name, task)).collect();
+        let decision = tasks.get(result).ok_or_else(|| {
+            anyhow::anyhow!("autoresearch result {:?} names an unknown task", result.0)
+        })?;
+        let TaskKind::Engine {
+            op: EngineOp::Decide,
+            source: Some(measurement),
+        } = &decision.task
+        else {
+            bail!(
+                "autoresearch result {:?} must be an engine decide task with source",
+                result.0
+            );
+        };
+        let measured = tasks.get(measurement).ok_or_else(|| {
+            anyhow::anyhow!(
+                "autoresearch decision {:?} names unknown measurement source {:?}",
+                result.0,
+                measurement.0
+            )
+        })?;
+        if !matches!(
+            measured.task,
+            TaskKind::Engine {
+                op: EngineOp::Measure,
+                ..
+            }
+        ) {
+            bail!(
+                "autoresearch decision source {:?} must be an engine measure task",
+                measurement.0
+            );
+        }
+        if !is_ancestor(&tasks, measurement, result) {
+            bail!(
+                "measurement {:?} must be an ancestor of decision {:?}",
+                measurement.0,
+                result.0
+            );
+        }
+
+        let applies: Vec<&TaskName> = self
+            .tasks
+            .iter()
+            .filter(|task| {
+                matches!(
+                    task.task,
+                    TaskKind::Engine {
+                        op: EngineOp::Apply,
+                        ..
+                    }
+                ) && is_ancestor(&tasks, &task.name, measurement)
+            })
+            .map(|task| &task.name)
+            .collect();
+        if applies.is_empty() {
+            bail!(
+                "autoresearch measurement {:?} requires an engine apply ancestor",
+                measurement.0
+            );
+        }
+        let has_proposal = self.tasks.iter().any(|task| {
+            matches!(
+                task.task,
+                TaskKind::Engine {
+                    op: EngineOp::Propose,
+                    ..
+                }
+            ) && applies
+                .iter()
+                .any(|apply| is_ancestor(&tasks, &task.name, apply))
+        });
+        if !has_proposal {
+            bail!("autoresearch apply path requires an engine propose ancestor");
+        }
+        Ok(())
+    }
+
+    /// The tasks nothing else depends on, used only by the legacy splice adapter.
     pub fn sinks(&self) -> Vec<TaskName> {
         self.tasks
             .iter()
-            .filter(|t| {
-                !self
-                    .tasks
-                    .iter()
-                    .any(|o| o.depends_on.iter().any(|d| d == &t.name))
+            .filter(|task| {
+                !self.tasks.iter().any(|other| {
+                    other
+                        .depends_on
+                        .iter()
+                        .any(|dependency| dependency == &task.name)
+                })
             })
-            .map(|t| t.name.clone())
+            .map(|task| task.name.clone())
             .collect()
     }
+}
+
+fn is_ancestor(tasks: &BTreeMap<&TaskName, &Task>, ancestor: &TaskName, node: &TaskName) -> bool {
+    let Some(task) = tasks.get(node) else {
+        return false;
+    };
+    task.depends_on
+        .iter()
+        .any(|dependency| dependency == ancestor || is_ancestor(tasks, ancestor, dependency))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn cfg(src: &str) -> WorkflowCfg {
-        toml::from_str(src).expect("parse")
+    fn parse(source: &str) -> WorkflowCfg {
+        toml::from_str(source).expect("parse workflow")
     }
 
     #[test]
-    fn reserved_names_are_refused() {
-        for name in RESERVED {
-            let c = cfg(&format!(
-                "[[task]]\nname = \"{name}\"\nkind = \"command\"\ncommand = \"true\"\n"
-            ));
-            let err = c.validate().unwrap_err().to_string();
-            assert!(err.contains("reserved"), "{name}: {err}");
-        }
+    fn legacy_splice_remains_valid() {
+        let workflow = parse(
+            "[[task]]\nname = \"review\"\nkind = \"command\"\ncommand = \"true\"\ndepends_on = [\"propose\"]\n",
+        );
+        workflow.validate().unwrap();
+        assert!(workflow.is_legacy_splice());
     }
 
     #[test]
-    fn depending_on_the_gate_is_refused() {
-        let c = cfg(
-            "[[task]]\nname = \"late\"\nkind = \"command\"\ncommand = \"true\"\ndepends_on = [\"measure\"]\n",
+    fn custom_graph_needs_no_autoresearch_shape() {
+        let workflow = parse(
+            "type = \"custom\"\nresult = \"publish\"\n[[task]]\nname = \"publish\"\nkind = \"command\"\ncommand = \"true\"\n",
         );
-        let err = c.validate().unwrap_err().to_string();
-        assert!(err.contains("before the gate"), "{err}");
+        workflow.validate().unwrap();
+        workflow
+            .admit(&WorkflowCaps::new(["workflow.custom"]))
+            .unwrap();
     }
 
     #[test]
-    fn unknown_dependency_is_refused() {
-        let c = cfg(
-            "[[task]]\nname = \"a\"\nkind = \"command\"\ncommand = \"true\"\ndepends_on = [\"ghost\"]\n",
-        );
-        assert!(
-            c.validate()
-                .unwrap_err()
-                .to_string()
-                .contains("unknown task")
-        );
+    fn admission_checks_type_and_operation_caps() {
+        let workflow = full_autoresearch();
+        let error = workflow
+            .admit(&WorkflowCaps::new(["workflow.autoresearch"]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("engine.propose"), "{error}");
+        workflow
+            .admit(&WorkflowCaps::autoresearch_engine())
+            .unwrap();
     }
 
     #[test]
-    fn duplicate_names_are_refused() {
-        let c = cfg(
-            "[[task]]\nname = \"a\"\nkind = \"command\"\ncommand = \"true\"\n\
-                     [[task]]\nname = \"a\"\nkind = \"command\"\ncommand = \"true\"\n",
-        );
-        assert!(c.validate().unwrap_err().to_string().contains("duplicate"));
+    fn autoresearch_shape_is_semantic_not_name_based() {
+        full_autoresearch().validate().unwrap();
     }
 
-    #[test]
-    fn sinks_are_the_tasks_nothing_depends_on() {
-        let c = cfg(
-            "[[task]]\nname = \"a\"\nkind = \"command\"\ncommand = \"true\"\n\
-                     [[task]]\nname = \"b\"\nkind = \"command\"\ncommand = \"true\"\ndepends_on = [\"a\"]\n\
-                     [[task]]\nname = \"c\"\nkind = \"command\"\ncommand = \"true\"\n",
-        );
-        c.validate().unwrap();
-        let sinks: Vec<String> = c.sinks().into_iter().map(|n| n.0).collect();
-        assert_eq!(
-            sinks,
-            ["b", "c"],
-            "`a` feeds `b`, so only b and c gate apply"
-        );
-    }
-
-    #[test]
-    fn an_empty_workflow_has_no_sinks() {
-        assert!(WorkflowCfg::default().sinks().is_empty());
-        WorkflowCfg::default().validate().unwrap();
+    fn full_autoresearch() -> WorkflowCfg {
+        parse(
+            "type = \"autoresearch\"\nresult = \"choose\"\n\
+             [[task]]\nname = \"invent\"\nkind = \"engine\"\nop = \"propose\"\n\
+             [[task]]\nname = \"deploy\"\nkind = \"engine\"\nop = \"apply\"\ndepends_on = [\"invent\"]\n\
+             [[task]]\nname = \"score\"\nkind = \"engine\"\nop = \"measure\"\ndepends_on = [\"deploy\"]\n\
+             [[task]]\nname = \"choose\"\nkind = \"engine\"\nop = \"decide\"\nsource = \"score\"\ndepends_on = [\"score\"]\n",
+        )
     }
 }

@@ -15,7 +15,7 @@ use serde_json::Value;
 
 use crate::crucible::{Judge, MeasureCtx, World};
 use crate::loop_driver::{self, Decided, IterStep, Measured, TurnVerdict};
-use crate::manifest::WorkflowCfg;
+use crate::manifest::{WorkflowCaps, WorkflowCfg, WorkflowType};
 use crate::plan::exec::{
     Attempt, AttemptOutcome, BatchItem, ExecCfg, Substrate, TaskRunner, execute,
 };
@@ -43,15 +43,20 @@ pub(crate) struct IterCtx<'a> {
     /// the typestate path would after the turn.
     pub spent_before: f64,
     pub started: Instant,
-    /// Pack-authored tasks to splice ahead of the gate, if the manifest declared any.
+    /// Pack-authored workflow, or the legacy splice format during migration.
     pub workflow: Option<&'a crate::manifest::WorkflowCfg>,
 }
 
-/// Run one iteration as the canonical template. Returns the driver-vocabulary step plus
+/// Run one capability-admitted autoresearch iteration. Returns the driver-vocabulary step plus
 /// the iteration's cost to fold into the run's spend. A measure error propagates as
 /// `Err`, exactly like the typestate path's `?`.
 pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(IterStep, f64)> {
     let plan = iteration_template(cx.prompt, cx.workflow)?;
+    let result_task = cx
+        .workflow
+        .filter(|workflow| !workflow.is_legacy_splice())
+        .and_then(|workflow| workflow.result.clone())
+        .unwrap_or_else(|| "decide".into());
     r.plan_event(&crate::plan::cli::plan_admitted_event(&plan));
 
     let mut runner = LoopTaskRunner {
@@ -62,6 +67,7 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
         control: cx.control,
         r,
         it: cx.it,
+        prompt: cx.prompt,
         rows: cx.rows,
         ctx: MeasureCtx {
             baseline_score: Some(cx.baseline_score),
@@ -72,8 +78,8 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
         spent_before: cx.spent_before,
         started: cx.started,
         signal: None,
-        measured: None,
-        decided: None,
+        measured: BTreeMap::new(),
+        decided: BTreeMap::new(),
         fatal: None,
         workflow_runner: crate::plan::harness::HarnessRunner {
             args: cx.args.clone(),
@@ -112,7 +118,7 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
         Some(Signal::Escalate) => IterStep::Escalated,
         Some(Signal::Park(pp)) => IterStep::Parked(pp),
         Some(Signal::Stop) => IterStep::Stopped,
-        None => match runner.decided.take() {
+        None => match runner.decided.remove(&result_task) {
             Some(d) => IterStep::Decided(Box::new(d)),
             // A pack task rejected the candidate before it reached the gate. That is the
             // point of allowing them, so it is a discard, not a run error.
@@ -141,33 +147,37 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
     Ok((step, outcome.spent_usd))
 }
 
-/// The canonical iteration template: `propose → apply → measure → decide`, all required,
-/// so a failed stage short-circuits the rest: the same "nothing runs on top of a
-/// failure" the typestate chain encoded in types.
-fn iteration_template(prompt: &str, workflow: Option<&WorkflowCfg>) -> Result<ValidPlan> {
-    let engine = |name: &str, op: EngineOp, deps: Vec<TaskName>| Task {
-        name: name.into(),
-        task: TaskKind::Engine(op),
-        depends_on: deps,
-        needs: "any".to_string(),
-        required: true,
-        isolation: None,
-        join: Join::default(),
-    };
-    let mut tasks = vec![Task {
-        name: "propose".into(),
-        task: TaskKind::Agent {
-            prompt: prompt.to_string(),
-            harness: None,
-            model: None,
-            effort: None,
-        },
-        depends_on: vec![],
-        needs: "any".to_string(),
-        required: true,
-        isolation: None,
-        join: Join::default(),
-    }];
+/// Materialize the legacy/default graph or admit a fully-authored autoresearch graph.
+/// The default is still `propose → apply → measure → decide`; unlike the old template,
+/// those are ordinary named tasks rather than privileged topology.
+fn iteration_template(_prompt: &str, workflow: Option<&WorkflowCfg>) -> Result<ValidPlan> {
+    if let Some(workflow) = workflow.filter(|workflow| !workflow.is_legacy_splice()) {
+        workflow
+            .admit(&WorkflowCaps::autoresearch_engine())
+            .context("admitting authored workflow into the autoresearch loop")?;
+        return Plan {
+            version: 1,
+            reason: None,
+            budget: PlanBudget { usd: f64::MAX },
+            tasks: workflow.tasks.clone(),
+        }
+        .validate()
+        .context("building authored iteration workflow");
+    }
+
+    let engine =
+        |name: &str, op: EngineOp, source: Option<TaskName>, deps: Vec<TaskName>| -> Task {
+            Task {
+                name: name.into(),
+                task: TaskKind::Engine { op, source },
+                depends_on: deps,
+                needs: "any".to_string(),
+                required: true,
+                isolation: None,
+                join: Join::default(),
+            }
+        };
+    let mut tasks = vec![engine("propose", EngineOp::Propose, None, vec![])];
 
     // Pack tasks sit between the turn and the gate. An unattached one hangs off `propose`,
     // and `apply` waits on every sink, so nothing a pack declares can end up beside or after
@@ -187,22 +197,32 @@ fn iteration_template(prompt: &str, workflow: Option<&WorkflowCfg>) -> Result<Va
         }
     }
 
-    tasks.push(engine("apply", EngineOp::Apply, apply_deps));
+    tasks.push(engine("apply", EngineOp::Apply, None, apply_deps));
     tasks.push(engine(
         "measure",
         EngineOp::Measure,
+        None,
         vec![TaskName("apply".to_string())],
     ));
     tasks.push(engine(
         "decide",
         EngineOp::Decide,
+        Some(TaskName("measure".to_string())),
         vec![TaskName("measure".to_string())],
     ));
+    let workflow = WorkflowCfg {
+        workflow_type: WorkflowType::Autoresearch,
+        result: Some("decide".into()),
+        tasks,
+    };
+    workflow
+        .admit(&WorkflowCaps::autoresearch_engine())
+        .context("admitting the default autoresearch workflow")?;
     Plan {
         version: 1,
         reason: None,
         budget: PlanBudget { usd: f64::MAX },
-        tasks,
+        tasks: workflow.tasks,
     }
     .validate()
     .context("building the iteration template")
@@ -228,14 +248,15 @@ struct LoopTaskRunner<'a, R: Reporter> {
     control: Option<&'a control::ControlState>,
     r: &'a mut R,
     it: u32,
+    prompt: &'a str,
     rows: &'a [Row],
     ctx: MeasureCtx,
     best_score: f64,
     spent_before: f64,
     started: Instant,
     signal: Option<Signal>,
-    measured: Option<Measured>,
-    decided: Option<Decided>,
+    measured: BTreeMap<TaskName, Measured>,
+    decided: BTreeMap<TaskName, Decided>,
     fatal: Option<anyhow::Error>,
     workflow_runner: crate::plan::harness::HarnessRunner,
 }
@@ -295,11 +316,11 @@ impl<R: Reporter> LoopTaskRunner<'_, R> {
         }
     }
 
-    fn measure(&mut self) -> Attempt {
+    fn measure(&mut self, task: &Task) -> Attempt {
         match loop_driver::measure_candidate(self.judge, &self.ctx, self.p, self.world) {
             Ok(m) => {
                 let out = serde_json::json!({ "score": m.reading.score, "valid": m.reading.valid });
-                self.measured = Some(m);
+                self.measured.insert(task.name.clone(), m);
                 pass(out)
             }
             Err(e) => {
@@ -311,11 +332,17 @@ impl<R: Reporter> LoopTaskRunner<'_, R> {
         }
     }
 
-    fn decide(&mut self) -> Attempt {
-        let Some(m) = self.measured.take() else {
+    fn decide(&mut self, task: &Task, source: Option<&TaskName>) -> Attempt {
+        let Some(source) = source else {
             return fail(
                 0.0,
-                "decide dispatched without a measured candidate".to_string(),
+                "decide dispatched without a measurement source".to_string(),
+            );
+        };
+        let Some(m) = self.measured.remove(source) else {
+            return fail(
+                0.0,
+                format!("decide source {source} has no measured candidate"),
             );
         };
         let d = loop_driver::decide_row(self.judge, self.best_score, self.it, m);
@@ -324,7 +351,7 @@ impl<R: Reporter> LoopTaskRunner<'_, R> {
             "solved": d.verdict.solved,
             "score": d.reading.score,
         });
-        self.decided = Some(d);
+        self.decided.insert(task.name.clone(), d);
         pass(out)
     }
 }
@@ -332,14 +359,30 @@ impl<R: Reporter> LoopTaskRunner<'_, R> {
 impl<R: Reporter> TaskRunner for LoopTaskRunner<'_, R> {
     fn run(&mut self, task: &Task, attempt: u32, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
         match &task.task {
-            TaskKind::Agent { prompt, .. } if task.name.0 == "propose" => self.propose(prompt),
             TaskKind::Agent { .. } | TaskKind::Command { .. } => {
                 self.workflow_runner.run(task, attempt, inputs)
             }
-            TaskKind::Engine(EngineOp::Apply) => self.apply(),
-            TaskKind::Engine(EngineOp::Measure) => self.measure(),
-            TaskKind::Engine(EngineOp::Decide) => self.decide(),
-            TaskKind::Engine(EngineOp::MeasureDiff) | TaskKind::TopK { .. } => fail(
+            TaskKind::Engine {
+                op: EngineOp::Propose,
+                ..
+            } => self.propose(self.prompt),
+            TaskKind::Engine {
+                op: EngineOp::Apply,
+                ..
+            } => self.apply(),
+            TaskKind::Engine {
+                op: EngineOp::Measure,
+                ..
+            } => self.measure(task),
+            TaskKind::Engine {
+                op: EngineOp::Decide,
+                source,
+            } => self.decide(task, source.as_ref()),
+            TaskKind::Engine {
+                op: EngineOp::MeasureDiff,
+                ..
+            }
+            | TaskKind::TopK { .. } => fail(
                 0.0,
                 format!(
                     "unexpected task kind in the loop template: {}",
@@ -563,7 +606,10 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
     for id in 0..cfg.n {
         tasks.push(Task {
             name: TaskName(format!("measure-{id}")),
-            task: TaskKind::Engine(EngineOp::MeasureDiff),
+            task: TaskKind::Engine {
+                op: EngineOp::MeasureDiff,
+                source: None,
+            },
             depends_on: vec![TaskName(format!("propose-{id}"))],
             needs: "any".to_string(),
             required: false,
@@ -768,7 +814,10 @@ impl<R: Reporter> TaskRunner for WideRunner<'_, R> {
                     &pending,
                 )
             }
-            TaskKind::Engine(EngineOp::MeasureDiff) => self.measure_diff(task, inputs),
+            TaskKind::Engine {
+                op: EngineOp::MeasureDiff,
+                ..
+            } => self.measure_diff(task, inputs),
             other => fail(
                 0.0,
                 format!(
@@ -970,7 +1019,39 @@ mod tests {
         let kinds: Vec<&str> = plan.tasks_topo().map(|t| t.task.label()).collect();
         assert_eq!(
             kinds,
-            ["agent", "engine_apply", "engine_measure", "engine_decide"]
+            [
+                "engine_propose",
+                "engine_apply",
+                "engine_measure",
+                "engine_decide"
+            ]
+        );
+    }
+
+    #[test]
+    fn authored_autoresearch_uses_semantics_instead_of_reserved_names() {
+        let workflow: WorkflowCfg = toml::from_str(
+            "type = \"autoresearch\"\nresult = \"keep-if-better\"\n\
+             [[task]]\nname = \"invent\"\nkind = \"engine\"\nop = \"propose\"\n\
+             [[task]]\nname = \"review\"\nkind = \"command\"\ncommand = \"true\"\ndepends_on = [\"invent\"]\n\
+             [[task]]\nname = \"deploy-preview\"\nkind = \"engine\"\nop = \"apply\"\ndepends_on = [\"review\"]\n\
+             [[task]]\nname = \"benchmark-a\"\nkind = \"engine\"\nop = \"measure\"\ndepends_on = [\"deploy-preview\"]\n\
+             [[task]]\nname = \"explain-score\"\nkind = \"command\"\ncommand = \"true\"\ndepends_on = [\"benchmark-a\"]\n\
+             [[task]]\nname = \"keep-if-better\"\nkind = \"engine\"\nop = \"decide\"\nsource = \"benchmark-a\"\ndepends_on = [\"benchmark-a\", \"explain-score\"]\n",
+        )
+        .unwrap();
+        let plan = iteration_template("dynamic prompt", Some(&workflow)).unwrap();
+        let names: Vec<&str> = plan.tasks_topo().map(|task| task.name.0.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "invent",
+                "review",
+                "deploy-preview",
+                "benchmark-a",
+                "explain-score",
+                "keep-if-better"
+            ]
         );
     }
 

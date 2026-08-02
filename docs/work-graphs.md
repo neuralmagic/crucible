@@ -4,9 +4,10 @@ A **plan** is a versioned DAG of **tasks** that a deterministic executor runs. T
 turns, plan-authored commands, or engine-owned reducers. The executor owns advancement: a task never
 decides what runs next.
 
-Today, the engine builds plans from templates (the loop iteration and wide tournament), and a
-human or pack can supply TOML or JSON through the `plan` CLI. Agent-emitted plans, replanning,
-and a separate policy-admission layer are not implemented yet.
+Today, the engine supplies a default loop graph and a wide-tournament template, and a human or
+pack can supply TOML or JSON through the `plan` CLI. Workflow admission separates authorable
+topology from authority: an orchestrator must advertise the workflow type and engine operations
+it can safely execute.
 
 ## Running a plan
 
@@ -69,9 +70,12 @@ depends_on = ["measure"]
 | `agent` | One agent turn. `harness` / `model` / `effort` override the manifest's `[agent]` defaults per task. |
 | `command` | A plan-authored command, with the same output contract as `measure_cmd`. |
 | `top_k` | Engine-owned reducer: keep the `k` best inputs by their `score` field. Needs at least one dependency. |
+| `engine` | Capability-owned operation (`propose`, `apply`, `measure`, `decide`, or `measure_diff`). Only an admitting orchestrator can execute it. |
 
-The loop's own stages (`apply`, `measure`, `decide`) are engine-constructed and cannot be
-authored. Packs never sequence the `World` or the `Judge` directly.
+Serialization is not authority. A workflow may author and sequence engine nodes, but admission
+requires matching capabilities such as `workflow.autoresearch`, `engine.apply`, and
+`engine.measure`. The generic plan runner rejects them because it owns neither a `World` nor a
+frozen `Judge`.
 
 A command string is not a trust boundary by itself. If it invokes a script that must remain
 trusted after an agent task edits the workspace, declare that script as a frozen
@@ -141,11 +145,57 @@ lossy fan-out, or for a gate over reviewers where one being advisory must not st
 
 ## The loop as a plan
 
-`--graph-loop` runs each loop iteration as a canonical plan:
+`--graph-loop` runs each loop iteration as a capability-admitted `autoresearch` workflow. With no
+authored workflow, the default expands to ordinary tasks:
 
 ```
-propose (agent) -> apply -> measure -> decide
+propose (engine) -> apply -> measure -> decide
 ```
+
+Task names and intervening topology are author-defined. An `autoresearch` result must be a decision
+fed by a frozen measurement with apply and proposal ancestors. A `custom` workflow has no such
+shape requirement; the outer orchestrator only admits it when it advertises `workflow.custom`.
+
+```toml
+[workflow]
+type = "autoresearch"
+result = "keep-if-better"
+
+[[workflow.task]]
+name = "invent"
+kind = "engine"
+op = "propose"
+
+[[workflow.task]]
+name = "review"
+kind = "command"
+command = "./review.sh"
+depends_on = ["invent"]
+
+[[workflow.task]]
+name = "deploy-preview"
+kind = "engine"
+op = "apply"
+depends_on = ["review"]
+
+[[workflow.task]]
+name = "benchmark"
+kind = "engine"
+op = "measure"
+depends_on = ["deploy-preview"]
+
+[[workflow.task]]
+name = "keep-if-better"
+kind = "engine"
+op = "decide"
+source = "benchmark"
+depends_on = ["benchmark"]
+```
+
+The corresponding admission needs `workflow.autoresearch`, `engine.propose`, `engine.apply`,
+`engine.measure`, and `engine.decide`. A custom orchestrator can instead admit `type = "custom"`
+and any subset of operations it implements. Task-level `needs` still controls where an admitted
+task can run; workflow capabilities control what the orchestrator is authorized to mean.
 
 Same decisions and same session events as the default path, plus additive `plan_admitted` and
 `task_result` lines. Cross-round state, keep/discard, and every between-round control (parking,

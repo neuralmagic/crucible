@@ -220,7 +220,7 @@ fn run_in(
         TaskKind::TopK { .. } => {
             return fail(0.0, "reducer task reached the runner".to_string());
         }
-        TaskKind::Engine(_) => {
+        TaskKind::Engine { .. } => {
             return fail(0.0, "engine task reached a non-loop runner".to_string());
         }
     };

@@ -29,11 +29,14 @@ pub enum Direction {
     Higher,
 }
 
-/// The canonical loop's engine-owned stages: the driver's `World`/`Judge` calls as tasks.
-/// Propose is not here: it's a plain `Agent` task; the executor never touches git or the
-/// judge itself, the loop runner does.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Capability-owned operations supplied by an engine or outer orchestrator. These are
+/// authorable graph nodes; serialization grants no authority to execute them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EngineOp {
+    /// Run the loop's candidate-producing agent turn. The task name is author-defined;
+    /// the current iteration prompt is supplied by the admitting autoresearch engine.
+    Propose,
     /// `World::apply`: make the candidate live (a failure = unscoreable, discard).
     Apply,
     /// `Judge::measure`: score the live candidate.
@@ -94,11 +97,15 @@ pub enum TaskKind {
     Command { command: String },
     /// Engine-builtin deterministic fold: keep the k best upstream outputs by `score`.
     TopK { k: u32, direction: Direction },
-    /// An engine-owned loop stage. Engine-constructable only: the variant is serde-skipped,
-    /// so no TOML/JSON front-end can author one: packs and agent plans never sequence the
-    /// `World`/`Judge` directly.
-    #[serde(skip)]
-    Engine(EngineOp),
+    /// A capability-owned engine operation. It is authorable graph data, but only an
+    /// orchestrator advertising the matching capability may admit and execute it.
+    Engine {
+        op: EngineOp,
+        /// Explicit input selected by operations such as `decide`. Dependencies express
+        /// scheduling; `source` identifies the typed value the operation consumes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<TaskName>,
+    },
 }
 
 impl TaskKind {
@@ -108,10 +115,26 @@ impl TaskKind {
             TaskKind::Agent { .. } => "agent",
             TaskKind::Command { .. } => "command",
             TaskKind::TopK { .. } => "top_k",
-            TaskKind::Engine(EngineOp::Apply) => "engine_apply",
-            TaskKind::Engine(EngineOp::Measure) => "engine_measure",
-            TaskKind::Engine(EngineOp::Decide) => "engine_decide",
-            TaskKind::Engine(EngineOp::MeasureDiff) => "engine_measure_diff",
+            TaskKind::Engine {
+                op: EngineOp::Propose,
+                ..
+            } => "engine_propose",
+            TaskKind::Engine {
+                op: EngineOp::Apply,
+                ..
+            } => "engine_apply",
+            TaskKind::Engine {
+                op: EngineOp::Measure,
+                ..
+            } => "engine_measure",
+            TaskKind::Engine {
+                op: EngineOp::Decide,
+                ..
+            } => "engine_decide",
+            TaskKind::Engine {
+                op: EngineOp::MeasureDiff,
+                ..
+            } => "engine_measure_diff",
         }
     }
 }
