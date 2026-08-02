@@ -39,8 +39,7 @@ pub enum EngineOp {
     Apply,
     /// `Judge::measure`: score the live candidate.
     Measure,
-    /// Assemble typed evaluation evidence into the candidate measurement consumed by
-    /// `Decide`. `source` selects the evaluation whose score is authoritative.
+    /// Fold evaluation evidence into a measurement; `source` supplies its score.
     Grade,
     /// `Judge::decide`: rule keep/discard against the run's best.
     Decide,
@@ -95,8 +94,7 @@ pub enum TaskKind {
     },
     /// A plan-authored command. Trusted scripts require frozen manifest injects.
     Command { command: String },
-    /// A frozen measurement command. Its last stdout line is JSON evidence; an explicit
-    /// `pass` or the optional threshold determines whether the task passed its gate.
+    /// A command whose final JSON object is graded by `pass` or a threshold.
     Evaluate {
         command: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]

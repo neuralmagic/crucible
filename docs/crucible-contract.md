@@ -220,14 +220,12 @@ measurement = grade(
 decision = decide(name = "choose", measurement = measurement)
 ```
 
-Dependencies express measurement rungs. Ready isolated siblings run concurrently. `evaluate()`
-expects a JSON object on its command's last stdout line. An explicit boolean `pass = false` vetoes
-the result; paired `threshold`/`direction` fields must also accept numeric `score`. Malformed
-`pass` values fail closed. With no threshold, the script's `pass` decides, defaulting to success
-when omitted. `grade()` defaults to joining passing evidence; set `join = "all"` for a strict
-join. It requires its selected `score` evaluator to have passed and assembles the typed reading
-consumed by the existing decision engine. The legacy
-`measure()` path and missing-workflow default are unchanged.
+Dependencies define measurement rungs; ready isolated siblings run concurrently. `evaluate()`
+expects a JSON object on its last stdout line. `pass = false` vetoes a result, malformed `pass`
+fails closed, and paired `threshold`/`direction` fields grade numeric `score`. Without a threshold,
+omitted `pass` means success. `grade()` selects a passing score evaluator and folds passing
+evidence by default; set `join = "all"` for a strict join. The legacy `measure()` path and default
+workflow are unchanged.
 
 `session = "solver"` binds agent-producing tasks to a durable logical conversation. The checkout
 may roll back after a discarded candidate while the solver session continues forward and retains
@@ -277,8 +275,8 @@ comprehensions, mutation, arbitrary operators, and `load()` are rejected. Task v
 they can be referenced directly in `depends_on`, `measurement`, and `result` without repeating
 names.
 
-- `propose(...)`, `apply(...)`, `measure(...)`, `grade(...)`, and `decide(...)` create capability-owned engine
-  tasks. `decide(measurement = score)` explicitly selects the frozen measurement it consumes.
+- `propose(...)`, `apply(...)`, `measure(...)`, `grade(...)`, and `decide(...)` create
+  capability-owned engine tasks. `decide(measurement = score)` selects its measurement.
 - `agent(...)` creates an agent task. `isolated = True` gives it a disposable worktree, ideal for
   concurrent read-only critics; leave it false for a synthesizer whose edits must survive.
   `session = "name"` opts into an engine-managed durable conversation.
@@ -292,19 +290,17 @@ names.
 - `workflow(type = ..., tasks = ..., result = ...)` is the explicit final expression.
 - `default_autoresearch(extra_tasks)` expands the historical loop into fully visible nodes.
 
-Agent tasks receive upstream structured results in their prompt and must write one JSON object to
-`PLAN_TASK_RESULT.json`. A required task failure discards the candidate before measurement; an
-advisory task uses `required = False`. `join = "passed"` lets a downstream task receive a
-non-empty set of successful results after all dependencies become terminal; it blocks rather than
-dispatching with no passing input.
+Agent tasks receive upstream results in their prompt and write one JSON object to
+`PLAN_TASK_RESULT.json`. Required failures discard the candidate; advisory tasks use
+`required = False`. `join = "passed"` waits for all dependencies, then receives their non-empty set
+of successful results. No passing input blocks the task.
 
 For local review, `crucible plan compile-workflow --file workflow.star` prints stable canonical
 JSON. Add `--manifest crucible.toml` to also replace the generated `[workflow]` block. Compilation
 applies source, task-count, evaluation-step, and prompt-size ceilings. The compiler exposes no
 filesystem API except `prompt_file`, and no process, environment, network, clock, or randomness API.
-Successful scope validation also renders the admitted graph to `WORKFLOW.png`. Scope PR tooling
-should commit that trusted artifact and embed it in the PR body; the renderer visually groups
-`evaluate`/`grade` as the measurement subgraph.
+Scope validation renders the admitted graph to `WORKFLOW.png` for the scope PR, grouping
+`evaluate` and `grade` as Measurement.
 
 ---
 

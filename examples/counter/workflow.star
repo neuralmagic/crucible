@@ -5,8 +5,7 @@
 candidate = propose(name = "propose", session = "solver")
 applied = apply(name = "apply", depends_on = [candidate])
 
-# Both checks see the same applied candidate and are ready together, so isolation lets the
-# executor run them concurrently. `score` is the primary reading; `shape` is supporting evidence.
+# Parallel isolated checks; `score` is the primary reading.
 shape = evaluate(
     name = "shape",
     run = "test -s value.txt && echo '{\"pass\": true, \"score\": 1}'",

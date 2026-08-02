@@ -40,12 +40,10 @@ wrote down as one.
 
 ## Decision
 
-Implementation note (2026-08-02): the first slice landed as typed `evaluate` tasks and an
-engine-owned `grade` node in the main authored work graph. This avoids a second nested DAG
-executor: dependencies are the measurement rungs, ready isolated evaluators use the generic
-executor's parallel batches, and `grade` produces the same reading consumed by `decide`. The
-legacy opaque `measure_cmd` path remains backwards compatible. Named broker job templates,
-digest/task caching, and targeted regrade described below remain follow-up work.
+Implemented (2026-08-02): typed `evaluate` tasks and engine-owned `grade` run in the main work
+graph. Dependencies define rungs, isolated evaluators use existing parallel batches, and `grade`
+feeds `decide`. Legacy `measure_cmd` remains supported. Broker templates, caching, and targeted
+regrade remain open.
 
 The manifest declares the DAG as data. The engine walks it. The domain keeps exactly one thing:
 the frozen per-task command baked into the sandbox image.

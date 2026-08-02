@@ -70,7 +70,7 @@ depends_on = ["measure"]
 | --- | --- |
 | `agent` | One agent turn. `harness` / `model` / `effort` override the manifest's `[agent]` defaults per task; `session` opts into durable continuation. |
 | `command` | A plan-authored command returning JSON on its last stdout line. |
-| `evaluate` | A frozen measurement command. An explicit `pass` wins; otherwise `threshold` + `direction` grade its numeric `score`. |
+| `evaluate` | A measurement command. `pass = false` vetoes; paired `threshold` + `direction` grade numeric `score`. |
 | `top_k` | Engine-owned reducer: keep the `k` best inputs by their `score` field. Needs at least one dependency. |
 | `engine` | Capability-owned operation (`propose`, `apply`, `measure`, `grade`, `decide`, or `measure_diff`). Only an admitting orchestrator can execute it. |
 
@@ -104,10 +104,9 @@ A task's output is JSON and becomes its dependents' input.
   spawn, harness, or stream error is a transport failure and follows the retry policy.
 - `agent` under `--agent-cmd`: the stand-in receives `CRUCIBLE_PROMPT`, `CRUCIBLE_HARNESS`,
   `CRUCIBLE_MODEL`, `CRUCIBLE_EFFORT`, and returns JSON on its last stdout line.
-- `evaluate`: the command contract plus measurement grading. Its JSON must be an object. An
-  explicit boolean `pass` is authoritative. With `threshold` and `direction`, the engine compares
-  `score` (`lower` means `score <= threshold`; `higher` means `score >= threshold`). With neither,
-  a successful command passes and its evidence flows downstream.
+- `evaluate`: requires a JSON object. `pass = false` fails and malformed `pass` fails closed.
+  Paired `threshold` and `direction` compare numeric `score` (`lower` is `<=`; `higher` is `>=`).
+  Without a threshold, a successful command passes unless `pass` is false.
 
 `top_k` reads a finite numeric `score` from each input, so an upstream task that wants to rank
 must emit one.
@@ -153,10 +152,8 @@ workspace.
 
 ### `join`
 
-`join = "all"` (default) requires every dependency to pass. `join = "passed"` dispatches once
-every dependency is terminal and folds the non-empty set that passed. If none can run or none
-passes, the join fails closed. Use it for a reducer over a lossy fan-out, or for a gate over
-reviewers where one being advisory must not stop the run.
+`join = "all"` (default) requires every dependency to pass. `join = "passed"` waits for every
+dependency, then folds the non-empty passing set. It fails closed if none can run or pass.
 
 ## The loop as a plan
 
@@ -223,11 +220,9 @@ rounds, so a turn that overruns the cap is still measured and decided.
 
 ### Authored measurement subgraphs
 
-The opaque `measure()` node remains the backwards-compatible path. A workflow that needs visible
-measurement tasks uses `evaluate()` and `grade()` instead. Dependency layers are the rungs; tasks
-on the same layer can run concurrently when isolated. `grade()` waits for the evidence graph,
-selects one evaluator as its score source, and produces the same typed measurement that `decide()`
-already consumes.
+The compatible `measure()` path remains available. For visible measurement, use `evaluate()` and
+`grade()`: dependencies define rungs, isolated peers can run concurrently, and `grade()` selects
+the score source for `decide()`.
 
 ```python
 candidate = propose(name = "invent")
@@ -275,10 +270,8 @@ workflow(
 )
 ```
 
-The renderer groups `evaluate` and `grade` nodes as **Measurement**, with evaluator fanout and
-joins left visible. During `crucible scope`, the trusted validation pipeline renders the admitted
-graph to `WORKFLOW.png` before freeze. The PNG is therefore part of the scope pack/PR; the agent
-authors the graph, but cannot substitute a misleading picture.
+The renderer groups `evaluate` and `grade` as **Measurement** while preserving edges. During
+`crucible scope`, validation writes the admitted graph to `WORKFLOW.png`; agents cannot replace it.
 
 Default off while it soaks.
 

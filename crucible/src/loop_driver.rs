@@ -306,8 +306,7 @@ pub(crate) fn measure_candidate(
     Ok(measured_from_reading(reading, p, world))
 }
 
-/// Capture candidate evidence around a reading assembled by an authored measurement graph.
-/// The opaque judge path above and `engine.grade` therefore preserve identical notes/diffs.
+/// Attach the candidate note and diff to an authored reading.
 pub(crate) fn measured_from_reading(
     reading: crucible::Reading,
     p: &Paths,
