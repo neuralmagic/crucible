@@ -1434,6 +1434,7 @@ dependencies = [
  "opentelemetry_sdk",
  "reqwest",
  "rusqlite",
+ "rustix",
  "semver",
  "serde",
  "serde_json",

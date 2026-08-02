@@ -100,11 +100,34 @@ pub fn render(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
     out
 }
 
+/// Fill and text color per task kind, shared by both styling forms.
+const CLASS_STYLES: [(&str, &str); 4] = [
+    ("agent", "fill:#458588,color:#fbf1c7"),
+    ("command", "fill:#98971a,color:#282828"),
+    ("reduce", "fill:#d79921,color:#282828"),
+    ("engine", "fill:#b16286,color:#fbf1c7"),
+];
+
+/// How node styling is spelled in the emitted source.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Styling {
+    /// Idiomatic mermaid, and what GitHub and any UI graph view expect.
+    ClassDef,
+    /// A `style <id>` line per node. The vendored engine parses neither `classDef` nor the
+    /// `:::` suffix, and drops the label of any node carrying one.
+    PerNode,
+}
+
 /// Render the compiled plan as mermaid flowchart source: pipeable into a terminal mermaid
 /// renderer, pasteable into GitHub markdown, and the same source a UI graph view consumes.
 pub fn render_mermaid(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
+    render_mermaid_styled(plan, caps, Styling::ClassDef)
+}
+
+fn render_mermaid_styled(plan: &ValidPlan, caps: &BTreeSet<String>, styling: Styling) -> String {
     let runnable = runnable_set(plan, &Substrate { caps: caps.clone() });
     let mut out = String::from("flowchart TD\n");
+    let mut styles = String::new();
     let ids: BTreeMap<_, _> = plan
         .tasks_topo()
         .enumerate()
@@ -135,21 +158,32 @@ pub fn render_mermaid(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
             if t.required { "" } else { " (advisory)" },
             if ok { "" } else { " ⛔" }
         );
+        let id = &ids[&t.name];
+        let class_suffix = match styling {
+            Styling::ClassDef => format!(":::{class}"),
+            Styling::PerNode => String::new(),
+        };
         out.push_str(&format!(
-            "    {id}{shape_open}\"{name}{detail}{marks}\"{shape_close}:::{class}\n",
-            id = ids[&t.name],
+            "    {id}{shape_open}\"{name}{detail}{marks}\"{shape_close}{class_suffix}\n",
             name = mermaid_label(&t.name.0),
         ));
+        if styling == Styling::PerNode
+            && let Some((_, props)) = CLASS_STYLES.iter().find(|(name, _)| *name == class)
+        {
+            styles.push_str(&format!("    style {id} {props}\n"));
+        }
         for d in &t.depends_on {
             out.push_str(&format!("    {} --> {}\n", ids[d], ids[&t.name]));
         }
     }
-    out.push_str(
-        "    classDef agent fill:#458588,color:#fbf1c7\n\
-         classDef command fill:#98971a,color:#282828\n\
-         classDef reduce fill:#d79921,color:#282828\n\
-         classDef engine fill:#b16286,color:#fbf1c7\n",
-    );
+    match styling {
+        Styling::ClassDef => {
+            for (name, props) in CLASS_STYLES {
+                out.push_str(&format!("    classDef {name} {props}\n"));
+            }
+        }
+        Styling::PerNode => out.push_str(&styles),
+    }
     out
 }
 
@@ -222,6 +256,26 @@ pub fn show(path: &Path, caps: &BTreeSet<String>, mermaid: bool, render_img: boo
     Ok(())
 }
 
+/// Label size the preview layout asks for, in SVG px; the render scale derives from it.
+const PREVIEW_FONT_PX: f32 = 12.0;
+
+/// Roughly how much of a cell's height a terminal glyph occupies.
+const GLYPH_FRACTION_OF_CELL: f32 = 0.8;
+
+/// Layout metrics for the raster only; the engine's defaults are tuned for a full page and
+/// look oversized at terminal scale. `--mermaid` stays clean source for pasting.
+const PREVIEW_LAYOUT_FRONTMATTER: &str = "\
+---
+config:
+  fontSize: 12
+  flowchart:
+    nodeSpacing: 30
+    rankSpacing: 30
+    padding: 8
+    wrappingWidth: 180
+---
+";
+
 /// Render the plan's mermaid to PNG (offline, vendored engine) and display it inline when
 /// the terminal speaks an image protocol; otherwise write `<plan>.png` next to the file.
 fn show_rendered(path: &Path, plan: &ValidPlan, caps: &BTreeSet<String>) -> Result<()> {
@@ -229,17 +283,38 @@ fn show_rendered(path: &Path, plan: &ValidPlan, caps: &BTreeSet<String>) -> Resu
         MermaidTheme, RenderLimits, RenderParams, default_engine, render_checked,
     };
 
-    let src = render_mermaid(plan, caps);
+    const THEME: MermaidTheme = MermaidTheme::Dark;
+    let src = format!(
+        "{PREVIEW_LAYOUT_FRONTMATTER}{}",
+        render_mermaid_styled(plan, caps, Styling::PerNode)
+    );
     let engine = default_engine();
-    let params = RenderParams {
-        theme: MermaidTheme::Dark,
-        ..RenderParams::default()
+    let inline = crate::plan::term_img::detect().zip(crate::plan::term_img::geometry());
+
+    // Oversample rather than target a width: stretching a few nodes across the window is what
+    // made them look enormous. The factor matches diagram text to the terminal's own glyphs.
+    // `max_height_px: 0` lets a deep DAG scroll instead of being squashed.
+    let params = match inline {
+        Some((_, geo)) => RenderParams {
+            theme: THEME,
+            target_width_px: 0,
+            scale: (geo.cell_height_px * GLYPH_FRACTION_OF_CELL / PREVIEW_FONT_PX).clamp(1.0, 4.0),
+            max_height_px: 0,
+            ..RenderParams::default()
+        },
+        None => RenderParams::for_os_viewer(THEME, 1600, 0),
     };
     let diagram = render_checked(engine.as_ref(), &src, &params, &RenderLimits::default())
         .map_err(|e| anyhow::anyhow!("mermaid render failed: {e}"))?;
-    match crate::plan::term_img::detect() {
-        Some(proto) => {
-            print!("{}", crate::plan::term_img::emit(proto, &diagram.png));
+
+    match inline {
+        Some((proto, geo)) => {
+            // Only fit to cells when the graph overflows; otherwise it gets scaled back up.
+            let fit_cols = (diagram.width_px > geo.width_px).then_some(geo.cols);
+            print!(
+                "{}",
+                crate::plan::term_img::emit(proto, &diagram.png, fit_cols)
+            );
         }
         None => {
             let out = path.with_extension("png");
@@ -420,6 +495,57 @@ mod tests {
         let out = render_mermaid(&plan, &BTreeSet::new());
         assert!(out.contains("t0[\"review/a\"]"));
         assert!(out.contains("t1[\"review-a\"]"));
+    }
+
+    #[test]
+    fn classdef_styling_is_the_pasteable_default() {
+        let plan = Plan::from_toml_str(SRC).unwrap().validate().unwrap();
+        let out = render_mermaid(&plan, &BTreeSet::new());
+        assert!(out.contains(":::agent"), "class suffix: {out}");
+        assert!(
+            out.contains("classDef agent fill:#458588,color:#fbf1c7"),
+            "classDef trailer: {out}"
+        );
+        assert!(!out.contains("style t0"), "no per-node styles: {out}");
+    }
+
+    #[test]
+    fn per_node_styling_drops_the_suffix_the_preview_engine_cannot_parse() {
+        // The vendored engine renders a `:::class` node as its bare id, losing the label, so
+        // the raster path must emit neither `:::` nor `classDef`.
+        let plan = Plan::from_toml_str(SRC).unwrap().validate().unwrap();
+        let out = render_mermaid_styled(&plan, &BTreeSet::new(), Styling::PerNode);
+        assert!(!out.contains(":::"), "no class suffix: {out}");
+        assert!(!out.contains("classDef"), "no classDef trailer: {out}");
+        assert!(out.contains(r#"t0(["propose"#), "label survives: {out}");
+        assert!(
+            out.contains("style t0 fill:#458588,color:#fbf1c7"),
+            "per-node style: {out}"
+        );
+    }
+
+    #[test]
+    fn both_styling_forms_agree_on_nodes_and_edges() {
+        // Only the styling lines may differ; the graph itself must be identical.
+        let plan = Plan::from_toml_str(SRC).unwrap().validate().unwrap();
+        let strip = |s: String| {
+            s.lines()
+                .filter(|l| {
+                    let l = l.trim();
+                    !l.starts_with("classDef ") && !l.starts_with("style ")
+                })
+                .map(|l| l.split(":::").next().unwrap_or(l).to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(
+            strip(render_mermaid(&plan, &BTreeSet::new())),
+            strip(render_mermaid_styled(
+                &plan,
+                &BTreeSet::new(),
+                Styling::PerNode
+            ))
+        );
     }
 
     #[test]
