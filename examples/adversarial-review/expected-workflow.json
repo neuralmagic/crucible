@@ -7,6 +7,7 @@
       "kind": "engine",
       "op": "propose",
       "depends_on": [],
+      "session": "solver",
       "needs": "any",
       "required": true,
       "isolation": null,

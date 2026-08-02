@@ -86,6 +86,17 @@ pub enum AgentSource {
     Command(String),
 }
 
+/// Whether this concrete turn configuration can honor a durable logical session. Capability
+/// admission uses this before execution; incompatible backends still fail closed at the harness
+/// boundary as defense in depth.
+pub(crate) fn supports_persistent_sessions(args: &Args) -> bool {
+    match args.agent_source() {
+        AgentSource::Command(_) => true,
+        AgentSource::LocalClaude => args.harness() == crate::harness::Harness::Claude,
+        AgentSource::OpenshellDriver => args.harness() == crate::harness::Harness::Claude,
+    }
+}
+
 /// A spawned transport: a child process plus the streams a turn reads from it.
 struct Spawned {
     child: Child,
@@ -103,10 +114,11 @@ impl AgentSource {
         p: &Paths,
         prompt: &str,
         extra_env: &[(String, String)],
+        session: Option<&crate::agent_session::SessionTurn>,
     ) -> std::io::Result<Spawned> {
         match self {
-            AgentSource::LocalClaude => spawn_local(args, p, prompt, extra_env),
-            AgentSource::Command(cmd) => spawn_command(cmd, p, prompt),
+            AgentSource::LocalClaude => spawn_local(args, p, prompt, extra_env, session),
+            AgentSource::Command(cmd) => spawn_command(cmd, p, prompt, session),
             // The openshell driver runs a multi-step flow, not a single child; `run_turn`
             // intercepts it before `spawn`, so this is never reached.
             AgentSource::OpenshellDriver => Err(std::io::Error::other(
@@ -118,7 +130,12 @@ impl AgentSource {
 
 /// Spawn the `command` backend's proposal: `sh -c <cmd>` in the workspace. Deterministic;
 /// its output is echoed through the sink like any other turn.
-fn spawn_command(cmd: &str, p: &Paths, prompt: &str) -> std::io::Result<Spawned> {
+fn spawn_command(
+    cmd: &str,
+    p: &Paths,
+    prompt: &str,
+    session: Option<&crate::agent_session::SessionTurn>,
+) -> std::io::Result<Spawned> {
     let mut c = Command::new("sh");
     c.arg("-c")
         .arg(cmd)
@@ -129,6 +146,18 @@ fn spawn_command(cmd: &str, p: &Paths, prompt: &str) -> std::io::Result<Spawned>
         .env("CRUCIBLE_PROMPT", prompt)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(session) = session {
+        c.env("CRUCIBLE_AGENT_SESSION", &session.logical_name)
+            .env("CRUCIBLE_AGENT_SESSION_ID", &session.provider_id)
+            .env(
+                "CRUCIBLE_AGENT_SESSION_ACTION",
+                if session.is_resume() {
+                    "resume"
+                } else {
+                    "start"
+                },
+            );
+    }
     // Same rule as `spawn_claude`: this child inherits the engine's process env, which under a
     // controller-dispatched run/scope/rank carries the engine's OWN trace parent. Whatever the
     // command shells out to (often `claude`) must not graft its spans onto our trace.
@@ -157,8 +186,12 @@ fn spawn_local(
     p: &Paths,
     prompt: &str,
     extra_env: &[(String, String)],
+    session: Option<&crate::agent_session::SessionTurn>,
 ) -> std::io::Result<Spawned> {
-    let argv = args.harness().local_argv(args, prompt);
+    let argv = match session {
+        Some(session) => args.harness().local_session_argv(args, prompt, session)?,
+        None => args.harness().local_argv(args, prompt),
+    };
     let Some((program, rest)) = argv.split_first() else {
         return Err(std::io::Error::other("harness produced an empty argv"));
     };
@@ -210,14 +243,27 @@ pub fn run_turn(
     json: bool,
     sink: impl FnMut(&str, RawStream, Option<&AgentEvent>),
 ) -> f64 {
+    run_turn_with_session(args, p, prompt, json, None, sink)
+}
+
+/// Run a turn attached to a prepared logical session. The caller commits the cursor only after
+/// observing a successful result, so transport failures cannot poison future resumes.
+pub(crate) fn run_turn_with_session(
+    args: &Args,
+    p: &Paths,
+    prompt: &str,
+    json: bool,
+    session: Option<&crate::agent_session::SessionTurn>,
+    sink: impl FnMut(&str, RawStream, Option<&AgentEvent>),
+) -> f64 {
     let source = args.agent_source();
     // The openshell driver owns a multi-step turn (gateway/provider/sandbox/exec/download),
     // not a single streamed child, delegate to its module rather than the generic path. It
     // reaches the engine runtime handle itself (see `crate::engine::handle`).
     if source == AgentSource::OpenshellDriver {
-        return crate::openshell::run::turn(args, p, prompt, json, sink);
+        return crate::openshell::run::turn(args, p, prompt, json, session, sink);
     }
-    run_turn_with(&source, args, p, prompt, json, sink)
+    run_turn_with(&source, args, p, prompt, json, session, sink)
 }
 
 /// Inner driver, generic over the source. Split out so the source is explicit and
@@ -228,6 +274,7 @@ fn run_turn_with(
     p: &Paths,
     prompt: &str,
     json: bool,
+    session: Option<&crate::agent_session::SessionTurn>,
     mut sink: impl FnMut(&str, RawStream, Option<&AgentEvent>),
 ) -> f64 {
     // Start the in-process OTLP collector for a local claude turn when telemetry is opted in
@@ -258,7 +305,7 @@ fn run_turn_with(
         .unwrap_or_default();
     let rate = collector.as_ref().map(|c| c.rate_handle());
 
-    let spawned = match source.spawn(args, p, prompt, &extra_env) {
+    let spawned = match source.spawn(args, p, prompt, &extra_env, session) {
         Ok(s) => s,
         Err(e) => {
             let ev = AgentEvent::Error {

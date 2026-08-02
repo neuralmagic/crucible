@@ -1450,6 +1450,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "url",
+ "uuid",
  "xai-grok-mermaid",
 ]
 

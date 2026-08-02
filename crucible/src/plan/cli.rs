@@ -62,7 +62,7 @@ pub fn render(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        let detail = match &t.task {
+        let mut detail = match &t.task {
             TaskKind::Agent { model, harness, .. } => format!(
                 "agent[{}/{}]",
                 harness.as_deref().unwrap_or("default"),
@@ -72,6 +72,9 @@ pub fn render(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
             TaskKind::TopK { k, .. } => format!("top_k[k={k}]"),
             TaskKind::Engine { .. } => t.task.label().to_string(),
         };
+        if let Some(session) = &t.session {
+            detail.push_str(&format!(" session={session}"));
+        }
         out.push_str(&format!(
             "  {:<20} {:<28} needs={:<8} {} deps: {}{}\n",
             t.name.0,
@@ -115,7 +118,7 @@ pub fn render_mermaid(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
             TaskKind::TopK { .. } => ("{{", "}}", "reduce"),
             TaskKind::Engine { .. } => ("[[", "]]", "engine"),
         };
-        let detail = match &t.task {
+        let mut detail = match &t.task {
             TaskKind::Agent { harness, model, .. } => format!(
                 "<br/>{}/{}",
                 mermaid_label(harness.as_deref().unwrap_or("default")),
@@ -124,6 +127,9 @@ pub fn render_mermaid(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
             TaskKind::Command { .. } | TaskKind::Engine { .. } => String::new(),
             TaskKind::TopK { k, .. } => format!("<br/>k={k}"),
         };
+        if let Some(session) = &t.session {
+            detail.push_str(&format!("<br/>session: {}", mermaid_label(session)));
+        }
         let marks = format!(
             "{}{}",
             if t.required { "" } else { " (advisory)" },
@@ -160,6 +166,7 @@ pub(crate) fn plan_admitted_event(plan: &ValidPlan) -> crate::session::SessionEv
                 name: t.name.0.clone(),
                 kind: t.task.label().to_string(),
                 depends_on: t.depends_on.iter().map(|d| d.0.clone()).collect(),
+                session: t.session.clone().unwrap_or_default(),
                 needs: t.needs.clone(),
                 required: t.required,
             })

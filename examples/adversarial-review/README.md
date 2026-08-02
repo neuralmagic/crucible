@@ -11,7 +11,9 @@ engine propose (edit) ───┤                                  ├─> gate
 
 `workflow.star` declares the entire iteration, including proposal, application, frozen measurement,
 and keep/discard as editable task nodes. Crucible still owns the capabilities behind those
-operations and admits the graph under the `autoresearch` workflow contract. The older standalone
+operations and admits the graph under the `autoresearch` workflow contract. Its proposer binds to
+the durable `solver` session, so a discarded checkout rolls back without erasing what the solver
+learned; the isolated reviewers intentionally start fresh. The older standalone
 plan fixtures below exercise the general plan runner with the same tasks:
 
 ```

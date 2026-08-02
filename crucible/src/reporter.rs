@@ -117,7 +117,15 @@ pub trait Reporter {
     /// Run the agent subprocess for `it`, streaming its output to the front-end.
     /// Returns the turn's cost and its error verdict ([`AgentTurn`]) so the loop can
     /// budget on it and discard a failed no-op turn.
-    fn run_agent(&mut self, args: &Args, p: &Paths, it: u32, prompt: &str) -> AgentTurn;
+    fn run_agent(
+        &mut self,
+        args: &Args,
+        p: &Paths,
+        it: u32,
+        prompt: &str,
+        resume_prompt: Option<&str>,
+        session: Option<&str>,
+    ) -> AgentTurn;
     /// Cumulative budget after a turn; lets the front-end draw a gauge / warn.
     fn budget(&mut self, _spent: f64, _elapsed: Duration) {}
     /// Interrupt checkpoint: decide whether to stop.

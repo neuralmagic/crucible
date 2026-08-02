@@ -65,6 +65,12 @@ impl WorkflowCaps {
         ])
     }
 
+    /// Advertise a private continuation store in addition to the core loop operations.
+    pub fn with_persistent_sessions(mut self) -> Self {
+        self.names.insert("agent.session.persist".to_string());
+        self
+    }
+
     fn require(&self, capability: &str) -> Result<()> {
         if !self.names.contains(capability) {
             bail!("workflow requires unavailable orchestrator capability {capability:?}");
@@ -180,6 +186,9 @@ impl WorkflowCfg {
         for task in &self.tasks {
             if let TaskKind::Engine { op, .. } = task.task {
                 caps.require(op.capability())?;
+            }
+            if task.session.is_some() {
+                caps.require("agent.session.persist")?;
             }
         }
         Ok(())
@@ -381,6 +390,25 @@ mod tests {
         assert!(error.contains("engine.propose"), "{error}");
         workflow
             .admit(&WorkflowCaps::autoresearch_engine())
+            .unwrap();
+    }
+
+    #[test]
+    fn persistent_session_is_separately_capability_gated() {
+        let workflow = parse(
+            "type = \"custom\"\nresult = \"solve\"\n\
+             [[task]]\nname = \"solve\"\nkind = \"agent\"\nprompt = \"go\"\nsession = \"solver\"\n",
+        );
+        let error = workflow
+            .admit(&WorkflowCaps::new(["workflow.custom"]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("agent.session.persist"), "{error}");
+        workflow
+            .admit(&WorkflowCaps::new([
+                "workflow.custom",
+                "agent.session.persist",
+            ]))
             .unwrap();
     }
 
