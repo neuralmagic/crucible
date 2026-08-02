@@ -440,14 +440,24 @@ mod tests {
     }
 
     #[test]
-    fn engine_tasks_are_not_authorable() {
-        for kind in ["engine", "engine_apply", "engine_measure", "engine_decide"] {
+    fn engine_tasks_are_authorable_data_but_legacy_kind_aliases_are_rejected() {
+        let authored = "version = 1\n[budget]\nusd = 1.0\n[[task]]\nname = \"score\"\nkind = \"engine\"\nop = \"measure\"\n";
+        let plan = Plan::from_toml_str(authored).unwrap();
+        assert!(matches!(
+            plan.tasks[0].task,
+            TaskKind::Engine {
+                op: EngineOp::Measure,
+                source: None
+            }
+        ));
+
+        for kind in ["engine_apply", "engine_measure", "engine_decide"] {
             let src = format!(
                 "version = 1\n[budget]\nusd = 1.0\n[[task]]\nname = \"x\"\nkind = \"{kind}\"\n"
             );
             assert!(
                 Plan::from_toml_str(&src).is_err(),
-                "kind {kind:?} must not parse — engine tasks are engine-constructable only"
+                "legacy kind alias {kind:?} must not parse"
             );
         }
     }
