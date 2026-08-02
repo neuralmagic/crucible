@@ -284,31 +284,23 @@ impl Compiler {
         }
 
         let task = match function {
-            "agent" => Task {
-                name: TaskName(take_string(&mut named, "name")?),
-                task: TaskKind::Agent {
+            "agent" => {
+                let name = TaskName(take_string(&mut named, "name")?);
+                let kind = TaskKind::Agent {
                     prompt: take_string(&mut named, "prompt")?,
                     harness: take_optional_string(&mut named, "harness")?,
                     model: take_optional_string(&mut named, "model")?,
                     effort: take_optional_string(&mut named, "effort")?,
-                },
-                depends_on: take_task_names(&mut named)?,
-                needs: take_string_default(&mut named, "needs", "any")?,
-                required: take_bool_default(&mut named, "required", true)?,
-                isolation: isolation(take_bool_default(&mut named, "isolated", false)?),
-                join: parse_join(&take_string_default(&mut named, "join", "all")?)?,
-            },
-            "command" => Task {
-                name: TaskName(take_string(&mut named, "name")?),
-                task: TaskKind::Command {
+                };
+                dsl_task(&mut named, name, kind)?
+            }
+            "command" => {
+                let name = TaskName(take_string(&mut named, "name")?);
+                let kind = TaskKind::Command {
                     command: take_string(&mut named, "run")?,
-                },
-                depends_on: take_task_names(&mut named)?,
-                needs: take_string_default(&mut named, "needs", "any")?,
-                required: take_bool_default(&mut named, "required", true)?,
-                isolation: isolation(take_bool_default(&mut named, "isolated", false)?),
-                join: parse_join(&take_string_default(&mut named, "join", "all")?)?,
-            },
+                };
+                dsl_task(&mut named, name, kind)?
+            }
             "top_k" => {
                 let k = take_int(&mut named, "k")?;
                 if k <= 0 {
@@ -319,8 +311,9 @@ impl Compiler {
                     "higher" => Direction::Higher,
                     other => bail!("top_k direction must be `lower` or `higher`, got {other:?}"),
                 };
-                if !named.contains_key("depends_on") {
-                    bail!("missing required argument \"depends_on\"");
+                let depends_on = take_task_names(&mut named)?;
+                if depends_on.is_empty() {
+                    bail!("top_k requires a non-empty depends_on");
                 }
                 Task {
                     name: TaskName(take_string(&mut named, "name")?),
@@ -328,7 +321,7 @@ impl Compiler {
                         k: k as u32,
                         direction,
                     },
-                    depends_on: take_task_names(&mut named)?,
+                    depends_on,
                     needs: "any".to_owned(),
                     required: take_bool_default(&mut named, "required", true)?,
                     isolation: None,
@@ -340,13 +333,16 @@ impl Compiler {
             "measure" => engine_task(&mut named, EngineOp::Measure, None)?,
             "decide" => {
                 let source = take_task_name(&mut named, "measurement")?;
-                if !named.contains_key("depends_on") {
-                    named.insert(
-                        "depends_on".to_owned(),
-                        Value::List(vec![Value::String(source.0.clone())]),
-                    );
-                }
-                engine_task(&mut named, EngineOp::Decide, Some(source))?
+                let depends_on = match named.remove("depends_on") {
+                    None => vec![source.clone()],
+                    Some(value) => task_names(value)?,
+                };
+                engine(
+                    &take_string(&mut named, "name")?,
+                    EngineOp::Decide,
+                    Some(source),
+                    depends_on,
+                )
             }
             _ => bail!("unknown workflow DSL function {function:?}"),
         };
@@ -438,6 +434,18 @@ fn engine_task(
     ))
 }
 
+fn dsl_task(named: &mut BTreeMap<String, Value>, name: TaskName, kind: TaskKind) -> Result<Task> {
+    Ok(Task {
+        name,
+        task: kind,
+        depends_on: take_task_names(named)?,
+        needs: take_string_default(named, "needs", "any")?,
+        required: take_bool_default(named, "required", true)?,
+        isolation: isolation(take_bool_default(named, "isolated", false)?),
+        join: parse_join(&take_string_default(named, "join", "all")?)?,
+    })
+}
+
 fn engine(name: &str, op: EngineOp, source: Option<TaskName>, depends_on: Vec<TaskName>) -> Task {
     Task {
         name: TaskName(name.to_owned()),
@@ -523,18 +531,23 @@ fn take_int(named: &mut BTreeMap<String, Value>, name: &str) -> Result<i32> {
 }
 
 fn take_task_names(named: &mut BTreeMap<String, Value>) -> Result<Vec<TaskName>> {
-    match named.remove("depends_on") {
-        None => Ok(Vec::new()),
-        Some(Value::List(names)) => names
-            .into_iter()
-            .map(|name| match name {
-                Value::String(name) => Ok(TaskName(name)),
-                Value::Task(task) => Ok(task.name),
-                _ => bail!("depends_on entries must be tasks or task-name strings"),
-            })
-            .collect(),
-        Some(_) => bail!("depends_on must be a list of tasks or task-name strings"),
-    }
+    named
+        .remove("depends_on")
+        .map_or(Ok(Vec::new()), task_names)
+}
+
+fn task_names(value: Value) -> Result<Vec<TaskName>> {
+    let Value::List(names) = value else {
+        bail!("depends_on must be a list of tasks or task-name strings");
+    };
+    names
+        .into_iter()
+        .map(|name| match name {
+            Value::String(name) => Ok(TaskName(name)),
+            Value::Task(task) => Ok(task.name),
+            _ => bail!("depends_on entries must be tasks or task-name strings"),
+        })
+        .collect()
 }
 
 fn isolation(isolated: bool) -> Option<Isolation> {
@@ -564,11 +577,7 @@ pub fn materialize_manifest(source_path: &Path, manifest_path: &Path) -> Result<
         workflow: &'a WorkflowCfg,
     }
 
-    let pack_dir = manifest_path
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let compiled = compile_file(source_path, pack_dir)?;
+    let compiled = compile_file(source_path, parent_or_cwd(manifest_path))?;
     let manifest = std::fs::read_to_string(manifest_path)
         .with_context(|| format!("reading manifest {}", manifest_path.display()))?;
     let mut document: DocumentMut = manifest
@@ -577,9 +586,6 @@ pub fn materialize_manifest(source_path: &Path, manifest_path: &Path) -> Result<
     let workflow_toml = toml::to_string(&ManifestWorkflow {
         workflow: &compiled.workflow,
     })?;
-    workflow_toml
-        .parse::<DocumentMut>()
-        .context("rendering compiled workflow as TOML")?;
     document.remove("workflow");
     let mut materialized = document.to_string();
     if !materialized.ends_with('\n') {
@@ -594,13 +600,8 @@ pub fn materialize_manifest(source_path: &Path, manifest_path: &Path) -> Result<
     Ok(compiled)
 }
 
-/// Replace a manifest atomically.
 fn write_atomically(path: &Path, body: &str) -> Result<()> {
-    let dir = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let mut file = tempfile::NamedTempFile::new_in(dir)
+    let mut file = tempfile::NamedTempFile::new_in(parent_or_cwd(path))
         .with_context(|| format!("creating temp file beside {}", path.display()))?;
     // Preserve the manifest's mode across the temporary-file rename.
     if let Ok(existing) = std::fs::metadata(path) {
@@ -611,17 +612,20 @@ fn write_atomically(path: &Path, body: &str) -> Result<()> {
     std::io::Write::write_all(file.as_file_mut(), body.as_bytes())?;
     file.as_file().sync_all()?;
     file.persist(path)
-        .map_err(|e| anyhow::anyhow!("installing {}: {e}", path.display()))?;
+        .with_context(|| format!("installing {}", path.display()))?;
     Ok(())
+}
+
+/// A bare filename has an empty parent; tempfiles and prompt resolution need a real directory.
+pub(crate) fn parent_or_cwd(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
 }
 
 /// Compile a conventional sibling `workflow.star` when one is present.
 pub fn materialize_sibling_manifest(manifest_path: &Path) -> Result<Option<CompiledWorkflow>> {
-    let pack_dir = manifest_path
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let source_path = pack_dir.join("workflow.star");
+    let source_path = parent_or_cwd(manifest_path).join("workflow.star");
     source_path
         .exists()
         .then(|| materialize_manifest(&source_path, manifest_path))
@@ -653,7 +657,6 @@ pub fn compile_source(source: &str, filename: &Path, pack_dir: &Path) -> Result<
     let Some(Value::Workflow(workflow)) = compiler.statement(ast.statement())? else {
         bail!("workflow source must end with workflow(...) or default_autoresearch([...])");
     };
-    workflow.validate()?;
     let canonical_json = serde_json::to_string_pretty(&workflow)? + "\n";
     Ok(CompiledWorkflow {
         workflow,
@@ -852,7 +855,6 @@ default_autoresearch([review])
         );
     }
 
-    /// Temp file plus rename, and the mode survives it.
     #[cfg(unix)]
     #[test]
     fn materializing_is_atomic_and_keeps_the_manifest_mode() {
@@ -880,7 +882,6 @@ default_autoresearch([review])
         let body = std::fs::read_to_string(&manifest_path).unwrap();
         assert!(body.contains("# preserved"), "{body}");
         assert!(body.contains("[[workflow.task]]"), "{body}");
-        // No temp file left beside the manifest.
         let strays: Vec<_> = std::fs::read_dir(&pack)
             .unwrap()
             .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
