@@ -26,7 +26,7 @@ starlark_syntax = "0.14.2"
 ctrlc = "3"
 git2.workspace = true
 fs_extra = "1.3.0"
-nix = { version = "0.31.3", features = ["signal"] }
+nix = { version = "0.31.3", features = ["fs", "signal"] }
 # Publish-on-keep: S3 run records via IRSA web-identity (creds auto-discovered from
 # AWS_ROLE_ARN + the projected token). The loop is sync, so `publish` owns a small
 # block_on runtime; the rest of the loop never touches tokio.

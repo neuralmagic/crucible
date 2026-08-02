@@ -1178,7 +1178,6 @@ fn render_prompt(template: &str, goal: &str, status: &str, steer: Option<String>
     out
 }
 
-/// Send a resumed solver only the authoritative world-state delta.
 fn render_resume_prompt(status: &str, regime: &str, steer: Option<&str>) -> String {
     let mut out = format!(
         "Continue the existing autoresearch session from your current plan and hypotheses.\n\n\

@@ -86,12 +86,12 @@ pub enum AgentSource {
     Command(String),
 }
 
-/// Whether this turn configuration supports durable sessions.
 pub(crate) fn supports_persistent_sessions(args: &Args) -> bool {
     match args.agent_source() {
         AgentSource::Command(_) => true,
-        AgentSource::LocalClaude => args.harness() == crate::harness::Harness::Claude,
-        AgentSource::OpenshellDriver => args.harness() == crate::harness::Harness::Claude,
+        AgentSource::LocalClaude | AgentSource::OpenshellDriver => {
+            args.harness() == crate::harness::Harness::Claude
+        }
     }
 }
 

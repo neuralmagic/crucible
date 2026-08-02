@@ -7,13 +7,16 @@ use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
+use nix::fcntl::{Flock, FlockArg};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::session::SessionAction;
+
 const LEDGER_FILE: &str = "agent-sessions.json";
+const LOCK_FILE: &str = ".agent-sessions.json.lock";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Entry {
@@ -27,7 +30,6 @@ struct Ledger {
     sessions: BTreeMap<String, Entry>,
 }
 
-/// A prepared turn with an opaque provider continuation.
 #[derive(Clone, Debug)]
 pub(crate) struct SessionTurn {
     pub logical_name: String,
@@ -40,18 +42,29 @@ impl SessionTurn {
         self.completed_turns > 0
     }
 
-    pub(crate) fn action(&self) -> &'static str {
+    pub(crate) fn action(&self) -> SessionAction {
         if self.is_resume() {
-            "resumed"
+            SessionAction::Resumed
         } else {
-            "started"
+            SessionAction::Started
         }
     }
 }
 
-fn lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+/// flock(2) on a sidecar file: `commit` is a read/modify/write and several crucible processes can
+/// share one state dir, which an in-process mutex would not cover. The lock is not the ledger
+/// itself, whose inode is replaced by every rename.
+fn lock(state: &Path) -> Result<Flock<std::fs::File>> {
+    let path = state.join(LOCK_FILE);
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening agent session lock {}", path.display()))?;
+    Flock::lock(file, FlockArg::LockExclusive)
+        .map_err(|(_, errno)| errno)
+        .with_context(|| format!("locking agent session ledger via {}", path.display()))
 }
 
 fn ledger_path(state: &Path) -> std::path::PathBuf {
@@ -70,9 +83,9 @@ fn read(state: &Path) -> Result<Ledger> {
     }
 }
 
-/// Resolve a session without mutating its ledger.
+/// Resolve a session without mutating its ledger. Unlocked: `commit` installs the ledger by
+/// rename, so a reader either sees the old file or the new one.
 pub(crate) fn prepare(state: &Path, logical_name: &str) -> Result<SessionTurn> {
-    let _guard = lock().lock().unwrap_or_else(|e| e.into_inner());
     let ledger = read(state)?;
     let entry = ledger.sessions.get(logical_name);
     Ok(SessionTurn {
@@ -86,9 +99,9 @@ pub(crate) fn prepare(state: &Path, logical_name: &str) -> Result<SessionTurn> {
 
 /// Atomically advance the private cursor after successful transport.
 pub(crate) fn commit(state: &Path, turn: &SessionTurn) -> Result<()> {
-    let _guard = lock().lock().unwrap_or_else(|e| e.into_inner());
     std::fs::create_dir_all(state)
         .with_context(|| format!("creating state directory {}", state.display()))?;
+    let _guard = lock(state)?;
     let mut ledger = read(state)?;
     ledger.sessions.insert(
         turn.logical_name.clone(),
@@ -116,6 +129,42 @@ pub(crate) fn commit(state: &Path, turn: &SessionTurn) -> Result<()> {
     std::fs::rename(&tmp, &path)
         .with_context(|| format!("installing agent session ledger {}", path.display()))?;
     Ok(())
+}
+
+/// `Err` carries the message every call site reports as the turn's error.
+pub(crate) fn prepare_named(
+    state: &Path,
+    session: Option<&str>,
+) -> std::result::Result<Option<SessionTurn>, String> {
+    match session.map(|name| prepare(state, name)) {
+        Some(Ok(turn)) => Ok(Some(turn)),
+        Some(Err(e)) => Err(format!("preparing agent session failed: {e:#}")),
+        None => Ok(None),
+    }
+}
+
+/// Advance the cursor only for a turn that transported cleanly; `Some` is the failure message.
+pub(crate) fn commit_if_ok(
+    state: &Path,
+    prepared: Option<&SessionTurn>,
+    transported: bool,
+) -> Option<String> {
+    let turn = prepared.filter(|_| transported)?;
+    commit(state, turn)
+        .err()
+        .map(|e| format!("committing agent session failed: {e:#}"))
+}
+
+/// A resumed turn gets the follow-up prompt when the caller has one.
+pub(crate) fn effective_prompt<'a>(
+    prepared: Option<&SessionTurn>,
+    prompt: &'a str,
+    resume_prompt: Option<&'a str>,
+) -> &'a str {
+    match prepared {
+        Some(turn) if turn.is_resume() => resume_prompt.unwrap_or(prompt),
+        _ => prompt,
+    }
 }
 
 #[cfg(test)]

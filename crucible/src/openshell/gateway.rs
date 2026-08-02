@@ -287,12 +287,6 @@ fn external_podman_socket() -> Option<String> {
         .filter(|socket| !socket.is_empty())
 }
 
-fn podman_socket() -> PathBuf {
-    let override_socket = external_podman_socket();
-    let xdg = std::env::var("XDG_RUNTIME_DIR").ok();
-    podman_socket_from(override_socket.as_deref(), xdg.as_deref(), libc_getuid())
-}
-
 /// `getuid()` without pulling a crate: crucible already depends on `nix`, but a tiny extern
 /// keeps this module self-contained. Always succeeds.
 fn libc_getuid() -> u32 {
@@ -372,8 +366,13 @@ async fn boot(driver: ComputeDriver, supervisor_image: Option<&str>) -> Result<(
     // 1. rootless podman API socket (the podman compute driver). Skipped under kubernetes,
     // where the sandbox is a sibling pod and there is no local daemon to boot.
     if needs_podman_socket(driver) {
-        let sock = podman_socket();
-        if external_podman_socket().is_none() {
+        let external = external_podman_socket();
+        let sock = podman_socket_from(
+            external.as_deref(),
+            std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
+            libc_getuid(),
+        );
+        if external.is_none() {
             if let Some(parent) = sock.parent() {
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("creating podman socket dir {}", parent.display()))?;
@@ -392,7 +391,7 @@ async fn boot(driver: ComputeDriver, supervisor_image: Option<&str>) -> Result<(
         if !wait_for(Duration::from_secs(15), || sock.exists()) {
             bail!(
                 "{} podman API socket did not appear at {}",
-                if external_podman_socket().is_some() {
+                if external.is_some() {
                     "configured"
                 } else {
                     "managed"

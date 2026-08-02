@@ -66,6 +66,22 @@ pub struct PlanTaskWire {
     pub required: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionAction {
+    Started,
+    Resumed,
+}
+
+impl std::fmt::Display for SessionAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            SessionAction::Started => "started",
+            SessionAction::Resumed => "resumed",
+        })
+    }
+}
+
 /// One event in the session log. Mirrors the `crucible::reporter::Reporter` calls so the
 /// viewer can rebuild identical state by folding the sequence (the same fold `App` does
 /// over `UiMsg`).
@@ -102,8 +118,7 @@ pub enum SessionEvent {
     /// reasoning are intentionally absent from the public event stream.
     AgentSession {
         session: String,
-        /// `started` or `resumed`.
-        action: String,
+        action: SessionAction,
         /// Number of successfully completed turns before this one.
         turn: u32,
     },
@@ -305,7 +320,7 @@ mod tests {
             SessionEvent::AgentStart { iter: 1 },
             SessionEvent::AgentSession {
                 session: "solver".into(),
-                action: "resumed".into(),
+                action: SessionAction::Resumed,
                 turn: 2,
             },
             SessionEvent::AgentDone,

@@ -79,16 +79,22 @@ pub(crate) fn local_session_argv(
     session: &crate::agent_session::SessionTurn,
 ) -> Vec<String> {
     let mut a = claude_base_args(args);
-    let at = a.len().saturating_sub(1); // before `-p`
-    if session.is_resume() {
-        a.insert(at, session.provider_id.clone());
-        a.insert(at, "--resume".to_string());
-    } else {
-        a.insert(at, session.provider_id.clone());
-        a.insert(at, "--session-id".to_string());
-    }
+    insert_session_flags(&mut a, session);
     a.push(prompt.to_string());
     a
+}
+
+/// Inserts `--resume|--session-id <id>` just before the trailing `-p` that
+/// [`claude_base_args`] guarantees.
+fn insert_session_flags(a: &mut Vec<String>, session: &crate::agent_session::SessionTurn) {
+    let at = a.len().saturating_sub(1);
+    let flag = if session.is_resume() {
+        "--resume"
+    } else {
+        "--session-id"
+    };
+    a.insert(at, session.provider_id.clone());
+    a.insert(at, flag.to_string());
 }
 
 /// The claude argv (program name first) for a sandbox turn: the shared base args, plus
@@ -112,14 +118,7 @@ pub(crate) fn sandbox_session_argv(
     session: &crate::agent_session::SessionTurn,
 ) -> Vec<String> {
     let mut a = sandbox_argv(args, mcp_seeded);
-    let at = a.len().saturating_sub(1);
-    if session.is_resume() {
-        a.insert(at, session.provider_id.clone());
-        a.insert(at, "--resume".to_string());
-    } else {
-        a.insert(at, session.provider_id.clone());
-        a.insert(at, "--session-id".to_string());
-    }
+    insert_session_flags(&mut a, session);
     a
 }
 
