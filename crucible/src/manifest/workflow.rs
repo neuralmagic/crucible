@@ -111,7 +111,7 @@ impl WorkflowCfg {
         let tasks: BTreeMap<&TaskName, &Task> =
             self.tasks.iter().map(|task| (&task.name, task)).collect();
         for task in &self.tasks {
-            if let TaskKind::Engine { source, .. } = &task.task {
+            if let TaskKind::Engine { op, source } = &task.task {
                 if !task.required {
                     bail!("engine task {:?} must be required", task.name.0);
                 }
@@ -123,6 +123,17 @@ impl WorkflowCfg {
                 }
                 if task.join != Join::All {
                     bail!("engine task {:?} must use join = \"all\"", task.name.0);
+                }
+                match (op, source) {
+                    (EngineOp::Decide, None) => {
+                        bail!("engine decide task {:?} requires source", task.name.0)
+                    }
+                    (EngineOp::Decide, Some(_)) | (_, None) => {}
+                    (_, Some(_)) => bail!(
+                        "engine {:?} task {:?} does not accept source",
+                        op,
+                        task.name.0
+                    ),
                 }
                 if let Some(source) = source {
                     if !tasks.contains_key(source) {
