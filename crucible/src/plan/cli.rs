@@ -6,8 +6,10 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::plan::exec::{Substrate, runnable_set};
-use crate::plan::ir::{Plan, TaskKind, ValidPlan};
+use crate::plan::ir::{Direction, Plan, TaskKind, ValidPlan};
 use xai_grok_mermaid::{MermaidTheme, RenderLimits, RenderParams, default_engine, render_checked};
+
+const MERMAID_COMMAND_PREVIEW_CHARS: usize = 72;
 
 /// Compile scope-time workflow authoring syntax. JSON on stdout is stable enough for a
 /// checked-in golden; `--manifest` additionally materializes the runtime TOML authority.
@@ -175,9 +177,25 @@ fn render_mermaid_styled(plan: &ValidPlan, caps: &BTreeSet<String>, styling: Sty
                 mermaid_label(harness.as_deref().unwrap_or("default")),
                 mermaid_label(model.as_deref().unwrap_or("default"))
             ),
-            TaskKind::Command { .. } | TaskKind::Evaluate { .. } | TaskKind::Engine { .. } => {
-                String::new()
+            TaskKind::Command { command } => {
+                format!("<br/>run: {}", mermaid_command_preview(command))
             }
+            TaskKind::Evaluate {
+                command,
+                threshold,
+                direction,
+            } => {
+                let mut detail = format!("<br/>run: {}", mermaid_command_preview(command));
+                if let (Some(threshold), Some(direction)) = (threshold, direction) {
+                    let comparison = match direction {
+                        Direction::Lower => "&lt;=",
+                        Direction::Higher => "&gt;=",
+                    };
+                    detail.push_str(&format!("<br/>pass: score {comparison} {threshold}"));
+                }
+                detail
+            }
+            TaskKind::Engine { .. } => String::new(),
             TaskKind::TopK { k, .. } => format!("<br/>k={k}"),
         };
         if let Some(session) = &t.session {
@@ -296,6 +314,16 @@ fn mermaid_label(name: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace(['\r', '\n'], " ")
+}
+
+fn mermaid_command_preview(command: &str) -> String {
+    let compact = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = compact.chars();
+    let mut preview: String = chars.by_ref().take(MERMAID_COMMAND_PREVIEW_CHARS).collect();
+    if chars.next().is_some() {
+        preview.push('…');
+    }
+    mermaid_label(&preview)
 }
 
 pub fn show(path: &Path, caps: &BTreeSet<String>, mermaid: bool, render_img: bool) -> Result<()> {
@@ -565,8 +593,8 @@ mod tests {
         "#;
         let plan = Plan::from_toml_str(src).unwrap().validate().unwrap();
         let out = render_mermaid(&plan, &BTreeSet::new());
-        assert!(out.contains("t0[\"review/a\"]"));
-        assert!(out.contains("t1[\"review-a\"]"));
+        assert!(out.contains("t0[\"review/a<br/>run: true\"]"));
+        assert!(out.contains("t1[\"review-a<br/>run: true\"]"));
     }
 
     #[test]
@@ -636,6 +664,8 @@ mod tests {
             name = "latency"
             kind = "evaluate"
             command = "./latency.sh"
+            threshold = 12.5
+            direction = "lower"
             depends_on = ["correctness"]
             isolation = "worktree"
             [[task]]
@@ -663,6 +693,8 @@ mod tests {
             mermaid.contains("classDef evaluate fill:#076678"),
             "{mermaid}"
         );
+        assert!(mermaid.contains("correctness<br/>run: ./correctness.sh"));
+        assert!(mermaid.contains("latency<br/>run: ./latency.sh<br/>pass: score &lt;= 12.5"));
         assert!(mermaid.contains("t1 --> t2"), "rung edge: {mermaid}");
         assert!(mermaid.contains("t1 --> t3"), "parallel fanout: {mermaid}");
 
@@ -681,6 +713,17 @@ mod tests {
         assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
         assert!(width > 0 && height > 0);
         let _ = std::fs::remove_file(output);
+    }
+
+    #[test]
+    fn mermaid_command_metadata_is_compact_escaped_and_truncated() {
+        let command = format!("printf   '<unsafe> & ready'\n{}", "x".repeat(100));
+        let preview = mermaid_command_preview(&command);
+
+        assert!(!preview.contains('\n'));
+        assert!(preview.contains("&lt;unsafe&gt; &amp; ready"));
+        assert!(preview.ends_with('…'));
+        assert_eq!(preview.matches("  ").count(), 0);
     }
 
     #[test]
