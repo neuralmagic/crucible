@@ -339,6 +339,7 @@ impl<R: Reporter> LoopTaskRunner<'_, R> {
                 "decide dispatched without a measurement source".to_string(),
             );
         };
+        // Safe to take: validation rejects two decides sharing a source.
         let Some(m) = self.measured.remove(source) else {
             return fail(
                 0.0,
