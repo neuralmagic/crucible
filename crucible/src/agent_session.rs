@@ -5,6 +5,10 @@
 //! live harness event stream is unchanged. World rollback and agent learning therefore have
 //! independent lifetimes: a discarded candidate can restore the checkout while the next turn
 //! resumes the solver that learned why it failed.
+//!
+//! The cursor advances on any turn that returned without an agent or transport error, even one
+//! graded a failure for writing no result: the conversation happened, and resuming it lets the
+//! next turn see its own botched attempt.
 
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
@@ -88,8 +92,8 @@ pub(crate) fn prepare(state: &Path, logical_name: &str) -> Result<SessionTurn> {
     })
 }
 
-/// Advance the opaque continuation cursor after a successful harness turn. The private 0600 file
-/// is replaced atomically; it is runtime state, not part of the public session event stream.
+/// Advance the cursor after a turn that returned without an agent or transport error. The
+/// private 0600 file is replaced atomically; runtime state, not part of the event stream.
 pub(crate) fn commit(state: &Path, turn: &SessionTurn) -> Result<()> {
     let _guard = lock().lock().unwrap_or_else(|e| e.into_inner());
     std::fs::create_dir_all(state)

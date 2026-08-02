@@ -246,8 +246,8 @@ pub fn run_turn(
     run_turn_with_session(args, p, prompt, json, None, sink)
 }
 
-/// Run a turn attached to a prepared logical session. The caller commits the cursor only after
-/// observing a successful result, so transport failures cannot poison future resumes.
+/// Run a turn attached to a prepared logical session. The caller commits the cursor only once
+/// the turn returns without an agent or transport error, so a failed spawn cannot poison resumes.
 pub(crate) fn run_turn_with_session(
     args: &Args,
     p: &Paths,

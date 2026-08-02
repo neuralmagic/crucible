@@ -454,6 +454,91 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A clean turn that writes no result is graded a failure but still advances the cursor.
+    /// Deliberate, and easy to "fix" into commit-only-on-pass, so pinned.
+    #[test]
+    fn a_turn_that_writes_no_result_fails_but_still_advances_the_session() {
+        let dir = std::env::temp_dir().join(format!(
+            "crucible-plan-session-quiet-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("quiet.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.join("quiet.sh"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        std::fs::write(
+            dir.join("crucible.toml"),
+            r#"
+            [repo]
+            path = "."
+            [workspace]
+            dir = "workspace"
+            setup_cmd = "mkdir -p workspace && cp quiet.sh workspace/ && git -C workspace init -q && git -C workspace add -A && git -C workspace -c user.email=c@l -c user.name=c -c commit.gpgsign=false commit -qm baseline"
+            [agent]
+            backend = "command"
+            agent_cmd = "./quiet.sh"
+            goal = "say nothing"
+            [judge]
+            measure_cmd = "echo 0"
+            direction = "higher"
+            "#,
+        )
+        .unwrap();
+
+        let plan = Plan::from_toml_str(
+            r#"
+            version = 1
+            [budget]
+            usd = 2.0
+            [[task]]
+            name = "quiet"
+            kind = "agent"
+            prompt = "produce nothing"
+            session = "solver"
+            required = false
+            "#,
+        )
+        .unwrap()
+        .validate()
+        .unwrap();
+
+        let mut runner = crate::run::prep_plan_runner(&dir.join("crucible.toml")).unwrap();
+        let state = runner.paths.state.clone();
+        assert!(
+            !crate::agent_session::prepare(&state, "solver")
+                .unwrap()
+                .is_resume(),
+            "no cursor before the first turn"
+        );
+        let out = execute(
+            &plan,
+            &Substrate::default(),
+            ExecCfg::default(),
+            &mut runner,
+            |_, _| {},
+        );
+
+        let result = &out.results[&"quiet".into()];
+        assert_eq!(result.status, TaskStatus::Fail, "{result:?}");
+        assert!(
+            result
+                .note
+                .as_deref()
+                .unwrap_or_default()
+                .contains(RESULT_FILE),
+            "the failure names the missing result file: {result:?}"
+        );
+        let next = crate::agent_session::prepare(&state, "solver").unwrap();
+        assert!(next.is_resume(), "the conversation is resumable: {next:?}");
+        assert_eq!(next.completed_turns, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Copy the shipped `examples/adversarial-review` fixture into a scratch dir, so the
     /// test exercises the EXACT files the example ships (it can't rot) without leaving a
     /// workspace behind in the repo.
