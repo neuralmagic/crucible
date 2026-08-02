@@ -43,8 +43,21 @@ measure_cmd = "./verify.sh"
 direction   = "higher"
 objective   = "cases_passed"
 
+
 # Generated from workflow.star. Edit the Starlark source; scope recompiles it.
 [workflow]
+type = "autoresearch"
+result = "decide"
+
+[[workflow.task]]
+name = "propose"
+kind = "engine"
+op = "propose"
+depends_on = []
+needs = "any"
+required = true
+join = "all"
+
 [[workflow.task]]
 name = "review-correctness"
 kind = "agent"
@@ -68,7 +81,7 @@ Do not edit any file. Review only.
 """
 model = "claude-opus-4-6"
 effort = "high"
-depends_on = []
+depends_on = ["propose"]
 needs = "any"
 required = true
 isolation = "worktree"
@@ -93,7 +106,7 @@ Write a single JSON object to PLAN_TASK_RESULT.json:
 Do not edit any file. Review only.
 """
 model = "claude-sonnet-5"
-depends_on = []
+depends_on = ["propose"]
 needs = "any"
 required = false
 isolation = "worktree"
@@ -107,3 +120,31 @@ depends_on = ["review-correctness", "review-copy"]
 needs = "any"
 required = true
 join = "passed"
+
+[[workflow.task]]
+name = "apply"
+kind = "engine"
+op = "apply"
+depends_on = ["gate"]
+needs = "any"
+required = true
+join = "all"
+
+[[workflow.task]]
+name = "measure"
+kind = "engine"
+op = "measure"
+depends_on = ["apply"]
+needs = "any"
+required = true
+join = "all"
+
+[[workflow.task]]
+name = "decide"
+kind = "engine"
+op = "decide"
+source = "measure"
+depends_on = ["measure"]
+needs = "any"
+required = true
+join = "all"

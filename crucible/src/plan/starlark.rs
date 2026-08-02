@@ -16,8 +16,8 @@ use starlark_syntax::syntax::ast::{
 };
 use starlark_syntax::syntax::{AstModule, Dialect};
 
-use crate::manifest::WorkflowCfg;
-use crate::plan::ir::{Direction, Isolation, Join, Task, TaskKind, TaskName};
+use crate::manifest::{WorkflowCfg, WorkflowType};
+use crate::plan::ir::{Direction, EngineOp, Isolation, Join, Task, TaskKind, TaskName};
 
 const MAX_SOURCE_BYTES: usize = 256 * 1024;
 const MAX_PROMPT_BYTES: usize = 256 * 1024;
@@ -204,7 +204,14 @@ impl Compiler {
         function: &str,
         args: &CallArgsP<starlark_syntax::syntax::ast::AstNoPayload>,
     ) -> Result<Value> {
-        if matches!(function, "prompt_file" | "deps" | "workflow") {
+        if matches!(
+            function,
+            "prompt_file" | "deps" | "workflow" | "default_autoresearch"
+        ) && args
+            .args
+            .iter()
+            .all(|argument| matches!(argument.node, Argument::Positional(_)))
+        {
             let [argument] = args.args.as_slice() else {
                 bail!("{function}() takes exactly one positional argument");
             };
@@ -225,22 +232,18 @@ impl Compiler {
                     .collect::<Result<Vec<_>>>()
                     .map(Value::List),
                 ("workflow", Value::List(tasks)) => {
-                    if tasks.len() > MAX_TASKS {
-                        bail!(
-                            "workflow expands to {} tasks; maximum is {MAX_TASKS}",
-                            tasks.len()
-                        );
-                    }
-                    let tasks = tasks
-                        .into_iter()
-                        .map(|task| match task {
-                            Value::Task(task) => Ok(task),
-                            _ => bail!("workflow() entries must be task constructor values"),
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    let workflow = WorkflowCfg { tasks };
+                    let tasks = task_list("workflow", tasks)?;
+                    let workflow = WorkflowCfg {
+                        workflow_type: WorkflowType::Autoresearch,
+                        result: None,
+                        tasks,
+                    };
                     workflow.validate()?;
                     Ok(Value::Workflow(workflow))
+                }
+                ("default_autoresearch", Value::List(tasks)) => {
+                    default_autoresearch(task_list("default_autoresearch", tasks)?)
+                        .map(Value::Workflow)
                 }
                 _ => bail!("{function}() received the wrong value type"),
             };
@@ -256,6 +259,34 @@ impl Compiler {
                 bail!("{function}() repeats argument {:?}", name.node);
             }
         }
+        if function == "workflow" {
+            let workflow_type = match take_string_default(&mut named, "type", "autoresearch")?
+                .as_str()
+            {
+                "autoresearch" => WorkflowType::Autoresearch,
+                "custom" => WorkflowType::Custom,
+                other => bail!("workflow type must be `autoresearch` or `custom`, got {other:?}"),
+            };
+            let tasks = match take_value(&mut named, "tasks")? {
+                Value::List(tasks) => task_list("workflow", tasks)?,
+                _ => bail!("workflow tasks must be a list of task constructor values"),
+            };
+            let result = take_optional_task_name(&mut named, "result")?;
+            if !named.is_empty() {
+                bail!(
+                    "workflow() has unknown argument(s): {}",
+                    named.keys().cloned().collect::<Vec<_>>().join(", ")
+                );
+            }
+            let workflow = WorkflowCfg {
+                workflow_type,
+                result,
+                tasks,
+            };
+            workflow.validate()?;
+            return Ok(Value::Workflow(workflow));
+        }
+
         let task = match function {
             "agent" => Task {
                 name: TaskName(take_string(&mut named, "name")?),
@@ -308,6 +339,19 @@ impl Compiler {
                     join: Join::Passed,
                 }
             }
+            "propose" => engine_task(&mut named, EngineOp::Propose, None)?,
+            "apply" => engine_task(&mut named, EngineOp::Apply, None)?,
+            "measure" => engine_task(&mut named, EngineOp::Measure, None)?,
+            "decide" => {
+                let source = take_task_name(&mut named, "measurement")?;
+                if !named.contains_key("depends_on") {
+                    named.insert(
+                        "depends_on".to_owned(),
+                        Value::List(vec![Value::String(source.0.clone())]),
+                    );
+                }
+                engine_task(&mut named, EngineOp::Decide, Some(source))?
+            }
             _ => bail!("unknown workflow DSL function {function:?}"),
         };
         if !named.is_empty() {
@@ -317,6 +361,96 @@ impl Compiler {
             );
         }
         Ok(Value::Task(task))
+    }
+}
+
+fn task_list(function: &str, tasks: Vec<Value>) -> Result<Vec<Task>> {
+    if tasks.len() > MAX_TASKS {
+        bail!(
+            "{function} expands to {} tasks; maximum is {MAX_TASKS}",
+            tasks.len()
+        );
+    }
+    tasks
+        .into_iter()
+        .map(|task| match task {
+            Value::Task(task) => Ok(task),
+            _ => bail!("{function} entries must be task constructor values"),
+        })
+        .collect()
+}
+
+fn default_autoresearch(mut extras: Vec<Task>) -> Result<WorkflowCfg> {
+    let propose = engine("propose", EngineOp::Propose, None, Vec::new());
+    for task in &mut extras {
+        if task.depends_on.is_empty() {
+            task.depends_on.push(propose.name.clone());
+        }
+    }
+    let mut tasks = vec![propose];
+    tasks.extend(extras);
+    let sinks: Vec<TaskName> = tasks
+        .iter()
+        .filter(|task| {
+            !tasks.iter().any(|other| {
+                other
+                    .depends_on
+                    .iter()
+                    .any(|dependency| dependency == &task.name)
+            })
+        })
+        .map(|task| task.name.clone())
+        .collect();
+    tasks.push(engine("apply", EngineOp::Apply, None, sinks));
+    tasks.push(engine(
+        "measure",
+        EngineOp::Measure,
+        None,
+        vec!["apply".into()],
+    ));
+    tasks.push(engine(
+        "decide",
+        EngineOp::Decide,
+        Some("measure".into()),
+        vec!["measure".into()],
+    ));
+    if tasks.len() > MAX_TASKS {
+        bail!(
+            "default_autoresearch expands to {} tasks; maximum is {MAX_TASKS}",
+            tasks.len()
+        );
+    }
+    let workflow = WorkflowCfg {
+        workflow_type: WorkflowType::Autoresearch,
+        result: Some("decide".into()),
+        tasks,
+    };
+    workflow.validate()?;
+    Ok(workflow)
+}
+
+fn engine_task(
+    named: &mut BTreeMap<String, Value>,
+    op: EngineOp,
+    source: Option<TaskName>,
+) -> Result<Task> {
+    Ok(engine(
+        &take_string(named, "name")?,
+        op,
+        source,
+        take_task_names(named)?,
+    ))
+}
+
+fn engine(name: &str, op: EngineOp, source: Option<TaskName>, depends_on: Vec<TaskName>) -> Task {
+    Task {
+        name: TaskName(name.to_owned()),
+        task: TaskKind::Engine { op, source },
+        depends_on,
+        needs: "any".to_owned(),
+        required: true,
+        isolation: None,
+        join: Join::All,
     }
 }
 
@@ -338,6 +472,26 @@ fn take_optional_string(named: &mut BTreeMap<String, Value>, name: &str) -> Resu
         Value::None => Ok(None),
         Value::String(value) => Ok(Some(value)),
         _ => bail!("argument {name:?} must be a string or None"),
+    }
+}
+
+fn take_task_name(named: &mut BTreeMap<String, Value>, name: &str) -> Result<TaskName> {
+    match take_value(named, name)? {
+        Value::String(value) => Ok(TaskName(value)),
+        Value::Task(task) => Ok(task.name),
+        _ => bail!("argument {name:?} must be a task or task-name string"),
+    }
+}
+
+fn take_optional_task_name(
+    named: &mut BTreeMap<String, Value>,
+    name: &str,
+) -> Result<Option<TaskName>> {
+    match named.remove(name).unwrap_or(Value::None) {
+        Value::None => Ok(None),
+        Value::String(value) => Ok(Some(TaskName(value))),
+        Value::Task(task) => Ok(Some(task.name)),
+        _ => bail!("argument {name:?} must be a task, task-name string, or None"),
     }
 }
 
@@ -379,10 +533,11 @@ fn take_task_names(named: &mut BTreeMap<String, Value>) -> Result<Vec<TaskName>>
             .into_iter()
             .map(|name| match name {
                 Value::String(name) => Ok(TaskName(name)),
-                _ => bail!("depends_on entries must be task-name strings"),
+                Value::Task(task) => Ok(task.name),
+                _ => bail!("depends_on entries must be tasks or task-name strings"),
             })
             .collect(),
-        Some(_) => bail!("depends_on must be a list of task-name strings"),
+        Some(_) => bail!("depends_on must be a list of tasks or task-name strings"),
     }
 }
 
@@ -407,7 +562,12 @@ pub fn compile_file(path: &Path, pack_dir: &Path) -> Result<CompiledWorkflow> {
 /// Compile `workflow.star` and replace the manifest's generated `[workflow]` block. The
 /// Starlark remains reviewable source; `crucible.toml` is the frozen runtime authority.
 pub fn materialize_manifest(source_path: &Path, manifest_path: &Path) -> Result<CompiledWorkflow> {
-    use toml_edit::{DocumentMut, Item, Table};
+    use toml_edit::DocumentMut;
+
+    #[derive(serde::Serialize)]
+    struct ManifestWorkflow<'a> {
+        workflow: &'a WorkflowCfg,
+    }
 
     let pack_dir = manifest_path
         .parent()
@@ -419,20 +579,22 @@ pub fn materialize_manifest(source_path: &Path, manifest_path: &Path) -> Result<
     let mut document: DocumentMut = manifest
         .parse()
         .with_context(|| format!("parsing manifest {}", manifest_path.display()))?;
-    let workflow_toml = toml::to_string(&compiled.workflow)?;
-    let mut workflow_document: DocumentMut = workflow_toml
-        .parse()
+    let workflow_toml = toml::to_string(&ManifestWorkflow {
+        workflow: &compiled.workflow,
+    })?;
+    workflow_toml
+        .parse::<DocumentMut>()
         .context("rendering compiled workflow as TOML")?;
-    let mut table = Table::new();
-    table.decor_mut().set_prefix(
+    document.remove("workflow");
+    let mut materialized = document.to_string();
+    if !materialized.ends_with('\n') {
+        materialized.push('\n');
+    }
+    materialized.push_str(
         "\n# Generated from workflow.star. Edit the Starlark source; scope recompiles it.\n",
     );
-    if let Some(tasks) = workflow_document.remove("task") {
-        table.insert("task", tasks);
-    }
-    document.remove("workflow");
-    document.insert("workflow", Item::Table(table));
-    std::fs::write(manifest_path, document.to_string())
+    materialized.push_str(&workflow_toml);
+    std::fs::write(manifest_path, materialized)
         .with_context(|| format!("writing manifest {}", manifest_path.display()))?;
     Ok(compiled)
 }
@@ -473,7 +635,7 @@ pub fn compile_source(source: &str, filename: &Path, pack_dir: &Path) -> Result<
         variables: BTreeMap::new(),
     };
     let Some(Value::Workflow(workflow)) = compiler.statement(ast.statement())? else {
-        bail!("workflow source must end with workflow([...])");
+        bail!("workflow source must end with workflow(...) or default_autoresearch([...])");
     };
     workflow.validate()?;
     let canonical_json = serde_json::to_string_pretty(&workflow)? + "\n";
@@ -550,6 +712,50 @@ workflow(reviews + [
         assert!(manifest.contains("Generated from workflow.star"));
         assert!(manifest.contains("[[workflow.task]]"));
         assert!(!manifest.contains("name = \"stale\""));
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn compiles_explicit_autoresearch_custom_and_default_workflows() {
+        let pack = temp_pack("types");
+        let explicit = r#"
+candidate = propose(name = "invent")
+review = command(name = "review", run = "./review.sh", depends_on = [candidate])
+live = apply(name = "deploy", depends_on = [review])
+score = measure(name = "benchmark", depends_on = [live])
+choice = decide(name = "choose", measurement = score)
+workflow(
+    type = "autoresearch",
+    tasks = [candidate, review, live, score, choice],
+    result = choice,
+)
+"#;
+        let compiled = compile_source(explicit, &pack.join("explicit.star"), &pack).unwrap();
+        assert_eq!(compiled.workflow.workflow_type, WorkflowType::Autoresearch);
+        assert_eq!(compiled.workflow.result, Some("choose".into()));
+        assert_eq!(compiled.workflow.tasks[0].name.0, "invent");
+
+        let custom = r#"
+publish = command(name = "publish", run = "./publish.sh")
+workflow(type = "custom", tasks = [publish], result = publish)
+"#;
+        let compiled = compile_source(custom, &pack.join("custom.star"), &pack).unwrap();
+        assert_eq!(compiled.workflow.workflow_type, WorkflowType::Custom);
+        assert_eq!(compiled.workflow.tasks.len(), 1);
+
+        let default = r#"
+review = command(name = "review", run = "./review.sh")
+default_autoresearch([review])
+"#;
+        let compiled = compile_source(default, &pack.join("default.star"), &pack).unwrap();
+        let names: Vec<&str> = compiled
+            .workflow
+            .tasks
+            .iter()
+            .map(|task| task.name.0.as_str())
+            .collect();
+        assert_eq!(names, ["propose", "review", "apply", "measure", "decide"]);
+        assert_eq!(compiled.workflow.result, Some("decide".into()));
         let _ = std::fs::remove_dir_all(&pack);
     }
 

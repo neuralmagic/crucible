@@ -125,19 +125,23 @@ runtime interpreter: scope compiles it to the existing `[[workflow.task]]` manif
 validation and again before freeze. The generated TOML is the runtime authority. This keeps plan
 authorship readable without moving the frozen judge or execution semantics into Starlark.
 
-The engine always owns the outer autoresearch loop:
+Topology is authorable; authority is not. A workflow declares `type = "autoresearch"` or
+`type = "custom"`, and an engine or outer orchestrator admits it only when it advertises the
+matching workflow capability. Each `engine` task also requires its own capability. Crucible's loop
+advertises `workflow.autoresearch` plus propose/apply/measure/decide, while its generic plan runner
+does not. Serializing an engine task never grants access to the `World` or frozen `Judge`.
 
-```text
-propose → <pack workflow> → apply → measure → decide
-```
+An autoresearch workflow is checked by semantics rather than reserved task names. Its selected
+result must be a `decide` task sourced from a frozen `measure`, with `apply` and `propose` ancestors.
+Tasks may be inserted anywhere, operations may be renamed, and multiple candidate or measurement
+branches may exist. A custom workflow has no autoresearch-shape requirement; universal DAG,
+source-typing, and operation-capability rules still apply.
 
-Tasks with no explicit dependencies attach to `propose`; `apply` waits for every workflow sink.
-A workflow can add critique, refinement, lint, or an early deterministic rejection, but it cannot
-replace, reorder, or run after the frozen measurement and decision stages.
-
-The DSL is deliberately small:
+The basic autoresearch flow is explicit and editable:
 
 ```python
+candidate = propose(name = "invent")
+
 critics = [
     agent(
         name = "correctness",
@@ -145,35 +149,70 @@ critics = [
         model = "claude-opus-4-6",
         effort = "high",
         isolated = True,
+        depends_on = [candidate],
     ),
     agent(
         name = "novelty",
         prompt = prompt_file("prompts/novelty.md"),
         required = False,
         isolated = True,
+        depends_on = [candidate],
     ),
 ]
 
-workflow(critics + [
-    agent(
-        name = "synthesize",
-        prompt = prompt_file("prompts/synthesize.md"),
-        depends_on = deps(critics),
-        join = "passed",
-    ),
-    command(
-        name = "smoke",
-        run = "./smoke.sh",
-        depends_on = ["synthesize"],
-    ),
-])
+synthesize = agent(
+    name = "synthesize",
+    prompt = prompt_file("prompts/synthesize.md"),
+    depends_on = deps(critics),
+    join = "passed",
+)
+smoke = command(name = "smoke", run = "./smoke.sh", depends_on = [synthesize])
+live = apply(name = "deploy-preview", depends_on = [smoke])
+score = measure(name = "benchmark", depends_on = [live])
+decision = decide(name = "keep-if-better", measurement = score)
+
+workflow(
+    type = "autoresearch",
+    tasks = [candidate] + critics + [synthesize, smoke, live, score, decision],
+    result = decision,
+)
 ```
+
+`default_autoresearch(extra_tasks)` is the compatibility convenience. It expands to the same
+ordinary propose/apply/measure/decide tasks, attaching unconnected extras after proposal and before
+apply. A missing `workflow.star` retains the historical default loop behavior. The old positional
+`workflow(tasks)` form remains accepted as a splice adapter while packs migrate.
+
+A custom orchestrator can admit a graph with no research lifecycle at all—for example, a creative
+studio that fans out three treatments, curates them, and publishes a contact sheet:
+
+```python
+treatments = [
+    agent(name = "surreal", prompt = prompt_file("prompts/surreal.md"), isolated = True),
+    agent(name = "minimal", prompt = prompt_file("prompts/minimal.md"), isolated = True),
+    agent(name = "documentary", prompt = prompt_file("prompts/documentary.md"), isolated = True),
+]
+curate = agent(
+    name = "curate",
+    prompt = prompt_file("prompts/curate.md"),
+    depends_on = deps(treatments),
+    join = "passed",
+)
+publish = command(name = "contact-sheet", run = "./render.sh", depends_on = [curate])
+workflow(type = "custom", tasks = treatments + [curate, publish], result = publish)
+```
+
+That graph requires `workflow.custom`; it does not pretend to satisfy autoresearch just because it
+uses agents and commands.
 
 This is a declarative Starlark subset: assignments, strings, integers, booleans, lists, list
 concatenation, and direct calls to the functions below. Control flow, function definitions,
-comprehensions, mutation, arbitrary operators, and `load()` are rejected. Task values are opaque,
-so authored source cannot forge engine-owned stages.
+comprehensions, mutation, arbitrary operators, and `load()` are rejected. Task values are opaque;
+they can be referenced directly in `depends_on`, `measurement`, and `result` without repeating
+names.
 
+- `propose(...)`, `apply(...)`, `measure(...)`, and `decide(...)` create capability-owned engine
+  tasks. `decide(measurement = score)` explicitly selects the frozen measurement it consumes.
 - `agent(...)` creates an agent task. `isolated = True` gives it a disposable worktree, ideal for
   concurrent read-only critics; leave it false for a synthesizer whose edits must survive.
 - `command(...)` creates a deterministic shell task in the candidate workspace.
@@ -182,8 +221,8 @@ so authored source cannot forge engine-owned stages.
 - `prompt_file(path)` reads a regular UTF-8 file below the pack directory and embeds its contents
   in the generated manifest. Absolute paths, `..`, symlinks, non-files, and oversized inputs are
   rejected.
-- `workflow(tasks)` is the required final expression. Duplicate/reserved names, unknown
-  dependencies, and edges toward `apply`, `measure`, or `decide` are rejected.
+- `workflow(type = ..., tasks = ..., result = ...)` is the explicit final expression.
+- `default_autoresearch(extra_tasks)` expands the historical loop into fully visible nodes.
 
 Agent tasks receive upstream structured results in their prompt and must write one JSON object to
 `PLAN_TASK_RESULT.json`. A required task failure discards the candidate before measurement; an

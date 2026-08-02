@@ -1,5 +1,17 @@
 {
+  "type": "autoresearch",
+  "result": "decide",
   "task": [
+    {
+      "name": "propose",
+      "kind": "engine",
+      "op": "propose",
+      "depends_on": [],
+      "needs": "any",
+      "required": true,
+      "isolation": null,
+      "join": "all"
+    },
     {
       "name": "review-correctness",
       "kind": "agent",
@@ -7,7 +19,9 @@
       "harness": null,
       "model": "claude-opus-4-6",
       "effort": "high",
-      "depends_on": [],
+      "depends_on": [
+        "propose"
+      ],
       "needs": "any",
       "required": true,
       "isolation": "worktree",
@@ -20,7 +34,9 @@
       "harness": null,
       "model": "claude-sonnet-5",
       "effort": null,
-      "depends_on": [],
+      "depends_on": [
+        "propose"
+      ],
       "needs": "any",
       "required": false,
       "isolation": "worktree",
@@ -38,6 +54,43 @@
       "required": true,
       "isolation": null,
       "join": "passed"
+    },
+    {
+      "name": "apply",
+      "kind": "engine",
+      "op": "apply",
+      "depends_on": [
+        "gate"
+      ],
+      "needs": "any",
+      "required": true,
+      "isolation": null,
+      "join": "all"
+    },
+    {
+      "name": "measure",
+      "kind": "engine",
+      "op": "measure",
+      "depends_on": [
+        "apply"
+      ],
+      "needs": "any",
+      "required": true,
+      "isolation": null,
+      "join": "all"
+    },
+    {
+      "name": "decide",
+      "kind": "engine",
+      "op": "decide",
+      "source": "measure",
+      "depends_on": [
+        "measure"
+      ],
+      "needs": "any",
+      "required": true,
+      "isolation": null,
+      "join": "all"
     }
   ]
 }
