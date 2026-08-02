@@ -13,7 +13,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use crate::crucible::{Judge, MeasureCtx, World};
+use crate::crucible::{Judge, MeasureCtx, Reading, World};
 use crate::loop_driver::{self, Decided, IterStep, Measured, TurnVerdict};
 use crate::manifest::{WorkflowCaps, WorkflowCfg, WorkflowType};
 use crate::plan::exec::{
@@ -145,7 +145,10 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
 }
 
 /// Build and admit the default or authored iteration graph.
-fn iteration_template(workflow: Option<&WorkflowCfg>, caps: &WorkflowCaps) -> Result<ValidPlan> {
+pub(crate) fn iteration_template(
+    workflow: Option<&WorkflowCfg>,
+    caps: &WorkflowCaps,
+) -> Result<ValidPlan> {
     if let Some(workflow) = workflow.filter(|workflow| !workflow.is_legacy_splice()) {
         workflow
             .admit(caps)
@@ -333,6 +336,57 @@ impl<R: Reporter> LoopTaskRunner<'_, R> {
         }
     }
 
+    fn grade(
+        &mut self,
+        task: &Task,
+        source: Option<&TaskName>,
+        inputs: &BTreeMap<TaskName, Value>,
+    ) -> Attempt {
+        let Some(source) = source else {
+            return fail(0.0, "grade dispatched without a score source".to_string());
+        };
+        let Some(primary) = inputs.get(source) else {
+            return fail(
+                0.0,
+                format!("grade score source {source} did not produce passing evidence"),
+            );
+        };
+        let Some(score) = primary.get("score").and_then(Value::as_f64) else {
+            return fail(
+                0.0,
+                format!("grade score source {source} has no numeric `score`"),
+            );
+        };
+        let reading = Reading {
+            valid: primary
+                .get("valid")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            score: Some(score),
+            solved: primary
+                .get("solved")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            note: primary
+                .get("note")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            detail: serde_json::json!({
+                "score_source": source.0,
+                "evidence": inputs,
+            }),
+        };
+        let measured = loop_driver::measured_from_reading(reading, self.p, self.world);
+        let out = serde_json::json!({
+            "score": measured.reading.score,
+            "valid": measured.reading.valid,
+            "evidence_count": inputs.len(),
+        });
+        self.measured.insert(task.name.clone(), measured);
+        pass(out)
+    }
+
     fn decide(&mut self, task: &Task, source: Option<&TaskName>) -> Attempt {
         let Some(source) = source else {
             return fail(
@@ -361,7 +415,7 @@ impl<R: Reporter> LoopTaskRunner<'_, R> {
 impl<R: Reporter> TaskRunner for LoopTaskRunner<'_, R> {
     fn run(&mut self, task: &Task, attempt: u32, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
         match &task.task {
-            TaskKind::Agent { .. } | TaskKind::Command { .. } => {
+            TaskKind::Agent { .. } | TaskKind::Command { .. } | TaskKind::Evaluate { .. } => {
                 self.workflow_runner.run(task, attempt, inputs)
             }
             TaskKind::Engine {
@@ -376,6 +430,10 @@ impl<R: Reporter> TaskRunner for LoopTaskRunner<'_, R> {
                 op: EngineOp::Measure,
                 ..
             } => self.measure(task),
+            TaskKind::Engine {
+                op: EngineOp::Grade,
+                source,
+            } => self.grade(task, source.as_ref(), inputs),
             TaskKind::Engine {
                 op: EngineOp::Decide,
                 source,
@@ -1055,6 +1113,60 @@ mod tests {
                 "keep-if-better"
             ]
         );
+    }
+
+    #[test]
+    fn authored_measurement_subgraph_drives_real_decisions() {
+        let workflow = r#"
+            [workflow]
+            type = "autoresearch"
+            result = "choose"
+            [[workflow.task]]
+            name = "invent"
+            kind = "engine"
+            op = "propose"
+            [[workflow.task]]
+            name = "apply"
+            kind = "engine"
+            op = "apply"
+            depends_on = ["invent"]
+            [[workflow.task]]
+            name = "correctness"
+            kind = "evaluate"
+            command = "v=$(cat value.txt); printf '{\"score\": %s, \"pass\": true}\n' \"$v\""
+            depends_on = ["apply"]
+            isolation = "worktree"
+            [[workflow.task]]
+            name = "score"
+            kind = "evaluate"
+            command = "v=$(cat value.txt); printf '{\"score\": %s, \"solved\": false}\n' \"$v\""
+            depends_on = ["apply"]
+            isolation = "worktree"
+            [[workflow.task]]
+            name = "grade"
+            kind = "engine"
+            op = "grade"
+            source = "score"
+            depends_on = ["correctness", "score"]
+            join = "passed"
+            [[workflow.task]]
+            name = "choose"
+            kind = "engine"
+            op = "decide"
+            source = "grade"
+            depends_on = ["grade"]
+        "#;
+        let trace = run_counter_cfg(true, 2, BUMP, false, Some(workflow));
+        assert_eq!(trace.best, 3.0, "{}", describe(&trace));
+        assert_eq!(
+            trace
+                .rows
+                .iter()
+                .map(|row| row.1.as_str())
+                .collect::<Vec<_>>(),
+            ["baseline", "keep", "keep"]
+        );
+        assert_eq!(trace.shutdown, "finished");
     }
 
     /// What one counter run left behind, for diffing the two paths.

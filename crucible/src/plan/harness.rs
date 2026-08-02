@@ -161,12 +161,17 @@ fn run_in(
             model,
             effort,
         } => (prompt, harness, model, effort),
-        TaskKind::Command { .. } => {
+        TaskKind::Command { .. } | TaskKind::Evaluate { .. } => {
             let mut shell = ShellRunner {
                 workdir: paths.workspace.clone(),
                 agent_cmd: None,
             };
-            return shell.run(task, attempt, inputs);
+            // `HarnessRunner` already created the private worktree above. Clear the marker
+            // for the inner shell runner, whose refusal protects direct callers that have
+            // not honored isolation.
+            let mut honored = task.clone();
+            honored.isolation = None;
+            return shell.run(&honored, attempt, inputs);
         }
         TaskKind::TopK { .. } => {
             return fail(0.0, "reducer task reached the runner".to_string());

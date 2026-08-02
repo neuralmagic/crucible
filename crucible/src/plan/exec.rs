@@ -162,7 +162,14 @@ pub(crate) fn runnable_set<'a>(
 ) -> BTreeSet<&'a TaskName> {
     let mut runnable: BTreeSet<&TaskName> = BTreeSet::new();
     for t in plan.tasks_topo() {
-        if substrate.supports(&t.needs) && t.depends_on.iter().all(|d| runnable.contains(d)) {
+        let deps_runnable = match t.join {
+            Join::All => t.depends_on.iter().all(|d| runnable.contains(d)),
+            // A lossy join is specifically allowed to run without advisory branches that this
+            // substrate cannot provide. Required dependencies independently trigger the
+            // fail-closed check in `execute`.
+            Join::Passed => true,
+        };
+        if substrate.supports(&t.needs) && deps_runnable {
             runnable.insert(&t.name);
         }
     }
@@ -308,7 +315,10 @@ pub fn execute(
             let inputs = inputs_for(t, &results);
             let (result, budget_exceeded) = match &t.task {
                 TaskKind::TopK { k, direction } => (reduce_top_k(&inputs, *k, *direction), false),
-                TaskKind::Agent { .. } | TaskKind::Command { .. } | TaskKind::Engine { .. } => {
+                TaskKind::Agent { .. }
+                | TaskKind::Command { .. }
+                | TaskKind::Evaluate { .. }
+                | TaskKind::Engine { .. } => {
                     run_with_retries(t, &inputs, cfg, runner, &mut spent, budget)
                 }
             };
@@ -734,6 +744,30 @@ mod tests {
             TaskStatus::Skipped
         );
         assert_eq!(r.dispatched.len(), 1);
+    }
+
+    #[test]
+    fn passed_join_can_ignore_an_unrunnable_advisory_branch() {
+        let mut tasks = vec![
+            task("score", &[], "any", true),
+            task("racecheck", &[], "gpu", false),
+        ];
+        let mut grade = task("grade", &["score", "racecheck"], "any", true);
+        grade.join = Join::Passed;
+        tasks.push(grade);
+        let plan = valid(tasks, 10.0);
+        let mut runner = ScriptRunner::new();
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut runner,
+            |_, _| {},
+        );
+        assert!(out.valid, "lossy grade remains runnable: {:?}", out.exit);
+        assert_eq!(out.results[&"racecheck".into()].status, TaskStatus::Skipped);
+        assert_eq!(out.results[&"grade".into()].status, TaskStatus::Pass);
+        assert_eq!(runner.seen_inputs["grade"], vec!["score".to_string()]);
     }
 
     #[test]

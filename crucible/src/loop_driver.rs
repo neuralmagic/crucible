@@ -303,6 +303,16 @@ pub(crate) fn measure_candidate(
     world: &dyn World,
 ) -> Result<Measured> {
     let reading = judge.measure(ctx)?;
+    Ok(measured_from_reading(reading, p, world))
+}
+
+/// Capture candidate evidence around a reading assembled by an authored measurement graph.
+/// The opaque judge path above and `engine.grade` therefore preserve identical notes/diffs.
+pub(crate) fn measured_from_reading(
+    reading: crucible::Reading,
+    p: &Paths,
+    world: &dyn World,
+) -> Measured {
     let note = {
         let c = candidate_note(p);
         if c.is_empty() {
@@ -312,12 +322,12 @@ pub(crate) fn measure_candidate(
         }
     };
     let (diff, diffstat) = capture_diff(world);
-    Ok(Measured {
+    Measured {
         reading,
         note,
         diff,
         diffstat,
-    })
+    }
 }
 
 /// Rule keep/discard on a measured candidate and build its results row: the one

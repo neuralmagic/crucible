@@ -28,8 +28,6 @@ measure_cmd = "./measure.nu"
 direction   = "higher"
 objective   = "value"
 
-# No [world] block  ->  GitWorld: kept iterations are commits, discards reset --hard + clean.
-
 # Generated from workflow.star. Edit the Starlark source; scope recompiles it.
 [workflow]
 type = "autoresearch"
@@ -55,20 +53,41 @@ required = true
 join = "all"
 
 [[workflow.task]]
-name = "measure"
-kind = "engine"
-op = "measure"
+name = "shape"
+kind = "evaluate"
+command = """test -s value.txt && echo '{"pass": true, "score": 1}'"""
 depends_on = ["apply"]
 needs = "any"
 required = true
+isolation = "worktree"
 join = "all"
+
+[[workflow.task]]
+name = "score"
+kind = "evaluate"
+command = "./measure.nu"
+depends_on = ["apply"]
+needs = "any"
+required = true
+isolation = "worktree"
+join = "all"
+
+[[workflow.task]]
+name = "grade"
+kind = "engine"
+op = "grade"
+source = "score"
+depends_on = ["shape", "score"]
+needs = "any"
+required = true
+join = "passed"
 
 [[workflow.task]]
 name = "decide"
 kind = "engine"
 op = "decide"
-source = "measure"
-depends_on = ["measure"]
+source = "grade"
+depends_on = ["grade"]
 needs = "any"
 required = true
 join = "all"

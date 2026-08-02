@@ -39,6 +39,9 @@ pub enum EngineOp {
     Apply,
     /// `Judge::measure`: score the live candidate.
     Measure,
+    /// Assemble typed evaluation evidence into the candidate measurement consumed by
+    /// `Decide`. `source` selects the evaluation whose score is authoritative.
+    Grade,
     /// `Judge::decide`: rule keep/discard against the run's best.
     Decide,
     /// The wide tournament's scoring stage: apply an upstream candidate diff to the main
@@ -92,6 +95,15 @@ pub enum TaskKind {
     },
     /// A plan-authored command. Trusted scripts require frozen manifest injects.
     Command { command: String },
+    /// A frozen measurement command. Its last stdout line is JSON evidence; an explicit
+    /// `pass` or the optional threshold determines whether the task passed its gate.
+    Evaluate {
+        command: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        threshold: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        direction: Option<Direction>,
+    },
     /// Engine-builtin deterministic fold: keep the k best upstream outputs by `score`.
     TopK { k: u32, direction: Direction },
     /// A capability-owned engine operation.
@@ -109,11 +121,13 @@ impl TaskKind {
         match self {
             TaskKind::Agent { .. } => "agent",
             TaskKind::Command { .. } => "command",
+            TaskKind::Evaluate { .. } => "evaluate",
             TaskKind::TopK { .. } => "top_k",
             TaskKind::Engine { op, .. } => match op {
                 EngineOp::Propose => "engine_propose",
                 EngineOp::Apply => "engine_apply",
                 EngineOp::Measure => "engine_measure",
+                EngineOp::Grade => "engine_grade",
                 EngineOp::Decide => "engine_decide",
                 EngineOp::MeasureDiff => "engine_measure_diff",
             },
@@ -253,6 +267,22 @@ impl Plan {
                         "task {:?}: top_k needs at least one dependency to fold",
                         t.name.0
                     );
+                }
+            }
+            if let TaskKind::Evaluate {
+                threshold,
+                direction,
+                ..
+            } = &t.task
+            {
+                if threshold.is_some() != direction.is_some() {
+                    bail!(
+                        "task {:?}: evaluate threshold and direction must be set together",
+                        t.name.0
+                    );
+                }
+                if threshold.is_some_and(|value| !value.is_finite()) {
+                    bail!("task {:?}: evaluate threshold must be finite", t.name.0);
                 }
             }
             if let Some(session) = &t.session {
