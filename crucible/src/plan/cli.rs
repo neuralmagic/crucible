@@ -135,11 +135,11 @@ fn render_mermaid_styled(plan: &ValidPlan, caps: &BTreeSet<String>, styling: Sty
         .collect();
     for t in plan.tasks_topo() {
         let ok = runnable.contains(&t.name);
-        let (shape_open, shape_close, class) = match &t.task {
-            TaskKind::Agent { .. } => ("([", "])", "agent"),
-            TaskKind::Command { .. } => ("[", "]", "command"),
-            TaskKind::TopK { .. } => ("{{", "}}", "reduce"),
-            TaskKind::Engine { .. } => ("[[", "]]", "engine"),
+        let (shape_open, shape_close, (class, props)) = match &t.task {
+            TaskKind::Agent { .. } => ("([", "])", CLASS_STYLES[0]),
+            TaskKind::Command { .. } => ("[", "]", CLASS_STYLES[1]),
+            TaskKind::TopK { .. } => ("{{", "}}", CLASS_STYLES[2]),
+            TaskKind::Engine { .. } => ("[[", "]]", CLASS_STYLES[3]),
         };
         let mut detail = match &t.task {
             TaskKind::Agent { harness, model, .. } => format!(
@@ -167,9 +167,7 @@ fn render_mermaid_styled(plan: &ValidPlan, caps: &BTreeSet<String>, styling: Sty
             "    {id}{shape_open}\"{name}{detail}{marks}\"{shape_close}{class_suffix}\n",
             name = mermaid_label(&t.name.0),
         ));
-        if styling == Styling::PerNode
-            && let Some((_, props)) = CLASS_STYLES.iter().find(|(name, _)| *name == class)
-        {
+        if styling == Styling::PerNode {
             styles.push_str(&format!("    style {id} {props}\n"));
         }
         for d in &t.depends_on {
@@ -262,19 +260,6 @@ const PREVIEW_FONT_PX: f32 = 12.0;
 /// Roughly how much of a cell's height a terminal glyph occupies.
 const GLYPH_FRACTION_OF_CELL: f32 = 0.8;
 
-/// Compact layout used only for raster previews.
-const PREVIEW_LAYOUT_FRONTMATTER: &str = "\
----
-config:
-  fontSize: 12
-  flowchart:
-    nodeSpacing: 30
-    rankSpacing: 30
-    padding: 8
-    wrappingWidth: 180
----
-";
-
 /// Render the plan's mermaid to PNG (offline, vendored engine) and display it inline when
 /// the terminal speaks an image protocol; otherwise write `<plan>.png` next to the file.
 fn show_rendered(path: &Path, plan: &ValidPlan, caps: &BTreeSet<String>) -> Result<()> {
@@ -283,8 +268,19 @@ fn show_rendered(path: &Path, plan: &ValidPlan, caps: &BTreeSet<String>) -> Resu
     };
 
     const THEME: MermaidTheme = MermaidTheme::Dark;
+    // Compact layout used only for raster previews; the font size must stay the one the
+    // render scale is derived from.
     let src = format!(
-        "{PREVIEW_LAYOUT_FRONTMATTER}{}",
+        "---
+config:
+  fontSize: {PREVIEW_FONT_PX}
+  flowchart:
+    nodeSpacing: 30
+    rankSpacing: 30
+    padding: 8
+    wrappingWidth: 180
+---
+{}",
         render_mermaid_styled(plan, caps, Styling::PerNode)
     );
     let engine = default_engine();
@@ -306,7 +302,6 @@ fn show_rendered(path: &Path, plan: &ValidPlan, caps: &BTreeSet<String>) -> Resu
 
     match inline {
         Some((proto, geo)) => {
-            // Fit only graphs wider than the viewport.
             let fit_cols = (diagram.width_px > geo.width_px).then_some(geo.cols);
             print!(
                 "{}",
