@@ -49,9 +49,7 @@ pub struct PrLinkWire {
     pub branch: String,
 }
 
-/// One task of a validated work-graph plan, on the wire so a viewer can draw the graph
-/// without the manifest. Mirrors the engine's validated plan task the way [`RowWire`]
-/// mirrors `Row`.
+/// A validated plan task emitted for visualization.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanTaskWire {
     pub name: String,
@@ -139,8 +137,7 @@ pub enum SessionEvent {
         links: Vec<PrLinkWire>,
     },
     Finished,
-    /// A work-graph plan was validated for execution: format version, reserved reason,
-    /// executor-enforced budget, and the full task graph so a viewer can draw it.
+    /// A work graph admitted for execution.
     PlanAdmitted {
         plan_version: u32,
         #[serde(default)]

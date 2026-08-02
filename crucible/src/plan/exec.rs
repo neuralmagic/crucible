@@ -169,9 +169,7 @@ pub(crate) fn runnable_set<'a>(
     runnable
 }
 
-/// Execute a validated plan to completion. `on_result` fires once per task as it
-/// reaches a terminal status, in dispatch order: the live-progress hook the session log
-/// (and any tailer) hangs off; the returned `PlanOutcome` carries the same results folded.
+/// Execute a plan; report each terminal result in dispatch order.
 pub fn execute(
     plan: &ValidPlan,
     substrate: &Substrate,
@@ -284,8 +282,7 @@ pub fn execute(
             } else if t.isolation.is_some() {
                 dispatch.push(t);
             } else {
-                // A ready serial task is a declaration-order barrier. Dispatch the
-                // isolated prefix now; later isolated tasks wait behind the serial one.
+                // A serial task is a barrier after the ready isolated prefix.
                 break;
             }
         }

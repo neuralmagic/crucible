@@ -131,7 +131,7 @@ pub fn render_mermaid(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
     out
 }
 
-/// The validated plan record on the wire: format version, reserved reason, budget, full graph.
+/// Serialize an admitted plan for the event stream.
 pub(crate) fn plan_admitted_event(plan: &ValidPlan) -> crate::session::SessionEvent {
     let p = plan.plan();
     crate::session::SessionEvent::PlanAdmitted {

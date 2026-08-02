@@ -43,13 +43,10 @@ pub(crate) struct IterCtx<'a> {
     /// the typestate path would after the turn.
     pub spent_before: f64,
     pub started: Instant,
-    /// Pack-authored workflow, or the legacy splice format during migration.
     pub workflow: Option<&'a crate::manifest::WorkflowCfg>,
 }
 
-/// Run one capability-admitted autoresearch iteration. Returns the driver-vocabulary step plus
-/// the iteration's cost to fold into the run's spend. A measure error propagates as
-/// `Err`, exactly like the typestate path's `?`.
+/// Run one admitted autoresearch iteration and return its step and cost.
 pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(IterStep, f64)> {
     let plan = iteration_template(cx.prompt, cx.workflow)?;
     let result_task = cx
@@ -120,8 +117,7 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
         Some(Signal::Stop) => IterStep::Stopped,
         None => match runner.decided.remove(&result_task) {
             Some(d) => IterStep::Decided(Box::new(d)),
-            // A pack task rejected the candidate before it reached the gate. That is the
-            // point of allowing them, so it is a discard, not a run error.
+            // A pre-gate rejection discards the candidate.
             None => match &outcome.exit {
                 crate::plan::exec::PlanExit::ShortCircuit { task } => {
                     let why = outcome
@@ -147,9 +143,7 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
     Ok((step, outcome.spent_usd))
 }
 
-/// Materialize the legacy/default graph or admit a fully-authored autoresearch graph.
-/// The default is still `propose → apply → measure → decide`; unlike the old template,
-/// those are ordinary named tasks rather than privileged topology.
+/// Build and admit the default or authored iteration graph.
 fn iteration_template(_prompt: &str, workflow: Option<&WorkflowCfg>) -> Result<ValidPlan> {
     if let Some(workflow) = workflow.filter(|workflow| !workflow.is_legacy_splice()) {
         workflow
@@ -179,9 +173,7 @@ fn iteration_template(_prompt: &str, workflow: Option<&WorkflowCfg>) -> Result<V
         };
     let mut tasks = vec![engine("propose", EngineOp::Propose, None, vec![])];
 
-    // Pack tasks sit between the turn and the gate. An unattached one hangs off `propose`,
-    // and `apply` waits on every sink, so nothing a pack declares can end up beside or after
-    // the gate no matter how it wired its own edges.
+    // Legacy splice tasks run between `propose` and `apply`; `apply` waits on every sink.
     let mut apply_deps = vec![TaskName("propose".to_string())];
     if let Some(w) = workflow.filter(|w| !w.tasks.is_empty()) {
         for t in &w.tasks {
@@ -324,8 +316,7 @@ impl<R: Reporter> LoopTaskRunner<'_, R> {
                 pass(out)
             }
             Err(e) => {
-                // A measure error aborts the run on the typestate path (`?`); park it for
-                // the driver to propagate once the executor unwinds.
+                // Propagate after the executor unwinds.
                 self.fatal = Some(e);
                 fail(0.0, "measure errored; aborting the run".to_string())
             }
@@ -339,7 +330,7 @@ impl<R: Reporter> LoopTaskRunner<'_, R> {
                 "decide dispatched without a measurement source".to_string(),
             );
         };
-        // Safe to take: validation rejects two decides sharing a source.
+        // Admission prevents two decisions from consuming one measurement.
         let Some(m) = self.measured.remove(source) else {
             return fail(
                 0.0,
@@ -936,8 +927,6 @@ mod tests {
     use clap::Parser;
     use std::path::Path;
 
-    /// A pack task lands between the turn and the gate, and `apply` waits on it. The
-    /// engine's four stages keep their order no matter what the pack declared.
     #[test]
     fn pack_tasks_splice_between_the_turn_and_the_gate() {
         let w: crate::manifest::WorkflowCfg = toml::from_str(
@@ -973,8 +962,6 @@ mod tests {
         assert_eq!(dep("decide"), ["measure"]);
     }
 
-    /// The point of allowing pack tasks: a rejection before the gate discards the iteration
-    /// without measuring, and the loop keeps going rather than erroring out.
     #[test]
     fn a_rejecting_pack_task_discards_the_iteration_before_measuring() {
         let trace = run_counter_cfg(
@@ -1207,8 +1194,6 @@ mod tests {
             LoopRuntime::default(),
         )
         .unwrap();
-        // The bump always wins unless a pack task rejects it, which is the one case a
-        // caller passes a workflow for.
         if workflow.is_none() {
             assert!(outcome.improved, "the counter bump must be kept");
         }
