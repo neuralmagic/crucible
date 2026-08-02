@@ -128,21 +128,21 @@ fn evaluation_attempt(task: &Task, mut value: Value) -> Attempt {
     let Some(object) = value.as_object_mut() else {
         return fail("evaluate result must be a JSON object".to_string());
     };
-    let passed = match object.get("pass").and_then(Value::as_bool) {
-        Some(passed) => passed,
-        None => match (threshold, direction) {
-            (Some(threshold), Some(Direction::Lower)) => object
-                .get("score")
-                .and_then(Value::as_f64)
-                .is_some_and(|score| score <= threshold),
-            (Some(threshold), Some(Direction::Higher)) => object
-                .get("score")
-                .and_then(Value::as_f64)
-                .is_some_and(|score| score >= threshold),
-            (None, None) => true,
-            _ => false,
-        },
+    // A declared threshold is the graph's gate, so `pass` can only narrow it, never widen it.
+    let within_threshold = match (threshold, direction) {
+        (Some(threshold), Some(Direction::Lower)) => object
+            .get("score")
+            .and_then(Value::as_f64)
+            .is_some_and(|score| score <= threshold),
+        (Some(threshold), Some(Direction::Higher)) => object
+            .get("score")
+            .and_then(Value::as_f64)
+            .is_some_and(|score| score >= threshold),
+        (None, None) => true,
+        // Validation rejects one without the other.
+        _ => false,
     };
+    let passed = within_threshold && object.get("pass").and_then(Value::as_bool).unwrap_or(true);
     object.insert("pass".to_string(), Value::Bool(passed));
     if passed {
         Attempt {
@@ -284,23 +284,59 @@ mod tests {
     }
 
     #[test]
-    fn explicit_evaluation_pass_overrides_threshold() {
-        let task = Task {
-            name: "quality".into(),
+    fn explicit_pass_narrows_a_threshold_but_cannot_widen_it() {
+        let evaluate = |name: &str, output: &str| Task {
+            name: name.into(),
             task: TaskKind::Evaluate {
-                command: r#"echo '{"score": 100, "pass": true}'"#.into(),
+                command: format!("echo '{output}'"),
                 threshold: Some(1.0),
                 direction: Some(Direction::Lower),
             },
             depends_on: vec![],
             session: None,
             needs: "any".into(),
-            required: true,
+            required: false,
             isolation: None,
             join: Join::All,
         };
-        let out = run_plan(vec![task], None);
-        assert_eq!(out.results[&"quality".into()].status, TaskStatus::Pass);
+        let over = run_plan(
+            vec![evaluate("over", r#"{"score": 100, "pass": true}"#)],
+            None,
+        );
+        assert_eq!(over.results[&"over".into()].status, TaskStatus::Fail);
+        let objected = run_plan(
+            vec![evaluate("objected", r#"{"score": 0.5, "pass": false}"#)],
+            None,
+        );
+        assert_eq!(
+            objected.results[&"objected".into()].status,
+            TaskStatus::Fail
+        );
+        let ok = run_plan(vec![evaluate("ok", r#"{"score": 0.5}"#)], None);
+        assert_eq!(ok.results[&"ok".into()].status, TaskStatus::Pass);
+    }
+
+    /// With no threshold there is no graph-level gate, so the script decides.
+    #[test]
+    fn an_unthresholded_evaluation_is_decided_by_its_script() {
+        let evaluate = |name: &str, output: &str| Task {
+            name: name.into(),
+            task: TaskKind::Evaluate {
+                command: format!("echo '{output}'"),
+                threshold: None,
+                direction: None,
+            },
+            depends_on: vec![],
+            session: None,
+            needs: "any".into(),
+            required: false,
+            isolation: None,
+            join: Join::All,
+        };
+        let green = run_plan(vec![evaluate("green", r#"{"pass": true}"#)], None);
+        assert_eq!(green.results[&"green".into()].status, TaskStatus::Pass);
+        let red = run_plan(vec![evaluate("red", r#"{"pass": false}"#)], None);
+        assert_eq!(red.results[&"red".into()].status, TaskStatus::Fail);
     }
 
     #[test]
