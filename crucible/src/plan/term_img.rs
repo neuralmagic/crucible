@@ -16,7 +16,7 @@ const ASSUMED_CELL_WIDTH_PX: u32 = 16;
 const ASSUMED_CELL_HEIGHT_PX: f32 = 32.0;
 
 /// The tty's usable geometry, in physical pixels.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub struct Geometry {
     pub cols: u16,
     pub width_px: u32,
