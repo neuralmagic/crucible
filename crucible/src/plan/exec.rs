@@ -311,7 +311,7 @@ pub fn execute(
             let inputs = inputs_for(t, &results);
             let (result, budget_exceeded) = match &t.task {
                 TaskKind::TopK { k, direction } => (reduce_top_k(&inputs, *k, *direction), false),
-                TaskKind::Agent { .. } | TaskKind::Command { .. } | TaskKind::Engine(_) => {
+                TaskKind::Agent { .. } | TaskKind::Command { .. } | TaskKind::Engine { .. } => {
                     run_with_retries(t, &inputs, cfg, runner, &mut spent, budget)
                 }
             };
