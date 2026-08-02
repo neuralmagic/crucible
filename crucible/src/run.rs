@@ -608,9 +608,14 @@ fn drive_loop(
     world: Box<dyn World + Send>,
     judge: Box<dyn Judge + Send>,
 ) -> Result<()> {
+    let mut args = args;
     install_ctrlc()?;
     if args.control_port.is_some() && !args.resume && args.ui != Ui::Stream {
         anyhow::bail!("--control-port requires --ui stream (or --resume)");
+    }
+
+    if workflow_implies_graph_loop(&args) {
+        args.graph_loop = true;
     }
 
     // When the controller dispatched this loop pod, adopt its dispatch span as the run's trace
@@ -817,6 +822,15 @@ pub(crate) fn install_toolbox(p: &Paths, exclude: &[String], skills_dir: &str) -
         }
     }
     Ok(())
+}
+
+/// An engine-task workflow only executes on the graph path; running it hand-sequenced would
+/// silently ignore the authored graph (and its sessions). Authoring one is the opt-in, so
+/// `--graph-loop` is implied. Legacy splice workflows run on both paths and imply nothing.
+fn workflow_implies_graph_loop(args: &Args) -> bool {
+    args.workflow
+        .as_ref()
+        .is_some_and(|w| !w.is_legacy_splice())
 }
 
 #[cfg(test)]
@@ -1105,5 +1119,60 @@ mod tests {
         assert!(err.to_string().contains("rig-cofnig-typo"));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn workflow_from(toml_src: &str) -> manifest::WorkflowCfg {
+        toml::from_str(toml_src).unwrap()
+    }
+
+    #[test]
+    fn engine_workflow_implies_graph_loop() {
+        let mut a = args_from(&["crucible"]);
+        a.workflow = Some(workflow_from(
+            r#"
+            result = "decide"
+            [[task]]
+            name = "propose"
+            kind = "engine"
+            op = "propose"
+            [[task]]
+            name = "apply"
+            kind = "engine"
+            op = "apply"
+            depends_on = ["propose"]
+            [[task]]
+            name = "measure"
+            kind = "engine"
+            op = "measure"
+            depends_on = ["apply"]
+            [[task]]
+            name = "decide"
+            kind = "engine"
+            op = "decide"
+            source = "measure"
+            depends_on = ["measure"]
+        "#,
+        ));
+        assert!(workflow_implies_graph_loop(&a));
+    }
+
+    #[test]
+    fn legacy_splice_workflow_does_not_imply_graph_loop() {
+        let mut a = args_from(&["crucible"]);
+        a.workflow = Some(workflow_from(
+            r#"
+            [[task]]
+            name = "lint"
+            kind = "command"
+            command = "true"
+        "#,
+        ));
+        assert!(!workflow_implies_graph_loop(&a));
+    }
+
+    #[test]
+    fn no_workflow_does_not_imply_graph_loop() {
+        let a = args_from(&["crucible"]);
+        assert!(!workflow_implies_graph_loop(&a));
     }
 }
