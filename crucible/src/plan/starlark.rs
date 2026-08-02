@@ -1,10 +1,6 @@
-//! Deterministic, scope-time Starlark frontend for pack workflows.
-//!
-//! Starlark is authoring syntax only: this compiler returns the existing [`WorkflowCfg`]
-//! IR. Scope freeze materializes that IR into `crucible.toml`, so runtime execution never
-//! depends on evaluating the source again. The DSL is data constructors plus the
-//! deliberately narrow `prompt_file` reader; there is no general filesystem, process,
-//! environment, network, clock, or randomness API.
+//! Deterministic Starlark frontend for [`WorkflowCfg`]. Scope freezes the compiled IR, so runtime
+//! never evaluates the source. Only `prompt_file` can read files; process, environment, network,
+//! clock, and randomness APIs are unavailable.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -28,7 +24,7 @@ const MAX_EVAL_STEPS: usize = 10_000;
 #[derive(Debug)]
 pub struct CompiledWorkflow {
     pub workflow: WorkflowCfg,
-    /// Pack-relative prompt files whose contents were embedded into the task IR.
+    /// Pack-relative prompts embedded in the task IR.
     pub prompt_files: Vec<PathBuf>,
     /// Stable, pretty JSON used by golden tests and review tooling.
     pub canonical_json: String,
@@ -559,8 +555,7 @@ pub fn compile_file(path: &Path, pack_dir: &Path) -> Result<CompiledWorkflow> {
     compile_source(&source, path, pack_dir)
 }
 
-/// Compile `workflow.star` and replace the manifest's generated `[workflow]` block. The
-/// Starlark remains reviewable source; `crucible.toml` is the frozen runtime authority.
+/// Compile `workflow.star` into the manifest's generated `[workflow]` block.
 pub fn materialize_manifest(source_path: &Path, manifest_path: &Path) -> Result<CompiledWorkflow> {
     use toml_edit::DocumentMut;
 
@@ -599,8 +594,7 @@ pub fn materialize_manifest(source_path: &Path, manifest_path: &Path) -> Result<
     Ok(compiled)
 }
 
-/// Replace `path` atomically; a truncating write that dies partway would leave the frozen
-/// manifest unloadable.
+/// Replace a manifest atomically.
 fn write_atomically(path: &Path, body: &str) -> Result<()> {
     let dir = path
         .parent()
@@ -608,7 +602,7 @@ fn write_atomically(path: &Path, body: &str) -> Result<()> {
         .unwrap_or_else(|| Path::new("."));
     let mut file = tempfile::NamedTempFile::new_in(dir)
         .with_context(|| format!("creating temp file beside {}", path.display()))?;
-    // NamedTempFile is 0600 and persist renames it in, so carry the original mode across.
+    // Preserve the manifest's mode across the temporary-file rename.
     if let Ok(existing) = std::fs::metadata(path) {
         file.as_file()
             .set_permissions(existing.permissions())

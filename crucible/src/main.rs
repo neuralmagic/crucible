@@ -296,8 +296,7 @@ pub(crate) enum Cmd {
 /// `crucible plan <show|run>`: compile and inspect a plan, or execute one.
 #[derive(clap::Subcommand)]
 pub(crate) enum PlanAction {
-    /// Compile a scope-authored `workflow.star` into canonical workflow JSON. With
-    /// `--manifest`, also replace that manifest's generated `[[workflow.task]]` block.
+    /// Compile `workflow.star`; optionally materialize it into a manifest.
     CompileWorkflow {
         /// Starlark workflow source (conventionally `<pack>/workflow.star`).
         #[arg(long)]

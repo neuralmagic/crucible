@@ -706,11 +706,8 @@ enum RoundVerdict {
     Failed(FailureEvidence),
 }
 
-/// Validate a proposed pack for one refine round: structural preconditions, then the full
-/// `crucible check`. Failures are classified into the stage-tagged [`FailureEvidence`].
-///
-/// Writes to the pack: a sibling `workflow.star` is compiled into `[[workflow.task]]` first,
-/// since there is nothing to validate until it is. That happens even for rounds that fail.
+/// Compile a sibling workflow, then validate one refine round. Compilation materializes the
+/// manifest even when validation fails.
 fn compile_and_validate_round(manifest_path: &Path) -> RoundVerdict {
     if !manifest_path.exists() {
         return RoundVerdict::Failed(FailureEvidence::Structure {

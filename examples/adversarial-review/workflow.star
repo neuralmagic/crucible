@@ -1,5 +1,4 @@
-# Scope-time authoring source for the complete autoresearch iteration. Engine operations
-# are ordinary task values; the autoresearch workflow type enforces their safe lifecycle.
+# The complete autoresearch iteration; its type enforces the engine lifecycle.
 
 candidate = propose(name = "propose")
 
