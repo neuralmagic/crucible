@@ -290,13 +290,7 @@ impl Propose {
                 &format!("round {round}: {} turn", kind.label()),
             );
             ctx.activity.begin_turn(total_cost);
-            let cost = run_propose_turn(
-                scratch,
-                &prompt,
-                &self.opts,
-                &mut ctx.transcript,
-                &mut ctx.activity,
-            );
+            let cost = self.drafting_turn(ctx, scratch, &prompt, round, kind, total_cost);
             total_cost += cost;
             ctx.propose_cost = Some(total_cost);
             sync_pack_from_workspace(scratch, &ctx.pack)?;
@@ -519,12 +513,13 @@ impl Propose {
                 &format!("round {refine_round}: refine turn (gaming-review concerns)"),
             );
             ctx.activity.begin_turn(*total_cost);
-            let cost = run_propose_turn(
+            let cost = self.drafting_turn(
+                ctx,
                 scratch,
                 &prompt,
-                &self.opts,
-                &mut ctx.transcript,
-                &mut ctx.activity,
+                refine_round,
+                RoundKind::Refine,
+                *total_cost,
             );
             *total_cost += cost;
             ctx.propose_cost = Some(*total_cost);
@@ -574,6 +569,47 @@ impl Propose {
         }
     }
 
+    /// Run one propose/refine turn in the `--repo` scratch checkout and return what it cost. A turn
+    /// whose backend died bringing the sandbox up never reached the agent, so it earns a fresh
+    /// sandbox ([`retry_turn`]). Empty output is NOT a retry trigger here: a drafting turn's product
+    /// is the files it wrote, not what it printed, and a turn that wrote nothing already fails
+    /// validation into refine evidence the next round can act on.
+    fn drafting_turn(
+        &self,
+        ctx: &mut ScopeCtx,
+        scratch: &Path,
+        prompt: &str,
+        round: u32,
+        kind: RoundKind,
+        total_cost: f64,
+    ) -> f64 {
+        let mut cost = 0.0;
+        let log = RetryLog {
+            progress: self.opts.progress,
+            round,
+            kind,
+            what: "the drafting turn",
+            total_cost,
+        };
+        retry_turn(
+            ctx,
+            &log,
+            |ctx| {
+                let health = run_propose_turn(
+                    scratch,
+                    prompt,
+                    &self.opts,
+                    &mut ctx.transcript,
+                    &mut ctx.activity,
+                );
+                cost += health.cost;
+                health
+            },
+            |health| health.setup_error.clone(),
+        );
+        cost
+    }
+
     /// Run one bounded, read-only adversarial gaming-review turn against the already-validated
     /// pack, record it as an `Adversary` round, and classify its outcome. Always appends exactly
     /// one [`RoundRecord`] to `ctx.refine_rounds` regardless of which branch it takes.
@@ -599,12 +635,31 @@ impl Propose {
             &format!("round {round}: adversary turn (gaming review)"),
         );
         ctx.activity.begin_turn(*total_cost);
-        let (cost, transcript) = run_adversary_turn(
-            &ctx.pack,
-            &prompt,
-            &self.opts,
-            &mut ctx.transcript,
-            &mut ctx.activity,
+        // Every attempt's cost counts: retries are meant to be free, but the ledger reports what
+        // actually happened rather than what the retry rule assumed.
+        let mut cost = 0.0;
+        let log = RetryLog {
+            progress: self.opts.progress,
+            round,
+            kind: RoundKind::Adversary,
+            what: "the adversary turn",
+            total_cost: *total_cost,
+        };
+        let ((_, transcript), attempts) = retry_turn(
+            ctx,
+            &log,
+            |ctx| {
+                let attempt = run_adversary_turn(
+                    &ctx.pack,
+                    &prompt,
+                    &self.opts,
+                    &mut ctx.transcript,
+                    &mut ctx.activity,
+                );
+                cost += attempt.0.cost;
+                attempt
+            },
+            adversary_retry_cause,
         );
         *total_cost += cost;
         ctx.propose_cost = Some(*total_cost);
@@ -620,12 +675,15 @@ impl Propose {
                 },
                 AdversaryOutcome::Concerns(attacks),
             ),
-            Err(detail) => (
-                RoundOutcome::Error {
-                    detail: detail.clone(),
-                },
-                AdversaryOutcome::Errored(detail),
-            ),
+            Err(detail) => {
+                let detail = format!("{detail}{}", attempts_suffix(attempts));
+                (
+                    RoundOutcome::Error {
+                        detail: detail.clone(),
+                    },
+                    AdversaryOutcome::Errored(detail),
+                )
+            }
         };
         ctx.refine_rounds.push(RoundRecord {
             round,
@@ -659,7 +717,7 @@ fn run_adversary_turn(
     opts: &ProposeOpts,
     session: &mut String,
     activity: &mut ActivityFeed,
-) -> (f64, String) {
+) -> (TurnHealth, String) {
     let args = turn_args(opts);
     let model = args.model.clone();
     let meta = scratch_dir("scope-adversary-meta");
@@ -675,8 +733,9 @@ fn run_adversary_turn(
     };
     let _ = std::fs::create_dir_all(&paths.state);
     let mut transcript = String::new();
+    let mut setup_error = None;
     let cost = agent::run_turn(&args, &paths, prompt, false, |_line, stream, ev| {
-        forward_error(ev);
+        forward_error(&mut setup_error, ev);
         if let Some(ev) = ev {
             transcript_event(session, ev);
             activity.observe(&model, ev);
@@ -694,7 +753,21 @@ fn run_adversary_turn(
         }
     });
     let _ = std::fs::remove_dir_all(&meta);
-    (cost, transcript)
+    (TurnHealth { cost, setup_error }, transcript)
+}
+
+/// Why an adversary attempt is worth re-running, or `None` if it answered. A turn whose sandbox
+/// never came up, or that came back with not one byte of output, cost nothing and decided nothing;
+/// output that merely fails to parse as a verdict is the agent's own doing and stands.
+fn adversary_retry_cause(attempt: &(TurnHealth, String)) -> Option<String> {
+    let (health, transcript) = attempt;
+    if let Some(error) = &health.setup_error {
+        return Some(error.clone());
+    }
+    transcript
+        .trim()
+        .is_empty()
+        .then(|| "the turn produced no output".to_string())
 }
 
 /// Write `REJECTED.md` for a gaming-review outcome that has no [`FailureEvidence`] to speak of (a
@@ -875,13 +948,89 @@ fn turn_args(opts: &ProposeOpts) -> crate::Args {
 
 /// The sinks below discard most events; agent errors always reach stderr, a backend that dies at
 /// spawn/auth otherwise leaves no trace in pod logs (three silent rounds, $0.0000, no pack).
-fn forward_error(ev: Option<&AgentEvent>) {
-    if let Some(AgentEvent::Error {
+/// The first setup-class error also lands in `setup_error`, which is what earns the turn a retry.
+fn forward_error(setup_error: &mut Option<String>, ev: Option<&AgentEvent>) {
+    let Some(AgentEvent::Error {
         error_type,
         message,
     }) = ev
-    {
-        eprintln!("[crucible scope] agent error ({error_type}): {message}");
+    else {
+        return;
+    };
+    eprintln!("[crucible scope] agent error ({error_type}): {message}");
+    if SETUP_ERROR_TYPES.contains(&error_type.as_str()) && setup_error.is_none() {
+        *setup_error = Some(format!("{error_type}: {message}"));
+    }
+}
+
+/// Error classes raised by the backend bringing the turn up, before the agent ever ran: the whole
+/// openshell orchestration (sandbox create, the egress policy load that intermittently times out,
+/// uploads) and a local/command backend that couldn't spawn its child. Both spend nothing, so the
+/// turn can be re-run on a fresh sandbox for free. Everything else (agent-reported API errors, a
+/// missing transcript) means the turn ran and is never retried.
+const SETUP_ERROR_TYPES: [&str; 2] = ["openshell", "spawn"];
+
+/// Attempts one agent turn gets before the pipeline gives up on it: the first plus two retries.
+/// Only zero-cost failures are re-run (see [`retry_turn`]).
+const TURN_ATTEMPTS: u32 = 3;
+
+/// What a turn reported besides its output: its cost, and the setup-class error the backend raised
+/// instead of running the agent.
+#[derive(Debug, Default)]
+struct TurnHealth {
+    cost: f64,
+    setup_error: Option<String>,
+}
+
+/// Re-run a turn while it keeps failing for free. `cause` classifies one attempt: `Some(reason)`
+/// means the turn spent nothing and produced nothing (its sandbox never came up, or it came back
+/// empty), so another sandbox is worth a shot; `None` means the turn answered, and the answer
+/// stands however unwelcome it is. Returns the last attempt plus how many attempts it took, which
+/// the caller names in its failure message.
+///
+/// Retrying is only sound while every attempt is a no-op: a turn that produced real output (a
+/// drafted pack, an adversary verdict) must never be re-rolled, that would be shopping for a
+/// friendlier answer.
+fn retry_turn<T>(
+    ctx: &mut ScopeCtx,
+    log: &RetryLog<'_>,
+    mut attempt: impl FnMut(&mut ScopeCtx) -> T,
+    cause: impl Fn(&T) -> Option<String>,
+) -> (T, u32) {
+    for n in 1..TURN_ATTEMPTS {
+        let result = attempt(ctx);
+        let Some(reason) = cause(&result) else {
+            return (result, n);
+        };
+        let note = format!(
+            "{what} attempt {n}/{TURN_ATTEMPTS} was a no-op ({reason}); retrying on a fresh sandbox",
+            what = log.what,
+        );
+        eprintln!("[crucible scope] {note}");
+        transcript_note(&mut ctx.transcript, &note);
+        emit_progress(log.progress, log.round, log.kind, &note, log.total_cost);
+        ctx.activity.begin_turn(log.total_cost);
+    }
+    (attempt(ctx), TURN_ATTEMPTS)
+}
+
+/// Where a retry announces itself: the round it belongs to, what to call the turn in the line, and
+/// the cost already spent (the progress beat's baseline).
+struct RetryLog<'a> {
+    progress: bool,
+    round: u32,
+    kind: RoundKind,
+    what: &'a str,
+    total_cost: f64,
+}
+
+/// The suffix a failure message carries when the turn was retried, so a rejection reads as "we
+/// gave it three sandboxes and it still came back with nothing" rather than one unlucky run.
+fn attempts_suffix(attempts: u32) -> String {
+    if attempts > 1 {
+        format!(" (after {attempts} attempts)")
+    } else {
+        String::new()
     }
 }
 
@@ -896,18 +1045,20 @@ fn run_propose_turn(
     opts: &ProposeOpts,
     session: &mut String,
     activity: &mut ActivityFeed,
-) -> f64 {
+) -> TurnHealth {
     let args = turn_args(opts);
     let model = args.model.clone();
     let paths = propose_paths(scratch);
     let _ = std::fs::create_dir_all(&paths.state);
-    agent::run_turn(&args, &paths, prompt, false, |_line, _stream, ev| {
-        forward_error(ev);
+    let mut setup_error = None;
+    let cost = agent::run_turn(&args, &paths, prompt, false, |_line, _stream, ev| {
+        forward_error(&mut setup_error, ev);
         if let Some(ev) = ev {
             transcript_event(session, ev);
             activity.observe(&model, ev);
         }
-    })
+    });
+    TurnHealth { cost, setup_error }
 }
 
 fn propose_paths(scratch: &Path) -> Paths {
@@ -3119,6 +3270,262 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         let _ = fs::remove_dir_all(&repo);
         let _ = fs::remove_dir_all(&out);
         let _ = fs::remove_dir_all(&goal_dir);
+    }
+
+    /// A review script that prints NOTHING on its first `empty_reviews` looks (the field failure:
+    /// a fresh sandbox whose turn comes back with no output at all) and passes on every look after.
+    /// The counter file doubles as the assertion that the turn really was re-run.
+    fn empty_then_passing_review(counter: &Path, empty_reviews: u32) -> String {
+        format!(
+            "n=$(cat '{c}' 2>/dev/null || echo 0)\nn=$((n+1))\necho $n > '{c}'\nif [ \"$n\" -le {empty_reviews} ]; then\n  :\nelse\n  echo '{{\"verdict\":\"pass\"}}'\nfi",
+            c = counter.display(),
+        )
+    }
+
+    fn count_of(counter: &Path) -> u32 {
+        fs::read_to_string(counter)
+            .expect("the review script ran at least once")
+            .trim()
+            .parse()
+            .expect("a counter")
+    }
+
+    /// Two empty adversary turns (the sandbox-flake shape) are retried on fresh sandboxes; the
+    /// third answers and the scope freezes on it, with exactly ONE adversary round recorded.
+    #[test]
+    fn adversary_empty_turn_is_retried_until_it_answers() {
+        let repo = tempdir("gaming-retry-repo");
+        git_repo_fixture(&repo);
+        let out = tempdir("gaming-retry-out");
+        let goal_dir = tempdir("gaming-retry-goal");
+        let goal_file = goal_dir.join("goal.md");
+        fs::write(&goal_file, "fix the thing").expect("write goal file");
+        let counter = goal_dir.join("review.count");
+        let script = goal_dir.join("propose.sh");
+        write_exec(
+            &script,
+            &with_review(
+                &values_proposer(100, 10, 3),
+                &empty_then_passing_review(&counter, 2),
+            ),
+        );
+
+        let report = execute(
+            &out,
+            None,
+            Some(&goal_file),
+            false,
+            Some(propose_opts_review(&repo, &script)),
+        );
+        assert!(
+            report.stages.iter().all(|s| s.passed),
+            "two empty turns must not condemn the scope: {:?}",
+            report.stages
+        );
+        assert_eq!(count_of(&counter), 3, "the empty turns were re-run");
+        assert_eq!(
+            report.rounds.len(),
+            2,
+            "retries are attempts at one round, not extra rounds: {:?}",
+            report.rounds
+        );
+        assert_eq!(report.rounds[1].kind, RoundKind::Adversary);
+        assert!(matches!(report.rounds[1].outcome, RoundOutcome::Passed));
+        assert!(
+            report.transcript.contains("retrying on a fresh sandbox"),
+            "the retry is named in the session log: {}",
+            report.transcript
+        );
+        assert!(out.join("SCOPE.md").exists());
+
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&out);
+        let _ = fs::remove_dir_all(&goal_dir);
+    }
+
+    /// A turn that comes back empty every time exhausts its attempts and fails with the existing
+    /// no-verdict message plus the attempt count.
+    #[test]
+    fn adversary_empty_every_attempt_fails_with_the_attempt_count() {
+        let repo = tempdir("gaming-retry-exhaust-repo");
+        git_repo_fixture(&repo);
+        let out = tempdir("gaming-retry-exhaust-out");
+        let goal_dir = tempdir("gaming-retry-exhaust-goal");
+        let goal_file = goal_dir.join("goal.md");
+        fs::write(&goal_file, "fix the thing").expect("write goal file");
+        let counter = goal_dir.join("review.count");
+        let script = goal_dir.join("propose.sh");
+        write_exec(
+            &script,
+            &with_review(
+                &values_proposer(100, 10, 3),
+                &empty_then_passing_review(&counter, 99),
+            ),
+        );
+
+        let report = execute(
+            &out,
+            None,
+            Some(&goal_file),
+            false,
+            Some(propose_opts_review(&repo, &script)),
+        );
+        let last = report.stages.last().expect("a last stage");
+        assert!(!last.passed, "exhausted retries must reject: {last:?}");
+        assert!(last.detail.contains("no parseable verdict"), "{last:?}");
+        assert!(last.detail.contains("after 3 attempts"), "{last:?}");
+        assert_eq!(
+            count_of(&counter),
+            TURN_ATTEMPTS,
+            "one turn, three sandboxes"
+        );
+        assert_eq!(report.rounds.len(), 2, "{:?}", report.rounds);
+        match &report.rounds[1].outcome {
+            RoundOutcome::Error { detail } => {
+                assert!(detail.contains("after 3 attempts"), "{detail}")
+            }
+            other => panic!("expected an Error outcome, got {other:?}"),
+        }
+        assert!(report.digest.is_none());
+        let rejected = fs::read_to_string(out.join("REJECTED.md")).expect("REJECTED.md written");
+        assert!(rejected.contains("after 3 attempts"), "{rejected}");
+
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&out);
+        let _ = fs::remove_dir_all(&goal_dir);
+    }
+
+    /// A turn that produced real output is the adversary's answer, retrying it would be shopping
+    /// for a friendlier verdict. Both the malformed case (output that never parses) and a genuine
+    /// `concerns` verdict must run the review exactly once.
+    #[test]
+    fn adversary_turn_with_output_is_never_retried() {
+        let babble = "echo 'looks fine to me, no notes'";
+        let concerns = "echo '{\"verdict\":\"concerns\",\"attacks\":[{\"kind\":\"boundary\",\"narrative\":\"wide open\",\"suggestion\":\"narrow it\"}]}'";
+        for (name, review, reviews_expected) in [
+            ("gaming-noretry-babble", babble, 1),
+            // concerns → one refine round → one more look, still concerns: two looks, no retries.
+            ("gaming-noretry-concerns", concerns, 2),
+        ] {
+            let repo = tempdir(&format!("{name}-repo"));
+            git_repo_fixture(&repo);
+            let out = tempdir(&format!("{name}-out"));
+            let goal_dir = tempdir(&format!("{name}-goal"));
+            let goal_file = goal_dir.join("goal.md");
+            fs::write(&goal_file, "fix the thing").expect("write goal file");
+            let counter = goal_dir.join("review.count");
+            let script = goal_dir.join("propose.sh");
+            // Count every look, then emit the fixed output under test.
+            let counted = format!(
+                "n=$(cat '{c}' 2>/dev/null || echo 0)\nn=$((n+1))\necho $n > '{c}'\n{review}",
+                c = counter.display(),
+            );
+            write_exec(
+                &script,
+                &with_review(&values_proposer(100, 10, 3), &counted),
+            );
+
+            let report = execute(
+                &out,
+                None,
+                Some(&goal_file),
+                false,
+                Some(propose_opts_review(&repo, &script)),
+            );
+            assert!(
+                !report.stages.last().expect("a last stage").passed,
+                "{name}: {:?}",
+                report.stages
+            );
+            assert_eq!(
+                count_of(&counter),
+                reviews_expected,
+                "{name}: an answering turn is never re-rolled"
+            );
+            assert!(
+                !report
+                    .stages
+                    .last()
+                    .expect("a last stage")
+                    .detail
+                    .contains("attempts"),
+                "{name}: no retry count on a turn that answered"
+            );
+
+            let _ = fs::remove_dir_all(&repo);
+            let _ = fs::remove_dir_all(&out);
+            let _ = fs::remove_dir_all(&goal_dir);
+        }
+    }
+
+    /// The retry gate's classification: an orchestration-class error (the field failure, an egress
+    /// policy that never loads on a fresh node) earns a free re-run; an error the agent itself
+    /// reported means the turn ran, and stands.
+    #[test]
+    fn only_setup_class_errors_earn_a_retry() {
+        let mut setup = None;
+        forward_error(
+            &mut setup,
+            Some(&AgentEvent::Error {
+                error_type: "openshell".into(),
+                message: "applying the sandbox egress policy: timed out waiting for policy \
+                          version 1 to load on 'node-7'"
+                    .into(),
+            }),
+        );
+        assert!(
+            setup
+                .as_deref()
+                .is_some_and(|e| e.contains("egress policy")),
+            "{setup:?}"
+        );
+        // The first cause is the one that stopped the turn; later noise never overwrites it.
+        forward_error(
+            &mut setup,
+            Some(&AgentEvent::Error {
+                error_type: "openshell".into(),
+                message: "teardown noise".into(),
+            }),
+        );
+        assert!(!setup.as_deref().unwrap_or_default().contains("teardown"));
+
+        let mut agent_side = None;
+        forward_error(
+            &mut agent_side,
+            Some(&AgentEvent::Error {
+                error_type: "overloaded".into(),
+                message: "the API is overloaded".into(),
+            }),
+        );
+        assert!(agent_side.is_none(), "{agent_side:?}");
+    }
+
+    #[test]
+    fn adversary_retry_cause_covers_setup_errors_and_silence_only() {
+        let setup = (
+            TurnHealth {
+                cost: 0.0,
+                setup_error: Some("openshell: policy timeout".into()),
+            },
+            String::new(),
+        );
+        assert!(
+            adversary_retry_cause(&setup).is_some_and(|c| c.contains("policy timeout")),
+            "a sandbox that never came up is a free re-run"
+        );
+        let silent = (TurnHealth::default(), "  \n\n".to_string());
+        assert!(
+            adversary_retry_cause(&silent).is_some_and(|c| c.contains("no output")),
+            "an empty turn decided nothing"
+        );
+        let answered = (
+            TurnHealth::default(),
+            "looks fine to me, no notes".to_string(),
+        );
+        assert!(
+            adversary_retry_cause(&answered).is_none(),
+            "output that merely fails to parse is still the agent's answer"
+        );
     }
 
     #[test]
