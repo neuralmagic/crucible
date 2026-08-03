@@ -105,3 +105,11 @@ runs = 3
   if any of that is wrong. `runs` must still be at least 3.
 - **`skip_baseline = true`.** A baseline reading is another full GPU job for a number the
   digest-keyed tools already memoize; the loop does not need it.
+
+## Author the work graph
+
+Beside `crucible.toml`, write `workflow.star`: `propose(name = "propose", session = "solver")`,
+then one `evaluate` task per oracle in the tools contract (dependencies mirroring the oracle
+ladder; oracles past the correctness terminal get `required = False`), a `grade` folding their
+evidence with the terminal oracle as `score`, and `decide`. The pipeline compiles it into the
+manifest automatically; do not hand-write the `[workflow]` block.
