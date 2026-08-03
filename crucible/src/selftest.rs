@@ -77,6 +77,26 @@ pub(crate) fn run(
     })
 }
 
+/// The broker-measured pack's half of [`run`]: the gate scores on GPU hardware reached through the
+/// broker's code-gen MCP tools, so there is no measurement to compare controls with here. Only the
+/// broker-free `good_cmd` runs (staged and rolled back exactly like a full control), and its exit
+/// status is the whole verdict — `bad_cmd` means nothing without a reading, so proving the gate
+/// discriminates is the brokered gate's own job.
+pub(crate) fn run_broker_free(
+    world: &dyn World,
+    workspace: &Path,
+    cfg: &SelftestCfg,
+) -> Result<()> {
+    let pristine = world
+        .snapshot("selftest-pristine")
+        .context("snapshotting the workspace before the broker-free gate self-test")?;
+    let staged = stage(workspace, &cfg.good_cmd);
+    world
+        .restore(&pristine)
+        .context("restoring the workspace after the broker-free gate self-test")?;
+    staged
+}
+
 /// Restore to `pristine`, stage `cmd`, measure `runs` times, restore to `pristine` again, so the
 /// next control (or the caller) always starts from the same known state.
 fn run_control(

@@ -416,6 +416,10 @@ pub(crate) struct RenderTurnArgs {
     /// --authoritative`. `scope` turn kind only.
     #[arg(long)]
     pub authoritative: bool,
+    /// The ask is broker-measured, forwarded to the in-pod `crucible scope --propose
+    /// --broker-measure`. `scope` turn kind only.
+    #[arg(long)]
+    pub broker_measure: bool,
 }
 
 #[derive(clap::Args)]

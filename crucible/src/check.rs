@@ -182,7 +182,13 @@ fn check_single(manifest_path: &Path) -> Result<CheckOutcome> {
             return Ok(out);
         }
     }
-    check_measure_once(&m.judge.measure_cmd, &workspace, &mut out);
+    // A broker-measured pack's gate scores on GPU hardware it reaches through the broker's
+    // code-gen MCP tools; running it here would either hang on a broker that isn't there or, worse,
+    // spend GPU jobs from a validation run. Everything that doesn't need hardware still runs.
+    let brokered = m.agent.broker.enabled;
+    if !brokered {
+        check_measure_once(&m.judge.measure_cmd, &workspace, &mut out);
+    }
     if let Some(w) =
         agent_editable_gate_warning(&m.judge.measure_cmd, &m, &manifest_dir, &workspace)
     {
@@ -192,8 +198,9 @@ fn check_single(manifest_path: &Path) -> Result<CheckOutcome> {
         out.findings.push(f);
     }
     if out.ok() {
-        match &m.judge.selftest {
-            Some(cfg) => {
+        match (&m.judge.selftest, brokered) {
+            (Some(cfg), true) => check_broker_free_selftest(&m, cfg, &workspace, &mut out),
+            (Some(cfg), false) => {
                 let result = (|| -> Result<SelftestReport> {
                     let frozen = frozen_injects(&m, &manifest_dir, &workspace);
                     let world = m.build_world(workspace.clone());
@@ -203,7 +210,7 @@ fn check_single(manifest_path: &Path) -> Result<CheckOutcome> {
                 })();
                 fold_selftest_result(result, &mut out);
             }
-            None => out.warnings.push(no_selftest_warning()),
+            (None, _) => out.warnings.push(no_selftest_warning()),
         }
     }
     Ok(out)
@@ -217,6 +224,31 @@ fn frozen_injects(m: &Manifest, manifest_dir: &Path, workspace: &Path) -> Vec<(P
         .filter(|(_, _, frozen)| *frozen)
         .map(|(src, dst, _)| (src, dst))
         .collect()
+}
+
+/// The self-test of a broker-measured pack: `good_cmd` is broker-free by contract (it resolves the
+/// `[measure]` tool contract and the call ladder the gate would issue, without a single broker
+/// call), which makes it the one part of that gate a machine with no GPUs can honestly run. A
+/// nonzero exit is a finding; passing it is not proof the gate discriminates, so say so.
+fn check_broker_free_selftest(
+    m: &Manifest,
+    cfg: &manifest::SelftestCfg,
+    workspace: &Path,
+    out: &mut CheckOutcome,
+) {
+    let world = m.build_world(workspace.to_path_buf());
+    match selftest::run_broker_free(world.as_ref(), workspace, cfg) {
+        Ok(()) => out.warnings.push(format!(
+            "broker-measured gate: measure_cmd was not executed (it scores through the broker's \
+             GPU tools); the broker-free self-test control `{}` passed, which proves the gate's \
+             offline half, not that it discriminates",
+            cfg.good_cmd
+        )),
+        Err(e) => out.findings.push(format!(
+            "broker-free gate self-test failed: {e:#} — a broker-measured pack's [judge.selftest] \
+             must pass with no broker and no GPUs in reach"
+        )),
+    }
 }
 
 fn no_selftest_warning() -> String {
@@ -849,6 +881,96 @@ mod tests {
                 .any(|f| f.contains("gate self-test") && f.contains("does not discriminate")),
             "{:?}",
             outcome.findings
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A broker-measured pack: the gate scores on GPU hardware through the broker's code-gen MCP
+    /// tools, so `measure.sh` must never run here — it drops `measure-ran` if it does.
+    fn scaffold_broker_domain(dir: &Path, good_cmd: &str) {
+        write_exec(
+            &dir.join("measure.sh"),
+            &format!(
+                "#!/bin/sh\ntouch {}\necho '{{\"valid\": true, \"score\": 1.0}}'\n",
+                dir.join("measure-ran").display()
+            ),
+        );
+        let manifest = format!(
+            r#"
+            [repo]
+            path = "."
+            [workspace]
+            dir = "workspace"
+            setup_cmd = "mkdir -p workspace && cp measure.sh workspace/ && git -C workspace init -q && git -C workspace add -A && git -C workspace -c user.email=t@t -c user.name=t commit -qm baseline"
+            [agent]
+            backend = "command"
+            agent_cmd = "true"
+            goal = "g"
+            [agent.broker]
+            enabled = true
+            bin = "crucible-broker"
+            build = true
+            [measure]
+            gpus = 2
+            [measure.benchmark]
+            command = "bench --frozen"
+            [judge]
+            measure_cmd = "./measure.sh"
+            direction = "lower"
+            objective = "perf"
+            skip_baseline = true
+            [judge.selftest]
+            good_cmd = "{good_cmd}"
+            bad_cmd = "true"
+            runs = 3
+            "#
+        );
+        fs::write(dir.join(MANIFEST), manifest).expect("write manifest");
+    }
+
+    #[test]
+    fn check_skips_the_measure_probe_for_a_broker_measured_pack() {
+        let dir = tempdir("broker-skip-measure");
+        scaffold_broker_domain(&dir, "echo ladder resolves");
+        let outcome = run(&dir.join(MANIFEST)).expect("check runs");
+        assert!(outcome.ok(), "findings: {:?}", outcome.findings);
+        assert!(
+            !dir.join("measure-ran").exists(),
+            "the brokered gate must not be executed by a check"
+        );
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.contains("measure_cmd was not executed")),
+            "{:?}",
+            outcome.warnings
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_fails_when_the_broker_free_selftest_fails() {
+        // The broker-free control is the only part of a brokered gate a GPU-less validator can run,
+        // so it is the one thing that must still pass.
+        let dir = tempdir("broker-selftest-fails");
+        scaffold_broker_domain(&dir, "exit 3");
+        let outcome = run(&dir.join(MANIFEST)).expect("check runs");
+        assert!(
+            !outcome.ok(),
+            "a failing broker-free control must fail check"
+        );
+        assert!(
+            outcome
+                .findings
+                .iter()
+                .any(|f| f.contains("broker-free gate self-test failed")),
+            "{:?}",
+            outcome.findings
+        );
+        assert!(
+            !dir.join("measure-ran").exists(),
+            "still no local gate execution on the failure path"
         );
         let _ = fs::remove_dir_all(&dir);
     }

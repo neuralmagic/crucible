@@ -2246,6 +2246,7 @@ mod tests {
                 gaming_refine_rounds: 1,
                 skip_gaming_review: false,
                 authoritative: false,
+                broker_measure: false,
             },
         )
         .expect("render turn");

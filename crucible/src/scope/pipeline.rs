@@ -27,6 +27,12 @@ const GOAL_CONTRACT: &str = include_str!("../prompts/scope-goal-contract.md");
 const GOAL_CONTRACT_AUTHORITATIVE: &str =
     include_str!("../prompts/scope-goal-contract-authoritative.md");
 
+/// The `{{MEASURE_MODE}}` section: the local T0/T1 gate shapes (GPU/rig work is out of scope and
+/// gets a `REJECTED.md`), or the broker-measured shape, where the score comes off GPU hardware the
+/// gate reaches through the broker's code-gen MCP tools and nothing local can run it.
+const MEASURE_MODE_LOCAL: &str = include_str!("../prompts/scope-measure-local.md");
+const MEASURE_MODE_BROKER: &str = include_str!("../prompts/scope-measure-broker.md");
+
 /// The confirmed tier a propose turn drafts against: threaded from the controller's ranker verdict
 /// (`--tier t0|t1`) into the prompt's `{{TIER}}` slot, so the agent follows the right section of
 /// `scope-propose.md` instead of guessing.
@@ -170,6 +176,10 @@ pub struct ProposeOpts {
     /// The goal is an authoritative brief (`--authoritative`): the propose/refine prompts tell
     /// the agent to carry its prescriptions into `goal.md` intact instead of de-prescribing them.
     pub authoritative: bool,
+    /// This ask is broker-measured (`--broker-measure`): the gate scores on GPU hardware reached
+    /// through the broker's code-gen MCP tools, so the prompts ask for a brokered pack instead of
+    /// a locally-runnable harness, and validation never executes `measure_cmd`.
+    pub broker_measure: bool,
 }
 
 /// Stage 2 (`--propose` only): one agent turn drafts the pack into `ctx.pack`. Runs after
@@ -253,6 +263,7 @@ impl Propose {
                     round,
                     self.opts.tier,
                     self.opts.authoritative,
+                    self.opts.broker_measure,
                 ),
                 _ => render_propose_prompt(
                     goal,
@@ -260,6 +271,7 @@ impl Propose {
                     &self.opts.repo,
                     self.opts.tier,
                     self.opts.authoritative,
+                    self.opts.broker_measure,
                 ),
             };
             let doing = match (&kind, &last_evidence) {
@@ -493,6 +505,7 @@ impl Propose {
                 refine_round,
                 self.opts.tier,
                 self.opts.authoritative,
+                self.opts.broker_measure,
             );
             emit_progress(
                 self.opts.progress,
@@ -750,6 +763,9 @@ fn compile_and_validate_round(manifest_path: &Path) -> RoundVerdict {
         Some(_) => {}
     }
 
+    // `check::run` reads the broker-measured escape off the manifest itself (`[agent.broker]`
+    // enabled = no local measure probe, broker-free self-test only), so a proposed brokered pack is
+    // validated by exactly the same rule a hand-written one is.
     let outcome = match check::run(manifest_path) {
         Ok(o) => o,
         Err(e) => {
@@ -816,13 +832,20 @@ fn render_propose_prompt(
     repo: &str,
     tier: ProposeTier,
     authoritative: bool,
+    broker_measure: bool,
 ) -> String {
     let contract = if authoritative {
         GOAL_CONTRACT_AUTHORITATIVE
     } else {
         GOAL_CONTRACT
     };
+    let measure_mode = if broker_measure {
+        MEASURE_MODE_BROKER
+    } else {
+        MEASURE_MODE_LOCAL
+    };
     SCOPE_PROPOSE_PROMPT
+        .replace("{{MEASURE_MODE}}", measure_mode.trim_end())
         .replace("{{GOAL_CONTRACT}}", contract.trim_end())
         .replace("{{GOAL}}", goal)
         .replace("{{OUT_DIR}}", &out_dir.display().to_string())
@@ -1539,6 +1562,7 @@ mod tests {
             progress: false,
             compute_driver: crate::openshell::gateway::ComputeDriver::Podman,
             authoritative: false,
+            broker_measure: false,
         }
     }
 
@@ -3395,6 +3419,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             "https://example.invalid/x.git",
             ProposeTier::T0,
             false,
+            false,
         );
         assert!(t0.contains("Confirmed tier: T0"), "{t0}");
         let t1 = render_propose_prompt(
@@ -3403,14 +3428,22 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             "https://example.invalid/x.git",
             ProposeTier::T1,
             false,
+            false,
         );
         assert!(t1.contains("Confirmed tier: T1"), "{t1}");
 
         let evidence = crate::refine::FailureEvidence::Structure {
             detail: "no [judge.selftest] table".to_string(),
         };
-        let refine_t1 =
-            refine::render_refine_prompt("fix it", &out, &evidence, 2, ProposeTier::T1, false);
+        let refine_t1 = refine::render_refine_prompt(
+            "fix it",
+            &out,
+            &evidence,
+            2,
+            ProposeTier::T1,
+            false,
+            false,
+        );
         assert!(refine_t1.contains("Confirmed tier: T1"), "{refine_t1}");
     }
 
@@ -3811,6 +3844,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             "https://x.invalid/x.git",
             ProposeTier::T0,
             false,
+            false,
         );
         assert!(
             propose.contains("frame the problem, NEVER the fix"),
@@ -3823,8 +3857,15 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         let evidence = crate::refine::FailureEvidence::Structure {
             detail: "no [judge.selftest] table".to_string(),
         };
-        let refine =
-            refine::render_refine_prompt("fix it", &out, &evidence, 2, ProposeTier::T0, false);
+        let refine = refine::render_refine_prompt(
+            "fix it",
+            &out,
+            &evidence,
+            2,
+            ProposeTier::T0,
+            false,
+            false,
+        );
         assert!(
             refine.contains("Keep `goal.md` de-prescribed"),
             "refine prompt keeps the de-prescribe guardrail"
@@ -3837,8 +3878,14 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
     fn authoritative_prompts_preserve_the_briefs_prescriptions() {
         let out = PathBuf::from("/tmp/does-not-need-to-exist-for-rendering");
         let goal = "swap the lookup path's allocator for a pooled arena";
-        let propose =
-            render_propose_prompt(goal, &out, "https://x.invalid/x.git", ProposeTier::T1, true);
+        let propose = render_propose_prompt(
+            goal,
+            &out,
+            "https://x.invalid/x.git",
+            ProposeTier::T1,
+            true,
+            false,
+        );
         assert!(propose.contains(goal), "the brief rides verbatim");
         assert!(
             propose.contains("authoritative brief"),
@@ -3861,7 +3908,8 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         let evidence = crate::refine::FailureEvidence::Structure {
             detail: "no [judge.selftest] table".to_string(),
         };
-        let refine = refine::render_refine_prompt(goal, &out, &evidence, 2, ProposeTier::T1, true);
+        let refine =
+            refine::render_refine_prompt(goal, &out, &evidence, 2, ProposeTier::T1, true, false);
         assert!(
             refine.contains("carries an authoritative brief"),
             "refine prompt keeps the brief intact across rounds: {refine}"
@@ -3869,6 +3917,83 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         assert!(
             !refine.contains("Keep `goal.md` de-prescribed"),
             "refine prompt drops the strip instruction for an authoritative brief"
+        );
+    }
+
+    /// The rendered prompt for the local (non-broker) T0/T1 pipeline, pinned byte for byte. Splitting
+    /// the gate-shape sections out into `{{MEASURE_MODE}}` must not move a single character of what
+    /// the proposer reads; update this golden only when the local prompt text changes on purpose.
+    const PROPOSE_LOCAL_GOLDEN: &str =
+        include_str!("../prompts/testdata/scope-propose-local-t0.md");
+
+    #[test]
+    fn local_measure_mode_renders_the_prompt_byte_for_byte() {
+        let rendered = render_propose_prompt(
+            "fix it",
+            Path::new("_pack"),
+            "https://x.invalid/x.git",
+            ProposeTier::T0,
+            false,
+            false,
+        );
+        assert_eq!(rendered, PROPOSE_LOCAL_GOLDEN);
+    }
+
+    /// Broker-measured mode replaces the local gate shape wholesale: the GPU work that used to mean
+    /// `REJECTED.md` is now the job, and the pack shape it asks for is the brokered one.
+    #[test]
+    fn broker_measure_mode_asks_for_a_brokered_pack() {
+        let propose = render_propose_prompt(
+            "bench the fused kernel",
+            Path::new("_pack"),
+            "https://x.invalid/x.git",
+            ProposeTier::T1,
+            false,
+            true,
+        );
+        for needle in [
+            "[agent.broker]",
+            "[measure]",
+            "codegen_build",
+            "codegen_benchmark",
+            "codegen_profile",
+            "skip_baseline = true",
+            "Fail closed",
+        ] {
+            assert!(
+                propose.contains(needle),
+                "broker prompt is missing {needle}"
+            );
+        }
+        assert!(
+            propose.contains("MANDATORY and MUST be broker-free"),
+            "the selftest stays mandatory and broker-free: {propose}"
+        );
+        assert!(
+            !propose.contains("out of scope for this pipeline")
+                && !propose.contains("T1 hard requirements"),
+            "the local T0/T1 gate shape is fully replaced: {propose}"
+        );
+
+        let evidence = crate::refine::FailureEvidence::Structure {
+            detail: "no [judge.selftest] table".to_string(),
+        };
+        let refine = refine::render_refine_prompt(
+            "bench the fused kernel",
+            Path::new("_pack"),
+            &evidence,
+            2,
+            ProposeTier::T1,
+            false,
+            true,
+        );
+        assert!(
+            refine.contains("This pack is broker-measured"),
+            "the refine turn keeps the brokered shape: {refine}"
+        );
+        assert!(
+            !refine.contains("a T1 pack's harness stays a"),
+            "the local tier guard is replaced, not stacked: {refine}"
         );
     }
 

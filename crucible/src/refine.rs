@@ -24,6 +24,11 @@ pub(crate) const GOAL_GUARD: &str = include_str!("prompts/scope-refine-goal-guar
 pub(crate) const GOAL_GUARD_AUTHORITATIVE: &str =
     include_str!("prompts/scope-refine-goal-guard-authoritative.md");
 
+/// The `{{MEASURE_MODE}}` block: hold the drafted local T0/T1 shape (the default), or hold the
+/// broker-measured shape, whose gate validation never executed because it needs GPU hardware.
+const MEASURE_MODE: &str = include_str!("prompts/scope-refine-measure-local.md");
+const MEASURE_MODE_BROKER: &str = include_str!("prompts/scope-refine-measure-broker.md");
+
 /// The engine-embedded adversarial gaming-review prompt: a read-only
 /// turn that attacks a pack that already passed validation, looking for ways an optimizing agent
 /// could score well without genuinely addressing the goal.
@@ -357,13 +362,20 @@ pub fn render_refine_prompt(
     round: u32,
     tier: crate::scope::ProposeTier,
     authoritative: bool,
+    broker_measure: bool,
 ) -> String {
     let guard = if authoritative {
         GOAL_GUARD_AUTHORITATIVE
     } else {
         GOAL_GUARD
     };
+    let measure_mode = if broker_measure {
+        MEASURE_MODE_BROKER
+    } else {
+        MEASURE_MODE
+    };
     SCOPE_REFINE_PROMPT
+        .replace("{{MEASURE_MODE}}", measure_mode.trim_end())
         .replace("{{GOAL_GUARD}}", guard.trim_end())
         .replace("{{GOAL}}", goal)
         .replace("{{OUT_DIR}}", &out_dir.display().to_string())

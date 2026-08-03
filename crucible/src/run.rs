@@ -173,6 +173,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                     gaming_refine_rounds: a.gaming_refine_rounds,
                     skip_gaming_review: a.skip_gaming_review,
                     authoritative: a.authoritative,
+                    broker_measure: a.broker_measure,
                 },
             );
         }

@@ -162,6 +162,10 @@ pub struct ScopeArgs {
     /// Goal is an authoritative brief: prompts carry prescriptions into `goal.md` intact.
     #[arg(long)]
     pub authoritative: bool,
+    /// Draft a broker-measured pack: the gate scores on GPU hardware through the broker's
+    /// code-gen MCP tools, so validation never runs `measure_cmd` locally.
+    #[arg(long)]
+    pub broker_measure: bool,
 }
 
 /// CLI entry point: resolve `--propose` vs. the classic pack path, run the pipeline, print each
@@ -194,6 +198,7 @@ pub fn run(a: ScopeArgs) -> Result<()> {
                 progress: a.marker,
                 compute_driver: a.compute_driver,
                 authoritative: a.authoritative,
+                broker_measure: a.broker_measure,
             }),
         )
     } else {

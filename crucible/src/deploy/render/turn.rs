@@ -81,6 +81,10 @@ pub struct TurnOpts {
     /// The goal is an authoritative brief, rendered into the scope wrapper as
     /// `crucible scope --propose --authoritative`. Ignored by a rank turn.
     pub authoritative: bool,
+    /// The ask is broker-measured, rendered into the scope wrapper as `crucible scope --propose
+    /// --broker-measure`: the drafted gate scores on GPU hardware through the broker's code-gen
+    /// MCP tools instead of a locally-runnable harness. Ignored by a rank turn.
+    pub broker_measure: bool,
 }
 
 /// Validate a [`TurnOpts::repo_ref`] before it is interpolated, unquoted, into the wrapper shell
@@ -208,6 +212,7 @@ pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
         gaming_refine_rounds,
         skip_gaming_review,
         authoritative,
+        broker_measure,
         ..
     } = opts;
     // Same flag the loop wrapper passes (`Renderer::wrapper_script`): without it the turn's
@@ -249,6 +254,11 @@ crucible rank-grounded --issue {issue} --workspace "$CHECKOUT" --max-cost {max_c
             } else {
                 ""
             };
+            let broker_measure_flag = if *broker_measure {
+                " --broker-measure"
+            } else {
+                ""
+            };
             // A non-upstream scenario has no GitHub item to fetch: its goal is the free text
             // ledgered at adoption. Base64-decode it into a file inside the pod and pass
             // `--goal-file` (which `--issue` conflicts with at the CLI), the same local-file
@@ -283,7 +293,7 @@ git clone --depth 50{branch_flag} {repo_url} "$CHECKOUT"
 SCOPE_OUT=/tmp/crucible-scope-out
 rm -rf "$SCOPE_OUT"
 {goal_source}crucible scope --propose --json --force --marker {goal_flag}{goal_arg} \
-  --repo "$CHECKOUT" --out "$SCOPE_OUT" --max-cost {max_cost}{tier_flag}{gaming_flag}{authoritative_flag} \
+  --repo "$CHECKOUT" --out "$SCOPE_OUT" --max-cost {max_cost}{tier_flag}{gaming_flag}{authoritative_flag}{broker_measure_flag} \
   --agent-backend openshell --sandbox-image {sandbox_image}{compute_driver_flag}
 "#
             )
@@ -454,6 +464,7 @@ mod tests {
                 gaming_refine_rounds: 1,
                 skip_gaming_review: false,
                 authoritative: false,
+                broker_measure: false,
             },
         )
         .expect("render turn");
@@ -549,6 +560,7 @@ mod tests {
                 gaming_refine_rounds: 1,
                 skip_gaming_review: false,
                 authoritative: false,
+                broker_measure: false,
             },
         )
         .expect("render turn");
@@ -627,6 +639,7 @@ mod tests {
                 gaming_refine_rounds: 1,
                 skip_gaming_review: false,
                 authoritative: false,
+                broker_measure: false,
             },
         )
         .expect("render turn");
@@ -687,6 +700,7 @@ mod tests {
                 gaming_refine_rounds: 3,
                 skip_gaming_review: false,
                 authoritative: false,
+                broker_measure: false,
             },
         )
         .expect("render scope turn");
@@ -776,6 +790,7 @@ mod tests {
                 gaming_refine_rounds: 1,
                 skip_gaming_review: false,
                 authoritative: false,
+                broker_measure: false,
             },
         )
         .expect("render scope turn");
@@ -830,6 +845,7 @@ mod tests {
                 gaming_refine_rounds: 1,
                 skip_gaming_review: false,
                 authoritative: false,
+                broker_measure: false,
             },
         )
         .expect("render scope turn");
@@ -874,6 +890,7 @@ mod tests {
                 gaming_refine_rounds: 2,
                 skip_gaming_review: true,
                 authoritative: true,
+                broker_measure: false,
             },
         )
         .expect("render scope turn");
@@ -888,6 +905,44 @@ mod tests {
         assert!(
             yaml.contains("--authoritative"),
             "the authoritative flag is forwarded: {yaml}"
+        );
+    }
+
+    /// `--broker-measure` reaches the in-pod `crucible scope --propose` only when the ask is
+    /// broker-measured: an unset flag must leave the wrapper exactly as it was.
+    #[test]
+    fn scope_turn_pod_passes_broker_measure_only_when_set() {
+        let render = |broker_measure: bool| {
+            render_turn(
+                &clone_test_profile(),
+                &TurnOpts {
+                    kind: TurnKind::Scope,
+                    name: "crucible-scope-owner-repo-51-abcd".to_string(),
+                    issue: "owner/repo#51".to_string(),
+                    goal_text: None,
+                    repo_url: "https://github.com/owner/repo.git".to_string(),
+                    repo_ref: None,
+                    sandbox_image: "registry.example.com/epp-sandbox:latest".to_string(),
+                    max_cost: 8.0,
+                    pin_digests: false,
+                    tier: Some(crate::scope::ProposeTier::T1),
+                    gaming_refine_rounds: 1,
+                    skip_gaming_review: false,
+                    authoritative: false,
+                    broker_measure,
+                },
+            )
+            .expect("render scope turn")
+        };
+        let on = render(true);
+        assert!(
+            on.contains("--broker-measure"),
+            "the flag is forwarded: {on}"
+        );
+        let off = render(false);
+        assert!(
+            !off.contains("--broker-measure"),
+            "an ordinary ask carries no flag: {off}"
         );
     }
 
@@ -925,6 +980,7 @@ mod tests {
                 gaming_refine_rounds: 1,
                 skip_gaming_review: false,
                 authoritative: false,
+                broker_measure: false,
             },
         )
     }
