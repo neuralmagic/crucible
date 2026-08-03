@@ -70,13 +70,14 @@ What it deliberately does **not** own: the *contents* of secrets (it references 
 Secrets provisions them), and the rig's domain YAML where the rig is a fixed artifact (ADR-0001 frozen
 workload) — the renderer references the rig, it doesn't invent model-server topology.
 
-```text
-  crucible.pd-rollout.toml ─┐
-                            ├─ crucible deploy render ──► loop-pod.yaml + rbac.yaml (+ apply)
-  deploy-profile (cluster) ─┘        │
-                                     ├─ env projected from the manifest (no hand-duplication)
-                                     ├─ image refs resolved to @sha256 (no manual re-pin)
-                                     └─ one shared openshell-loop template across domains
+```mermaid
+flowchart LR
+    manifest["domain manifest<br/>crucible.toml"] --> render["crucible deploy render"]
+    profile["deploy profile<br/>cluster facts"] --> render
+    render --> output["loop-pod YAML + RBAC YAML<br/>optionally apply"]
+    render --> env["project manifest values into environment"]
+    render --> pins["resolve image references to sha256 digests"]
+    render --> template["instantiate the shared OpenShell loop template"]
 ```
 
 ## Consequences

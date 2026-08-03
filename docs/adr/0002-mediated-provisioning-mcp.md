@@ -125,16 +125,18 @@ so a trace captured by the loop warms CI and vice-versa.
 
 ## Architecture sketch
 
-```
-  sandbox (egress: ONLY the MCP endpoint allowlisted)
-    claude ──MCP──> loop-pod MCP server  (trusted identity: rig + capture RBAC + forge token)
-                          │
-                          ├─ resolve cache (traces/ + S3 by trace_id)  ── HIT ─> knobs (sync)
-                          ├─ admission: gpu-check headroom + caps  ── ok ─> Kueue submit
-                          ├─ judge-changing? ─> re-scope (baseline + fingerprint, ADR-0001)
-                          └─ needs human? ─> approval backend:
-                                 ├─ forge: open issue/PR, poll for /approve-capture (headless)
-                                 └─ control bridge: surface event, operator keystroke (attended)
+```mermaid
+flowchart LR
+    sandbox["Claude sandbox<br/>only MCP endpoint allowlisted"] -->|"MCP"| broker["loop-pod MCP server<br/>trusted rig, capture RBAC, and forge identity"]
+    broker --> cache["resolve cache<br/>local traces + S3 by trace_id"]
+    cache -->|"hit"| knobs["return knobs synchronously"]
+    broker --> admission["admission<br/>GPU headroom + caps"]
+    admission -->|"admitted"| kueue["submit Kueue job"]
+    broker --> changed{"judge-changing request?"}
+    changed -->|"yes"| rescope["re-scope<br/>baseline + fingerprint"]
+    broker --> human{"human approval required?"}
+    human -->|"headless"| forge["open issue or PR<br/>poll for approval command"]
+    human -->|"attended"| control["surface control event<br/>operator decision"]
 ```
 
 ## Consequences

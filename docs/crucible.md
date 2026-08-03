@@ -26,14 +26,17 @@ a frozen, expensive black-box evaluation, over a **reversibly-mutable** world, w
 
 ## The loop
 
-```
-   ┌─────────────────────────── budget / steer / stop / escalate ──────────────────────┐
-   │                                                                                    │
-   ▼                                                                                    │
- propose ──▶ apply ──▶ measure ──▶ accept? ──▶ remember ──▶ (next iteration) ───────────┘
- (agent)    (World)    (Judge)    keep|discard  (git +
-                                   │            session log)
-                                   └─ discard ▶ restore (World) ▶ next
+```mermaid
+flowchart LR
+    controls["budget / steer / stop / escalate"] -.-> propose["propose<br/>(agent)"]
+    propose --> apply["apply<br/>(World)"]
+    apply --> measure["measure<br/>(Judge)"]
+    measure --> accept{"accept?<br/>keep or discard"}
+    accept -->|"keep"| remember["remember<br/>(Git + session log)"]
+    accept -->|"discard"| restore["restore<br/>(World)"]
+    remember --> next["next iteration"]
+    restore --> next
+    next --> propose
 ```
 
 - **propose**: the agent edits the world toward the goal. The proposal policy is a

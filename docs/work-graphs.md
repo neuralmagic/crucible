@@ -160,8 +160,9 @@ dependency, then folds the non-empty passing set. It fails closed if none can ru
 `--graph-loop` runs each loop iteration as a capability-admitted `autoresearch` workflow. With no
 authored workflow, the default expands to ordinary tasks:
 
-```
-propose (engine) -> apply -> measure -> decide
+```mermaid
+flowchart LR
+    propose["propose (engine)"] --> apply["apply"] --> measure["measure"] --> decide["decide"]
 ```
 
 Task names and intervening topology are author-defined. An `autoresearch` result must be a decision
