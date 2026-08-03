@@ -420,8 +420,9 @@ struct Renderer<'a> {
 
 /// The agent pod's security context, shared by the loop pod and the turn pods: privileged ONLY
 /// under the podman driver (nested rootless podman needs a privileged outer container). The
-/// kubernetes driver runs sandboxes as sibling pods, so the pod itself carries no security
-/// context at all and schedules under a restricted PSA/SCC (OpenShift `restricted-v2` included).
+/// kubernetes driver runs sandboxes as sibling pods, so this base context is `None` and the pod
+/// schedules under a restricted PSA/SCC (OpenShift `restricted-v2` included); the loop pod layers
+/// AppArmor on top when the domain builds in-pod (see `loop_security_context`).
 pub(crate) fn agent_security_context(driver: ComputeDriver) -> Option<core::SecurityContext> {
     (driver == ComputeDriver::Podman).then(|| core::SecurityContext {
         privileged: Some(true),
@@ -430,6 +431,32 @@ pub(crate) fn agent_security_context(driver: ComputeDriver) -> Option<core::Secu
 }
 
 impl Renderer<'_> {
+    /// Whether the loop pod runs buildah itself (`build_epp` / codegen builds). containerd's
+    /// default AppArmor profile denies mount syscalls even inside a user namespace, which kills
+    /// every in-pod build (storage init, layer extraction, chroot isolation), so those pods need
+    /// `appArmorProfile: Unconfined` on the loop container — the same fix forge applies to its
+    /// cluster build Jobs. Scoped to building domains only: Unconfined violates baseline PSA, and
+    /// plain domains should keep scheduling under restricted PSA/SCC.
+    fn builds_in_pod(&self) -> bool {
+        self.input
+            .deploy_targets
+            .iter()
+            .any(|d| d.buildah.is_some())
+            || self.input.measure.is_some()
+    }
+
+    fn loop_security_context(&self) -> Option<core::SecurityContext> {
+        let mut sc = agent_security_context(self.driver);
+        if self.builds_in_pod() {
+            sc.get_or_insert_with(Default::default).app_armor_profile =
+                Some(core::AppArmorProfile {
+                    type_: "Unconfined".to_string(),
+                    localhost_profile: None,
+                });
+        }
+        sc
+    }
+
     fn pod(&self) -> Result<core::Pod> {
         let container = core::Container {
             name: "loop".to_string(),
@@ -437,7 +464,7 @@ impl Renderer<'_> {
             image_pull_policy: Some("IfNotPresent".to_string()),
             command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
             args: Some(vec![self.wrapper_script()]),
-            security_context: agent_security_context(self.driver),
+            security_context: self.loop_security_context(),
             env: Some(self.env()?),
             volume_mounts: Some(self.volume_mounts()),
             resources: Some(self.resources()),
@@ -570,6 +597,15 @@ impl Renderer<'_> {
         ));
         if let Some(apply) = self.input.apply_cmd {
             env.push(plain("BROKER_COMPOSITE_APPLY_CMD", apply.to_string()));
+        }
+
+        // In-pod buildah can't mount: no /dev/fuse for the image default (overlay+fuse-overlayfs)
+        // and no privileges for kernel overlay, so builds run vfs + chroot — the same recipe as
+        // forge's cluster build Jobs. Pairs with the Unconfined AppArmor profile
+        // (loop_security_context); both halves are needed before a build succeeds.
+        if self.builds_in_pod() {
+            env.push(plain("STORAGE_DRIVER", "vfs".to_string()));
+            env.push(plain("BUILDAH_ISOLATION", "chroot".to_string()));
         }
 
         // kubectl + forge path consts fixed by the template (the broker's hooks read these).
@@ -2670,7 +2706,7 @@ mod tests {
         );
         assert!(
             !yaml.contains("privileged"),
-            "no securityContext under the kubernetes driver (sandboxes are sibling pods): {yaml}"
+            "never privileged under the kubernetes driver (sandboxes are sibling pods): {yaml}"
         );
         assert!(
             yaml.contains("name: CRUCIBLE_POD_IP"),
@@ -2679,6 +2715,69 @@ mod tests {
         assert!(
             yaml.contains("fieldPath: status.podIP"),
             "pod IP from downward API: {yaml}"
+        );
+    }
+
+    /// A domain that builds in-pod (buildah deploy target or `[measure]`) gets AppArmor Unconfined
+    /// on the loop container: containerd's default profile denies the mount syscalls buildah needs,
+    /// even inside a user namespace. One without stays context-free for restricted PSA/SCC.
+    #[test]
+    fn kubernetes_loop_apparmor_scoped_to_building_domains() {
+        let profile = k8s_profile("");
+        // loop_manifest has [deploy.buildah] => the loop pod runs buildah itself.
+        let yaml = render_k8s(&profile);
+        assert!(
+            yaml.contains("appArmorProfile") && yaml.contains("type: Unconfined"),
+            "in-pod builds need AppArmor Unconfined on the loop container: {yaml}"
+        );
+        for (k, v) in [("STORAGE_DRIVER", "vfs"), ("BUILDAH_ISOLATION", "chroot")] {
+            assert!(
+                yaml.contains(&format!("name: {k}")) && yaml.contains(&format!("value: {v}")),
+                "in-pod builds run buildah as {k}={v}: {yaml}"
+            );
+        }
+
+        // deploy_name only (config tuning, no in-pod buildah) => no securityContext at all.
+        let manifest: Manifest = toml::from_str(
+            r#"
+            [repo]
+            path = "."
+            [agent]
+            backend = "openshell"
+            goal = "shrink p95"
+            sandbox_image = "registry.example.com/alpha-sandbox:latest"
+            [judge]
+            measure_cmd = "./measure.nu"
+            direction = "lower"
+            [deploy]
+            deploy_name = "alpha"
+        "#,
+        )
+        .expect("manifest parses");
+        let input = RenderInput::from_manifest(&manifest, "alpha").expect("render input");
+        let yaml = render(
+            input,
+            std::path::Path::new("/opt/crucible/domains/alpha"),
+            "crucible.toml",
+            &profile,
+            &RenderOpts {
+                iterations: 1,
+                max_cost: 0.0,
+                pin_digests: false,
+                pr_repo: None,
+                pack: None,
+                clusters_file: None,
+            },
+        )
+        .expect("render");
+        assert!(
+            !yaml.contains("appArmorProfile"),
+            "no in-pod builds => restricted-PSA-clean loop pod: {yaml}"
+        );
+        assert!(!yaml.contains("securityContext"), "{yaml}");
+        assert!(
+            !yaml.contains("STORAGE_DRIVER"),
+            "no in-pod builds => no buildah env: {yaml}"
         );
     }
 
