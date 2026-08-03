@@ -122,19 +122,23 @@ ask implies `block`. Explicit beats implicit — the skill asks the agent to dec
 
 ## Architecture sketch
 
-```
-  agent turn:  request_trace{c=48} ─▶ pending_approval{handle}
-               write PROVISIONING_PENDING.json {mode}, END turn   (no spin-wait)
+```mermaid
+flowchart TD
+    request["agent calls request_trace"] --> pending["pending_approval with handle"]
+    pending --> marker["write PROVISIONING_PENDING.json<br/>with mode, then end turn"]
+    marker --> take["loop calls take_pending after turn"]
+    take -->|"mode = block"| park["park<br/>pause budget clock and emit Parked event"]
+    take -->|"mode = continue"| iterate["continue in frozen regime"]
 
-  loop (crucible, long-lived):  take_pending() post-turn
-      ├─ mode=block    ─▶ PARK: budget clock paused, SessionEvent::Parked, idle
-      └─ mode=continue ─▶ keep iterating in the frozen regime
-
-  broker (long-lived process):  watch the approval
-      └─ /approve-capture  ─▶  rescope{regime} ─▶ crucible control bridge (localhost:port)
-
-  loop wakes (both modes, via the re-scope path):  take_rescope() at the next iteration head
-      └─ re-baseline @ new regime + bump fingerprint + new segment ─▶ resume
+    pending --> watch["long-lived broker watches approval"]
+    watch --> approved["approval command received"]
+    approved --> rescope["send rescope with new regime"]
+    rescope --> bridge["Crucible control bridge"]
+    bridge --> head["take_rescope at next iteration head"]
+    park --> head
+    iterate --> head
+    head --> baseline["re-baseline, bump fingerprint,<br/>and start a new segment"]
+    baseline --> resume["resume loop"]
 ```
 
 ## Consequences
