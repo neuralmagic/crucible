@@ -12,6 +12,50 @@ use serde::{Deserialize, Serialize};
 /// Bump only on a breaking change to the on-disk shape.
 pub const WIRE_VERSION: u8 = 1;
 
+/// How one declared grade-evidence task ended up. A lossy grade (`join = "passed"`)
+/// folds only passing dependencies, so the folded score alone cannot say which
+/// declared rungs never contributed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceDisposition {
+    /// Ran and passed; its output was folded into the grade.
+    Passed,
+    /// Ran and failed its check.
+    Failed,
+    /// Never produced evidence: skipped, blocked, or dead on transport.
+    Skipped,
+}
+
+/// One declared grade-evidence task with its disposition, recorded per graded row so a
+/// candidate that "passed the ladder" is distinguishable from one that passed the rungs
+/// that happened to run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvidenceEntry {
+    pub task: String,
+    pub disposition: EvidenceDisposition,
+    /// The terminal note for a failed/skipped task (why it did not contribute).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
+}
+
+impl std::fmt::Display for EvidenceEntry {
+    /// Compact human form: `refcheck ✓`, `calc-diff ✗ (why)`, `tensor-pipe SKIPPED (why)`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let marker = match self.disposition {
+            EvidenceDisposition::Passed => "✓",
+            EvidenceDisposition::Failed => "✗",
+            EvidenceDisposition::Skipped => "SKIPPED",
+        };
+        write!(f, "{} {marker}", self.task)?;
+        if !self.note.is_empty() {
+            // Bounded like candidate notes: transport errors can run to whole stack traces.
+            let note: String = self.note.chars().take(120).collect();
+            write!(f, " ({note})")?;
+        }
+        Ok(())
+    }
+}
+
 /// A plain-serde mirror of `Row`, so `Row`'s fields can churn without touching the
 /// on-disk contract.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +79,10 @@ pub struct RowWire {
     /// paired with a tree it did not measure. Absent on non-keep rows and on older logs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kept_snap: Option<String>,
+    /// The grade step's declared evidence set with per-task dispositions. Empty on
+    /// ungraded rows and on logs written before the field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<EvidenceEntry>,
 }
 
 /// One draft PR publish-on-keep opened, on the wire so the controller's pull-ingest can fold it
@@ -297,6 +345,18 @@ mod tests {
             total: None,
             phase: None,
             kept_snap: Some("abc123".into()),
+            evidence: vec![
+                EvidenceEntry {
+                    task: "refcheck".into(),
+                    disposition: EvidenceDisposition::Passed,
+                    note: String::new(),
+                },
+                EvidenceEntry {
+                    task: "tensor-pipe".into(),
+                    disposition: EvidenceDisposition::Skipped,
+                    note: "worktree setup failed".into(),
+                },
+            ],
         };
         for ev in [
             SessionEvent::Start {
@@ -483,6 +543,35 @@ mod tests {
                 assert_eq!(attempts, 0);
                 assert!(output.is_none());
             }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evidence_entry_renders_compactly_and_old_rows_decode_without_it() {
+        let passed = EvidenceEntry {
+            task: "refcheck".into(),
+            disposition: EvidenceDisposition::Passed,
+            note: String::new(),
+        };
+        assert_eq!(passed.to_string(), "refcheck ✓");
+        let skipped = EvidenceEntry {
+            task: "tensor-pipe".into(),
+            disposition: EvidenceDisposition::Skipped,
+            note: "worktree setup failed".into(),
+        };
+        assert_eq!(
+            skipped.to_string(),
+            "tensor-pipe SKIPPED (worktree setup failed)"
+        );
+
+        // A pre-evidence row line still decodes, with the field defaulting to empty.
+        let ev = decode(
+            r#"{"v":1,"kind":"row","row":{"iter":1,"decision":"keep","note":"n","detail":"d"},"solved":false}"#,
+        )
+        .expect("old row decodes");
+        match ev {
+            SessionEvent::Row { row, .. } => assert!(row.evidence.is_empty()),
             other => panic!("wrong variant: {other:?}"),
         }
     }

@@ -34,6 +34,20 @@ pub struct Row {
     /// of pairing the logged best score with whatever the re-prepared checkout holds.
     /// `None` on non-keep rows and on logs written before the field existed.
     pub kept_snap: Option<String>,
+    /// The grade step's declared evidence set with per-task dispositions, so the row
+    /// says which declared checks never ran instead of presenting a partially graded
+    /// candidate as fully graded. Empty on ungraded rows.
+    pub evidence: Vec<crate::session::EvidenceEntry>,
+}
+
+/// One-line evidence rendering for the human-readable outputs (console rows, RESULTS.md,
+/// PR bodies): `refcheck ✓ calc-diff ✓ tensor-pipe SKIPPED (reason)`.
+pub(crate) fn evidence_line(evidence: &[crate::session::EvidenceEntry]) -> String {
+    evidence
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Run-wide context every front-end needs to render the start banner. Built once

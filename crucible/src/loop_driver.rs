@@ -194,6 +194,9 @@ pub(crate) struct Measured {
     pub(crate) note: String,
     pub(crate) diff: String,
     pub(crate) diffstat: String,
+    /// The grade step's declared-vs-ran evidence record; empty everywhere but the graph
+    /// runner's grade task (the plain measure path has no declared evidence set).
+    pub(crate) evidence: Vec<crate::session::EvidenceEntry>,
 }
 
 /// The outcome of [`decide_row`]: the results row, the keep/discard verdict, and the reading
@@ -389,6 +392,7 @@ pub(crate) fn measured_from_reading(
         note,
         diff,
         diffstat,
+        evidence: Vec::new(),
     }
 }
 
@@ -402,6 +406,7 @@ pub(crate) fn decide_row(judge: &dyn Judge, best_score: f64, it: u32, m: Measure
         note,
         diff,
         diffstat,
+        evidence,
     } = m;
     let verdict = judge.decide(&reading, best_score);
     let row = Row {
@@ -415,6 +420,7 @@ pub(crate) fn decide_row(judge: &dyn Judge, best_score: f64, it: u32, m: Measure
         total: reading_total(&reading),
         phase: None,
         kept_snap: None,
+        evidence,
     };
     Decided {
         row,
@@ -1499,9 +1505,19 @@ fn write_results(p: &Paths, goal: &str, prior: &str, rows: &[Row]) -> Result<()>
     }
     s.push_str("\n## This run\n\n| iter | decision | note | detail |\n| --- | --- | --- | --- |\n");
     for r in rows {
+        // The declared-vs-ran evidence record rides the detail cell, so a row graded with
+        // skipped rungs never reads as fully graded.
+        let mut detail = r.detail.clone();
+        if !r.evidence.is_empty() {
+            if !detail.is_empty() {
+                detail.push(' ');
+            }
+            detail.push_str("evidence: ");
+            detail.push_str(&crate::reporter::evidence_line(&r.evidence));
+        }
         s.push_str(&format!(
             "| {} | {} | {} | {} |\n",
-            r.iter, r.decision, r.note, r.detail
+            r.iter, r.decision, r.note, detail
         ));
     }
     std::fs::write(p.workspace.join("RESULTS.md"), s).context("writing RESULTS.md")?;
@@ -1639,6 +1655,7 @@ mod tests {
                 total: Some(42),
                 phase: None,
                 kept_snap: None,
+                evidence: Vec::new(),
             },
             solved: false,
         };
@@ -1699,6 +1716,7 @@ mod tests {
                 total: Some(10),
                 phase: None,
                 kept_snap: None,
+                evidence: Vec::new(),
             },
             solved: false,
         };
@@ -1714,6 +1732,7 @@ mod tests {
                 total: None,
                 phase: Some("wide".into()),
                 kept_snap: None,
+                evidence: Vec::new(),
             },
             solved: false,
         };
@@ -1897,6 +1916,7 @@ mod tests {
                 total: None,
                 phase: None,
                 kept_snap: kept_snap.map(str::to_string),
+                evidence: Vec::new(),
             },
             solved: false,
         };
@@ -2846,5 +2866,55 @@ mod tests {
         assert!(!snap.is_empty());
         assert_eq!(row.decision, "baseline-skipped");
         assert_eq!(row.score, None);
+    }
+
+    #[test]
+    fn results_md_detail_carries_the_evidence_line() {
+        use crate::session::{EvidenceDisposition, EvidenceEntry};
+        let dir = std::env::temp_dir().join(format!("crucible-results-md-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = crate::Paths::for_worktree(dir.clone(), None);
+        let rows = vec![
+            Row {
+                iter: 1,
+                decision: "keep".into(),
+                note: "candidate".into(),
+                detail: "mega_diff=0.001".into(),
+                evidence: vec![
+                    EvidenceEntry {
+                        task: "refcheck".into(),
+                        disposition: EvidenceDisposition::Passed,
+                        note: String::new(),
+                    },
+                    EvidenceEntry {
+                        task: "tensor-pipe".into(),
+                        disposition: EvidenceDisposition::Skipped,
+                        note: "worktree setup failed".into(),
+                    },
+                ],
+                ..Default::default()
+            },
+            Row {
+                iter: 2,
+                decision: "discard".into(),
+                note: "worse".into(),
+                detail: "d".into(),
+                ..Default::default()
+            },
+        ];
+        write_results(&p, "goal", "", &rows).unwrap();
+        let s = std::fs::read_to_string(dir.join("RESULTS.md")).unwrap();
+        assert!(
+            s.contains(
+                "| 1 | keep | candidate | mega_diff=0.001 evidence: refcheck ✓ tensor-pipe SKIPPED (worktree setup failed) |"
+            ),
+            "graded row detail carries the evidence line:\n{s}"
+        );
+        assert!(
+            s.contains("| 2 | discard | worse | d |"),
+            "an ungraded row's detail is untouched:\n{s}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

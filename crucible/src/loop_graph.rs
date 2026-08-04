@@ -5,8 +5,10 @@
 //! The templates carry no budget of their own (`f64::MAX`): the driver owns the run budget
 //! and checks it between rounds, so a turn that blows the cap is still measured and decided.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
@@ -23,7 +25,14 @@ use crate::plan::ir::{
     Direction, EngineOp, Isolation, Join, Plan, PlanBudget, Task, TaskKind, TaskName, ValidPlan,
 };
 use crate::reporter::{Reporter, Row};
+use crate::session::{EvidenceDisposition, EvidenceEntry};
 use crate::{Args, Paths, Prepared, STOP, agent, control};
+
+/// Terminal status + note per settled task, shared between the executor's `on_result`
+/// callback and the grade runner (both live inside one serial `execute` call). Grade
+/// needs it because its `inputs` hold only the passing dependencies: the declared
+/// evidence tasks that failed or never ran are invisible there.
+type TaskStates = Rc<RefCell<BTreeMap<TaskName, (TaskStatus, Option<String>)>>>;
 
 /// Everything one graph iteration reads from the driver. Scalars are copies of the
 /// segment state; the driver folds the returned [`IterStep`] + cost back itself.
@@ -62,6 +71,7 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
         .unwrap_or_else(|| "decide".into());
     r.plan_event(&crate::plan::cli::plan_admitted_event(&plan));
 
+    let task_states: TaskStates = TaskStates::default();
     let mut runner = LoopTaskRunner {
         args: cx.args,
         p: cx.p,
@@ -85,6 +95,7 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
         measured: BTreeMap::new(),
         decided: BTreeMap::new(),
         fatal: None,
+        task_states: Rc::clone(&task_states),
         workflow_runner: crate::plan::harness::HarnessRunner {
             args: cx.args.clone(),
             paths: cx.p.clone(),
@@ -99,6 +110,9 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
         ExecCfg::default(),
         &mut runner,
         |task, result| {
+            task_states
+                .borrow_mut()
+                .insert(task.name.clone(), (result.status, result.note.clone()));
             task_events.push(crate::plan::cli::task_result_event(
                 plan.plan().version,
                 cx.it,
@@ -279,6 +293,9 @@ struct LoopTaskRunner<'a, R: Reporter> {
     measured: BTreeMap<TaskName, Measured>,
     decided: BTreeMap<TaskName, Decided>,
     fatal: Option<anyhow::Error>,
+    /// Settled-task dispositions, fed by the executor's `on_result` callback; read by
+    /// `grade` to record which declared evidence tasks actually ran.
+    task_states: TaskStates,
     workflow_runner: crate::plan::harness::HarnessRunner,
 }
 
@@ -406,11 +423,40 @@ impl<R: Reporter> LoopTaskRunner<'_, R> {
                 "evidence": inputs,
             }),
         };
-        let measured = loop_driver::measured_from_reading(reading, self.p, self.world);
+        // The folded inputs hold only the passing dependencies (`join = "passed"`), so
+        // record every DECLARED evidence task with its disposition: a candidate that
+        // passed two of three declared rungs must not read as fully graded.
+        let states = self.task_states.borrow();
+        let evidence: Vec<EvidenceEntry> = task
+            .depends_on
+            .iter()
+            .map(|dep| {
+                let (status, note) = states
+                    .get(dep)
+                    .map(|(s, n)| (*s, n.clone().unwrap_or_default()))
+                    .unwrap_or((TaskStatus::Skipped, "no terminal status recorded".into()));
+                EvidenceEntry {
+                    task: dep.0.clone(),
+                    disposition: match status {
+                        TaskStatus::Pass => EvidenceDisposition::Passed,
+                        TaskStatus::Fail => EvidenceDisposition::Failed,
+                        TaskStatus::Transport
+                        | TaskStatus::Skipped
+                        | TaskStatus::Blocked
+                        | TaskStatus::Truncated => EvidenceDisposition::Skipped,
+                    },
+                    note,
+                }
+            })
+            .collect();
+        drop(states);
+        let mut measured = loop_driver::measured_from_reading(reading, self.p, self.world);
+        measured.evidence = evidence.clone();
         let out = serde_json::json!({
             "score": measured.reading.score,
             "valid": measured.reading.valid,
             "evidence_count": inputs.len(),
+            "evidence": evidence,
         });
         self.measured.insert(task.name.clone(), measured);
         pass(out)
@@ -851,6 +897,7 @@ impl<R: Reporter> WideRunner<'_, R> {
                     total: reading.detail.get("total").and_then(Value::as_u64),
                     phase: Some("wide".into()),
                     kept_snap: None,
+                    evidence: Vec::new(),
                 };
                 self.r.row(&row, false);
                 self.rows.push(row);
@@ -1207,6 +1254,121 @@ mod tests {
             ["baseline", "keep", "keep"]
         );
         assert_eq!(trace.shutdown, "finished");
+        // Every declared evidence task ran and passed, so the record carries no skips.
+        for (i, ev) in trace.row_evidence.iter().enumerate().skip(1) {
+            let dispositions: Vec<&str> = ev
+                .iter()
+                .map(|e| e["disposition"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                dispositions,
+                ["passed", "passed"],
+                "row {i} evidence: {ev:?}"
+            );
+        }
+    }
+
+    /// The run-6 shape: a declared evidence task never runs (here: unrunnable on the
+    /// substrate) and another errors, `join = "passed"` folds only the survivor, and the
+    /// grade output + row must still record all three declared dispositions.
+    #[test]
+    fn grade_records_declared_evidence_dispositions() {
+        let workflow = r#"
+            [workflow]
+            type = "autoresearch"
+            result = "choose"
+            [[workflow.task]]
+            name = "invent"
+            kind = "engine"
+            op = "propose"
+            [[workflow.task]]
+            name = "apply"
+            kind = "engine"
+            op = "apply"
+            depends_on = ["invent"]
+            [[workflow.task]]
+            name = "score"
+            kind = "evaluate"
+            command = "v=$(cat value.txt); printf '{\"score\": %s, \"pass\": true}\n' \"$v\""
+            depends_on = ["apply"]
+            [[workflow.task]]
+            name = "flaky"
+            kind = "evaluate"
+            command = "echo broken >&2; exit 7"
+            depends_on = ["apply"]
+            required = false
+            [[workflow.task]]
+            name = "tensor-pipe"
+            kind = "evaluate"
+            command = "true"
+            depends_on = ["apply"]
+            required = false
+            needs = "ncu"
+            [[workflow.task]]
+            name = "grade"
+            kind = "engine"
+            op = "grade"
+            source = "score"
+            depends_on = ["score", "flaky", "tensor-pipe"]
+            join = "passed"
+            [[workflow.task]]
+            name = "choose"
+            kind = "engine"
+            op = "decide"
+            source = "grade"
+            depends_on = ["grade"]
+        "#;
+        let trace = run_counter_cfg(true, 1, BUMP, false, Some(workflow));
+        assert_eq!(
+            trace
+                .rows
+                .iter()
+                .map(|row| row.1.as_str())
+                .collect::<Vec<_>>(),
+            ["baseline", "keep"],
+            "{}",
+            describe(&trace)
+        );
+
+        // The grade task_result output carries the declared set, not just the folded one.
+        let (_, status, output) = trace
+            .task_results
+            .iter()
+            .find(|(t, _, _)| t == "grade")
+            .expect("grade task_result on the wire");
+        assert_eq!(status, "pass");
+        let out = output.as_ref().unwrap();
+        assert_eq!(out["evidence_count"], 1, "only the passing rung folded");
+        let wire_evidence = out["evidence"].as_array().unwrap();
+
+        // The kept row carries the same record, in declaration order.
+        let row_evidence = &trace.row_evidence[1];
+        assert_eq!(wire_evidence, row_evidence);
+        let by_task: Vec<(&str, &str, &str)> = row_evidence
+            .iter()
+            .map(|e| {
+                (
+                    e["task"].as_str().unwrap(),
+                    e["disposition"].as_str().unwrap(),
+                    e["note"].as_str().unwrap_or(""),
+                )
+            })
+            .collect();
+        assert_eq!(by_task[0], ("score", "passed", ""));
+        assert_eq!(by_task[1].0, "flaky");
+        assert_eq!(by_task[1].1, "failed");
+        assert!(
+            by_task[1].2.contains("exit 7"),
+            "the failed rung keeps its note: {:?}",
+            by_task[1].2
+        );
+        assert_eq!(by_task[2].0, "tensor-pipe");
+        assert_eq!(by_task[2].1, "skipped");
+        assert!(
+            by_task[2].2.contains("unrunnable"),
+            "the skipped rung keeps its note: {:?}",
+            by_task[2].2
+        );
     }
 
     /// What one counter run left behind, for diffing the two paths.
@@ -1225,6 +1387,10 @@ mod tests {
         notes: Vec<String>,
         /// `iter` values on the task_result lines, in emission order (graph runs only).
         task_iters: Vec<u32>,
+        /// Each row's `evidence` array (empty when absent), parallel to `rows`.
+        row_evidence: Vec<Vec<serde_json::Value>>,
+        /// task_result lines as (task, status, output), in emission order.
+        task_results: Vec<(String, String, Option<serde_json::Value>)>,
     }
 
     /// The deterministic proposer: value.txt += 1 every turn.
@@ -1371,19 +1537,31 @@ mod tests {
         let mut shutdown = String::new();
         let mut task_iters = Vec::new();
         let mut notes: Vec<String> = Vec::new();
+        let mut row_evidence = Vec::new();
+        let mut task_results = Vec::new();
         for line in log.lines() {
             let v: serde_json::Value = serde_json::from_str(line).unwrap();
             let kind = v["kind"].as_str().unwrap().to_string();
             match kind.as_str() {
-                "row" => rows.push((
-                    v["row"]["iter"].as_u64().unwrap() as u32,
-                    v["row"]["decision"].as_str().unwrap().to_string(),
-                    v["row"]["score"].as_f64(),
-                )),
+                "row" => {
+                    rows.push((
+                        v["row"]["iter"].as_u64().unwrap() as u32,
+                        v["row"]["decision"].as_str().unwrap().to_string(),
+                        v["row"]["score"].as_f64(),
+                    ));
+                    row_evidence.push(v["row"]["evidence"].as_array().cloned().unwrap_or_default());
+                }
                 "summary" => best = v["best_score"].as_f64().unwrap(),
                 "shutdown" => shutdown = v["outcome"].as_str().unwrap().to_string(),
                 "note" => notes.push(v["msg"].as_str().unwrap_or("").to_string()),
-                "task_result" => task_iters.push(v["iter"].as_u64().unwrap() as u32),
+                "task_result" => {
+                    task_iters.push(v["iter"].as_u64().unwrap() as u32);
+                    task_results.push((
+                        v["task"].as_str().unwrap().to_string(),
+                        v["status"].as_str().unwrap().to_string(),
+                        v.get("output").filter(|o| !o.is_null()).cloned(),
+                    ));
+                }
                 _ => {}
             }
             kinds.push(kind);
@@ -1398,6 +1576,8 @@ mod tests {
             shutdown,
             task_iters,
             notes,
+            row_evidence,
+            task_results,
         }
     }
 
