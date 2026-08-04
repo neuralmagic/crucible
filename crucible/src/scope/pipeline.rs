@@ -424,8 +424,10 @@ impl Propose {
     /// adversarial gaming-review loop before freeze. `pass` freezes as normal; `concerns` earns a
     /// refine round seeded with the attacks followed by a re-validate and a fresh review, up to
     /// `--gaming-refine-rounds` cycles (the allowance is its own, never drawn from `--refine-rounds`).
-    /// The last look is always final, concerns there, a failed re-validate, or a verdict that never
-    /// parses all reject with the whole trail. Never called when `--skip-gaming-review` is set.
+    /// Zero cycles is a real posture, not unset: one review, and any concern rejects immediately
+    /// (skip-gaming-review is the knob for no review at all). The last look is always final,
+    /// concerns there, a failed re-validate, or a verdict that never parses all reject with the
+    /// whole trail. Never called when `--skip-gaming-review` is set.
     fn run_gaming_review(
         &self,
         ctx: &mut ScopeCtx,
@@ -434,7 +436,7 @@ impl Propose {
         passed_round: u32,
         total_cost: &mut f64,
     ) -> Result<String> {
-        let cycles_max = self.opts.gaming_refine_rounds.max(1);
+        let cycles_max = self.opts.gaming_refine_rounds;
         let mut last_passed = passed_round;
         let mut refines_done = 0u32;
         loop {
@@ -3144,6 +3146,47 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
     }
 
     /// `--gaming-refine-rounds 2`: concerns→fix→concerns→fix→pass survives. Each refined pack
+    /// `--gaming-refine-rounds 0` is a real posture, not unset: one adversary look, and the first
+    /// concern rejects immediately with no refine round (0 used to be silently promoted to 1).
+    #[test]
+    fn gaming_refine_rounds_zero_rejects_on_first_concern() {
+        let repo = tempdir("gaming-n0-repo");
+        git_repo_fixture(&repo);
+        let out = tempdir("gaming-n0-out");
+        let goal_dir = tempdir("gaming-n0-goal");
+        let goal_file = goal_dir.join("goal.md");
+        fs::write(&goal_file, "fix the thing").expect("write goal file");
+        let review_counter = goal_dir.join("review.count");
+        let script = goal_dir.join("propose.sh");
+        write_exec(
+            &script,
+            &with_review(
+                &values_proposer(100, 10, 3),
+                &counting_review(&review_counter, 1),
+            ),
+        );
+
+        let mut opts = propose_opts_review(&repo, &script);
+        opts.gaming_refine_rounds = 0;
+        let report = execute(&out, None, Some(&goal_file), false, Some(opts));
+        let kinds: Vec<RoundKind> = report.rounds.iter().map(|r| r.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![RoundKind::Propose, RoundKind::Adversary],
+            "no refine round at zero cycles: {:?}",
+            report.rounds
+        );
+        assert!(
+            out.join("REJECTED.md").exists(),
+            "first concern rejects at zero refine cycles"
+        );
+        assert!(!out.join("SCOPE.md").exists());
+
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&out);
+        let _ = fs::remove_dir_all(&goal_dir);
+    }
+
     /// re-validates and earns its own fresh adversary look before the freeze.
     #[test]
     fn gaming_refine_rounds_two_survives_a_second_concern_cycle() {
