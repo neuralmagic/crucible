@@ -115,7 +115,7 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
         return Err(e);
     }
     let step = match runner.signal.take() {
-        Some(Signal::Discard) => IterStep::Discarded,
+        Some(Signal::Discard(reason)) => IterStep::Discarded { reason },
         Some(Signal::Escalate) => IterStep::Escalated,
         Some(Signal::Park(pp)) => IterStep::Parked(pp),
         Some(Signal::Stop) => IterStep::Stopped,
@@ -133,7 +133,9 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
                         "workflow task {task} rejected the candidate (discarding iter {}): {why}",
                         cx.it
                     ));
-                    IterStep::Discarded
+                    IterStep::Discarded {
+                        reason: format!("{task} rejected the candidate: {why}"),
+                    }
                 }
                 exit => anyhow::bail!(
                     "graph iteration ended with neither a decision nor a control signal (exit: {exit:?})"
@@ -228,7 +230,7 @@ pub(crate) fn iteration_template(
 /// What the propose task's post-turn drains decided, parked here for the driver: the
 /// executor only sees pass/fail, the loop control travels out of band.
 enum Signal {
-    Discard,
+    Discard(String),
     Escalate,
     Park(crate::provisioning::PendingProvisioning),
     Stop,
@@ -288,7 +290,7 @@ impl<R: Reporter> LoopTaskRunner<'_, R> {
                 cost_usd: cost,
             },
             TurnVerdict::Discard => {
-                self.signal = Some(Signal::Discard);
+                self.signal = Some(Signal::Discard("turn failed".to_string()));
                 fail(cost, "turn failed; iteration discarded".to_string())
             }
             // Transport-class turn death: hand the executor a Transport outcome so
@@ -321,7 +323,7 @@ impl<R: Reporter> LoopTaskRunner<'_, R> {
                     "apply failed (discarding iter {}): {e:#}",
                     self.it
                 ));
-                self.signal = Some(Signal::Discard);
+                self.signal = Some(Signal::Discard(format!("apply failed: {e:#}")));
                 fail(0.0, format!("apply failed: {e:#}"))
             }
         }
@@ -1051,11 +1053,21 @@ mod tests {
             ),
         );
         let decisions: Vec<&str> = trace.rows.iter().map(|(_, d, _)| d.as_str()).collect();
+        // Discarded iterations still land on the scoreboard (decision + reason), so a run that
+        // lost everything reads as what it is instead of a clean "finished" with one row.
         assert_eq!(
             decisions,
-            ["baseline"],
+            ["baseline", "discarded", "discarded"],
             "every iteration is discarded before it can be measured: {}",
             describe(&trace)
+        );
+        assert!(
+            trace
+                .rows
+                .iter()
+                .all(|(_, d, score)| d != "discarded" || score.is_none()),
+            "a discarded row never carries a score: {:?}",
+            trace.rows
         );
         assert!(
             trace.notes.iter().any(|n| n.contains("review")
