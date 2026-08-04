@@ -5,7 +5,8 @@
 //! front-end, and calls [`crate::loop_driver::run_loop`].
 
 use crate::crucible::{Judge, World};
-use crate::loop_driver::{self, LoopRuntime, load_resume_state, run_loop};
+use crate::loop_driver::{LoopRuntime, run_loop};
+use crate::recovery::{RecoveryPlan, ResumeRecovery, classify_session, plan_recovery};
 use crate::{Args, Cli, Cmd, Paths, Prepared, STOP, Ui};
 use crate::{
     agent, broker, check, console, control, deploy, init, manifest, publish, reporter, scope,
@@ -642,37 +643,49 @@ fn drive_loop(
     let outcome = {
         let _run_guard = run_span.as_ref().map(tracing::Span::enter);
         if args.resume {
-            // Resume: replay the parked log, then continue in append (stream) mode.
-            let resume = load_resume_state(&p.session_log)?;
-            // Every iteration already ran: exit clean WITHOUT re-running the finish path. A
-            // restarted pod (OnFailure + persistent state) that replayed the finish re-published
-            // the kept candidate each lap — four duplicate draft PRs in one crash-loop. Exit 0,
-            // not the outcome code: the pod's work is done, and a nonzero would restart it forever.
-            if loop_driver::resume_finished(&resume, args.iterations, args.max_cost) {
-                eprintln!(
-                    "resume: nothing to do ({} of {} iterations ran, ${:.2} of ${:.2} spent)",
-                    resume.next_iter.saturating_sub(1),
-                    args.iterations,
-                    resume.spent,
-                    args.max_cost
-                );
-                return Ok(());
+            // Resume: replay the parked log (counters + a classification of how the
+            // previous process died), then continue in append (stream) mode. The plan
+            // gates everything: a NoOp exits 0 WITHOUT re-running the finish path (a
+            // restarted OnFailure pod that replayed the finish re-published the kept
+            // candidate each lap — four duplicate draft PRs in one crash-loop), and a
+            // Refuse (an escalated run) keeps exit code 2's meaning across a resume.
+            let recovered = classify_session(&p.session_log)?;
+            match plan_recovery(&recovered, args.iterations, args.max_cost) {
+                RecoveryPlan::NoOp { message } => {
+                    eprintln!("resume: {message}");
+                    return Ok(());
+                }
+                RecoveryPlan::Refuse { message } => anyhow::bail!("resume: {message}"),
+                RecoveryPlan::Continue {
+                    repark,
+                    pending_regime,
+                } => {
+                    let recovery = ResumeRecovery {
+                        class: recovered.classification.class(),
+                        iter: recovered.classification.iter(),
+                        detail: recovered.classification.detail(),
+                        repark,
+                        pending_regime,
+                    };
+                    let meta = reporter::RunMeta::from_args(&args);
+                    let mut r = stream::SessionReporter::resume(&p, meta)?;
+                    let control = start_control_bridge(&args, &p)?;
+                    run_loop(
+                        &args,
+                        &p,
+                        &prep,
+                        &mut r,
+                        world.as_ref(),
+                        judge.as_ref(),
+                        LoopRuntime {
+                            control: control.as_deref(),
+                            resume: Some(recovered.resume),
+                            recovery: Some(recovery),
+                            ledger: None,
+                        },
+                    )?
+                }
             }
-            let meta = reporter::RunMeta::from_args(&args);
-            let mut r = stream::SessionReporter::resume(&p, meta)?;
-            let control = start_control_bridge(&args, &p)?;
-            run_loop(
-                &args,
-                &p,
-                &prep,
-                &mut r,
-                world.as_ref(),
-                judge.as_ref(),
-                LoopRuntime {
-                    control: control.as_deref(),
-                    resume: Some(resume),
-                },
-            )?
         } else {
             let meta = reporter::RunMeta::from_args(&args);
             match args.ui {
@@ -700,7 +713,7 @@ fn drive_loop(
                         judge.as_ref(),
                         LoopRuntime {
                             control: control.as_deref(),
-                            resume: None,
+                            ..LoopRuntime::default()
                         },
                     )?
                 }

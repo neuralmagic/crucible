@@ -22,6 +22,7 @@ fn reading_total(r: &crucible::Reading) -> Option<u64> {
 }
 
 /// State restored from a prior run's session log so [`run_loop`] can continue it.
+#[derive(Debug)]
 pub(crate) struct ResumeState {
     pub rows: Vec<Row>,
     pub best_score: f64,
@@ -50,6 +51,11 @@ pub(crate) struct ResumeState {
 pub(crate) struct LoopRuntime<'a> {
     pub control: Option<&'a control::ControlState>,
     pub resume: Option<ResumeState>,
+    /// How this resume classified the previous shutdown; present only with `resume`.
+    pub recovery: Option<crate::recovery::ResumeRecovery>,
+    /// Admission-ledger handle for replaying durable operator inputs on resume.
+    #[allow(dead_code)]
+    pub ledger: Option<std::sync::Arc<crate::admission::AdmissionLedger>>,
 }
 
 /// An opaque rollback token from [`World::snapshot`]. The engine never inspects it (a git
@@ -348,6 +354,9 @@ pub(crate) fn drain_turn_markers<R: Reporter>(
             if let Some(control) = control {
                 control.set_pending_regime(pp.trace_id.clone());
             }
+            // Open the approval bracket on the wire: a dangling wait (no resolve before
+            // the log ends) is how a resume knows an approval was still outstanding.
+            r.approval_wait(&pp.handle, &pp.trace_id, pp.mode);
             match pp.mode {
                 provisioning::WaitMode::Block => {
                     r.note(&format!(
@@ -562,7 +571,7 @@ fn run_loop_body<R: Reporter>(
             best_snap: resumed_best.best_snap,
         };
         start_iter = rs.next_iter;
-        let run = Run {
+        let mut run = Run {
             rows: rs.rows,
             spent: rs.spent,
             kept_shas: resumed_best.kept_shas,
@@ -587,6 +596,17 @@ fn run_loop_body<R: Reporter>(
         ));
         if let Some(why) = &resumed_best.degraded {
             r.note(&format!("resume: {why}"));
+        }
+        // The classification of how the previous process died, recorded on the wire, and
+        // its recovery actions: re-register the approval key so an operator `approve`
+        // resolves it, and re-arm a block-mode park (the iteration-head park consumes
+        // `pending_block`).
+        if let Some(rec) = runtime.recovery {
+            r.recovery(rec.class, rec.iter, &rec.detail);
+            if let (Some(control), Some(regime)) = (control, rec.pending_regime) {
+                control.set_pending_regime(regime);
+            }
+            run.pending_block = rec.repark;
         }
         // Recompute the identity fresh (from the live manifest/workspace) and hard-warn, never
         // abort, when it differs from what the original run recorded. Scores across this resume
@@ -755,6 +775,9 @@ fn run_loop_body<R: Reporter>(
         // An approved judge-changing grant arrived (via the control channel / MCP): re-baseline
         // into the new regime and open a fresh segment before this iteration measures.
         if let Some(new_regime) = control.and_then(|c| c.take_rescope()) {
+            // Close any open approval bracket: a rescope IS the grant. Harmless when no
+            // wait was open (the classifier treats an unmatched resolve as a no-op).
+            r.approval_resolved("granted", &new_regime);
             r.note(&format!(
                 "control: re-scoping to '{new_regime}' — re-baselining a new comparable segment"
             ));
@@ -773,6 +796,7 @@ fn run_loop_body<R: Reporter>(
         // A denial that arrived while *continuing* (the agent had a fallback, so the loop never
         // parked) just means the regime change won't happen; note it and stay in the frozen regime.
         if let Some(reason) = control.and_then(|c| c.take_deny()) {
+            r.approval_resolved("denied", &reason);
             r.note(&format!(
                 "approval not granted ({reason}) — staying in the frozen regime"
             ));
@@ -1279,83 +1303,94 @@ fn restore_kept_best(
     }
 }
 
-/// Replay a parked run's session log into a [`ResumeState`]. The decided rows carry
-/// their measured `score`/`total`, so baseline + best restore exactly; the last summary
-/// gives `best_score` (recomputed from kept rows if absent).
-pub(crate) fn load_resume_state(session_log: &std::path::Path) -> Result<ResumeState> {
-    use session::{IntoRow, SessionEvent};
-    let content = std::fs::read_to_string(session_log).with_context(|| {
-        format!(
-            "reading session log {} to resume (run with --ui stream first?)",
-            session_log.display()
-        )
-    })?;
-    let mut rows: Vec<Row> = Vec::new();
-    let mut spent = 0.0_f64;
-    let mut summary_best: Option<f64> = None;
-    let mut solved_any = false;
-    let mut identity = None;
-    let mut published_branches: Vec<String> = Vec::new();
-    for line in content.lines() {
-        match session::decode(line) {
-            Some(SessionEvent::Row { row, solved }) => {
+/// The counter fold `--resume` replays from the session log: decided rows, last budget,
+/// last summary, last identity, published branches. Fed one decoded event at a time so
+/// [`crate::recovery::classify_session`] can drive it and the tail scanner in a single
+/// pass over the log. The decided rows carry their measured `score`/`total`, so
+/// baseline + best restore exactly; the last summary gives `best_score` (recomputed from
+/// kept rows if absent).
+#[derive(Default)]
+pub(crate) struct ResumeFold {
+    rows: Vec<Row>,
+    spent: f64,
+    summary_best: Option<f64>,
+    solved_any: bool,
+    identity: Option<crate::identity::RunIdentity>,
+    published_branches: Vec<String>,
+}
+
+impl ResumeFold {
+    pub(crate) fn feed(&mut self, ev: &session::SessionEvent) {
+        use session::{IntoRow, SessionEvent};
+        match ev {
+            SessionEvent::Row { row, solved } => {
                 // Wide-round rows (phase:"wide") are historical context only on resume; they
                 // must not count toward next_iter or influence the deep loop's baseline/best.
                 // Infra-dead rows (phase:"infra") record turns that never started — their
                 // iteration was never consumed, so counting them would skip it on resume.
                 if matches!(row.phase.as_deref(), Some("wide") | Some("infra")) {
-                    continue;
+                    return;
                 }
-                solved_any |= solved;
-                rows.push(row.into_row());
+                self.solved_any |= *solved;
+                self.rows.push(row.clone().into_row());
             }
-            Some(SessionEvent::Budget { spent: s, .. }) => spent = s,
-            Some(SessionEvent::Summary { best_score, .. }) => summary_best = Some(best_score),
+            SessionEvent::Budget { spent, .. } => self.spent = *spent,
+            SessionEvent::Summary { best_score, .. } => self.summary_best = Some(*best_score),
             // Last one wins: a run resumed more than once re-emits a fresh identity each time.
-            Some(SessionEvent::Identity { identity: id }) => identity = Some(id),
+            SessionEvent::Identity { identity } => self.identity = Some(identity.clone()),
             // Accumulated across segments: every branch any prior publish opened a PR from,
             // so a replayed finish can recognize an already-published kept commit.
-            Some(SessionEvent::PrLinks { links }) => {
-                published_branches.extend(links.into_iter().map(|l| l.branch));
+            SessionEvent::PrLinks { links } => {
+                self.published_branches
+                    .extend(links.iter().map(|l| l.branch.clone()));
             }
             _ => {}
         }
     }
-    if rows.is_empty() {
-        anyhow::bail!(
-            "session log {} has no rows to resume from",
-            session_log.display()
-        );
+
+    /// Whether any decided row was folded; a rowless log is unresumable and the caller
+    /// refuses before calling [`finish`](Self::finish).
+    pub(crate) fn has_rows(&self) -> bool {
+        !self.rows.is_empty()
     }
-    let baseline_score = rows.first().and_then(|r| r.score).unwrap_or(f64::INFINITY);
-    let baseline_total = rows.first().and_then(|r| r.total).unwrap_or(0);
-    let best_score = summary_best.unwrap_or_else(|| {
-        rows.iter()
-            .filter(|r| r.decision == "keep")
-            .filter_map(|r| r.score)
-            .fold(baseline_score, f64::min)
-    });
-    // Keeps are monotone within a segment, so the last kept row IS the best; its tiebreak
-    // travels with the best score. No keeps = the baseline's (usually absent) tiebreak.
-    let best_tiebreak = rows
-        .iter()
-        .rev()
-        .find(|r| r.decision == "keep")
-        .or_else(|| rows.first())
-        .and_then(|r| r.tiebreak);
-    let next_iter = rows.iter().map(|r| r.iter).max().unwrap_or(0) + 1;
-    Ok(ResumeState {
-        rows,
-        best_score,
-        best_tiebreak,
-        baseline_score,
-        baseline_total,
-        spent,
-        next_iter,
-        solved_any,
-        identity,
-        published_branches,
-    })
+
+    pub(crate) fn finish(self) -> ResumeState {
+        let baseline_score = self
+            .rows
+            .first()
+            .and_then(|r| r.score)
+            .unwrap_or(f64::INFINITY);
+        let baseline_total = self.rows.first().and_then(|r| r.total).unwrap_or(0);
+        let best_score = self.summary_best.unwrap_or_else(|| {
+            self.rows
+                .iter()
+                .filter(|r| r.decision == "keep")
+                .filter_map(|r| r.score)
+                .fold(baseline_score, f64::min)
+        });
+        // Keeps are monotone within a segment, so the last kept row IS the best; its tiebreak
+        // travels with the best score. No keeps = the baseline's (usually absent) tiebreak.
+        let best_tiebreak = self
+            .rows
+            .iter()
+            .rev()
+            .find(|r| r.decision == "keep")
+            .or_else(|| self.rows.first())
+            .and_then(|r| r.tiebreak);
+        let next_iter = self.rows.iter().map(|r| r.iter).max().unwrap_or(0) + 1;
+        ResumeState {
+            rows: self.rows,
+            best_score,
+            best_tiebreak,
+            baseline_score,
+            baseline_total,
+            spent: self.spent,
+            next_iter,
+            solved_any: self.solved_any,
+            identity: self.identity,
+            published_branches: self.published_branches,
+        }
+    }
 }
 
 /// The resume no-op guard: the restored log already covers every iteration, or the budget
@@ -1467,18 +1502,25 @@ fn park_for_approval<R: Reporter>(
     };
     r.note("parked: idle, awaiting approval (budget paused)");
     let start = Instant::now();
+    // Bracket bookkeeping: a deny/timeout resolves the wait here; a grant resolves at
+    // the iteration-head rescope drain (the single re-baseline site, which also owns
+    // the `granted` resolve); a stop deliberately resolves NOTHING, so a stopped run's
+    // log keeps the wait open and a resume re-parks on it.
     let outcome = loop {
         if control.has_rescope() {
             break ParkOutcome::Resumed;
         }
         if let Some(reason) = control.take_deny() {
+            r.approval_resolved("denied", &reason);
             break ParkOutcome::Denied(reason);
         }
         if STOP.load(Ordering::SeqCst) {
             break ParkOutcome::Stopped;
         }
         if timeout.is_some_and(|cap| start.elapsed() >= cap) {
-            break ParkOutcome::Denied("park timed out waiting for approval".into());
+            let why = "park timed out waiting for approval";
+            r.approval_resolved("timeout", why);
+            break ParkOutcome::Denied(why.into());
         }
         std::thread::sleep(Duration::from_millis(250));
     };
@@ -1705,6 +1747,12 @@ fn write_results(p: &Paths, goal: &str, prior: &str, rows: &[Row]) -> Result<()>
 mod tests {
     use super::*;
     use crate::reporter::{AgentTurn, Phase, Row, Stop, TurnBudget};
+
+    /// The counter fold as `--resume` consumes it (through the classifier), so these
+    /// replay tests exercise the same path `run.rs` takes.
+    fn load_resume_state(session_log: &std::path::Path) -> Result<ResumeState> {
+        crate::recovery::classify_session(session_log).map(|s| s.resume)
+    }
 
     /// The 401 that killed a 5h turn, plus the other transport signatures, classify as retryable;
     /// content-level failures (an escalation-worthy error string, a plain crash) do not.
@@ -2231,6 +2279,8 @@ mod tests {
     #[derive(Default)]
     struct NoteCapture {
         notes: Vec<String>,
+        waits: Vec<(String, String, provisioning::WaitMode)>,
+        resolved: Vec<(String, String)>,
     }
     impl Reporter for NoteCapture {
         fn start(&mut self, _: &str, _: &str) {}
@@ -2255,6 +2305,14 @@ mod tests {
             Stop::Continue
         }
         fn summary(&mut self, _: &[Row], _: &str, _: f64) {}
+        fn approval_wait(&mut self, handle: &str, trace_id: &str, mode: provisioning::WaitMode) {
+            self.waits
+                .push((handle.to_string(), trace_id.to_string(), mode));
+        }
+        fn approval_resolved(&mut self, outcome: &str, reason: &str) {
+            self.resolved
+                .push((outcome.to_string(), reason.to_string()));
+        }
     }
 
     #[test]
@@ -2293,6 +2351,11 @@ mod tests {
             Some("concurrency=48"),
             "the drain still gets the granted regime"
         );
+        assert!(
+            r.resolved.is_empty(),
+            "the grant resolves at the rescope drain, not in the park: {:?}",
+            r.resolved
+        );
     }
 
     #[test]
@@ -2316,6 +2379,11 @@ mod tests {
             _ => panic!("expected Denied"),
         }
         assert!(!control.has_rescope(), "a denial never sets a rescope");
+        assert_eq!(
+            r.resolved,
+            vec![("denied".to_string(), "over budget".to_string())],
+            "the denial closes the approval bracket"
+        );
     }
 
     #[test]
@@ -2338,6 +2406,8 @@ mod tests {
             parked >= Duration::from_millis(100),
             "waited the timeout: {parked:?}"
         );
+        assert_eq!(r.resolved.len(), 1, "{:?}", r.resolved);
+        assert_eq!(r.resolved[0].0, "timeout");
     }
 
     #[test]
@@ -2432,6 +2502,7 @@ mod tests {
         /// Every prompt handed to `run_agent`, in call order.
         prompts: Vec<String>,
         escalation_path: Option<std::path::PathBuf>,
+        recoveries: Vec<(crate::session::RecoveryClass, u32, String)>,
     }
     impl Reporter for RecordingReporter {
         fn start(&mut self, _: &str, _: &str) {}
@@ -2480,6 +2551,9 @@ mod tests {
         fn shutdown(&mut self, outcome: &str, reason: &str) {
             self.shutdowns
                 .push((outcome.to_string(), reason.to_string()));
+        }
+        fn recovery(&mut self, class: crate::session::RecoveryClass, iter: u32, detail: &str) {
+            self.recoveries.push((class, iter, detail.to_string()));
         }
     }
 
@@ -3334,6 +3408,153 @@ mod tests {
             r.shutdowns
         );
         assert_eq!(r.shutdowns[0].0, "error");
+    }
+
+    fn resume_state_for_test(next_iter: u32) -> ResumeState {
+        ResumeState {
+            rows: vec![
+                Row {
+                    iter: 0,
+                    decision: "baseline".into(),
+                    score: Some(240.0),
+                    ..Default::default()
+                },
+                Row {
+                    iter: 1,
+                    decision: "discard".into(),
+                    score: Some(250.0),
+                    ..Default::default()
+                },
+            ],
+            best_score: 240.0,
+            baseline_score: 240.0,
+            baseline_total: 0,
+            spent: 0.0,
+            next_iter,
+            solved_any: false,
+            identity: None,
+            best_tiebreak: None,
+            published_branches: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn resume_emits_recovery_and_reparks_a_block_approval() {
+        let f = fixture(2, 0.0, false);
+        let judge = FakeJudge {
+            keep: false,
+            solved: false,
+            fail_baseline: false,
+        };
+        let mut r = RecordingReporter::default();
+        let recovery = crate::recovery::ResumeRecovery {
+            class: crate::session::RecoveryClass::DiedAwaitingApproval,
+            iter: 0,
+            detail: "parked on approval h".into(),
+            repark: Some(provisioning::PendingProvisioning {
+                mode: provisioning::WaitMode::Block,
+                trace_id: "t".into(),
+                handle: "h".into(),
+            }),
+            pending_regime: Some("t".into()),
+        };
+        run_loop(
+            &f.args,
+            &f.paths,
+            &f.prepared,
+            &mut r,
+            &FakeWorld,
+            &judge,
+            LoopRuntime {
+                control: None,
+                resume: Some(resume_state_for_test(2)),
+                recovery: Some(recovery),
+                ledger: None,
+            },
+        )
+        .expect("resumed run finishes");
+        assert_eq!(r.recoveries.len(), 1, "exactly one recovery line");
+        let (class, iter, detail) = &r.recoveries[0];
+        assert!(matches!(
+            class,
+            crate::session::RecoveryClass::DiedAwaitingApproval
+        ));
+        assert_eq!(*iter, 0);
+        assert!(detail.contains("approval h"), "{detail}");
+        // The repark seeded pending_block: with no control bridge the park notes and
+        // continues instead of hanging.
+        assert!(
+            r.notes.iter().any(|n| n.contains("no control bridge")),
+            "the re-armed park ran: {:?}",
+            r.notes
+        );
+        assert_eq!(r.shutdowns[0].0, "finished");
+    }
+
+    #[test]
+    fn resume_reregisters_the_pending_regime_on_the_control_bridge() {
+        let f = fixture(2, 0.0, false);
+        let judge = FakeJudge {
+            keep: false,
+            solved: false,
+            fail_baseline: false,
+        };
+        let control = control::ControlState::default();
+        let mut r = RecordingReporter::default();
+        let recovery = crate::recovery::ResumeRecovery {
+            class: crate::session::RecoveryClass::DiedBetweenIterations,
+            iter: 1,
+            detail: String::new(),
+            repark: None,
+            pending_regime: Some("c=48".into()),
+        };
+        run_loop(
+            &f.args,
+            &f.paths,
+            &f.prepared,
+            &mut r,
+            &FakeWorld,
+            &judge,
+            LoopRuntime {
+                control: Some(&control),
+                resume: Some(resume_state_for_test(2)),
+                recovery: Some(recovery),
+                ledger: None,
+            },
+        )
+        .expect("resumed run finishes");
+        assert_eq!(
+            control.approve_pending().as_deref(),
+            Some("c=48"),
+            "an operator approve resolves the re-registered ask"
+        );
+    }
+
+    #[test]
+    fn drain_turn_markers_opens_the_approval_bracket() {
+        let f = fixture(1, 0.0, false);
+        std::fs::write(
+            &f.paths.provisioning,
+            r#"{"mode":"continue","trace_id":"t","handle":"h"}"#,
+        )
+        .unwrap();
+        let mut r = NoteCapture::default();
+        let v = drain_turn_markers(&mut r, &f.paths, None, 1, &AgentTurn::default(), &[]);
+        assert!(matches!(v, TurnVerdict::Proceed));
+        assert_eq!(
+            r.waits,
+            vec![("h".into(), "t".into(), provisioning::WaitMode::Continue)]
+        );
+
+        std::fs::write(
+            &f.paths.provisioning,
+            r#"{"mode":"block","trace_id":"t2","handle":"h2"}"#,
+        )
+        .unwrap();
+        let v = drain_turn_markers(&mut r, &f.paths, None, 1, &AgentTurn::default(), &[]);
+        assert!(matches!(v, TurnVerdict::Park(_)));
+        assert_eq!(r.waits.len(), 2, "block mode opens the bracket too");
+        assert_eq!(r.waits[1].2, provisioning::WaitMode::Block);
     }
 
     #[test]

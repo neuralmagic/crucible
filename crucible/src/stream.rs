@@ -280,6 +280,29 @@ impl Reporter for SessionReporter {
         self.emit(ev);
     }
 
+    fn recovery(&mut self, class: crate::session::RecoveryClass, iter: u32, detail: &str) {
+        self.emit(&SessionEvent::Recovery {
+            class,
+            iter,
+            detail: detail.to_string(),
+        });
+    }
+
+    fn approval_wait(&mut self, handle: &str, trace_id: &str, mode: crate::provisioning::WaitMode) {
+        self.emit(&SessionEvent::ApprovalWait {
+            handle: handle.to_string(),
+            trace_id: trace_id.to_string(),
+            mode: mode.as_str().to_string(),
+        });
+    }
+
+    fn approval_resolved(&mut self, outcome: &str, reason: &str) {
+        self.emit(&SessionEvent::ApprovalResolved {
+            outcome: outcome.to_string(),
+            reason: reason.to_string(),
+        });
+    }
+
     fn pr_links(&mut self, links: &[crate::session::PrLinkWire]) {
         if links.is_empty() {
             return;

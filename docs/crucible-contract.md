@@ -593,11 +593,31 @@ Additive event kinds beyond the compat set include:
   a hard-warning `note` event, never an abort.
 - **`shutdown`**: `{ outcome, reason }`, emitted **exactly once**, as the **last** line of every
   run (after `finished`/`summary`). `outcome` is one of `finished`/`solved`/`budget`/`stopped`/
-  `escalated`/`error`. Session-log consumers key a run's terminal state off this line; a dead
-  stream with **no** `shutdown` line means the pod likely died mid-run, not a clean exit.
+  `escalated`/`stalled`/`error`. Session-log consumers key a run's terminal state off this line; a
+  dead stream with **no** `shutdown` line means the pod likely died mid-run, not a clean exit.
+  `--resume` consumes this invariant, not just documents it: a resumed run classifies the log
+  tail (see `recovery` below) and a trailing `shutdown` is the "exited on purpose" signal. In a
+  resumed (appended) log, only the **trailing** `shutdown` counts; one followed by more events
+  belongs to an earlier process.
 - **`agent_session`**: `{ session, action, turn }`, emitted before a persistent agent turn so a
   viewer can draw continuation lanes and distinguish `started` from `resumed`. It deliberately
   contains neither the provider cursor nor native transcript content.
+- **`approval_wait`**: `{ handle, trace_id, mode }`, emitted when the loop reads the agent's
+  pending-provisioning marker. `mode` is `block` (the loop parks idle) or `continue` (it keeps
+  iterating in the frozen regime). Bracket invariant: every `approval_wait` is closed by an
+  `approval_resolved` **except** on stop-while-parked and process death, so a dangling wait in
+  the log tail means the run ended with the approval outstanding, and a resume re-parks a
+  block-mode one and re-registers the approval key so an operator `approve` still resolves it.
+- **`approval_resolved`**: `{ outcome, reason }` with `outcome` one of `granted`/`denied`/
+  `timeout`. A grant is emitted at the iteration-head rescope drain (the single re-baseline
+  site); a stop deliberately emits nothing (a stop doesn't resolve the ask).
+- **`recovery`**: `{ class, iter, detail }`, emitted once per `--resume` right after the resume
+  note: how the resumed process classified its predecessor's end. `class` is one of
+  `clean_exit`/`died_in_baseline`/`died_in_wide_round`/`died_mid_turn`/`died_deciding`/
+  `died_in_plan_task`/`died_awaiting_approval`/`died_between_iterations`; `iter` is the
+  iteration the interruption touched (0 when not iteration-scoped); `detail` is a human-readable
+  evidence summary. Purely a record: the loop acts on the in-process classification, never by
+  re-reading this line.
 
 **`RunIdentity`** (`crucible/src/identity.rs`) is the comparability key: two runs' scores are
 comparable only if it matches. It's a hash-of-hashes (`v1:<hex>`) over, per component (one

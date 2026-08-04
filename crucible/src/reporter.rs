@@ -222,6 +222,28 @@ pub trait Reporter {
     /// iteration. Default no-op: only the session reporter persists them; the console
     /// front-end has no plan rendering, and the legacy sequencing path never emits one.
     fn plan_event(&mut self, _ev: &crate::session::SessionEvent) {}
+    /// How this resume classified the previous shutdown. The default renders a note; the
+    /// session reporter overrides it to emit a structured
+    /// [`crate::session::SessionEvent::Recovery`].
+    fn recovery(&mut self, class: crate::session::RecoveryClass, iter: u32, detail: &str) {
+        self.note(&format!("recovery: {class} (iter {iter}): {detail}"));
+    }
+    /// The loop began waiting on a mediated-provisioning approval. The default renders a
+    /// note; the session reporter overrides it to emit a structured
+    /// [`crate::session::SessionEvent::ApprovalWait`], opening the bracket a resume's
+    /// classifier reads (a dangling wait means the run died with the approval open).
+    fn approval_wait(&mut self, handle: &str, trace_id: &str, mode: crate::provisioning::WaitMode) {
+        self.note(&format!(
+            "approval wait [{}] {handle} ({trace_id})",
+            mode.as_str()
+        ));
+    }
+    /// The wait reached a terminal outcome (`granted`/`denied`/`timeout`), closing the
+    /// bracket. Deliberately NOT called on a stop-while-parked: a stop doesn't resolve
+    /// the ask, and the still-open bracket makes a resume re-park on it.
+    fn approval_resolved(&mut self, outcome: &str, reason: &str) {
+        self.note(&format!("approval {outcome}: {reason}"));
+    }
     /// The draft PR(s) publish-on-keep opened, reported once after publish so the durable session
     /// log carries them (the controller's pull-ingest folds them onto the kept candidates' `pr_url`).
     /// The default is a no-op, the console already prints each URL via `note`; only the session

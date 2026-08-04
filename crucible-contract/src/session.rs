@@ -145,6 +145,36 @@ impl std::fmt::Display for SessionAction {
     }
 }
 
+/// Why a resumed run believed its predecessor stopped. Emitted once per resume as a
+/// [`SessionEvent::Recovery`] event so operators see the classification on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryClass {
+    CleanExit,
+    DiedInBaseline,
+    DiedInWideRound,
+    DiedMidTurn,
+    DiedDeciding,
+    DiedInPlanTask,
+    DiedAwaitingApproval,
+    DiedBetweenIterations,
+}
+
+impl std::fmt::Display for RecoveryClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            RecoveryClass::CleanExit => "clean_exit",
+            RecoveryClass::DiedInBaseline => "died_in_baseline",
+            RecoveryClass::DiedInWideRound => "died_in_wide_round",
+            RecoveryClass::DiedMidTurn => "died_mid_turn",
+            RecoveryClass::DiedDeciding => "died_deciding",
+            RecoveryClass::DiedInPlanTask => "died_in_plan_task",
+            RecoveryClass::DiedAwaitingApproval => "died_awaiting_approval",
+            RecoveryClass::DiedBetweenIterations => "died_between_iterations",
+        })
+    }
+}
+
 /// One event in the session log. Mirrors the `crucible::reporter::Reporter` calls so the
 /// viewer can rebuild identical state by folding the sequence (the same fold `App` does
 /// over `UiMsg`).
@@ -272,12 +302,42 @@ pub enum SessionEvent {
         span_id: String,
     },
     /// The loop is exiting, emitted exactly once as the LAST line of the session log. `outcome` is
-    /// one of `finished`/`solved`/`budget`/`stopped`/`escalated`/`error`. The viewer keys its
-    /// terminal state off this line: a dead stream with no `Shutdown` line means the pod died
+    /// one of `finished`/`solved`/`budget`/`stopped`/`escalated`/`stalled`/`error`. The viewer keys
+    /// its terminal state off this line: a dead stream with no `Shutdown` line means the pod died
     /// mid-run rather than exiting cleanly.
     Shutdown {
         outcome: String,
         reason: String,
+    },
+    /// The loop began waiting on a mediated-provisioning approval. `mode` is `block` (parked
+    /// idle) or `continue` (iterating in the frozen regime). A dangling ApprovalWait (no
+    /// ApprovalResolved before the log ends) means the run died, or was stopped, with the
+    /// approval outstanding; resume re-parks a block-mode one.
+    ApprovalWait {
+        handle: String,
+        #[serde(default)]
+        trace_id: String,
+        mode: String,
+    },
+    /// The wait above reached a terminal outcome: `granted`/`denied`/`timeout`. Deliberately
+    /// NOT emitted on a stop-while-parked (a stop doesn't resolve the ask), so a resumed run
+    /// re-parks on the still-open approval.
+    ApprovalResolved {
+        outcome: String,
+        #[serde(default)]
+        reason: String,
+    },
+    /// How this resume classified the previous shutdown, emitted once right after the resume
+    /// note. Purely a record: the classifier derives it from the log tail; the loop's behavior
+    /// is driven by the in-process recovery plan, not by re-reading this.
+    Recovery {
+        class: RecoveryClass,
+        /// The iteration the interruption touched; 0 when not iteration-scoped.
+        #[serde(default)]
+        iter: u32,
+        /// Human-readable evidence summary (dangling-turn stats, plan gap, approval handle).
+        #[serde(default)]
+        detail: String,
     },
 }
 
@@ -458,8 +518,68 @@ mod tests {
                 outcome: "finished".into(),
                 reason: "all iterations completed".into(),
             },
+            SessionEvent::ApprovalWait {
+                handle: "https://github.com/wseaton/llm-d-router/pull/7".into(),
+                trace_id: "model=Qwen/Qwen3-0.6B;c=48".into(),
+                mode: "block".into(),
+            },
+            SessionEvent::ApprovalResolved {
+                outcome: "granted".into(),
+                reason: "concurrency=48".into(),
+            },
+            SessionEvent::Recovery {
+                class: RecoveryClass::DiedMidTurn,
+                iter: 4,
+                detail: "turn in flight at iter 4, 132 agent events".into(),
+            },
         ] {
             assert_round_trips(ev);
+        }
+    }
+
+    #[test]
+    fn recovery_class_tokens_are_snake_case_and_display_matches_serde() {
+        for (class, token) in [
+            (RecoveryClass::CleanExit, "clean_exit"),
+            (RecoveryClass::DiedInBaseline, "died_in_baseline"),
+            (RecoveryClass::DiedInWideRound, "died_in_wide_round"),
+            (RecoveryClass::DiedMidTurn, "died_mid_turn"),
+            (RecoveryClass::DiedDeciding, "died_deciding"),
+            (RecoveryClass::DiedInPlanTask, "died_in_plan_task"),
+            (
+                RecoveryClass::DiedAwaitingApproval,
+                "died_awaiting_approval",
+            ),
+            (
+                RecoveryClass::DiedBetweenIterations,
+                "died_between_iterations",
+            ),
+        ] {
+            let line = encode(&SessionEvent::Recovery {
+                class,
+                iter: 0,
+                detail: String::new(),
+            });
+            assert!(line.contains(&format!(r#""class":"{token}""#)), "{line}");
+            assert_eq!(class.to_string(), token);
+        }
+    }
+
+    #[test]
+    fn approval_wait_minimal_line_decodes_with_defaults() {
+        let ev = decode(r#"{"v":1,"kind":"approval_wait","handle":"h","mode":"continue"}"#)
+            .expect("minimal approval_wait decodes");
+        match ev {
+            SessionEvent::ApprovalWait {
+                handle,
+                trace_id,
+                mode,
+            } => {
+                assert_eq!(handle, "h");
+                assert_eq!(trace_id, "");
+                assert_eq!(mode, "continue");
+            }
+            other => panic!("wrong variant: {other:?}"),
         }
     }
 
