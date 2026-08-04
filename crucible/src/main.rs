@@ -688,6 +688,10 @@ pub(crate) struct Paths {
     /// Pending-provisioning marker the agent writes when it has an open approval to wait on; the loop
     /// detects it after a turn and parks or continues per its `mode`.
     pub provisioning: PathBuf,
+    /// Append-only NDJSON record of every external input (steer/approve/deny/rescope/budget/
+    /// pause/stop), authoritative over the session log for what an operator asked for. A
+    /// resume replays it to re-arm inputs that never took effect.
+    pub admissions: PathBuf,
 }
 
 impl Paths {
@@ -705,6 +709,7 @@ impl Paths {
             steer: manifest_dir.join("STEER.md"),
             session_log: state.join("session.jsonl"),
             control: state.join("control.json"),
+            admissions: state.join("admissions.jsonl"),
             escalation,
             provisioning,
             state,
@@ -720,6 +725,9 @@ impl Paths {
             state: worktree.join("state"),
             session_log: worktree.join("state/session.jsonl"),
             control: worktree.join("state/control.json"),
+            // An isolated task worktree takes no external input; the path exists only so
+            // `Paths` stays one shape.
+            admissions: worktree.join("state/admissions.jsonl"),
             escalation: worktree.join("ESCALATION.json"),
             provisioning: worktree.join("PROVISIONING_PENDING.json"),
             workspace: worktree,

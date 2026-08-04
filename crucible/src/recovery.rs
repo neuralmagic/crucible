@@ -13,6 +13,7 @@ use crate::loop_driver::{ResumeFold, ResumeState};
 use crate::provisioning::{self, WaitMode};
 use crate::session::{self, RecoveryClass, SessionEvent};
 use anyhow::{Context, Result};
+use crucible_contract::admission::AdmissionKey;
 use std::io::BufRead;
 use std::path::Path;
 
@@ -546,6 +547,54 @@ pub(crate) fn plan_recovery(s: &SessionRecovery, iterations: u32, max_cost: f64)
                 handle: a.handle.clone(),
             }),
         pending_regime: s.pending_approval.as_ref().map(|a| a.trace_id.clone()),
+    }
+}
+
+/// What a resume does about an approval the previous process left outstanding, after both
+/// sources of truth have been consulted.
+pub(crate) struct ResumeApproval {
+    /// Re-arm the block-mode park, unless the grant is already on the ledger.
+    pub repark: Option<provisioning::PendingProvisioning>,
+    /// Re-register the approval key so an operator `approve` still resolves it.
+    pub pending_regime: Option<String>,
+    /// One line for the session log when the ledger overrode the log's wait-state.
+    pub note: Option<String>,
+}
+
+/// Precedence between the two sources of truth for an outstanding approval:
+/// `admissions.jsonl` is authoritative for what an operator asked for, the session log for
+/// what the loop was waiting on. So the ledger is consulted first, and a re-scope it holds
+/// under the key derived from THIS ask ([`AdmissionKey::rescope_from`] over
+/// [`AdmissionKey::approve`]) means the grant landed before the death: re-parking would
+/// idle on an approval that already happened, so the park is dropped and the iteration-head
+/// drain applies the re-scope. Any other state (no ledger, an unrelated re-scope, nothing
+/// recorded) leaves the classifier's re-park and key registration alone.
+pub(crate) fn resume_approval(
+    rec: &ResumeRecovery,
+    replay: Option<&crate::admission::ResumeReplay>,
+) -> ResumeApproval {
+    let granted = rec.pending_regime.as_deref().filter(|trace| {
+        let derived = AdmissionKey::rescope_from(&AdmissionKey::approve(trace));
+        replay.is_some_and(|r| {
+            r.unsettled_rescope
+                .as_ref()
+                .is_some_and(|(key, _)| key == &derived)
+        })
+    });
+    match granted {
+        Some(trace) => ResumeApproval {
+            repark: None,
+            pending_regime: None,
+            note: Some(format!(
+                "resume: the approval for '{trace}' was already granted before the run died \
+                 — applying the recorded re-scope instead of parking"
+            )),
+        },
+        None => ResumeApproval {
+            repark: rec.repark.clone(),
+            pending_regime: rec.pending_regime.clone(),
+            note: None,
+        },
     }
 }
 
@@ -1150,6 +1199,63 @@ mod tests {
                 );
             }
             _ => panic!("expected NoOp"),
+        }
+    }
+
+    fn awaiting(trace: &str) -> ResumeRecovery {
+        ResumeRecovery {
+            class: RecoveryClass::DiedAwaitingApproval,
+            iter: 3,
+            detail: String::new(),
+            repark: Some(provisioning::PendingProvisioning {
+                mode: WaitMode::Block,
+                trace_id: trace.into(),
+                handle: "https://github.com/o/r/pull/7".into(),
+            }),
+            pending_regime: Some(trace.into()),
+        }
+    }
+
+    fn replay_holding(rescope: Option<(AdmissionKey, &str)>) -> crate::admission::ResumeReplay {
+        crate::admission::ResumeReplay {
+            unsettled_rescope: rescope.map(|(key, regime)| (key, regime.to_string())),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_ledger_recorded_grant_for_this_ask_suppresses_the_repark() {
+        let rec = awaiting("model=Q;c=48");
+        let derived = AdmissionKey::rescope_from(&AdmissionKey::approve("model=Q;c=48"));
+        let action = resume_approval(&rec, Some(&replay_holding(Some((derived, "model=Q;c=48")))));
+        assert!(
+            action.repark.is_none(),
+            "the grant landed before the death — parking would wait for nothing"
+        );
+        assert!(
+            action.pending_regime.is_none(),
+            "and the ask is closed, so a fresh approve can't grant it twice"
+        );
+        assert!(action.note.is_some_and(|n| n.contains("already granted")));
+    }
+
+    #[test]
+    fn an_unrelated_pending_rescope_leaves_the_repark_alone() {
+        let rec = awaiting("model=Q;c=48");
+        let other = AdmissionKey::rescope_from(&AdmissionKey::approve("some-other-ask"));
+        let action = resume_approval(&rec, Some(&replay_holding(Some((other, "c=8")))));
+        assert!(action.repark.is_some());
+        assert_eq!(action.pending_regime.as_deref(), Some("model=Q;c=48"));
+        assert!(action.note.is_none());
+    }
+
+    #[test]
+    fn with_no_ledger_or_no_grant_the_classifier_decides_alone() {
+        let rec = awaiting("t");
+        for replay in [None, Some(replay_holding(None))] {
+            let action = resume_approval(&rec, replay.as_ref());
+            assert!(action.repark.is_some());
+            assert_eq!(action.pending_regime.as_deref(), Some("t"));
         }
     }
 }
