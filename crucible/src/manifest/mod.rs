@@ -314,6 +314,12 @@ pub struct AgentCfg {
     pub goal: Option<String>,
     #[serde(default)]
     pub goal_file: Option<String>,
+    /// Path (relative to the domain pack) of a diff handed to iteration 1 as declared seed
+    /// material. The content is hashed into the run identity and disclosed on the published PR;
+    /// the agent applies and validates it itself, it is never silently applied to the tree.
+    /// Absent = an unseeded run.
+    #[serde(default)]
+    pub seed_diff: Option<String>,
     #[serde(default)]
     pub toolbox_dir: Option<String>,
     /// Skill directory names under `toolbox_dir` that must never reach the loop agent's

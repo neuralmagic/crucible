@@ -430,10 +430,11 @@ mod tests {
                     }],
                     manifest_hash: "1111111111111111".into(),
                     inject_hash: "2222222222222222".into(),
+                    seed_hash: String::new(),
                     measure_cmd: "./measure.sh".into(),
                     direction: "lower".into(),
                     rig: RigIdentity::default(),
-                    digest: "v1:3333333333333333".into(),
+                    digest: "v2:3333333333333333".into(),
                 },
             },
             SessionEvent::PrLinks {

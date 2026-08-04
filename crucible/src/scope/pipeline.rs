@@ -1608,7 +1608,7 @@ mod tests {
             report
                 .digest
                 .as_deref()
-                .is_some_and(|d| d.starts_with("v1:"))
+                .is_some_and(|d| d.starts_with("v2:"))
         );
 
         let scope_md = fs::read_to_string(out.join("SCOPE.md")).expect("SCOPE.md written");
@@ -1823,13 +1823,13 @@ mod tests {
             report
                 .digest
                 .as_deref()
-                .is_some_and(|d| d.starts_with("v1:"))
+                .is_some_and(|d| d.starts_with("v2:"))
         );
 
         let scope_md = fs::read_to_string(dir.join("SCOPE.md")).expect("SCOPE.md written");
         assert!(scope_md.contains("raise the score"));
         assert!(scope_md.contains("pack manifest [agent].goal"));
-        assert!(scope_md.contains("digest: `v1:"));
+        assert!(scope_md.contains("digest: `v2:"));
         assert!(scope_md.contains("S2 propose"));
         assert!(scope_md.contains("![Validated workflow graph](WORKFLOW.png)"));
 
@@ -2338,7 +2338,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             assert!(stage["passed"].is_boolean());
             assert!(stage["detail"].is_string());
         }
-        assert!(json["digest"].as_str().unwrap().starts_with("v1:"));
+        assert!(json["digest"].as_str().unwrap().starts_with("v2:"));
 
         let _ = fs::remove_dir_all(&dir);
     }

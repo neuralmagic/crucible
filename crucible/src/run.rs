@@ -404,6 +404,7 @@ fn run_from_manifest(args: Args) -> Result<()> {
         template,
         identity,
         skip_baseline: m.judge.skip_baseline,
+        seed_diff: read_seed_diff(&manifest_dir, m.agent.seed_diff.as_deref())?,
     };
 
     // Frozen injects (the gate's own files) go to the judge so it re-establishes them before each
@@ -423,6 +424,18 @@ fn run_from_manifest(args: Args) -> Result<()> {
     let judge = m.build_judge(workspace, frozen_injects)?;
 
     drive_loop(args, p, prep, world, judge)
+}
+
+/// Read the `[agent].seed_diff` content for iteration 1's prompt. The identity build hashes the
+/// same file; a declared seed that can't be read errors there first, this context is a backstop.
+fn read_seed_diff(manifest_dir: &Path, seed_diff: Option<&str>) -> Result<Option<String>> {
+    seed_diff
+        .map(|rel| {
+            let path = manifest_dir.join(rel);
+            std::fs::read_to_string(&path)
+                .with_context(|| format!("reading [agent].seed_diff {}", path.display()))
+        })
+        .transpose()
 }
 
 /// Run a composite domain: set up each component's checkout under one base workspace, build
@@ -495,6 +508,7 @@ fn run_composite(args: Args, manifest_path: PathBuf) -> Result<()> {
         template,
         identity,
         skip_baseline: m.judge.skip_baseline,
+        seed_diff: read_seed_diff(&manifest_dir, m.agent.seed_diff.as_deref())?,
     };
 
     args.search = m.search.clone();

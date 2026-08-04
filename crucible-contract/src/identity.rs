@@ -7,8 +7,8 @@
 use serde::{Deserialize, Serialize};
 
 /// Bump when the digest's input list changes shape, so an old digest can never silently collide
-/// with a new one over a different set of inputs.
-const FORMAT_VERSION: &str = "v1";
+/// with a new one over a different set of inputs. v2 added `seed_hash`.
+const FORMAT_VERSION: &str = "v2";
 
 /// One component's contribution to the identity: where its source came from and the pristine
 /// commit the workspace started from. A single-domain run has exactly one (unnamed) entry; a
@@ -49,6 +49,12 @@ pub struct RunIdentity {
     pub manifest_hash: String,
     /// Hash over each `[[workspace.inject]]` entry's source content + destination path.
     pub inject_hash: String,
+    /// Hash of the `[agent].seed_diff` content, the pack-declared starting diff handed to
+    /// iteration 1. Empty when the manifest declares none. Separate from `inject_hash` so a run
+    /// seeded with a known-good diff can never share a digest with an unseeded one (run 6
+    /// published a hand-steered diff under an identity that said otherwise).
+    #[serde(default)]
+    pub seed_hash: String,
     /// `[judge].measure_cmd`, the gate's identity.
     pub measure_cmd: String,
     /// `[judge].direction` (`"lower"`/`"higher"`), raw from the manifest.
@@ -64,6 +70,7 @@ impl RunIdentity {
         components: Vec<ComponentIdentity>,
         manifest_hash: String,
         inject_hash: String,
+        seed_hash: String,
         measure_cmd: String,
         direction: String,
         rig: RigIdentity,
@@ -72,6 +79,7 @@ impl RunIdentity {
             &components,
             &manifest_hash,
             &inject_hash,
+            &seed_hash,
             &measure_cmd,
             &direction,
             &rig,
@@ -80,6 +88,7 @@ impl RunIdentity {
             components,
             manifest_hash,
             inject_hash,
+            seed_hash,
             measure_cmd,
             direction,
             rig,
@@ -92,6 +101,7 @@ fn compute_digest(
     components: &[ComponentIdentity],
     manifest_hash: &str,
     inject_hash: &str,
+    seed_hash: &str,
     measure_cmd: &str,
     direction: &str,
     rig: &RigIdentity,
@@ -104,6 +114,7 @@ fn compute_digest(
     }
     parts.push(manifest_hash.as_bytes());
     parts.push(inject_hash.as_bytes());
+    parts.push(seed_hash.as_bytes());
     parts.push(measure_cmd.as_bytes());
     parts.push(direction.as_bytes());
     parts.push(rig.def_ref.as_bytes());

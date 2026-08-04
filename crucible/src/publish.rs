@@ -137,6 +137,10 @@ pub struct Record<'a> {
     /// The run's comparability key ([`crate::identity::RunIdentity::digest`]), so a
     /// report/leaderboard can group or gate runs by world identity without re-deriving it.
     pub identity_digest: &'a str,
+    /// Content hash of the pack-declared `[agent].seed_diff` iteration 1 was handed
+    /// ([`crate::identity::RunIdentity::seed_hash`]). Empty = an unseeded run; non-empty makes
+    /// the PR disclose the seeding (run 6 published a hand-steered diff with no disclosure).
+    pub seed_hash: &'a str,
 }
 
 /// Best-effort publish. Logs progress/failures through `r` and never returns an
@@ -979,6 +983,13 @@ fn pr_body(rec: &Record<'_>) -> String {
         }
         _ => s.push('\n'),
     }
+    if !rec.seed_hash.is_empty() {
+        s.push_str(&format!(
+            "**Seeded:** iteration 1 was handed a pack-declared seed diff \
+             (content hash `{}`); the kept work builds on it.\n\n",
+            rec.seed_hash
+        ));
+    }
     let kept: Vec<&Row> = rec.rows.iter().filter(|r| r.decision == "keep").collect();
     for row in kept {
         s.push_str(&kept_section(row));
@@ -1217,7 +1228,8 @@ mod tests {
             published_branches: &[],
             cost_usd: 0.0,
             elapsed: std::time::Duration::ZERO,
-            identity_digest: "v1:0",
+            identity_digest: "v2:0",
+            seed_hash: "",
         });
         assert!(body.contains("## Epilogue checks (advisory)"), "{body}");
         assert!(body.contains("- passed — perf: ok"), "{body}");
@@ -1225,6 +1237,51 @@ mod tests {
             body.contains("- **FAILED** — racecheck: exit 3: boom"),
             "{body}"
         );
+        // An unseeded run makes no seeding claim.
+        assert!(!body.contains("**Seeded:**"), "{body}");
+    }
+
+    /// A seeded run's PR discloses the seeding and the seed's content hash; DeepGEMM#5 shipped a
+    /// hand-steered diff under an autoresearch banner with neither.
+    #[test]
+    fn pr_body_discloses_a_pack_seed() {
+        let args = <crate::Cli as clap::Parser>::try_parse_from(["crucible"])
+            .unwrap()
+            .run;
+        let paths = crate::Paths::for_manifest(
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+            &std::env::temp_dir(),
+            None,
+        );
+        let rows = vec![Row {
+            iter: 1,
+            decision: "keep".into(),
+            note: "kept it".into(),
+            ..Default::default()
+        }];
+        let body = pr_body(&Record {
+            args: &args,
+            paths: &paths,
+            run_id: "test-run",
+            goal: "goal",
+            model: "model",
+            gate: "gate".into(),
+            rows: &rows,
+            baseline_score: 2.0,
+            best_score: 1.0,
+            improved: true,
+            kept_shas: &[],
+            base_sha: None,
+            components: &[],
+            published_branches: &[],
+            cost_usd: 0.0,
+            elapsed: std::time::Duration::ZERO,
+            identity_digest: "v2:0",
+            seed_hash: "cafe1234cafe1234",
+        });
+        assert!(body.contains("**Seeded:**"), "{body}");
+        assert!(body.contains("`cafe1234cafe1234`"), "{body}");
     }
 
     /// The bug this guards: a composed workspace runs on a DETACHED HEAD, so kept commits never reached
