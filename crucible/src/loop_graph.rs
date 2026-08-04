@@ -22,7 +22,8 @@ use crate::plan::exec::{
     Attempt, AttemptOutcome, BatchItem, ExecCfg, Substrate, TaskRunner, TaskStatus, execute,
 };
 use crate::plan::ir::{
-    Direction, EngineOp, Isolation, Join, Plan, PlanBudget, Task, TaskKind, TaskName, ValidPlan,
+    Direction, EngineOp, Isolation, Join, Plan, PlanBudget, Stage, Task, TaskKind, TaskName,
+    ValidPlan,
 };
 use crate::reporter::{Reporter, Row, TurnBudget};
 use crate::session::{EvidenceDisposition, EvidenceEntry};
@@ -197,7 +198,7 @@ pub(crate) fn iteration_template(
             version: 1,
             reason: None,
             budget: PlanBudget { usd: f64::MAX },
-            tasks: workflow.tasks.clone(),
+            tasks: workflow.iteration_tasks(),
         }
         .validate()
         .context("building authored iteration workflow");
@@ -218,15 +219,16 @@ pub(crate) fn iteration_template(
                 required: true,
                 isolation: None,
                 join: Join::default(),
+                stage: Stage::Iteration,
             }
         };
     let mut tasks = vec![engine("propose", EngineOp::Propose, None, vec![])];
 
     // Legacy splice tasks run between `propose` and `apply`; `apply` waits on every sink.
+    // Epilogue tasks never splice: they run once post-loop, not per iteration.
     let mut apply_deps = vec![TaskName("propose".to_string())];
     if let Some(w) = workflow.filter(|w| !w.tasks.is_empty()) {
-        for t in &w.tasks {
-            let mut t = t.clone();
+        for mut t in w.iteration_tasks() {
             if t.depends_on.is_empty() {
                 t.depends_on = vec![TaskName("propose".to_string())];
             }
@@ -267,6 +269,172 @@ pub(crate) fn iteration_template(
     }
     .validate()
     .context("building the iteration template")
+}
+
+/// Build the workflow's run-scoped epilogue subgraph; `None` when it declares none.
+pub(crate) fn epilogue_template(workflow: &WorkflowCfg) -> Result<Option<ValidPlan>> {
+    let tasks = workflow.epilogue_tasks();
+    if tasks.is_empty() {
+        return Ok(None);
+    }
+    Plan {
+        version: 1,
+        reason: None,
+        budget: PlanBudget { usd: f64::MAX },
+        tasks,
+    }
+    .validate()
+    .context("building the epilogue template")
+    .map(Some)
+}
+
+/// The final kept candidate, as epilogue tasks see it: injected into every task's inputs
+/// under the reserved [`crate::manifest::KEPT_INPUT`] key, so a command/evaluate task
+/// reads it from `CRUCIBLE_INPUTS` exactly like any upstream result.
+pub(crate) struct KeptContext {
+    pub iter: u32,
+    pub score: Option<f64>,
+    pub tiebreak: Option<f64>,
+    pub sha: Option<String>,
+    pub snapshot: Option<String>,
+    pub note: String,
+}
+
+impl KeptContext {
+    fn to_value(&self) -> Value {
+        serde_json::json!({
+            "iter": self.iter,
+            "score": self.score,
+            "tiebreak": self.tiebreak,
+            "sha": self.sha,
+            "snapshot": self.snapshot,
+            "note": self.note,
+        })
+    }
+}
+
+/// Run the epilogue subgraph once, against the kept candidate live in the workspace.
+/// Advisory by contract: the returned rows and the notes make a failure loud, but nothing
+/// here can un-keep the candidate. Returns the advisory rows and the subgraph's cost.
+pub(crate) fn run_epilogue<R: Reporter>(
+    args: &Args,
+    p: &Paths,
+    workflow: &WorkflowCfg,
+    kept: &KeptContext,
+    r: &mut R,
+) -> Result<(Vec<Row>, f64)> {
+    let Some(plan) = epilogue_template(workflow)? else {
+        return Ok((Vec::new(), 0.0));
+    };
+    r.note(&format!(
+        "epilogue: running {} run-scoped task(s) against the kept candidate (iter {})",
+        plan.plan().tasks.len(),
+        kept.iter
+    ));
+    r.plan_event(&crate::plan::cli::plan_admitted_event(&plan));
+
+    let mut runner = EpilogueRunner {
+        inner: crate::plan::harness::HarnessRunner {
+            args: args.clone(),
+            paths: p.clone(),
+        },
+        kept: kept.to_value(),
+    };
+    let mut task_events = Vec::new();
+    let outcome = execute(
+        &plan,
+        &Substrate::default(),
+        ExecCfg::default(),
+        &mut runner,
+        |task, result| {
+            task_events.push(crate::plan::cli::task_result_event(
+                plan.plan().version,
+                kept.iter,
+                task,
+                result,
+            ));
+        },
+    );
+    for ev in &task_events {
+        r.plan_event(ev);
+    }
+
+    let mut rows = Vec::new();
+    for task in plan.tasks_topo() {
+        let Some(result) = outcome.results.get(&task.name) else {
+            continue;
+        };
+        let (decision, failed) = match result.status {
+            TaskStatus::Pass => ("epilogue", false),
+            TaskStatus::Skipped | TaskStatus::Blocked => ("epilogue-skip", false),
+            TaskStatus::Fail | TaskStatus::Transport | TaskStatus::Truncated => {
+                ("epilogue-fail", true)
+            }
+        };
+        let why = result.note.clone().unwrap_or_else(|| match result.status {
+            TaskStatus::Pass => "ok".to_string(),
+            other => other.as_str().to_string(),
+        });
+        if failed {
+            r.note(&format!(
+                "epilogue task {} FAILED (advisory — the kept candidate stands): {why}",
+                task.name
+            ));
+        }
+        rows.push(Row {
+            iter: kept.iter,
+            decision: decision.to_string(),
+            note: format!("{}: {why}", task.name),
+            detail: result
+                .output
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            score: result
+                .output
+                .as_ref()
+                .and_then(|o| o.get("score"))
+                .and_then(Value::as_f64),
+            phase: Some("epilogue".to_string()),
+            ..Default::default()
+        });
+    }
+    Ok((rows, outcome.spent_usd))
+}
+
+/// [`crate::plan::harness::HarnessRunner`] plus the kept-candidate input: the executor
+/// derives inputs from dependencies, and the epilogue's roots have none, so the kept
+/// context rides in here on every task.
+struct EpilogueRunner {
+    inner: crate::plan::harness::HarnessRunner,
+    kept: Value,
+}
+
+impl EpilogueRunner {
+    fn with_kept(&self, inputs: &BTreeMap<TaskName, Value>) -> BTreeMap<TaskName, Value> {
+        let mut inputs = inputs.clone();
+        inputs.insert(crate::manifest::KEPT_INPUT.into(), self.kept.clone());
+        inputs
+    }
+}
+
+impl TaskRunner for EpilogueRunner {
+    fn run(&mut self, task: &Task, attempt: u32, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
+        let inputs = self.with_kept(inputs);
+        self.inner.run(task, attempt, &inputs)
+    }
+
+    fn run_many(&mut self, batch: &[BatchItem<'_>]) -> Vec<Attempt> {
+        let batch: Vec<BatchItem<'_>> = batch
+            .iter()
+            .map(|b| BatchItem {
+                task: b.task,
+                attempt: b.attempt,
+                inputs: self.with_kept(&b.inputs),
+            })
+            .collect();
+        self.inner.run_many(&batch)
+    }
 }
 
 /// What the propose task's post-turn drains decided, parked here for the driver: the
@@ -763,6 +931,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
             required: false,
             isolation: Some(Isolation::Worktree),
             join: Join::All,
+            stage: Stage::Iteration,
         });
     }
     for id in 0..cfg.n {
@@ -779,6 +948,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
             required: false,
             isolation: None,
             join: Join::All,
+            stage: Stage::Iteration,
         });
     }
     tasks.push(Task {
@@ -795,6 +965,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
         required: false,
         isolation: None,
         join: Join::Passed,
+        stage: Stage::Iteration,
     });
     Plan {
         version: 1,
@@ -1137,6 +1308,50 @@ mod tests {
         );
         assert_eq!(dep("measure"), ["apply"]);
         assert_eq!(dep("decide"), ["measure"]);
+    }
+
+    /// Epilogue tasks stay out of the per-iteration plan entirely (legacy splice and
+    /// fully-authored form) and land in their own post-loop template.
+    #[test]
+    fn epilogue_tasks_leave_the_iteration_plan_for_the_epilogue_template() {
+        let w: WorkflowCfg = toml::from_str(
+            "[[task]]\nname = \"review\"\nkind = \"command\"\ncommand = \"true\"\n\
+             [[task]]\nname = \"racecheck\"\nkind = \"command\"\ncommand = \"true\"\nstage = \"epilogue\"\n",
+        )
+        .unwrap();
+        w.validate().unwrap();
+        let plan = iteration_template(Some(&w), &WorkflowCaps::autoresearch_engine()).unwrap();
+        let names: Vec<&str> = plan.tasks_topo().map(|t| t.name.0.as_str()).collect();
+        assert_eq!(names, ["propose", "review", "apply", "measure", "decide"]);
+        assert_eq!(
+            plan.get(&"apply".into()).unwrap().depends_on,
+            [TaskName::from("review")],
+            "apply waits on the iteration sink, never on an epilogue task"
+        );
+
+        let epilogue = epilogue_template(&w).unwrap().expect("epilogue declared");
+        let names: Vec<&str> = epilogue.tasks_topo().map(|t| t.name.0.as_str()).collect();
+        assert_eq!(names, ["racecheck"]);
+
+        let authored: WorkflowCfg = toml::from_str(
+            "type = \"autoresearch\"\nresult = \"choose\"\n\
+             [[task]]\nname = \"invent\"\nkind = \"engine\"\nop = \"propose\"\n\
+             [[task]]\nname = \"deploy\"\nkind = \"engine\"\nop = \"apply\"\ndepends_on = [\"invent\"]\n\
+             [[task]]\nname = \"score\"\nkind = \"engine\"\nop = \"measure\"\ndepends_on = [\"deploy\"]\n\
+             [[task]]\nname = \"choose\"\nkind = \"engine\"\nop = \"decide\"\nsource = \"score\"\ndepends_on = [\"score\"]\n\
+             [[task]]\nname = \"racecheck\"\nkind = \"command\"\ncommand = \"true\"\nstage = \"epilogue\"\n",
+        )
+        .unwrap();
+        let plan =
+            iteration_template(Some(&authored), &WorkflowCaps::autoresearch_engine()).unwrap();
+        assert!(
+            plan.get(&"racecheck".into()).is_none(),
+            "authored iteration plan must not carry the epilogue task"
+        );
+        let no_epilogue: WorkflowCfg =
+            toml::from_str("[[task]]\nname = \"review\"\nkind = \"command\"\ncommand = \"true\"\n")
+                .unwrap();
+        assert!(epilogue_template(&no_epilogue).unwrap().is_none());
     }
 
     #[test]

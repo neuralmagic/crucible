@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::plan::ir::{Direction, Join, Task, TaskKind, TaskName, ValidPlan};
+use crate::plan::ir::{Direction, Join, Stage, Task, TaskKind, TaskName, ValidPlan};
 
 /// What the substrate can measure. Missing caps truncate the plan fail-closed.
 #[derive(Clone, Debug, Default)]
@@ -649,6 +649,7 @@ mod tests {
             required,
             isolation: None,
             join: Join::default(),
+            stage: Stage::Iteration,
         }
     }
 
@@ -1026,6 +1027,7 @@ mod tests {
             required: true,
             isolation: None,
             join: Join::default(),
+            stage: Stage::Iteration,
         });
         let plan = valid(tasks, 10.0);
         let mut r = ScriptRunner::new();
@@ -1079,6 +1081,7 @@ mod tests {
             required: false,
             isolation: None,
             join: Join::default(),
+            stage: Stage::Iteration,
         });
         let plan = valid(tasks, 10.0);
         let mut r = ScriptRunner::new();
@@ -1265,6 +1268,7 @@ mod tests {
             required: false,
             isolation: None,
             join: Join::Passed,
+            stage: Stage::Iteration,
         };
         tasks.push(pick);
         let plan = valid(tasks, 10.0);

@@ -276,6 +276,22 @@ The renderer groups `evaluate` and `grade` as **Measurement** while preserving e
 
 Default off while it soaks.
 
+### Run-scoped epilogue tasks
+
+`stage = "epilogue"` on a `[[workflow.task]]` (Starlark: `stage = "epilogue"` on `agent()`,
+`command()`, or `evaluate()`) removes the task from the per-iteration graph. The epilogue
+subgraph runs once, after the loop concludes cleanly (finished, budget, or solved), against the
+final kept candidate, and only if the run kept something. This is where a 90-minute
+`compute-sanitizer` racecheck or a slow perf benchmark belongs.
+
+Each task's `CRUCIBLE_INPUTS` carries the kept candidate under the reserved `kept` key:
+`{"iter", "score", "tiebreak", "sha", "snapshot", "note"}`. Dependencies may not cross stages,
+engine ops cannot be epilogue, and the workflow `result` must iterate.
+
+Epilogue results are advisory: they cannot un-keep the candidate. Rows land in the session log
+and RESULTS.md (`epilogue` / `epilogue-skip` / `epilogue-fail`), and the PR body gets an
+"Epilogue checks (advisory)" section with failures marked **FAILED**.
+
 ## Worked example
 
 `examples/adversarial-review` puts a review task between a code node and the gate below it, in

@@ -5,7 +5,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::plan::ir::{EngineOp, Join, Plan, PlanBudget, Task, TaskKind, TaskName};
+use crate::plan::ir::{EngineOp, Join, Plan, PlanBudget, Stage, Task, TaskKind, TaskName};
+
+/// Reserved epilogue input key: [`crate::loop_graph`] injects the kept candidate's
+/// context into every epilogue task's inputs under this name.
+pub const KEPT_INPUT: &str = "kept";
 
 /// Names used only by the compatibility template.
 const LEGACY_NAMES: [&str; 4] = ["propose", "apply", "measure", "decide"];
@@ -97,6 +101,7 @@ impl WorkflowCfg {
     /// Validate structure and type-specific invariants, without granting authority.
     pub fn validate(&self) -> Result<()> {
         if self.is_legacy_splice() {
+            self.validate_stages()?;
             return self.validate_legacy_splice();
         }
 
@@ -107,6 +112,7 @@ impl WorkflowCfg {
             tasks: self.tasks.clone(),
         };
         plan.validate()?;
+        self.validate_stages()?;
 
         let tasks: BTreeMap<&TaskName, &Task> =
             self.tasks.iter().map(|task| (&task.name, task)).collect();
@@ -250,6 +256,53 @@ impl WorkflowCfg {
                 .all(|task| !matches!(task.task, TaskKind::Engine { .. }))
     }
 
+    /// Stage rules, shared by both authoring forms. The two stages compile into separate
+    /// plans (per-iteration vs. once post-loop), so a dependency cannot cross them, the
+    /// loop's engine ops have no post-run meaning, and the decision task must iterate.
+    fn validate_stages(&self) -> Result<()> {
+        let stages: BTreeMap<&TaskName, Stage> = self
+            .tasks
+            .iter()
+            .map(|task| (&task.name, task.stage))
+            .collect();
+        for task in &self.tasks {
+            if task.stage == Stage::Epilogue {
+                if matches!(task.task, TaskKind::Engine { .. }) {
+                    bail!(
+                        "engine task {:?} cannot run in the epilogue (the loop is over)",
+                        task.name.0
+                    );
+                }
+                if task.name.0 == KEPT_INPUT {
+                    bail!(
+                        "epilogue task name {KEPT_INPUT:?} is reserved for the kept-candidate input"
+                    );
+                }
+            }
+            for dependency in &task.depends_on {
+                // Unknown names default to Iteration here; the legacy splice's implicit
+                // "propose" is an iteration task, and the authored path rejects truly
+                // unknown dependencies in its plan validation.
+                let dependency_stage = stages.get(dependency).copied().unwrap_or_default();
+                if dependency_stage != task.stage {
+                    bail!(
+                        "task {:?} (stage {:?}) depends on {:?} (stage {:?}); dependencies cannot cross stages",
+                        task.name.0,
+                        task.stage,
+                        dependency.0,
+                        dependency_stage
+                    );
+                }
+            }
+        }
+        if let Some(result) = &self.result
+            && stages.get(result).copied().unwrap_or_default() == Stage::Epilogue
+        {
+            bail!("workflow result {:?} cannot be an epilogue task", result.0);
+        }
+        Ok(())
+    }
+
     fn validate_legacy_splice(&self) -> Result<()> {
         let mut seen = BTreeSet::new();
         for task in &self.tasks {
@@ -364,7 +417,8 @@ impl WorkflowCfg {
         Ok(())
     }
 
-    /// Terminal tasks used by the compatibility splice adapter.
+    /// Terminal tasks used by the compatibility splice adapter. Epilogue tasks never
+    /// splice, so they are neither sinks nor dependents here.
     pub fn sinks(&self) -> Vec<TaskName> {
         let depended: BTreeSet<&TaskName> = self
             .tasks
@@ -373,9 +427,31 @@ impl WorkflowCfg {
             .collect();
         self.tasks
             .iter()
-            .filter(|task| !depended.contains(&task.name))
+            .filter(|task| task.stage == Stage::Iteration && !depended.contains(&task.name))
             .map(|task| task.name.clone())
             .collect()
+    }
+
+    /// The per-iteration subset: everything not marked `stage = "epilogue"`.
+    pub fn iteration_tasks(&self) -> Vec<Task> {
+        self.tasks
+            .iter()
+            .filter(|task| task.stage == Stage::Iteration)
+            .cloned()
+            .collect()
+    }
+
+    /// Run-scoped tasks that fire once post-loop against the final kept candidate.
+    pub fn epilogue_tasks(&self) -> Vec<Task> {
+        self.tasks
+            .iter()
+            .filter(|task| task.stage == Stage::Epilogue)
+            .cloned()
+            .collect()
+    }
+
+    pub fn has_epilogue(&self) -> bool {
+        self.tasks.iter().any(|task| task.stage == Stage::Epilogue)
     }
 }
 
@@ -603,6 +679,95 @@ mod tests {
         };
         let error = workflow.validate().unwrap_err().to_string();
         assert!(error.contains("must be an evaluate task"), "{error}");
+    }
+
+    #[test]
+    fn epilogue_tasks_split_cleanly_from_the_iteration_graph() {
+        let workflow = parse(
+            "type = \"autoresearch\"\nresult = \"choose\"\n\
+             [[task]]\nname = \"invent\"\nkind = \"engine\"\nop = \"propose\"\n\
+             [[task]]\nname = \"deploy\"\nkind = \"engine\"\nop = \"apply\"\ndepends_on = [\"invent\"]\n\
+             [[task]]\nname = \"score\"\nkind = \"engine\"\nop = \"measure\"\ndepends_on = [\"deploy\"]\n\
+             [[task]]\nname = \"choose\"\nkind = \"engine\"\nop = \"decide\"\nsource = \"score\"\ndepends_on = [\"score\"]\n\
+             [[task]]\nname = \"racecheck\"\nkind = \"command\"\ncommand = \"true\"\nstage = \"epilogue\"\nrequired = false\n",
+        );
+        workflow.validate().unwrap();
+        assert!(workflow.has_epilogue());
+        let iteration: Vec<String> = workflow
+            .iteration_tasks()
+            .into_iter()
+            .map(|t| t.name.0)
+            .collect();
+        assert_eq!(iteration, ["invent", "deploy", "score", "choose"]);
+        let epilogue: Vec<String> = workflow
+            .epilogue_tasks()
+            .into_iter()
+            .map(|t| t.name.0)
+            .collect();
+        assert_eq!(epilogue, ["racecheck"]);
+    }
+
+    /// Legacy splice: an epilogue task is neither spliced nor a sink `apply` waits on.
+    #[test]
+    fn legacy_splice_sinks_exclude_epilogue_tasks() {
+        let workflow = parse(
+            "[[task]]\nname = \"review\"\nkind = \"command\"\ncommand = \"true\"\n\
+             [[task]]\nname = \"racecheck\"\nkind = \"command\"\ncommand = \"true\"\nstage = \"epilogue\"\n",
+        );
+        workflow.validate().unwrap();
+        assert!(workflow.is_legacy_splice());
+        assert_eq!(workflow.sinks(), vec![TaskName::from("review")]);
+    }
+
+    #[test]
+    fn dependencies_cannot_cross_stages() {
+        // Epilogue depending on an iteration task: the iteration output is long gone.
+        let workflow = parse(
+            "[[task]]\nname = \"review\"\nkind = \"command\"\ncommand = \"true\"\n\
+             [[task]]\nname = \"racecheck\"\nkind = \"command\"\ncommand = \"true\"\nstage = \"epilogue\"\ndepends_on = [\"review\"]\n",
+        );
+        let error = workflow.validate().unwrap_err().to_string();
+        assert!(error.contains("cannot cross stages"), "{error}");
+
+        // Iteration depending on an epilogue task would deadlock every iteration.
+        let workflow = parse(
+            "[[task]]\nname = \"racecheck\"\nkind = \"command\"\ncommand = \"true\"\nstage = \"epilogue\"\n\
+             [[task]]\nname = \"review\"\nkind = \"command\"\ncommand = \"true\"\ndepends_on = [\"racecheck\"]\n",
+        );
+        let error = workflow.validate().unwrap_err().to_string();
+        assert!(error.contains("cannot cross stages"), "{error}");
+
+        // The legacy splice's implicit propose dependency is an iteration task too.
+        let workflow = parse(
+            "[[task]]\nname = \"racecheck\"\nkind = \"command\"\ncommand = \"true\"\nstage = \"epilogue\"\ndepends_on = [\"propose\"]\n",
+        );
+        let error = workflow.validate().unwrap_err().to_string();
+        assert!(error.contains("cannot cross stages"), "{error}");
+    }
+
+    #[test]
+    fn engine_tasks_cannot_be_epilogue() {
+        let mut workflow = full_autoresearch();
+        workflow.tasks[2].stage = Stage::Epilogue;
+        let error = workflow.validate().unwrap_err().to_string();
+        assert!(error.contains("cannot run in the epilogue"), "{error}");
+    }
+
+    #[test]
+    fn epilogue_cannot_be_the_result_or_claim_the_kept_name() {
+        let workflow = parse(
+            "type = \"custom\"\nresult = \"racecheck\"\n\
+             [[task]]\nname = \"solve\"\nkind = \"command\"\ncommand = \"true\"\n\
+             [[task]]\nname = \"racecheck\"\nkind = \"command\"\ncommand = \"true\"\nstage = \"epilogue\"\n",
+        );
+        let error = workflow.validate().unwrap_err().to_string();
+        assert!(error.contains("cannot be an epilogue task"), "{error}");
+
+        let workflow = parse(
+            "[[task]]\nname = \"kept\"\nkind = \"command\"\ncommand = \"true\"\nstage = \"epilogue\"\n",
+        );
+        let error = workflow.validate().unwrap_err().to_string();
+        assert!(error.contains("reserved"), "{error}");
     }
 
     fn full_autoresearch() -> WorkflowCfg {
