@@ -180,6 +180,10 @@ async fn try_turn(
     tracing::Span::current().record("sandbox", name.as_str());
     let basename = workdir_basename(p)?;
     let _ = gw.delete_sandbox(&name).await;
+    // Deletion is async; creating against a still-terminating CR fails "already exists".
+    gw.wait_deleted(&name)
+        .await
+        .context("clearing a stale sandbox before create")?;
     stage(
         sink,
         &format!(
@@ -443,8 +447,11 @@ async fn try_turn(
     }
     .await;
 
-    // 10. Per-turn-fresh: delete the sandbox regardless of the turn's outcome.
+    // 10. Per-turn-fresh: delete the sandbox regardless of the turn's outcome. Clear the
+    //     turn-token too: an empty token means uncapped, so the engine's own post-turn broker
+    //     calls (the gate's rungs) never inherit a turn budget the agent already spent.
     let _ = gw.delete_sandbox(&name).await;
+    let _ = fs::write(forge::storage_root().join("turn-token"), "").await;
     result
 }
 

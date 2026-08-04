@@ -291,6 +291,12 @@ impl<R: Reporter> LoopTaskRunner<'_, R> {
                 self.signal = Some(Signal::Discard);
                 fail(cost, "turn failed; iteration discarded".to_string())
             }
+            // Transport-class turn death: hand the executor a Transport outcome so
+            // `run_with_retries` re-runs the turn (the session resumes where it died).
+            TurnVerdict::Retry => Attempt {
+                outcome: AttemptOutcome::Transport("turn died on a transport error".to_string()),
+                cost_usd: cost,
+            },
             TurnVerdict::Escalate => {
                 self.signal = Some(Signal::Escalate);
                 fail(cost, "agent escalated".to_string())
