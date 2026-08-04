@@ -28,6 +28,16 @@ pub enum WaitMode {
     Continue,
 }
 
+impl WaitMode {
+    /// The serde token, for wire fields that carry the mode as a string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WaitMode::Block => "block",
+            WaitMode::Continue => "continue",
+        }
+    }
+}
+
 /// A parsed `PROVISIONING_PENDING.json`. Domain-neutral: the engine only acts on `mode` and
 /// surfaces `trace_id`/`handle`. Any `regime` params the agent records are for the broker / the
 /// run record and are ignored here (serde drops unknown fields), so the engine never parses a
