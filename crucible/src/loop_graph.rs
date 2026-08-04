@@ -921,6 +921,7 @@ impl<R: Reporter> WideRunner<'_, R> {
                     phase: Some("wide".into()),
                     kept_snap: None,
                     evidence: Vec::new(),
+                    candidate_md: String::new(),
                 };
                 self.r.row(&row, false);
                 self.rows.push(row);

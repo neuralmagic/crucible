@@ -5,7 +5,7 @@
 //! front-end, and calls [`crate::loop_driver::run_loop`].
 
 use crate::crucible::{Judge, World};
-use crate::loop_driver::{LoopRuntime, load_resume_state, run_loop};
+use crate::loop_driver::{self, LoopRuntime, load_resume_state, run_loop};
 use crate::{Args, Cli, Cmd, Paths, Prepared, STOP, Ui};
 use crate::{
     agent, broker, check, console, control, deploy, init, manifest, publish, reporter, scope,
@@ -634,8 +634,7 @@ fn drive_loop(
             // restarted pod (OnFailure + persistent state) that replayed the finish re-published
             // the kept candidate each lap — four duplicate draft PRs in one crash-loop. Exit 0,
             // not the outcome code: the pod's work is done, and a nonzero would restart it forever.
-            let over_budget = args.max_cost > 0.0 && resume.spent >= args.max_cost;
-            if resume.next_iter > args.iterations || over_budget {
+            if loop_driver::resume_finished(&resume, args.iterations, args.max_cost) {
                 eprintln!(
                     "resume: nothing to do ({} of {} iterations ran, ${:.2} of ${:.2} spent)",
                     resume.next_iter.saturating_sub(1),
