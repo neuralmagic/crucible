@@ -630,6 +630,18 @@ fn drive_loop(
         if args.resume {
             // Resume: replay the parked log, then continue in append (stream) mode.
             let resume = load_resume_state(&p.session_log)?;
+            // Every iteration already ran: exit clean WITHOUT re-running the finish path. A
+            // restarted pod (OnFailure + persistent state) that replayed the finish re-published
+            // the kept candidate each lap — four duplicate draft PRs in one crash-loop. Exit 0,
+            // not the outcome code: the pod's work is done, and a nonzero would restart it forever.
+            if resume.next_iter > args.iterations {
+                eprintln!(
+                    "resume: all {} iterations already ran (session log has {} rows); nothing to do",
+                    args.iterations,
+                    resume.rows.len()
+                );
+                return Ok(());
+            }
             let meta = reporter::RunMeta::from_args(&args);
             let mut r = stream::SessionReporter::resume(&p, meta)?;
             let control = start_control_bridge(&args, &p)?;
