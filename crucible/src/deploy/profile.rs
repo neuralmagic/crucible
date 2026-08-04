@@ -246,7 +246,9 @@ pub struct StatePvcTemplate {
 
 /// PVC access modes. The Kubernetes API (and so k8s-openapi) types these as bare strings; the
 /// domain is closed, so the profile rejects a typo at parse instead of at provisioning.
+/// The shared `Read` prefix is the API's naming, not ours.
 #[derive(Deserialize, Clone, Copy)]
+#[allow(clippy::enum_variant_names)]
 pub enum AccessMode {
     ReadWriteOnce,
     ReadOnlyMany,
