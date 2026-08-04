@@ -54,6 +54,7 @@ ANTHROPIC_VERTEX_PROJECT_ID = "my-gcp-project"
 [judge]
 measure_cmd = "./measure.sh"                  # REQUIRED. §3. Any executable, any language.
 direction   = "lower"                         # lower | higher. REQUIRED.
+tiebreak_direction = "lower"                  # optional; direction of the `tiebreak` scalar (§4). default: direction
 objective   = "score"                         # display label (the old `gate` name). default "score"
 
 [judge.selftest]                              # optional (ADR-0014 S1). Runs in `crucible check`, never in a loop iteration.
@@ -339,6 +340,8 @@ Every command (`measure_cmd`, `apply_cmd`, `snapshot_cmd`, `restore_cmd`, `setup
   ```
   - `valid` (bool, REQUIRED): false ⇒ unscoreable candidate, always discarded.
   - `score` (number|null): the fitness. `null`/absent ⇒ treated as invalid.
+  - `tiebreak` (number, optional): secondary fitness for functional gates whose `score` is
+    effectively boolean; on an exact `score` tie, a strictly better `tiebreak` still keeps (§4).
   - `solved` (bool, optional, default false): the win condition was met (terminates the loop).
   - `note` (string, optional): one-line human summary.
   - `detail` (object, optional): free-form; surfaced in the row + session log. The domain
@@ -407,11 +410,19 @@ Given a `Reading { valid, score, solved, note, detail }`, the current `best_scor
 manifest `direction`:
 
 ```
-keep   = valid && score.is_some() && (better(score, best_score, direction) || solved)
+keep   = valid && score.is_some() && (better(score, best_score, direction)
+                                      || (score == best_score && tiebreak_better)
+                                      || solved)
 solved = reading.solved
 better(s, b, lower)  = s < b
 better(s, b, higher) = s > b
 ```
+
+`tiebreak_better` applies only when the reading carries a `tiebreak`: it is
+`better(tiebreak, best_tiebreak, tiebreak_direction)`, where `tiebreak_direction` is
+`[judge].tiebreak_direction` (optional, defaults to `direction`) and a best with no recorded
+tiebreak counts as the worst value. A reading without a `tiebreak` ties exactly as before:
+discard.
 
 - **`solved` implies `keep`.** A win is the whole point, so a candidate the measure command
   declares `solved` is kept (and terminates the loop) *even if its score doesn't strictly beat

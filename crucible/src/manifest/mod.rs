@@ -444,6 +444,10 @@ impl Manifest {
         judge::parse_direction(&self.judge.direction)
     }
 
+    pub fn tiebreak_direction(&self) -> Result<Option<Direction>> {
+        judge::parse_tiebreak_direction(&self.judge)
+    }
+
     /// Resolve `[workspace].inject` entries to absolute `(src, dst, frozen)`: `src` under
     /// `manifest_dir` (the baked artifact), `dst` under `workspace` (the clone).
     pub fn resolved_injects(
@@ -612,6 +616,10 @@ impl CompositeManifest {
 
     pub fn direction(&self) -> Result<Direction> {
         judge::parse_direction(&self.judge.direction)
+    }
+
+    pub fn tiebreak_direction(&self) -> Result<Option<Direction>> {
+        judge::parse_tiebreak_direction(&self.judge)
     }
 
     /// The composite's base workspace dir, holds the per-component checkouts.

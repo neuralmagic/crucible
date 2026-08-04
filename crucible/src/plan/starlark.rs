@@ -346,9 +346,16 @@ impl Compiler {
             "measure" => engine_task(&mut named, EngineOp::Measure, None)?,
             "grade" => {
                 let source = take_task_name(&mut named, "score")?;
+                // Optional secondary axis: the named task's score breaks primary-score ties.
+                let tiebreak = take_optional_task_name(&mut named, "tiebreak")?;
                 let mut evidence = take_named_task_names(&mut named, "evidence")?;
                 if !evidence.contains(&source) {
                     evidence.push(source.clone());
+                }
+                if let Some(t) = &tiebreak
+                    && !evidence.contains(t)
+                {
+                    evidence.push(t.clone());
                 }
                 let mut task = engine(
                     &take_string(&mut named, "name")?,
@@ -356,6 +363,9 @@ impl Compiler {
                     Some(source),
                     evidence,
                 );
+                if let TaskKind::Engine { tiebreak: slot, .. } = &mut task.task {
+                    *slot = tiebreak;
+                }
                 task.join = parse_join(&take_string_default(&mut named, "join", "passed")?)?;
                 task
             }
@@ -490,7 +500,11 @@ fn dsl_task(
 fn engine(name: &str, op: EngineOp, source: Option<TaskName>, depends_on: Vec<TaskName>) -> Task {
     Task {
         name: TaskName(name.to_owned()),
-        task: TaskKind::Engine { op, source },
+        task: TaskKind::Engine {
+            op,
+            source,
+            tiebreak: None,
+        },
         depends_on,
         session: None,
         needs: "any".to_owned(),
@@ -895,6 +909,7 @@ measurement = grade(
     name = "final-grade",
     evidence = [correctness, latency, racecheck],
     score = latency,
+    tiebreak = racecheck,
 )
 choice = decide(name = "choose", measurement = measurement)
 workflow(
@@ -920,7 +935,9 @@ workflow(
             TaskKind::Engine {
                 op: EngineOp::Grade,
                 source: Some(ref source),
+                tiebreak: Some(ref tiebreak),
             } if source == &TaskName("latency".to_string())
+                && tiebreak == &TaskName("racecheck".to_string())
         ));
         let _ = std::fs::remove_dir_all(&pack);
     }

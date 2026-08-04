@@ -37,6 +37,7 @@ impl Manifest {
             workspace,
             measure_cmd: self.judge.measure_cmd.clone(),
             direction: self.direction()?,
+            tiebreak_direction: self.tiebreak_direction()?,
             objective: self.judge.objective.clone(),
             frozen_injects,
         }))
@@ -71,6 +72,7 @@ impl CompositeManifest {
             workspace: self.base_dir(manifest_dir),
             measure_cmd: self.judge.measure_cmd.clone(),
             direction: self.direction()?,
+            tiebreak_direction: self.tiebreak_direction()?,
             objective: self.judge.objective.clone(),
             frozen_injects: vec![],
         }))
