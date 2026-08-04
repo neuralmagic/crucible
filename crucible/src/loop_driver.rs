@@ -103,9 +103,8 @@ impl Segment {
 struct Run {
     rows: Vec<Row>,
     spent: f64,
-    /// SHAs of commits this session kept, for the publish summary. (A resumed run's earlier keeps
-    /// live in git history but aren't replayed here; the branch push gates on any kept row, so the
-    /// deliverable still ships.)
+    /// SHAs of commits this session kept, for the publish summary. A resumed run rebuilds the
+    /// pre-resume keeps from the log's kept rows (see [`restore_kept_best`]).
     kept_shas: Vec<String>,
     /// The pristine upstream SHA the workspace was checked out at, captured from segment 0's baseline
     /// snapshot BEFORE any agent commit (a later re-baseline would see kept commits, so this is taken
@@ -415,6 +414,7 @@ pub(crate) fn decide_row(judge: &dyn Judge, best_score: f64, it: u32, m: Measure
         score: reading.score,
         total: reading_total(&reading),
         phase: None,
+        kept_snap: None,
     };
     Decided {
         row,
@@ -511,21 +511,24 @@ fn run_loop_body<R: Reporter>(
         // Resume restores state in-memory only: the log already holds the prior
         // `start` + rows, so re-emitting them would double-count on replay. We append
         // just the continuation (a resume note, then the new iterations). Segment 0 opens
-        // in the default regime with the restored scores (the live deployment holds the kept best).
+        // in the default regime with the restored scores, on the kept-best tree put back
+        // by `restore_kept_best` (a re-prepared checkout is the upstream baseline, not
+        // the tree the logged best score measured).
         let resumed_identity = rs.identity.clone();
+        let resumed_best = restore_kept_best(world, judge.direction(), &rs.rows, rs.best_score)?;
         let segment = Segment {
             regime: "default".to_string(),
             fingerprint: fingerprint(&prep.goal, &judge.objective(), "default"),
             baseline_score: rs.baseline_score,
-            best_score: rs.best_score,
+            best_score: resumed_best.best_score,
             baseline_total: rs.baseline_total,
-            best_snap: Snapshot(world.snapshot("resume").context("resume snapshot")?),
+            best_snap: resumed_best.best_snap,
         };
         start_iter = rs.next_iter;
         let run = Run {
             rows: rs.rows,
             spent: rs.spent,
-            kept_shas: Vec::new(),
+            kept_shas: resumed_best.kept_shas,
             base_sha: None,
             base_snap: None,
             solved_any: rs.solved_any,
@@ -544,6 +547,9 @@ fn run_loop_body<R: Reporter>(
             "resumed: {} prior rows restored, continuing at iter {start_iter}",
             run.rows.len()
         ));
+        if let Some(why) = &resumed_best.degraded {
+            r.note(&format!("resume: {why}"));
+        }
         // Recompute the identity fresh (from the live manifest/workspace) and hard-warn, never
         // abort, when it differs from what the original run recorded. Scores across this resume
         // boundary aren't comparable because the world changed, but the resumed deployment still holds
@@ -830,7 +836,7 @@ fn run_loop_body<R: Reporter>(
             dead_turns = 0;
         }
         let Decided {
-            row,
+            mut row,
             verdict,
             reading,
         } = match step {
@@ -908,6 +914,8 @@ fn run_loop_body<R: Reporter>(
                     if let Some(sha) = world.commit_sha(&snap) {
                         run.kept_shas.push(sha);
                     }
+                    // The row carries the token so a resume can restore this kept tree.
+                    row.kept_snap = Some(snap.clone());
                     run.segment.best_snap = Snapshot(snap);
                 }
                 Err(e) => r.note(&format!("snapshot failed (change still live): {e:#}")),
@@ -1072,6 +1080,71 @@ fn spawn_feedback_watcher<R: Reporter>(r: &mut R, prs: &[publish::PrLink], p: &P
             p.steer.display()
         )),
         Err(e) => r.note(&format!("watch-feedback: failed to spawn watch-pr: {e:#}")),
+    }
+}
+
+/// The resumed segment's best tree, score, and keeps, resolved together by
+/// [`restore_kept_best`] so the score can never be paired with a tree it did not measure.
+struct ResumedBest {
+    best_snap: Snapshot,
+    best_score: f64,
+    kept_shas: Vec<String>,
+    /// Set when kept rows exist but their tree could not be restored; the loop notes it.
+    degraded: Option<String>,
+}
+
+/// Put the workspace back on the kept-best tree recorded in the resumed rows. A resume runs on
+/// a re-prepared checkout (the upstream baseline), so without this the logged best score sits
+/// on a tree that never earned it, and the agent burns iterations rediscovering its own kept
+/// work. When the tree cannot come back (a log predating [`Row::kept_snap`], or the restore
+/// fails), the logged best is dropped to the direction's worst so the first valid candidate is
+/// kept instead of losing a tie against a ghost.
+fn restore_kept_best(
+    world: &dyn World,
+    direction: crate::command_judge::Direction,
+    rows: &[Row],
+    logged_best: f64,
+) -> Result<ResumedBest> {
+    let Some(last_kept) = rows.iter().rev().find(|row| row.decision == "keep") else {
+        // No keeps: the re-prepared checkout IS the baseline the logged scores measured.
+        return Ok(ResumedBest {
+            best_snap: Snapshot(world.snapshot("resume").context("resume snapshot")?),
+            best_score: logged_best,
+            kept_shas: Vec::new(),
+            degraded: None,
+        });
+    };
+    let restored = match last_kept.kept_snap.as_deref() {
+        Some(snap) => world
+            .restore(snap)
+            .map(|()| snap.to_string())
+            .map_err(|e| format!("restore failed: {e:#}")),
+        None => Err("the log predates kept-snapshot tokens".to_string()),
+    };
+    match restored {
+        Ok(snap) => Ok(ResumedBest {
+            // Rebuild the publish summary's keeps from the rows; without this the end-of-run
+            // publish can't reference any keep that predates the resume.
+            kept_shas: rows
+                .iter()
+                .filter(|row| row.decision == "keep")
+                .filter_map(|row| row.kept_snap.as_deref())
+                .filter_map(|snap| world.commit_sha(snap))
+                .collect(),
+            best_snap: Snapshot(snap),
+            best_score: logged_best,
+            degraded: None,
+        }),
+        Err(why) => Ok(ResumedBest {
+            best_snap: Snapshot(world.snapshot("resume").context("resume snapshot")?),
+            best_score: worst_score(direction),
+            kept_shas: Vec::new(),
+            degraded: Some(format!(
+                "kept-best tree not restorable ({why}); dropping best score {logged_best} so \
+                 the first valid candidate is kept — prior scores measured a tree this run \
+                 does not hold"
+            )),
+        }),
     }
 }
 
@@ -1342,10 +1415,7 @@ fn run_baseline(
 ) -> Result<(f64, u64, String, Row)> {
     let snap = world.snapshot("baseline").context("baseline snapshot")?;
     if skip {
-        let score = match judge.direction() {
-            crate::command_judge::Direction::Higher => f64::NEG_INFINITY,
-            crate::command_judge::Direction::Lower => f64::INFINITY,
-        };
+        let score = worst_score(judge.direction());
         let row = Row {
             iter: 0,
             decision: "baseline-skipped".into(),
@@ -1370,6 +1440,14 @@ fn run_baseline(
         ..Default::default()
     };
     Ok((score, total, snap, row))
+}
+
+/// The direction's worst score: the no-valid-candidate sentinel any real measurement beats.
+fn worst_score(direction: crate::command_judge::Direction) -> f64 {
+    match direction {
+        crate::command_judge::Direction::Higher => f64::NEG_INFINITY,
+        crate::command_judge::Direction::Lower => f64::INFINITY,
+    }
 }
 
 /// A short, stable content fingerprint of the evaluation setup (goal + objective + regime).
@@ -1560,6 +1638,7 @@ mod tests {
                 score: Some(score),
                 total: Some(42),
                 phase: None,
+                kept_snap: None,
             },
             solved: false,
         };
@@ -1619,6 +1698,7 @@ mod tests {
                 score: Some(score),
                 total: Some(10),
                 phase: None,
+                kept_snap: None,
             },
             solved: false,
         };
@@ -1633,6 +1713,7 @@ mod tests {
                 score: Some(score),
                 total: None,
                 phase: Some("wide".into()),
+                kept_snap: None,
             },
             solved: false,
         };
@@ -1678,6 +1759,160 @@ mod tests {
         );
         assert_eq!(rs.baseline_score, 200.0, "baseline from deep row, not wide");
         assert_eq!(rs.next_iter, 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A `World` that records `restore` calls and answers `commit_sha` with the token itself,
+    /// for the resume-restore tests.
+    #[derive(Default)]
+    struct RecordingWorld {
+        restores: std::sync::Mutex<Vec<String>>,
+        fail_restore: bool,
+    }
+    impl World for RecordingWorld {
+        fn snapshot(&self, _label: &str) -> Result<String> {
+            Ok("fresh".to_string())
+        }
+        fn restore(&self, snap: &str) -> Result<()> {
+            if self.fail_restore {
+                anyhow::bail!("no such commit");
+            }
+            self.restores.lock().unwrap().push(snap.to_string());
+            Ok(())
+        }
+        fn commit_sha(&self, snap: &str) -> Option<String> {
+            Some(snap.to_string())
+        }
+    }
+
+    fn resumed_row(iter: u32, decision: &str, snap: Option<&str>) -> Row {
+        Row {
+            iter,
+            decision: decision.into(),
+            kept_snap: snap.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resume_restores_kept_tree_and_rebuilds_keeps() {
+        let world = RecordingWorld::default();
+        let rows = [
+            resumed_row(0, "baseline", None),
+            resumed_row(1, "keep", Some("aaa")),
+            resumed_row(2, "discard", None),
+            resumed_row(3, "keep", Some("bbb")),
+        ];
+        let best = restore_kept_best(&world, crate::command_judge::Direction::Lower, &rows, 180.0)
+            .unwrap();
+        assert_eq!(
+            *world.restores.lock().unwrap(),
+            vec!["bbb".to_string()],
+            "restores exactly the last kept tree"
+        );
+        assert_eq!(best.best_snap.as_str(), "bbb");
+        assert_eq!(
+            best.best_score, 180.0,
+            "restored tree keeps the logged best"
+        );
+        assert_eq!(
+            best.kept_shas,
+            vec!["aaa".to_string(), "bbb".to_string()],
+            "publish keeps rebuilt from the kept rows"
+        );
+        assert!(best.degraded.is_none());
+    }
+
+    #[test]
+    fn resume_without_restorable_snap_resets_best() {
+        // An old log: kept rows exist but carry no snapshot token.
+        let world = RecordingWorld::default();
+        let rows = [
+            resumed_row(0, "baseline", None),
+            resumed_row(1, "keep", None),
+        ];
+        let best = restore_kept_best(&world, crate::command_judge::Direction::Lower, &rows, 180.0)
+            .unwrap();
+        assert!(world.restores.lock().unwrap().is_empty());
+        assert_eq!(
+            best.best_snap.as_str(),
+            "fresh",
+            "falls back to the checkout"
+        );
+        assert_eq!(
+            best.best_score,
+            f64::INFINITY,
+            "logged best dropped: its tree is gone, any valid candidate must win"
+        );
+        assert!(best.kept_shas.is_empty());
+        assert!(best.degraded.is_some());
+
+        // Same degradation when the token is present but the world can't restore it.
+        let world = RecordingWorld {
+            fail_restore: true,
+            ..Default::default()
+        };
+        let rows = [
+            resumed_row(0, "baseline", None),
+            resumed_row(1, "keep", Some("gone")),
+        ];
+        let best = restore_kept_best(&world, crate::command_judge::Direction::Higher, &rows, 42.0)
+            .unwrap();
+        assert_eq!(
+            best.best_score,
+            f64::NEG_INFINITY,
+            "direction-aware sentinel"
+        );
+        assert!(best.kept_shas.is_empty());
+        assert!(best.degraded.is_some());
+    }
+
+    #[test]
+    fn resume_with_no_keeps_keeps_logged_best() {
+        let world = RecordingWorld::default();
+        let rows = [
+            resumed_row(0, "baseline", None),
+            resumed_row(1, "discard", None),
+        ];
+        let best = restore_kept_best(&world, crate::command_judge::Direction::Lower, &rows, 240.0)
+            .unwrap();
+        assert!(world.restores.lock().unwrap().is_empty());
+        assert_eq!(best.best_snap.as_str(), "fresh");
+        assert_eq!(best.best_score, 240.0, "the checkout IS the baseline");
+        assert!(best.degraded.is_none());
+    }
+
+    #[test]
+    fn resume_rows_carry_kept_snap() {
+        use session::{RowWire, SessionEvent, encode};
+        let mk = |iter, decision: &str, kept_snap: Option<&str>| SessionEvent::Row {
+            row: RowWire {
+                iter,
+                decision: decision.into(),
+                note: String::new(),
+                detail: String::new(),
+                diff: String::new(),
+                diffstat: String::new(),
+                score: Some(200.0),
+                total: None,
+                phase: None,
+                kept_snap: kept_snap.map(str::to_string),
+            },
+            solved: false,
+        };
+        let log = [
+            mk(0, "baseline", None),
+            mk(1, "keep", Some("aaa")),
+            SessionEvent::Finished,
+        ]
+        .iter()
+        .map(encode)
+        .collect::<Vec<_>>()
+        .join("\n");
+        let path = std::env::temp_dir().join("crucible-resume-kept-snap.jsonl");
+        std::fs::write(&path, log).unwrap();
+        let rs = load_resume_state(&path).unwrap();
+        assert_eq!(rs.rows[1].kept_snap.as_deref(), Some("aaa"));
         let _ = std::fs::remove_file(&path);
     }
 

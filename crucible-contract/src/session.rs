@@ -30,6 +30,11 @@ pub struct RowWire {
     pub total: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
+    /// The World snapshot token committed when this row was kept (a git world packs the commit
+    /// sha). A resume restores the kept-best tree from it, so the logged best score is never
+    /// paired with a tree it did not measure. Absent on non-keep rows and on older logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept_snap: Option<String>,
 }
 
 /// One draft PR publish-on-keep opened, on the wire so the controller's pull-ingest can fold it
@@ -291,6 +296,7 @@ mod tests {
             score: Some(210.0),
             total: None,
             phase: None,
+            kept_snap: Some("abc123".into()),
         };
         for ev in [
             SessionEvent::Start {
