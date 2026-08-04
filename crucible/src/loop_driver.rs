@@ -233,24 +233,27 @@ pub(crate) enum TurnVerdict {
 /// failed, not the turn's content. Matched on the surfaced error text because the CLI backends
 /// flatten their HTTP/auth failures to strings.
 fn is_transport_turn_error(why: &str) -> bool {
-    [
-        "401",
-        "unauthenticated",
-        "invalid authentication",
-        "403",
-        "429",
-        "rate limit",
-        "overloaded",
-        "500",
-        "502",
-        "503",
-        "529",
-        "connection",
-        "timed out",
-        "timeout",
-    ]
-    .iter()
-    .any(|sig| why.to_ascii_lowercase().contains(sig))
+    let why = why.to_ascii_lowercase();
+    // HTTP status codes match only as standalone tokens: a bare `contains("502")` would
+    // misclassify any error mentioning "5023 rows" or a path like `/tmp/x502`.
+    let codes = ["401", "403", "429", "500", "502", "503", "529"];
+    let code_hit = why
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|tok| codes.contains(&tok));
+    code_hit
+        || [
+            "unauthenticated",
+            "invalid authentication",
+            "rate limit",
+            "overloaded",
+            "connection reset",
+            "connection refused",
+            "failed to connect",
+            "timed out",
+            "timeout",
+        ]
+        .iter()
+        .any(|sig| why.contains(sig))
 }
 
 pub(crate) fn drain_turn_markers<R: Reporter>(
