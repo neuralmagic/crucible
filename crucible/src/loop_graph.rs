@@ -17,7 +17,7 @@ use crate::crucible::{Judge, MeasureCtx, Reading, World};
 use crate::loop_driver::{self, Decided, IterStep, Measured, TurnVerdict};
 use crate::manifest::{WorkflowCaps, WorkflowCfg, WorkflowType};
 use crate::plan::exec::{
-    Attempt, AttemptOutcome, BatchItem, ExecCfg, Substrate, TaskRunner, execute,
+    Attempt, AttemptOutcome, BatchItem, ExecCfg, Substrate, TaskRunner, TaskStatus, execute,
 };
 use crate::plan::ir::{
     Direction, EngineOp, Isolation, Join, Plan, PlanBudget, Task, TaskKind, TaskName, ValidPlan,
@@ -124,17 +124,38 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
             // A pre-gate rejection discards the candidate.
             None => match &outcome.exit {
                 crate::plan::exec::PlanExit::ShortCircuit { task } => {
-                    let why = outcome
-                        .results
-                        .get(task)
-                        .and_then(|r| r.note.clone())
-                        .unwrap_or_default();
-                    runner.r.note(&format!(
-                        "workflow task {task} rejected the candidate (discarding iter {}): {why}",
-                        cx.it
-                    ));
-                    IterStep::Discarded {
-                        reason: format!("{task} rejected the candidate: {why}"),
+                    let result = outcome.results.get(task);
+                    let why = result.and_then(|r| r.note.clone()).unwrap_or_default();
+                    // A propose task that exhausted its transport retries never started a
+                    // turn: no candidate exists to reject, so hand the driver NeverStarted
+                    // (it re-runs the iteration instead of consuming it, bounded there).
+                    let propose_dead = result.is_some_and(|r| r.status == TaskStatus::Transport)
+                        && plan.plan().tasks.iter().any(|t| {
+                            t.name == *task
+                                && matches!(
+                                    t.task,
+                                    TaskKind::Engine {
+                                        op: EngineOp::Propose,
+                                        ..
+                                    }
+                                )
+                        });
+                    if propose_dead {
+                        runner.r.note(&format!(
+                            "workflow task {task} never started (iter {} not consumed): {why}",
+                            cx.it
+                        ));
+                        IterStep::NeverStarted {
+                            reason: format!("{task} died on transport: {why}"),
+                        }
+                    } else {
+                        runner.r.note(&format!(
+                            "workflow task {task} rejected the candidate (discarding iter {}): {why}",
+                            cx.it
+                        ));
+                        IterStep::Discarded {
+                            reason: format!("{task} rejected the candidate: {why}"),
+                        }
                     }
                 }
                 exit => anyhow::bail!(
@@ -295,8 +316,8 @@ impl<R: Reporter> LoopTaskRunner<'_, R> {
             }
             // Transport-class turn death: hand the executor a Transport outcome so
             // `run_with_retries` re-runs the turn (the session resumes where it died).
-            TurnVerdict::Retry => Attempt {
-                outcome: AttemptOutcome::Transport("turn died on a transport error".to_string()),
+            TurnVerdict::Retry(why) => Attempt {
+                outcome: AttemptOutcome::Transport(why),
                 cost_usd: cost,
             },
             TurnVerdict::Escalate => {
