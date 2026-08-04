@@ -513,6 +513,37 @@ impl Gateway {
         }
     }
 
+    /// Poll until the sandbox is actually GONE (`GetSandbox` returns NotFound). Deletion is
+    /// asynchronous (finalizers, pod teardown), so a delete followed by an immediate create races
+    /// the terminating CR and loses with "already exists" — once leaked, that collision burned
+    /// every remaining iteration of a run. Bounded by the same provisioning timeout as
+    /// [`Gateway::wait_ready`].
+    #[tracing::instrument(skip_all, fields(rpc = "wait_deleted", sandbox = name))]
+    pub async fn wait_deleted(&self, name: &str) -> Result<()> {
+        let deadline = Instant::now() + provision_timeout();
+        let mut client = self.poll_client();
+        loop {
+            match client
+                .get_sandbox(GetSandboxRequest {
+                    name: name.to_string(),
+                    ..Default::default()
+                })
+                .await
+            {
+                Err(s) if s.code() == tonic::Code::NotFound => return Ok(()),
+                Err(s) => return Err(anyhow!("get_sandbox({name}) while waiting for delete: {s}")),
+                Ok(_) => {}
+            }
+            if Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "sandbox '{name}' still exists {}s after delete",
+                    provision_timeout().as_secs()
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
     /// Whether the provider exists (`GetProvider` succeeds). Create-on-first-turn,
     /// update-thereafter, same as the old `provider get` probe.
     #[tracing::instrument(skip_all, fields(rpc = "get_provider", provider = name))]

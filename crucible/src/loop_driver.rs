@@ -215,11 +215,38 @@ pub(crate) enum TurnVerdict {
     Proceed,
     /// The turn failed (`is_error`): discard the iteration.
     Discard,
+    /// The turn died on a transport-class error (auth expiry, rate limit, connection): worth
+    /// re-running the turn — the session survives, so a retry resumes rather than restarts.
+    Retry,
     /// The agent escalated: halt for human review.
     Escalate,
     /// The agent blocked on a pending approval with no fallback.
     Park(provisioning::PendingProvisioning),
     Stop,
+}
+
+/// Whether an agent-turn error is transport-class: the infrastructure between us and the model
+/// failed, not the turn's content. Matched on the surfaced error text because the CLI backends
+/// flatten their HTTP/auth failures to strings.
+fn is_transport_turn_error(why: &str) -> bool {
+    [
+        "401",
+        "unauthenticated",
+        "invalid authentication",
+        "403",
+        "429",
+        "rate limit",
+        "overloaded",
+        "500",
+        "502",
+        "503",
+        "529",
+        "connection",
+        "timed out",
+        "timeout",
+    ]
+    .iter()
+    .any(|sig| why.to_ascii_lowercase().contains(sig))
 }
 
 pub(crate) fn drain_turn_markers<R: Reporter>(
@@ -237,6 +264,15 @@ pub(crate) fn drain_turn_markers<R: Reporter>(
     // same restore-and-continue an unscoreable (apply-failed) candidate takes.
     if turn.is_error {
         let why = turn.error.as_deref().unwrap_or("agent reported an error");
+        // A transport-class death (expired token, rate limit, dropped connection) says nothing
+        // about the candidate; the session survives, so a retried turn resumes where it died
+        // instead of the iteration being discarded (a 5h turn once died ungraded on one 401).
+        if is_transport_turn_error(why) {
+            r.note(&format!(
+                "agent turn hit a transport error (retrying): {why}"
+            ));
+            return TurnVerdict::Retry;
+        }
         r.note(&format!("agent turn failed (discarding iter {it}): {why}"));
         return TurnVerdict::Discard;
     }
@@ -741,7 +777,9 @@ fn run_loop_body<R: Reporter>(
                         }
                     }
                 }
-                TurnVerdict::Discard => IterStep::Discarded,
+                // The classic driver has no per-task retry loop; a transport death still
+                // discards the iteration here (the graph path is where the retry lives).
+                TurnVerdict::Discard | TurnVerdict::Retry => IterStep::Discarded,
                 TurnVerdict::Escalate => IterStep::Escalated,
                 TurnVerdict::Park(pp) => IterStep::Parked(pp),
                 TurnVerdict::Stop => IterStep::Stopped,
@@ -1311,6 +1349,28 @@ fn write_results(p: &Paths, goal: &str, prior: &str, rows: &[Row]) -> Result<()>
 mod tests {
     use super::*;
     use crate::reporter::{AgentTurn, Phase, Row, Stop};
+
+    /// The 401 that killed a 5h turn, plus the other transport signatures, classify as retryable;
+    /// content-level failures (an escalation-worthy error string, a plain crash) do not.
+    #[test]
+    fn transport_turn_errors_classify_retryable() {
+        for why in [
+            "Failed to authenticate. API Error: 401 [{\"error\":{\"code\":401,\"status\":\"UNAUTHENTICATED\"}}]",
+            "API Error: 429 rate limit exceeded",
+            "server overloaded, try again later",
+            "connection reset by peer",
+            "request timed out",
+        ] {
+            assert!(is_transport_turn_error(why), "{why}");
+        }
+        for why in [
+            "agent reported an error",
+            "the model refused the task",
+            "candidate deleted the reference oracle",
+        ] {
+            assert!(!is_transport_turn_error(why), "{why}");
+        }
+    }
 
     #[test]
     fn render_prompt_fills_slots_and_appends_steer() {
