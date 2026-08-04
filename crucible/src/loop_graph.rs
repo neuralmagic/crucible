@@ -220,6 +220,7 @@ pub(crate) fn iteration_template(
                 isolation: None,
                 join: Join::default(),
                 stage: Stage::Iteration,
+                emits: Vec::new(),
             }
         };
     let mut tasks = vec![engine("propose", EngineOp::Propose, None, vec![])];
@@ -932,6 +933,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
             isolation: Some(Isolation::Worktree),
             join: Join::All,
             stage: Stage::Iteration,
+            emits: Vec::new(),
         });
     }
     for id in 0..cfg.n {
@@ -949,6 +951,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
             isolation: None,
             join: Join::All,
             stage: Stage::Iteration,
+            emits: Vec::new(),
         });
     }
     tasks.push(Task {
@@ -966,6 +969,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
         isolation: None,
         join: Join::Passed,
         stage: Stage::Iteration,
+        emits: Vec::new(),
     });
     Plan {
         version: 1,

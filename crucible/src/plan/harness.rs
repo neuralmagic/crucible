@@ -756,6 +756,7 @@ mod tests {
             isolation: None,
             join: Join::default(),
             stage: Stage::Iteration,
+            emits: Vec::new(),
         };
         let mut runner = HarnessRunner {
             args: <crate::Cli as clap::Parser>::try_parse_from(["crucible"])

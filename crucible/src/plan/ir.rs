@@ -21,6 +21,11 @@ impl From<&str> for TaskName {
     }
 }
 
+/// A field name a task promises to include in its JSON output.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct OutputField(pub String);
+
 /// Grading direction for reducers, mirroring the judge's convention.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -193,6 +198,11 @@ pub struct Task {
     /// run once post-loop against the kept best.
     #[serde(default, skip_serializing_if = "Stage::is_iteration")]
     pub stage: Stage,
+    /// Fields the task's JSON output promises to include. Presence is checked at
+    /// runtime (a passing attempt missing one is a measured failure); consumer
+    /// contracts (`top_k`, grade sources) are checked at validation. Empty = undeclared.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub emits: Vec<OutputField>,
 }
 
 /// Executor-enforced accounting limit; overruns fail the plan.
@@ -318,6 +328,82 @@ impl Plan {
                 if threshold.is_some_and(|value| !value.is_finite()) {
                     bail!("task {:?}: evaluate threshold must be finite", t.name.0);
                 }
+            }
+            if !t.emits.is_empty() {
+                if matches!(t.task, TaskKind::TopK { .. } | TaskKind::Engine { .. }) {
+                    bail!(
+                        "task {:?}: emits is not accepted on {} tasks; their outputs are engine-defined",
+                        t.name.0,
+                        t.task.label()
+                    );
+                }
+                let mut fields = BTreeSet::new();
+                for field in &t.emits {
+                    if field.0.is_empty()
+                        || field.0.len() > 64
+                        || !field
+                            .0
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    {
+                        bail!(
+                            "task {:?} declares invalid output field {:?}; use 1-64 ASCII letters, digits, or `_`",
+                            t.name.0,
+                            field.0
+                        );
+                    }
+                    if !fields.insert(&field.0) {
+                        bail!(
+                            "task {:?} declares output field {:?} twice",
+                            t.name.0,
+                            field.0
+                        );
+                    }
+                }
+            }
+            // Consumer contracts are presence-only: a declared emits that omits `score`
+            // where a score is read is a wiring bug worth failing before any spend.
+            // An empty emits stays unchecked.
+            let score_declared = |name: &TaskName| {
+                index.get(name).is_none_or(|&i| {
+                    let emits = &self.tasks[i].emits;
+                    emits.is_empty() || emits.iter().any(|f| f.0 == "score")
+                })
+            };
+            if matches!(t.task, TaskKind::TopK { .. }) {
+                for d in &t.depends_on {
+                    if !score_declared(d) {
+                        bail!(
+                            "task {:?}: top_k ranks by `score`, but dependency {:?} declares emits without it",
+                            t.name.0,
+                            d.0
+                        );
+                    }
+                }
+            }
+            if let TaskKind::Engine {
+                op: EngineOp::Grade,
+                source: Some(source),
+                ..
+            } = &t.task
+                && !score_declared(source)
+            {
+                bail!(
+                    "task {:?}: grade reads `score` from {:?}, which declares emits without it",
+                    t.name.0,
+                    source.0
+                );
+            }
+            if let TaskKind::Evaluate {
+                threshold: Some(_), ..
+            } = &t.task
+                && !t.emits.is_empty()
+                && !t.emits.iter().any(|f| f.0 == "score")
+            {
+                bail!(
+                    "task {:?}: a thresholded evaluate grades `score`, but its emits omits it",
+                    t.name.0
+                );
             }
             if let Some(session) = &t.session {
                 if session.is_empty()
@@ -452,6 +538,7 @@ mod tests {
             isolation: None,
             join: Join::default(),
             stage: Stage::Iteration,
+            emits: Vec::new(),
         }
     }
 
@@ -572,6 +659,7 @@ mod tests {
             isolation: None,
             join: Join::default(),
             stage: Stage::Iteration,
+            emits: Vec::new(),
         };
         let err = plan(vec![t]).validate().unwrap_err();
         assert!(err.to_string().contains("at least one dependency"));
@@ -665,5 +753,145 @@ mod tests {
         let json = serde_json::to_string(&p).unwrap();
         let back = Plan::from_json_str(&json).unwrap().validate().unwrap();
         assert_eq!(back.plan().tasks.len(), 2);
+    }
+
+    fn emitting(name: &str, deps: &[&str], emits: &[&str]) -> Task {
+        let mut t = agent(name, deps);
+        t.emits = emits
+            .iter()
+            .map(|f| OutputField((*f).to_string()))
+            .collect();
+        t
+    }
+
+    fn top_k(name: &str, deps: &[&str]) -> Task {
+        Task {
+            name: name.into(),
+            task: TaskKind::TopK {
+                k: 1,
+                direction: Direction::Higher,
+            },
+            depends_on: deps.iter().map(|d| (*d).into()).collect(),
+            session: None,
+            needs: "any".into(),
+            required: true,
+            isolation: None,
+            join: Join::default(),
+            stage: Stage::Iteration,
+            emits: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn emits_fields_must_be_short_identifiers_without_duplicates() {
+        for bad in ["", "has-dash", "sp ace", &"x".repeat(65)] {
+            let err = plan(vec![emitting("a", &[], &[bad])])
+                .validate()
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("invalid output field"),
+                "{bad:?}: {err}"
+            );
+        }
+        let err = plan(vec![emitting("a", &[], &["score", "score"])])
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("twice"));
+        assert!(
+            plan(vec![emitting("a", &[], &["score", "pass", "note_1"])])
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn emits_is_rejected_on_top_k_and_engine_tasks() {
+        let mut pick = top_k("pick", &["a"]);
+        pick.emits = vec![OutputField("kept".into())];
+        let err = plan(vec![agent("a", &[]), pick]).validate().unwrap_err();
+        assert!(err.to_string().contains("engine-defined"), "{err}");
+
+        let mut measure = agent("measure", &[]);
+        measure.task = TaskKind::Engine {
+            op: EngineOp::Measure,
+            source: None,
+            tiebreak: None,
+        };
+        measure.emits = vec![OutputField("score".into())];
+        let err = plan(vec![measure]).validate().unwrap_err();
+        assert!(err.to_string().contains("engine-defined"), "{err}");
+    }
+
+    #[test]
+    fn top_k_dependency_declaring_emits_must_include_score() {
+        let err = plan(vec![
+            emitting("m", &[], &["latency_ms"]),
+            top_k("pick", &["m"]),
+        ])
+        .validate()
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("declares emits without it"),
+            "{err}"
+        );
+
+        assert!(
+            plan(vec![emitting("m", &[], &["score"]), top_k("pick", &["m"])])
+                .validate()
+                .is_ok()
+        );
+        // Empty emits = undeclared = unchecked.
+        assert!(
+            plan(vec![agent("m", &[]), top_k("pick", &["m"])])
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn grade_source_declaring_emits_must_include_score() {
+        let mut source = emitting("score", &[], &["latency_ms"]);
+        source.task = TaskKind::Evaluate {
+            command: "./x.sh".into(),
+            threshold: None,
+            direction: None,
+        };
+        let mut grade = agent("grade", &["score"]);
+        grade.task = TaskKind::Engine {
+            op: EngineOp::Grade,
+            source: Some("score".into()),
+            tiebreak: None,
+        };
+        let err = plan(vec![source, grade]).validate().unwrap_err();
+        assert!(err.to_string().contains("grade reads `score`"), "{err}");
+    }
+
+    #[test]
+    fn thresholded_evaluate_declaring_emits_must_include_score() {
+        let mut t = emitting("latency", &[], &["latency_ms"]);
+        t.task = TaskKind::Evaluate {
+            command: "./x.sh".into(),
+            threshold: Some(10.0),
+            direction: Some(Direction::Lower),
+        };
+        let err = plan(vec![t.clone()]).validate().unwrap_err();
+        assert!(err.to_string().contains("thresholded evaluate"), "{err}");
+
+        t.emits.push(OutputField("score".into()));
+        assert!(plan(vec![t]).validate().is_ok());
+    }
+
+    #[test]
+    fn empty_emits_is_omitted_from_the_wire_and_round_trips() {
+        let bare = serde_json::to_value(agent("a", &[])).unwrap();
+        assert!(bare.get("emits").is_none(), "{bare}");
+
+        let declared = emitting("a", &[], &["score"]);
+        let json = serde_json::to_string(&plan(vec![declared])).unwrap();
+        let back = Plan::from_json_str(&json).unwrap().validate().unwrap();
+        assert_eq!(
+            back.plan().tasks[0].emits,
+            vec![OutputField("score".into())]
+        );
     }
 }

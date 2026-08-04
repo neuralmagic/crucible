@@ -234,6 +234,41 @@ what it learned. Tasks sharing a session must be dependency-ordered and cannot b
 parallel critics should stay fresh or use distinct sessions. Admission requires
 `agent.session.persist`. A missing `session` preserves the historical fresh-turn behavior.
 
+Sessions can also be declared first-class with `session(...)` and bound by value:
+
+```python
+solver = session(name = "solver", model = "claude-opus-4-6", effort = "high")
+candidate = propose(name = "invent", session = solver)
+refine = agent(name = "refine", prompt = prompt_file("prompts/refine.md"), session = solver,
+               depends_on = [candidate])
+```
+
+Declarations are compile-time only; the generated manifest carries the same per-task `session`,
+`harness`, `model`, and `effort` fields as before. The rules:
+
+- A declaration's `harness` / `model` / `effort` are defaults that materialize onto every agent
+  task bound to it. A bound task may repeat a value but not contradict it: one session is one
+  serial conversation under one agent config.
+- A session carrying defaults cannot bind to `propose()`, whose agent config is owned by the
+  manifest's `[agent]`. A default-free declaration binds to it exactly as a string does.
+- Duplicate declarations of one name, and declarations never bound to a task, are compile errors.
+- While a file declares no sessions, bare strings keep the historical pass-through behavior.
+  Once any `session()` exists, every string `session = "x"` must name a declared session
+  (declared before use), so a typo can no longer silently open a second fresh conversation.
+
+Tasks may also declare their output contract: `emits = ["score", "pass"]` on `agent()`,
+`command()`, or `evaluate()` names fields the task's JSON output promises to include.
+Compilation rejects a `top_k` dependency, `grade` score source, or thresholded `evaluate` whose
+declared emits omits `score`; at runtime a passing attempt missing a declared field becomes a
+measured failure at the producing task instead of a mystery downstream. An absent `emits`
+declares nothing and changes nothing.
+
+Compile errors carry `file:line:col` and a did-you-mean suggestion for unknown functions,
+kwargs, variables, and session names. A behavioral change from earlier releases: a task
+constructed in `workflow.star` but omitted from `workflow(tasks = ...)` is now a compile error
+naming the construction site, because a silently dropped task is a silently weakened
+measurement. Delete the assignment or include the task.
+
 Crucible's private ledger contains only the logical name, an opaque harness cursor, and a
 completed-turn count. It never copies that cursor or Claude's native transcript into
 `session.jsonl`; the existing live harness event policy, including streamed thinking events, is
@@ -281,6 +316,8 @@ names.
 - `agent(...)` creates an agent task. `isolated = True` gives it a disposable worktree, ideal for
   concurrent read-only critics; leave it false for a synthesizer whose edits must survive.
   `session = "name"` opts into an engine-managed durable conversation.
+- `session(name = ..., harness = ?, model = ?, effort = ?)` declares a durable conversation with
+  optional agent defaults, bindable as the `session =` value on `agent()` and `propose()`.
 - `command(...)` creates a deterministic shell task in the candidate workspace.
 - `evaluate(...)` creates a typed measurement command with optional threshold grading.
 - `top_k(...)` creates a reducer for wider authored graphs.

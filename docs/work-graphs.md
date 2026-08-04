@@ -55,6 +55,7 @@ needs = "gpu"               # default "any"
 required = true             # default true
 isolation = "worktree"      # optional
 join = "all"                # default "all"
+emits = ["score"]           # optional declared output fields; absent = undeclared
 
 [[task]]
 name = "pick"
@@ -109,7 +110,14 @@ A task's output is JSON and becomes its dependents' input.
   Without a threshold, a successful command passes unless `pass` is false.
 
 `top_k` reads a finite numeric `score` from each input, so an upstream task that wants to rank
-must emit one.
+must emit one. That contract is declarable: `emits = ["score"]` on an `agent`, `command`, or
+`evaluate` task names fields its JSON output promises to include. Validation rejects a `top_k`
+dependency, `grade` score source, or thresholded `evaluate` whose declared emits omits `score`,
+before anything runs; at runtime a passing attempt missing a declared field is converted to a
+measured failure at the producing task (never retried, blocks dependents), so output drift fails
+where it happened instead of downstream. An empty or absent `emits` declares nothing and is
+never checked. `top_k` and `engine` tasks cannot declare emits; their outputs are
+engine-defined.
 
 ## Execution semantics
 

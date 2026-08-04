@@ -770,6 +770,29 @@ mod tests {
         assert!(error.contains("reserved"), "{error}");
     }
 
+    #[test]
+    fn emits_round_trips_toml_and_does_not_affect_admission() {
+        let workflow = parse(
+            "type = \"custom\"\nresult = \"check\"\n\
+             [[task]]\nname = \"check\"\nkind = \"evaluate\"\ncommand = \"true\"\nemits = [\"score\", \"pass\"]\n",
+        );
+        workflow.validate().unwrap();
+        workflow
+            .admit(&WorkflowCaps::new(["workflow.custom"]))
+            .unwrap();
+        let toml = toml::to_string(&workflow).unwrap();
+        assert!(toml.contains("emits = [\"score\", \"pass\"]"), "{toml}");
+        let back: WorkflowCfg = toml::from_str(&toml).unwrap();
+        assert_eq!(back.tasks[0].emits.len(), 2);
+
+        // Undeclared emits stays off the wire, keeping existing manifests byte-identical.
+        let bare = parse(
+            "type = \"custom\"\nresult = \"c\"\n\
+             [[task]]\nname = \"c\"\nkind = \"command\"\ncommand = \"true\"\n",
+        );
+        assert!(!toml::to_string(&bare).unwrap().contains("emits"));
+    }
+
     fn full_autoresearch() -> WorkflowCfg {
         parse(
             "type = \"autoresearch\"\nresult = \"choose\"\n\
