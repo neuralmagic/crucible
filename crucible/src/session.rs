@@ -25,6 +25,7 @@ impl From<&Row> for RowWire {
             phase: r.phase.clone(),
             kept_snap: r.kept_snap.clone(),
             evidence: r.evidence.clone(),
+            candidate_md: r.candidate_md.clone(),
         }
     }
 }
@@ -50,6 +51,7 @@ impl IntoRow for RowWire {
             phase: self.phase,
             kept_snap: self.kept_snap,
             evidence: self.evidence,
+            candidate_md: self.candidate_md,
         }
     }
 }
@@ -123,6 +125,7 @@ mod tests {
                 disposition: EvidenceDisposition::Passed,
                 note: String::new(),
             }],
+            candidate_md: "# Candidate\n\nfull writeup".into(),
         };
         let wire = RowWire::from(&row);
         let back = wire.into_row();
@@ -138,5 +141,6 @@ mod tests {
         assert_eq!(back.phase, row.phase);
         assert_eq!(back.kept_snap, row.kept_snap);
         assert_eq!(back.evidence, row.evidence);
+        assert_eq!(back.candidate_md, row.candidate_md);
     }
 }

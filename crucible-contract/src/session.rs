@@ -87,6 +87,12 @@ pub struct RowWire {
     /// ungraded rows and on logs written before the field existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<EvidenceEntry>,
+    /// The agent's whole CANDIDATE.md for this iteration (`note` is its first line-folded
+    /// 120 chars, table-sized). Carried in full so the PR body can print the actual
+    /// writeup instead of a mid-word truncation. Empty when the agent wrote none, and on
+    /// logs written before the field existed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub candidate_md: String,
 }
 
 /// One draft PR publish-on-keep opened, on the wire so the controller's pull-ingest can fold it
@@ -362,6 +368,7 @@ mod tests {
                     note: "worktree setup failed".into(),
                 },
             ],
+            candidate_md: "# Candidate: full writeup\n\nbody".into(),
         };
         for ev in [
             SessionEvent::Start {
@@ -576,7 +583,10 @@ mod tests {
         )
         .expect("old row decodes");
         match ev {
-            SessionEvent::Row { row, .. } => assert!(row.evidence.is_empty()),
+            SessionEvent::Row { row, .. } => {
+                assert!(row.evidence.is_empty());
+                assert!(row.candidate_md.is_empty());
+            }
             other => panic!("wrong variant: {other:?}"),
         }
     }

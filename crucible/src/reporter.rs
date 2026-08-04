@@ -41,6 +41,9 @@ pub struct Row {
     /// says which declared checks never ran instead of presenting a partially graded
     /// candidate as fully graded. Empty on ungraded rows.
     pub evidence: Vec<crate::session::EvidenceEntry>,
+    /// The agent's whole CANDIDATE.md (`note` is its 120-char single-line fold). The PR
+    /// body prints this; every table keeps using `note`. Empty when the agent wrote none.
+    pub candidate_md: String,
 }
 
 /// One-line evidence rendering for the human-readable outputs (console rows, RESULTS.md,

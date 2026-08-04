@@ -38,6 +38,10 @@ pub(crate) struct ResumeState {
     /// aborts, when it differs: scores across that boundary aren't comparable because the
     /// world changed.
     pub identity: Option<crate::identity::RunIdentity>,
+    /// Head branches of every draft PR prior segments already opened (from the log's `pr_links`
+    /// events). Publish skips a kept candidate whose branch is in here, so replaying the finish
+    /// path cannot open a second PR for the same kept commit.
+    pub published_branches: Vec<String>,
 }
 
 /// Optional runtime state for special loop starts (remote control and resume). Kept in
@@ -128,6 +132,9 @@ struct Run {
     /// Set when the agent blocked on a pending approval with no frozen-regime fallback; the loop
     /// parks at the next iteration head until the re-scope lands.
     pending_block: Option<provisioning::PendingProvisioning>,
+    /// Head branches prior segments already opened PRs from (restored from the log's `pr_links`
+    /// events; empty on a fresh run). Publish skips candidates whose branch is in here.
+    published_branches: Vec<String>,
     segment: Segment,
 }
 
@@ -204,6 +211,8 @@ pub(crate) struct Measured {
     /// The grade step's declared-vs-ran evidence record; empty everywhere but the graph
     /// runner's grade task (the plain measure path has no declared evidence set).
     pub(crate) evidence: Vec<crate::session::EvidenceEntry>,
+    /// The agent's whole CANDIDATE.md (see [`candidate_note`]); rides the row to publish.
+    pub(crate) candidate_md: String,
 }
 
 /// The outcome of [`decide_row`]: the results row, the keep/discard verdict, and the reading
@@ -385,13 +394,11 @@ pub(crate) fn measured_from_reading(
     p: &Paths,
     world: &dyn World,
 ) -> Measured {
-    let note = {
-        let c = candidate_note(p);
-        if c.is_empty() {
-            reading.note.clone()
-        } else {
-            c
-        }
+    let (candidate_note, candidate_md) = candidate_note(p);
+    let note = if candidate_note.is_empty() {
+        reading.note.clone()
+    } else {
+        candidate_note
     };
     let (diff, diffstat) = capture_diff(world);
     Measured {
@@ -400,6 +407,7 @@ pub(crate) fn measured_from_reading(
         diff,
         diffstat,
         evidence: Vec::new(),
+        candidate_md,
     }
 }
 
@@ -420,6 +428,7 @@ pub(crate) fn decide_row(
         diff,
         diffstat,
         evidence,
+        candidate_md,
     } = m;
     let verdict = judge.decide(&reading, best_score, best_tiebreak);
     let row = Row {
@@ -435,6 +444,7 @@ pub(crate) fn decide_row(
         phase: None,
         kept_snap: None,
         evidence,
+        candidate_md,
     };
     Decided {
         row,
@@ -561,6 +571,7 @@ fn run_loop_body<R: Reporter>(
             solved_any: rs.solved_any,
             parked_total: Duration::ZERO,
             pending_block: None,
+            published_branches: rs.published_branches,
             segment,
         };
         update_control_status(
@@ -623,6 +634,7 @@ fn run_loop_body<R: Reporter>(
             solved_any: false,
             parked_total: Duration::ZERO,
             pending_block: None,
+            published_branches: Vec::new(),
             segment,
         };
         r.row(&base_row, false);
@@ -986,6 +998,7 @@ fn run_loop_body<R: Reporter>(
                 base_sha: run.base_sha.as_deref(),
                 // Progress publish never pushes branches (S3 only), so no composite targets here.
                 components: &[],
+                published_branches: &run.published_branches,
                 cost_usd: run.spent,
                 elapsed: started.elapsed(),
                 identity_digest: &prep.identity.digest,
@@ -1045,6 +1058,7 @@ fn run_loop_body<R: Reporter>(
             kept_shas: &run.kept_shas,
             base_sha: run.base_sha.as_deref(),
             components: &components,
+            published_branches: &run.published_branches,
             cost_usd: run.spent,
             elapsed: started.elapsed(),
             identity_digest: &prep.identity.digest,
@@ -1204,6 +1218,7 @@ pub(crate) fn load_resume_state(session_log: &std::path::Path) -> Result<ResumeS
     let mut summary_best: Option<f64> = None;
     let mut solved_any = false;
     let mut identity = None;
+    let mut published_branches: Vec<String> = Vec::new();
     for line in content.lines() {
         match session::decode(line) {
             Some(SessionEvent::Row { row, solved }) => {
@@ -1221,6 +1236,11 @@ pub(crate) fn load_resume_state(session_log: &std::path::Path) -> Result<ResumeS
             Some(SessionEvent::Summary { best_score, .. }) => summary_best = Some(best_score),
             // Last one wins: a run resumed more than once re-emits a fresh identity each time.
             Some(SessionEvent::Identity { identity: id }) => identity = Some(id),
+            // Accumulated across segments: every branch any prior publish opened a PR from,
+            // so a replayed finish can recognize an already-published kept commit.
+            Some(SessionEvent::PrLinks { links }) => {
+                published_branches.extend(links.into_iter().map(|l| l.branch));
+            }
             _ => {}
         }
     }
@@ -1257,7 +1277,16 @@ pub(crate) fn load_resume_state(session_log: &std::path::Path) -> Result<ResumeS
         next_iter,
         solved_any,
         identity,
+        published_branches,
     })
+}
+
+/// The resume no-op guard: the restored log already covers every iteration, or the budget
+/// is spent, so the pod's work is done. The caller must exit clean WITHOUT re-running the
+/// finish path — replaying it re-published the kept candidate each restart lap (run 6
+/// opened five draft PRs for one kept diff).
+pub(crate) fn resume_finished(rs: &ResumeState, iterations: u32, max_cost: f64) -> bool {
+    rs.next_iter > iterations || (max_cost > 0.0 && rs.spent >= max_cost)
 }
 
 fn wait_if_paused<R: Reporter>(control: Option<&control::ControlState>, r: &mut R) {
@@ -1520,16 +1549,19 @@ fn take_steer(p: &Paths) -> Option<String> {
     Some(text)
 }
 
-/// Read (and consume) the agent's CANDIDATE.md note. Consumed because the file is harness
-/// furniture excluded from git; without the delete, a discard's clean no longer removes it and a
-/// stale note would bleed into later iterations' rows.
-fn candidate_note(p: &Paths) -> String {
+/// Read (and consume) the agent's CANDIDATE.md, returning `(note, full)`: the 120-char
+/// single-line fold for tables, plus the whole text so the PR body prints the actual
+/// writeup (DeepGEMM#5 shipped only the fold, truncated mid-word). Consumed because the
+/// file is harness furniture excluded from git; without the delete, a discard's clean no
+/// longer removes it and a stale note would bleed into later iterations' rows.
+fn candidate_note(p: &Paths) -> (String, String) {
     let path = p.workspace.join("CANDIDATE.md");
-    let note = std::fs::read_to_string(&path)
-        .map(|s| s.trim().replace('\n', " ").chars().take(120).collect())
+    let full: String = std::fs::read_to_string(&path)
+        .map(|s| s.trim().to_string())
         .unwrap_or_default();
     let _ = std::fs::remove_file(&path);
-    note
+    let note = full.replace('\n', " ").chars().take(120).collect();
+    (note, full)
 }
 
 fn write_results(p: &Paths, goal: &str, prior: &str, rows: &[Row]) -> Result<()> {
@@ -1701,6 +1733,7 @@ mod tests {
                 phase: None,
                 kept_snap: None,
                 evidence: Vec::new(),
+                candidate_md: String::new(),
             },
             solved: false,
         };
@@ -1763,6 +1796,7 @@ mod tests {
                 phase: None,
                 kept_snap: None,
                 evidence: Vec::new(),
+                candidate_md: String::new(),
             },
             solved: false,
         };
@@ -1816,6 +1850,7 @@ mod tests {
                 phase: None,
                 kept_snap: None,
                 evidence: Vec::new(),
+                candidate_md: String::new(),
             },
             solved: false,
         };
@@ -1833,6 +1868,7 @@ mod tests {
                 phase: Some("wide".into()),
                 kept_snap: None,
                 evidence: Vec::new(),
+                candidate_md: String::new(),
             },
             solved: false,
         };
@@ -2051,6 +2087,7 @@ mod tests {
                 phase: None,
                 kept_snap: kept_snap.map(str::to_string),
                 evidence: Vec::new(),
+                candidate_md: String::new(),
             },
             solved: false,
         };
@@ -3056,5 +3093,62 @@ mod tests {
             "an ungraded row's detail is untouched:\n{s}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Run 6's real session log, pinned: one launch, five `finished` records, five draft PRs
+    /// (DeepGEMM#5–#9) for one kept diff. The fixture proves three things end to end: the rows
+    /// restore, [`resume_finished`] no-ops a resume of the finished run (the f19d64a guard), and
+    /// the five replayed publishes — five run ids, one kept commit — collapse to one branch name
+    /// under sha keying.
+    #[test]
+    fn run6_fixture_restores_noops_and_dedupes_publish() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sessions/run6-session.jsonl");
+        let rs = load_resume_state(&path).unwrap();
+
+        // Rows restore: baseline + iters 1..6, exactly one keep (the steered iter 1).
+        assert_eq!(rs.rows.len(), 7, "baseline plus six iterations");
+        assert_eq!(rs.rows[0].decision, "baseline-skipped");
+        let kept: Vec<&Row> = rs.rows.iter().filter(|r| r.decision == "keep").collect();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].iter, 1);
+        assert!(
+            kept[0]
+                .note
+                .starts_with("# Candidate: Block-scaled FP8 MegaMoE")
+        );
+        // The kept row's grade detail restores too (the PR body's metrics source).
+        assert!(kept[0].detail.contains("mega_diff"));
+
+        // The run declared 6 iterations and burned them all: resuming is a no-op. The guard
+        // must NOT fire while iterations remain (the same log under a raised cap continues).
+        assert_eq!(rs.next_iter, 7);
+        assert!(resume_finished(&rs, 6, 40.0));
+        assert!(!resume_finished(&rs, 12, 40.0));
+        // The budget arm: the run spent ~$3.13, so a $3 cap also finishes it.
+        assert!(resume_finished(&rs, 12, 3.0));
+
+        // The five replayed publishes each minted a run-id-keyed branch: five branches, one
+        // kept diff. All five restore into the published set…
+        assert_eq!(rs.published_branches.len(), 5);
+        let distinct: std::collections::BTreeSet<&String> = rs.published_branches.iter().collect();
+        assert_eq!(distinct.len(), 5, "the bug: one diff, five branches");
+        // …while sha keying derives ONE branch for the kept commit no matter the run id, so
+        // the republish check has a stable key to match on.
+        let goal = "# GOAL Fold block-scaled FP8 into DeepGEMM";
+        let kept_shas = vec!["4d3406b1c9aa0f2e77aa000000000000deadbeef".to_string()];
+        let branches: std::collections::BTreeSet<String> = [
+            "20260804T021753Z-goal-fold-block-scaled-fp8-into-deepgemm",
+            "20260804T041307Z-goal-fold-block-scaled-fp8-into-deepgemm",
+            "20260804T044928Z-goal-fold-block-scaled-fp8-into-deepgemm",
+        ]
+        .iter()
+        .map(|run_id| crate::publish::head_branch_for_test(goal, run_id, &kept_shas))
+        .collect();
+        assert_eq!(
+            branches.len(),
+            1,
+            "same kept sha, same branch: {branches:?}"
+        );
     }
 }
