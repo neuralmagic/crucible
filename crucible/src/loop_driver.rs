@@ -125,6 +125,12 @@ struct Run {
     segment: Segment,
 }
 
+/// Consecutive never-started turns (transport/sandbox death before the agent produced
+/// anything) after which the run halts as [`LoopExit::Stalled`]. Such a turn re-runs its
+/// iteration instead of consuming it, so without this bound one dead node could spin the
+/// run forever (run 6 burned 7 of 9 iterations on a single sandbox that never came up).
+const MAX_DEAD_TURN_ATTEMPTS: u32 = 3;
+
 /// How a run ended, the single enumeration of every way the loop exits, replacing the old
 /// `escalated: Option` flag plus the scattered `break`s. Mapped to an [`Outcome`] once
 /// at the end of [`run_loop`].
@@ -142,6 +148,9 @@ enum LoopExit {
     /// back eagerly at the break site (differently per site) so the variant only needs to
     /// mark the run as "needs human" for the exit code.
     Escalated,
+    /// [`MAX_DEAD_TURN_ATTEMPTS`] consecutive turns died on transport before starting: the
+    /// run is stalled on infrastructure, not out of iterations.
+    Stalled,
 }
 
 impl LoopExit {
@@ -156,6 +165,10 @@ impl LoopExit {
             LoopExit::Escalated => (
                 "escalated",
                 "the agent declared the harness inadequate — halted for human review",
+            ),
+            LoopExit::Stalled => (
+                "stalled",
+                "the run stalled on consecutive transport failures — no turn could start",
             ),
         }
     }
@@ -203,6 +216,13 @@ pub(crate) enum IterStep {
     Discarded {
         reason: String,
     },
+    /// The turn never started: a transport-class death (sandbox setup, auth, connection)
+    /// before the agent produced anything. There is no candidate to discard, so the driver
+    /// re-runs the SAME iteration instead of consuming it, bounded by
+    /// [`MAX_DEAD_TURN_ATTEMPTS`] consecutive attempts.
+    NeverStarted {
+        reason: String,
+    },
     /// Halt for human review (the escalation is already reported).
     Escalated,
     /// Park at the next iteration head on a blocking approval.
@@ -221,7 +241,8 @@ pub(crate) enum TurnVerdict {
     Discard,
     /// The turn died on a transport-class error (auth expiry, rate limit, connection): worth
     /// re-running the turn — the session survives, so a retry resumes rather than restarts.
-    Retry,
+    /// Carries the surfaced error so the retry/stall records name the actual failure.
+    Retry(String),
     /// The agent escalated: halt for human review.
     Escalate,
     /// The agent blocked on a pending approval with no fallback.
@@ -278,7 +299,7 @@ pub(crate) fn drain_turn_markers<R: Reporter>(
             r.note(&format!(
                 "agent turn hit a transport error (retrying): {why}"
             ));
-            return TurnVerdict::Retry;
+            return TurnVerdict::Retry(why.to_string());
         }
         r.note(&format!("agent turn failed (discarding iter {it}): {why}"));
         return TurnVerdict::Discard;
@@ -645,10 +666,15 @@ fn run_loop_body<R: Reporter>(
         }
     }
 
-    // How this run ends. Each early exit sets it before breaking; a `for` that runs to completion
-    // leaves it `Finished`. One match below folds it into the `Outcome`.
+    // How this run ends. Each early exit sets it before breaking; a loop that runs out of
+    // iterations leaves it `Finished`. One match below folds it into the `Outcome`.
     let mut exit = LoopExit::Finished;
-    for it in start_iter..=args.iterations {
+    // `it` advances only when a turn actually started: a never-started attempt re-runs the
+    // same iteration (hence a `while`, not a `for`), and `dead_turns` counts the consecutive
+    // never-started attempts that bound the re-runs.
+    let mut dead_turns: u32 = 0;
+    let mut it = start_iter;
+    while it <= args.iterations {
         wait_if_paused(control, r);
         // The agent blocked on a pending approval last turn (it had no frozen-regime fallback).
         // Park here (idle, budget-paused) until the approval lands as a re-scope (the broker
@@ -786,17 +812,23 @@ fn run_loop_body<R: Reporter>(
                         }
                     }
                 }
-                // The classic driver has no per-task retry loop; a transport death still
-                // discards the iteration here (the graph path is where the retry lives).
-                TurnVerdict::Discard | TurnVerdict::Retry => IterStep::Discarded {
+                TurnVerdict::Discard => IterStep::Discarded {
                     reason: "turn failed".to_string(),
                 },
+                // The classic driver has no per-task retry loop; a transport death means
+                // the turn never started, so the driver re-runs this iteration (the graph
+                // path retries in-task first and reaches the same fold on exhaustion).
+                TurnVerdict::Retry(why) => IterStep::NeverStarted { reason: why },
                 TurnVerdict::Escalate => IterStep::Escalated,
                 TurnVerdict::Park(pp) => IterStep::Parked(pp),
                 TurnVerdict::Stop => IterStep::Stopped,
             }
         };
 
+        // Any step other than NeverStarted proves a turn started: reset the stall streak.
+        if !matches!(&step, IterStep::NeverStarted { .. }) {
+            dead_turns = 0;
+        }
         let Decided {
             row,
             verdict,
@@ -813,6 +845,36 @@ fn run_loop_body<R: Reporter>(
                 r.row(&row, false);
                 run.rows.push(row);
                 world.restore(run.segment.best_snap.as_str())?;
+                it += 1;
+                continue;
+            }
+            // A never-started turn produced no candidate, so there is nothing to charge the
+            // iteration for: log the dead attempt faithfully (row + note), then re-run the
+            // same `it`. Bounded so a dead node stalls the run instead of burning it to the
+            // iteration cap as a fake "finished".
+            IterStep::NeverStarted { reason } => {
+                dead_turns += 1;
+                let row = Row {
+                    iter: it,
+                    decision: "infra-dead".to_string(),
+                    note: reason,
+                    phase: Some("infra".to_string()),
+                    ..Default::default()
+                };
+                r.row(&row, false);
+                run.rows.push(row);
+                write_results(p, &prep.goal, &prep.prior, &run.rows)?;
+                world.restore(run.segment.best_snap.as_str())?;
+                if dead_turns >= MAX_DEAD_TURN_ATTEMPTS {
+                    r.note(&format!(
+                        "{dead_turns} consecutive turns died before starting — the run is stalled"
+                    ));
+                    exit = LoopExit::Stalled;
+                    break;
+                }
+                r.note(&format!(
+                    "turn never started (attempt {dead_turns}/{MAX_DEAD_TURN_ATTEMPTS}) — re-running iter {it} without consuming it"
+                ));
                 continue;
             }
             IterStep::Escalated => {
@@ -825,6 +887,7 @@ fn run_loop_body<R: Reporter>(
                 update_control_status(control, "parked", it, run.segment.best_score, run.spent);
                 run.pending_block = Some(pp);
                 write_results(p, &prep.goal, &prep.prior, &run.rows)?;
+                it += 1;
                 continue;
             }
             IterStep::Stopped => {
@@ -895,6 +958,7 @@ fn run_loop_body<R: Reporter>(
             exit = LoopExit::Solved;
             break;
         }
+        it += 1;
     }
 
     r.summary(&run.rows, &judge.objective(), run.segment.best_score);
@@ -1032,7 +1096,9 @@ pub(crate) fn load_resume_state(session_log: &std::path::Path) -> Result<ResumeS
             Some(SessionEvent::Row { row, solved }) => {
                 // Wide-round rows (phase:"wide") are historical context only on resume; they
                 // must not count toward next_iter or influence the deep loop's baseline/best.
-                if row.phase.as_deref() == Some("wide") {
+                // Infra-dead rows (phase:"infra") record turns that never started — their
+                // iteration was never consumed, so counting them would skip it on resume.
+                if matches!(row.phase.as_deref(), Some("wide") | Some("infra")) {
                     continue;
                 }
                 solved_any |= solved;
@@ -1802,10 +1868,14 @@ mod tests {
     struct RecordingReporter {
         shutdowns: Vec<(String, String)>,
         notes: Vec<String>,
+        rows: Vec<Row>,
         stop_now: bool,
         agent_cost: f64,
         agent_is_error: bool,
         agent_error: Option<String>,
+        /// Scripted turns, popped per `run_agent` call; when empty the `agent_*` knobs apply.
+        agent_turns: std::collections::VecDeque<AgentTurn>,
+        agent_calls: u32,
         escalation_path: Option<std::path::PathBuf>,
     }
     impl Reporter for RecordingReporter {
@@ -1814,7 +1884,9 @@ mod tests {
         fn note(&mut self, msg: &str) {
             self.notes.push(msg.to_string());
         }
-        fn row(&mut self, _: &Row, _: bool) {}
+        fn row(&mut self, row: &Row, _: bool) {
+            self.rows.push(row.clone());
+        }
         fn run_agent(
             &mut self,
             _: &Args,
@@ -1824,11 +1896,15 @@ mod tests {
             _: Option<&str>,
             _: Option<&str>,
         ) -> AgentTurn {
+            self.agent_calls += 1;
             if let Some(path) = &self.escalation_path {
                 let _ = std::fs::write(
                     path,
                     r#"{"category":"harness-limitation","reason":"gate is broken","evidence":""}"#,
                 );
+            }
+            if let Some(turn) = self.agent_turns.pop_front() {
+                return turn;
             }
             AgentTurn {
                 cost: self.agent_cost,
@@ -2164,6 +2240,138 @@ mod tests {
         );
     }
 
+    /// The run-6 signature: a transport-class death before the agent produced anything.
+    fn dead_turn() -> AgentTurn {
+        AgentTurn {
+            cost: 0.0,
+            is_error: true,
+            error: Some(
+                "applying the sandbox egress policy: timed out waiting for policy version 1".into(),
+            ),
+        }
+    }
+
+    #[test]
+    fn never_started_turn_does_not_consume_the_iteration() {
+        // One iteration, first turn dies on transport: the driver must re-run iter 1 (two
+        // run_agent calls), record the dead attempt as an infra-dead row, and still decide
+        // the re-run as iter 1 — a "finished" exit with both rows present.
+        let f = fixture(1, 0.0, false);
+        let judge = FakeJudge {
+            keep: false,
+            solved: false,
+            fail_baseline: false,
+        };
+        let mut r = RecordingReporter {
+            agent_turns: [dead_turn(), AgentTurn::default()].into(),
+            ..Default::default()
+        };
+        run_loop(
+            &f.args,
+            &f.paths,
+            &f.prepared,
+            &mut r,
+            &FakeWorld,
+            &judge,
+            LoopRuntime::default(),
+        )
+        .expect("a re-run dead turn is a clean finish, not an error");
+        assert_eq!(r.agent_calls, 2, "iter 1 re-ran after the dead turn");
+        assert_eq!(
+            r.shutdowns,
+            vec![("finished".into(), "all iterations completed".into())]
+        );
+        assert!(
+            r.rows.iter().any(|row| row.iter == 1
+                && row.decision == "infra-dead"
+                && row.phase.as_deref() == Some("infra")),
+            "the dead attempt stays on the record: {:?}",
+            r.rows
+        );
+        assert!(
+            r.rows
+                .iter()
+                .any(|row| row.iter == 1 && row.decision == "discard"),
+            "the re-run turn was measured and decided as iter 1: {:?}",
+            r.rows
+        );
+    }
+
+    #[test]
+    fn consecutive_dead_turns_stall_the_run() {
+        // Every turn dies on transport: the run must halt as "stalled" after
+        // MAX_DEAD_TURN_ATTEMPTS consecutive dead attempts, never burn to the iteration
+        // cap and report "finished" (run 6 did exactly that, 7 dead iterations deep).
+        let f = fixture(5, 0.0, false);
+        let judge = FakeJudge {
+            keep: false,
+            solved: false,
+            fail_baseline: false,
+        };
+        let mut r = RecordingReporter {
+            agent_is_error: true,
+            agent_error: Some("connection refused".into()),
+            ..Default::default()
+        };
+        run_loop(
+            &f.args,
+            &f.paths,
+            &f.prepared,
+            &mut r,
+            &FakeWorld,
+            &judge,
+            LoopRuntime::default(),
+        )
+        .expect("a stall is a clean exit, not an error");
+        assert_eq!(r.agent_calls, MAX_DEAD_TURN_ATTEMPTS, "bounded attempts");
+        assert_eq!(r.shutdowns.len(), 1, "one shutdown: {:?}", r.shutdowns);
+        assert_eq!(r.shutdowns[0].0, "stalled");
+        assert!(
+            r.shutdowns[0]
+                .1
+                .contains("stalled on consecutive transport failures"),
+            "the reason names the stall, not iteration completion: {}",
+            r.shutdowns[0].1
+        );
+    }
+
+    #[test]
+    fn started_turn_resets_the_dead_streak() {
+        // Two dead attempts, a started turn, two more dead attempts, another started turn:
+        // the streak resets on every started turn, so the run finishes instead of stalling
+        // (an unreset counter would have stalled on the fourth dead turn).
+        let f = fixture(2, 0.0, false);
+        let judge = FakeJudge {
+            keep: false,
+            solved: false,
+            fail_baseline: false,
+        };
+        let mut r = RecordingReporter {
+            agent_turns: [
+                dead_turn(),
+                dead_turn(),
+                AgentTurn::default(),
+                dead_turn(),
+                dead_turn(),
+                AgentTurn::default(),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        run_loop(
+            &f.args,
+            &f.paths,
+            &f.prepared,
+            &mut r,
+            &FakeWorld,
+            &judge,
+            LoopRuntime::default(),
+        )
+        .expect("the streak resets, so the run finishes");
+        assert_eq!(r.agent_calls, 6, "every scripted turn ran");
+        assert_eq!(r.shutdowns[0].0, "finished");
+    }
+
     // --- the same exit paths through the graph loop (--graph-loop): the template + runner
     // must preserve every LoopExit the typestate path produces ---
 
@@ -2311,6 +2519,47 @@ mod tests {
         assert!(outcome.escalated);
         assert_eq!(r.shutdowns.len(), 1, "one shutdown: {:?}", r.shutdowns);
         assert_eq!(r.shutdowns[0].0, "escalated");
+    }
+
+    #[test]
+    fn graph_loop_stalls_on_dead_propose_turns() {
+        // The graph path retries a transport-dead turn inside the propose task first
+        // (ExecCfg transport_retries); only an exhausted task counts as one dead attempt
+        // toward the driver's stall bound.
+        let f = graph_fixture(5, 0.0);
+        let judge = FakeJudge {
+            keep: false,
+            solved: false,
+            fail_baseline: false,
+        };
+        let mut r = RecordingReporter {
+            agent_is_error: true,
+            agent_error: Some("request timed out".into()),
+            ..Default::default()
+        };
+        run_loop(
+            &f.args,
+            &f.paths,
+            &f.prepared,
+            &mut r,
+            &FakeWorld,
+            &judge,
+            LoopRuntime::default(),
+        )
+        .expect("a stall is a clean exit, not an error");
+        // 3 in-task turn attempts (1 + 2 transport retries) per dead iteration attempt.
+        assert_eq!(r.agent_calls, 3 * MAX_DEAD_TURN_ATTEMPTS);
+        assert_eq!(r.shutdowns.len(), 1, "one shutdown: {:?}", r.shutdowns);
+        assert_eq!(r.shutdowns[0].0, "stalled");
+        assert!(
+            r.rows
+                .iter()
+                .filter(|row| row.decision == "infra-dead")
+                .count()
+                == MAX_DEAD_TURN_ATTEMPTS as usize,
+            "one infra-dead row per exhausted attempt: {:?}",
+            r.rows
+        );
     }
 
     #[test]

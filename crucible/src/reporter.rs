@@ -10,7 +10,7 @@ use crate::{Args, Paths};
 use std::time::Duration;
 
 /// One row in the results log / final summary.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Row {
     pub iter: u32,
     pub decision: String,
@@ -26,7 +26,8 @@ pub struct Row {
     pub score: Option<f64>,
     /// Total test count for this row (test gate), for the same reason.
     pub total: Option<u64>,
-    /// `Some("wide")` for wide-round rows; `None` for the deep (default) loop.
+    /// `Some("wide")` for wide-round rows, `Some("infra")` for never-started turn
+    /// records; `None` for the deep (default) loop.
     pub phase: Option<String>,
 }
 
