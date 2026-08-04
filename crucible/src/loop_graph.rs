@@ -1746,14 +1746,16 @@ mod tests {
             run_id: "parity".into(),
             prior: String::new(),
             skip_baseline: false,
+            seed_diff: None,
             identity: crate::identity::RunIdentity {
                 components: Vec::new(),
                 manifest_hash: "h".into(),
                 inject_hash: "h".into(),
+                seed_hash: String::new(),
                 measure_cmd: "./measure.sh".into(),
                 direction: "higher".into(),
                 rig: Default::default(),
-                digest: "v1:0".into(),
+                digest: "v2:0".into(),
             },
         };
         let world = m.build_world(workspace.clone());

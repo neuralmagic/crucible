@@ -741,6 +741,9 @@ pub(crate) struct Prepared {
     pub identity: identity::RunIdentity,
     /// `[judge].skip_baseline`: baseline (and re-scope re-baseline) snapshots only, no measure.
     pub skip_baseline: bool,
+    /// `[agent].seed_diff` content, handed to iteration 1's prompt as labeled seed material (its
+    /// content hash rides `identity.seed_hash`). `None` = an unseeded run.
+    pub seed_diff: Option<String>,
 }
 
 fn main() -> Result<()> {

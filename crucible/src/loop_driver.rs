@@ -794,8 +794,21 @@ fn run_loop_body<R: Reporter>(
         if steer.is_some() {
             r.note("injected operator steer");
         }
+        // The pack-declared seed diff goes to iteration 1 only: it's starting material, not
+        // standing guidance, and later iterations already stand on whatever iter 1 kept.
+        let seed = if it == 1 {
+            prep.seed_diff.as_deref()
+        } else {
+            None
+        };
+        if seed.is_some() {
+            r.note(&format!(
+                "injected pack seed diff (hash {})",
+                prep.identity.seed_hash
+            ));
+        }
         let resume_prompt = render_resume_prompt(&status, &run.segment.regime, steer.as_deref());
-        let prompt = render_prompt(&prep.template, &prep.goal, &status, steer);
+        let prompt = render_prompt(&prep.template, &prep.goal, &status, steer, seed);
 
         let step = if args.graph_loop {
             // One canonical-template plan per iteration through the shared executor.
@@ -1014,6 +1027,7 @@ fn run_loop_body<R: Reporter>(
                 cost_usd: run.spent,
                 elapsed: started.elapsed(),
                 identity_digest: &prep.identity.digest,
+                seed_hash: &prep.identity.seed_hash,
             },
         );
 
@@ -1124,6 +1138,7 @@ fn run_loop_body<R: Reporter>(
             cost_usd: run.spent,
             elapsed: started.elapsed(),
             identity_digest: &prep.identity.digest,
+            seed_hash: &prep.identity.seed_hash,
         },
     );
     // Record the opened PR(s) on the session log so the controller's pull-ingest can fold them onto
@@ -1506,7 +1521,13 @@ fn capture_diff(world: &dyn World) -> (String, String) {
 /// blanket-label them "highest-priority operator" (that would elevate an untrusted reviewer comment to
 /// an operator order). Instead it states the trust rule, and each source frames its own block: operator
 /// text is raw/authoritative, a reviewer comment self-frames as untrusted (`pr_watch::steer_text`).
-fn render_prompt(template: &str, goal: &str, status: &str, steer: Option<String>) -> String {
+fn render_prompt(
+    template: &str,
+    goal: &str,
+    status: &str,
+    steer: Option<String>,
+    seed: Option<&str>,
+) -> String {
     let steer_text = steer.unwrap_or_default();
     let steer_text = steer_text.trim();
     let mut out = template
@@ -1524,6 +1545,19 @@ fn render_prompt(template: &str, goal: &str, status: &str, steer: Option<String>
         );
         out.push_str(steer_text);
         out.push('\n');
+    }
+    // Seed material rides the prompt, not the tree: the agent applies and validates it itself,
+    // exactly like an operator steer would arrive, so a broken seed fails loudly in the turn
+    // instead of silently corrupting the workspace before the first measurement.
+    if let Some(seed) = seed.map(str::trim).filter(|s| !s.is_empty()) {
+        out.push_str(
+            "\n\n## SEED (pack-declared starting diff)\n\
+             The pack declares the diff below as starting material for this run. Apply it \
+             yourself and validate the result before building on it; it has NOT been applied to \
+             the tree, and it must still pass the gate like any other candidate.\n\n```diff\n",
+        );
+        out.push_str(seed);
+        out.push_str("\n```\n");
     }
     out
 }
@@ -1697,7 +1731,13 @@ mod tests {
     #[test]
     fn render_prompt_fills_slots_and_appends_steer() {
         let t = "goal={{GOAL}} status={{BEST_SCORE}}";
-        let out = render_prompt(t, "fix it", "240 ms", Some("focus on the producer".into()));
+        let out = render_prompt(
+            t,
+            "fix it",
+            "240 ms",
+            Some("focus on the producer".into()),
+            None,
+        );
         assert!(out.contains("goal=fix it status=240 ms"));
         // Provenance-honest header (operator authoritative, reviewer untrusted), not a blanket
         // "highest-priority operator" banner that would elevate an untrusted PR comment.
@@ -1705,8 +1745,21 @@ mod tests {
         assert!(out.contains("untrusted external input"));
         assert!(out.contains("focus on the producer"));
         // no steer -> no steer section
-        let plain = render_prompt(t, "g", "s", None);
+        let plain = render_prompt(t, "g", "s", None, None);
         assert!(!plain.contains("## STEER"));
+    }
+
+    #[test]
+    fn render_prompt_labels_seed_material() {
+        let t = "goal={{GOAL}} status={{STATUS}}";
+        let out = render_prompt(t, "g", "s", None, Some("--- a\n+++ b\n"));
+        assert!(out.contains("## SEED (pack-declared starting diff)"));
+        // The agent applies it; the harness never touches the tree.
+        assert!(out.contains("NOT been applied to the tree"));
+        assert!(out.contains("--- a\n+++ b"));
+        // no seed -> no seed section
+        let plain = render_prompt(t, "g", "s", None, None);
+        assert!(!plain.contains("## SEED"));
     }
 
     #[test]
@@ -2376,6 +2429,8 @@ mod tests {
         /// Scripted turns, popped per `run_agent` call; when empty the `agent_*` knobs apply.
         agent_turns: std::collections::VecDeque<AgentTurn>,
         agent_calls: u32,
+        /// Every prompt handed to `run_agent`, in call order.
+        prompts: Vec<String>,
         escalation_path: Option<std::path::PathBuf>,
     }
     impl Reporter for RecordingReporter {
@@ -2392,12 +2447,13 @@ mod tests {
             _: &Args,
             _: &Paths,
             _: u32,
-            _: &str,
+            prompt: &str,
             _: Option<&str>,
             _: Option<&str>,
             _: TurnBudget,
         ) -> AgentTurn {
             self.agent_calls += 1;
+            self.prompts.push(prompt.to_string());
             if let Some(path) = &self.escalation_path {
                 let _ = std::fs::write(
                     path,
@@ -2522,14 +2578,16 @@ mod tests {
             run_id: "fixture-run".into(),
             prior: String::new(),
             skip_baseline: false,
+            seed_diff: None,
             identity: crate::identity::RunIdentity {
                 components: Vec::new(),
                 manifest_hash: "h".into(),
                 inject_hash: "h".into(),
+                seed_hash: String::new(),
                 measure_cmd: "m".into(),
                 direction: "lower".into(),
                 rig: Default::default(),
-                digest: "v1:0".into(),
+                digest: "v2:0".into(),
             },
         };
         Fixture {
@@ -2538,6 +2596,51 @@ mod tests {
             paths,
             prepared,
         }
+    }
+
+    #[test]
+    fn seed_diff_reaches_iter_one_prompt_only() {
+        let mut f = fixture(3, 0.0, false);
+        f.prepared.seed_diff = Some("--- a/x.py\n+++ b/x.py\n".into());
+        f.prepared.identity.seed_hash = "deadbeefdeadbeef".into();
+        let world = FakeWorld;
+        let judge = FakeJudge {
+            keep: false,
+            solved: false,
+            fail_baseline: false,
+        };
+        let mut r = RecordingReporter::default();
+        run_loop(
+            &f.args,
+            &f.paths,
+            &f.prepared,
+            &mut r,
+            &world,
+            &judge,
+            LoopRuntime::default(),
+        )
+        .expect("run_loop should finish cleanly");
+        assert_eq!(r.prompts.len(), 3, "one prompt per iteration");
+        assert!(
+            r.prompts[0].contains("## SEED (pack-declared starting diff)"),
+            "iter 1 gets the seed: {}",
+            r.prompts[0]
+        );
+        assert!(r.prompts[0].contains("--- a/x.py"), "{}", r.prompts[0]);
+        for (i, prompt) in r.prompts.iter().enumerate().skip(1) {
+            assert!(
+                !prompt.contains("## SEED") && !prompt.contains("--- a/x.py"),
+                "iter {} must not carry the seed: {prompt}",
+                i + 1
+            );
+        }
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n.contains("injected pack seed diff (hash deadbeefdeadbeef)")),
+            "the injection is logged: {:?}",
+            r.notes
+        );
     }
 
     #[test]
