@@ -2423,6 +2423,8 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             name: name.to_string(),
             summary: summary.to_string(),
             subagent: false,
+            input: None,
+            result: None,
         }
     }
 

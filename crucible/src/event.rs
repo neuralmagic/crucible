@@ -48,6 +48,14 @@ fn model_prices(model: &str) -> (f64, f64, f64, f64) {
     )
 }
 
+/// The turn's provisional cost from one mid-turn token sample: the OTEL number when
+/// telemetry stamped one, otherwise the pricing-table estimate. Reconciled by the
+/// authoritative turn-end cost, so streaming this keeps the budget line moving
+/// inside a turn without changing what the run ultimately charges.
+pub fn provisional_cost(model: &str, t: &Tokens) -> f64 {
+    t.cost_usd.unwrap_or_else(|| estimate_cost(model, t))
+}
+
 /// Estimate the run cost so far from the live token counts × model pricing.
 /// Replaced by the agent's authoritative number once `result`/OTEL reports it.
 pub fn estimate_cost(model: &str, t: &Tokens) -> f64 {
@@ -56,4 +64,47 @@ pub fn estimate_cost(model: &str, t: &Tokens) -> f64 {
         + t.output as f64 * pout
         + t.cache_read as f64 * pcr
         + t.cache_write as f64 * pcw
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> Tokens {
+        Tokens {
+            input: 1_000_000,
+            output: 1_000_000,
+            cache_read: 1_000_000,
+            cache_write: 1_000_000,
+            total: 4_000_000,
+            rate: None,
+            cost_usd: None,
+        }
+    }
+
+    #[test]
+    fn estimate_matches_published_per_mtok_rates() {
+        // 1 MTok of each bucket: input + output + 0.1x input (read) + 1.25x input (write).
+        for (model, input, output) in [
+            ("claude-opus-4-6", 5.0, 25.0),
+            ("claude-sonnet-4-6", 3.0, 15.0),
+            ("claude-haiku-4-5", 1.0, 5.0),
+            // Unknown models price as Opus, the loop default.
+            ("mystery-model", 5.0, 25.0),
+        ] {
+            let want = input + output + input * 0.1 + input * 1.25;
+            let got = estimate_cost(model, &sample());
+            assert!((got - want).abs() < 1e-9, "{model}: got {got}, want {want}");
+        }
+    }
+
+    #[test]
+    fn provisional_prefers_the_authoritative_sample_cost() {
+        let mut t = sample();
+        t.cost_usd = Some(0.42);
+        assert!((provisional_cost("claude-opus-4-6", &t) - 0.42).abs() < 1e-9);
+        t.cost_usd = None;
+        let est = estimate_cost("claude-opus-4-6", &t);
+        assert!((provisional_cost("claude-opus-4-6", &t) - est).abs() < 1e-9);
+    }
 }
