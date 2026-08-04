@@ -209,6 +209,8 @@ struct JobEnv {
     /// Output-only trace transport for profile jobs; NOT mounted on benchmark/lm_eval jobs (the
     /// measured jobs' spec stays minimal, and measurement inputs stay digest-only).
     artifacts: Option<ArtifactsPvc>,
+    /// The submitting pod as Job owner (GC of orphans); None for spokes/cross-namespace.
+    owner: Option<forge::measure_job::JobOwner>,
     /// The delegated spoke cluster, when BROKER_CODEGEN_KUBECONFIG is set. `None` = the ambient
     /// client, exactly as before.
     spoke: Option<SpokeEnv>,
@@ -270,6 +272,7 @@ impl JobEnv {
                 read_only: false,
             });
         }
+        let owner = owner_from_env(&namespace, spoke_from_env().is_some());
         Ok(Self {
             namespace,
             queue_name: env_or("BROKER_CODEGEN_QUEUE", "crucible-measure"),
@@ -287,6 +290,7 @@ impl JobEnv {
                 env_nonempty("BROKER_CODEGEN_ARTIFACTS_DIR"),
             ),
             spoke: spoke_from_env(),
+            owner,
         })
     }
 
@@ -297,6 +301,21 @@ impl JobEnv {
             .map(|s| s.target.clone())
             .unwrap_or_default()
     }
+}
+
+/// The submitting pod as a Job owner, so orphaned GPU jobs garbage-collect with the loop pod
+/// (a dead consumer must not keep a GPU busy). Only for hub-local jobs in the pod's OWN
+/// namespace: an ownerReference cannot cross clusters (spokes) or namespaces. Identity rides
+/// the downward-API env the renderer projects; absent env (older render, local run) = no owner,
+/// exactly the old behavior.
+fn owner_from_env(job_namespace: &str, spoke: bool) -> Option<forge::measure_job::JobOwner> {
+    if spoke {
+        return None;
+    }
+    let name = env_nonempty("CRUCIBLE_POD_NAME")?;
+    let uid = env_nonempty("CRUCIBLE_POD_UID")?;
+    let pod_namespace = env_nonempty("CRUCIBLE_POD_NAMESPACE")?;
+    (pod_namespace == job_namespace).then_some(forge::measure_job::JobOwner { name, uid })
 }
 
 /// A reachability-class submission failure on a delegated spoke becomes the typed
@@ -1246,6 +1265,7 @@ fn job_spec(
         active_deadline_seconds: env.active_deadline_seconds,
         ttl_seconds: env.ttl_seconds,
         pvc_mounts,
+        owner: env.owner.clone(),
     }
 }
 
@@ -1319,6 +1339,8 @@ pub fn spoke_smoke(opts: &SpokeSmoke) -> Result<Value, String> {
         active_deadline_seconds: opts.deadline_secs.max(1),
         ttl_seconds: 600,
         pvc_mounts: Vec::new(),
+        // A spoke job: the hub pod's UID means nothing on the target cluster.
+        owner: None,
     };
     eprintln!(
         "submitting spoke smoke Job {name} to {} (namespace {}, queue {})",
@@ -2476,6 +2498,7 @@ mod tests {
             shm_size_gi: 16,
             active_deadline_seconds: 5400,
             ttl_seconds: 86400,
+            owner: None,
             pvc_mounts: vec![PvcMount {
                 claim_name: "model-cache".into(),
                 mount_path: "/models".into(),
