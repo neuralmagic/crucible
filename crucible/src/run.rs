@@ -634,11 +634,14 @@ fn drive_loop(
             // restarted pod (OnFailure + persistent state) that replayed the finish re-published
             // the kept candidate each lap — four duplicate draft PRs in one crash-loop. Exit 0,
             // not the outcome code: the pod's work is done, and a nonzero would restart it forever.
-            if resume.next_iter > args.iterations {
+            let over_budget = args.max_cost > 0.0 && resume.spent >= args.max_cost;
+            if resume.next_iter > args.iterations || over_budget {
                 eprintln!(
-                    "resume: all {} iterations already ran (session log has {} rows); nothing to do",
+                    "resume: nothing to do ({} of {} iterations ran, ${:.2} of ${:.2} spent)",
+                    resume.next_iter.saturating_sub(1),
                     args.iterations,
-                    resume.rows.len()
+                    resume.spent,
+                    args.max_cost
                 );
                 return Ok(());
             }
