@@ -348,7 +348,7 @@ Scope validation renders the admitted graph to `WORKFLOW.png` for the scope PR, 
 | --- | --- |
 | config: `method_prompt`, `goal_file`, `toolbox_dir` | **manifest-relative** |
 | agent workspace (the measured checkout) | `manifest_dir / [workspace].dir` |
-| runtime state (`session.jsonl`, `control.json`) | `--state-dir`, default `manifest_dir/state` |
+| runtime state (`session.jsonl`, `admissions.jsonl`, `control.json`) | `--state-dir`, default `manifest_dir/state` |
 | `STEER.md` | `--steer`, default `manifest_dir/STEER.md` |
 | `ESCALATION.json` (agent's harness-blocker marker, ADR-0001) | `<workspace>/ESCALATION.json`: written by `escalate`, consumed by the engine post-turn |
 
@@ -627,6 +627,52 @@ frozen manifest text's hash, a hash over every `[[workspace.inject]]`'s source c
 destination path, `[judge].measure_cmd`, and `[judge].direction`. It's computed once at run
 setup and doesn't change within a run (a re-scope moves the loop's own `Segment` fingerprint,
 a different hash over goal/objective/regime; the two are deliberately independent).
+
+---
+
+## 7.1 Admission ledger (`state/admissions.jsonl`) and the control-bridge `id`
+
+Every external input into a run (steer, approve, deny, rescope, set-budget, pause, resume,
+stop, abort) is recorded in a second NDJSON file, `state/admissions.jsonl`, before it takes
+effect. Same envelope shape as the session log (`{"v":1,"kind":…}`, blank/torn lines skipped),
+two kinds:
+
+- **`admitted`**: `{ key, seq, ts, input, …payload }` — `input` is the command token and the
+  payload is flattened alongside it (`{"input":"rescope","regime":"c=48"}`).
+- **`settled`**: `{ key, outcome, ts, note }` with `outcome` one of `applied`/`superseded`/
+  `rejected`.
+
+Contract, per idempotency key: exactly one `admitted`, then at most one `settled`, and the
+**first** terminal outcome wins. A key with no `settled` line is an input the run still owes;
+`--resume` re-arms exactly those (an un-delivered steer, a granted-but-undrained re-scope, the
+live budget cap, the pause level) and closes out the ones a resume overrides (stop/abort become
+`superseded`, as do approvals that died before their grant was recorded).
+
+**Precedence:** `admissions.jsonl` is authoritative for what an operator asked for; the session
+log is authoritative for what the loop was waiting on. Where they disagree about an outstanding
+approval, the ledger wins: a re-scope recorded under the key derived from the ask suppresses the
+session log's re-park.
+
+Control-bridge commands gain an optional **`id`** (string, non-empty, ≤256 bytes) on every
+mutating object-form command:
+
+```json
+{"cmd":"steer","text":"…","id":"pr-comment:owner/repo#7:12345"}
+```
+
+Redelivering the same `id` with the same payload converges on the original admission
+(`{"ok":true,"cmd":"steer","key":"…","dup":true}`, plus `"outcome"` when it already settled)
+rather than acting twice; the same `id` with a *different* payload is refused
+(`{"ok":false,…,"error":"idempotency conflict: …"}`) and nothing is written. Omitting `id` is
+exactly the old behavior: the server generates a key and every delivery is a fresh input, so
+old clients and old servers interoperate unchanged. A `stop`/`abort` whose record cannot be
+written still stops the run and says so with `"unrecorded":true`; every other command fails
+closed (no effect) if its admission can't be recorded.
+
+Two consequences worth knowing: the bridge no longer writes `STEER.md` (a `steer` command goes
+straight into the ledger, and the loop's drain reads both the ledger and whatever the file
+channel accumulated), and "applied" for a steer means *delivered into a turn's prompt*, not
+heeded, and not that its iteration was kept.
 
 ---
 

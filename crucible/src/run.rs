@@ -669,7 +669,10 @@ fn drive_loop(
                     };
                     let meta = reporter::RunMeta::from_args(&args);
                     let mut r = stream::SessionReporter::resume(&p, meta)?;
-                    let control = start_control_bridge(&args, &p)?;
+                    // Fold the prior run's admissions before the bridge is up, so no
+                    // inbound command can land on a half-built index.
+                    let ledger = open_admission_ledger(&p, forge::ndjson::Open::Fold)?;
+                    let control = start_control_bridge(&args, &p, &ledger)?;
                     run_loop(
                         &args,
                         &p,
@@ -681,7 +684,7 @@ fn drive_loop(
                             control: control.as_deref(),
                             resume: Some(recovered.resume),
                             recovery: Some(recovery),
-                            ledger: None,
+                            ledger: Some(ledger),
                         },
                     )?
                 }
@@ -703,7 +706,10 @@ fn drive_loop(
                 }
                 Ui::Stream => {
                     let mut r = stream::SessionReporter::stream(&p, meta)?;
-                    let control = start_control_bridge(&args, &p)?;
+                    // A fresh run must not inherit the last run's un-drained inputs, the
+                    // same rule `SessionReporter::stream` applies to the session log.
+                    let ledger = open_admission_ledger(&p, forge::ndjson::Open::Truncate)?;
+                    let control = start_control_bridge(&args, &p, &ledger)?;
                     run_loop(
                         &args,
                         &p,
@@ -713,6 +719,7 @@ fn drive_loop(
                         judge.as_ref(),
                         LoopRuntime {
                             control: control.as_deref(),
+                            ledger: Some(ledger),
                             ..LoopRuntime::default()
                         },
                     )?
@@ -821,10 +828,20 @@ fn install_ctrlc() -> Result<()> {
 fn start_control_bridge(
     args: &Args,
     p: &Paths,
+    ledger: &std::sync::Arc<crate::admission::AdmissionLedger>,
 ) -> Result<Option<std::sync::Arc<control::ControlState>>> {
     args.control_port
-        .map(|port| control::spawn_bridge(port, p.clone()))
+        .map(|port| control::spawn_bridge(port, p.clone(), ledger.clone()))
         .transpose()
+}
+
+/// Open the run's admission ledger. Every external input is recorded here before it takes
+/// effect, so this has to exist before anything can deliver one.
+fn open_admission_ledger(
+    p: &Paths,
+    mode: forge::ndjson::Open,
+) -> Result<std::sync::Arc<crate::admission::AdmissionLedger>> {
+    crate::admission::AdmissionLedger::open(&p.admissions, mode).map(std::sync::Arc::new)
 }
 
 /// Copy every non-excluded skill under `p.skills` into the workspace's `skills_dir` (the

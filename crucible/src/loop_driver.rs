@@ -11,6 +11,7 @@ use crate::{Args, Paths, Prepared, STOP};
 use crate::{control, crucible, escalation, provisioning, publish, session};
 use anyhow::{Context, Result};
 use crucible::{Judge, World};
+use crucible_contract::admission::AdmissionOutcome;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -53,8 +54,10 @@ pub(crate) struct LoopRuntime<'a> {
     pub resume: Option<ResumeState>,
     /// How this resume classified the previous shutdown; present only with `resume`.
     pub recovery: Option<crate::recovery::ResumeRecovery>,
-    /// Admission-ledger handle for replaying durable operator inputs on resume.
-    #[allow(dead_code)]
+    /// The run's admission ledger, shared with the control bridge: the steer queue, the
+    /// keyed rescope/deny drains, and the resume replay of un-drained operator inputs.
+    /// `None` for the front-ends that have no bridge (console/jsonl), which fall back to
+    /// the plain `STEER.md` read.
     pub ledger: Option<std::sync::Arc<crate::admission::AdmissionLedger>>,
 }
 
@@ -542,6 +545,7 @@ fn run_loop_body<R: Reporter>(
     runtime: LoopRuntime<'_>,
 ) -> Result<Outcome> {
     let control = runtime.control;
+    let ledger = runtime.ledger.as_deref();
     let started = Instant::now();
     let start_iter: u32;
     let is_resume = runtime.resume.is_some();
@@ -597,16 +601,27 @@ fn run_loop_body<R: Reporter>(
         if let Some(why) = &resumed_best.degraded {
             r.note(&format!("resume: {why}"));
         }
+        // The ledger is authoritative for operator inputs, the session log only for the
+        // loop's own wait-state, so it is read FIRST: a grant recorded before the death
+        // settles what the dangling approval bracket means.
+        let replay = ledger.map(crate::admission::AdmissionLedger::replay_for_resume);
         // The classification of how the previous process died, recorded on the wire, and
         // its recovery actions: re-register the approval key so an operator `approve`
         // resolves it, and re-arm a block-mode park (the iteration-head park consumes
         // `pending_block`).
         if let Some(rec) = runtime.recovery {
             r.recovery(rec.class, rec.iter, &rec.detail);
-            if let (Some(control), Some(regime)) = (control, rec.pending_regime) {
+            let approval = crate::recovery::resume_approval(&rec, replay.as_ref());
+            if let Some(why) = &approval.note {
+                r.note(why);
+            }
+            if let (Some(control), Some(regime)) = (control, approval.pending_regime) {
                 control.set_pending_regime(regime);
             }
-            run.pending_block = rec.repark;
+            run.pending_block = approval.repark;
+        }
+        if let (Some(ledger), Some(replay)) = (ledger, replay) {
+            replay_admissions(ledger, control, replay, r);
         }
         // Recompute the identity fresh (from the live manifest/workspace) and hard-warn, never
         // abort, when it differs from what the original run recorded. Scores across this resume
@@ -746,7 +761,7 @@ fn run_loop_body<R: Reporter>(
         // fires it over the control bridge) or we're told to stop. The drain below then
         // re-baselines into the granted regime.
         if let Some(pp) = run.pending_block.take() {
-            match park_for_approval(control, r, &mut run.parked_total, args.max_park()) {
+            match park_for_approval(control, ledger, r, &mut run.parked_total, args.max_park()) {
                 ParkOutcome::Resumed => {} // the re-scope drain below re-baselines
                 ParkOutcome::Denied(why) => {
                     // `block` means the agent had no frozen-regime fallback, a denial leaves
@@ -774,7 +789,7 @@ fn run_loop_body<R: Reporter>(
         }
         // An approved judge-changing grant arrived (via the control channel / MCP): re-baseline
         // into the new regime and open a fresh segment before this iteration measures.
-        if let Some(new_regime) = control.and_then(|c| c.take_rescope()) {
+        if let Some((rescope_key, new_regime)) = control.and_then(|c| c.take_rescope()) {
             // Close any open approval bracket: a rescope IS the grant. Harmless when no
             // wait was open (the classifier treats an unmatched resolve as a no-op).
             r.approval_resolved("granted", &new_regime);
@@ -782,10 +797,24 @@ fn run_loop_body<R: Reporter>(
                 "control: re-scoping to '{new_regime}' — re-baselining a new comparable segment"
             ));
             // One atomic swap of the goalpost: the new regime, its fingerprint, the re-baselined
-            // scores, and the fresh rollback snapshot all land together.
-            let (segment, _row) =
-                Segment::baseline(world, judge, &prep.goal, new_regime, prep.skip_baseline)?;
+            // scores, and the fresh rollback snapshot all land together. The admission settles
+            // only once the swap has happened: a baseline error leaves it un-drained, so a
+            // resume re-arms the grant instead of losing it.
+            let (segment, _row) = Segment::baseline(
+                world,
+                judge,
+                &prep.goal,
+                new_regime.clone(),
+                prep.skip_baseline,
+            )?;
             run.segment = segment;
+            if let Some(ledger) = ledger {
+                let _ = ledger.settle(
+                    &rescope_key,
+                    AdmissionOutcome::Applied,
+                    &format!("re-baselined into '{new_regime}' at iter {it}"),
+                );
+            }
             r.segment(
                 &run.segment.fingerprint,
                 run.segment.baseline_score,
@@ -795,11 +824,18 @@ fn run_loop_body<R: Reporter>(
         }
         // A denial that arrived while *continuing* (the agent had a fallback, so the loop never
         // parked) just means the regime change won't happen; note it and stay in the frozen regime.
-        if let Some(reason) = control.and_then(|c| c.take_deny()) {
+        if let Some((deny_key, reason)) = control.and_then(|c| c.take_deny()) {
             r.approval_resolved("denied", &reason);
             r.note(&format!(
                 "approval not granted ({reason}) — staying in the frozen regime"
             ));
+            if let Some(ledger) = ledger {
+                let _ = ledger.settle(
+                    &deny_key,
+                    AdmissionOutcome::Applied,
+                    &format!("drained at the head of iter {it}"),
+                );
+            }
         }
         if matches!(r.check_interrupt(p, &run.rows), Stop::Quit) {
             exit = LoopExit::Stopped;
@@ -814,8 +850,11 @@ fn run_loop_body<R: Reporter>(
         write_results(p, &prep.goal, &prep.prior, &run.rows)?;
 
         let status = judge.status(run.segment.best_score);
-        let steer = take_steer(p);
-        if steer.is_some() {
+        // Everything an operator sent that no turn has carried yet, in admission order.
+        // The keys settle below, after the turn ran: a turn that never started re-delivers
+        // the same batch instead of eating it.
+        let steer_batch = crate::admission::drain_steer(ledger, &p.steer);
+        if steer_batch.text.is_some() {
             r.note("injected operator steer");
         }
         // The pack-declared seed diff goes to iteration 1 only: it's starting material, not
@@ -831,8 +870,15 @@ fn run_loop_body<R: Reporter>(
                 prep.identity.seed_hash
             ));
         }
-        let resume_prompt = render_resume_prompt(&status, &run.segment.regime, steer.as_deref());
-        let prompt = render_prompt(&prep.template, &prep.goal, &status, steer, seed);
+        let resume_prompt =
+            render_resume_prompt(&status, &run.segment.regime, steer_batch.text.as_deref());
+        let prompt = render_prompt(
+            &prep.template,
+            &prep.goal,
+            &status,
+            steer_batch.text.clone(),
+            seed,
+        );
 
         let step = if args.graph_loop {
             // One canonical-template plan per iteration through the shared executor.
@@ -923,8 +969,18 @@ fn run_loop_body<R: Reporter>(
         };
 
         // Any step other than NeverStarted proves a turn started: reset the stall streak.
+        // A started turn also carried the steer batch in its prompt, which is what settles
+        // an admitted steer ("delivered", not "heeded"); a turn that never started leaves
+        // the batch owed, so the re-run of this iteration re-delivers it.
         if !matches!(&step, IterStep::NeverStarted { .. }) {
             dead_turns = 0;
+            if let Some(ledger) = ledger {
+                ledger.settle_all(
+                    &steer_batch.keys,
+                    AdmissionOutcome::Applied,
+                    &format!("delivered in iter {it}"),
+                );
+            }
         }
         let Decided {
             mut row,
@@ -1492,6 +1548,7 @@ enum ParkOutcome {
 /// bridge. With no control bridge nothing could deliver an outcome, so we note and proceed.
 fn park_for_approval<R: Reporter>(
     control: Option<&control::ControlState>,
+    ledger: Option<&crate::admission::AdmissionLedger>,
     r: &mut R,
     parked_total: &mut Duration,
     timeout: Option<Duration>,
@@ -1510,8 +1567,11 @@ fn park_for_approval<R: Reporter>(
         if control.has_rescope() {
             break ParkOutcome::Resumed;
         }
-        if let Some(reason) = control.take_deny() {
+        if let Some((deny_key, reason)) = control.take_deny() {
             r.approval_resolved("denied", &reason);
+            if let Some(ledger) = ledger {
+                let _ = ledger.settle(&deny_key, AdmissionOutcome::Applied, "drained by the park");
+            }
             break ParkOutcome::Denied(reason);
         }
         if STOP.load(Ordering::SeqCst) {
@@ -1682,14 +1742,75 @@ fn fingerprint(goal: &str, objective: &str, regime: &str) -> String {
     crate::identity::fnv1a_hex(&[goal.as_bytes(), objective.as_bytes(), regime.as_bytes()])
 }
 
-/// Consume STEER.md if it has content (then blank it), returning the guidance.
-fn take_steer(p: &Paths) -> Option<String> {
-    let text = std::fs::read_to_string(&p.steer).ok()?;
-    if text.trim().is_empty() {
-        return None;
+/// Re-arm the operator inputs a resumed run still owes, out of the admission ledger: the
+/// live budget cap and the pause level (levels the in-memory `ControlState` lost with the
+/// process), and any re-scope or denial that was granted but never drained. Un-delivered
+/// steers need nothing here, the drain's `peek` finds them. Stops the resume overrides, and
+/// approvals that died before their grant was recorded, are closed out so the ledger shows
+/// the loop finished with them.
+fn replay_admissions<R: Reporter>(
+    ledger: &crate::admission::AdmissionLedger,
+    control: Option<&control::ControlState>,
+    replay: crate::admission::ResumeReplay,
+    r: &mut R,
+) {
+    if replay.skipped_lines > 0 {
+        r.note(&format!(
+            "resume: {} torn line(s) skipped in the admission ledger",
+            replay.skipped_lines
+        ));
     }
-    let _ = std::fs::write(&p.steer, "");
-    Some(text)
+    if let Some(aside) = &replay.quarantined {
+        r.note(&format!(
+            "resume: the admission ledger was unreadable and was moved to {} — prior \
+             operator inputs are NOT restored",
+            aside.display()
+        ));
+    }
+    ledger.settle_all(
+        &replay.stale_stops,
+        AdmissionOutcome::Superseded,
+        "operator resumed the run",
+    );
+    ledger.settle_all(
+        &replay.stale_approves,
+        AdmissionOutcome::Superseded,
+        "the run died before the grant was recorded — re-approve",
+    );
+    if !replay.stale_approves.is_empty() {
+        r.note(&format!(
+            "resume: {} approval(s) never reached a grant — re-send `approve`",
+            replay.stale_approves.len()
+        ));
+    }
+    if replay.steers_pending > 0 {
+        r.note(&format!(
+            "resume: {} un-delivered steer(s) restored",
+            replay.steers_pending
+        ));
+    }
+    let Some(control) = control else {
+        return;
+    };
+    if let Some(usd) = replay.last_budget {
+        control.set_live_max_cost(usd);
+        r.note(&format!("resume: live budget cap ${usd:.2} restored"));
+    }
+    if replay.paused {
+        control.pause();
+        r.note("resume: the run was paused when it died — still paused, send `resume`");
+    }
+    if let Some((key, regime)) = replay.unsettled_rescope {
+        // The iteration-head drain applies it (and settles the admission there). Nothing
+        // can be displaced: the slot is empty in a freshly built `ControlState`.
+        let _ = control.set_rescope(key, regime.clone());
+        r.note(&format!(
+            "resume: re-scope to '{regime}' was granted but never applied — re-arming it"
+        ));
+    }
+    if let Some((key, reason)) = replay.unsettled_deny {
+        let _ = control.set_deny(key, reason);
+    }
 }
 
 /// Read (and consume) the agent's CANDIDATE.md, returning `(note, full)`: the 120-char
@@ -1747,6 +1868,7 @@ fn write_results(p: &Paths, goal: &str, prior: &str, rows: &[Row]) -> Result<()>
 mod tests {
     use super::*;
     use crate::reporter::{AgentTurn, Phase, Row, Stop, TurnBudget};
+    use crucible_contract::admission::AdmissionKey;
 
     /// The counter fold as `--resume` consumes it (through the classifier), so these
     /// replay tests exercise the same path `run.rs` takes.
@@ -2324,12 +2446,12 @@ mod tests {
         let deliver = control.clone();
         let h = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(60));
-            deliver.set_rescope("concurrency=48".into());
+            deliver.set_rescope(AdmissionKey::new("grant"), "concurrency=48".into());
         });
 
         let mut r = NoteCapture::default();
         let mut parked = Duration::ZERO;
-        let outcome = park_for_approval(Some(&control), &mut r, &mut parked, None);
+        let outcome = park_for_approval(Some(&control), None, &mut r, &mut parked, None);
         h.join().unwrap();
 
         assert!(matches!(outcome, ParkOutcome::Resumed));
@@ -2347,7 +2469,7 @@ mod tests {
             r.notes
         );
         assert_eq!(
-            control.take_rescope().as_deref(),
+            control.take_rescope().map(|(_, regime)| regime).as_deref(),
             Some("concurrency=48"),
             "the drain still gets the granted regime"
         );
@@ -2366,11 +2488,11 @@ mod tests {
         let deliver = control.clone();
         let h = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(60));
-            deliver.set_deny("over budget".into());
+            deliver.set_deny(AdmissionKey::new("d1"), "over budget".into());
         });
         let mut r = NoteCapture::default();
         let mut parked = Duration::ZERO;
-        let outcome = park_for_approval(Some(&control), &mut r, &mut parked, None);
+        let outcome = park_for_approval(Some(&control), None, &mut r, &mut parked, None);
         h.join().unwrap();
         match outcome {
             ParkOutcome::Denied(why) => {
@@ -2394,6 +2516,7 @@ mod tests {
         let mut parked = Duration::ZERO;
         let outcome = park_for_approval(
             Some(&control),
+            None,
             &mut r,
             &mut parked,
             Some(Duration::from_millis(120)),
@@ -2415,7 +2538,7 @@ mod tests {
         // No bridge => nothing could deliver an approval; park notes and returns rather than hang.
         let mut r = NoteCapture::default();
         let mut parked = Duration::ZERO;
-        let outcome = park_for_approval(None, &mut r, &mut parked, None);
+        let outcome = park_for_approval(None, None, &mut r, &mut parked, None);
         assert!(matches!(outcome, ParkOutcome::Resumed));
         assert_eq!(parked, Duration::ZERO);
         assert!(r.notes.iter().any(|n| n.contains("no control bridge")));
@@ -2499,7 +2622,7 @@ mod tests {
         /// Scripted turns, popped per `run_agent` call; when empty the `agent_*` knobs apply.
         agent_turns: std::collections::VecDeque<AgentTurn>,
         agent_calls: u32,
-        /// Every prompt handed to `run_agent`, in call order.
+        /// Every prompt the loop rendered, so a test can see what the turn actually carried.
         prompts: Vec<String>,
         escalation_path: Option<std::path::PathBuf>,
         recoveries: Vec<(crate::session::RecoveryClass, u32, String)>,
@@ -2642,6 +2765,7 @@ mod tests {
             steer: dir.path().join("STEER.md"),
             session_log: state.join("session.jsonl"),
             control: state.join("control.json"),
+            admissions: state.join("admissions.jsonl"),
             escalation,
             provisioning,
             state,
@@ -3524,9 +3648,177 @@ mod tests {
         )
         .expect("resumed run finishes");
         assert_eq!(
-            control.approve_pending().as_deref(),
+            control.take_pending_regime().as_deref(),
             Some("c=48"),
             "an operator approve resolves the re-registered ask"
+        );
+    }
+
+    /// A real ledger at the fixture's `admissions.jsonl`.
+    fn fixture_ledger(f: &Fixture) -> std::sync::Arc<crate::admission::AdmissionLedger> {
+        std::sync::Arc::new(
+            crate::admission::AdmissionLedger::open(
+                &f.paths.admissions,
+                forge::ndjson::Open::Truncate,
+            )
+            .expect("ledger"),
+        )
+    }
+
+    #[test]
+    fn an_admitted_steer_reaches_the_prompt_and_settles_once_the_turn_ran() {
+        use crucible_contract::admission::{AdmittedInput, SteerSource};
+
+        let f = fixture(2, 0.0, false);
+        let ledger = fixture_ledger(&f);
+        ledger
+            .admit(
+                Some(AdmissionKey::new("pr-comment:o/r#7:1")),
+                AdmittedInput::Steer {
+                    text: "hoist the dup check".into(),
+                    from: SteerSource::Operator,
+                },
+            )
+            .expect("admit");
+
+        let judge = FakeJudge {
+            keep: false,
+            solved: false,
+            fail_baseline: false,
+        };
+        let mut r = RecordingReporter::default();
+        run_loop(
+            &f.args,
+            &f.paths,
+            &f.prepared,
+            &mut r,
+            &FakeWorld,
+            &judge,
+            LoopRuntime {
+                ledger: Some(ledger.clone()),
+                ..LoopRuntime::default()
+            },
+        )
+        .expect("run finishes");
+
+        assert!(
+            r.prompts[0].contains("hoist the dup check"),
+            "the first turn carried it: {}",
+            r.prompts[0]
+        );
+        assert!(
+            !r.prompts[1].contains("hoist the dup check"),
+            "and only that turn: {}",
+            r.prompts[1]
+        );
+        assert!(
+            ledger.peek_steers().is_empty(),
+            "delivered means settled — a later resume must not re-send it"
+        );
+        assert_eq!(
+            r.notes
+                .iter()
+                .filter(|n| n.contains("operator steer"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_steer_whose_turn_never_started_is_re_delivered() {
+        use crucible_contract::admission::{AdmittedInput, SteerSource};
+
+        let f = fixture(2, 0.0, false);
+        let ledger = fixture_ledger(&f);
+        ledger
+            .admit(
+                None,
+                AdmittedInput::Steer {
+                    text: "try cache-first".into(),
+                    from: SteerSource::Operator,
+                },
+            )
+            .expect("admit");
+
+        let judge = FakeJudge {
+            keep: false,
+            solved: false,
+            fail_baseline: false,
+        };
+        let mut r = RecordingReporter::default();
+        // The first turn dies in transport (never started); the second runs.
+        r.agent_turns.push_back(AgentTurn {
+            cost: 0.0,
+            is_error: true,
+            error: Some("Connection reset by peer".into()),
+        });
+        run_loop(
+            &f.args,
+            &f.paths,
+            &f.prepared,
+            &mut r,
+            &FakeWorld,
+            &judge,
+            LoopRuntime {
+                ledger: Some(ledger.clone()),
+                ..LoopRuntime::default()
+            },
+        )
+        .expect("run finishes");
+
+        assert!(r.prompts.len() >= 2);
+        assert!(
+            r.prompts[0].contains("try cache-first") && r.prompts[1].contains("try cache-first"),
+            "the re-run of the dead iteration carries the steer again"
+        );
+        assert!(
+            ledger.peek_steers().is_empty(),
+            "settled by the turn that ran"
+        );
+    }
+
+    #[test]
+    fn the_resume_replay_re_arms_the_levels_and_edges_the_ledger_still_owes() {
+        use crucible_contract::admission::{AdmissionOutcome, AdmittedInput};
+
+        let f = fixture(2, 0.0, false);
+        let ledger = fixture_ledger(&f);
+        ledger
+            .admit(None, AdmittedInput::SetBudget { usd: 7.5 })
+            .expect("budget");
+        ledger
+            .admit(
+                Some(AdmissionKey::new("r1")),
+                AdmittedInput::Rescope {
+                    regime: "c=48".into(),
+                },
+            )
+            .expect("rescope");
+        ledger
+            .admit(Some(AdmissionKey::new("s1")), AdmittedInput::Stop)
+            .expect("stop");
+
+        let control = control::ControlState::default();
+        let mut r = NoteCapture::default();
+        replay_admissions(&ledger, Some(&control), ledger.replay_for_resume(), &mut r);
+
+        assert_eq!(control.live_max_cost(), Some(7.5), "the level came back");
+        assert_eq!(
+            control.take_rescope(),
+            Some((AdmissionKey::new("r1"), "c=48".to_string())),
+            "the granted-but-undrained re-scope is re-armed"
+        );
+        // A resume IS the operator's override of the stop, and the ledger records that.
+        assert_eq!(
+            ledger
+                .settle(&AdmissionKey::new("s1"), AdmissionOutcome::Applied, "late")
+                .expect("settle"),
+            Some(AdmissionOutcome::Superseded)
+        );
+        assert!(
+            r.notes.iter().any(|n| n.contains("budget cap")),
+            "{:?}",
+            r.notes
         );
     }
 

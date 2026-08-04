@@ -43,6 +43,11 @@ pub mod fleet;
 /// closed-vocabulary template expander, and the watched-path content digest.
 pub mod spec;
 
+/// Append-only NDJSON ledger mechanics (flock-guarded append, torn-tail-tolerant fold,
+/// quarantine) shared by the engine's durable records; the domain types stay with their
+/// owners.
+pub mod ndjson;
+
 /// The declarative-build backends: the detached rootless-buildah cluster Job and the GithubActions
 /// dispatch, sharing one "build + push, crucible pins the digest" contract.
 pub mod build;

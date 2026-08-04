@@ -659,6 +659,7 @@ fn run_adversary_turn(
         state: meta.join("state"),
         session_log: meta.join("state/session.jsonl"),
         control: meta.join("state/control.json"),
+        admissions: meta.join("state/admissions.jsonl"),
         escalation: meta.join("ESCALATION.json"),
         provisioning: meta.join("PROVISIONING_PENDING.json"),
     };
@@ -897,6 +898,7 @@ fn propose_paths(scratch: &Path) -> Paths {
         state: scratch.join("state"),
         session_log: scratch.join("state/session.jsonl"),
         control: scratch.join("state/control.json"),
+        admissions: scratch.join("state/admissions.jsonl"),
         escalation: scratch.join("ESCALATION.json"),
         provisioning: scratch.join("PROVISIONING_PENDING.json"),
     }

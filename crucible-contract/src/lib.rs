@@ -5,6 +5,7 @@
 //! round-trips of the *same* types on both sides, which makes schema drift a compile error.
 //! The crate depends on serde only, with no async runtime and no kube client.
 
+pub mod admission;
 pub mod artifact;
 pub mod envelope;
 pub mod event;
@@ -13,6 +14,10 @@ pub mod markers;
 pub mod session;
 pub mod tier;
 
+pub use admission::{
+    ADMISSION_WIRE_VERSION, AdmissionEvent, AdmissionKey, AdmissionOutcome, AdmittedInput,
+    SteerSource,
+};
 pub use artifact::{
     ArtifactKind, ArtifactRef, IngestError, IngestPath, IngestResponse, content_digest,
 };

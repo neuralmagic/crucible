@@ -26,3 +26,4 @@ Expand this section in the sidebar to browse the full list.
 | [0020](./0020-candidate-build-modes.md) | Candidate build modes, how a proposal becomes a measured artifact | Proposed |
 | [0022](./0022-measure-task-dags.md) | Measure task DAGs, the engine walks the ladder | Proposed |
 | [0023](./0023-recovery-classification.md) | Recovery classification for `--resume` | Implemented |
+| [0024](./0024-admission-ledger.md) | Admission ledger for external inputs | Implemented |
