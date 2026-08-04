@@ -197,8 +197,12 @@ pub(crate) struct Decided {
 /// [`run_loop_body`].
 pub(crate) enum IterStep {
     Decided(Box<Decided>),
-    /// Discard and move on (failed turn or failed apply); the reason is already noted.
-    Discarded,
+    /// Discard and move on (failed turn, failed apply, gate rejection). The reason lands in the
+    /// iteration's Row, so the run summary counts every iteration honestly — a run that lost all
+    /// its iterations must not read as a clean "finished" with an empty scoreboard.
+    Discarded {
+        reason: String,
+    },
     /// Halt for human review (the escalation is already reported).
     Escalated,
     /// Park at the next iteration head on a blocking approval.
@@ -773,13 +777,17 @@ fn run_loop_body<R: Reporter>(
                         }
                         Err(e) => {
                             r.note(&format!("apply failed (discarding iter {it}): {e:#}"));
-                            IterStep::Discarded
+                            IterStep::Discarded {
+                                reason: format!("apply failed: {e:#}"),
+                            }
                         }
                     }
                 }
                 // The classic driver has no per-task retry loop; a transport death still
                 // discards the iteration here (the graph path is where the retry lives).
-                TurnVerdict::Discard | TurnVerdict::Retry => IterStep::Discarded,
+                TurnVerdict::Discard | TurnVerdict::Retry => IterStep::Discarded {
+                    reason: "turn failed".to_string(),
+                },
                 TurnVerdict::Escalate => IterStep::Escalated,
                 TurnVerdict::Park(pp) => IterStep::Parked(pp),
                 TurnVerdict::Stop => IterStep::Stopped,
@@ -792,7 +800,15 @@ fn run_loop_body<R: Reporter>(
             reading,
         } = match step {
             IterStep::Decided(d) => *d,
-            IterStep::Discarded => {
+            IterStep::Discarded { reason } => {
+                let row = Row {
+                    iter: it,
+                    decision: "discarded".to_string(),
+                    note: reason,
+                    ..Default::default()
+                };
+                r.row(&row, false);
+                run.rows.push(row);
                 world.restore(run.segment.best_snap.as_str())?;
                 continue;
             }
