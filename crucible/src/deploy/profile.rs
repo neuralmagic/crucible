@@ -200,6 +200,13 @@ pub struct Cluster {
     /// the pod logs. Unset = no drop-box; the engine falls back to marker emission.
     #[serde(default)]
     pub ingest_url: Option<String>,
+    /// PVC mounted at the domain's `state/` dir. When set, run state (session.jsonl, the
+    /// agent-session files) survives the pod: the wrapper passes `--resume` when a session log is
+    /// already present and the pod restarts on failure instead of dying with its emptyDir — a
+    /// crashed run continues its turn instead of discarding hours of solver context. Unset = the
+    /// state dir stays pod-local and a dead pod is a dead run.
+    #[serde(default)]
+    pub state_pvc: Option<String>,
 }
 
 fn default_kubeconfig_configmap() -> String {

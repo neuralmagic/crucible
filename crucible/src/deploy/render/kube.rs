@@ -497,7 +497,17 @@ impl Renderer<'_> {
                 }]),
                 service_account_name: Some(self.profile.cluster.service_account.clone()),
                 automount_service_account_token: Some(false),
-                restart_policy: Some("Never".to_string()),
+                // With persistent state a crash is resumable, so let the kubelet restart the pod
+                // (the wrapper detects the session log and passes --resume). Without it a restart
+                // would silently start a fresh run on a blank emptyDir, so the pod stays one-shot.
+                restart_policy: Some(
+                    if self.profile.cluster.state_pvc.is_some() {
+                        "OnFailure"
+                    } else {
+                        "Never"
+                    }
+                    .to_string(),
+                ),
                 affinity: node_avoid_affinity(self.profile),
                 host_aliases: self.host_aliases(),
                 init_containers: self.init_containers(),
@@ -757,10 +767,17 @@ impl Renderer<'_> {
             ComputeDriver::Kubernetes => " --compute-driver=kubernetes",
             ComputeDriver::Podman => "",
         };
+        // Persistent state: a non-empty session log on the mounted PVC means a prior pod of this
+        // run already produced rows, so this start is a continuation, not a fresh run.
+        let resume_flag = if self.profile.cluster.state_pvc.is_some() {
+            r#" $([ -s "$D/state/session.jsonl" ] && echo --resume)"#
+        } else {
+            ""
+        };
         format!(
             r#"D={domain_dir}
 crucible --manifest="$D/{manifest_file}" --ui=stream --agent-backend=openshell \
-  --sandbox-image={sandbox_image} --control-port={CONTROL_PORT} --iterations={iterations} --max-cost={max_cost}{results_bucket_flag}{pr_repo_flag}{compute_driver_flag}
+  --sandbox-image={sandbox_image} --control-port={CONTROL_PORT} --iterations={iterations} --max-cost={max_cost}{results_bucket_flag}{pr_repo_flag}{compute_driver_flag}{resume_flag}
 rc=$?
 if [ -z "${{CRUCIBLE_INGEST_URL:-}}" ]; then
   echo "=================== {session_delimiter}$rc) ==================="
@@ -807,6 +824,15 @@ exit $rc
             mounts.push(core::VolumeMount {
                 name: PACK_WORKDIR_VOLUME.to_string(),
                 mount_path: self.domain_dir(),
+                ..Default::default()
+            });
+        }
+        // Persistent run state: mounted OVER the domain dir's state/ subdir so session.jsonl and
+        // the agent-session files outlive the pod (the wrapper's `--resume` reads them back).
+        if self.profile.cluster.state_pvc.is_some() {
+            mounts.push(core::VolumeMount {
+                name: "run-state".to_string(),
+                mount_path: format!("{}/state", self.domain_dir()),
                 ..Default::default()
             });
         }
@@ -992,6 +1018,18 @@ exit $rc
                         }),
                         ..Default::default()
                     }]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
+
+        // Persistent run state (see volume_mounts): the claim the profile's `state_pvc` names.
+        if let Some(pvc) = &self.profile.cluster.state_pvc {
+            volumes.push(core::Volume {
+                name: "run-state".to_string(),
+                persistent_volume_claim: Some(core::PersistentVolumeClaimVolumeSource {
+                    claim_name: pvc.clone(),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -2716,6 +2754,31 @@ mod tests {
             yaml.contains("fieldPath: status.podIP"),
             "pod IP from downward API: {yaml}"
         );
+    }
+
+    /// `state_pvc` makes a run survive its pod: the claim mounts over the domain's state/ dir,
+    /// the pod restarts on failure, and the wrapper passes `--resume` when a session log already
+    /// exists. Without it the pod stays one-shot (a restart would silently fresh-start a run).
+    #[test]
+    fn state_pvc_mounts_resumes_and_restarts_on_failure() {
+        let with = k8s_profile("state_pvc = \"deepgemm-state\"");
+        let yaml = render_k8s(&with);
+        assert!(yaml.contains("claimName: deepgemm-state"), "{yaml}");
+        assert!(
+            yaml.contains("mountPath: /opt/crucible/domains/alpha/state"),
+            "{yaml}"
+        );
+        assert!(yaml.contains("restartPolicy: OnFailure"), "{yaml}");
+        assert!(
+            yaml.contains(r#"$([ -s "$D/state/session.jsonl" ] && echo --resume)"#),
+            "{yaml}"
+        );
+
+        let without = k8s_profile("");
+        let yaml = render_k8s(&without);
+        assert!(yaml.contains("restartPolicy: Never"), "{yaml}");
+        assert!(!yaml.contains("--resume"), "{yaml}");
+        assert!(!yaml.contains("run-state"), "{yaml}");
     }
 
     /// A domain that builds in-pod (buildah deploy target or `[measure]`) gets AppArmor Unconfined
