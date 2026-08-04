@@ -23,6 +23,7 @@ impl From<&Row> for RowWire {
             total: r.total,
             phase: r.phase.clone(),
             kept_snap: r.kept_snap.clone(),
+            evidence: r.evidence.clone(),
         }
     }
 }
@@ -46,6 +47,7 @@ impl IntoRow for RowWire {
             total: self.total,
             phase: self.phase,
             kept_snap: self.kept_snap,
+            evidence: self.evidence,
         }
     }
 }
@@ -113,6 +115,11 @@ mod tests {
             total: None,
             phase: None,
             kept_snap: Some("abc123".into()),
+            evidence: vec![EvidenceEntry {
+                task: "refcheck".into(),
+                disposition: EvidenceDisposition::Passed,
+                note: String::new(),
+            }],
         };
         let wire = RowWire::from(&row);
         let back = wire.into_row();
@@ -126,5 +133,6 @@ mod tests {
         assert_eq!(back.total, row.total);
         assert_eq!(back.phase, row.phase);
         assert_eq!(back.kept_snap, row.kept_snap);
+        assert_eq!(back.evidence, row.evidence);
     }
 }

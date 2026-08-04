@@ -40,6 +40,12 @@ impl Reporter for ConsoleReporter {
         if !row.diffstat.is_empty() {
             println!("  diff: {}", row.diffstat);
         }
+        if !row.evidence.is_empty() {
+            println!(
+                "  evidence: {}",
+                crate::reporter::evidence_line(&row.evidence)
+            );
+        }
         if solved {
             println!("  SOLVED — the goal's win condition was met.");
         }
@@ -185,6 +191,17 @@ impl Reporter for ConsoleReporter {
 fn print_rows(rows: &[Row]) {
     println!("\n-- progress --");
     for r in rows {
-        println!("  iter {:>2} {:>8}  {}", r.iter, r.decision, r.note);
+        let evidence = if r.evidence.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "  [evidence: {}]",
+                crate::reporter::evidence_line(&r.evidence)
+            )
+        };
+        println!(
+            "  iter {:>2} {:>8}  {}{evidence}",
+            r.iter, r.decision, r.note
+        );
     }
 }
