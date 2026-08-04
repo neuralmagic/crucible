@@ -29,6 +29,11 @@ pub struct Row {
     /// `Some("wide")` for wide-round rows, `Some("infra")` for never-started turn
     /// records; `None` for the deep (default) loop.
     pub phase: Option<String>,
+    /// The World snapshot token committed when this row was kept (a git world packs the
+    /// commit sha). Carried on the wire so a resume can restore the kept-best tree instead
+    /// of pairing the logged best score with whatever the re-prepared checkout holds.
+    /// `None` on non-keep rows and on logs written before the field existed.
+    pub kept_snap: Option<String>,
 }
 
 /// Run-wide context every front-end needs to render the start banner. Built once

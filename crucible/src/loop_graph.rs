@@ -850,6 +850,7 @@ impl<R: Reporter> WideRunner<'_, R> {
                     score: reading.score,
                     total: reading.detail.get("total").and_then(Value::as_u64),
                     phase: Some("wide".into()),
+                    kept_snap: None,
                 };
                 self.r.row(&row, false);
                 self.rows.push(row);
