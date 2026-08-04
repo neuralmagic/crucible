@@ -115,18 +115,15 @@ pub(crate) struct ControlState {
     next_seq: AtomicU64,
     live_max_cost: Mutex<Option<f64>>,
     status: Mutex<StatusSnapshot>,
-    /// A pending re-scope: the admission it arrived as, and the regime label to re-baseline
-    /// into, drained by the loop at the next iteration head. Set when an approved
-    /// judge-changing grant arrives. The key travels with the regime so the loop can settle
-    /// the admission where it applies it.
+    /// Pending re-scope, drained by the loop at the next iteration head. The key travels
+    /// with the regime so the loop can settle the admission where it applies it.
     rescope: Mutex<Option<(AdmissionKey, String)>>,
     /// The regime an open approval would grant (attended path): the loop records it from the agent's
     /// pending marker so an operator `approve` keystroke can turn it into a `rescope` without naming
     /// the regime. `None` when there's no approval awaiting an operator.
     pending_regime: Mutex<Option<String>>,
-    /// A pending approval was rejected (deny path): the admission and its reason, drained by
-    /// the park as the terminal "not granted" outcome. Set by the `deny` command (forge
-    /// denial / operator / policy).
+    /// A rejected pending approval, drained by the park as the terminal "not granted"
+    /// outcome.
     deny: Mutex<Option<(AdmissionKey, String)>>,
 }
 
@@ -164,9 +161,7 @@ impl ControlState {
         self.live_max_cost.lock().ok().and_then(|g| *g)
     }
 
-    /// Drain a pending re-scope request (its admission key and the new regime label) if one
-    /// was set since the last check. The loop calls this at the iteration head and, if
-    /// `Some`, re-baselines and settles the admission.
+    /// Drained by the loop at the iteration head, which re-baselines and settles it.
     pub(crate) fn take_rescope(&self) -> Option<(AdmissionKey, String)> {
         self.rescope.lock().ok()?.take()
     }
@@ -207,9 +202,8 @@ impl ControlState {
         }
     }
 
-    /// Arm the re-scope the loop's next iteration head drains. Returns the key of an
-    /// undrained re-scope this displaced, which the caller settles as superseded: one truth
-    /// per admission, and the silent overwrite this used to be is now on the record.
+    /// Arm the re-scope the next iteration head drains. Returns the key of an undrained
+    /// re-scope this displaced, which the caller settles as superseded.
     pub(crate) fn set_rescope(&self, key: AdmissionKey, regime: String) -> Option<AdmissionKey> {
         let Ok(mut slot) = self.rescope.lock() else {
             return None;
@@ -225,17 +219,15 @@ impl ControlState {
         }
     }
 
-    /// Take the regime an open approval would grant (attended path), leaving nothing behind:
-    /// the caller admits the derived re-scope BEFORE arming it, and hands the regime back
-    /// ([`set_pending_regime`](Self::set_pending_regime)) if that record can't be written.
-    /// `None` when there is nothing awaiting approval.
+    /// Take the regime an open approval would grant. The caller admits the derived
+    /// re-scope BEFORE arming it, and hands the regime back if the record can't be
+    /// written.
     pub(crate) fn take_pending_regime(&self) -> Option<String> {
         self.pending_regime.lock().ok()?.take()
     }
 
-    /// Record that a pending approval was rejected (deny path). Clears any recorded pending
-    /// regime so a later `approve` can't resurrect a denied ask. Returns the key of an
-    /// undrained denial this displaced, for the caller to settle as superseded.
+    /// Record a denial, clearing any pending regime so a later `approve` can't resurrect
+    /// a denied ask. Returns the key of an undrained denial this displaced.
     pub(crate) fn set_deny(&self, key: AdmissionKey, reason: String) -> Option<AdmissionKey> {
         if let Ok(mut pending) = self.pending_regime.lock() {
             *pending = None;
@@ -458,10 +450,8 @@ fn write_reply(writer: &Client, reply: &Value) {
     let _ = stream.flush();
 }
 
-/// Apply one request under the admission contract: nothing mutates the run before its
-/// `Admitted` line is on disk, a redelivered command converges on the original admission
-/// instead of acting twice, and `stop`/`abort` stay safety valves that fire even when the
-/// record can't be written.
+/// Nothing mutates the run before its `Admitted` line is on disk; a redelivered command
+/// converges; `stop`/`abort` fire even when the record can't be written.
 fn apply_command(req: ControlRequest, state: &ControlState, ledger: &AdmissionLedger) -> Value {
     let ControlRequest { id, cmd } = req;
     match cmd {
@@ -482,8 +472,7 @@ fn apply_command(req: ControlRequest, state: &ControlState, ledger: &AdmissionLe
             let _ = ledger.settle(key, AdmissionOutcome::Applied, "resumed");
             json!({"ok": true, "cmd": "resume"})
         }),
-        // The ledger IS the steer queue now: the drain at the next iteration head reads
-        // every un-delivered admission, so the bridge no longer writes STEER.md.
+        // The ledger IS the steer queue: the bridge no longer writes STEER.md.
         ControlCommand::Steer { text } => admitted(
             ledger,
             id,
@@ -531,10 +520,8 @@ fn apply_command(req: ControlRequest, state: &ControlState, ledger: &AdmissionLe
     }
 }
 
-/// Turn an operator `approve` into the re-scope the loop's iteration head drains. The grant
-/// is recorded BEFORE the slot is armed, under a key derived from the ASK rather than from
-/// this command, so two operators approving the same ask converge on one re-scope and a
-/// resume can recognize the grant that belongs to the approval its log left dangling.
+/// The grant is recorded BEFORE the slot is armed, under a key derived from the ASK, so
+/// approvals of the same ask converge and a resume can recognize a recorded grant.
 fn grant_approval(
     state: &ControlState,
     ledger: &AdmissionLedger,
@@ -595,9 +582,8 @@ fn grant_approval(
     }
 }
 
-/// Admit, then apply. The effect runs only for a fresh admission: a duplicate converged on
-/// the original (whose effect already ran, or is still pending), a conflict is refused, and
-/// a ledger write failure refuses the command rather than acting unrecorded.
+/// Admit, then apply. The effect runs only for a fresh admission; a conflict or ledger
+/// write failure refuses the command rather than acting unrecorded.
 fn admitted(
     ledger: &AdmissionLedger,
     id: Option<AdmissionKey>,
@@ -652,8 +638,7 @@ fn stop_the_run(id: Option<AdmissionKey>, input: AdmittedInput, ledger: &Admissi
     }
 }
 
-/// Close out the admission a newly-armed one displaced: the silent overwrite this used to
-/// be is now a recorded supersession.
+/// Settle the admission a newly-armed one displaced as superseded.
 fn supersede(ledger: &AdmissionLedger, displaced: Option<AdmissionKey>, by: &AdmissionKey) {
     if let Some(old) = displaced {
         let _ = ledger.settle(
@@ -713,9 +698,8 @@ enum ControlCommand {
     },
 }
 
-/// One inbound command plus its optional idempotency key. Clients that send no `id` get a
-/// generated one, which is exactly the old behavior (every delivery is a fresh input); a
-/// client that wants redelivery to converge names the input's natural key.
+/// One inbound command plus its optional idempotency key. No `id` means a generated one
+/// (every delivery is a fresh input); a natural key makes redelivery converge.
 #[derive(Debug, PartialEq)]
 struct ControlRequest {
     id: Option<AdmissionKey>,
@@ -814,11 +798,9 @@ fn command_from_name(cmd: &str, value: &Value) -> std::result::Result<ControlCom
     }
 }
 
-/// Append one steer payload to `path` in the marker-wrapped shape the loop's steer drain
-/// ([`crate::admission::drain_steer`]) reads. `pub(crate)` because `pr_watch`'s reseed sink writes
-/// the exact same shape straight to a file when there's no live run's control bridge to send a
-/// `steer` command to. The bridge itself no longer writes this file: a `steer` command goes
-/// straight into the admission ledger.
+/// Append one steer payload in the marker-wrapped shape [`crate::admission::drain_steer`]
+/// reads. `pr_watch`'s reseed sink writes this file when there is no live control bridge;
+/// the bridge itself admits `steer` straight into the ledger.
 pub(crate) fn append_steer(path: &Path, text: &str) -> std::io::Result<()> {
     if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir)?;

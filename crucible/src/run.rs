@@ -643,12 +643,9 @@ fn drive_loop(
     let outcome = {
         let _run_guard = run_span.as_ref().map(tracing::Span::enter);
         if args.resume {
-            // Resume: replay the parked log (counters + a classification of how the
-            // previous process died), then continue in append (stream) mode. The plan
-            // gates everything: a NoOp exits 0 WITHOUT re-running the finish path (a
-            // restarted OnFailure pod that replayed the finish re-published the kept
-            // candidate each lap — four duplicate draft PRs in one crash-loop), and a
-            // Refuse (an escalated run) keeps exit code 2's meaning across a resume.
+            // Replay the parked log, then continue in append mode. A NoOp exits 0
+            // WITHOUT re-running the finish path (replaying finish re-published the
+            // kept candidate each crash-loop lap); Refuse keeps exit code 2's meaning.
             let recovered = classify_session(&p.session_log)?;
             match plan_recovery(&recovered, args.iterations, args.max_cost) {
                 RecoveryPlan::NoOp { message } => {
@@ -706,8 +703,7 @@ fn drive_loop(
                 }
                 Ui::Stream => {
                     let mut r = stream::SessionReporter::stream(&p, meta)?;
-                    // A fresh run must not inherit the last run's un-drained inputs, the
-                    // same rule `SessionReporter::stream` applies to the session log.
+                    // A fresh run must not inherit the last run's un-drained inputs.
                     let ledger = open_admission_ledger(&p, forge::ndjson::Open::Truncate)?;
                     let control = start_control_bridge(&args, &p, &ledger)?;
                     run_loop(
@@ -835,8 +831,8 @@ fn start_control_bridge(
         .transpose()
 }
 
-/// Open the run's admission ledger. Every external input is recorded here before it takes
-/// effect, so this has to exist before anything can deliver one.
+/// Every external input is recorded here before it takes effect, so this must exist
+/// before anything can deliver one.
 fn open_admission_ledger(
     p: &Paths,
     mode: forge::ndjson::Open,

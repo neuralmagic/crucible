@@ -44,12 +44,11 @@ pub mod fleet;
 pub mod spec;
 
 /// Append-only NDJSON ledger mechanics (flock-guarded append, torn-tail-tolerant fold,
-/// quarantine) shared by the engine's durable records; the domain types stay with their
-/// owners.
+/// quarantine); domain types stay with their owners.
 pub mod ndjson;
 
-/// Durable tool steps: the content-keyed ledger that lets a restarted process replay work it
-/// already finished (a pushed image, a completed GPU measure) instead of repaying it.
+/// Durable tool steps: a content-keyed ledger so a restarted process replays finished
+/// work instead of repaying it.
 pub mod steps;
 
 /// The declarative-build backends: the detached rootless-buildah cluster Job and the GithubActions

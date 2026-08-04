@@ -1,24 +1,17 @@
-//! The admission-ledger wire format: `state/admissions.jsonl`, the durable record of every
-//! external input into a run.
-//!
-//! One line per event, same versioned NDJSON envelope as the session log
-//! (`{"v":1,"kind":"admitted"|"settled",...}`), blank/torn lines decode to `None`. The
-//! contract is a two-state machine per idempotency key: exactly one `Admitted`, then at
-//! most one `Settled` (first terminal outcome wins). The ledger is authoritative for
-//! operator inputs; the session log only mirrors what the loop did with them.
+//! Admission-ledger wire format for `state/admissions.jsonl`. One versioned NDJSON line
+//! per event; per key, exactly one `Admitted` then at most one `Settled` (first terminal
+//! wins). Blank/torn lines decode to `None`.
 
 use serde::{Deserialize, Serialize};
 
 /// Bump only on a breaking change to the on-disk shape.
 pub const ADMISSION_WIRE_VERSION: u8 = 1;
 
-/// Longest accepted client-supplied key. Keys ride an NDJSON command and index an
-/// in-memory map for the life of the run, so they are bounded at the door.
+/// Keys index an in-memory map for the life of the run, so they are bounded at the door.
 pub const MAX_KEY_LEN: usize = 256;
 
-/// The idempotency key for one admitted input: client-supplied when the source has a
-/// natural one (`pr-comment:<owner>/<repo>#<n>:<comment_id>`), generated when absent.
-/// A newtype so it can't be confused with the run's other strings.
+/// Idempotency key: client-supplied when the source has a natural one
+/// (`pr-comment:<owner>/<repo>#<n>:<comment_id>`), generated when absent.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct AdmissionKey(String);
@@ -28,15 +21,13 @@ impl AdmissionKey {
         Self(key.into())
     }
 
-    /// The key a broker/operator approval of `trace_id` admits under, so a redelivered
-    /// `approve` for the same ask converges instead of granting twice.
+    /// A redelivered `approve` for the same ask converges instead of granting twice.
     pub fn approve(trace_id: &str) -> Self {
         Self(format!("approve:{trace_id}"))
     }
 
-    /// The key of the re-scope an approval converts into. Derived (not generated) so a
-    /// resume can tell "this grant was already recorded" from "some other re-scope is
-    /// pending": the whole crash-window fix rests on this being computable from the ask.
+    /// The key of the re-scope an approval converts into. Derived, not generated, so a
+    /// resume can tell "this grant was recorded" from "some other re-scope is pending".
     pub fn rescope_from(approve: &AdmissionKey) -> Self {
         Self(format!("rescope-from:{}", approve.0))
     }
@@ -52,8 +43,7 @@ impl std::fmt::Display for AdmissionKey {
     }
 }
 
-/// Where a steer came from, carried so the record shows provenance (the prompt framing
-/// already distinguishes operator from reviewer text; this makes it queryable).
+/// Steer provenance, queryable from the record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "source", rename_all = "snake_case")]
 pub enum SteerSource {
@@ -61,12 +51,11 @@ pub enum SteerSource {
     Operator,
     /// A PR review comment relayed by `watch-pr`.
     PrComment { url: String, author: String },
-    /// Read out of `STEER.md` at the drain (a manual append, or a `watch-pr --reseed` file).
+    /// Read out of `STEER.md` at the drain.
     SteerFile,
 }
 
-/// The payload of one external input: one variant per mutating bridge command. The
-/// read-only commands (`status`, `tail`) are never admitted.
+/// One variant per mutating bridge command; read-only commands are never admitted.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "input", rename_all = "snake_case")]
 pub enum AdmittedInput {
@@ -82,7 +71,6 @@ pub enum AdmittedInput {
 }
 
 impl AdmittedInput {
-    /// The command token this input arrived as, for reply/record text.
     pub fn cmd(&self) -> &'static str {
         match self {
             AdmittedInput::Steer { .. } => "steer",
@@ -102,11 +90,11 @@ impl AdmittedInput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AdmissionOutcome {
-    /// It took effect (a steer reached a turn's prompt, a re-scope re-baselined).
+    /// Took effect (a steer reached a turn's prompt, a re-scope re-baselined).
     Applied,
-    /// A newer input replaced it before it took effect, or a resume overrode it.
+    /// A newer input replaced it, or a resume overrode it.
     Superseded,
-    /// It could not take effect (an `approve` with nothing pending).
+    /// Could not take effect (an `approve` with nothing pending).
     Rejected,
 }
 
@@ -179,9 +167,8 @@ fn default_version() -> u8 {
     ADMISSION_WIRE_VERSION
 }
 
-/// Encode one event as a single NDJSON line (no trailing newline). Infallible for our own
-/// types; the impossible serde error yields a line that decodes to `None` rather than a
-/// half-written record.
+/// One NDJSON line, no trailing newline. A serde failure yields a line that decodes to
+/// `None` rather than a half-written record.
 pub fn encode(ev: &AdmissionEvent) -> String {
     serde_json::to_string(&EnvelopeRef {
         v: ADMISSION_WIRE_VERSION,

@@ -688,9 +688,8 @@ pub(crate) struct Paths {
     /// Pending-provisioning marker the agent writes when it has an open approval to wait on; the loop
     /// detects it after a turn and parks or continues per its `mode`.
     pub provisioning: PathBuf,
-    /// Append-only NDJSON record of every external input (steer/approve/deny/rescope/budget/
-    /// pause/stop), authoritative over the session log for what an operator asked for. A
-    /// resume replays it to re-arm inputs that never took effect.
+    /// Append-only NDJSON record of every external input, authoritative over the session
+    /// log for what an operator asked for; a resume replays it.
     pub admissions: PathBuf,
 }
 

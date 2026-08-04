@@ -1,29 +1,6 @@
-//! Durable tool steps: a content-keyed record of expensive work that already finished.
-//!
-//! A step is a unit of work whose completed result is an immutable *value* — an image digest,
-//! a metrics map, a trace handle. Recording those values means a process that dies mid-sequence
-//! resumes where it stopped instead of repaying every proven step (a 90-minute GPU oracle is
-//! repaid exactly once). The semantics are flue's `step.do`, kept verbatim:
-//!
-//! - **At-least-once-executed.** A crash between the work finishing and the record landing
-//!   re-executes the work next time, and two racing callers may both run the same step. Step
-//!   bodies must therefore be safe to repeat (builds push immutable tags, measures resubmit).
-//! - **Exactly-once-recorded.** The record is one fsync'd line appended before the caller
-//!   consumes the value. A later call with the same identity replays it without running the body.
-//! - **Only settled facts are recorded.** `Ok` is a fact of the identity and is recorded; `Err`
-//!   is transport and records nothing, so the step re-executes. A caller that can produce a
-//!   *possibly flaky* `Ok` (a crashed GPU job) must not route it through [`StepLedger::run`].
-//! - **Eligibility: values, never state.** A step must never record a claim about mutable
-//!   external state ("X is deployed" is cluster state, not a value): skipping the re-execution
-//!   of one after a crash would assert something nobody checked.
-//!
-//! Identity is `(scope, step)` where `step` embeds the full content key of the work, so changed
-//! inputs can never replay a stale result and unchanged inputs replay across any process
-//! boundary. `scope` bounds lifetime.
-//!
-//! The file is append-only NDJSON, last record wins, never truncated. It is a cache and never
-//! authoritative: an unreadable ledger, a torn tail, or a failed append all degrade to "execute
-//! the work", never to a failed call.
+//! Durable tool steps: content-keyed records of expensive work that already finished.
+//! At-least-once-executed, exactly-once-recorded: bodies must be safe to repeat; only
+//! settled values are recorded, never claims about mutable state. The file is a cache.
 
 use crate::ndjson::{Durability, Ledger, fold};
 use anyhow::{Context, Result};
@@ -35,13 +12,14 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// On-disk format version. Bumped only by a breaking change to [`StepRecord`]; a record written
-/// by a newer version is skipped (re-executing is always safe, mis-reading is not).
+/// Bumped only by a breaking change to [`StepRecord`]; newer records are skipped
+/// (re-executing is safe, mis-reading is not).
 pub const STEP_WIRE_VERSION: u8 = 1;
 
 const LEDGER_FILE: &str = "steps.jsonl";
 
-/// Identity of a durable step. `step` carries the content key of the work itself.
+/// `step` carries the content key of the work, so changed inputs never replay stale
+/// results; `scope` bounds lifetime.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct StepKey {
     pub scope: String,
@@ -57,8 +35,8 @@ impl StepKey {
     }
 }
 
-/// One recorded step. Values are small: a large artifact is recorded as the pointer that
-/// reaches it (a log handle, a digest), never inline.
+/// Values are small: a large artifact is recorded as a pointer (log handle, digest),
+/// never inline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepRecord {
     #[serde(default = "default_version")]
@@ -66,7 +44,7 @@ pub struct StepRecord {
     #[serde(flatten)]
     pub key: StepKey,
     pub value: Value,
-    /// Epoch seconds, informational (ordering comes from the file, not from this).
+    /// Epoch seconds, informational; ordering comes from the file.
     pub recorded_at: u64,
 }
 
@@ -74,28 +52,22 @@ fn default_version() -> u8 {
     STEP_WIRE_VERSION
 }
 
-/// What [`StepLedger::run`] hands back: the value, plus whether the body ran.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepOutcome<T> {
     pub value: T,
-    /// True when the value came from the ledger, so the caller can tell the user (and skip
-    /// charging a budget for work that did not happen).
+    /// Came from the ledger: skip charging a budget for work that did not happen.
     pub replayed: bool,
 }
 
-/// The step ledger at `<dir>/steps.jsonl`.
-///
-/// Holds no open handle and no in-memory state: every lookup re-reads the file, which is what
-/// makes a record written by a *different* process (the broker that died) visible to this one.
-/// Callers that need speed keep their own memo in front of it.
+/// Holds no open handle and no in-memory state: every lookup re-reads the file, so a
+/// record written by a different process is visible to this one.
 pub struct StepLedger {
     path: PathBuf,
 }
 
 impl StepLedger {
-    /// The ledger under `dir`. Nothing touches the filesystem until the first record: a run
-    /// that never records a step never creates a file, and a directory that cannot be created
-    /// degrades to "every step executes" rather than failing construction.
+    /// Touches the filesystem only on the first record; an uncreatable directory degrades
+    /// to "every step executes".
     pub fn new(dir: &Path) -> Self {
         Self {
             path: dir.join(LEDGER_FILE),
@@ -106,15 +78,13 @@ impl StepLedger {
         &self.path
     }
 
-    /// The recorded value for `key`, or `None` when there is none (or it no longer decodes into
-    /// `T`, which means the caller's value type changed and the work must be redone).
+    /// `None` when absent or no longer decoding into `T` (the work must be redone).
     pub fn lookup<T: DeserializeOwned>(&self, key: &StepKey) -> Option<T> {
         let value = self.folded().remove(key)?;
         serde_json::from_value(value).ok()
     }
 
-    /// Every value recorded under `scope`, last-wins, ordered by step name. Undecodable records
-    /// are skipped.
+    /// Every value under `scope`, last-wins, ordered by step name.
     pub fn scan<T: DeserializeOwned>(&self, scope: &str) -> Vec<T> {
         self.folded()
             .into_iter()
@@ -139,11 +109,9 @@ impl StepLedger {
             .with_context(|| format!("appending to step ledger {}", self.path.display()))
     }
 
-    /// `step.do`: replay the recorded value for `key`, or run `f` and record its `Ok`.
-    ///
-    /// An `Err` from `f` records nothing and propagates, so the step re-executes next call. A
-    /// failed append is reported on stderr and the real value is still returned: bookkeeping
-    /// never fails work.
+    /// Replay the recorded value for `key`, or run `f` and record its `Ok`. An `Err`
+    /// records nothing; a failed append still returns the value (bookkeeping never fails
+    /// work).
     pub fn run<T, E>(
         &self,
         key: &StepKey,
@@ -168,8 +136,7 @@ impl StepLedger {
         })
     }
 
-    /// Last-wins fold of the whole file. A record from a future format version is skipped: a
-    /// value we cannot be sure we understand must re-execute rather than replay.
+    /// Last-wins fold; a future-version record is skipped (re-execute, don't guess).
     fn folded(&self) -> BTreeMap<StepKey, Value> {
         let mut map = BTreeMap::new();
         for record in fold(&self.path, decode).records {
@@ -184,9 +151,8 @@ fn decode(line: &str) -> Option<StepRecord> {
     (record.v <= STEP_WIRE_VERSION).then_some(record)
 }
 
-/// A stable content fingerprint of `parts` for a step name: sha256 of the parts, joined by a
-/// separator they cannot contain, truncated to 16 hex chars (64 bits of collision space over a
-/// handful of records per run). Stable across processes and toolchains, unlike a `DefaultHasher`.
+/// sha256 over `parts` with a NUL separator, truncated to 16 hex chars. Stable across
+/// processes and toolchains, unlike `DefaultHasher`.
 pub fn fingerprint(parts: &[&str]) -> String {
     let mut h = Sha256::new();
     for part in parts {

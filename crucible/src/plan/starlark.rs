@@ -41,17 +41,15 @@ struct CompileContext {
     prompt_files: BTreeSet<PathBuf>,
     total_prompt_bytes: usize,
     eval_steps: usize,
-    /// Construction site of every task a DSL constructor built, keyed by task name.
-    /// Compared against the final workflow's task list: a constructed-but-dropped task
+    /// Every task a DSL constructor built, keyed by name. A constructed-but-dropped task
     /// silently never runs, so it is a compile error.
     constructed_tasks: BTreeMap<String, FileSpan>,
     /// `session(...)` declarations by name, with the declaring site.
     sessions: BTreeMap<String, (SessionDecl, FileSpan)>,
     /// Declared sessions bound to at least one task.
     bound_sessions: BTreeSet<String>,
-    /// Bare-string session refs made while no declaration existed yet. If a declaration
-    /// appears later in the file these are errors: a session must be declared before use
-    /// so its defaults can materialize.
+    /// Bare-string session refs made before any declaration. A later declaration makes
+    /// these errors: a session must be declared before use.
     string_session_refs: BTreeMap<String, FileSpan>,
 }
 
@@ -183,10 +181,8 @@ const DSL_FUNCTIONS: &[&str] = &[
     "workflow",
 ];
 
-/// Every kwarg a constructor accepts. Unknown-kwarg errors suggest from this table, and
-/// a test compiles a call carrying every listed kwarg (and rejects an unlisted one) per
-/// constructor, so the table cannot drift from what the arms consume. New DSL kwargs go
-/// through here.
+/// Every kwarg a constructor accepts. Unknown-kwarg errors suggest from this table; a
+/// test compiles every listed kwarg per constructor so it cannot drift from the arms.
 fn known_kwargs(function: &str) -> &'static [&'static str] {
     match function {
         "agent" => &[
@@ -678,9 +674,9 @@ impl Compiler<'_> {
         ))
     }
 
-    /// Consume the `session` kwarg: a `session(...)` value, or a bare string. Strings
-    /// keep the historical pass-through behavior only while the file declares no
-    /// sessions; once any `session()` exists every string must name a declared one.
+    /// A `session(...)` value, or a bare string. Strings keep the historical
+    /// pass-through only while the file declares no sessions; once any `session()`
+    /// exists every string must name a declared one.
     fn take_session(
         &mut self,
         named: &mut BTreeMap<String, Value>,

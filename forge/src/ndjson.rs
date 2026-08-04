@@ -1,11 +1,6 @@
-//! Append-only NDJSON ledger mechanics, shared by every durable record the engine keeps
-//! (the run's admission ledger, the broker's step ledger).
-//!
-//! Domain semantics stay with the caller: this owns only the file. An append takes an
-//! exclusive `flock` so a second writer (another thread, or another process holding the
-//! same path) can never interleave a half line; a fold skips the blank or torn tail a
-//! killed writer leaves behind; a file that cannot be read at all is moved aside rather
-//! than wedging the caller.
+//! Append-only NDJSON ledger mechanics; domain semantics stay with the caller.
+//! Appends hold an exclusive `flock` so writers never interleave a half line; folds skip
+//! a killed writer's torn tail; an unreadable file is quarantined, not fatal.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -17,9 +12,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Durability {
     /// Write + flush. A power loss can still lose the tail, so the caller must treat a
-    /// lost record as never-written (safe re-delivery), never as data loss.
+    /// lost record as never-written, never as data loss.
     Flush,
-    /// Write + flush + `sync_data`: the record is on the platter before `append` returns.
+    /// Write + flush + `sync_data`: on the platter before `append` returns.
     Fsync,
 }
 
@@ -30,8 +25,7 @@ pub enum Open {
     Truncate,
     /// Keep it and fold it into the caller's in-memory state.
     Fold,
-    /// Keep it without reading it: the caller folds on its own schedule (see
-    /// [`Ledger::append_only`]).
+    /// Keep it without reading: the caller folds on its own schedule.
     Keep,
 }
 
@@ -39,9 +33,9 @@ pub enum Open {
 #[derive(Debug)]
 pub struct Folded<T> {
     pub records: Vec<T>,
-    /// Blank or torn lines skipped (the tail a killed writer leaves).
+    /// Blank or torn lines skipped.
     pub skipped: usize,
-    /// Where an unreadable file was moved so the caller could start clean.
+    /// Where an unreadable file was moved.
     pub quarantined: Option<PathBuf>,
 }
 
@@ -55,7 +49,6 @@ impl<T> Default for Folded<T> {
     }
 }
 
-/// An open append-only NDJSON file.
 pub struct Ledger {
     file: File,
     path: PathBuf,
@@ -63,10 +56,8 @@ pub struct Ledger {
 }
 
 impl Ledger {
-    /// Fold the file that is already there (per `mode`), then open it for appends.
-    /// `decode` returns `None` for a line that isn't a whole record, which is skipped and
-    /// counted instead of failing the open: the last line of a killed writer's file is
-    /// routinely half-written.
+    /// Fold the existing file (per `mode`), then open for appends. `decode` returns
+    /// `None` for a torn line, which is skipped and counted instead of failing the open.
     pub fn open<T>(
         path: &Path,
         mode: Open,
@@ -105,15 +96,14 @@ impl Ledger {
         ))
     }
 
-    /// Open for appends without reading what is already there, for a caller that folds the
-    /// file separately (or only ever writes).
+    /// Open for appends without reading what is already there.
     pub fn append_only(path: &Path, durability: Durability) -> io::Result<Self> {
         let (ledger, _) = Self::open(path, Open::Keep, durability, |_| None::<()>)?;
         Ok(ledger)
     }
 
-    /// Append one record. `line` must not contain a newline (it is one NDJSON record);
-    /// the terminator is added here so a caller can never write a record without one.
+    /// `line` must be newline-free; the terminator is added here so a caller can never
+    /// write a record without one.
     pub fn append(&mut self, line: &str) -> io::Result<()> {
         let _guard = FlockGuard::acquire(&self.file)?;
         let mut payload = String::with_capacity(line.len() + 1);
@@ -132,9 +122,8 @@ impl Ledger {
     }
 }
 
-/// Terminate a half-written last line. The torn record itself is unrecoverable (it is
-/// skipped by every fold), but without this the NEXT append would be glued onto it and
-/// lost too, turning one dead record into two.
+/// Terminate a half-written last line. The torn record is unrecoverable, but without
+/// this the NEXT append would be glued onto it and lost too.
 fn heal_torn_tail(file: &mut File) -> io::Result<()> {
     let len = file.metadata()?.len();
     if len == 0 {
@@ -151,10 +140,8 @@ fn heal_torn_tail(file: &mut File) -> io::Result<()> {
     Ok(())
 }
 
-/// Read every whole record out of `path`. A file that cannot be opened or read through is
-/// quarantined (moved to `<name>.corrupt-<unix-secs>`) and folds as empty: a ledger we
-/// cannot read is not one we can trust to be complete, and wedging the caller over it
-/// would be worse than starting clean with the evidence kept on disk.
+/// Read every whole record. A file that cannot be opened or read through is quarantined
+/// (moved to `<name>.corrupt-<unix-secs>`) and folds as empty.
 pub fn fold<T>(path: &Path, decode: impl Fn(&str) -> Option<T>) -> Folded<T> {
     if !path.exists() {
         return Folded::default();
@@ -198,8 +185,8 @@ fn quarantined<T>(path: &Path) -> Folded<T> {
     }
 }
 
-/// An exclusive `flock` held for the length of one write. Holds the raw descriptor rather
-/// than the `&File` so the caller can still write through the handle while locked.
+/// Exclusive `flock` held for one write. Holds the raw fd rather than the `&File` so the
+/// caller can still write through the handle while locked.
 struct FlockGuard {
     fd: std::os::fd::RawFd,
 }

@@ -1,21 +1,6 @@
-//! The admission ledger: a durable, idempotent record of every external input into a run
-//! (steer, approve/deny, rescope, set-budget, pause/resume, stop/abort).
-//!
-//! Three rules, all of them the reason this file exists:
-//!
-//! - **Admission precedes effect.** Nothing mutates the run until its `Admitted` line is
-//!   fsync'd, so an input that took effect always has a record. The only exception is
-//!   `stop`/`abort`, safety valves that apply even when the write fails.
-//! - **Idempotency converges.** Same key + same payload returns the original admission
-//!   (a bridge reconnect that redelivers a command must not steer twice); same key +
-//!   different payload is a conflict, rejected with nothing written.
-//! - **Exactly one terminal outcome.** Every `Admitted` reaches at most one `Settled`;
-//!   the first terminal wins. An input with no `Settled` line is still outstanding, which
-//!   is exactly what `--resume` re-arms: the steer that died mid-turn, the re-scope that
-//!   was granted but never drained, the live budget override.
-//!
-//! `state/admissions.jsonl` is authoritative for operator inputs; the session log records
-//! only what the loop did with them.
+//! Admission ledger: a durable, idempotent record of every external input into a run.
+//! Nothing mutates the run until its `Admitted` line is fsync'd (except stop/abort);
+//! same key + same payload converges, different payload conflicts; first `Settled` wins.
 
 use anyhow::{Context, Result};
 use crucible_contract::admission::{
@@ -32,20 +17,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub(crate) enum Admitted {
     /// Recorded for the first time: the caller applies the effect.
     Fresh(AdmissionKey),
-    /// Exact replay of an already-admitted input, with its terminal outcome if it reached
-    /// one. Nothing was written and the effect must NOT be re-applied.
+    /// Exact replay; nothing written, the effect must NOT be re-applied.
     Duplicate(AdmissionKey, Option<AdmissionOutcome>),
-    /// The key was admitted with a different payload: one truth per key, so this is
-    /// rejected and nothing is written.
+    /// Same key, different payload: rejected, nothing written.
     Conflict(AdmissionKey),
 }
 
-/// One admitted input as the fold holds it.
 struct Record {
     key: AdmissionKey,
     input: AdmittedInput,
-    /// Canonical JSON of `input`, the conflict-detection comparand (no hash scheme two
-    /// sides would have to agree on).
+    /// Canonical JSON of `input`, the conflict comparand.
     payload: String,
     settled: Option<AdmissionOutcome>,
 }
@@ -53,24 +34,21 @@ struct Record {
 struct Inner {
     file: Ledger,
     next_seq: u64,
-    /// Every admitted input in admission order.
     log: Vec<Record>,
-    /// Key to its position in `log`.
     index: HashMap<AdmissionKey, usize>,
     /// Torn lines skipped at open, and where an unreadable file was moved.
     skipped: usize,
     quarantined: Option<PathBuf>,
 }
 
-/// The open ledger, shared (`Arc`) between the bridge threads and the loop thread.
+/// Shared between the bridge threads and the loop thread.
 pub(crate) struct AdmissionLedger {
     inner: Mutex<Inner>,
 }
 
 impl AdmissionLedger {
-    /// Open `state/admissions.jsonl`. A fresh run truncates (it must not inherit the last
-    /// run's un-drained inputs, mirroring `SessionReporter::stream` vs `::resume`); a
-    /// resumed run folds what is there.
+    /// A fresh run truncates (it must not inherit the last run's un-drained inputs);
+    /// a resumed run folds what is there.
     pub(crate) fn open(path: &Path, mode: Open) -> Result<Self> {
         let (file, folded) = Ledger::open(path, mode, Durability::Fsync, decode)
             .with_context(|| format!("opening admission ledger {}", path.display()))?;
@@ -90,9 +68,8 @@ impl AdmissionLedger {
         })
     }
 
-    /// Durably record an input BEFORE it takes effect. A fresh admission appends one
-    /// fsync'd line (admissions arrive at human rates, so the sync is free and is the
-    /// whole durability guarantee); a duplicate or a conflict writes nothing.
+    /// Durably record an input BEFORE it takes effect; a duplicate or conflict writes
+    /// nothing.
     pub(crate) fn admit(
         &self,
         key: Option<AdmissionKey>,
@@ -117,8 +94,8 @@ impl AdmissionLedger {
             ts: now_secs(),
             input: input.clone(),
         });
-        // Register in memory only after the record is on disk: a failed append must leave
-        // no trace of an input the caller is about to refuse to apply.
+        // Register in memory only after the append lands: a failed write must leave
+        // no trace.
         g.file
             .append(&line)
             .with_context(|| format!("appending admission {key}"))?;
@@ -134,10 +111,8 @@ impl AdmissionLedger {
         Ok(Admitted::Fresh(key))
     }
 
-    /// Record the terminal outcome. First terminal wins: settling an already-settled key
-    /// writes nothing and returns the outcome that stands. `None` means the key was never
-    /// admitted here. A lost `Settled` line only re-arms the input on resume (safe
-    /// re-delivery), so this never needs to fail a run.
+    /// First terminal wins: settling a settled key writes nothing and returns the
+    /// outcome that stands. `None` means the key was never admitted.
     pub(crate) fn settle(
         &self,
         key: &AdmissionKey,
@@ -164,17 +139,16 @@ impl AdmissionLedger {
         Ok(Some(outcome))
     }
 
-    /// Settle each key, swallowing IO errors: a settle that doesn't land only re-arms its
-    /// input on resume, which every apply site tolerates, so it must never fail the loop.
+    /// Settle each key, swallowing IO errors: a lost settle only re-arms the input on
+    /// resume, so it must never fail the loop.
     pub(crate) fn settle_all(&self, keys: &[AdmissionKey], outcome: AdmissionOutcome, note: &str) {
         for key in keys {
             let _ = self.settle(key, outcome, note);
         }
     }
 
-    /// The unsettled steers in admission order, WITHOUT settling them. Two-phase on
-    /// purpose: the loop renders the prompt from these and settles only once the turn that
-    /// carried the text has run, so a death mid-turn re-delivers on resume.
+    /// Unsettled steers in admission order, WITHOUT settling: the loop settles only once
+    /// the turn that carried the text has run, so a death mid-turn re-delivers on resume.
     pub(crate) fn peek_steers(&self) -> Vec<(AdmissionKey, String)> {
         let Ok(g) = self.lock() else {
             return Vec::new();
@@ -189,8 +163,7 @@ impl AdmissionLedger {
             .collect()
     }
 
-    /// The resume fold: levels to re-establish, edges to re-arm, and the stale inputs a
-    /// resume overrides.
+    /// Levels to re-establish, edges to re-arm, stale inputs a resume overrides.
     pub(crate) fn replay_for_resume(&self) -> ResumeReplay {
         let Ok(g) = self.lock() else {
             return ResumeReplay::default();
@@ -203,7 +176,7 @@ impl AdmissionLedger {
         for r in &g.log {
             let unsettled = r.settled.is_none();
             match &r.input {
-                // Levels: the last one admitted is the state the run died in, settled or not.
+                // Levels: the last one admitted stands, settled or not.
                 AdmittedInput::SetBudget { usd } => replay.last_budget = Some(*usd),
                 AdmittedInput::Pause => replay.paused = true,
                 AdmittedInput::Resume => replay.paused = false,
@@ -215,8 +188,7 @@ impl AdmissionLedger {
                 AdmittedInput::Deny { reason } if unsettled => {
                     replay.unsettled_deny = Some((r.key.clone(), reason.clone()));
                 }
-                // A resume IS the operator's override of a stop, and an approve that never
-                // reached its grant has to be re-sent: both close out here.
+                // A resume overrides a stop; an un-granted approve must be re-sent.
                 AdmittedInput::Stop | AdmittedInput::Abort if unsettled => {
                     replay.stale_stops.push(r.key.clone());
                 }
@@ -241,8 +213,8 @@ impl Inner {
                 key, seq, input, ..
             } => {
                 self.next_seq = self.next_seq.max(seq + 1);
-                // Two Admitted lines for one key can only come from a hand-edited file;
-                // the first is the truth (one admission per key).
+                // Two Admitted lines per key only happen in a hand-edited file; the
+                // first wins.
                 if self.index.contains_key(&key) {
                     return;
                 }
@@ -255,8 +227,7 @@ impl Inner {
                     settled: None,
                 });
             }
-            // A settlement for a key with no admission (a truncated head) has nothing to
-            // close; drop it rather than inventing a record.
+            // A settlement with no admission (truncated head) has nothing to close.
             AdmissionEvent::Settled { key, outcome, .. } => {
                 if let Some(&at) = self.index.get(&key) {
                     self.log[at].settled.get_or_insert(outcome);
@@ -269,40 +240,34 @@ impl Inner {
 /// What a resumed run owes the operator, folded out of the ledger.
 #[derive(Debug, Default)]
 pub(crate) struct ResumeReplay {
-    /// The live budget override in force at the death (a level, not an edge).
+    /// Live budget override in force at the death.
     pub last_budget: Option<f64>,
-    /// Whether the run was paused at the death.
     pub paused: bool,
-    /// A re-scope that was granted but never drained by an iteration head.
+    /// Re-scope granted but never drained by an iteration head.
     pub unsettled_rescope: Option<(AdmissionKey, String)>,
-    /// A denial that never reached a park or an iteration head.
+    /// Denial that never reached a park or an iteration head.
     pub unsettled_deny: Option<(AdmissionKey, String)>,
-    /// How many steers were admitted but never delivered into a turn.
+    /// Steers admitted but never delivered into a turn.
     pub steers_pending: usize,
-    /// Stops/aborts the resume overrides (resuming IS the operator's override).
+    /// Stops/aborts the resume overrides.
     pub stale_stops: Vec<AdmissionKey>,
-    /// Approves that never converted into a grant (the death hit the admit-to-convert
-    /// window); the operator has to re-approve.
+    /// Approves that never converted into a grant; the operator re-approves.
     pub stale_approves: Vec<AdmissionKey>,
     /// Torn lines skipped when the file was folded.
     pub skipped_lines: usize,
-    /// Where an unreadable ledger was moved so this run could start clean.
+    /// Where an unreadable ledger was moved.
     pub quarantined: Option<PathBuf>,
 }
 
-/// One iteration head's worth of steer: the admitted text to render, and the keys that
-/// settle once the turn it feeds has run.
+/// Steer text to render, plus the keys that settle once the turn it feeds has run.
 #[derive(Debug, Default)]
 pub(crate) struct SteerBatch {
     pub keys: Vec<AdmissionKey>,
     pub text: Option<String>,
 }
 
-/// The iteration-head steer drain: admit whatever sits in `STEER.md` (the file channel is
-/// still first-class — a manual `echo >>`, a `watch-pr --reseed` file — it just goes
-/// through admission like everything else), then return every un-delivered steer as one
-/// batch. Without a ledger (the console/jsonl front-ends have no bridge) this is the
-/// historical read-and-blank.
+/// Admit whatever sits in `STEER.md`, then return every un-delivered steer as one batch.
+/// Without a ledger this is the historical read-and-blank.
 pub(crate) fn drain_steer(ledger: Option<&AdmissionLedger>, steer_path: &Path) -> SteerBatch {
     let file_text = take_steer_file(steer_path);
     let Some(ledger) = ledger else {
@@ -319,8 +284,7 @@ pub(crate) fn drain_steer(ledger: Option<&AdmissionLedger>, steer_path: &Path) -
                 from: SteerSource::SteerFile,
             },
         );
-        // A failed admission must not swallow the operator's text: the file is already
-        // blanked, so deliver it un-recorded rather than dropping it.
+        // The file is already blanked; deliver un-recorded rather than dropping the text.
         if admitted.is_err() {
             let mut batch = pending_batch(ledger);
             batch.text = Some(match batch.text {
@@ -348,7 +312,6 @@ fn pending_batch(ledger: &AdmissionLedger) -> SteerBatch {
     }
 }
 
-/// Consume `STEER.md` if it has content (then blank it), returning the guidance.
 fn take_steer_file(path: &Path) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
     if text.trim().is_empty() {
@@ -358,8 +321,7 @@ fn take_steer_file(path: &Path) -> Option<String> {
     Some(text)
 }
 
-/// A generated key for an input whose source has no natural one. v7 is timestamp-ordered,
-/// so a ledger read by eye stays in admission order.
+/// v7 is timestamp-ordered, so a ledger read by eye stays in admission order.
 fn generated_key() -> AdmissionKey {
     AdmissionKey::new(uuid::Uuid::now_v7().to_string())
 }

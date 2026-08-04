@@ -8,9 +8,8 @@
 //! blocked on the tool call, but a background process it started is not), then hands it to the
 //! generic [`forge`] build. No git push, no new egress, no driver IPC.
 //!
-//! The build is a durable step keyed by the sandbox tree hash plus the build config (see
-//! [`forge::steps`]), so a second call on an unchanged tree — including one from a broker that has
-//! since restarted — replays the ref it already pushed instead of re-syncing and re-running buildah.
+//! The build is a durable step keyed by tree hash plus build config ([`forge::steps`]):
+//! an unchanged tree replays the pushed ref, even across a broker restart.
 //!
 //! ```text
 //!   agent (sandbox)  --build_epp-->  broker (loop pod)
@@ -38,8 +37,8 @@ const DEFAULT_COMPOSITE_APPLY_CMD: &str = "fullstack-pd-apply";
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum BuildReply {
     /// Built + pushed; `image_ref` is live in the registry and recorded as the latest candidate.
-    /// `cached` marks a replayed build: this exact tree+config was already pushed (possibly by a
-    /// broker process that has since died), so nothing was rebuilt.
+    /// `cached` marks a replayed build: this exact tree+config was already pushed,
+    /// possibly by a broker process that has since died.
     Built {
         image_ref: String,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -121,9 +120,8 @@ fn do_build() -> Result<BuildReply> {
     }
 }
 
-/// The build as a durable step: an unchanged tree built against an unchanged config replays the
-/// ref it already pushed, skipping the sandbox download AND the buildah run. Without a key the
-/// build runs unrecorded (see [`build_step_key`]).
+/// An unchanged tree against an unchanged config replays the ref it already pushed,
+/// skipping the sandbox download AND the buildah run. No key = the build runs unrecorded.
 fn build_step(
     ledger: &StepLedger,
     key: Option<StepKey>,
@@ -138,10 +136,9 @@ fn build_step(
     }
 }
 
-/// The content key of a build: the exact source tree plus the exact build config, so a replay is
-/// only possible when nothing about the artifact could differ. `None` when the sandbox can't
-/// produce a git tree hash (no git in the workdir, a gateway hiccup) — the build then runs
-/// unrecorded rather than failing, the same degrade [`verified_sync`] makes for a missing hasher.
+/// The exact source tree plus the exact build config, so a replay is only possible when
+/// nothing about the artifact could differ. `None` when the sandbox can't produce a tree
+/// hash; the build then runs unrecorded rather than failing.
 fn build_step_key(workdir: &str, cfg: &BuildConfig) -> Option<StepKey> {
     match sandbox_git_tree_hash(workdir) {
         Ok(tree) => Some(crate::steps::key(format!(

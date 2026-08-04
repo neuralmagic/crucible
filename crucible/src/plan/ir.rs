@@ -199,8 +199,8 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Stage::is_iteration")]
     pub stage: Stage,
     /// Fields the task's JSON output promises to include. Presence is checked at
-    /// runtime (a passing attempt missing one is a measured failure); consumer
-    /// contracts (`top_k`, grade sources) are checked at validation. Empty = undeclared.
+    /// runtime; consumer contracts (`top_k`, grade sources) at validation. Empty =
+    /// undeclared.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub emits: Vec<OutputField>,
 }
@@ -363,7 +363,6 @@ impl Plan {
             }
             // Consumer contracts are presence-only: a declared emits that omits `score`
             // where a score is read is a wiring bug worth failing before any spend.
-            // An empty emits stays unchecked.
             let score_declared = |name: &TaskName| {
                 index.get(name).is_none_or(|&i| {
                     let emits = &self.tasks[i].emits;

@@ -230,9 +230,8 @@ fn fetch_comments(pr: &PrRef) -> Result<Vec<Comment>> {
 }
 
 /// Send one `steer` command to the loop's control bridge, the exact NDJSON shape `control.rs` parses
-/// into a `ControlCommand::Steer`, which the loop's next turn picks up. `key` is the comment's
-/// natural idempotency key: a reconnect, a watcher restart, or a second `--once` pass redelivers the
-/// same comment, and the run's admission ledger converges on the original instead of steering twice.
+/// into a `ControlCommand::Steer`. `key` is the comment's natural idempotency key, so a
+/// redelivered comment converges on the original admission instead of steering twice.
 fn send_steer(addr: &str, text: &str, key: &str) -> std::io::Result<()> {
     let cmd = serde_json::json!({ "cmd": "steer", "text": text, "id": key });
     let mut stream = TcpStream::connect(addr)?;
