@@ -20,16 +20,24 @@ pub(crate) fn setup(workspace: &Path, dest: &Path, pending: &str) -> Result<()> 
     if dest.exists() {
         std::fs::remove_dir_all(dest)?;
     }
-    let status = std::process::Command::new("git")
-        .args([
-            "clone",
-            "--local",
-            "--no-checkout",
-            &workspace.to_string_lossy(),
-            &dest.to_string_lossy(),
-        ])
-        .output()
-        .context("git clone --local for a task worktree")?;
+    let clone = |extra: &[&str]| -> Result<std::process::Output> {
+        let mut args = vec!["clone", "--local", "--no-checkout"];
+        args.extend_from_slice(extra);
+        std::process::Command::new("git")
+            .args(&args)
+            .arg(workspace.as_os_str())
+            .arg(dest.as_os_str())
+            .output()
+            .context("git clone --local for a task worktree")
+    };
+    let mut status = clone(&[])?;
+    if !status.status.success() {
+        // Hardlinks can't cross filesystems ("Invalid cross-device link"): a state dir on a PVC
+        // puts the clone on a different device than the workspace. Copy objects instead; slower,
+        // but a worktree either way.
+        let _ = std::fs::remove_dir_all(dest);
+        status = clone(&["--no-hardlinks"])?;
+    }
     if !status.status.success() {
         anyhow::bail!(
             "git clone --local failed: {}",
