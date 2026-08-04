@@ -78,7 +78,8 @@ impl DescVars {
         format!(
             "{opening} The loop pod pulls your working tree out of the sandbox, runs the \
              container build, and pushes it — you never hold build creds. Returns a JSON status: \
-             built{{image_ref}} (ready to deploy) | compile_error{{log}} (fix the errors and call \
+             built{{image_ref, cached}} (ready to deploy; cached=true means this exact tree was \
+             already built and pushed, so nothing was rebuilt) | compile_error{{log}} (fix the errors and call \
              again) | wrap_up{{reason}} (your candidate budget for this turn is spent — commit \
              your best CANDIDATE.md and END the turn) | disabled | error. Edit, build, fix, \
              repeat until it builds, then deploy_candidate."

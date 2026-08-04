@@ -8,6 +8,10 @@
 //! blocked on the tool call, but a background process it started is not), then hands it to the
 //! generic [`forge`] build. No git push, no new egress, no driver IPC.
 //!
+//! The build is a durable step keyed by the sandbox tree hash plus the build config (see
+//! [`forge::steps`]), so a second call on an unchanged tree — including one from a broker that has
+//! since restarted — replays the ref it already pushed instead of re-syncing and re-running buildah.
+//!
 //! ```text
 //!   agent (sandbox)  --build_epp-->  broker (loop pod)
 //!       broker: openshell sandbox download ci <workdir>  <ctx>
@@ -17,6 +21,7 @@
 //! ```
 
 use anyhow::{Context, Result};
+use forge::steps::{StepKey, StepLedger, StepOutcome};
 use forge::{BuildConfig, BuildOutcome, DeployConfig};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -33,7 +38,13 @@ const DEFAULT_COMPOSITE_APPLY_CMD: &str = "fullstack-pd-apply";
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum BuildReply {
     /// Built + pushed; `image_ref` is live in the registry and recorded as the latest candidate.
-    Built { image_ref: String },
+    /// `cached` marks a replayed build: this exact tree+config was already pushed (possibly by a
+    /// broker process that has since died), so nothing was rebuilt.
+    Built {
+        image_ref: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        cached: bool,
+    },
     /// A composite deploy was kicked off on a background thread; poll `deploy_status(deploy_id)` to
     /// scan the live phase (and, opt-in, the raw log). Returns instantly so you never block on the roll.
     Building { deploy_id: String },
@@ -87,15 +98,79 @@ fn do_build() -> Result<BuildReply> {
     let build_cfg = BuildConfig::from_env()
         .context("build config (set FORGE_REGISTRY / FORGE_AUTHFILE on the loop pod)")?;
     let ctx = ctx_dir(&build_cfg);
-    sync_sandbox(&sandbox_workdir()?, &ctx)?;
-    let tag = unique_tag(&ctx);
-    match forge::build_and_push(&build_cfg, &ctx, &tag)? {
+    let workdir = sandbox_workdir()?;
+    let outcome = build_step(
+        &crate::steps::ledger(),
+        build_step_key(&workdir, &build_cfg),
+        &mut || {
+            sync_sandbox(&workdir, &ctx)?;
+            forge::build_and_push(&build_cfg, &ctx, &unique_tag(&ctx))
+        },
+    )?;
+    match outcome.value {
         BuildOutcome::CompileError { log } => Ok(BuildReply::CompileError { log }),
         BuildOutcome::Built { image_ref } => {
+            // Runs on a replay too: the recorded ref is still the latest candidate, and the
+            // pointer file may belong to a process that died before writing it.
             forge::record_latest(&latest_file(), &image_ref)?;
-            Ok(BuildReply::Built { image_ref })
+            Ok(BuildReply::Built {
+                image_ref,
+                cached: outcome.replayed,
+            })
         }
     }
+}
+
+/// The build as a durable step: an unchanged tree built against an unchanged config replays the
+/// ref it already pushed, skipping the sandbox download AND the buildah run. Without a key the
+/// build runs unrecorded (see [`build_step_key`]).
+fn build_step(
+    ledger: &StepLedger,
+    key: Option<StepKey>,
+    build: &mut dyn FnMut() -> Result<BuildOutcome>,
+) -> Result<StepOutcome<BuildOutcome>> {
+    match key {
+        Some(key) => ledger.run(&key, build),
+        None => Ok(StepOutcome {
+            value: build()?,
+            replayed: false,
+        }),
+    }
+}
+
+/// The content key of a build: the exact source tree plus the exact build config, so a replay is
+/// only possible when nothing about the artifact could differ. `None` when the sandbox can't
+/// produce a git tree hash (no git in the workdir, a gateway hiccup) — the build then runs
+/// unrecorded rather than failing, the same degrade [`verified_sync`] makes for a missing hasher.
+fn build_step_key(workdir: &str, cfg: &BuildConfig) -> Option<StepKey> {
+    match sandbox_git_tree_hash(workdir) {
+        Ok(tree) => Some(crate::steps::key(format!(
+            "build-epp:{tree}:{}",
+            cfg_fingerprint(cfg)
+        ))),
+        Err(e) => {
+            eprintln!("==> build_epp: no sandbox git tree hash ({e:#}); building unrecorded");
+            None
+        }
+    }
+}
+
+/// The whole finalized config is fingerprinted, not just the registry: the artifact depends on
+/// the Dockerfile, the platform, and the push destination too.
+fn cfg_fingerprint(cfg: &BuildConfig) -> String {
+    let authfile = cfg.authfile.to_string_lossy();
+    let storage = cfg
+        .storage_root
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    forge::steps::fingerprint(&[
+        &cfg.registry,
+        &cfg.dockerfile,
+        &authfile,
+        &cfg.platform,
+        &storage,
+    ])
 }
 
 fn do_deploy(image_ref: Option<String>) -> Result<BuildReply> {
@@ -360,7 +435,8 @@ mod tests {
     fn replies_serialize_with_a_status_tag() {
         assert!(
             json(&BuildReply::Built {
-                image_ref: "quay.io/x/y:t".into()
+                image_ref: "quay.io/x/y:t".into(),
+                cached: false,
             })
             .contains(r#""status":"built""#)
         );
@@ -465,6 +541,132 @@ mod tests {
     fn sh_quote_wraps_and_escapes() {
         assert_eq!(sh_quote("/sandbox/epp"), "'/sandbox/epp'");
         assert_eq!(sh_quote("a'b"), "'a'\\''b'");
+    }
+
+    fn step_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("broker-steps-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The whole point: the second build of an unchanged tree neither syncs nor builds, and the
+    /// agent is told the ref came back cached.
+    #[test]
+    fn an_unchanged_tree_replays_the_pushed_ref() {
+        let ledger = StepLedger::new(&step_dir("replay"));
+        let key = Some(crate::steps::key("build-epp:tree1:cfg1"));
+        let mut builds = 0;
+        let first = build_step(&ledger, key.clone(), &mut || {
+            builds += 1;
+            Ok(BuildOutcome::Built {
+                image_ref: "quay.io/x/y:abc-1".into(),
+            })
+        })
+        .unwrap();
+        assert!(!first.replayed);
+
+        let second = build_step(&ledger, key, &mut || {
+            builds += 1;
+            anyhow::bail!("a replayed build must not sync or run buildah")
+        })
+        .unwrap();
+        assert!(second.replayed);
+        assert_eq!(second.value, first.value, "the same immutable pushed ref");
+        assert_eq!(builds, 1);
+    }
+
+    /// A compile error is a fact of the tree: replay it rather than rebuild a known-broken tree.
+    #[test]
+    fn a_compile_error_replays_without_a_rebuild() {
+        let ledger = StepLedger::new(&step_dir("compile-error"));
+        let key = Some(crate::steps::key("build-epp:tree1:cfg1"));
+        build_step(&ledger, key.clone(), &mut || {
+            Ok(BuildOutcome::CompileError {
+                log: "error[E0432]".into(),
+            })
+        })
+        .unwrap();
+        let replay = build_step(&ledger, key, &mut || {
+            anyhow::bail!("a replayed build must not run buildah")
+        })
+        .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(
+            replay.value,
+            BuildOutcome::CompileError {
+                log: "error[E0432]".into()
+            }
+        );
+    }
+
+    /// A sync/push failure is transport: nothing is recorded, so the next call really builds.
+    #[test]
+    fn a_sync_failure_is_not_recorded() {
+        let ledger = StepLedger::new(&step_dir("sync-failure"));
+        let key = Some(crate::steps::key("build-epp:tree1:cfg1"));
+        let err = build_step(&ledger, key.clone(), &mut || {
+            anyhow::bail!("openshell sandbox download failed")
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("download failed"));
+        let retry = build_step(&ledger, key, &mut || {
+            Ok(BuildOutcome::Built {
+                image_ref: "quay.io/x/y:abc-2".into(),
+            })
+        })
+        .unwrap();
+        assert!(!retry.replayed);
+    }
+
+    /// No tree hash, no identity: build every time rather than replay something unkeyed.
+    #[test]
+    fn an_unkeyed_build_always_runs() {
+        let ledger = StepLedger::new(&step_dir("unkeyed"));
+        let mut builds = 0;
+        for _ in 0..2 {
+            let out = build_step(&ledger, None, &mut || {
+                builds += 1;
+                Ok(BuildOutcome::Built {
+                    image_ref: "quay.io/x/y:abc".into(),
+                })
+            })
+            .unwrap();
+            assert!(!out.replayed);
+        }
+        assert_eq!(builds, 2);
+    }
+
+    /// Identity covers the config, not just the tree: a changed registry must not replay.
+    #[test]
+    fn the_config_fingerprint_moves_with_the_config() {
+        let base = BuildConfig {
+            registry: "quay.io/a/b".into(),
+            dockerfile: "Dockerfile".into(),
+            authfile: PathBuf::from("/run/auth.json"),
+            platform: "linux/amd64".into(),
+            storage_root: Some(PathBuf::from("/var/lib/forge")),
+        };
+        let mut moved = base.clone();
+        moved.registry = "quay.io/a/c".into();
+        assert_eq!(cfg_fingerprint(&base), cfg_fingerprint(&base.clone()));
+        assert_ne!(cfg_fingerprint(&base), cfg_fingerprint(&moved));
+    }
+
+    /// The replay flag rides the reply only when it is true, so an ordinary build's JSON is
+    /// byte-identical to what agents saw before.
+    #[test]
+    fn cached_is_absent_from_a_fresh_build_reply() {
+        let fresh = json(&BuildReply::Built {
+            image_ref: "quay.io/x/y:t".into(),
+            cached: false,
+        });
+        assert!(!fresh.contains("cached"), "{fresh}");
+        let replayed = json(&BuildReply::Built {
+            image_ref: "quay.io/x/y:t".into(),
+            cached: true,
+        });
+        assert!(replayed.contains(r#""cached":true"#), "{replayed}");
     }
 
     #[test]

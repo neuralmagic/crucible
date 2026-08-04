@@ -61,6 +61,9 @@ pub struct CodegenState {
     /// Digests this broker's own `build()` produced; measures refuse anything else, since the frozen
     /// command is no protection inside an agent-chosen image.
     built: Mutex<HashSet<String>>,
+    /// The durable tier under `memo`/`built`: everything in them dies with the pod, and repaying a
+    /// finished 90-minute measure because the pod restarted is the scar this closes.
+    steps: forge::steps::StepLedger,
     budget: Budget,
     logs: LogStore,
     /// The GPU jobs THIS broker submitted (a bounded ring), the only jobs `codegen_jobs` reports.
@@ -133,7 +136,10 @@ struct TrackedJob {
     result: Option<JobResult>,
 }
 
-#[derive(Clone)]
+/// A settled result, memoized in-process and recorded in the step ledger. Only facts of the key
+/// live here: a crashed or timed-out job is never cached, so it re-runs.
+#[derive(Clone, Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 enum Cached {
     Build {
         digest: String,
@@ -151,9 +157,14 @@ enum Cached {
 
 impl CodegenState {
     pub fn new() -> Self {
+        Self::with_steps(crate::steps::ledger())
+    }
+
+    fn with_steps(steps: forge::steps::StepLedger) -> Self {
         Self {
             memo: Mutex::new(HashMap::new()),
             built: Mutex::new(HashSet::new()),
+            steps,
             budget: Budget::from_env(),
             logs: LogStore::from_env(),
             jobs: Mutex::new(VecDeque::new()),
@@ -173,10 +184,27 @@ impl CodegenState {
             m.remove(key);
         }
     }
+    /// Memo first, then the ledger: a hit there is work a previous broker process finished, so it
+    /// is rehydrated into the memo (and into the provenance set, for a build) before it is served.
     fn get(&self, key: &str) -> Option<Cached> {
-        self.memo.lock().ok().and_then(|m| m.get(key).cloned())
+        if let Some(hit) = self.memo.lock().ok().and_then(|m| m.get(key).cloned()) {
+            return Some(hit);
+        }
+        let recorded: Cached = self.steps.lookup(&crate::steps::key(key))?;
+        if let Cached::Build { digest, .. } = &recorded {
+            self.mark_built(digest);
+        }
+        if let Ok(mut m) = self.memo.lock() {
+            m.insert(key.to_string(), recorded.clone());
+        }
+        Some(recorded)
     }
+    /// Record before the memo: the caller consumes the value the moment this returns, and a
+    /// recorded step is what makes that consumption survive the pod.
     fn put(&self, key: String, val: Cached) {
+        if let Err(e) = self.steps.record(&crate::steps::key(key.clone()), &val) {
+            eprintln!("warning: recording step {key:?} failed: {e:#}");
+        }
         if let Ok(mut m) = self.memo.lock() {
             m.insert(key, val);
         }
@@ -186,8 +214,22 @@ impl CodegenState {
             s.insert(digest.to_string());
         }
     }
+    /// A digest is ours if this process built it or if the ledger says a broker did. Without the
+    /// ledger half, a restarted broker refuses to measure a digest that is already in the registry
+    /// and forces a rebuild before any measure can run.
     fn is_built(&self, digest: &str) -> bool {
-        self.built.lock().is_ok_and(|s| s.contains(digest))
+        if self.built.lock().is_ok_and(|s| s.contains(digest)) {
+            return true;
+        }
+        let recorded = self
+            .steps
+            .scan::<Cached>(crate::steps::SCOPE)
+            .iter()
+            .any(|c| matches!(c, Cached::Build { digest: d, .. } if d == digest));
+        if recorded {
+            self.mark_built(digest);
+        }
+        recorded
     }
     fn record_job(&self, job: TrackedJob) {
         if let Ok(mut ring) = self.jobs.lock() {
@@ -2104,6 +2146,18 @@ mod tests {
         overlay.finalize(2).unwrap()
     }
 
+    /// A state whose step ledger is a fresh temp dir, so a unit test never reads or writes the
+    /// shared build volume (and two tests can never replay each other's steps).
+    fn test_state() -> Arc<CodegenState> {
+        Arc::new(CodegenState::with_steps(forge::steps::StepLedger::new(
+            &steps_dir(),
+        )))
+    }
+
+    fn steps_dir() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("codegen-steps-{}-{}", std::process::id(), nonce()))
+    }
+
     fn temp_budget(max_calls: u32, max_gpu_minutes: f64) -> (Budget, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
             "codegen-budget-test-{}-{}",
@@ -2215,7 +2269,7 @@ mod tests {
         if std::env::var("BROKER_CODEGEN").is_ok() {
             return;
         }
-        let st = Arc::new(CodegenState::new());
+        let st = test_state();
         assert!(build(&st, "derive").contains(r#""status":"disabled""#));
         assert!(benchmark(&st, "repo@sha256:x", &[], None).contains(r#""status":"disabled""#));
         assert!(lm_eval(&st, "repo@sha256:x", None).contains(r#""status":"disabled""#));
@@ -2324,7 +2378,7 @@ mod tests {
     fn build_errors_when_the_tree_cannot_be_hashed() {
         // No live sandbox and no workdir env in the test process, so the build must error out
         // naming the missing key, never proceed with fabricated provenance.
-        let st = CodegenState::new();
+        let st = test_state();
         let err = build_inner(&st, &bench_cfg(), BuildMode::Derive).unwrap_err();
         assert!(err.contains("BROKER_SANDBOX_WORKDIR"), "{err}");
         assert!(err.contains("BROKER_CODEGEN_SANDBOX_WORKDIR"), "{err}");
@@ -2332,7 +2386,7 @@ mod tests {
 
     #[test]
     fn measure_rejects_a_digest_this_broker_did_not_build() {
-        let st = Arc::new(CodegenState::new());
+        let st = test_state();
         let cfg = bench_cfg();
         let reply = run_benchmark(&st, &cfg, "ghcr.io/evil/img@sha256:beef", &[], None);
         match reply {
@@ -2350,7 +2404,7 @@ mod tests {
 
     #[test]
     fn undeclared_kwarg_is_rejected_before_any_side_effect() {
-        let st = Arc::new(CodegenState::new());
+        let st = test_state();
         let cfg = bench_cfg();
         // lm_eval's `limit` is not declared in the fixture.
         let reply = run_lm_eval(&st, &cfg, "repo@sha256:x", Some(100));
@@ -2373,7 +2427,7 @@ mod tests {
 
     #[test]
     fn memo_replays_a_measure_and_a_build() {
-        let st = CodegenState::new();
+        let st = test_state();
         let mkey = measure_key("d", "benchmark", &[]);
         st.put(
             mkey.clone(),
@@ -2402,6 +2456,86 @@ mod tests {
             }
             _ => panic!("expected a cached build"),
         }
+    }
+
+    /// The pod died between the build and the measure. A new process shares nothing in memory
+    /// with the old one, so the ledger is the only thing that can replay the digest and the
+    /// completed measure instead of repaying both.
+    #[test]
+    fn a_restarted_broker_replays_recorded_steps() {
+        let dir = steps_dir();
+        let bkey = build_key("treehash", BuildMode::Derive, &bench_cfg().build);
+        let mkey = measure_key("repo@sha256:x", "benchmark", &[]);
+        {
+            let dead = CodegenState::with_steps(forge::steps::StepLedger::new(&dir));
+            dead.put(
+                bkey.clone(),
+                Cached::Build {
+                    digest: "repo@sha256:x".into(),
+                    log: "build-x-1.log".into(),
+                },
+            );
+            dead.mark_built("repo@sha256:x");
+            dead.put(
+                mkey.clone(),
+                Cached::Measure {
+                    metrics: BTreeMap::from([("tpot_ms".into(), 9.1)]),
+                    logs: vec!["bench-x-1.log".into()],
+                },
+            );
+        }
+        let fresh = CodegenState::with_steps(forge::steps::StepLedger::new(&dir));
+        match fresh.get(&bkey) {
+            Some(Cached::Build { digest, log }) => {
+                assert_eq!(digest, "repo@sha256:x");
+                assert_eq!(log, "build-x-1.log");
+            }
+            _ => panic!("expected the recorded build"),
+        }
+        match fresh.get(&mkey) {
+            Some(Cached::Measure { metrics, logs }) => {
+                assert_eq!(metrics["tpot_ms"], 9.1);
+                assert_eq!(logs, vec!["bench-x-1.log".to_string()]);
+            }
+            _ => panic!("expected the recorded measure"),
+        }
+        // Serving a recorded build also restores its provenance, so the memo hit and the ledger
+        // hit leave the state in the same place.
+        assert!(fresh.is_built("repo@sha256:x"));
+    }
+
+    /// The provenance gate reads the ledger directly: an agent that kept a digest across a broker
+    /// restart can measure it without a pointless rebuild.
+    #[test]
+    fn is_built_accepts_a_digest_only_the_ledger_knows() {
+        let dir = steps_dir();
+        CodegenState::with_steps(forge::steps::StepLedger::new(&dir)).put(
+            build_key("treehash", BuildMode::Derive, &bench_cfg().build),
+            Cached::Build {
+                digest: "repo@sha256:x".into(),
+                log: "build-x-1.log".into(),
+            },
+        );
+        let fresh = CodegenState::with_steps(forge::steps::StepLedger::new(&dir));
+        assert!(fresh.is_built("repo@sha256:x"));
+        assert!(!fresh.is_built("ghcr.io/evil/img@sha256:beef"));
+    }
+
+    /// Two different runs' records coexist under content keys; neither can serve the other.
+    #[test]
+    fn a_changed_content_key_is_a_ledger_miss() {
+        let st = test_state();
+        st.put(
+            build_key("tree-a", BuildMode::Derive, &bench_cfg().build),
+            Cached::Build {
+                digest: "repo@sha256:a".into(),
+                log: "build-a-1.log".into(),
+            },
+        );
+        assert!(
+            st.get(&build_key("tree-b", BuildMode::Derive, &bench_cfg().build))
+                .is_none()
+        );
     }
 
     #[test]
@@ -2564,7 +2698,7 @@ mod tests {
     #[test]
     fn profile_without_a_configured_section_is_a_readable_rejection() {
         // bench_cfg has no [tools.profile]: the call is UNCONFIGURED rather than an error/config failure.
-        let st = Arc::new(CodegenState::new());
+        let st = test_state();
         let reply = run_profile(&st, &bench_cfg(), "repo@sha256:x");
         match reply {
             CodegenReply::Unconfigured { reason } => {
@@ -2576,7 +2710,7 @@ mod tests {
 
     #[test]
     fn profile_rejects_a_digest_this_broker_did_not_build() {
-        let st = Arc::new(CodegenState::new());
+        let st = test_state();
         let reply = run_profile(&st, &profile_cfg(), "ghcr.io/evil/img@sha256:beef");
         match reply {
             CodegenReply::Error { error } => {
@@ -2824,7 +2958,7 @@ mod tests {
 
     #[test]
     fn profile_memo_replays_a_captured_trace() {
-        let st = CodegenState::new();
+        let st = test_state();
         let key = measure_key("d", "profile", &[]);
         st.put(
             key.clone(),
@@ -2885,7 +3019,7 @@ mod tests {
 
     #[test]
     fn job_ring_records_at_submit_bounds_and_marks_terminal() {
-        let st = CodegenState::new();
+        let st = test_state();
         for i in 0..JOB_RING_CAP + 5 {
             st.record_job(tracked(&format!("crucible-bench-{i}"), "bench", None));
         }

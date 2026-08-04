@@ -48,6 +48,10 @@ pub mod spec;
 /// owners.
 pub mod ndjson;
 
+/// Durable tool steps: the content-keyed ledger that lets a restarted process replay work it
+/// already finished (a pushed image, a completed GPU measure) instead of repaying it.
+pub mod steps;
+
 /// The declarative-build backends: the detached rootless-buildah cluster Job and the GithubActions
 /// dispatch, sharing one "build + push, crucible pins the digest" contract.
 pub mod build;
@@ -91,7 +95,9 @@ pub struct DeployConfig {
 /// The result of a build. A non-zero `buildah bud` is the caller's (agent's) problem (a compile
 /// error or a bad Dockerfile edit) and the log is handed back to fix within the turn; infra
 /// failures (no buildah, a push that can't auth) surface as `Err` instead.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Serialized as the recorded value of a build [`steps`] step, so the tagged shape is on disk.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
 pub enum BuildOutcome {
     /// Built and (after `build_and_push`) pushed; `image_ref` is live in the registry.
     Built { image_ref: String },
