@@ -6,7 +6,7 @@
 //! operator the steer/quit prompt.
 
 use crate::event::{AgentEvent, RawStream};
-use crate::reporter::{AgentTurn, Phase, Reporter, Row, Stop};
+use crate::reporter::{AgentTurn, Phase, Reporter, Row, Stop, TurnBudget};
 use crate::{Args, Paths, STOP, agent};
 use std::io::{IsTerminal, Write};
 use std::sync::atomic::Ordering;
@@ -59,6 +59,7 @@ impl Reporter for ConsoleReporter {
         prompt: &str,
         resume_prompt: Option<&str>,
         session: Option<&str>,
+        budget: TurnBudget,
     ) -> AgentTurn {
         println!("  -> running agent (iteration {it}, {}) …", args.model);
         // Pretty stream (json=false): echo each line so the human sees the same
@@ -66,6 +67,7 @@ impl Reporter for ConsoleReporter {
         // watch the result event for a failed (is_error) no-op turn.
         let mut is_error = false;
         let mut error = None;
+        let mut over_cap_stopped = false;
         let prepared = match crate::agent_session::prepare_named(&p.state, session) {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -103,6 +105,20 @@ impl Reporter for ConsoleReporter {
                 if let Some(AgentEvent::Error { message, .. }) = ev {
                     is_error = true;
                     error = Some(message.clone());
+                }
+                if let Some(AgentEvent::Tokens(t)) = ev {
+                    // Same mid-turn cap check as the session reporter; the console
+                    // skips per-sample budget lines to keep the echo readable.
+                    let spent =
+                        budget.spent_before + crate::event::provisional_cost(&args.model, t);
+                    if budget.over_cap(spent) && !over_cap_stopped {
+                        over_cap_stopped = true;
+                        println!(
+                            "  budget: provisional spend ${spent:.4} reached cap ${:.2} mid-turn — stopping the agent",
+                            budget.max_cost
+                        );
+                        crate::pid_registry::kill_all();
+                    }
                 }
                 match stream {
                     RawStream::Stdout => println!("{}", raw.trim_end()),

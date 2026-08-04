@@ -6,7 +6,7 @@
 //! workspace prep, front-end choice) lives in [`crate::run`]; this module is just the loop and
 //! its helpers.
 
-use crate::reporter::{AgentTurn, Outcome, Phase, Reporter, Row, Stop};
+use crate::reporter::{AgentTurn, Outcome, Phase, Reporter, Row, Stop, TurnBudget};
 use crate::{Args, Paths, Prepared, STOP};
 use crate::{control, crucible, escalation, provisioning, publish, session};
 use anyhow::{Context, Result};
@@ -825,7 +825,19 @@ fn run_loop_body<R: Reporter>(
             run.spent += cost;
             step
         } else {
-            let turn = r.run_agent(args, p, it, &prompt, None, None);
+            let turn = r.run_agent(
+                args,
+                p,
+                it,
+                &prompt,
+                None,
+                None,
+                TurnBudget {
+                    spent_before: run.spent,
+                    started,
+                    max_cost: live_max_cost(args, control),
+                },
+            );
             run.spent += turn.cost;
             if let Some(control) = control {
                 control.set_spend(run.spent);
@@ -1324,6 +1336,13 @@ fn update_control_status(
 
 /// True when a cost/time cap is set and reached; notes it on `r`. `parked_total` is idle time
 /// spent waiting on a human approval, excluded from the wall-clock the time cap measures.
+/// The effective cost cap: a live control override wins over the CLI arg.
+pub(crate) fn live_max_cost(args: &Args, control: Option<&control::ControlState>) -> f64 {
+    control
+        .and_then(control::ControlState::live_max_cost)
+        .unwrap_or(args.max_cost)
+}
+
 fn over_budget<R: Reporter>(
     args: &Args,
     control: Option<&control::ControlState>,
@@ -1332,9 +1351,7 @@ fn over_budget<R: Reporter>(
     parked_total: Duration,
     r: &mut R,
 ) -> bool {
-    let max_cost = control
-        .and_then(control::ControlState::live_max_cost)
-        .unwrap_or(args.max_cost);
+    let max_cost = live_max_cost(args, control);
     if max_cost > 0.0 && spent >= max_cost {
         r.note(&format!(
             "budget: cost ${spent:.4} reached cap ${:.2} — stopping",
@@ -1603,7 +1620,7 @@ fn write_results(p: &Paths, goal: &str, prior: &str, rows: &[Row]) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reporter::{AgentTurn, Phase, Row, Stop};
+    use crate::reporter::{AgentTurn, Phase, Row, Stop, TurnBudget};
 
     /// The 401 that killed a 5h turn, plus the other transport signatures, classify as retryable;
     /// content-level failures (an escalation-worthy error string, a plain crash) do not.
@@ -2127,6 +2144,7 @@ mod tests {
             _: &str,
             _: Option<&str>,
             _: Option<&str>,
+            _: TurnBudget,
         ) -> AgentTurn {
             AgentTurn::default()
         }
@@ -2327,6 +2345,7 @@ mod tests {
             _: &str,
             _: Option<&str>,
             _: Option<&str>,
+            _: TurnBudget,
         ) -> AgentTurn {
             self.agent_calls += 1;
             if let Some(path) = &self.escalation_path {

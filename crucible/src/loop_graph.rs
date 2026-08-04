@@ -24,7 +24,7 @@ use crate::plan::exec::{
 use crate::plan::ir::{
     Direction, EngineOp, Isolation, Join, Plan, PlanBudget, Task, TaskKind, TaskName, ValidPlan,
 };
-use crate::reporter::{Reporter, Row};
+use crate::reporter::{Reporter, Row, TurnBudget};
 use crate::session::{EvidenceDisposition, EvidenceEntry};
 use crate::{Args, Paths, Prepared, STOP, agent, control};
 
@@ -316,6 +316,11 @@ impl<R: Reporter> LoopTaskRunner<'_, R> {
             prompt,
             Some(self.resume_prompt),
             task.session.as_deref(),
+            TurnBudget {
+                spent_before: self.spent_before,
+                started: self.started,
+                max_cost: loop_driver::live_max_cost(self.args, self.control),
+            },
         );
         let cost = turn.cost;
         if let Some(control) = self.control {

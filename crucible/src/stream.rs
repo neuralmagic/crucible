@@ -9,7 +9,7 @@
 //! into identical run state.
 
 use crate::event::AgentEvent;
-use crate::reporter::{AgentTurn, Phase, Reporter, Row, RunMeta, Stop};
+use crate::reporter::{AgentTurn, Phase, Reporter, Row, RunMeta, Stop, TurnBudget};
 use crate::session::{self, RowWire, SessionEvent, SessionPhase};
 use crate::{Args, Paths, STOP, agent};
 use anyhow::{Context, Result};
@@ -140,6 +140,7 @@ impl Reporter for SessionReporter {
         prompt: &str,
         resume_prompt: Option<&str>,
         session: Option<&str>,
+        budget: TurnBudget,
     ) -> AgentTurn {
         let prepared = match crate::agent_session::prepare_named(&p.state, session) {
             Ok(prepared) => prepared,
@@ -166,6 +167,8 @@ impl Reporter for SessionReporter {
         // loop can discard a failed turn.
         let mut is_error = false;
         let mut error = None;
+        // Stop the agent at most once per turn when provisional spend crosses the cap.
+        let mut over_cap_stopped = false;
         let cost = agent::run_turn_with_session(
             args,
             p,
@@ -186,6 +189,29 @@ impl Reporter for SessionReporter {
                     if let AgentEvent::Error { message, .. } = ev {
                         is_error = true;
                         error = Some(message.clone());
+                    }
+                    if let AgentEvent::Tokens(t) = ev {
+                        // Provisional mid-turn budget line; the loop's turn-end
+                        // budget call reconciles it with the authoritative cost.
+                        let spent =
+                            budget.spent_before + crate::event::provisional_cost(&args.model, t);
+                        sink.write_event(&SessionEvent::Budget {
+                            spent,
+                            elapsed_secs: budget.started.elapsed().as_secs(),
+                        });
+                        if budget.over_cap(spent) && !over_cap_stopped {
+                            over_cap_stopped = true;
+                            sink.write_event(&SessionEvent::Note {
+                                msg: format!(
+                                    "budget: provisional spend ${spent:.4} reached cap ${:.2} mid-turn — stopping the agent",
+                                    budget.max_cost
+                                ),
+                            });
+                            // Ends a local agent child; a sandboxed turn has no
+                            // local pid, so there the loop's post-turn guard stops
+                            // the run instead.
+                            crate::pid_registry::kill_all();
+                        }
                     }
                     sink.write_event(&SessionEvent::Agent { event: ev.clone() });
                 }

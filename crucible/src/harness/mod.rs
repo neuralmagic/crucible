@@ -196,13 +196,18 @@ impl Harness {
     }
 
     /// The stream decoder for this harness's stdout. `rate`, when present, is the in-process
-    /// OTLP collector's live 60 s-window token rate stamped onto each `tokens` sample.
-    pub(crate) fn decoder(self, rate: Option<&RateHandle>) -> StreamDecoder {
+    /// OTLP collector's live 60 s-window token rate stamped onto each `tokens` sample;
+    /// `tool_io` opts tool events into carrying bounded inputs and result excerpts
+    /// (see [`crate::agent::tool_io_full`]).
+    pub(crate) fn decoder(self, rate: Option<&RateHandle>, tool_io: bool) -> StreamDecoder {
         match self {
-            Harness::Claude => StreamDecoder::StreamJson(match rate {
-                Some(r) => StreamJsonParser::with_rate(r.clone()),
-                None => StreamJsonParser::default(),
-            }),
+            Harness::Claude => StreamDecoder::StreamJson(
+                match rate {
+                    Some(r) => StreamJsonParser::with_rate(r.clone()),
+                    None => StreamJsonParser::default(),
+                }
+                .with_tool_io(tool_io),
+            ),
             Harness::Hermes => StreamDecoder::RawLines,
         }
     }
