@@ -30,6 +30,9 @@ pub enum Open {
     Truncate,
     /// Keep it and fold it into the caller's in-memory state.
     Fold,
+    /// Keep it without reading it: the caller folds on its own schedule (see
+    /// [`Ledger::append_only`]).
+    Keep,
 }
 
 /// What folding an existing ledger file produced.
@@ -83,6 +86,7 @@ impl Ledger {
                 Folded::default()
             }
             Open::Fold => fold(path, decode),
+            Open::Keep => Folded::default(),
         };
         // `read` is for the torn-tail heal below only; every write goes through `append`.
         let mut file = OpenOptions::new()
@@ -99,6 +103,13 @@ impl Ledger {
             },
             folded,
         ))
+    }
+
+    /// Open for appends without reading what is already there, for a caller that folds the
+    /// file separately (or only ever writes).
+    pub fn append_only(path: &Path, durability: Durability) -> io::Result<Self> {
+        let (ledger, _) = Self::open(path, Open::Keep, durability, |_| None::<()>)?;
+        Ok(ledger)
     }
 
     /// Append one record. `line` must not contain a newline (it is one NDJSON record);
@@ -294,6 +305,17 @@ mod tests {
         drop(l);
         let (_l, folded) = Ledger::open(&path, Open::Fold, Durability::Flush, ident).expect("open");
         assert_eq!(folded.records, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn append_only_keeps_what_is_there_without_reading_it() {
+        let path = tmp("append-only");
+        std::fs::write(&path, "a;\n").expect("seed");
+        let mut l = Ledger::append_only(&path, Durability::Flush).expect("open");
+        l.append("b;").expect("b");
+        drop(l);
+        let (_l, folded) = Ledger::open(&path, Open::Fold, Durability::Flush, ident).expect("open");
+        assert_eq!(folded.records, vec!["a".to_string(), "b".to_string()]);
     }
 
     #[test]

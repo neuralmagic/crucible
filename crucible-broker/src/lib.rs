@@ -34,6 +34,7 @@ pub mod jira;
 pub(crate) mod measure;
 pub mod profile;
 pub mod server;
+pub(crate) mod steps;
 pub mod telemetry;
 pub(crate) mod turn;
 pub mod types;

@@ -27,3 +27,4 @@ Expand this section in the sidebar to browse the full list.
 | [0022](./0022-measure-task-dags.md) | Measure task DAGs, the engine walks the ladder | Proposed |
 | [0023](./0023-recovery-classification.md) | Recovery classification for `--resume` | Implemented |
 | [0024](./0024-admission-ledger.md) | Admission ledger for external inputs | Implemented |
+| [0025](./0025-durable-tool-steps.md) | Durable tool steps for broker builds and measures | Implemented |
