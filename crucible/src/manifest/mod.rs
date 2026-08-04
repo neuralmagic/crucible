@@ -22,7 +22,7 @@ pub use openshell::OpenshellCfg;
 pub use relay::RelayFile;
 pub use search::SearchCfg;
 pub use selftest::SelftestCfg;
-pub use workflow::{WorkflowCaps, WorkflowCfg, WorkflowType};
+pub use workflow::{KEPT_INPUT, WorkflowCaps, WorkflowCfg, WorkflowType};
 pub use world::WorldCfg;
 
 use crate::command_judge::Direction;

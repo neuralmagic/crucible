@@ -1028,6 +1028,56 @@ fn run_loop_body<R: Reporter>(
         it += 1;
     }
 
+    // Run-scoped epilogue: expensive one-shot checks (a 90-minute racecheck, a slow perf
+    // rung) that cannot ride the per-iteration graph run once here, against the final kept
+    // candidate. Advisory by contract: rows land in the log, RESULTS.md, the summary, and
+    // the PR body, but nothing here can un-keep the candidate, and a concluded run stays
+    // concluded even if the epilogue itself cannot run.
+    if matches!(
+        exit,
+        LoopExit::Finished | LoopExit::Budget | LoopExit::Solved
+    ) && let Some(workflow) = args.workflow.as_ref().filter(|w| w.has_epilogue())
+    {
+        let kept = run
+            .rows
+            .iter()
+            .rev()
+            .find(|row| row.decision == "keep")
+            .map(|row| crate::loop_graph::KeptContext {
+                iter: row.iter,
+                score: row.score,
+                tiebreak: row.tiebreak,
+                sha: run.kept_shas.last().cloned(),
+                snapshot: row.kept_snap.clone(),
+                note: row.note.clone(),
+            });
+        match kept {
+            None => r.note("epilogue skipped: the run kept nothing"),
+            Some(kept) => {
+                // The epilogue measures the kept tree, not whatever the last discard left
+                // behind; skip loudly rather than score the wrong tree.
+                if let Err(e) = world.restore(run.segment.best_snap.as_str()) {
+                    r.note(&format!(
+                        "epilogue skipped: restoring the kept best failed: {e:#}"
+                    ));
+                } else {
+                    match crate::loop_graph::run_epilogue(args, p, workflow, &kept, r) {
+                        Ok((rows, cost)) => {
+                            run.spent += cost;
+                            r.budget(run.spent, started.elapsed());
+                            for row in rows {
+                                r.row(&row, false);
+                                run.rows.push(row);
+                            }
+                            write_results(p, &prep.goal, &prep.prior, &run.rows)?;
+                        }
+                        Err(e) => r.note(&format!("epilogue failed to run (advisory): {e:#}")),
+                    }
+                }
+            }
+        }
+    }
+
     r.summary(&run.rows, &judge.objective(), run.segment.best_score);
     update_control_status(
         control,
@@ -2580,6 +2630,143 @@ mod tests {
             r.shutdowns
         );
         assert_eq!(r.shutdowns[0].0, "stopped");
+    }
+
+    // --- run-scoped epilogue: once post-loop, on the kept best, advisory ---
+
+    fn epilogue_workflow(command_toml: &str) -> crate::manifest::WorkflowCfg {
+        let workflow: crate::manifest::WorkflowCfg = toml::from_str(&format!(
+            "[[task]]\nname = \"racecheck\"\nkind = \"command\"\n{command_toml}\nstage = \"epilogue\"\n"
+        ))
+        .expect("parse epilogue workflow");
+        workflow.validate().expect("valid epilogue workflow");
+        workflow
+    }
+
+    /// Two kept iterations, one epilogue run: the task fires once post-loop (never per
+    /// iteration), sees the kept-candidate context in `CRUCIBLE_INPUTS` (the command exits
+    /// nonzero without it), and its advisory row reaches RESULTS.md.
+    #[test]
+    fn epilogue_runs_once_post_loop_against_the_kept_candidate() {
+        let mut f = fixture(2, 0.0, true);
+        f.args.workflow = Some(epilogue_workflow(
+            r#"command = "case \"$CRUCIBLE_INPUTS\" in *kept*) echo '{\"score\": 7}';; *) exit 1;; esac""#,
+        ));
+        let world = FakeWorld;
+        let judge = FakeJudge {
+            keep: true,
+            solved: false,
+            fail_baseline: false,
+        };
+        let mut r = RecordingReporter::default();
+        run_loop(
+            &f.args,
+            &f.paths,
+            &f.prepared,
+            &mut r,
+            &world,
+            &judge,
+            LoopRuntime::default(),
+        )
+        .expect("run_loop should finish cleanly");
+
+        let epilogue: Vec<&Row> = r
+            .rows
+            .iter()
+            .filter(|row| row.phase.as_deref() == Some("epilogue"))
+            .collect();
+        assert_eq!(epilogue.len(), 1, "one epilogue run, not one per iteration");
+        assert_eq!(epilogue[0].decision, "epilogue");
+        assert_eq!(epilogue[0].note, "racecheck: ok");
+        assert_eq!(epilogue[0].score, Some(7.0));
+        assert_eq!(epilogue[0].iter, 2, "attributed to the last kept iteration");
+        let results = std::fs::read_to_string(f.paths.workspace.join("RESULTS.md")).unwrap();
+        assert!(results.contains("epilogue | racecheck: ok"), "{results}");
+    }
+
+    #[test]
+    fn epilogue_is_skipped_when_the_run_kept_nothing() {
+        let mut f = fixture(2, 0.0, false);
+        f.args.workflow = Some(epilogue_workflow(r#"command = "echo {}""#));
+        let world = FakeWorld;
+        let judge = FakeJudge {
+            keep: false,
+            solved: false,
+            fail_baseline: false,
+        };
+        let mut r = RecordingReporter::default();
+        run_loop(
+            &f.args,
+            &f.paths,
+            &f.prepared,
+            &mut r,
+            &world,
+            &judge,
+            LoopRuntime::default(),
+        )
+        .expect("run_loop should finish cleanly");
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n == "epilogue skipped: the run kept nothing"),
+            "{:?}",
+            r.notes
+        );
+        assert!(
+            r.rows
+                .iter()
+                .all(|row| row.phase.as_deref() != Some("epilogue")),
+            "no epilogue rows without a kept candidate"
+        );
+    }
+
+    /// An epilogue failure is loud (note + row + RESULTS.md) but changes nothing: the run
+    /// still finishes, the kept row stands, and the loop's outcome is untouched.
+    #[test]
+    fn epilogue_failure_is_advisory_and_does_not_unkeep() {
+        let mut f = fixture(1, 0.0, true);
+        f.args.workflow = Some(epilogue_workflow(r#"command = "echo boom >&2; exit 3""#));
+        let world = FakeWorld;
+        let judge = FakeJudge {
+            keep: true,
+            solved: false,
+            fail_baseline: false,
+        };
+        let mut r = RecordingReporter::default();
+        run_loop(
+            &f.args,
+            &f.paths,
+            &f.prepared,
+            &mut r,
+            &world,
+            &judge,
+            LoopRuntime::default(),
+        )
+        .expect("an epilogue failure must not fail the run");
+
+        assert_eq!(r.shutdowns.len(), 1);
+        assert_eq!(r.shutdowns[0].0, "finished");
+        let epilogue: Vec<&Row> = r
+            .rows
+            .iter()
+            .filter(|row| row.phase.as_deref() == Some("epilogue"))
+            .collect();
+        assert_eq!(epilogue.len(), 1);
+        assert_eq!(epilogue[0].decision, "epilogue-fail");
+        assert!(epilogue[0].note.contains("boom"), "{:?}", epilogue[0].note);
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n.contains("FAILED (advisory — the kept candidate stands)")),
+            "{:?}",
+            r.notes
+        );
+        assert!(
+            r.rows.iter().any(|row| row.decision == "keep"),
+            "the kept row stands"
+        );
+        let results = std::fs::read_to_string(f.paths.workspace.join("RESULTS.md")).unwrap();
+        assert!(results.contains("epilogue-fail"), "{results}");
     }
 
     #[test]

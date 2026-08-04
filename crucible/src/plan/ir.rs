@@ -60,6 +60,28 @@ pub enum Isolation {
     Worktree,
 }
 
+/// When the loop schedules a workflow task (`stage = "iteration" | "epilogue"`). Only the
+/// loop's workflow admission gives this meaning; the plain plan executor runs whatever
+/// tasks it is handed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Stage {
+    /// Rides the per-iteration graph (the default, and the only behavior before epilogues).
+    #[default]
+    Iteration,
+    /// Excluded from the per-iteration graph; runs once after the loop concludes, against
+    /// the final kept candidate, and only if the run kept something. Advisory by contract:
+    /// it cannot un-keep the candidate.
+    Epilogue,
+}
+
+impl Stage {
+    /// Keeps the default off the wire: frozen packs' canonical JSON predates the field.
+    fn is_iteration(&self) -> bool {
+        *self == Stage::Iteration
+    }
+}
+
 /// How dependency outputs join into a task's inputs (`join = "all" | "passed"`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -167,6 +189,10 @@ pub struct Task {
     /// Dependency-join semantics (see [`Join`]).
     #[serde(default)]
     pub join: Join,
+    /// Loop scheduling (see [`Stage`]): epilogue tasks leave the per-iteration graph and
+    /// run once post-loop against the kept best.
+    #[serde(default, skip_serializing_if = "Stage::is_iteration")]
+    pub stage: Stage,
 }
 
 /// Executor-enforced accounting limit; overruns fail the plan.
@@ -425,6 +451,7 @@ mod tests {
             required: true,
             isolation: None,
             join: Join::default(),
+            stage: Stage::Iteration,
         }
     }
 
@@ -544,6 +571,7 @@ mod tests {
             required: true,
             isolation: None,
             join: Join::default(),
+            stage: Stage::Iteration,
         };
         let err = plan(vec![t]).validate().unwrap_err();
         assert!(err.to_string().contains("at least one dependency"));

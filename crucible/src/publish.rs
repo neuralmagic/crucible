@@ -983,6 +983,25 @@ fn pr_body(rec: &Record<'_>) -> String {
     for row in kept {
         s.push_str(&kept_section(row));
     }
+    // Run-scoped epilogue results: advisory (they cannot un-keep), but a reviewer must
+    // see a failed racecheck next to the candidate it ran against.
+    let epilogue: Vec<&Row> = rec
+        .rows
+        .iter()
+        .filter(|r| r.phase.as_deref() == Some("epilogue"))
+        .collect();
+    if !epilogue.is_empty() {
+        s.push_str("## Epilogue checks (advisory)\n\n");
+        for row in epilogue {
+            let mark = match row.decision.as_str() {
+                "epilogue" => "passed",
+                "epilogue-skip" => "SKIPPED",
+                _ => "**FAILED**",
+            };
+            s.push_str(&format!("- {mark} — {}\n", row.note));
+        }
+        s.push('\n');
+    }
     s.push_str(&format!(
         "Model `{}` · cost ${:.2} · {}s.\n",
         rec.model,
@@ -1146,6 +1165,67 @@ fn sibling_links(component: &str, opened: &[(String, String, String)]) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Epilogue rows reach the PR body as an advisory section, with failures shouted.
+    #[test]
+    fn pr_body_reports_epilogue_results_loudly() {
+        let args = <crate::Cli as clap::Parser>::try_parse_from(["crucible"])
+            .unwrap()
+            .run;
+        let paths = crate::Paths::for_manifest(
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+            &std::env::temp_dir(),
+            None,
+        );
+        let rows = vec![
+            Row {
+                iter: 1,
+                decision: "keep".into(),
+                note: "kept it".into(),
+                ..Default::default()
+            },
+            Row {
+                iter: 1,
+                decision: "epilogue".into(),
+                note: "perf: ok".into(),
+                phase: Some("epilogue".into()),
+                ..Default::default()
+            },
+            Row {
+                iter: 1,
+                decision: "epilogue-fail".into(),
+                note: "racecheck: exit 3: boom".into(),
+                phase: Some("epilogue".into()),
+                ..Default::default()
+            },
+        ];
+        let body = pr_body(&Record {
+            args: &args,
+            paths: &paths,
+            run_id: "test-run",
+            goal: "goal",
+            model: "model",
+            gate: "gate".into(),
+            rows: &rows,
+            baseline_score: 2.0,
+            best_score: 1.0,
+            improved: true,
+            kept_shas: &[],
+            base_sha: None,
+            components: &[],
+            published_branches: &[],
+            cost_usd: 0.0,
+            elapsed: std::time::Duration::ZERO,
+            identity_digest: "v1:0",
+        });
+        assert!(body.contains("## Epilogue checks (advisory)"), "{body}");
+        assert!(body.contains("- passed — perf: ok"), "{body}");
+        assert!(
+            body.contains("- **FAILED** — racecheck: exit 3: boom"),
+            "{body}"
+        );
+    }
 
     /// The bug this guards: a composed workspace runs on a DETACHED HEAD, so kept commits never reached
     /// the fork. This reproduces the exact path, detached HEAD -> `git push HEAD:refs/heads/<branch>`

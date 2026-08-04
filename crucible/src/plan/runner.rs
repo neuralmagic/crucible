@@ -196,7 +196,7 @@ fn fail(note: String) -> Attempt {
 mod tests {
     use super::*;
     use crate::plan::exec::{ExecCfg, PlanExit, Substrate, TaskStatus, execute};
-    use crate::plan::ir::{Direction, Join, Plan, PlanBudget};
+    use crate::plan::ir::{Direction, Join, Plan, PlanBudget, Stage};
 
     fn runner() -> ShellRunner {
         ShellRunner {
@@ -217,6 +217,7 @@ mod tests {
             required: true,
             isolation: None,
             join: Join::default(),
+            stage: Stage::Iteration,
         }
     }
 
@@ -297,6 +298,7 @@ mod tests {
             required: true,
             isolation: None,
             join: Join::All,
+            stage: Stage::Iteration,
         };
         let passed = run_plan(vec![evaluate("latency", 9.5)], None);
         assert_eq!(passed.results[&"latency".into()].status, TaskStatus::Pass);
@@ -323,6 +325,7 @@ mod tests {
             required: false,
             isolation: None,
             join: Join::All,
+            stage: Stage::Iteration,
         };
         let over = run_plan(
             vec![evaluate("over", r#"{"score": 100, "pass": true}"#)],
@@ -356,6 +359,7 @@ mod tests {
             required: false,
             isolation: None,
             join: Join::All,
+            stage: Stage::Iteration,
         };
         let green = run_plan(vec![evaluate("green", r#"{"pass": true}"#)], None);
         assert_eq!(green.results[&"green".into()].status, TaskStatus::Pass);
@@ -378,6 +382,7 @@ mod tests {
             required: false,
             isolation: None,
             join: Join::All,
+            stage: Stage::Iteration,
         };
         let out = run_plan(vec![task], None);
         let result = &out.results[&"malformed".into()];
@@ -408,6 +413,7 @@ mod tests {
             required: true,
             isolation: None,
             join: Join::default(),
+            stage: Stage::Iteration,
         };
         let out = run_plan(vec![t], None);
         assert_eq!(out.results[&"a".into()].status, TaskStatus::Fail);
@@ -430,6 +436,7 @@ mod tests {
             required: true,
             isolation: None,
             join: Join::default(),
+            stage: Stage::Iteration,
         };
         let out = run_plan(
             vec![t],
@@ -478,6 +485,7 @@ mod tests {
             required: true,
             isolation: None,
             join: Join::default(),
+            stage: Stage::Iteration,
         };
         let measure = |name: &str, dep: &str| {
             command(
@@ -499,6 +507,7 @@ mod tests {
             required: true,
             isolation: None,
             join: Join::default(),
+            stage: Stage::Iteration,
         };
         let out = run_plan(
             vec![

@@ -13,7 +13,7 @@ use starlark_syntax::syntax::ast::{
 use starlark_syntax::syntax::{AstModule, Dialect};
 
 use crate::manifest::{WorkflowCfg, WorkflowType};
-use crate::plan::ir::{Direction, EngineOp, Isolation, Join, Task, TaskKind, TaskName};
+use crate::plan::ir::{Direction, EngineOp, Isolation, Join, Stage, Task, TaskKind, TaskName};
 
 const MAX_SOURCE_BYTES: usize = 256 * 1024;
 const MAX_PROMPT_BYTES: usize = 256 * 1024;
@@ -339,6 +339,7 @@ impl Compiler {
                     required: take_bool_default(&mut named, "required", true)?,
                     isolation: None,
                     join: Join::Passed,
+                    stage: Stage::Iteration,
                 }
             }
             "propose" => engine_task(&mut named, EngineOp::Propose, None)?,
@@ -412,8 +413,10 @@ fn task_list(function: &str, tasks: Vec<Value>) -> Result<Vec<Task>> {
 
 fn default_autoresearch(mut extras: Vec<Task>) -> Result<WorkflowCfg> {
     let propose = engine("propose", EngineOp::Propose, None, Vec::new());
+    // Epilogue extras never splice into the iteration chain: no implicit propose
+    // dependency, and they cannot be the sinks apply waits on.
     for task in &mut extras {
-        if task.depends_on.is_empty() {
+        if task.stage == Stage::Iteration && task.depends_on.is_empty() {
             task.depends_on.push(propose.name.clone());
         }
     }
@@ -422,12 +425,13 @@ fn default_autoresearch(mut extras: Vec<Task>) -> Result<WorkflowCfg> {
     let sinks: Vec<TaskName> = tasks
         .iter()
         .filter(|task| {
-            !tasks.iter().any(|other| {
-                other
-                    .depends_on
-                    .iter()
-                    .any(|dependency| dependency == &task.name)
-            })
+            task.stage == Stage::Iteration
+                && !tasks.iter().any(|other| {
+                    other
+                        .depends_on
+                        .iter()
+                        .any(|dependency| dependency == &task.name)
+                })
         })
         .map(|task| task.name.clone())
         .collect();
@@ -494,7 +498,16 @@ fn dsl_task(
         required: take_bool_default(named, "required", true)?,
         isolation: isolation(take_bool_default(named, "isolated", false)?),
         join: parse_join(&take_string_default(named, "join", "all")?)?,
+        stage: parse_stage(&take_string_default(named, "stage", "iteration")?)?,
     })
+}
+
+fn parse_stage(value: &str) -> Result<Stage> {
+    match value {
+        "iteration" => Ok(Stage::Iteration),
+        "epilogue" => Ok(Stage::Epilogue),
+        other => bail!("stage must be `iteration` or `epilogue`, got {other:?}"),
+    }
 }
 
 fn engine(name: &str, op: EngineOp, source: Option<TaskName>, depends_on: Vec<TaskName>) -> Task {
@@ -511,6 +524,7 @@ fn engine(name: &str, op: EngineOp, source: Option<TaskName>, depends_on: Vec<Ta
         required: true,
         isolation: None,
         join: Join::All,
+        stage: Stage::Iteration,
     }
 }
 
@@ -873,6 +887,55 @@ default_autoresearch([review])
             .collect();
         assert_eq!(names, ["propose", "review", "apply", "measure", "decide"]);
         assert_eq!(compiled.workflow.result, Some("decide".into()));
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn stage_epilogue_authors_a_run_scoped_task() {
+        let pack = temp_pack("epilogue");
+        let source = r#"
+review = command(name = "review", run = "./review.sh")
+racecheck = command(
+    name = "racecheck",
+    run = "./racecheck.sh",
+    stage = "epilogue",
+    required = False,
+)
+default_autoresearch([review, racecheck])
+"#;
+        let compiled = compile_source(source, &pack.join("epilogue.star"), &pack).unwrap();
+        let racecheck = compiled
+            .workflow
+            .tasks
+            .iter()
+            .find(|task| task.name.0 == "racecheck")
+            .unwrap();
+        assert_eq!(racecheck.stage, Stage::Epilogue);
+        assert!(
+            racecheck.depends_on.is_empty(),
+            "epilogue tasks get no implicit propose dependency"
+        );
+        let apply = compiled
+            .workflow
+            .tasks
+            .iter()
+            .find(|task| task.name.0 == "apply")
+            .unwrap();
+        assert_eq!(
+            apply.depends_on,
+            ["review".into()],
+            "apply waits on the iteration sink only"
+        );
+
+        let bad = r#"
+racecheck = command(name = "racecheck", run = "./racecheck.sh", stage = "finale")
+default_autoresearch([racecheck])
+"#;
+        let error = format!(
+            "{:#}",
+            compile_source(bad, &pack.join("bad.star"), &pack).unwrap_err()
+        );
+        assert!(error.contains("`iteration` or `epilogue`"), "{error}");
         let _ = std::fs::remove_dir_all(&pack);
     }
 
