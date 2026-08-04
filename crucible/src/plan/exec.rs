@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::plan::ir::{Direction, Join, Stage, Task, TaskKind, TaskName, ValidPlan};
+use crate::plan::ir::{Direction, Join, Task, TaskKind, TaskName, ValidPlan};
 
 /// What the substrate can measure. Missing caps truncate the plan fail-closed.
 #[derive(Clone, Debug, Default)]
@@ -585,7 +585,7 @@ fn reduce_top_k(inputs: &BTreeMap<TaskName, Value>, k: u32, direction: Direction
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::ir::{Join, Plan, PlanBudget};
+    use crate::plan::ir::{Join, Plan, PlanBudget, Stage};
 
     type Script = BTreeMap<(String, u32), (fn() -> AttemptOutcome, f64)>;
 
