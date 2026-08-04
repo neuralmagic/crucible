@@ -54,10 +54,8 @@ pub(crate) struct LoopRuntime<'a> {
     pub resume: Option<ResumeState>,
     /// How this resume classified the previous shutdown; present only with `resume`.
     pub recovery: Option<crate::recovery::ResumeRecovery>,
-    /// The run's admission ledger, shared with the control bridge: the steer queue, the
-    /// keyed rescope/deny drains, and the resume replay of un-drained operator inputs.
-    /// `None` for the front-ends that have no bridge (console/jsonl), which fall back to
-    /// the plain `STEER.md` read.
+    /// Admission ledger shared with the control bridge. `None` for front-ends with no
+    /// bridge (console/jsonl), which fall back to the plain `STEER.md` read.
     pub ledger: Option<std::sync::Arc<crate::admission::AdmissionLedger>>,
 }
 
@@ -601,14 +599,9 @@ fn run_loop_body<R: Reporter>(
         if let Some(why) = &resumed_best.degraded {
             r.note(&format!("resume: {why}"));
         }
-        // The ledger is authoritative for operator inputs, the session log only for the
-        // loop's own wait-state, so it is read FIRST: a grant recorded before the death
-        // settles what the dangling approval bracket means.
+        // The ledger is read FIRST: a grant recorded before the death settles what the
+        // dangling approval bracket means.
         let replay = ledger.map(crate::admission::AdmissionLedger::replay_for_resume);
-        // The classification of how the previous process died, recorded on the wire, and
-        // its recovery actions: re-register the approval key so an operator `approve`
-        // resolves it, and re-arm a block-mode park (the iteration-head park consumes
-        // `pending_block`).
         if let Some(rec) = runtime.recovery {
             r.recovery(rec.class, rec.iter, &rec.detail);
             let approval = crate::recovery::resume_approval(&rec, replay.as_ref());
@@ -797,9 +790,8 @@ fn run_loop_body<R: Reporter>(
                 "control: re-scoping to '{new_regime}' — re-baselining a new comparable segment"
             ));
             // One atomic swap of the goalpost: the new regime, its fingerprint, the re-baselined
-            // scores, and the fresh rollback snapshot all land together. The admission settles
-            // only once the swap has happened: a baseline error leaves it un-drained, so a
-            // resume re-arms the grant instead of losing it.
+            // scores, and the fresh rollback snapshot all land together. The admission
+            // settles only after the swap: a baseline error leaves it for the resume.
             let (segment, _row) = Segment::baseline(
                 world,
                 judge,
@@ -850,9 +842,8 @@ fn run_loop_body<R: Reporter>(
         write_results(p, &prep.goal, &prep.prior, &run.rows)?;
 
         let status = judge.status(run.segment.best_score);
-        // Everything an operator sent that no turn has carried yet, in admission order.
-        // The keys settle below, after the turn ran: a turn that never started re-delivers
-        // the same batch instead of eating it.
+        // Un-carried steers, in admission order. The keys settle after the turn ran, so a
+        // turn that never started re-delivers the same batch.
         let steer_batch = crate::admission::drain_steer(ledger, &p.steer);
         if steer_batch.text.is_some() {
             r.note("injected operator steer");
@@ -969,9 +960,8 @@ fn run_loop_body<R: Reporter>(
         };
 
         // Any step other than NeverStarted proves a turn started: reset the stall streak.
-        // A started turn also carried the steer batch in its prompt, which is what settles
-        // an admitted steer ("delivered", not "heeded"); a turn that never started leaves
-        // the batch owed, so the re-run of this iteration re-delivers it.
+        // A started turn carried the steer batch in its prompt, which settles an admitted
+        // steer ("delivered", not "heeded"); a never-started turn leaves the batch owed.
         if !matches!(&step, IterStep::NeverStarted { .. }) {
             dead_turns = 0;
             if let Some(ledger) = ledger {
@@ -1359,12 +1349,9 @@ fn restore_kept_best(
     }
 }
 
-/// The counter fold `--resume` replays from the session log: decided rows, last budget,
-/// last summary, last identity, published branches. Fed one decoded event at a time so
-/// [`crate::recovery::classify_session`] can drive it and the tail scanner in a single
-/// pass over the log. The decided rows carry their measured `score`/`total`, so
-/// baseline + best restore exactly; the last summary gives `best_score` (recomputed from
-/// kept rows if absent).
+/// The counter fold `--resume` replays from the session log. Fed one event at a time so
+/// [`crate::recovery::classify_session`] can drive it and the tail scanner in one pass.
+/// Decided rows carry `score`/`total`, so baseline + best restore exactly.
 #[derive(Default)]
 pub(crate) struct ResumeFold {
     rows: Vec<Row>,
@@ -1404,8 +1391,7 @@ impl ResumeFold {
         }
     }
 
-    /// Whether any decided row was folded; a rowless log is unresumable and the caller
-    /// refuses before calling [`finish`](Self::finish).
+    /// A rowless log is unresumable; the caller refuses before [`finish`](Self::finish).
     pub(crate) fn has_rows(&self) -> bool {
         !self.rows.is_empty()
     }
@@ -1559,10 +1545,9 @@ fn park_for_approval<R: Reporter>(
     };
     r.note("parked: idle, awaiting approval (budget paused)");
     let start = Instant::now();
-    // Bracket bookkeeping: a deny/timeout resolves the wait here; a grant resolves at
-    // the iteration-head rescope drain (the single re-baseline site, which also owns
-    // the `granted` resolve); a stop deliberately resolves NOTHING, so a stopped run's
-    // log keeps the wait open and a resume re-parks on it.
+    // A deny/timeout resolves the wait here; a grant resolves at the iteration-head
+    // rescope drain; a stop deliberately resolves NOTHING, so the log keeps the wait
+    // open and a resume re-parks on it.
     let outcome = loop {
         if control.has_rescope() {
             break ParkOutcome::Resumed;
@@ -1742,12 +1727,9 @@ fn fingerprint(goal: &str, objective: &str, regime: &str) -> String {
     crate::identity::fnv1a_hex(&[goal.as_bytes(), objective.as_bytes(), regime.as_bytes()])
 }
 
-/// Re-arm the operator inputs a resumed run still owes, out of the admission ledger: the
-/// live budget cap and the pause level (levels the in-memory `ControlState` lost with the
-/// process), and any re-scope or denial that was granted but never drained. Un-delivered
-/// steers need nothing here, the drain's `peek` finds them. Stops the resume overrides, and
-/// approvals that died before their grant was recorded, are closed out so the ledger shows
-/// the loop finished with them.
+/// Re-arm what a resumed run still owes: the budget and pause levels the in-memory
+/// `ControlState` lost, plus any re-scope or denial granted but never drained. Stale
+/// stops and un-granted approves are closed out.
 fn replay_admissions<R: Reporter>(
     ledger: &crate::admission::AdmissionLedger,
     control: Option<&control::ControlState>,
@@ -1801,8 +1783,8 @@ fn replay_admissions<R: Reporter>(
         r.note("resume: the run was paused when it died — still paused, send `resume`");
     }
     if let Some((key, regime)) = replay.unsettled_rescope {
-        // The iteration-head drain applies it (and settles the admission there). Nothing
-        // can be displaced: the slot is empty in a freshly built `ControlState`.
+        // Applied and settled at the iteration-head drain; nothing can be displaced,
+        // the slot is empty in a freshly built `ControlState`.
         let _ = control.set_rescope(key, regime.clone());
         r.note(&format!(
             "resume: re-scope to '{regime}' was granted but never applied — re-arming it"

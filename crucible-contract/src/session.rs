@@ -309,10 +309,9 @@ pub enum SessionEvent {
         outcome: String,
         reason: String,
     },
-    /// The loop began waiting on a mediated-provisioning approval. `mode` is `block` (parked
-    /// idle) or `continue` (iterating in the frozen regime). A dangling ApprovalWait (no
-    /// ApprovalResolved before the log ends) means the run died, or was stopped, with the
-    /// approval outstanding; resume re-parks a block-mode one.
+    /// The loop began waiting on a mediated-provisioning approval. A dangling ApprovalWait
+    /// means the run died or stopped with the approval outstanding; resume re-parks a
+    /// block-mode one.
     ApprovalWait {
         handle: String,
         #[serde(default)]
@@ -327,9 +326,8 @@ pub enum SessionEvent {
         #[serde(default)]
         reason: String,
     },
-    /// How this resume classified the previous shutdown, emitted once right after the resume
-    /// note. Purely a record: the classifier derives it from the log tail; the loop's behavior
-    /// is driven by the in-process recovery plan, not by re-reading this.
+    /// How this resume classified the previous shutdown. Purely a record: the loop's
+    /// behavior is driven by the in-process recovery plan, not by re-reading this.
     Recovery {
         class: RecoveryClass,
         /// The iteration the interruption touched; 0 when not iteration-scoped.

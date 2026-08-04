@@ -61,8 +61,7 @@ pub struct CodegenState {
     /// Digests this broker's own `build()` produced; measures refuse anything else, since the frozen
     /// command is no protection inside an agent-chosen image.
     built: Mutex<HashSet<String>>,
-    /// The durable tier under `memo`/`built`: everything in them dies with the pod, and repaying a
-    /// finished 90-minute measure because the pod restarted is the scar this closes.
+    /// The durable tier under `memo`/`built`, which die with the pod.
     steps: forge::steps::StepLedger,
     budget: Budget,
     logs: LogStore,
@@ -214,9 +213,8 @@ impl CodegenState {
             s.insert(digest.to_string());
         }
     }
-    /// A digest is ours if this process built it or if the ledger says a broker did. Without the
-    /// ledger half, a restarted broker refuses to measure a digest that is already in the registry
-    /// and forces a rebuild before any measure can run.
+    /// Ours if this process built it or the ledger says a broker did. Without the ledger
+    /// half, a restarted broker forces a rebuild before it will measure a pushed digest.
     fn is_built(&self, digest: &str) -> bool {
         if self.built.lock().is_ok_and(|s| s.contains(digest)) {
             return true;

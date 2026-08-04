@@ -1,12 +1,6 @@
-//! Recovery classification: one streaming pass over a dead run's session log that names
-//! HOW it died, so `--resume` acts on facts instead of pretending every interruption was
-//! a clean stop.
-//!
-//! The classifier reads only the durable log, never marker files (those are
-//! consume-on-read and gone by park time). It produces facts plus a class token; policy
-//! lives in [`plan_recovery`], the one function that maps a classification to what
-//! `--resume` does. Retry semantics, iteration accounting, and tree restoration belong
-//! elsewhere: [`TurnEvidence`] is their input, not their implementation.
+//! Recovery classification: one pass over a dead run's session log names how it died.
+//! Reads only the durable log (marker files are consume-on-read and gone by park time).
+//! Facts only; policy lives in [`plan_recovery`].
 
 use crate::event::AgentEvent;
 use crate::loop_driver::{ResumeFold, ResumeState};
@@ -17,24 +11,23 @@ use crucible_contract::admission::AdmissionKey;
 use std::io::BufRead;
 use std::path::Path;
 
-/// Evidence scraped from a dangling turn's Agent events. Facts only: the retry/backoff
-/// policy that consumes these belongs to iteration accounting, not to this module.
+/// Evidence scraped from a dangling turn's Agent events; retry policy lives elsewhere.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TurnEvidence {
-    /// Agent events seen inside the dangling AgentStart..(missing AgentDone) bracket.
+    /// Events inside the dangling AgentStart bracket.
     pub agent_events: u32,
     /// Last per-turn cost seen (`Tokens.cost_usd` or `OtelSummary.cost_usd`).
     pub last_cost_usd: Option<f64>,
     /// Last error text (`Error.message` or an is_error `Result.error`), verbatim.
     pub last_error: Option<String>,
-    /// The durable session the turn ran under, from the preceding AgentSession line.
+    /// From the preceding AgentSession line.
     pub session: Option<DanglingSession>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct DanglingSession {
     pub name: String,
-    /// The 1-based turn number the AgentSession line announced.
+    /// 1-based, from the AgentSession line.
     pub turn: u32,
 }
 
@@ -46,10 +39,8 @@ pub(crate) struct PendingApproval {
     pub mode: WaitMode,
 }
 
-/// A plan admitted but never accounted (PlanAdmitted with its iteration's Row absent).
-/// The coarseness is inherent: the graph runner batches TaskResult emission until the
-/// executor returns (`crate::loop_graph`), so a mid-plan death leaves no per-task rows;
-/// `resulted` is non-empty only when the executor returned but the Row never landed.
+/// PlanAdmitted with its iteration's Row absent. The graph runner batches TaskResult
+/// emission until the executor returns, so a mid-plan death leaves `resulted` empty.
 #[derive(Debug, Clone)]
 pub(crate) struct OpenPlan {
     pub plan_version: u32,
@@ -61,7 +52,7 @@ pub(crate) struct OpenPlan {
     pub wide: bool,
 }
 
-/// What the tail of the log says happened. Facts plus a class token; no policy.
+/// What the tail of the log says happened.
 #[derive(Debug, Clone)]
 pub(crate) enum Classification {
     /// Shutdown line present: the previous process exited on purpose.
@@ -92,9 +83,8 @@ pub(crate) enum Classification {
     DiedBetweenIterations { last_iter: u32 },
 }
 
-/// The `Shutdown.outcome` tokens as a closed enum (`crate::loop_driver::LoopExit` owns the
-/// writer side). Unknown tokens map to `Other` so a newer writer never breaks an older
-/// resumer.
+/// `Shutdown.outcome` tokens. Unknown maps to `Other` so a newer writer never breaks an
+/// older resumer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ShutdownOutcome {
     Finished,
@@ -135,7 +125,6 @@ impl ShutdownOutcome {
     }
 }
 
-/// Truncate to `max` chars on a char boundary, marking the cut.
 fn trunc(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -145,7 +134,6 @@ fn trunc(s: &str, max: usize) -> String {
 }
 
 impl Classification {
-    /// The wire token for the Recovery event.
     pub(crate) fn class(&self) -> RecoveryClass {
         match self {
             Classification::CleanExit { .. } => RecoveryClass::CleanExit,
@@ -159,7 +147,7 @@ impl Classification {
         }
     }
 
-    /// The iteration the interruption touched, for the Recovery event (0 if none).
+    /// The iteration the interruption touched (0 if none).
     pub(crate) fn iter(&self) -> u32 {
         match self {
             Classification::DiedMidTurn { iter, .. }
@@ -170,7 +158,7 @@ impl Classification {
         }
     }
 
-    /// One-line evidence summary for the Recovery event's `detail` and the resume note.
+    /// One-line evidence summary for the Recovery event and the resume note.
     pub(crate) fn detail(&self) -> String {
         match self {
             Classification::CleanExit { outcome, reason } => {
@@ -245,14 +233,13 @@ impl Classification {
     }
 }
 
-/// The per-event scanner. Fed every decoded line in order; `finish` names the tail.
 #[derive(Default)]
 struct TailScan {
     /// Only a TRAILING Shutdown counts: a resumed process appends past its
     /// predecessor's Shutdown, so any later event clears it.
     shutdown: Option<(String, String)>,
     saw_iteration_phase: bool,
-    /// Any decided (non-wide, non-infra) row, matching the counter fold's filter.
+    /// Any decided (non-wide, non-infra) row.
     saw_any_row: bool,
     last_row_iter: u32,
     last_phase_iter: u32,
@@ -281,8 +268,7 @@ impl TailScan {
                 if phase == "iteration" {
                     self.saw_iteration_phase = true;
                     self.last_phase_iter = *iter;
-                    // The Row arm is the primary clear; this is the safety net for
-                    // paths that account an iteration without a Row (park-continue).
+                    // Safety net for paths that account an iteration without a Row.
                     self.done_unrowed = None;
                 }
             }
@@ -342,8 +328,7 @@ impl TailScan {
                 {
                     self.done_unrowed = None;
                 }
-                // Any row after an admission accounts the plan's iteration: keep,
-                // discard, discarded, infra-dead, or a wide result row.
+                // Any row after an admission accounts the plan's iteration.
                 self.open_plan = None;
             }
             SessionEvent::PlanAdmitted {
@@ -371,8 +356,8 @@ impl TailScan {
                 self.open_approval = Some(PendingApproval {
                     handle: handle.clone(),
                     trace_id: trace_id.clone(),
-                    // Unknown tokens degrade to Continue: never re-park on a mode a
-                    // newer writer invented and this binary can't honor.
+                    // Unknown tokens degrade to Continue: never re-park on a mode
+                    // this binary can't honor.
                     mode: if mode == "block" {
                         WaitMode::Block
                     } else {
@@ -381,12 +366,11 @@ impl TailScan {
                 });
             }
             SessionEvent::ApprovalResolved { .. } => self.open_approval = None,
-            // Counter-fold events and inert history (a Recovery from an earlier resume).
             _ => {}
         }
     }
 
-    /// Name the tail. Precedence: each earlier case subsumes the later ones.
+    /// Precedence: each earlier case subsumes the later ones.
     fn finish(mut self) -> (Classification, Option<PendingApproval>) {
         let pending = self.open_approval.clone();
         let classification = if let Some((outcome, reason)) = self.shutdown {
@@ -425,19 +409,17 @@ impl TailScan {
     }
 }
 
-/// Everything `--resume` needs from the log, produced in ONE pass: the counter fold
-/// (rows/spent/best) and the tail classification.
+/// Everything `--resume` needs from the log, produced in one pass.
 #[derive(Debug)]
 pub(crate) struct SessionRecovery {
     pub resume: ResumeState,
     pub classification: Classification,
-    /// Dangling approval regardless of class (block or continue), for re-registration.
+    /// Dangling approval regardless of class, for re-registration.
     pub pending_approval: Option<PendingApproval>,
 }
 
 /// Replay the session log into resume counters and a tail classification. Torn final
-/// lines decode to `None` and are skipped, so a mid-write kill is tolerated by
-/// construction. A rowless log is a refusal: `--resume` means continue, not restart.
+/// lines are skipped; a rowless log is a refusal (`--resume` means continue, not restart).
 pub(crate) fn classify_session(session_log: &Path) -> Result<SessionRecovery> {
     let file = std::fs::File::open(session_log).with_context(|| {
         format!(
@@ -471,12 +453,11 @@ pub(crate) fn classify_session(session_log: &Path) -> Result<SessionRecovery> {
     })
 }
 
-/// What `--resume` should do, derived from the classification. The typed successor to
-/// the arithmetic no-op guard in `run.rs`.
+/// What `--resume` should do, derived from the classification.
 pub(crate) enum RecoveryPlan {
-    /// Exit 0 without entering the loop (and without re-running the finish path).
+    /// Exit 0 without entering the loop or re-running the finish path.
     NoOp { message: String },
-    /// Refuse with a nonzero explanation (escalated runs need a human, not a re-run).
+    /// Nonzero exit: escalated runs need a human, not a re-run.
     Refuse { message: String },
     /// Enter the loop. `repark` re-arms the block-mode approval wait; `pending_regime`
     /// re-registers the approval key on the control bridge.
@@ -486,8 +467,7 @@ pub(crate) enum RecoveryPlan {
     },
 }
 
-/// The classification hand-off from `run.rs` into the loop, resolved by
-/// [`plan_recovery`]. Carried on [`crate::loop_driver::LoopRuntime`].
+/// Classification hand-off from `run.rs` into the loop.
 pub(crate) struct ResumeRecovery {
     pub class: RecoveryClass,
     pub iter: u32,
@@ -496,8 +476,7 @@ pub(crate) struct ResumeRecovery {
     pub pending_regime: Option<String>,
 }
 
-/// Map a classification to the resume action. Policy lives here, in one auditable
-/// function; the classifier only reports facts.
+/// Map a classification to the resume action; all policy lives here.
 pub(crate) fn plan_recovery(s: &SessionRecovery, iterations: u32, max_cost: f64) -> RecoveryPlan {
     let finished = crate::loop_driver::resume_finished(&s.resume, iterations, max_cost);
     let nothing_to_do = || RecoveryPlan::NoOp {
@@ -524,8 +503,7 @@ pub(crate) fn plan_recovery(s: &SessionRecovery, iterations: u32, max_cost: f64)
                     ),
                 };
             }
-            // Budget falls through to the arithmetic guard: the operator may resume
-            // with a raised cap, in which case the run continues.
+            // Budget falls through: the operator may resume with a raised cap.
             ShutdownOutcome::Budget
             | ShutdownOutcome::Stopped
             | ShutdownOutcome::Stalled
@@ -550,25 +528,18 @@ pub(crate) fn plan_recovery(s: &SessionRecovery, iterations: u32, max_cost: f64)
     }
 }
 
-/// What a resume does about an approval the previous process left outstanding, after both
-/// sources of truth have been consulted.
+/// What a resume does about an approval the previous process left outstanding.
 pub(crate) struct ResumeApproval {
     /// Re-arm the block-mode park, unless the grant is already on the ledger.
     pub repark: Option<provisioning::PendingProvisioning>,
     /// Re-register the approval key so an operator `approve` still resolves it.
     pub pending_regime: Option<String>,
-    /// One line for the session log when the ledger overrode the log's wait-state.
+    /// Session-log line when the ledger overrode the log's wait-state.
     pub note: Option<String>,
 }
 
-/// Precedence between the two sources of truth for an outstanding approval:
-/// `admissions.jsonl` is authoritative for what an operator asked for, the session log for
-/// what the loop was waiting on. So the ledger is consulted first, and a re-scope it holds
-/// under the key derived from THIS ask ([`AdmissionKey::rescope_from`] over
-/// [`AdmissionKey::approve`]) means the grant landed before the death: re-parking would
-/// idle on an approval that already happened, so the park is dropped and the iteration-head
-/// drain applies the re-scope. Any other state (no ledger, an unrelated re-scope, nothing
-/// recorded) leaves the classifier's re-park and key registration alone.
+/// The ledger wins over the log: a re-scope recorded under this ask's derived key means
+/// the grant landed before the death, so drop the park and let the drain apply it.
 pub(crate) fn resume_approval(
     rec: &ResumeRecovery,
     replay: Option<&crate::admission::ResumeReplay>,

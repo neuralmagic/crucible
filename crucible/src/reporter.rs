@@ -222,16 +222,13 @@ pub trait Reporter {
     /// iteration. Default no-op: only the session reporter persists them; the console
     /// front-end has no plan rendering, and the legacy sequencing path never emits one.
     fn plan_event(&mut self, _ev: &crate::session::SessionEvent) {}
-    /// How this resume classified the previous shutdown. The default renders a note; the
-    /// session reporter overrides it to emit a structured
-    /// [`crate::session::SessionEvent::Recovery`].
+    /// How this resume classified the previous shutdown; the session reporter emits a
+    /// structured [`crate::session::SessionEvent::Recovery`].
     fn recovery(&mut self, class: crate::session::RecoveryClass, iter: u32, detail: &str) {
         self.note(&format!("recovery: {class} (iter {iter}): {detail}"));
     }
-    /// The loop began waiting on a mediated-provisioning approval. The default renders a
-    /// note; the session reporter overrides it to emit a structured
-    /// [`crate::session::SessionEvent::ApprovalWait`], opening the bracket a resume's
-    /// classifier reads (a dangling wait means the run died with the approval open).
+    /// Opens the approval bracket a resume's classifier reads: a dangling wait means the
+    /// run died with the approval open.
     fn approval_wait(&mut self, handle: &str, trace_id: &str, mode: crate::provisioning::WaitMode) {
         self.note(&format!(
             "approval wait [{}] {handle} ({trace_id})",
