@@ -50,6 +50,8 @@ pub(crate) struct IterCtx<'a> {
     pub baseline_score: f64,
     pub baseline_total: u64,
     pub best_score: f64,
+    /// The kept best's secondary tiebreak scalar, alongside `best_score`.
+    pub best_tiebreak: Option<f64>,
     /// Run spend before this iteration, so the runner reports the same cumulative budget
     /// the typestate path would after the turn.
     pub spent_before: f64,
@@ -89,6 +91,7 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
             best_score: Some(cx.best_score),
         },
         best_score: cx.best_score,
+        best_tiebreak: cx.best_tiebreak,
         spent_before: cx.spent_before,
         started: cx.started,
         signal: None,
@@ -204,7 +207,11 @@ pub(crate) fn iteration_template(
         |name: &str, op: EngineOp, source: Option<TaskName>, deps: Vec<TaskName>| -> Task {
             Task {
                 name: name.into(),
-                task: TaskKind::Engine { op, source },
+                task: TaskKind::Engine {
+                    op,
+                    source,
+                    tiebreak: None,
+                },
                 depends_on: deps,
                 session: None,
                 needs: "any".to_string(),
@@ -287,6 +294,7 @@ struct LoopTaskRunner<'a, R: Reporter> {
     rows: &'a [Row],
     ctx: MeasureCtx,
     best_score: f64,
+    best_tiebreak: Option<f64>,
     spent_before: f64,
     started: Instant,
     signal: Option<Signal>,
@@ -386,6 +394,7 @@ impl<R: Reporter> LoopTaskRunner<'_, R> {
         &mut self,
         task: &Task,
         source: Option<&TaskName>,
+        tiebreak: Option<&TaskName>,
         inputs: &BTreeMap<TaskName, Value>,
     ) -> Attempt {
         let Some(source) = source else {
@@ -403,12 +412,20 @@ impl<R: Reporter> LoopTaskRunner<'_, R> {
                 format!("grade score source {source} has no numeric `score`"),
             );
         };
+        // The declared tiebreak task's score becomes the reading's secondary scalar.
+        // Best-effort by design: a tiebreak task that failed or was skipped is simply
+        // absent from the passing inputs, and the decide falls back to primary-only.
+        let tiebreak = tiebreak
+            .and_then(|t| inputs.get(t))
+            .and_then(|v| v.get("score"))
+            .and_then(Value::as_f64);
         let reading = Reading {
             valid: primary
                 .get("valid")
                 .and_then(Value::as_bool)
                 .unwrap_or(true),
             score: Some(score),
+            tiebreak,
             solved: primary
                 .get("solved")
                 .and_then(Value::as_bool)
@@ -454,6 +471,7 @@ impl<R: Reporter> LoopTaskRunner<'_, R> {
         measured.evidence = evidence.clone();
         let out = serde_json::json!({
             "score": measured.reading.score,
+            "tiebreak": measured.reading.tiebreak,
             "valid": measured.reading.valid,
             "evidence_count": inputs.len(),
             "evidence": evidence,
@@ -476,7 +494,8 @@ impl<R: Reporter> LoopTaskRunner<'_, R> {
                 format!("decide source {source} has no measured candidate"),
             );
         };
-        let d = loop_driver::decide_row(self.judge, self.best_score, self.it, m);
+        let d =
+            loop_driver::decide_row(self.judge, self.best_score, self.best_tiebreak, self.it, m);
         let out = serde_json::json!({
             "keep": d.verdict.keep,
             "solved": d.verdict.solved,
@@ -508,10 +527,12 @@ impl<R: Reporter> TaskRunner for LoopTaskRunner<'_, R> {
             TaskKind::Engine {
                 op: EngineOp::Grade,
                 source,
-            } => self.grade(task, source.as_ref(), inputs),
+                tiebreak,
+            } => self.grade(task, source.as_ref(), tiebreak.as_ref(), inputs),
             TaskKind::Engine {
                 op: EngineOp::Decide,
                 source,
+                ..
             } => self.decide(task, source.as_ref()),
             TaskKind::Engine {
                 op: EngineOp::MeasureDiff,
@@ -745,6 +766,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
             task: TaskKind::Engine {
                 op: EngineOp::MeasureDiff,
                 source: None,
+                tiebreak: None,
             },
             depends_on: vec![TaskName(format!("propose-{id}"))],
             session: None,
@@ -881,7 +903,7 @@ impl<R: Reporter> WideRunner<'_, R> {
         match self.judge.measure(&ctx) {
             Ok(reading) => {
                 let (diff_text, diffstat) = self.world.staged_diff();
-                let decision = if self.judge.decide(&reading, self.baseline_score).keep {
+                let decision = if self.judge.decide(&reading, self.baseline_score, None).keep {
                     "wide-keep"
                 } else {
                     "wide-discard"
@@ -894,6 +916,7 @@ impl<R: Reporter> WideRunner<'_, R> {
                     diff: diff_text,
                     diffstat,
                     score: reading.score,
+                    tiebreak: reading.tiebreak,
                     total: reading.detail.get("total").and_then(Value::as_u64),
                     phase: Some("wide".into()),
                     kept_snap: None,

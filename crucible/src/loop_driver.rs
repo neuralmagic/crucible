@@ -25,6 +25,8 @@ fn reading_total(r: &crucible::Reading) -> Option<u64> {
 pub(crate) struct ResumeState {
     pub rows: Vec<Row>,
     pub best_score: f64,
+    /// The kept best's secondary tiebreak scalar, restored with its score.
+    pub best_tiebreak: Option<f64>,
     pub baseline_score: f64,
     pub baseline_total: u64,
     pub spent: f64,
@@ -68,6 +70,10 @@ struct Segment {
     /// Mutable within the segment: a kept improvement lowers it. A re-scope resets it to the new
     /// baseline.
     best_score: f64,
+    /// The kept best's secondary tiebreak scalar, tracked with `best_score` so a
+    /// primary-score tie can be ruled on the secondary axis. `None` when the kept best
+    /// (or the baseline) declared none.
+    best_tiebreak: Option<f64>,
     baseline_total: u64,
     best_snap: Snapshot,
 }
@@ -90,6 +96,7 @@ impl Segment {
             fingerprint,
             baseline_score,
             best_score: baseline_score,
+            best_tiebreak: row.tiebreak,
             baseline_total,
             best_snap: Snapshot(snap),
         };
@@ -400,7 +407,13 @@ pub(crate) fn measured_from_reading(
 /// decision+row constructor, shared by the typestate path and the graph runner. The
 /// reading the row reports and the keep path commits is the one that was actually
 /// measured (`Measured` is consumed).
-pub(crate) fn decide_row(judge: &dyn Judge, best_score: f64, it: u32, m: Measured) -> Decided {
+pub(crate) fn decide_row(
+    judge: &dyn Judge,
+    best_score: f64,
+    best_tiebreak: Option<f64>,
+    it: u32,
+    m: Measured,
+) -> Decided {
     let Measured {
         reading,
         note,
@@ -408,7 +421,7 @@ pub(crate) fn decide_row(judge: &dyn Judge, best_score: f64, it: u32, m: Measure
         diffstat,
         evidence,
     } = m;
-    let verdict = judge.decide(&reading, best_score);
+    let verdict = judge.decide(&reading, best_score, best_tiebreak);
     let row = Row {
         iter: it,
         decision: if verdict.keep { "keep" } else { "discard" }.into(),
@@ -417,6 +430,7 @@ pub(crate) fn decide_row(judge: &dyn Judge, best_score: f64, it: u32, m: Measure
         diff,
         diffstat,
         score: reading.score,
+        tiebreak: reading.tiebreak,
         total: reading_total(&reading),
         phase: None,
         kept_snap: None,
@@ -468,8 +482,8 @@ impl Iteration<Applied> {
 impl Iteration<Measured> {
     /// Rule keep/discard and build the results row. Consumes the `Measured`, so the reading the row
     /// reports and the keep path commits is the one that was actually measured.
-    fn decide(self, judge: &dyn Judge, best_score: f64) -> Decided {
-        decide_row(judge, best_score, self.it, self.state)
+    fn decide(self, judge: &dyn Judge, best_score: f64, best_tiebreak: Option<f64>) -> Decided {
+        decide_row(judge, best_score, best_tiebreak, self.it, self.state)
     }
 }
 
@@ -521,12 +535,19 @@ fn run_loop_body<R: Reporter>(
         // by `restore_kept_best` (a re-prepared checkout is the upstream baseline, not
         // the tree the logged best score measured).
         let resumed_identity = rs.identity.clone();
-        let resumed_best = restore_kept_best(world, judge.direction(), &rs.rows, rs.best_score)?;
+        let resumed_best = restore_kept_best(
+            world,
+            judge.direction(),
+            &rs.rows,
+            rs.best_score,
+            rs.best_tiebreak,
+        )?;
         let segment = Segment {
             regime: "default".to_string(),
             fingerprint: fingerprint(&prep.goal, &judge.objective(), "default"),
             baseline_score: rs.baseline_score,
             best_score: resumed_best.best_score,
+            best_tiebreak: resumed_best.best_tiebreak,
             baseline_total: rs.baseline_total,
             best_snap: resumed_best.best_snap,
         };
@@ -782,6 +803,7 @@ fn run_loop_body<R: Reporter>(
                     baseline_score: run.segment.baseline_score,
                     baseline_total: run.segment.baseline_total,
                     best_score: run.segment.best_score,
+                    best_tiebreak: run.segment.best_tiebreak,
                     spent_before: run.spent,
                     started,
                     workflow: args.workflow.as_ref(),
@@ -811,9 +833,11 @@ fn run_loop_body<R: Reporter>(
                                 best_score: Some(run.segment.best_score),
                             };
                             IterStep::Decided(Box::new(
-                                applied
-                                    .measure(judge, &ctx, p, world)?
-                                    .decide(judge, run.segment.best_score),
+                                applied.measure(judge, &ctx, p, world)?.decide(
+                                    judge,
+                                    run.segment.best_score,
+                                    run.segment.best_tiebreak,
+                                ),
                             ))
                         }
                         Err(e) => {
@@ -911,6 +935,10 @@ fn run_loop_body<R: Reporter>(
         if verdict.keep {
             if let Some(s) = reading.score {
                 run.segment.best_score = s;
+                // The kept candidate defines BOTH axes, even when its tiebreak is absent:
+                // carrying a stale tiebreak forward would compare the next tie against a
+                // scalar the current best never earned.
+                run.segment.best_tiebreak = reading.tiebreak;
                 update_control_status(control, "iteration", it, run.segment.best_score, run.spent);
             }
             // The World owns reversibility now: snapshot commits the kept state (git memory)
@@ -1094,6 +1122,7 @@ fn spawn_feedback_watcher<R: Reporter>(r: &mut R, prs: &[publish::PrLink], p: &P
 struct ResumedBest {
     best_snap: Snapshot,
     best_score: f64,
+    best_tiebreak: Option<f64>,
     kept_shas: Vec<String>,
     /// Set when kept rows exist but their tree could not be restored; the loop notes it.
     degraded: Option<String>,
@@ -1110,12 +1139,14 @@ fn restore_kept_best(
     direction: crate::command_judge::Direction,
     rows: &[Row],
     logged_best: f64,
+    logged_tiebreak: Option<f64>,
 ) -> Result<ResumedBest> {
     let Some(last_kept) = rows.iter().rev().find(|row| row.decision == "keep") else {
         // No keeps: the re-prepared checkout IS the baseline the logged scores measured.
         return Ok(ResumedBest {
             best_snap: Snapshot(world.snapshot("resume").context("resume snapshot")?),
             best_score: logged_best,
+            best_tiebreak: logged_tiebreak,
             kept_shas: Vec::new(),
             degraded: None,
         });
@@ -1139,11 +1170,14 @@ fn restore_kept_best(
                 .collect(),
             best_snap: Snapshot(snap),
             best_score: logged_best,
+            best_tiebreak: logged_tiebreak,
             degraded: None,
         }),
         Err(why) => Ok(ResumedBest {
             best_snap: Snapshot(world.snapshot("resume").context("resume snapshot")?),
             best_score: worst_score(direction),
+            // The score's artifact is gone, so its tiebreak goes with it.
+            best_tiebreak: None,
             kept_shas: Vec::new(),
             degraded: Some(format!(
                 "kept-best tree not restorable ({why}); dropping best score {logged_best} so \
@@ -1204,10 +1238,19 @@ pub(crate) fn load_resume_state(session_log: &std::path::Path) -> Result<ResumeS
             .filter_map(|r| r.score)
             .fold(baseline_score, f64::min)
     });
+    // Keeps are monotone within a segment, so the last kept row IS the best; its tiebreak
+    // travels with the best score. No keeps = the baseline's (usually absent) tiebreak.
+    let best_tiebreak = rows
+        .iter()
+        .rev()
+        .find(|r| r.decision == "keep")
+        .or_else(|| rows.first())
+        .and_then(|r| r.tiebreak);
     let next_iter = rows.iter().map(|r| r.iter).max().unwrap_or(0) + 1;
     Ok(ResumeState {
         rows,
         best_score,
+        best_tiebreak,
         baseline_score,
         baseline_total,
         spent,
@@ -1442,6 +1485,7 @@ fn run_baseline(
         note: base.note.clone(),
         detail: judge.detail(&base),
         score: base.score,
+        tiebreak: base.tiebreak,
         total: reading_total(&base),
         ..Default::default()
     };
@@ -1652,6 +1696,7 @@ mod tests {
                 diff: String::new(),
                 diffstat: String::new(),
                 score: Some(score),
+                tiebreak: None,
                 total: Some(42),
                 phase: None,
                 kept_snap: None,
@@ -1702,6 +1747,59 @@ mod tests {
     }
 
     #[test]
+    fn resume_restores_best_tiebreak_from_the_last_kept_row() {
+        use session::{RowWire, SessionEvent, encode};
+        let mk = |iter, decision: &str, tiebreak: Option<f64>| SessionEvent::Row {
+            row: RowWire {
+                iter,
+                decision: decision.into(),
+                note: String::new(),
+                detail: String::new(),
+                diff: String::new(),
+                diffstat: String::new(),
+                score: Some(0.0),
+                tiebreak,
+                total: None,
+                phase: None,
+                kept_snap: None,
+                evidence: Vec::new(),
+            },
+            solved: false,
+        };
+        let log = [
+            mk(0, "baseline", None),
+            mk(1, "keep", Some(0.7)),
+            mk(2, "keep", Some(0.5)),
+            mk(3, "discard", Some(0.1)),
+            SessionEvent::Finished,
+        ]
+        .iter()
+        .map(encode)
+        .collect::<Vec<_>>()
+        .join("\n");
+        let path = std::env::temp_dir().join("crucible-resume-tiebreak.jsonl");
+        std::fs::write(&path, log).unwrap();
+        let rs = load_resume_state(&path).unwrap();
+        assert_eq!(
+            rs.best_tiebreak,
+            Some(0.5),
+            "the last kept row's tiebreak, not the discard's"
+        );
+        let _ = std::fs::remove_file(&path);
+
+        // No keeps: the baseline's (absent) tiebreak.
+        let log = [mk(0, "baseline", None), mk(1, "discard", Some(0.1))]
+            .iter()
+            .map(encode)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, log).unwrap();
+        let rs = load_resume_state(&path).unwrap();
+        assert_eq!(rs.best_tiebreak, None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn resume_filters_out_wide_phase_rows() {
         use session::{RowWire, SessionEvent, encode};
         let mk_deep = |iter, decision: &str, score: f64| SessionEvent::Row {
@@ -1713,6 +1811,7 @@ mod tests {
                 diff: String::new(),
                 diffstat: String::new(),
                 score: Some(score),
+                tiebreak: None,
                 total: Some(10),
                 phase: None,
                 kept_snap: None,
@@ -1729,6 +1828,7 @@ mod tests {
                 diff: String::new(),
                 diffstat: String::new(),
                 score: Some(score),
+                tiebreak: None,
                 total: None,
                 phase: Some("wide".into()),
                 kept_snap: None,
@@ -1822,8 +1922,14 @@ mod tests {
             resumed_row(2, "discard", None),
             resumed_row(3, "keep", Some("bbb")),
         ];
-        let best = restore_kept_best(&world, crate::command_judge::Direction::Lower, &rows, 180.0)
-            .unwrap();
+        let best = restore_kept_best(
+            &world,
+            crate::command_judge::Direction::Lower,
+            &rows,
+            180.0,
+            Some(0.5),
+        )
+        .unwrap();
         assert_eq!(
             *world.restores.lock().unwrap(),
             vec!["bbb".to_string()],
@@ -1833,6 +1939,11 @@ mod tests {
         assert_eq!(
             best.best_score, 180.0,
             "restored tree keeps the logged best"
+        );
+        assert_eq!(
+            best.best_tiebreak,
+            Some(0.5),
+            "the tiebreak travels with the score"
         );
         assert_eq!(
             best.kept_shas,
@@ -1850,8 +1961,14 @@ mod tests {
             resumed_row(0, "baseline", None),
             resumed_row(1, "keep", None),
         ];
-        let best = restore_kept_best(&world, crate::command_judge::Direction::Lower, &rows, 180.0)
-            .unwrap();
+        let best = restore_kept_best(
+            &world,
+            crate::command_judge::Direction::Lower,
+            &rows,
+            180.0,
+            Some(0.5),
+        )
+        .unwrap();
         assert!(world.restores.lock().unwrap().is_empty());
         assert_eq!(
             best.best_snap.as_str(),
@@ -1875,12 +1992,22 @@ mod tests {
             resumed_row(0, "baseline", None),
             resumed_row(1, "keep", Some("gone")),
         ];
-        let best = restore_kept_best(&world, crate::command_judge::Direction::Higher, &rows, 42.0)
-            .unwrap();
+        let best = restore_kept_best(
+            &world,
+            crate::command_judge::Direction::Higher,
+            &rows,
+            42.0,
+            Some(0.5),
+        )
+        .unwrap();
         assert_eq!(
             best.best_score,
             f64::NEG_INFINITY,
             "direction-aware sentinel"
+        );
+        assert_eq!(
+            best.best_tiebreak, None,
+            "a dropped best drops its tiebreak too"
         );
         assert!(best.kept_shas.is_empty());
         assert!(best.degraded.is_some());
@@ -1893,8 +2020,14 @@ mod tests {
             resumed_row(0, "baseline", None),
             resumed_row(1, "discard", None),
         ];
-        let best = restore_kept_best(&world, crate::command_judge::Direction::Lower, &rows, 240.0)
-            .unwrap();
+        let best = restore_kept_best(
+            &world,
+            crate::command_judge::Direction::Lower,
+            &rows,
+            240.0,
+            None,
+        )
+        .unwrap();
         assert!(world.restores.lock().unwrap().is_empty());
         assert_eq!(best.best_snap.as_str(), "fresh");
         assert_eq!(best.best_score, 240.0, "the checkout IS the baseline");
@@ -1913,6 +2046,7 @@ mod tests {
                 diff: String::new(),
                 diffstat: String::new(),
                 score: Some(200.0),
+                tiebreak: None,
                 total: None,
                 phase: None,
                 kept_snap: kept_snap.map(str::to_string),
@@ -2088,12 +2222,18 @@ mod tests {
             Ok(crucible::Reading {
                 valid: true,
                 score: Some(100.0),
+                tiebreak: None,
                 solved: self.solved,
                 note: "note".into(),
                 detail: serde_json::json!({}),
             })
         }
-        fn decide(&self, _reading: &crucible::Reading, _best_score: f64) -> crucible::Decision {
+        fn decide(
+            &self,
+            _reading: &crucible::Reading,
+            _best_score: f64,
+            _best_tiebreak: Option<f64>,
+        ) -> crucible::Decision {
             crucible::Decision {
                 keep: self.keep,
                 solved: self.solved,

@@ -113,7 +113,12 @@ impl WorkflowCfg {
         // A measurement source may feed only one decision.
         let mut decided_sources: BTreeMap<&TaskName, &TaskName> = BTreeMap::new();
         for task in &self.tasks {
-            if let TaskKind::Engine { op, source } = &task.task {
+            if let TaskKind::Engine {
+                op,
+                source,
+                tiebreak,
+            } = &task.task
+            {
                 if !task.required {
                     bail!("engine task {:?} must be required", task.name.0);
                 }
@@ -173,6 +178,36 @@ impl WorkflowCfg {
                     }
                     if *op == EngineOp::Grade && !source_task.required {
                         bail!("engine grade score source {:?} must be required", source.0);
+                    }
+                }
+                if let Some(tiebreak) = tiebreak {
+                    if *op != EngineOp::Grade {
+                        bail!(
+                            "engine {op:?} task {:?} does not accept tiebreak",
+                            task.name.0
+                        );
+                    }
+                    let Some(tiebreak_task) = tasks.get(tiebreak) else {
+                        bail!(
+                            "engine grade task {:?} names unknown tiebreak {:?}",
+                            task.name.0,
+                            tiebreak.0
+                        );
+                    };
+                    if !matches!(tiebreak_task.task, TaskKind::Evaluate { .. }) {
+                        bail!(
+                            "engine grade tiebreak {:?} must be an evaluate task",
+                            tiebreak.0
+                        );
+                    }
+                    // Unlike the score source, the tiebreak may be advisory: a rung that
+                    // failed or never ran just leaves the reading without a secondary.
+                    if !is_ancestor(&tasks, tiebreak, &task.name) {
+                        bail!(
+                            "engine grade tiebreak {:?} must be an ancestor of {:?}",
+                            tiebreak.0,
+                            task.name.0
+                        );
                     }
                 }
             }
@@ -257,6 +292,7 @@ impl WorkflowCfg {
         let TaskKind::Engine {
             op: EngineOp::Decide,
             source: Some(measurement),
+            ..
         } = &decision.task
         else {
             bail!(
@@ -501,11 +537,69 @@ mod tests {
     }
 
     #[test]
+    fn grade_accepts_an_advisory_tiebreak_evaluate_source() {
+        let workflow = parse(
+            "type = \"autoresearch\"\nresult = \"choose\"\n\
+             [[task]]\nname = \"invent\"\nkind = \"engine\"\nop = \"propose\"\n\
+             [[task]]\nname = \"deploy\"\nkind = \"engine\"\nop = \"apply\"\ndepends_on = [\"invent\"]\n\
+             [[task]]\nname = \"correctness\"\nkind = \"evaluate\"\ncommand = \"./correctness.sh\"\ndepends_on = [\"deploy\"]\nisolation = \"worktree\"\n\
+             [[task]]\nname = \"latency\"\nkind = \"evaluate\"\ncommand = \"./latency.sh\"\ndepends_on = [\"correctness\"]\nisolation = \"worktree\"\nrequired = false\n\
+             [[task]]\nname = \"grade\"\nkind = \"engine\"\nop = \"grade\"\nsource = \"correctness\"\ntiebreak = \"latency\"\ndepends_on = [\"correctness\", \"latency\"]\njoin = \"passed\"\n\
+             [[task]]\nname = \"choose\"\nkind = \"engine\"\nop = \"decide\"\nsource = \"grade\"\ndepends_on = [\"grade\"]\n",
+        );
+        workflow.validate().unwrap();
+    }
+
+    #[test]
+    fn tiebreak_is_rejected_outside_grade() {
+        let mut workflow = full_autoresearch();
+        // tiebreak on a decide task is rejected.
+        workflow.tasks[3].task = TaskKind::Engine {
+            op: EngineOp::Decide,
+            source: Some("score".into()),
+            tiebreak: Some("score".into()),
+        };
+        let error = workflow.validate().unwrap_err().to_string();
+        assert!(error.contains("does not accept tiebreak"), "{error}");
+
+        // A tiebreak naming a non-evaluate task is rejected.
+        let mut workflow = full_autoresearch();
+        workflow.tasks[2].task = TaskKind::Engine {
+            op: EngineOp::Measure,
+            source: None,
+            tiebreak: Some("deploy".into()),
+        };
+        let error = workflow.validate().unwrap_err().to_string();
+        assert!(error.contains("does not accept tiebreak"), "{error}");
+    }
+
+    #[test]
+    fn grade_tiebreak_must_name_a_known_evaluate_task() {
+        let base = "type = \"autoresearch\"\nresult = \"choose\"\n\
+             [[task]]\nname = \"invent\"\nkind = \"engine\"\nop = \"propose\"\n\
+             [[task]]\nname = \"deploy\"\nkind = \"engine\"\nop = \"apply\"\ndepends_on = [\"invent\"]\n\
+             [[task]]\nname = \"correctness\"\nkind = \"evaluate\"\ncommand = \"./correctness.sh\"\ndepends_on = [\"deploy\"]\nisolation = \"worktree\"\n\
+             [[task]]\nname = \"choose\"\nkind = \"engine\"\nop = \"decide\"\nsource = \"grade\"\ndepends_on = [\"grade\"]\n";
+        let unknown = format!(
+            "{base}[[task]]\nname = \"grade\"\nkind = \"engine\"\nop = \"grade\"\nsource = \"correctness\"\ntiebreak = \"ghost\"\ndepends_on = [\"correctness\"]\njoin = \"passed\"\n"
+        );
+        let error = parse(&unknown).validate().unwrap_err().to_string();
+        assert!(error.contains("unknown tiebreak"), "{error}");
+
+        let not_evaluate = format!(
+            "{base}[[task]]\nname = \"grade\"\nkind = \"engine\"\nop = \"grade\"\nsource = \"correctness\"\ntiebreak = \"deploy\"\ndepends_on = [\"correctness\"]\njoin = \"passed\"\n"
+        );
+        let error = parse(&not_evaluate).validate().unwrap_err().to_string();
+        assert!(error.contains("must be an evaluate task"), "{error}");
+    }
+
+    #[test]
     fn grade_requires_an_evaluation_score_source() {
         let mut workflow = full_autoresearch();
         workflow.tasks[2].task = TaskKind::Engine {
             op: EngineOp::Grade,
             source: Some("deploy".into()),
+            tiebreak: None,
         };
         let error = workflow.validate().unwrap_err().to_string();
         assert!(error.contains("must be an evaluate task"), "{error}");

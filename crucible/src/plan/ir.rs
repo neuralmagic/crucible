@@ -110,6 +110,10 @@ pub enum TaskKind {
         /// Typed input; dependencies still control scheduling.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<TaskName>,
+        /// Grade only: the evaluate task whose score becomes the reading's secondary
+        /// `tiebreak` scalar (breaks primary-score ties in the keep rule).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tiebreak: Option<TaskName>,
     },
 }
 
@@ -553,7 +557,8 @@ mod tests {
             plan.tasks[0].task,
             TaskKind::Engine {
                 op: EngineOp::Measure,
-                source: None
+                source: None,
+                tiebreak: None
             }
         ));
 

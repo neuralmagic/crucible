@@ -30,6 +30,10 @@ use anyhow::Result;
 pub struct Reading {
     pub valid: bool,
     pub score: Option<f64>,
+    /// Optional secondary scalar for functional gates whose primary score is effectively
+    /// boolean (a pass/fail rung reporting 0.0/1.0): when two candidates tie on `score`,
+    /// a strictly better `tiebreak` still keeps. Absent = ties discard, as ever.
+    pub tiebreak: Option<f64>,
     pub solved: bool,
     pub note: String,
     pub detail: serde_json::Value,
@@ -126,8 +130,9 @@ pub trait Judge {
     /// ignore it.
     fn measure(&self, ctx: &MeasureCtx) -> Result<Reading>;
 
-    /// Keep this reading? `best_score` is the run-so-far context the engine tracks.
-    fn decide(&self, reading: &Reading, best_score: f64) -> Decision;
+    /// Keep this reading? `best_score`/`best_tiebreak` are the run-so-far context the engine
+    /// tracks (the tiebreak is the kept best's secondary scalar, `None` when it had none).
+    fn decide(&self, reading: &Reading, best_score: f64, best_tiebreak: Option<f64>) -> Decision;
 
     /// One-line objective status injected into the agent's prompt (e.g. "210 ms").
     fn status(&self, best_score: f64) -> String;

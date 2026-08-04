@@ -70,6 +70,10 @@ pub struct RowWire {
     pub diffstat: String,
     #[serde(default)]
     pub score: Option<f64>,
+    /// Secondary scalar for functional gates: breaks primary-score ties in the keep rule.
+    /// Absent on rows without one and on logs written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tiebreak: Option<f64>,
     #[serde(default)]
     pub total: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -342,6 +346,7 @@ mod tests {
             diff: "diff --git a/p.go b/p.go\n@@ -1 +1 @@\n-old\n+new\n".into(),
             diffstat: "1 file changed, 1 insertion(+), 1 deletion(-)".into(),
             score: Some(210.0),
+            tiebreak: Some(0.5),
             total: None,
             phase: None,
             kept_snap: Some("abc123".into()),

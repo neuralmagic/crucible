@@ -24,6 +24,9 @@ pub struct Row {
     /// The measured fitness for this row (bench: p99 ms; test: failed count). Carried
     /// numerically (not just in `note`) so a resumed run can restore baseline/best.
     pub score: Option<f64>,
+    /// Secondary scalar for functional gates: breaks primary-score ties in the keep rule.
+    /// Carried numerically so a resume restores the kept best's tiebreak with its score.
+    pub tiebreak: Option<f64>,
     /// Total test count for this row (test gate), for the same reason.
     pub total: Option<u64>,
     /// `Some("wide")` for wide-round rows, `Some("infra")` for never-started turn

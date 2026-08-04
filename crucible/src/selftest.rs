@@ -185,6 +185,7 @@ mod tests {
             Ok(crate::crucible::Reading {
                 valid: true,
                 score: Some(score),
+                tiebreak: None,
                 solved: false,
                 note: String::new(),
                 detail: serde_json::Value::Null,
@@ -194,6 +195,7 @@ mod tests {
             &self,
             _r: &crate::crucible::Reading,
             _best_score: f64,
+            _best_tiebreak: Option<f64>,
         ) -> crate::crucible::Decision {
             unreachable!("selftest doesn't call decide")
         }
