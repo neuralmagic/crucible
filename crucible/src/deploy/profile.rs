@@ -205,8 +205,73 @@ pub struct Cluster {
     /// already present and the pod restarts on failure instead of dying with its emptyDir — a
     /// crashed run continues its turn instead of discarding hours of solver context. Unset = the
     /// state dir stays pod-local and a dead pod is a dead run.
+    ///
+    /// A string names an EXISTING claim; a table is a claim template the render materializes as a
+    /// PVC document named `<run>-state` (so `kubectl apply` owns the claim's lifecycle too).
+    /// Starting a genuinely fresh run on a kept claim requires deleting it (or its contents):
+    /// the wrapper sees the old session log and resumes.
     #[serde(default)]
-    pub state_pvc: Option<String>,
+    pub state_pvc: Option<StatePvc>,
+}
+
+/// `state_pvc = "name"` (use an existing claim) or a `[cluster.state_pvc]` template
+/// (render generates the claim).
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub enum StatePvc {
+    Existing(String),
+    Template(StatePvcTemplate),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatePvcTemplate {
+    /// Cluster default when unset.
+    #[serde(default)]
+    pub storage_class: Option<String>,
+    /// Requested size; state is small (a session log + agent-session files).
+    #[serde(default = "default_state_size")]
+    pub size: String,
+    /// The loop pod is the only consumer, so RWO unless the profile says otherwise.
+    #[serde(default = "default_state_access_modes")]
+    pub access_modes: Vec<AccessMode>,
+    /// Extra claim labels, merged over the render's managed-by/run labels (profile wins on
+    /// conflict). Some environments gate provisioning on them (cost centers, backup policies).
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+    /// Claim annotations, verbatim (storage-class parameters, ownership tags).
+    #[serde(default)]
+    pub annotations: BTreeMap<String, String>,
+}
+
+/// PVC access modes. The Kubernetes API (and so k8s-openapi) types these as bare strings; the
+/// domain is closed, so the profile rejects a typo at parse instead of at provisioning.
+#[derive(Deserialize, Clone, Copy)]
+pub enum AccessMode {
+    ReadWriteOnce,
+    ReadOnlyMany,
+    ReadWriteMany,
+    ReadWriteOncePod,
+}
+
+impl AccessMode {
+    /// The canonical API string, exactly the enum variant's name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AccessMode::ReadWriteOnce => "ReadWriteOnce",
+            AccessMode::ReadOnlyMany => "ReadOnlyMany",
+            AccessMode::ReadWriteMany => "ReadWriteMany",
+            AccessMode::ReadWriteOncePod => "ReadWriteOncePod",
+        }
+    }
+}
+
+fn default_state_size() -> String {
+    "1Gi".to_string()
+}
+
+fn default_state_access_modes() -> Vec<AccessMode> {
+    vec![AccessMode::ReadWriteOnce]
 }
 
 fn default_kubeconfig_configmap() -> String {

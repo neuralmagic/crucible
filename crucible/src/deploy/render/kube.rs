@@ -238,6 +238,13 @@ pub fn render(
     let netpol_yaml =
         serde_norway::to_string(&r.netpol()).context("serializing the NetworkPolicy")?;
     let mut out = format!("{pod_yaml}---\n{rbac_yaml}---\n{netpol_yaml}");
+    // Templated run-state claim: rendered with the pod so `kubectl apply` owns its lifecycle.
+    // Appended (not prepended) to keep the [pod, rbac, netpol] head layout controllers index by
+    // `kind` against; apply-order within one file doesn't matter to the kubelet (the pod waits).
+    if let Some(pvc) = r.state_pvc_doc() {
+        let yaml = serde_norway::to_string(&pvc).context("serializing the state PVC")?;
+        out.push_str(&format!("---\n{yaml}"));
+    }
     // Under the kubernetes driver the gateway SA needs sandbox CRD RBAC + a ClusterRole for
     // tokenreviews and node reads.
     if profile.cluster.sandbox_driver == ComputeDriver::Kubernetes {
@@ -455,6 +462,63 @@ impl Renderer<'_> {
                 });
         }
         sc
+    }
+
+    /// The state claim this pod mounts: the profile-named existing claim, or `<run>-state` when
+    /// the profile carries a template (the render emits the claim itself). None = no persistence.
+    fn state_claim_name(&self) -> Option<String> {
+        match self.profile.cluster.state_pvc.as_ref()? {
+            crate::deploy::profile::StatePvc::Existing(name) => Some(name.clone()),
+            crate::deploy::profile::StatePvc::Template(_) => {
+                Some(format!("{}-state", self.input.name))
+            }
+        }
+    }
+
+    /// The generated PVC document, when the profile's `state_pvc` is a template. No
+    /// ownerReferences: a static render has no owner UID to point at (the pod is born in the same
+    /// apply), and the claim outliving the pod is the point — delete it to start a fresh run.
+    fn state_pvc_doc(&self) -> Option<core::PersistentVolumeClaim> {
+        let crate::deploy::profile::StatePvc::Template(t) =
+            self.profile.cluster.state_pvc.as_ref()?
+        else {
+            return None;
+        };
+        let mut labels = BTreeMap::from([
+            (
+                crucible_contract::MANAGED_BY_KEY.to_string(),
+                crucible_contract::MANAGED_BY_VALUE.to_string(),
+            ),
+            ("crucible/run".to_string(), self.input.name.to_string()),
+        ]);
+        labels.extend(t.labels.clone());
+        Some(core::PersistentVolumeClaim {
+            metadata: ObjectMeta {
+                name: self.state_claim_name(),
+                namespace: Some(self.profile.cluster.loop_namespace.clone()),
+                labels: Some(labels),
+                annotations: (!t.annotations.is_empty()).then(|| t.annotations.clone()),
+                ..Default::default()
+            },
+            spec: Some(core::PersistentVolumeClaimSpec {
+                access_modes: Some(
+                    t.access_modes
+                        .iter()
+                        .map(|m| m.as_str().to_string())
+                        .collect(),
+                ),
+                storage_class_name: t.storage_class.clone(),
+                resources: Some(core::VolumeResourceRequirements {
+                    requests: Some(BTreeMap::from([(
+                        "storage".to_string(),
+                        k8s_openapi::apimachinery::pkg::api::resource::Quantity(t.size.clone()),
+                    )])),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
     }
 
     fn pod(&self) -> Result<core::Pod> {
@@ -1024,12 +1088,13 @@ exit $rc
             });
         }
 
-        // Persistent run state (see volume_mounts): the claim the profile's `state_pvc` names.
-        if let Some(pvc) = &self.profile.cluster.state_pvc {
+        // Persistent run state (see volume_mounts): the claim the profile's `state_pvc` names
+        // or the one this render generates.
+        if let Some(claim) = self.state_claim_name() {
             volumes.push(core::Volume {
                 name: "run-state".to_string(),
                 persistent_volume_claim: Some(core::PersistentVolumeClaimVolumeSource {
-                    claim_name: pvc.clone(),
+                    claim_name: claim,
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -2761,6 +2826,7 @@ mod tests {
     /// exists. Without it the pod stays one-shot (a restart would silently fresh-start a run).
     #[test]
     fn state_pvc_mounts_resumes_and_restarts_on_failure() {
+        // String form: an existing claim is referenced, never generated.
         let with = k8s_profile("state_pvc = \"deepgemm-state\"");
         let yaml = render_k8s(&with);
         assert!(yaml.contains("claimName: deepgemm-state"), "{yaml}");
@@ -2773,12 +2839,60 @@ mod tests {
             yaml.contains(r#"$([ -s "$D/state/session.jsonl" ] && echo --resume)"#),
             "{yaml}"
         );
+        assert!(!yaml.contains("kind: PersistentVolumeClaim"), "{yaml}");
 
         let without = k8s_profile("");
         let yaml = render_k8s(&without);
         assert!(yaml.contains("restartPolicy: Never"), "{yaml}");
         assert!(!yaml.contains("--resume"), "{yaml}");
         assert!(!yaml.contains("run-state"), "{yaml}");
+    }
+
+    /// The table form is a claim template: the render emits the PVC itself (`<run>-state`),
+    /// carrying the profile's storage class, size, access modes, labels, and annotations. A typo'd
+    /// access mode dies at parse (closed enum), not at provisioning.
+    #[test]
+    fn state_pvc_template_generates_the_claim() {
+        let profile = k8s_profile(
+            r#"[cluster.state_pvc]
+            storage_class = "shared-vast"
+            size = "2Gi"
+            access_modes = ["ReadWriteMany"]
+            labels = { "cost-center" = "llm-d" }
+            annotations = { "backup.example.com/policy" = "none" }
+            "#,
+        );
+        let yaml = render_k8s(&profile);
+        assert!(yaml.contains("kind: PersistentVolumeClaim"), "{yaml}");
+        assert!(yaml.contains("name: alpha-state"), "{yaml}");
+        assert!(yaml.contains("claimName: alpha-state"), "{yaml}");
+        assert!(yaml.contains("storageClassName: shared-vast"), "{yaml}");
+        assert!(yaml.contains("storage: 2Gi"), "{yaml}");
+        assert!(yaml.contains("ReadWriteMany"), "{yaml}");
+        assert!(yaml.contains("cost-center: llm-d"), "{yaml}");
+        assert!(yaml.contains("backup.example.com/policy: none"), "{yaml}");
+        // The render's own labels survive the merge.
+        assert!(yaml.contains("crucible/run: alpha"), "{yaml}");
+        assert!(yaml.contains("restartPolicy: OnFailure"), "{yaml}");
+
+        assert!(
+            toml::from_str::<DeployProfile>(
+                r#"
+                [cluster]
+                loop_namespace = "a"
+                rig_namespace = "a"
+                service_account = "a"
+                supervisor_image = "img"
+                [cluster.state_pvc]
+                access_modes = ["ReadWriteTypo"]
+                [image]
+                loop = "img"
+                pull_secret = "s"
+                "#
+            )
+            .is_err(),
+            "an unknown access mode must fail at parse"
+        );
     }
 
     /// A domain that builds in-pod (buildah deploy target or `[measure]`) gets AppArmor Unconfined
