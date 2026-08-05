@@ -43,6 +43,14 @@ pub mod fleet;
 /// closed-vocabulary template expander, and the watched-path content digest.
 pub mod spec;
 
+/// Append-only NDJSON ledger mechanics (flock-guarded append, torn-tail-tolerant fold,
+/// quarantine); domain types stay with their owners.
+pub mod ndjson;
+
+/// Durable tool steps: a content-keyed ledger so a restarted process replays finished
+/// work instead of repaying it.
+pub mod steps;
+
 /// The declarative-build backends: the detached rootless-buildah cluster Job and the GithubActions
 /// dispatch, sharing one "build + push, crucible pins the digest" contract.
 pub mod build;
@@ -86,7 +94,9 @@ pub struct DeployConfig {
 /// The result of a build. A non-zero `buildah bud` is the caller's (agent's) problem (a compile
 /// error or a bad Dockerfile edit) and the log is handed back to fix within the turn; infra
 /// failures (no buildah, a push that can't auth) surface as `Err` instead.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Serialized as the recorded value of a build [`steps`] step, so the tagged shape is on disk.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
 pub enum BuildOutcome {
     /// Built and (after `build_and_push`) pushed; `image_ref` is live in the registry.
     Built { image_ref: String },

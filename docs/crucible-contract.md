@@ -54,6 +54,7 @@ ANTHROPIC_VERTEX_PROJECT_ID = "my-gcp-project"
 [judge]
 measure_cmd = "./measure.sh"                  # REQUIRED. §3. Any executable, any language.
 direction   = "lower"                         # lower | higher. REQUIRED.
+tiebreak_direction = "lower"                  # optional; direction of the `tiebreak` scalar (§4). default: direction
 objective   = "score"                         # display label (the old `gate` name). default "score"
 
 [judge.selftest]                              # optional (ADR-0014 S1). Runs in `crucible check`, never in a loop iteration.
@@ -233,6 +234,41 @@ what it learned. Tasks sharing a session must be dependency-ordered and cannot b
 parallel critics should stay fresh or use distinct sessions. Admission requires
 `agent.session.persist`. A missing `session` preserves the historical fresh-turn behavior.
 
+Sessions can also be declared first-class with `session(...)` and bound by value:
+
+```python
+solver = session(name = "solver", model = "claude-opus-4-6", effort = "high")
+candidate = propose(name = "invent", session = solver)
+refine = agent(name = "refine", prompt = prompt_file("prompts/refine.md"), session = solver,
+               depends_on = [candidate])
+```
+
+Declarations are compile-time only; the generated manifest carries the same per-task `session`,
+`harness`, `model`, and `effort` fields as before. The rules:
+
+- A declaration's `harness` / `model` / `effort` are defaults that materialize onto every agent
+  task bound to it. A bound task may repeat a value but not contradict it: one session is one
+  serial conversation under one agent config.
+- A session carrying defaults cannot bind to `propose()`, whose agent config is owned by the
+  manifest's `[agent]`. A default-free declaration binds to it exactly as a string does.
+- Duplicate declarations of one name, and declarations never bound to a task, are compile errors.
+- While a file declares no sessions, bare strings keep the historical pass-through behavior.
+  Once any `session()` exists, every string `session = "x"` must name a declared session
+  (declared before use), so a typo can no longer silently open a second fresh conversation.
+
+Tasks may also declare their output contract: `emits = ["score", "pass"]` on `agent()`,
+`command()`, or `evaluate()` names fields the task's JSON output promises to include.
+Compilation rejects a `top_k` dependency, `grade` score source, or thresholded `evaluate` whose
+declared emits omits `score`; at runtime a passing attempt missing a declared field becomes a
+measured failure at the producing task instead of a mystery downstream. An absent `emits`
+declares nothing and changes nothing.
+
+Compile errors carry `file:line:col` and a did-you-mean suggestion for unknown functions,
+kwargs, variables, and session names. A behavioral change from earlier releases: a task
+constructed in `workflow.star` but omitted from `workflow(tasks = ...)` is now a compile error
+naming the construction site, because a silently dropped task is a silently weakened
+measurement. Delete the assignment or include the task.
+
 Crucible's private ledger contains only the logical name, an opaque harness cursor, and a
 completed-turn count. It never copies that cursor or Claude's native transcript into
 `session.jsonl`; the existing live harness event policy, including streamed thinking events, is
@@ -280,6 +316,8 @@ names.
 - `agent(...)` creates an agent task. `isolated = True` gives it a disposable worktree, ideal for
   concurrent read-only critics; leave it false for a synthesizer whose edits must survive.
   `session = "name"` opts into an engine-managed durable conversation.
+- `session(name = ..., harness = ?, model = ?, effort = ?)` declares a durable conversation with
+  optional agent defaults, bindable as the `session =` value on `agent()` and `propose()`.
 - `command(...)` creates a deterministic shell task in the candidate workspace.
 - `evaluate(...)` creates a typed measurement command with optional threshold grading.
 - `top_k(...)` creates a reducer for wider authored graphs.
@@ -310,7 +348,7 @@ Scope validation renders the admitted graph to `WORKFLOW.png` for the scope PR, 
 | --- | --- |
 | config: `method_prompt`, `goal_file`, `toolbox_dir` | **manifest-relative** |
 | agent workspace (the measured checkout) | `manifest_dir / [workspace].dir` |
-| runtime state (`session.jsonl`, `control.json`) | `--state-dir`, default `manifest_dir/state` |
+| runtime state (`session.jsonl`, `admissions.jsonl`, `control.json`) | `--state-dir`, default `manifest_dir/state` |
 | `STEER.md` | `--steer`, default `manifest_dir/STEER.md` |
 | `ESCALATION.json` (agent's harness-blocker marker, ADR-0001) | `<workspace>/ESCALATION.json`: written by `escalate`, consumed by the engine post-turn |
 
@@ -339,6 +377,8 @@ Every command (`measure_cmd`, `apply_cmd`, `snapshot_cmd`, `restore_cmd`, `setup
   ```
   - `valid` (bool, REQUIRED): false ⇒ unscoreable candidate, always discarded.
   - `score` (number|null): the fitness. `null`/absent ⇒ treated as invalid.
+  - `tiebreak` (number, optional): secondary fitness for functional gates whose `score` is
+    effectively boolean; on an exact `score` tie, a strictly better `tiebreak` still keeps (§4).
   - `solved` (bool, optional, default false): the win condition was met (terminates the loop).
   - `note` (string, optional): one-line human summary.
   - `detail` (object, optional): free-form; surfaced in the row + session log. The domain
@@ -407,11 +447,19 @@ Given a `Reading { valid, score, solved, note, detail }`, the current `best_scor
 manifest `direction`:
 
 ```
-keep   = valid && score.is_some() && (better(score, best_score, direction) || solved)
+keep   = valid && score.is_some() && (better(score, best_score, direction)
+                                      || (score == best_score && tiebreak_better)
+                                      || solved)
 solved = reading.solved
 better(s, b, lower)  = s < b
 better(s, b, higher) = s > b
 ```
+
+`tiebreak_better` applies only when the reading carries a `tiebreak`: it is
+`better(tiebreak, best_tiebreak, tiebreak_direction)`, where `tiebreak_direction` is
+`[judge].tiebreak_direction` (optional, defaults to `direction`) and a best with no recorded
+tiebreak counts as the worst value. A reading without a `tiebreak` ties exactly as before:
+discard.
 
 - **`solved` implies `keep`.** A win is the whole point, so a candidate the measure command
   declares `solved` is kept (and terminates the loop) *even if its score doesn't strictly beat
@@ -545,11 +593,31 @@ Additive event kinds beyond the compat set include:
   a hard-warning `note` event, never an abort.
 - **`shutdown`**: `{ outcome, reason }`, emitted **exactly once**, as the **last** line of every
   run (after `finished`/`summary`). `outcome` is one of `finished`/`solved`/`budget`/`stopped`/
-  `escalated`/`error`. Session-log consumers key a run's terminal state off this line; a dead
-  stream with **no** `shutdown` line means the pod likely died mid-run, not a clean exit.
+  `escalated`/`stalled`/`error`. Session-log consumers key a run's terminal state off this line; a
+  dead stream with **no** `shutdown` line means the pod likely died mid-run, not a clean exit.
+  `--resume` consumes this invariant, not just documents it: a resumed run classifies the log
+  tail (see `recovery` below) and a trailing `shutdown` is the "exited on purpose" signal. In a
+  resumed (appended) log, only the **trailing** `shutdown` counts; one followed by more events
+  belongs to an earlier process.
 - **`agent_session`**: `{ session, action, turn }`, emitted before a persistent agent turn so a
   viewer can draw continuation lanes and distinguish `started` from `resumed`. It deliberately
   contains neither the provider cursor nor native transcript content.
+- **`approval_wait`**: `{ handle, trace_id, mode }`, emitted when the loop reads the agent's
+  pending-provisioning marker. `mode` is `block` (the loop parks idle) or `continue` (it keeps
+  iterating in the frozen regime). Bracket invariant: every `approval_wait` is closed by an
+  `approval_resolved` **except** on stop-while-parked and process death, so a dangling wait in
+  the log tail means the run ended with the approval outstanding, and a resume re-parks a
+  block-mode one and re-registers the approval key so an operator `approve` still resolves it.
+- **`approval_resolved`**: `{ outcome, reason }` with `outcome` one of `granted`/`denied`/
+  `timeout`. A grant is emitted at the iteration-head rescope drain (the single re-baseline
+  site); a stop deliberately emits nothing (a stop doesn't resolve the ask).
+- **`recovery`**: `{ class, iter, detail }`, emitted once per `--resume` right after the resume
+  note: how the resumed process classified its predecessor's end. `class` is one of
+  `clean_exit`/`died_in_baseline`/`died_in_wide_round`/`died_mid_turn`/`died_deciding`/
+  `died_in_plan_task`/`died_awaiting_approval`/`died_between_iterations`; `iter` is the
+  iteration the interruption touched (0 when not iteration-scoped); `detail` is a human-readable
+  evidence summary. Purely a record: the loop acts on the in-process classification, never by
+  re-reading this line.
 
 **`RunIdentity`** (`crucible/src/identity.rs`) is the comparability key: two runs' scores are
 comparable only if it matches. It's a hash-of-hashes (`v1:<hex>`) over, per component (one
@@ -559,6 +627,52 @@ frozen manifest text's hash, a hash over every `[[workspace.inject]]`'s source c
 destination path, `[judge].measure_cmd`, and `[judge].direction`. It's computed once at run
 setup and doesn't change within a run (a re-scope moves the loop's own `Segment` fingerprint,
 a different hash over goal/objective/regime; the two are deliberately independent).
+
+---
+
+## 7.1 Admission ledger (`state/admissions.jsonl`) and the control-bridge `id`
+
+Every external input into a run (steer, approve, deny, rescope, set-budget, pause, resume,
+stop, abort) is recorded in a second NDJSON file, `state/admissions.jsonl`, before it takes
+effect. Same envelope shape as the session log (`{"v":1,"kind":…}`, blank/torn lines skipped),
+two kinds:
+
+- **`admitted`**: `{ key, seq, ts, input, …payload }` — `input` is the command token and the
+  payload is flattened alongside it (`{"input":"rescope","regime":"c=48"}`).
+- **`settled`**: `{ key, outcome, ts, note }` with `outcome` one of `applied`/`superseded`/
+  `rejected`.
+
+Contract, per idempotency key: exactly one `admitted`, then at most one `settled`, and the
+**first** terminal outcome wins. A key with no `settled` line is an input the run still owes;
+`--resume` re-arms exactly those (an un-delivered steer, a granted-but-undrained re-scope, the
+live budget cap, the pause level) and closes out the ones a resume overrides (stop/abort become
+`superseded`, as do approvals that died before their grant was recorded).
+
+**Precedence:** `admissions.jsonl` is authoritative for what an operator asked for; the session
+log is authoritative for what the loop was waiting on. Where they disagree about an outstanding
+approval, the ledger wins: a re-scope recorded under the key derived from the ask suppresses the
+session log's re-park.
+
+Control-bridge commands gain an optional **`id`** (string, non-empty, ≤256 bytes) on every
+mutating object-form command:
+
+```json
+{"cmd":"steer","text":"…","id":"pr-comment:owner/repo#7:12345"}
+```
+
+Redelivering the same `id` with the same payload converges on the original admission
+(`{"ok":true,"cmd":"steer","key":"…","dup":true}`, plus `"outcome"` when it already settled)
+rather than acting twice; the same `id` with a *different* payload is refused
+(`{"ok":false,…,"error":"idempotency conflict: …"}`) and nothing is written. Omitting `id` is
+exactly the old behavior: the server generates a key and every delivery is a fresh input, so
+old clients and old servers interoperate unchanged. A `stop`/`abort` whose record cannot be
+written still stops the run and says so with `"unrecorded":true`; every other command fails
+closed (no effect) if its admission can't be recorded.
+
+Two consequences worth knowing: the bridge no longer writes `STEER.md` (a `steer` command goes
+straight into the ledger, and the loop's drain reads both the ledger and whatever the file
+channel accumulated), and "applied" for a steer means *delivered into a turn's prompt*, not
+heeded, and not that its iteration was kept.
 
 ---
 

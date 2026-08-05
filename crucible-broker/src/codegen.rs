@@ -14,7 +14,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const RESULT_SENTINEL: &str = "___CRUCIBLE_RESULT___";
@@ -37,6 +37,19 @@ const LIMIT_ENV: &str = "CRUCIBLE_LM_EVAL_LIMIT";
 /// tick `activeDeadlineSeconds`.
 const QUEUE_SLACK: Duration = Duration::from_secs(1800);
 
+/// How long one benchmark/lm_eval/profile CALL blocks before degrading to a `pending` reply. The
+/// job itself keeps running on a detached worker (up to the Job deadline + [`QUEUE_SLACK`]); an
+/// identical re-issue re-attaches to it. The default sits well above typical Kueue admission so
+/// the common case still resolves inside a single call.
+fn call_wait_budget() -> Duration {
+    Duration::from_secs(env_u32("BROKER_CODEGEN_CALL_WAIT_SECONDS", 1200) as u64)
+}
+
+/// The next-step guidance a `pending` reply carries, so an agent doesn't invent sleep loops.
+const PENDING_HINT: &str = "the job keeps running server-side; re-issue this exact call to \
+    re-attach and keep waiting (a finished job replays from cache), or poll codegen_jobs / \
+    fetch_log meanwhile";
+
 /// GPU jobs remembered for `codegen_jobs`: the in-flight ones plus this many recent terminal ones,
 /// so the agent can correlate after a blocking call returns.
 const JOB_RING_CAP: usize = 20;
@@ -48,10 +61,64 @@ pub struct CodegenState {
     /// Digests this broker's own `build()` produced; measures refuse anything else, since the frozen
     /// command is no protection inside an agent-chosen image.
     built: Mutex<HashSet<String>>,
+    /// The durable tier under `memo`/`built`, which die with the pod.
+    steps: forge::steps::StepLedger,
     budget: Budget,
     logs: LogStore,
     /// The GPU jobs THIS broker submitted (a bounded ring), the only jobs `codegen_jobs` reports.
     jobs: Mutex<VecDeque<TrackedJob>>,
+    /// Measure/profile jobs a worker thread is still driving, keyed by memo key: an identical
+    /// re-issued call attaches here instead of submitting a duplicate Kueue job.
+    inflight: Mutex<HashMap<String, Arc<InflightJob>>>,
+}
+
+/// One detached measure/profile job between "the call stopped waiting" and "the worker collected
+/// the result". Waiters block on `done`; the worker memoizes a success BEFORE filling `reply` and
+/// removing the map entry, so an attach miss followed by a memo miss proves nothing is running.
+struct InflightJob {
+    job: String,
+    log: String,
+    reply: Mutex<Option<CodegenReply>>,
+    done: Condvar,
+}
+
+impl InflightJob {
+    fn new(job: String, log: String) -> Self {
+        Self {
+            job,
+            log,
+            reply: Mutex::new(None),
+            done: Condvar::new(),
+        }
+    }
+    fn finish(&self, reply: CodegenReply) {
+        if let Ok(mut slot) = self.reply.lock() {
+            *slot = Some(reply);
+        }
+        self.done.notify_all();
+    }
+    /// Wait up to `budget` for the worker's reply; a timeout degrades to `pending` naming the
+    /// live job and its log handle (the job keeps running).
+    fn wait(&self, budget: Duration) -> CodegenReply {
+        let poisoned = || CodegenReply::Error {
+            error: "in-flight job state poisoned".into(),
+        };
+        let Ok(guard) = self.reply.lock() else {
+            return poisoned();
+        };
+        let Ok((slot, _)) = self.done.wait_timeout_while(guard, budget, |r| r.is_none()) else {
+            return poisoned();
+        };
+        match &*slot {
+            Some(reply) => reply.clone(),
+            None => CodegenReply::Pending {
+                job: self.job.clone(),
+                log: self.log.clone(),
+                waited_secs: budget.as_secs(),
+                hint: PENDING_HINT,
+            },
+        }
+    }
 }
 
 /// One submitted GPU job as `codegen_jobs` remembers it. `result` flips from `None` (in flight)
@@ -68,7 +135,10 @@ struct TrackedJob {
     result: Option<JobResult>,
 }
 
-#[derive(Clone)]
+/// A settled result, memoized in-process and recorded in the step ledger. Only facts of the key
+/// live here: a crashed or timed-out job is never cached, so it re-runs.
+#[derive(Clone, Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 enum Cached {
     Build {
         digest: String,
@@ -86,18 +156,54 @@ enum Cached {
 
 impl CodegenState {
     pub fn new() -> Self {
+        Self::with_steps(crate::steps::ledger())
+    }
+
+    fn with_steps(steps: forge::steps::StepLedger) -> Self {
         Self {
             memo: Mutex::new(HashMap::new()),
             built: Mutex::new(HashSet::new()),
+            steps,
             budget: Budget::from_env(),
             logs: LogStore::from_env(),
             jobs: Mutex::new(VecDeque::new()),
+            inflight: Mutex::new(HashMap::new()),
         }
     }
-    fn get(&self, key: &str) -> Option<Cached> {
-        self.memo.lock().ok().and_then(|m| m.get(key).cloned())
+    fn inflight_get(&self, key: &str) -> Option<Arc<InflightJob>> {
+        self.inflight.lock().ok().and_then(|m| m.get(key).cloned())
     }
+    fn inflight_insert(&self, key: String, job: Arc<InflightJob>) {
+        if let Ok(mut m) = self.inflight.lock() {
+            m.insert(key, job);
+        }
+    }
+    fn inflight_remove(&self, key: &str) {
+        if let Ok(mut m) = self.inflight.lock() {
+            m.remove(key);
+        }
+    }
+    /// Memo first, then the ledger: a hit there is work a previous broker process finished, so it
+    /// is rehydrated into the memo (and into the provenance set, for a build) before it is served.
+    fn get(&self, key: &str) -> Option<Cached> {
+        if let Some(hit) = self.memo.lock().ok().and_then(|m| m.get(key).cloned()) {
+            return Some(hit);
+        }
+        let recorded: Cached = self.steps.lookup(&crate::steps::key(key))?;
+        if let Cached::Build { digest, .. } = &recorded {
+            self.mark_built(digest);
+        }
+        if let Ok(mut m) = self.memo.lock() {
+            m.insert(key.to_string(), recorded.clone());
+        }
+        Some(recorded)
+    }
+    /// Record before the memo: the caller consumes the value the moment this returns, and a
+    /// recorded step is what makes that consumption survive the pod.
     fn put(&self, key: String, val: Cached) {
+        if let Err(e) = self.steps.record(&crate::steps::key(key.clone()), &val) {
+            eprintln!("warning: recording step {key:?} failed: {e:#}");
+        }
         if let Ok(mut m) = self.memo.lock() {
             m.insert(key, val);
         }
@@ -107,8 +213,21 @@ impl CodegenState {
             s.insert(digest.to_string());
         }
     }
+    /// Ours if this process built it or the ledger says a broker did. Without the ledger
+    /// half, a restarted broker forces a rebuild before it will measure a pushed digest.
     fn is_built(&self, digest: &str) -> bool {
-        self.built.lock().is_ok_and(|s| s.contains(digest))
+        if self.built.lock().is_ok_and(|s| s.contains(digest)) {
+            return true;
+        }
+        let recorded = self
+            .steps
+            .scan::<Cached>(crate::steps::SCOPE)
+            .iter()
+            .any(|c| matches!(c, Cached::Build { digest: d, .. } if d == digest));
+        if recorded {
+            self.mark_built(digest);
+        }
+        recorded
     }
     fn record_job(&self, job: TrackedJob) {
         if let Ok(mut ring) = self.jobs.lock() {
@@ -165,6 +284,14 @@ pub enum CodegenReply {
         logs: Vec<String>,
         cached: bool,
     },
+    /// The call's wait budget ran out before the Kueue job resolved; the job is STILL running
+    /// server-side and an identical re-issue attaches to it rather than resubmitting.
+    Pending {
+        job: String,
+        log: String,
+        waited_secs: u64,
+        hint: &'static str,
+    },
     Unconfigured {
         reason: String,
     },
@@ -209,6 +336,8 @@ struct JobEnv {
     /// Output-only trace transport for profile jobs; NOT mounted on benchmark/lm_eval jobs (the
     /// measured jobs' spec stays minimal, and measurement inputs stay digest-only).
     artifacts: Option<ArtifactsPvc>,
+    /// The submitting pod as Job owner (GC of orphans); None for spokes/cross-namespace.
+    owner: Option<forge::measure_job::JobOwner>,
     /// The delegated spoke cluster, when BROKER_CODEGEN_KUBECONFIG is set. `None` = the ambient
     /// client, exactly as before.
     spoke: Option<SpokeEnv>,
@@ -270,6 +399,7 @@ impl JobEnv {
                 read_only: false,
             });
         }
+        let owner = owner_from_env(&namespace, spoke_from_env().is_some());
         Ok(Self {
             namespace,
             queue_name: env_or("BROKER_CODEGEN_QUEUE", "crucible-measure"),
@@ -287,6 +417,7 @@ impl JobEnv {
                 env_nonempty("BROKER_CODEGEN_ARTIFACTS_DIR"),
             ),
             spoke: spoke_from_env(),
+            owner,
         })
     }
 
@@ -297,6 +428,21 @@ impl JobEnv {
             .map(|s| s.target.clone())
             .unwrap_or_default()
     }
+}
+
+/// The submitting pod as a Job owner, so orphaned GPU jobs garbage-collect with the loop pod
+/// (a dead consumer must not keep a GPU busy). Only for hub-local jobs in the pod's OWN
+/// namespace: an ownerReference cannot cross clusters (spokes) or namespaces. Identity rides
+/// the downward-API env the renderer projects; absent env (older render, local run) = no owner,
+/// exactly the old behavior.
+fn owner_from_env(job_namespace: &str, spoke: bool) -> Option<forge::measure_job::JobOwner> {
+    if spoke {
+        return None;
+    }
+    let name = env_nonempty("CRUCIBLE_POD_NAME")?;
+    let uid = env_nonempty("CRUCIBLE_POD_UID")?;
+    let pod_namespace = env_nonempty("CRUCIBLE_POD_NAMESPACE")?;
+    (pod_namespace == job_namespace).then_some(forge::measure_job::JobOwner { name, uid })
 }
 
 /// A reachability-class submission failure on a delegated spoke becomes the typed
@@ -361,7 +507,7 @@ pub(crate) fn build(state: &CodegenState, mode: &str) -> String {
 }
 
 pub(crate) fn benchmark(
-    state: &CodegenState,
+    state: &Arc<CodegenState>,
     digest: &str,
     toggles: &[(String, String)],
     reps: Option<u32>,
@@ -369,11 +515,11 @@ pub(crate) fn benchmark(
     guard(|cfg| run_benchmark(state, cfg, digest, toggles, reps))
 }
 
-pub(crate) fn lm_eval(state: &CodegenState, digest: &str, limit: Option<u32>) -> String {
+pub(crate) fn lm_eval(state: &Arc<CodegenState>, digest: &str, limit: Option<u32>) -> String {
     guard(|cfg| run_lm_eval(state, cfg, digest, limit))
 }
 
-pub(crate) fn profile(state: &CodegenState, digest: &str) -> String {
+pub(crate) fn profile(state: &Arc<CodegenState>, digest: &str) -> String {
     guard(|cfg| run_profile(state, cfg, digest))
 }
 
@@ -879,7 +1025,7 @@ fn run_git(dir: &Path, index: &Path, args: &[&str]) -> Result<String, String> {
 }
 
 fn run_benchmark(
-    state: &CodegenState,
+    state: &Arc<CodegenState>,
     cfg: &ToolsConfig,
     digest: &str,
     toggles: &[(String, String)],
@@ -900,7 +1046,7 @@ fn run_benchmark(
 }
 
 fn run_lm_eval(
-    state: &CodegenState,
+    state: &Arc<CodegenState>,
     cfg: &ToolsConfig,
     digest: &str,
     limit: Option<u32>,
@@ -915,7 +1061,7 @@ fn run_lm_eval(
     }
 }
 
-fn run_profile(state: &CodegenState, cfg: &ToolsConfig, digest: &str) -> CodegenReply {
+fn run_profile(state: &Arc<CodegenState>, cfg: &ToolsConfig, digest: &str) -> CodegenReply {
     let Some(pcfg) = &cfg.profile else {
         return CodegenReply::Unconfigured {
             reason: "profile is not configured for this rig/scenario".into(),
@@ -930,7 +1076,7 @@ fn run_profile(state: &CodegenState, cfg: &ToolsConfig, digest: &str) -> Codegen
 /// Capture a GPU trace of a built candidate: same provenance gate, budget accounting, and Kueue job
 /// shape as a benchmark (profiling holds GPUs; it counts). Memoized on (digest, "profile").
 fn do_profile(
-    state: &CodegenState,
+    state: &Arc<CodegenState>,
     cfg: &ToolsConfig,
     pcfg: &ProfileCfg,
     digest: &str,
@@ -942,6 +1088,10 @@ fn do_profile(
         ));
     }
     let key = measure_key(digest, "profile", &[]);
+    // Attach before the memo check; same ordering contract as `measure`.
+    if let Some(entry) = state.inflight_get(&key) {
+        return Ok(entry.wait(call_wait_budget()));
+    }
     if let Some(Cached::Profile { trace, logs }) = state.get(&key) {
         return Ok(CodegenReply::Profiled {
             trace,
@@ -972,60 +1122,99 @@ fn do_profile(
         log: log_handle.clone(),
         result: None,
     });
-    let live = |snapshot: &str| {
-        let _ = std::fs::write(&log_path, snapshot);
-    };
-    // Two trace transports: the artifacts PVC (the job writes $OUT onto a volume the broker also
-    // mounts, the multi-MB path) or, unconfigured, base64 through the job log (small traces only,
-    // guarded by FALLBACK_TRACE_MAX_BYTES).
-    let run = match &env.artifacts {
-        Some(a) => {
-            let out_path = format!("{}/{}.{}", a.mount_path, name, pcfg.trace_ext);
-            let mounts = vec![PvcMount {
-                claim_name: a.claim_name.clone(),
-                mount_path: a.mount_path.clone(),
-                read_only: false,
-            }];
-            submit(
+    let worker_state = Arc::clone(state);
+    let worker_key = key.clone();
+    let pcfg = pcfg.clone();
+    let gpus = cfg.gpus;
+    let digest = digest.to_string();
+    let job_name = name.clone();
+    let handle = log_handle.clone();
+    let work = move || -> CodegenReply {
+        let live = |snapshot: &str| {
+            let _ = std::fs::write(&log_path, snapshot);
+        };
+        // Two trace transports: the artifacts PVC (the job writes $OUT onto a volume the broker
+        // also mounts, the multi-MB path) or, unconfigured, base64 through the job log (small
+        // traces only, guarded by FALLBACK_TRACE_MAX_BYTES).
+        let run = match &env.artifacts {
+            Some(a) => {
+                let out_path = format!("{}/{}.{}", a.mount_path, job_name, pcfg.trace_ext);
+                let mounts = vec![PvcMount {
+                    claim_name: a.claim_name.clone(),
+                    mount_path: a.mount_path.clone(),
+                    read_only: false,
+                }];
+                submit(
+                    &env.target(),
+                    &job_spec(
+                        &env,
+                        gpus,
+                        &digest,
+                        &job_name,
+                        &wrap_command_profile_pvc(&pcfg.command, &out_path),
+                        &[],
+                        &mounts,
+                    ),
+                    live,
+                )
+            }
+            None => submit(
                 &env.target(),
                 &job_spec(
                     &env,
-                    cfg.gpus,
-                    digest,
-                    &name,
-                    &wrap_command_profile_pvc(&pcfg.command, &out_path),
+                    gpus,
+                    &digest,
+                    &job_name,
+                    &wrap_command_profile(&pcfg.command, &pcfg.trace_ext),
                     &[],
-                    &mounts,
+                    &[],
                 ),
                 live,
-            )
-        }
-        None => submit(
-            &env.target(),
-            &job_spec(
-                &env,
-                cfg.gpus,
-                digest,
-                &name,
-                &wrap_command_profile(&pcfg.command, &pcfg.trace_ext),
-                &[],
-                &[],
             ),
-            live,
-        ),
+        };
+        let run = match run {
+            Ok(run) => run,
+            // A failed submission must not leave the tracked job "in flight" forever.
+            Err(e) => {
+                worker_state.finish_job(&job_name, JobResult::Failed);
+                return submit_failure_reply(env.spoke.as_ref(), e);
+            }
+        };
+        worker_state.finish_job(&job_name, run.result);
+        collect_profile(
+            &worker_state,
+            run,
+            &env,
+            &pcfg,
+            worker_key,
+            handle,
+            &job_name,
+            &digest,
+            gpus,
+            &token,
+        )
+        .unwrap_or_else(|error| CodegenReply::Error { error })
     };
-    let run = match run {
-        Ok(run) => run,
-        // A failed submission must not leave the tracked job "in flight" forever.
-        Err(e) => {
-            state.finish_job(&name, JobResult::Failed);
-            return Ok(submit_failure_reply(env.spoke.as_ref(), e));
-        }
-    };
-    state.finish_job(&name, run.result);
-    state
-        .budget
-        .record(&token, gpu_minutes(run.elapsed, cfg.gpus))?;
+    let entry = Arc::new(InflightJob::new(name, log_handle));
+    Ok(detach_and_wait(state, key, entry, call_wait_budget(), work))
+}
+
+/// The post-terminal tail of a profile job: budget accounting, trace collection over whichever
+/// transport, memoization. Memo-before-map-removal, same as [`collect_measure`].
+#[allow(clippy::too_many_arguments)]
+fn collect_profile(
+    state: &CodegenState,
+    run: GpuJobRun,
+    env: &JobEnv,
+    pcfg: &ProfileCfg,
+    key: String,
+    log_handle: String,
+    name: &str,
+    digest: &str,
+    gpus: u32,
+    token: &str,
+) -> Result<CodegenReply, String> {
+    state.budget.record(token, gpu_minutes(run.elapsed, gpus))?;
     state.logs.overwrite(&log_handle, run.logs.as_bytes())?;
 
     if run.result != JobResult::Succeeded {
@@ -1086,8 +1275,45 @@ impl MeasureKind {
     }
 }
 
+/// Run `work` (a submitted GPU job driven to a terminal state) on a detached worker thread,
+/// waiting up to the call budget for its reply. On budget exhaustion the caller gets `pending`
+/// and the worker keeps going: a success lands in the memo (written inside `work`, before the
+/// entry leaves the map) so a later identical call replays it; an identical call that arrives
+/// while the worker is still driving attaches to `entry` instead of resubmitting.
+fn detach_and_wait(
+    state: &Arc<CodegenState>,
+    key: String,
+    entry: Arc<InflightJob>,
+    wait: Duration,
+    work: impl FnOnce() -> CodegenReply + Send + 'static,
+) -> CodegenReply {
+    state.inflight_insert(key.clone(), entry.clone());
+    let worker_state = Arc::clone(state);
+    let worker_entry = Arc::clone(&entry);
+    let worker_key = key.clone();
+    let spawned = std::thread::Builder::new()
+        .name(format!("codegen-{}", entry.job))
+        .spawn(move || {
+            let reply = work();
+            worker_entry.finish(reply);
+            worker_state.inflight_remove(&worker_key);
+        });
+    match spawned {
+        Ok(_) => entry.wait(wait),
+        // Spawn failure (resource exhaustion) drops `work` unsubmitted: unwind the tracking so
+        // nothing looks in flight forever.
+        Err(e) => {
+            state.finish_job(&entry.job, JobResult::Failed);
+            state.inflight_remove(&key);
+            CodegenReply::Error {
+                error: format!("spawning the measure worker thread: {e}"),
+            }
+        }
+    }
+}
+
 fn measure(
-    state: &CodegenState,
+    state: &Arc<CodegenState>,
     cfg: &ToolsConfig,
     digest: &str,
     kind: MeasureKind,
@@ -1125,6 +1351,11 @@ fn measure(
         }
     };
 
+    // Attach BEFORE the memo check: the worker memoizes before its entry leaves the map, so this
+    // lookup order can't lose a result that lands between the two.
+    if let Some(entry) = state.inflight_get(&key) {
+        return Ok(entry.wait(call_wait_budget()));
+    }
     if let Some(Cached::Measure { metrics, logs }) = state.get(&key) {
         return Ok(CodegenReply::Measured {
             metrics,
@@ -1154,62 +1385,103 @@ fn measure(
         log: handle.clone(),
         result: None,
     });
-    let run = match submit(
-        &env.target(),
-        &job_spec(
-            &env,
-            cfg.gpus,
-            digest,
-            &name,
-            &wrap_command(&command),
-            &kwarg_env,
-            &[],
-        ),
-        |snapshot| {
-            let _ = std::fs::write(&log_path, snapshot);
-        },
-    ) {
-        Ok(run) => run,
-        // A failed submission must not leave the tracked job "in flight" forever.
-        Err(e) => {
-            state.finish_job(&name, JobResult::Failed);
-            return Ok(submit_failure_reply(env.spoke.as_ref(), e));
-        }
+    let tail = MeasureTail {
+        key: key.clone(),
+        log_handle: handle.clone(),
+        objective,
+        output_len: cfg.benchmark.output_len,
+        num_prompts: cfg.benchmark.num_prompts,
+        gpus: cfg.gpus,
+        token,
     };
-    state.finish_job(&name, run.result);
+    let worker_state = Arc::clone(state);
+    let digest = digest.to_string();
+    let job_name = name.clone();
+    let work = move || -> CodegenReply {
+        let run = match submit(
+            &env.target(),
+            &job_spec(
+                &env,
+                tail.gpus,
+                &digest,
+                &job_name,
+                &wrap_command(&command),
+                &kwarg_env,
+                &[],
+            ),
+            |snapshot| {
+                let _ = std::fs::write(&log_path, snapshot);
+            },
+        ) {
+            Ok(run) => run,
+            // A failed submission must not leave the tracked job "in flight" forever.
+            Err(e) => {
+                worker_state.finish_job(&job_name, JobResult::Failed);
+                return submit_failure_reply(env.spoke.as_ref(), e);
+            }
+        };
+        worker_state.finish_job(&job_name, run.result);
+        collect_measure(&worker_state, run, &kind, tail)
+            .unwrap_or_else(|error| CodegenReply::Error { error })
+    };
+    let entry = Arc::new(InflightJob::new(name, handle));
+    Ok(detach_and_wait(state, key, entry, call_wait_budget(), work))
+}
+
+/// What the detached worker needs beyond the run itself, owned: the tool call that submitted the
+/// job may have returned `pending` long before this tail runs.
+struct MeasureTail {
+    key: String,
+    log_handle: String,
+    objective: Objective,
+    output_len: u64,
+    num_prompts: u64,
+    gpus: u32,
+    token: String,
+}
+
+/// The post-terminal tail of a measure job: budget accounting, final log capture, result parsing,
+/// memoization. A memo write here happens before the worker's inflight entry is removed (see
+/// [`detach_and_wait`]).
+fn collect_measure(
+    state: &CodegenState,
+    run: GpuJobRun,
+    kind: &MeasureKind,
+    tail: MeasureTail,
+) -> Result<CodegenReply, String> {
     state
         .budget
-        .record(&token, gpu_minutes(run.elapsed, cfg.gpus))?;
-    state.logs.overwrite(&handle, run.logs.as_bytes())?;
+        .record(&tail.token, gpu_minutes(run.elapsed, tail.gpus))?;
+    state
+        .logs
+        .overwrite(&tail.log_handle, run.logs.as_bytes())?;
 
     if run.result != JobResult::Succeeded {
         return Ok(CodegenReply::JobFailed {
             reason: job_failure_reason(run.result),
-            logs: vec![handle],
+            logs: vec![tail.log_handle],
         });
     }
     let value = parse_result_json(&run.logs).map_err(|e| format!("parsing result JSON: {e}"))?;
-    let metrics = match &kind {
-        MeasureKind::Benchmark { .. } => {
-            bench_metrics(&value, cfg.benchmark.output_len, cfg.benchmark.num_prompts)?
-        }
+    let metrics = match kind {
+        MeasureKind::Benchmark { .. } => bench_metrics(&value, tail.output_len, tail.num_prompts)?,
         MeasureKind::LmEval { .. } => {
-            let score = extract_score(&value, &objective.key)?;
-            BTreeMap::from([(objective.key.clone(), score)])
+            let score = extract_score(&value, &tail.objective.key)?;
+            BTreeMap::from([(tail.objective.key.clone(), score)])
         }
     };
 
     state.put(
-        key,
+        tail.key,
         Cached::Measure {
             metrics: metrics.clone(),
-            logs: vec![handle.clone()],
+            logs: vec![tail.log_handle.clone()],
         },
     );
     Ok(CodegenReply::Measured {
         metrics,
-        objective,
-        logs: vec![handle],
+        objective: tail.objective,
+        logs: vec![tail.log_handle],
         cached: false,
     })
 }
@@ -1246,6 +1518,7 @@ fn job_spec(
         active_deadline_seconds: env.active_deadline_seconds,
         ttl_seconds: env.ttl_seconds,
         pvc_mounts,
+        owner: env.owner.clone(),
     }
 }
 
@@ -1319,6 +1592,8 @@ pub fn spoke_smoke(opts: &SpokeSmoke) -> Result<Value, String> {
         active_deadline_seconds: opts.deadline_secs.max(1),
         ttl_seconds: 600,
         pvc_mounts: Vec::new(),
+        // A spoke job: the hub pod's UID means nothing on the target cluster.
+        owner: None,
     };
     eprintln!(
         "submitting spoke smoke Job {name} to {} (namespace {}, queue {})",
@@ -1869,6 +2144,18 @@ mod tests {
         overlay.finalize(2).unwrap()
     }
 
+    /// A state whose step ledger is a fresh temp dir, so a unit test never reads or writes the
+    /// shared build volume (and two tests can never replay each other's steps).
+    fn test_state() -> Arc<CodegenState> {
+        Arc::new(CodegenState::with_steps(forge::steps::StepLedger::new(
+            &steps_dir(),
+        )))
+    }
+
+    fn steps_dir() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("codegen-steps-{}-{}", std::process::id(), nonce()))
+    }
+
     fn temp_budget(max_calls: u32, max_gpu_minutes: f64) -> (Budget, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
             "codegen-budget-test-{}-{}",
@@ -1980,7 +2267,7 @@ mod tests {
         if std::env::var("BROKER_CODEGEN").is_ok() {
             return;
         }
-        let st = CodegenState::new();
+        let st = test_state();
         assert!(build(&st, "derive").contains(r#""status":"disabled""#));
         assert!(benchmark(&st, "repo@sha256:x", &[], None).contains(r#""status":"disabled""#));
         assert!(lm_eval(&st, "repo@sha256:x", None).contains(r#""status":"disabled""#));
@@ -2089,7 +2376,7 @@ mod tests {
     fn build_errors_when_the_tree_cannot_be_hashed() {
         // No live sandbox and no workdir env in the test process, so the build must error out
         // naming the missing key, never proceed with fabricated provenance.
-        let st = CodegenState::new();
+        let st = test_state();
         let err = build_inner(&st, &bench_cfg(), BuildMode::Derive).unwrap_err();
         assert!(err.contains("BROKER_SANDBOX_WORKDIR"), "{err}");
         assert!(err.contains("BROKER_CODEGEN_SANDBOX_WORKDIR"), "{err}");
@@ -2097,7 +2384,7 @@ mod tests {
 
     #[test]
     fn measure_rejects_a_digest_this_broker_did_not_build() {
-        let st = CodegenState::new();
+        let st = test_state();
         let cfg = bench_cfg();
         let reply = run_benchmark(&st, &cfg, "ghcr.io/evil/img@sha256:beef", &[], None);
         match reply {
@@ -2115,7 +2402,7 @@ mod tests {
 
     #[test]
     fn undeclared_kwarg_is_rejected_before_any_side_effect() {
-        let st = CodegenState::new();
+        let st = test_state();
         let cfg = bench_cfg();
         // lm_eval's `limit` is not declared in the fixture.
         let reply = run_lm_eval(&st, &cfg, "repo@sha256:x", Some(100));
@@ -2138,7 +2425,7 @@ mod tests {
 
     #[test]
     fn memo_replays_a_measure_and_a_build() {
-        let st = CodegenState::new();
+        let st = test_state();
         let mkey = measure_key("d", "benchmark", &[]);
         st.put(
             mkey.clone(),
@@ -2167,6 +2454,86 @@ mod tests {
             }
             _ => panic!("expected a cached build"),
         }
+    }
+
+    /// The pod died between the build and the measure. A new process shares nothing in memory
+    /// with the old one, so the ledger is the only thing that can replay the digest and the
+    /// completed measure instead of repaying both.
+    #[test]
+    fn a_restarted_broker_replays_recorded_steps() {
+        let dir = steps_dir();
+        let bkey = build_key("treehash", BuildMode::Derive, &bench_cfg().build);
+        let mkey = measure_key("repo@sha256:x", "benchmark", &[]);
+        {
+            let dead = CodegenState::with_steps(forge::steps::StepLedger::new(&dir));
+            dead.put(
+                bkey.clone(),
+                Cached::Build {
+                    digest: "repo@sha256:x".into(),
+                    log: "build-x-1.log".into(),
+                },
+            );
+            dead.mark_built("repo@sha256:x");
+            dead.put(
+                mkey.clone(),
+                Cached::Measure {
+                    metrics: BTreeMap::from([("tpot_ms".into(), 9.1)]),
+                    logs: vec!["bench-x-1.log".into()],
+                },
+            );
+        }
+        let fresh = CodegenState::with_steps(forge::steps::StepLedger::new(&dir));
+        match fresh.get(&bkey) {
+            Some(Cached::Build { digest, log }) => {
+                assert_eq!(digest, "repo@sha256:x");
+                assert_eq!(log, "build-x-1.log");
+            }
+            _ => panic!("expected the recorded build"),
+        }
+        match fresh.get(&mkey) {
+            Some(Cached::Measure { metrics, logs }) => {
+                assert_eq!(metrics["tpot_ms"], 9.1);
+                assert_eq!(logs, vec!["bench-x-1.log".to_string()]);
+            }
+            _ => panic!("expected the recorded measure"),
+        }
+        // Serving a recorded build also restores its provenance, so the memo hit and the ledger
+        // hit leave the state in the same place.
+        assert!(fresh.is_built("repo@sha256:x"));
+    }
+
+    /// The provenance gate reads the ledger directly: an agent that kept a digest across a broker
+    /// restart can measure it without a pointless rebuild.
+    #[test]
+    fn is_built_accepts_a_digest_only_the_ledger_knows() {
+        let dir = steps_dir();
+        CodegenState::with_steps(forge::steps::StepLedger::new(&dir)).put(
+            build_key("treehash", BuildMode::Derive, &bench_cfg().build),
+            Cached::Build {
+                digest: "repo@sha256:x".into(),
+                log: "build-x-1.log".into(),
+            },
+        );
+        let fresh = CodegenState::with_steps(forge::steps::StepLedger::new(&dir));
+        assert!(fresh.is_built("repo@sha256:x"));
+        assert!(!fresh.is_built("ghcr.io/evil/img@sha256:beef"));
+    }
+
+    /// Two different runs' records coexist under content keys; neither can serve the other.
+    #[test]
+    fn a_changed_content_key_is_a_ledger_miss() {
+        let st = test_state();
+        st.put(
+            build_key("tree-a", BuildMode::Derive, &bench_cfg().build),
+            Cached::Build {
+                digest: "repo@sha256:a".into(),
+                log: "build-a-1.log".into(),
+            },
+        );
+        assert!(
+            st.get(&build_key("tree-b", BuildMode::Derive, &bench_cfg().build))
+                .is_none()
+        );
     }
 
     #[test]
@@ -2329,7 +2696,7 @@ mod tests {
     #[test]
     fn profile_without_a_configured_section_is_a_readable_rejection() {
         // bench_cfg has no [tools.profile]: the call is UNCONFIGURED rather than an error/config failure.
-        let st = CodegenState::new();
+        let st = test_state();
         let reply = run_profile(&st, &bench_cfg(), "repo@sha256:x");
         match reply {
             CodegenReply::Unconfigured { reason } => {
@@ -2341,7 +2708,7 @@ mod tests {
 
     #[test]
     fn profile_rejects_a_digest_this_broker_did_not_build() {
-        let st = CodegenState::new();
+        let st = test_state();
         let reply = run_profile(&st, &profile_cfg(), "ghcr.io/evil/img@sha256:beef");
         match reply {
             CodegenReply::Error { error } => {
@@ -2476,6 +2843,7 @@ mod tests {
             shm_size_gi: 16,
             active_deadline_seconds: 5400,
             ttl_seconds: 86400,
+            owner: None,
             pvc_mounts: vec![PvcMount {
                 claim_name: "model-cache".into(),
                 mount_path: "/models".into(),
@@ -2588,7 +2956,7 @@ mod tests {
 
     #[test]
     fn profile_memo_replays_a_captured_trace() {
-        let st = CodegenState::new();
+        let st = test_state();
         let key = measure_key("d", "profile", &[]);
         st.put(
             key.clone(),
@@ -2649,7 +3017,7 @@ mod tests {
 
     #[test]
     fn job_ring_records_at_submit_bounds_and_marks_terminal() {
-        let st = CodegenState::new();
+        let st = test_state();
         for i in 0..JOB_RING_CAP + 5 {
             st.record_job(tracked(&format!("crucible-bench-{i}"), "bench", None));
         }
@@ -3024,5 +3392,100 @@ mod tests {
         assert_eq!(hex_token("deadbeef  -"), "deadbeef");
         assert_eq!(short_hint("repo@sha256:abcdef123456"), "abcdef123456");
         assert_eq!(short_hint(":::"), "x");
+    }
+
+    fn measured_fixture() -> CodegenReply {
+        CodegenReply::Measured {
+            metrics: BTreeMap::from([("tpot_ms".into(), 9.1)]),
+            objective: Objective {
+                key: "tpot_ms".into(),
+                direction: Direction::Lower,
+            },
+            logs: vec!["bench-d-1.log".into()],
+            cached: false,
+        }
+    }
+
+    #[test]
+    fn pending_reply_serializes_with_a_status_tag() {
+        let pending = json_reply(&CodegenReply::Pending {
+            job: "crucible-bench-42".into(),
+            log: "bench-d-1.log".into(),
+            waited_secs: 1200,
+            hint: PENDING_HINT,
+        });
+        assert!(pending.contains(r#""status":"pending""#), "{pending}");
+        assert!(pending.contains(r#""job":"crucible-bench-42""#));
+        assert!(pending.contains(r#""log":"bench-d-1.log""#));
+        assert!(pending.contains("re-issue"), "{pending}");
+    }
+
+    #[test]
+    fn inflight_wait_degrades_to_pending_then_hands_over_the_reply() {
+        let entry = Arc::new(InflightJob::new(
+            "crucible-bench-1".into(),
+            "bench-d-1.log".into(),
+        ));
+        // Budget exhausted before the worker finishes: pending, naming the live job + log.
+        match entry.wait(Duration::from_millis(1)) {
+            CodegenReply::Pending { job, log, .. } => {
+                assert_eq!(job, "crucible-bench-1");
+                assert_eq!(log, "bench-d-1.log");
+            }
+            other => panic!("expected pending, got {other:?}"),
+        }
+        // The worker resolves; a waiter already blocked on the condvar gets the terminal reply.
+        let worker_entry = entry.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            worker_entry.finish(measured_fixture());
+        });
+        assert_eq!(entry.wait(Duration::from_secs(10)), measured_fixture());
+        t.join().unwrap();
+        // A late attach finds the reply already in the slot without waiting.
+        assert_eq!(entry.wait(Duration::ZERO), measured_fixture());
+    }
+
+    #[test]
+    fn detach_and_wait_returns_pending_and_the_reissue_attaches() {
+        let st = Arc::new(CodegenState::new());
+        let key = measure_key("repo@sha256:d", "benchmark", &[]);
+        let entry = Arc::new(InflightJob::new(
+            "crucible-bench-7".into(),
+            "bench-d-1.log".into(),
+        ));
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let worker_st = st.clone();
+        let worker_key = key.clone();
+        let reply = detach_and_wait(&st, key.clone(), entry, Duration::ZERO, move || {
+            // Blocks until the test releases it, standing in for a queued Kueue job; memoize
+            // before returning, like the real workers do.
+            rx.recv().ok();
+            worker_st.put(
+                worker_key,
+                Cached::Measure {
+                    metrics: BTreeMap::from([("tpot_ms".into(), 9.1)]),
+                    logs: vec!["bench-d-1.log".into()],
+                },
+            );
+            measured_fixture()
+        });
+        assert!(
+            matches!(reply, CodegenReply::Pending { .. }),
+            "zero budget must degrade to pending, got {reply:?}"
+        );
+        // A re-issue while the job runs attaches to the same worker instead of resubmitting.
+        let attached = st.inflight_get(&key).expect("entry stays in the map");
+        tx.send(()).unwrap();
+        assert_eq!(attached.wait(Duration::from_secs(10)), measured_fixture());
+        // Memo-before-removal: once the entry leaves the map the memo must already hold the
+        // result, so an attach miss + memo miss can't lose a finished job.
+        while st.inflight_get(&key).is_some() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            matches!(st.get(&key), Some(Cached::Measure { .. })),
+            "memo must be written before the inflight entry is removed"
+        );
     }
 }

@@ -39,3 +39,6 @@
   - [ADR 0019: The loop pod stops being a container host — OpenShell's Kubernetes driver](./adr/0019-openshell-kubernetes-driver.md)
   - [ADR 0020: Candidate build modes — how a proposal becomes a measured artifact](./adr/0020-candidate-build-modes.md)
   - [ADR 0022: Measure task DAGs — the engine walks the ladder](./adr/0022-measure-task-dags.md)
+  - [ADR 0023: Recovery classification for `--resume`](./adr/0023-recovery-classification.md)
+  - [ADR 0024: Admission ledger for external inputs](./adr/0024-admission-ledger.md)
+  - [ADR 0025: Durable tool steps for broker builds and measures](./adr/0025-durable-tool-steps.md)

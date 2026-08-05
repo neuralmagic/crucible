@@ -43,6 +43,18 @@ pub struct GpuJobSpec {
     pub active_deadline_seconds: i64,
     pub ttl_seconds: i32,
     pub pvc_mounts: Vec<PvcMount>,
+    /// Owner the Job is garbage-collected with, normally the submitting loop pod: a job whose
+    /// consumer died is a GPU burning for nobody (an orphaned sanitizer once held an H200 for
+    /// 90 minutes). `None` for cross-cluster (spoke) or cross-namespace submits, where an
+    /// ownerReference is impossible.
+    pub owner: Option<JobOwner>,
+}
+
+/// The same-namespace pod a measure Job is owned by (`kind: Pod`, `controller: false`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobOwner {
+    pub name: String,
+    pub uid: String,
 }
 
 /// A driven Job's terminal state, captured logs, and the wall-clock it held resources for.
@@ -162,6 +174,18 @@ fn render_gpu_job(spec: &GpuJobSpec) -> Job {
             name: Some(spec.name.clone()),
             namespace: Some(spec.namespace.clone()),
             labels: Some(labels.clone()),
+            owner_references: spec.owner.as_ref().map(|o| {
+                vec![
+                    k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+                        api_version: "v1".to_string(),
+                        kind: "Pod".to_string(),
+                        name: o.name.clone(),
+                        uid: o.uid.clone(),
+                        controller: Some(false),
+                        block_owner_deletion: Some(false),
+                    },
+                ]
+            }),
             ..Default::default()
         },
         spec: Some(JobSpec {
@@ -295,6 +319,7 @@ mod tests {
             shm_size_gi: 16,
             active_deadline_seconds: 5400,
             ttl_seconds: 86400,
+            owner: None,
             pvc_mounts: vec![
                 PvcMount {
                     claim_name: "model-cache".into(),
@@ -328,6 +353,28 @@ mod tests {
         assert_eq!(
             tmpl_labels.get(KUEUE_QUEUE_LABEL).map(String::as_str),
             Some("crucible-measure")
+        );
+    }
+
+    /// An owner makes the Job garbage-collect with its submitting pod (a dead consumer must not
+    /// keep a GPU busy); no owner (spoke/cross-namespace submits) renders no ownerReferences.
+    #[test]
+    fn owner_renders_a_pod_owner_reference() {
+        let mut with = spec();
+        with.owner = Some(JobOwner {
+            name: "deepgemm-loop".into(),
+            uid: "abc-123".into(),
+        });
+        let refs = render_gpu_job(&with).metadata.owner_references.unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].kind, "Pod");
+        assert_eq!(refs[0].name, "deepgemm-loop");
+        assert_eq!(refs[0].uid, "abc-123");
+        assert_eq!(refs[0].controller, Some(false));
+
+        assert!(
+            render_gpu_job(&spec()).metadata.owner_references.is_none(),
+            "no owner => no ownerReferences"
         );
     }
 

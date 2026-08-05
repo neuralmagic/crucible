@@ -22,6 +22,7 @@
 //! - Ctrl+C never just dies: it stops cleanly after the current step and prints a summary. Headless offers a steer/quit prompt.
 //! - Steering: drop guidance in STEER.md (or via the prompt) and it is injected into the next iteration's prompt, the lever for when the agent goes off the rails.
 
+mod admission;
 mod agent;
 mod agent_session;
 mod broker;
@@ -51,6 +52,7 @@ mod provisioning;
 mod ps;
 mod publish;
 mod rank_grounded;
+mod recovery;
 mod refine;
 mod relay;
 mod reporter;
@@ -686,6 +688,9 @@ pub(crate) struct Paths {
     /// Pending-provisioning marker the agent writes when it has an open approval to wait on; the loop
     /// detects it after a turn and parks or continues per its `mode`.
     pub provisioning: PathBuf,
+    /// Append-only NDJSON record of every external input, authoritative over the session
+    /// log for what an operator asked for; a resume replays it.
+    pub admissions: PathBuf,
 }
 
 impl Paths {
@@ -703,6 +708,7 @@ impl Paths {
             steer: manifest_dir.join("STEER.md"),
             session_log: state.join("session.jsonl"),
             control: state.join("control.json"),
+            admissions: state.join("admissions.jsonl"),
             escalation,
             provisioning,
             state,
@@ -718,6 +724,9 @@ impl Paths {
             state: worktree.join("state"),
             session_log: worktree.join("state/session.jsonl"),
             control: worktree.join("state/control.json"),
+            // An isolated task worktree takes no external input; the path exists only so
+            // `Paths` stays one shape.
+            admissions: worktree.join("state/admissions.jsonl"),
             escalation: worktree.join("ESCALATION.json"),
             provisioning: worktree.join("PROVISIONING_PENDING.json"),
             workspace: worktree,
@@ -741,6 +750,9 @@ pub(crate) struct Prepared {
     pub identity: identity::RunIdentity,
     /// `[judge].skip_baseline`: baseline (and re-scope re-baseline) snapshots only, no measure.
     pub skip_baseline: bool,
+    /// `[agent].seed_diff` content, handed to iteration 1's prompt as labeled seed material (its
+    /// content hash rides `identity.seed_hash`). `None` = an unseeded run.
+    pub seed_diff: Option<String>,
 }
 
 fn main() -> Result<()> {

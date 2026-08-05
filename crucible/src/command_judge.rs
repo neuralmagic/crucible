@@ -33,6 +33,8 @@ struct MeasureOut {
     #[serde(default)]
     score: Option<f64>,
     #[serde(default)]
+    tiebreak: Option<f64>,
+    #[serde(default)]
     solved: bool,
     #[serde(default)]
     note: Option<String>,
@@ -44,6 +46,10 @@ pub struct CommandJudge {
     pub workspace: PathBuf,
     pub measure_cmd: String,
     pub direction: Direction,
+    /// Which way the secondary `tiebreak` scalar improves. `None` inherits `direction`,
+    /// so a pack only declares it when the two axes disagree (a pass/fail primary that is
+    /// lower-is-better with a higher-is-better throughput tiebreak).
+    pub tiebreak_direction: Option<Direction>,
     pub objective: String,
     /// Frozen judge files (absolute `src`, `dst`) re-copied before each scored measure so a candidate
     /// can't edit the gate (a tuning harness, a regression test) to game it. Empty for most domains.
@@ -97,6 +103,7 @@ impl CommandJudge {
         Ok(Reading {
             valid,
             score: parsed.score,
+            tiebreak: parsed.tiebreak,
             solved: parsed.solved,
             note: parsed.note.unwrap_or_else(|| match parsed.score {
                 Some(s) => format!("{} = {s}", self.objective),
@@ -112,7 +119,7 @@ impl Judge for CommandJudge {
         self.run_measure(ctx)
     }
 
-    fn decide(&self, r: &Reading, best_score: f64) -> Decision {
+    fn decide(&self, r: &Reading, best_score: f64, best_tiebreak: Option<f64>) -> Decision {
         // Universal rule: keep a valid candidate that either strictly beats best by direction
         // OR the measure command declared `solved`. The win condition is the whole point, so a
         // domain whose win lands at an *equal* score must still be kept and terminate the loop
@@ -123,7 +130,20 @@ impl Judge for CommandJudge {
             .score
             .map(|s| self.direction.better(s, best_score))
             .unwrap_or(false);
-        let keep = r.valid && r.score.is_some() && (better || r.solved);
+        // Lexicographic fallback for functional gates: on an exact primary tie, a candidate
+        // reporting a strictly better `tiebreak` still keeps. A missing best tiebreak counts
+        // as the worst (the kept best never declared one, so any declared value beats it);
+        // a candidate without one falls through to the plain strictly-better rule.
+        let tie_break_better = r.score == Some(best_score)
+            && r.tiebreak.is_some_and(|t| {
+                let dir = self.tiebreak_direction.unwrap_or(self.direction);
+                let best = best_tiebreak.unwrap_or(match dir {
+                    Direction::Lower => f64::INFINITY,
+                    Direction::Higher => f64::NEG_INFINITY,
+                });
+                dir.better(t, best)
+            });
+        let keep = r.valid && r.score.is_some() && (better || tie_break_better || r.solved);
         Decision {
             keep,
             solved: keep && r.solved,
@@ -168,6 +188,7 @@ mod tests {
             workspace: PathBuf::from("/tmp"),
             measure_cmd: String::new(),
             direction: dir,
+            tiebreak_direction: None,
             objective: "score".into(),
             frozen_injects: Vec::new(),
         }
@@ -182,13 +203,22 @@ mod tests {
         }
     }
 
+    fn reading_tb(score: f64, tiebreak: Option<f64>) -> Reading {
+        Reading {
+            valid: true,
+            score: Some(score),
+            tiebreak,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn lower_keeps_strictly_smaller() {
         let j = judge(Direction::Lower);
-        assert!(j.decide(&reading(true, 10.0, false), 20.0).keep);
-        assert!(!j.decide(&reading(true, 20.0, false), 20.0).keep);
+        assert!(j.decide(&reading(true, 10.0, false), 20.0, None).keep);
+        assert!(!j.decide(&reading(true, 20.0, false), 20.0, None).keep);
         assert!(
-            !j.decide(&reading(false, 1.0, false), 20.0).keep,
+            !j.decide(&reading(false, 1.0, false), 20.0, None).keep,
             "invalid never keeps"
         );
     }
@@ -196,10 +226,10 @@ mod tests {
     #[test]
     fn higher_keeps_strictly_larger_and_passes_solved() {
         let j = judge(Direction::Higher);
-        let d = j.decide(&reading(true, 5.0, true), 4.0);
+        let d = j.decide(&reading(true, 5.0, true), 4.0, None);
         assert!(d.keep && d.solved, "better + solved -> kept + solved");
         // A plain (unsolved) candidate that isn't strictly better is dropped.
-        let d = j.decide(&reading(true, 3.0, false), 4.0);
+        let d = j.decide(&reading(true, 3.0, false), 4.0, None);
         assert!(!d.keep && !d.solved);
     }
 
@@ -208,11 +238,70 @@ mod tests {
         // The test-gate case: a win lands at a score that doesn't strictly beat best
         // (green suite == 0 failures == baseline's 0). `solved` must still keep + terminate.
         let lo = judge(Direction::Lower);
-        let d = lo.decide(&reading(true, 0.0, true), 0.0);
+        let d = lo.decide(&reading(true, 0.0, true), 0.0, None);
         assert!(d.keep && d.solved, "solved at an equal score is kept");
         // Solved never rescues an invalid reading, though.
-        let d = lo.decide(&reading(false, 0.0, true), 0.0);
+        let d = lo.decide(&reading(false, 0.0, true), 0.0, None);
         assert!(!d.keep && !d.solved, "invalid never keeps, solved or not");
+    }
+
+    #[test]
+    fn primary_tie_keeps_on_strictly_better_tiebreak() {
+        // The functional-gate case: every passing candidate scores 0.0, so the secondary
+        // scalar is the only gradient. Tiebreak direction inherits the judge's (lower).
+        let j = judge(Direction::Lower);
+        let d = j.decide(&reading_tb(0.0, Some(10.0)), 0.0, Some(12.0));
+        assert!(d.keep, "tie + better tiebreak keeps");
+        // The kept best never declared a tiebreak: any declared value beats absent.
+        assert!(j.decide(&reading_tb(0.0, Some(10.0)), 0.0, None).keep);
+    }
+
+    #[test]
+    fn primary_tie_discards_on_worse_or_absent_tiebreak() {
+        let j = judge(Direction::Lower);
+        assert!(
+            !j.decide(&reading_tb(0.0, Some(12.0)), 0.0, Some(10.0)).keep,
+            "tie + worse tiebreak discards"
+        );
+        assert!(
+            !j.decide(&reading_tb(0.0, Some(10.0)), 0.0, Some(10.0)).keep,
+            "tie on both axes discards"
+        );
+        assert!(
+            !j.decide(&reading_tb(0.0, None), 0.0, Some(10.0)).keep,
+            "tie with no candidate tiebreak behaves as before: discard"
+        );
+        assert!(
+            !j.decide(&reading_tb(0.0, None), 0.0, None).keep,
+            "no tiebreak anywhere: today's behavior exactly"
+        );
+    }
+
+    #[test]
+    fn strictly_better_primary_keeps_regardless_of_tiebreak() {
+        let j = judge(Direction::Lower);
+        assert!(j.decide(&reading_tb(1.0, Some(99.0)), 2.0, Some(0.0)).keep);
+        // And a strictly worse primary never keeps, however good the tiebreak.
+        assert!(!j.decide(&reading_tb(3.0, Some(0.0)), 2.0, Some(99.0)).keep);
+    }
+
+    #[test]
+    fn declared_tiebreak_direction_overrides_the_judges() {
+        // Lower-is-better primary (failures) with a higher-is-better tiebreak (throughput).
+        let mut j = judge(Direction::Lower);
+        j.tiebreak_direction = Some(Direction::Higher);
+        assert!(
+            j.decide(&reading_tb(0.0, Some(200.0)), 0.0, Some(100.0))
+                .keep
+        );
+        assert!(
+            !j.decide(&reading_tb(0.0, Some(50.0)), 0.0, Some(100.0))
+                .keep
+        );
+        // An invalid reading never keeps, tiebreak or not.
+        let mut r = reading_tb(0.0, Some(200.0));
+        r.valid = false;
+        assert!(!j.decide(&r, 0.0, Some(100.0)).keep);
     }
 
     #[test]

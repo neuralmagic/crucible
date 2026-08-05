@@ -25,3 +25,6 @@ Expand this section in the sidebar to browse the full list.
 | [0019](./0019-openshell-kubernetes-driver.md) | The loop pod stops being a container host, OpenShell's Kubernetes driver | Partially implemented |
 | [0020](./0020-candidate-build-modes.md) | Candidate build modes, how a proposal becomes a measured artifact | Proposed |
 | [0022](./0022-measure-task-dags.md) | Measure task DAGs, the engine walks the ladder | Proposed |
+| [0023](./0023-recovery-classification.md) | Recovery classification for `--resume` | Implemented |
+| [0024](./0024-admission-ledger.md) | Admission ledger for external inputs | Implemented |
+| [0025](./0025-durable-tool-steps.md) | Durable tool steps for broker builds and measures | Implemented |

@@ -36,6 +36,23 @@ fn hash_injects(injects: &[(PathBuf, PathBuf, bool)]) -> Result<String> {
     Ok(fnv1a_hex(&refs))
 }
 
+/// Hash the `[agent].seed_diff` content, empty when the manifest declares none. A declared seed
+/// that can't be read is an error, not an empty hash: an unseeded digest must never be recorded
+/// for a run that meant to be seeded.
+fn hash_seed(manifest_dir: &Path, seed_diff: Option<&str>) -> Result<String> {
+    let Some(rel) = seed_diff else {
+        return Ok(String::new());
+    };
+    let path = manifest_dir.join(rel);
+    let content = std::fs::read(&path).with_context(|| {
+        format!(
+            "reading [agent].seed_diff {} for identity digest",
+            path.display()
+        )
+    })?;
+    Ok(fnv1a_hex(&[&content]))
+}
+
 /// Build the identity for a single-domain run.
 pub fn for_manifest(
     manifest_path: &Path,
@@ -57,10 +74,12 @@ pub fn for_manifest(
     let manifest_text = manifest::frozen_manifest_text(manifest_path, workspace)?;
     let injects = m.resolved_injects(manifest_dir, workspace);
     let inject_hash = hash_injects(&injects)?;
+    let seed_hash = hash_seed(manifest_dir, m.agent.seed_diff.as_deref())?;
     Ok(RunIdentity::new(
         components,
         fnv1a_hex(&[manifest_text.as_bytes()]),
         inject_hash,
+        seed_hash,
         m.judge.measure_cmd.clone(),
         m.judge.direction.clone(),
         RigIdentity::default(),
@@ -90,10 +109,17 @@ pub fn for_composite(
         })
         .collect();
     let manifest_text = manifest::frozen_manifest_text(manifest_path, base_workspace)?;
+    // `parent()` of a bare `crucible.toml` is `Some("")`; treat it as the current directory.
+    let manifest_dir = manifest_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let seed_hash = hash_seed(manifest_dir, m.agent.seed_diff.as_deref())?;
     Ok(RunIdentity::new(
         components,
         fnv1a_hex(&[manifest_text.as_bytes()]),
         hash_injects(&[])?,
+        seed_hash,
         m.judge.measure_cmd.clone(),
         m.judge.direction.clone(),
         RigIdentity::default(),
@@ -167,7 +193,7 @@ mod tests {
         let b = for_manifest(&manifest_path, &dir, &dir, &m).expect("identity b");
         assert_eq!(a.digest, b.digest, "same inputs must yield the same digest");
         assert_eq!(a.components[0].base_sha, sha);
-        assert!(a.digest.starts_with("v1:"));
+        assert!(a.digest.starts_with("v2:"));
 
         // Change one input (measure_cmd), the digest must move.
         let (manifest_path2, m2) = manifest_with(&dir, "");
@@ -231,6 +257,38 @@ mod tests {
             a.digest, b.digest,
             "a changed inject source must change the digest"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seed_diff_moves_the_digest() {
+        let dir = tempdir();
+        init_repo(&dir);
+        let (manifest_path, m) = manifest_with(&dir, "");
+        let unseeded = for_manifest(&manifest_path, &dir, &dir, &m).expect("unseeded identity");
+        assert!(unseeded.seed_hash.is_empty());
+
+        let seed_src = dir.join("seed.diff");
+        fs::write(&seed_src, "--- a\n+++ b\n").expect("write seed");
+        let (manifest_path, m) = manifest_with(&dir, r#"seed_diff = "seed.diff""#);
+        let seeded = for_manifest(&manifest_path, &dir, &dir, &m).expect("seeded identity");
+        assert!(!seeded.seed_hash.is_empty());
+        assert_ne!(
+            unseeded.digest, seeded.digest,
+            "declaring a seed must change the digest"
+        );
+
+        fs::write(&seed_src, "--- a\n+++ c\n").expect("edit seed");
+        let reseeded = for_manifest(&manifest_path, &dir, &dir, &m).expect("reseeded identity");
+        assert_ne!(
+            seeded.digest, reseeded.digest,
+            "changed seed content must change the digest"
+        );
+
+        // A declared seed that can't be read is an error, never an unseeded digest.
+        fs::remove_file(&seed_src).expect("remove seed");
+        assert!(for_manifest(&manifest_path, &dir, &dir, &m).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

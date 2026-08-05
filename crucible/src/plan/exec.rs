@@ -363,6 +363,24 @@ pub fn execute(
     }
 }
 
+/// Declared-output check: a passing attempt whose JSON lacks a promised field is a
+/// measured failure at the producing task, not a mystery downstream.
+fn enforce_emits(task: &Task, outcome: AttemptOutcome) -> AttemptOutcome {
+    let AttemptOutcome::Pass(value) = &outcome else {
+        return outcome;
+    };
+    match task
+        .emits
+        .iter()
+        .find(|field| value.get(&field.0).is_none())
+    {
+        None => outcome,
+        Some(missing) => {
+            AttemptOutcome::Fail(format!("output missing declared field {:?}", missing.0))
+        }
+    }
+}
+
 fn run_with_retries(
     t: &Task,
     inputs: &BTreeMap<TaskName, Value>,
@@ -380,7 +398,7 @@ fn run_with_retries(
         let a = runner.run(t, attempts, inputs);
         cost += a.cost_usd;
         *spent += a.cost_usd;
-        match a.outcome {
+        match enforce_emits(t, a.outcome) {
             AttemptOutcome::Pass(output) => {
                 return (
                     TaskResult {
@@ -471,7 +489,8 @@ fn run_batch_with_retries<'a>(
         for ((idx, item), a) in wave.into_iter().zip(attempts) {
             *spent += a.cost_usd;
             cost_so_far[idx] += a.cost_usd;
-            attempted.push((idx, item, a.outcome));
+            let outcome = enforce_emits(item.task, a.outcome);
+            attempted.push((idx, item, outcome));
         }
         let retry_budget_blocked = *spent >= budget;
         budget_exceeded |= *spent > budget;
@@ -585,7 +604,7 @@ fn reduce_top_k(inputs: &BTreeMap<TaskName, Value>, k: u32, direction: Direction
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::ir::{Join, Plan, PlanBudget};
+    use crate::plan::ir::{Join, Plan, PlanBudget, Stage};
 
     type Script = BTreeMap<(String, u32), (fn() -> AttemptOutcome, f64)>;
 
@@ -649,6 +668,8 @@ mod tests {
             required,
             isolation: None,
             join: Join::default(),
+            stage: Stage::Iteration,
+            emits: Vec::new(),
         }
     }
 
@@ -1026,6 +1047,8 @@ mod tests {
             required: true,
             isolation: None,
             join: Join::default(),
+            stage: Stage::Iteration,
+            emits: Vec::new(),
         });
         let plan = valid(tasks, 10.0);
         let mut r = ScriptRunner::new();
@@ -1079,6 +1102,8 @@ mod tests {
             required: false,
             isolation: None,
             join: Join::default(),
+            stage: Stage::Iteration,
+            emits: Vec::new(),
         });
         let plan = valid(tasks, 10.0);
         let mut r = ScriptRunner::new();
@@ -1265,6 +1290,8 @@ mod tests {
             required: false,
             isolation: None,
             join: Join::Passed,
+            stage: Stage::Iteration,
+            emits: Vec::new(),
         };
         tasks.push(pick);
         let plan = valid(tasks, 10.0);
@@ -1374,6 +1401,123 @@ mod tests {
         assert_eq!(b.attempts, 3);
         assert!((b.cost_usd - 0.3).abs() < 1e-9, "every wave's cost booked");
         assert_eq!(out.results[&"iso-a".into()].status, TaskStatus::Pass);
+    }
+
+    fn emitting(name: &str, deps: &[&str], required: bool, emits: &[&str]) -> Task {
+        let mut t = task(name, deps, "any", required);
+        t.emits = emits
+            .iter()
+            .map(|f| crate::plan::ir::OutputField((*f).to_string()))
+            .collect();
+        t
+    }
+
+    #[test]
+    fn declared_emits_present_passes_and_missing_is_a_measured_failure() {
+        let plan = valid(
+            vec![
+                emitting("ok", &[], false, &["score"]),
+                emitting("drifted", &[], false, &["score", "pass"]),
+                task("child", &["drifted"], "any", false),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.on(
+            "ok",
+            1,
+            || AttemptOutcome::Pass(serde_json::json!({"score": 1.0})),
+            0.1,
+        );
+        r.on(
+            "drifted",
+            1,
+            || AttemptOutcome::Pass(serde_json::json!({"score": 1.0})),
+            0.1,
+        );
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        assert_eq!(out.results[&"ok".into()].status, TaskStatus::Pass);
+        let drifted = &out.results[&"drifted".into()];
+        assert_eq!(drifted.status, TaskStatus::Fail);
+        assert_eq!(drifted.attempts, 1, "a measured failure never retries");
+        assert!(
+            drifted.note.as_ref().unwrap().contains("\"pass\""),
+            "the note names the missing field: {:?}",
+            drifted.note
+        );
+        assert_eq!(out.results[&"child".into()].status, TaskStatus::Blocked);
+    }
+
+    #[test]
+    fn required_emits_violation_short_circuits() {
+        let plan = valid(
+            vec![
+                emitting("gate", &[], true, &["score"]),
+                task("rest", &["gate"], "any", true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.on(
+            "gate",
+            1,
+            || AttemptOutcome::Pass(serde_json::json!({"latency_ms": 3})),
+            0.1,
+        );
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        assert!(!out.valid);
+        assert_eq!(
+            out.exit,
+            PlanExit::ShortCircuit {
+                task: "gate".into()
+            }
+        );
+        assert!(!r.dispatched.iter().any(|(n, _)| n == "rest"));
+    }
+
+    #[test]
+    fn batch_path_enforces_emits_per_item() {
+        let mut ok = emitting("iso-ok", &[], false, &["score"]);
+        ok.isolation = Some(crate::plan::ir::Isolation::Worktree);
+        let mut bad = emitting("iso-bad", &[], false, &["score"]);
+        bad.isolation = Some(crate::plan::ir::Isolation::Worktree);
+        let plan = valid(vec![ok, bad], 10.0);
+        let mut r = ScriptRunner::new();
+        r.on(
+            "iso-ok",
+            1,
+            || AttemptOutcome::Pass(serde_json::json!({"score": 2.0})),
+            0.1,
+        );
+        r.on(
+            "iso-bad",
+            1,
+            || AttemptOutcome::Pass(serde_json::json!({})),
+            0.1,
+        );
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        assert_eq!(out.results[&"iso-ok".into()].status, TaskStatus::Pass);
+        let bad = &out.results[&"iso-bad".into()];
+        assert_eq!(bad.status, TaskStatus::Fail);
+        assert_eq!(bad.attempts, 1);
     }
 
     #[test]

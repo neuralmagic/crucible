@@ -92,7 +92,9 @@ pub enum AgentEvent {
         #[serde(default)]
         delta: String,
     },
-    /// A tool or subagent invocation, with the compact summary line.
+    /// A tool or subagent invocation, with the compact summary line. `input`/`result`
+    /// are populated only under verbose tool IO (`CRUCIBLE_SESSION_TOOL_IO=full`),
+    /// bounded producer-side; the default stays name+summary so the log stays compact.
     Tool {
         #[serde(default)]
         name: String,
@@ -100,6 +102,10 @@ pub enum AgentEvent {
         summary: String,
         #[serde(default)]
         subagent: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<String>,
     },
     /// A token/cost telemetry sample.
     Tokens(Tokens),
@@ -220,7 +226,19 @@ mod tests {
             ),
             (
                 r#"{"v":1,"kind":"tool","name":"Edit","summary":"p.go: x","subagent":false,"input":{"file_path":"p.go"}}"#,
-                |e| matches!(e, AgentEvent::Tool { name, subagent, .. } if name == "Edit" && !*subagent),
+                |e| {
+                    matches!(e, AgentEvent::Tool { name, subagent, input, .. }
+                    if name == "Edit" && !*subagent
+                    && input.as_ref().and_then(|i| i.get("file_path")).and_then(|p| p.as_str()) == Some("p.go"))
+                },
+            ),
+            (
+                // A verbose-mode result excerpt round-trips; compact lines above stay valid.
+                r#"{"v":1,"kind":"tool","name":"Bash","summary":"result","subagent":false,"result":"ok\n"}"#,
+                |e| {
+                    matches!(e, AgentEvent::Tool { name, result, input, .. }
+                    if name == "Bash" && result.as_deref() == Some("ok\n") && input.is_none())
+                },
             ),
             (
                 r#"{"v":1,"kind":"tokens","input":0,"output":6000,"cache_read":0,"cache_write":0,"total":6000,"rate":null}"#,

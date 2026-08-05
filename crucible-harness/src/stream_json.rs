@@ -8,10 +8,15 @@
 use crate::otel::RateHandle;
 use crucible_contract::event::{AgentEvent, Tokens};
 use serde_json::Value;
+use std::collections::HashMap;
 
 /// Emit a [`Tokens`] sample once the running total has grown by at least this much
 /// (or on the first sample).
 const TOKEN_EMIT_STEP: u64 = 5_000;
+
+/// Byte bound on each verbose tool input / result excerpt, so one giant Write or
+/// Read cannot balloon the session log.
+const TOOL_IO_LIMIT: usize = 2_048;
 
 /// Which streamed text block is currently open (its deltas buffer to line boundaries).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -49,6 +54,15 @@ pub struct StreamJsonParser {
 
     // Live token rate from the OTLP collector; `None` when no collector is running.
     rate: Option<RateHandle>,
+
+    // Verbose tool IO (CRUCIBLE_SESSION_TOOL_IO=full): tool events carry bounded
+    // inputs, and the tool results claude echoes back as `user` messages become
+    // result-excerpt events. Off by default so the session log stays compact.
+    tool_io: bool,
+    // The open `tool_use` block's id, and id -> name for labeling result excerpts.
+    // Only populated under verbose tool IO.
+    tool_id: Option<String>,
+    tool_names: HashMap<String, String>,
 }
 
 impl StreamJsonParser {
@@ -58,6 +72,12 @@ impl StreamJsonParser {
             rate: Some(rate),
             ..Default::default()
         }
+    }
+
+    /// Opt into verbose tool IO: tool events carry bounded inputs and result excerpts.
+    pub fn with_tool_io(mut self, on: bool) -> Self {
+        self.tool_io = on;
+        self
     }
 
     /// Decode one line of claude `stream-json`, returning every [`AgentEvent`] it completed.
@@ -97,7 +117,9 @@ impl StreamJsonParser {
                 });
             }
             Some("stream_event") => self.stream_event(&msg, &mut out),
-            // `assistant`/`user` message echoes, `rate_limit_event`, unknown kinds: no-op.
+            // `user` echoes carry the tool results; only read under verbose tool IO.
+            Some("user") => self.tool_results(&msg, &mut out),
+            // `assistant` message echoes, `rate_limit_event`, unknown kinds: no-op.
             _ => {}
         }
         out
@@ -114,7 +136,7 @@ impl StreamJsonParser {
             Some("api_retry") => out.push(AgentEvent::Retry {
                 attempt: u64_field(msg, "attempt") as u32,
                 max: u64_field(msg, "max_retries") as u32,
-                error: str_field(msg, "error"),
+                error: retry_error(msg),
             }),
             _ => {}
         }
@@ -134,6 +156,10 @@ impl StreamJsonParser {
                     Some("tool_use" | "server_tool_use") => {
                         self.tool_name = Some(str_field(block, "name"));
                         self.tool_json.clear();
+                        if self.tool_io {
+                            let id = str_field(block, "id");
+                            self.tool_id = (!id.is_empty()).then_some(id);
+                        }
                     }
                     _ => {}
                 }
@@ -212,10 +238,20 @@ impl StreamJsonParser {
                 .map(|p| format_tool(&name, p))
                 .unwrap_or_default();
             let subagent = name == "Agent" || name == "Task";
+            let input = if self.tool_io {
+                if let Some(id) = self.tool_id.take() {
+                    self.tool_names.insert(id, name.clone());
+                }
+                parsed.as_ref().map(bounded_input)
+            } else {
+                None
+            };
             out.push(AgentEvent::Tool {
                 name,
                 summary,
                 subagent,
+                input,
+                result: None,
             });
             self.tool_json.clear();
             return;
@@ -224,6 +260,39 @@ impl StreamJsonParser {
             && !self.buf.is_empty()
         {
             out.push(kind.event(std::mem::take(&mut self.buf)));
+        }
+    }
+
+    /// Under verbose tool IO, turn each `tool_result` block claude echoes back in a
+    /// `user` message into a Tool event carrying a bounded result excerpt, labeled
+    /// with the originating tool's name via the id map. A no-op by default.
+    fn tool_results(&mut self, msg: &Value, out: &mut Vec<AgentEvent>) {
+        if !self.tool_io {
+            return;
+        }
+        let Some(content) = msg
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_array)
+        else {
+            return;
+        };
+        for block in content {
+            if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                continue;
+            }
+            let id = str_field(block, "tool_use_id");
+            let name = self
+                .tool_names
+                .remove(&id)
+                .unwrap_or_else(|| "tool".to_string());
+            out.push(AgentEvent::Tool {
+                name,
+                summary: "result".to_string(),
+                subagent: false,
+                input: None,
+                result: Some(truncate_chars(&result_text(block), TOOL_IO_LIMIT)),
+            });
         }
     }
 
@@ -340,6 +409,73 @@ fn format_tool(name: &str, p: &Value) -> String {
     }
 }
 
+/// The underlying error of an `api_retry` line. The CLI often reports the literal
+/// string "unknown" in `error` while the useful detail sits elsewhere (an error
+/// object, or sibling fields), so dig before settling — and when nothing classifies,
+/// carry the raw line so the log never says just "unknown".
+fn retry_error(msg: &Value) -> String {
+    let direct = match msg.get("error") {
+        Some(Value::String(s)) => s.clone(),
+        Some(obj @ Value::Object(_)) => {
+            let m = str_field(obj, "message");
+            if m.is_empty() {
+                str_field(obj, "type")
+            } else {
+                m
+            }
+        }
+        _ => String::new(),
+    };
+    if !direct.is_empty() && direct != "unknown" {
+        return truncate_chars(&direct, 300);
+    }
+    for key in ["message", "status", "reason"] {
+        let v = str_field(msg, key);
+        if !v.is_empty() {
+            return truncate_chars(&v, 300);
+        }
+    }
+    truncate_chars(&msg.to_string(), 300)
+}
+
+/// Char-truncate with an ellipsis marker; identity when already within `limit`.
+fn truncate_chars(s: &str, limit: usize) -> String {
+    if s.chars().count() <= limit {
+        s.to_string()
+    } else {
+        let mut t: String = s.chars().take(limit).collect();
+        t.push('…');
+        t
+    }
+}
+
+/// Bound a verbose tool input: pass small inputs through verbatim; large ones become
+/// a truncated string of their serialization (truncated JSON is not valid JSON, so it
+/// cannot stay a structured value).
+fn bounded_input(v: &Value) -> Value {
+    let s = v.to_string();
+    if s.len() <= TOOL_IO_LIMIT {
+        v.clone()
+    } else {
+        Value::String(truncate_chars(&s, TOOL_IO_LIMIT))
+    }
+}
+
+/// A `tool_result` block's text: `content` is either a plain string or an array of
+/// blocks whose text-typed entries we join.
+fn result_text(block: &Value) -> String {
+    match block.get("content") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+            .map(|b| str_field(b, "text"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
 fn str_field(v: &Value, key: &str) -> String {
     v.get(key).and_then(Value::as_str).unwrap_or("").to_string()
 }
@@ -436,11 +572,15 @@ mod tests {
                     name,
                     summary,
                     subagent,
+                    input,
+                    result,
                 },
             ] => {
                 assert_eq!(name, "Edit");
                 assert_eq!(summary, "p.go: snap := x");
                 assert!(!subagent);
+                assert!(input.is_none(), "compact by default: no input recorded");
+                assert!(result.is_none());
             }
             other => panic!("expected one Tool, got {other:?}"),
         }
@@ -578,6 +718,118 @@ mod tests {
             matches!(&ev[..], [AgentEvent::Retry { attempt, max, error }]
             if *attempt == 2 && *max == 10 && error == "overloaded_error")
         );
+    }
+
+    #[test]
+    fn api_retry_digs_past_unknown_for_the_real_error() {
+        // error:"unknown" with a sibling message: the message wins.
+        let ev = run(&[
+            r#"{"type":"system","subtype":"api_retry","attempt":1,"max_retries":15,"error":"unknown","message":"upstream connect error"}"#,
+        ]);
+        assert!(
+            matches!(&ev[..], [AgentEvent::Retry { error, .. }] if error == "upstream connect error")
+        );
+
+        // error as an object: its message wins.
+        let ev = run(&[
+            r#"{"type":"system","subtype":"api_retry","attempt":1,"max_retries":15,"error":{"type":"overloaded_error","message":"busy"}}"#,
+        ]);
+        assert!(matches!(&ev[..], [AgentEvent::Retry { error, .. }] if error == "busy"));
+
+        // Nothing classifiable: the whole raw line rides along instead of "unknown".
+        let ev = run(&[
+            r#"{"type":"system","subtype":"api_retry","attempt":1,"max_retries":15,"error":"unknown","delay_ms":2000}"#,
+        ]);
+        match &ev[..] {
+            [AgentEvent::Retry { error, .. }] => {
+                assert!(error.contains("delay_ms"), "raw payload carried: {error}");
+                assert_ne!(error, "unknown");
+            }
+            other => panic!("expected one Retry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verbose_tool_io_carries_input_and_result_excerpt() {
+        let mut p = StreamJsonParser::default().with_tool_io(true);
+        let lines = [
+            r#"{"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"tool_use","id":"toolu_1","name":"Bash"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\"command\":\"ls\"}"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop"}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"text","text":"a.txt\nb.txt"}]}]}}"#,
+        ];
+        let ev: Vec<AgentEvent> = lines.iter().flat_map(|l| p.push(l)).collect();
+        match &ev[..] {
+            [
+                AgentEvent::Tool {
+                    name: call_name,
+                    input,
+                    result: call_result,
+                    ..
+                },
+                AgentEvent::Tool {
+                    name: res_name,
+                    result,
+                    ..
+                },
+            ] => {
+                assert_eq!(call_name, "Bash");
+                assert_eq!(
+                    input
+                        .as_ref()
+                        .and_then(|i| i.get("command"))
+                        .and_then(|c| c.as_str()),
+                    Some("ls")
+                );
+                assert!(call_result.is_none());
+                assert_eq!(res_name, "Bash", "result labeled via the id map");
+                assert_eq!(result.as_deref(), Some("a.txt\nb.txt"));
+            }
+            other => panic!("expected call + result Tool events, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verbose_tool_io_bounds_oversized_input_and_result() {
+        let big = "x".repeat(TOOL_IO_LIMIT * 2);
+        let mut p = StreamJsonParser::default().with_tool_io(true);
+        let lines = [
+            r#"{"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"tool_use","id":"toolu_2","name":"Write"}}}"#.to_string(),
+            format!(
+                r#"{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"input_json_delta","partial_json":"{{\"content\":\"{big}\"}}"}}}}}}"#
+            ),
+            r#"{"type":"stream_event","event":{"type":"content_block_stop"}}"#.to_string(),
+            format!(
+                r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"toolu_2","content":"{big}"}}]}}}}"#
+            ),
+        ];
+        let ev: Vec<AgentEvent> = lines.iter().flat_map(|l| p.push(l)).collect();
+        match &ev[..] {
+            [
+                AgentEvent::Tool { input, .. },
+                AgentEvent::Tool { result, .. },
+            ] => {
+                // An oversized input degrades to a truncated string of its serialization.
+                let stored = input
+                    .as_ref()
+                    .and_then(|i| i.as_str())
+                    .expect("truncated to string");
+                assert!(stored.chars().count() <= TOOL_IO_LIMIT + 1);
+                assert!(stored.ends_with('…'));
+                let excerpt = result.as_deref().expect("result excerpt");
+                assert!(excerpt.chars().count() <= TOOL_IO_LIMIT + 1);
+                assert!(excerpt.ends_with('…'));
+            }
+            other => panic!("expected call + result Tool events, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_mode_ignores_tool_results() {
+        let ev = run(&[
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"secret-ish output"}]}}"#,
+        ]);
+        assert!(ev.is_empty(), "compact mode drops tool results, got {ev:?}");
     }
 
     /// Golden test against a real `claude --output-format stream-json` capture. The parser is

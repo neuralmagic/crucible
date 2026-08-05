@@ -318,7 +318,7 @@ fn task_worktree_name(name: &TaskName) -> String {
 mod tests {
     use super::*;
     use crate::plan::exec::{ExecCfg, PlanExit, Substrate, TaskStatus, execute};
-    use crate::plan::ir::{Join, Plan};
+    use crate::plan::ir::{Join, Plan, Stage};
 
     #[test]
     fn isolation_worktree_names_do_not_collide_after_display_sanitization() {
@@ -755,6 +755,8 @@ mod tests {
             required: true,
             isolation: None,
             join: Join::default(),
+            stage: Stage::Iteration,
+            emits: Vec::new(),
         };
         let mut runner = HarnessRunner {
             args: <crate::Cli as clap::Parser>::try_parse_from(["crucible"])

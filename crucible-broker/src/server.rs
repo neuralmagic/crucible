@@ -347,7 +347,8 @@ impl McpServer {
     #[tool(
         description = "Build your CURRENT edits into a candidate image. The loop pod \
         pulls your working tree out of the sandbox, runs the container build, and pushes it — you \
-        never hold build creds. Returns a JSON status: built{image_ref} (ready to deploy) | \
+        never hold build creds. Returns a JSON status: built{image_ref, cached} (ready to deploy; \
+        cached=true means this exact tree was already built and pushed, so nothing was rebuilt) | \
         compile_error{log} (fix the errors and call again) | wrap_up{reason} (your candidate budget \
         for this turn is spent — commit your best CANDIDATE.md and END the turn) | disabled | error. \
         Edit, build, fix, repeat until it builds, then deploy_candidate."
@@ -500,10 +501,14 @@ impl McpServer {
         optionally `toggles` (env-name→value, only scenario-declared names AND values) for A/B comparison \
         runs, and `reps` (scenario-declared bounds) to average out noise. Returns JSON: measured{metrics, objective{key, \
         direction}, logs, cached} — `objective` names the metric the gate optimizes (e.g. tpot_ms, lower \
-        wins). Repeat calls on the same digest+toggles are memoized (cached=true). Also: job_failed{reason, \
-        logs} (crash — fetch_log to investigate) | rejected_kwarg | budget_exhausted | disabled | error. \
-        The call BLOCKS until the job finishes; for progress, run it in a backgrounded step and poll \
-        codegen_jobs + fetch_log (its handle) from a concurrent session."
+        wins). Repeat calls on the same digest+toggles are memoized (cached=true): a re-issue after the \
+        job finished is a free cache hit, NEVER a resubmission. Also: pending{job, log, hint} (the wait \
+        budget ran out while the job was still queued/running — it KEEPS running; re-issue this exact \
+        call to re-attach and keep waiting, do NOT sleep-loop) | job_failed{reason, logs} (crash — \
+        fetch_log to investigate) | rejected_kwarg | budget_exhausted | disabled | error. The call \
+        BLOCKS until the job resolves or the server wait budget (default 20 min, above typical Kueue \
+        admission) runs out; for progress, poll codegen_jobs + fetch_log (its handle) from a \
+        concurrent session."
     )]
     async fn codegen_benchmark(
         &self,
@@ -522,9 +527,12 @@ impl McpServer {
         description = "Run the FROZEN lm_eval correctness suite against a built candidate on the GPU (the \
         gate re-runs this frozen; use it as your dev check). Pass `digest` from codegen_build; optionally \
         `limit` (eval example count, scenario-declared bounds). Returns JSON: measured{metrics, objective{key, direction}, logs, \
-        cached} — objective is the score to maximize. Memoized per digest+limit. Also: job_failed{reason, \
-        logs} | rejected_kwarg | budget_exhausted | disabled | error. The call BLOCKS until the job \
-        finishes; for progress, poll codegen_jobs + fetch_log from a concurrent session."
+        cached} — objective is the score to maximize. Memoized per digest+limit (a re-issue after the \
+        job finished is a free cache hit, never a resubmission). Also: pending{job, log, hint} (wait \
+        budget ran out, job still queued/running — re-issue this exact call to re-attach) | \
+        job_failed{reason, logs} | rejected_kwarg | budget_exhausted | disabled | error. The call \
+        BLOCKS until the job resolves or the server wait budget (default 20 min) runs out; for \
+        progress, poll codegen_jobs + fetch_log from a concurrent session."
     )]
     async fn codegen_lm_eval(&self, Parameters(args): Parameters<CodegenLmEvalArgs>) -> String {
         let state = self.codegen.clone();
@@ -541,10 +549,13 @@ impl McpServer {
         Kueue-admitted job (like codegen_benchmark — it HOLDS GPUs and counts against your budget), \
         the frozen capture command writes its trace artifact, and the broker hands you a handle. Pass \
         `digest` from codegen_build. Returns JSON: profiled{trace, logs, cached} — read `trace` with \
-        fetch_trace (binary artifact) and `logs` with fetch_log. Memoized per digest (cached=true). \
-        Also: unconfigured{reason} (this rig/scenario declares no profile — nothing to run) | \
-        job_failed{reason, logs} | budget_exhausted | disabled | error. The call BLOCKS until the job \
-        finishes; for progress, poll codegen_jobs + fetch_log from a concurrent session."
+        fetch_trace (binary artifact) and `logs` with fetch_log. Memoized per digest (cached=true — a \
+        re-issue after the job finished is a free cache hit, never a resubmission). Also: \
+        unconfigured{reason} (this rig/scenario declares no profile — nothing to run) | pending{job, \
+        log, hint} (wait budget ran out, job still queued/running — re-issue this exact call to \
+        re-attach) | job_failed{reason, logs} | budget_exhausted | disabled | error. The call BLOCKS \
+        until the job resolves or the server wait budget (default 20 min) runs out; for progress, poll \
+        codegen_jobs + fetch_log from a concurrent session."
     )]
     async fn codegen_profile(&self, Parameters(args): Parameters<CodegenProfileArgs>) -> String {
         let state = self.codegen.clone();

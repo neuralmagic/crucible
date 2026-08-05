@@ -71,6 +71,7 @@ needs = "any"
 required = true
 isolation = "worktree"
 join = "all"
+emits = ["score", "pass"]
 
 [[workflow.task]]
 name = "grade"

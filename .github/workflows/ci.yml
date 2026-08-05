@@ -32,18 +32,40 @@ env:
 
 jobs:
   # One job, ordered fail-fast: fmt is instant, then the compile-heavy steps share a single
-  # warm target/ (setup-rust-toolchain caches the cargo registry + target dir).
+  # warm target/. Same-repo refs get the org's beefy self-hosted runners (32-core, sccache
+  # in S3, baked toolchain); fork PRs MUST stay on hosted runners — self-hosted instances
+  # carry an IAM role, and this is a public repo.
   build-and-test:
     timeout-minutes: 25
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
+      # The baked AMI already carries the toolchain and tools; hosted runners install them.
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
         with:
           components: rustfmt, clippy
+          # The GH cache API round-trips from EC2 are slower than sccache's in-region S3.
+          cache: ${{ runner.environment == 'github-hosted' }}
+
+      - name: Install cargo-nextest (hosted only)
+        if: runner.environment == 'github-hosted'
+        uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2.82.2
+        with:
+          tool: cargo-nextest
+
+      - name: Enable sccache + mold
+        if: runner.environment == 'self-hosted'
+        run: |
+          {
+            echo "SCCACHE_BUCKET=llm-d-sccache-783952637884"
+            echo "SCCACHE_REGION=us-east-1"
+            echo "SCCACHE_S3_KEY_PREFIX=crucible"
+            echo "RUSTC_WRAPPER=sccache"
+            echo "RUSTFLAGS=-C link-arg=-fuse-ld=mold"
+          } >> "$GITHUB_ENV"
 
       - name: Format
         run: cargo fmt --all --check
@@ -61,8 +83,17 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked --no-deps -- -D warnings
 
+      # nextest for the run (parallel, per-test isolation), cargo test for doctests,
+      # which nextest does not execute.
       - name: Test
-        run: cargo test --workspace --all-features --locked
+        run: cargo nextest run --workspace --all-features --locked
+
+      - name: Doctests
+        run: cargo test --doc --workspace --all-features --locked
+
+      - name: sccache stats
+        if: runner.environment == 'self-hosted' && always()
+        run: sccache --show-stats
 
   # Supply-chain checks, independent of the build: known-vulnerability audit over Cargo.lock
   # (policy in .cargo/audit.toml) plus the cargo-deny policy (licenses, sources, advisories;

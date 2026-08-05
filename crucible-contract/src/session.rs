@@ -12,6 +12,50 @@ use serde::{Deserialize, Serialize};
 /// Bump only on a breaking change to the on-disk shape.
 pub const WIRE_VERSION: u8 = 1;
 
+/// How one declared grade-evidence task ended up. A lossy grade (`join = "passed"`)
+/// folds only passing dependencies, so the folded score alone cannot say which
+/// declared rungs never contributed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceDisposition {
+    /// Ran and passed; its output was folded into the grade.
+    Passed,
+    /// Ran and failed its check.
+    Failed,
+    /// Never produced evidence: skipped, blocked, or dead on transport.
+    Skipped,
+}
+
+/// One declared grade-evidence task with its disposition, recorded per graded row so a
+/// candidate that "passed the ladder" is distinguishable from one that passed the rungs
+/// that happened to run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvidenceEntry {
+    pub task: String,
+    pub disposition: EvidenceDisposition,
+    /// The terminal note for a failed/skipped task (why it did not contribute).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
+}
+
+impl std::fmt::Display for EvidenceEntry {
+    /// Compact human form: `refcheck ✓`, `calc-diff ✗ (why)`, `tensor-pipe SKIPPED (why)`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let marker = match self.disposition {
+            EvidenceDisposition::Passed => "✓",
+            EvidenceDisposition::Failed => "✗",
+            EvidenceDisposition::Skipped => "SKIPPED",
+        };
+        write!(f, "{} {marker}", self.task)?;
+        if !self.note.is_empty() {
+            // Bounded like candidate notes: transport errors can run to whole stack traces.
+            let note: String = self.note.chars().take(120).collect();
+            write!(f, " ({note})")?;
+        }
+        Ok(())
+    }
+}
+
 /// A plain-serde mirror of `Row`, so `Row`'s fields can churn without touching the
 /// on-disk contract.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,10 +70,29 @@ pub struct RowWire {
     pub diffstat: String,
     #[serde(default)]
     pub score: Option<f64>,
+    /// Secondary scalar for functional gates: breaks primary-score ties in the keep rule.
+    /// Absent on rows without one and on logs written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tiebreak: Option<f64>,
     #[serde(default)]
     pub total: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
+    /// The World snapshot token committed when this row was kept (a git world packs the commit
+    /// sha). A resume restores the kept-best tree from it, so the logged best score is never
+    /// paired with a tree it did not measure. Absent on non-keep rows and on older logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept_snap: Option<String>,
+    /// The grade step's declared evidence set with per-task dispositions. Empty on
+    /// ungraded rows and on logs written before the field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<EvidenceEntry>,
+    /// The agent's whole CANDIDATE.md for this iteration (`note` is its first line-folded
+    /// 120 chars, table-sized). Carried in full so the PR body can print the actual
+    /// writeup instead of a mid-word truncation. Empty when the agent wrote none, and on
+    /// logs written before the field existed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub candidate_md: String,
 }
 
 /// One draft PR publish-on-keep opened, on the wire so the controller's pull-ingest can fold it
@@ -78,6 +141,36 @@ impl std::fmt::Display for SessionAction {
         f.write_str(match self {
             SessionAction::Started => "started",
             SessionAction::Resumed => "resumed",
+        })
+    }
+}
+
+/// Why a resumed run believed its predecessor stopped. Emitted once per resume as a
+/// [`SessionEvent::Recovery`] event so operators see the classification on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryClass {
+    CleanExit,
+    DiedInBaseline,
+    DiedInWideRound,
+    DiedMidTurn,
+    DiedDeciding,
+    DiedInPlanTask,
+    DiedAwaitingApproval,
+    DiedBetweenIterations,
+}
+
+impl std::fmt::Display for RecoveryClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            RecoveryClass::CleanExit => "clean_exit",
+            RecoveryClass::DiedInBaseline => "died_in_baseline",
+            RecoveryClass::DiedInWideRound => "died_in_wide_round",
+            RecoveryClass::DiedMidTurn => "died_mid_turn",
+            RecoveryClass::DiedDeciding => "died_deciding",
+            RecoveryClass::DiedInPlanTask => "died_in_plan_task",
+            RecoveryClass::DiedAwaitingApproval => "died_awaiting_approval",
+            RecoveryClass::DiedBetweenIterations => "died_between_iterations",
         })
     }
 }
@@ -209,12 +302,40 @@ pub enum SessionEvent {
         span_id: String,
     },
     /// The loop is exiting, emitted exactly once as the LAST line of the session log. `outcome` is
-    /// one of `finished`/`solved`/`budget`/`stopped`/`escalated`/`error`. The viewer keys its
-    /// terminal state off this line: a dead stream with no `Shutdown` line means the pod died
+    /// one of `finished`/`solved`/`budget`/`stopped`/`escalated`/`stalled`/`error`. The viewer keys
+    /// its terminal state off this line: a dead stream with no `Shutdown` line means the pod died
     /// mid-run rather than exiting cleanly.
     Shutdown {
         outcome: String,
         reason: String,
+    },
+    /// The loop began waiting on a mediated-provisioning approval. A dangling ApprovalWait
+    /// means the run died or stopped with the approval outstanding; resume re-parks a
+    /// block-mode one.
+    ApprovalWait {
+        handle: String,
+        #[serde(default)]
+        trace_id: String,
+        mode: String,
+    },
+    /// The wait above reached a terminal outcome: `granted`/`denied`/`timeout`. Deliberately
+    /// NOT emitted on a stop-while-parked (a stop doesn't resolve the ask), so a resumed run
+    /// re-parks on the still-open approval.
+    ApprovalResolved {
+        outcome: String,
+        #[serde(default)]
+        reason: String,
+    },
+    /// How this resume classified the previous shutdown. Purely a record: the loop's
+    /// behavior is driven by the in-process recovery plan, not by re-reading this.
+    Recovery {
+        class: RecoveryClass,
+        /// The iteration the interruption touched; 0 when not iteration-scoped.
+        #[serde(default)]
+        iter: u32,
+        /// Human-readable evidence summary (dangling-turn stats, plan gap, approval handle).
+        #[serde(default)]
+        detail: String,
     },
 }
 
@@ -289,8 +410,23 @@ mod tests {
             diff: "diff --git a/p.go b/p.go\n@@ -1 +1 @@\n-old\n+new\n".into(),
             diffstat: "1 file changed, 1 insertion(+), 1 deletion(-)".into(),
             score: Some(210.0),
+            tiebreak: Some(0.5),
             total: None,
             phase: None,
+            kept_snap: Some("abc123".into()),
+            evidence: vec![
+                EvidenceEntry {
+                    task: "refcheck".into(),
+                    disposition: EvidenceDisposition::Passed,
+                    note: String::new(),
+                },
+                EvidenceEntry {
+                    task: "tensor-pipe".into(),
+                    disposition: EvidenceDisposition::Skipped,
+                    note: "worktree setup failed".into(),
+                },
+            ],
+            candidate_md: "# Candidate: full writeup\n\nbody".into(),
         };
         for ev in [
             SessionEvent::Start {
@@ -352,10 +488,11 @@ mod tests {
                     }],
                     manifest_hash: "1111111111111111".into(),
                     inject_hash: "2222222222222222".into(),
+                    seed_hash: String::new(),
                     measure_cmd: "./measure.sh".into(),
                     direction: "lower".into(),
                     rig: RigIdentity::default(),
-                    digest: "v1:3333333333333333".into(),
+                    digest: "v2:3333333333333333".into(),
                 },
             },
             SessionEvent::PrLinks {
@@ -379,8 +516,68 @@ mod tests {
                 outcome: "finished".into(),
                 reason: "all iterations completed".into(),
             },
+            SessionEvent::ApprovalWait {
+                handle: "https://github.com/wseaton/llm-d-router/pull/7".into(),
+                trace_id: "model=Qwen/Qwen3-0.6B;c=48".into(),
+                mode: "block".into(),
+            },
+            SessionEvent::ApprovalResolved {
+                outcome: "granted".into(),
+                reason: "concurrency=48".into(),
+            },
+            SessionEvent::Recovery {
+                class: RecoveryClass::DiedMidTurn,
+                iter: 4,
+                detail: "turn in flight at iter 4, 132 agent events".into(),
+            },
         ] {
             assert_round_trips(ev);
+        }
+    }
+
+    #[test]
+    fn recovery_class_tokens_are_snake_case_and_display_matches_serde() {
+        for (class, token) in [
+            (RecoveryClass::CleanExit, "clean_exit"),
+            (RecoveryClass::DiedInBaseline, "died_in_baseline"),
+            (RecoveryClass::DiedInWideRound, "died_in_wide_round"),
+            (RecoveryClass::DiedMidTurn, "died_mid_turn"),
+            (RecoveryClass::DiedDeciding, "died_deciding"),
+            (RecoveryClass::DiedInPlanTask, "died_in_plan_task"),
+            (
+                RecoveryClass::DiedAwaitingApproval,
+                "died_awaiting_approval",
+            ),
+            (
+                RecoveryClass::DiedBetweenIterations,
+                "died_between_iterations",
+            ),
+        ] {
+            let line = encode(&SessionEvent::Recovery {
+                class,
+                iter: 0,
+                detail: String::new(),
+            });
+            assert!(line.contains(&format!(r#""class":"{token}""#)), "{line}");
+            assert_eq!(class.to_string(), token);
+        }
+    }
+
+    #[test]
+    fn approval_wait_minimal_line_decodes_with_defaults() {
+        let ev = decode(r#"{"v":1,"kind":"approval_wait","handle":"h","mode":"continue"}"#)
+            .expect("minimal approval_wait decodes");
+        match ev {
+            SessionEvent::ApprovalWait {
+                handle,
+                trace_id,
+                mode,
+            } => {
+                assert_eq!(handle, "h");
+                assert_eq!(trace_id, "");
+                assert_eq!(mode, "continue");
+            }
+            other => panic!("wrong variant: {other:?}"),
         }
     }
 
@@ -476,6 +673,38 @@ mod tests {
                 assert_eq!(status, "fail");
                 assert_eq!(attempts, 0);
                 assert!(output.is_none());
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evidence_entry_renders_compactly_and_old_rows_decode_without_it() {
+        let passed = EvidenceEntry {
+            task: "refcheck".into(),
+            disposition: EvidenceDisposition::Passed,
+            note: String::new(),
+        };
+        assert_eq!(passed.to_string(), "refcheck ✓");
+        let skipped = EvidenceEntry {
+            task: "tensor-pipe".into(),
+            disposition: EvidenceDisposition::Skipped,
+            note: "worktree setup failed".into(),
+        };
+        assert_eq!(
+            skipped.to_string(),
+            "tensor-pipe SKIPPED (worktree setup failed)"
+        );
+
+        // A pre-evidence row line still decodes, with the field defaulting to empty.
+        let ev = decode(
+            r#"{"v":1,"kind":"row","row":{"iter":1,"decision":"keep","note":"n","detail":"d"},"solved":false}"#,
+        )
+        .expect("old row decodes");
+        match ev {
+            SessionEvent::Row { row, .. } => {
+                assert!(row.evidence.is_empty());
+                assert!(row.candidate_md.is_empty());
             }
             other => panic!("wrong variant: {other:?}"),
         }

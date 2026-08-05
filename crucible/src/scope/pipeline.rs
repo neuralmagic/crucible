@@ -424,8 +424,10 @@ impl Propose {
     /// adversarial gaming-review loop before freeze. `pass` freezes as normal; `concerns` earns a
     /// refine round seeded with the attacks followed by a re-validate and a fresh review, up to
     /// `--gaming-refine-rounds` cycles (the allowance is its own, never drawn from `--refine-rounds`).
-    /// The last look is always final, concerns there, a failed re-validate, or a verdict that never
-    /// parses all reject with the whole trail. Never called when `--skip-gaming-review` is set.
+    /// Zero cycles is a real posture, not unset: one review, and any concern rejects immediately
+    /// (skip-gaming-review is the knob for no review at all). The last look is always final,
+    /// concerns there, a failed re-validate, or a verdict that never parses all reject with the
+    /// whole trail. Never called when `--skip-gaming-review` is set.
     fn run_gaming_review(
         &self,
         ctx: &mut ScopeCtx,
@@ -434,7 +436,7 @@ impl Propose {
         passed_round: u32,
         total_cost: &mut f64,
     ) -> Result<String> {
-        let cycles_max = self.opts.gaming_refine_rounds.max(1);
+        let cycles_max = self.opts.gaming_refine_rounds;
         let mut last_passed = passed_round;
         let mut refines_done = 0u32;
         loop {
@@ -657,6 +659,7 @@ fn run_adversary_turn(
         state: meta.join("state"),
         session_log: meta.join("state/session.jsonl"),
         control: meta.join("state/control.json"),
+        admissions: meta.join("state/admissions.jsonl"),
         escalation: meta.join("ESCALATION.json"),
         provisioning: meta.join("PROVISIONING_PENDING.json"),
     };
@@ -895,6 +898,7 @@ fn propose_paths(scratch: &Path) -> Paths {
         state: scratch.join("state"),
         session_log: scratch.join("state/session.jsonl"),
         control: scratch.join("state/control.json"),
+        admissions: scratch.join("state/admissions.jsonl"),
         escalation: scratch.join("ESCALATION.json"),
         provisioning: scratch.join("PROVISIONING_PENDING.json"),
     }
@@ -1606,7 +1610,7 @@ mod tests {
             report
                 .digest
                 .as_deref()
-                .is_some_and(|d| d.starts_with("v1:"))
+                .is_some_and(|d| d.starts_with("v2:"))
         );
 
         let scope_md = fs::read_to_string(out.join("SCOPE.md")).expect("SCOPE.md written");
@@ -1821,13 +1825,13 @@ mod tests {
             report
                 .digest
                 .as_deref()
-                .is_some_and(|d| d.starts_with("v1:"))
+                .is_some_and(|d| d.starts_with("v2:"))
         );
 
         let scope_md = fs::read_to_string(dir.join("SCOPE.md")).expect("SCOPE.md written");
         assert!(scope_md.contains("raise the score"));
         assert!(scope_md.contains("pack manifest [agent].goal"));
-        assert!(scope_md.contains("digest: `v1:"));
+        assert!(scope_md.contains("digest: `v2:"));
         assert!(scope_md.contains("S2 propose"));
         assert!(scope_md.contains("![Validated workflow graph](WORKFLOW.png)"));
 
@@ -2336,7 +2340,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             assert!(stage["passed"].is_boolean());
             assert!(stage["detail"].is_string());
         }
-        assert!(json["digest"].as_str().unwrap().starts_with("v1:"));
+        assert!(json["digest"].as_str().unwrap().starts_with("v2:"));
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2421,6 +2425,8 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             name: name.to_string(),
             summary: summary.to_string(),
             subagent: false,
+            input: None,
+            result: None,
         }
     }
 
@@ -3144,6 +3150,47 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
     }
 
     /// `--gaming-refine-rounds 2`: concerns→fix→concerns→fix→pass survives. Each refined pack
+    /// `--gaming-refine-rounds 0` is a real posture, not unset: one adversary look, and the first
+    /// concern rejects immediately with no refine round (0 used to be silently promoted to 1).
+    #[test]
+    fn gaming_refine_rounds_zero_rejects_on_first_concern() {
+        let repo = tempdir("gaming-n0-repo");
+        git_repo_fixture(&repo);
+        let out = tempdir("gaming-n0-out");
+        let goal_dir = tempdir("gaming-n0-goal");
+        let goal_file = goal_dir.join("goal.md");
+        fs::write(&goal_file, "fix the thing").expect("write goal file");
+        let review_counter = goal_dir.join("review.count");
+        let script = goal_dir.join("propose.sh");
+        write_exec(
+            &script,
+            &with_review(
+                &values_proposer(100, 10, 3),
+                &counting_review(&review_counter, 1),
+            ),
+        );
+
+        let mut opts = propose_opts_review(&repo, &script);
+        opts.gaming_refine_rounds = 0;
+        let report = execute(&out, None, Some(&goal_file), false, Some(opts));
+        let kinds: Vec<RoundKind> = report.rounds.iter().map(|r| r.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![RoundKind::Propose, RoundKind::Adversary],
+            "no refine round at zero cycles: {:?}",
+            report.rounds
+        );
+        assert!(
+            out.join("REJECTED.md").exists(),
+            "first concern rejects at zero refine cycles"
+        );
+        assert!(!out.join("SCOPE.md").exists());
+
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&out);
+        let _ = fs::remove_dir_all(&goal_dir);
+    }
+
     /// re-validates and earns its own fresh adversary look before the freeze.
     #[test]
     fn gaming_refine_rounds_two_survives_a_second_concern_cycle() {

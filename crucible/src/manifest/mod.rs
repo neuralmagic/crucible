@@ -22,7 +22,7 @@ pub use openshell::OpenshellCfg;
 pub use relay::RelayFile;
 pub use search::SearchCfg;
 pub use selftest::SelftestCfg;
-pub use workflow::{WorkflowCaps, WorkflowCfg, WorkflowType};
+pub use workflow::{KEPT_INPUT, WorkflowCaps, WorkflowCfg, WorkflowType};
 pub use world::WorldCfg;
 
 use crate::command_judge::Direction;
@@ -314,6 +314,12 @@ pub struct AgentCfg {
     pub goal: Option<String>,
     #[serde(default)]
     pub goal_file: Option<String>,
+    /// Path (relative to the domain pack) of a diff handed to iteration 1 as declared seed
+    /// material. The content is hashed into the run identity and disclosed on the published PR;
+    /// the agent applies and validates it itself, it is never silently applied to the tree.
+    /// Absent = an unseeded run.
+    #[serde(default)]
+    pub seed_diff: Option<String>,
     #[serde(default)]
     pub toolbox_dir: Option<String>,
     /// Skill directory names under `toolbox_dir` that must never reach the loop agent's
@@ -442,6 +448,10 @@ impl Manifest {
 
     pub fn direction(&self) -> Result<Direction> {
         judge::parse_direction(&self.judge.direction)
+    }
+
+    pub fn tiebreak_direction(&self) -> Result<Option<Direction>> {
+        judge::parse_tiebreak_direction(&self.judge)
     }
 
     /// Resolve `[workspace].inject` entries to absolute `(src, dst, frozen)`: `src` under
@@ -612,6 +622,10 @@ impl CompositeManifest {
 
     pub fn direction(&self) -> Result<Direction> {
         judge::parse_direction(&self.judge.direction)
+    }
+
+    pub fn tiebreak_direction(&self) -> Result<Option<Direction>> {
+        judge::parse_tiebreak_direction(&self.judge)
     }
 
     /// The composite's base workspace dir, holds the per-component checkouts.

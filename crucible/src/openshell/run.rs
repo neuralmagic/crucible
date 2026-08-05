@@ -400,7 +400,7 @@ async fn try_turn(
                 }
             }
         });
-        let decoder = harness.decoder(rate.as_ref());
+        let decoder = harness.decoder(rate.as_ref(), crate::agent::tool_io_full(args));
         let exec_result = exec_and_stream(&gw, &name, &wrapper, decoder, &exec_opts, sink).await;
         refresher.abort();
         let mut cost = exec_result?;

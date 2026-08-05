@@ -230,12 +230,18 @@ fn fetch_comments(pr: &PrRef) -> Result<Vec<Comment>> {
 }
 
 /// Send one `steer` command to the loop's control bridge, the exact NDJSON shape `control.rs` parses
-/// into a `ControlCommand::Steer`, which appends to `STEER.md` for the next turn.
-fn send_steer(addr: &str, text: &str) -> std::io::Result<()> {
-    let cmd = serde_json::json!({ "cmd": "steer", "text": text });
+/// into a `ControlCommand::Steer`. `key` is the comment's natural idempotency key, so a
+/// redelivered comment converges on the original admission instead of steering twice.
+fn send_steer(addr: &str, text: &str, key: &str) -> std::io::Result<()> {
+    let cmd = serde_json::json!({ "cmd": "steer", "text": text, "id": key });
     let mut stream = TcpStream::connect(addr)?;
     writeln!(stream, "{cmd}")?;
     stream.flush()
+}
+
+/// The idempotency key one PR comment steers under, stable across watcher processes.
+fn comment_key(pr: &PrRef, c: &Comment) -> String {
+    format!("pr-comment:{}/{}#{}:{}", pr.owner, pr.repo, pr.number, c.id)
 }
 
 /// Where a fresh, authorized comment's steer text goes.
@@ -256,11 +262,13 @@ impl Sink {
         }
     }
 
-    /// Deliver one comment's steer text. Errors are the caller's to log; never panics.
-    fn deliver(&self, text: &str) -> Result<()> {
+    /// Deliver one comment's steer text under its idempotency `key`. Errors are the caller's to
+    /// log; never panics. The reseed file carries no key: nothing reads it until the next run
+    /// starts, and that run admits the whole file as one block.
+    fn deliver(&self, text: &str, key: &str) -> Result<()> {
         match self {
             Sink::Steer(addr) => {
-                send_steer(addr, text).context("sending steer over the control bridge")
+                send_steer(addr, text, key).context("sending steer over the control bridge")
             }
             Sink::Reseed(path) => {
                 control::append_steer(path, text).context("appending to reseed file")
@@ -346,7 +354,7 @@ pub fn watch_and_steer(pr_urls: &[String], sink: &Sink, opts: &WatchOpts) -> Res
                             );
                             continue;
                         }
-                        match sink.deliver(&steer_text(pr, c)) {
+                        match sink.deliver(&steer_text(pr, c), &comment_key(pr, c)) {
                             Ok(()) => eprintln!(
                                 "watch-pr: delivered comment {} on {}/{}#{} (@{}, {})",
                                 c.id,
@@ -555,18 +563,22 @@ mod tests {
             line
         });
 
-        send_steer(&addr, "PR review from @bob:\ntry X").expect("send");
+        send_steer(&addr, "PR review from @bob:\ntry X", "pr-comment:o/r#7:42").expect("send");
 
         let line = server.join().expect("join");
         let v: serde_json::Value = serde_json::from_str(line.trim()).expect("json");
         assert_eq!(v["cmd"], "steer");
         assert_eq!(v["text"], "PR review from @bob:\ntry X");
+        assert_eq!(
+            v["id"], "pr-comment:o/r#7:42",
+            "the comment's key rides along so a redelivery converges"
+        );
     }
 
     #[test]
     fn reseed_sink_appends_the_same_shape_the_loop_reads() {
         // No live run: the reseed sink writes straight to a file (`control::append_steer`'s exact
-        // marker-wrapped shape), which `loop_driver::take_steer` reads at the next run's first turn.
+        // marker-wrapped shape), which the next run's first steer drain reads.
         let path = std::env::temp_dir().join(format!(
             "crucible-pr-watch-reseed-{}-{}.md",
             std::process::id(),
@@ -574,9 +586,9 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         let sink = Sink::Reseed(path.clone());
-        sink.deliver("reviewer asks: hoist the dup check")
+        sink.deliver("reviewer asks: hoist the dup check", "k1")
             .expect("deliver");
-        sink.deliver("reviewer asks: pick fail-closed")
+        sink.deliver("reviewer asks: pick fail-closed", "k2")
             .expect("deliver");
 
         let text = std::fs::read_to_string(&path).expect("read reseed file");
@@ -630,7 +642,8 @@ mod tests {
         for (pr, comments) in [(&pr_a, &comments_a), (&pr_b, &comments_b)] {
             for c in fresh_comments(comments, &seen, "") {
                 assert!(authz.authorized(c));
-                sink.deliver(&steer_text(pr, c)).expect("deliver");
+                sink.deliver(&steer_text(pr, c), &comment_key(pr, c))
+                    .expect("deliver");
             }
         }
 

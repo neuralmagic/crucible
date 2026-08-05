@@ -20,8 +20,12 @@ impl From<&Row> for RowWire {
             diff: r.diff.clone(),
             diffstat: r.diffstat.clone(),
             score: r.score,
+            tiebreak: r.tiebreak,
             total: r.total,
             phase: r.phase.clone(),
+            kept_snap: r.kept_snap.clone(),
+            evidence: r.evidence.clone(),
+            candidate_md: r.candidate_md.clone(),
         }
     }
 }
@@ -42,8 +46,12 @@ impl IntoRow for RowWire {
             diff: self.diff,
             diffstat: self.diffstat,
             score: self.score,
+            tiebreak: self.tiebreak,
             total: self.total,
             phase: self.phase,
+            kept_snap: self.kept_snap,
+            evidence: self.evidence,
+            candidate_md: self.candidate_md,
         }
     }
 }
@@ -108,8 +116,16 @@ mod tests {
             diff: "diff --git a/p.go b/p.go\n@@ -1 +1 @@\n-old\n+new\n".into(),
             diffstat: "1 file changed, 1 insertion(+), 1 deletion(-)".into(),
             score: Some(210.0),
+            tiebreak: Some(0.25),
             total: None,
             phase: None,
+            kept_snap: Some("abc123".into()),
+            evidence: vec![EvidenceEntry {
+                task: "refcheck".into(),
+                disposition: EvidenceDisposition::Passed,
+                note: String::new(),
+            }],
+            candidate_md: "# Candidate\n\nfull writeup".into(),
         };
         let wire = RowWire::from(&row);
         let back = wire.into_row();
@@ -120,7 +136,11 @@ mod tests {
         assert_eq!(back.diff, row.diff);
         assert_eq!(back.diffstat, row.diffstat);
         assert_eq!(back.score, row.score);
+        assert_eq!(back.tiebreak, row.tiebreak);
         assert_eq!(back.total, row.total);
         assert_eq!(back.phase, row.phase);
+        assert_eq!(back.kept_snap, row.kept_snap);
+        assert_eq!(back.evidence, row.evidence);
+        assert_eq!(back.candidate_md, row.candidate_md);
     }
 }

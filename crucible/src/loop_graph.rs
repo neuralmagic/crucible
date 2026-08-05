@@ -5,8 +5,10 @@
 //! The templates carry no budget of their own (`f64::MAX`): the driver owns the run budget
 //! and checks it between rounds, so a turn that blows the cap is still measured and decided.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
@@ -17,13 +19,21 @@ use crate::crucible::{Judge, MeasureCtx, Reading, World};
 use crate::loop_driver::{self, Decided, IterStep, Measured, TurnVerdict};
 use crate::manifest::{WorkflowCaps, WorkflowCfg, WorkflowType};
 use crate::plan::exec::{
-    Attempt, AttemptOutcome, BatchItem, ExecCfg, Substrate, TaskRunner, execute,
+    Attempt, AttemptOutcome, BatchItem, ExecCfg, Substrate, TaskRunner, TaskStatus, execute,
 };
 use crate::plan::ir::{
-    Direction, EngineOp, Isolation, Join, Plan, PlanBudget, Task, TaskKind, TaskName, ValidPlan,
+    Direction, EngineOp, Isolation, Join, Plan, PlanBudget, Stage, Task, TaskKind, TaskName,
+    ValidPlan,
 };
-use crate::reporter::{Reporter, Row};
+use crate::reporter::{Reporter, Row, TurnBudget};
+use crate::session::{EvidenceDisposition, EvidenceEntry};
 use crate::{Args, Paths, Prepared, STOP, agent, control};
+
+/// Terminal status + note per settled task, shared between the executor's `on_result`
+/// callback and the grade runner (both live inside one serial `execute` call). Grade
+/// needs it because its `inputs` hold only the passing dependencies: the declared
+/// evidence tasks that failed or never ran are invisible there.
+type TaskStates = Rc<RefCell<BTreeMap<TaskName, (TaskStatus, Option<String>)>>>;
 
 /// Everything one graph iteration reads from the driver. Scalars are copies of the
 /// segment state; the driver folds the returned [`IterStep`] + cost back itself.
@@ -41,6 +51,8 @@ pub(crate) struct IterCtx<'a> {
     pub baseline_score: f64,
     pub baseline_total: u64,
     pub best_score: f64,
+    /// The kept best's secondary tiebreak scalar, alongside `best_score`.
+    pub best_tiebreak: Option<f64>,
     /// Run spend before this iteration, so the runner reports the same cumulative budget
     /// the typestate path would after the turn.
     pub spent_before: f64,
@@ -62,6 +74,7 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
         .unwrap_or_else(|| "decide".into());
     r.plan_event(&crate::plan::cli::plan_admitted_event(&plan));
 
+    let task_states: TaskStates = TaskStates::default();
     let mut runner = LoopTaskRunner {
         args: cx.args,
         p: cx.p,
@@ -79,12 +92,14 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
             best_score: Some(cx.best_score),
         },
         best_score: cx.best_score,
+        best_tiebreak: cx.best_tiebreak,
         spent_before: cx.spent_before,
         started: cx.started,
         signal: None,
         measured: BTreeMap::new(),
         decided: BTreeMap::new(),
         fatal: None,
+        task_states: Rc::clone(&task_states),
         workflow_runner: crate::plan::harness::HarnessRunner {
             args: cx.args.clone(),
             paths: cx.p.clone(),
@@ -99,6 +114,9 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
         ExecCfg::default(),
         &mut runner,
         |task, result| {
+            task_states
+                .borrow_mut()
+                .insert(task.name.clone(), (result.status, result.note.clone()));
             task_events.push(crate::plan::cli::task_result_event(
                 plan.plan().version,
                 cx.it,
@@ -115,7 +133,7 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
         return Err(e);
     }
     let step = match runner.signal.take() {
-        Some(Signal::Discard) => IterStep::Discarded,
+        Some(Signal::Discard(reason)) => IterStep::Discarded { reason },
         Some(Signal::Escalate) => IterStep::Escalated,
         Some(Signal::Park(pp)) => IterStep::Parked(pp),
         Some(Signal::Stop) => IterStep::Stopped,
@@ -124,16 +142,39 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
             // A pre-gate rejection discards the candidate.
             None => match &outcome.exit {
                 crate::plan::exec::PlanExit::ShortCircuit { task } => {
-                    let why = outcome
-                        .results
-                        .get(task)
-                        .and_then(|r| r.note.clone())
-                        .unwrap_or_default();
-                    runner.r.note(&format!(
-                        "workflow task {task} rejected the candidate (discarding iter {}): {why}",
-                        cx.it
-                    ));
-                    IterStep::Discarded
+                    let result = outcome.results.get(task);
+                    let why = result.and_then(|r| r.note.clone()).unwrap_or_default();
+                    // A propose task that exhausted its transport retries never started a
+                    // turn: no candidate exists to reject, so hand the driver NeverStarted
+                    // (it re-runs the iteration instead of consuming it, bounded there).
+                    let propose_dead = result.is_some_and(|r| r.status == TaskStatus::Transport)
+                        && plan.plan().tasks.iter().any(|t| {
+                            t.name == *task
+                                && matches!(
+                                    t.task,
+                                    TaskKind::Engine {
+                                        op: EngineOp::Propose,
+                                        ..
+                                    }
+                                )
+                        });
+                    if propose_dead {
+                        runner.r.note(&format!(
+                            "workflow task {task} never started (iter {} not consumed): {why}",
+                            cx.it
+                        ));
+                        IterStep::NeverStarted {
+                            reason: format!("{task} died on transport: {why}"),
+                        }
+                    } else {
+                        runner.r.note(&format!(
+                            "workflow task {task} rejected the candidate (discarding iter {}): {why}",
+                            cx.it
+                        ));
+                        IterStep::Discarded {
+                            reason: format!("{task} rejected the candidate: {why}"),
+                        }
+                    }
                 }
                 exit => anyhow::bail!(
                     "graph iteration ended with neither a decision nor a control signal (exit: {exit:?})"
@@ -157,7 +198,7 @@ pub(crate) fn iteration_template(
             version: 1,
             reason: None,
             budget: PlanBudget { usd: f64::MAX },
-            tasks: workflow.tasks.clone(),
+            tasks: workflow.iteration_tasks(),
         }
         .validate()
         .context("building authored iteration workflow");
@@ -167,22 +208,28 @@ pub(crate) fn iteration_template(
         |name: &str, op: EngineOp, source: Option<TaskName>, deps: Vec<TaskName>| -> Task {
             Task {
                 name: name.into(),
-                task: TaskKind::Engine { op, source },
+                task: TaskKind::Engine {
+                    op,
+                    source,
+                    tiebreak: None,
+                },
                 depends_on: deps,
                 session: None,
                 needs: "any".to_string(),
                 required: true,
                 isolation: None,
                 join: Join::default(),
+                stage: Stage::Iteration,
+                emits: Vec::new(),
             }
         };
     let mut tasks = vec![engine("propose", EngineOp::Propose, None, vec![])];
 
     // Legacy splice tasks run between `propose` and `apply`; `apply` waits on every sink.
+    // Epilogue tasks never splice: they run once post-loop, not per iteration.
     let mut apply_deps = vec![TaskName("propose".to_string())];
     if let Some(w) = workflow.filter(|w| !w.tasks.is_empty()) {
-        for t in &w.tasks {
-            let mut t = t.clone();
+        for mut t in w.iteration_tasks() {
             if t.depends_on.is_empty() {
                 t.depends_on = vec![TaskName("propose".to_string())];
             }
@@ -225,10 +272,176 @@ pub(crate) fn iteration_template(
     .context("building the iteration template")
 }
 
+/// Build the workflow's run-scoped epilogue subgraph; `None` when it declares none.
+pub(crate) fn epilogue_template(workflow: &WorkflowCfg) -> Result<Option<ValidPlan>> {
+    let tasks = workflow.epilogue_tasks();
+    if tasks.is_empty() {
+        return Ok(None);
+    }
+    Plan {
+        version: 1,
+        reason: None,
+        budget: PlanBudget { usd: f64::MAX },
+        tasks,
+    }
+    .validate()
+    .context("building the epilogue template")
+    .map(Some)
+}
+
+/// The final kept candidate, as epilogue tasks see it: injected into every task's inputs
+/// under the reserved [`crate::manifest::KEPT_INPUT`] key, so a command/evaluate task
+/// reads it from `CRUCIBLE_INPUTS` exactly like any upstream result.
+pub(crate) struct KeptContext {
+    pub iter: u32,
+    pub score: Option<f64>,
+    pub tiebreak: Option<f64>,
+    pub sha: Option<String>,
+    pub snapshot: Option<String>,
+    pub note: String,
+}
+
+impl KeptContext {
+    fn to_value(&self) -> Value {
+        serde_json::json!({
+            "iter": self.iter,
+            "score": self.score,
+            "tiebreak": self.tiebreak,
+            "sha": self.sha,
+            "snapshot": self.snapshot,
+            "note": self.note,
+        })
+    }
+}
+
+/// Run the epilogue subgraph once, against the kept candidate live in the workspace.
+/// Advisory by contract: the returned rows and the notes make a failure loud, but nothing
+/// here can un-keep the candidate. Returns the advisory rows and the subgraph's cost.
+pub(crate) fn run_epilogue<R: Reporter>(
+    args: &Args,
+    p: &Paths,
+    workflow: &WorkflowCfg,
+    kept: &KeptContext,
+    r: &mut R,
+) -> Result<(Vec<Row>, f64)> {
+    let Some(plan) = epilogue_template(workflow)? else {
+        return Ok((Vec::new(), 0.0));
+    };
+    r.note(&format!(
+        "epilogue: running {} run-scoped task(s) against the kept candidate (iter {})",
+        plan.plan().tasks.len(),
+        kept.iter
+    ));
+    r.plan_event(&crate::plan::cli::plan_admitted_event(&plan));
+
+    let mut runner = EpilogueRunner {
+        inner: crate::plan::harness::HarnessRunner {
+            args: args.clone(),
+            paths: p.clone(),
+        },
+        kept: kept.to_value(),
+    };
+    let mut task_events = Vec::new();
+    let outcome = execute(
+        &plan,
+        &Substrate::default(),
+        ExecCfg::default(),
+        &mut runner,
+        |task, result| {
+            task_events.push(crate::plan::cli::task_result_event(
+                plan.plan().version,
+                kept.iter,
+                task,
+                result,
+            ));
+        },
+    );
+    for ev in &task_events {
+        r.plan_event(ev);
+    }
+
+    let mut rows = Vec::new();
+    for task in plan.tasks_topo() {
+        let Some(result) = outcome.results.get(&task.name) else {
+            continue;
+        };
+        let (decision, failed) = match result.status {
+            TaskStatus::Pass => ("epilogue", false),
+            TaskStatus::Skipped | TaskStatus::Blocked => ("epilogue-skip", false),
+            TaskStatus::Fail | TaskStatus::Transport | TaskStatus::Truncated => {
+                ("epilogue-fail", true)
+            }
+        };
+        let why = result.note.clone().unwrap_or_else(|| match result.status {
+            TaskStatus::Pass => "ok".to_string(),
+            other => other.as_str().to_string(),
+        });
+        if failed {
+            r.note(&format!(
+                "epilogue task {} FAILED (advisory — the kept candidate stands): {why}",
+                task.name
+            ));
+        }
+        rows.push(Row {
+            iter: kept.iter,
+            decision: decision.to_string(),
+            note: format!("{}: {why}", task.name),
+            detail: result
+                .output
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            score: result
+                .output
+                .as_ref()
+                .and_then(|o| o.get("score"))
+                .and_then(Value::as_f64),
+            phase: Some("epilogue".to_string()),
+            ..Default::default()
+        });
+    }
+    Ok((rows, outcome.spent_usd))
+}
+
+/// [`crate::plan::harness::HarnessRunner`] plus the kept-candidate input: the executor
+/// derives inputs from dependencies, and the epilogue's roots have none, so the kept
+/// context rides in here on every task.
+struct EpilogueRunner {
+    inner: crate::plan::harness::HarnessRunner,
+    kept: Value,
+}
+
+impl EpilogueRunner {
+    fn with_kept(&self, inputs: &BTreeMap<TaskName, Value>) -> BTreeMap<TaskName, Value> {
+        let mut inputs = inputs.clone();
+        inputs.insert(crate::manifest::KEPT_INPUT.into(), self.kept.clone());
+        inputs
+    }
+}
+
+impl TaskRunner for EpilogueRunner {
+    fn run(&mut self, task: &Task, attempt: u32, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
+        let inputs = self.with_kept(inputs);
+        self.inner.run(task, attempt, &inputs)
+    }
+
+    fn run_many(&mut self, batch: &[BatchItem<'_>]) -> Vec<Attempt> {
+        let batch: Vec<BatchItem<'_>> = batch
+            .iter()
+            .map(|b| BatchItem {
+                task: b.task,
+                attempt: b.attempt,
+                inputs: self.with_kept(&b.inputs),
+            })
+            .collect();
+        self.inner.run_many(&batch)
+    }
+}
+
 /// What the propose task's post-turn drains decided, parked here for the driver: the
 /// executor only sees pass/fail, the loop control travels out of band.
 enum Signal {
-    Discard,
+    Discard(String),
     Escalate,
     Park(crate::provisioning::PendingProvisioning),
     Stop,
@@ -250,12 +463,16 @@ struct LoopTaskRunner<'a, R: Reporter> {
     rows: &'a [Row],
     ctx: MeasureCtx,
     best_score: f64,
+    best_tiebreak: Option<f64>,
     spent_before: f64,
     started: Instant,
     signal: Option<Signal>,
     measured: BTreeMap<TaskName, Measured>,
     decided: BTreeMap<TaskName, Decided>,
     fatal: Option<anyhow::Error>,
+    /// Settled-task dispositions, fed by the executor's `on_result` callback; read by
+    /// `grade` to record which declared evidence tasks actually ran.
+    task_states: TaskStates,
     workflow_runner: crate::plan::harness::HarnessRunner,
 }
 
@@ -268,6 +485,11 @@ impl<R: Reporter> LoopTaskRunner<'_, R> {
             prompt,
             Some(self.resume_prompt),
             task.session.as_deref(),
+            TurnBudget {
+                spent_before: self.spent_before,
+                started: self.started,
+                max_cost: loop_driver::live_max_cost(self.args, self.control),
+            },
         );
         let cost = turn.cost;
         if let Some(control) = self.control {
@@ -288,13 +510,13 @@ impl<R: Reporter> LoopTaskRunner<'_, R> {
                 cost_usd: cost,
             },
             TurnVerdict::Discard => {
-                self.signal = Some(Signal::Discard);
+                self.signal = Some(Signal::Discard("turn failed".to_string()));
                 fail(cost, "turn failed; iteration discarded".to_string())
             }
             // Transport-class turn death: hand the executor a Transport outcome so
             // `run_with_retries` re-runs the turn (the session resumes where it died).
-            TurnVerdict::Retry => Attempt {
-                outcome: AttemptOutcome::Transport("turn died on a transport error".to_string()),
+            TurnVerdict::Retry(why) => Attempt {
+                outcome: AttemptOutcome::Transport(why),
                 cost_usd: cost,
             },
             TurnVerdict::Escalate => {
@@ -321,7 +543,7 @@ impl<R: Reporter> LoopTaskRunner<'_, R> {
                     "apply failed (discarding iter {}): {e:#}",
                     self.it
                 ));
-                self.signal = Some(Signal::Discard);
+                self.signal = Some(Signal::Discard(format!("apply failed: {e:#}")));
                 fail(0.0, format!("apply failed: {e:#}"))
             }
         }
@@ -346,6 +568,7 @@ impl<R: Reporter> LoopTaskRunner<'_, R> {
         &mut self,
         task: &Task,
         source: Option<&TaskName>,
+        tiebreak: Option<&TaskName>,
         inputs: &BTreeMap<TaskName, Value>,
     ) -> Attempt {
         let Some(source) = source else {
@@ -363,12 +586,20 @@ impl<R: Reporter> LoopTaskRunner<'_, R> {
                 format!("grade score source {source} has no numeric `score`"),
             );
         };
+        // The declared tiebreak task's score becomes the reading's secondary scalar.
+        // Best-effort by design: a tiebreak task that failed or was skipped is simply
+        // absent from the passing inputs, and the decide falls back to primary-only.
+        let tiebreak = tiebreak
+            .and_then(|t| inputs.get(t))
+            .and_then(|v| v.get("score"))
+            .and_then(Value::as_f64);
         let reading = Reading {
             valid: primary
                 .get("valid")
                 .and_then(Value::as_bool)
                 .unwrap_or(true),
             score: Some(score),
+            tiebreak,
             solved: primary
                 .get("solved")
                 .and_then(Value::as_bool)
@@ -383,11 +614,41 @@ impl<R: Reporter> LoopTaskRunner<'_, R> {
                 "evidence": inputs,
             }),
         };
-        let measured = loop_driver::measured_from_reading(reading, self.p, self.world);
+        // The folded inputs hold only the passing dependencies (`join = "passed"`), so
+        // record every DECLARED evidence task with its disposition: a candidate that
+        // passed two of three declared rungs must not read as fully graded.
+        let states = self.task_states.borrow();
+        let evidence: Vec<EvidenceEntry> = task
+            .depends_on
+            .iter()
+            .map(|dep| {
+                let (status, note) = states
+                    .get(dep)
+                    .map(|(s, n)| (*s, n.clone().unwrap_or_default()))
+                    .unwrap_or((TaskStatus::Skipped, "no terminal status recorded".into()));
+                EvidenceEntry {
+                    task: dep.0.clone(),
+                    disposition: match status {
+                        TaskStatus::Pass => EvidenceDisposition::Passed,
+                        TaskStatus::Fail => EvidenceDisposition::Failed,
+                        TaskStatus::Transport
+                        | TaskStatus::Skipped
+                        | TaskStatus::Blocked
+                        | TaskStatus::Truncated => EvidenceDisposition::Skipped,
+                    },
+                    note,
+                }
+            })
+            .collect();
+        drop(states);
+        let mut measured = loop_driver::measured_from_reading(reading, self.p, self.world);
+        measured.evidence = evidence.clone();
         let out = serde_json::json!({
             "score": measured.reading.score,
+            "tiebreak": measured.reading.tiebreak,
             "valid": measured.reading.valid,
             "evidence_count": inputs.len(),
+            "evidence": evidence,
         });
         self.measured.insert(task.name.clone(), measured);
         pass(out)
@@ -407,7 +668,8 @@ impl<R: Reporter> LoopTaskRunner<'_, R> {
                 format!("decide source {source} has no measured candidate"),
             );
         };
-        let d = loop_driver::decide_row(self.judge, self.best_score, self.it, m);
+        let d =
+            loop_driver::decide_row(self.judge, self.best_score, self.best_tiebreak, self.it, m);
         let out = serde_json::json!({
             "keep": d.verdict.keep,
             "solved": d.verdict.solved,
@@ -439,10 +701,12 @@ impl<R: Reporter> TaskRunner for LoopTaskRunner<'_, R> {
             TaskKind::Engine {
                 op: EngineOp::Grade,
                 source,
-            } => self.grade(task, source.as_ref(), inputs),
+                tiebreak,
+            } => self.grade(task, source.as_ref(), tiebreak.as_ref(), inputs),
             TaskKind::Engine {
                 op: EngineOp::Decide,
                 source,
+                ..
             } => self.decide(task, source.as_ref()),
             TaskKind::Engine {
                 op: EngineOp::MeasureDiff,
@@ -668,6 +932,8 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
             required: false,
             isolation: Some(Isolation::Worktree),
             join: Join::All,
+            stage: Stage::Iteration,
+            emits: Vec::new(),
         });
     }
     for id in 0..cfg.n {
@@ -676,6 +942,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
             task: TaskKind::Engine {
                 op: EngineOp::MeasureDiff,
                 source: None,
+                tiebreak: None,
             },
             depends_on: vec![TaskName(format!("propose-{id}"))],
             session: None,
@@ -683,6 +950,8 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
             required: false,
             isolation: None,
             join: Join::All,
+            stage: Stage::Iteration,
+            emits: Vec::new(),
         });
     }
     tasks.push(Task {
@@ -699,6 +968,8 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
         required: false,
         isolation: None,
         join: Join::Passed,
+        stage: Stage::Iteration,
+        emits: Vec::new(),
     });
     Plan {
         version: 1,
@@ -812,7 +1083,7 @@ impl<R: Reporter> WideRunner<'_, R> {
         match self.judge.measure(&ctx) {
             Ok(reading) => {
                 let (diff_text, diffstat) = self.world.staged_diff();
-                let decision = if self.judge.decide(&reading, self.baseline_score).keep {
+                let decision = if self.judge.decide(&reading, self.baseline_score, None).keep {
                     "wide-keep"
                 } else {
                     "wide-discard"
@@ -825,8 +1096,12 @@ impl<R: Reporter> WideRunner<'_, R> {
                     diff: diff_text,
                     diffstat,
                     score: reading.score,
+                    tiebreak: reading.tiebreak,
                     total: reading.detail.get("total").and_then(Value::as_u64),
                     phase: Some("wide".into()),
+                    kept_snap: None,
+                    evidence: Vec::new(),
+                    candidate_md: String::new(),
                 };
                 self.r.row(&row, false);
                 self.rows.push(row);
@@ -1039,6 +1314,50 @@ mod tests {
         assert_eq!(dep("decide"), ["measure"]);
     }
 
+    /// Epilogue tasks stay out of the per-iteration plan entirely (legacy splice and
+    /// fully-authored form) and land in their own post-loop template.
+    #[test]
+    fn epilogue_tasks_leave_the_iteration_plan_for_the_epilogue_template() {
+        let w: WorkflowCfg = toml::from_str(
+            "[[task]]\nname = \"review\"\nkind = \"command\"\ncommand = \"true\"\n\
+             [[task]]\nname = \"racecheck\"\nkind = \"command\"\ncommand = \"true\"\nstage = \"epilogue\"\n",
+        )
+        .unwrap();
+        w.validate().unwrap();
+        let plan = iteration_template(Some(&w), &WorkflowCaps::autoresearch_engine()).unwrap();
+        let names: Vec<&str> = plan.tasks_topo().map(|t| t.name.0.as_str()).collect();
+        assert_eq!(names, ["propose", "review", "apply", "measure", "decide"]);
+        assert_eq!(
+            plan.get(&"apply".into()).unwrap().depends_on,
+            [TaskName::from("review")],
+            "apply waits on the iteration sink, never on an epilogue task"
+        );
+
+        let epilogue = epilogue_template(&w).unwrap().expect("epilogue declared");
+        let names: Vec<&str> = epilogue.tasks_topo().map(|t| t.name.0.as_str()).collect();
+        assert_eq!(names, ["racecheck"]);
+
+        let authored: WorkflowCfg = toml::from_str(
+            "type = \"autoresearch\"\nresult = \"choose\"\n\
+             [[task]]\nname = \"invent\"\nkind = \"engine\"\nop = \"propose\"\n\
+             [[task]]\nname = \"deploy\"\nkind = \"engine\"\nop = \"apply\"\ndepends_on = [\"invent\"]\n\
+             [[task]]\nname = \"score\"\nkind = \"engine\"\nop = \"measure\"\ndepends_on = [\"deploy\"]\n\
+             [[task]]\nname = \"choose\"\nkind = \"engine\"\nop = \"decide\"\nsource = \"score\"\ndepends_on = [\"score\"]\n\
+             [[task]]\nname = \"racecheck\"\nkind = \"command\"\ncommand = \"true\"\nstage = \"epilogue\"\n",
+        )
+        .unwrap();
+        let plan =
+            iteration_template(Some(&authored), &WorkflowCaps::autoresearch_engine()).unwrap();
+        assert!(
+            plan.get(&"racecheck".into()).is_none(),
+            "authored iteration plan must not carry the epilogue task"
+        );
+        let no_epilogue: WorkflowCfg =
+            toml::from_str("[[task]]\nname = \"review\"\nkind = \"command\"\ncommand = \"true\"\n")
+                .unwrap();
+        assert!(epilogue_template(&no_epilogue).unwrap().is_none());
+    }
+
     #[test]
     fn a_rejecting_pack_task_discards_the_iteration_before_measuring() {
         let trace = run_counter_cfg(
@@ -1051,11 +1370,21 @@ mod tests {
             ),
         );
         let decisions: Vec<&str> = trace.rows.iter().map(|(_, d, _)| d.as_str()).collect();
+        // Discarded iterations still land on the scoreboard (decision + reason), so a run that
+        // lost everything reads as what it is instead of a clean "finished" with one row.
         assert_eq!(
             decisions,
-            ["baseline"],
+            ["baseline", "discarded", "discarded"],
             "every iteration is discarded before it can be measured: {}",
             describe(&trace)
+        );
+        assert!(
+            trace
+                .rows
+                .iter()
+                .all(|(_, d, score)| d != "discarded" || score.is_none()),
+            "a discarded row never carries a score: {:?}",
+            trace.rows
         );
         assert!(
             trace.notes.iter().any(|n| n.contains("review")
@@ -1173,6 +1502,121 @@ mod tests {
             ["baseline", "keep", "keep"]
         );
         assert_eq!(trace.shutdown, "finished");
+        // Every declared evidence task ran and passed, so the record carries no skips.
+        for (i, ev) in trace.row_evidence.iter().enumerate().skip(1) {
+            let dispositions: Vec<&str> = ev
+                .iter()
+                .map(|e| e["disposition"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                dispositions,
+                ["passed", "passed"],
+                "row {i} evidence: {ev:?}"
+            );
+        }
+    }
+
+    /// The run-6 shape: a declared evidence task never runs (here: unrunnable on the
+    /// substrate) and another errors, `join = "passed"` folds only the survivor, and the
+    /// grade output + row must still record all three declared dispositions.
+    #[test]
+    fn grade_records_declared_evidence_dispositions() {
+        let workflow = r#"
+            [workflow]
+            type = "autoresearch"
+            result = "choose"
+            [[workflow.task]]
+            name = "invent"
+            kind = "engine"
+            op = "propose"
+            [[workflow.task]]
+            name = "apply"
+            kind = "engine"
+            op = "apply"
+            depends_on = ["invent"]
+            [[workflow.task]]
+            name = "score"
+            kind = "evaluate"
+            command = "v=$(cat value.txt); printf '{\"score\": %s, \"pass\": true}\n' \"$v\""
+            depends_on = ["apply"]
+            [[workflow.task]]
+            name = "flaky"
+            kind = "evaluate"
+            command = "echo broken >&2; exit 7"
+            depends_on = ["apply"]
+            required = false
+            [[workflow.task]]
+            name = "tensor-pipe"
+            kind = "evaluate"
+            command = "true"
+            depends_on = ["apply"]
+            required = false
+            needs = "ncu"
+            [[workflow.task]]
+            name = "grade"
+            kind = "engine"
+            op = "grade"
+            source = "score"
+            depends_on = ["score", "flaky", "tensor-pipe"]
+            join = "passed"
+            [[workflow.task]]
+            name = "choose"
+            kind = "engine"
+            op = "decide"
+            source = "grade"
+            depends_on = ["grade"]
+        "#;
+        let trace = run_counter_cfg(true, 1, BUMP, false, Some(workflow));
+        assert_eq!(
+            trace
+                .rows
+                .iter()
+                .map(|row| row.1.as_str())
+                .collect::<Vec<_>>(),
+            ["baseline", "keep"],
+            "{}",
+            describe(&trace)
+        );
+
+        // The grade task_result output carries the declared set, not just the folded one.
+        let (_, status, output) = trace
+            .task_results
+            .iter()
+            .find(|(t, _, _)| t == "grade")
+            .expect("grade task_result on the wire");
+        assert_eq!(status, "pass");
+        let out = output.as_ref().unwrap();
+        assert_eq!(out["evidence_count"], 1, "only the passing rung folded");
+        let wire_evidence = out["evidence"].as_array().unwrap();
+
+        // The kept row carries the same record, in declaration order.
+        let row_evidence = &trace.row_evidence[1];
+        assert_eq!(wire_evidence, row_evidence);
+        let by_task: Vec<(&str, &str, &str)> = row_evidence
+            .iter()
+            .map(|e| {
+                (
+                    e["task"].as_str().unwrap(),
+                    e["disposition"].as_str().unwrap(),
+                    e["note"].as_str().unwrap_or(""),
+                )
+            })
+            .collect();
+        assert_eq!(by_task[0], ("score", "passed", ""));
+        assert_eq!(by_task[1].0, "flaky");
+        assert_eq!(by_task[1].1, "failed");
+        assert!(
+            by_task[1].2.contains("exit 7"),
+            "the failed rung keeps its note: {:?}",
+            by_task[1].2
+        );
+        assert_eq!(by_task[2].0, "tensor-pipe");
+        assert_eq!(by_task[2].1, "skipped");
+        assert!(
+            by_task[2].2.contains("unrunnable"),
+            "the skipped rung keeps its note: {:?}",
+            by_task[2].2
+        );
     }
 
     /// What one counter run left behind, for diffing the two paths.
@@ -1191,6 +1635,10 @@ mod tests {
         notes: Vec<String>,
         /// `iter` values on the task_result lines, in emission order (graph runs only).
         task_iters: Vec<u32>,
+        /// Each row's `evidence` array (empty when absent), parallel to `rows`.
+        row_evidence: Vec<Vec<serde_json::Value>>,
+        /// task_result lines as (task, status, output), in emission order.
+        task_results: Vec<(String, String, Option<serde_json::Value>)>,
     }
 
     /// The deterministic proposer: value.txt += 1 every turn.
@@ -1302,14 +1750,16 @@ mod tests {
             run_id: "parity".into(),
             prior: String::new(),
             skip_baseline: false,
+            seed_diff: None,
             identity: crate::identity::RunIdentity {
                 components: Vec::new(),
                 manifest_hash: "h".into(),
                 inject_hash: "h".into(),
+                seed_hash: String::new(),
                 measure_cmd: "./measure.sh".into(),
                 direction: "higher".into(),
                 rig: Default::default(),
-                digest: "v1:0".into(),
+                digest: "v2:0".into(),
             },
         };
         let world = m.build_world(workspace.clone());
@@ -1337,19 +1787,31 @@ mod tests {
         let mut shutdown = String::new();
         let mut task_iters = Vec::new();
         let mut notes: Vec<String> = Vec::new();
+        let mut row_evidence = Vec::new();
+        let mut task_results = Vec::new();
         for line in log.lines() {
             let v: serde_json::Value = serde_json::from_str(line).unwrap();
             let kind = v["kind"].as_str().unwrap().to_string();
             match kind.as_str() {
-                "row" => rows.push((
-                    v["row"]["iter"].as_u64().unwrap() as u32,
-                    v["row"]["decision"].as_str().unwrap().to_string(),
-                    v["row"]["score"].as_f64(),
-                )),
+                "row" => {
+                    rows.push((
+                        v["row"]["iter"].as_u64().unwrap() as u32,
+                        v["row"]["decision"].as_str().unwrap().to_string(),
+                        v["row"]["score"].as_f64(),
+                    ));
+                    row_evidence.push(v["row"]["evidence"].as_array().cloned().unwrap_or_default());
+                }
                 "summary" => best = v["best_score"].as_f64().unwrap(),
                 "shutdown" => shutdown = v["outcome"].as_str().unwrap().to_string(),
                 "note" => notes.push(v["msg"].as_str().unwrap_or("").to_string()),
-                "task_result" => task_iters.push(v["iter"].as_u64().unwrap() as u32),
+                "task_result" => {
+                    task_iters.push(v["iter"].as_u64().unwrap() as u32);
+                    task_results.push((
+                        v["task"].as_str().unwrap().to_string(),
+                        v["status"].as_str().unwrap().to_string(),
+                        v.get("output").filter(|o| !o.is_null()).cloned(),
+                    ));
+                }
                 _ => {}
             }
             kinds.push(kind);
@@ -1364,6 +1826,8 @@ mod tests {
             shutdown,
             task_iters,
             notes,
+            row_evidence,
+            task_results,
         }
     }
 

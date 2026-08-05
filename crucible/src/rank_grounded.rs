@@ -314,6 +314,7 @@ fn grounded_paths(scratch: &Path) -> Paths {
         state: scratch.join("state"),
         session_log: scratch.join("state/session.jsonl"),
         control: scratch.join("state/control.json"),
+        admissions: scratch.join("state/admissions.jsonl"),
         escalation: scratch.join("ESCALATION.json"),
         provisioning: scratch.join("PROVISIONING_PENDING.json"),
     }

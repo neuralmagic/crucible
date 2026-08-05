@@ -7,10 +7,34 @@
 //! mode, not a degraded fallback.
 
 use crate::{Args, Paths};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Cumulative-budget context for one agent turn. Cost is only authoritative at turn
+/// end, so mid-turn the reporters price the streamed token samples (see
+/// [`crate::event::provisional_cost`]) and emit provisional budget updates; the
+/// loop's turn-end budget call reconciles them. Without this a run could spend its
+/// whole cap inside one turn before any guard fires.
+#[derive(Clone, Copy)]
+pub struct TurnBudget {
+    /// Run spend before this turn started (authoritative).
+    pub spent_before: f64,
+    /// When the run started, so provisional updates carry the run-relative clock.
+    pub started: Instant,
+    /// Effective cost cap resolved by the loop (live control override or the CLI
+    /// arg); 0 means uncapped.
+    pub max_cost: f64,
+}
+
+impl TurnBudget {
+    /// Whether a provisional spend crosses the cap (same threshold as the loop's
+    /// between-iteration guard).
+    pub fn over_cap(&self, spent: f64) -> bool {
+        self.max_cost > 0.0 && spent >= self.max_cost
+    }
+}
 
 /// One row in the results log / final summary.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Row {
     pub iter: u32,
     pub decision: String,
@@ -24,10 +48,36 @@ pub struct Row {
     /// The measured fitness for this row (bench: p99 ms; test: failed count). Carried
     /// numerically (not just in `note`) so a resumed run can restore baseline/best.
     pub score: Option<f64>,
+    /// Secondary scalar for functional gates: breaks primary-score ties in the keep rule.
+    /// Carried numerically so a resume restores the kept best's tiebreak with its score.
+    pub tiebreak: Option<f64>,
     /// Total test count for this row (test gate), for the same reason.
     pub total: Option<u64>,
-    /// `Some("wide")` for wide-round rows; `None` for the deep (default) loop.
+    /// `Some("wide")` for wide-round rows, `Some("infra")` for never-started turn
+    /// records; `None` for the deep (default) loop.
     pub phase: Option<String>,
+    /// The World snapshot token committed when this row was kept (a git world packs the
+    /// commit sha). Carried on the wire so a resume can restore the kept-best tree instead
+    /// of pairing the logged best score with whatever the re-prepared checkout holds.
+    /// `None` on non-keep rows and on logs written before the field existed.
+    pub kept_snap: Option<String>,
+    /// The grade step's declared evidence set with per-task dispositions, so the row
+    /// says which declared checks never ran instead of presenting a partially graded
+    /// candidate as fully graded. Empty on ungraded rows.
+    pub evidence: Vec<crate::session::EvidenceEntry>,
+    /// The agent's whole CANDIDATE.md (`note` is its 120-char single-line fold). The PR
+    /// body prints this; every table keeps using `note`. Empty when the agent wrote none.
+    pub candidate_md: String,
+}
+
+/// One-line evidence rendering for the human-readable outputs (console rows, RESULTS.md,
+/// PR bodies): `refcheck ✓ calc-diff ✓ tensor-pipe SKIPPED (reason)`.
+pub(crate) fn evidence_line(evidence: &[crate::session::EvidenceEntry]) -> String {
+    evidence
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Run-wide context every front-end needs to render the start banner. Built once
@@ -116,7 +166,11 @@ pub trait Reporter {
     fn row(&mut self, row: &Row, solved: bool);
     /// Run the agent subprocess for `it`, streaming its output to the front-end.
     /// Returns the turn's cost and its error verdict ([`AgentTurn`]) so the loop can
-    /// budget on it and discard a failed no-op turn.
+    /// budget on it and discard a failed no-op turn. `budget` carries the run spend
+    /// so far and the cost cap: reporters stream provisional budget updates from
+    /// mid-turn token samples and may stop a local agent once the provisional spend
+    /// crosses the cap.
+    #[allow(clippy::too_many_arguments)]
     fn run_agent(
         &mut self,
         args: &Args,
@@ -125,6 +179,7 @@ pub trait Reporter {
         prompt: &str,
         resume_prompt: Option<&str>,
         session: Option<&str>,
+        budget: TurnBudget,
     ) -> AgentTurn;
     /// Cumulative budget after a turn; lets the front-end draw a gauge / warn.
     fn budget(&mut self, _spent: f64, _elapsed: Duration) {}
@@ -167,6 +222,25 @@ pub trait Reporter {
     /// iteration. Default no-op: only the session reporter persists them; the console
     /// front-end has no plan rendering, and the legacy sequencing path never emits one.
     fn plan_event(&mut self, _ev: &crate::session::SessionEvent) {}
+    /// How this resume classified the previous shutdown; the session reporter emits a
+    /// structured [`crate::session::SessionEvent::Recovery`].
+    fn recovery(&mut self, class: crate::session::RecoveryClass, iter: u32, detail: &str) {
+        self.note(&format!("recovery: {class} (iter {iter}): {detail}"));
+    }
+    /// Opens the approval bracket a resume's classifier reads: a dangling wait means the
+    /// run died with the approval open.
+    fn approval_wait(&mut self, handle: &str, trace_id: &str, mode: crate::provisioning::WaitMode) {
+        self.note(&format!(
+            "approval wait [{}] {handle} ({trace_id})",
+            mode.as_str()
+        ));
+    }
+    /// The wait reached a terminal outcome (`granted`/`denied`/`timeout`), closing the
+    /// bracket. Deliberately NOT called on a stop-while-parked: a stop doesn't resolve
+    /// the ask, and the still-open bracket makes a resume re-park on it.
+    fn approval_resolved(&mut self, outcome: &str, reason: &str) {
+        self.note(&format!("approval {outcome}: {reason}"));
+    }
     /// The draft PR(s) publish-on-keep opened, reported once after publish so the durable session
     /// log carries them (the controller's pull-ingest folds them onto the kept candidates' `pr_url`).
     /// The default is a no-op, the console already prints each URL via `note`; only the session
@@ -183,5 +257,23 @@ pub trait Reporter {
     /// consumer tailing it can tell "the run ended" from "the stream just went quiet".
     fn shutdown(&mut self, outcome: &str, reason: &str) {
         self.note(&format!("run ended: {outcome} ({reason})"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn over_cap_matches_the_loop_guard_threshold() {
+        let b = TurnBudget {
+            spent_before: 0.0,
+            started: Instant::now(),
+            max_cost: 0.0,
+        };
+        assert!(!b.over_cap(1e9), "0 means uncapped");
+        let b = TurnBudget { max_cost: 5.0, ..b };
+        assert!(!b.over_cap(4.99));
+        assert!(b.over_cap(5.0), ">= like over_budget");
     }
 }

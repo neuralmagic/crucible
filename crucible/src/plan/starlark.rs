@@ -3,9 +3,11 @@
 //! clock, and randomness APIs are unavailable.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use starlark_syntax::codemap::{FileSpan, Span};
 use starlark_syntax::lexer::TokenInt;
 use starlark_syntax::syntax::ast::{
     Argument, AssignTarget, AstLiteral, AstStmt, BinOp, CallArgsP, Expr, Stmt,
@@ -13,7 +15,10 @@ use starlark_syntax::syntax::ast::{
 use starlark_syntax::syntax::{AstModule, Dialect};
 
 use crate::manifest::{WorkflowCfg, WorkflowType};
-use crate::plan::ir::{Direction, EngineOp, Isolation, Join, Task, TaskKind, TaskName};
+use crate::plan::diag;
+use crate::plan::ir::{
+    Direction, EngineOp, Isolation, Join, OutputField, Stage, Task, TaskKind, TaskName,
+};
 
 const MAX_SOURCE_BYTES: usize = 256 * 1024;
 const MAX_PROMPT_BYTES: usize = 256 * 1024;
@@ -36,6 +41,16 @@ struct CompileContext {
     prompt_files: BTreeSet<PathBuf>,
     total_prompt_bytes: usize,
     eval_steps: usize,
+    /// Every task a DSL constructor built, keyed by name. A constructed-but-dropped task
+    /// silently never runs, so it is a compile error.
+    constructed_tasks: BTreeMap<String, FileSpan>,
+    /// `session(...)` declarations by name, with the declaring site.
+    sessions: BTreeMap<String, (SessionDecl, FileSpan)>,
+    /// Declared sessions bound to at least one task.
+    bound_sessions: BTreeSet<String>,
+    /// Bare-string session refs made before any declaration. A later declaration makes
+    /// these errors: a session must be declared before use.
+    string_session_refs: BTreeMap<String, FileSpan>,
 }
 
 impl CompileContext {
@@ -115,15 +130,134 @@ enum Value {
     String(String),
     List(Vec<Value>),
     Task(Task),
+    Session(SessionDecl),
     Workflow(WorkflowCfg),
 }
 
-struct Compiler {
+/// A `session(...)` declaration: a durable conversation name plus optional agent
+/// defaults that materialize onto the agent tasks bound to it.
+#[derive(Clone, Debug)]
+struct SessionDecl {
+    name: String,
+    harness: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+}
+
+impl SessionDecl {
+    fn has_defaults(&self) -> bool {
+        self.harness.is_some() || self.model.is_some() || self.effort.is_some()
+    }
+}
+
+/// A compile error already carrying its `file:line:col` prefix, so the call-site
+/// wrapper in [`Compiler::locate`] does not prefix it a second time.
+#[derive(Debug)]
+struct Diagnostic(String);
+
+impl fmt::Display for Diagnostic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Diagnostic {}
+
+/// The callable DSL surface, for unknown-function suggestions.
+const DSL_FUNCTIONS: &[&str] = &[
+    "agent",
+    "apply",
+    "command",
+    "decide",
+    "default_autoresearch",
+    "deps",
+    "evaluate",
+    "grade",
+    "measure",
+    "prompt_file",
+    "propose",
+    "session",
+    "top_k",
+    "workflow",
+];
+
+/// Every kwarg a constructor accepts. Unknown-kwarg errors suggest from this table; a
+/// test compiles every listed kwarg per constructor so it cannot drift from the arms.
+fn known_kwargs(function: &str) -> &'static [&'static str] {
+    match function {
+        "agent" => &[
+            "name",
+            "prompt",
+            "harness",
+            "model",
+            "effort",
+            "session",
+            "emits",
+            "depends_on",
+            "needs",
+            "required",
+            "isolated",
+            "join",
+            "stage",
+        ],
+        "command" => &[
+            "name",
+            "run",
+            "emits",
+            "depends_on",
+            "needs",
+            "required",
+            "isolated",
+            "join",
+            "stage",
+        ],
+        "evaluate" => &[
+            "name",
+            "run",
+            "threshold",
+            "direction",
+            "emits",
+            "depends_on",
+            "needs",
+            "required",
+            "isolated",
+            "join",
+            "stage",
+        ],
+        "top_k" => &["name", "k", "direction", "depends_on", "required"],
+        "propose" => &["name", "session", "depends_on"],
+        "apply" | "measure" => &["name", "depends_on"],
+        "grade" => &["name", "score", "evidence", "join"],
+        "decide" => &["name", "measurement", "depends_on"],
+        "session" => &["name", "harness", "model", "effort"],
+        "workflow" => &["type", "tasks", "result"],
+        _ => &[],
+    }
+}
+
+struct Compiler<'a> {
+    module: &'a AstModule,
     context: CompileContext,
     variables: BTreeMap<String, Value>,
 }
 
-impl Compiler {
+impl Compiler<'_> {
+    fn err_at(&self, span: Span, message: impl fmt::Display) -> anyhow::Error {
+        anyhow::Error::new(Diagnostic(format!(
+            "{}: {message}",
+            self.module.file_span(span)
+        )))
+    }
+
+    /// Attach the call site to an error that does not already carry a location.
+    fn locate(&self, span: Span, error: anyhow::Error) -> anyhow::Error {
+        if error.is::<Diagnostic>() {
+            error
+        } else {
+            self.err_at(span, format!("{error:#}"))
+        }
+    }
+
     fn statement(&mut self, statement: &AstStmt) -> Result<Option<Value>> {
         self.context.step()?;
         match &statement.node {
@@ -136,19 +270,24 @@ impl Compiler {
             }
             Stmt::Assign(assign) => {
                 let AssignTarget::Identifier(name) = &assign.lhs.node else {
-                    bail!("workflow assignments must target a single variable name");
+                    return Err(self.err_at(
+                        assign.lhs.span,
+                        "workflow assignments must target a single variable name",
+                    ));
                 };
                 let value = self.expression(&assign.rhs)?;
                 self.variables.insert(name.node.ident.clone(), value);
                 Ok(None)
             }
             Stmt::Expression(expression) => self.expression(expression).map(Some),
-            Stmt::Load(_) => bail!(
-                "workflow Starlark may not use load(); use pack-local prompt_file() for prompts"
-            ),
-            _ => bail!(
-                "workflow Starlark is declarative: use assignments, lists, list concatenation, and DSL calls"
-            ),
+            Stmt::Load(_) => Err(self.err_at(
+                statement.span,
+                "workflow Starlark may not use load(); use pack-local prompt_file() for prompts",
+            )),
+            _ => Err(self.err_at(
+                statement.span,
+                "workflow Starlark is declarative: use assignments, lists, list concatenation, and DSL calls",
+            )),
         }
     }
 
@@ -159,16 +298,23 @@ impl Compiler {
                 "True" => Ok(Value::Bool(true)),
                 "False" => Ok(Value::Bool(false)),
                 "None" => Ok(Value::None),
-                name => self
-                    .variables
-                    .get(name)
-                    .cloned()
-                    .with_context(|| format!("unknown workflow variable {name:?}")),
+                name => match self.variables.get(name) {
+                    Some(value) => Ok(value.clone()),
+                    None => Err(self.err_at(
+                        expression.span,
+                        diag::with_suggestion(
+                            format!("unknown workflow variable {name:?}"),
+                            diag::suggest(name, self.variables.keys().map(String::as_str)),
+                        ),
+                    )),
+                },
             },
             Expr::Literal(AstLiteral::String(value)) => Ok(Value::String(value.node.clone())),
             Expr::Literal(AstLiteral::Int(value)) => match &value.node {
                 TokenInt::I32(value) => Ok(Value::Int(*value)),
-                TokenInt::BigInt(_) => bail!("workflow integers must fit in 32 bits"),
+                TokenInt::BigInt(_) => {
+                    Err(self.err_at(expression.span, "workflow integers must fit in 32 bits"))
+                }
             },
             Expr::Literal(AstLiteral::Float(value)) => Ok(Value::Float(value.node)),
             Expr::List(items) | Expr::Tuple(items) => items
@@ -180,28 +326,45 @@ impl Compiler {
                 let (Value::List(mut left), Value::List(right)) =
                     (self.expression(left)?, self.expression(right)?)
                 else {
-                    bail!("workflow `+` is supported only for task or dependency lists");
+                    return Err(self.err_at(
+                        expression.span,
+                        "workflow `+` is supported only for task or dependency lists",
+                    ));
                 };
                 left.extend(right);
                 Ok(Value::List(left))
             }
             Expr::Call(function, args) => {
-                let Expr::Identifier(function) = &function.node else {
-                    bail!("workflow calls must name a DSL constructor directly");
+                let Expr::Identifier(identifier) = &function.node else {
+                    return Err(self.err_at(
+                        function.span,
+                        "workflow calls must name a DSL constructor directly",
+                    ));
                 };
-                self.call(&function.node.ident, args)
+                self.call(&identifier.node.ident, function.span, args)
             }
-            _ => bail!(
-                "unsupported workflow expression; use strings, integers, booleans, lists, list concatenation, and DSL calls"
-            ),
+            _ => Err(self.err_at(
+                expression.span,
+                "unsupported workflow expression; use strings, integers, booleans, lists, list concatenation, and DSL calls",
+            )),
         }
     }
 
     fn call(
         &mut self,
         function: &str,
+        function_span: Span,
         args: &CallArgsP<starlark_syntax::syntax::ast::AstNoPayload>,
     ) -> Result<Value> {
+        if !DSL_FUNCTIONS.contains(&function) {
+            return Err(self.err_at(
+                function_span,
+                diag::with_suggestion(
+                    format!("unknown workflow DSL function {function:?}"),
+                    diag::suggest(function, DSL_FUNCTIONS.iter().copied()),
+                ),
+            ));
+        }
         if matches!(
             function,
             "prompt_file" | "deps" | "workflow" | "default_autoresearch"
@@ -211,10 +374,16 @@ impl Compiler {
             .all(|argument| matches!(argument.node, Argument::Positional(_)))
         {
             let [argument] = args.args.as_slice() else {
-                bail!("{function}() takes exactly one positional argument");
+                return Err(self.err_at(
+                    function_span,
+                    format!("{function}() takes exactly one positional argument"),
+                ));
             };
             let Argument::Positional(argument) = &argument.node else {
-                bail!("{function}() takes exactly one positional argument");
+                return Err(self.err_at(
+                    function_span,
+                    format!("{function}() takes exactly one positional argument"),
+                ));
             };
             let value = self.expression(argument)?;
             return match (function, value) {
@@ -243,20 +412,44 @@ impl Compiler {
                     default_autoresearch(task_list("default_autoresearch", tasks)?)
                         .map(Value::Workflow)
                 }
-                _ => bail!("{function}() received the wrong value type"),
+                _ => Err(self.err_at(
+                    function_span,
+                    format!("{function}() received the wrong value type"),
+                )),
             };
         }
 
         let mut named = BTreeMap::new();
+        let mut arg_spans: BTreeMap<String, Span> = BTreeMap::new();
         for argument in &args.args {
             let Argument::Named(name, value) = &argument.node else {
-                bail!("{function}() task constructor arguments must be named");
+                return Err(self.err_at(
+                    argument.span,
+                    format!("{function}() task constructor arguments must be named"),
+                ));
             };
             let value = self.expression(value)?;
             if named.insert(name.node.clone(), value).is_some() {
-                bail!("{function}() repeats argument {:?}", name.node);
+                return Err(self.err_at(
+                    argument.span,
+                    format!("{function}() repeats argument {:?}", name.node),
+                ));
             }
+            arg_spans.insert(name.node.clone(), argument.span);
         }
+        self.constructor(function, function_span, named, arg_spans)
+            .map_err(|error| self.locate(function_span, error))
+    }
+
+    /// Build the value for a named-argument DSL call. Every kwarg an arm consumes must
+    /// appear in [`known_kwargs`], which the leftover check reports against.
+    fn constructor(
+        &mut self,
+        function: &str,
+        span: Span,
+        mut named: BTreeMap<String, Value>,
+        arg_spans: BTreeMap<String, Span>,
+    ) -> Result<Value> {
         if function == "workflow" {
             let workflow_type = match take_string_default(&mut named, "type", "autoresearch")?
                 .as_str()
@@ -270,12 +463,7 @@ impl Compiler {
                 _ => bail!("workflow tasks must be a list of task constructor values"),
             };
             let result = take_optional_task_name(&mut named, "result")?;
-            if !named.is_empty() {
-                bail!(
-                    "workflow() has unknown argument(s): {}",
-                    named.keys().cloned().collect::<Vec<_>>().join(", ")
-                );
-            }
+            self.no_unknown_kwargs(function, span, &named, &arg_spans)?;
             let workflow = WorkflowCfg {
                 workflow_type,
                 result,
@@ -284,18 +472,73 @@ impl Compiler {
             workflow.validate()?;
             return Ok(Value::Workflow(workflow));
         }
+        if function == "session" {
+            let name = take_string(&mut named, "name")?;
+            if !is_valid_session_name(&name) {
+                bail!("session name {name:?} must be 1-64 ASCII letters, digits, `.`, `_`, or `-`");
+            }
+            let decl = SessionDecl {
+                harness: take_optional_string(&mut named, "harness")?,
+                model: take_optional_string(&mut named, "model")?,
+                effort: take_optional_string(&mut named, "effort")?,
+                name,
+            };
+            self.no_unknown_kwargs(function, span, &named, &arg_spans)?;
+            if let Some((_, first)) = self.context.sessions.get(&decl.name) {
+                return Err(self.err_at(
+                    span,
+                    format!("session {:?} is already declared at {first}", decl.name),
+                ));
+            }
+            self.context.sessions.insert(
+                decl.name.clone(),
+                (decl.clone(), self.module.file_span(span)),
+            );
+            return Ok(Value::Session(decl));
+        }
+        if matches!(function, "prompt_file" | "deps" | "default_autoresearch") {
+            bail!("{function}() takes exactly one positional argument");
+        }
 
         let task = match function {
             "agent" => {
                 let name = TaskName(take_string(&mut named, "name")?);
+                let prompt = take_string(&mut named, "prompt")?;
+                let mut harness = take_optional_string(&mut named, "harness")?;
+                let mut model = take_optional_string(&mut named, "model")?;
+                let mut effort = take_optional_string(&mut named, "effort")?;
+                let session = self.take_session(&mut named, &arg_spans, span)?;
+                if let Some(decl) = &session {
+                    // A session is one serial conversation under one agent config, so
+                    // declared defaults fill unset knobs and conflicts are errors.
+                    for (knob, own, default) in [
+                        ("harness", &mut harness, &decl.harness),
+                        ("model", &mut model, &decl.model),
+                        ("effort", &mut effort, &decl.effort),
+                    ] {
+                        let Some(theirs) = default else { continue };
+                        match own {
+                            None => *own = Some(theirs.clone()),
+                            Some(mine) if mine.as_str() != theirs.as_str() => {
+                                return Err(self.err_at(
+                                    span,
+                                    format!(
+                                        "task {:?} sets {knob} {mine:?} but session {:?} declares {theirs:?}; a session is one conversation under one config",
+                                        name.0, decl.name
+                                    ),
+                                ));
+                            }
+                            Some(_) => {}
+                        }
+                    }
+                }
                 let kind = TaskKind::Agent {
-                    prompt: take_string(&mut named, "prompt")?,
-                    harness: take_optional_string(&mut named, "harness")?,
-                    model: take_optional_string(&mut named, "model")?,
-                    effort: take_optional_string(&mut named, "effort")?,
+                    prompt,
+                    harness,
+                    model,
+                    effort,
                 };
-                let session = take_optional_string(&mut named, "session")?;
-                dsl_task(&mut named, name, kind, session)?
+                dsl_task(&mut named, name, kind, session.map(|decl| decl.name))?
             }
             "command" => {
                 let name = TaskName(take_string(&mut named, "name")?);
@@ -339,16 +582,43 @@ impl Compiler {
                     required: take_bool_default(&mut named, "required", true)?,
                     isolation: None,
                     join: Join::Passed,
+                    stage: Stage::Iteration,
+                    emits: Vec::new(),
                 }
             }
-            "propose" => engine_task(&mut named, EngineOp::Propose, None)?,
+            "propose" => {
+                let session = self.take_session(&mut named, &arg_spans, span)?;
+                if let Some(decl) = &session
+                    && decl.has_defaults()
+                {
+                    // The engine propose turn's agent config is owned by the manifest's
+                    // [agent]; accepting the defaults here would silently ignore them.
+                    return Err(self.err_at(
+                        arg_spans.get("session").copied().unwrap_or(span),
+                        format!(
+                            "session {:?} declares agent defaults, but propose() takes its agent config from the manifest's [agent]",
+                            decl.name
+                        ),
+                    ));
+                }
+                let mut task = engine_task(&mut named, EngineOp::Propose, None)?;
+                task.session = session.map(|decl| decl.name);
+                task
+            }
             "apply" => engine_task(&mut named, EngineOp::Apply, None)?,
             "measure" => engine_task(&mut named, EngineOp::Measure, None)?,
             "grade" => {
                 let source = take_task_name(&mut named, "score")?;
+                // Optional secondary axis: the named task's score breaks primary-score ties.
+                let tiebreak = take_optional_task_name(&mut named, "tiebreak")?;
                 let mut evidence = take_named_task_names(&mut named, "evidence")?;
                 if !evidence.contains(&source) {
                     evidence.push(source.clone());
+                }
+                if let Some(t) = &tiebreak
+                    && !evidence.contains(t)
+                {
+                    evidence.push(t.clone());
                 }
                 let mut task = engine(
                     &take_string(&mut named, "name")?,
@@ -356,6 +626,9 @@ impl Compiler {
                     Some(source),
                     evidence,
                 );
+                if let TaskKind::Engine { tiebreak: slot, .. } = &mut task.task {
+                    *slot = tiebreak;
+                }
                 task.join = parse_join(&take_string_default(&mut named, "join", "passed")?)?;
                 task
             }
@@ -374,13 +647,81 @@ impl Compiler {
             }
             _ => bail!("unknown workflow DSL function {function:?}"),
         };
-        if !named.is_empty() {
-            bail!(
-                "{function}() has unknown argument(s): {}",
-                named.keys().cloned().collect::<Vec<_>>().join(", ")
-            );
-        }
+        self.no_unknown_kwargs(function, span, &named, &arg_spans)?;
+        self.context
+            .constructed_tasks
+            .insert(task.name.0.clone(), self.module.file_span(span));
         Ok(Value::Task(task))
+    }
+
+    fn no_unknown_kwargs(
+        &self,
+        function: &str,
+        span: Span,
+        named: &BTreeMap<String, Value>,
+        arg_spans: &BTreeMap<String, Span>,
+    ) -> Result<()> {
+        let Some(unknown) = named.keys().next() else {
+            return Ok(());
+        };
+        let at = arg_spans.get(unknown).copied().unwrap_or(span);
+        Err(self.err_at(
+            at,
+            diag::with_suggestion(
+                format!("{function}() has unknown argument {unknown:?}"),
+                diag::suggest(unknown, known_kwargs(function).iter().copied()),
+            ),
+        ))
+    }
+
+    /// A `session(...)` value, or a bare string. Strings keep the historical
+    /// pass-through only while the file declares no sessions; once any `session()`
+    /// exists every string must name a declared one.
+    fn take_session(
+        &mut self,
+        named: &mut BTreeMap<String, Value>,
+        arg_spans: &BTreeMap<String, Span>,
+        call_span: Span,
+    ) -> Result<Option<SessionDecl>> {
+        let span = arg_spans.get("session").copied().unwrap_or(call_span);
+        match named.remove("session").unwrap_or(Value::None) {
+            Value::None => Ok(None),
+            Value::Session(decl) => {
+                self.context.bound_sessions.insert(decl.name.clone());
+                Ok(Some(decl))
+            }
+            Value::String(name) => {
+                if let Some((decl, _)) = self.context.sessions.get(&name) {
+                    let decl = decl.clone();
+                    self.context.bound_sessions.insert(name);
+                    Ok(Some(decl))
+                } else if self.context.sessions.is_empty() {
+                    let site = self.module.file_span(span);
+                    self.context
+                        .string_session_refs
+                        .entry(name.clone())
+                        .or_insert(site);
+                    Ok(Some(SessionDecl {
+                        name,
+                        harness: None,
+                        model: None,
+                        effort: None,
+                    }))
+                } else {
+                    Err(self.err_at(
+                        span,
+                        diag::with_suggestion(
+                            format!("session {name:?} is not declared"),
+                            diag::suggest(&name, self.context.sessions.keys().map(String::as_str)),
+                        ),
+                    ))
+                }
+            }
+            _ => Err(self.err_at(
+                span,
+                "argument \"session\" must be a session() value or a string",
+            )),
+        }
     }
 }
 
@@ -402,8 +743,10 @@ fn task_list(function: &str, tasks: Vec<Value>) -> Result<Vec<Task>> {
 
 fn default_autoresearch(mut extras: Vec<Task>) -> Result<WorkflowCfg> {
     let propose = engine("propose", EngineOp::Propose, None, Vec::new());
+    // Epilogue extras never splice into the iteration chain: no implicit propose
+    // dependency, and they cannot be the sinks apply waits on.
     for task in &mut extras {
-        if task.depends_on.is_empty() {
+        if task.stage == Stage::Iteration && task.depends_on.is_empty() {
             task.depends_on.push(propose.name.clone());
         }
     }
@@ -412,12 +755,13 @@ fn default_autoresearch(mut extras: Vec<Task>) -> Result<WorkflowCfg> {
     let sinks: Vec<TaskName> = tasks
         .iter()
         .filter(|task| {
-            !tasks.iter().any(|other| {
-                other
-                    .depends_on
-                    .iter()
-                    .any(|dependency| dependency == &task.name)
-            })
+            task.stage == Stage::Iteration
+                && !tasks.iter().any(|other| {
+                    other
+                        .depends_on
+                        .iter()
+                        .any(|dependency| dependency == &task.name)
+                })
         })
         .map(|task| task.name.clone())
         .collect();
@@ -454,19 +798,12 @@ fn engine_task(
     op: EngineOp,
     source: Option<TaskName>,
 ) -> Result<Task> {
-    let session = if op == EngineOp::Propose {
-        take_optional_string(named, "session")?
-    } else {
-        None
-    };
-    let mut task = engine(
+    Ok(engine(
         &take_string(named, "name")?,
         op,
         source,
         take_task_names(named)?,
-    );
-    task.session = session;
-    Ok(task)
+    ))
 }
 
 fn dsl_task(
@@ -484,20 +821,60 @@ fn dsl_task(
         required: take_bool_default(named, "required", true)?,
         isolation: isolation(take_bool_default(named, "isolated", false)?),
         join: parse_join(&take_string_default(named, "join", "all")?)?,
+        stage: parse_stage(&take_string_default(named, "stage", "iteration")?)?,
+        emits: take_output_fields(named)?,
     })
+}
+
+fn parse_stage(value: &str) -> Result<Stage> {
+    match value {
+        "iteration" => Ok(Stage::Iteration),
+        "epilogue" => Ok(Stage::Epilogue),
+        other => bail!("stage must be `iteration` or `epilogue`, got {other:?}"),
+    }
 }
 
 fn engine(name: &str, op: EngineOp, source: Option<TaskName>, depends_on: Vec<TaskName>) -> Task {
     Task {
         name: TaskName(name.to_owned()),
-        task: TaskKind::Engine { op, source },
+        task: TaskKind::Engine {
+            op,
+            source,
+            tiebreak: None,
+        },
         depends_on,
         session: None,
         needs: "any".to_owned(),
         required: true,
         isolation: None,
         join: Join::All,
+        stage: Stage::Iteration,
+        emits: Vec::new(),
     }
+}
+
+fn take_output_fields(named: &mut BTreeMap<String, Value>) -> Result<Vec<OutputField>> {
+    match named.remove("emits").unwrap_or(Value::None) {
+        Value::None => Ok(Vec::new()),
+        Value::List(fields) => fields
+            .into_iter()
+            .map(|field| match field {
+                Value::String(field) => Ok(OutputField(field)),
+                _ => bail!("emits entries must be strings"),
+            })
+            .collect(),
+        _ => bail!("argument \"emits\" must be a list of field-name strings"),
+    }
+}
+
+/// Mirrors the session charset rule enforced by plan validation, so the error lands at
+/// the declaration instead of after the graph is assembled.
+fn is_valid_session_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
 fn take_value(named: &mut BTreeMap<String, Value>, name: &str) -> Result<Value> {
@@ -726,21 +1103,63 @@ pub fn compile_source(source: &str, filename: &Path, pack_dir: &Path) -> Result<
     )
     .map_err(|error| anyhow::anyhow!("parsing workflow Starlark: {error}"))?;
     let mut compiler = Compiler {
+        module: &ast,
         context: CompileContext {
             pack_dir: pack_dir.to_path_buf(),
             prompt_files: BTreeSet::new(),
             total_prompt_bytes: 0,
             eval_steps: 0,
+            constructed_tasks: BTreeMap::new(),
+            sessions: BTreeMap::new(),
+            bound_sessions: BTreeSet::new(),
+            string_session_refs: BTreeMap::new(),
         },
         variables: BTreeMap::new(),
     };
     let Some(Value::Workflow(workflow)) = compiler.statement(ast.statement())? else {
         bail!("workflow source must end with workflow(...) or default_autoresearch([...])");
     };
+    let context = compiler.context;
+    let included: BTreeSet<&str> = workflow.tasks.iter().map(|t| t.name.0.as_str()).collect();
+    let dropped: Vec<String> = context
+        .constructed_tasks
+        .iter()
+        .filter(|(name, _)| !included.contains(name.as_str()))
+        .map(|(name, site)| format!("{name:?} ({site})"))
+        .collect();
+    if !dropped.is_empty() {
+        bail!(
+            "task(s) constructed but not included in the workflow: {}; add them to workflow(tasks = ...) or delete them",
+            dropped.join(", ")
+        );
+    }
+    if !context.sessions.is_empty() && !context.string_session_refs.is_empty() {
+        let refs: Vec<String> = context
+            .string_session_refs
+            .iter()
+            .map(|(name, site)| format!("{name:?} ({site})"))
+            .collect();
+        bail!(
+            "session string reference(s) {} appear before any session() declaration; declare sessions before binding them",
+            refs.join(", ")
+        );
+    }
+    let unbound: Vec<String> = context
+        .sessions
+        .iter()
+        .filter(|(name, _)| !context.bound_sessions.contains(*name))
+        .map(|(name, (_, site))| format!("{name:?} ({site})"))
+        .collect();
+    if !unbound.is_empty() {
+        bail!(
+            "session(s) declared but never bound to a task: {}; bind with session = <declaration> or delete them",
+            unbound.join(", ")
+        );
+    }
     let canonical_json = serde_json::to_string_pretty(&workflow)? + "\n";
     Ok(CompiledWorkflow {
         workflow,
-        prompt_files: compiler.context.prompt_files.into_iter().collect(),
+        prompt_files: context.prompt_files.into_iter().collect(),
         canonical_json,
     })
 }
@@ -863,6 +1282,55 @@ default_autoresearch([review])
     }
 
     #[test]
+    fn stage_epilogue_authors_a_run_scoped_task() {
+        let pack = temp_pack("epilogue");
+        let source = r#"
+review = command(name = "review", run = "./review.sh")
+racecheck = command(
+    name = "racecheck",
+    run = "./racecheck.sh",
+    stage = "epilogue",
+    required = False,
+)
+default_autoresearch([review, racecheck])
+"#;
+        let compiled = compile_source(source, &pack.join("epilogue.star"), &pack).unwrap();
+        let racecheck = compiled
+            .workflow
+            .tasks
+            .iter()
+            .find(|task| task.name.0 == "racecheck")
+            .unwrap();
+        assert_eq!(racecheck.stage, Stage::Epilogue);
+        assert!(
+            racecheck.depends_on.is_empty(),
+            "epilogue tasks get no implicit propose dependency"
+        );
+        let apply = compiled
+            .workflow
+            .tasks
+            .iter()
+            .find(|task| task.name.0 == "apply")
+            .unwrap();
+        assert_eq!(
+            apply.depends_on,
+            ["review".into()],
+            "apply waits on the iteration sink only"
+        );
+
+        let bad = r#"
+racecheck = command(name = "racecheck", run = "./racecheck.sh", stage = "finale")
+default_autoresearch([racecheck])
+"#;
+        let error = format!(
+            "{:#}",
+            compile_source(bad, &pack.join("bad.star"), &pack).unwrap_err()
+        );
+        assert!(error.contains("`iteration` or `epilogue`"), "{error}");
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
     fn compiles_parallel_measurement_rungs_and_grade() {
         let pack = temp_pack("measurement");
         let source = r#"
@@ -895,6 +1363,7 @@ measurement = grade(
     name = "final-grade",
     evidence = [correctness, latency, racecheck],
     score = latency,
+    tiebreak = racecheck,
 )
 choice = decide(name = "choose", measurement = measurement)
 workflow(
@@ -920,7 +1389,9 @@ workflow(
             TaskKind::Engine {
                 op: EngineOp::Grade,
                 source: Some(ref source),
+                tiebreak: Some(ref tiebreak),
             } if source == &TaskName("latency".to_string())
+                && tiebreak == &TaskName("racecheck".to_string())
         ));
         let _ = std::fs::remove_dir_all(&pack);
     }
@@ -1050,6 +1521,294 @@ workflow(type = "custom", tasks = [score, strict, lossy], result = strict)
             .filter(|name| name.to_string_lossy().starts_with(".tmp"))
             .collect();
         assert!(strays.is_empty(), "left temp files: {strays:?}");
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn unknown_kwarg_function_and_variable_errors_carry_location_and_suggestion() {
+        let pack = temp_pack("diagnostics");
+        let kwarg = "a = agent(name = \"a\", prompt = \"p\", depend_on = [])\nworkflow([a])\n";
+        let err = compile_source(kwarg, &pack.join("workflow.star"), &pack)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("workflow.star:1:"), "{err}");
+        assert!(
+            err.contains("agent() has unknown argument \"depend_on\""),
+            "{err}"
+        );
+        assert!(err.contains("did you mean \"depends_on\"?"), "{err}");
+
+        let function = "a = agnt(name = \"a\", prompt = \"p\")\nworkflow([a])\n";
+        let err = compile_source(function, &pack.join("workflow.star"), &pack)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("workflow.star:1:"), "{err}");
+        assert!(
+            err.contains("unknown workflow DSL function \"agnt\""),
+            "{err}"
+        );
+        assert!(err.contains("did you mean \"agent\"?"), "{err}");
+
+        let variable = "candidate = command(name = \"c\", run = \"true\")\nworkflow([candidat])\n";
+        let err = compile_source(variable, &pack.join("workflow.star"), &pack)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("workflow.star:2:"), "{err}");
+        assert!(
+            err.contains("unknown workflow variable \"candidat\""),
+            "{err}"
+        );
+        assert!(err.contains("did you mean \"candidate\"?"), "{err}");
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn constructed_but_dropped_tasks_are_a_compile_error_naming_the_site() {
+        let pack = temp_pack("dropped");
+        let source = r#"
+keep = command(name = "keep", run = "true")
+racecheck = evaluate(name = "racecheck", run = "true")
+workflow(type = "custom", tasks = [keep], result = keep)
+"#;
+        let err = compile_source(source, &pack.join("workflow.star"), &pack)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not included in the workflow"), "{err}");
+        assert!(err.contains("\"racecheck\""), "{err}");
+        assert!(err.contains("workflow.star:3:"), "{err}");
+        assert!(!err.contains("\"keep\""), "{err}");
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn session_defaults_materialize_and_conflicts_are_rejected() {
+        let pack = temp_pack("session-defaults");
+        let source = r#"
+solver = session(name = "solver", model = "claude-opus-4-6", effort = "high")
+a = agent(name = "a", prompt = "p", session = solver)
+b = agent(name = "b", prompt = "p", model = "claude-opus-4-6", session = "solver", depends_on = [a])
+workflow(type = "custom", tasks = [a, b], result = b)
+"#;
+        let compiled = compile_source(source, &pack.join("workflow.star"), &pack).unwrap();
+        for task in &compiled.workflow.tasks {
+            assert_eq!(task.session.as_deref(), Some("solver"));
+            let TaskKind::Agent { model, effort, .. } = &task.task else {
+                panic!("expected agent task");
+            };
+            assert_eq!(model.as_deref(), Some("claude-opus-4-6"), "{}", task.name);
+            assert_eq!(effort.as_deref(), Some("high"), "{}", task.name);
+        }
+
+        let conflict = r#"
+solver = session(name = "solver", model = "claude-opus-4-6")
+a = agent(name = "a", prompt = "p", model = "claude-sonnet-5", session = solver)
+workflow(type = "custom", tasks = [a], result = a)
+"#;
+        let err = compile_source(conflict, &pack.join("workflow.star"), &pack)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("one conversation under one config"), "{err}");
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn duplicate_session_declarations_error_at_the_second_site() {
+        let pack = temp_pack("session-dup");
+        let source =
+            "a = session(name = \"solver\")\nb = session(name = \"solver\")\nworkflow([])\n";
+        let err = compile_source(source, &pack.join("workflow.star"), &pack)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already declared"), "{err}");
+        assert!(err.contains("workflow.star:2:"), "{err}");
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn string_session_refs_are_checked_once_any_session_is_declared() {
+        let pack = temp_pack("session-strings");
+        let typo = r#"
+solver = session(name = "solver")
+a = agent(name = "a", prompt = "p", session = solver)
+b = agent(name = "b", prompt = "p", session = "sovler", depends_on = [a])
+workflow(type = "custom", tasks = [a, b], result = b)
+"#;
+        let err = compile_source(typo, &pack.join("workflow.star"), &pack)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("session \"sovler\" is not declared"), "{err}");
+        assert!(err.contains("did you mean \"solver\"?"), "{err}");
+
+        // Without any declaration, bare strings keep the historical pass-through.
+        let bare = r#"
+a = agent(name = "a", prompt = "p", session = "solver")
+b = agent(name = "b", prompt = "p", session = "sovler", depends_on = [a])
+workflow(type = "custom", tasks = [a, b], result = b)
+"#;
+        let compiled = compile_source(bare, &pack.join("workflow.star"), &pack).unwrap();
+        assert_eq!(
+            compiled.workflow.tasks[1].session.as_deref(),
+            Some("sovler")
+        );
+
+        let late = r#"
+a = agent(name = "a", prompt = "p", session = "solver")
+solver = session(name = "solver")
+b = agent(name = "b", prompt = "p", session = solver, depends_on = [a])
+workflow(type = "custom", tasks = [a, b], result = b)
+"#;
+        let err = compile_source(late, &pack.join("workflow.star"), &pack)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("before any session() declaration"), "{err}");
+        assert!(err.contains("\"solver\""), "{err}");
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn unbound_sessions_and_propose_session_defaults_are_rejected() {
+        let pack = temp_pack("session-rules");
+        let unbound = r#"
+solver = session(name = "solver")
+a = agent(name = "a", prompt = "p")
+workflow(type = "custom", tasks = [a], result = a)
+"#;
+        let err = compile_source(unbound, &pack.join("workflow.star"), &pack)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("never bound to a task"), "{err}");
+        assert!(err.contains("\"solver\""), "{err}");
+
+        let propose_defaults = r#"
+solver = session(name = "solver", model = "claude-opus-4-6")
+c = propose(name = "c", session = solver)
+workflow(type = "custom", tasks = [c], result = c)
+"#;
+        let err = compile_source(propose_defaults, &pack.join("workflow.star"), &pack)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("manifest's [agent]"), "{err}");
+
+        // A default-free session binds to propose exactly as a string does.
+        let plain = r#"
+solver = session(name = "solver")
+c = propose(name = "c", session = solver)
+workflow(type = "custom", tasks = [c], result = c)
+"#;
+        let compiled = compile_source(plain, &pack.join("workflow.star"), &pack).unwrap();
+        assert_eq!(
+            compiled.workflow.tasks[0].session.as_deref(),
+            Some("solver")
+        );
+
+        let bad_name = "s = session(name = \"has space\")\nworkflow([])\n";
+        let err = compile_source(bad_name, &pack.join("workflow.star"), &pack)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("1-64 ASCII"), "{err}");
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn emits_parses_on_dsl_tasks_and_is_unknown_on_engine_constructors() {
+        let pack = temp_pack("emits");
+        let source = r#"
+e = evaluate(name = "e", run = "true", emits = ["score", "pass"])
+workflow(type = "custom", tasks = [e], result = e)
+"#;
+        let compiled = compile_source(source, &pack.join("workflow.star"), &pack).unwrap();
+        assert_eq!(
+            compiled.workflow.tasks[0].emits,
+            vec![
+                crate::plan::ir::OutputField("score".into()),
+                crate::plan::ir::OutputField("pass".into()),
+            ]
+        );
+
+        for source in [
+            "c = propose(name = \"c\", emits = [\"score\"])\nworkflow([c])\n",
+            "m = command(name = \"m\", run = \"true\")\np = top_k(name = \"p\", k = 1, direction = \"lower\", depends_on = [m], emits = [\"kept\"])\nworkflow([m, p])\n",
+        ] {
+            let err = compile_source(source, &pack.join("workflow.star"), &pack)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("unknown argument \"emits\""), "{err}");
+        }
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// The drift guard for [`known_kwargs`]: per constructor, a call carrying every
+    /// listed kwarg compiles (so the arm consumes each one) and an unlisted kwarg
+    /// errors (so the arm consumes nothing off-table).
+    #[test]
+    fn every_declared_kwarg_compiles_and_an_unlisted_one_errors() {
+        let pack = temp_pack("kwarg-slices");
+        let cases: &[(&str, &str)] = &[
+            (
+                "agent",
+                "s = session(name = \"sess\")\na = agent(name = \"a\", prompt = \"p\", harness = \"claude\", model = \"m\", effort = \"high\", session = s, emits = [\"score\"], depends_on = [], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\"{extra})\nworkflow(type = \"custom\", tasks = [a], result = a)\n",
+            ),
+            (
+                "command",
+                "c = command(name = \"c\", run = \"true\", emits = [\"score\"], depends_on = [], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\"{extra})\nworkflow(type = \"custom\", tasks = [c], result = c)\n",
+            ),
+            (
+                "evaluate",
+                "e = evaluate(name = \"e\", run = \"true\", threshold = 1, direction = \"higher\", emits = [\"score\"], depends_on = [], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\"{extra})\nworkflow(type = \"custom\", tasks = [e], result = e)\n",
+            ),
+            (
+                "top_k",
+                "m = command(name = \"m\", run = \"true\")\np = top_k(name = \"p\", k = 1, direction = \"lower\", depends_on = [m], required = True{extra})\nworkflow(type = \"custom\", tasks = [m, p], result = p)\n",
+            ),
+            (
+                "propose",
+                "c = propose(name = \"c\", session = \"solver\", depends_on = []{extra})\nworkflow(type = \"custom\", tasks = [c], result = c)\n",
+            ),
+            (
+                "apply",
+                "a = apply(name = \"a\", depends_on = []{extra})\nworkflow(type = \"custom\", tasks = [a], result = a)\n",
+            ),
+            (
+                "measure",
+                "m = measure(name = \"m\", depends_on = []{extra})\nworkflow(type = \"custom\", tasks = [m], result = m)\n",
+            ),
+            (
+                "grade",
+                "s = evaluate(name = \"s\", run = \"true\")\ng = grade(name = \"g\", score = s, evidence = [s], join = \"passed\"{extra})\nworkflow(type = \"custom\", tasks = [s, g], result = g)\n",
+            ),
+            (
+                "decide",
+                "s = evaluate(name = \"s\", run = \"true\")\ng = grade(name = \"g\", score = s, evidence = [s])\nd = decide(name = \"d\", measurement = g, depends_on = [g]{extra})\nworkflow(type = \"custom\", tasks = [s, g, d], result = d)\n",
+            ),
+            (
+                "session",
+                "s = session(name = \"s\", harness = \"claude\", model = \"m\", effort = \"high\"{extra})\na = agent(name = \"a\", prompt = \"p\", session = s)\nworkflow(type = \"custom\", tasks = [a], result = a)\n",
+            ),
+            (
+                "workflow",
+                "c = command(name = \"c\", run = \"true\")\nworkflow(type = \"custom\", tasks = [c], result = c{extra})\n",
+            ),
+        ];
+        for (function, template) in cases {
+            for kwarg in known_kwargs(function) {
+                assert!(
+                    template.contains(&format!("{kwarg} = ")),
+                    "{function} template does not exercise kwarg {kwarg:?}"
+                );
+            }
+            let ok = template.replace("{extra}", "");
+            compile_source(&ok, &pack.join("workflow.star"), &pack)
+                .unwrap_or_else(|e| panic!("{function} full-kwarg call must compile: {e}"));
+            let bad = template.replace("{extra}", ", bogus_zzz = \"x\"");
+            let err = compile_source(&bad, &pack.join("workflow.star"), &pack)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("unknown argument \"bogus_zzz\""),
+                "{function}: {err}"
+            );
+            assert!(err.contains(&format!("{function}()")), "{function}: {err}");
+        }
         let _ = std::fs::remove_dir_all(&pack);
     }
 

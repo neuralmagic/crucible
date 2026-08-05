@@ -344,7 +344,7 @@ fn run_turn_with(
         if matches!(source, AgentSource::LocalClaude) {
             // Local agent: decode via the harness's stream decoder (shared with the openshell
             // exec path).
-            let decoder = args.harness().decoder(rate.as_ref());
+            let decoder = args.harness().decoder(rate.as_ref(), tool_io_full(args));
             let (c, bt) = pump_stream(out, json, decoder, &mut sink);
             cost = c;
             best_tokens = bt;
@@ -423,6 +423,25 @@ pub(crate) fn otel_enabled(args: &Args) -> bool {
     }
     std::env::var("CRUCIBLE_OTEL")
         .map(|v| truthy(&v))
+        .unwrap_or(false)
+}
+
+/// Whether session-log tool events carry full inputs and result excerpts
+/// (`CRUCIBLE_SESSION_TOOL_IO=full` in the manifest `[agent].env` or the process
+/// env). Off by default: the compact name+summary form keeps the log small, but
+/// made a run's edits unreconstructable without diffing the PR — this flag exists
+/// for runs someone will want to review.
+pub(crate) fn tool_io_full(args: &Args) -> bool {
+    let full = |v: &str| v.trim().eq_ignore_ascii_case("full");
+    if let Some((_, v)) = args
+        .env
+        .iter()
+        .find(|(k, _)| k == "CRUCIBLE_SESSION_TOOL_IO")
+    {
+        return full(v);
+    }
+    std::env::var("CRUCIBLE_SESSION_TOOL_IO")
+        .map(|v| full(&v))
         .unwrap_or(false)
 }
 
@@ -529,6 +548,7 @@ fn human_line(ev: &AgentEvent) -> Option<String> {
             name,
             summary,
             subagent,
+            ..
         } => {
             let icon = if *subagent { "\u{1f916}" } else { "\u{1f527}" };
             Some(format!("{icon} {name} {summary}").trim_end().to_string())
@@ -572,6 +592,20 @@ mod tests {
     fn openshell_backend_routes_to_the_in_rust_driver() {
         let src = args(&["--agent-backend", "openshell"]).agent_source();
         assert_eq!(src, AgentSource::OpenshellDriver);
+    }
+
+    #[test]
+    fn tool_io_defaults_compact_and_manifest_env_opts_in() {
+        let mut a = args(&[]);
+        assert!(!tool_io_full(&a), "compact by default");
+        a.env
+            .push(("CRUCIBLE_SESSION_TOOL_IO".to_string(), "full".to_string()));
+        assert!(tool_io_full(&a));
+        // Any value other than "full" stays compact.
+        a.env.pop();
+        a.env
+            .push(("CRUCIBLE_SESSION_TOOL_IO".to_string(), "yes".to_string()));
+        assert!(!tool_io_full(&a));
     }
 
     #[test]

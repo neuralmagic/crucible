@@ -5,12 +5,15 @@
 //!     `runs/<goal-slug>/<run_id>/`, plus `index/<run_id>.json` and a per-goal `latest.json`.
 //!     Creds are IRSA web-identity (`AWS_ROLE_ARN` + the projected token).
 //!   * **draft PR, keep only.** Each kept candidate's commits pushed as
-//!     `autoresearch/<run_id>/<candidate>` with the pristine base pinned as `…-base`, and a
+//!     `autoresearch/<goal-slug>/<kept-sha12>` with the pristine base pinned as `…-base`, and a
 //!     draft PR opened between them via `gh` (PAT in `AUTORESEARCH_PR_TOKEN`/`GITHUB_TOKEN`).
-//!     Pinning the base branch makes each PR's diff exactly that candidate's commits.
+//!     Pinning the base branch makes each PR's diff exactly that candidate's commits. Branches
+//!     key on the kept commit sha (not the run id) so a resume replaying the finish path maps
+//!     the same kept diff to the same branch, and the already-published set from the session
+//!     log turns the republish into a no-op instead of a duplicate PR.
 //!
-//! `run_id` (`<YYYYMMDDTHHMMSSZ>-<goal-slug>`) is the join key: S3 prefix component,
-//! branch name, and the PR↔S3 cross-reference. Time-first so keys sort chronologically.
+//! `run_id` (`<YYYYMMDDTHHMMSSZ>-<goal-slug>`) is the join key for the S3 prefix and the
+//! PR↔S3 cross-reference. Time-first so keys sort chronologically.
 
 use crate::reporter::{Reporter, Row};
 use crate::{Args, Paths};
@@ -125,11 +128,19 @@ pub struct Record<'a> {
     /// draft PR against its fork. Empty for a single-repo run (the `base_sha`/`kept_shas` single-PR
     /// path runs instead). Built by [`composite_targets`].
     pub components: &'a [PublishTarget],
+    /// Head branches this run (or the segments it resumed) already opened PRs from, restored from
+    /// the session log's `pr_links` events. A candidate whose branch is in here is already
+    /// published: skip it instead of opening a duplicate PR.
+    pub published_branches: &'a [String],
     pub cost_usd: f64,
     pub elapsed: Duration,
     /// The run's comparability key ([`crate::identity::RunIdentity::digest`]), so a
     /// report/leaderboard can group or gate runs by world identity without re-deriving it.
     pub identity_digest: &'a str,
+    /// Content hash of the pack-declared `[agent].seed_diff` iteration 1 was handed
+    /// ([`crate::identity::RunIdentity::seed_hash`]). Empty = an unseeded run; non-empty makes
+    /// the PR disclose the seeding (run 6 published a hand-steered diff with no disclosure).
+    pub seed_hash: &'a str,
 }
 
 /// Best-effort publish. Logs progress/failures through `r` and never returns an
@@ -184,7 +195,7 @@ fn open_prs<R: Reporter>(r: &mut R, rec: &Record<'_>) -> Vec<PrLink> {
             }
         }
     } else if !rec.args.pr_repo.is_empty() {
-        match open_single_repo_prs(rec) {
+        match open_single_repo_prs(r, rec) {
             Ok(prs) => {
                 r.note(&format!("opened {} draft PR(s)", prs.len()));
                 prs
@@ -607,26 +618,43 @@ fn parse_s3_uri(uri: &str) -> Result<(String, String)> {
 
 // --- git PR channel --------------------------------------------------------
 
-/// The head branch for one kept candidate: `autoresearch/<run_id>/<candidate_id>`. The
+/// The head branch for one kept candidate: `autoresearch/<namespace>/<candidate_id>`. The
 /// `<candidate_id>` discriminant makes a multi-candidate run (an ablation/portfolio) push each
-/// candidate to its OWN branch instead of every candidate clobbering one `autoresearch/<run_id>` ref.
+/// candidate to its OWN branch instead of every candidate clobbering one shared ref.
 /// `candidate_id` must be unique within the run and must not end in `-base` (that suffix names the
-/// sibling base branch, see [`base_branch_name`]); the plain-index scheme the callers use satisfies both.
-fn head_branch_name(run_id: &str, candidate_id: &str) -> String {
-    format!("autoresearch/{run_id}/{candidate_id}")
+/// sibling base branch, see [`base_branch_name`]).
+///
+/// Both parts must be stable across a resume replay: the namespace is the goal slug and the
+/// discriminant the kept commit's short sha whenever that sha is known (see
+/// [`single_repo_candidates`]). Run-id-keyed branches minted a fresh branch + PR per replayed
+/// finish — run 6 opened five PRs for one kept diff.
+fn head_branch_name(namespace: &str, candidate_id: &str) -> String {
+    format!("autoresearch/{namespace}/{candidate_id}")
+}
+
+/// First 12 chars of a commit sha, the branch discriminant for a kept candidate.
+/// Char-indexed so a malformed non-ASCII "sha" truncates instead of panicking.
+fn short_sha(sha: &str) -> &str {
+    match sha.char_indices().nth(12) {
+        Some((i, _)) => &sha[..i],
+        None => sha,
+    }
 }
 
 /// The base branch for one kept candidate: the head branch plus a `-base` suffix, pinned at the
 /// pristine upstream SHA so the PR diff is exactly that candidate's commits.
-fn base_branch_name(run_id: &str, candidate_id: &str) -> String {
-    format!("autoresearch/{run_id}/{candidate_id}-base")
+fn base_branch_name(namespace: &str, candidate_id: &str) -> String {
+    format!("autoresearch/{namespace}/{candidate_id}-base")
 }
 
 /// One publishable candidate: a collision-free discriminant within the run (goes in the branch name)
-/// plus the local refs its PR spans. A single-repo run keeps exactly one today (the workspace HEAD on
+/// plus the local refs its PR spans. A single-repo run keeps exactly one today (the kept tip on
 /// the pristine base); the multi-candidate portfolio that keeps SEVERAL candidates per run, each its own
 /// branch + PR for side-by-side ablation, is the separate upstream piece.
 struct KeptCandidate {
+    /// Branch namespace: the goal slug when the kept tip sha is known (stable across resume
+    /// replays), else the run id (the legacy scheme; no cross-replay dedupe possible).
+    namespace: String,
     /// Discriminant, unique within the run, never suffixed `-base` (see [`head_branch_name`]).
     id: String,
     /// Local ref for the kept tip, `HEAD`, or a bare SHA.
@@ -635,15 +663,51 @@ struct KeptCandidate {
     base_sha: Option<String>,
 }
 
-/// The single-repo run's kept candidates. Today exactly one: the cumulative kept-commit chain at the
-/// workspace HEAD, on the pristine base. Returned as a list so the publish loop already opens one PR
-/// per candidate, a multi-candidate portfolio (N kept candidates per run) drops in here with no publish change.
-fn single_repo_candidates(base_sha: Option<&str>) -> Vec<KeptCandidate> {
-    vec![KeptCandidate {
-        id: "0".to_string(),
-        head_ref: "HEAD".to_string(),
-        base_sha: base_sha.map(str::to_string),
-    }]
+impl KeptCandidate {
+    fn head_branch(&self) -> String {
+        head_branch_name(&self.namespace, &self.id)
+    }
+    fn base_branch(&self) -> String {
+        base_branch_name(&self.namespace, &self.id)
+    }
+}
+
+/// The single-repo run's kept candidates. Today exactly one: the cumulative kept-commit chain
+/// (its tip is the last of `kept_shas`), on the pristine base. When the kept tip sha is known
+/// the branch keys on it, so republishing the same kept commit derives the same branch no
+/// matter which run id the replay minted; without a sha (a resume from a log predating kept
+/// snapshots) the run-id scheme still applies. Returned as a list so the publish loop already
+/// opens one PR per candidate, a multi-candidate portfolio drops in here with no publish change.
+fn single_repo_candidates(
+    goal: &str,
+    run_id: &str,
+    kept_shas: &[String],
+    base_sha: Option<&str>,
+) -> Vec<KeptCandidate> {
+    let cand = match kept_shas.last() {
+        Some(sha) => KeptCandidate {
+            namespace: slug(goal),
+            id: short_sha(sha).to_string(),
+            head_ref: sha.clone(),
+            base_sha: base_sha.map(str::to_string),
+        },
+        None => KeptCandidate {
+            namespace: run_id.to_string(),
+            id: "0".to_string(),
+            head_ref: "HEAD".to_string(),
+            base_sha: base_sha.map(str::to_string),
+        },
+    };
+    vec![cand]
+}
+
+/// Test-only view of the branch derivation, so the run-6 fixture test (in `loop_driver`'s
+/// tests) can assert replay stability without shelling git.
+#[cfg(test)]
+pub(crate) fn head_branch_for_test(goal: &str, run_id: &str, kept_shas: &[String]) -> String {
+    single_repo_candidates(goal, run_id, kept_shas, None)
+        .remove(0)
+        .head_branch()
 }
 
 /// Push each kept candidate's tip (+ its pristine base) to its own branch and open a DRAFT PR per
@@ -655,14 +719,22 @@ fn single_repo_candidates(base_sha: Option<&str>) -> Vec<KeptCandidate> {
 /// branch-to-branch, not SHA-to-SHA, so git reconstructs the delta, no hand-rolled base+delta. On
 /// resume the base SHA is absent (it lived in the original run), so that PR opens against the repo's
 /// default branch.
-fn open_single_repo_prs(rec: &Record<'_>) -> Result<Vec<PrLink>> {
+fn open_single_repo_prs<R: Reporter>(r: &mut R, rec: &Record<'_>) -> Result<Vec<PrLink>> {
     let token = pr_token()?;
     // PAT in the URL (x-access-token is GitHub's conventional username for a token-as-password). The
     // URL is kept out of every error message (see push_ref) so the token never lands in a log.
     let url = push_url(&rec.args.pr_repo, &token);
     let mut links = Vec::new();
-    for cand in single_repo_candidates(rec.base_sha) {
-        let head = head_branch_name(rec.run_id, &cand.id);
+    for cand in single_repo_candidates(rec.goal, rec.run_id, rec.kept_shas, rec.base_sha) {
+        let head = cand.head_branch();
+        // Sha-keyed branches make a republished kept commit recognizable: a prior segment
+        // already opened this branch's PR, so this replay is a no-op, not a duplicate.
+        if rec.published_branches.contains(&head) {
+            r.note(&format!(
+                "publish: kept commit already published as {head}; skipping duplicate PR"
+            ));
+            continue;
+        }
         push_ref(&rec.paths.workspace, &url, &cand.head_ref, &head).with_context(|| {
             format!("pushing kept commits to {} branch {head}", rec.args.pr_repo)
         })?;
@@ -671,7 +743,7 @@ fn open_single_repo_prs(rec: &Record<'_>) -> Result<Vec<PrLink>> {
         // base commit is an ancestor of HEAD, so it's already a local object, push it by SHA to a ref.
         let base_branch = match &cand.base_sha {
             Some(sha) => {
-                let b = base_branch_name(rec.run_id, &cand.id);
+                let b = cand.base_branch();
                 push_ref(&rec.paths.workspace, &url, sha, &b)
                     .with_context(|| format!("pushing pristine base {sha} to branch {b}"))?;
                 Some(b)
@@ -713,14 +785,22 @@ fn push_url(repo: &str, token: &str) -> String {
 /// work stays in git memory + S3, recoverable.
 fn open_composite_prs<R: Reporter>(r: &mut R, rec: &Record<'_>) -> Result<Vec<PrLink>> {
     let token = pr_token()?;
-    // A composite run is one candidate (the cross-cut change) spanning several repos, so the candidate
-    // discriminant is constant, the per-fork axis is `repo`, not the branch.
-    let head = head_branch_name(rec.run_id, "0");
-    let base_branch = base_branch_name(rec.run_id, "0");
+    let ns = slug(rec.goal);
 
-    // Open every component's PR, collecting (name, repo, url) for the cross-link pass.
-    let mut opened: Vec<(String, String, String)> = Vec::new();
+    // Open every component's PR, collecting (name, repo, url, branch) for the cross-link pass.
+    // Each fork's branch keys on that component's kept tip sha, same replay-stability argument
+    // as the single-repo path (see [`head_branch_name`]).
+    let mut opened: Vec<(String, String, String, String)> = Vec::new();
     for c in rec.components {
+        let head = head_branch_name(&ns, short_sha(&c.head_sha));
+        if rec.published_branches.contains(&head) {
+            r.note(&format!(
+                "publish: {} kept tip already published as {head}; skipping duplicate PR",
+                c.name
+            ));
+            continue;
+        }
+        let base_branch = base_branch_name(&ns, short_sha(&c.head_sha));
         let url = push_url(&c.repo, &token);
         push_ref(&c.workspace, &url, &c.head_sha, &head)
             .with_context(|| format!("pushing {} kept tip to {} branch {head}", c.name, c.repo))?;
@@ -732,14 +812,18 @@ fn open_composite_prs<R: Reporter>(r: &mut R, rec: &Record<'_>) -> Result<Vec<Pr
         let pr = open_pr(&c.repo, &title, &body, &head, Some(&base_branch), &token)
             .with_context(|| format!("opening draft PR for component {} on {}", c.name, c.repo))?;
         r.note(&format!("  {} → {}: {pr}", c.name, c.repo));
-        opened.push((c.name.clone(), c.repo.clone(), pr));
+        opened.push((c.name.clone(), c.repo.clone(), pr, head));
     }
 
     // Cross-link the set: each body lists the sibling PRs (only meaningful when >1 component changed).
     if opened.len() > 1 {
-        for (name, repo, _url) in &opened {
-            let body = composite_pr_body_linked(rec, name, &opened);
-            if let Err(e) = edit_pr_body(repo, &pr_url_for(repo, &opened), &body, &token) {
+        let link_set: Vec<(String, String, String)> = opened
+            .iter()
+            .map(|(name, repo, url, _)| (name.clone(), repo.clone(), url.clone()))
+            .collect();
+        for (name, repo, _url) in &link_set {
+            let body = composite_pr_body_linked(rec, name, &link_set);
+            if let Err(e) = edit_pr_body(repo, &pr_url_for(repo, &link_set), &body, &token) {
                 r.note(&format!(
                     "  cross-link of {name} PR failed (non-fatal): {e:#}"
                 ));
@@ -748,11 +832,11 @@ fn open_composite_prs<R: Reporter>(r: &mut R, rec: &Record<'_>) -> Result<Vec<Pr
     }
     Ok(opened
         .into_iter()
-        .map(|(name, repo, url)| PrLink {
+        .map(|(name, repo, url, branch)| PrLink {
             name,
             repo,
             url,
-            branch: head.clone(),
+            branch,
         })
         .collect())
 }
@@ -883,8 +967,11 @@ fn pr_title(rec: &Record<'_>) -> String {
     }
 }
 
-/// The PR body: goal, the baseline→best delta, each kept candidate's note, run cost/elapsed, and a
-/// link back to the S3 run record (the PR and S3 cross-reference via run_id).
+/// The PR body: goal, the baseline→best delta, one section per kept iteration (the agent's full
+/// CANDIDATE.md, the grade's metrics table, the candidate digest, and the declared-evidence
+/// dispositions), run cost/elapsed, and a link back to the S3 run record (the PR and S3
+/// cross-reference via run_id). The full writeup ships because a reviewer only sees this body:
+/// DeepGEMM#5 arrived with the 120-char row note, cut mid-word, and no numbers.
 fn pr_body(rec: &Record<'_>) -> String {
     let mut s = String::new();
     s.push_str(&format!("Autoresearch run `{}`.\n\n", rec.run_id));
@@ -896,11 +983,33 @@ fn pr_body(rec: &Record<'_>) -> String {
         }
         _ => s.push('\n'),
     }
+    if !rec.seed_hash.is_empty() {
+        s.push_str(&format!(
+            "**Seeded:** iteration 1 was handed a pack-declared seed diff \
+             (content hash `{}`); the kept work builds on it.\n\n",
+            rec.seed_hash
+        ));
+    }
     let kept: Vec<&Row> = rec.rows.iter().filter(|r| r.decision == "keep").collect();
-    if !kept.is_empty() {
-        s.push_str("**Kept candidates:**\n");
-        for row in kept {
-            s.push_str(&format!("- iter {}: {}\n", row.iter, row.note));
+    for row in kept {
+        s.push_str(&kept_section(row));
+    }
+    // Run-scoped epilogue results: advisory (they cannot un-keep), but a reviewer must
+    // see a failed racecheck next to the candidate it ran against.
+    let epilogue: Vec<&Row> = rec
+        .rows
+        .iter()
+        .filter(|r| r.phase.as_deref() == Some("epilogue"))
+        .collect();
+    if !epilogue.is_empty() {
+        s.push_str("## Epilogue checks (advisory)\n\n");
+        for row in epilogue {
+            let mark = match row.decision.as_str() {
+                "epilogue" => "passed",
+                "epilogue-skip" => "SKIPPED",
+                _ => "**FAILED**",
+            };
+            s.push_str(&format!("- {mark} — {}\n", row.note));
         }
         s.push('\n');
     }
@@ -918,6 +1027,99 @@ fn pr_body(rec: &Record<'_>) -> String {
     }
     s.push_str("\n🤖 opened by crucible autoresearch (draft — review and steer).\n");
     s
+}
+
+/// One kept iteration's PR section: the agent's whole CANDIDATE.md (the row note is its
+/// 120-char fold, useless to a reviewer), then the grade's metrics, digest, and which
+/// declared checks actually ran.
+fn kept_section(row: &Row) -> String {
+    let mut s = format!("## Kept: iter {}\n\n", row.iter);
+    let writeup = if row.candidate_md.is_empty() {
+        // Logs predating `candidate_md` only carried the fold; better than nothing.
+        row.note.as_str()
+    } else {
+        row.candidate_md.as_str()
+    };
+    s.push_str(writeup.trim());
+    s.push('\n');
+    let table = metrics_table(&row.detail);
+    if !table.is_empty() {
+        s.push('\n');
+        s.push_str(&table);
+    }
+    for digest in candidate_digests(&row.detail) {
+        s.push_str(&format!("\nCandidate digest: `{digest}`\n"));
+    }
+    if !row.evidence.is_empty() {
+        s.push_str(&format!(
+            "\nDeclared checks: {}\n",
+            crate::reporter::evidence_line(&row.evidence)
+        ));
+    }
+    s.push('\n');
+    s
+}
+
+/// A kept row's grade detail rendered as a markdown metrics table. The graph grade's fold is
+/// `{"evidence": {<task>: {"detail": {"metrics": {...}, "threshold": ...}, ...}}}`; each
+/// metric becomes a row, with the task's declared threshold alongside. Empty when the detail
+/// doesn't carry that shape (a plain command judge) — the PR then simply has no table. The
+/// `pass` pseudo-metric echoes the check verdict and is dropped.
+fn metrics_table(detail: &str) -> String {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(detail) else {
+        return String::new();
+    };
+    let Some(evidence) = v.get("evidence").and_then(serde_json::Value::as_object) else {
+        return String::new();
+    };
+    let mut rows = Vec::new();
+    for (task, entry) in evidence {
+        let d = entry.get("detail");
+        let threshold = d
+            .and_then(|d| d.get("threshold"))
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        let Some(metrics) = d
+            .and_then(|d| d.get("metrics"))
+            .and_then(serde_json::Value::as_object)
+        else {
+            continue;
+        };
+        for (name, value) in metrics {
+            if name == "pass" {
+                continue;
+            }
+            rows.push(format!("| {task} | {name} | {value} | {threshold} |"));
+        }
+    }
+    if rows.is_empty() {
+        return String::new();
+    }
+    format!(
+        "| check | metric | value | threshold |\n| --- | --- | --- | --- |\n{}\n",
+        rows.join("\n")
+    )
+}
+
+/// Distinct candidate digests from the grade detail's evidence entries, first-seen order.
+/// Normally one (every rung graded the same built image); more than one means the rungs
+/// measured different builds, which a reviewer should see.
+fn candidate_digests(detail: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(detail) else {
+        return Vec::new();
+    };
+    let Some(evidence) = v.get("evidence").and_then(serde_json::Value::as_object) else {
+        return Vec::new();
+    };
+    let mut digests: Vec<String> = Vec::new();
+    for entry in evidence.values() {
+        if let Some(d) = entry.get("digest").and_then(serde_json::Value::as_str)
+            && !digests.iter().any(|have| have == d)
+        {
+            digests.push(d.to_string());
+        }
+    }
+    digests
 }
 
 /// A composite component's PR title: the shared goal/delta plus which component this PR carries.
@@ -974,6 +1176,113 @@ fn sibling_links(component: &str, opened: &[(String, String, String)]) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Epilogue rows reach the PR body as an advisory section, with failures shouted.
+    #[test]
+    fn pr_body_reports_epilogue_results_loudly() {
+        let args = <crate::Cli as clap::Parser>::try_parse_from(["crucible"])
+            .unwrap()
+            .run;
+        let paths = crate::Paths::for_manifest(
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+            &std::env::temp_dir(),
+            None,
+        );
+        let rows = vec![
+            Row {
+                iter: 1,
+                decision: "keep".into(),
+                note: "kept it".into(),
+                ..Default::default()
+            },
+            Row {
+                iter: 1,
+                decision: "epilogue".into(),
+                note: "perf: ok".into(),
+                phase: Some("epilogue".into()),
+                ..Default::default()
+            },
+            Row {
+                iter: 1,
+                decision: "epilogue-fail".into(),
+                note: "racecheck: exit 3: boom".into(),
+                phase: Some("epilogue".into()),
+                ..Default::default()
+            },
+        ];
+        let body = pr_body(&Record {
+            args: &args,
+            paths: &paths,
+            run_id: "test-run",
+            goal: "goal",
+            model: "model",
+            gate: "gate".into(),
+            rows: &rows,
+            baseline_score: 2.0,
+            best_score: 1.0,
+            improved: true,
+            kept_shas: &[],
+            base_sha: None,
+            components: &[],
+            published_branches: &[],
+            cost_usd: 0.0,
+            elapsed: std::time::Duration::ZERO,
+            identity_digest: "v2:0",
+            seed_hash: "",
+        });
+        assert!(body.contains("## Epilogue checks (advisory)"), "{body}");
+        assert!(body.contains("- passed — perf: ok"), "{body}");
+        assert!(
+            body.contains("- **FAILED** — racecheck: exit 3: boom"),
+            "{body}"
+        );
+        // An unseeded run makes no seeding claim.
+        assert!(!body.contains("**Seeded:**"), "{body}");
+    }
+
+    /// A seeded run's PR discloses the seeding and the seed's content hash; DeepGEMM#5 shipped a
+    /// hand-steered diff under an autoresearch banner with neither.
+    #[test]
+    fn pr_body_discloses_a_pack_seed() {
+        let args = <crate::Cli as clap::Parser>::try_parse_from(["crucible"])
+            .unwrap()
+            .run;
+        let paths = crate::Paths::for_manifest(
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+            &std::env::temp_dir(),
+            None,
+        );
+        let rows = vec![Row {
+            iter: 1,
+            decision: "keep".into(),
+            note: "kept it".into(),
+            ..Default::default()
+        }];
+        let body = pr_body(&Record {
+            args: &args,
+            paths: &paths,
+            run_id: "test-run",
+            goal: "goal",
+            model: "model",
+            gate: "gate".into(),
+            rows: &rows,
+            baseline_score: 2.0,
+            best_score: 1.0,
+            improved: true,
+            kept_shas: &[],
+            base_sha: None,
+            components: &[],
+            published_branches: &[],
+            cost_usd: 0.0,
+            elapsed: std::time::Duration::ZERO,
+            identity_digest: "v2:0",
+            seed_hash: "cafe1234cafe1234",
+        });
+        assert!(body.contains("**Seeded:**"), "{body}");
+        assert!(body.contains("`cafe1234cafe1234`"), "{body}");
+    }
 
     /// The bug this guards: a composed workspace runs on a DETACHED HEAD, so kept commits never reached
     /// the fork. This reproduces the exact path, detached HEAD -> `git push HEAD:refs/heads/<branch>`
@@ -1179,25 +1488,121 @@ mod tests {
 
     #[test]
     fn single_repo_run_keeps_one_candidate_today() {
-        // The foundation as it stands: one kept candidate (workspace HEAD on the pristine base). The
-        // multi-candidate portfolio that returns several here is the deferred piece.
-        let cands = single_repo_candidates(Some("abc123"));
+        // The foundation as it stands: one kept candidate (the kept tip on the pristine base).
+        // The multi-candidate portfolio that returns several here is the deferred piece.
+        let kept = vec!["4d3406b1c9aa0f2e77aa000000000000deadbeef".to_string()];
+        let cands = single_repo_candidates("# Cut latency", "run-a", &kept, Some("abc123"));
         assert_eq!(
             cands.len(),
             1,
             "single-repo run keeps exactly one candidate today"
         );
-        assert_eq!(cands[0].id, "0");
-        assert_eq!(cands[0].head_ref, "HEAD");
+        // Sha-keyed: the branch derives from goal slug + kept tip sha, and the head ref IS the
+        // kept sha (a replay's HEAD may sit elsewhere).
+        assert_eq!(cands[0].namespace, "cut-latency");
+        assert_eq!(cands[0].id, "4d3406b1c9aa");
+        assert_eq!(cands[0].head_ref, kept[0]);
         assert_eq!(cands[0].base_sha.as_deref(), Some("abc123"));
-        // Resume: no pristine base recorded -> that PR opens against the default branch.
-        assert_eq!(single_repo_candidates(None)[0].base_sha, None);
-        // The candidate's discriminant feeds the branch derivation.
-        let run = "20260716T000000Z-x";
         assert_eq!(
-            head_branch_name(run, &cands[0].id),
-            format!("autoresearch/{run}/0")
+            cands[0].head_branch(),
+            "autoresearch/cut-latency/4d3406b1c9aa"
         );
+        // Resume: no pristine base recorded -> that PR opens against the default branch.
+        let no_base = single_repo_candidates("# Cut latency", "run-a", &kept, None);
+        assert_eq!(no_base[0].base_sha, None);
+        // No kept sha (a log predating kept snapshots): the legacy run-id scheme.
+        let legacy = single_repo_candidates("# Cut latency", "run-a", &[], Some("abc123"));
+        assert_eq!(legacy[0].head_branch(), "autoresearch/run-a/0");
+        assert_eq!(legacy[0].head_ref, "HEAD");
+    }
+
+    /// The run-6 failure mode: five resume replays, five run ids, one kept diff, five PRs.
+    /// Sha-keyed branches make every replay derive the SAME branch, so the published-branch
+    /// check can turn the republish into a no-op.
+    #[test]
+    fn same_kept_sha_derives_the_same_branch_across_run_ids() {
+        let kept = vec!["4d3406b1c9aa0f2e77aa000000000000deadbeef".to_string()];
+        let goal = "# GOAL Fold block-scaled FP8 into DeepGEMM";
+        let a = single_repo_candidates(goal, "20260804T021753Z-goal", &kept, None);
+        let b = single_repo_candidates(goal, "20260804T044928Z-goal", &kept, None);
+        assert_eq!(a[0].head_branch(), b[0].head_branch());
+        assert_eq!(a[0].base_branch(), b[0].base_branch());
+        // A different kept commit is a different candidate: distinct branch.
+        let other = vec!["ffff06b1c9aa0f2e77aa000000000000deadbeef".to_string()];
+        let c = single_repo_candidates(goal, "20260804T021753Z-goal", &other, None);
+        assert_ne!(a[0].head_branch(), c[0].head_branch());
+    }
+
+    #[test]
+    fn short_sha_truncates_safely() {
+        assert_eq!(short_sha("4d3406b1c9aa0f2e"), "4d3406b1c9aa");
+        assert_eq!(short_sha("abc"), "abc");
+        assert_eq!(short_sha(""), "");
+    }
+
+    /// The DeepGEMM#5 gap: the PR body must carry the whole CANDIDATE.md, the graded
+    /// metrics with thresholds, the candidate digest, and which declared checks ran —
+    /// not a 120-char note cut mid-word.
+    #[test]
+    fn kept_section_carries_full_writeup_metrics_digest_and_checks() {
+        use crate::session::{EvidenceDisposition, EvidenceEntry};
+        let detail = r#"{"evidence":{
+            "calc-diff":{"detail":{"digest":"quay.io/x/cand@sha256:d2d3","metrics":{"calc_diff":0.0,"mega_diff":0.000994230754400638,"metric":0.0,"pass":1.0},"threshold":0.001},"digest":"quay.io/x/cand@sha256:d2d3","pass":true,"score":0.0},
+            "refcheck":{"detail":{"digest":"quay.io/x/cand@sha256:d2d3","metrics":{"metric":4.4869505444466995e-8,"pass":1.0,"refcheck":4.4869505444466995e-8},"threshold":1e-6},"digest":"quay.io/x/cand@sha256:d2d3","pass":true,"score":0.0}}}"#;
+        let row = Row {
+            iter: 1,
+            decision: "keep".into(),
+            note: "# Candidate: Block-scaled FP8 MegaMoE on SM90 (H200)  ## What changed  **Deliverable A (graded this run):** Added a comp".into(),
+            detail: detail.into(),
+            candidate_md: "# Candidate: Block-scaled FP8 MegaMoE on SM90 (H200)\n\n## What changed\n\n**Deliverable A (graded this run):** Added a composed MegaMoE path.".into(),
+            evidence: vec![
+                EvidenceEntry {
+                    task: "refcheck".into(),
+                    disposition: EvidenceDisposition::Passed,
+                    note: String::new(),
+                },
+                EvidenceEntry {
+                    task: "tensor-pipe".into(),
+                    disposition: EvidenceDisposition::Skipped,
+                    note: "worktree setup failed".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let s = kept_section(&row);
+        // The full writeup, not the truncated note.
+        assert!(s.contains("Added a composed MegaMoE path."), "{s}");
+        // Metrics with values and thresholds; the `pass` echo dropped.
+        assert!(
+            s.contains("| calc-diff | mega_diff | 0.000994230754400638 | 0.001 |"),
+            "{s}"
+        );
+        assert!(
+            s.contains("| refcheck | refcheck | 4.4869505444466995e-8 | 1e-6 |"),
+            "{s}"
+        );
+        assert!(!s.contains("| pass |"), "{s}");
+        // One digest (shared across rungs), printed once.
+        assert_eq!(s.matches("Candidate digest:").count(), 1, "{s}");
+        assert!(s.contains("`quay.io/x/cand@sha256:d2d3`"), "{s}");
+        // Declared checks with dispositions, skipped ones included.
+        assert!(
+            s.contains("tensor-pipe SKIPPED (worktree setup failed)"),
+            "{s}"
+        );
+
+        // A row without the full writeup (old log) falls back to the note; no table when the
+        // detail isn't grade-shaped.
+        let old = Row {
+            iter: 2,
+            decision: "keep".into(),
+            note: "short note".into(),
+            detail: "cache_hit=0.83".into(),
+            ..Default::default()
+        };
+        let s = kept_section(&old);
+        assert!(s.contains("short note"), "{s}");
+        assert!(!s.contains("| check |"), "{s}");
     }
 
     #[test]

@@ -5,7 +5,8 @@
 //! front-end, and calls [`crate::loop_driver::run_loop`].
 
 use crate::crucible::{Judge, World};
-use crate::loop_driver::{LoopRuntime, load_resume_state, run_loop};
+use crate::loop_driver::{LoopRuntime, run_loop};
+use crate::recovery::{RecoveryPlan, ResumeRecovery, classify_session, plan_recovery};
 use crate::{Args, Cli, Cmd, Paths, Prepared, STOP, Ui};
 use crate::{
     agent, broker, check, console, control, deploy, init, manifest, publish, reporter, scope,
@@ -404,6 +405,7 @@ fn run_from_manifest(args: Args) -> Result<()> {
         template,
         identity,
         skip_baseline: m.judge.skip_baseline,
+        seed_diff: read_seed_diff(&manifest_dir, m.agent.seed_diff.as_deref())?,
     };
 
     // Frozen injects (the gate's own files) go to the judge so it re-establishes them before each
@@ -423,6 +425,18 @@ fn run_from_manifest(args: Args) -> Result<()> {
     let judge = m.build_judge(workspace, frozen_injects)?;
 
     drive_loop(args, p, prep, world, judge)
+}
+
+/// Read the `[agent].seed_diff` content for iteration 1's prompt. The identity build hashes the
+/// same file; a declared seed that can't be read errors there first, this context is a backstop.
+fn read_seed_diff(manifest_dir: &Path, seed_diff: Option<&str>) -> Result<Option<String>> {
+    seed_diff
+        .map(|rel| {
+            let path = manifest_dir.join(rel);
+            std::fs::read_to_string(&path)
+                .with_context(|| format!("reading [agent].seed_diff {}", path.display()))
+        })
+        .transpose()
 }
 
 /// Run a composite domain: set up each component's checkout under one base workspace, build
@@ -495,6 +509,7 @@ fn run_composite(args: Args, manifest_path: PathBuf) -> Result<()> {
         template,
         identity,
         skip_baseline: m.judge.skip_baseline,
+        seed_diff: read_seed_diff(&manifest_dir, m.agent.seed_diff.as_deref())?,
     };
 
     args.search = m.search.clone();
@@ -628,23 +643,49 @@ fn drive_loop(
     let outcome = {
         let _run_guard = run_span.as_ref().map(tracing::Span::enter);
         if args.resume {
-            // Resume: replay the parked log, then continue in append (stream) mode.
-            let resume = load_resume_state(&p.session_log)?;
-            let meta = reporter::RunMeta::from_args(&args);
-            let mut r = stream::SessionReporter::resume(&p, meta)?;
-            let control = start_control_bridge(&args, &p)?;
-            run_loop(
-                &args,
-                &p,
-                &prep,
-                &mut r,
-                world.as_ref(),
-                judge.as_ref(),
-                LoopRuntime {
-                    control: control.as_deref(),
-                    resume: Some(resume),
-                },
-            )?
+            // Replay the parked log, then continue in append mode. A NoOp exits 0
+            // WITHOUT re-running the finish path (replaying finish re-published the
+            // kept candidate each crash-loop lap); Refuse keeps exit code 2's meaning.
+            let recovered = classify_session(&p.session_log)?;
+            match plan_recovery(&recovered, args.iterations, args.max_cost) {
+                RecoveryPlan::NoOp { message } => {
+                    eprintln!("resume: {message}");
+                    return Ok(());
+                }
+                RecoveryPlan::Refuse { message } => anyhow::bail!("resume: {message}"),
+                RecoveryPlan::Continue {
+                    repark,
+                    pending_regime,
+                } => {
+                    let recovery = ResumeRecovery {
+                        class: recovered.classification.class(),
+                        iter: recovered.classification.iter(),
+                        detail: recovered.classification.detail(),
+                        repark,
+                        pending_regime,
+                    };
+                    let meta = reporter::RunMeta::from_args(&args);
+                    let mut r = stream::SessionReporter::resume(&p, meta)?;
+                    // Fold the prior run's admissions before the bridge is up, so no
+                    // inbound command can land on a half-built index.
+                    let ledger = open_admission_ledger(&p, forge::ndjson::Open::Fold)?;
+                    let control = start_control_bridge(&args, &p, &ledger)?;
+                    run_loop(
+                        &args,
+                        &p,
+                        &prep,
+                        &mut r,
+                        world.as_ref(),
+                        judge.as_ref(),
+                        LoopRuntime {
+                            control: control.as_deref(),
+                            resume: Some(recovered.resume),
+                            recovery: Some(recovery),
+                            ledger: Some(ledger),
+                        },
+                    )?
+                }
+            }
         } else {
             let meta = reporter::RunMeta::from_args(&args);
             match args.ui {
@@ -662,7 +703,9 @@ fn drive_loop(
                 }
                 Ui::Stream => {
                     let mut r = stream::SessionReporter::stream(&p, meta)?;
-                    let control = start_control_bridge(&args, &p)?;
+                    // A fresh run must not inherit the last run's un-drained inputs.
+                    let ledger = open_admission_ledger(&p, forge::ndjson::Open::Truncate)?;
+                    let control = start_control_bridge(&args, &p, &ledger)?;
                     run_loop(
                         &args,
                         &p,
@@ -672,7 +715,8 @@ fn drive_loop(
                         judge.as_ref(),
                         LoopRuntime {
                             control: control.as_deref(),
-                            resume: None,
+                            ledger: Some(ledger),
+                            ..LoopRuntime::default()
                         },
                     )?
                 }
@@ -780,10 +824,20 @@ fn install_ctrlc() -> Result<()> {
 fn start_control_bridge(
     args: &Args,
     p: &Paths,
+    ledger: &std::sync::Arc<crate::admission::AdmissionLedger>,
 ) -> Result<Option<std::sync::Arc<control::ControlState>>> {
     args.control_port
-        .map(|port| control::spawn_bridge(port, p.clone()))
+        .map(|port| control::spawn_bridge(port, p.clone(), ledger.clone()))
         .transpose()
+}
+
+/// Every external input is recorded here before it takes effect, so this must exist
+/// before anything can deliver one.
+fn open_admission_ledger(
+    p: &Paths,
+    mode: forge::ndjson::Open,
+) -> Result<std::sync::Arc<crate::admission::AdmissionLedger>> {
+    crate::admission::AdmissionLedger::open(&p.admissions, mode).map(std::sync::Arc::new)
 }
 
 /// Copy every non-excluded skill under `p.skills` into the workspace's `skills_dir` (the
