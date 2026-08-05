@@ -1,0 +1,4 @@
+# One toolchain everywhere: laptops, CI, and the baked runner AMI all resolve this.
+[toolchain]
+channel = "stable"
+components = ["clippy", "rustfmt"]
