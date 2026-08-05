@@ -238,9 +238,8 @@ pub fn render(
     let netpol_yaml =
         serde_norway::to_string(&r.netpol()).context("serializing the NetworkPolicy")?;
     let mut out = format!("{pod_yaml}---\n{rbac_yaml}---\n{netpol_yaml}");
-    // Templated run-state claim: rendered with the pod so `kubectl apply` owns its lifecycle.
-    // Appended (not prepended) to keep the [pod, rbac, netpol] head layout controllers index by
-    // `kind` against; apply-order within one file doesn't matter to the kubelet (the pod waits).
+    // Appended, not prepended: controllers index the [pod, rbac, netpol] head layout by `kind`.
+    // Apply-order within one file is irrelevant, the pod waits for its claim.
     if let Some(pvc) = r.state_pvc_doc() {
         let yaml = serde_norway::to_string(&pvc).context("serializing the state PVC")?;
         out.push_str(&format!("---\n{yaml}"));
@@ -464,8 +463,8 @@ impl Renderer<'_> {
         sc
     }
 
-    /// The state claim this pod mounts: the profile-named existing claim, or `<run>-state` when
-    /// the profile carries a template (the render emits the claim itself). None = no persistence.
+    /// The profile-named existing claim, or `<run>-state` when the profile carries a template.
+    /// None = no persistence.
     fn state_claim_name(&self) -> Option<String> {
         match self.profile.cluster.state_pvc.as_ref()? {
             crate::deploy::profile::StatePvc::Existing(name) => Some(name.clone()),
@@ -475,9 +474,8 @@ impl Renderer<'_> {
         }
     }
 
-    /// The generated PVC document, when the profile's `state_pvc` is a template. No
-    /// ownerReferences: a static render has no owner UID to point at (the pod is born in the same
-    /// apply), and the claim outliving the pod is the point — delete it to start a fresh run.
+    /// Generated when `state_pvc` is a template. No ownerReferences: a static render has no owner
+    /// UID to point at, and the claim outliving the pod is the point.
     fn state_pvc_doc(&self) -> Option<core::PersistentVolumeClaim> {
         let crate::deploy::profile::StatePvc::Template(t) =
             self.profile.cluster.state_pvc.as_ref()?
@@ -1088,8 +1086,7 @@ exit $rc
             });
         }
 
-        // Persistent run state (see volume_mounts): the claim the profile's `state_pvc` names
-        // or the one this render generates.
+        // Persistent run state (see volume_mounts).
         if let Some(claim) = self.state_claim_name() {
             volumes.push(core::Volume {
                 name: "run-state".to_string(),
@@ -2826,7 +2823,7 @@ mod tests {
     /// exists. Without it the pod stays one-shot (a restart would silently fresh-start a run).
     #[test]
     fn state_pvc_mounts_resumes_and_restarts_on_failure() {
-        // String form: an existing claim is referenced, never generated.
+        // String form references an existing claim, never generates one.
         let with = k8s_profile("state_pvc = \"deepgemm-state\"");
         let yaml = render_k8s(&with);
         assert!(yaml.contains("claimName: deepgemm-state"), "{yaml}");
@@ -2848,9 +2845,8 @@ mod tests {
         assert!(!yaml.contains("run-state"), "{yaml}");
     }
 
-    /// The table form is a claim template: the render emits the PVC itself (`<run>-state`),
-    /// carrying the profile's storage class, size, access modes, labels, and annotations. A typo'd
-    /// access mode dies at parse (closed enum), not at provisioning.
+    /// Table form emits `<run>-state` with the profile's storage class, size, access modes,
+    /// labels, and annotations.
     #[test]
     fn state_pvc_template_generates_the_claim() {
         let profile = k8s_profile(

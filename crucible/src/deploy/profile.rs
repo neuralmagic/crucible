@@ -206,16 +206,14 @@ pub struct Cluster {
     /// crashed run continues its turn instead of discarding hours of solver context. Unset = the
     /// state dir stays pod-local and a dead pod is a dead run.
     ///
-    /// A string names an EXISTING claim; a table is a claim template the render materializes as a
-    /// PVC document named `<run>-state` (so `kubectl apply` owns the claim's lifecycle too).
-    /// Starting a genuinely fresh run on a kept claim requires deleting it (or its contents):
-    /// the wrapper sees the old session log and resumes.
+    /// A string names an existing claim; a table is a template the render materializes as
+    /// `<run>-state`. A kept claim must be deleted to start fresh: the wrapper sees the old
+    /// session log and resumes.
     #[serde(default)]
     pub state_pvc: Option<StatePvc>,
 }
 
-/// `state_pvc = "name"` (use an existing claim) or a `[cluster.state_pvc]` template
-/// (render generates the claim).
+/// `state_pvc = "name"` (existing claim) or a `[cluster.state_pvc]` template.
 #[derive(Deserialize)]
 #[serde(untagged)]
 pub enum StatePvc {
@@ -229,24 +227,23 @@ pub struct StatePvcTemplate {
     /// Cluster default when unset.
     #[serde(default)]
     pub storage_class: Option<String>,
-    /// Requested size; state is small (a session log + agent-session files).
+    /// State is small: a session log plus agent-session files.
     #[serde(default = "default_state_size")]
     pub size: String,
     /// The loop pod is the only consumer, so RWO unless the profile says otherwise.
     #[serde(default = "default_state_access_modes")]
     pub access_modes: Vec<AccessMode>,
-    /// Extra claim labels, merged over the render's managed-by/run labels (profile wins on
-    /// conflict). Some environments gate provisioning on them (cost centers, backup policies).
+    /// Merged over the render's managed-by/run labels, profile wins. Some environments gate
+    /// provisioning on them.
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
-    /// Claim annotations, verbatim (storage-class parameters, ownership tags).
+    /// Verbatim: storage-class parameters, ownership tags.
     #[serde(default)]
     pub annotations: BTreeMap<String, String>,
 }
 
-/// PVC access modes. The Kubernetes API (and so k8s-openapi) types these as bare strings; the
-/// domain is closed, so the profile rejects a typo at parse instead of at provisioning.
-/// The shared `Read` prefix is the API's naming, not ours.
+/// The API types these as bare strings; a closed enum rejects a typo at parse instead of at
+/// provisioning. The shared `Read` prefix is the API's naming, not ours.
 #[derive(Deserialize, Clone, Copy)]
 #[allow(clippy::enum_variant_names)]
 pub enum AccessMode {
@@ -257,7 +254,6 @@ pub enum AccessMode {
 }
 
 impl AccessMode {
-    /// The canonical API string, exactly the enum variant's name.
     pub fn as_str(self) -> &'static str {
         match self {
             AccessMode::ReadWriteOnce => "ReadWriteOnce",
