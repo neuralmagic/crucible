@@ -333,6 +333,9 @@ struct JobEnv {
     active_deadline_seconds: i64,
     ttl_seconds: i32,
     pvc_mounts: Vec<PvcMount>,
+    /// When a prewarmed model-weights PVC is mounted, the path it lands at — exported as HF_HOME so
+    /// HF/vllm resolve the cache offline (with HF_HUB_OFFLINE=1) instead of pulling from the network.
+    model_mount: Option<String>,
     /// Output-only trace transport for profile jobs; NOT mounted on benchmark/lm_eval jobs (the
     /// measured jobs' spec stays minimal, and measurement inputs stay digest-only).
     artifacts: Option<ArtifactsPvc>,
@@ -385,10 +388,13 @@ impl JobEnv {
         // Optional prewarmed model-weights PVC: unset means the GPU jobs get NO weights mount
         // (kernel domains measure source, not a served model). Never a fallback claim name.
         let mut pvc_mounts = Vec::new();
+        let mut model_mount = None;
         if let Some(model) = env_nonempty("BROKER_CODEGEN_MODEL_PVC") {
+            let mount_path = env_or("BROKER_CODEGEN_MODEL_MOUNT", "/models");
+            model_mount = Some(mount_path.clone());
             pvc_mounts.push(PvcMount {
                 claim_name: model,
-                mount_path: env_or("BROKER_CODEGEN_MODEL_MOUNT", "/models"),
+                mount_path,
                 read_only: true,
             });
         }
@@ -411,6 +417,7 @@ impl JobEnv {
             active_deadline_seconds: env_u32("BROKER_CODEGEN_DEADLINE_SECONDS", 5400) as i64,
             ttl_seconds: env_u32("BROKER_CODEGEN_TTL_SECONDS", 86400) as i32,
             pvc_mounts,
+            model_mount,
             artifacts: artifacts_pvc(
                 env_nonempty("BROKER_CODEGEN_ARTIFACTS_PVC"),
                 env_nonempty("BROKER_CODEGEN_ARTIFACTS_MOUNT"),
@@ -1499,6 +1506,11 @@ fn job_spec(
     extra_mounts: &[PvcMount],
 ) -> GpuJobSpec {
     let mut container_env = vec![("HF_HUB_OFFLINE".to_string(), "1".to_string())];
+    // Point HF/vllm at the prewarmed model-cache PVC so the offline load resolves from disk. Without
+    // this, HF_HUB_OFFLINE only guarantees no network — it still looks under the default ~/.cache.
+    if let Some(model_mount) = &env.model_mount {
+        container_env.push(("HF_HOME".to_string(), model_mount.clone()));
+    }
     container_env.extend(kwarg_env.iter().cloned());
     let mut pvc_mounts = env.pvc_mounts.clone();
     pvc_mounts.extend(extra_mounts.iter().cloned());
@@ -2849,6 +2861,7 @@ mod tests {
                 mount_path: "/models".into(),
                 read_only: true,
             }],
+            model_mount: Some("/models".into()),
             artifacts,
             spoke: None,
         }
@@ -2876,6 +2889,24 @@ mod tests {
                 .all(|m| m.claim_name != "crucible-artifacts"),
             "{:?}",
             bench.pvc_mounts
+        );
+        // With a model cache mounted, HF_HOME points at it (alongside HF_HUB_OFFLINE) so the offline
+        // load resolves from disk rather than the default ~/.cache.
+        assert!(
+            bench
+                .env
+                .iter()
+                .any(|(k, v)| k == "HF_HOME" && v == "/models"),
+            "HF_HOME must point at the model mount: {:?}",
+            bench.env
+        );
+        assert!(
+            bench
+                .env
+                .iter()
+                .any(|(k, v)| k == "HF_HUB_OFFLINE" && v == "1"),
+            "{:?}",
+            bench.env
         );
         // A profile-shaped spec mounts it WRITABLE at the configured path.
         let extra = vec![PvcMount {
