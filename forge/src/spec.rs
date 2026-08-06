@@ -413,6 +413,12 @@ pub fn validate_builds(builds: &BTreeMap<String, BuildSpec>) -> Result<()> {
             }
         }
 
+        // `image` is expanded like any other field (the cluster backend does so before it builds
+        // the push ref), so it gets the same closed-vocabulary check. A `builds.<dep>.digest_ref`
+        // here is load-bearing for ordering: without `dep` in `needs`, this build dispatches
+        // before that digest exists.
+        check_template_field(&format!("[build.{name}].image"), &spec.image, spec, builds)?;
+
         if let Some(gh) = &spec.github {
             for (key, value) in &gh.inputs {
                 let where_ = format!("[build.{name}.github.inputs].{key}");
@@ -870,6 +876,64 @@ mod tests {
         assert_ne!(content_digest(&root, &[]).unwrap(), real);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `image` is template-expanded before the push ref is built, so it gets the same
+    /// closed-vocabulary check as the cluster fields, and its `digest_ref` refs are held to the
+    /// same `needs` rule (without which this build dispatches before the digest exists).
+    #[test]
+    fn image_is_closed_vocabulary_validated() {
+        let bad_var = builds_from(
+            r#"
+            [build.x]
+            backend = "cluster"
+            image   = "ghcr.io/x/{{ secret }}"
+            [build.x.cluster]
+            containerfile = "C"
+        "#,
+        );
+        let err = format!(
+            "{:#}",
+            anyhow::Error::new(validate_builds(&bad_var).unwrap_err())
+        );
+        assert!(err.contains("vocabulary is closed"), "{err}");
+        assert!(err.contains("[build.x].image"), "{err}");
+
+        let missing_need = builds_from(
+            r#"
+            [build.base]
+            backend = "cluster"
+            image   = "ghcr.io/x/base"
+            [build.base.cluster]
+            containerfile = "C"
+            [build.top]
+            backend = "cluster"
+            image   = "{{ builds.base.digest_ref }}"
+            [build.top.cluster]
+            containerfile = "C"
+        "#,
+        );
+        let err = validate_builds(&missing_need).unwrap_err().to_string();
+        assert!(err.contains("not in this build's needs"), "{err}");
+        assert!(err.contains("[build.top].image"), "{err}");
+
+        // Declared need: valid. A plain untemplated image stays valid too.
+        let ok = builds_from(
+            r#"
+            [build.base]
+            backend = "cluster"
+            image   = "ghcr.io/x/base"
+            [build.base.cluster]
+            containerfile = "C"
+            [build.top]
+            backend = "cluster"
+            image   = "{{ builds.base.digest_ref }}"
+            needs   = ["base"]
+            [build.top.cluster]
+            containerfile = "C"
+        "#,
+        );
+        assert!(validate_builds(&ok).is_ok());
     }
 
     #[test]
