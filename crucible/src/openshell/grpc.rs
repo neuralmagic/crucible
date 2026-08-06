@@ -7,7 +7,7 @@
 //! CLI, see [`crate::openshell::gateway`] and [`crate::openshell::run`].
 
 use crate::openshell::gateway::{GATEWAY_NAME, GATEWAY_PORT};
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result};
 use openshell_core::auth::EdgeAuthInterceptor;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::{
@@ -388,15 +388,22 @@ impl Gateway {
                 ..Default::default()
             })
             .await
-            .map_err(|s| anyhow!("get_sandbox({name}): {s}"))?
+            .map_err(GrpcError::rpc(format!("get_sandbox({name})")))?
             .into_inner()
             .sandbox
-            .ok_or_else(|| anyhow!("sandbox '{name}' missing from response"))?;
+            .ok_or_else(|| GrpcError::SandboxMissing {
+                name: name.to_owned(),
+            })?;
         sandbox
             .metadata
             .map(|m| m.id)
             .filter(|id| !id.is_empty())
-            .ok_or_else(|| anyhow!("sandbox '{name}' has no id"))
+            .ok_or_else(|| {
+                GrpcError::SandboxHasNoId {
+                    name: name.to_owned(),
+                }
+                .into()
+            })
     }
 
     /// Create the sandbox and wait for it to reach `Ready`. `--no-auto-providers` is expressed
@@ -429,7 +436,7 @@ impl Gateway {
         client
             .create_sandbox(request)
             .await
-            .map_err(|s| anyhow!("create_sandbox({name}): {s}"))?;
+            .map_err(GrpcError::rpc(format!("create_sandbox({name})")))?;
         self.wait_ready(name).await
     }
 
@@ -451,29 +458,34 @@ impl Gateway {
 
         let (outcome, result) = loop {
             attempts += 1;
-            let phase = match client
-                .get_sandbox(GetSandboxRequest {
-                    name: name.to_string(),
-                    ..Default::default()
-                })
-                .await
-            {
-                Ok(resp) => resp.into_inner().sandbox.map_or(0, |s| s.phase()),
-                Err(s) => {
-                    break (
-                        POLL_ERROR,
-                        Err(anyhow!("get_sandbox({name}) while waiting for ready: {s}")),
-                    );
-                }
-            };
+            let phase =
+                match client
+                    .get_sandbox(GetSandboxRequest {
+                        name: name.to_string(),
+                        ..Default::default()
+                    })
+                    .await
+                {
+                    Ok(resp) => resp.into_inner().sandbox.map_or(0, |s| s.phase()),
+                    Err(s) => {
+                        break (
+                            POLL_ERROR,
+                            Err(GrpcError::rpc(format!(
+                                "get_sandbox({name}) while waiting for ready"
+                            ))(s)
+                            .into()),
+                        );
+                    }
+                };
             match SandboxPhase::try_from(phase) {
                 Ok(SandboxPhase::Ready) => break (POLL_READY, Ok(())),
                 Ok(SandboxPhase::Error) => {
                     break (
                         POLL_ERROR,
-                        Err(anyhow!(
-                            "sandbox '{name}' entered the error phase during provisioning"
-                        )),
+                        Err(GrpcError::SandboxErrorPhase {
+                            name: name.to_owned(),
+                        }
+                        .into()),
                     );
                 }
                 _ => {}
@@ -481,10 +493,11 @@ impl Gateway {
             if Instant::now() >= deadline {
                 break (
                     POLL_TIMEOUT,
-                    Err(anyhow!(
-                        "sandbox '{name}' did not become ready within {}s",
-                        provision_timeout().as_secs()
-                    )),
+                    Err(GrpcError::SandboxNotReady {
+                        name: name.to_owned(),
+                        seconds: provision_timeout().as_secs(),
+                    }
+                    .into()),
                 );
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -509,7 +522,7 @@ impl Gateway {
         {
             Ok(_) => Ok(()),
             Err(s) if s.code() == tonic::Code::NotFound => Ok(()),
-            Err(s) => Err(anyhow!("delete_sandbox({name}): {s}")),
+            Err(s) => Err(GrpcError::rpc(format!("delete_sandbox({name})"))(s).into()),
         }
     }
 
@@ -531,14 +544,20 @@ impl Gateway {
                 .await
             {
                 Err(s) if s.code() == tonic::Code::NotFound => return Ok(()),
-                Err(s) => return Err(anyhow!("get_sandbox({name}) while waiting for delete: {s}")),
+                Err(s) => {
+                    return Err(GrpcError::rpc(format!(
+                        "get_sandbox({name}) while waiting for delete"
+                    ))(s)
+                    .into());
+                }
                 Ok(_) => {}
             }
             if Instant::now() >= deadline {
-                return Err(anyhow!(
-                    "sandbox '{name}' still exists {}s after delete",
-                    provision_timeout().as_secs()
-                ));
+                return Err(GrpcError::SandboxStillExists {
+                    name: name.to_owned(),
+                    seconds: provision_timeout().as_secs(),
+                }
+                .into());
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
@@ -586,7 +605,8 @@ impl Gateway {
             .map(|_| ())
             // The token is in the request body, not this message; but keep any surfaced
             // error clean regardless.
-            .map_err(|s| anyhow!("create_provider({name}): {}", s.code()))
+            .map_err(GrpcError::rpc(format!("create_provider({name})")))
+            .map_err(Into::into)
     }
 
     /// Register a provider whose credentials are gateway-minted (`CreateProvider` with an EMPTY
@@ -611,7 +631,8 @@ impl Gateway {
             })
             .await
             .map(|_| ())
-            .map_err(|s| anyhow!("create_provider({name}): {} ({})", s.code(), s.message()))
+            .map_err(GrpcError::rpc(format!("create_provider({name})")))
+            .map_err(Into::into)
     }
 
     /// Flip one global gateway setting (`UpdateConfig`, global scope, single-key mutation).
@@ -631,13 +652,8 @@ impl Gateway {
             })
             .await
             .map(|_| ())
-            .map_err(|s| {
-                anyhow!(
-                    "update_config(setting {key}): {} ({})",
-                    s.code(),
-                    s.message()
-                )
-            })
+            .map_err(GrpcError::rpc(format!("update_config(setting {key})")))
+            .map_err(Into::into)
     }
 
     /// Point a credential's refresh at an STS web-identity mint (`ConfigureProviderRefresh`).
@@ -663,13 +679,10 @@ impl Gateway {
             })
             .await
             .map(|_| ())
-            .map_err(|s| {
-                anyhow!(
-                    "configure_provider_refresh({name}): {} ({})",
-                    s.code(),
-                    s.message()
-                )
-            })
+            .map_err(GrpcError::rpc(format!(
+                "configure_provider_refresh({name})"
+            )))
+            .map_err(Into::into)
     }
 
     /// Mint a credential synchronously right now (`RotateProviderCredential`), the pre-warm that
@@ -685,13 +698,10 @@ impl Gateway {
             })
             .await
             .map(|_| ())
-            .map_err(|s| {
-                anyhow!(
-                    "rotate_provider_credential({name}): {} ({})",
-                    s.code(),
-                    s.message()
-                )
-            })
+            .map_err(GrpcError::rpc(format!(
+                "rotate_provider_credential({name})"
+            )))
+            .map_err(Into::into)
     }
 
     /// Swap a freshly minted token into the existing provider (`UpdateProvider`). An empty
@@ -708,7 +718,8 @@ impl Gateway {
             })
             .await
             .map(|_| ())
-            .map_err(|s| anyhow!("update_provider({name}): {}", s.code()))
+            .map_err(GrpcError::rpc(format!("update_provider({name})")))
+            .map_err(Into::into)
     }
 
     /// Push the egress allowlist and block until the sandbox loads it (`UpdateConfig` +
@@ -740,7 +751,7 @@ impl Gateway {
             })
             .await
             .map(|r| r.into_inner().version)
-            .map_err(|s| anyhow!("update_config({name}): {s}"))?;
+            .map_err(GrpcError::rpc(format!("update_config({name})")))?;
 
         // Poll until the pushed revision is loaded (or superseded by a newer one, both mean the
         // supervisor is running a live policy), failing on a load error or timeout.
@@ -767,7 +778,7 @@ impl Gateway {
                 Err(s) => {
                     break (
                         POLL_ERROR,
-                        Err(anyhow!("get_sandbox_policy_status({name}): {s}")),
+                        Err(GrpcError::rpc(format!("get_sandbox_policy_status({name})"))(s).into()),
                     );
                 }
             };
@@ -779,9 +790,11 @@ impl Gateway {
                     Ok(PolicyStatus::Failed) => {
                         break (
                             POLL_ERROR,
-                            Err(anyhow!(
-                                "policy version {version} failed to load: {load_error}"
-                            )),
+                            Err(GrpcError::PolicyLoadFailed {
+                                version,
+                                load_error,
+                            }
+                            .into()),
                         );
                     }
                     _ => {}
@@ -790,9 +803,11 @@ impl Gateway {
             if Instant::now() >= deadline {
                 break (
                     POLL_TIMEOUT,
-                    Err(anyhow!(
-                        "timed out waiting for policy version {version} to load on '{name}'"
-                    )),
+                    Err(GrpcError::PolicyLoadTimeout {
+                        version,
+                        name: name.to_owned(),
+                    }
+                    .into()),
                 );
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -857,7 +872,7 @@ impl Gateway {
         let mut stream = client
             .exec_sandbox(request)
             .await
-            .map_err(|s| anyhow!("exec_sandbox({name}): {s}"))?
+            .map_err(GrpcError::rpc(format!("exec_sandbox({name})")))?
             .into_inner();
 
         let mut stdout = LineSplitter::default();
@@ -980,36 +995,103 @@ fn generated_rule_name(host: &str, port: u32) -> String {
 /// [`crate::openshell::policy`] resolves) into a [`NetworkEndpoint`], validating each segment the way the
 /// CLI's `--add-endpoint` parser does. crucible does not emit the endpoint-options segment, so
 /// this stops at enforcement.
-fn parse_endpoint_spec(spec: &str) -> Result<NetworkEndpoint> {
+/// A gateway RPC that came back non-OK. `call` names the RPC and its subject; tonic's `Status`
+/// is the source, so the chain reads `create_sandbox(ci): status: ResourceExhausted, ...`.
+#[derive(Debug, thiserror::Error)]
+pub enum GrpcError {
+    #[error("{call}")]
+    Rpc {
+        call: String,
+        #[source]
+        status: tonic::Status,
+    },
+    #[error("sandbox '{name}' missing from response")]
+    SandboxMissing { name: String },
+    #[error("sandbox '{name}' has no id")]
+    SandboxHasNoId { name: String },
+    #[error("sandbox '{name}' entered the error phase during provisioning")]
+    SandboxErrorPhase { name: String },
+    #[error("sandbox '{name}' did not become ready within {seconds}s")]
+    SandboxNotReady { name: String, seconds: u64 },
+    #[error("sandbox '{name}' still exists {seconds}s after delete")]
+    SandboxStillExists { name: String, seconds: u64 },
+    #[error("policy version {version} failed to load: {load_error}")]
+    PolicyLoadFailed { version: u32, load_error: String },
+    #[error("timed out waiting for policy version {version} to load on '{name}'")]
+    PolicyLoadTimeout { version: u32, name: String },
+}
+
+impl GrpcError {
+    /// A `map_err` argument: `.map_err(GrpcError::rpc(format!("get_sandbox({name})")))`.
+    fn rpc(call: impl Into<String>) -> impl FnOnce(tonic::Status) -> Self {
+        let call = call.into();
+        move |status| GrpcError::Rpc { call, status }
+    }
+}
+
+/// A rejected endpoint spec. The offending spec is named once here rather than re-interpolated
+/// into every message.
+#[derive(Debug, thiserror::Error, PartialEq)]
+#[error("endpoint '{spec}' {problem}")]
+pub struct EndpointSpecError {
+    spec: String,
+    problem: EndpointProblem,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub enum EndpointProblem {
+    #[error("must be host:port[:access[:protocol[:enforcement]]]")]
+    Shape,
+    #[error("has an invalid host segment")]
+    Host,
+    #[error("has a non-numeric port")]
+    NonNumericPort,
+    #[error("port must be in 1..=65535")]
+    PortRange,
+    #[error("access must be read-only, read-write, or full")]
+    Access,
+    #[error("protocol must be rest, websocket, or sql")]
+    Protocol,
+    #[error("enforcement must be enforce or audit")]
+    Enforcement,
+    #[error("cannot set enforcement without a protocol")]
+    EnforcementWithoutProtocol,
+}
+
+fn parse_endpoint_spec(spec: &str) -> Result<NetworkEndpoint, EndpointSpecError> {
+    let reject = |problem| EndpointSpecError {
+        spec: spec.to_owned(),
+        problem,
+    };
     let parts: Vec<&str> = spec.split(':').collect();
     if !(2..=5).contains(&parts.len()) {
-        bail!("endpoint '{spec}' must be host:port[:access[:protocol[:enforcement]]]");
+        return Err(reject(EndpointProblem::Shape));
     }
     let host = parts[0].trim();
     if host.is_empty() || host.contains(char::is_whitespace) || host.contains('/') {
-        bail!("endpoint '{spec}' has an invalid host segment");
+        return Err(reject(EndpointProblem::Host));
     }
     let port: u32 = parts[1]
         .trim()
         .parse()
-        .map_err(|_| anyhow!("endpoint '{spec}' has a non-numeric port"))?;
+        .map_err(|_| reject(EndpointProblem::NonNumericPort))?;
     if port == 0 || port > 65535 {
-        bail!("endpoint '{spec}' port must be in 1..=65535");
+        return Err(reject(EndpointProblem::PortRange));
     }
     let access = parts.get(2).copied().unwrap_or("").trim();
     let protocol = parts.get(3).copied().unwrap_or("").trim();
     let enforcement = parts.get(4).copied().unwrap_or("").trim();
     if !access.is_empty() && !matches!(access, "read-only" | "read-write" | "full") {
-        bail!("endpoint '{spec}' access must be read-only, read-write, or full");
+        return Err(reject(EndpointProblem::Access));
     }
     if !protocol.is_empty() && !matches!(protocol, "rest" | "websocket" | "sql") {
-        bail!("endpoint '{spec}' protocol must be rest, websocket, or sql");
+        return Err(reject(EndpointProblem::Protocol));
     }
     if !enforcement.is_empty() && !matches!(enforcement, "enforce" | "audit") {
-        bail!("endpoint '{spec}' enforcement must be enforce or audit");
+        return Err(reject(EndpointProblem::Enforcement));
     }
     if !enforcement.is_empty() && protocol.is_empty() {
-        bail!("endpoint '{spec}' cannot set enforcement without a protocol");
+        return Err(reject(EndpointProblem::EnforcementWithoutProtocol));
     }
     Ok(NetworkEndpoint {
         host: host.to_string(),

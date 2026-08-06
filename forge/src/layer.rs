@@ -19,6 +19,14 @@ use std::path::{Component, Path, PathBuf};
 const WH_PREFIX: &str = ".wh.";
 const WH_OPAQUE: &str = ".wh..wh..opaque";
 
+/// A tar member whose path escapes the extraction root. Refused rather than normalized: a
+/// layer that ships `../` is not something to guess the intent of.
+#[derive(Debug, thiserror::Error)]
+#[error("unsafe tar member path {}", .path.display())]
+pub struct UnsafeTarMemberPath {
+    path: std::path::PathBuf,
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(bytes);
@@ -208,7 +216,10 @@ fn safe_join(dest: &Path, rel: &Path) -> Result<PathBuf> {
             Component::Normal(c) => out.push(c),
             Component::CurDir => {}
             Component::RootDir | Component::Prefix(_) | Component::ParentDir => {
-                anyhow::bail!("unsafe tar member path {}", rel.display());
+                return Err(UnsafeTarMemberPath {
+                    path: rel.to_path_buf(),
+                }
+                .into());
             }
         }
     }

@@ -12,10 +12,18 @@
 //! accepts a connection, so the first turn's MCP calls never race the boot.
 
 use crate::manifest::BrokerCfg;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use std::net::{SocketAddr, TcpStream};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+#[derive(Debug, thiserror::Error)]
+#[error("provisioning broker (`{bin}`) did not start listening on {probe} within {seconds}s")]
+struct BrokerBootTimeout {
+    bin: String,
+    probe: String,
+    seconds: u64,
+}
 
 /// How long to wait for the broker to start listening before giving up.
 const BOOT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -84,11 +92,12 @@ pub fn ensure_running(
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    bail!(
-        "provisioning broker (`{}`) did not start listening on {probe} within {}s",
-        cfg.bin,
-        BOOT_TIMEOUT.as_secs()
-    )
+    Err(BrokerBootTimeout {
+        bin: cfg.bin.clone(),
+        probe: probe.to_string(),
+        seconds: BOOT_TIMEOUT.as_secs(),
+    }
+    .into())
 }
 
 /// A fresh random bearer token: 24 bytes of OS entropy, hex-encoded. Read from `/dev/urandom`

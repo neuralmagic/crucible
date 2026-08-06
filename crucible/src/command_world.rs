@@ -9,11 +9,19 @@
 //!   owns the framing, and neither `run_loop` nor the domain scripts see the other half.
 
 use crate::crucible::World;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use crucible_vcs::git_memory;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+#[derive(Debug, thiserror::Error)]
+#[error("command `{command}` failed ({status}): {stderr}")]
+struct CommandFailed {
+    command: String,
+    status: std::process::ExitStatus,
+    stderr: String,
+}
 
 /// Run a domain command via `sh -c` in the workspace, returning its trimmed stdout. `token`,
 /// when present (restore), is passed as the `CRUCIBLE_TOKEN` env var, the opaque snapshot
@@ -28,11 +36,12 @@ fn run_cmd(workspace: &Path, cmd: &str, token: Option<&str>) -> Result<String> {
         .output()
         .with_context(|| format!("exec `{cmd}` in {}", workspace.display()))?;
     if !out.status.success() {
-        bail!(
-            "command `{cmd}` failed ({}): {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+        return Err(CommandFailed {
+            command: cmd.to_owned(),
+            status: out.status,
+            stderr: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+        }
+        .into());
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }

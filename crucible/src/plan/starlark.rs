@@ -3,10 +3,8 @@
 //! clock, and randomness APIs are unavailable.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
 use starlark_syntax::codemap::{FileSpan, Span};
 use starlark_syntax::lexer::TokenInt;
 use starlark_syntax::syntax::ast::{
@@ -14,11 +12,14 @@ use starlark_syntax::syntax::ast::{
 };
 use starlark_syntax::syntax::{AstModule, Dialect};
 
-use crate::manifest::{WorkflowCfg, WorkflowType};
+use crate::errors::FileError;
+use crate::manifest::{WorkflowCfg, WorkflowError, WorkflowType};
 use crate::plan::diag;
 use crate::plan::ir::{
     Direction, EngineOp, Isolation, Join, OutputField, Stage, Task, TaskKind, TaskName,
 };
+
+type Result<T> = std::result::Result<T, CompileError>;
 
 const MAX_SOURCE_BYTES: usize = 256 * 1024;
 const MAX_PROMPT_BYTES: usize = 256 * 1024;
@@ -57,7 +58,7 @@ impl CompileContext {
     fn prompt_file(&mut self, raw: &str) -> Result<String> {
         let relative = safe_relative_path(raw)?;
         let root = std::fs::canonicalize(&self.pack_dir)
-            .with_context(|| format!("resolving pack directory {}", self.pack_dir.display()))?;
+            .map_err(FileError::at("resolving pack directory", &self.pack_dir))?;
         let mut path = self.pack_dir.clone();
         let mut metadata = None;
         for component in relative.components() {
@@ -66,40 +67,46 @@ impl CompileContext {
             };
             path.push(component);
             let current = std::fs::symlink_metadata(&path)
-                .with_context(|| format!("reading prompt metadata {}", path.display()))?;
+                .map_err(FileError::at("reading prompt metadata", &path))?;
             if current.file_type().is_symlink() {
-                bail!("prompt_file({raw:?}) may not traverse symlinks");
+                return Err(CompileError::PromptSymlink {
+                    raw: raw.to_owned(),
+                });
             }
             metadata = Some(current);
         }
         if !metadata.is_some_and(|metadata| metadata.is_file()) {
-            bail!("prompt_file({raw:?}) must name a regular, non-symlink file");
+            return Err(CompileError::PromptNotRegularFile {
+                raw: raw.to_owned(),
+            });
         }
-        let canonical = std::fs::canonicalize(&path)
-            .with_context(|| format!("resolving prompt file {}", path.display()))?;
+        let canonical =
+            std::fs::canonicalize(&path).map_err(FileError::at("resolving prompt file", &path))?;
         if !canonical.starts_with(&root) {
-            bail!("prompt_file({raw:?}) escapes the pack directory");
+            return Err(CompileError::PromptEscapesPack {
+                raw: raw.to_owned(),
+            });
         }
-        let bytes = std::fs::read(&canonical)
-            .with_context(|| format!("reading prompt file {}", canonical.display()))?;
+        let bytes =
+            std::fs::read(&canonical).map_err(FileError::at("reading prompt file", &canonical))?;
         if bytes.len() > MAX_PROMPT_BYTES {
-            bail!(
-                "prompt_file({raw:?}) is {} bytes; maximum is {MAX_PROMPT_BYTES}",
-                bytes.len()
-            );
+            return Err(CompileError::PromptTooLarge {
+                raw: raw.to_owned(),
+                bytes: bytes.len(),
+            });
         }
         self.total_prompt_bytes = self.total_prompt_bytes.saturating_add(bytes.len());
         if self.total_prompt_bytes > MAX_TOTAL_PROMPT_BYTES {
-            bail!("workflow embeds more than {MAX_TOTAL_PROMPT_BYTES} bytes of prompt files");
+            return Err(CompileError::PromptBudgetSpent);
         }
         self.prompt_files.insert(relative);
-        String::from_utf8(bytes).context("prompt files must be UTF-8")
+        Ok(String::from_utf8(bytes)?)
     }
 
     fn step(&mut self) -> Result<()> {
         self.eval_steps += 1;
         if self.eval_steps > MAX_EVAL_STEPS {
-            bail!("workflow evaluation exceeds {MAX_EVAL_STEPS} expression steps");
+            return Err(CompileError::EvalStepsSpent);
         }
         Ok(())
     }
@@ -108,7 +115,7 @@ impl CompileContext {
 fn safe_relative_path(raw: &str) -> Result<PathBuf> {
     let path = Path::new(raw);
     if raw.trim().is_empty() || path.is_absolute() {
-        bail!("prompt_file path must be a non-empty pack-relative path");
+        return Err(CompileError::PromptPathEmpty);
     }
     if path.components().any(|part| {
         matches!(
@@ -116,7 +123,7 @@ fn safe_relative_path(raw: &str) -> Result<PathBuf> {
             Component::ParentDir | Component::RootDir | Component::Prefix(_)
         )
     }) {
-        bail!("prompt_file path may not contain `..` or escape the pack");
+        return Err(CompileError::PromptPathTraversal);
     }
     Ok(path.to_path_buf())
 }
@@ -150,18 +157,204 @@ impl SessionDecl {
     }
 }
 
-/// A compile error already carrying its `file:line:col` prefix, so the call-site
-/// wrapper in [`Compiler::locate`] does not prefix it a second time.
-#[derive(Debug)]
-struct Diagnostic(String);
+/// Everything the Starlark frontend can reject. [`CompileError::At`] carries the
+/// `file:line:col` prefix, so [`Compiler::locate`] can tell a located error from a bare one
+/// instead of sniffing a formatted string.
+///
+/// Causes are real `source()` links, so the message a user reads comes from
+/// [`crate::errors::report`] (or anyhow's `{:#}`), not from `Display` alone.
+#[derive(Debug, thiserror::Error)]
+pub enum CompileError {
+    /// An error located at its authoring site. The innermost site wins.
+    #[error("{at}")]
+    At {
+        at: FileSpan,
+        #[source]
+        inner: Box<CompileError>,
+    },
+    #[error(transparent)]
+    File(#[from] FileError),
+    #[error("prompt files must be UTF-8")]
+    PromptNotUtf8(#[from] std::string::FromUtf8Error),
+    #[error("parsing workflow Starlark: {0}")]
+    Parse(String),
+    #[error(transparent)]
+    Workflow(#[from] WorkflowError),
+    #[error("serializing the compiled workflow")]
+    Json(#[from] serde_json::Error),
 
-impl fmt::Display for Diagnostic {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
+    #[error("prompt_file({raw:?}) may not traverse symlinks")]
+    PromptSymlink { raw: String },
+    #[error("prompt_file({raw:?}) must name a regular, non-symlink file")]
+    PromptNotRegularFile { raw: String },
+    #[error("prompt_file({raw:?}) escapes the pack directory")]
+    PromptEscapesPack { raw: String },
+    #[error("prompt_file({raw:?}) is {bytes} bytes; maximum is {MAX_PROMPT_BYTES}")]
+    PromptTooLarge { raw: String, bytes: usize },
+    #[error("workflow embeds more than {MAX_TOTAL_PROMPT_BYTES} bytes of prompt files")]
+    PromptBudgetSpent,
+    #[error("prompt_file path must be a non-empty pack-relative path")]
+    PromptPathEmpty,
+    #[error("prompt_file path may not contain `..` or escape the pack")]
+    PromptPathTraversal,
+
+    #[error("workflow source is {bytes} bytes; maximum is {MAX_SOURCE_BYTES}")]
+    SourceTooLarge { bytes: usize },
+    #[error("workflow evaluation exceeds {MAX_EVAL_STEPS} expression steps")]
+    EvalStepsSpent,
+    #[error("{function} expands to {count} tasks; maximum is {MAX_TASKS}")]
+    TooManyTasks { function: String, count: usize },
+
+    #[error("workflow assignments must target a single variable name")]
+    NonIdentifierAssignment,
+    #[error("workflow Starlark may not use load(); use pack-local prompt_file() for prompts")]
+    LoadUnsupported,
+    #[error(
+        "workflow Starlark is declarative: use assignments, lists, list concatenation, and DSL calls"
+    )]
+    NonDeclarativeStatement,
+    #[error("unknown workflow variable {name:?}{}", diag::hint(.suggestion.as_deref()))]
+    UnknownVariable {
+        name: String,
+        suggestion: Option<String>,
+    },
+    #[error("workflow integers must fit in 32 bits")]
+    IntegerTooWide,
+    #[error("workflow `+` is supported only for task or dependency lists")]
+    UnsupportedAddition,
+    #[error("workflow calls must name a DSL constructor directly")]
+    IndirectCall,
+    #[error(
+        "unsupported workflow expression; use strings, integers, booleans, lists, list concatenation, and DSL calls"
+    )]
+    UnsupportedExpression,
+
+    #[error("unknown workflow DSL function {function:?}{}", diag::hint(.suggestion.as_deref()))]
+    UnknownFunction {
+        function: String,
+        suggestion: Option<String>,
+    },
+    #[error("{function}() takes exactly one positional argument")]
+    NotOnePositional { function: String },
+    #[error("{function}() received the wrong value type")]
+    WrongPositionalType { function: String },
+    #[error("{function}() task constructor arguments must be named")]
+    PositionalArgument { function: String },
+    #[error("{function}() repeats argument {argument:?}")]
+    RepeatedArgument { function: String, argument: String },
+    #[error("{function}() has unknown argument {argument:?}{}", diag::hint(.suggestion.as_deref()))]
+    UnknownArgument {
+        function: String,
+        argument: String,
+        suggestion: Option<String>,
+    },
+
+    #[error("workflow type must be `autoresearch` or `custom`, got {got:?}")]
+    UnknownWorkflowType { got: String },
+    #[error("workflow tasks must be a list of task constructor values")]
+    TasksNotList,
+    #[error("deps() entries must be task constructor values")]
+    DepsEntryNotTask,
+    #[error("{function} entries must be task constructor values")]
+    TaskListEntryNotTask { function: String },
+
+    #[error("session name {name:?} must be 1-64 ASCII letters, digits, `.`, `_`, or `-`")]
+    InvalidSessionName { name: String },
+    #[error("session {name:?} is already declared at {first}")]
+    DuplicateSession { name: String, first: FileSpan },
+    #[error(
+        "task {task:?} sets {knob} {mine:?} but session {session:?} declares {theirs:?}; a session \
+         is one conversation under one config"
+    )]
+    SessionConfigConflict {
+        task: String,
+        knob: &'static str,
+        mine: String,
+        session: String,
+        theirs: String,
+    },
+    #[error(
+        "session {name:?} declares agent defaults, but propose() takes its agent config from the \
+         manifest's [agent]"
+    )]
+    ProposeSessionDefaults { name: String },
+    #[error("session {name:?} is not declared{}", diag::hint(.suggestion.as_deref()))]
+    UndeclaredSession {
+        name: String,
+        suggestion: Option<String>,
+    },
+    #[error("argument \"session\" must be a session() value or a string")]
+    SessionWrongType,
+
+    #[error("top_k k must be >= 1")]
+    TopKZero,
+    #[error("top_k direction must be `lower` or `higher`, got {got:?}")]
+    UnknownTopKDirection { got: String },
+    #[error("top_k requires a non-empty depends_on")]
+    TopKWithoutDependencies,
+    #[error("stage must be `iteration` or `epilogue`, got {got:?}")]
+    UnknownStage { got: String },
+    #[error("join must be `all` or `passed`, got {got:?}")]
+    UnknownJoin { got: String },
+    #[error("emits entries must be strings")]
+    EmitsEntryNotString,
+    #[error("argument \"emits\" must be a list of field-name strings")]
+    EmitsNotList,
+
+    #[error("missing required argument {argument:?}")]
+    MissingArgument { argument: String },
+    /// One arm for every scalar-kwarg type check; `expected` completes the sentence.
+    #[error("argument {argument:?} must be {expected}")]
+    WrongArgumentType {
+        argument: String,
+        expected: &'static str,
+    },
+    #[error("argument {argument:?} must be `lower`, `higher`, or None, got {got:?}")]
+    UnknownDirection { argument: String, got: String },
+    #[error("{argument} must be a list of tasks or task-name strings")]
+    TaskNamesNotList { argument: String },
+    #[error("{argument} entries must be tasks or task-name strings")]
+    TaskNameEntryWrongType { argument: String },
+
+    #[error("workflow source must end with workflow(...) or default_autoresearch([...])")]
+    NoWorkflowResult,
+    #[error(
+        "task(s) constructed but not included in the workflow: {}; add them to \
+         workflow(tasks = ...) or delete them",
+        .sites.join(", ")
+    )]
+    DroppedTasks { sites: Vec<String> },
+    #[error(
+        "session string reference(s) {} appear before any session() declaration; declare sessions \
+         before binding them",
+        .sites.join(", ")
+    )]
+    LateSessionDeclaration { sites: Vec<String> },
+    #[error(
+        "session(s) declared but never bound to a task: {}; bind with session = <declaration> or \
+         delete them",
+        .sites.join(", ")
+    )]
+    UnboundSessions { sites: Vec<String> },
 }
 
-impl std::error::Error for Diagnostic {}
+/// Compiling `workflow.star` into the manifest's generated `[workflow]` block: the compile
+/// itself, plus the TOML surgery that installs the result.
+#[derive(Debug, thiserror::Error)]
+pub enum MaterializeError {
+    #[error(transparent)]
+    Compile(#[from] CompileError),
+    #[error(transparent)]
+    File(#[from] FileError),
+    #[error("parsing manifest {}", .path.display())]
+    ParseManifest {
+        path: PathBuf,
+        #[source]
+        cause: toml_edit::TomlError,
+    },
+    #[error("serializing the workflow block")]
+    Serialize(#[from] toml::ser::Error),
+}
 
 /// The callable DSL surface, for unknown-function suggestions.
 const DSL_FUNCTIONS: &[&str] = &[
@@ -242,19 +435,18 @@ struct Compiler<'a> {
 }
 
 impl Compiler<'_> {
-    fn err_at(&self, span: Span, message: impl fmt::Display) -> anyhow::Error {
-        anyhow::Error::new(Diagnostic(format!(
-            "{}: {message}",
-            self.module.file_span(span)
-        )))
+    fn err_at(&self, span: Span, error: CompileError) -> CompileError {
+        CompileError::At {
+            at: self.module.file_span(span),
+            inner: Box::new(error),
+        }
     }
 
     /// Attach the call site to an error that does not already carry a location.
-    fn locate(&self, span: Span, error: anyhow::Error) -> anyhow::Error {
-        if error.is::<Diagnostic>() {
-            error
-        } else {
-            self.err_at(span, format!("{error:#}"))
+    fn locate(&self, span: Span, error: CompileError) -> CompileError {
+        match error {
+            located @ CompileError::At { .. } => located,
+            error => self.err_at(span, error),
         }
     }
 
@@ -270,24 +462,15 @@ impl Compiler<'_> {
             }
             Stmt::Assign(assign) => {
                 let AssignTarget::Identifier(name) = &assign.lhs.node else {
-                    return Err(self.err_at(
-                        assign.lhs.span,
-                        "workflow assignments must target a single variable name",
-                    ));
+                    return Err(self.err_at(assign.lhs.span, CompileError::NonIdentifierAssignment));
                 };
                 let value = self.expression(&assign.rhs)?;
                 self.variables.insert(name.node.ident.clone(), value);
                 Ok(None)
             }
             Stmt::Expression(expression) => self.expression(expression).map(Some),
-            Stmt::Load(_) => Err(self.err_at(
-                statement.span,
-                "workflow Starlark may not use load(); use pack-local prompt_file() for prompts",
-            )),
-            _ => Err(self.err_at(
-                statement.span,
-                "workflow Starlark is declarative: use assignments, lists, list concatenation, and DSL calls",
-            )),
+            Stmt::Load(_) => Err(self.err_at(statement.span, CompileError::LoadUnsupported)),
+            _ => Err(self.err_at(statement.span, CompileError::NonDeclarativeStatement)),
         }
     }
 
@@ -302,10 +485,14 @@ impl Compiler<'_> {
                     Some(value) => Ok(value.clone()),
                     None => Err(self.err_at(
                         expression.span,
-                        diag::with_suggestion(
-                            format!("unknown workflow variable {name:?}"),
-                            diag::suggest(name, self.variables.keys().map(String::as_str)),
-                        ),
+                        CompileError::UnknownVariable {
+                            name: name.to_owned(),
+                            suggestion: diag::suggest(
+                                name,
+                                self.variables.keys().map(String::as_str),
+                            )
+                            .map(str::to_owned),
+                        },
                     )),
                 },
             },
@@ -313,7 +500,7 @@ impl Compiler<'_> {
             Expr::Literal(AstLiteral::Int(value)) => match &value.node {
                 TokenInt::I32(value) => Ok(Value::Int(*value)),
                 TokenInt::BigInt(_) => {
-                    Err(self.err_at(expression.span, "workflow integers must fit in 32 bits"))
+                    Err(self.err_at(expression.span, CompileError::IntegerTooWide))
                 }
             },
             Expr::Literal(AstLiteral::Float(value)) => Ok(Value::Float(value.node)),
@@ -326,27 +513,18 @@ impl Compiler<'_> {
                 let (Value::List(mut left), Value::List(right)) =
                     (self.expression(left)?, self.expression(right)?)
                 else {
-                    return Err(self.err_at(
-                        expression.span,
-                        "workflow `+` is supported only for task or dependency lists",
-                    ));
+                    return Err(self.err_at(expression.span, CompileError::UnsupportedAddition));
                 };
                 left.extend(right);
                 Ok(Value::List(left))
             }
             Expr::Call(function, args) => {
                 let Expr::Identifier(identifier) = &function.node else {
-                    return Err(self.err_at(
-                        function.span,
-                        "workflow calls must name a DSL constructor directly",
-                    ));
+                    return Err(self.err_at(function.span, CompileError::IndirectCall));
                 };
                 self.call(&identifier.node.ident, function.span, args)
             }
-            _ => Err(self.err_at(
-                expression.span,
-                "unsupported workflow expression; use strings, integers, booleans, lists, list concatenation, and DSL calls",
-            )),
+            _ => Err(self.err_at(expression.span, CompileError::UnsupportedExpression)),
         }
     }
 
@@ -359,10 +537,11 @@ impl Compiler<'_> {
         if !DSL_FUNCTIONS.contains(&function) {
             return Err(self.err_at(
                 function_span,
-                diag::with_suggestion(
-                    format!("unknown workflow DSL function {function:?}"),
-                    diag::suggest(function, DSL_FUNCTIONS.iter().copied()),
-                ),
+                CompileError::UnknownFunction {
+                    function: function.to_owned(),
+                    suggestion: diag::suggest(function, DSL_FUNCTIONS.iter().copied())
+                        .map(str::to_owned),
+                },
             ));
         }
         if matches!(
@@ -373,17 +552,14 @@ impl Compiler<'_> {
             .iter()
             .all(|argument| matches!(argument.node, Argument::Positional(_)))
         {
+            let one_positional = || CompileError::NotOnePositional {
+                function: function.to_owned(),
+            };
             let [argument] = args.args.as_slice() else {
-                return Err(self.err_at(
-                    function_span,
-                    format!("{function}() takes exactly one positional argument"),
-                ));
+                return Err(self.err_at(function_span, one_positional()));
             };
             let Argument::Positional(argument) = &argument.node else {
-                return Err(self.err_at(
-                    function_span,
-                    format!("{function}() takes exactly one positional argument"),
-                ));
+                return Err(self.err_at(function_span, one_positional()));
             };
             let value = self.expression(argument)?;
             return match (function, value) {
@@ -394,7 +570,7 @@ impl Compiler<'_> {
                     .into_iter()
                     .map(|task| match task {
                         Value::Task(task) => Ok(Value::String(task.name.0)),
-                        _ => bail!("deps() entries must be task constructor values"),
+                        _ => Err(CompileError::DepsEntryNotTask),
                     })
                     .collect::<Result<Vec<_>>>()
                     .map(Value::List),
@@ -414,7 +590,9 @@ impl Compiler<'_> {
                 }
                 _ => Err(self.err_at(
                     function_span,
-                    format!("{function}() received the wrong value type"),
+                    CompileError::WrongPositionalType {
+                        function: function.to_owned(),
+                    },
                 )),
             };
         }
@@ -425,14 +603,19 @@ impl Compiler<'_> {
             let Argument::Named(name, value) = &argument.node else {
                 return Err(self.err_at(
                     argument.span,
-                    format!("{function}() task constructor arguments must be named"),
+                    CompileError::PositionalArgument {
+                        function: function.to_owned(),
+                    },
                 ));
             };
             let value = self.expression(value)?;
             if named.insert(name.node.clone(), value).is_some() {
                 return Err(self.err_at(
                     argument.span,
-                    format!("{function}() repeats argument {:?}", name.node),
+                    CompileError::RepeatedArgument {
+                        function: function.to_owned(),
+                        argument: name.node.clone(),
+                    },
                 ));
             }
             arg_spans.insert(name.node.clone(), argument.span);
@@ -451,16 +634,19 @@ impl Compiler<'_> {
         arg_spans: BTreeMap<String, Span>,
     ) -> Result<Value> {
         if function == "workflow" {
-            let workflow_type = match take_string_default(&mut named, "type", "autoresearch")?
-                .as_str()
-            {
-                "autoresearch" => WorkflowType::Autoresearch,
-                "custom" => WorkflowType::Custom,
-                other => bail!("workflow type must be `autoresearch` or `custom`, got {other:?}"),
-            };
+            let workflow_type =
+                match take_string_default(&mut named, "type", "autoresearch")?.as_str() {
+                    "autoresearch" => WorkflowType::Autoresearch,
+                    "custom" => WorkflowType::Custom,
+                    other => {
+                        return Err(CompileError::UnknownWorkflowType {
+                            got: other.to_owned(),
+                        });
+                    }
+                };
             let tasks = match take_value(&mut named, "tasks")? {
                 Value::List(tasks) => task_list("workflow", tasks)?,
-                _ => bail!("workflow tasks must be a list of task constructor values"),
+                _ => return Err(CompileError::TasksNotList),
             };
             let result = take_optional_task_name(&mut named, "result")?;
             self.no_unknown_kwargs(function, span, &named, &arg_spans)?;
@@ -475,7 +661,7 @@ impl Compiler<'_> {
         if function == "session" {
             let name = take_string(&mut named, "name")?;
             if !is_valid_session_name(&name) {
-                bail!("session name {name:?} must be 1-64 ASCII letters, digits, `.`, `_`, or `-`");
+                return Err(CompileError::InvalidSessionName { name });
             }
             let decl = SessionDecl {
                 harness: take_optional_string(&mut named, "harness")?,
@@ -487,7 +673,10 @@ impl Compiler<'_> {
             if let Some((_, first)) = self.context.sessions.get(&decl.name) {
                 return Err(self.err_at(
                     span,
-                    format!("session {:?} is already declared at {first}", decl.name),
+                    CompileError::DuplicateSession {
+                        name: decl.name.clone(),
+                        first: first.clone(),
+                    },
                 ));
             }
             self.context.sessions.insert(
@@ -497,7 +686,9 @@ impl Compiler<'_> {
             return Ok(Value::Session(decl));
         }
         if matches!(function, "prompt_file" | "deps" | "default_autoresearch") {
-            bail!("{function}() takes exactly one positional argument");
+            return Err(CompileError::NotOnePositional {
+                function: function.to_owned(),
+            });
         }
 
         let task = match function {
@@ -522,10 +713,13 @@ impl Compiler<'_> {
                             Some(mine) if mine.as_str() != theirs.as_str() => {
                                 return Err(self.err_at(
                                     span,
-                                    format!(
-                                        "task {:?} sets {knob} {mine:?} but session {:?} declares {theirs:?}; a session is one conversation under one config",
-                                        name.0, decl.name
-                                    ),
+                                    CompileError::SessionConfigConflict {
+                                        task: name.0.clone(),
+                                        knob,
+                                        mine: mine.clone(),
+                                        session: decl.name.clone(),
+                                        theirs: theirs.clone(),
+                                    },
                                 ));
                             }
                             Some(_) => {}
@@ -559,16 +753,20 @@ impl Compiler<'_> {
             "top_k" => {
                 let k = take_int(&mut named, "k")?;
                 if k <= 0 {
-                    bail!("top_k k must be >= 1");
+                    return Err(CompileError::TopKZero);
                 }
                 let direction = match take_string(&mut named, "direction")?.as_str() {
                     "lower" => Direction::Lower,
                     "higher" => Direction::Higher,
-                    other => bail!("top_k direction must be `lower` or `higher`, got {other:?}"),
+                    other => {
+                        return Err(CompileError::UnknownTopKDirection {
+                            got: other.to_owned(),
+                        });
+                    }
                 };
                 let depends_on = take_task_names(&mut named)?;
                 if depends_on.is_empty() {
-                    bail!("top_k requires a non-empty depends_on");
+                    return Err(CompileError::TopKWithoutDependencies);
                 }
                 Task {
                     name: TaskName(take_string(&mut named, "name")?),
@@ -595,10 +793,9 @@ impl Compiler<'_> {
                     // [agent]; accepting the defaults here would silently ignore them.
                     return Err(self.err_at(
                         arg_spans.get("session").copied().unwrap_or(span),
-                        format!(
-                            "session {:?} declares agent defaults, but propose() takes its agent config from the manifest's [agent]",
-                            decl.name
-                        ),
+                        CompileError::ProposeSessionDefaults {
+                            name: decl.name.clone(),
+                        },
                     ));
                 }
                 let mut task = engine_task(&mut named, EngineOp::Propose, None)?;
@@ -645,7 +842,12 @@ impl Compiler<'_> {
                     depends_on,
                 )
             }
-            _ => bail!("unknown workflow DSL function {function:?}"),
+            _ => {
+                return Err(CompileError::UnknownFunction {
+                    function: function.to_owned(),
+                    suggestion: None,
+                });
+            }
         };
         self.no_unknown_kwargs(function, span, &named, &arg_spans)?;
         self.context
@@ -667,10 +869,12 @@ impl Compiler<'_> {
         let at = arg_spans.get(unknown).copied().unwrap_or(span);
         Err(self.err_at(
             at,
-            diag::with_suggestion(
-                format!("{function}() has unknown argument {unknown:?}"),
-                diag::suggest(unknown, known_kwargs(function).iter().copied()),
-            ),
+            CompileError::UnknownArgument {
+                function: function.to_owned(),
+                argument: unknown.clone(),
+                suggestion: diag::suggest(unknown, known_kwargs(function).iter().copied())
+                    .map(str::to_owned),
+            },
         ))
     }
 
@@ -710,33 +914,36 @@ impl Compiler<'_> {
                 } else {
                     Err(self.err_at(
                         span,
-                        diag::with_suggestion(
-                            format!("session {name:?} is not declared"),
-                            diag::suggest(&name, self.context.sessions.keys().map(String::as_str)),
-                        ),
+                        CompileError::UndeclaredSession {
+                            suggestion: diag::suggest(
+                                &name,
+                                self.context.sessions.keys().map(String::as_str),
+                            )
+                            .map(str::to_owned),
+                            name,
+                        },
                     ))
                 }
             }
-            _ => Err(self.err_at(
-                span,
-                "argument \"session\" must be a session() value or a string",
-            )),
+            _ => Err(self.err_at(span, CompileError::SessionWrongType)),
         }
     }
 }
 
 fn task_list(function: &str, tasks: Vec<Value>) -> Result<Vec<Task>> {
     if tasks.len() > MAX_TASKS {
-        bail!(
-            "{function} expands to {} tasks; maximum is {MAX_TASKS}",
-            tasks.len()
-        );
+        return Err(CompileError::TooManyTasks {
+            function: function.to_owned(),
+            count: tasks.len(),
+        });
     }
     tasks
         .into_iter()
         .map(|task| match task {
             Value::Task(task) => Ok(task),
-            _ => bail!("{function} entries must be task constructor values"),
+            _ => Err(CompileError::TaskListEntryNotTask {
+                function: function.to_owned(),
+            }),
         })
         .collect()
 }
@@ -779,10 +986,10 @@ fn default_autoresearch(mut extras: Vec<Task>) -> Result<WorkflowCfg> {
         vec!["measure".into()],
     ));
     if tasks.len() > MAX_TASKS {
-        bail!(
-            "default_autoresearch expands to {} tasks; maximum is {MAX_TASKS}",
-            tasks.len()
-        );
+        return Err(CompileError::TooManyTasks {
+            function: "default_autoresearch".to_owned(),
+            count: tasks.len(),
+        });
     }
     let workflow = WorkflowCfg {
         workflow_type: WorkflowType::Autoresearch,
@@ -830,7 +1037,9 @@ fn parse_stage(value: &str) -> Result<Stage> {
     match value {
         "iteration" => Ok(Stage::Iteration),
         "epilogue" => Ok(Stage::Epilogue),
-        other => bail!("stage must be `iteration` or `epilogue`, got {other:?}"),
+        other => Err(CompileError::UnknownStage {
+            got: other.to_owned(),
+        }),
     }
 }
 
@@ -860,10 +1069,10 @@ fn take_output_fields(named: &mut BTreeMap<String, Value>) -> Result<Vec<OutputF
             .into_iter()
             .map(|field| match field {
                 Value::String(field) => Ok(OutputField(field)),
-                _ => bail!("emits entries must be strings"),
+                _ => Err(CompileError::EmitsEntryNotString),
             })
             .collect(),
-        _ => bail!("argument \"emits\" must be a list of field-name strings"),
+        _ => Err(CompileError::EmitsNotList),
     }
 }
 
@@ -877,16 +1086,26 @@ fn is_valid_session_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
+/// The type an argument had to be, for [`CompileError::WrongArgumentType`].
+fn wrong_type(name: &str, expected: &'static str) -> CompileError {
+    CompileError::WrongArgumentType {
+        argument: name.to_owned(),
+        expected,
+    }
+}
+
 fn take_value(named: &mut BTreeMap<String, Value>, name: &str) -> Result<Value> {
     named
         .remove(name)
-        .with_context(|| format!("missing required argument {name:?}"))
+        .ok_or_else(|| CompileError::MissingArgument {
+            argument: name.to_owned(),
+        })
 }
 
 fn take_string(named: &mut BTreeMap<String, Value>, name: &str) -> Result<String> {
     match take_value(named, name)? {
         Value::String(value) => Ok(value),
-        _ => bail!("argument {name:?} must be a string"),
+        _ => Err(wrong_type(name, "a string")),
     }
 }
 
@@ -894,7 +1113,7 @@ fn take_optional_string(named: &mut BTreeMap<String, Value>, name: &str) -> Resu
     match named.remove(name).unwrap_or(Value::None) {
         Value::None => Ok(None),
         Value::String(value) => Ok(Some(value)),
-        _ => bail!("argument {name:?} must be a string or None"),
+        _ => Err(wrong_type(name, "a string or None")),
     }
 }
 
@@ -902,7 +1121,7 @@ fn take_task_name(named: &mut BTreeMap<String, Value>, name: &str) -> Result<Tas
     match take_value(named, name)? {
         Value::String(value) => Ok(TaskName(value)),
         Value::Task(task) => Ok(task.name),
-        _ => bail!("argument {name:?} must be a task or task-name string"),
+        _ => Err(wrong_type(name, "a task or task-name string")),
     }
 }
 
@@ -914,7 +1133,7 @@ fn take_optional_task_name(
         Value::None => Ok(None),
         Value::String(value) => Ok(Some(TaskName(value))),
         Value::Task(task) => Ok(Some(task.name)),
-        _ => bail!("argument {name:?} must be a task, task-name string, or None"),
+        _ => Err(wrong_type(name, "a task, task-name string, or None")),
     }
 }
 
@@ -926,7 +1145,7 @@ fn take_string_default(
     match named.remove(name) {
         None => Ok(default.to_owned()),
         Some(Value::String(value)) => Ok(value),
-        Some(_) => bail!("argument {name:?} must be a string"),
+        Some(_) => Err(wrong_type(name, "a string")),
     }
 }
 
@@ -938,14 +1157,14 @@ fn take_bool_default(
     match named.remove(name) {
         None => Ok(default),
         Some(Value::Bool(value)) => Ok(value),
-        Some(_) => bail!("argument {name:?} must be True or False"),
+        Some(_) => Err(wrong_type(name, "True or False")),
     }
 }
 
 fn take_int(named: &mut BTreeMap<String, Value>, name: &str) -> Result<i32> {
     match take_value(named, name)? {
         Value::Int(value) => Ok(value),
-        _ => bail!("argument {name:?} must be an integer"),
+        _ => Err(wrong_type(name, "an integer")),
     }
 }
 
@@ -954,7 +1173,7 @@ fn take_optional_number(named: &mut BTreeMap<String, Value>, name: &str) -> Resu
         Value::None => Ok(None),
         Value::Int(value) => Ok(Some(value as f64)),
         Value::Float(value) => Ok(Some(value)),
-        _ => bail!("argument {name:?} must be a number or None"),
+        _ => Err(wrong_type(name, "a number or None")),
     }
 }
 
@@ -966,10 +1185,11 @@ fn take_optional_direction(
         Value::None => Ok(None),
         Value::String(value) if value == "lower" => Ok(Some(Direction::Lower)),
         Value::String(value) if value == "higher" => Ok(Some(Direction::Higher)),
-        Value::String(value) => {
-            bail!("argument {name:?} must be `lower`, `higher`, or None, got {value:?}")
-        }
-        _ => bail!("argument {name:?} must be a string or None"),
+        Value::String(value) => Err(CompileError::UnknownDirection {
+            argument: name.to_owned(),
+            got: value,
+        }),
+        _ => Err(wrong_type(name, "a string or None")),
     }
 }
 
@@ -979,7 +1199,9 @@ fn take_task_names(named: &mut BTreeMap<String, Value>) -> Result<Vec<TaskName>>
 
 fn take_named_task_names(named: &mut BTreeMap<String, Value>, name: &str) -> Result<Vec<TaskName>> {
     if !named.contains_key(name) {
-        bail!("missing required argument {name:?}");
+        return Err(CompileError::MissingArgument {
+            argument: name.to_owned(),
+        });
     }
     take_named_task_names_optional(named, name)
 }
@@ -995,14 +1217,18 @@ fn take_named_task_names_optional(
 
 fn task_names(argument: &str, value: Value) -> Result<Vec<TaskName>> {
     let Value::List(names) = value else {
-        bail!("{argument} must be a list of tasks or task-name strings");
+        return Err(CompileError::TaskNamesNotList {
+            argument: argument.to_owned(),
+        });
     };
     names
         .into_iter()
         .map(|name| match name {
             Value::String(name) => Ok(TaskName(name)),
             Value::Task(task) => Ok(task.name),
-            _ => bail!("{argument} entries must be tasks or task-name strings"),
+            _ => Err(CompileError::TaskNameEntryWrongType {
+                argument: argument.to_owned(),
+            }),
         })
         .collect()
 }
@@ -1015,18 +1241,23 @@ fn parse_join(join: &str) -> Result<Join> {
     match join {
         "all" => Ok(Join::All),
         "passed" => Ok(Join::Passed),
-        other => bail!("join must be `all` or `passed`, got {other:?}"),
+        other => Err(CompileError::UnknownJoin {
+            got: other.to_owned(),
+        }),
     }
 }
 
 pub fn compile_file(path: &Path, pack_dir: &Path) -> Result<CompiledWorkflow> {
-    let source = std::fs::read_to_string(path)
-        .with_context(|| format!("reading workflow source {}", path.display()))?;
+    let source =
+        std::fs::read_to_string(path).map_err(FileError::at("reading workflow source", path))?;
     compile_source(&source, path, pack_dir)
 }
 
 /// Compile `workflow.star` into the manifest's generated `[workflow]` block.
-pub fn materialize_manifest(source_path: &Path, manifest_path: &Path) -> Result<CompiledWorkflow> {
+pub fn materialize_manifest(
+    source_path: &Path,
+    manifest_path: &Path,
+) -> std::result::Result<CompiledWorkflow, MaterializeError> {
     use toml_edit::DocumentMut;
 
     #[derive(serde::Serialize)]
@@ -1036,10 +1267,14 @@ pub fn materialize_manifest(source_path: &Path, manifest_path: &Path) -> Result<
 
     let compiled = compile_file(source_path, parent_or_cwd(manifest_path))?;
     let manifest = std::fs::read_to_string(manifest_path)
-        .with_context(|| format!("reading manifest {}", manifest_path.display()))?;
-    let mut document: DocumentMut = manifest
-        .parse()
-        .with_context(|| format!("parsing manifest {}", manifest_path.display()))?;
+        .map_err(FileError::at("reading manifest", manifest_path))?;
+    let mut document: DocumentMut =
+        manifest
+            .parse()
+            .map_err(|cause| MaterializeError::ParseManifest {
+                path: manifest_path.to_path_buf(),
+                cause,
+            })?;
     let workflow_toml = toml::to_string(&ManifestWorkflow {
         workflow: &compiled.workflow,
     })?;
@@ -1052,24 +1287,25 @@ pub fn materialize_manifest(source_path: &Path, manifest_path: &Path) -> Result<
         "\n# Generated from workflow.star. Edit the Starlark source; scope recompiles it.\n",
     );
     materialized.push_str(&workflow_toml);
-    write_atomically(manifest_path, &materialized)
-        .with_context(|| format!("writing manifest {}", manifest_path.display()))?;
+    write_atomically(manifest_path, &materialized)?;
     Ok(compiled)
 }
 
-fn write_atomically(path: &Path, body: &str) -> Result<()> {
+fn write_atomically(path: &Path, body: &str) -> std::result::Result<(), FileError> {
     let mut file = tempfile::NamedTempFile::new_in(parent_or_cwd(path))
-        .with_context(|| format!("creating temp file beside {}", path.display()))?;
+        .map_err(FileError::at("creating temp file beside", path))?;
     // Preserve the manifest's mode across the temporary-file rename.
     if let Ok(existing) = std::fs::metadata(path) {
         file.as_file()
             .set_permissions(existing.permissions())
-            .with_context(|| format!("preserving permissions on {}", path.display()))?;
+            .map_err(FileError::at("preserving permissions on", path))?;
     }
-    std::io::Write::write_all(file.as_file_mut(), body.as_bytes())?;
-    file.as_file().sync_all()?;
+    let write = FileError::at("writing", path);
+    std::io::Write::write_all(file.as_file_mut(), body.as_bytes())
+        .and_then(|()| file.as_file().sync_all())
+        .map_err(write)?;
     file.persist(path)
-        .with_context(|| format!("installing {}", path.display()))?;
+        .map_err(|error| FileError::at("installing", path)(error.error))?;
     Ok(())
 }
 
@@ -1081,7 +1317,9 @@ pub(crate) fn parent_or_cwd(path: &Path) -> &Path {
 }
 
 /// Compile a conventional sibling `workflow.star` when one is present.
-pub fn materialize_sibling_manifest(manifest_path: &Path) -> Result<Option<CompiledWorkflow>> {
+pub fn materialize_sibling_manifest(
+    manifest_path: &Path,
+) -> std::result::Result<Option<CompiledWorkflow>, MaterializeError> {
     let source_path = parent_or_cwd(manifest_path).join("workflow.star");
     source_path
         .exists()
@@ -1091,17 +1329,16 @@ pub fn materialize_sibling_manifest(manifest_path: &Path) -> Result<Option<Compi
 
 pub fn compile_source(source: &str, filename: &Path, pack_dir: &Path) -> Result<CompiledWorkflow> {
     if source.len() > MAX_SOURCE_BYTES {
-        bail!(
-            "workflow source is {} bytes; maximum is {MAX_SOURCE_BYTES}",
-            source.len()
-        );
+        return Err(CompileError::SourceTooLarge {
+            bytes: source.len(),
+        });
     }
     let ast = AstModule::parse(
         &filename.display().to_string(),
         source.to_owned(),
         &Dialect::Standard,
     )
-    .map_err(|error| anyhow::anyhow!("parsing workflow Starlark: {error}"))?;
+    .map_err(|error| CompileError::Parse(error.to_string()))?;
     let mut compiler = Compiler {
         module: &ast,
         context: CompileContext {
@@ -1117,7 +1354,7 @@ pub fn compile_source(source: &str, filename: &Path, pack_dir: &Path) -> Result<
         variables: BTreeMap::new(),
     };
     let Some(Value::Workflow(workflow)) = compiler.statement(ast.statement())? else {
-        bail!("workflow source must end with workflow(...) or default_autoresearch([...])");
+        return Err(CompileError::NoWorkflowResult);
     };
     let context = compiler.context;
     let included: BTreeSet<&str> = workflow.tasks.iter().map(|t| t.name.0.as_str()).collect();
@@ -1128,10 +1365,7 @@ pub fn compile_source(source: &str, filename: &Path, pack_dir: &Path) -> Result<
         .map(|(name, site)| format!("{name:?} ({site})"))
         .collect();
     if !dropped.is_empty() {
-        bail!(
-            "task(s) constructed but not included in the workflow: {}; add them to workflow(tasks = ...) or delete them",
-            dropped.join(", ")
-        );
+        return Err(CompileError::DroppedTasks { sites: dropped });
     }
     if !context.sessions.is_empty() && !context.string_session_refs.is_empty() {
         let refs: Vec<String> = context
@@ -1139,10 +1373,7 @@ pub fn compile_source(source: &str, filename: &Path, pack_dir: &Path) -> Result<
             .iter()
             .map(|(name, site)| format!("{name:?} ({site})"))
             .collect();
-        bail!(
-            "session string reference(s) {} appear before any session() declaration; declare sessions before binding them",
-            refs.join(", ")
-        );
+        return Err(CompileError::LateSessionDeclaration { sites: refs });
     }
     let unbound: Vec<String> = context
         .sessions
@@ -1151,10 +1382,7 @@ pub fn compile_source(source: &str, filename: &Path, pack_dir: &Path) -> Result<
         .map(|(name, (_, site))| format!("{name:?} ({site})"))
         .collect();
     if !unbound.is_empty() {
-        bail!(
-            "session(s) declared but never bound to a task: {}; bind with session = <declaration> or delete them",
-            unbound.join(", ")
-        );
+        return Err(CompileError::UnboundSessions { sites: unbound });
     }
     let canonical_json = serde_json::to_string_pretty(&workflow)? + "\n";
     Ok(CompiledWorkflow {
@@ -1322,10 +1550,8 @@ default_autoresearch([review, racecheck])
 racecheck = command(name = "racecheck", run = "./racecheck.sh", stage = "finale")
 default_autoresearch([racecheck])
 "#;
-        let error = format!(
-            "{:#}",
-            compile_source(bad, &pack.join("bad.star"), &pack).unwrap_err()
-        );
+        let error =
+            crate::errors::report(&compile_source(bad, &pack.join("bad.star"), &pack).unwrap_err());
         assert!(error.contains("`iteration` or `epilogue`"), "{error}");
         let _ = std::fs::remove_dir_all(&pack);
     }
@@ -1418,10 +1644,11 @@ workflow(type = "custom", tasks = [score, strict, lossy], result = strict)
             format!("workflow([agent(name = \"r\", prompt = prompt_file({path:?}))])\n")
         };
         assert!(
-            compile_source(&source("../secret.md"), &pack.join("workflow.star"), &pack)
-                .unwrap_err()
-                .to_string()
-                .contains("may not contain")
+            crate::errors::report(
+                &compile_source(&source("../secret.md"), &pack.join("workflow.star"), &pack)
+                    .unwrap_err()
+            )
+            .contains("may not contain")
         );
         #[cfg(unix)]
         {
@@ -1429,13 +1656,14 @@ workflow(type = "custom", tasks = [score, strict, lossy], result = strict)
             std::fs::write(pack.join("real.md"), "secret").unwrap();
             symlink(pack.join("real.md"), pack.join("prompts/link.md")).unwrap();
             assert!(
-                compile_source(
-                    &source("prompts/link.md"),
-                    &pack.join("workflow.star"),
-                    &pack
+                crate::errors::report(
+                    &compile_source(
+                        &source("prompts/link.md"),
+                        &pack.join("workflow.star"),
+                        &pack
+                    )
+                    .unwrap_err()
                 )
-                .unwrap_err()
-                .to_string()
                 .contains("symlink")
             );
         }
@@ -1445,13 +1673,14 @@ workflow(type = "custom", tasks = [score, strict, lossy], result = strict)
         )
         .unwrap();
         assert!(
-            compile_source(
-                &source("prompts/huge.md"),
-                &pack.join("workflow.star"),
-                &pack
+            crate::errors::report(
+                &compile_source(
+                    &source("prompts/huge.md"),
+                    &pack.join("workflow.star"),
+                    &pack
+                )
+                .unwrap_err()
             )
-            .unwrap_err()
-            .to_string()
             .contains("maximum")
         );
         let _ = std::fs::remove_dir_all(&pack);
@@ -1462,10 +1691,10 @@ workflow(type = "custom", tasks = [score, strict, lossy], result = strict)
         let pack = temp_pack("bounds");
         let load = "load(\"x.star\", \"x\")\nworkflow([])\n";
         assert!(
-            compile_source(load, &pack.join("workflow.star"), &pack)
-                .unwrap_err()
-                .to_string()
-                .contains("may not use load")
+            crate::errors::report(
+                &compile_source(load, &pack.join("workflow.star"), &pack).unwrap_err()
+            )
+            .contains("may not use load")
         );
         let runaway = "xs = []\nfor i in range(1000000):\n    xs.append(i)\nworkflow([])\n";
         assert!(compile_source(runaway, &pack.join("workflow.star"), &pack).is_err());
@@ -1528,9 +1757,9 @@ workflow(type = "custom", tasks = [score, strict, lossy], result = strict)
     fn unknown_kwarg_function_and_variable_errors_carry_location_and_suggestion() {
         let pack = temp_pack("diagnostics");
         let kwarg = "a = agent(name = \"a\", prompt = \"p\", depend_on = [])\nworkflow([a])\n";
-        let err = compile_source(kwarg, &pack.join("workflow.star"), &pack)
-            .unwrap_err()
-            .to_string();
+        let err = crate::errors::report(
+            &compile_source(kwarg, &pack.join("workflow.star"), &pack).unwrap_err(),
+        );
         assert!(err.contains("workflow.star:1:"), "{err}");
         assert!(
             err.contains("agent() has unknown argument \"depend_on\""),
@@ -1539,9 +1768,9 @@ workflow(type = "custom", tasks = [score, strict, lossy], result = strict)
         assert!(err.contains("did you mean \"depends_on\"?"), "{err}");
 
         let function = "a = agnt(name = \"a\", prompt = \"p\")\nworkflow([a])\n";
-        let err = compile_source(function, &pack.join("workflow.star"), &pack)
-            .unwrap_err()
-            .to_string();
+        let err = crate::errors::report(
+            &compile_source(function, &pack.join("workflow.star"), &pack).unwrap_err(),
+        );
         assert!(err.contains("workflow.star:1:"), "{err}");
         assert!(
             err.contains("unknown workflow DSL function \"agnt\""),
@@ -1550,9 +1779,9 @@ workflow(type = "custom", tasks = [score, strict, lossy], result = strict)
         assert!(err.contains("did you mean \"agent\"?"), "{err}");
 
         let variable = "candidate = command(name = \"c\", run = \"true\")\nworkflow([candidat])\n";
-        let err = compile_source(variable, &pack.join("workflow.star"), &pack)
-            .unwrap_err()
-            .to_string();
+        let err = crate::errors::report(
+            &compile_source(variable, &pack.join("workflow.star"), &pack).unwrap_err(),
+        );
         assert!(err.contains("workflow.star:2:"), "{err}");
         assert!(
             err.contains("unknown workflow variable \"candidat\""),
@@ -1570,9 +1799,9 @@ keep = command(name = "keep", run = "true")
 racecheck = evaluate(name = "racecheck", run = "true")
 workflow(type = "custom", tasks = [keep], result = keep)
 "#;
-        let err = compile_source(source, &pack.join("workflow.star"), &pack)
-            .unwrap_err()
-            .to_string();
+        let err = crate::errors::report(
+            &compile_source(source, &pack.join("workflow.star"), &pack).unwrap_err(),
+        );
         assert!(err.contains("not included in the workflow"), "{err}");
         assert!(err.contains("\"racecheck\""), "{err}");
         assert!(err.contains("workflow.star:3:"), "{err}");
@@ -1604,9 +1833,9 @@ solver = session(name = "solver", model = "claude-opus-4-6")
 a = agent(name = "a", prompt = "p", model = "claude-sonnet-5", session = solver)
 workflow(type = "custom", tasks = [a], result = a)
 "#;
-        let err = compile_source(conflict, &pack.join("workflow.star"), &pack)
-            .unwrap_err()
-            .to_string();
+        let err = crate::errors::report(
+            &compile_source(conflict, &pack.join("workflow.star"), &pack).unwrap_err(),
+        );
         assert!(err.contains("one conversation under one config"), "{err}");
         let _ = std::fs::remove_dir_all(&pack);
     }
@@ -1616,9 +1845,9 @@ workflow(type = "custom", tasks = [a], result = a)
         let pack = temp_pack("session-dup");
         let source =
             "a = session(name = \"solver\")\nb = session(name = \"solver\")\nworkflow([])\n";
-        let err = compile_source(source, &pack.join("workflow.star"), &pack)
-            .unwrap_err()
-            .to_string();
+        let err = crate::errors::report(
+            &compile_source(source, &pack.join("workflow.star"), &pack).unwrap_err(),
+        );
         assert!(err.contains("already declared"), "{err}");
         assert!(err.contains("workflow.star:2:"), "{err}");
         let _ = std::fs::remove_dir_all(&pack);
@@ -1633,9 +1862,9 @@ a = agent(name = "a", prompt = "p", session = solver)
 b = agent(name = "b", prompt = "p", session = "sovler", depends_on = [a])
 workflow(type = "custom", tasks = [a, b], result = b)
 "#;
-        let err = compile_source(typo, &pack.join("workflow.star"), &pack)
-            .unwrap_err()
-            .to_string();
+        let err = crate::errors::report(
+            &compile_source(typo, &pack.join("workflow.star"), &pack).unwrap_err(),
+        );
         assert!(err.contains("session \"sovler\" is not declared"), "{err}");
         assert!(err.contains("did you mean \"solver\"?"), "{err}");
 
@@ -1657,9 +1886,9 @@ solver = session(name = "solver")
 b = agent(name = "b", prompt = "p", session = solver, depends_on = [a])
 workflow(type = "custom", tasks = [a, b], result = b)
 "#;
-        let err = compile_source(late, &pack.join("workflow.star"), &pack)
-            .unwrap_err()
-            .to_string();
+        let err = crate::errors::report(
+            &compile_source(late, &pack.join("workflow.star"), &pack).unwrap_err(),
+        );
         assert!(err.contains("before any session() declaration"), "{err}");
         assert!(err.contains("\"solver\""), "{err}");
         let _ = std::fs::remove_dir_all(&pack);
@@ -1673,9 +1902,9 @@ solver = session(name = "solver")
 a = agent(name = "a", prompt = "p")
 workflow(type = "custom", tasks = [a], result = a)
 "#;
-        let err = compile_source(unbound, &pack.join("workflow.star"), &pack)
-            .unwrap_err()
-            .to_string();
+        let err = crate::errors::report(
+            &compile_source(unbound, &pack.join("workflow.star"), &pack).unwrap_err(),
+        );
         assert!(err.contains("never bound to a task"), "{err}");
         assert!(err.contains("\"solver\""), "{err}");
 
@@ -1684,9 +1913,9 @@ solver = session(name = "solver", model = "claude-opus-4-6")
 c = propose(name = "c", session = solver)
 workflow(type = "custom", tasks = [c], result = c)
 "#;
-        let err = compile_source(propose_defaults, &pack.join("workflow.star"), &pack)
-            .unwrap_err()
-            .to_string();
+        let err = crate::errors::report(
+            &compile_source(propose_defaults, &pack.join("workflow.star"), &pack).unwrap_err(),
+        );
         assert!(err.contains("manifest's [agent]"), "{err}");
 
         // A default-free session binds to propose exactly as a string does.
@@ -1702,9 +1931,9 @@ workflow(type = "custom", tasks = [c], result = c)
         );
 
         let bad_name = "s = session(name = \"has space\")\nworkflow([])\n";
-        let err = compile_source(bad_name, &pack.join("workflow.star"), &pack)
-            .unwrap_err()
-            .to_string();
+        let err = crate::errors::report(
+            &compile_source(bad_name, &pack.join("workflow.star"), &pack).unwrap_err(),
+        );
         assert!(err.contains("1-64 ASCII"), "{err}");
         let _ = std::fs::remove_dir_all(&pack);
     }
@@ -1729,9 +1958,8 @@ workflow(type = "custom", tasks = [e], result = e)
             "c = propose(name = \"c\", emits = [\"score\"])\nworkflow([c])\n",
             "m = command(name = \"m\", run = \"true\")\np = top_k(name = \"p\", k = 1, direction = \"lower\", depends_on = [m], emits = [\"kept\"])\nworkflow([m, p])\n",
         ] {
-            let err = compile_source(source, &pack.join("workflow.star"), &pack)
-                .unwrap_err()
-                .to_string();
+            let err = compile_source(source, &pack.join("workflow.star"), &pack).unwrap_err();
+            let err = crate::errors::report(&err);
             assert!(err.contains("unknown argument \"emits\""), "{err}");
         }
         let _ = std::fs::remove_dir_all(&pack);
@@ -1800,9 +2028,8 @@ workflow(type = "custom", tasks = [e], result = e)
             compile_source(&ok, &pack.join("workflow.star"), &pack)
                 .unwrap_or_else(|e| panic!("{function} full-kwarg call must compile: {e}"));
             let bad = template.replace("{extra}", ", bogus_zzz = \"x\"");
-            let err = compile_source(&bad, &pack.join("workflow.star"), &pack)
-                .unwrap_err()
-                .to_string();
+            let err = compile_source(&bad, &pack.join("workflow.star"), &pack).unwrap_err();
+            let err = crate::errors::report(&err);
             assert!(
                 err.contains("unknown argument \"bogus_zzz\""),
                 "{function}: {err}"

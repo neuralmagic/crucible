@@ -20,7 +20,16 @@
 //! selected only when probing shows it actually works, or when explicitly configured.
 
 use crate::layer::{BuiltLayer, LayerEntry, build_layer_tar};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
+
+/// The two ways a capture execution refuses: the wrong OS, or a command that ran and failed.
+#[derive(Debug, thiserror::Error)]
+pub enum CaptureError {
+    #[error("{mechanism} capture is only supported on Linux")]
+    NotLinux { mechanism: &'static str },
+    #[error("capture command exited with {status}")]
+    CommandFailed { status: std::process::ExitStatus },
+}
 use oci_client::secrets::RegistryAuth;
 #[cfg(target_os = "linux")]
 use std::ffi::{CStr, CString};
@@ -652,7 +661,10 @@ pub struct OverlayfsChroot;
 #[cfg(not(target_os = "linux"))]
 impl Executor for OverlayfsChroot {
     fn execute(&self, _plan: &ExecPlan) -> Result<()> {
-        bail!("overlayfs+chroot capture is only supported on Linux")
+        Err(CaptureError::NotLinux {
+            mechanism: "overlayfs+chroot",
+        }
+        .into())
     }
 }
 
@@ -697,7 +709,10 @@ pub struct UsernsExecutor;
 #[cfg(not(target_os = "linux"))]
 impl Executor for UsernsExecutor {
     fn execute(&self, _plan: &ExecPlan) -> Result<()> {
-        bail!("user-namespace capture is only supported on Linux")
+        Err(CaptureError::NotLinux {
+            mechanism: "user-namespace",
+        }
+        .into())
     }
 }
 
@@ -727,7 +742,7 @@ impl Executor for UsernsExecutor {
              inside a user namespace also needs kernel >= 5.11",
         )?;
         if !status.success() {
-            bail!("capture command exited with {status}");
+            return Err(CaptureError::CommandFailed { status }.into());
         }
         Ok(())
     }
@@ -935,7 +950,7 @@ fn run_chrooted(merged: &Path, command: &str, env: &[(String, String)]) -> Resul
         .status()
         .context("spawning `/bin/sh` inside the chroot")?;
     if !status.success() {
-        bail!("capture command exited with {status}");
+        return Err(CaptureError::CommandFailed { status }.into());
     }
     Ok(())
 }

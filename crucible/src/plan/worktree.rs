@@ -9,6 +9,24 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+/// A git invocation that ran but exited nonzero. Every worktree operation fails the same way,
+/// so the operation name is a field rather than five near-identical messages.
+#[derive(Debug, thiserror::Error)]
+#[error("{operation} failed: {stderr}")]
+pub(crate) struct GitFailed {
+    operation: &'static str,
+    stderr: String,
+}
+
+impl GitFailed {
+    fn new(operation: &'static str, stderr: &[u8]) -> Self {
+        Self {
+            operation,
+            stderr: String::from_utf8_lossy(stderr).into_owned(),
+        }
+    }
+}
+
 /// Create a task worktree as a shallow copy of `workspace`. Uses `git clone --local`, which
 /// hard-links objects, so a fan-out of N candidates costs ~one checkout each rather than N
 /// full copies.
@@ -39,10 +57,7 @@ pub(crate) fn setup(workspace: &Path, dest: &Path, pending: &str) -> Result<()> 
         status = clone(&["--no-hardlinks"])?;
     }
     if !status.status.success() {
-        anyhow::bail!(
-            "git clone --local failed: {}",
-            String::from_utf8_lossy(&status.stderr)
-        );
+        return Err(GitFailed::new("git clone --local", &status.stderr).into());
     }
     // Check out HEAD so the task has a working tree.
     let checkout = std::process::Command::new("git")
@@ -50,10 +65,7 @@ pub(crate) fn setup(workspace: &Path, dest: &Path, pending: &str) -> Result<()> 
         .output()
         .context("git checkout HEAD in a task worktree")?;
     if !checkout.status.success() {
-        anyhow::bail!(
-            "git checkout in a task worktree failed: {}",
-            String::from_utf8_lossy(&checkout.stderr)
-        );
+        return Err(GitFailed::new("git checkout in a task worktree", &checkout.stderr).into());
     }
     // A clone only carries committed state, but isolation has to mean "the workspace as it
     // stands right now": an upstream task's uncommitted edits are exactly what the isolated
@@ -70,10 +82,7 @@ pub(crate) fn capture_diff(worktree: &Path) -> Result<String> {
         .output()
         .context("git add -A in a task worktree")?;
     if !add.status.success() {
-        anyhow::bail!(
-            "git add -A failed: {}",
-            String::from_utf8_lossy(&add.stderr)
-        );
+        return Err(GitFailed::new("git add -A", &add.stderr).into());
     }
     let output = std::process::Command::new("git")
         .args([
@@ -86,10 +95,7 @@ pub(crate) fn capture_diff(worktree: &Path) -> Result<String> {
         .output()
         .context("git diff --cached in a task worktree")?;
     if !output.status.success() {
-        anyhow::bail!(
-            "git diff --cached failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        return Err(GitFailed::new("git diff --cached", &output.stderr).into());
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
@@ -120,10 +126,7 @@ pub(crate) fn apply(main_ws: &Path, diff: &str) -> Result<()> {
 
     let output = apply.wait_with_output()?;
     if !output.status.success() {
-        anyhow::bail!(
-            "git apply failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        return Err(GitFailed::new("git apply", &output.stderr).into());
     }
     Ok(())
 }

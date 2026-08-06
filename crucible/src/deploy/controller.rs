@@ -34,15 +34,17 @@ const API_PORT: i32 = 8080;
 const ROLE_LABEL_KEY: &str = "crucible.dev/role";
 const ROLE_LABEL_VALUE: &str = "controller";
 
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "rendering the controller needs a [controller] table in the deploy profile (image, \
+     state_volume_size, discovery_cadence_secs, watched_repos, caps)"
+)]
+pub struct MissingControllerTable;
+
 /// Render the controller's `Deployment` + `PersistentVolumeClaim` + `Service` + `Role`/`RoleBinding` as
 /// one multi-document YAML string.
 pub fn render(profile: &DeployProfile, opts: &RenderOpts) -> Result<String> {
-    let cfg = profile.controller.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "rendering the controller needs a [controller] table in the deploy profile (image, \
-             state_volume_size, discovery_cadence_secs, watched_repos, caps)"
-        )
-    })?;
+    let cfg = profile.controller.as_ref().ok_or(MissingControllerTable)?;
 
     let image = if opts.pin_digests {
         forge::oci::pin_digest(&cfg.image, None)

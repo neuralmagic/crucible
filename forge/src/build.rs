@@ -15,13 +15,35 @@
 
 use crate::kube::{self, JobResult};
 use crate::oci;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1 as core;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+/// A cluster build Job that reached a terminal non-success state. Both carry the build log
+/// tail: it is the only evidence an operator has once the pod is gone.
+#[derive(Debug, thiserror::Error)]
+pub enum ClusterBuildError {
+    #[error("build Job {job} failed (namespace {namespace}). Build log tail:\n{log}")]
+    JobFailed {
+        job: String,
+        namespace: String,
+        log: String,
+    },
+    #[error(
+        "build Job {job} did not finish within {seconds}s (namespace {namespace}); the Job was \
+         deleted. Build log tail:\n{log}"
+    )]
+    JobTimedOut {
+        job: String,
+        seconds: u64,
+        namespace: String,
+        log: String,
+    },
+}
 
 /// Default rootless-buildah builder image. Overridable per dispatch (the CLI reads `FORGE_BUILDER_IMAGE`).
 pub const DEFAULT_BUILDER_IMAGE: &str = "quay.io/buildah/stable:latest";
@@ -375,10 +397,12 @@ pub fn dispatch_cluster(req: &ClusterBuildRequest, authfile: &Path) -> Result<Bu
                 Some(200),
             )
             .unwrap_or_default();
-            bail!(
-                "build Job {job_name} failed (namespace {}). Build log tail:\n{log}",
-                req.namespace
-            )
+            Err(ClusterBuildError::JobFailed {
+                job: job_name,
+                namespace: req.namespace.clone(),
+                log,
+            }
+            .into())
         }
         JobResult::TimedOut => {
             // Reap the wedged Job (and its pod) so it can't hold cluster resources past the deadline.
@@ -395,12 +419,13 @@ pub fn dispatch_cluster(req: &ClusterBuildRequest, authfile: &Path) -> Result<Bu
             {
                 eprintln!("warning: failed to delete timed-out build Job {job_name}: {e:#}");
             }
-            bail!(
-                "build Job {job_name} did not finish within {}s (namespace {}); the Job was deleted. \
-                 Build log tail:\n{log}",
-                req.timeout.as_secs(),
-                req.namespace
-            )
+            Err(ClusterBuildError::JobTimedOut {
+                job: job_name,
+                seconds: req.timeout.as_secs(),
+                namespace: req.namespace.clone(),
+                log,
+            }
+            .into())
         }
     }
 }

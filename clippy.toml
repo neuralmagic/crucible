@@ -1,0 +1,14 @@
+# These four all mint a stringly-typed anyhow::Error at the throw site: callers can only match
+# on them by substring, and the message never becomes part of the module's contract. Return a
+# `thiserror` enum variant instead. `.context()` on a real error stays fine, it decorates a
+# cause rather than inventing one.
+#
+# Modules still carrying them opt out with a file-level
+# `#![allow(clippy::disallowed_macros)]`; deleting that line is how a module graduates.
+# scripts/bail-ratchet.sh holds the opt-out count down.
+disallowed-macros = [
+    { path = "anyhow::bail", reason = "return a typed thiserror variant instead" },
+    { path = "anyhow::ensure", reason = "return a typed thiserror variant instead" },
+    { path = "anyhow::anyhow", reason = "return a typed thiserror variant instead" },
+    { path = "anyhow::format_err", reason = "return a typed thiserror variant instead" },
+]

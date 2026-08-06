@@ -1,5 +1,11 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::Deserialize;
+
+#[derive(Debug, thiserror::Error)]
+#[error("broker URL has an empty authority: {url:?}")]
+pub struct EmptyBrokerAuthority {
+    url: String,
+}
 
 /// The loop-pod provisioning broker (the domain's `bin`). When `enabled`, crucible
 /// spawns it as a run-lifetime child for the `openshell` backend and seeds the `.mcp.json` so the
@@ -94,7 +100,10 @@ pub fn broker_endpoint_from_url(url: &str) -> Result<String> {
     // The authority is everything before the first `/` (or the whole thing if no path).
     let host_port = rest.split('/').next().unwrap_or(rest);
     if host_port.is_empty() {
-        bail!("broker URL has an empty authority: {url:?}");
+        return Err(EmptyBrokerAuthority {
+            url: url.to_owned(),
+        }
+        .into());
     }
     // Split host and optional port. A bracketed IPv6 literal carries colons inside the brackets, so
     // it is the only case where a colon is not a port separator: `[::1]:8849` or bare `[::1]`.

@@ -29,6 +29,12 @@ use crate::reporter::{Reporter, Row, TurnBudget};
 use crate::session::{EvidenceDisposition, EvidenceEntry};
 use crate::{Args, Paths, Prepared, STOP, agent, control};
 
+#[derive(Debug, thiserror::Error)]
+#[error("graph iteration ended with neither a decision nor a control signal (exit: {exit})")]
+struct NoDecisionOrSignal {
+    exit: String,
+}
+
 /// Terminal status + note per settled task, shared between the executor's `on_result`
 /// callback and the grade runner (both live inside one serial `execute` call). Grade
 /// needs it because its `inputs` hold only the passing dependencies: the declared
@@ -176,9 +182,12 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
                         }
                     }
                 }
-                exit => anyhow::bail!(
-                    "graph iteration ended with neither a decision nor a control signal (exit: {exit:?})"
-                ),
+                exit => {
+                    return Err(NoDecisionOrSignal {
+                        exit: format!("{exit:?}"),
+                    }
+                    .into());
+                }
             },
         },
     };

@@ -9,6 +9,12 @@ use k8s_openapi::api::core::v1 as core;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use std::collections::BTreeMap;
 
+#[derive(Debug, thiserror::Error)]
+#[error("unknown --turn-kind `{got}` (expected `rank` or `scope`)")]
+pub struct UnknownTurnKind {
+    got: String,
+}
+
 /// What kind of one-shot turn a rendered turn pod runs. End-to-end strong type: the CLI parses it,
 /// the renderer switches the wrapper command + label on it, and `WorkPodSpec::render_argv` round-trips
 /// it back to the CLI flag the subprocess sees.
@@ -34,7 +40,10 @@ impl TurnKind {
         match s {
             "rank" => Ok(TurnKind::Rank),
             "scope" => Ok(TurnKind::Scope),
-            other => anyhow::bail!("unknown --turn-kind `{other}` (expected `rank` or `scope`)"),
+            other => Err(UnknownTurnKind {
+                got: other.to_owned(),
+            }
+            .into()),
         }
     }
 }

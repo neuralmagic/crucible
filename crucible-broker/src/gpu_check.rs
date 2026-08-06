@@ -6,8 +6,14 @@
 
 use crate::admission::{Admission, AdmissionDecision, GpuNeed, decide};
 use crate::types::TraceParams;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use std::process::Command;
+
+#[derive(Debug, thiserror::Error)]
+#[error("gen-capture-jobs failed: {stderr}")]
+struct GenCaptureJobsFailed {
+    stderr: String,
+}
 
 /// Headroom + capture submission against the active kube context.
 pub struct GpuCheck {
@@ -63,10 +69,10 @@ impl Admission for GpuCheck {
             .output()
             .context("gen-capture-jobs.py")?;
         if !manifests.status.success() {
-            bail!(
-                "gen-capture-jobs failed: {}",
-                String::from_utf8_lossy(&manifests.stderr).trim()
-            );
+            return Err(GenCaptureJobsFailed {
+                stderr: String::from_utf8_lossy(&manifests.stderr).trim().to_owned(),
+            }
+            .into());
         }
         let yaml =
             String::from_utf8(manifests.stdout).context("capture manifests are not UTF-8")?;

@@ -1,7 +1,13 @@
 use crate::command_judge::Direction;
 use crate::manifest::selftest::SelftestCfg;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::Deserialize;
+
+#[derive(Debug, thiserror::Error)]
+#[error("[judge].direction must be \"lower\" or \"higher\", got {got:?}")]
+pub struct UnknownDirection {
+    got: String,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -43,7 +49,10 @@ pub fn parse_direction(s: &str) -> Result<Direction> {
     match s {
         "lower" => Ok(Direction::Lower),
         "higher" => Ok(Direction::Higher),
-        other => bail!("[judge].direction must be \"lower\" or \"higher\", got {other:?}"),
+        other => Err(UnknownDirection {
+            got: other.to_owned(),
+        }
+        .into()),
     }
 }
 

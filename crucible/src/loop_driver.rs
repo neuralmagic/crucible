@@ -15,6 +15,16 @@ use crucible_contract::admission::AdmissionOutcome;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+#[derive(Debug, thiserror::Error)]
+#[error("winner produced no diff")]
+struct WinnerProducedNoDiff;
+
+#[derive(Debug, thiserror::Error)]
+#[error("baseline measurement invalid: {note}")]
+struct BaselineInvalid {
+    note: String,
+}
+
 /// The secondary numeric a [`crucible::Reading`] may carry in its detail JSON (a test
 /// gate's total test count). The engine threads it as `baseline_total` into the judge; a
 /// domain without it just reports `None`.
@@ -716,7 +726,7 @@ fn run_loop_body<R: Reporter>(
             ));
             let applied = winner_diff
                 .filter(|d| !d.trim().is_empty())
-                .ok_or_else(|| anyhow::anyhow!("winner produced no diff"))
+                .ok_or_else(|| WinnerProducedNoDiff.into())
                 .and_then(|d| crate::plan::worktree::apply(&p.workspace, &d));
             if let Err(e) = applied {
                 r.note(&format!(
@@ -1692,7 +1702,10 @@ fn run_baseline(
     }
     let base = judge.measure(&crucible::MeasureCtx::default())?;
     if !base.valid {
-        anyhow::bail!("baseline measurement invalid: {}", base.note);
+        return Err(BaselineInvalid {
+            note: base.note.clone(),
+        }
+        .into());
     }
     let score = base.score.unwrap_or(f64::INFINITY);
     let total = reading_total(&base).unwrap_or(0);
@@ -1846,7 +1859,9 @@ fn write_results(p: &Paths, goal: &str, prior: &str, rows: &[Row]) -> Result<()>
     Ok(())
 }
 
+// The World/Judge fakes below fail on purpose; a fake failure carries no error contract.
 #[cfg(test)]
+#[allow(clippy::disallowed_macros)]
 mod tests {
     use super::*;
     use crate::reporter::{AgentTurn, Phase, Row, Stop, TurnBudget};

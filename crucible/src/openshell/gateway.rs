@@ -17,11 +17,40 @@
 //! The daemons (podman service, gateway) are spawned detached and live for the run; crucible
 //! is the pod entrypoint, so the container runtime reaps them when crucible exits.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+/// The ways gateway startup gives up. Each carries the diagnostics an operator needs (the log
+/// tail, the last status line) as fields, so the message is assembled once here.
+#[derive(Debug, thiserror::Error)]
+pub enum GatewayError {
+    #[error(
+        "openshell gateway {reported} is older than the minimum {minimum} this crucible requires \
+         — rebuild the loop image's gateway from the pinned fork rev {} (Cargo.lock's \
+         openshell-core rev; see the openshell-gateway workflow)",
+        crate::openshell::grpc::EXPECTED_GATEWAY_REV
+    )]
+    TooOld { reported: String, minimum: String },
+    #[error("{origin} podman API socket did not appear at {}", .socket.display())]
+    PodmanSocketMissing {
+        origin: &'static str,
+        socket: PathBuf,
+    },
+    #[error("generate-certs failed: {stderr}")]
+    GenerateCertsFailed { stderr: String },
+    #[error("gateway register failed within 30s: {last}\n{log_tail}")]
+    RegisterTimeout { last: String, log_tail: String },
+    #[error(
+        "gateway did not become healthy within 60s\nlast `openshell status`: {last_status}\n{log_tail}"
+    )]
+    HealthTimeout {
+        last_status: String,
+        log_tail: String,
+    },
+}
 
 /// Gateway bind/connect port.
 pub const GATEWAY_PORT: u16 = 17670;
@@ -344,12 +373,11 @@ async fn check_gateway_version() -> Result<Option<String>> {
     let (min_major, min_minor, min_patch) = grpc::MIN_GATEWAY_VERSION;
     match grpc::check_gateway_version(&reported) {
         VersionGate::Ok => Ok(None),
-        VersionGate::TooOld { reported } => bail!(
-            "openshell gateway {reported} is older than the minimum {min_major}.{min_minor}.{min_patch} \
-             this crucible requires — rebuild the loop image's gateway from the pinned fork rev \
-             {} (Cargo.lock's openshell-core rev; see the openshell-gateway workflow)",
-            grpc::EXPECTED_GATEWAY_REV
-        ),
+        VersionGate::TooOld { reported } => Err(GatewayError::TooOld {
+            reported,
+            minimum: format!("{min_major}.{min_minor}.{min_patch}"),
+        }
+        .into()),
         VersionGate::RevMismatch { reported_commit } => Ok(Some(format!(
             "openshell gateway commit g{reported_commit} differs from the rev crucible compiled \
              against ({}) — RPC surface looks compatible, provenance does not",
@@ -389,15 +417,15 @@ async fn boot(driver: ComputeDriver, supervisor_image: Option<&str>) -> Result<(
                 .context("spawn `podman system service`")?;
         }
         if !wait_for(Duration::from_secs(15), || sock.exists()) {
-            bail!(
-                "{} podman API socket did not appear at {}",
-                if external.is_some() {
+            return Err(GatewayError::PodmanSocketMissing {
+                origin: if external.is_some() {
                     "configured"
                 } else {
                     "managed"
                 },
-                sock.display()
-            );
+                socket: sock.clone(),
+            }
+            .into());
         }
     }
 
@@ -412,10 +440,10 @@ async fn boot(driver: ComputeDriver, supervisor_image: Option<&str>) -> Result<(
         .output()
         .context("exec openshell-gateway generate-certs")?;
     if !certs.status.success() {
-        bail!(
-            "generate-certs failed: {}",
-            String::from_utf8_lossy(&certs.stderr).trim()
-        );
+        return Err(GatewayError::GenerateCertsFailed {
+            stderr: String::from_utf8_lossy(&certs.stderr).trim().to_owned(),
+        }
+        .into());
     }
 
     // 3b. Under kubernetes, ship the freshly generated client TLS material to the sandbox
@@ -468,10 +496,11 @@ async fn boot(driver: ComputeDriver, supervisor_image: Option<&str>) -> Result<(
             }
         });
     if !registered {
-        bail!(
-            "gateway register failed within 30s: {last}\n{}",
-            tail_gateway_log(&log_path)
-        );
+        return Err(GatewayError::RegisterTimeout {
+            last,
+            log_tail: tail_gateway_log(&log_path),
+        }
+        .into());
     }
     // The certs now exist (register wrote them), so a single reusable probe covers the poll loop.
     // Its `healthy()` is async, so the health wait is an async loop (not the sync `wait_for` the
@@ -495,10 +524,11 @@ async fn boot(driver: ComputeDriver, supervisor_image: Option<&str>) -> Result<(
         // Diagnostics only: quote the CLI's view of the gateway plus the gateway's own log
         // tail, so the timeout is never a bare one-liner.
         let (_, last_status) = status_check();
-        bail!(
-            "gateway did not become healthy within 60s\nlast `openshell status`: {last_status}\n{}",
-            tail_gateway_log(&log_path)
-        );
+        return Err(GatewayError::HealthTimeout {
+            last_status,
+            log_tail: tail_gateway_log(&log_path),
+        }
+        .into());
     }
     Ok(())
 }

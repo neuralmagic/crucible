@@ -31,6 +31,10 @@ struct Record {
     settled: Option<AdmissionOutcome>,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("admission ledger lock poisoned")]
+struct LedgerLockPoisoned;
+
 struct Inner {
     file: Ledger,
     next_seq: u64,
@@ -200,9 +204,9 @@ impl AdmissionLedger {
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Inner>> {
-        self.inner
-            .lock()
-            .map_err(|_| anyhow::anyhow!("admission ledger lock poisoned"))
+        // A poisoned lock means a prior holder panicked mid-fold; the ledger's in-memory view
+        // can no longer be trusted, so every later call fails the same way.
+        self.inner.lock().map_err(|_| LedgerLockPoisoned.into())
     }
 }
 

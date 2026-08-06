@@ -10,13 +10,79 @@
 //!     .github             -> GithubBuild  (repo, workflow, ref, inputs, outputs)
 //! ```
 
-use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use walkdir::WalkDir;
+
+type Result<T> = std::result::Result<T, SpecError>;
+
+/// Everything the `[build]` schema can reject: template vocabulary, cross-field validation,
+/// and the watched-path digest walk. Causes hang off `source()`, so render with anyhow's
+/// `{:#}` (or [`std::error::Error::source`]) rather than a bare `{}`.
+#[derive(Debug, thiserror::Error)]
+pub enum SpecError {
+    #[error(
+        "unknown template variable {{{{ {var} }}}} — the vocabulary is closed: \
+         sha, tag, image, correlation_id, builds.<name>.digest_ref"
+    )]
+    UnknownTemplateVar { var: String },
+    #[error("unterminated `{{{{` in template {template:?}")]
+    UnterminatedTemplate { template: String },
+    #[error("no digest provided for dependency build {dep:?}")]
+    MissingDependencyDigest { dep: String },
+
+    #[error(
+        "[build.{build}] backend = \"cluster\" needs a [build.{build}.cluster] table \
+         (containerfile, context, platform)"
+    )]
+    MissingClusterTable { build: String },
+    #[error(
+        "[build.{build}] backend = \"github-actions\" needs a [build.{build}.github] table \
+         (repo, workflow, ...)"
+    )]
+    MissingGithubTable { build: String },
+    #[error("[build.{build}].needs references itself")]
+    SelfNeeds { build: String },
+    #[error("[build.{build}].needs references {dep:?}, which is not a declared build")]
+    UndeclaredNeeds { build: String, dep: String },
+    #[error("cycle in [build] needs: {} -> {dep}", .path.join(" -> "))]
+    NeedsCycle { path: Vec<String>, dep: String },
+
+    /// A bad template in a named field; `field` is the `[build.x.y].z` the error points at.
+    #[error("{field}")]
+    Field {
+        field: String,
+        #[source]
+        source: Box<SpecError>,
+    },
+    #[error("{field} references builds.{dep}.digest_ref, an undeclared build")]
+    UndeclaredDigestRef { field: String, dep: String },
+    #[error(
+        "{field} uses builds.{dep}.digest_ref but {dep:?} is not in this build's needs — \
+         add it so the digest is available before dispatch"
+    )]
+    DigestRefNotInNeeds { field: String, dep: String },
+
+    #[error("invalid watch glob {pattern:?}")]
+    InvalidWatchGlob {
+        pattern: String,
+        #[source]
+        source: globset::Error,
+    },
+    #[error("building the watch globset")]
+    BuildGlobset(#[source] globset::Error),
+    #[error("walking the workspace tree for the content digest")]
+    WalkTree(#[from] walkdir::Error),
+    #[error("reading watched file {}", .path.display())]
+    ReadWatchedFile {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
 
 /// Which backend builds and pushes a named image. `Cluster` = a detached rootless-buildah Job on the
 /// engine's own cluster (M0); `GithubActions` = a `workflow_dispatch` against a repo's build workflow
@@ -243,10 +309,7 @@ fn parse_var(inner: &str) -> Result<TemplateVar> {
             {
                 return Ok(TemplateVar::BuildDigestRef(name.to_string()));
             }
-            bail!(
-                "unknown template variable {{{{ {t} }}}} — the vocabulary is closed: \
-                 sha, tag, image, correlation_id, builds.<name>.digest_ref"
-            )
+            Err(SpecError::UnknownTemplateVar { var: t.to_owned() })
         }
     }
 }
@@ -260,7 +323,9 @@ fn template_vars(s: &str) -> Result<Vec<TemplateVar>> {
         let after = &rest[start + 2..];
         let end = after
             .find("}}")
-            .with_context(|| format!("unterminated `{{{{` in template {s:?}"))?;
+            .ok_or_else(|| SpecError::UnterminatedTemplate {
+                template: s.to_owned(),
+            })?;
         out.push(parse_var(&after[..end])?);
         rest = &after[end + 2..];
     }
@@ -289,7 +354,9 @@ impl TemplateContext {
             let after = &rest[start + 2..];
             let end = after
                 .find("}}")
-                .with_context(|| format!("unterminated `{{{{` in template {template:?}"))?;
+                .ok_or_else(|| SpecError::UnterminatedTemplate {
+                    template: template.to_owned(),
+                })?;
             out.push_str(&self.resolve(&parse_var(&after[..end])?)?);
             rest = &after[end + 2..];
         }
@@ -307,7 +374,7 @@ impl TemplateContext {
                 .build_digests
                 .get(name)
                 .cloned()
-                .with_context(|| format!("no digest provided for dependency build {name:?}"))?,
+                .ok_or_else(|| SpecError::MissingDependencyDigest { dep: name.clone() })?,
         })
     }
 }
@@ -319,23 +386,30 @@ impl TemplateContext {
 pub fn validate_builds(builds: &BTreeMap<String, BuildSpec>) -> Result<()> {
     for (name, spec) in builds {
         match spec.backend {
-            BuildBackend::Cluster if spec.cluster.is_none() => bail!(
-                "[build.{name}] backend = \"cluster\" needs a [build.{name}.cluster] table \
-                 (containerfile, context, platform)"
-            ),
-            BuildBackend::GithubActions if spec.github.is_none() => bail!(
-                "[build.{name}] backend = \"github-actions\" needs a [build.{name}.github] table \
-                 (repo, workflow, ...)"
-            ),
+            BuildBackend::Cluster if spec.cluster.is_none() => {
+                return Err(SpecError::MissingClusterTable {
+                    build: name.clone(),
+                });
+            }
+            BuildBackend::GithubActions if spec.github.is_none() => {
+                return Err(SpecError::MissingGithubTable {
+                    build: name.clone(),
+                });
+            }
             _ => {}
         }
 
         for dep in &spec.needs {
             if dep == name {
-                bail!("[build.{name}].needs references itself");
+                return Err(SpecError::SelfNeeds {
+                    build: name.clone(),
+                });
             }
             if !builds.contains_key(dep) {
-                bail!("[build.{name}].needs references {dep:?}, which is not a declared build");
+                return Err(SpecError::UndeclaredNeeds {
+                    build: name.clone(),
+                    dep: dep.clone(),
+                });
             }
         }
 
@@ -368,19 +442,25 @@ fn check_template_field(
     spec: &BuildSpec,
     builds: &BTreeMap<String, BuildSpec>,
 ) -> Result<()> {
-    let vars = template_vars(value).with_context(|| where_.to_string())?;
+    let vars = template_vars(value).map_err(|source| SpecError::Field {
+        field: where_.to_owned(),
+        source: Box::new(source),
+    })?;
     for var in vars {
         let TemplateVar::BuildDigestRef(dep) = &var else {
             continue;
         };
         if !builds.contains_key(dep) {
-            bail!("{where_} references builds.{dep}.digest_ref, an undeclared build");
+            return Err(SpecError::UndeclaredDigestRef {
+                field: where_.to_owned(),
+                dep: dep.clone(),
+            });
         }
         if !spec.needs.contains(dep) {
-            bail!(
-                "{where_} uses builds.{dep}.digest_ref but {dep:?} is not in this build's needs — \
-                 add it so the digest is available before dispatch"
-            );
+            return Err(SpecError::DigestRefNotInNeeds {
+                field: where_.to_owned(),
+                dep: dep.clone(),
+            });
         }
     }
     Ok(())
@@ -413,7 +493,10 @@ fn detect_cycles(builds: &BTreeMap<String, BuildSpec>) -> Result<()> {
             for dep in &spec.needs {
                 match marks.get(dep.as_str()) {
                     Some(Mark::OnStack) => {
-                        bail!("cycle in [build] needs: {} -> {dep}", path.join(" -> "))
+                        return Err(SpecError::NeedsCycle {
+                            path: path.iter().map(|step| (*step).to_owned()).collect(),
+                            dep: dep.clone(),
+                        });
                     }
                     Some(Mark::Done) => {}
                     None => visit(dep, builds, marks, path)?,
@@ -452,13 +535,16 @@ pub fn content_digest(root: &Path, patterns: &[String]) -> Result<WatchDigest> {
     use globset::{Glob, GlobSetBuilder};
     let mut gsb = GlobSetBuilder::new();
     for p in patterns {
-        gsb.add(Glob::new(p).with_context(|| format!("invalid watch glob {p:?}"))?);
+        gsb.add(Glob::new(p).map_err(|source| SpecError::InvalidWatchGlob {
+            pattern: p.clone(),
+            source,
+        })?);
     }
-    let set = gsb.build().context("building the watch globset")?;
+    let set = gsb.build().map_err(SpecError::BuildGlobset)?;
 
     let mut files: Vec<PathBuf> = Vec::new();
     for entry in WalkDir::new(root) {
-        let entry = entry.context("walking the workspace tree for the content digest")?;
+        let entry = entry?;
         if !entry.file_type().is_file() {
             continue;
         }
@@ -474,8 +560,10 @@ pub fn content_digest(root: &Path, patterns: &[String]) -> Result<WatchDigest> {
         let rel = f.strip_prefix(root).unwrap_or(f);
         hasher.update(rel.to_string_lossy().as_bytes());
         hasher.update([0u8]);
-        let bytes =
-            std::fs::read(f).with_context(|| format!("reading watched file {}", f.display()))?;
+        let bytes = std::fs::read(f).map_err(|source| SpecError::ReadWatchedFile {
+            path: f.clone(),
+            source,
+        })?;
         hasher.update((bytes.len() as u64).to_le_bytes());
         hasher.update(&bytes);
     }
@@ -797,7 +885,10 @@ mod tests {
         "#,
         );
         // The field label is the outer context; the vocabulary cause is its source (shown with `{:#}`).
-        let err = format!("{:#}", validate_builds(&bad).unwrap_err());
+        let err = format!(
+            "{:#}",
+            anyhow::Error::new(validate_builds(&bad).unwrap_err())
+        );
         assert!(err.contains("vocabulary is closed"), "{err}");
         assert!(err.contains("[build.x.cluster].containerfile"), "{err}");
 

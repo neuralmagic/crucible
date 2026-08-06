@@ -47,20 +47,3 @@ All three set = the `jira_*` tools go live; anything missing = they answer `disa
 overrides any configured access level to read+comment regardless of what the env or the shared
 crate's config would allow.
 
-## Smoke-test your real instance
-
-The `jira_smoke` example drives the exact client the broker uses (same read+comment ceiling, same
-compact renderings) against a live Atlassian Cloud instance. Configure it the same way the broker
-pod is configured, all through the environment (creds never land on a command line):
-
-```bash
-export JIRA_URL=https://your-org.atlassian.net
-export JIRA_USERNAME=you@your-org.com
-export JIRA_API_TOKEN="$(cat ~/.jiratoken)"
-
-# read-only: a JQL search
-cargo run -p crucible-broker --example jira_smoke -- 'project = PROJ ORDER BY created DESC'
-
-# pass '' for the JQL plus an issue key and body to exercise get_issue and post one comment (the write path)
-cargo run -p crucible-broker --example jira_smoke -- '' PROJ-123 'hello from the mediated broker'
-```

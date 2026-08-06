@@ -504,7 +504,10 @@ fn s3_record(rec: &Record<'_>, prs: &[PrLink]) -> Result<String> {
 pub fn fetch_object(uri: &str, dest: &std::path::Path) -> Result<()> {
     let (bucket, key) = parse_s3_uri(uri)?;
     if key.is_empty() {
-        anyhow::bail!("fetch object URI has no key: `{uri}`");
+        return Err(PublishError::NoKey {
+            uri: uri.to_owned(),
+        }
+        .into());
     }
     crate::engine::handle()?.block_on(async {
         let conf = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
@@ -603,15 +606,42 @@ async fn put(
     Ok(())
 }
 
+/// A malformed publish target. The URI forms and the `gh`/`git` shell-outs are the two ways
+/// publishing refuses on its own terms; everything else is plumbing and stays `anyhow`.
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub enum PublishError {
+    #[error("results bucket must be an s3:// URI, got `{uri}`")]
+    NotAnS3Uri { uri: String },
+    #[error("results bucket URI has no bucket: `{uri}`")]
+    NoBucket { uri: String },
+    #[error("fetch object URI has no key: `{uri}`")]
+    NoKey { uri: String },
+    #[error("gh pr edit failed: {stderr}")]
+    PrEditFailed { stderr: String },
+    #[error("gh pr create failed: {stderr}")]
+    PrCreateFailed { stderr: String },
+    #[error("gh pr create succeeded but printed no PR url")]
+    PrCreateSilent,
+    #[error("git push of {refspec} failed ({status})")]
+    GitPushFailed {
+        refspec: String,
+        status: std::process::ExitStatus,
+    },
+}
+
 /// `s3://bucket[/prefix]` → (bucket, prefix). Prefix is trimmed of slashes and may
 /// be empty.
-fn parse_s3_uri(uri: &str) -> Result<(String, String)> {
+fn parse_s3_uri(uri: &str) -> Result<(String, String), PublishError> {
     let rest = uri
         .strip_prefix("s3://")
-        .with_context(|| format!("results bucket must be an s3:// URI, got `{uri}`"))?;
+        .ok_or_else(|| PublishError::NotAnS3Uri {
+            uri: uri.to_owned(),
+        })?;
     let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
     if bucket.is_empty() {
-        anyhow::bail!("results bucket URI has no bucket: `{uri}`");
+        return Err(PublishError::NoBucket {
+            uri: uri.to_owned(),
+        });
     }
     Ok((bucket.to_string(), prefix.trim_matches('/').to_string()))
 }
@@ -865,10 +895,10 @@ fn edit_pr_body(repo: &str, url: &str, body: &str, token: &str) -> Result<()> {
         .output()
         .context("running `gh pr edit`")?;
     if !out.status.success() {
-        anyhow::bail!(
-            "gh pr edit failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+        return Err(PublishError::PrEditFailed {
+            stderr: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+        }
+        .into());
     }
     Ok(())
 }
@@ -902,7 +932,11 @@ fn push_ref(workspace: &Path, url: &str, local_ref: &str, branch: &str) -> Resul
         .status()
         .context("running `git push` (is git on PATH?)")?;
     if !status.success() {
-        anyhow::bail!("git push of {refspec} failed ({status})");
+        return Err(PublishError::GitPushFailed {
+            refspec: refspec.to_owned(),
+            status,
+        }
+        .into());
     }
     Ok(())
 }
@@ -939,10 +973,10 @@ fn open_pr(
         .output()
         .context("running `gh pr create` (is gh on PATH?)")?;
     if !out.status.success() {
-        anyhow::bail!(
-            "gh pr create failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+        return Err(PublishError::PrCreateFailed {
+            stderr: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+        }
+        .into());
     }
     // gh prints the PR url on its own line; take the last url line to be safe.
     let url = String::from_utf8_lossy(&out.stdout)
@@ -952,7 +986,7 @@ fn open_pr(
         .unwrap_or("")
         .to_string();
     if url.is_empty() {
-        anyhow::bail!("gh pr create succeeded but printed no PR url");
+        return Err(PublishError::PrCreateSilent.into());
     }
     Ok(url)
 }

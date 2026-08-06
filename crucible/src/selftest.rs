@@ -6,8 +6,15 @@
 use crate::command_judge::Direction;
 use crate::crucible::{Judge, MeasureCtx, World};
 use crate::manifest::SelftestCfg;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use std::path::Path;
+
+#[derive(Debug, thiserror::Error)]
+#[error("selftest control `{command}` exited nonzero: {status}")]
+struct ControlCommandFailed {
+    command: String,
+    status: std::process::ExitStatus,
+}
 
 /// The self-test's verdict: each control's full outcome (per-run readings + mean), the direction it was
 /// judged by, and whether the gate discriminated (`good` strictly better than `bad`, both valid, per
@@ -126,7 +133,11 @@ fn stage(workspace: &Path, cmd: &str) -> Result<()> {
         .status()
         .with_context(|| format!("exec selftest control `{cmd}` in {}", workspace.display()))?;
     if !status.success() {
-        bail!("selftest control `{cmd}` exited nonzero: {status}");
+        return Err(ControlCommandFailed {
+            command: cmd.to_owned(),
+            status,
+        }
+        .into());
     }
     Ok(())
 }

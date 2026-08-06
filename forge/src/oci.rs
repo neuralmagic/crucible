@@ -620,7 +620,9 @@ pub(crate) async fn unpack_rootfs(base_ref: &str, dest: &Path, auth: &RegistryAu
     Ok(())
 }
 
+// The retry stubs below fail on purpose; a fake failure carries no error contract.
 #[cfg(test)]
+#[allow(clippy::disallowed_macros)]
 mod tests {
     use super::*;
     use std::io::Read;

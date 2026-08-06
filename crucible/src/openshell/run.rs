@@ -18,7 +18,21 @@ use crate::harness::{Harness, SandboxLayout, TranscriptLocator, TurnArtifacts};
 use crate::openshell::grpc::Gateway;
 use crate::openshell::{gateway, grpc, policy, provider, sandbox};
 use crate::{Args, Paths, relay};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
+
+/// Failures of the `openshell` CLI shell-outs and the private-transcript path checks. The
+/// surrounding turn plumbing stays `anyhow`; these are the checks this module owns.
+#[derive(Debug, thiserror::Error)]
+pub enum OpenshellCliError {
+    #[error("openshell {label} cancelled (interrupt)")]
+    Cancelled { label: String },
+    #[error("openshell {label} failed: {stderr}")]
+    Failed { label: String, stderr: String },
+    #[error("private session locator is outside Claude's pinned config directory")]
+    LocatorOutsideConfigDir,
+    #[error("Claude transcript path does not match the admitted session id")]
+    TranscriptSessionMismatch,
+}
 use crucible_harness::OtelCollector;
 use std::sync::atomic::Ordering;
 use tokio::fs;
@@ -595,14 +609,15 @@ async fn run_os(args: &[String], label: &str, cancel: &CancellationToken) -> Res
     let mut cmd = Command::new("openshell");
     cmd.args(args).kill_on_drop(true);
     tokio::select! {
-        _ = cancel.cancelled() => bail!("openshell {label} cancelled (interrupt)"),
+        _ = cancel.cancelled() => Err(OpenshellCliError::Cancelled { label: label.to_owned() }.into()),
         out = cmd.output() => {
             let out = out.with_context(|| format!("exec `openshell {label}`"))?;
             if !out.status.success() {
-                bail!(
-                    "openshell {label} failed: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                );
+                return Err(OpenshellCliError::Failed {
+                    label: label.to_owned(),
+                    stderr: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+                }
+                .into());
             }
             Ok(())
         }
@@ -772,7 +787,7 @@ async fn restore_private_session(
         .with_context(|| format!("reading private session locator {}", locator_path.display()))?;
     let remote = remote.trim();
     if !valid_private_remote(remote, session) {
-        bail!("private session locator is outside Claude's pinned config directory");
+        return Err(OpenshellCliError::LocatorOutsideConfigDir.into());
     }
     let parent = std::path::Path::new(remote)
         .parent()
@@ -808,7 +823,7 @@ async fn persist_private_session(
         .await
         .context("Claude turn produced no resumable private transcript")?;
     if !valid_private_remote(&remote, session) {
-        bail!("Claude transcript path does not match the admitted session id");
+        return Err(OpenshellCliError::TranscriptSessionMismatch.into());
     }
 
     let scratch = tempfile::tempdir().context("creating private session download scratch")?;

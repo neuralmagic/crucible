@@ -9,6 +9,18 @@ use crate::plan::exec::{Substrate, runnable_set};
 use crate::plan::ir::{Direction, Plan, TaskKind, ValidPlan};
 use xai_grok_mermaid::{MermaidTheme, RenderLimits, RenderParams, default_engine, render_checked};
 
+#[derive(Debug, thiserror::Error)]
+#[error("mermaid render failed: {detail}")]
+struct MermaidRenderFailed {
+    detail: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("plan did not reach a valid verdict ({exit})")]
+struct NoValidVerdict {
+    exit: String,
+}
+
 const MERMAID_COMMAND_PREVIEW_CHARS: usize = 72;
 
 /// Compile scope-time workflow authoring syntax. JSON on stdout is stable enough for a
@@ -38,6 +50,7 @@ pub fn load(path: &Path) -> Result<ValidPlan> {
         Plan::from_json_str(&src)?
     };
     plan.validate()
+        .with_context(|| format!("validating plan {}", path.display()))
 }
 
 /// Render the compiled plan: tasks in dependency-first order, plus the truncation verdict
@@ -428,7 +441,12 @@ config:
         params,
         &RenderLimits::default(),
     )
-    .map_err(|e| anyhow::anyhow!("mermaid render failed: {e}"))
+    .map_err(|e| {
+        MermaidRenderFailed {
+            detail: e.to_string(),
+        }
+        .into()
+    })
 }
 
 /// Render a validated graph to PNG.
@@ -531,7 +549,10 @@ pub fn run(
         plan.plan().budget.usd
     );
     if !out.valid {
-        anyhow::bail!("plan did not reach a valid verdict ({exit})");
+        return Err(NoValidVerdict {
+            exit: exit.to_string(),
+        }
+        .into());
     }
     println!("verdict: valid");
     Ok(())

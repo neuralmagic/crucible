@@ -5,8 +5,14 @@
 //! `workspace/`), a stub judge that always reports the same score so a first dry run and
 //! `crucible check` succeed before the real scoring command is hooked up.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use std::path::Path;
+
+#[derive(Debug, thiserror::Error)]
+#[error("refusing to overwrite existing file: {} (crucible init never overwrites)", .path.display())]
+struct WouldOverwrite {
+    path: std::path::PathBuf,
+}
 
 pub const MANIFEST_FILE: &str = "crucible.toml";
 pub const MEASURE_FILE: &str = "crucible-measure.sh";
@@ -51,10 +57,7 @@ pub fn run(dir: &Path) -> Result<()> {
     let measure_path = dir.join(MEASURE_FILE);
     for p in [&manifest_path, &measure_path] {
         if p.exists() {
-            bail!(
-                "refusing to overwrite existing file: {} (crucible init never overwrites)",
-                p.display()
-            );
+            return Err(WouldOverwrite { path: p.clone() }.into());
         }
     }
     std::fs::write(&manifest_path, MANIFEST_TEMPLATE)

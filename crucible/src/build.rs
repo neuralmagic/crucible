@@ -6,7 +6,30 @@
 //! controller dispatches, one implementation, two callers.
 
 use crate::manifest::{CompositeManifest, Manifest, is_composite};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
+
+/// What the `crucible build` CLI refuses on its own terms: a missing dependency digest, a
+/// malformed `--dep`, and the two credential lookups. Everything else is plumbing and stays
+/// `anyhow`.
+#[derive(Debug, thiserror::Error)]
+pub enum BuildCliError {
+    #[error(
+        "build {build:?} needs {dep:?}, but no digest was provided — pass \
+         --dep {dep}=<registry/repo@sha256:…> (the controller ledger supplies this in M1)"
+    )]
+    MissingDepDigest { build: String, dep: String },
+    #[error("--dep must be name=digest_ref, got {arg:?}")]
+    MalformedDep { arg: String },
+    #[error("no $GITHUB_TOKEN set and `gh auth token` failed: {stderr}")]
+    GhAuthFailed { stderr: String },
+    #[error("no $GITHUB_TOKEN set and `gh auth token` returned an empty token")]
+    GhAuthEmpty,
+    #[error(
+        "no push authfile found: pass --authfile, set $REGISTRY_AUTH_FILE, or create \
+         ~/.docker/config.json"
+    )]
+    NoAuthfile,
+}
 use forge::spec::{BuildBackend, BuildSpec, GithubBuild, TemplateContext};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -75,11 +98,11 @@ pub fn run(args: BuildArgs) -> Result<()> {
     // (the controller ledger supplies these in M1).
     for need in &spec.needs {
         if !provided.contains_key(need) {
-            bail!(
-                "build {:?} needs {need:?}, but no digest was provided — pass \
-                 --dep {need}=<registry/repo@sha256:…> (the controller ledger supplies this in M1)",
-                args.name
-            );
+            return Err(BuildCliError::MissingDepDigest {
+                build: args.name.clone(),
+                dep: need.clone(),
+            }
+            .into());
         }
     }
 
@@ -189,11 +212,11 @@ fn run_github(
 
     for need in &spec.needs {
         if !provided.contains_key(need) {
-            bail!(
-                "build {:?} needs {need:?}, but no digest was provided — pass \
-                 --dep {need}=<registry/repo@sha256:…> (the controller ledger supplies this in M1)",
-                args.name
-            );
+            return Err(BuildCliError::MissingDepDigest {
+                build: args.name.clone(),
+                dep: need.clone(),
+            }
+            .into());
         }
     }
 
@@ -258,17 +281,17 @@ fn resolve_github_token() -> Result<String> {
         .output()
         .context("no $GITHUB_TOKEN set and running `gh auth token` failed (is gh installed?)")?;
     if !out.status.success() {
-        bail!(
-            "no $GITHUB_TOKEN set and `gh auth token` failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+        return Err(BuildCliError::GhAuthFailed {
+            stderr: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+        }
+        .into());
     }
     let token = String::from_utf8(out.stdout)
         .context("`gh auth token` output is not utf8")?
         .trim()
         .to_string();
     if token.is_empty() {
-        bail!("no $GITHUB_TOKEN set and `gh auth token` returned an empty token");
+        return Err(BuildCliError::GhAuthEmpty.into());
     }
     Ok(token)
 }
@@ -315,7 +338,7 @@ fn parse_deps(deps: &[String]) -> Result<BTreeMap<String, String>> {
             .split_once('=')
             .with_context(|| format!("--dep must be name=digest_ref, got {d:?}"))?;
         if name.is_empty() || digest.is_empty() {
-            bail!("--dep must be name=digest_ref, got {d:?}");
+            return Err(BuildCliError::MalformedDep { arg: d.clone() }.into());
         }
         out.insert(name.to_string(), digest.to_string());
     }
@@ -365,10 +388,7 @@ fn resolve_authfile(flag: &Option<PathBuf>) -> Result<PathBuf> {
     if p.exists() {
         return Ok(p);
     }
-    bail!(
-        "no push authfile found: pass --authfile, set $REGISTRY_AUTH_FILE, or create \
-         ~/.docker/config.json"
-    )
+    Err(BuildCliError::NoAuthfile.into())
 }
 
 /// A short, unique-enough correlation id (low 32 bits of the nanosecond clock, hex). Uniquifies the

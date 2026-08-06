@@ -1,0 +1,16 @@
+# Run with `prek run --all-files` (or `just hooks`). `prek install` wires it to git commit.
+repos:
+  - repo: local
+    hooks:
+      - id: fmt
+        name: cargo fmt
+        entry: cargo fmt --all --
+        language: system
+        types: [rust]
+
+      - id: typed-error-ratchet
+        name: no new stringly-error modules
+        entry: scripts/typed-error-ratchet.sh
+        language: system
+        pass_filenames: false
+        types: [rust]

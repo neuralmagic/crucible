@@ -14,6 +14,40 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "{name}: rendering a single-domain manifest needs a [deploy] block (deploy_name and/or \
+     buildah); add one, or run this domain as part of a composite instead"
+)]
+struct MissingDeployBlock {
+    name: String,
+}
+
+/// What the loop-pod render refuses: an unimplemented topology, and the two pack-delivery
+/// limits that would otherwise produce a ConfigMap the API server rejects.
+#[derive(Debug, thiserror::Error)]
+pub enum RenderError {
+    #[error(
+        "[clusters.{cluster}] has a bastion block, but the SSH tunnel is not implemented yet; \
+         remove the bastion block or target a routable spoke"
+    )]
+    BastionUnsupported { cluster: String },
+    #[error(
+        "pack dir {} has no files to deliver (expected at least crucible.toml)",
+        .path.display()
+    )]
+    EmptyPackDir { path: std::path::PathBuf },
+    #[error(
+        "pack at {} is {bytes} bytes, over the {CONFIGMAP_MAX_BYTES}-byte ConfigMap budget — \
+         it won't fit in a ConfigMap; shrink the pack",
+        .path.display()
+    )]
+    PackOverConfigMapBudget {
+        path: std::path::PathBuf,
+        bytes: usize,
+    },
+}
+
 /// In-pod paths fixed by the openshell-loop template (the volume mounts the renderer always emits).
 const KUBECONFIG_PATH: &str = "/etc/kube/kubeconfig";
 const PUSH_AUTHFILE_PATH: &str = "/etc/quay/push.json";
@@ -161,11 +195,8 @@ impl<'a> RenderInput<'a> {
     /// Project a plain single-domain manifest: a degenerate composite of one component (itself), so
     /// it needs its own `[deploy]` block naming that one target.
     pub fn from_manifest(manifest: &'a Manifest, name: &'a str) -> Result<Self> {
-        let deploy = manifest.deploy.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "{name}: rendering a single-domain manifest needs a [deploy] block (deploy_name and/or \
-                 buildah); add one, or run this domain as part of a composite instead"
-            )
+        let deploy = manifest.deploy.as_ref().ok_or_else(|| MissingDeployBlock {
+            name: name.to_owned(),
         })?;
         Ok(Self {
             name,
@@ -215,10 +246,10 @@ pub fn render(
     if let Some((name, entry)) = &spoke
         && entry.bastion.is_some()
     {
-        anyhow::bail!(
-            "[clusters.{name}] has a bastion block, but the SSH tunnel is not implemented yet; \
-             remove the bastion block or target a routable spoke"
-        );
+        return Err(RenderError::BastionUnsupported {
+            cluster: name.clone(),
+        }
+        .into());
     }
     let r = Renderer {
         input,
@@ -279,18 +310,18 @@ pub fn render(
 fn pack_configmap(manifest_dir: &Path, name: &str, namespace: &str) -> Result<core::ConfigMap> {
     let files = collect_pack_files(manifest_dir)?;
     if files.is_empty() {
-        anyhow::bail!(
-            "pack dir {} has no files to deliver (expected at least crucible.toml)",
-            manifest_dir.display()
-        );
+        return Err(RenderError::EmptyPackDir {
+            path: manifest_dir.to_path_buf(),
+        }
+        .into());
     }
     let total: usize = files.iter().map(|(_, b)| b.len()).sum();
     if total > CONFIGMAP_MAX_BYTES {
-        anyhow::bail!(
-            "pack at {} is {total} bytes, over the {CONFIGMAP_MAX_BYTES}-byte ConfigMap budget — \
-             it won't fit in a ConfigMap; shrink the pack",
-            manifest_dir.display()
-        );
+        return Err(RenderError::PackOverConfigMapBudget {
+            path: manifest_dir.to_path_buf(),
+            bytes: total,
+        }
+        .into());
     }
     let mut data: BTreeMap<String, String> = BTreeMap::new();
     let mut binary: BTreeMap<String, k8s_openapi::ByteString> = BTreeMap::new();

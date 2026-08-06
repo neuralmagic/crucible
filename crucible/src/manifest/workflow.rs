@@ -2,10 +2,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::plan::ir::{EngineOp, Join, Plan, PlanBudget, Stage, Task, TaskKind, TaskName};
+use crate::plan::ir::{
+    EngineOp, Join, Plan, PlanBudget, PlanError, Stage, Task, TaskKind, TaskName,
+};
 
 /// Reserved epilogue input key: [`crate::loop_graph`] injects the kept candidate's
 /// context into every epilogue task's inputs under this name.
@@ -76,12 +77,100 @@ impl WorkflowCaps {
         self
     }
 
-    fn require(&self, capability: &str) -> Result<()> {
-        if !self.names.contains(capability) {
-            bail!("workflow requires unavailable orchestrator capability {capability:?}");
+    fn require(&self, capability: &'static str) -> Result<(), WorkflowError> {
+        if self.names.contains(capability) {
+            Ok(())
+        } else {
+            Err(WorkflowError::MissingCapability { capability })
         }
-        Ok(())
     }
+}
+
+/// Everything [`WorkflowCfg::validate`] and [`WorkflowCfg::admit`] can reject. Structural
+/// graph errors come through [`PlanError`]; the rest are workflow-shape and capability rules.
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub enum WorkflowError {
+    #[error(transparent)]
+    Plan(#[from] PlanError),
+    #[error("workflow requires unavailable orchestrator capability {capability:?}")]
+    MissingCapability { capability: &'static str },
+    #[error("engine task {task:?} must be required")]
+    EngineTaskOptional { task: String },
+    #[error("engine task {task:?} cannot run in an isolated worktree")]
+    EngineTaskIsolated { task: String },
+    #[error("engine task {task:?} must use join = \"all\"")]
+    EngineTaskJoin { task: String },
+    #[error("engine {op:?} task {task:?} requires source")]
+    EngineSourceRequired { op: EngineOp, task: String },
+    #[error("engine {op:?} task {task:?} does not accept source")]
+    EngineSourceUnexpected { op: EngineOp, task: String },
+    #[error("engine task {task:?} names unknown source {source_task:?}")]
+    UnknownEngineSource { task: String, source_task: String },
+    #[error("engine task source {source_task:?} must be an ancestor of {task:?}")]
+    EngineSourceNotAncestor { source_task: String, task: String },
+    #[error(
+        "engine decide tasks {first:?} and {second:?} share measurement source {source_task:?}; a \
+         measurement can be graded once"
+    )]
+    SharedDecideSource {
+        first: String,
+        second: String,
+        source_task: String,
+    },
+    #[error("engine grade source {source_task:?} must be an evaluate task")]
+    GradeSourceNotEvaluate { source_task: String },
+    #[error("engine grade score source {source_task:?} must be required")]
+    GradeSourceOptional { source_task: String },
+    #[error("engine {op:?} task {task:?} does not accept tiebreak")]
+    TiebreakUnexpected { op: EngineOp, task: String },
+    #[error("engine grade task {task:?} names unknown tiebreak {tiebreak:?}")]
+    UnknownTiebreak { task: String, tiebreak: String },
+    #[error("engine grade tiebreak {tiebreak:?} must be an evaluate task")]
+    TiebreakNotEvaluate { tiebreak: String },
+    #[error("engine grade tiebreak {tiebreak:?} must be an ancestor of {task:?}")]
+    TiebreakNotAncestor { tiebreak: String, task: String },
+    #[error("custom workflow result {result:?} names an unknown task")]
+    UnknownCustomResult { result: String },
+    #[error("engine task {task:?} cannot run in the epilogue (the loop is over)")]
+    EngineTaskInEpilogue { task: String },
+    #[error("epilogue task name {KEPT_INPUT:?} is reserved for the kept-candidate input")]
+    ReservedEpilogueName,
+    #[error(
+        "task {task:?} (stage {stage:?}) depends on {dependency:?} (stage {dependency_stage:?}); \
+         dependencies cannot cross stages"
+    )]
+    CrossStageDependency {
+        task: String,
+        stage: Stage,
+        dependency: String,
+        dependency_stage: Stage,
+    },
+    #[error("workflow result {result:?} cannot be an epilogue task")]
+    EpilogueResult { result: String },
+    #[error("[[workflow.task]] has an empty name")]
+    LegacyEmptyName,
+    #[error("legacy [[workflow.task]] name {name:?} collides with its compatibility template")]
+    LegacyReservedName { name: String },
+    #[error("duplicate [[workflow.task]] name {name:?}")]
+    LegacyDuplicateName { name: String },
+    #[error("legacy [[workflow.task]] {task:?} depends on unknown task {dependency:?}")]
+    LegacyUnknownDependency { task: String, dependency: String },
+    #[error("fully-authored autoresearch workflow requires result")]
+    AutoresearchMissingResult,
+    #[error("autoresearch result {result:?} names an unknown task")]
+    AutoresearchUnknownResult { result: String },
+    #[error("autoresearch result {result:?} must be an engine decide task with source")]
+    AutoresearchResultNotDecide { result: String },
+    #[error("autoresearch decision {result:?} names unknown measurement source {measurement:?}")]
+    AutoresearchUnknownMeasurement { result: String, measurement: String },
+    #[error("autoresearch decision source {measurement:?} must be an engine measure or grade task")]
+    AutoresearchMeasurementNotEngine { measurement: String },
+    #[error("measurement {measurement:?} must be an ancestor of decision {result:?}")]
+    MeasurementNotAncestor { measurement: String, result: String },
+    #[error("autoresearch measurement {measurement:?} requires an engine apply ancestor")]
+    AutoresearchNoApply { measurement: String },
+    #[error("autoresearch apply path requires an engine propose ancestor")]
+    AutoresearchNoPropose,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -99,7 +188,7 @@ pub struct WorkflowCfg {
 
 impl WorkflowCfg {
     /// Validate structure and type-specific invariants, without granting authority.
-    pub fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<(), WorkflowError> {
         if self.is_legacy_splice() {
             self.validate_stages()?;
             return self.validate_legacy_splice();
@@ -125,95 +214,91 @@ impl WorkflowCfg {
                 tiebreak,
             } = &task.task
             {
+                let name = || task.name.0.clone();
                 if !task.required {
-                    bail!("engine task {:?} must be required", task.name.0);
+                    return Err(WorkflowError::EngineTaskOptional { task: name() });
                 }
                 if task.isolation.is_some() {
-                    bail!(
-                        "engine task {:?} cannot run in an isolated worktree",
-                        task.name.0
-                    );
+                    return Err(WorkflowError::EngineTaskIsolated { task: name() });
                 }
                 if task.join != Join::All && *op != EngineOp::Grade {
-                    bail!("engine task {:?} must use join = \"all\"", task.name.0);
+                    return Err(WorkflowError::EngineTaskJoin { task: name() });
                 }
                 match (op, source) {
                     (EngineOp::Decide | EngineOp::Grade, None) => {
-                        bail!("engine {op:?} task {:?} requires source", task.name.0)
+                        return Err(WorkflowError::EngineSourceRequired {
+                            op: *op,
+                            task: name(),
+                        });
                     }
                     (EngineOp::Decide | EngineOp::Grade, Some(_)) | (_, None) => {}
-                    (_, Some(_)) => bail!(
-                        "engine {:?} task {:?} does not accept source",
-                        op,
-                        task.name.0
-                    ),
+                    (_, Some(_)) => {
+                        return Err(WorkflowError::EngineSourceUnexpected {
+                            op: *op,
+                            task: name(),
+                        });
+                    }
                 }
                 if let Some(source) = source {
                     let Some(source_task) = tasks.get(source) else {
-                        bail!(
-                            "engine task {:?} names unknown source {:?}",
-                            task.name.0,
-                            source.0
-                        );
+                        return Err(WorkflowError::UnknownEngineSource {
+                            task: name(),
+                            source_task: source.0.clone(),
+                        });
                     };
                     if !is_ancestor(&tasks, source, &task.name) {
-                        bail!(
-                            "engine task source {:?} must be an ancestor of {:?}",
-                            source.0,
-                            task.name.0
-                        );
+                        return Err(WorkflowError::EngineSourceNotAncestor {
+                            source_task: source.0.clone(),
+                            task: name(),
+                        });
                     }
                     if *op == EngineOp::Decide
                         && let Some(first) = decided_sources.insert(source, &task.name)
                     {
-                        bail!(
-                            "engine decide tasks {:?} and {:?} share measurement source {:?}; a \
-                             measurement can be graded once",
-                            first.0,
-                            task.name.0,
-                            source.0
-                        );
+                        return Err(WorkflowError::SharedDecideSource {
+                            first: first.0.clone(),
+                            second: name(),
+                            source_task: source.0.clone(),
+                        });
                     }
                     if *op == EngineOp::Grade
                         && !matches!(source_task.task, TaskKind::Evaluate { .. })
                     {
-                        bail!(
-                            "engine grade source {:?} must be an evaluate task",
-                            source.0
-                        );
+                        return Err(WorkflowError::GradeSourceNotEvaluate {
+                            source_task: source.0.clone(),
+                        });
                     }
                     if *op == EngineOp::Grade && !source_task.required {
-                        bail!("engine grade score source {:?} must be required", source.0);
+                        return Err(WorkflowError::GradeSourceOptional {
+                            source_task: source.0.clone(),
+                        });
                     }
                 }
                 if let Some(tiebreak) = tiebreak {
                     if *op != EngineOp::Grade {
-                        bail!(
-                            "engine {op:?} task {:?} does not accept tiebreak",
-                            task.name.0
-                        );
+                        return Err(WorkflowError::TiebreakUnexpected {
+                            op: *op,
+                            task: name(),
+                        });
                     }
                     let Some(tiebreak_task) = tasks.get(tiebreak) else {
-                        bail!(
-                            "engine grade task {:?} names unknown tiebreak {:?}",
-                            task.name.0,
-                            tiebreak.0
-                        );
+                        return Err(WorkflowError::UnknownTiebreak {
+                            task: name(),
+                            tiebreak: tiebreak.0.clone(),
+                        });
                     };
                     if !matches!(tiebreak_task.task, TaskKind::Evaluate { .. }) {
-                        bail!(
-                            "engine grade tiebreak {:?} must be an evaluate task",
-                            tiebreak.0
-                        );
+                        return Err(WorkflowError::TiebreakNotEvaluate {
+                            tiebreak: tiebreak.0.clone(),
+                        });
                     }
                     // Unlike the score source, the tiebreak may be advisory: a rung that
                     // failed or never ran just leaves the reading without a secondary.
                     if !is_ancestor(&tasks, tiebreak, &task.name) {
-                        bail!(
-                            "engine grade tiebreak {:?} must be an ancestor of {:?}",
-                            tiebreak.0,
-                            task.name.0
-                        );
+                        return Err(WorkflowError::TiebreakNotAncestor {
+                            tiebreak: tiebreak.0.clone(),
+                            task: name(),
+                        });
                     }
                 }
             }
@@ -224,16 +309,15 @@ impl WorkflowCfg {
         } else if let Some(result) = &self.result
             && !self.tasks.iter().any(|task| &task.name == result)
         {
-            bail!(
-                "custom workflow result {:?} names an unknown task",
-                result.0
-            );
+            return Err(WorkflowError::UnknownCustomResult {
+                result: result.0.clone(),
+            });
         }
         Ok(())
     }
 
     /// Require orchestrator authority for the workflow and its engine operations.
-    pub fn admit(&self, caps: &WorkflowCaps) -> Result<()> {
+    pub fn admit(&self, caps: &WorkflowCaps) -> Result<(), WorkflowError> {
         self.validate()?;
         caps.require(self.workflow_type.capability())?;
         for task in &self.tasks {
@@ -259,7 +343,7 @@ impl WorkflowCfg {
     /// Stage rules, shared by both authoring forms. The two stages compile into separate
     /// plans (per-iteration vs. once post-loop), so a dependency cannot cross them, the
     /// loop's engine ops have no post-run meaning, and the decision task must iterate.
-    fn validate_stages(&self) -> Result<()> {
+    fn validate_stages(&self) -> Result<(), WorkflowError> {
         let stages: BTreeMap<&TaskName, Stage> = self
             .tasks
             .iter()
@@ -268,15 +352,12 @@ impl WorkflowCfg {
         for task in &self.tasks {
             if task.stage == Stage::Epilogue {
                 if matches!(task.task, TaskKind::Engine { .. }) {
-                    bail!(
-                        "engine task {:?} cannot run in the epilogue (the loop is over)",
-                        task.name.0
-                    );
+                    return Err(WorkflowError::EngineTaskInEpilogue {
+                        task: task.name.0.clone(),
+                    });
                 }
                 if task.name.0 == KEPT_INPUT {
-                    bail!(
-                        "epilogue task name {KEPT_INPUT:?} is reserved for the kept-candidate input"
-                    );
+                    return Err(WorkflowError::ReservedEpilogueName);
                 }
             }
             for dependency in &task.depends_on {
@@ -285,80 +366,85 @@ impl WorkflowCfg {
                 // unknown dependencies in its plan validation.
                 let dependency_stage = stages.get(dependency).copied().unwrap_or_default();
                 if dependency_stage != task.stage {
-                    bail!(
-                        "task {:?} (stage {:?}) depends on {:?} (stage {:?}); dependencies cannot cross stages",
-                        task.name.0,
-                        task.stage,
-                        dependency.0,
-                        dependency_stage
-                    );
+                    return Err(WorkflowError::CrossStageDependency {
+                        task: task.name.0.clone(),
+                        stage: task.stage,
+                        dependency: dependency.0.clone(),
+                        dependency_stage,
+                    });
                 }
             }
         }
         if let Some(result) = &self.result
             && stages.get(result).copied().unwrap_or_default() == Stage::Epilogue
         {
-            bail!("workflow result {:?} cannot be an epilogue task", result.0);
+            return Err(WorkflowError::EpilogueResult {
+                result: result.0.clone(),
+            });
         }
         Ok(())
     }
 
-    fn validate_legacy_splice(&self) -> Result<()> {
+    fn validate_legacy_splice(&self) -> Result<(), WorkflowError> {
         let mut seen = BTreeSet::new();
         for task in &self.tasks {
             let name = task.name.0.as_str();
             if name.trim().is_empty() {
-                bail!("[[workflow.task]] has an empty name");
+                return Err(WorkflowError::LegacyEmptyName);
             }
             if LEGACY_NAMES.contains(&name) {
-                bail!(
-                    "legacy [[workflow.task]] name {name:?} collides with its compatibility template"
-                );
+                return Err(WorkflowError::LegacyReservedName {
+                    name: name.to_owned(),
+                });
             }
             if !seen.insert(name) {
-                bail!("duplicate [[workflow.task]] name {name:?}");
+                return Err(WorkflowError::LegacyDuplicateName {
+                    name: name.to_owned(),
+                });
             }
         }
         for task in &self.tasks {
             for dependency in &task.depends_on {
                 let name = dependency.0.as_str();
                 if name != "propose" && !seen.contains(name) {
-                    bail!(
-                        "legacy [[workflow.task]] {:?} depends on unknown task {name:?}",
-                        task.name.0
-                    );
+                    return Err(WorkflowError::LegacyUnknownDependency {
+                        task: task.name.0.clone(),
+                        dependency: name.to_owned(),
+                    });
                 }
             }
         }
         Ok(())
     }
 
-    fn validate_autoresearch(&self) -> Result<()> {
-        let result = self.result.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("fully-authored autoresearch workflow requires result")
-        })?;
+    fn validate_autoresearch(&self) -> Result<(), WorkflowError> {
+        let result = self
+            .result
+            .as_ref()
+            .ok_or(WorkflowError::AutoresearchMissingResult)?;
         let tasks: BTreeMap<&TaskName, &Task> =
             self.tasks.iter().map(|task| (&task.name, task)).collect();
-        let decision = tasks.get(result).ok_or_else(|| {
-            anyhow::anyhow!("autoresearch result {:?} names an unknown task", result.0)
-        })?;
+        let decision =
+            tasks
+                .get(result)
+                .ok_or_else(|| WorkflowError::AutoresearchUnknownResult {
+                    result: result.0.clone(),
+                })?;
         let TaskKind::Engine {
             op: EngineOp::Decide,
             source: Some(measurement),
             ..
         } = &decision.task
         else {
-            bail!(
-                "autoresearch result {:?} must be an engine decide task with source",
-                result.0
-            );
+            return Err(WorkflowError::AutoresearchResultNotDecide {
+                result: result.0.clone(),
+            });
         };
         let measured = tasks.get(measurement).ok_or_else(|| {
-            anyhow::anyhow!(
-                "autoresearch decision {:?} names unknown measurement source {:?}",
-                result.0,
-                measurement.0
-            )
+            WorkflowError::AutoresearchUnknownMeasurement {
+                result: result.0.clone(),
+                measurement: measurement.0.clone(),
+            }
         })?;
         if !matches!(
             measured.task,
@@ -367,17 +453,15 @@ impl WorkflowCfg {
                 ..
             }
         ) {
-            bail!(
-                "autoresearch decision source {:?} must be an engine measure or grade task",
-                measurement.0
-            );
+            return Err(WorkflowError::AutoresearchMeasurementNotEngine {
+                measurement: measurement.0.clone(),
+            });
         }
         if !is_ancestor(&tasks, measurement, result) {
-            bail!(
-                "measurement {:?} must be an ancestor of decision {:?}",
-                measurement.0,
-                result.0
-            );
+            return Err(WorkflowError::MeasurementNotAncestor {
+                measurement: measurement.0.clone(),
+                result: result.0.clone(),
+            });
         }
 
         let applies: Vec<&TaskName> = self
@@ -395,10 +479,9 @@ impl WorkflowCfg {
             .map(|task| &task.name)
             .collect();
         if applies.is_empty() {
-            bail!(
-                "autoresearch measurement {:?} requires an engine apply ancestor",
-                measurement.0
-            );
+            return Err(WorkflowError::AutoresearchNoApply {
+                measurement: measurement.0.clone(),
+            });
         }
         let has_proposal = self.tasks.iter().any(|task| {
             matches!(
@@ -412,7 +495,7 @@ impl WorkflowCfg {
                 .any(|apply| is_ancestor(&tasks, &task.name, apply))
         });
         if !has_proposal {
-            bail!("autoresearch apply path requires an engine propose ancestor");
+            return Err(WorkflowError::AutoresearchNoPropose);
         }
         Ok(())
     }
@@ -507,11 +590,14 @@ mod tests {
     #[test]
     fn admission_checks_type_and_operation_caps() {
         let workflow = full_autoresearch();
-        let error = workflow
-            .admit(&WorkflowCaps::new(["workflow.autoresearch"]))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("engine.propose"), "{error}");
+        assert_eq!(
+            workflow
+                .admit(&WorkflowCaps::new(["workflow.autoresearch"]))
+                .unwrap_err(),
+            WorkflowError::MissingCapability {
+                capability: "engine.propose"
+            }
+        );
         workflow
             .admit(&WorkflowCaps::autoresearch_engine())
             .unwrap();
@@ -523,11 +609,14 @@ mod tests {
             "type = \"custom\"\nresult = \"solve\"\n\
              [[task]]\nname = \"solve\"\nkind = \"agent\"\nprompt = \"go\"\nsession = \"solver\"\n",
         );
-        let error = workflow
-            .admit(&WorkflowCaps::new(["workflow.custom"]))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("agent.session.persist"), "{error}");
+        assert_eq!(
+            workflow
+                .admit(&WorkflowCaps::new(["workflow.custom"]))
+                .unwrap_err(),
+            WorkflowError::MissingCapability {
+                capability: "agent.session.persist"
+            }
+        );
         workflow
             .admit(&WorkflowCaps::new([
                 "workflow.custom",
@@ -552,9 +641,14 @@ mod tests {
              [[task]]\nname = \"choose\"\nkind = \"engine\"\nop = \"decide\"\nsource = \"score\"\ndepends_on = [\"score\"]\n\
              [[task]]\nname = \"second-guess\"\nkind = \"engine\"\nop = \"decide\"\nsource = \"score\"\ndepends_on = [\"choose\"]\n",
         );
-        let error = workflow.validate().unwrap_err().to_string();
-        assert!(error.contains("share measurement source"), "{error}");
-        assert!(error.contains("score"), "{error}");
+        assert_eq!(
+            workflow.validate().unwrap_err(),
+            WorkflowError::SharedDecideSource {
+                first: "choose".to_owned(),
+                second: "second-guess".to_owned(),
+                source_task: "score".to_owned(),
+            }
+        );
     }
 
     /// N diamonds means 2^N paths. `off-path` forces an ancestry question whose answer is
@@ -635,8 +729,13 @@ mod tests {
             source: Some("score".into()),
             tiebreak: Some("score".into()),
         };
-        let error = workflow.validate().unwrap_err().to_string();
-        assert!(error.contains("does not accept tiebreak"), "{error}");
+        assert_eq!(
+            workflow.validate().unwrap_err(),
+            WorkflowError::TiebreakUnexpected {
+                op: EngineOp::Decide,
+                task: "choose".to_owned(),
+            }
+        );
 
         // A tiebreak naming a non-evaluate task is rejected.
         let mut workflow = full_autoresearch();
@@ -645,8 +744,13 @@ mod tests {
             source: None,
             tiebreak: Some("deploy".into()),
         };
-        let error = workflow.validate().unwrap_err().to_string();
-        assert!(error.contains("does not accept tiebreak"), "{error}");
+        assert_eq!(
+            workflow.validate().unwrap_err(),
+            WorkflowError::TiebreakUnexpected {
+                op: EngineOp::Measure,
+                task: "score".to_owned(),
+            }
+        );
     }
 
     #[test]
@@ -659,14 +763,23 @@ mod tests {
         let unknown = format!(
             "{base}[[task]]\nname = \"grade\"\nkind = \"engine\"\nop = \"grade\"\nsource = \"correctness\"\ntiebreak = \"ghost\"\ndepends_on = [\"correctness\"]\njoin = \"passed\"\n"
         );
-        let error = parse(&unknown).validate().unwrap_err().to_string();
-        assert!(error.contains("unknown tiebreak"), "{error}");
+        assert_eq!(
+            parse(&unknown).validate().unwrap_err(),
+            WorkflowError::UnknownTiebreak {
+                task: "grade".to_owned(),
+                tiebreak: "ghost".to_owned(),
+            }
+        );
 
         let not_evaluate = format!(
             "{base}[[task]]\nname = \"grade\"\nkind = \"engine\"\nop = \"grade\"\nsource = \"correctness\"\ntiebreak = \"deploy\"\ndepends_on = [\"correctness\"]\njoin = \"passed\"\n"
         );
-        let error = parse(&not_evaluate).validate().unwrap_err().to_string();
-        assert!(error.contains("must be an evaluate task"), "{error}");
+        assert_eq!(
+            parse(&not_evaluate).validate().unwrap_err(),
+            WorkflowError::TiebreakNotEvaluate {
+                tiebreak: "deploy".to_owned()
+            }
+        );
     }
 
     #[test]
@@ -677,8 +790,12 @@ mod tests {
             source: Some("deploy".into()),
             tiebreak: None,
         };
-        let error = workflow.validate().unwrap_err().to_string();
-        assert!(error.contains("must be an evaluate task"), "{error}");
+        assert_eq!(
+            workflow.validate().unwrap_err(),
+            WorkflowError::GradeSourceNotEvaluate {
+                source_task: "deploy".to_owned()
+            }
+        );
     }
 
     #[test]
@@ -726,31 +843,56 @@ mod tests {
             "[[task]]\nname = \"review\"\nkind = \"command\"\ncommand = \"true\"\n\
              [[task]]\nname = \"racecheck\"\nkind = \"command\"\ncommand = \"true\"\nstage = \"epilogue\"\ndepends_on = [\"review\"]\n",
         );
-        let error = workflow.validate().unwrap_err().to_string();
-        assert!(error.contains("cannot cross stages"), "{error}");
+        assert_eq!(
+            workflow.validate().unwrap_err(),
+            WorkflowError::CrossStageDependency {
+                task: "racecheck".to_owned(),
+                stage: Stage::Epilogue,
+                dependency: "review".to_owned(),
+                dependency_stage: Stage::Iteration,
+            }
+        );
 
         // Iteration depending on an epilogue task would deadlock every iteration.
         let workflow = parse(
             "[[task]]\nname = \"racecheck\"\nkind = \"command\"\ncommand = \"true\"\nstage = \"epilogue\"\n\
              [[task]]\nname = \"review\"\nkind = \"command\"\ncommand = \"true\"\ndepends_on = [\"racecheck\"]\n",
         );
-        let error = workflow.validate().unwrap_err().to_string();
-        assert!(error.contains("cannot cross stages"), "{error}");
+        assert_eq!(
+            workflow.validate().unwrap_err(),
+            WorkflowError::CrossStageDependency {
+                task: "review".to_owned(),
+                stage: Stage::Iteration,
+                dependency: "racecheck".to_owned(),
+                dependency_stage: Stage::Epilogue,
+            }
+        );
 
         // The legacy splice's implicit propose dependency is an iteration task too.
         let workflow = parse(
             "[[task]]\nname = \"racecheck\"\nkind = \"command\"\ncommand = \"true\"\nstage = \"epilogue\"\ndepends_on = [\"propose\"]\n",
         );
-        let error = workflow.validate().unwrap_err().to_string();
-        assert!(error.contains("cannot cross stages"), "{error}");
+        assert_eq!(
+            workflow.validate().unwrap_err(),
+            WorkflowError::CrossStageDependency {
+                task: "racecheck".to_owned(),
+                stage: Stage::Epilogue,
+                dependency: "propose".to_owned(),
+                dependency_stage: Stage::Iteration,
+            }
+        );
     }
 
     #[test]
     fn engine_tasks_cannot_be_epilogue() {
         let mut workflow = full_autoresearch();
         workflow.tasks[2].stage = Stage::Epilogue;
-        let error = workflow.validate().unwrap_err().to_string();
-        assert!(error.contains("cannot run in the epilogue"), "{error}");
+        assert_eq!(
+            workflow.validate().unwrap_err(),
+            WorkflowError::EngineTaskInEpilogue {
+                task: "score".to_owned()
+            }
+        );
     }
 
     #[test]
@@ -760,14 +902,20 @@ mod tests {
              [[task]]\nname = \"solve\"\nkind = \"command\"\ncommand = \"true\"\n\
              [[task]]\nname = \"racecheck\"\nkind = \"command\"\ncommand = \"true\"\nstage = \"epilogue\"\n",
         );
-        let error = workflow.validate().unwrap_err().to_string();
-        assert!(error.contains("cannot be an epilogue task"), "{error}");
+        assert_eq!(
+            workflow.validate().unwrap_err(),
+            WorkflowError::EpilogueResult {
+                result: "racecheck".to_owned()
+            }
+        );
 
         let workflow = parse(
             "[[task]]\nname = \"kept\"\nkind = \"command\"\ncommand = \"true\"\nstage = \"epilogue\"\n",
         );
-        let error = workflow.validate().unwrap_err().to_string();
-        assert!(error.contains("reserved"), "{error}");
+        assert_eq!(
+            workflow.validate().unwrap_err(),
+            WorkflowError::ReservedEpilogueName
+        );
     }
 
     #[test]

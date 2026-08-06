@@ -28,11 +28,157 @@
 use crate::build::BuildSuccess;
 use crate::oci::{self, RETRY_DELAYS, with_retry};
 use crate::spec::{CorrelationSource, DigestKind, DigestSource};
-use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
+
+type Result<T> = std::result::Result<T, GithubError>;
+
+/// Everything the GitHub Actions build backend can fail with. Transport and library causes
+/// hang off `source()`; render the whole chain with anyhow's `{:#}`, not a bare `{}`.
+#[derive(Debug, thiserror::Error)]
+pub enum GithubError {
+    #[error("github repo {repo:?} must be \"owner/repo\"")]
+    MalformedRepo { repo: String },
+    #[error(
+        "github workflow {workflow:?} must be a workflow filename like \"crucible-build.yml\" \
+         ([A-Za-z0-9._-]+.ya?ml, no path separators or \"..\")"
+    )]
+    MalformedWorkflowFilename { workflow: String },
+    #[error(
+        "build {build:?}: digest source `artifact` (name={artifact:?}, path={path:?}) is not \
+         implemented — the registry-tag path is the default and the single source of \
+         truth; declare `digest = \"registry-tag\"` or leave [outputs] unset"
+    )]
+    UnsupportedDigestSource {
+        build: String,
+        artifact: String,
+        path: String,
+    },
+    #[error(
+        "workflow input validation failed for {workflow} in {repo} at ref {git_ref}:\n  - {}",
+        .errors.join("\n  - ")
+    )]
+    InputValidation {
+        repo: String,
+        workflow: String,
+        git_ref: String,
+        errors: Vec<String>,
+    },
+
+    #[error("introspecting {workflow} in {repo} at ref {git_ref}")]
+    Introspecting {
+        repo: String,
+        workflow: String,
+        git_ref: String,
+        #[source]
+        source: Box<GithubError>,
+    },
+    #[error("parsing workflow YAML")]
+    ParseYaml(#[from] serde_norway::Error),
+    #[error("workflow has no `on:` trigger block")]
+    NoTriggerBlock,
+    #[error("workflow has no `on.workflow_dispatch` — it isn't dispatchable")]
+    NotDispatchable,
+    #[error("on.workflow_dispatch.inputs is not a mapping")]
+    InputsNotMapping,
+    #[error("a workflow_dispatch input name is not a string")]
+    InputNameNotString,
+
+    #[error(
+        "no workflow run correlated to dispatch {correlation_id:?} within {window:?} \
+         (correlation = {correlation:?}); the dispatch may have been rejected or the workflow \
+         doesn't echo the correlation id"
+    )]
+    NoCorrelatedRun {
+        correlation_id: String,
+        window: Duration,
+        correlation: CorrelationSource,
+    },
+    #[error("build {build:?}: workflow run {run_id} finished {conclusion:?} — see {html_url}")]
+    RunFailed {
+        build: String,
+        run_id: u64,
+        conclusion: String,
+        html_url: String,
+    },
+    #[error(
+        "build {build:?}: workflow run {run_id} did not finish within {timeout:?} \
+         (last status: {status:?}) — see {html_url}"
+    )]
+    RunUnfinished {
+        build: String,
+        run_id: u64,
+        timeout: Duration,
+        status: Option<String>,
+        html_url: String,
+    },
+    #[error("workflow_dispatch to {url} failed: HTTP {status}: {body}")]
+    DispatchRejected {
+        url: String,
+        status: reqwest::StatusCode,
+        body: String,
+    },
+
+    #[error(".github/workflows/{workflow} not found in {repo} at ref {git_ref}")]
+    WorkflowNotFound {
+        repo: String,
+        workflow: String,
+        git_ref: String,
+    },
+    #[error(
+        ".github/workflows/{workflow} in {repo} is {len} bytes, over the \
+         {MAX_WORKFLOW_BYTES}-byte cap"
+    )]
+    WorkflowTooLarge {
+        repo: String,
+        workflow: String,
+        len: u64,
+    },
+    #[error(".github/workflows/{workflow} in {repo} exceeds the {MAX_WORKFLOW_BYTES}-byte cap")]
+    WorkflowBodyOverCap { repo: String, workflow: String },
+    #[error("workflow file is not utf8")]
+    WorkflowNotUtf8(#[from] std::string::FromUtf8Error),
+
+    /// A `reqwest` failure; `doing` names the call, the transport error is the source.
+    #[error("{doing}")]
+    Http {
+        doing: String,
+        #[source]
+        source: reqwest::Error,
+    },
+    #[error("building the {what} runtime")]
+    Runtime {
+        what: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+    /// A retried call or a registry lookup, both of which report through `anyhow`.
+    #[error("{doing}")]
+    Upstream {
+        doing: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+impl GithubError {
+    /// A `map_err` argument for a `reqwest` call: `.map_err(GithubError::http("listing runs"))`.
+    fn http(doing: impl Into<String>) -> impl FnOnce(reqwest::Error) -> Self {
+        let doing = doing.into();
+        move |source| GithubError::Http { doing, source }
+    }
+
+    /// The same, for the anyhow-reporting helpers in [`crate::oci`].
+    fn upstream(doing: impl Into<String>) -> impl FnOnce(anyhow::Error) -> Self {
+        let doing = doing.into();
+        move |source| GithubError::Upstream {
+            doing,
+            source: source.into(),
+        }
+    }
+}
 
 const GITHUB_API: &str = "https://api.github.com";
 /// The pinned REST API version header GitHub asks every request to send.
@@ -112,12 +258,16 @@ pub fn dispatch_github(
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .context("building the github-dispatch runtime")?;
+        .map_err(|source| GithubError::Runtime {
+            what: "github-dispatch",
+            source,
+        })?;
     rt.block_on(run_build(req, token))?;
 
     // Only the registry-tag path reaches here (`ensure_digest_supported` rejected the rest up-front).
-    let digest_ref = oci::pin_digest(&req.image_ref, authfile)
-        .with_context(|| format!("resolving the pushed digest for {}", req.image_ref))?;
+    let digest_ref = oci::pin_digest(&req.image_ref, authfile).map_err(GithubError::upstream(
+        format!("resolving the pushed digest for {}", req.image_ref),
+    ))?;
     Ok(BuildSuccess {
         image_ref: req.image_ref.clone(),
         digest_ref,
@@ -155,9 +305,12 @@ async fn correlate(
 ) -> Result<u64> {
     loop {
         let runs = with_retry("listing workflow runs", &RETRY_DELAYS, || async {
-            list_workflow_runs(client, &req.repo, &req.workflow, token).await
+            list_workflow_runs(client, &req.repo, &req.workflow, token)
+                .await
+                .map_err(anyhow::Error::from)
         })
-        .await?;
+        .await
+        .map_err(GithubError::upstream("listing workflow runs"))?;
 
         let found = match req.correlation {
             CorrelationSource::RunName => runs
@@ -172,13 +325,11 @@ async fn correlate(
             return Ok(id);
         }
         if Instant::now() >= deadline {
-            bail!(
-                "no workflow run correlated to dispatch {:?} within {:?} (correlation = {:?}); the \
-                 dispatch may have been rejected or the workflow doesn't echo the correlation id",
-                req.correlation_id,
-                req.timeout.min(CORRELATION_WINDOW),
-                req.correlation
-            );
+            return Err(GithubError::NoCorrelatedRun {
+                correlation_id: req.correlation_id.clone(),
+                window: req.timeout.min(CORRELATION_WINDOW),
+                correlation: req.correlation,
+            });
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
@@ -194,29 +345,35 @@ async fn poll_run(
     deadline: Instant,
 ) -> Result<()> {
     loop {
-        let run = with_retry(&format!("polling run {run_id}"), &RETRY_DELAYS, || async {
-            get_run(client, &req.repo, run_id, token).await
+        let poll = format!("polling run {run_id}");
+        let run = with_retry(&poll, &RETRY_DELAYS, || async {
+            get_run(client, &req.repo, run_id, token)
+                .await
+                .map_err(anyhow::Error::from)
         })
-        .await?;
+        .await
+        .map_err(GithubError::upstream(poll))?;
 
         match run_outcome(&run) {
             Some(RunOutcome::Success) => return Ok(()),
-            Some(RunOutcome::Failure(conclusion)) => bail!(
-                "build {:?}: workflow run {run_id} finished {conclusion:?} — see {}",
-                req.name,
-                run.html_url
-            ),
+            Some(RunOutcome::Failure(conclusion)) => {
+                return Err(GithubError::RunFailed {
+                    build: req.name.clone(),
+                    run_id,
+                    conclusion,
+                    html_url: run.html_url,
+                });
+            }
             None => {}
         }
         if Instant::now() >= deadline {
-            bail!(
-                "build {:?}: workflow run {run_id} did not finish within {:?} (last status: {:?}) \
-                 — see {}",
-                req.name,
-                req.timeout,
-                run.status,
-                run.html_url
-            );
+            return Err(GithubError::RunUnfinished {
+                build: req.name.clone(),
+                run_id,
+                timeout: req.timeout,
+                status: run.status,
+                html_url: run.html_url,
+            });
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
@@ -235,8 +392,12 @@ fn validate_workflow(
     ensure_repo(repo)?;
     ensure_workflow_filename(workflow)?;
     let yaml = fetch_workflow_content(repo, workflow, git_ref, token)?;
-    let inputs = parse_workflow_inputs(&yaml)
-        .with_context(|| format!("introspecting {workflow} in {repo} at ref {git_ref}"))?;
+    let inputs = parse_workflow_inputs(&yaml).map_err(|source| GithubError::Introspecting {
+        repo: repo.to_owned(),
+        workflow: workflow.to_owned(),
+        git_ref: git_ref.to_owned(),
+        source: Box::new(source),
+    })?;
     Ok(validate_input_mapping(&inputs, mapped))
 }
 
@@ -259,10 +420,12 @@ pub fn preflight_workflow(
         eprintln!("warning: {w}");
     }
     if !report.errors.is_empty() {
-        bail!(
-            "workflow input validation failed for {workflow} in {repo} at ref {git_ref}:\n  - {}",
-            report.errors.join("\n  - ")
-        );
+        return Err(GithubError::InputValidation {
+            repo: repo.to_owned(),
+            workflow: workflow.to_owned(),
+            git_ref: git_ref.to_owned(),
+            errors: report.errors,
+        });
     }
     eprintln!("==> workflow inputs validate against {workflow} ({repo}@{git_ref})");
     Ok(())
@@ -310,18 +473,17 @@ fn parse_yaml_bool(v: &serde_norway::Value) -> Option<bool> {
 
 fn parse_workflow_inputs(yaml: &str) -> Result<Vec<WorkflowInput>> {
     use serde_norway::Value;
-    let doc: Value = serde_norway::from_str(yaml).context("parsing workflow YAML")?;
+    let doc: Value = serde_norway::from_str(yaml)?;
 
     let on = doc
         .get("on")
         .or_else(|| doc.get(Value::Bool(true)))
-        .context("workflow has no `on:` trigger block")?;
+        .ok_or(GithubError::NoTriggerBlock)?;
 
-    let not_dispatchable = "workflow has no `on.workflow_dispatch` — it isn't dispatchable";
     let wd = match on {
         // `on: workflow_dispatch`: dispatchable, no inputs.
         Value::String(s) if s == "workflow_dispatch" => return Ok(Vec::new()),
-        Value::String(_) => bail!("{not_dispatchable}"),
+        Value::String(_) => return Err(GithubError::NotDispatchable),
         // `on: [push, workflow_dispatch]`: dispatchable iff the trigger is in the list, no inputs.
         Value::Sequence(triggers) => {
             if triggers
@@ -330,17 +492,17 @@ fn parse_workflow_inputs(yaml: &str) -> Result<Vec<WorkflowInput>> {
             {
                 return Ok(Vec::new());
             }
-            bail!("{not_dispatchable}");
+            return Err(GithubError::NotDispatchable);
         }
         // `on: { workflow_dispatch: … }`: the only form that can carry inputs.
-        _ => on.get("workflow_dispatch").context(not_dispatchable)?,
+        _ => on
+            .get("workflow_dispatch")
+            .ok_or(GithubError::NotDispatchable)?,
     };
 
     // `workflow_dispatch:` may be null (dispatchable, no inputs) or a mapping possibly without inputs.
     let inputs = match wd.get("inputs") {
-        Some(v) if !v.is_null() => v
-            .as_mapping()
-            .context("on.workflow_dispatch.inputs is not a mapping")?,
+        Some(v) if !v.is_null() => v.as_mapping().ok_or(GithubError::InputsNotMapping)?,
         _ => return Ok(Vec::new()),
     };
 
@@ -348,7 +510,7 @@ fn parse_workflow_inputs(yaml: &str) -> Result<Vec<WorkflowInput>> {
     for (key, val) in inputs {
         let name = key
             .as_str()
-            .context("a workflow_dispatch input name is not a string")?
+            .ok_or(GithubError::InputNameNotString)?
             .to_string();
         let required = val
             .get("required")
@@ -455,7 +617,9 @@ fn ensure_repo(repo: &str) -> Result<()> {
         Some((owner, name)) if !owner.is_empty() && !name.is_empty() && !name.contains('/') => {
             Ok(())
         }
-        _ => bail!("github repo {repo:?} must be \"owner/repo\""),
+        _ => Err(GithubError::MalformedRepo {
+            repo: repo.to_owned(),
+        }),
     }
 }
 
@@ -480,10 +644,9 @@ fn ensure_workflow_filename(workflow: &str) -> Result<()> {
     if valid {
         Ok(())
     } else {
-        bail!(
-            "github workflow {workflow:?} must be a workflow filename like \"crucible-build.yml\" \
-             ([A-Za-z0-9._-]+.ya?ml, no path separators or \"..\")"
-        )
+        Err(GithubError::MalformedWorkflowFilename {
+            workflow: workflow.to_owned(),
+        })
     }
 }
 
@@ -497,11 +660,11 @@ fn ensure_digest_supported(name: &str, digest: &DigestSource) -> Result<()> {
             name: artifact_name,
             path,
             ..
-        } => bail!(
-            "build {name:?}: digest source `artifact` (name={artifact_name:?}, path={path:?}) is not \
-             implemented — the registry-tag path is the default and the single source of \
-             truth; declare `digest = \"registry-tag\"` or leave [outputs] unset"
-        ),
+        } => Err(GithubError::UnsupportedDigestSource {
+            build: name.to_owned(),
+            artifact: artifact_name.clone(),
+            path: path.clone(),
+        }),
     }
 }
 
@@ -549,7 +712,7 @@ fn build_client() -> Result<reqwest::Client> {
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
         .build()
-        .context("building the github http client")
+        .map_err(GithubError::http("building the github http client"))
 }
 
 /// rustls 0.23 won't auto-pick a CryptoProvider when several are linked; choose one before any TLS
@@ -576,14 +739,16 @@ async fn post_dispatch(
             .await
             .map_err(anyhow::Error::from)
     })
-    .await?;
+    .await
+    .map_err(GithubError::upstream("dispatching the workflow"))?;
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
-        bail!(
-            "workflow_dispatch to {url} failed: HTTP {status}: {}",
-            truncate(&text, ERR_BODY_CHARS)
-        );
+        return Err(GithubError::DispatchRejected {
+            url,
+            status,
+            body: truncate(&text, ERR_BODY_CHARS),
+        });
     }
     Ok(())
 }
@@ -599,13 +764,12 @@ async fn list_workflow_runs(
         .query(&[("event", "workflow_dispatch"), ("per_page", "30")])
         .send()
         .await
-        .context("listing workflow runs")?
-        .error_for_status()
-        .context("listing workflow runs")?;
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(GithubError::http("listing workflow runs"))?;
     let parsed: WorkflowRunsResponse = resp
         .json()
         .await
-        .context("parsing the workflow-runs response")?;
+        .map_err(GithubError::http("parsing the workflow-runs response"))?;
     Ok(parsed.workflow_runs)
 }
 
@@ -619,12 +783,11 @@ async fn get_run(
     let resp = gh_get_or_post(client.get(&url), token)
         .send()
         .await
-        .with_context(|| format!("fetching run {run_id}"))?
-        .error_for_status()
-        .with_context(|| format!("fetching run {run_id}"))?;
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(GithubError::http(format!("fetching run {run_id}")))?;
     resp.json()
         .await
-        .with_context(|| format!("parsing run {run_id}"))
+        .map_err(GithubError::http(format!("parsing run {run_id}")))
 }
 
 /// Blocking fetch of a workflow file's raw text via the contents API (its own runtime; called only
@@ -638,7 +801,10 @@ fn fetch_workflow_content(
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .context("building the workflow-fetch runtime")?;
+        .map_err(|source| GithubError::Runtime {
+            what: "workflow-fetch",
+            source,
+        })?;
     rt.block_on(async {
         install_crypto_provider();
         let client = build_client()?;
@@ -649,36 +815,43 @@ fn fetch_workflow_content(
             .query(&[("ref", git_ref)])
             .send()
             .await
-            .context("fetching the workflow file")?;
+            .map_err(GithubError::http("fetching the workflow file"))?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            bail!(".github/workflows/{workflow} not found in {repo} at ref {git_ref}");
+            return Err(GithubError::WorkflowNotFound {
+                repo: repo.to_owned(),
+                workflow: workflow.to_owned(),
+                git_ref: git_ref.to_owned(),
+            });
         }
         let mut resp = resp
             .error_for_status()
-            .context("fetching the workflow file")?;
+            .map_err(GithubError::http("fetching the workflow file"))?;
         // Reject an over-cap body before buffering it: check the advertised length first (cheap), then
         // stream chunk-by-chunk so a lying/absent Content-Length can't slip a huge body past the cap.
         if let Some(len) = resp.content_length()
-            && len > MAX_WORKFLOW_BYTES {
-                bail!(
-                    ".github/workflows/{workflow} in {repo} is {len} bytes, over the \
-                     {MAX_WORKFLOW_BYTES}-byte cap"
-                );
-            }
+            && len > MAX_WORKFLOW_BYTES
+        {
+            return Err(GithubError::WorkflowTooLarge {
+                repo: repo.to_owned(),
+                workflow: workflow.to_owned(),
+                len,
+            });
+        }
         let mut buf: Vec<u8> = Vec::new();
         while let Some(chunk) = resp
             .chunk()
             .await
-            .context("reading the workflow file body")?
+            .map_err(GithubError::http("reading the workflow file body"))?
         {
             if buf.len() as u64 + chunk.len() as u64 > MAX_WORKFLOW_BYTES {
-                bail!(
-                    ".github/workflows/{workflow} in {repo} exceeds the {MAX_WORKFLOW_BYTES}-byte cap"
-                );
+                return Err(GithubError::WorkflowBodyOverCap {
+                    repo: repo.to_owned(),
+                    workflow: workflow.to_owned(),
+                });
             }
             buf.extend_from_slice(&chunk);
         }
-        String::from_utf8(buf).context("workflow file is not utf8")
+        Ok(String::from_utf8(buf)?)
     })
 }
 

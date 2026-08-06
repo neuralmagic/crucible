@@ -22,14 +22,29 @@ pub use openshell::OpenshellCfg;
 pub use relay::RelayFile;
 pub use search::SearchCfg;
 pub use selftest::SelftestCfg;
-pub use workflow::{KEPT_INPUT, WorkflowCaps, WorkflowCfg, WorkflowType};
+pub use workflow::{KEPT_INPUT, WorkflowCaps, WorkflowCfg, WorkflowError, WorkflowType};
 pub use world::WorldCfg;
 
 use crate::command_judge::Direction;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
+
+/// Manifest-level rejections that belong to no single sub-table.
+#[derive(Debug, thiserror::Error)]
+pub enum ManifestError {
+    #[error("inject destination {} is a directory", .path.display())]
+    InjectDestIsDir { path: PathBuf },
+    #[error(
+        "[agent.broker].bin is required when the broker is enabled (the domain's broker binary)"
+    )]
+    BrokerBinRequired,
+    #[error("a composite needs at least two [[component]] entries")]
+    CompositeTooSmall,
+    #[error("duplicate component domain `{domain}`")]
+    DuplicateComponent { domain: String },
+}
 
 /// Shared tail of `Manifest`/`CompositeManifest`'s `load_frozen`: given the initial working-tree
 /// parse (needed only to learn where the workspace is) and that workspace's path, decide whether
@@ -275,7 +290,10 @@ pub fn apply_inject(src: &Path, dst: &Path) -> Result<()> {
     }
     match dst_meta {
         Ok(meta) if meta.file_type().is_dir() && !meta.file_type().is_symlink() => {
-            bail!("inject destination {} is a directory", dst.display());
+            return Err(ManifestError::InjectDestIsDir {
+                path: dst.to_path_buf(),
+            }
+            .into());
         }
         Ok(_) => std::fs::remove_file(dst)
             .with_context(|| format!("removing old inject destination {}", dst.display()))?,
@@ -382,9 +400,7 @@ fn validate_common(
     build: &BTreeMap<String, forge::spec::BuildSpec>,
 ) -> Result<()> {
     if agent.broker.enabled && agent.broker.bin.is_empty() {
-        bail!(
-            "[agent.broker].bin is required when the broker is enabled (the domain's broker binary)"
-        );
+        return Err(ManifestError::BrokerBinRequired.into());
     }
     search::validate_search(search)?;
     if let Some(w) = workflow {
@@ -603,12 +619,15 @@ impl CompositeManifest {
 
     fn validate(&self) -> Result<()> {
         if self.components.len() < 2 {
-            bail!("a composite needs at least two [[component]] entries");
+            return Err(ManifestError::CompositeTooSmall.into());
         }
         let mut seen = std::collections::BTreeSet::new();
         for c in &self.components {
             if !seen.insert(c.domain.as_str()) {
-                bail!("duplicate component domain `{}`", c.domain);
+                return Err(ManifestError::DuplicateComponent {
+                    domain: c.domain.clone(),
+                }
+                .into());
             }
         }
         validate_common(
