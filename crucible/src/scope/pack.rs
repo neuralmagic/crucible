@@ -1,10 +1,32 @@
 use crate::agent::AgentBackend;
 use crate::manifest;
 use crate::scope::cli::ScopeReport;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use base64::Engine as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+
+/// A pack that cannot be written or shipped. The two cap arms are the reason the marker
+/// protocol stays honest: a truncated blob would look like a real pack to the controller.
+#[derive(Debug, thiserror::Error)]
+pub enum PackError {
+    #[error(
+        "--out {} already exists and is non-empty (pass --force to propose into it anyway)",
+        .path.display()
+    )]
+    OutDirNotEmpty { path: std::path::PathBuf },
+    #[error(
+        "pack tar is {bytes} bytes, over the {PACK_TAR_CAP_BYTES}-byte cap — refusing to emit a \
+         pack that can't ride the pod logs whole"
+    )]
+    TarOverCap { bytes: usize },
+    #[error(
+        "pack payload is {encoded} bytes encoded ({tarred} bytes tarred), over the \
+         {PACK_PAYLOAD_CAP_BYTES}-byte cap — refusing to emit a pack that can't ride the pod \
+         logs whole"
+    )]
+    PayloadOverCap { encoded: usize, tarred: usize },
+}
 
 /// The prefix of the single-line pack marker a SURVIVING `--marker` scope turn emits before the
 /// report marker: base64 of the gzipped tar of the frozen pack directory. With `scope_executor =
@@ -330,10 +352,10 @@ pub(super) fn ensure_out_dir(out: &Path, force: bool) -> Result<()> {
         .next()
         .is_some();
     if nonempty && !force {
-        bail!(
-            "--out {} already exists and is non-empty (pass --force to propose into it anyway)",
-            out.display()
-        );
+        return Err(PackError::OutDirNotEmpty {
+            path: out.to_path_buf(),
+        }
+        .into());
     }
     Ok(())
 }
@@ -366,11 +388,7 @@ pub(super) fn tar_pack_dir(dir: &Path) -> Result<Vec<u8>> {
         .into_inner()
         .context("finishing the pack tar stream")?;
     if tar.len() > PACK_TAR_CAP_BYTES {
-        bail!(
-            "pack tar is {} bytes, over the {PACK_TAR_CAP_BYTES}-byte cap — refusing to emit a \
-             pack that can't ride the pod logs whole",
-            tar.len()
-        );
+        return Err(PackError::TarOverCap { bytes: tar.len() }.into());
     }
     Ok(tar)
 }
@@ -411,13 +429,11 @@ pub(super) fn pack_marker_payload(dir: &Path) -> Result<String> {
     let gz = enc.finish().context("finishing the pack gzip stream")?;
     let payload = base64::engine::general_purpose::STANDARD.encode(gz);
     if payload.len() > PACK_PAYLOAD_CAP_BYTES {
-        bail!(
-            "pack payload is {} bytes encoded ({} bytes tarred), over the \
-             {PACK_PAYLOAD_CAP_BYTES}-byte cap — refusing to emit a pack that can't ride the pod \
-             logs whole",
-            payload.len(),
-            tar.len()
-        );
+        return Err(PackError::PayloadOverCap {
+            encoded: payload.len(),
+            tarred: tar.len(),
+        }
+        .into());
     }
     Ok(payload)
 }

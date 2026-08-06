@@ -17,6 +17,7 @@
 
 use serde::Serialize;
 use serde_json::json;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -38,6 +39,39 @@ struct TargetCfg {
 }
 
 /// What a profiling tool reports back to the agent (a tagged JSON, like the build `BuildReply`).
+/// Why a capture or query refused. The MCP reply is JSON text, so these are rendered with
+/// anyhow's `{:#}` (`anyhow::Error::new(err)`) to flatten the `source()` chain onto one line.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ProfileError {
+    #[error("creating profile dir {}", .dir.display())]
+    CreateProfileDir {
+        dir: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("running capture command")]
+    SpawnCapture(#[source] io::Error),
+    #[error("capture failed: {stderr}")]
+    CaptureFailed { stderr: String },
+    #[error("capture produced no profile at $OUT (is the endpoint reachable / authorized?)")]
+    CaptureEmpty,
+    #[error("running query command")]
+    SpawnQuery(#[source] io::Error),
+    #[error("query failed: {stderr}")]
+    QueryFailed { stderr: String },
+    #[error("handle must be a bare capture name, not a path: {handle:?}")]
+    HandleIsAPath { handle: String },
+    #[error(
+        "no captured profile named {handle:?} for target {target:?} \
+         (capture one with `profile` first)"
+    )]
+    NoSuchProfile { handle: String, target: String },
+    #[error("no profile captured yet for target {target:?} — call `profile` first")]
+    NoLatestCapture { target: String },
+    #[error("the latest capture for target {target:?} is gone; call `profile` again")]
+    LatestCaptureGone { target: String },
+}
+
 #[derive(Debug, Serialize, PartialEq, Eq)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ProfileReply {
@@ -83,7 +117,7 @@ pub(crate) fn profile(target: Option<&str>, kind: &str, seconds: u32) -> String 
     let seconds = seconds.clamp(1, MAX_SECONDS);
     json(
         &do_capture(&cfg, cmd, kind, seconds).unwrap_or_else(|e| ProfileReply::Error {
-            error: format!("{e:#}"),
+            error: format!("{:#}", anyhow::Error::new(e)),
         }),
     )
 }
@@ -110,7 +144,7 @@ pub(crate) fn profile_query(target: Option<&str>, query: &str, handle: Option<St
     }
     json(
         &do_query(&cfg, cmd, query, handle).unwrap_or_else(|e| ProfileReply::Error {
-            error: format!("{e:#}"),
+            error: format!("{:#}", anyhow::Error::new(e)),
         }),
     )
 }
@@ -120,10 +154,12 @@ fn do_capture(
     cmd: &str,
     kind: &str,
     seconds: u32,
-) -> anyhow::Result<ProfileReply> {
+) -> Result<ProfileReply, ProfileError> {
     let dir = target_dir(&cfg.name);
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| anyhow::anyhow!("creating profile dir {}: {e}", dir.display()))?;
+    std::fs::create_dir_all(&dir).map_err(|source| ProfileError::CreateProfileDir {
+        dir: dir.clone(),
+        source,
+    })?;
     let handle = format!("{kind}-{}.{}", nonce(), cfg.ext);
     let out = dir.join(&handle);
 
@@ -134,19 +170,16 @@ fn do_capture(
         .env("SECONDS", seconds.to_string())
         .env("OUT", &out)
         .output()
-        .map_err(|e| anyhow::anyhow!("running capture command: {e}"))?;
+        .map_err(ProfileError::SpawnCapture)?;
 
     if !status.status.success() {
-        anyhow::bail!(
-            "capture failed: {}",
-            String::from_utf8_lossy(&status.stderr).trim()
-        );
+        return Err(ProfileError::CaptureFailed {
+            stderr: String::from_utf8_lossy(&status.stderr).trim().to_owned(),
+        });
     }
     let bytes = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
     if bytes == 0 {
-        anyhow::bail!(
-            "capture produced no profile at $OUT (is the endpoint reachable / authorized?)"
-        );
+        return Err(ProfileError::CaptureEmpty);
     }
     // Record the latest so `profile_query` with no handle targets this capture (per target).
     let _ = std::fs::write(latest_marker(&cfg.name), out.to_string_lossy().as_bytes());
@@ -164,7 +197,7 @@ fn do_query(
     cmd: &str,
     query: &str,
     handle: Option<String>,
-) -> anyhow::Result<ProfileReply> {
+) -> Result<ProfileReply, ProfileError> {
     let profile_path = resolve_profile(&target_dir(&cfg.name), &cfg.name, handle)?;
     let out = Command::new("sh")
         .arg("-c")
@@ -172,14 +205,13 @@ fn do_query(
         .env("PROFILE", &profile_path)
         .env("QUERY", query)
         .output()
-        .map_err(|e| anyhow::anyhow!("running query command: {e}"))?;
+        .map_err(ProfileError::SpawnQuery)?;
 
     if !out.status.success() {
         // pprof writes useful diagnostics to stderr; surface them so the agent can correct the query.
-        anyhow::bail!(
-            "query failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+        return Err(ProfileError::QueryFailed {
+            stderr: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+        });
     }
     let text = String::from_utf8_lossy(&out.stdout).trim_end().to_string();
     Ok(ProfileReply::Query {
@@ -193,36 +225,38 @@ fn do_query(
 
 /// Resolve the profile to query within a target's dir: an explicit handle (sanitized to a bare filename
 /// under that dir, no path traversal) or the target's recorded latest capture.
-fn resolve_profile(dir: &Path, target: &str, handle: Option<String>) -> anyhow::Result<PathBuf> {
+fn resolve_profile(
+    dir: &Path,
+    target: &str,
+    handle: Option<String>,
+) -> Result<PathBuf, ProfileError> {
     match handle.filter(|h| !h.is_empty()) {
         Some(h) => {
             if h.contains('/') || h.contains("..") {
-                anyhow::bail!("handle must be a bare capture name, not a path: {h:?}");
+                return Err(ProfileError::HandleIsAPath { handle: h });
             }
             let p = dir.join(&h);
             if !p.is_file() {
-                anyhow::bail!(
-                    "no captured profile named {h:?} for target {target:?} \
-                     (capture one with `profile` first)"
-                );
+                return Err(ProfileError::NoSuchProfile {
+                    handle: h,
+                    target: target.to_owned(),
+                });
             }
             Ok(p)
         }
         None => {
             let marker = latest_marker(target);
             let path = std::fs::read_to_string(&marker)
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "no profile captured yet for target {target:?} — call `profile` first"
-                    )
+                .map_err(|_| ProfileError::NoLatestCapture {
+                    target: target.to_owned(),
                 })?
                 .trim()
                 .to_string();
             let p = PathBuf::from(path);
             if !p.is_file() {
-                anyhow::bail!(
-                    "the latest capture for target {target:?} is gone; call `profile` again"
-                );
+                return Err(ProfileError::LatestCaptureGone {
+                    target: target.to_owned(),
+                });
             }
             Ok(p)
         }

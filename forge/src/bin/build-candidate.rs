@@ -7,13 +7,23 @@
 //!   build-candidate                          # build+push+deploy the cwd at its git sha
 //!   build-candidate --context src --tag spike --no-deploy
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use clap::Parser;
 use forge::{
     BuildConfig, BuildOutcome, DEFAULT_LATEST_FILE, DeployConfig, build_and_push, context_tag,
     deploy, record_latest,
 };
 use std::path::PathBuf;
+
+#[derive(Debug, thiserror::Error)]
+#[error("build failed (see log above)")]
+struct CompileFailed;
+
+#[derive(Debug, thiserror::Error)]
+#[error("{what} is required to deploy (or pass --no-deploy)")]
+struct MissingDeployArg {
+    what: String,
+}
 
 #[derive(Parser)]
 #[command(about = "Build + push (+ deploy) a workspace candidate image on the loop pod.")]
@@ -112,7 +122,7 @@ fn main() -> Result<()> {
     match build_and_push(&build_cfg, &args.context, &tag)? {
         BuildOutcome::CompileError { log } => {
             eprintln!("{log}");
-            bail!("build failed (see log above)");
+            Err(CompileFailed.into())
         }
         BuildOutcome::Built { image_ref } => {
             // Pin to a digest so the deployed ref is immutable AND byte-identical across turns for
@@ -135,6 +145,10 @@ fn main() -> Result<()> {
 /// A deploy target is only required when actually deploying; surface a clear error rather than a
 /// clap "required" that would also block `--no-deploy`.
 fn require(v: Option<String>, what: &str) -> Result<String> {
-    v.filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("{what} is required to deploy (or pass --no-deploy)"))
+    v.filter(|s| !s.is_empty()).ok_or_else(|| {
+        MissingDeployArg {
+            what: what.to_owned(),
+        }
+        .into()
+    })
 }

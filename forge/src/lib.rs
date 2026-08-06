@@ -14,9 +14,18 @@
 //!                                                         live deployment
 //! ```
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+
+/// A `buildah` invocation that ran and exited nonzero, with the log tail as evidence.
+#[derive(Debug, thiserror::Error)]
+pub enum BuildahFailed {
+    #[error("buildah {args} failed while pruning build storage: {log}")]
+    Prune { args: String, log: String },
+    #[error("push failed for {image_ref}: {log}")]
+    Push { image_ref: String, log: String },
+}
 
 /// Native-OCI image derivation (no container runtime): append a file-overlay layer onto a base image and
 /// push it. The buildah-free path for "base image + a couple edited files" candidates.
@@ -228,11 +237,11 @@ pub fn prune_storage(cfg: &BuildConfig) -> Result<()> {
         let out = run("buildah", &args, None)
             .context("running buildah to prune the isolated build storage")?;
         if !out.status.success() {
-            bail!(
-                "buildah {} failed while pruning build storage: {}",
-                args.join(" "),
-                log_tail(&out)
-            );
+            return Err(BuildahFailed::Prune {
+                args: args.join(" "),
+                log: log_tail(&out),
+            }
+            .into());
         }
     }
     Ok(())
@@ -278,7 +287,11 @@ pub fn build_and_push(cfg: &BuildConfig, context_dir: &Path, tag: &str) -> Resul
             let out = run("buildah", &buildah_push_args(cfg, &image_ref), None)
                 .context("running `buildah push`")?;
             if !out.status.success() {
-                bail!("push failed for {image_ref}: {}", log_tail(&out));
+                return Err(BuildahFailed::Push {
+                    image_ref,
+                    log: log_tail(&out),
+                }
+                .into());
             }
             Ok(BuildOutcome::Built { image_ref })
         }
@@ -330,7 +343,11 @@ pub fn build_and_push_streaming(
             let status = run_streaming("buildah", &buildah_push_args(cfg, &image_ref), log)
                 .context("running `buildah push`")?;
             if !status.success() {
-                bail!("push failed for {image_ref}: {}", file_log_tail(log));
+                return Err(BuildahFailed::Push {
+                    image_ref,
+                    log: file_log_tail(log),
+                }
+                .into());
             }
             Ok(BuildOutcome::Built { image_ref })
         }

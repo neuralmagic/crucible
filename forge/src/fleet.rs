@@ -6,10 +6,21 @@
 //! The hub holds each spoke's credential: a named Secret carrying a scoped-SA kubeconfig under the
 //! `kubeconfig` key. Reference-only, nothing here ever reads a credential's contents.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+/// What a `[clusters.<name>]` table (or the `--clusters` flag) can get wrong.
+#[derive(Debug, thiserror::Error)]
+pub enum FleetError {
+    #[error("[clusters.{cluster}].kubeconfig_secret must be a non-empty Secret name")]
+    EmptyKubeconfigSecret { cluster: String },
+    #[error("[clusters.{cluster}].proxy_url must be an http:// or socks5:// URL, got {proxy:?}")]
+    BadProxyUrl { cluster: String, proxy: String },
+    #[error("--clusters {} does not exist", .path.display())]
+    MissingClustersFile { path: std::path::PathBuf },
+}
 
 /// The fleet file's default name, resolved in the profile's own directory.
 pub const FLEET_FILE_NAME: &str = "clusters.toml";
@@ -82,12 +93,19 @@ impl ClusterEntry {
     /// key, quoted back to the operator.
     pub fn validate(&self, name: &str) -> Result<()> {
         if self.kubeconfig_secret.trim().is_empty() {
-            bail!("[clusters.{name}].kubeconfig_secret must be a non-empty Secret name");
+            return Err(FleetError::EmptyKubeconfigSecret {
+                cluster: name.to_owned(),
+            }
+            .into());
         }
         if let Some(proxy) = &self.proxy_url
             && !(proxy.starts_with("http://") || proxy.starts_with("socks5://"))
         {
-            bail!("[clusters.{name}].proxy_url must be an http:// or socks5:// URL, got {proxy:?}");
+            return Err(FleetError::BadProxyUrl {
+                cluster: name.to_owned(),
+                proxy: proxy.clone(),
+            }
+            .into());
         }
         Ok(())
     }
@@ -117,7 +135,10 @@ impl FleetFile {
         match override_path {
             Some(p) => {
                 if !p.exists() {
-                    bail!("--clusters {} does not exist", p.display());
+                    return Err(FleetError::MissingClustersFile {
+                        path: p.to_path_buf(),
+                    }
+                    .into());
                 }
                 Ok(Some(p.to_path_buf()))
             }

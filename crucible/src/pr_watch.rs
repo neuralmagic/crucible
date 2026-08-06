@@ -20,6 +20,17 @@ use std::net::TcpStream;
 use std::path::PathBuf;
 use std::time::Duration;
 
+#[derive(Debug, thiserror::Error)]
+#[error("gh api {path} failed: {stderr}")]
+struct GhApiFailed {
+    path: String,
+    stderr: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("watch-pr needs at least one --pr")]
+struct NoPrsToWatch;
+
 /// Default poll cadence. Coarse, human review is minutes-to-hours (matches the approval watcher).
 pub const DEFAULT_POLL_SECS: u64 = 20;
 
@@ -221,10 +232,11 @@ fn fetch_comments(pr: &PrRef) -> Result<Vec<Comment>> {
         .output()
         .context("running `gh api` (is gh on PATH?)")?;
     if !out.status.success() {
-        anyhow::bail!(
-            "gh api {path} failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+        return Err(GhApiFailed {
+            path: path.to_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+        }
+        .into());
     }
     parse_comments(&String::from_utf8_lossy(&out.stdout))
 }
@@ -300,7 +312,9 @@ pub struct WatchOpts {
 /// `steer_text` says which repo's PR a comment came from. Poll/fetch/deliver errors are logged and
 /// retried in continuous mode, a transient forge hiccup or a not-yet-up bridge never kills the watcher.
 pub fn watch_and_steer(pr_urls: &[String], sink: &Sink, opts: &WatchOpts) -> Result<()> {
-    anyhow::ensure!(!pr_urls.is_empty(), "watch-pr needs at least one --pr");
+    if pr_urls.is_empty() {
+        return Err(NoPrsToWatch.into());
+    }
     let prs: Vec<PrRef> = pr_urls
         .iter()
         .map(|u| parse_pr_url(u).with_context(|| format!("not a GitHub PR url: {u}")))

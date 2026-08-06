@@ -40,6 +40,10 @@ build-loop:
 lint:
     cargo fmt --check && cargo clippy --workspace --all-targets && cargo test --workspace
 
+# Run the pre-commit hooks over the whole tree (prek: https://github.com/j178/prek).
+hooks:
+    prek run --all-files
+
 # End-to-end proof of forge-layer-capture: throwaway registry:2 + unprivileged userns capture in a
 # Linux container (add a file, delete one) + docker-run verification of the derived digest ref.
 # Observable step by step; re-runs are fast (cargo caches in named docker volumes).

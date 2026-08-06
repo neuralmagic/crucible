@@ -1,5 +1,18 @@
-use anyhow::{Result, bail};
 use serde::Deserialize;
+
+/// Why a `[search]` block is unusable. Checked at manifest load, before any wide round spends.
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub enum SearchError {
+    #[error(
+        "[search].approaches needs at least {wide} entries (one per wide candidate), got {got} \
+         — diversity must be engineered, not random"
+    )]
+    TooFewApproaches { wide: u32, got: usize },
+    #[error("[search].policy must be \"top-k\" (the only v1 policy), got {got:?}")]
+    UnknownPolicy { got: String },
+    #[error("[search].policy_k must be in 1..={wide} (wide), got {got}")]
+    PolicyKOutOfRange { wide: u32, got: u32 },
+}
 
 /// Wide-round search config: how many candidates, which approaches, which tournament policy.
 /// Required `approaches` when `wide > 0`, no auto-generated fallback.
@@ -21,31 +34,27 @@ pub struct SearchCfg {
     pub policy_k: u32,
 }
 
-pub fn validate_search(search: &Option<SearchCfg>) -> Result<()> {
+pub fn validate_search(search: &Option<SearchCfg>) -> Result<(), SearchError> {
     let Some(s) = search else { return Ok(()) };
     if s.wide == 0 {
         return Ok(());
     }
     if s.approaches.len() < s.wide as usize {
-        bail!(
-            "[search].approaches needs at least {} entries (one per wide candidate), got {} \
-             — diversity must be engineered, not random",
-            s.wide,
-            s.approaches.len()
-        );
+        return Err(SearchError::TooFewApproaches {
+            wide: s.wide,
+            got: s.approaches.len(),
+        });
     }
     if s.policy != "top-k" {
-        bail!(
-            "[search].policy must be \"top-k\" (the only v1 policy), got {:?}",
-            s.policy
-        );
+        return Err(SearchError::UnknownPolicy {
+            got: s.policy.clone(),
+        });
     }
     if s.policy_k == 0 || s.policy_k > s.wide {
-        bail!(
-            "[search].policy_k must be in 1..={} (wide), got {}",
-            s.wide,
-            s.policy_k
-        );
+        return Err(SearchError::PolicyKOutOfRange {
+            wide: s.wide,
+            got: s.policy_k,
+        });
     }
     Ok(())
 }
@@ -97,8 +106,10 @@ mod tests {
             policy: "top-k".into(),
             policy_k: 1,
         });
-        let err = validate_search(&s).unwrap_err();
-        assert!(err.to_string().contains("approaches needs at least 3"));
+        assert_eq!(
+            validate_search(&s).unwrap_err(),
+            SearchError::TooFewApproaches { wide: 3, got: 2 }
+        );
     }
 
     #[test]
@@ -110,7 +121,12 @@ mod tests {
             policy_k: 1,
         });
         let err = validate_search(&s).unwrap_err();
-        assert!(err.to_string().contains("top-k"));
+        assert_eq!(
+            err,
+            SearchError::UnknownPolicy {
+                got: "round-robin".to_owned()
+            }
+        );
     }
 
     #[test]

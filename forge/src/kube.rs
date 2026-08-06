@@ -8,7 +8,34 @@
 //! (the broker) and uses `block_in_place` there, else spins a private current-thread runtime (the CLI /
 //! forge bins), so the same fn is safe whether or not it's called from inside tokio.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
+
+/// Cluster-side refusals forge reports in its own words: a rollout that ran out of time, a
+/// container name that isn't in the deployment, and the two RBAC denials whose messages tell
+/// an operator exactly which binding is missing.
+#[derive(Debug, thiserror::Error)]
+pub enum KubeError {
+    #[error("deploy/{deployment} did not complete its rollout within {seconds}s")]
+    RolloutTimeout { deployment: String, seconds: u64 },
+    #[error("container {container} not found in deploy/{deployment} (has {count}: {names})")]
+    NoSuchContainer {
+        container: String,
+        deployment: String,
+        count: usize,
+        names: String,
+    },
+    #[error(
+        "listing pods in namespace {namespace} was denied: {message} (needs a Role/RoleBinding \
+         granting `list` on pods in {namespace})"
+    )]
+    ListPodsDeniedInNamespace { namespace: String, message: String },
+    #[error(
+        "listing pods cluster-wide was denied: {message} (needs a ClusterRole/ClusterRoleBinding \
+         granting `list` on pods across all namespaces; pass --namespace to scope to one \
+         namespace you do have access to)"
+    )]
+    ListPodsDeniedClusterWide { message: String },
+}
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Node, Pod, Secret};
@@ -244,10 +271,11 @@ pub fn rollout_status(ns: &str, deployment: &str, timeout: Duration) -> Result<(
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                bail!(
-                    "deploy/{deployment} did not complete its rollout within {}s",
-                    timeout.as_secs()
-                );
+                return Err(KubeError::RolloutTimeout {
+                    deployment: deployment.to_owned(),
+                    seconds: timeout.as_secs(),
+                }
+                .into());
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
@@ -322,15 +350,17 @@ fn container_index(
     if containers.len() == 1 {
         return Ok(0);
     }
-    bail!(
-        "container {container} not found in deploy/{deployment} (has {}: {})",
-        containers.len(),
-        containers
+    Err(KubeError::NoSuchContainer {
+        container: container.to_owned(),
+        deployment: deployment.to_owned(),
+        count: containers.len(),
+        names: containers
             .iter()
             .map(|c| c.name.as_str())
             .collect::<Vec<_>>()
-            .join(", ")
-    )
+            .join(", "),
+    }
+    .into())
 }
 
 /// Format `env` as `KEY=VALUE` lines, one per line, in order: the exact text `forge-kube get-env`
@@ -489,17 +519,12 @@ pub fn list_pods(ns: Option<&str>, selector: &str) -> Result<Vec<Pod>> {
         match api.list(&ListParams::default().labels(selector)).await {
             Ok(list) => Ok(list.items),
             Err(kube::Error::Api(e)) if e.code == 403 => match ns {
-                Some(ns) => bail!(
-                    "listing pods in namespace {ns} was denied: {} (needs a Role/RoleBinding granting \
-                     `list` on pods in {ns})",
-                    e.message
-                ),
-                None => bail!(
-                    "listing pods cluster-wide was denied: {} (needs a ClusterRole/ClusterRoleBinding \
-                     granting `list` on pods across all namespaces; pass --namespace to scope to one \
-                     namespace you do have access to)",
-                    e.message
-                ),
+                Some(ns) => Err(KubeError::ListPodsDeniedInNamespace {
+                    namespace: ns.to_owned(),
+                    message: e.message,
+                }
+                .into()),
+                None => Err(KubeError::ListPodsDeniedClusterWide { message: e.message }.into()),
             },
             Err(e) => Err(e).with_context(|| format!("listing pods by selector {selector}")),
         }

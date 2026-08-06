@@ -34,6 +34,7 @@ serde_norway = "0.9"
 uuid = { version = "1", features = ["v4"] }
 sha2 = "0.11.0"
 tar = "0.4.46"
+thiserror.workspace = true
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
 # Structured logging for the capture/derive flows: leveled events an operator filters with RUST_LOG;
 # the bins install the fmt subscriber on stderr so stdout stays the machine-readable ref.

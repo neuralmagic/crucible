@@ -11,8 +11,15 @@
 //! `agentic/<...>` branch is the durable state record on the fork.
 
 use crate::approval::{ApprovalBackend, ApprovalRequest, ApprovalState};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use std::process::Command;
+
+#[derive(Debug, thiserror::Error)]
+#[error("gh {subcommand:?} failed: {stderr}")]
+struct GhFailed {
+    subcommand: String,
+    stderr: String,
+}
 
 /// Approval via a draft PR on `repo` (e.g. `wseaton/llm-d-router`), branched off `base`.
 pub struct DraftPrApproval {
@@ -189,11 +196,11 @@ fn gh_raw(args: &[&str]) -> Result<Vec<u8>> {
         .output()
         .context("exec `gh` (is it installed + authed / GH_TOKEN set?)")?;
     if !out.status.success() {
-        bail!(
-            "gh {:?} failed: {}",
-            args.first().unwrap_or(&""),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+        return Err(GhFailed {
+            subcommand: args.first().unwrap_or(&"").to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+        }
+        .into());
     }
     Ok(out.stdout)
 }

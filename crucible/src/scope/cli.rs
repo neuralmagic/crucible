@@ -9,10 +9,14 @@ use crate::scope::progress::ActivityFeed;
 use crate::scope::transcript::{
     SCOPE_TRANSCRIPT_MARKER, TRANSCRIPT_CAP_BYTES, cap_transcript, gzip_transcript,
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use base64::Engine as _;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+
+#[derive(Debug, thiserror::Error)]
+#[error("--propose requires a goal source: --issue or --goal-file")]
+struct ProposeNeedsGoal;
 
 /// The prefix of the single-line scope-report marker `--marker` emits as the command's last output.
 /// The controller's WorkPod log scraper matches the same shared literal from `crucible-contract`.
@@ -176,7 +180,7 @@ pub fn run(a: ScopeArgs) -> Result<()> {
             .repo
             .context("--propose requires --repo <url|path> (the code under test)")?;
         if a.issue.is_none() && a.goal_file.is_none() {
-            bail!("--propose requires a goal source: --issue or --goal-file");
+            return Err(ProposeNeedsGoal.into());
         }
         (
             out,

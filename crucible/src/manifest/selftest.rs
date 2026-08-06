@@ -1,5 +1,9 @@
-use anyhow::{Result, bail};
+use anyhow::Result;
 use serde::Deserialize;
+
+#[derive(Debug, thiserror::Error, PartialEq)]
+#[error("[judge.selftest].runs must be >= 1, got 0")]
+pub struct ZeroSelftestRuns;
 
 /// `[judge.selftest]`: a known-good and a known-bad config, each a command that stages it into
 /// the workspace/world. Both are required once the table is present, a self-test that only
@@ -22,10 +26,10 @@ fn default_selftest_runs() -> u32 {
 
 /// Shared by [`Manifest`]/[`CompositeManifest`] validation: `[judge.selftest].runs` must be at
 /// least 1 (a mean over zero runs is meaningless).
-pub fn validate_selftest(selftest: &Option<SelftestCfg>) -> Result<()> {
+pub fn validate_selftest(selftest: &Option<SelftestCfg>) -> Result<(), ZeroSelftestRuns> {
     let Some(s) = selftest else { return Ok(()) };
     if s.runs == 0 {
-        bail!("[judge.selftest].runs must be >= 1, got 0");
+        return Err(ZeroSelftestRuns);
     }
     Ok(())
 }

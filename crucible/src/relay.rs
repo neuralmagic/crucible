@@ -24,9 +24,25 @@
 //! the workspace/repo, so tokens cannot leak into git memory or published diffs.
 
 use crate::manifest::RelayFile;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use base64::Engine;
 use std::path::Path;
+
+/// What a `[[relay]]` entry can get wrong: an ambiguous source, an out-of-vocabulary
+/// `${...}` expansion, or a producer command that failed.
+#[derive(Debug, thiserror::Error)]
+pub enum RelayError {
+    #[error("relay `{dest}` needs exactly one of `template` / `from_file` / `from_cmd`")]
+    AmbiguousSource { dest: String },
+    #[error("relay template: unknown `${{{expr}}}` (use env:, file:, file64:, or cmd:)")]
+    UnknownExpansion { expr: String },
+    #[error("relay command `{command}` failed ({status}): {stderr}")]
+    CommandFailed {
+        command: String,
+        status: std::process::ExitStatus,
+        stderr: String,
+    },
+}
 
 /// Render a relay file's content from its single source: `template` (interpolated),
 /// `from_file` (verbatim), or `from_cmd` (a host command's stdout). The OpenShell backend
@@ -40,10 +56,10 @@ pub fn render(ws: &Path, rf: &RelayFile) -> Result<String> {
         (None, None, Some(cmd)) => {
             run(ws, cmd).with_context(|| format!("running relay command for {}", rf.dest))
         }
-        _ => bail!(
-            "relay `{}` needs exactly one of `template` / `from_file` / `from_cmd`",
-            rf.dest
-        ),
+        _ => Err(RelayError::AmbiguousSource {
+            dest: rf.dest.clone(),
+        }
+        .into()),
     }
 }
 
@@ -72,7 +88,10 @@ fn interpolate(ws: &Path, tpl: &str) -> Result<String> {
         } else if let Some(cmd) = expr.strip_prefix("cmd:") {
             run(ws, cmd)?
         } else {
-            bail!("relay template: unknown `${{{expr}}}` (use env:, file:, file64:, or cmd:)");
+            return Err(RelayError::UnknownExpansion {
+                expr: expr.to_owned(),
+            }
+            .into());
         };
         out.push_str(&val);
         rest = &after[end + 1..];
@@ -110,11 +129,12 @@ fn run(ws: &Path, cmd: &str) -> Result<String> {
         .output()
         .with_context(|| format!("exec relay command `{cmd}`"))?;
     if !out.status.success() {
-        bail!(
-            "relay command `{cmd}` failed ({}): {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+        return Err(RelayError::CommandFailed {
+            command: cmd.to_owned(),
+            status: out.status,
+            stderr: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+        }
+        .into());
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }

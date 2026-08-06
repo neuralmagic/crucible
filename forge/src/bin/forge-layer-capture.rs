@@ -18,6 +18,12 @@ use forge::capture::{
 use forge::oci::{registry_of, resolve_auth};
 use std::path::PathBuf;
 
+#[derive(Debug, thiserror::Error)]
+#[error("--mount CONTAINER path must be absolute, got {container}")]
+struct RelativeMountPath {
+    container: String,
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum ExecutorArg {
     /// Probe for a working privileged mount, else fall back to the user-namespace executor.
@@ -77,7 +83,10 @@ fn parse_mount(spec: &str) -> Result<BindMount> {
         .split_once(':')
         .with_context(|| format!("--mount must be HOST:CONTAINER, got {spec}"))?;
     if !container.starts_with('/') {
-        anyhow::bail!("--mount CONTAINER path must be absolute, got {container}");
+        return Err(RelativeMountPath {
+            container: container.to_string(),
+        }
+        .into());
     }
     Ok(BindMount {
         host: PathBuf::from(host),

@@ -17,7 +17,7 @@
 use crate::Paths;
 use crate::agent::{self, AgentBackend};
 use crate::event::{AgentEvent, RawStream};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::Parser;
 use crucible_contract::Disposition;
 use serde::Deserialize;
@@ -120,61 +120,6 @@ struct RawVerdict {
     confidence: Option<String>,
 }
 
-/// `owner/repo#N` -> `(owner/repo, N)` (scope's `parse_issue` sibling).
-fn parse_issue(issue: &str) -> Result<(String, u64)> {
-    let (repo, number) = issue
-        .split_once('#')
-        .with_context(|| format!("--issue must be owner/repo#N, got {issue:?}"))?;
-    let number: u64 = number
-        .parse()
-        .with_context(|| format!("--issue number isn't a valid integer: {issue:?}"))?;
-    Ok((repo.to_string(), number))
-}
-
-/// Fetch an issue's title, body, and label names from the GitHub REST API, the grounded prompt's
-/// `{{TITLE}}`/`{{BODY}}`/`{{LABELS}}`. Honors `GITHUB_TOKEN`/`GH_TOKEN` and `GITHUB_API_URL`
-/// (GHES), the same variables `scope`'s `goal_from_issue` reads.
-fn fetch_issue(repo: &str, number: u64) -> Result<(String, String, Vec<String>)> {
-    let api = std::env::var("GITHUB_API_URL").unwrap_or_else(|_| "https://api.github.com".into());
-    let url = format!("{}/repos/{repo}/issues/{number}", api.trim_end_matches('/'));
-    let client = reqwest::blocking::Client::builder()
-        .user_agent("crucible-rank-grounded")
-        .build()
-        .context("building the GitHub API client")?;
-    let mut req = client
-        .get(&url)
-        .header("Accept", "application/vnd.github+json");
-    let token = std::env::var("GITHUB_TOKEN")
-        .or_else(|_| std::env::var("GH_TOKEN"))
-        .ok()
-        .filter(|t| !t.is_empty());
-    if let Some(token) = token {
-        req = req.bearer_auth(token);
-    }
-    let resp = req.send().with_context(|| format!("GET {url}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        bail!("GET {url} returned {status}");
-    }
-    let issue: serde_json::Value = resp
-        .json()
-        .with_context(|| format!("decoding the response from {url}"))?;
-    let title = issue["title"].as_str().unwrap_or("").to_string();
-    let body = issue["body"].as_str().unwrap_or("").to_string();
-    let labels = issue["labels"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|l| l["name"].as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
-    if title.is_empty() && body.is_empty() {
-        bail!("issue {repo}#{number} has no title or body");
-    }
-    Ok((title, body, labels))
-}
-
 fn render_prompt(title: &str, body: &str, labels: &[String]) -> String {
     RANK_GROUNDED_PROMPT
         .replace("{{TITLE}}", title)
@@ -202,9 +147,20 @@ fn git(workspace: &Path, args: &[&str]) -> Result<()> {
         .status()
         .context("running git")?;
     if !status.success() {
-        bail!("git {:?} failed ({status})", args.first().unwrap_or(&""));
+        return Err(GitFailed {
+            subcommand: args.first().unwrap_or(&"").to_string(),
+            status,
+        }
+        .into());
     }
     Ok(())
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("git {subcommand:?} failed ({status})")]
+struct GitFailed {
+    subcommand: String,
+    status: std::process::ExitStatus,
 }
 
 /// Accumulate the agent's textual output so the verdict can be scraped from its last line: streamed
@@ -286,18 +242,36 @@ fn last_balanced_block(buf: &str) -> Option<Verdict> {
     None
 }
 
+/// Why a candidate verdict line was rejected. Every arm means "skip this line", so the caller
+/// keeps scanning rather than trusting a half-formed verdict.
+#[derive(Debug, thiserror::Error)]
+enum VerdictError {
+    #[error("verdict line is not valid JSON")]
+    NotJson(#[from] serde_json::Error),
+    #[error("empty rationale")]
+    EmptyRationale,
+    #[error("unknown tier")]
+    UnknownTier(#[from] crucible_contract::TierParseError),
+    #[error("unknown confidence `{got}`")]
+    UnknownConfidence { got: String },
+}
+
 /// Parse + validate one verdict line: an unknown tier/confidence or an empty rationale is a parse
 /// error (never a silent default), so a half-formed line is skipped rather than trusted.
-fn parse_verdict(raw: &str) -> Result<Verdict> {
+fn parse_verdict(raw: &str) -> Result<Verdict, VerdictError> {
     let v: RawVerdict = serde_json::from_str(raw)?;
     if v.rationale.trim().is_empty() {
-        bail!("empty rationale");
+        return Err(VerdictError::EmptyRationale);
     }
     let disposition = Disposition::parse(&v.tier)?;
     let confidence = match v.confidence.as_deref() {
         None | Some("high") => "high",
         Some("low") => "low",
-        Some(other) => bail!("unknown confidence `{other}`"),
+        Some(other) => {
+            return Err(VerdictError::UnknownConfidence {
+                got: other.to_owned(),
+            });
+        }
     };
     Ok(Verdict {
         disposition,
@@ -386,10 +360,10 @@ fn run_grounded_turn(
 /// Drive one grounded ranking turn and return its report. Pure of process exit / printing, [`run`]
 /// owns rendering + the exit code, so tests drive this directly.
 pub fn execute(a: &RankGroundedArgs) -> Result<GroundedReport> {
-    let (repo, number) = parse_issue(&a.issue)?;
-    let (title, body, labels) = fetch_issue(&repo, number)
+    let (repo, number) = crate::issue::parse_ref(&a.issue)?;
+    let issue = crate::issue::fetch(&repo, number, "crucible-rank-grounded")
         .with_context(|| format!("fetching {} for grounded ranking", a.issue))?;
-    let prompt = render_prompt(&title, &body, &labels);
+    let prompt = render_prompt(&issue.title, &issue.body, &issue.labels);
     let (cost, buf) = run_grounded_turn(&a.workspace, &prompt, a)?;
     let over_budget = a.max_cost > 0.0 && cost > a.max_cost;
     let verdict = extract_verdict(&buf);

@@ -170,7 +170,9 @@ fn now_secs() -> u64 {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_macros)]
 mod tests {
+    // The ledger stubs below fail on purpose; a fake failure carries no error contract.
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
 

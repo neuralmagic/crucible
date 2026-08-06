@@ -27,6 +27,28 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// The one required piece of loop-pod config the broker cannot default.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "BROKER_SANDBOX_WORKDIR is not set on the loop pod (the sandbox path holding the agent's \
+     edits, e.g. /sandbox/<workspace-basename>)"
+)]
+pub(crate) struct SandboxWorkdirUnset;
+
+/// The two ways the workspace sync itself refuses, as opposed to the injected IO failing.
+/// The surrounding functions stay `anyhow`-typed: their plumbing errors are one-off contexts,
+/// these two are the contract.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SyncError {
+    #[error(
+        "sandbox tree kept changing across {attempts} sync attempts — a background process in \
+         the sandbox is still writing. Wait for it to finish (or stop it), then call the tool again"
+    )]
+    TreeUnstable { attempts: u32 },
+    #[error("openshell sandbox download failed: {stderr}")]
+    DownloadFailed { stderr: String },
+}
+
 /// Domain hook the broker runs on the synced composite tree: it builds every changed backend,
 /// rolls them live, and verifies the cross-component invariant. Env-configured so crucible-broker
 /// stays domain-agnostic.
@@ -217,10 +239,7 @@ fn verified_sync(
         eprintln!("==> sandbox tree changed during sync (attempt {attempt}/{ATTEMPTS}); retrying");
         before = after;
     }
-    anyhow::bail!(
-        "sandbox tree kept changing across {ATTEMPTS} sync attempts — a background process in the \
-         sandbox is still writing. Wait for it to finish (or stop it), then call the tool again"
-    )
+    Err(SyncError::TreeUnstable { attempts: ATTEMPTS }.into())
 }
 
 /// One `openshell sandbox download`, into a cleared staging dir so a file the agent deleted in the
@@ -244,10 +263,10 @@ fn download_sandbox(sandbox_path: &str, dest: &Path) -> Result<()> {
         .output()
         .context("running `openshell sandbox download` (is openshell on PATH?)")?;
     if !out.status.success() {
-        anyhow::bail!(
-            "openshell sandbox download failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+        return Err(SyncError::DownloadFailed {
+            stderr: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+        }
+        .into());
     }
     Ok(())
 }
@@ -352,12 +371,7 @@ pub(crate) fn sandbox_workdir() -> Result<String> {
     std::env::var("BROKER_SANDBOX_WORKDIR")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "BROKER_SANDBOX_WORKDIR is not set on the loop pod (the sandbox path holding the \
-                 agent's edits, e.g. /sandbox/<workspace-basename>)"
-            )
-        })
+        .ok_or_else(|| SandboxWorkdirUnset.into())
 }
 
 /// The driver's per-run sandbox name (`ci-<pid>-<workspace-hash>`), handed over at spawn as
@@ -424,7 +438,10 @@ pub(crate) fn json(reply: &BuildReply) -> String {
         .unwrap_or_else(|e| format!(r#"{{"status":"error","error":"{e}"}}"#))
 }
 
+// The injected-IO stubs below fail on purpose; a fake failure carries no error contract worth
+// typing, so the macro ban is lifted for the test module only.
 #[cfg(test)]
+#[allow(clippy::disallowed_macros)]
 mod tests {
     use super::*;
 

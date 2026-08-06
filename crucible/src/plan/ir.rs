@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// Task identity: cache key component, wire label, UI label. Unique within a plan.
@@ -246,6 +246,78 @@ impl ValidPlan {
     }
 }
 
+/// Everything [`Plan::validate`] can reject. Structural only: capability admission and
+/// autoresearch shape live in [`crate::manifest::WorkflowCfg`].
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub enum PlanError {
+    #[error("unsupported plan version {version}; this build supports only version 1")]
+    UnsupportedVersion { version: u32 },
+    #[error("plan declares no tasks")]
+    NoTasks,
+    #[error("plan budget.usd must be a positive number, got {usd}")]
+    NonPositiveBudget { usd: f64 },
+    #[error("task #{index} has an empty name")]
+    EmptyTaskName { index: usize },
+    #[error("duplicate task name {task:?}")]
+    DuplicateTask { task: String },
+    #[error("task {task:?} depends on itself")]
+    SelfDependency { task: String },
+    #[error("task {task:?} depends on unknown task {dependency:?}")]
+    UnknownDependency { task: String, dependency: String },
+    #[error("task {task:?} lists dependency {dependency:?} twice")]
+    RepeatedDependency { task: String, dependency: String },
+    #[error("task {task:?}: join = \"passed\" needs at least one dependency")]
+    JoinPassedWithoutDependencies { task: String },
+    #[error("task {task:?}: top_k k must be >= 1")]
+    TopKZero { task: String },
+    #[error("task {task:?}: top_k needs at least one dependency to fold")]
+    TopKWithoutDependencies { task: String },
+    #[error("task {task:?}: evaluate threshold and direction must be set together")]
+    ThresholdWithoutDirection { task: String },
+    #[error("task {task:?}: evaluate threshold must be finite")]
+    NonFiniteThreshold { task: String },
+    #[error(
+        "task {task:?}: emits is not accepted on {kind} tasks; their outputs are engine-defined"
+    )]
+    EmitsOnEngineTask { task: String, kind: &'static str },
+    #[error(
+        "task {task:?} declares invalid output field {field:?}; use 1-64 ASCII letters, digits, or `_`"
+    )]
+    InvalidOutputField { task: String, field: String },
+    #[error("task {task:?} declares output field {field:?} twice")]
+    DuplicateOutputField { task: String, field: String },
+    #[error(
+        "task {task:?}: top_k ranks by `score`, but dependency {dependency:?} declares emits without it"
+    )]
+    TopKSourceOmitsScore { task: String, dependency: String },
+    #[error("task {task:?}: grade reads `score` from {from:?}, which declares emits without it")]
+    GradeSourceOmitsScore { task: String, from: String },
+    #[error("task {task:?}: a thresholded evaluate grades `score`, but its emits omits it")]
+    ThresholdedEvaluateOmitsScore { task: String },
+    #[error(
+        "task {task:?} has invalid session {session:?}; use 1-64 ASCII letters, digits, `.`, `_`, or `-`"
+    )]
+    InvalidSessionName { task: String, session: String },
+    #[error(
+        "task {task:?} sets session, but only agent and engine propose tasks can resume an agent"
+    )]
+    SessionOnUnsupportedTask { task: String },
+    #[error(
+        "task {task:?} sets session {session:?}, but durable sessions cannot use disposable isolation"
+    )]
+    SessionWithIsolation { task: String, session: String },
+    #[error("plan has a dependency cycle involving: {}", .tasks.join(", "))]
+    DependencyCycle { tasks: Vec<String> },
+    #[error(
+        "tasks {left:?} and {right:?} share session {session:?} but are not dependency-ordered"
+    )]
+    UnorderedSession {
+        left: String,
+        right: String,
+        session: String,
+    },
+}
+
 impl Plan {
     /// Parse JSON without validating it.
     pub fn from_json_str(s: &str) -> Result<Plan> {
@@ -258,59 +330,60 @@ impl Plan {
     }
 
     /// Validate structure and compute dependency order.
-    pub fn validate(self) -> Result<ValidPlan> {
+    pub fn validate(self) -> Result<ValidPlan, PlanError> {
         if self.version != 1 {
-            bail!(
-                "unsupported plan version {}; this build supports only version 1",
-                self.version
-            );
+            return Err(PlanError::UnsupportedVersion {
+                version: self.version,
+            });
         }
         if self.tasks.is_empty() {
-            bail!("plan declares no tasks");
+            return Err(PlanError::NoTasks);
         }
         if !self.budget.usd.is_finite() || self.budget.usd <= 0.0 {
-            bail!(
-                "plan budget.usd must be a positive number, got {}",
-                self.budget.usd
-            );
+            return Err(PlanError::NonPositiveBudget {
+                usd: self.budget.usd,
+            });
         }
         let mut index: BTreeMap<&TaskName, usize> = BTreeMap::new();
         for (i, t) in self.tasks.iter().enumerate() {
             if t.name.0.trim().is_empty() {
-                bail!("task #{i} has an empty name");
+                return Err(PlanError::EmptyTaskName { index: i });
             }
             if index.insert(&t.name, i).is_some() {
-                bail!("duplicate task name {:?}", t.name.0);
+                return Err(PlanError::DuplicateTask {
+                    task: t.name.0.clone(),
+                });
             }
         }
         for t in &self.tasks {
+            let task = || t.name.0.clone();
             let mut seen = BTreeSet::new();
             for d in &t.depends_on {
                 if d == &t.name {
-                    bail!("task {:?} depends on itself", t.name.0);
+                    return Err(PlanError::SelfDependency { task: task() });
                 }
                 if !index.contains_key(d) {
-                    bail!("task {:?} depends on unknown task {:?}", t.name.0, d.0);
+                    return Err(PlanError::UnknownDependency {
+                        task: task(),
+                        dependency: d.0.clone(),
+                    });
                 }
                 if !seen.insert(d) {
-                    bail!("task {:?} lists dependency {:?} twice", t.name.0, d.0);
+                    return Err(PlanError::RepeatedDependency {
+                        task: task(),
+                        dependency: d.0.clone(),
+                    });
                 }
             }
             if t.join == Join::Passed && t.depends_on.is_empty() {
-                bail!(
-                    "task {:?}: join = \"passed\" needs at least one dependency",
-                    t.name.0
-                );
+                return Err(PlanError::JoinPassedWithoutDependencies { task: task() });
             }
             if let TaskKind::TopK { k, .. } = &t.task {
                 if *k == 0 {
-                    bail!("task {:?}: top_k k must be >= 1", t.name.0);
+                    return Err(PlanError::TopKZero { task: task() });
                 }
                 if t.depends_on.is_empty() {
-                    bail!(
-                        "task {:?}: top_k needs at least one dependency to fold",
-                        t.name.0
-                    );
+                    return Err(PlanError::TopKWithoutDependencies { task: task() });
                 }
             }
             if let TaskKind::Evaluate {
@@ -320,22 +393,18 @@ impl Plan {
             } = &t.task
             {
                 if threshold.is_some() != direction.is_some() {
-                    bail!(
-                        "task {:?}: evaluate threshold and direction must be set together",
-                        t.name.0
-                    );
+                    return Err(PlanError::ThresholdWithoutDirection { task: task() });
                 }
                 if threshold.is_some_and(|value| !value.is_finite()) {
-                    bail!("task {:?}: evaluate threshold must be finite", t.name.0);
+                    return Err(PlanError::NonFiniteThreshold { task: task() });
                 }
             }
             if !t.emits.is_empty() {
                 if matches!(t.task, TaskKind::TopK { .. } | TaskKind::Engine { .. }) {
-                    bail!(
-                        "task {:?}: emits is not accepted on {} tasks; their outputs are engine-defined",
-                        t.name.0,
-                        t.task.label()
-                    );
+                    return Err(PlanError::EmitsOnEngineTask {
+                        task: task(),
+                        kind: t.task.label(),
+                    });
                 }
                 let mut fields = BTreeSet::new();
                 for field in &t.emits {
@@ -346,18 +415,16 @@ impl Plan {
                             .chars()
                             .all(|c| c.is_ascii_alphanumeric() || c == '_')
                     {
-                        bail!(
-                            "task {:?} declares invalid output field {:?}; use 1-64 ASCII letters, digits, or `_`",
-                            t.name.0,
-                            field.0
-                        );
+                        return Err(PlanError::InvalidOutputField {
+                            task: task(),
+                            field: field.0.clone(),
+                        });
                     }
                     if !fields.insert(&field.0) {
-                        bail!(
-                            "task {:?} declares output field {:?} twice",
-                            t.name.0,
-                            field.0
-                        );
+                        return Err(PlanError::DuplicateOutputField {
+                            task: task(),
+                            field: field.0.clone(),
+                        });
                     }
                 }
             }
@@ -372,11 +439,10 @@ impl Plan {
             if matches!(t.task, TaskKind::TopK { .. }) {
                 for d in &t.depends_on {
                     if !score_declared(d) {
-                        bail!(
-                            "task {:?}: top_k ranks by `score`, but dependency {:?} declares emits without it",
-                            t.name.0,
-                            d.0
-                        );
+                        return Err(PlanError::TopKSourceOmitsScore {
+                            task: task(),
+                            dependency: d.0.clone(),
+                        });
                     }
                 }
             }
@@ -387,11 +453,10 @@ impl Plan {
             } = &t.task
                 && !score_declared(source)
             {
-                bail!(
-                    "task {:?}: grade reads `score` from {:?}, which declares emits without it",
-                    t.name.0,
-                    source.0
-                );
+                return Err(PlanError::GradeSourceOmitsScore {
+                    task: task(),
+                    from: source.0.clone(),
+                });
             }
             if let TaskKind::Evaluate {
                 threshold: Some(_), ..
@@ -399,10 +464,7 @@ impl Plan {
                 && !t.emits.is_empty()
                 && !t.emits.iter().any(|f| f.0 == "score")
             {
-                bail!(
-                    "task {:?}: a thresholded evaluate grades `score`, but its emits omits it",
-                    t.name.0
-                );
+                return Err(PlanError::ThresholdedEvaluateOmitsScore { task: task() });
             }
             if let Some(session) = &t.session {
                 if session.is_empty()
@@ -411,11 +473,10 @@ impl Plan {
                         .chars()
                         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
                 {
-                    bail!(
-                        "task {:?} has invalid session {:?}; use 1-64 ASCII letters, digits, `.`, `_`, or `-`",
-                        t.name.0,
-                        session
-                    );
+                    return Err(PlanError::InvalidSessionName {
+                        task: task(),
+                        session: session.clone(),
+                    });
                 }
                 if !matches!(
                     t.task,
@@ -425,17 +486,13 @@ impl Plan {
                             ..
                         }
                 ) {
-                    bail!(
-                        "task {:?} sets session, but only agent and engine propose tasks can resume an agent",
-                        t.name.0
-                    );
+                    return Err(PlanError::SessionOnUnsupportedTask { task: task() });
                 }
                 if t.isolation.is_some() {
-                    bail!(
-                        "task {:?} sets session {:?}, but durable sessions cannot use disposable isolation",
-                        t.name.0,
-                        session
-                    );
+                    return Err(PlanError::SessionWithIsolation {
+                        task: task(),
+                        session: session.clone(),
+                    });
                 }
             }
         }
@@ -467,14 +524,12 @@ impl Plan {
             }
         }
         if topo.len() != n {
-            let stuck: Vec<&str> = (0..n)
-                .filter(|&i| indegree[i] > 0)
-                .map(|i| self.tasks[i].name.0.as_str())
-                .collect();
-            bail!(
-                "plan has a dependency cycle involving: {}",
-                stuck.join(", ")
-            );
+            return Err(PlanError::DependencyCycle {
+                tasks: (0..n)
+                    .filter(|&i| indegree[i] > 0)
+                    .map(|i| self.tasks[i].name.0.clone())
+                    .collect(),
+            });
         }
         // One native conversation is serial, so shared sessions require an ordering path.
         let reaches = |from: usize, to: usize| {
@@ -503,12 +558,11 @@ impl Plan {
             for (offset, left) in tasks.iter().enumerate() {
                 for right in &tasks[offset + 1..] {
                     if !reaches(*left, *right) && !reaches(*right, *left) {
-                        bail!(
-                            "tasks {:?} and {:?} share session {:?} but are not dependency-ordered",
-                            self.tasks[*left].name.0,
-                            self.tasks[*right].name.0,
-                            session
-                        );
+                        return Err(PlanError::UnorderedSession {
+                            left: self.tasks[*left].name.0.clone(),
+                            right: self.tasks[*right].name.0.clone(),
+                            session: session.to_owned(),
+                        });
                     }
                 }
             }
@@ -581,19 +635,30 @@ mod tests {
         let err = plan(vec![agent("a", &[]), agent("a", &[])])
             .validate()
             .unwrap_err();
-        assert!(err.to_string().contains("duplicate task name"));
+        assert!(matches!(err, PlanError::DuplicateTask { task } if task == "a"));
     }
 
     #[test]
     fn unknown_dependency_rejected() {
         let err = plan(vec![agent("a", &["ghost"])]).validate().unwrap_err();
-        assert!(err.to_string().contains("unknown task"));
+        assert_eq!(
+            err,
+            PlanError::UnknownDependency {
+                task: "a".to_owned(),
+                dependency: "ghost".to_owned(),
+            }
+        );
     }
 
     #[test]
     fn self_dependency_rejected() {
         let err = plan(vec![agent("a", &["a"])]).validate().unwrap_err();
-        assert!(err.to_string().contains("depends on itself"));
+        assert_eq!(
+            err,
+            PlanError::SelfDependency {
+                task: "a".to_owned()
+            }
+        );
     }
 
     #[test]
@@ -601,9 +666,10 @@ mod tests {
         let err = plan(vec![agent("a", &["b"]), agent("b", &["a"])])
             .validate()
             .unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("cycle"));
-        assert!(msg.contains('a') && msg.contains('b'));
+        let PlanError::DependencyCycle { tasks } = err else {
+            panic!("expected a cycle, got {err}");
+        };
+        assert_eq!(tasks, vec!["a".to_owned(), "b".to_owned()]);
     }
 
     #[test]
@@ -611,8 +677,10 @@ mod tests {
         for version in [0, 2, u32::MAX] {
             let mut p = plan(vec![agent("a", &[])]);
             p.version = version;
-            let err = p.validate().unwrap_err();
-            assert!(err.to_string().contains("supports only version 1"));
+            assert_eq!(
+                p.validate().unwrap_err(),
+                PlanError::UnsupportedVersion { version }
+            );
         }
     }
 
@@ -627,11 +695,24 @@ mod tests {
         let mut racing = agent("racing", &[]);
         racing.session = Some("solver".into());
         let err = plan(vec![first.clone(), racing]).validate().unwrap_err();
-        assert!(err.to_string().contains("not dependency-ordered"));
+        assert_eq!(
+            err,
+            PlanError::UnorderedSession {
+                left: "first".to_owned(),
+                right: "racing".to_owned(),
+                session: "solver".to_owned(),
+            }
+        );
 
         first.isolation = Some(Isolation::Worktree);
         let err = plan(vec![first]).validate().unwrap_err();
-        assert!(err.to_string().contains("cannot use disposable isolation"));
+        assert_eq!(
+            err,
+            PlanError::SessionWithIsolation {
+                task: "first".to_owned(),
+                session: "solver".to_owned(),
+            }
+        );
     }
 
     #[test]
@@ -661,7 +742,12 @@ mod tests {
             emits: Vec::new(),
         };
         let err = plan(vec![t]).validate().unwrap_err();
-        assert!(err.to_string().contains("at least one dependency"));
+        assert_eq!(
+            err,
+            PlanError::TopKWithoutDependencies {
+                task: "pick".to_owned()
+            }
+        );
     }
 
     #[test]
@@ -788,14 +874,20 @@ mod tests {
                 .validate()
                 .unwrap_err();
             assert!(
-                err.to_string().contains("invalid output field"),
+                matches!(err, PlanError::InvalidOutputField { ref field, .. } if field == bad),
                 "{bad:?}: {err}"
             );
         }
         let err = plan(vec![emitting("a", &[], &["score", "score"])])
             .validate()
             .unwrap_err();
-        assert!(err.to_string().contains("twice"));
+        assert_eq!(
+            err,
+            PlanError::DuplicateOutputField {
+                task: "a".to_owned(),
+                field: "score".to_owned(),
+            }
+        );
         assert!(
             plan(vec![emitting("a", &[], &["score", "pass", "note_1"])])
                 .validate()
@@ -808,7 +900,13 @@ mod tests {
         let mut pick = top_k("pick", &["a"]);
         pick.emits = vec![OutputField("kept".into())];
         let err = plan(vec![agent("a", &[]), pick]).validate().unwrap_err();
-        assert!(err.to_string().contains("engine-defined"), "{err}");
+        assert_eq!(
+            err,
+            PlanError::EmitsOnEngineTask {
+                task: "pick".to_owned(),
+                kind: "top_k",
+            }
+        );
 
         let mut measure = agent("measure", &[]);
         measure.task = TaskKind::Engine {
@@ -818,7 +916,7 @@ mod tests {
         };
         measure.emits = vec![OutputField("score".into())];
         let err = plan(vec![measure]).validate().unwrap_err();
-        assert!(err.to_string().contains("engine-defined"), "{err}");
+        assert!(matches!(err, PlanError::EmitsOnEngineTask { .. }), "{err}");
     }
 
     #[test]
@@ -829,9 +927,12 @@ mod tests {
         ])
         .validate()
         .unwrap_err();
-        assert!(
-            err.to_string().contains("declares emits without it"),
-            "{err}"
+        assert_eq!(
+            err,
+            PlanError::TopKSourceOmitsScore {
+                task: "pick".to_owned(),
+                dependency: "m".to_owned(),
+            }
         );
 
         assert!(
@@ -862,7 +963,13 @@ mod tests {
             tiebreak: None,
         };
         let err = plan(vec![source, grade]).validate().unwrap_err();
-        assert!(err.to_string().contains("grade reads `score`"), "{err}");
+        assert_eq!(
+            err,
+            PlanError::GradeSourceOmitsScore {
+                task: "grade".to_owned(),
+                from: "score".to_owned(),
+            }
+        );
     }
 
     #[test]
@@ -874,7 +981,12 @@ mod tests {
             direction: Some(Direction::Lower),
         };
         let err = plan(vec![t.clone()]).validate().unwrap_err();
-        assert!(err.to_string().contains("thresholded evaluate"), "{err}");
+        assert_eq!(
+            err,
+            PlanError::ThresholdedEvaluateOmitsScore {
+                task: "latency".to_owned()
+            }
+        );
 
         t.emits.push(OutputField("score".into()));
         assert!(plan(vec![t]).validate().is_ok());

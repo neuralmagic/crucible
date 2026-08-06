@@ -5,6 +5,7 @@
 //! front-end, and calls [`crate::loop_driver::run_loop`].
 
 use crate::crucible::{Judge, World};
+use crate::errors::FileError;
 use crate::loop_driver::{LoopRuntime, run_loop};
 use crate::recovery::{RecoveryPlan, ResumeRecovery, classify_session, plan_recovery};
 use crate::{Args, Cli, Cmd, Paths, Prepared, STOP, Ui};
@@ -16,6 +17,55 @@ use anyhow::{Context, Result};
 use crucible_vcs::vcs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
+
+/// The run layer's own failures: CLI-flag combinations the parser can't express, workspace
+/// setup, and the manifest fields a run needs. Causes hang off `source()`; the top-level
+/// dispatch turns these into anyhow errors so the CLI prints the whole chain.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RunError {
+    #[error("watch-pr needs exactly one of --control-addr or --reseed")]
+    WatchPrNoSink,
+    #[error("watch-pr takes exactly one of --control-addr or --reseed, not both")]
+    WatchPrTwoSinks,
+    #[error("[agent].backend must be local|openshell|command, got {got:?}")]
+    UnknownAgentBackend { got: String },
+    #[error("running setup_cmd: {cmd}")]
+    SpawnSetupCmd {
+        cmd: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("setup_cmd failed ({status}): {cmd}")]
+    SetupCmdFailed {
+        cmd: String,
+        status: std::process::ExitStatus,
+    },
+    #[error("[repo] needs url or path (or give [workspace].setup_cmd)")]
+    NoRepoSource,
+    #[error("git clone")]
+    SpawnGitClone(#[source] std::io::Error),
+    #[error("git clone {src} -> {} failed", .dest.display())]
+    GitCloneFailed { src: String, dest: PathBuf },
+    #[error("manifest [agent] needs `goal` or `goal_file` (or pass --goal)")]
+    NoGoal,
+    #[error("--control-port requires --ui stream (or --resume)")]
+    ControlPortNeedsStream,
+    #[error("resume: {message}")]
+    ResumeRefused { message: String },
+    #[error(
+        "[agent].toolbox_exclude names `{name}`, but no such skill dir exists under {}",
+        .skills.display()
+    )]
+    UnknownToolboxExclude { name: String, skills: PathBuf },
+    #[error("failed to copy skill {}", .skill.display())]
+    CopySkill {
+        skill: PathBuf,
+        #[source]
+        source: fs_extra::error::Error,
+    },
+    #[error(transparent)]
+    File(#[from] FileError),
+}
 
 /// Route the parsed CLI: subcommands run standalone; everything else is a manifest run.
 pub(crate) fn dispatch(cli: Cli) -> Result<()> {
@@ -77,12 +127,8 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
         let sink = match (control_addr, reseed) {
             (Some(addr), None) => crate::pr_watch::Sink::Steer(addr),
             (None, Some(path)) => crate::pr_watch::Sink::Reseed(path),
-            (None, None) => {
-                anyhow::bail!("watch-pr needs exactly one of --control-addr or --reseed")
-            }
-            (Some(_), Some(_)) => {
-                anyhow::bail!("watch-pr takes exactly one of --control-addr or --reseed, not both")
-            }
+            (None, None) => return Err(RunError::WatchPrNoSink.into()),
+            (Some(_), Some(_)) => return Err(RunError::WatchPrTwoSinks.into()),
         };
         let opts = crate::pr_watch::WatchOpts {
             poll: std::time::Duration::from_secs(poll_secs),
@@ -234,12 +280,14 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
     run_from_manifest(cli.run)
 }
 
-fn parse_backend(s: &str) -> Result<agent::AgentBackend> {
+fn parse_backend(s: &str) -> Result<agent::AgentBackend, RunError> {
     match s {
         "local" => Ok(agent::AgentBackend::Local),
         "openshell" => Ok(agent::AgentBackend::Openshell),
         "command" => Ok(agent::AgentBackend::Command),
-        other => anyhow::bail!("[agent].backend must be local|openshell|command, got {other:?}"),
+        other => Err(RunError::UnknownAgentBackend {
+            got: other.to_owned(),
+        }),
     }
 }
 
@@ -249,16 +297,22 @@ pub(crate) fn manifest_setup(
     m: &manifest::Manifest,
     manifest_dir: &Path,
     workspace: &Path,
-) -> Result<()> {
+) -> Result<(), RunError> {
     if let Some(cmd) = &m.workspace.setup_cmd {
         let status = std::process::Command::new("sh")
             .arg("-c")
             .arg(cmd)
             .current_dir(manifest_dir)
             .status()
-            .with_context(|| format!("running setup_cmd: {cmd}"))?;
+            .map_err(|source| RunError::SpawnSetupCmd {
+                cmd: cmd.clone(),
+                source,
+            })?;
         if !status.success() {
-            anyhow::bail!("setup_cmd failed ({status}): {cmd}");
+            return Err(RunError::SetupCmdFailed {
+                cmd: cmd.clone(),
+                status,
+            });
         }
         return Ok(());
     }
@@ -267,20 +321,23 @@ pub(crate) fn manifest_setup(
         .url
         .clone()
         .or_else(|| m.repo.path.clone())
-        .context("[repo] needs url or path (or give [workspace].setup_cmd)")?;
+        .ok_or(RunError::NoRepoSource)?;
     clone_repo(&src, m.repo.git_ref.as_deref(), workspace)
 }
 
 /// `git clone <src> <dest>` then optional `checkout <ref>`. The default-setup primitive, shared by the
 /// single-domain `manifest_setup` and the per-component composite checkout.
-pub(crate) fn clone_repo(src: &str, git_ref: Option<&str>, dest: &Path) -> Result<()> {
+pub(crate) fn clone_repo(src: &str, git_ref: Option<&str>, dest: &Path) -> Result<(), RunError> {
     let ok = std::process::Command::new("git")
         .args(["clone", src, &dest.to_string_lossy()])
         .status()
-        .context("git clone")?
+        .map_err(RunError::SpawnGitClone)?
         .success();
     if !ok {
-        anyhow::bail!("git clone {src} -> {} failed", dest.display());
+        return Err(RunError::GitCloneFailed {
+            src: src.to_owned(),
+            dest: dest.to_path_buf(),
+        });
     }
     if let Some(r) = git_ref {
         let _ = std::process::Command::new("git")
@@ -590,25 +647,26 @@ fn resolve_goal_template(
     args: &Args,
     agent: &manifest::AgentCfg,
     manifest_dir: &Path,
-) -> Result<(String, String)> {
+) -> Result<(String, String), RunError> {
     let goal = if let Some(g) = &args.goal {
         g.clone()
     } else if let Some(f) = &args.goal_file {
-        std::fs::read_to_string(f)
-            .with_context(|| format!("reading --goal-file {}", f.display()))?
+        std::fs::read_to_string(f).map_err(FileError::at("reading --goal-file", f))?
     } else {
         match (&agent.goal, &agent.goal_file) {
             (Some(g), _) => g.clone(),
-            (None, Some(f)) => std::fs::read_to_string(manifest_dir.join(f))
-                .with_context(|| format!("reading goal_file {f}"))?,
-            (None, None) => {
-                anyhow::bail!("manifest [agent] needs `goal` or `goal_file` (or pass --goal)")
+            (None, Some(f)) => {
+                let path = manifest_dir.join(f);
+                std::fs::read_to_string(&path).map_err(FileError::at("reading goal_file", &path))?
             }
+            (None, None) => return Err(RunError::NoGoal),
         }
     };
     let template = match &agent.method_prompt {
-        Some(mp) => std::fs::read_to_string(manifest_dir.join(mp))
-            .with_context(|| format!("reading method_prompt {mp}"))?,
+        Some(mp) => {
+            let path = manifest_dir.join(mp);
+            std::fs::read_to_string(&path).map_err(FileError::at("reading method_prompt", &path))?
+        }
         None => "{{GOAL}}\n\nStatus: {{STATUS}}\n{{STEER}}".to_string(),
     };
     Ok((goal, template))
@@ -626,7 +684,7 @@ fn drive_loop(
     let mut args = args;
     install_ctrlc()?;
     if args.control_port.is_some() && !args.resume && args.ui != Ui::Stream {
-        anyhow::bail!("--control-port requires --ui stream (or --resume)");
+        return Err(RunError::ControlPortNeedsStream.into());
     }
 
     if workflow_implies_graph_loop(&args) {
@@ -652,7 +710,9 @@ fn drive_loop(
                     eprintln!("resume: {message}");
                     return Ok(());
                 }
-                RecoveryPlan::Refuse { message } => anyhow::bail!("resume: {message}"),
+                RecoveryPlan::Refuse { message } => {
+                    return Err(RunError::ResumeRefused { message }.into());
+                }
                 RecoveryPlan::Continue {
                     repark,
                     pending_regime,
@@ -846,22 +906,29 @@ fn open_admission_ledger(
 /// never see, see [`manifest::AgentCfg::toolbox_exclude`]. A name in `exclude` that doesn't
 /// exist under the toolbox dir is a manifest bug (the exclusion is silently doing nothing), so
 /// it's an error rather than a warning.
-pub(crate) fn install_toolbox(p: &Paths, exclude: &[String], skills_dir: &str) -> Result<()> {
+pub(crate) fn install_toolbox(
+    p: &Paths,
+    exclude: &[String],
+    skills_dir: &str,
+) -> Result<(), RunError> {
     let Some(src) = &p.skills else {
         return Ok(());
     };
     for name in exclude {
         if !src.join(name).is_dir() {
-            anyhow::bail!(
-                "[agent].toolbox_exclude names `{name}`, but no such skill dir exists under {}",
-                src.display()
-            );
+            return Err(RunError::UnknownToolboxExclude {
+                name: name.clone(),
+                skills: src.clone(),
+            });
         }
     }
     let dst = p.workspace.join(skills_dir);
-    std::fs::create_dir_all(&dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let skill = entry?.path();
+    std::fs::create_dir_all(&dst).map_err(FileError::at("creating the toolbox dir", &dst))?;
+    let entries = std::fs::read_dir(src).map_err(FileError::at("reading the skills dir", src))?;
+    for entry in entries {
+        let skill = entry
+            .map_err(FileError::at("reading the skills dir", src))?
+            .path();
         if skill.is_dir() {
             let Some(name) = skill.file_name() else {
                 continue;
@@ -871,8 +938,10 @@ pub(crate) fn install_toolbox(p: &Paths, exclude: &[String], skills_dir: &str) -
             }
             let _ = std::fs::remove_dir_all(dst.join(name));
             let opts = fs_extra::dir::CopyOptions::new().overwrite(true);
-            fs_extra::dir::copy(&skill, &dst, &opts)
-                .with_context(|| format!("failed to copy skill {}", skill.display()))?;
+            fs_extra::dir::copy(&skill, &dst, &opts).map_err(|source| RunError::CopySkill {
+                skill: skill.clone(),
+                source,
+            })?;
         }
     }
     Ok(())

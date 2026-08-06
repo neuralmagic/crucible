@@ -14,7 +14,7 @@ use crate::scope::pack::{
 };
 use crate::scope::progress::{ActivityFeed, emit_progress};
 use crate::scope::transcript::{transcript_event, transcript_note, write_seed_context};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -61,6 +61,94 @@ impl ProposeTier {
             ProposeTier::T1 => "t1",
         }
     }
+}
+
+/// Why a scope stage refused. The [`Stage`] trait stays `anyhow`-typed (stages are
+/// heterogeneous and each carries its own plumbing errors); these are the pipeline's own
+/// rejections, so the refine/review verdicts are values a caller can match instead of prose.
+#[derive(Debug, thiserror::Error)]
+pub(super) enum ScopeError {
+    #[error(
+        "scope refine stopped before round {round} for {}: cumulative turn cost ${total_cost:.4} \
+         already meets --max-cost ${max_cost:.2}, budget exhausted; last failure: {summary}",
+        .pack.display()
+    )]
+    RefineBudgetSpent {
+        round: u32,
+        pack: PathBuf,
+        total_cost: f64,
+        max_cost: f64,
+        summary: String,
+    },
+    #[error(
+        "scope refine exhausted {rounds_max} round(s) without a discriminating gate for {} \
+         (total turn cost ${total_cost:.4}); last failure: {summary}",
+        .pack.display()
+    )]
+    RefineExhausted {
+        rounds_max: u32,
+        pack: PathBuf,
+        total_cost: f64,
+        summary: String,
+    },
+    #[error("proposer declined this issue: {reason}")]
+    ProposerDeclined { reason: String },
+    #[error(
+        "the frozen pack failed re-validation after the freeze rewrite for {}: {evidence}",
+        .pack.display()
+    )]
+    FrozenPackInvalid { pack: PathBuf, evidence: String },
+    #[error(
+        "scope gaming review produced no parseable verdict{stage} for {} \
+         (total turn cost ${total_cost:.4}): {detail}",
+        .pack.display()
+    )]
+    ReviewVerdictUnparseable {
+        stage: String,
+        pack: PathBuf,
+        total_cost: f64,
+        detail: String,
+    },
+    #[error(
+        "scope gaming review still found concerns after {cycles_max} refine round(s) for {} \
+         (total turn cost ${total_cost:.4})",
+        .pack.display()
+    )]
+    ReviewConcernsRemain {
+        cycles_max: u32,
+        pack: PathBuf,
+        total_cost: f64,
+    },
+    #[error(
+        "scope gaming review found concerns for {} but the budget is exhausted (cumulative turn \
+         cost ${total_cost:.4} already meets --max-cost ${max_cost:.2}) — no refine round",
+        .pack.display()
+    )]
+    ReviewBudgetSpent {
+        pack: PathBuf,
+        total_cost: f64,
+        max_cost: f64,
+    },
+    #[error(
+        "scope gaming review's refine round {round} failed validation for {} \
+         (total turn cost ${total_cost:.4}): {evidence}",
+        .pack.display()
+    )]
+    ReviewRefineFailed {
+        round: u32,
+        pack: PathBuf,
+        total_cost: f64,
+        evidence: String,
+    },
+    #[error("{detail}")]
+    CheckFailed { detail: String },
+    #[error("{} already exists (pass --force to overwrite)", .path.display())]
+    ScopeReportExists { path: PathBuf },
+    #[error(
+        "neither --issue, --goal-file, nor the pack manifest's [agent].goal/goal_file \
+         resolved a goal"
+    )]
+    NoGoalResolved,
 }
 
 /// One stage's result, independent of how the pipeline renders it (console lines or one JSON
@@ -115,7 +203,7 @@ impl Stage for Ingest {
 
     fn run(&self, ctx: &mut ScopeCtx) -> Result<String> {
         let (goal, source) = if let Some(issue) = &self.issue {
-            let (repo, number) = parse_issue(issue)?;
+            let (repo, number) = crate::issue::parse_ref(issue)?;
             (goal_from_issue(&repo, number)?, format!("--issue {issue}"))
         } else if let Some(f) = &self.goal_file {
             let goal = std::fs::read_to_string(f)
@@ -232,13 +320,14 @@ impl Propose {
                     .as_ref()
                     .map(FailureEvidence::describe)
                     .unwrap_or_else(|| "no evidence captured".to_string());
-                bail!(
-                    "scope refine stopped before round {round} for {}: cumulative turn cost \
-                     ${total_cost:.4} already meets --max-cost ${:.2}, budget exhausted; last \
-                     failure: {summary}",
-                    ctx.pack.display(),
-                    self.opts.max_cost
-                );
+                return Err(ScopeError::RefineBudgetSpent {
+                    round,
+                    pack: ctx.pack.clone(),
+                    total_cost,
+                    max_cost: self.opts.max_cost,
+                    summary,
+                }
+                .into());
             }
             let kind = if round == 1 {
                 RoundKind::Propose
@@ -295,7 +384,10 @@ impl Propose {
             let rejected = ctx.pack.join("REJECTED.md");
             if rejected.exists() {
                 let reason = std::fs::read_to_string(&rejected).unwrap_or_default();
-                bail!("proposer declined this issue: {}", reason.trim());
+                return Err(ScopeError::ProposerDeclined {
+                    reason: reason.trim().to_owned(),
+                }
+                .into());
             }
 
             let judge_block = read_judge_block(&ctx.manifest_path);
@@ -336,11 +428,13 @@ impl Propose {
             .as_ref()
             .map(FailureEvidence::describe)
             .unwrap_or_else(|| "no evidence captured".to_string());
-        bail!(
-            "scope refine exhausted {rounds_max} round(s) without a discriminating gate for {} \
-             (total turn cost ${total_cost:.4}); last failure: {summary}",
-            ctx.pack.display()
-        )
+        Err(ScopeError::RefineExhausted {
+            rounds_max,
+            pack: ctx.pack.clone(),
+            total_cost,
+            summary,
+        }
+        .into())
     }
 
     /// The between-rounds budget gate: with `--max-cost` set, another agent turn never starts
@@ -394,11 +488,13 @@ impl Propose {
         // doesn't need). A failure here is a rewrite bug, fail the scope loudly, never ship it.
         match compile_and_validate_round(&ctx.manifest_path) {
             RoundVerdict::Passed(outcome) => ctx.check_outcome = Some(outcome),
-            RoundVerdict::Failed(evidence) => bail!(
-                "the frozen pack failed re-validation after the freeze rewrite for {}: {}",
-                ctx.pack.display(),
-                evidence.describe()
-            ),
+            RoundVerdict::Failed(evidence) => {
+                return Err(ScopeError::FrozenPackInvalid {
+                    pack: ctx.pack.clone(),
+                    evidence: evidence.describe(),
+                }
+                .into());
+            }
         }
 
         // De-prescribe the shipped pack: the self-test has already run (during the re-validation
@@ -456,12 +552,13 @@ impl Propose {
                         review_round,
                         &format!("the {note_stage} turn produced no parseable verdict: {detail}"),
                     );
-                    bail!(
-                        "scope gaming review produced no parseable verdict{bail_stage} for {} \
-                         (total turn cost ${:.4}): {detail}",
-                        ctx.pack.display(),
-                        *total_cost
-                    )
+                    return Err(ScopeError::ReviewVerdictUnparseable {
+                        stage: bail_stage.to_string(),
+                        pack: ctx.pack.clone(),
+                        total_cost: *total_cost,
+                        detail,
+                    }
+                    .into());
                 }
                 AdversaryOutcome::Concerns(attacks) => attacks,
             };
@@ -469,22 +566,21 @@ impl Propose {
             let evidence = FailureEvidence::Adversary { attacks };
             if refines_done >= cycles_max {
                 write_rejection(ctx, review_round, Some(&evidence));
-                bail!(
-                    "scope gaming review still found concerns after {cycles_max} refine round(s) \
-                     for {} (total turn cost ${:.4})",
-                    ctx.pack.display(),
-                    *total_cost
-                )
+                return Err(ScopeError::ReviewConcernsRemain {
+                    cycles_max,
+                    pack: ctx.pack.clone(),
+                    total_cost: *total_cost,
+                }
+                .into());
             }
             if self.budget_exhausted(*total_cost) {
                 write_rejection(ctx, review_round, Some(&evidence));
-                bail!(
-                    "scope gaming review found concerns for {} but the budget is exhausted \
-                     (cumulative turn cost ${:.4} already meets --max-cost ${:.2}) — no refine round",
-                    ctx.pack.display(),
-                    *total_cost,
-                    self.opts.max_cost
-                );
+                return Err(ScopeError::ReviewBudgetSpent {
+                    pack: ctx.pack.clone(),
+                    total_cost: *total_cost,
+                    max_cost: self.opts.max_cost,
+                }
+                .into());
             }
 
             let refine_round = review_round + 1;
@@ -522,7 +618,10 @@ impl Propose {
             let rejected = ctx.pack.join("REJECTED.md");
             if rejected.exists() {
                 let reason = std::fs::read_to_string(&rejected).unwrap_or_default();
-                bail!("proposer declined this issue: {}", reason.trim());
+                return Err(ScopeError::ProposerDeclined {
+                    reason: reason.trim().to_owned(),
+                }
+                .into());
             }
 
             let judge_block = read_judge_block(&ctx.manifest_path);
@@ -538,13 +637,13 @@ impl Propose {
                         },
                     });
                     write_rejection(ctx, refine_round, Some(&ev));
-                    bail!(
-                        "scope gaming review's refine round {refine_round} failed validation for \
-                         {} (total turn cost ${:.4}): {}",
-                        ctx.pack.display(),
-                        *total_cost,
-                        ev.describe()
-                    )
+                    return Err(ScopeError::ReviewRefineFailed {
+                        round: refine_round,
+                        pack: ctx.pack.clone(),
+                        total_cost: *total_cost,
+                        evidence: ev.describe(),
+                    }
+                    .into());
                 }
                 RoundVerdict::Passed(outcome) => {
                     ctx.refine_rounds.push(RoundRecord {
@@ -722,7 +821,10 @@ fn compile_and_validate_round(manifest_path: &Path) -> RoundVerdict {
     }
     if let Err(error) = crate::plan::starlark::materialize_sibling_manifest(manifest_path) {
         return RoundVerdict::Failed(FailureEvidence::Structure {
-            detail: format!("workflow.star did not compile into [[workflow.task]]: {error:#}"),
+            detail: format!(
+                "workflow.star did not compile into [[workflow.task]]: {}",
+                crate::errors::report(&error)
+            ),
         });
     }
     let m = match manifest::Manifest::load(manifest_path) {
@@ -941,7 +1043,7 @@ impl Stage for Validate {
             detail.push_str(&format!(" (warnings: {})", outcome.warnings.join("; ")));
         }
         if !ok {
-            bail!("{detail}");
+            return Err(ScopeError::CheckFailed { detail }.into());
         }
         let (width, height) = render_workflow_preview(&ctx.manifest_path, &ctx.pack)?;
         detail.push_str(&format!(
@@ -1002,10 +1104,7 @@ impl Stage for Freeze {
     fn run(&self, ctx: &mut ScopeCtx) -> Result<String> {
         let scope_md = ctx.pack.join("SCOPE.md");
         if scope_md.exists() && !self.force {
-            bail!(
-                "{} already exists (pass --force to overwrite)",
-                scope_md.display()
-            );
+            return Err(ScopeError::ScopeReportExists { path: scope_md }.into());
         }
         let identity = compute_identity(&ctx.manifest_path)?;
         let body = render_scope_md(ctx, &identity);
@@ -1017,51 +1116,10 @@ impl Stage for Freeze {
     }
 }
 
-/// `--issue owner/repo#N` -> `(owner/repo, N)`.
-fn parse_issue(issue: &str) -> Result<(String, u64)> {
-    let (repo, number) = issue
-        .split_once('#')
-        .with_context(|| format!("--issue must be owner/repo#N, got {issue:?}"))?;
-    let number: u64 = number
-        .parse()
-        .with_context(|| format!("--issue number isn't a valid integer: {issue:?}"))?;
-    Ok((repo.to_string(), number))
-}
-
-/// Fetch the issue from the GitHub REST API and return `# title\n\nbody` as the goal text.
-/// Honors `GITHUB_TOKEN`/`GH_TOKEN` for private repos and rate limits (unauthenticated works
-/// for public repos), and `GITHUB_API_URL` for GHES, the same variables Actions sets.
-fn goal_from_issue(repo: &str, number: u64) -> Result<String> {
-    let api = std::env::var("GITHUB_API_URL").unwrap_or_else(|_| "https://api.github.com".into());
-    let url = format!("{}/repos/{repo}/issues/{number}", api.trim_end_matches('/'));
-    let client = reqwest::blocking::Client::builder()
-        .user_agent("crucible-scope")
-        .build()
-        .context("building the GitHub API client")?;
-    let mut req = client
-        .get(&url)
-        .header("Accept", "application/vnd.github+json");
-    let token = std::env::var("GITHUB_TOKEN")
-        .or_else(|_| std::env::var("GH_TOKEN"))
-        .ok()
-        .filter(|t| !t.is_empty());
-    if let Some(token) = token {
-        req = req.bearer_auth(token);
-    }
-    let resp = req.send().with_context(|| format!("GET {url}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        bail!("GET {url} returned {status}");
-    }
-    let issue: serde_json::Value = resp
-        .json()
-        .with_context(|| format!("decoding the response from {url}"))?;
-    let title = issue["title"].as_str().unwrap_or("");
-    let body = issue["body"].as_str().unwrap_or("");
-    if title.is_empty() && body.is_empty() {
-        bail!("issue {repo}#{number} has no title or body");
-    }
-    Ok(format!("# {title}\n\n{body}\n"))
+/// The goal text for `--issue`: `# title\n\nbody`.
+fn goal_from_issue(repo: &str, number: u64) -> Result<String, crate::issue::IssueError> {
+    let issue = crate::issue::fetch(repo, number, "crucible-scope")?;
+    Ok(format!("# {}\n\n{}\n", issue.title, issue.body))
 }
 
 /// Fall back to the pack manifest's own `[agent].goal`/`goal_file` (composite and single-domain
@@ -1076,10 +1134,7 @@ fn manifest_goal(manifest_path: &Path) -> Result<(String, String)> {
                 .with_context(|| format!("reading pack manifest goal_file {f}"))?;
             Ok((goal, format!("pack manifest [agent].goal_file {f}")))
         }
-        (None, None) => bail!(
-            "neither --issue, --goal-file, nor the pack manifest's [agent].goal/goal_file \
-             resolved a goal"
-        ),
+        (None, None) => Err(ScopeError::NoGoalResolved.into()),
     }
 }
 

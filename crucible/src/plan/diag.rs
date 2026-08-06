@@ -20,11 +20,13 @@ pub(crate) fn suggest<'a>(
     best.map(|(_, candidate)| candidate)
 }
 
-/// Append `; did you mean "x"?` when a suggestion exists.
-pub(crate) fn with_suggestion(message: String, suggestion: Option<&str>) -> String {
+/// The `; did you mean "x"?` suffix an error message appends, empty when there is no
+/// suggestion. Errors carry the raw `Option` and render it here, so the suggestion stays
+/// a field rather than being baked into a pre-formatted string.
+pub(crate) fn hint(suggestion: Option<&str>) -> String {
     match suggestion {
-        Some(candidate) => format!("{message}; did you mean {candidate:?}?"),
-        None => message,
+        Some(candidate) => format!("; did you mean {candidate:?}?"),
+        None => String::new(),
     }
 }
 
@@ -76,17 +78,8 @@ mod tests {
     }
 
     #[test]
-    fn with_suggestion_appends_only_when_present() {
-        assert_eq!(
-            with_suggestion(
-                "unknown argument \"depend_on\"".to_string(),
-                Some("depends_on")
-            ),
-            "unknown argument \"depend_on\"; did you mean \"depends_on\"?"
-        );
-        assert_eq!(
-            with_suggestion("unknown argument \"zzz\"".to_string(), None),
-            "unknown argument \"zzz\""
-        );
+    fn hint_renders_only_when_present() {
+        assert_eq!(hint(Some("depends_on")), "; did you mean \"depends_on\"?");
+        assert_eq!(hint(None), "");
     }
 }

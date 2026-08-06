@@ -11,6 +11,13 @@ use crucible_contract::admission::AdmissionKey;
 use std::io::BufRead;
 use std::path::Path;
 
+#[derive(Debug, thiserror::Error)]
+#[error("session log {} has no rows to resume from ({class})", .path.display())]
+struct EmptySessionLog {
+    path: std::path::PathBuf,
+    class: String,
+}
+
 /// Evidence scraped from a dangling turn's Agent events; retry policy lives elsewhere.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TurnEvidence {
@@ -440,11 +447,11 @@ pub(crate) fn classify_session(session_log: &Path) -> Result<SessionRecovery> {
     }
     let (classification, pending_approval) = scan.finish();
     if !fold.has_rows() {
-        anyhow::bail!(
-            "session log {} has no rows to resume from ({})",
-            session_log.display(),
-            classification.class()
-        );
+        return Err(EmptySessionLog {
+            path: session_log.to_path_buf(),
+            class: classification.class().to_string(),
+        }
+        .into());
     }
     Ok(SessionRecovery {
         resume: fold.finish(),
