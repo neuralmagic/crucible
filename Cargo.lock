@@ -1429,6 +1429,7 @@ dependencies = [
  "k8s-openapi",
  "nix",
  "openshell-core",
+ "openshell-policy",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
@@ -2854,7 +2855,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -3410,6 +3411,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "libyml"
+version = "0.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3302702afa434ffa30847a83305f0a69d6abd74293b6554c18ec85c7ef30c980"
+dependencies = [
+ "anyhow",
+ "version_check",
+]
+
+[[package]]
 name = "libz-sys"
 version = "1.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3875,6 +3886,19 @@ dependencies = [
  "tonic-prost-build",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "openshell-policy"
+version = "0.0.0"
+source = "git+https://github.com/wseaton/OpenShell.git?rev=591580c98179dda75a2e7f0cc034f3fa0d266520#591580c98179dda75a2e7f0cc034f3fa0d266520"
+dependencies = [
+ "miette",
+ "openshell-core",
+ "prost-types",
+ "serde",
+ "serde_json",
+ "serde_yml",
 ]
 
 [[package]]
@@ -4485,7 +4509,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.41",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "thiserror",
  "tokio",
  "tracing",
@@ -4523,7 +4547,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.52.0",
 ]
@@ -5312,6 +5336,21 @@ dependencies = [
  "ryu",
  "serde",
  "unsafe-libyaml",
+]
+
+[[package]]
+name = "serde_yml"
+version = "0.0.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "59e2dd588bf1597a252c3b920e0143eb99b0f76e4e082f4c92ce34fbc9e71ddd"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "libyml",
+ "memchr",
+ "ryu",
+ "serde",
+ "version_check",
 ]
 
 [[package]]

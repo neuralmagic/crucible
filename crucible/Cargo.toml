@@ -98,6 +98,7 @@ gcp_auth = "0.12"
 # file upload/download stay on the CLI. default-features=false drops the crate's telemetry HTTP
 # client, unused here.
 openshell-core.workspace = true
+openshell-policy.workspace = true
 # `tls-ring` is load-bearing: without an explicit provider feature tonic relies on the
 # process-default rustls CryptoProvider, which is ambiguous in this dep graph (both ring and
 # aws-lc-rs are compiled in) and panics at channel construction.

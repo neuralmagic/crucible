@@ -455,6 +455,19 @@ struct Renderer<'a> {
     spoke: Option<(String, ClusterEntry)>,
 }
 
+/// What in-pod buildah needs when seccomp/SCC is the gate, in the order buildah fails without them:
+/// the user namespace and its uid_map, file capabilities on extracted layers, its RLIMIT_NOFILE
+/// bump, and chroot isolation itself. Requested only under `[cluster].buildah_capabilities`.
+const BUILDAH_CAPABILITIES: [&str; 7] = [
+    "SYS_ADMIN",
+    "SYS_RESOURCE",
+    "SETFCAP",
+    "SYS_CHROOT",
+    "MKNOD",
+    "SETUID",
+    "SETGID",
+];
+
 /// The agent pod's security context, shared by the loop pod and the turn pods: privileged ONLY
 /// under the podman driver (nested rootless podman needs a privileged outer container). The
 /// kubernetes driver runs sandboxes as sibling pods, so this base context is `None` and the pod
@@ -490,6 +503,20 @@ impl Renderer<'_> {
                     type_: "Unconfined".to_string(),
                     localhost_profile: None,
                 });
+        }
+        // The seccomp/SCC half of the same problem (see `Cluster::buildah_capabilities`). AppArmor
+        // is not the gate on OpenShift: buildah dies on `unshare`, then `uid_map`, then file caps,
+        // then RLIMIT_NOFILE, each needing a capability the restricted default drops.
+        if self.profile.cluster.buildah_capabilities {
+            let sc = sc.get_or_insert_with(Default::default);
+            sc.seccomp_profile = Some(core::SeccompProfile {
+                type_: "Unconfined".to_string(),
+                localhost_profile: None,
+            });
+            sc.capabilities = Some(core::Capabilities {
+                add: Some(BUILDAH_CAPABILITIES.iter().map(|c| c.to_string()).collect()),
+                drop: None,
+            });
         }
         sc
     }
@@ -2804,6 +2831,32 @@ mod tests {
         "#
         );
         toml::from_str(&text).expect("k8s profile parses")
+    }
+
+    /// buildah's capability set is opt-in per cluster: asking for it where AppArmor is the gate
+    /// gets the pod rejected by a restricted PSA/SCC rather than scheduled, so a profile that stays
+    /// silent must render exactly as before.
+    #[test]
+    fn buildah_capabilities_are_opt_in_per_cluster() {
+        let with = render_k8s(&k8s_profile("buildah_capabilities = true"));
+        assert!(
+            with.contains("SYS_ADMIN") && with.contains("SETFCAP") && with.contains("SYS_RESOURCE"),
+            "the declared cluster must get the capabilities buildah fails without"
+        );
+        assert!(
+            with.contains("seccompProfile"),
+            "seccomp must be Unconfined: RuntimeDefault is what blocks unshare"
+        );
+
+        let without = render_k8s(&k8s_profile(""));
+        assert!(
+            !without.contains("SYS_ADMIN"),
+            "an undeclared cluster must not request capabilities it may not hold"
+        );
+        assert!(
+            !without.contains("seccompProfile"),
+            "an undeclared cluster keeps the restricted default"
+        );
     }
 
     fn k8s_manifest() -> Manifest {
