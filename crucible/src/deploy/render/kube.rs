@@ -793,6 +793,24 @@ impl Renderer<'_> {
             env.extend(kubernetes_sandbox_env(self.profile, &self.sandbox_image));
         }
 
+        let downward = |name: &str, field_path: &str| core::EnvVar {
+            name: name.to_string(),
+            value: None,
+            value_from: Some(core::EnvVarSource {
+                field_ref: Some(core::ObjectFieldSelector {
+                    field_path: field_path.to_string(),
+                    api_version: None,
+                }),
+                ..Default::default()
+            }),
+        };
+
+        // The node's IP, so a profile can address a node-local collector as "$(HOST_IP):4317".
+        // MUST precede the profile's own [env] below: kubelet expands $(VAR) only against vars
+        // defined earlier in the same container, and an unexpanded reference is passed through as
+        // that literal string rather than failing.
+        env.push(downward("HOST_IP", "status.hostIP"));
+
         // Generic environment env the domain's hooks/gate need, names are the profile's. Last so
         // a profile can override a default if it ever needs to.
         for (k, v) in &self.profile.env {
@@ -815,17 +833,6 @@ impl Renderer<'_> {
         // segment equal the token's bound-pod claim by construction (pod-binding = run-scoping);
         // name + uid + namespace let the broker set this pod as its GPU Jobs' owner, so orphaned
         // jobs garbage-collect when the pod dies instead of holding a GPU for nobody.
-        let downward = |name: &str, field_path: &str| core::EnvVar {
-            name: name.to_string(),
-            value: None,
-            value_from: Some(core::EnvVarSource {
-                field_ref: Some(core::ObjectFieldSelector {
-                    field_path: field_path.to_string(),
-                    api_version: None,
-                }),
-                ..Default::default()
-            }),
-        };
         env.push(downward(crucible_contract::ENV_POD_NAME, "metadata.name"));
         env.push(downward("CRUCIBLE_POD_UID", "metadata.uid"));
         env.push(downward("CRUCIBLE_POD_NAMESPACE", "metadata.namespace"));
@@ -3020,6 +3027,38 @@ mod tests {
         assert!(
             yaml.contains("value: Unconfined"),
             "app armor is Unconfined: {yaml}"
+        );
+    }
+
+    /// `HOST_IP` carries the node IP from the downward API so a profile can point at a node-local
+    /// collector, and it MUST be emitted before the profile's own `[env]`. kubelet expands `$(VAR)`
+    /// only against vars defined earlier in the same container and passes an unresolvable reference
+    /// through as its literal text, so the wrong order yields an endpoint of `http://$(HOST_IP):4317`
+    /// that fails at the exporter instead of at render.
+    #[test]
+    fn host_ip_precedes_the_profile_env_that_expands_it() {
+        let profile = k8s_profile(
+            r#"
+            [env]
+            OTEL_EXPORTER_OTLP_ENDPOINT = "http://$(HOST_IP):4317"
+        "#,
+        );
+        let yaml = render_k8s(&profile);
+
+        assert!(
+            yaml.contains("fieldPath: status.hostIP"),
+            "HOST_IP comes from the downward API: {yaml}"
+        );
+
+        let host_ip = yaml
+            .find("name: HOST_IP")
+            .expect("HOST_IP env on the loop pod");
+        let endpoint = yaml
+            .find("name: OTEL_EXPORTER_OTLP_ENDPOINT")
+            .expect("profile env on the loop pod");
+        assert!(
+            host_ip < endpoint,
+            "HOST_IP must precede the profile env referencing it ({host_ip} vs {endpoint}): {yaml}"
         );
     }
 
