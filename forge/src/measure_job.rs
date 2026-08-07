@@ -29,7 +29,9 @@ pub struct GpuJobSpec {
     pub namespace: String,
     /// The digest-pinned candidate image.
     pub image: String,
-    pub queue_name: String,
+    /// The Kueue LocalQueue to submit through. `None` on a cluster WITHOUT Kueue: the Job then
+    /// carries no queue label and starts unsuspended, because nothing else would ever admit it.
+    pub queue_name: Option<String>,
     pub pull_secret: Option<String>,
     /// Shell body run as `sh -c`.
     pub command: String,
@@ -43,6 +45,9 @@ pub struct GpuJobSpec {
     pub active_deadline_seconds: i64,
     pub ttl_seconds: i32,
     pub pvc_mounts: Vec<PvcMount>,
+    /// Node labels the Job must land on. Without Kueue there is no flavor to pin placement, so a
+    /// heterogeneous cluster will happily schedule an NVFP4 job onto the wrong GPU generation.
+    pub node_selector: BTreeMap<String, String>,
     /// Owner the Job is garbage-collected with, normally the submitting loop pod: a job whose
     /// consumer died is a GPU burning for nobody (an orphaned sanitizer once held an H200 for
     /// 90 minutes). `None` for cross-cluster (spoke) or cross-namespace submits, where an
@@ -67,14 +72,17 @@ pub struct GpuJobRun {
 
 impl GpuJobSpec {
     fn labels(&self) -> BTreeMap<String, String> {
-        BTreeMap::from([
+        let mut labels = BTreeMap::from([
             (
                 "app.kubernetes.io/managed-by".to_string(),
                 "crucible".to_string(),
             ),
             ("app".to_string(), "crucible".to_string()),
-            (KUEUE_QUEUE_LABEL.to_string(), self.queue_name.clone()),
-        ])
+        ]);
+        if let Some(queue) = &self.queue_name {
+            labels.insert(KUEUE_QUEUE_LABEL.to_string(), queue.clone());
+        }
+        labels
     }
 
     fn container(&self) -> core::Container {
@@ -167,6 +175,7 @@ fn render_gpu_job(spec: &GpuJobSpec) -> Job {
             .map(|name| vec![core::LocalObjectReference { name }]),
         containers: vec![spec.container()],
         volumes: Some(spec.volumes()),
+        node_selector: (!spec.node_selector.is_empty()).then(|| spec.node_selector.clone()),
         ..Default::default()
     };
     Job {
@@ -190,7 +199,8 @@ fn render_gpu_job(spec: &GpuJobSpec) -> Job {
         },
         spec: Some(JobSpec {
             backoff_limit: Some(0),
-            suspend: Some(true),
+            // No Kueue on this cluster means no admission controller to unsuspend it.
+            suspend: Some(spec.queue_name.is_some()),
             active_deadline_seconds: Some(spec.active_deadline_seconds.max(1)),
             ttl_seconds_after_finished: Some(spec.ttl_seconds),
             template: core::PodTemplateSpec {
@@ -227,9 +237,10 @@ pub fn run_gpu_job_with(
         .with_context(|| format!("submitting measure Job {}", spec.name))?;
     tracing::info!(
         job = %spec.name,
-        queue = %spec.queue_name,
+        queue = spec.queue_name.as_deref().unwrap_or("none"),
         gpus = spec.gpus,
-        "gpu job submitted (suspended; Kueue owns admission)"
+        suspended = spec.queue_name.is_some(),
+        "gpu job submitted"
     );
     let wait = Duration::from_secs(spec.active_deadline_seconds.max(1) as u64) + queue_slack;
     let deadline = Instant::now() + wait;
@@ -308,10 +319,14 @@ mod tests {
             name: "crucible-bench-abc".into(),
             namespace: "test-ns".into(),
             image: "ghcr.io/example/img@sha256:deadbeef".into(),
-            queue_name: "crucible-measure".into(),
+            queue_name: Some("crucible-measure".into()),
             pull_secret: Some("test-pull-secret".into()),
             command: "bench throughput ...".into(),
             env: vec![("HF_HUB_OFFLINE".into(), "1".into())],
+            node_selector: BTreeMap::from([(
+                "nvidia.com/gpu.product".to_string(),
+                "NVIDIA-B200".to_string(),
+            )]),
             gpus: 2,
             cpu: "16".into(),
             mem_request: "128Gi".into(),
@@ -354,6 +369,47 @@ mod tests {
             tmpl_labels.get(KUEUE_QUEUE_LABEL).map(String::as_str),
             Some("crucible-measure")
         );
+    }
+
+    /// Without Kueue nothing would ever unsuspend the Job, so it must start running and carry no
+    /// queue label (a stray label on a Kueue-less cluster is a lie about how it got admitted).
+    #[test]
+    fn a_queueless_job_starts_unsuspended_and_unlabelled() {
+        let mut spec = spec();
+        spec.queue_name = None;
+        let job = render_gpu_job(&spec);
+        assert_eq!(job.metadata.labels.unwrap().get(KUEUE_QUEUE_LABEL), None);
+        let js = job.spec.unwrap();
+        assert_eq!(js.suspend, Some(false), "no admission controller exists");
+        assert_eq!(
+            js.template
+                .metadata
+                .unwrap()
+                .labels
+                .unwrap()
+                .get(KUEUE_QUEUE_LABEL),
+            None
+        );
+    }
+
+    /// The node selector is what keeps an arch-specific measure off the wrong GPU generation; an
+    /// empty selector must stay absent rather than render as `{}`.
+    #[test]
+    fn the_node_selector_reaches_the_pod_template() {
+        let job = render_gpu_job(&spec());
+        let pod = job.spec.unwrap().template.spec.unwrap();
+        assert_eq!(
+            pod.node_selector
+                .as_ref()
+                .and_then(|s| s.get("nvidia.com/gpu.product"))
+                .map(String::as_str),
+            Some("NVIDIA-B200")
+        );
+
+        let mut bare = spec();
+        bare.node_selector = BTreeMap::new();
+        let pod = render_gpu_job(&bare).spec.unwrap().template.spec.unwrap();
+        assert_eq!(pod.node_selector, None, "an empty selector pins nothing");
     }
 
     /// An owner makes the Job garbage-collect with its submitting pod (a dead consumer must not
