@@ -811,6 +811,27 @@ impl Renderer<'_> {
         // that literal string rather than failing.
         env.push(downward("HOST_IP", "status.hostIP"));
 
+        // The pod's own identity from the downward API. The name makes the ingest `{pod}` path
+        // segment equal the token's bound-pod claim by construction (pod-binding = run-scoping);
+        // name + uid + namespace let the broker set this pod as its GPU Jobs' owner, so orphaned
+        // jobs garbage-collect when the pod dies instead of holding a GPU for nobody. Same ordering
+        // constraint as HOST_IP above, so a profile can interpolate these too.
+        env.push(downward(crucible_contract::ENV_POD_NAME, "metadata.name"));
+        env.push(downward("CRUCIBLE_POD_UID", "metadata.uid"));
+        env.push(downward("CRUCIBLE_POD_NAMESPACE", "metadata.namespace"));
+
+        // Stamp the pod onto every span the loop exports. One loop pod is one run, so this is the
+        // key that groups a run's turns while it is still going: the run span covers the whole loop
+        // and a span only reaches the backend once it ENDS, so until the run finishes there is no
+        // exported ancestor to group by. A resource attribute is on each span as it arrives.
+        // The SDK reads this via Resource::builder()'s EnvResourceDetector. The profile's [env]
+        // below can replace it outright (duplicate names: last wins).
+        env.push(plain(
+            "OTEL_RESOURCE_ATTRIBUTES",
+            "k8s.pod.name=$(CRUCIBLE_POD_NAME),k8s.namespace.name=$(CRUCIBLE_POD_NAMESPACE)"
+                .to_string(),
+        ));
+
         // Generic environment env the domain's hooks/gate need, names are the profile's. Last so
         // a profile can override a default if it ever needs to.
         for (k, v) in &self.profile.env {
@@ -828,14 +849,6 @@ impl Renderer<'_> {
                 format!("{INGEST_TOKEN_DIR}/token"),
             ));
         }
-
-        // The pod's own identity from the downward API. The name makes the ingest `{pod}` path
-        // segment equal the token's bound-pod claim by construction (pod-binding = run-scoping);
-        // name + uid + namespace let the broker set this pod as its GPU Jobs' owner, so orphaned
-        // jobs garbage-collect when the pod dies instead of holding a GPU for nobody.
-        env.push(downward(crucible_contract::ENV_POD_NAME, "metadata.name"));
-        env.push(downward("CRUCIBLE_POD_UID", "metadata.uid"));
-        env.push(downward("CRUCIBLE_POD_NAMESPACE", "metadata.namespace"));
 
         Ok(env)
     }
@@ -3059,6 +3072,57 @@ mod tests {
         assert!(
             host_ip < endpoint,
             "HOST_IP must precede the profile env referencing it ({host_ip} vs {endpoint}): {yaml}"
+        );
+    }
+
+    /// Every loop-pod span carries `k8s.pod.name`, which is what groups one run's turns while the
+    /// run is still going (the run span only reaches the backend when it ends). The value
+    /// interpolates `CRUCIBLE_POD_NAME`/`CRUCIBLE_POD_NAMESPACE`, so both must be defined ahead of
+    /// it or kubelet passes the reference through as literal text and the backend gets a pod named
+    /// `$(CRUCIBLE_POD_NAME)`.
+    #[test]
+    fn resource_attrs_follow_the_pod_identity_they_interpolate() {
+        let yaml = render_k8s(&k8s_profile(""));
+
+        let attrs = yaml
+            .find("name: OTEL_RESOURCE_ATTRIBUTES")
+            .expect("resource attrs on the loop pod");
+        for var in ["CRUCIBLE_POD_NAME", "CRUCIBLE_POD_NAMESPACE"] {
+            let defined = yaml
+                .find(&format!("name: {var}"))
+                .unwrap_or_else(|| panic!("{var} env on the loop pod: {yaml}"));
+            assert!(
+                defined < attrs,
+                "{var} must precede OTEL_RESOURCE_ATTRIBUTES ({defined} vs {attrs}): {yaml}"
+            );
+        }
+        assert!(
+            yaml.contains("k8s.pod.name=$(CRUCIBLE_POD_NAME)"),
+            "pod name is the grouping key: {yaml}"
+        );
+    }
+
+    /// A profile setting `OTEL_RESOURCE_ATTRIBUTES` itself wins: duplicate env names resolve
+    /// last-one-wins, and the profile's block is emitted after the default.
+    #[test]
+    fn profile_resource_attrs_override_the_default() {
+        let profile = k8s_profile(
+            r#"
+            [env]
+            OTEL_RESOURCE_ATTRIBUTES = "deployment.environment=bespoke"
+        "#,
+        );
+        let yaml = render_k8s(&profile);
+        let first = yaml
+            .find("name: OTEL_RESOURCE_ATTRIBUTES")
+            .expect("default resource attrs");
+        let last = yaml
+            .rfind("name: OTEL_RESOURCE_ATTRIBUTES")
+            .expect("profile resource attrs");
+        assert!(first < last, "the profile's copy comes last: {yaml}");
+        assert!(
+            yaml[last..].contains("deployment.environment=bespoke"),
+            "the profile's value is the winning one: {yaml}"
         );
     }
 
