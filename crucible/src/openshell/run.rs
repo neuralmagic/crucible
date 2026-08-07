@@ -217,9 +217,15 @@ async fn try_turn(
     if aws_provider {
         providers.push(provider::AWS_PROVIDER_NAME.to_string());
     }
-    gw.create_sandbox(&name, args.sandbox_image.as_deref(), &providers, &labels)
-        .await
-        .context("creating the openshell sandbox")?;
+    gw.create_sandbox(
+        &name,
+        args.sandbox_image.as_deref(),
+        &providers,
+        &labels,
+        &args.openshell.read_only_paths,
+    )
+    .await
+    .context("creating the openshell sandbox")?;
 
     // 3b. Hand the broker this turn's boundary: a fresh token at `<storage>/turn-token`. The
     //     broker's per-turn candidate budget resets when the value changes. Best-effort, on a

@@ -12,11 +12,11 @@ use openshell_core::auth::EdgeAuthInterceptor;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::{
     AddNetworkRule, ConfigureProviderRefreshRequest, CreateProviderRequest, CreateSandboxRequest,
-    DeleteSandboxRequest, ExecSandboxRequest, GetProviderRequest, GetSandboxLogsRequest,
-    GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest, NetworkBinary,
-    NetworkEndpoint, NetworkPolicyRule, PolicyMergeOperation, PolicyStatus, Provider,
-    ProviderCredentialRefreshStrategy, RotateProviderCredentialRequest, SandboxLogLine,
-    SandboxPhase, SandboxSpec, SandboxTemplate, ServiceStatus, UpdateConfigRequest,
+    DeleteSandboxRequest, ExecSandboxRequest, FilesystemPolicy, GetProviderRequest,
+    GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest,
+    NetworkBinary, NetworkEndpoint, NetworkPolicyRule, PolicyMergeOperation, PolicyStatus,
+    Provider, ProviderCredentialRefreshStrategy, RotateProviderCredentialRequest, SandboxLogLine,
+    SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate, ServiceStatus, UpdateConfigRequest,
     UpdateProviderRequest, exec_sandbox_event::Payload as ExecPayload,
     policy_merge_operation::Operation as MergeOp,
 };
@@ -417,15 +417,23 @@ impl Gateway {
         image: Option<&str>,
         providers: &[String],
         labels: &[(String, String)],
+        read_only_paths: &[String],
     ) -> Result<()> {
         let template = image.map(|img| SandboxTemplate {
             image: img.to_string(),
             ..SandboxTemplate::default()
         });
+        // The filesystem half of the policy is STATIC: the gateway refuses to change it after
+        // creation, so it rides the create request. The network half stays absent here and is
+        // merged in afterwards by `update_policy_wait` (merge ops are additive, and only network
+        // ops exist), so declaring paths cannot disturb egress. `include_workdir` must stay true —
+        // it is what makes the agent's own workspace writable.
+        let policy = sandbox_filesystem_policy(read_only_paths);
         let request = CreateSandboxRequest {
             spec: Some(SandboxSpec {
                 providers: providers.to_vec(),
                 template,
+                policy,
                 ..SandboxSpec::default()
             }),
             name: name.to_string(),
@@ -925,6 +933,19 @@ fn build_provider(name: &str, cred_key: &str, token: &str) -> Provider {
     }
 }
 
+/// The static filesystem half of a sandbox policy, or `None` when the domain declared no paths (the
+/// gateway then applies its own default rather than a crucible-authored empty one).
+fn sandbox_filesystem_policy(read_only_paths: &[String]) -> Option<SandboxPolicy> {
+    (!read_only_paths.is_empty()).then(|| SandboxPolicy {
+        filesystem: Some(FilesystemPolicy {
+            include_workdir: true,
+            read_only: read_only_paths.to_vec(),
+            read_write: Vec::new(),
+        }),
+        ..SandboxPolicy::default()
+    })
+}
+
 /// Whether a supervisor log line reports a policy denial. The precise signals are the OCSF
 /// network/HTTP `DENIED` action token (the proxy emits `CONNECT denied …` as an OCSF event,
 /// which carries no structured fields, so its message is the marker) and any structured
@@ -1234,6 +1255,38 @@ pYBZ
             std::env::remove_var("XDG_CONFIG_HOME");
         }
         assert_eq!(dir, PathBuf::from("/cfg/openshell/gateways/ci/mtls"));
+    }
+
+    /// The sandbox is landlock-confined to its workdir, so a domain that ships a pipeline or a
+    /// toolbox elsewhere in the image must declare those paths or the agent gets `Permission
+    /// denied` on files it can plainly see. The filesystem half is static (the gateway rejects
+    /// changing it later), so it has to ride the create request, and `include_workdir` must survive
+    /// — dropping it would take the agent's own workspace with it.
+    #[test]
+    fn declared_paths_ride_the_create_request_as_a_static_filesystem_policy() {
+        let policy = sandbox_filesystem_policy(&[
+            "/opt/ai_auto_analyze".to_string(),
+            "/opt/crucible-tools".to_string(),
+        ])
+        .expect("declared paths must produce a policy");
+        let fs = policy.filesystem.expect("filesystem half is set");
+        assert!(fs.include_workdir, "the workspace must stay writable");
+        assert_eq!(
+            fs.read_only,
+            ["/opt/ai_auto_analyze", "/opt/crucible-tools"]
+        );
+        assert!(fs.read_write.is_empty(), "declared paths are read-only");
+        assert!(
+            policy.network_policies.is_empty(),
+            "egress is merged in later; creating must not assert a network half"
+        );
+    }
+
+    /// No declared paths -> no policy at all, so the sandbox keeps the gateway's default rather
+    /// than a crucible-authored one that happens to be empty.
+    #[test]
+    fn no_declared_paths_sends_no_policy() {
+        assert!(sandbox_filesystem_policy(&[]).is_none());
     }
 
     #[test]
