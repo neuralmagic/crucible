@@ -39,6 +39,7 @@ pub fn render_yaml(manifest_path: &Path, profile_path: &Path, opts: &RenderOpts)
         render::render(input, manifest_dir, manifest_file, &profile, opts)
     } else {
         let manifest = Manifest::load(manifest_path)?;
+        crate::check::ensure_injects_resolve(&manifest, manifest_dir)?;
         let name = manifest_dir
             .file_name()
             .and_then(|n| n.to_str())

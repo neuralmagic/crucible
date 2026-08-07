@@ -33,11 +33,25 @@ pub(crate) fn enabled() -> bool {
     ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The span service name: the configured broker name when there is one, else the binary's own.
+/// Leaked because a tracer name must outlive the provider, and there is exactly one per process.
+fn resolve_service_name(configured: Option<String>, fallback: &'static str) -> &'static str {
+    match configured {
+        Some(name) if !name.trim().is_empty() => Box::leak(name.trim().to_owned().into_boxed_str()),
+        _ => fallback,
+    }
+}
+
 /// Install the global tracing subscriber: always the stderr `fmt` layer (the broker's existing
-/// pod-log narration), plus the OTLP span layer when an endpoint is configured. `service_name` is
-/// the binary name so Tempo's service graph separates per-domain broker binaries.
+/// pod-log narration), plus the OTLP span layer when an endpoint is configured.
 /// Must run inside a tokio runtime (the OTLP batch processor spawns on it).
-pub fn init(service_name: &'static str) -> Telemetry {
+///
+/// The service name is `BROKER_NAME` (the engine passes `[agent.broker].name`) falling back to
+/// `fallback`, the binary's own name. Domains share one generic broker binary, so naming spans
+/// after the binary makes every domain look alike — and worse, a domain reusing another's binary
+/// reports that domain's name.
+pub fn init(fallback: &'static str) -> Telemetry {
+    let service_name = resolve_service_name(std::env::var("BROKER_NAME").ok(), fallback);
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,rmcp=debug"));
     let fmt_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
@@ -155,6 +169,29 @@ fn build_provider(endpoint: &str, service_name: &'static str) -> anyhow::Result<
 
 #[cfg(test)]
 mod tests {
+    /// A domain that reuses another domain's broker binary must not report that domain's name;
+    /// the configured `[agent.broker].name` wins, and blank config falls back rather than
+    /// producing an empty service.
+    #[test]
+    fn service_name_prefers_the_configured_broker_name() {
+        assert_eq!(
+            resolve_service_name(Some("vllm-broker".to_string()), "crucible-broker"),
+            "vllm-broker"
+        );
+        assert_eq!(
+            resolve_service_name(Some("  spaced  ".to_string()), "crucible-broker"),
+            "spaced"
+        );
+        assert_eq!(
+            resolve_service_name(None, "crucible-broker"),
+            "crucible-broker"
+        );
+        assert_eq!(
+            resolve_service_name(Some("   ".to_string()), "crucible-broker"),
+            "crucible-broker"
+        );
+    }
+
     use super::*;
 
     #[test]
