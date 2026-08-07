@@ -28,6 +28,9 @@ uuid = { version = "1", features = ["v7"] }
 # The OpenShell gateway's native gRPC clients + auth interceptor — one pin for every crate that
 # talks to the gateway (engine + broker), so the two can never link different protos.
 openshell-core = { git = "https://github.com/wseaton/OpenShell.git", rev = "591580c98179dda75a2e7f0cc034f3fa0d266520", default-features = false }
+# Same rev as openshell-core: the sandbox filesystem defaults (/dev/null, /usr, /etc ...) live here,
+# and crucible extends them rather than restating them.
+openshell-policy = { git = "https://github.com/wseaton/OpenShell.git", rev = "591580c98179dda75a2e7f0cc034f3fa0d266520", default-features = false }
 tonic = { version = "0.14", features = ["channel", "tls-native-roots", "tls-ring"] }
 thiserror = "2"
 

@@ -933,17 +933,28 @@ fn build_provider(name: &str, cred_key: &str, token: &str) -> Provider {
     }
 }
 
-/// The static filesystem half of a sandbox policy, or `None` when the domain declared no paths (the
-/// gateway then applies its own default rather than a crucible-authored empty one).
+/// The domain's declared paths ADDED to openshell's restrictive default, or `None` when it declared
+/// none (the gateway then applies that same default itself).
+///
+/// Extending rather than authoring is load-bearing: the default is what grants `/usr`, `/etc`,
+/// `/proc` and, critically, read-write `/dev/null`. A policy listing only the domain's paths takes
+/// those away and the sandbox breaks before it runs anything — bash cannot initialize without
+/// `/dev/null`, so every tool call fails with a shell that never started.
 fn sandbox_filesystem_policy(read_only_paths: &[String]) -> Option<SandboxPolicy> {
-    (!read_only_paths.is_empty()).then(|| SandboxPolicy {
-        filesystem: Some(FilesystemPolicy {
-            include_workdir: true,
-            read_only: read_only_paths.to_vec(),
-            read_write: Vec::new(),
-        }),
-        ..SandboxPolicy::default()
-    })
+    if read_only_paths.is_empty() {
+        return None;
+    }
+    let mut policy = openshell_policy::restrictive_default_policy();
+    let filesystem = policy
+        .filesystem
+        .get_or_insert_with(FilesystemPolicy::default);
+    filesystem.include_workdir = true;
+    for path in read_only_paths {
+        if !filesystem.read_only.contains(path) {
+            filesystem.read_only.push(path.clone());
+        }
+    }
+    Some(policy)
 }
 
 /// Whether a supervisor log line reports a policy denial. The precise signals are the OCSF
@@ -1271,11 +1282,27 @@ pYBZ
         .expect("declared paths must produce a policy");
         let fs = policy.filesystem.expect("filesystem half is set");
         assert!(fs.include_workdir, "the workspace must stay writable");
-        assert_eq!(
-            fs.read_only,
-            ["/opt/ai_auto_analyze", "/opt/crucible-tools"]
+        for declared in ["/opt/ai_auto_analyze", "/opt/crucible-tools"] {
+            assert!(
+                fs.read_only.iter().any(|p| p == declared),
+                "declared path {declared} must be readable: {:?}",
+                fs.read_only
+            );
+        }
+        // The default's paths must survive. /dev/null especially: without it the sandbox's shell
+        // cannot initialize, so every tool call fails before it runs.
+        assert!(
+            fs.read_write.iter().any(|p| p == "/dev/null"),
+            "/dev/null must stay read-write: {:?}",
+            fs.read_write
         );
-        assert!(fs.read_write.is_empty(), "declared paths are read-only");
+        for base in ["/usr", "/etc", "/proc"] {
+            assert!(
+                fs.read_only.iter().any(|p| p == base),
+                "default path {base} must survive: {:?}",
+                fs.read_only
+            );
+        }
         assert!(
             policy.network_policies.is_empty(),
             "egress is merged in later; creating must not assert a network half"
