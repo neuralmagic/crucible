@@ -36,6 +36,11 @@ use std::path::{Component, Path, PathBuf};
 pub enum ManifestError {
     #[error("inject destination {} is a directory", .path.display())]
     InjectDestIsDir { path: PathBuf },
+    #[error("[[workspace.inject]] sources not found under {}:\n{}", .manifest_dir.display(), .missing.join("\n"))]
+    InjectSrcMissing {
+        manifest_dir: PathBuf,
+        missing: Vec<String>,
+    },
     #[error(
         "[agent.broker].bin is required when the broker is enabled (the domain's broker binary)"
     )]

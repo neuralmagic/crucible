@@ -43,6 +43,19 @@ pub struct OpenshellCfg {
     /// Binaries to subtract, applied last, same exact-string semantics as `deny_endpoints`.
     #[serde(default)]
     pub deny_binaries: Vec<String>,
+    /// Absolute image paths the sandboxed agent may READ and EXECUTE, on top of its workspace.
+    ///
+    /// A sandbox is landlock-confined to its workdir, so anything the domain image ships outside it
+    /// — a vendored pipeline, the nu toolbox under `/opt` — is `Permission denied` to the agent even
+    /// though the file is world-readable and `oc exec` reads it fine. The failure is quiet: the
+    /// agent reports the tool as missing and improvises, which is how a run silently stops using
+    /// the method its brief mandates. List those paths here.
+    ///
+    /// This is a real widening of the sandbox: everything listed is readable AND executable for the
+    /// whole turn (landlock's read group is Execute|ReadFile|ReadDir). Name specific directories,
+    /// never `/`. Static for the sandbox's life — the gateway rejects changing it after creation.
+    #[serde(default)]
+    pub read_only_paths: Vec<String>,
 }
 
 impl Default for OpenshellCfg {
@@ -55,6 +68,7 @@ impl Default for OpenshellCfg {
             inherit_defaults: true,
             deny_endpoints: Vec::new(),
             deny_binaries: Vec::new(),
+            read_only_paths: Vec::new(),
         }
     }
 }

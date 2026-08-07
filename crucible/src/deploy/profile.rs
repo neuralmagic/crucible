@@ -211,6 +211,18 @@ pub struct Cluster {
     /// session log and resumes.
     #[serde(default)]
     pub state_pvc: Option<StatePvc>,
+    /// Grant the loop container what in-pod buildah needs on a cluster that gates it with
+    /// seccomp/SCC rather than AppArmor (OpenShift): `seccompProfile: Unconfined` plus the
+    /// capabilities buildah fails on, one at a time — `SYS_ADMIN` (it re-execs into a user
+    /// namespace and the kernel refuses the uid_map without it), `SETFCAP` (layers carry file
+    /// capabilities), `SYS_RESOURCE` (it raises RLIMIT_NOFILE), and `SYS_CHROOT`/`MKNOD`/`SETUID`/
+    /// `SETGID` for chroot isolation itself.
+    ///
+    /// Off by default, and deliberately not implied by a domain that builds in-pod: on a cluster
+    /// where the AppArmor route already works, ASKING for these gets the pod rejected by a
+    /// restricted PSA/SCC instead of scheduling it. Requires an SCC that permits them.
+    #[serde(default)]
+    pub buildah_capabilities: bool,
 }
 
 /// `state_pvc = "name"` (existing claim) or a `[cluster.state_pvc]` template.
