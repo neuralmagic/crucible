@@ -324,7 +324,8 @@ pub enum CodegenReply {
 /// GPU-job substrate read from env on the loop pod (the deploy-side facts rather than the tool contract).
 struct JobEnv {
     namespace: String,
-    queue_name: String,
+    /// `None` on a cluster without Kueue: jobs then start unsuspended (see `GpuJobSpec`).
+    queue_name: Option<String>,
     pull_secret: Option<String>,
     cpu: String,
     mem_request: String,
@@ -336,6 +337,9 @@ struct JobEnv {
     /// When a prewarmed model-weights PVC is mounted, the path it lands at — exported as HF_HOME so
     /// HF/vllm resolve the cache offline (with HF_HUB_OFFLINE=1) instead of pulling from the network.
     model_mount: Option<String>,
+    /// Node labels the GPU jobs must land on, `k=v` pairs. Load-bearing on a Kueue-less cluster with
+    /// mixed GPU generations: nothing else keeps an arch-specific measure off the wrong node.
+    node_selector: BTreeMap<String, String>,
     /// Output-only trace transport for profile jobs; NOT mounted on benchmark/lm_eval jobs (the
     /// measured jobs' spec stays minimal, and measurement inputs stay digest-only).
     artifacts: Option<ArtifactsPvc>,
@@ -383,6 +387,13 @@ struct ArtifactsPvc {
 }
 
 impl JobEnv {
+    /// How the queue reads in status/ledger output; `none` when the cluster has no Kueue.
+    fn queue_display(&self) -> String {
+        self.queue_name
+            .clone()
+            .unwrap_or_else(|| "none".to_string())
+    }
+
     fn from_env() -> Result<Self, String> {
         let namespace = env_req("BROKER_CODEGEN_NAMESPACE")?;
         // Optional prewarmed model-weights PVC: unset means the GPU jobs get NO weights mount
@@ -408,7 +419,10 @@ impl JobEnv {
         let owner = owner_from_env(&namespace, spoke_from_env().is_some());
         Ok(Self {
             namespace,
-            queue_name: env_or("BROKER_CODEGEN_QUEUE", "crucible-measure"),
+            // Kueue is the default substrate; BROKER_CODEGEN_KUEUE=false is the escape hatch for
+            // clusters that have none, where a suspended Job would sit forever.
+            queue_name: env_bool("BROKER_CODEGEN_KUEUE", true)
+                .then(|| env_or("BROKER_CODEGEN_QUEUE", "crucible-measure")),
             pull_secret: env_nonempty("BROKER_CODEGEN_PULL_SECRET"),
             cpu: env_or("BROKER_CODEGEN_CPU", "16"),
             mem_request: env_or("BROKER_CODEGEN_MEM_REQUEST", "128Gi"),
@@ -418,6 +432,7 @@ impl JobEnv {
             ttl_seconds: env_u32("BROKER_CODEGEN_TTL_SECONDS", 86400) as i32,
             pvc_mounts,
             model_mount,
+            node_selector: env_node_selector("BROKER_CODEGEN_NODE_SELECTOR"),
             artifacts: artifacts_pvc(
                 env_nonempty("BROKER_CODEGEN_ARTIFACTS_PVC"),
                 env_nonempty("BROKER_CODEGEN_ARTIFACTS_MOUNT"),
@@ -1124,7 +1139,7 @@ fn do_profile(
         kind: "profile",
         digest: digest.to_string(),
         namespace: env.namespace.clone(),
-        queue_name: env.queue_name.clone(),
+        queue_name: env.queue_display(),
         started_at: epoch_secs(),
         log: log_handle.clone(),
         result: None,
@@ -1387,7 +1402,7 @@ fn measure(
         kind: kind.tag(),
         digest: digest.to_string(),
         namespace: env.namespace.clone(),
-        queue_name: env.queue_name.clone(),
+        queue_name: env.queue_display(),
         started_at: epoch_secs(),
         log: handle.clone(),
         result: None,
@@ -1530,6 +1545,7 @@ fn job_spec(
         active_deadline_seconds: env.active_deadline_seconds,
         ttl_seconds: env.ttl_seconds,
         pvc_mounts,
+        node_selector: env.node_selector.clone(),
         owner: env.owner.clone(),
     }
 }
@@ -1543,7 +1559,7 @@ fn submit(
     // job name + queue identify the Kueue job on the trace, gpu_minutes is the recorded cost.
     let span = tracing::Span::current();
     span.record("job", spec.name.as_str());
-    span.record("queue", spec.queue_name.as_str());
+    span.record("queue", spec.queue_name.as_deref().unwrap_or("none"));
     let run = run_gpu_job_with(target, spec, QUEUE_SLACK, on_logs)
         .map_err(|e| format!("running measure job: {e:#}"))?;
     span.record("gpu_minutes", gpu_minutes(run.elapsed, spec.gpus));
@@ -1592,7 +1608,7 @@ pub fn spoke_smoke(opts: &SpokeSmoke) -> Result<Value, String> {
         name: name.clone(),
         namespace: opts.namespace.clone(),
         image: opts.image.clone(),
-        queue_name: opts.queue.clone(),
+        queue_name: (!opts.queue.trim().is_empty()).then(|| opts.queue.clone()),
         pull_secret: None,
         command: wrap_command(&sentinel),
         env: Vec::new(),
@@ -1604,6 +1620,8 @@ pub fn spoke_smoke(opts: &SpokeSmoke) -> Result<Value, String> {
         active_deadline_seconds: opts.deadline_secs.max(1),
         ttl_seconds: 600,
         pvc_mounts: Vec::new(),
+        // CPU-only sentinel: it runs anywhere the spoke will take it.
+        node_selector: BTreeMap::new(),
         // A spoke job: the hub pod's UID means nothing on the target cluster.
         owner: None,
     };
@@ -2111,6 +2129,24 @@ fn env_nonempty(k: &str) -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+/// `k=v,k=v` node labels. A malformed pair is dropped rather than fatal: a typo'd selector that
+/// silently widens placement is worse than one that never applies, and the job logs the spec.
+fn env_node_selector(k: &str) -> BTreeMap<String, String> {
+    env_nonempty(k)
+        .map(|raw| {
+            raw.split(',')
+                .filter_map(|pair| pair.split_once('='))
+                .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                .filter(|(k, v)| !k.is_empty() && !v.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+fn env_bool(k: &str, default: bool) -> bool {
+    env_nonempty(k)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 fn env_u32(k: &str, default: u32) -> u32 {
     env_nonempty(k)
@@ -2847,7 +2883,7 @@ mod tests {
     fn test_job_env(artifacts: Option<ArtifactsPvc>) -> JobEnv {
         JobEnv {
             namespace: "test-ns".into(),
-            queue_name: "q".into(),
+            queue_name: Some("q".into()),
             pull_secret: None,
             cpu: "16".into(),
             mem_request: "128Gi".into(),
@@ -2855,6 +2891,7 @@ mod tests {
             shm_size_gi: 16,
             active_deadline_seconds: 5400,
             ttl_seconds: 86400,
+            node_selector: BTreeMap::new(),
             owner: None,
             pvc_mounts: vec![PvcMount {
                 claim_name: "model-cache".into(),
