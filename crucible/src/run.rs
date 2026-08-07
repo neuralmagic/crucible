@@ -697,6 +697,10 @@ fn drive_loop(
     // leaves the turn spans rooting themselves independently. Held across the whole loop, then
     // dropped below so the span closes and the OTLP layer batches it before `flush`.
     let run_span = crate::engine::run_span(&p.workspace.to_string_lossy(), &prep.run_id);
+    // A signal would otherwise kill the process with this span still open and the batch unflushed,
+    // so every rolled loop pod loses its run span. Installed here, where the span exists, rather
+    // than behind a static.
+    crate::engine::abort_on_signal(run_span.clone());
 
     let outcome = {
         let _run_guard = run_span.as_ref().map(tracing::Span::enter);
