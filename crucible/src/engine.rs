@@ -131,30 +131,43 @@ fn dispatch_parent() -> Option<opentelemetry::Context> {
     parent
 }
 
-/// The long-lived `run` root span for a loop pod dispatched by the controller, parented to that
-/// dispatch's span so Tempo shows one tree (controller → run → turn → RPCs). Returns `None`, and the
-/// openshell turn spans root themselves independently, unless BOTH the engine's OTLP exporter is
-/// installed AND the controller injected a parseable `TRACEPARENT`. Enter the returned span for the
+/// The long-lived `run` root span for a loop. When the controller dispatched this pod the span is
+/// parented to that dispatch, so the backend shows one tree (controller → run → turn → RPCs); a
+/// standalone run (no controller, so no `TRACEPARENT`) gets the same span self-rooted. Returns
+/// `None` only when the engine's OTLP exporter is not installed. Enter the returned span for the
 /// life of the loop: the `openshell_turn` spans, created on the same thread, then nest under it
 /// (wide-round turns run on their own threads and root themselves, no thread-local to inherit).
 ///
-/// CONSUMER kind pairs with the controller dispatch's PRODUCER span, the async producer/consumer
-/// edge Tempo's service-graph processor draws the controller → crucible link from.
+/// CONSUMER kind is recorded only in the dispatched case, where it pairs with the controller's
+/// PRODUCER span — the async producer/consumer edge a service-graph processor draws the
+/// controller → crucible link from. A self-rooted run pairs with nothing and stays unkinded.
+///
+/// NOTE: a span reaches the backend only when it ENDS, and this one spans the whole loop. Turns
+/// are visible as they finish, but they show as parentless until the run closes and this span is
+/// exported. Grouping in-flight turns needs an attribute on the turns themselves, not this span.
 pub(crate) fn run_span(workspace: &str, run_id: &str) -> Option<tracing::Span> {
     use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
     // Exporter off (the default) means the tracing macros are no-ops, nothing to parent.
     PROVIDER.get()?;
-    let parent = dispatch_parent()?;
+    // No dispatch parent (a standalone run: no controller, so no TRACEPARENT) still gets a run
+    // span — self-rooted. Without it every `openshell_turn` roots itself and a run's turns share
+    // no ancestor at all, which is how standalone runs used to reach the backend.
+    let parent = dispatch_parent();
     let span = tracing::info_span!(
         "run",
-        otel.kind = "consumer",
+        // CONSUMER only when there is a producer to pair with; a self-rooted run is not the
+        // consumer half of anything, and mislabelling it invents a service-graph edge.
+        otel.kind = tracing::field::Empty,
         workspace = workspace,
         run_id = run_id,
     );
-    // Best-effort: a failed link just leaves the run span self-rooted, never fails the run.
-    if let Err(e) = span.set_parent(parent) {
-        tracing::warn!(error = %e, "linking the run span to the controller dispatch failed");
+    if let Some(parent) = parent {
+        span.record("otel.kind", "consumer");
+        // Best-effort: a failed link just leaves the run span self-rooted, never fails the run.
+        if let Err(e) = span.set_parent(parent) {
+            tracing::warn!(error = %e, "linking the run span to the controller dispatch failed");
+        }
     }
     Some(span)
 }
