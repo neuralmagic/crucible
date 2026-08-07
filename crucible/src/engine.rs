@@ -109,6 +109,112 @@ pub(crate) fn flush() {
     let _ = rx.recv_timeout(Duration::from_secs(3));
 }
 
+/// Why the run is being torn down, and the exit code that reports it. `128 + signo`, the shell
+/// convention, so a killed loop is distinguishable from one that chose its own exit code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Termination {
+    /// SIGTERM: what `oc delete pod` and every rolling redeploy sends.
+    Terminated,
+    /// SIGINT: a local ctrl-c.
+    Interrupted,
+}
+
+impl Termination {
+    fn exit_code(self) -> i32 {
+        match self {
+            Self::Terminated => 143,
+            Self::Interrupted => 130,
+        }
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Terminated => "SIGTERM",
+            Self::Interrupted => "SIGINT",
+        }
+    }
+}
+
+/// Resolves on SIGTERM or ctrl-c, naming which arrived. Mirrors `crucible-broker`'s
+/// `telemetry::shutdown_signal`; the broker feeds it to axum's graceful shutdown, the engine has no
+/// server to drain so it acts on it directly in [`abort_on_signal`].
+async fn termination_signal() -> Termination {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            // No SIGTERM handler means nothing to wait on; never resolve, so ctrl-c still wins the
+            // select instead of this arm firing spuriously.
+            Err(_) => std::future::pending().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => Termination::Interrupted,
+        _ = terminate => Termination::Terminated,
+    }
+}
+
+/// End `span` as aborted: mark it, then close the OTel side explicitly.
+///
+/// Dropping the `tracing::Span` is not enough here. The signal handler holds a CLONE while the run
+/// path still holds the original, so the span would not close until a drop that a killed process
+/// never reaches. Ending through the OTel span directly closes it regardless of who else holds a
+/// handle, which is the whole point on this path.
+fn end_span_aborted(span: &tracing::Span, reason: &str) {
+    use opentelemetry::KeyValue;
+    use opentelemetry::trace::{Status, TraceContextExt as _};
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+
+    let cx = span.context();
+    let otel = cx.span();
+    if !otel.span_context().is_valid() {
+        return;
+    }
+    otel.set_attribute(KeyValue::new("crucible.aborted", true));
+    otel.set_attribute(KeyValue::new("crucible.abort_reason", reason.to_string()));
+    otel.set_status(Status::error(format!("run aborted by {reason}")));
+    otel.end();
+}
+
+/// Close the run out on SIGTERM/ctrl-c instead of dying mid-batch.
+///
+/// The engine has no graceful-shutdown path of its own: `run` ends in `std::process::exit`, so a
+/// signal kills the process with the run span still OPEN and the batch processor's queue
+/// unflushed. Every `oc delete pod` — which is every roll of a loop — therefore loses the run span
+/// and whatever turns had not been exported yet, producing exactly the orphaned-span picture that
+/// looks like a telemetry bug and is really a missing handler.
+///
+/// A no-op when telemetry is off (`run_span` is `None`), and a no-op when the engine runtime is
+/// missing rather than a hard error: failing to install an abort handler must never be the thing
+/// that stops a run from starting.
+pub(crate) fn abort_on_signal(run_span: Option<tracing::Span>) {
+    let Some(span) = run_span else {
+        return;
+    };
+    let Ok(handle) = handle() else {
+        return;
+    };
+    handle.spawn(async move {
+        let cause = termination_signal().await;
+        eprintln!(
+            "[crucible] {} received; closing the run span and flushing spans",
+            cause.reason()
+        );
+        end_span_aborted(&span, cause.reason());
+        // `flush` parks this worker for up to 3s. Acceptable: the process is exiting, and the
+        // alternative is exporting nothing.
+        flush();
+        std::process::exit(cause.exit_code());
+    });
+}
+
 /// The W3C env vars the controller's dispatches (loop run, scope turn, rank turn) inject; the
 /// engine adopts them as its trace parent. Distinct from the `OTEL_*` exporter config, so they
 /// never collide with it.
@@ -952,5 +1058,28 @@ mod tests {
             resolve_endpoint(Some("  ".into()), Some("http://tempo:4317".into())),
             Some("http://tempo:4317".into())
         );
+    }
+
+    #[test]
+    fn termination_reports_the_shell_signal_codes() {
+        // 128 + signo, so a killed loop is distinguishable from a chosen exit code. 143 is the one
+        // that matters: it is what every `oc delete pod` of a loop produces.
+        assert_eq!(Termination::Terminated.exit_code(), 143);
+        assert_eq!(Termination::Interrupted.exit_code(), 130);
+        assert_eq!(Termination::Terminated.reason(), "SIGTERM");
+        assert_eq!(Termination::Interrupted.reason(), "SIGINT");
+    }
+
+    #[test]
+    fn abort_on_signal_without_a_span_is_a_noop() {
+        // Telemetry off means no run span, and installing a handler must not require a runtime.
+        abort_on_signal(None);
+    }
+
+    #[test]
+    fn end_span_aborted_ignores_an_unsampled_span() {
+        // No exporter installed in the test process, so the span carries an invalid SpanContext and
+        // the OTel end is skipped. The guard is what keeps this path safe on a telemetry-off run.
+        end_span_aborted(&tracing::Span::none(), "SIGTERM");
     }
 }
