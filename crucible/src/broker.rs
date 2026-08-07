@@ -61,7 +61,8 @@ pub fn ensure_running(
     };
 
     let mut cmd = Command::new(&cfg.bin);
-    cmd.env("BROKER_BIND", &cfg.bind)
+    cmd.env("BROKER_NAME", &cfg.name)
+        .env("BROKER_BIND", &cfg.bind)
         .env("BROKER_TOKEN", &token)
         // The deep loop's per-workspace sandbox name (the pid in it is ours, crucible spawns the
         // broker), so the broker's build sync downloads from the right sandbox, not a fixed "ci".
