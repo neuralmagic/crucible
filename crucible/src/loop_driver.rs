@@ -67,6 +67,9 @@ pub(crate) struct LoopRuntime<'a> {
     /// Admission ledger shared with the control bridge. `None` for front-ends with no
     /// bridge (console/jsonl), which fall back to the plain `STEER.md` read.
     pub ledger: Option<std::sync::Arc<crate::admission::AdmissionLedger>>,
+    /// The liveness beat's view of the loop, refreshed wherever the control status is. `None`
+    /// when the beat is disabled (`CRUCIBLE_HEARTBEAT_SECS=0`).
+    pub heartbeat: Option<std::sync::Arc<crate::heartbeat::Heartbeat>>,
 }
 
 /// An opaque rollback token from [`World::snapshot`]. The engine never inspects it (a git
@@ -554,6 +557,7 @@ fn run_loop_body<R: Reporter>(
 ) -> Result<Outcome> {
     let control = runtime.control;
     let ledger = runtime.ledger.as_deref();
+    let heartbeat = runtime.heartbeat.as_deref();
     let started = Instant::now();
     let start_iter: u32;
     let is_resume = runtime.resume.is_some();
@@ -1022,6 +1026,7 @@ fn run_loop_body<R: Reporter>(
         // missing stamp only costs the page a "?".
         write_turn_meta(it, run.spent);
         update_control_status(control, "iteration", it, run.segment.best_score, run.spent);
+        beat_position(heartbeat, it, run.spent);
         write_results(p, &prep.goal, &prep.prior, &run.rows)?;
 
         let status = judge.status(run.segment.best_score);
@@ -1080,6 +1085,7 @@ fn run_loop_body<R: Reporter>(
                 r,
             )?;
             run.spent += cost;
+            beat_position(heartbeat, it, run.spent);
             step
         } else {
             let turn = r.run_agent(
@@ -1099,6 +1105,7 @@ fn run_loop_body<R: Reporter>(
             if let Some(control) = control {
                 control.set_spend(run.spent);
             }
+            beat_position(heartbeat, it, run.spent);
             r.budget(run.spent, started.elapsed());
 
             match drain_turn_markers(r, p, control, it, &turn, &run.rows) {
@@ -1333,6 +1340,7 @@ fn run_loop_body<R: Reporter>(
                     match crate::loop_graph::run_epilogue(args, p, workflow, &kept, r) {
                         Ok((rows, cost)) => {
                             run.spent += cost;
+                            beat_position(heartbeat, args.iterations, run.spent);
                             r.budget(run.spent, started.elapsed());
                             for row in rows {
                                 r.row(&row, false);
@@ -1355,6 +1363,7 @@ fn run_loop_body<R: Reporter>(
         run.segment.best_score,
         run.spent,
     );
+    beat_position(heartbeat, args.iterations, run.spent);
 
     // Publish-on-keep: durable artifacts off the (possibly ephemeral) pod. Runs here
     // so it fires on every exit path (clean finish, Ctrl+C, or budget-stop) and is
@@ -1641,6 +1650,14 @@ fn wait_if_paused<R: Reporter>(control: Option<&control::ControlState>, r: &mut 
     }
     if !STOP.load(Ordering::SeqCst) {
         r.note("control: resumed");
+    }
+}
+
+/// Publish the loop's position to the liveness beat, alongside the control-status update, so a
+/// beat can never report a state the control plane has not seen. A no-op when the beat is off.
+fn beat_position(heartbeat: Option<&crate::heartbeat::Heartbeat>, iter: u32, spent: f64) {
+    if let Some(hb) = heartbeat {
+        hb.record(iter, spent);
     }
 }
 
@@ -4288,6 +4305,7 @@ mod tests {
                 resume: Some(resume_state_for_test(2)),
                 recovery: Some(recovery),
                 ledger: None,
+                heartbeat: None,
             },
         )
         .expect("resumed run finishes");
@@ -4338,6 +4356,7 @@ mod tests {
                 resume: Some(resume_state_for_test(2)),
                 recovery: Some(recovery),
                 ledger: None,
+                heartbeat: None,
             },
         )
         .expect("resumed run finishes");

@@ -40,6 +40,7 @@ mod errors;
 mod escalation;
 mod event;
 mod harness;
+mod heartbeat;
 mod hermes_trace;
 mod identity;
 mod ingest_client;

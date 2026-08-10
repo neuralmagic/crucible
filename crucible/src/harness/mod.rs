@@ -16,7 +16,7 @@ use crate::Args;
 use crate::event::{AgentEvent, RawStream};
 use crate::stream_json::StreamJsonParser;
 use crate::turn_trace::{GenAiRecord, ToolInvocation};
-use crucible_harness::RateHandle;
+use crucible_harness::LiveMeters;
 use std::time::Duration;
 
 /// Which agent harness runs the turn. `claude` is the default everywhere; `hermes` is the
@@ -74,7 +74,9 @@ pub(crate) struct TurnArtifacts {
 /// `RawLines`, one `Raw` event per non-empty line, structure arriving post-hoc via the
 /// transcript backfill.
 pub(crate) enum StreamDecoder {
-    StreamJson(StreamJsonParser),
+    /// Boxed: the stateful parser dwarfs the empty variant, and the decoder is constructed once
+    /// per turn, so the indirection costs nothing that matters.
+    StreamJson(Box<StreamJsonParser>),
     RawLines,
 }
 
@@ -195,19 +197,19 @@ impl Harness {
         }
     }
 
-    /// The stream decoder for this harness's stdout. `rate`, when present, is the in-process
-    /// OTLP collector's live 60 s-window token rate stamped onto each `tokens` sample;
-    /// `tool_io` opts tool events into carrying bounded inputs and result excerpts
+    /// The stream decoder for this harness's stdout. `meters`, when present, are the in-process
+    /// OTLP collector's live readings (60 s-window token rate and running cost) stamped onto each
+    /// `tokens` sample; `tool_io` opts tool events into carrying bounded inputs and result excerpts
     /// (see [`crate::agent::tool_io_full`]).
-    pub(crate) fn decoder(self, rate: Option<&RateHandle>, tool_io: bool) -> StreamDecoder {
+    pub(crate) fn decoder(self, meters: Option<&LiveMeters>, tool_io: bool) -> StreamDecoder {
         match self {
-            Harness::Claude => StreamDecoder::StreamJson(
-                match rate {
-                    Some(r) => StreamJsonParser::with_rate(r.clone()),
+            Harness::Claude => StreamDecoder::StreamJson(Box::new(
+                match meters {
+                    Some(m) => StreamJsonParser::with_meters(m.clone()),
                     None => StreamJsonParser::default(),
                 }
                 .with_tool_io(tool_io),
-            ),
+            )),
             Harness::Hermes => StreamDecoder::RawLines,
         }
     }
