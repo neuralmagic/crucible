@@ -303,7 +303,7 @@ fn run_turn_with(
         .as_ref()
         .map(|c| crucible_harness::otel_env(&c.local_endpoint()))
         .unwrap_or_default();
-    let rate = collector.as_ref().map(|c| c.rate_handle());
+    let meters = collector.as_ref().map(OtelCollector::meters);
 
     let spawned = match source.spawn(args, p, prompt, &extra_env, session) {
         Ok(s) => s,
@@ -344,7 +344,7 @@ fn run_turn_with(
         if matches!(source, AgentSource::LocalClaude) {
             // Local agent: decode via the harness's stream decoder (shared with the openshell
             // exec path).
-            let decoder = args.harness().decoder(rate.as_ref(), tool_io_full(args));
+            let decoder = args.harness().decoder(meters.as_ref(), tool_io_full(args));
             let (c, bt) = pump_stream(out, json, decoder, &mut sink);
             cost = c;
             best_tokens = bt;

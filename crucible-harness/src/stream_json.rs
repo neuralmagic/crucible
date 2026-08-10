@@ -5,7 +5,7 @@
 //! text/thinking deltas buffer to line boundaries so one event is one line. Unknown top-level
 //! and event types are ignored, so schema drift in claude's output cannot break a viewer.
 
-use crate::otel::RateHandle;
+use crate::otel::{CostHandle, LiveMeters, RateHandle};
 use crucible_contract::event::{AgentEvent, Tokens};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -52,8 +52,12 @@ pub struct StreamJsonParser {
     tool_name: Option<String>,
     tool_json: String,
 
-    // Live token rate from the OTLP collector; `None` when no collector is running.
-    rate: Option<RateHandle>,
+    // Live token rate and running cost from the OTLP collector; `None` when no collector is
+    // running.
+    meters: Option<LiveMeters>,
+    // The stream's own cumulative cost, which only arrives with the turn-end `result` message.
+    // Kept so a live cost sample can never report LESS than the agent has already declared.
+    stream_cost: f64,
 
     // Verbose tool IO (CRUCIBLE_SESSION_TOOL_IO=full): tool events carry bounded
     // inputs, and the tool results claude echoes back as `user` messages become
@@ -66,10 +70,11 @@ pub struct StreamJsonParser {
 }
 
 impl StreamJsonParser {
-    /// A parser that stamps each `tokens` sample with the collector's live 60 s-window rate.
-    pub fn with_rate(rate: RateHandle) -> Self {
+    /// A parser that stamps each `tokens` sample with the collector's live meters: the 60 s-window
+    /// token rate and the turn's cost so far.
+    pub fn with_meters(meters: LiveMeters) -> Self {
         StreamJsonParser {
-            rate: Some(rate),
+            meters: Some(meters),
             ..Default::default()
         }
     }
@@ -108,11 +113,13 @@ impl StreamJsonParser {
                         }
                     })
                     .filter(|s| !s.is_empty());
+                let cost_usd = f64_field(&msg, "total_cost_usd");
+                self.stream_cost = self.stream_cost.max(cost_usd);
                 out.push(AgentEvent::Result {
                     subtype: str_field(&msg, "subtype"),
                     is_error,
                     turns: u64_field(&msg, "num_turns") as u32,
-                    cost_usd: f64_field(&msg, "total_cost_usd"),
+                    cost_usd,
                     error,
                 });
             }
@@ -296,6 +303,18 @@ impl StreamJsonParser {
         }
     }
 
+    /// The collector's running cost, when it beats what the stream has declared for itself. The
+    /// agent exports its cost metric every 10 s while `total_cost_usd` lands only at turn end, so
+    /// mid-turn this is the only honest number; once the stream reports its own (larger, final)
+    /// figure, that one wins.
+    fn live_cost(&self) -> Option<f64> {
+        self.meters
+            .as_ref()
+            .map(|m| &m.cost)
+            .and_then(CostHandle::get)
+            .filter(|live| *live > self.stream_cost)
+    }
+
     /// Emit a [`Tokens`] sample when the running total first appears or grows by a step. `rate`
     /// carries the collector's live rate when one is attached; `None` when telemetry is off.
     fn maybe_emit_tokens(&mut self, out: &mut Vec<AgentEvent>) {
@@ -312,8 +331,12 @@ impl StreamJsonParser {
             cache_read: self.cache_read,
             cache_write: self.cache_write,
             total,
-            rate: self.rate.as_ref().and_then(RateHandle::get),
-            cost_usd: None,
+            rate: self
+                .meters
+                .as_ref()
+                .map(|m| &m.rate)
+                .and_then(RateHandle::get),
+            cost_usd: self.live_cost(),
         }));
     }
 }
@@ -620,8 +643,8 @@ mod tests {
 
     #[test]
     fn tokens_carry_the_live_rate_when_a_handle_is_attached() {
-        let handle = RateHandle::default();
-        let mut p = StreamJsonParser::with_rate(handle.clone());
+        let meters = LiveMeters::default();
+        let mut p = StreamJsonParser::with_meters(meters.clone());
         let drive = |p: &mut StreamJsonParser| -> Vec<AgentEvent> {
             let mut evs = p.push(
                 r#"{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":6000,"output_tokens":1}}}}"#,
@@ -642,8 +665,8 @@ mod tests {
         }
 
         // Now a rate is live -> it rides the sample.
-        handle.store(318.4);
-        let mut p2 = StreamJsonParser::with_rate(handle);
+        meters.rate.store(318.4);
+        let mut p2 = StreamJsonParser::with_meters(meters);
         match drive(&mut p2).into_iter().find_map(|e| match e {
             AgentEvent::Tokens(t) => Some(t),
             _ => None,
@@ -651,6 +674,40 @@ mod tests {
             Some(t) => assert_eq!(t.rate, Some(318.4)),
             None => panic!("expected a tokens sample"),
         }
+    }
+
+    #[test]
+    fn tokens_carry_the_collectors_live_cost() {
+        let meters = LiveMeters::default();
+        let drive = |p: &mut StreamJsonParser| -> Option<Tokens> {
+            let mut evs = p.push(
+                r#"{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":6000,"output_tokens":1}}}}"#,
+            );
+            evs.extend(p.push(
+                r#"{"type":"stream_event","event":{"type":"message_delta","usage":{"output_tokens":4}}}"#,
+            ));
+            evs.into_iter().find_map(|e| match e {
+                AgentEvent::Tokens(t) => Some(t),
+                _ => None,
+            })
+        };
+
+        // No cost export yet -> nothing to stamp, and the budget falls back to the estimate.
+        let mut p = StreamJsonParser::with_meters(meters.clone());
+        assert_eq!(drive(&mut p).expect("a tokens sample").cost_usd, None);
+
+        // A live cost the stream has not declared yet wins.
+        meters.cost.add(23.4567);
+        let mut p2 = StreamJsonParser::with_meters(meters.clone());
+        assert_eq!(
+            drive(&mut p2).expect("a tokens sample").cost_usd,
+            Some(23.4567)
+        );
+
+        // Once the stream declares a LARGER figure of its own, that one wins.
+        let mut p3 = StreamJsonParser::with_meters(meters);
+        p3.push(r#"{"type":"result","subtype":"success","num_turns":1,"total_cost_usd":25.0}"#);
+        assert_eq!(drive(&mut p3).expect("a tokens sample").cost_usd, None);
     }
 
     #[test]

@@ -14,6 +14,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1297,6 +1298,193 @@ impl MeasureKind {
     }
 }
 
+/// One GPU job's lifecycle phase, as a poll can see it. Ordered: a phase can be SKIPPED (a fast
+/// job's first poll already sees logs) but never revisited, so a blip in one cluster read cannot
+/// reopen a phase the job has already left.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum JobPhase {
+    Submitted,
+    Admitted,
+    Running,
+    Measuring,
+}
+
+impl JobPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            JobPhase::Submitted => "submitted",
+            JobPhase::Admitted => "admitted",
+            JobPhase::Running => "running",
+            JobPhase::Measuring => "measuring",
+        }
+    }
+}
+
+/// The phase one poll implies (pure). Deliberately NO "engine ready" phase: that would mean
+/// grepping the job's logs for domain-specific readiness markers, which the broker has no business
+/// knowing. Log output at all is the honest generic signal, and that is `Measuring`.
+fn phase_for(admitted: bool, pod_running: bool, has_logs: bool) -> JobPhase {
+    if has_logs {
+        JobPhase::Measuring
+    } else if pod_running {
+        JobPhase::Running
+    } else if admitted {
+        JobPhase::Admitted
+    } else {
+        JobPhase::Submitted
+    }
+}
+
+/// The phase spans of one GPU job: exactly one is open at a time, and its lifetime IS that phase's
+/// wall clock. The field's own drop closes the last span on every exit path (a failed job, a parse
+/// error, an early return alike).
+struct PhaseSpans {
+    current: Option<tracing::Span>,
+    /// Set by [`PhaseSpans::close`]. The watcher's poll thread outlives its owner (see
+    /// [`PhaseWatcher`]'s Drop), and a late poll must not reopen a phase after the job is done.
+    closed: bool,
+}
+
+impl PhaseSpans {
+    fn new() -> Self {
+        PhaseSpans {
+            current: None,
+            closed: false,
+        }
+    }
+
+    /// Close the open phase, then open `phase` under `parent`. A no-op once closed.
+    fn advance(&mut self, parent: &opentelemetry::Context, phase: JobPhase) {
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        if self.closed {
+            return;
+        }
+        // Dropped BEFORE the next span is built: the close timestamp is the phase boundary.
+        self.current = None;
+        let span = tracing::info_span!("codegen.phase", phase = phase.as_str());
+        if let Err(e) = span.set_parent(parent.clone()) {
+            tracing::debug!(error = %e, "parenting a codegen phase span failed");
+        }
+        self.current = Some(span);
+    }
+
+    /// Close the trailing phase for good.
+    fn close(&mut self) {
+        self.current = None;
+        self.closed = true;
+    }
+}
+
+/// How often the phase watcher asks the cluster where the job is. Matches forge's live log poll,
+/// so a job costs the same order of apiserver round-trips per interval either way.
+const PHASE_POLL: Duration = Duration::from_secs(15);
+
+/// Stop-flag check interval, so a finished job's watcher joins in milliseconds instead of waiting
+/// out [`PHASE_POLL`].
+const PHASE_TICK: Duration = Duration::from_millis(250);
+
+/// Drives [`PhaseSpans`] for one in-flight GPU job from a background thread: Kueue admission and
+/// pod phase come from the cluster every [`PHASE_POLL`], first log output from the caller via
+/// [`PhaseWatcher::log_flag`]. Every cluster read is best-effort; a failure leaves the current
+/// phase span open, and span bookkeeping never fails the job.
+///
+/// Dropping the watcher stops the thread and closes the trailing span, so the last phase covers
+/// the result parse (where the sentinel is read) and ends with the worker. Drop does NOT join: a
+/// poll can be parked inside a kube read for as long as the client's timeout allows, and the drop
+/// runs on the measure worker just before it hands back the reply. The span closes under the mutex
+/// instead, and the thread is left to notice the stop flag and exit on its own (the same reason
+/// [`live_views`] runs its lookups detached).
+struct PhaseWatcher {
+    stop: Arc<AtomicBool>,
+    saw_logs: Arc<AtomicBool>,
+    spans: Arc<Mutex<PhaseSpans>>,
+}
+
+impl PhaseWatcher {
+    /// Start watching `job`. `parent` is the MCP tool span's OTel context. The caller starts this
+    /// immediately before submitting, so the `submitted` span opens one create-RPC ahead of the
+    /// Job actually existing.
+    fn start(
+        parent: opentelemetry::Context,
+        target: KubeTarget,
+        namespace: String,
+        job: String,
+    ) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let saw_logs = Arc::new(AtomicBool::new(false));
+        let spans = Arc::new(Mutex::new(PhaseSpans::new()));
+        let (thread_stop, thread_logs, thread_spans) =
+            (Arc::clone(&stop), Arc::clone(&saw_logs), Arc::clone(&spans));
+        // tracing's subscriber is a thread-local a fresh thread does not inherit.
+        let dispatch = tracing::dispatcher::get_default(tracing::Dispatch::clone);
+        let spawned = std::thread::Builder::new()
+            .name(format!("codegen-phase-{job}"))
+            .spawn(move || {
+                let _dispatch = tracing::dispatcher::set_default(&dispatch);
+                let mut phase = JobPhase::Submitted;
+                // The lock is only ever held for the span swap, never across a cluster read, so
+                // the owner's Drop can always take it promptly.
+                if let Ok(mut spans) = thread_spans.lock() {
+                    spans.advance(&parent, phase);
+                }
+                while sleep_until_poll(&thread_stop) {
+                    let admitted = forge::kube::workload_statuses(&target, &namespace)
+                        .ok()
+                        .and_then(|by_job| by_job.get(&job).map(|k| k.admitted))
+                        .unwrap_or(false);
+                    let pod_running = forge::kube::job_pod_status(&target, &namespace, &job)
+                        .map(|p| p.phase.as_deref() == Some("Running"))
+                        .unwrap_or(false);
+                    let seen =
+                        phase_for(admitted, pod_running, thread_logs.load(Ordering::Relaxed));
+                    if seen > phase {
+                        if let Ok(mut spans) = thread_spans.lock() {
+                            spans.advance(&parent, seen);
+                        }
+                        phase = seen;
+                    }
+                }
+            });
+        if let Err(e) = spawned {
+            // No watcher thread means no phase spans; the job itself is unaffected.
+            tracing::debug!(error = %e, "spawning the codegen phase watcher failed");
+        }
+        PhaseWatcher {
+            stop,
+            saw_logs,
+            spans,
+        }
+    }
+
+    /// The flag the log callback sets on its first non-empty snapshot.
+    fn log_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.saw_logs)
+    }
+}
+
+impl Drop for PhaseWatcher {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Ok(mut spans) = self.spans.lock() {
+            spans.close();
+        }
+    }
+}
+
+/// Sleep out one [`PHASE_POLL`] in [`PHASE_TICK`] slices. `false` means stop; do not poll again.
+fn sleep_until_poll(stop: &AtomicBool) -> bool {
+    let mut left = PHASE_POLL;
+    while !left.is_zero() {
+        if stop.load(Ordering::Relaxed) {
+            return false;
+        }
+        let slice = PHASE_TICK.min(left);
+        std::thread::sleep(slice);
+        left -= slice;
+    }
+    !stop.load(Ordering::Relaxed)
+}
+
 /// Run `work` (a submitted GPU job driven to a terminal state) on a detached worker thread,
 /// waiting up to the call budget for its reply. On budget exhaustion the caller gets `pending`
 /// and the worker keeps going: a success lands in the memo (written inside `work`, before the
@@ -1419,7 +1607,23 @@ fn measure(
     let worker_state = Arc::clone(state);
     let digest = digest.to_string();
     let job_name = name.clone();
+    // The phase spans hang off the MCP tool span, whose context is captured HERE, on the blocking
+    // thread `telemetry::spawn_blocking` entered it on: `work` runs on a detached worker that
+    // tracing's thread-local current-span never reaches. The OTel context, not the `Span` itself,
+    // because holding a Span clone would keep the tool span open until the job ends, and a
+    // `pending` reply's tool span must report the call, not the job.
+    let tool_cx = {
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        tracing::Span::current().context()
+    };
     let work = move || -> CodegenReply {
+        let phases = PhaseWatcher::start(
+            tool_cx,
+            env.target(),
+            env.namespace.clone(),
+            job_name.clone(),
+        );
+        let saw_logs = phases.log_flag();
         let run = match submit(
             &env.target(),
             &job_spec(
@@ -1432,6 +1636,9 @@ fn measure(
                 &[],
             ),
             |snapshot| {
+                if !snapshot.trim().is_empty() {
+                    saw_logs.store(true, Ordering::Relaxed);
+                }
                 let _ = std::fs::write(&log_path, snapshot);
             },
         ) {
@@ -1443,8 +1650,12 @@ fn measure(
             }
         };
         worker_state.finish_job(&job_name, run.result);
-        collect_measure(&worker_state, run, &kind, tail)
-            .unwrap_or_else(|error| CodegenReply::Error { error })
+        let reply = collect_measure(&worker_state, run, &kind, tail)
+            .unwrap_or_else(|error| CodegenReply::Error { error });
+        // Held until here so the last phase span covers the sentinel parse; dropping it closes
+        // that span and joins the watcher.
+        drop(phases);
+        reply
     };
     let entry = Arc::new(InflightJob::new(name, handle));
     Ok(detach_and_wait(state, key, entry, call_wait_budget(), work))
@@ -2174,6 +2385,151 @@ fn json_reply(reply: &CodegenReply) -> String {
 mod tests {
     use super::*;
     use config::Direction;
+
+    /// Every phase a poll can imply, from the three signals it has.
+    #[test]
+    fn phase_for_covers_the_matrix() {
+        use JobPhase::*;
+        let cases = [
+            ((false, false, false), Submitted),
+            ((true, false, false), Admitted),
+            ((true, true, false), Running),
+            ((true, true, true), Measuring),
+            // Logs outrank everything: a job printing output is measuring whatever the slower
+            // Kueue/pod reads still say.
+            ((false, false, true), Measuring),
+            ((false, true, false), Running),
+        ];
+        for ((admitted, pod_running, has_logs), want) in cases {
+            let got = phase_for(admitted, pod_running, has_logs);
+            assert_eq!(
+                got, want,
+                "admitted={admitted} running={pod_running} logs={has_logs}"
+            );
+        }
+    }
+
+    #[test]
+    fn phases_are_ordered_so_a_blip_cannot_walk_backwards() {
+        assert!(JobPhase::Submitted < JobPhase::Admitted);
+        assert!(JobPhase::Admitted < JobPhase::Running);
+        assert!(JobPhase::Running < JobPhase::Measuring);
+    }
+
+    /// A real subscriber layer recording span opens and closes in order, so the test observes the
+    /// actual tracing lifecycle rather than a stand-in for it.
+    #[derive(Clone, Default)]
+    struct SpanLog {
+        events: Arc<Mutex<Vec<String>>>,
+        names: Arc<Mutex<std::collections::HashMap<u64, String>>>,
+    }
+
+    impl SpanLog {
+        fn taken(&self) -> Vec<String> {
+            self.events
+                .lock()
+                .map(|mut e| std::mem::take(&mut *e))
+                .unwrap_or_default()
+        }
+    }
+
+    struct PhaseField(Option<String>);
+
+    impl tracing::field::Visit for PhaseField {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "phase" {
+                self.0 = Some(value.to_string());
+            }
+        }
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "phase" && self.0.is_none() {
+                self.0 = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::layer::Layer<S> for SpanLog {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &tracing::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut f = PhaseField(None);
+            attrs.record(&mut f);
+            let name = f.0.unwrap_or_else(|| attrs.metadata().name().to_string());
+            if let Ok(mut n) = self.names.lock() {
+                n.insert(id.into_u64(), name.clone());
+            }
+            if let Ok(mut e) = self.events.lock() {
+                e.push(format!("open {name}"));
+            }
+        }
+
+        fn on_close(&self, id: tracing::Id, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+            let name = self
+                .names
+                .lock()
+                .ok()
+                .and_then(|n| n.get(&id.into_u64()).cloned())
+                .unwrap_or_default();
+            if let Ok(mut e) = self.events.lock() {
+                e.push(format!("close {name}"));
+            }
+        }
+    }
+
+    /// `advance` closes the phase it is leaving before opening the next, and dropping the holder
+    /// closes the trailing one (the JobFailed / early-return path).
+    #[test]
+    fn phase_spans_close_in_order_and_drop_closes_the_last() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let log = SpanLog::default();
+        let subscriber = tracing_subscriber::registry().with(log.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let parent = opentelemetry::Context::new();
+
+        let mut spans = PhaseSpans::new();
+        spans.advance(&parent, JobPhase::Submitted);
+        spans.advance(&parent, JobPhase::Admitted);
+        spans.advance(&parent, JobPhase::Measuring);
+        assert_eq!(
+            log.taken(),
+            vec![
+                "open submitted",
+                "close submitted",
+                "open admitted",
+                "close admitted",
+                "open measuring",
+            ]
+        );
+
+        drop(spans);
+        assert_eq!(
+            log.taken().last().map(String::as_str),
+            Some("close measuring")
+        );
+    }
+
+    /// The watcher's poll thread is detached, so a poll that lands after the owner dropped must
+    /// not reopen a phase.
+    #[test]
+    fn advancing_after_close_opens_nothing() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let log = SpanLog::default();
+        let subscriber = tracing_subscriber::registry().with(log.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let parent = opentelemetry::Context::new();
+
+        let mut spans = PhaseSpans::new();
+        spans.advance(&parent, JobPhase::Running);
+        spans.close();
+        assert_eq!(log.taken(), vec!["open running", "close running"]);
+
+        spans.advance(&parent, JobPhase::Measuring);
+        drop(spans);
+        assert!(log.taken().is_empty());
+    }
 
     fn bench_cfg() -> ToolsConfig {
         let json = serde_json::json!({

@@ -43,6 +43,51 @@ impl RateHandle {
     }
 }
 
+/// Shared, lock-free reader of the turn's cost so far in USD, folded from every
+/// `claude_code.cost.usage` export. `0.0` (the default) reads back as `None`.
+///
+/// Why this exists: the stream's own `total_cost_usd` only lands in the turn-end `result` message,
+/// so a mid-turn budget tick priced a $23 turn at $0.36. The agent exports its cost metric every
+/// 10 s, which is the only honest live number available.
+#[derive(Clone, Default)]
+pub struct CostHandle(Arc<AtomicU64>);
+
+impl CostHandle {
+    /// Fold one export's cost in. ACCUMULATES rather than replaces, mirroring [`summarize`]'s
+    /// per-model `+=`: the agent exports delta temporality, so the running total here converges on
+    /// the same figure the turn-end [`OtelSummary`] reports.
+    pub(crate) fn add(&self, delta: f64) {
+        if !delta.is_finite() || delta <= 0.0 {
+            return;
+        }
+        let mut prev = self.0.load(Ordering::Relaxed);
+        loop {
+            let next = (f64::from_bits(prev) + delta).to_bits();
+            match self
+                .0
+                .compare_exchange_weak(prev, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return,
+                Err(actual) => prev = actual,
+            }
+        }
+    }
+
+    /// The turn's cost so far, or `None` when no cost export has landed yet.
+    pub fn get(&self) -> Option<f64> {
+        let c = f64::from_bits(self.0.load(Ordering::Relaxed));
+        (c > 0.0).then_some(c)
+    }
+}
+
+/// The collector's live per-turn meters, cloned into the stream decoder. Bundled because the two
+/// handles are always taken together and always from the same collector.
+#[derive(Clone, Default)]
+pub struct LiveMeters {
+    pub rate: RateHandle,
+    pub cost: CostHandle,
+}
+
 /// Sliding-window rate estimator: samples `(monotonic_secs, cumulative_total)`, prunes anything
 /// older than [`WINDOW`], and reports the slope across the surviving window. Time is passed in as
 /// monotonic seconds so the window math is unit-testable without a clock.
@@ -83,7 +128,7 @@ impl RateWindow {
 /// Server-side state shared across handlers.
 struct CollectorState {
     log: Mutex<std::fs::File>,
-    rate: RateHandle,
+    meters: LiveMeters,
     window: Mutex<RateWindow>,
     start: Instant,
 }
@@ -93,7 +138,7 @@ struct CollectorState {
 /// thread.
 pub struct OtelCollector {
     port: u16,
-    rate: RateHandle,
+    meters: LiveMeters,
     log_path: PathBuf,
     shutdown: Option<oneshot::Sender<()>>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -112,10 +157,10 @@ impl OtelCollector {
             .append(true)
             .open(&log_path)?;
 
-        let rate = RateHandle::default();
+        let meters = LiveMeters::default();
         let state = Arc::new(CollectorState {
             log: Mutex::new(file),
-            rate: rate.clone(),
+            meters: meters.clone(),
             window: Mutex::new(RateWindow::new()),
             start: Instant::now(),
         });
@@ -172,7 +217,7 @@ impl OtelCollector {
         match port_rx.recv() {
             Ok(Ok(port)) => Ok(OtelCollector {
                 port,
-                rate,
+                meters,
                 log_path,
                 shutdown: Some(sd_tx),
                 handle: Some(handle),
@@ -195,9 +240,14 @@ impl OtelCollector {
         self.port
     }
 
-    /// The shared rate handle to clone into a [`crate::stream_json::StreamJsonParser`].
-    pub fn rate_handle(&self) -> RateHandle {
-        self.rate.clone()
+    /// The shared live meters to clone into a [`crate::stream_json::StreamJsonParser`].
+    pub fn meters(&self) -> LiveMeters {
+        self.meters.clone()
+    }
+
+    /// The running cost total on its own, for callers that only price the turn.
+    pub fn cost_handle(&self) -> CostHandle {
+        self.meters.cost.clone()
     }
 
     /// The `http://<host>:<port>` endpoint for a *local* agent (loopback).
@@ -273,8 +323,9 @@ async fn ingest(State(state): State<Arc<CollectorState>>, req: Request) -> Respo
         let now_secs = state.start.elapsed().as_secs_f64();
         if let Ok(mut w) = state.window.lock() {
             let rate = w.update(now_secs, total);
-            state.rate.store(rate);
+            state.meters.rate.store(rate);
         }
+        state.meters.cost.add(sum_cost_usage(&payload));
     }
 
     axum::response::Response::builder()
@@ -287,11 +338,16 @@ async fn ingest(State(state): State<Arc<CollectorState>>, req: Request) -> Respo
 /// Sum every `claude_code.token.usage` data-point value in one metrics export (all models/types),
 /// the cumulative total the rate window slopes over.
 fn sum_token_usage(payload: &Value) -> f64 {
+    metric_total(payload, "claude_code.token.usage")
+}
+
+/// Sum every data point of the named metric in one export, across models and types.
+fn metric_total(payload: &Value, name: &str) -> f64 {
     let mut total = 0.0;
     for rm in array(payload, "resourceMetrics") {
         for sm in array(rm, "scopeMetrics") {
             for metric in array(sm, "metrics") {
-                if metric.get("name").and_then(Value::as_str) != Some("claude_code.token.usage") {
+                if metric.get("name").and_then(Value::as_str) != Some(name) {
                     continue;
                 }
                 for dp in data_points(metric) {
@@ -301,6 +357,12 @@ fn sum_token_usage(payload: &Value) -> f64 {
         }
     }
     total
+}
+
+/// Sum every `claude_code.cost.usage` data-point value in one metrics export (all models), the
+/// per-export cost delta [`CostHandle`] folds in.
+fn sum_cost_usage(payload: &Value) -> f64 {
+    metric_total(payload, "claude_code.cost.usage")
 }
 
 /// The token/cost/latency/active-time rollup of a captured OTLP jsonl. Tokens are `u64` (the
@@ -813,6 +875,102 @@ mod tests {
         let big = vec![b'x'; MAX_EXPORT_BYTES + 1];
         let resp = post_bytes(port, "/v1/metrics", &big);
         assert!(resp.contains("413"), "expected 413, got: {resp}");
+        collector.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cost_handle_accumulates_and_zero_reads_as_none() {
+        let h = CostHandle::default();
+        assert!(h.get().is_none());
+        h.add(0.25);
+        h.add(0.75);
+        // Non-positive and non-finite folds are dropped rather than poisoning the total.
+        h.add(0.0);
+        h.add(-1.0);
+        h.add(f64::NAN);
+        assert_eq!(h.get(), Some(1.0));
+    }
+
+    /// The live cost must land on the same number `build_summary` reports at turn end, whatever
+    /// the exporter's temporality: both sides fold every export's cost data points the same way.
+    #[test]
+    fn live_cost_converges_on_the_turn_end_summary() {
+        for (label, exports) in [
+            // Delta temporality: each export carries only what accrued since the last one.
+            ("delta", vec![0.10_f64, 0.05, 0.31]),
+            // Cumulative temporality as the agent emits it: identical repeated exports.
+            ("cumulative", vec![0.20, 0.20, 0.20]),
+        ] {
+            let dir =
+                std::env::temp_dir().join(format!("otel-cost-{label}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let log = dir.join("otel.jsonl");
+            let collector =
+                OtelCollector::start(log.clone(), "127.0.0.1").expect("collector binds");
+            let port = collector.port();
+
+            for (i, cost) in exports.iter().enumerate() {
+                let body = serde_json::to_vec(&json!({
+                    "resourceMetrics": [{"scopeMetrics": [{"metrics": [
+                        {"name": "claude_code.token.usage", "sum": {"dataPoints": [
+                            {"asInt": 1000 * (i as i64 + 1), "attributes": [
+                                {"key": "model", "value": {"stringValue": "claude-opus-4-6"}},
+                                {"key": "type", "value": {"stringValue": "input"}},
+                            ]},
+                        ]}},
+                        {"name": "claude_code.cost.usage", "sum": {"dataPoints": [
+                            {"asDouble": cost, "attributes": [
+                                {"key": "model", "value": {"stringValue": "claude-opus-4-6"}},
+                            ]},
+                        ]}},
+                    ]}]}],
+                }))
+                .unwrap();
+                assert!(post_bytes(port, "/v1/metrics", &body).contains("partialSuccess"));
+            }
+
+            let live = collector
+                .cost_handle()
+                .get()
+                .expect("a live cost after exports");
+            let expected: f64 = exports.iter().sum();
+            assert!((live - expected).abs() < 1e-9, "{label}: live was {live}");
+            let summary = collector.summary().expect("summary after exports");
+            assert!(
+                (live - summary.cost_usd).abs() < 1e-9,
+                "{label}: live {live} vs summary {}",
+                summary.cost_usd
+            );
+            // The meters bundle hands out the same shared totals.
+            assert_eq!(collector.meters().cost.get(), Some(live));
+
+            collector.stop();
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// An export with no cost metric (tokens only) must leave the live total untouched.
+    #[test]
+    fn a_costless_export_does_not_disturb_the_live_total() {
+        let dir = std::env::temp_dir().join(format!("otel-nocost-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let collector =
+            OtelCollector::start(dir.join("otel.jsonl"), "127.0.0.1").expect("collector binds");
+        let port = collector.port();
+        let body = serde_json::to_vec(&json!({
+            "resourceMetrics": [{"scopeMetrics": [{"metrics": [
+                {"name": "claude_code.token.usage", "sum": {"dataPoints": [
+                    {"asInt": 4200, "attributes": [
+                        {"key": "model", "value": {"stringValue": "m"}},
+                        {"key": "type", "value": {"stringValue": "input"}},
+                    ]},
+                ]}},
+            ]}]}],
+        }))
+        .unwrap();
+        assert!(post_bytes(port, "/v1/metrics", &body).contains("partialSuccess"));
+        assert!(collector.cost_handle().get().is_none());
         collector.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }

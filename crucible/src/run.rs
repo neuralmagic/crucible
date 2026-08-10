@@ -702,6 +702,13 @@ fn drive_loop(
     // than behind a static.
     crate::engine::abort_on_signal(run_span.clone());
 
+    // The liveness beat runs for the whole loop, parented to the run span so its beats hang off the
+    // run in Tempo. Declared AFTER `run_span` so the guard's Drop runs first and the beat is joined
+    // before the span it holds goes away, on the error returns below as well as the success path.
+    let heartbeat = crate::heartbeat::period_from_env()
+        .map(|period| crate::heartbeat::start(period, run_span.clone()));
+    let beat = heartbeat.as_ref().map(crate::heartbeat::BeatGuard::beat);
+
     let outcome = {
         let _run_guard = run_span.as_ref().map(tracing::Span::enter);
         if args.resume {
@@ -746,6 +753,7 @@ fn drive_loop(
                             resume: Some(recovered.resume),
                             recovery: Some(recovery),
                             ledger: Some(ledger),
+                            heartbeat: beat.clone(),
                         },
                     )?
                 }
@@ -762,7 +770,10 @@ fn drive_loop(
                         &mut r,
                         world.as_ref(),
                         judge.as_ref(),
-                        LoopRuntime::default(),
+                        LoopRuntime {
+                            heartbeat: beat.clone(),
+                            ..LoopRuntime::default()
+                        },
                     )?
                 }
                 Ui::Stream => {
@@ -780,6 +791,7 @@ fn drive_loop(
                         LoopRuntime {
                             control: control.as_deref(),
                             ledger: Some(ledger),
+                            heartbeat: beat.clone(),
                             ..LoopRuntime::default()
                         },
                     )?
@@ -793,13 +805,19 @@ fn drive_loop(
                         &mut r,
                         world.as_ref(),
                         judge.as_ref(),
-                        LoopRuntime::default(),
+                        LoopRuntime {
+                            heartbeat: beat.clone(),
+                            ..LoopRuntime::default()
+                        },
                     )?
                 }
             }
         }
     };
     deliver_run_evidence(&p);
+    // Explicit because this path ends in `process::exit`, which runs no destructors: the beat
+    // thread holds a clone of the run span, so a live beat would keep it open past the flush below.
+    drop(heartbeat);
     // Close the run span (drop it, now that its guard is gone) so the OTLP layer batches it, THEN
     // flush: the loop exits via process::exit, which skips EngineCtx::Drop.
     drop(run_span);

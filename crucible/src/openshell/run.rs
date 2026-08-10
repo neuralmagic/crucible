@@ -273,7 +273,7 @@ async fn try_turn(
     } else {
         None
     };
-    let rate = collector.as_ref().map(|c| c.rate_handle());
+    let meters = collector.as_ref().map(OtelCollector::meters);
 
     // Best-effort sandbox teardown from here on, so a mid-turn failure still cleans up.
     let result = async {
@@ -420,7 +420,7 @@ async fn try_turn(
                 }
             }
         });
-        let decoder = harness.decoder(rate.as_ref(), crate::agent::tool_io_full(args));
+        let decoder = harness.decoder(meters.as_ref(), crate::agent::tool_io_full(args));
         let exec_result = exec_and_stream(&gw, &name, &wrapper, decoder, &exec_opts, sink).await;
         refresher.abort();
         let mut cost = exec_result?;
