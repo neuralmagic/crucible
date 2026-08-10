@@ -106,6 +106,8 @@ Any language works the same way, because the engine reads only the JSON verdict.
 | **Session log** | versioned NDJSON event stream (the source of truth) | `session.rs` |
 | **Memory** | git-as-memory (kept commits) + `RESULTS.md` | `vcs.rs` + `write_results` |
 | **Control plane** | steer / stop-park / resume / escalate | `STEER.md` / `state/control.json` / `--resume` / `ESCALATION.json` |
+| **Distress** | the agent pages the operator; `severity=error` suspends the run with the pod alive | `crucible-broker::distress` + `crucible/src/distress.rs` |
+| **Durable run state** | `[cluster] state_pvc` mounts a claim over the domain's `state/` dir, so a replaced pod resumes instead of restarting the run. A named (shared) claim is keyed per run by a `state/<run>` subPath and needs RWX; a `[cluster.state_pvc]` table materializes a dedicated `<run>-state` claim mounted at its root | `deploy/profile.rs` + `deploy/render/kube.rs` |
 | **Provisioning** | mediated MCP broker: the agent asks, the host holds the keys (GPU capture, issue-tracker grounding, draft PRs) | `crucible-broker` (ADR-0002) |
 | **Profiler** | generic profile-over-MCP: pprof for a Go service, GPU traces for a model server | `crucible-broker::profile` (ADR-0006) |
 | **Build + deploy** | engine-side build, and `crucible deploy render` projects the loop/deployment manifests, digest-pinned | `forge` + `crucible/src/deploy/` (ADR-0005 / 0012) |
@@ -190,6 +192,49 @@ git default.
 The litmus test for "framework, not demo": any second repo runs this way with **no
 new Rust**.
 
+## Distress: the agent can page you
+
+A doomed run used to burn its budget quietly. The broker exposes a `distress` tool so the
+agent can say so, with a required severity that decides what happens:
+
+| severity | Slack | Run |
+| --- | --- | --- |
+| `info` | posted | continues; the note lands on the next decided row in `RESULTS.md` |
+| `warn` | posted | continues; same note channel |
+| `error` | posted | **suspends**: the current turn finishes and is decided, then the loop parks with the pod alive and state preserved |
+
+`error` is for runs that cannot succeed without you: the same environment failure recurring
+across iterations, a missing capability, a goal that is infeasible as specified. It is not for
+hard-but-possible tasks. The tool replies `{"status":"suspending"}` and the agent wraps up its
+turn; the suspend happens at the next iteration head, after that turn's bookkeeping, so nothing
+is lost. Repeat `error` calls while suspended are no-ops. If the marker cannot be written (a full
+or read-only volume) the tool returns an error instead of `suspending` and posts nothing: the run
+is not suspended, so neither the agent nor the page may claim it is.
+
+Mechanically the suspend is a pending approval: the loop opens the same `approval_wait` bracket
+provisioning uses, so suspended wall-clock accrues to `parked_total` and is excluded from
+`--max-time`. The distressed iteration still counts (its turn ran); the suspended time counts
+against nothing. `--max-park` bounds the wait.
+
+The handoff is one file on the loop pod's forge-storage volume, `/var/lib/forge/distress`.
+Deleting it is the resume grant:
+
+```sh
+oc exec <pod> -n <ns> -- rm /var/lib/forge/distress   # resume in place
+```
+
+For a fix that has to be baked at pod start (image pins, the pack, resources), re-roll the pod
+instead: the marker lives on an emptyDir, so the replacement starts clean, and a resume that
+finds the dangling distress bracket does not re-park. Info/warn notes ride
+`/var/lib/forge/distress-notes.jsonl` and are consumed onto the next row.
+
+Env the render stamps on the loop pod (the broker inherits it, so the page can name the run):
+`CRUCIBLE_RUN_NAME`, `CRUCIBLE_ITERATIONS`, `CRUCIBLE_LOOP_IMAGE`, alongside the existing
+downward-API `CRUCIBLE_POD_NAME` / `CRUCIBLE_POD_NAMESPACE`. Slack is webhook-only: point
+`SLACK_WEBHOOK_URL` at an incoming webhook through the profile's `[[secret_env]]`, and set
+`DATADOG_BASE_URL` if your Datadog site is not `app.datadoghq.com`. With no webhook configured
+the suspend still happens; delivery is fire-and-forget by design.
+
 ## Concept → code (where to look)
 
 - loop / budget / keep-discard: `crucible/src/run.rs` + `crucible/src/loop_driver.rs`
@@ -197,6 +242,7 @@ new Rust**.
 - World/Judge batteries: `crucible/src/command_world.rs` (`GitWorld`/`CommandWorld`/`CompositeWorld`), `crucible/src/command_judge.rs` (`CommandJudge`)
 - composite domains: `crucible/src/manifest.rs` (`CompositeManifest`) + `crucible/src/run.rs` (`run_composite`)
 - mediated broker (provisioning / issue tracker / profiler / draft PR): `crucible-broker/`
+- distress (agent-raised suspend + the Slack page): `crucible-broker/src/distress.rs` + `crucible/src/distress.rs`
 - engine-side build + rendered deploy: `forge/` (build, native-OCI derive, kube-rs) + `crucible/src/deploy/`
 - agent transport: `crucible/src/agent.rs`
 - frontends: `crucible/src/{console,jsonl,stream}.rs`

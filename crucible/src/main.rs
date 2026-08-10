@@ -34,6 +34,7 @@ mod console;
 pub(crate) mod control;
 mod crucible;
 mod deploy;
+mod distress;
 mod engine;
 mod errors;
 mod escalation;

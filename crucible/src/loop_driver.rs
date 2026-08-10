@@ -756,6 +756,11 @@ fn run_loop_body<R: Reporter>(
     // same iteration (hence a `while`, not a `for`), and `dead_turns` counts the consecutive
     // never-started attempts that bound the re-runs.
     let mut dead_turns: u32 = 0;
+    // The marker this run already parked on (by its `ts_ms`), so a marker the operator left in
+    // place can't re-park the loop, and a fresh distress still can.
+    let mut parked_distress_ts: Option<u64> = None;
+    // The mtime of the malformed marker already complained about; a rewrite re-notes.
+    let mut bad_marker_seen: Option<Option<std::time::SystemTime>> = None;
     let mut it = start_iter;
     while it <= args.iterations {
         wait_if_paused(control, r);
@@ -839,6 +844,74 @@ fn run_loop_body<R: Reporter>(
                 );
             }
         }
+        // The agent raised `distress(severity=error)` during the last turn: that turn finished and
+        // was decided above, so bookkeeping is complete and this is the safe point to suspend.
+        // Modeled as an approval wait (same bracket, same parked-time accounting); the operator's
+        // `rm` of the marker is the grant.
+        match crate::distress::read_marker() {
+            Some(Ok(marker)) if parked_distress_ts != Some(marker.ts_ms) => {
+                parked_distress_ts = Some(marker.ts_ms);
+                // The turn that raised distress is already numbered; this row annotates it.
+                let row = Row {
+                    iter: it.saturating_sub(1),
+                    decision: "distressed".to_string(),
+                    note: marker.reason.clone(),
+                    ..Default::default()
+                };
+                // An in-place restart re-reads a marker the operator never cleared and re-parks
+                // (correct: no grant was given), but the row for it is already in the resumed log.
+                if !run.rows.iter().any(|prior| {
+                    prior.decision == row.decision
+                        && prior.iter == row.iter
+                        && prior.note == row.note
+                }) {
+                    r.row(&row, false);
+                    run.rows.push(row);
+                    write_results(p, &prep.goal, &prep.prior, &run.rows)?;
+                }
+                r.note(&format!(
+                    "distress: {}, suspended awaiting the operator (clear {})",
+                    marker.reason,
+                    forge::storage_root().join("distress").display()
+                ));
+                for item in &marker.evidence {
+                    r.note(&format!("distress evidence: {item}"));
+                }
+                update_control_status(control, "distressed", it, run.segment.best_score, run.spent);
+                r.approval_wait(
+                    crate::distress::HANDLE,
+                    crate::distress::HANDLE,
+                    provisioning::WaitMode::Block,
+                );
+                match park_for_distress(p, &run.rows, r, &mut run.parked_total, args.max_park()) {
+                    DistressOutcome::Cleared => {
+                        r.approval_resolved("granted", "distress cleared by operator");
+                        r.note("distress cleared, resuming");
+                        // The head re-checks budget/interrupts before the next turn runs.
+                        continue;
+                    }
+                    DistressOutcome::Stopped => {
+                        exit = LoopExit::Stopped;
+                        break;
+                    }
+                    DistressOutcome::TimedOut => {
+                        r.note("distress park timed out, stopping with state preserved");
+                        exit = LoopExit::Stopped;
+                        break;
+                    }
+                }
+            }
+            // A marker we cannot parse is a broken handoff, not a suspend order: note it once per
+            // rewrite and keep iterating. Wedging a paid run on a bad byte is the worse failure.
+            Some(Err(why)) => {
+                let mtime = crate::distress::marker_mtime();
+                if bad_marker_seen != Some(mtime) {
+                    bad_marker_seen = Some(mtime);
+                    r.note(&format!("distress marker unreadable ({why}), not parking"));
+                }
+            }
+            _ => {}
+        }
         if matches!(r.check_interrupt(p, &run.rows), Stop::Quit) {
             exit = LoopExit::Stopped;
             break;
@@ -848,6 +921,9 @@ fn run_loop_body<R: Reporter>(
             break;
         }
         r.phase(Phase::Iteration(it));
+        // The broker's distress page prints the iteration it fired on; best-effort by design, a
+        // missing stamp only costs the page a "?".
+        write_turn_meta(it, run.spent);
         update_control_status(control, "iteration", it, run.segment.best_score, run.spent);
         write_results(p, &prep.goal, &prep.prior, &run.rows)?;
 
@@ -989,12 +1065,13 @@ fn run_loop_body<R: Reporter>(
         } = match step {
             IterStep::Decided(d) => *d,
             IterStep::Discarded { reason } => {
-                let row = Row {
+                let mut row = Row {
                     iter: it,
                     decision: "discarded".to_string(),
                     note: reason,
                     ..Default::default()
                 };
+                fold_distress_notes(r, &mut row.note);
                 r.row(&row, false);
                 run.rows.push(row);
                 world.restore(run.segment.best_snap.as_str())?;
@@ -1048,6 +1125,7 @@ fn run_loop_body<R: Reporter>(
                 break;
             }
         };
+        fold_distress_notes(r, &mut row.note);
 
         if verdict.keep {
             if let Some(s) = reading.score {
@@ -1586,6 +1664,66 @@ fn park_for_approval<R: Reporter>(
         ParkOutcome::Stopped => {}
     }
     outcome
+}
+
+/// Fold the turn's info/warn distress notes onto the row being written: they are per-turn signals,
+/// so RESULTS.md carries them next to the outcome they happened during. Consumed on read, hence
+/// one call per row-emitting path.
+fn fold_distress_notes<R: Reporter>(r: &mut R, note: &mut String) {
+    for (severity, reason) in crate::distress::drain_notes() {
+        r.note(&format!("distress[{severity}]: {reason}"));
+        note.push_str(&format!("; distress[{severity}]: {reason}"));
+    }
+}
+
+/// Why a [`park_for_distress`] ended.
+#[derive(Debug, PartialEq, Eq)]
+enum DistressOutcome {
+    /// The operator removed the marker: that IS the grant, resume at the next iteration head.
+    Cleared,
+    /// Ctrl+C / stop / a control interrupt while suspended.
+    Stopped,
+    /// `--max-park` elapsed with the marker still in place.
+    TimedOut,
+}
+
+/// Suspend the loop while the broker's distress marker exists. Idle and budget-paused: the caller
+/// folds the elapsed time into `parked_total`, so suspended wall-clock burns no time budget. The
+/// engine never deletes the marker: the operator's `rm` is the resume grant.
+fn park_for_distress<R: Reporter>(
+    p: &Paths,
+    rows: &[Row],
+    r: &mut R,
+    parked_total: &mut Duration,
+    timeout: Option<Duration>,
+) -> DistressOutcome {
+    let start = Instant::now();
+    let outcome = loop {
+        if crate::distress::read_marker().is_none() {
+            break DistressOutcome::Cleared;
+        }
+        if STOP.load(Ordering::SeqCst) || matches!(r.check_interrupt(p, rows), Stop::Quit) {
+            break DistressOutcome::Stopped;
+        }
+        if timeout.is_some_and(|cap| start.elapsed() >= cap) {
+            break DistressOutcome::TimedOut;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    *parked_total += start.elapsed();
+    outcome
+}
+
+/// Stamp the current iteration where the broker's distress page reads it (`<storage>/turn-meta.json`,
+/// the per-turn sibling of `turn-token`). Best-effort: the broker prints `?` without it, and a
+/// local run has no storage dir at all.
+fn write_turn_meta(iter: u32, spent_usd: f64) {
+    let dir = forge::storage_root();
+    if !dir.is_dir() {
+        return;
+    }
+    let body = serde_json::json!({ "iter": iter, "spent_usd": spent_usd }).to_string();
+    let _ = std::fs::write(dir.join("turn-meta.json"), body);
 }
 
 /// Capture the agent's staged change for this iteration before keep/discard
@@ -2400,6 +2538,8 @@ mod tests {
         notes: Vec<String>,
         waits: Vec<(String, String, provisioning::WaitMode)>,
         resolved: Vec<(String, String)>,
+        /// Polls to answer `Continue` before reporting `Quit`; 0 = never interrupt.
+        quit_after: Option<u32>,
     }
     impl Reporter for NoteCapture {
         fn start(&mut self, _: &str, _: &str) {}
@@ -2421,7 +2561,14 @@ mod tests {
             AgentTurn::default()
         }
         fn check_interrupt(&mut self, _: &Paths, _: &[Row]) -> Stop {
-            Stop::Continue
+            match &mut self.quit_after {
+                Some(0) => Stop::Quit,
+                Some(n) => {
+                    *n -= 1;
+                    Stop::Continue
+                }
+                None => Stop::Continue,
+            }
         }
         fn summary(&mut self, _: &[Row], _: &str, _: f64) {}
         fn approval_wait(&mut self, handle: &str, trace_id: &str, mode: provisioning::WaitMode) {
@@ -2541,6 +2688,384 @@ mod tests {
         assert!(r.notes.iter().any(|n| n.contains("no control bridge")));
     }
 
+    // --- distress: the agent-raised suspend ---
+
+    /// A `run_loop` fixture plus a scratch `FORGE_STORAGE_ROOT` for the handoff files. The
+    /// fixture's lock already covers the storage root, so these tests must not take `env_lock`
+    /// themselves. The tuple's drop order (root first, then the fixture holding the lock) is what
+    /// keeps the env var from outliving the lock.
+    fn distress_fixture(name: &str, iterations: u32) -> (Fixture, crate::distress::testing::Root) {
+        let f = fixture(iterations, 0.0, false);
+        let root = crate::distress::testing::Root::new(name);
+        (f, root)
+    }
+
+    fn write_marker(root: &std::path::Path, reason: &str, ts_ms: u64) {
+        std::fs::write(
+            root.join("distress"),
+            serde_json::json!({ "reason": reason, "evidence": [], "ts_ms": ts_ms }).to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn distress_park_resumes_when_the_operator_clears_the_marker() {
+        let (f, root) = distress_fixture("loop-cleared", 1);
+        write_marker(&root.dir, "torch skew", 1);
+        // The operator's `oc exec ... rm`, played by a thread.
+        let marker = root.dir.join("distress");
+        let h = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            std::fs::remove_file(&marker).unwrap();
+        });
+
+        let mut r = NoteCapture::default();
+        let mut parked = Duration::ZERO;
+        let outcome = park_for_distress(&f.paths, &[], &mut r, &mut parked, None);
+        h.join().unwrap();
+
+        assert_eq!(outcome, DistressOutcome::Cleared);
+        assert!(
+            parked >= Duration::from_millis(40),
+            "suspended time is accounted so over_budget can exclude it: {parked:?}"
+        );
+    }
+
+    #[test]
+    fn distress_park_stops_on_an_interrupt() {
+        let (f, root) = distress_fixture("loop-stop", 1);
+        write_marker(&root.dir, "unfixable", 1);
+        let mut r = NoteCapture {
+            quit_after: Some(1),
+            ..Default::default()
+        };
+        let mut parked = Duration::ZERO;
+        assert_eq!(
+            park_for_distress(&f.paths, &[], &mut r, &mut parked, None),
+            DistressOutcome::Stopped
+        );
+        assert!(
+            root.dir.join("distress").exists(),
+            "a stop leaves the marker for the operator"
+        );
+    }
+
+    #[test]
+    fn distress_park_times_out_with_the_marker_intact() {
+        let (f, root) = distress_fixture("loop-timeout", 1);
+        write_marker(&root.dir, "nobody came", 1);
+        let mut r = NoteCapture::default();
+        let mut parked = Duration::ZERO;
+        assert_eq!(
+            park_for_distress(
+                &f.paths,
+                &[],
+                &mut r,
+                &mut parked,
+                Some(Duration::from_millis(120))
+            ),
+            DistressOutcome::TimedOut
+        );
+        assert!(parked >= Duration::from_millis(100), "{parked:?}");
+        assert!(root.dir.join("distress").exists());
+    }
+
+    #[test]
+    fn parked_time_is_excluded_from_the_time_budget() {
+        // The whole point of routing distress through the approval machinery: a run suspended
+        // longer than its time cap is not over budget, because suspended time buys nothing.
+        let mut f = fixture(1, 0.0, false);
+        f.args.max_time = "0.1s".into();
+        let started = Instant::now();
+        std::thread::sleep(Duration::from_millis(150));
+        let mut r = NoteCapture::default();
+        assert!(
+            !over_budget(
+                &f.args,
+                None,
+                0.0,
+                started,
+                Duration::from_millis(150),
+                &mut r
+            ),
+            "suspended wall-clock must not burn the time cap"
+        );
+        assert!(
+            over_budget(&f.args, None, 0.0, started, Duration::ZERO, &mut r),
+            "the same elapsed time WITHOUT a park is over budget"
+        );
+    }
+
+    #[test]
+    fn info_and_warn_notes_fold_onto_the_decided_row() {
+        let _g = crate::distress::testing::env_lock();
+        let root = crate::distress::testing::Root::new("loop-notes");
+        std::fs::write(
+            root.dir.join("distress-notes.jsonl"),
+            "{\"severity\":\"info\",\"reason\":\"cache warm\"}\n\
+             {\"severity\":\"warn\",\"reason\":\"flaky node\"}\n",
+        )
+        .unwrap();
+        let mut r = NoteCapture::default();
+        let mut note = String::from("kept: -3%");
+        fold_distress_notes(&mut r, &mut note);
+        assert_eq!(
+            note,
+            "kept: -3%; distress[info]: cache warm; distress[warn]: flaky node"
+        );
+        assert!(r.notes.iter().any(|n| n == "distress[info]: cache warm"));
+        // Consumed: the next row does not re-fold them.
+        let mut second = String::from("discarded");
+        fold_distress_notes(&mut r, &mut second);
+        assert_eq!(second, "discarded");
+    }
+
+    #[test]
+    fn turn_meta_is_stamped_for_the_distress_page() {
+        let _g = crate::distress::testing::env_lock();
+        let root = crate::distress::testing::Root::new("loop-turnmeta");
+        write_turn_meta(7, 12.5);
+        let v: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(root.dir.join("turn-meta.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v["iter"], 7);
+        assert_eq!(v["spent_usd"], 12.5);
+        // No storage dir (a local run) is not an error.
+        std::fs::remove_dir_all(&root.dir).unwrap();
+        write_turn_meta(8, 0.0);
+        assert!(!root.dir.exists());
+    }
+
+    /// A logged row as the session log would replay it on resume.
+    fn logged_row(
+        iter: u32,
+        decision: &str,
+        note: &str,
+        score: Option<f64>,
+        kept_snap: Option<&str>,
+    ) -> session::SessionEvent {
+        session::SessionEvent::Row {
+            row: session::RowWire {
+                iter,
+                decision: decision.into(),
+                note: note.into(),
+                detail: String::new(),
+                diff: String::new(),
+                diffstat: String::new(),
+                score,
+                total: score.map(|_| 100),
+                phase: None,
+                kept_snap: kept_snap.map(str::to_string),
+                tiebreak: None,
+                evidence: Vec::new(),
+                candidate_md: String::new(),
+            },
+            solved: false,
+        }
+    }
+
+    #[test]
+    fn a_distressed_row_folds_as_inert_on_resume() {
+        // The distressed row is an annotation, not a measurement: it carries no score and no
+        // kept snapshot, so a resume must not treat it as the baseline or the best.
+        let mut fold = ResumeFold::default();
+        for ev in [
+            logged_row(1, "keep", "", Some(10.0), Some("snap-1")),
+            logged_row(1, "distressed", "torch skew", None, None),
+        ] {
+            fold.feed(&ev);
+        }
+        let state = fold.finish();
+        assert_eq!(state.best_score, 10.0, "the kept row still defines best");
+        assert_eq!(
+            state.next_iter, 2,
+            "the distressed row shares iter 1, so the next turn is 2"
+        );
+        assert_eq!(state.rows.len(), 2, "it stays in the log for the agent");
+    }
+
+    /// The whole head path through `run_loop`: a marker the agent dropped mid-turn is picked up at
+    /// the NEXT iteration head (the turn that raised it finishes and is decided normally), rows and
+    /// the approval bracket land, the loop suspends, and the operator's `rm` resumes it in place.
+    #[test]
+    fn a_marker_parks_the_head_and_the_operator_rm_resumes_the_run() {
+        let (f, root) = distress_fixture("loop-head-park", 2);
+        let marker = root.dir.join("distress");
+        let mut r = RecordingReporter {
+            distress_after_turn: Some((1, marker.clone(), "torch skew".into())),
+            ..Default::default()
+        };
+        // The operator's `oc exec ... rm`, once the loop is actually parked on it.
+        let clear = marker.clone();
+        let operator = std::thread::spawn(move || {
+            while !clear.exists() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::thread::sleep(Duration::from_millis(60));
+            std::fs::remove_file(&clear).unwrap();
+        });
+
+        run_loop(
+            &f.args,
+            &f.paths,
+            &f.prepared,
+            &mut r,
+            &FakeWorld,
+            &FakeJudge {
+                keep: false,
+                solved: false,
+                fail_baseline: false,
+            },
+            LoopRuntime::default(),
+        )
+        .expect("a granted distress resumes, it does not error");
+        operator.join().unwrap();
+
+        assert_eq!(r.agent_calls, 2, "both iterations still run: {:?}", r.notes);
+        let distressed: Vec<&Row> = r
+            .rows
+            .iter()
+            .filter(|row| row.decision == "distressed")
+            .collect();
+        assert_eq!(distressed.len(), 1, "{:?}", r.rows);
+        assert_eq!(
+            distressed[0].iter, 1,
+            "the row annotates the turn that raised it, not the one about to run"
+        );
+        assert_eq!(distressed[0].note, "torch skew");
+        assert!(
+            distressed[0].score.is_none(),
+            "an annotation, not a measurement"
+        );
+        assert_eq!(
+            r.waits,
+            vec![(
+                "distress".to_string(),
+                "distress".to_string(),
+                provisioning::WaitMode::Block
+            )],
+            "the park runs under an approval bracket"
+        );
+        assert_eq!(
+            r.resolved,
+            vec![(
+                "granted".to_string(),
+                "distress cleared by operator".to_string()
+            )]
+        );
+        assert!(
+            r.notes.iter().any(|n| n.contains("distress cleared")),
+            "{:?}",
+            r.notes
+        );
+        // RESULTS carries the distressed row for whoever reads the run afterwards.
+        let results = std::fs::read_to_string(f.paths.workspace.join("RESULTS.md")).unwrap();
+        assert!(results.contains("distressed"), "{results}");
+    }
+
+    /// A marker we cannot parse is a broken handoff, not a suspend order: one complaint, no park,
+    /// no row, and the bytes are left where the operator can look at them.
+    #[test]
+    fn a_malformed_marker_is_noted_once_and_never_parks() {
+        let (f, root) = distress_fixture("loop-malformed", 3);
+        std::fs::write(root.dir.join("distress"), "{not json").unwrap();
+        let mut r = RecordingReporter::default();
+
+        run_loop(
+            &f.args,
+            &f.paths,
+            &f.prepared,
+            &mut r,
+            &FakeWorld,
+            &FakeJudge {
+                keep: false,
+                solved: false,
+                fail_baseline: false,
+            },
+            LoopRuntime::default(),
+        )
+        .expect("a bad byte must never wedge a paid run");
+
+        assert_eq!(r.agent_calls, 3, "every iteration still ran");
+        assert_eq!(
+            r.notes.iter().filter(|n| n.contains("unreadable")).count(),
+            1,
+            "one complaint per bad marker, not one per iteration: {:?}",
+            r.notes
+        );
+        assert!(
+            r.waits.is_empty(),
+            "no approval bracket for a broken marker"
+        );
+        assert!(
+            r.rows.iter().all(|row| row.decision != "distressed"),
+            "{:?}",
+            r.rows
+        );
+        assert!(
+            root.dir.join("distress").exists(),
+            "a malformed marker is operator evidence, never collected"
+        );
+    }
+
+    /// An in-place restart re-reads a marker the operator never cleared. Re-parking is right (no
+    /// grant was given) but the row for it came back with the resumed log, so it must not double.
+    #[test]
+    fn a_marker_surviving_a_restart_reparks_without_a_second_row() {
+        let (f, root) = distress_fixture("loop-restart", 2);
+        let marker = root.dir.join("distress");
+        write_marker(&root.dir, "torch skew", 42);
+        // The pre-restart log: iteration 1 ran, then this same marker parked the head.
+        let mut fold = ResumeFold::default();
+        for ev in [
+            logged_row(1, "discard", "", Some(100.0), None),
+            logged_row(1, "distressed", "torch skew", None, None),
+        ] {
+            fold.feed(&ev);
+        }
+        let prior_run = fold.finish();
+        let mut r = RecordingReporter::default();
+        let clear = marker.clone();
+        let operator = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            std::fs::remove_file(&clear).unwrap();
+        });
+
+        run_loop(
+            &f.args,
+            &f.paths,
+            &f.prepared,
+            &mut r,
+            &FakeWorld,
+            &FakeJudge {
+                keep: false,
+                solved: false,
+                fail_baseline: false,
+            },
+            LoopRuntime {
+                resume: Some(prior_run),
+                ..Default::default()
+            },
+        )
+        .expect("the park resolves when the operator clears it");
+        operator.join().unwrap();
+
+        assert!(
+            r.rows.iter().all(|row| row.decision != "distressed"),
+            "the resumed row already covers this marker: {:?}",
+            r.rows
+        );
+        let results = std::fs::read_to_string(f.paths.workspace.join("RESULTS.md")).unwrap();
+        assert_eq!(
+            results.matches("distressed").count(),
+            1,
+            "one marker, one row: {results}"
+        );
+        assert_eq!(r.waits.len(), 1, "it still parks: no grant was given");
+        assert_eq!(r.agent_calls, 1, "iteration 2 runs after the grant");
+    }
+
     // --- run_loop's shutdown emission: one Reporter::shutdown call per exit path ---
 
     /// A `World` that never fails: `apply`/`restore` no-op, `snapshot` hands back a fixed opaque
@@ -2623,6 +3148,11 @@ mod tests {
         prompts: Vec<String>,
         escalation_path: Option<std::path::PathBuf>,
         recoveries: Vec<(crate::session::RecoveryClass, u32, String)>,
+        waits: Vec<(String, String, provisioning::WaitMode)>,
+        resolved: Vec<(String, String)>,
+        /// Plays the agent calling `distress(severity=error)`: after this many turns, write the
+        /// broker's park marker at the given path with the given reason.
+        distress_after_turn: Option<(u32, std::path::PathBuf, String)>,
     }
     impl Reporter for RecordingReporter {
         fn start(&mut self, _: &str, _: &str) {}
@@ -2645,6 +3175,16 @@ mod tests {
         ) -> AgentTurn {
             self.agent_calls += 1;
             self.prompts.push(prompt.to_string());
+            if let Some((turn, path, reason)) = &self.distress_after_turn
+                && self.agent_calls == *turn
+            {
+                std::fs::write(
+                    path,
+                    serde_json::json!({ "reason": reason, "evidence": ["log-3"], "ts_ms": 42 })
+                        .to_string(),
+                )
+                .expect("plant the park marker");
+            }
             if let Some(path) = &self.escalation_path {
                 let _ = std::fs::write(
                     path,
@@ -2675,11 +3215,23 @@ mod tests {
         fn recovery(&mut self, class: crate::session::RecoveryClass, iter: u32, detail: &str) {
             self.recoveries.push((class, iter, detail.to_string()));
         }
+        fn approval_wait(&mut self, handle: &str, trace_id: &str, mode: provisioning::WaitMode) {
+            self.waits
+                .push((handle.to_string(), trace_id.to_string(), mode));
+        }
+        fn approval_resolved(&mut self, outcome: &str, reason: &str) {
+            self.resolved
+                .push((outcome.to_string(), reason.to_string()));
+        }
     }
 
     /// A scratch workspace + the `Args`/`Paths`/`Prepared` triple `run_loop` needs, wired to a
     /// `FakeWorld`/scripted `FakeJudge` so the loop runs with no subprocess, no git, no gate.
     struct Fixture {
+        /// The iteration head reads the distress marker and stamps `turn-meta.json` under the
+        /// process-global `FORGE_STORAGE_ROOT`, so two concurrent loops fight over one directory.
+        /// Every fixture serializes on the same lock the distress tests use.
+        _lock: std::sync::MutexGuard<'static, ()>,
         _dir: tempfile_dir::TempDir,
         args: Args,
         paths: Paths,
@@ -2712,6 +3264,7 @@ mod tests {
     }
 
     fn fixture(iterations: u32, max_cost: f64, no_early_stop: bool) -> Fixture {
+        let _lock = crate::distress::testing::env_lock();
         let dir = tempfile_dir::TempDir::new();
         let workspace = dir.path().to_path_buf();
         let state = workspace.join("state");
@@ -2786,6 +3339,7 @@ mod tests {
             },
         };
         Fixture {
+            _lock,
             _dir: dir,
             args,
             paths,
