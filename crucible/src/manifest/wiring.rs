@@ -14,16 +14,21 @@ impl Manifest {
     /// `CommandWorld` (git memory plus any of apply/snapshot/restore). Boxed `+ Send` so a
     /// front-end can move the world onto a worker thread.
     pub fn build_world(&self, workspace: PathBuf) -> Box<dyn World + Send> {
-        crucible_vcs::git_memory::install_harness_excludes(&workspace);
+        let carry_forward = self.workspace.carry_forward.clone();
+        crucible_vcs::git_memory::install_harness_excludes(&workspace, &carry_forward);
         let w = &self.world;
         if w.apply_cmd.is_none() && w.snapshot_cmd.is_none() && w.restore_cmd.is_none() {
-            Box::new(GitWorld { workspace })
+            Box::new(GitWorld {
+                workspace,
+                carry_forward,
+            })
         } else {
             Box::new(CommandWorld {
                 workspace,
                 apply_cmd: w.apply_cmd.clone(),
                 snapshot_cmd: w.snapshot_cmd.clone(),
                 restore_cmd: w.restore_cmd.clone(),
+                carry_forward,
             })
         }
     }
@@ -54,7 +59,7 @@ impl CompositeManifest {
             .map(|c| (c.name, c.workspace))
             .collect();
         for (_, ws) in &components {
-            crucible_vcs::git_memory::install_harness_excludes(ws);
+            crucible_vcs::git_memory::install_harness_excludes(ws, &[]);
         }
         Ok(Box::new(CompositeWorld {
             components,
@@ -62,6 +67,7 @@ impl CompositeManifest {
             apply_cmd: self.world.apply_cmd.clone(),
             snapshot_cmd: self.world.snapshot_cmd.clone(),
             restore_cmd: self.world.restore_cmd.clone(),
+            carry_forward: Vec::new(),
         }))
     }
 

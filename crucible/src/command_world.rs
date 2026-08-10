@@ -61,6 +61,8 @@ fn split_token(snap: &str) -> (&str, &str) {
 /// Reversibility *is* git: snapshot commits, restore resets + cleans. The any-repo default.
 pub struct GitWorld {
     pub workspace: PathBuf,
+    /// `[workspace].carry_forward`: untracked pipeline outputs a discard must not delete.
+    pub carry_forward: Vec<String>,
 }
 
 impl World for GitWorld {
@@ -68,7 +70,7 @@ impl World for GitWorld {
         git_memory::snapshot(&self.workspace, label)
     }
     fn restore(&self, snap: &str) -> Result<()> {
-        git_memory::restore(&self.workspace, snap)
+        git_memory::restore(&self.workspace, snap, &self.carry_forward)
     }
     fn commit_sha(&self, snap: &str) -> Option<String> {
         Some(snap.to_string())
@@ -85,6 +87,8 @@ pub struct CommandWorld {
     pub apply_cmd: Option<String>,
     pub snapshot_cmd: Option<String>,
     pub restore_cmd: Option<String>,
+    /// `[workspace].carry_forward`: untracked pipeline outputs a discard must not delete.
+    pub carry_forward: Vec<String>,
 }
 
 impl World for CommandWorld {
@@ -108,7 +112,7 @@ impl World for CommandWorld {
     }
     fn restore(&self, snap: &str) -> Result<()> {
         let (git, domain) = split_token(snap);
-        git_memory::restore(&self.workspace, git)?;
+        git_memory::restore(&self.workspace, git, &self.carry_forward)?;
         if let Some(cmd) = &self.restore_cmd {
             run_cmd(&self.workspace, cmd, Some(domain))?;
         }
@@ -146,6 +150,9 @@ pub struct CompositeWorld {
     pub apply_cmd: Option<String>,
     pub snapshot_cmd: Option<String>,
     pub restore_cmd: Option<String>,
+    /// Carried paths applied to every component workspace. Composite manifests don't expose
+    /// `carry_forward` yet, so this is always empty; it exists so restore has one shape.
+    pub carry_forward: Vec<String>,
 }
 
 impl World for CompositeWorld {
@@ -190,7 +197,8 @@ impl World for CompositeWorld {
                 .find(|(n, _)| n == name)
                 .map(|(_, ws)| ws)
                 .with_context(|| format!("restore: unknown component `{name}` in token"))?;
-            git_memory::restore(ws, sha).with_context(|| format!("restore component `{name}`"))?;
+            git_memory::restore(ws, sha, &self.carry_forward)
+                .with_context(|| format!("restore component `{name}`"))?;
         }
         if let Some(cmd) = &self.restore_cmd {
             run_cmd(&self.base_dir, cmd, Some(&token.domain))?;
@@ -285,6 +293,47 @@ mod tests {
     }
 
     #[test]
+    fn command_world_restore_keeps_carried_output_and_still_runs_restore_cmd() {
+        use std::fs;
+        let root = std::env::temp_dir().join(format!("cw-carry-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("kernel.cuh"), "v0\n").unwrap();
+        crucible_vcs::vcs::ensure_repo(&root).unwrap();
+        crucible_vcs::git_memory::install_harness_excludes(&root, &["codegen-out/".to_string()]);
+
+        let domtok_file = root.join("domtok-seen");
+        let world = CommandWorld {
+            workspace: root.clone(),
+            apply_cmd: None,
+            snapshot_cmd: Some("echo DOMTOK".to_string()),
+            restore_cmd: Some(format!(
+                "printf '%s' \"$CRUCIBLE_TOKEN\" > {}",
+                domtok_file.display()
+            )),
+            carry_forward: vec!["codegen-out/".to_string()],
+        };
+
+        let base = world.snapshot("baseline").unwrap();
+        fs::create_dir_all(root.join("codegen-out")).unwrap();
+        fs::write(root.join("codegen-out/plan.md"), "port plan").unwrap();
+        fs::write(root.join("kernel.cuh"), "v1\n").unwrap();
+        fs::write(root.join("scratch.txt"), "junk").unwrap();
+
+        world.restore(&base).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("codegen-out/plan.md")).unwrap(),
+            "port plan",
+            "carried output survives the discard"
+        );
+        assert_eq!(fs::read_to_string(root.join("kernel.cuh")).unwrap(), "v0\n");
+        assert!(!root.join("scratch.txt").exists());
+        assert_eq!(fs::read_to_string(&domtok_file).unwrap(), "DOMTOK");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn composite_snapshots_and_restores_each_component() {
         use std::fs;
         let root = std::env::temp_dir().join(format!("composite-test-{}", std::process::id()));
@@ -309,6 +358,7 @@ mod tests {
                 "printf '%s' \"$CRUCIBLE_TOKEN\" > {}",
                 domtok_file.display()
             )),
+            carry_forward: Vec::new(),
         };
 
         // Baseline: a valid JSON token naming both components + the combined domain token.
@@ -355,6 +405,7 @@ mod tests {
             apply_cmd: None,
             snapshot_cmd: None,
             restore_cmd: None,
+            carry_forward: Vec::new(),
         };
 
         // No edits yet -> empty diff.
@@ -405,6 +456,7 @@ mod tests {
             apply_cmd: None,
             snapshot_cmd: None,
             restore_cmd: None,
+            carry_forward: Vec::new(),
         };
 
         // Baseline pins both components' pristine shas.

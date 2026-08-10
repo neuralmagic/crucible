@@ -462,6 +462,12 @@ fn run_from_manifest(args: Args) -> Result<()> {
         template,
         identity,
         skip_baseline: m.judge.skip_baseline,
+        preflight: m.preflight.clone(),
+        preflight_modes: m
+            .measure
+            .as_ref()
+            .and_then(crate::manifest::MeasureCfg::build_modes)
+            .unwrap_or_default(),
         seed_diff: read_seed_diff(&manifest_dir, m.agent.seed_diff.as_deref())?,
     };
 
@@ -566,6 +572,12 @@ fn run_composite(args: Args, manifest_path: PathBuf) -> Result<()> {
         template,
         identity,
         skip_baseline: m.judge.skip_baseline,
+        preflight: m.preflight.clone(),
+        preflight_modes: m
+            .measure
+            .as_ref()
+            .and_then(crate::manifest::MeasureCfg::build_modes)
+            .unwrap_or_default(),
         seed_diff: read_seed_diff(&manifest_dir, m.agent.seed_diff.as_deref())?,
     };
 
