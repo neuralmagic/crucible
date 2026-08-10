@@ -168,7 +168,8 @@ pub(crate) fn head_sha(ws: &Path) -> Result<String> {
 }
 
 /// `git clean -fd -e <keep> ...`: remove untracked (not ignored) files and fully-untracked
-/// directories, preserving the given top-level paths; leaves dirs that still hold tracked files.
+/// directories, preserving the given workspace-relative paths (at any depth); leaves dirs that
+/// still hold tracked files.
 pub(crate) fn clean_untracked(ws: &Path, keep: &[&str]) -> Result<()> {
     let repo = Repository::open(ws).context("open workspace repo")?;
     let mut opts = StatusOptions::new();
@@ -182,20 +183,51 @@ pub(crate) fn clean_untracked(ws: &Path, keep: &[&str]) -> Result<()> {
         }
         let Ok(raw) = entry.path() else { continue };
         let rel = raw.trim_end_matches('/'); // untracked dirs carry a trailing slash
-        let kept = keep
-            .iter()
-            .any(|k| rel == *k || rel.starts_with(&format!("{k}/")));
-        if kept {
+        if is_kept(rel, keep) {
             continue;
         }
-        let full = ws.join(rel);
-        let _ = if full.is_dir() {
-            std::fs::remove_dir_all(&full)
-        } else {
-            std::fs::remove_file(&full)
-        };
+        remove_unless_kept(&ws.join(rel), rel, keep);
     }
     Ok(())
+}
+
+/// True when `rel` is a keep entry or lives under one.
+fn is_kept(rel: &str, keep: &[&str]) -> bool {
+    keep.iter()
+        .any(|k| rel == *k || rel.starts_with(&format!("{k}/")))
+}
+
+/// True when `rel` is a strict ancestor of some keep entry, i.e. deleting it would take a kept
+/// path with it.
+fn holds_kept(rel: &str, keep: &[&str]) -> bool {
+    keep.iter().any(|k| k.starts_with(&format!("{rel}/")))
+}
+
+/// Delete `full` (workspace-relative `rel`), except that a directory holding a nested keep entry
+/// is descended into instead: status collapses a fully-untracked dir to a single entry, so a keep
+/// like `out/traces` arrives here as the parent `out`, and `remove_dir_all` would take the kept
+/// artifacts with it (it bypasses git, so the exclude buys nothing).
+fn remove_unless_kept(full: &Path, rel: &str, keep: &[&str]) {
+    if !full.is_dir() {
+        let _ = std::fs::remove_file(full);
+        return;
+    }
+    if !holds_kept(rel, keep) {
+        let _ = std::fs::remove_dir_all(full);
+        return;
+    }
+    let Ok(children) = std::fs::read_dir(full) else {
+        return;
+    };
+    for child in children.flatten() {
+        let name = child.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let child_rel = format!("{rel}/{name}");
+        if is_kept(&child_rel, keep) {
+            continue;
+        }
+        remove_unless_kept(&child.path(), &child_rel, keep);
+    }
 }
 
 #[cfg(test)]
@@ -249,6 +281,31 @@ mod tests {
         assert!(ws.join(".claude/skills/s.md").exists(), ".claude kept");
         assert!(ws.join("RESULTS.md").exists(), "RESULTS.md kept");
         assert!(ws.join("tracked.txt").exists(), "tracked file kept");
+    }
+
+    #[test]
+    fn clean_keeps_a_nested_path_inside_an_otherwise_doomed_dir() {
+        let tmp = tempdir();
+        let ws = tmp.as_path();
+        let repo = init_repo(ws);
+        commit_initial(&repo, ws);
+
+        // `out/` is fully untracked, so status collapses it to one entry even though only
+        // `out/traces` is kept.
+        fs::create_dir_all(ws.join("out/traces/deep")).expect("traces");
+        fs::write(ws.join("out/traces/deep/t.json"), "trace").expect("trace");
+        fs::write(ws.join("out/junk.txt"), "x").expect("junk");
+        fs::create_dir_all(ws.join("out/build")).expect("build");
+        fs::write(ws.join("out/build/o.a"), "x").expect("obj");
+
+        clean_untracked(ws, &["out/traces"]).expect("clean");
+
+        assert_eq!(
+            fs::read_to_string(ws.join("out/traces/deep/t.json")).expect("kept"),
+            "trace"
+        );
+        assert!(!ws.join("out/junk.txt").exists(), "sibling file removed");
+        assert!(!ws.join("out/build").exists(), "sibling dir removed");
     }
 
     #[test]

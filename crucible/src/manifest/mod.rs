@@ -49,6 +49,12 @@ pub enum ManifestError {
     CompositeTooSmall,
     #[error("duplicate component domain `{domain}`")]
     DuplicateComponent { domain: String },
+    #[error(
+        "[workspace].carry_forward entry `{entry}` must be a non-empty workspace-relative path with no `.` or `..` component"
+    )]
+    BadCarryForward { entry: String },
+    #[error("[workspace].carry_forward is not supported in a composite manifest")]
+    CompositeCarryForward,
 }
 
 /// Shared tail of `Manifest`/`CompositeManifest`'s `load_frozen`: given the initial working-tree
@@ -239,6 +245,23 @@ pub struct Workspace {
     /// (a T1 scoring harness, a seeded fixture). See [`Inject`].
     #[serde(default)]
     pub inject: Vec<Inject>,
+    /// Workspace-relative paths holding derived pipeline output (code traces, a codegen tree) that a
+    /// discard must NOT delete, so iteration N+1 doesn't re-derive what iteration N already paid
+    /// for. Each entry is added to `.git/info/exclude` and spared by the discard's clean, so carried
+    /// content is invisible to candidate identity: a turn that only regenerates it still reads as no
+    /// change. Absent (the default) = today's fresh-start behavior exactly; methodology-sensitive
+    /// campaigns simply omit the key.
+    ///
+    /// Constraints and known gaps:
+    /// - A path the repo TRACKS is not protected: git excludes only apply to untracked files, and
+    ///   the discard's `reset --hard` reverts tracked content regardless. Carry pipeline output the
+    ///   repo doesn't track.
+    /// - A path that doesn't exist yet is fine; the exclude is prospective.
+    /// - Wide-tournament worktrees are fresh checkouts with no untracked carried dirs, so the wide
+    ///   round doesn't benefit.
+    /// - Composite manifests reject the key: per-component carry-forward is a non-goal.
+    #[serde(default)]
+    pub carry_forward: Vec<String>,
 }
 
 impl Default for Workspace {
@@ -247,6 +270,7 @@ impl Default for Workspace {
             dir: default_workspace_dir(),
             setup_cmd: None,
             inject: Vec::new(),
+            carry_forward: Vec::new(),
         }
     }
 }
@@ -398,6 +422,7 @@ pub struct HermesCfg {
 /// broker-bin requirement plus the three sub-validators. Callers add their own shape-specific
 /// checks (composite component count/uniqueness) around this.
 fn validate_common(
+    workspace: &Workspace,
     agent: &AgentCfg,
     judge: &JudgeCfg,
     search: &Option<SearchCfg>,
@@ -407,12 +432,36 @@ fn validate_common(
     if agent.broker.enabled && agent.broker.bin.is_empty() {
         return Err(ManifestError::BrokerBinRequired.into());
     }
+    validate_carry_forward(&workspace.carry_forward)?;
     search::validate_search(search)?;
     if let Some(w) = workflow {
         w.validate()?;
     }
     selftest::validate_selftest(&judge.selftest)?;
     forge::spec::validate_builds(build)?;
+    Ok(())
+}
+
+/// `[workspace].carry_forward` entries name paths inside the workspace, so an absolute path or one
+/// climbing out via `..` would have the discard spare something outside the tree it owns. A `.`
+/// component is rejected rather than normalized: entries are compared literally against git's
+/// workspace-relative status paths and written verbatim as exclude patterns, and `./out` matches
+/// neither, so it would silently carry nothing.
+fn validate_carry_forward(entries: &[String]) -> Result<()> {
+    for entry in entries {
+        let trimmed = entry.trim_end_matches('/');
+        let bad = trimmed.is_empty()
+            || Path::new(entry).is_absolute()
+            || Path::new(entry)
+                .components()
+                .any(|c| matches!(c, Component::ParentDir | Component::CurDir));
+        if bad {
+            return Err(ManifestError::BadCarryForward {
+                entry: entry.clone(),
+            }
+            .into());
+        }
+    }
     Ok(())
 }
 
@@ -459,6 +508,7 @@ impl Manifest {
     /// Cross-field checks the type system + `deny_unknown_fields` can't express. Run at load.
     fn validate(&self) -> Result<()> {
         validate_common(
+            &self.workspace,
             &self.agent,
             &self.judge,
             &self.search,
@@ -626,6 +676,11 @@ impl CompositeManifest {
         if self.components.len() < 2 {
             return Err(ManifestError::CompositeTooSmall.into());
         }
+        // Composite worlds build one git memory per component, none of which honors the top-level
+        // key. Rejecting beats accepting it and silently carrying nothing.
+        if !self.workspace.carry_forward.is_empty() {
+            return Err(ManifestError::CompositeCarryForward.into());
+        }
         let mut seen = std::collections::BTreeSet::new();
         for c in &self.components {
             if !seen.insert(c.domain.as_str()) {
@@ -636,6 +691,7 @@ impl CompositeManifest {
             }
         }
         validate_common(
+            &self.workspace,
             &self.agent,
             &self.judge,
             &self.search,
@@ -727,6 +783,72 @@ mod tests {
         assert_eq!(m.workspace.dir, "workspace"); // default
         assert!(m.world.snapshot_cmd.is_none(), "no [world] -> GitWorld");
         assert!(m.publish.is_none(), "no [publish] -> no PR target");
+    }
+
+    #[test]
+    fn parses_and_validates_workspace_carry_forward() {
+        let manifest = |carry: &str| {
+            format!(
+                r#"
+            [repo]
+            path = "."
+            [workspace]
+            carry_forward = {carry}
+            [judge]
+            measure_cmd = "m"
+            direction = "higher"
+            [agent]
+            backend = "command"
+            agent_cmd = "a"
+            goal = "g"
+        "#
+            )
+        };
+        let dir = tempdir("carry-forward");
+        let path = dir.join("crucible.toml");
+
+        std::fs::write(
+            &path,
+            manifest(r#"["codegen-out/", "traces", "target/codegen"]"#),
+        )
+        .unwrap();
+        let m = Manifest::load(&path).expect("valid carry_forward loads");
+        assert_eq!(
+            m.workspace.carry_forward,
+            ["codegen-out/", "traces", "target/codegen"]
+        );
+
+        // An absolute path or a `..` escape would have the discard spare files outside the
+        // workspace; an empty entry would spare everything. `.` components are rejected too:
+        // entries are matched literally against git's relative paths, so `./out` would carry
+        // nothing at all.
+        for bad in [
+            r#"["/etc"]"#,
+            r#"["../secrets"]"#,
+            r#"["out/../.."]"#,
+            r#"["/"]"#,
+            r#"["./codegen-out"]"#,
+            r#"["."]"#,
+        ] {
+            std::fs::write(&path, manifest(bad)).unwrap();
+            let err = match Manifest::load(&path) {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("{bad} must be rejected"),
+            };
+            assert!(err.contains("carry_forward"), "{bad}: {err}");
+        }
+
+        // Absent key = today's fresh-start behavior.
+        std::fs::write(&path, manifest("[]").replace("carry_forward = []", "")).unwrap();
+        let no_key = match Manifest::load(&path) {
+            Ok(m) => m,
+            Err(e) => panic!("absent key must load: {e}"),
+        };
+        assert!(
+            no_key.workspace.carry_forward.is_empty(),
+            "absent key = fresh start"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1056,6 +1178,31 @@ mod tests {
         "#;
         let m: CompositeManifest = toml::from_str(one).unwrap();
         assert!(m.validate().is_err(), "a composite needs >= 2 components");
+    }
+
+    #[test]
+    fn composite_rejects_carry_forward() {
+        let text = r#"
+            [composite]
+            name = "x"
+            [[component]]
+            domain = "vllm"
+            [[component]]
+            domain = "kernels"
+            [workspace]
+            carry_forward = ["codegen-out"]
+            [agent]
+            goal = "g"
+            [judge]
+            measure_cmd = "m"
+            direction = "higher"
+        "#;
+        let m: CompositeManifest = toml::from_str(text).unwrap();
+        let err = match m.validate() {
+            Err(e) => e.to_string(),
+            Ok(()) => panic!("composite carry_forward must be rejected, not silently ignored"),
+        };
+        assert!(err.contains("carry_forward"), "{err}");
     }
 
     #[test]
