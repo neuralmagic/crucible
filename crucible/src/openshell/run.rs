@@ -201,8 +201,9 @@ async fn try_turn(
     stage(
         sink,
         &format!(
-            "creating sandbox from {} (pulls the image on first use — can take many minutes)",
-            args.sandbox_image.as_deref().unwrap_or("the default image")
+            "creating sandbox from {} (pulls the image on first use, up to {}s before the wait gives up)",
+            args.sandbox_image.as_deref().unwrap_or("the default image"),
+            grpc::pull_timeout().as_secs()
         ),
     );
     let labels = [

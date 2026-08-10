@@ -245,6 +245,7 @@ mod tests {
         init_git(&dir);
         let world = GitWorld {
             workspace: dir.clone(),
+            carry_forward: Vec::new(),
         };
         let judge = ValueJudge {
             workspace: dir.clone(),
@@ -273,6 +274,7 @@ mod tests {
         init_git(&dir);
         let world = GitWorld {
             workspace: dir.clone(),
+            carry_forward: Vec::new(),
         };
         let judge = ValueJudge {
             workspace: dir.clone(),
@@ -294,6 +296,7 @@ mod tests {
         init_git(&dir);
         let world = GitWorld {
             workspace: dir.clone(),
+            carry_forward: Vec::new(),
         };
         let judge = ValueJudge {
             workspace: dir.clone(),
@@ -327,6 +330,7 @@ mod tests {
         init_git(&dir);
         let world = GitWorld {
             workspace: dir.clone(),
+            carry_forward: Vec::new(),
         };
         let judge = ValueJudge {
             workspace: dir.clone(),
@@ -370,6 +374,7 @@ mod tests {
         init_git(&dir);
         let world = GitWorld {
             workspace: dir.clone(),
+            carry_forward: Vec::new(),
         };
         let judge = ValueJudge {
             workspace: dir.clone(),

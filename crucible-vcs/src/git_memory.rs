@@ -21,20 +21,36 @@ const HARNESS_EXCLUDES: &[&str] = &[
     "PROVISIONING_PENDING.json",
 ];
 
-/// Idempotently append [`HARNESS_EXCLUDES`] to the workspace's `.git/info/exclude`, the
-/// repo-local ignore file every git consumer honors. Best-effort: a workspace that isn't a
-/// git checkout is left alone.
-pub fn install_harness_excludes(ws: &Path) {
+/// Idempotently append [`HARNESS_EXCLUDES`] plus `extra` to the workspace's `.git/info/exclude`,
+/// the repo-local ignore file every git consumer honors. `extra` is the manifest's carried
+/// pipeline artifacts: they must be excluded so a turn that only regenerates them still reads as
+/// "no candidate change", and they are also passed to [`restore`] so the clean spares them.
+/// Best-effort: a workspace that isn't a git checkout is left alone.
+pub fn install_harness_excludes(ws: &Path, extra: &[String]) {
     let Ok(repo) = git2::Repository::open(ws) else {
         return;
     };
     let exclude = repo.path().join("info").join("exclude");
     let existing = std::fs::read_to_string(&exclude).unwrap_or_default();
-    let missing: Vec<&str> = HARNESS_EXCLUDES
+    let wanted: Vec<String> = HARNESS_EXCLUDES
         .iter()
-        .copied()
-        .filter(|e| !existing.lines().any(|l| l.trim() == *e))
+        .map(|e| (*e).to_string())
+        .chain(extra.iter().map(|e| exclude_line(ws, e)))
         .collect();
+    // Dedup ignores a trailing slash: a carried dir's entry is written slashless until the first
+    // run creates the dir, and re-appending the `/` form afterwards would accrete near-duplicates
+    // for a pattern that already matches.
+    let mut missing: Vec<&str> = Vec::new();
+    for line in &wanted {
+        let want = line.trim_end_matches('/');
+        let known = existing
+            .lines()
+            .any(|l| l.trim().trim_end_matches('/') == want)
+            || missing.iter().any(|m| m.trim_end_matches('/') == want);
+        if !known {
+            missing.push(line.as_str());
+        }
+    }
     if missing.is_empty() {
         return;
     }
@@ -45,6 +61,17 @@ pub fn install_harness_excludes(ws: &Path) {
     };
     let _ = std::fs::create_dir_all(exclude.parent().unwrap_or(repo.path()));
     let _ = std::fs::write(&exclude, format!("{existing}{sep}{}\n", missing.join("\n")));
+}
+
+/// The `.git/info/exclude` line for a carried path. A directory gets a trailing `/` so the
+/// pattern can't also swallow a same-named file; entries that already end in `/` are declaring
+/// themselves a directory even before the first run creates it.
+fn exclude_line(ws: &Path, entry: &str) -> String {
+    if entry.ends_with('/') || ws.join(entry).is_dir() {
+        format!("{}/", entry.trim_end_matches('/'))
+    } else {
+        entry.to_string()
+    }
 }
 
 /// The git half of a World snapshot: stage the workspace and, if anything changed, commit it
@@ -69,10 +96,19 @@ pub fn staged_diff(ws: &Path) -> (String, String) {
 }
 
 /// The git half of a World restore: hard-reset to `sha`, then drop untracked files (keeping
-/// the toolbox + results log).
-pub fn restore(ws: &Path, sha: &str) -> Result<()> {
+/// the toolbox + results log, plus `keep_extra`: the manifest's carried pipeline artifacts).
+///
+/// `keep_extra` only spares UNTRACKED paths. A carried path that the repo tracks is reverted by
+/// the reset like any other tracked file, which is why the manifest documents carry_forward as
+/// pipeline output only.
+pub fn restore(ws: &Path, sha: &str, keep_extra: &[String]) -> Result<()> {
     vcs::reset_to(ws, sha)?;
-    vcs::clean_untracked(ws, KEEP_ON_CLEAN)?;
+    let keep: Vec<&str> = KEEP_ON_CLEAN
+        .iter()
+        .copied()
+        .chain(keep_extra.iter().map(|k| k.trim_end_matches('/')))
+        .collect();
+    vcs::clean_untracked(ws, &keep)?;
     Ok(())
 }
 
@@ -99,6 +135,16 @@ mod tests {
         TempDir(base)
     }
 
+    /// A workspace with one tracked file and a first commit, the shape every restore test needs.
+    fn seeded_repo() -> (TempDir, String) {
+        let tmp = tempdir();
+        let ws = tmp.0.clone();
+        std::fs::write(ws.join("kernel.cuh"), "v0\n").expect("seed");
+        vcs::ensure_repo(&ws).expect("ensure repo");
+        let sha = vcs::head_sha(&ws).expect("head");
+        (tmp, sha)
+    }
+
     #[test]
     fn harness_excludes_install_idempotently_and_hide_furniture_from_git() {
         let tmp = tempdir();
@@ -110,8 +156,8 @@ mod tests {
             cfg.set_str("user.email", "test@test").expect("email");
         }
 
-        install_harness_excludes(ws);
-        install_harness_excludes(ws);
+        install_harness_excludes(ws, &[]);
+        install_harness_excludes(ws, &[]);
         let exclude =
             std::fs::read_to_string(repo.path().join("info/exclude")).expect("exclude exists");
         for entry in HARNESS_EXCLUDES {
@@ -139,7 +185,136 @@ mod tests {
     #[test]
     fn harness_excludes_skip_a_non_git_dir() {
         let tmp = tempdir();
-        install_harness_excludes(tmp.0.as_path());
+        install_harness_excludes(tmp.0.as_path(), &[]);
         assert!(!tmp.0.join(".git").exists());
+    }
+
+    #[test]
+    fn carried_paths_are_excluded_idempotently_with_dir_lines() {
+        let (tmp, _) = seeded_repo();
+        let ws = tmp.0.as_path();
+        std::fs::create_dir_all(ws.join("existing-dir")).expect("dir");
+        let carried = [
+            "codegen-out/".to_string(),
+            "existing-dir".to_string(),
+            "trace.json".to_string(),
+        ];
+
+        install_harness_excludes(ws, &carried);
+        install_harness_excludes(ws, &carried);
+        let exclude = std::fs::read_to_string(ws.join(".git/info/exclude")).expect("exclude");
+        let count = |line: &str| exclude.lines().filter(|l| l.trim() == line).count();
+        // A dir gets one trailing slash whether the manifest wrote one or the dir exists on disk;
+        // a plain file entry is left alone.
+        assert_eq!(count("codegen-out/"), 1, "{exclude}");
+        assert_eq!(count("existing-dir/"), 1, "{exclude}");
+        assert_eq!(count("trace.json"), 1, "{exclude}");
+        assert_eq!(count("codegen-out"), 0, "no slashless duplicate: {exclude}");
+    }
+
+    #[test]
+    fn restore_keeps_carried_output_and_still_cleans_siblings() {
+        let (tmp, base) = seeded_repo();
+        let ws = tmp.0.as_path();
+        let carried = ["codegen-out/".to_string()];
+        install_harness_excludes(ws, &carried);
+
+        std::fs::create_dir_all(ws.join("codegen-out/traces")).expect("carried dir");
+        std::fs::write(ws.join("codegen-out/traces/t.json"), "trace").expect("carried file");
+        std::fs::write(ws.join("scratch.txt"), "junk").expect("junk");
+        std::fs::write(ws.join("kernel.cuh"), "v1\n").expect("edit");
+
+        restore(ws, &base, &carried).expect("restore");
+
+        assert_eq!(
+            std::fs::read_to_string(ws.join("codegen-out/traces/t.json")).expect("carried kept"),
+            "trace"
+        );
+        assert!(!ws.join("scratch.txt").exists(), "sibling junk cleaned");
+        assert_eq!(
+            std::fs::read_to_string(ws.join("kernel.cuh")).expect("tracked"),
+            "v0\n",
+            "tracked edit rolled back"
+        );
+    }
+
+    #[test]
+    fn a_turn_that_only_writes_carried_output_is_not_a_candidate_change() {
+        let (tmp, base) = seeded_repo();
+        let ws = tmp.0.as_path();
+        let carried = ["codegen-out/".to_string()];
+        install_harness_excludes(ws, &carried);
+
+        std::fs::create_dir_all(ws.join("codegen-out")).expect("carried dir");
+        std::fs::write(ws.join("codegen-out/plan.md"), "port plan").expect("carried file");
+
+        assert_eq!(
+            snapshot(ws, "turn1").expect("snapshot"),
+            base,
+            "no memory commit for carried-only output"
+        );
+        let (diff, _) = staged_diff(ws);
+        assert!(
+            diff.is_empty(),
+            "carried output stays out of the diff: {diff}"
+        );
+    }
+
+    #[test]
+    fn a_nested_carried_path_survives_a_dirty_parent() {
+        let (tmp, base) = seeded_repo();
+        let ws = tmp.0.as_path();
+        let carried = ["out/codegen".to_string()];
+        install_harness_excludes(ws, &carried);
+
+        std::fs::create_dir_all(ws.join("out/codegen")).expect("carried dir");
+        std::fs::write(ws.join("out/codegen/gen.rs"), "fn main() {}").expect("carried file");
+        std::fs::write(ws.join("out/junk.log"), "noise").expect("junk");
+
+        restore(ws, &base, &carried).expect("restore");
+
+        assert_eq!(
+            std::fs::read_to_string(ws.join("out/codegen/gen.rs")).expect("carried kept"),
+            "fn main() {}"
+        );
+        assert!(!ws.join("out/junk.log").exists(), "parent still cleaned");
+    }
+
+    #[test]
+    fn exclude_install_is_a_no_op_once_the_carried_dir_exists() {
+        let (tmp, _) = seeded_repo();
+        let ws = tmp.0.as_path();
+        let carried = ["codegen-out".to_string()];
+
+        install_harness_excludes(ws, &carried);
+        std::fs::create_dir_all(ws.join("codegen-out")).expect("carried dir");
+        install_harness_excludes(ws, &carried);
+
+        let exclude = std::fs::read_to_string(ws.join(".git/info/exclude")).expect("exclude");
+        let hits = exclude
+            .lines()
+            .filter(|l| l.trim().trim_end_matches('/') == "codegen-out")
+            .count();
+        assert_eq!(
+            hits, 1,
+            "no near-duplicate after the dir appears: {exclude}"
+        );
+    }
+
+    #[test]
+    fn a_tracked_carried_path_is_still_reverted() {
+        let (tmp, base) = seeded_repo();
+        let ws = tmp.0.as_path();
+        // kernel.cuh is tracked, so listing it as carried buys nothing: excludes never apply to
+        // tracked files and `reset --hard` reverts it. This pins the documented limitation.
+        let carried = ["kernel.cuh".to_string()];
+        install_harness_excludes(ws, &carried);
+        std::fs::write(ws.join("kernel.cuh"), "v1\n").expect("edit");
+
+        restore(ws, &base, &carried).expect("restore");
+        assert_eq!(
+            std::fs::read_to_string(ws.join("kernel.cuh")).expect("tracked"),
+            "v0\n"
+        );
     }
 }

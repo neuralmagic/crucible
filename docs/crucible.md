@@ -70,6 +70,36 @@ Each command runs in the workspace with the domain's env:
 The accept policy is generic: *keep if `valid` and `score` beats the best per
 `direction`; solved iff `measure` says so.* No per-domain code for the keep/win logic.
 
+### Carrying pipeline artifacts across a discard
+
+A discard resets the workspace and cleans untracked files, so anything an iteration derived
+on the way to its candidate (code traces, a generated port tree) is gone by the next turn and
+gets re-derived. `[workspace] carry_forward` names workspace-relative paths that survive:
+
+```toml
+[workspace]
+carry_forward = ["codegen-out/"]
+```
+
+Each entry is written to `.git/info/exclude` and spared by the discard's clean, so carried
+content never reaches a candidate diff, snapshot commit, or tree hash: a turn that only
+regenerates it still reads as no candidate change.
+
+Limits worth knowing before you use it:
+
+- A path the repo **tracks** is not protected. Git excludes only apply to untracked files, and
+  the discard's `git reset --hard` reverts tracked content regardless. Carry pipeline output
+  the repo doesn't track.
+- A path that doesn't exist yet is fine; the exclude is prospective.
+- Nested paths (`target/codegen-out`) work: the clean descends into the parent instead of
+  deleting it. Entries must be plain relative paths, so no `.`, `..`, or leading `/`.
+- Wide-tournament rounds run in fresh worktrees with no untracked carried dirs, so they don't
+  benefit.
+- Composite manifests reject the key; per-component carry-forward is a non-goal.
+
+Omitting it is the default and keeps today's fresh-start behavior exactly, which is what a
+methodology-sensitive campaign wants.
+
 ### Languages: pick per command, the engine doesn't care
 
 The contract is JSON + exit codes, so each command can be whatever fits:
@@ -208,6 +238,7 @@ git default.
    ```toml
    [repo]      url|path, ref
    [workspace] setup_cmd          # optional; default: git clone + checkout
+               carry_forward      # optional; untracked derived paths a discard keeps
    [agent]     model, method_prompt, goal_file|goal, toolbox_dir, env
    [judge]     measure_cmd, direction = "lower"|"higher"
    [world]     apply_cmd?, snapshot_cmd?, restore_cmd?   # omitted → git

@@ -618,10 +618,7 @@ impl<R: Reporter> LoopTaskRunner<'_, R> {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
-            detail: serde_json::json!({
-                "score_source": source.0,
-                "evidence": inputs,
-            }),
+            detail: detail_json(source, inputs, primary),
         };
         // The folded inputs hold only the passing dependencies (`join = "passed"`), so
         // record every DECLARED evidence task with its disposition: a candidate that
@@ -734,6 +731,24 @@ impl<R: Reporter> TaskRunner for LoopTaskRunner<'_, R> {
     fn run_many(&mut self, batch: &[BatchItem<'_>]) -> Vec<Attempt> {
         self.workflow_runner.run_many(batch)
     }
+}
+
+/// The graded reading's detail JSON, which the judge stringifies into the RESULTS row's
+/// detail cell. The score source's broker log handles ride along so a kept row can be
+/// pulled back to full logs with `fetch_log`, not just the note's stderr tail.
+fn detail_json(source: &TaskName, inputs: &BTreeMap<TaskName, Value>, primary: &Value) -> Value {
+    let handles: Vec<Value> = primary
+        .get("logs")
+        .and_then(Value::as_array)
+        .map(|logs| logs.iter().filter(|v| v.is_string()).cloned().collect())
+        .unwrap_or_default();
+    let mut detail = serde_json::Map::new();
+    detail.insert("score_source".to_string(), serde_json::json!(source.0));
+    detail.insert("evidence".to_string(), serde_json::json!(inputs));
+    if !handles.is_empty() {
+        detail.insert("logs".to_string(), Value::Array(handles));
+    }
+    Value::Object(detail)
 }
 
 fn pass(v: Value) -> Attempt {
@@ -1628,6 +1643,63 @@ mod tests {
         );
     }
 
+    /// A kept row must carry the score source's broker log handles, so the agent can
+    /// pull the full log with `fetch_log` instead of squinting at the note's tail.
+    #[test]
+    fn grade_detail_carries_the_score_source_log_handles() {
+        let workflow = r#"
+            [workflow]
+            type = "autoresearch"
+            result = "choose"
+            [[workflow.task]]
+            name = "invent"
+            kind = "engine"
+            op = "propose"
+            [[workflow.task]]
+            name = "apply"
+            kind = "engine"
+            op = "apply"
+            depends_on = ["invent"]
+            [[workflow.task]]
+            name = "score"
+            kind = "evaluate"
+            command = "v=$(cat value.txt); printf '{\"score\": %s, \"pass\": true, \"logs\": [\"job-a.log\", 7]}\n' \"$v\""
+            depends_on = ["apply"]
+            [[workflow.task]]
+            name = "grade"
+            kind = "engine"
+            op = "grade"
+            source = "score"
+            depends_on = ["score"]
+            join = "passed"
+            [[workflow.task]]
+            name = "choose"
+            kind = "engine"
+            op = "decide"
+            source = "grade"
+            depends_on = ["grade"]
+        "#;
+        let trace = run_counter_cfg(true, 1, BUMP, false, Some(workflow));
+        assert_eq!(
+            trace
+                .rows
+                .iter()
+                .map(|row| row.1.as_str())
+                .collect::<Vec<_>>(),
+            ["baseline", "keep"],
+            "{}",
+            describe(&trace)
+        );
+        let detail: serde_json::Value = serde_json::from_str(&trace.row_details[1]).unwrap();
+        assert_eq!(detail["score_source"], "score");
+        assert_eq!(
+            detail["logs"].as_array().unwrap(),
+            &vec![serde_json::Value::from("job-a.log")],
+            "non-string members are dropped: {}",
+            trace.row_details[1]
+        );
+    }
+
     /// What one counter run left behind, for diffing the two paths.
     struct RunTrace {
         /// Session-event kind sequence, in emission order.
@@ -1646,6 +1718,8 @@ mod tests {
         task_iters: Vec<u32>,
         /// Each row's `evidence` array (empty when absent), parallel to `rows`.
         row_evidence: Vec<Vec<serde_json::Value>>,
+        /// Each row's `detail` string (empty when absent), parallel to `rows`.
+        row_details: Vec<String>,
         /// task_result lines as (task, status, output), in emission order.
         task_results: Vec<(String, String, Option<serde_json::Value>)>,
     }
@@ -1799,6 +1873,7 @@ mod tests {
         let mut task_iters = Vec::new();
         let mut notes: Vec<String> = Vec::new();
         let mut row_evidence = Vec::new();
+        let mut row_details = Vec::new();
         let mut task_results = Vec::new();
         for line in log.lines() {
             let v: serde_json::Value = serde_json::from_str(line).unwrap();
@@ -1811,6 +1886,7 @@ mod tests {
                         v["row"]["score"].as_f64(),
                     ));
                     row_evidence.push(v["row"]["evidence"].as_array().cloned().unwrap_or_default());
+                    row_details.push(v["row"]["detail"].as_str().unwrap_or_default().to_string());
                 }
                 "summary" => best = v["best_score"].as_f64().unwrap(),
                 "shutdown" => shutdown = v["outcome"].as_str().unwrap().to_string(),
@@ -1838,6 +1914,7 @@ mod tests {
             task_iters,
             notes,
             row_evidence,
+            row_details,
             task_results,
         }
     }

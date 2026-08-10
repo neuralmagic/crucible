@@ -15,9 +15,9 @@ use openshell_core::proto::{
     DeleteSandboxRequest, ExecSandboxRequest, FilesystemPolicy, GetProviderRequest,
     GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest,
     NetworkBinary, NetworkEndpoint, NetworkPolicyRule, PolicyMergeOperation, PolicyStatus,
-    Provider, ProviderCredentialRefreshStrategy, RotateProviderCredentialRequest, SandboxLogLine,
-    SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate, ServiceStatus, UpdateConfigRequest,
-    UpdateProviderRequest, exec_sandbox_event::Payload as ExecPayload,
+    Provider, ProviderCredentialRefreshStrategy, RotateProviderCredentialRequest, SandboxCondition,
+    SandboxLogLine, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate, ServiceStatus,
+    UpdateConfigRequest, UpdateProviderRequest, exec_sandbox_event::Payload as ExecPayload,
     policy_merge_operation::Operation as MergeOp,
 };
 use std::collections::HashMap;
@@ -137,14 +137,61 @@ fn record_poll_summary(attempts: u64, started: Instant, outcome: &str) {
     span.record("outcome", outcome);
 }
 
-/// How long to wait for a fresh sandbox to reach `Ready` before giving up (mirrors the CLI's
-/// `OPENSHELL_PROVISION_TIMEOUT`, default 300s, the in-pod image pull can be slow).
+/// How long a sandbox gets to reach `Ready` once its image is pulled (mirrors the CLI's
+/// `OPENSHELL_PROVISION_TIMEOUT`, default 300s).
 fn provision_timeout() -> Duration {
     let secs = std::env::var("OPENSHELL_PROVISION_TIMEOUT")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(300);
     Duration::from_secs(secs)
+}
+
+/// The cap on the whole wait while the image may still be pulling. The first create after a node
+/// roll pulls a multi-GB agent image, which routinely outlasts [`provision_timeout`]: counting the
+/// short deadline from create killed the sandbox mid-pull and burned another full pull on the
+/// retry. Overridable via `OPENSHELL_PULL_TIMEOUT`.
+pub(crate) fn pull_timeout() -> Duration {
+    let secs = std::env::var("OPENSHELL_PULL_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1800);
+    Duration::from_secs(secs)
+}
+
+/// Condition reasons that prove the image is on the node. Kubelet reports the pull and the
+/// container lifecycle through these; matched case-insensitively because the driver passes the
+/// platform's spelling through untouched.
+const PULL_DONE_REASONS: [&str; 3] = ["pulled", "started", "created"];
+
+/// Condition types whose `True` status implies the containers are running, hence pulled.
+const PULLED_IMPLYING_TYPES: [&str; 2] = ["ContainersReady", "Ready"];
+
+/// Whether the sandbox's conditions carry evidence that the image pull finished. A driver that
+/// never populates conditions yields no evidence, and the wait stays bounded by [`pull_timeout`].
+fn pull_complete(conditions: &[SandboxCondition]) -> bool {
+    conditions.iter().any(|c| {
+        PULL_DONE_REASONS
+            .iter()
+            .any(|r| c.reason.eq_ignore_ascii_case(r))
+            || (PULLED_IMPLYING_TYPES.contains(&c.r#type.as_str()) && c.status == "True")
+    })
+}
+
+/// The instant the ready-wait gives up: the pull cap until pull completion is observed, then the
+/// earlier of that cap and the provision window measured from the pull. Keeping the pull cap in
+/// the `min` means late evidence cannot extend the wait past the outer bound.
+fn ready_deadline(
+    started: Instant,
+    pull_done_at: Option<Instant>,
+    pull_cap: Duration,
+    ready_cap: Duration,
+) -> Instant {
+    let outer = started + pull_cap;
+    match pull_done_at {
+        None => outer,
+        Some(t) => outer.min(t + ready_cap),
+    }
 }
 
 /// The gateway's local mTLS client-cert directory for the registered gateway (`gateway add
@@ -449,24 +496,29 @@ impl Gateway {
     }
 
     /// Poll `GetSandbox` until the sandbox is `Ready` (or `Error`/timeout). A fresh create starts
-    /// in `Provisioning`; the wait covers the in-pod image pull. The ticks ride the untraced
+    /// in `Provisioning`; the wait covers the in-pod image pull. The deadline is split: the
+    /// generous [`pull_timeout`] until the status conditions show the pull finished, then
+    /// [`provision_timeout`] from that point (see [`ready_deadline`]). The ticks ride the untraced
     /// [`Gateway::poll_client`]; the loop's story lands on this span.
     #[tracing::instrument(skip_all, fields(
         rpc = "wait_ready",
         sandbox = name,
         attempts = tracing::field::Empty,
         elapsed_ms = tracing::field::Empty,
+        pull_ms = tracing::field::Empty,
         outcome = tracing::field::Empty,
     ))]
     async fn wait_ready(&self, name: &str) -> Result<()> {
         let started = Instant::now();
-        let deadline = started + provision_timeout();
+        let pull_cap = pull_timeout();
+        let ready_cap = provision_timeout();
+        let mut pull_done_at: Option<Instant> = None;
         let mut client = self.poll_client();
         let mut attempts: u64 = 0;
 
         let (outcome, result) = loop {
             attempts += 1;
-            let phase =
+            let status =
                 match client
                     .get_sandbox(GetSandboxRequest {
                         name: name.to_string(),
@@ -474,7 +526,7 @@ impl Gateway {
                     })
                     .await
                 {
-                    Ok(resp) => resp.into_inner().sandbox.map_or(0, |s| s.phase()),
+                    Ok(resp) => resp.into_inner().sandbox.and_then(|s| s.status),
                     Err(s) => {
                         break (
                             POLL_ERROR,
@@ -485,6 +537,19 @@ impl Gateway {
                         );
                     }
                 };
+            let phase = status.as_ref().map_or(0, |s| s.phase);
+            if pull_done_at.is_none()
+                && status
+                    .as_ref()
+                    .is_some_and(|s| pull_complete(&s.conditions))
+            {
+                let now = Instant::now();
+                pull_done_at = Some(now);
+                tracing::Span::current().record(
+                    "pull_ms",
+                    u64::try_from((now - started).as_millis()).unwrap_or(u64::MAX),
+                );
+            }
             match SandboxPhase::try_from(phase) {
                 Ok(SandboxPhase::Ready) => break (POLL_READY, Ok(())),
                 Ok(SandboxPhase::Error) => {
@@ -498,12 +563,20 @@ impl Gateway {
                 }
                 _ => {}
             }
-            if Instant::now() >= deadline {
+            if Instant::now() >= ready_deadline(started, pull_done_at, pull_cap, ready_cap) {
+                let stage = match pull_done_at {
+                    None => ReadyStage::PullIncomplete {
+                        seconds: started.elapsed().as_secs(),
+                    },
+                    Some(t) => ReadyStage::AfterPull {
+                        seconds: t.elapsed().as_secs(),
+                    },
+                };
                 break (
                     POLL_TIMEOUT,
                     Err(GrpcError::SandboxNotReady {
                         name: name.to_owned(),
-                        seconds: provision_timeout().as_secs(),
+                        stage,
                     }
                     .into()),
                 );
@@ -1043,14 +1116,36 @@ pub enum GrpcError {
     SandboxHasNoId { name: String },
     #[error("sandbox '{name}' entered the error phase during provisioning")]
     SandboxErrorPhase { name: String },
-    #[error("sandbox '{name}' did not become ready within {seconds}s")]
-    SandboxNotReady { name: String, seconds: u64 },
+    #[error("sandbox '{name}' {stage}")]
+    SandboxNotReady { name: String, stage: ReadyStage },
     #[error("sandbox '{name}' still exists {seconds}s after delete")]
     SandboxStillExists { name: String, seconds: u64 },
     #[error("policy version {version} failed to load: {load_error}")]
     PolicyLoadFailed { version: u32, load_error: String },
     #[error("timed out waiting for policy version {version} to load on '{name}'")]
     PolicyLoadTimeout { version: u32, name: String },
+}
+
+/// Which half of the split ready deadline expired, so the message says whether the image never
+/// landed (a slow registry or a dead node) or the sandbox stalled after the pull (a broken image
+/// or supervisor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadyStage {
+    PullIncomplete { seconds: u64 },
+    AfterPull { seconds: u64 },
+}
+
+impl std::fmt::Display for ReadyStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadyStage::PullIncomplete { seconds } => {
+                write!(f, "not ready after {seconds}s (image pull incomplete)")
+            }
+            ReadyStage::AfterPull { seconds } => {
+                write!(f, "not ready {seconds}s after image pull completed")
+            }
+        }
+    }
 }
 
 impl GrpcError {
@@ -1753,6 +1848,154 @@ pYBZ
         assert!(
             output.contains("elapsed_ms="),
             "how long it waited belongs on the span, got: {output}"
+        );
+    }
+
+    fn condition(r#type: &str, status: &str, reason: &str) -> SandboxCondition {
+        SandboxCondition {
+            r#type: r#type.to_string(),
+            status: status.to_string(),
+            reason: reason.to_string(),
+            message: String::new(),
+            last_transition_time: String::new(),
+        }
+    }
+
+    /// No conditions at all is the shape a driver that reports nothing produces: no evidence, so
+    /// the wait must stay on the pull cap rather than assume the image landed.
+    #[test]
+    fn pull_complete_needs_evidence() {
+        assert!(!pull_complete(&[]));
+        assert!(!pull_complete(&[condition(
+            "PodScheduled",
+            "True",
+            "Scheduled"
+        )]));
+        assert!(!pull_complete(&[condition("Ready", "False", "Pulling")]));
+        assert!(!pull_complete(&[condition(
+            "ContainersReady",
+            "Unknown",
+            ""
+        )]));
+    }
+
+    /// Kubelet's spelling of the reason is passed through by the driver, so matching is
+    /// case-insensitive on the whole pull/start/create family.
+    #[test]
+    fn pull_complete_reads_pull_reasons_case_insensitively() {
+        for reason in ["Pulled", "pulled", "PULLED", "Started", "Created"] {
+            assert!(
+                pull_complete(&[condition("Whatever", "False", reason)]),
+                "reason {reason} proves the image is on the node"
+            );
+        }
+    }
+
+    /// A running container implies a finished pull even when no reason survived the driver's
+    /// translation, but only when the condition is actually true.
+    #[test]
+    fn pull_complete_reads_container_readiness_types() {
+        assert!(pull_complete(&[condition("ContainersReady", "True", "")]));
+        assert!(pull_complete(&[condition("Ready", "True", "")]));
+        assert!(!pull_complete(&[condition("Ready", "false", "")]));
+        assert!(!pull_complete(&[condition("ContainersReady", "False", "")]));
+    }
+
+    #[test]
+    fn ready_deadline_without_evidence_is_the_pull_cap() {
+        let started = Instant::now();
+        let cap = Duration::from_secs(1800);
+        assert_eq!(
+            ready_deadline(started, None, cap, Duration::from_secs(300)),
+            started + cap
+        );
+    }
+
+    #[test]
+    fn ready_deadline_after_early_evidence_is_the_ready_cap_from_the_pull() {
+        let started = Instant::now();
+        let pull = started + Duration::from_secs(60);
+        assert_eq!(
+            ready_deadline(
+                started,
+                Some(pull),
+                Duration::from_secs(1800),
+                Duration::from_secs(300)
+            ),
+            pull + Duration::from_secs(300)
+        );
+    }
+
+    /// Evidence arriving just under the pull cap must not push the wait past it: a sandbox that
+    /// pulls for 29 minutes still has to fail by 30, not by 35.
+    #[test]
+    fn ready_deadline_never_exceeds_the_pull_cap() {
+        let started = Instant::now();
+        let pull_cap = Duration::from_secs(1800);
+        let pull = started + Duration::from_secs(1790);
+        assert_eq!(
+            ready_deadline(started, Some(pull), pull_cap, Duration::from_secs(300)),
+            started + pull_cap
+        );
+    }
+
+    #[test]
+    fn ready_deadline_with_a_zero_ready_cap_expires_at_the_pull() {
+        let started = Instant::now();
+        let pull = started + Duration::from_secs(5);
+        assert_eq!(
+            ready_deadline(
+                started,
+                Some(pull),
+                Duration::from_secs(1800),
+                Duration::ZERO
+            ),
+            pull
+        );
+    }
+
+    #[test]
+    fn pull_timeout_defaults_to_thirty_minutes_and_honors_the_env() {
+        let _guard = crate::test_env_lock();
+        unsafe {
+            std::env::remove_var("OPENSHELL_PULL_TIMEOUT");
+        }
+        assert_eq!(pull_timeout(), Duration::from_secs(1800));
+        unsafe {
+            std::env::set_var("OPENSHELL_PULL_TIMEOUT", "42");
+        }
+        let overridden = pull_timeout();
+        // A garbage value falls back to the default rather than failing the turn.
+        unsafe {
+            std::env::set_var("OPENSHELL_PULL_TIMEOUT", "soon");
+        }
+        let garbage = pull_timeout();
+        unsafe {
+            std::env::remove_var("OPENSHELL_PULL_TIMEOUT");
+        }
+        assert_eq!(overridden, Duration::from_secs(42));
+        assert_eq!(garbage, Duration::from_secs(1800));
+    }
+
+    /// The two timeouts have different fixes (slow registry vs broken image), so the message has
+    /// to say which one fired.
+    #[test]
+    fn not_ready_message_names_the_stage() {
+        let pulling = GrpcError::SandboxNotReady {
+            name: "ci-abc".to_string(),
+            stage: ReadyStage::PullIncomplete { seconds: 1800 },
+        };
+        assert_eq!(
+            pulling.to_string(),
+            "sandbox 'ci-abc' not ready after 1800s (image pull incomplete)"
+        );
+        let stalled = GrpcError::SandboxNotReady {
+            name: "ci-abc".to_string(),
+            stage: ReadyStage::AfterPull { seconds: 300 },
+        };
+        assert_eq!(
+            stalled.to_string(),
+            "sandbox 'ci-abc' not ready 300s after image pull completed"
         );
     }
 }
