@@ -108,9 +108,9 @@ impl Segment {
         judge: &dyn Judge,
         goal: &str,
         regime: String,
-        skip: bool,
+        source: BaselineSource,
     ) -> Result<(Self, Row)> {
-        let (baseline_score, baseline_total, snap, row) = run_baseline(world, judge, skip)?;
+        let (baseline_score, baseline_total, snap, row) = run_baseline(world, judge, source)?;
         let fingerprint = fingerprint(goal, &judge.objective(), &regime);
         let segment = Segment {
             regime,
@@ -557,6 +557,10 @@ fn run_loop_body<R: Reporter>(
     let started = Instant::now();
     let start_iter: u32;
     let is_resume = runtime.resume.is_some();
+    // Held across the whole body: an approved re-scope re-baselines, and re-measuring a rescoped
+    // baseline without an agent turn is impossible for a codegen domain, so it reuses this same
+    // preflight measurement. A resumed run never sets it (its baseline came back from the log).
+    let mut preflight_baseline: Option<crate::preflight::PreflightBaseline> = None;
 
     let mut run = if let Some(rs) = runtime.resume {
         // Resume restores state in-memory only: the log already holds the prior
@@ -647,6 +651,35 @@ fn run_loop_body<R: Reporter>(
         r.identity(&prep.identity);
         start_iter = 1;
 
+        if let Some(cfg) = &prep.preflight {
+            r.phase(Phase::Preflight);
+            update_control_status(control, "preflight", 0, f64::INFINITY, 0.0);
+            match crate::preflight::run(cfg, &prep.preflight_modes, &p.workspace, r) {
+                Ok(seeded) => preflight_baseline = seeded,
+                Err(e)
+                    if e.downcast_ref::<crate::preflight::PreflightStopped>()
+                        .is_some() =>
+                {
+                    let (outcome, reason) = LoopExit::Stopped.shutdown_reason();
+                    r.shutdown(outcome, reason);
+                    return Ok(Outcome::default());
+                }
+                Err(e) => {
+                    // The run has no rows yet, so the refusal builds its own one-row log: an
+                    // environment verdict still has to land in RESULTS.md for the postmortem.
+                    let row = Row {
+                        iter: 0,
+                        decision: "preflight-failed".into(),
+                        note: format!("{e:#}"),
+                        ..Default::default()
+                    };
+                    r.row(&row, false);
+                    write_results(p, &prep.goal, &prep.prior, &[row])?;
+                    return Err(e);
+                }
+            }
+        }
+
         r.phase(Phase::Baseline);
         update_control_status(control, "baseline", 0, f64::INFINITY, 0.0);
         let (segment, base_row) = Segment::baseline(
@@ -654,7 +687,7 @@ fn run_loop_body<R: Reporter>(
             judge,
             &prep.goal,
             "default".to_string(),
-            prep.skip_baseline,
+            baseline_source(prep.skip_baseline, preflight_baseline.as_ref()),
         )?;
         // The pristine base: segment 0's baseline snapshot is the upstream checkout, before any
         // agent commit. Captured here (not at publish time) because a kept iteration advances HEAD,
@@ -807,7 +840,7 @@ fn run_loop_body<R: Reporter>(
                 judge,
                 &prep.goal,
                 new_regime.clone(),
-                prep.skip_baseline,
+                baseline_source(prep.skip_baseline, preflight_baseline.as_ref()),
             )?;
             run.segment = segment;
             if let Some(ledger) = ledger {
@@ -1680,25 +1713,49 @@ fn render_resume_prompt(status: &str, regime: &str, steer: Option<&str>) -> Stri
     out
 }
 
+/// Where segment 0's (or a re-scoped segment's) baseline number comes from.
+enum BaselineSource {
+    /// Measure the pristine tree with the judge.
+    Measure,
+    /// Snapshot only, no measure: a codegen domain has no meaningful pristine baseline, so seed the
+    /// direction's worst score and keep any valid candidate.
+    Skip,
+    /// Snapshot only, but with a real number: preflight already measured the unmodified tree at
+    /// zero agent cost, so iteration 1 decides against it instead of the worst-score sentinel.
+    Preseeded(crate::preflight::PreflightBaseline),
+}
+
 /// Measure a fresh baseline: snapshot the world, measure, validate. Returns `(score, total,
 /// rollback snapshot, baseline Row)`. Shared by the initial baseline and an approved re-scope.
-/// `skip` = snapshot only (base_sha/base_snap provenance kept), no measure: codegen domains have
-/// no meaningful pristine baseline, so seed the direction's worst score and keep any valid candidate.
 fn run_baseline(
     world: &dyn World,
     judge: &dyn Judge,
-    skip: bool,
+    source: BaselineSource,
 ) -> Result<(f64, u64, String, Row)> {
     let snap = world.snapshot("baseline").context("baseline snapshot")?;
-    if skip {
-        let score = worst_score(judge.direction());
-        let row = Row {
-            iter: 0,
-            decision: "baseline-skipped".into(),
-            note: "baseline skipped (codegen)".into(),
-            ..Default::default()
-        };
-        return Ok((score, 0, snap, row));
+    match source {
+        BaselineSource::Measure => {}
+        BaselineSource::Skip => {
+            let score = worst_score(judge.direction());
+            let row = Row {
+                iter: 0,
+                decision: "baseline-skipped".into(),
+                note: "baseline skipped (codegen)".into(),
+                ..Default::default()
+            };
+            return Ok((score, 0, snap, row));
+        }
+        BaselineSource::Preseeded(b) => {
+            let row = Row {
+                iter: 0,
+                decision: "baseline".into(),
+                note: format!("preflight baseline: {}", b.note),
+                score: Some(b.score),
+                tiebreak: b.tiebreak,
+                ..Default::default()
+            };
+            return Ok((b.score, 0, snap, row));
+        }
     }
     let base = judge.measure(&crucible::MeasureCtx::default())?;
     if !base.valid {
@@ -1720,6 +1777,20 @@ fn run_baseline(
         ..Default::default()
     };
     Ok((score, total, snap, row))
+}
+
+/// Which baseline a run's segment opens on. A preflight measurement only substitutes for a
+/// *skipped* baseline; when the judge measures its own baseline, that measurement wins (it is the
+/// gate's own number, on the gate's own axis).
+fn baseline_source(
+    skip: bool,
+    preflight: Option<&crate::preflight::PreflightBaseline>,
+) -> BaselineSource {
+    match preflight {
+        _ if !skip => BaselineSource::Measure,
+        Some(b) => BaselineSource::Preseeded(b.clone()),
+        None => BaselineSource::Skip,
+    }
 }
 
 /// The direction's worst score: the no-valid-candidate sentinel any real measurement beats.
@@ -2623,6 +2694,8 @@ mod tests {
         prompts: Vec<String>,
         escalation_path: Option<std::path::PathBuf>,
         recoveries: Vec<(crate::session::RecoveryClass, u32, String)>,
+        /// `(fingerprint, baseline_score, regime)` per segment boundary.
+        segments: Vec<(String, f64, String)>,
     }
     impl Reporter for RecordingReporter {
         fn start(&mut self, _: &str, _: &str) {}
@@ -2674,6 +2747,10 @@ mod tests {
         }
         fn recovery(&mut self, class: crate::session::RecoveryClass, iter: u32, detail: &str) {
             self.recoveries.push((class, iter, detail.to_string()));
+        }
+        fn segment(&mut self, fingerprint: &str, baseline_score: f64, regime: &str) {
+            self.segments
+                .push((fingerprint.to_string(), baseline_score, regime.to_string()));
         }
     }
 
@@ -2773,6 +2850,8 @@ mod tests {
             run_id: "fixture-run".into(),
             prior: String::new(),
             skip_baseline: false,
+            preflight: None,
+            preflight_modes: Vec::new(),
             seed_diff: None,
             identity: crate::identity::RunIdentity {
                 components: Vec::new(),
@@ -3856,12 +3935,148 @@ mod tests {
             fail_baseline: true,
         };
         let (score, total, snap, row) =
-            run_baseline(&FakeWorld, &judge, true).expect("skip never measures");
+            run_baseline(&FakeWorld, &judge, BaselineSource::Skip).expect("skip never measures");
         assert_eq!(score, f64::INFINITY);
         assert_eq!(total, 0);
         assert!(!snap.is_empty());
         assert_eq!(row.decision, "baseline-skipped");
         assert_eq!(row.score, None);
+    }
+
+    /// A `[preflight]` block whose rungs are real `sh` commands (no mocks): the ladder plus an
+    /// optional baseline rung.
+    fn preflight_cfg(commands: &[&str], baseline: Option<&str>) -> crate::manifest::PreflightCfg {
+        crate::manifest::PreflightCfg {
+            commands: commands.iter().map(|c| c.to_string()).collect(),
+            baseline: baseline.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn preflight_failure_refuses_to_start_before_any_agent_turn() {
+        let mut f = fixture(3, 0.0, false);
+        f.prepared.preflight = Some(preflight_cfg(
+            &["echo 'libnvrtc.so not found' 1>&2; exit 1"],
+            None,
+        ));
+        let world = FakeWorld;
+        let judge = FakeJudge {
+            keep: false,
+            solved: false,
+            fail_baseline: false,
+        };
+        let mut r = RecordingReporter::default();
+        let err = run_loop(
+            &f.args,
+            &f.paths,
+            &f.prepared,
+            &mut r,
+            &world,
+            &judge,
+            LoopRuntime::default(),
+        )
+        .expect_err("a failing rung is an environment verdict");
+        assert!(
+            format!("{err:#}").contains("libnvrtc.so not found"),
+            "the stderr tail rides the error: {err:#}"
+        );
+        assert_eq!(r.agent_calls, 0, "no iteration may be burned");
+        assert_eq!(r.rows.len(), 1, "just the refusal row: {:?}", r.rows);
+        assert_eq!(r.rows[0].decision, "preflight-failed");
+        assert_eq!(r.rows[0].iter, 0);
+        assert_eq!(r.shutdowns.len(), 1, "{:?}", r.shutdowns);
+        assert_eq!(r.shutdowns[0].0, "error");
+    }
+
+    #[test]
+    fn preflight_baseline_seeds_the_segment_and_iteration_one_decides_against_it() {
+        // skip_baseline is the codegen setting this exists for: without preflight the segment
+        // would open on the worst-score sentinel. FakeJudge measures 100.0 every iteration.
+        let mut f = fixture(1, 0.0, false);
+        f.prepared.skip_baseline = true;
+        f.prepared.preflight = Some(preflight_cfg(
+            &[r#"echo '{"pass":true,"digest":"sha256:base","note":"built"}'"#],
+            Some(r#"echo '{"score":140.0,"tiebreak":0.5,"note":"tpot=140 {digest}"}'"#),
+        ));
+        let world = FakeWorld;
+        let judge = FakeJudge {
+            keep: true,
+            solved: false,
+            fail_baseline: true, // proves the preseeded path never calls measure() for the baseline
+        };
+        let mut r = RecordingReporter::default();
+        run_loop(
+            &f.args,
+            &f.paths,
+            &f.prepared,
+            &mut r,
+            &world,
+            &judge,
+            LoopRuntime::default(),
+        )
+        .expect_err("the iteration's own measure still explodes; the baseline did not");
+        let base = r
+            .rows
+            .iter()
+            .find(|row| row.iter == 0)
+            .expect("a baseline row landed");
+        assert_eq!(base.decision, "baseline", "not baseline-skipped: {base:?}");
+        assert_eq!(base.score, Some(140.0));
+        assert_eq!(base.tiebreak, Some(0.5));
+        assert!(
+            base.note
+                .contains("preflight baseline: tpot=140 sha256:base"),
+            "the note carries the rung's note with the digest substituted: {}",
+            base.note
+        );
+    }
+
+    #[test]
+    fn preseeded_baseline_survives_a_rescope_rebaseline() {
+        // A rescope re-baselines. Re-measuring a rescoped codegen baseline without an agent turn
+        // is impossible, so the new segment must reuse the same preflight number.
+        let mut f = fixture(2, 0.0, false);
+        f.prepared.skip_baseline = true;
+        f.prepared.preflight = Some(preflight_cfg(
+            &[r#"echo '{"pass":true}'"#],
+            Some(r#"echo '{"score":88.0,"note":"seeded"}'"#),
+        ));
+        let control = std::sync::Arc::new(control::ControlState::default());
+        control.set_rescope(AdmissionKey::new("g1"), "concurrency=48".into());
+        let world = FakeWorld;
+        let judge = FakeJudge {
+            keep: false,
+            solved: false,
+            fail_baseline: false,
+        };
+        let mut r = RecordingReporter::default();
+        let runtime = LoopRuntime {
+            control: Some(&control),
+            ..LoopRuntime::default()
+        };
+        run_loop(
+            &f.args,
+            &f.paths,
+            &f.prepared,
+            &mut r,
+            &world,
+            &judge,
+            runtime,
+        )
+        .expect("the rescope re-baselines cleanly");
+        assert!(
+            r.notes.iter().any(|n| n.contains("re-scoping")),
+            "the rescope drained: {:?}",
+            r.notes
+        );
+        // Both `segment` announcements carry the preseeded number, so the goalpost never fell
+        // back to the worst-score sentinel across the boundary.
+        assert!(
+            r.segments.iter().all(|(_, score, _)| *score == 88.0),
+            "every segment opened on the preflight baseline: {:?}",
+            r.segments
+        );
+        assert_eq!(r.segments.len(), 2, "segment 0 plus the rescoped one");
     }
 
     #[test]

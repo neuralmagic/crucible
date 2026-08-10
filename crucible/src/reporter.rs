@@ -130,6 +130,8 @@ impl Outcome {
 /// Which stage of the loop is running, for the progress display.
 #[derive(Clone, Copy)]
 pub enum Phase {
+    /// The zero-agent-cost rung ladder against the unmodified tree, before any baseline.
+    Preflight,
     Baseline,
     Iteration(u32),
 }

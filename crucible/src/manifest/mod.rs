@@ -7,6 +7,7 @@ mod deploy;
 mod judge;
 mod measure;
 mod openshell;
+mod preflight;
 mod relay;
 mod search;
 mod selftest;
@@ -19,6 +20,7 @@ pub use deploy::DeployCfg;
 pub use judge::JudgeCfg;
 pub use measure::MeasureCfg;
 pub use openshell::OpenshellCfg;
+pub use preflight::{MODE_PLACEHOLDER, PreflightCfg};
 pub use relay::RelayFile;
 pub use search::SearchCfg;
 pub use selftest::SelftestCfg;
@@ -201,6 +203,10 @@ pub struct Manifest {
     /// candidate on a GPU declare it; a config-tuning or live-deployment domain leaves it unset.
     #[serde(default)]
     pub measure: Option<MeasureCfg>,
+    /// The zero-agent-cost rung ladder run against the unmodified baseline tree before iteration 1.
+    /// Absent = no preflight (the run starts straight at the baseline).
+    #[serde(default)]
+    pub preflight: Option<PreflightCfg>,
 }
 
 /// A single-repo run's publish-on-keep config: the fork the kept commits are pushed to as a draft PR.
@@ -403,6 +409,8 @@ fn validate_common(
     search: &Option<SearchCfg>,
     workflow: &Option<WorkflowCfg>,
     build: &BTreeMap<String, forge::spec::BuildSpec>,
+    preflight: &Option<PreflightCfg>,
+    measure: &Option<MeasureCfg>,
 ) -> Result<()> {
     if agent.broker.enabled && agent.broker.bin.is_empty() {
         return Err(ManifestError::BrokerBinRequired.into());
@@ -413,6 +421,7 @@ fn validate_common(
     }
     selftest::validate_selftest(&judge.selftest)?;
     forge::spec::validate_builds(build)?;
+    preflight::validate_preflight(preflight, measure)?;
     Ok(())
 }
 
@@ -464,6 +473,8 @@ impl Manifest {
             &self.search,
             &self.workflow,
             &self.build,
+            &self.preflight,
+            &self.measure,
         )
     }
 
@@ -546,6 +557,10 @@ pub struct CompositeManifest {
     /// candidate on a GPU declare it; a config-tuning or live-deployment domain leaves it unset.
     #[serde(default)]
     pub measure: Option<MeasureCfg>,
+    /// The zero-agent-cost rung ladder run against the unmodified baseline tree before iteration 1.
+    /// Absent = no preflight (the run starts straight at the baseline).
+    #[serde(default)]
+    pub preflight: Option<PreflightCfg>,
 }
 
 #[derive(Deserialize)]
@@ -641,6 +656,8 @@ impl CompositeManifest {
             &self.search,
             &self.workflow,
             &self.build,
+            &self.preflight,
+            &self.measure,
         )
     }
 
@@ -727,6 +744,129 @@ mod tests {
         assert_eq!(m.workspace.dir, "workspace"); // default
         assert!(m.world.snapshot_cmd.is_none(), "no [world] -> GitWorld");
         assert!(m.publish.is_none(), "no [publish] -> no PR target");
+    }
+
+    /// `[preflight]` on a codegen manifest: the rung ladder, the `{mode}` fan-out list it needs,
+    /// and the optional baseline rung.
+    fn preflight_manifest(preflight: &str, modes: &str) -> String {
+        format!(
+            r#"
+            [repo]
+            path = "."
+            [judge]
+            measure_cmd = "m"
+            direction = "higher"
+            objective = "v"
+            [agent]
+            backend = "command"
+            agent_cmd = "a"
+            goal = "g"
+            [measure]
+            gpus = 2
+            [measure.build]
+            base_image = "reg/base:latest"
+            mutable_kwargs = {{ mode = {modes} }}
+            {preflight}
+        "#
+        )
+    }
+
+    #[test]
+    fn preflight_parses_its_ladder_and_baseline() {
+        let m: Manifest = toml::from_str(&preflight_manifest(
+            r#"
+            [preflight]
+            commands = ["gate.py --rung 1 --mode {mode}", "gate.py --rung 2 --digest {digest}"]
+            baseline = "gate.py --rung 3 --digest {digest}"
+        "#,
+            r#"["derive", "full"]"#,
+        ))
+        .expect("preflight parses");
+        m.validate().expect("a declared mode list satisfies {mode}");
+        let cfg = m.preflight.expect("[preflight] present");
+        assert_eq!(cfg.commands.len(), 2);
+        assert_eq!(
+            cfg.baseline.as_deref(),
+            Some("gate.py --rung 3 --digest {digest}")
+        );
+        assert_eq!(
+            m.measure.and_then(|x| x.build_modes()),
+            Some(vec!["derive".to_string(), "full".to_string()]),
+            "the {{mode}} fan-out list comes from [measure.build].mutable_kwargs.mode"
+        );
+    }
+
+    #[test]
+    fn preflight_rejects_an_unknown_key() {
+        let parsed = toml::from_str::<Manifest>(&preflight_manifest(
+            r#"
+            [preflight]
+            commands = ["gate.py"]
+            rungs = 3
+        "#,
+            r#"["derive"]"#,
+        ));
+        let err = match parsed {
+            Err(e) => e,
+            Ok(_) => panic!("unknown [preflight] key is a typo, not a feature"),
+        };
+        assert!(err.to_string().contains("rungs"), "{err}");
+    }
+
+    #[test]
+    fn preflight_rejects_an_empty_ladder() {
+        let m: Manifest = toml::from_str(&preflight_manifest(
+            "[preflight]\ncommands = []\n",
+            r#"["derive"]"#,
+        ))
+        .unwrap();
+        let err = m.validate().expect_err("an empty ladder validates nothing");
+        assert!(
+            err.to_string().contains("[preflight].commands is empty"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn preflight_mode_placeholder_needs_a_declared_mode_list() {
+        // No [measure] at all: nothing to fan {mode} out over.
+        let bare = r#"
+            [repo]
+            path = "."
+            [judge]
+            measure_cmd = "m"
+            direction = "higher"
+            objective = "v"
+            [agent]
+            backend = "command"
+            agent_cmd = "a"
+            goal = "g"
+            [preflight]
+            commands = ["gate.py --mode {mode}"]
+        "#;
+        let m: Manifest = toml::from_str(bare).unwrap();
+        let err = m
+            .validate()
+            .expect_err("{mode} with no [measure] is unexpandable");
+        assert!(
+            err.to_string()
+                .contains("[measure.build].mutable_kwargs.mode"),
+            "the error names the missing key: {err:#}"
+        );
+        // Declared but empty is the same verdict: zero expansions means the rung never runs.
+        let m: Manifest = toml::from_str(&preflight_manifest(
+            "[preflight]\ncommands = [\"gate.py --mode {mode}\"]\n",
+            "[]",
+        ))
+        .unwrap();
+        let err = m
+            .validate()
+            .expect_err("an empty mode list expands to nothing");
+        assert!(
+            err.to_string()
+                .contains("[measure.build].mutable_kwargs.mode"),
+            "{err:#}"
+        );
     }
 
     #[test]

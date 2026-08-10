@@ -66,6 +66,10 @@ pub trait SessionPhase: Sized {
 impl SessionPhase for SessionEvent {
     fn phase(p: Phase) -> Self {
         match p {
+            Phase::Preflight => SessionEvent::Phase {
+                phase: "preflight".into(),
+                iter: 0,
+            },
             Phase::Baseline => SessionEvent::Phase {
                 phase: "baseline".into(),
                 iter: 0,
@@ -88,6 +92,7 @@ mod tests {
     #[test]
     fn phase_bridge_round_trips() {
         for (phase, want_phase, want_iter) in [
+            (Phase::Preflight, "preflight", 0),
             (Phase::Baseline, "baseline", 0),
             (Phase::Iteration(2), "iteration", 2),
         ] {

@@ -1759,6 +1759,8 @@ mod tests {
             run_id: "parity".into(),
             prior: String::new(),
             skip_baseline: false,
+            preflight: None,
+            preflight_modes: Vec::new(),
             seed_diff: None,
             identity: crate::identity::RunIdentity {
                 components: Vec::new(),
