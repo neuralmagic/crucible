@@ -36,6 +36,18 @@ pub struct RequestTraceArgs {
     long_frac: f64,
 }
 
+/// Args for `distress`: signal the operator, and at `error` severity suspend the run.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DistressArgs {
+    /// How loud: `info`/`warn` note and continue, `error` suspends the run and pages the operator.
+    severity: crate::distress::Severity,
+    /// What is wrong, in one line. Must be non-empty.
+    reason: String,
+    /// Concrete artifacts backing the claim (log handles, RESULTS rows).
+    #[serde(default)]
+    evidence: Vec<String>,
+}
+
 /// Args for `check_capture`: poll an opened approval by its handle (the PR url).
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CheckCaptureArgs {
@@ -329,6 +341,32 @@ impl McpServer {
                     .unwrap_or_else(|e| format!(r#"{{"status":"error","error":"{e}"}}"#))
             }
             Err(e) => format!(r#"{{"status":"error","error":"{e}"}}"#),
+        }
+    }
+
+    #[tool(
+        description = "Signal the operator. severity=error suspends the run and pages the \
+        operator; invoke it only when the run cannot succeed without operator action: the same \
+        environment failure has recurred across iterations, a required capability is missing, or \
+        the goal is infeasible as specified. It is not for hard-but-possible tasks. \
+        severity=info|warn post a status note and the run continues; use them for cheap \
+        operator-should-know signals. reason must be non-empty; evidence should reference \
+        concrete artifacts (log handles, RESULTS rows)."
+    )]
+    async fn distress(&self, Parameters(args): Parameters<DistressArgs>) -> String {
+        if args.reason.trim().is_empty() {
+            return json_err("reason must be non-empty: say what the operator has to fix");
+        }
+        // Writes the handoff file and posts the webhook (blocking IO); keep it off the reactor,
+        // and off `tokio::task::spawn_blocking` so the events land on the tool span.
+        match crate::telemetry::spawn_blocking(move || {
+            crate::distress::distress(args.severity, &args.reason, &args.evidence)
+        })
+        .await
+        {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(e)) => json_err(&e),
+            Err(e) => json_err(&format!("distress task failed: {e}")),
         }
     }
 
@@ -1046,6 +1084,42 @@ mod tests {
         assert!(
             info.capabilities.tools.is_some(),
             "server must declare the tools capability so clients call tools/list"
+        );
+    }
+
+    /// The distress tool must reach the agent's tool list with the guardrail intact: the
+    /// description IS the policy that keeps `error` for genuinely doomed runs, and a required
+    /// `severity` is what keeps a casual call from suspending.
+    #[test]
+    fn distress_is_listed_with_its_guardrail_and_required_severity() {
+        use crate::broker::NullResolver;
+        use rmcp::ServerHandler;
+        let server = McpServer::new(
+            Box::new(NullResolver),
+            frozen(),
+            false,
+            None,
+            Arc::new(DeployRegistry::new()),
+            Arc::new(CodegenState::new()),
+        );
+        let tool = server
+            .get_tool("distress")
+            .expect("distress must be listed");
+        let desc = tool.description.clone().unwrap_or_default();
+        assert!(desc.contains("severity=error suspends the run"), "{desc}");
+        assert!(desc.contains("not for hard-but-possible tasks"), "{desc}");
+        let schema = serde_json::to_value(&tool.input_schema).unwrap();
+        let required: Vec<String> = schema["required"]
+            .as_array()
+            .unwrap_or(&Vec::new())
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        assert!(required.contains(&"severity".to_string()), "{schema}");
+        assert!(required.contains(&"reason".to_string()), "{schema}");
+        assert!(
+            !required.contains(&"evidence".to_string()),
+            "evidence is optional: {schema}"
         );
     }
 

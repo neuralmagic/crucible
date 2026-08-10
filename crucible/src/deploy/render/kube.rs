@@ -532,6 +532,18 @@ impl Renderer<'_> {
         }
     }
 
+    /// Where inside the claim this run's state lives. A named existing claim is shared by every run
+    /// pointed at it, so each run gets its own `state/<run>` subtree or two runs would interleave
+    /// their session.jsonl. A template claim is already per-run, so it mounts at the root.
+    fn state_sub_path(&self) -> Option<String> {
+        match self.profile.cluster.state_pvc.as_ref()? {
+            crate::deploy::profile::StatePvc::Existing(_) => {
+                Some(format!("state/{}", self.input.name))
+            }
+            crate::deploy::profile::StatePvc::Template(_) => None,
+        }
+    }
+
     /// Generated when `state_pvc` is a template. No ownerReferences: a static render has no owner
     /// UID to point at, and the claim outliving the pod is the point.
     fn state_pvc_doc(&self) -> Option<core::PersistentVolumeClaim> {
@@ -859,6 +871,16 @@ impl Renderer<'_> {
                 .to_string(),
         ));
 
+        // Run identity for anything that has to name this run to a human (today: the broker's
+        // distress page). The broker inherits the loop pod's env wholesale, so naming them here is
+        // the whole plumbing. Before the profile's [env] so a profile can override them.
+        env.push(plain("CRUCIBLE_RUN_NAME", self.input.name.to_string()));
+        env.push(plain(
+            "CRUCIBLE_ITERATIONS",
+            self.opts.iterations.to_string(),
+        ));
+        env.push(plain("CRUCIBLE_LOOP_IMAGE", self.image.clone()));
+
         // Generic environment env the domain's hooks/gate need, names are the profile's. Last so
         // a profile can override a default if it ever needs to.
         for (k, v) in &self.profile.env {
@@ -979,6 +1001,7 @@ exit $rc
             mounts.push(core::VolumeMount {
                 name: "run-state".to_string(),
                 mount_path: format!("{}/state", self.domain_dir()),
+                sub_path: self.state_sub_path(),
                 ..Default::default()
             });
         }
@@ -2947,12 +2970,44 @@ mod tests {
             "{yaml}"
         );
         assert!(!yaml.contains("kind: PersistentVolumeClaim"), "{yaml}");
+        // A named claim is shared, so this run's state is keyed under its own subtree.
+        assert!(yaml.contains("subPath: state/alpha"), "{yaml}");
 
         let without = k8s_profile("");
         let yaml = render_k8s(&without);
         assert!(yaml.contains("restartPolicy: Never"), "{yaml}");
         assert!(!yaml.contains("--resume"), "{yaml}");
         assert!(!yaml.contains("run-state"), "{yaml}");
+    }
+
+    /// The subPath keying is for shared claims only, and adding it must not have perturbed the
+    /// no-state-pvc render: a profile without the knob renders exactly what it rendered before.
+    #[test]
+    fn state_subpath_only_for_shared_claims() {
+        let dedicated = render_k8s(&k8s_profile(
+            r#"[cluster.state_pvc]
+            size = "2Gi"
+            "#,
+        ));
+        assert!(dedicated.contains("claimName: alpha-state"), "{dedicated}");
+        assert!(
+            !dedicated.contains("subPath: state/alpha"),
+            "a per-run claim mounts at its root: {dedicated}"
+        );
+
+        // Byte-identical: the only mounts carrying a subPath without state_pvc are the pull authfile
+        // and (under pack delivery) the staged domain dir, neither of which this profile changes.
+        let baseline = render_k8s(&k8s_profile(""));
+        let subpaths: Vec<&str> = baseline
+            .lines()
+            .map(str::trim_start)
+            .filter(|l| l.starts_with("subPath:"))
+            .collect();
+        assert_eq!(
+            subpaths,
+            vec!["subPath: auth.json"],
+            "no state_pvc must render no run-state mount at all: {baseline}"
+        );
     }
 
     /// Table form emits `<run>-state` with the profile's storage class, size, access modes,
@@ -3152,6 +3207,44 @@ mod tests {
         assert!(
             yaml.contains("k8s.pod.name=$(CRUCIBLE_POD_NAME)"),
             "pod name is the grouping key: {yaml}"
+        );
+    }
+
+    /// The run-identity stamps the broker's distress page prints. The broker inherits the loop
+    /// pod's env, so rendering them here is the entire plumbing; the profile's own [env] must
+    /// still be able to override them, which means they render BEFORE it.
+    #[test]
+    fn run_identity_env_renders_before_the_profile_env_that_can_override_it() {
+        let profile = k8s_profile(
+            r#"
+            [env]
+            CRUCIBLE_RUN_NAME = "override"
+        "#,
+        );
+        let yaml = render_k8s(&profile);
+        for var in [
+            "CRUCIBLE_RUN_NAME",
+            "CRUCIBLE_ITERATIONS",
+            "CRUCIBLE_LOOP_IMAGE",
+        ] {
+            assert!(
+                yaml.contains(&format!("name: {var}")),
+                "{var} missing: {yaml}"
+            );
+        }
+        let default = yaml
+            .find("name: CRUCIBLE_RUN_NAME")
+            .expect("the rendered default");
+        let overridden = yaml
+            .rfind("name: CRUCIBLE_RUN_NAME")
+            .expect("the profile override");
+        assert!(
+            default < overridden,
+            "the profile's value must come last (last one wins): {yaml}"
+        );
+        assert!(
+            yaml.contains("name: CRUCIBLE_ITERATIONS\n      value: '1'"),
+            "the iteration cap renders as its own value: {yaml}"
         );
     }
 
