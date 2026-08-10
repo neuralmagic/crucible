@@ -427,27 +427,29 @@ pub struct HermesCfg {
 /// Cross-field checks shared by [`Manifest::validate`] and [`CompositeManifest::validate`]: the
 /// broker-bin requirement plus the three sub-validators. Callers add their own shape-specific
 /// checks (composite component count/uniqueness) around this.
-fn validate_common(
-    workspace: &Workspace,
-    agent: &AgentCfg,
-    judge: &JudgeCfg,
-    search: &Option<SearchCfg>,
-    workflow: &Option<WorkflowCfg>,
-    build: &BTreeMap<String, forge::spec::BuildSpec>,
-    preflight: &Option<PreflightCfg>,
-    measure: &Option<MeasureCfg>,
-) -> Result<()> {
-    if agent.broker.enabled && agent.broker.bin.is_empty() {
+struct CommonCfg<'a> {
+    workspace: &'a Workspace,
+    agent: &'a AgentCfg,
+    judge: &'a JudgeCfg,
+    search: &'a Option<SearchCfg>,
+    workflow: &'a Option<WorkflowCfg>,
+    build: &'a BTreeMap<String, forge::spec::BuildSpec>,
+    preflight: &'a Option<PreflightCfg>,
+    measure: &'a Option<MeasureCfg>,
+}
+
+fn validate_common(c: CommonCfg<'_>) -> Result<()> {
+    if c.agent.broker.enabled && c.agent.broker.bin.is_empty() {
         return Err(ManifestError::BrokerBinRequired.into());
     }
-    validate_carry_forward(&workspace.carry_forward)?;
-    search::validate_search(search)?;
-    if let Some(w) = workflow {
+    validate_carry_forward(&c.workspace.carry_forward)?;
+    search::validate_search(c.search)?;
+    if let Some(w) = c.workflow {
         w.validate()?;
     }
-    selftest::validate_selftest(&judge.selftest)?;
-    forge::spec::validate_builds(build)?;
-    preflight::validate_preflight(preflight, measure)?;
+    selftest::validate_selftest(&c.judge.selftest)?;
+    forge::spec::validate_builds(c.build)?;
+    preflight::validate_preflight(c.preflight, c.measure)?;
     Ok(())
 }
 
@@ -516,16 +518,16 @@ impl Manifest {
 
     /// Cross-field checks the type system + `deny_unknown_fields` can't express. Run at load.
     fn validate(&self) -> Result<()> {
-        validate_common(
-            &self.workspace,
-            &self.agent,
-            &self.judge,
-            &self.search,
-            &self.workflow,
-            &self.build,
-            &self.preflight,
-            &self.measure,
-        )
+        validate_common(CommonCfg {
+            workspace: &self.workspace,
+            agent: &self.agent,
+            judge: &self.judge,
+            search: &self.search,
+            workflow: &self.workflow,
+            build: &self.build,
+            preflight: &self.preflight,
+            measure: &self.measure,
+        })
     }
 
     pub fn direction(&self) -> Result<Direction> {
@@ -705,16 +707,16 @@ impl CompositeManifest {
                 .into());
             }
         }
-        validate_common(
-            &self.workspace,
-            &self.agent,
-            &self.judge,
-            &self.search,
-            &self.workflow,
-            &self.build,
-            &self.preflight,
-            &self.measure,
-        )
+        validate_common(CommonCfg {
+            workspace: &self.workspace,
+            agent: &self.agent,
+            judge: &self.judge,
+            search: &self.search,
+            workflow: &self.workflow,
+            build: &self.build,
+            preflight: &self.preflight,
+            measure: &self.measure,
+        })
     }
 
     pub fn direction(&self) -> Result<Direction> {
