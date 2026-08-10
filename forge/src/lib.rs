@@ -224,6 +224,20 @@ fn buildah_rmi_all_args(cfg: &BuildConfig) -> Vec<String> {
     a
 }
 
+/// `buildah rmi <ref>` argv: drop one image by ref.
+fn buildah_rmi_args(cfg: &BuildConfig, image_ref: &str) -> Vec<String> {
+    let mut a = cfg.storage_flags();
+    a.extend(["rmi".into(), image_ref.to_string()]);
+    a
+}
+
+/// `buildah rmi --prune` argv: drop dangling (untagged) images only; tagged bases survive.
+fn buildah_rmi_prune_args(cfg: &BuildConfig) -> Vec<String> {
+    let mut a = cfg.storage_flags();
+    a.extend(["rmi".into(), "--prune".into()]);
+    a
+}
+
 /// Empty the ISOLATED buildah storage (containers, then images). The vfs storage under a per-broker
 /// `storage_root` is scratch rather than a cache: every build leaves its full layer set behind, and
 /// nothing else reads it, so leaving it accumulates disk until the volume dies. A `None`
@@ -234,15 +248,35 @@ pub fn prune_storage(cfg: &BuildConfig) -> Result<()> {
         return Ok(());
     }
     for args in [buildah_rm_all_args(cfg), buildah_rmi_all_args(cfg)] {
-        let out = run("buildah", &args, None)
-            .context("running buildah to prune the isolated build storage")?;
-        if !out.status.success() {
-            return Err(BuildahFailed::Prune {
-                args: args.join(" "),
-                log: log_tail(&out),
-            }
-            .into());
+        prune_step(&args)?;
+    }
+    Ok(())
+}
+
+/// [`prune_storage`], but the pulled BASE image survives: drop the working containers, the built
+/// candidate (`built_ref`, already pushed — the registry and the memo own it now), and dangling
+/// intermediates. Re-pulling the multi-GB base cost ~10 minutes of every build; a tagged base in
+/// the isolated storage is the one layer set worth keeping between builds.
+pub fn prune_storage_keep_base(cfg: &BuildConfig, built_ref: Option<&str>) -> Result<()> {
+    if cfg.storage_root.is_none() {
+        return Ok(());
+    }
+    prune_step(&buildah_rm_all_args(cfg))?;
+    if let Some(built) = built_ref {
+        prune_step(&buildah_rmi_args(cfg, built))?;
+    }
+    prune_step(&buildah_rmi_prune_args(cfg))
+}
+
+fn prune_step(args: &[String]) -> Result<()> {
+    let out = run("buildah", args, None)
+        .context("running buildah to prune the isolated build storage")?;
+    if !out.status.success() {
+        return Err(BuildahFailed::Prune {
+            args: args.join(" "),
+            log: log_tail(&out),
         }
+        .into());
     }
     Ok(())
 }
@@ -315,7 +349,7 @@ fn build_streaming(
         context_dir.display(),
         log.display()
     );
-    let status = run_streaming(
+    let status = run_streaming_traced(
         "buildah",
         &buildah_bud_args(cfg, context_dir, &image_ref),
         log,
@@ -353,6 +387,109 @@ pub fn build_and_push_streaming(
         }
         compile_err => Ok(compile_err),
     }
+}
+
+/// [`run_streaming`], but the child's stdout is teed through this process so buildah's
+/// `STEP n/m:` markers become child tracing spans — a 30-minute build shows up in a trace as
+/// per-layer bars instead of one opaque block. Bytes still land in `log` as they arrive (stdout
+/// line-at-a-time, stderr in raw chunks), so a concurrent `fetch_log` tail behaves as before.
+fn run_streaming_traced(
+    program: &str,
+    args: &[String],
+    log: &Path,
+) -> Result<std::process::ExitStatus> {
+    use std::io::{BufRead, Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    if let Some(parent) = log.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .with_context(|| format!("opening live log {}", log.display()))?;
+    let file = Arc::new(Mutex::new(file));
+
+    let mut child = Command::new(program)
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawning `{program}`"))?;
+
+    // The scanning thread has no span context of its own; capture the caller's (the broker's
+    // tool-call span) so step spans parent onto the build instead of forming orphan traces.
+    let build_span = tracing::Span::current();
+
+    let stderr_file = Arc::clone(&file);
+    let stderr_thread = child.stderr.take().map(|mut err| {
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            while let Ok(n) = err.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                if let Ok(mut f) = stderr_file.lock() {
+                    let _ = f.write_all(&buf[..n]);
+                }
+            }
+        })
+    });
+
+    let stdout_thread = child.stdout.take().map(|out| {
+        let file = Arc::clone(&file);
+        std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(out);
+            let mut line = String::new();
+            // Holding the previous step's span until the next marker makes its close time the
+            // next step's start, so span duration is the layer's real wall-clock.
+            let mut step_span: Option<tracing::Span> = None;
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                if let Ok(mut f) = file.lock() {
+                    let _ = f.write_all(line.as_bytes());
+                }
+                if let Some((step, total, instruction)) = parse_step_marker(line.trim_end()) {
+                    drop(step_span.take());
+                    step_span = Some(tracing::info_span!(
+                        parent: &build_span,
+                        "buildah.step",
+                        step,
+                        total,
+                        instruction,
+                    ));
+                }
+            }
+            drop(step_span);
+        })
+    });
+
+    let status = child
+        .wait()
+        .with_context(|| format!("waiting for `{program}`"))?;
+    if let Some(t) = stdout_thread {
+        let _ = t.join();
+    }
+    if let Some(t) = stderr_thread {
+        let _ = t.join();
+    }
+    Ok(status)
+}
+
+/// Parse a buildah `STEP <n>/<m>: <instruction>` marker; the instruction is clipped so a huge RUN
+/// body doesn't become a span attribute.
+fn parse_step_marker(line: &str) -> Option<(u32, u32, String)> {
+    let rest = line.strip_prefix("STEP ")?;
+    let (counts, instruction) = rest.split_once(": ")?;
+    let (step, total) = counts.split_once('/')?;
+    let instruction: String = instruction.chars().take(120).collect();
+    Some((step.parse().ok()?, total.parse().ok()?, instruction))
 }
 
 /// Run a command with stdout AND stderr appended straight into `log`. The descriptors go to the
@@ -492,7 +629,48 @@ fn env_req(key: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::*;
+
+    /// The keep-base prune must never touch SYSTEM storage, and its argv set drops containers,
+    /// the built candidate, and dangling images — never `--all` images (that is what re-pulled
+    /// the base every build).
+    #[test]
+    fn keep_base_prune_args_spare_tagged_images() {
+        let cfg = build_cfg();
+        assert_eq!(
+            buildah_rmi_args(&cfg, "quay.io/acme/candidate:codegen-1")[cfg.storage_flags().len()..],
+            [
+                "rmi".to_string(),
+                "quay.io/acme/candidate:codegen-1".to_string()
+            ]
+        );
+        assert_eq!(
+            buildah_rmi_prune_args(&cfg)[cfg.storage_flags().len()..],
+            ["rmi".to_string(), "--prune".to_string()]
+        );
+        let mut no_root = build_cfg();
+        no_root.storage_root = None;
+        assert!(prune_storage_keep_base(&no_root, Some("x")).is_ok());
+    }
+
+    #[test]
+    fn step_markers_parse_and_ignore_noise() {
+        assert_eq!(
+            parse_step_marker("STEP 4/4: RUN MAX_JOBS=32 python3 setup.py build_ext"),
+            Some((4, 4, "RUN MAX_JOBS=32 python3 setup.py build_ext".into()))
+        );
+        let long = format!("STEP 2/4: RUN {}", "x".repeat(500));
+        let (_, _, instruction) = parse_step_marker(&long).unwrap();
+        assert_eq!(instruction.chars().count(), 120);
+        for noise in [
+            "Copying blob sha256:abc",
+            "STEP marker mentioned mid-log",
+            "-- Configuring done (95.6s)",
+            "STEP not/numeric: RUN true",
+        ] {
+            assert_eq!(parse_step_marker(noise), None, "{noise}");
+        }
+    }
 
     fn build_cfg() -> BuildConfig {
         BuildConfig {

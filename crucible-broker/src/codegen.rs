@@ -797,11 +797,15 @@ fn build_inner(
     let (log_handle, log_path) = state.logs.allocate("build", &tag)?;
     let outcome = forge::build_and_push_streaming(&build_cfg, &ctx, &tag, &log_path);
     let _ = std::fs::remove_file(&dockerfile);
-    // Prune the isolated buildah storage on EVERY outcome (pushed, compile error, infra error): the
-    // vfs layers are dead weight either way; a build leaves the full base+derive set behind, and a
-    // few builds fill the volume. The registry holds the pushed artifact and the memo holds the
-    // digest, so nothing local is needed again; re-pulling the base per build is the accepted cost.
-    if let Err(e) = forge::prune_storage(&build_cfg) {
+    // Prune on EVERY outcome (pushed, compile error, infra error), but keep the pulled BASE: the
+    // registry holds the pushed artifact and the memo holds the digest, while re-pulling the
+    // multi-GB base cost ~10 minutes of every build. Containers, the built candidate, and
+    // dangling intermediates still go — those are what filled the volume.
+    let built_ref = match &outcome {
+        Ok(forge::BuildOutcome::Built { image_ref }) => Some(image_ref.clone()),
+        _ => None,
+    };
+    if let Err(e) = forge::prune_storage_keep_base(&build_cfg, built_ref.as_deref()) {
         eprintln!("warning: pruning codegen build storage failed: {e:#}");
     }
     match outcome.map_err(|e| format!("build/push: {e:#}"))? {

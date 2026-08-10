@@ -309,13 +309,24 @@ pub(crate) fn plan_admitted_event(plan: &ValidPlan) -> crate::session::SessionEv
 }
 
 /// One terminal task result on the wire. `iter` is the loop round (0 for a standalone
-/// `plan run`); fields belonging to other emitters stay at their defaults.
+/// `plan run`); fields belonging to other emitters stay at their defaults. `trace_id`/`span_id`
+/// carry the emitter's current trace context (the iteration's span) so a RESULTS row links
+/// straight to its trace; no active span leaves them empty.
 pub(crate) fn task_result_event(
     plan_version: u32,
     iter: u32,
     task: &crate::plan::ir::Task,
     r: &crate::plan::exec::TaskResult,
 ) -> crate::session::SessionEvent {
+    let (trace_id, span_id) = crate::engine::current_trace_env()
+        .and_then(|(tp, _)| {
+            let f: Vec<&str> = tp.split('-').collect();
+            match f.as_slice() {
+                [_, tid, sid, ..] => Some((tid.to_string(), sid.to_string())),
+                _ => None,
+            }
+        })
+        .unwrap_or_default();
     crate::session::SessionEvent::TaskResult {
         task: task.name.0.clone(),
         status: r.status.as_str().to_string(),
@@ -330,8 +341,8 @@ pub(crate) fn task_result_event(
         output: r.output.clone(),
         note: r.note.clone().unwrap_or_default(),
         secs: 0.0,
-        trace_id: String::new(),
-        span_id: String::new(),
+        trace_id,
+        span_id,
     }
 }
 

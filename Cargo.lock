@@ -1501,6 +1501,7 @@ dependencies = [
  "axum",
  "crucible-contract",
  "jiff",
+ "reqwest",
  "serde_json",
  "tokio",
 ]

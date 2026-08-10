@@ -1025,6 +1025,11 @@ fn run_loop_body<R: Reporter>(
         // The broker's distress page prints the iteration it fired on; best-effort by design, a
         // missing stamp only costs the page a "?".
         write_turn_meta(it, run.spent);
+        // One span per loop round, entered for the iteration's whole body on this thread: the
+        // turn span, gate evaluations, and broker traceparent files all nest under it, so a trace
+        // groups by iteration and `iter` is queryable directly.
+        let iter_span = tracing::info_span!("iteration", iter = it, spent_usd = run.spent);
+        let _iter_span = iter_span.enter();
         update_control_status(control, "iteration", it, run.segment.best_score, run.spent);
         beat_position(heartbeat, it, run.spent);
         write_results(p, &prep.goal, &prep.prior, &run.rows)?;
@@ -3448,6 +3453,7 @@ mod tests {
             model: "test-model".into(),
             harness: None,
             hermes: Default::default(),
+            disallowed_tools: Vec::new(),
             reasoning_effort: None,
             agent_backend: crate::agent::AgentBackend::Command,
             sandbox_image: None,
