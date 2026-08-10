@@ -14,6 +14,22 @@ pub struct MeasureCfg {
 }
 
 impl MeasureCfg {
+    /// The build modes `[measure.build].mutable_kwargs.mode` declares, in declared order. `None`
+    /// when the key is absent or is not an array of strings: the broker owns the schema, so a
+    /// shape this doesn't recognize is reported as "not declared" rather than re-validated here.
+    pub fn build_modes(&self) -> Option<Vec<String>> {
+        self.tools
+            .get("build")?
+            .as_table()?
+            .get("mutable_kwargs")?
+            .as_table()?
+            .get("mode")?
+            .as_array()?
+            .iter()
+            .map(|v| v.as_str().map(str::to_string))
+            .collect()
+    }
+
     /// The broker-child env this contract projects: the enable flag + the tools-defaults JSON. The
     /// per-cluster substrate facts (namespace/queue/PVCs/max_gpus) come from the deploy profile, not here.
     pub fn broker_env(&self) -> Result<Vec<(String, String)>, String> {

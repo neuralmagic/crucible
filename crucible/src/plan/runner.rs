@@ -117,7 +117,7 @@ impl ShellRunner {
             return fail(format!(
                 "exit {}: {}",
                 out.status.code().unwrap_or(-1),
-                stderr.lines().last().unwrap_or("").trim()
+                stderr_tail(&stderr)
             ));
         }
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -132,6 +132,66 @@ impl ShellRunner {
             )),
         }
     }
+}
+
+/// Lines kept from the end of stderr. A build/pytest verdict plus its immediate
+/// context fits well inside this; more would drown the row.
+const TAIL_LINES: usize = 40;
+/// Per-line clip. Long torch stack frames and nvcc command echoes are mostly path
+/// noise, and one of them must not eat the whole budget.
+const TAIL_LINE_CHARS: usize = 240;
+/// Whole-tail clip.
+const TAIL_CHARS: usize = 4000;
+
+/// Compress a process's stderr into a single line for a failure note.
+///
+/// The note is rendered into a markdown table cell in RESULTS.md, so the result must
+/// be one line with no unescaped `|`. Truncation drops from the FRONT because the
+/// verdict (the compiler error, the pytest summary) is at the end.
+fn stderr_tail(stderr: &str) -> String {
+    let lines: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let joined = lines[lines.len().saturating_sub(TAIL_LINES)..]
+        .iter()
+        .map(|line| line.chars().take(TAIL_LINE_CHARS).collect::<String>())
+        .map(|line| line.replace('|', "\\|"))
+        .collect::<Vec<_>>()
+        .join(" ⏎ ");
+    let over = joined.chars().count().saturating_sub(TAIL_CHARS);
+    if over == 0 {
+        return joined;
+    }
+    // One char of the budget goes to the marker so the note admits it lost its head.
+    std::iter::once('…')
+        .chain(joined.chars().skip(over + 1))
+        .collect()
+}
+
+/// Broker log handles an evaluation record may carry (`"logs": ["job-abc.log"]`).
+/// Handles are bare filenames minted by the broker's log store, so a `|` or a
+/// newline means the record is lying; escape rather than trust it, since the note
+/// lands in a markdown table cell.
+fn log_handles(object: &serde_json::Map<String, Value>) -> Vec<String> {
+    let Some(array) = object.get("logs").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    array
+        .iter()
+        .filter_map(Value::as_str)
+        .map(|handle| {
+            handle
+                .chars()
+                .filter(|c| !c.is_control())
+                .collect::<String>()
+                .replace('|', "\\|")
+                .trim()
+                .to_string()
+        })
+        .filter(|handle| !handle.is_empty())
+        .collect()
 }
 
 fn evaluation_attempt(task: &Task, mut value: Value) -> Attempt {
@@ -169,6 +229,9 @@ fn evaluation_attempt(task: &Task, mut value: Value) -> Attempt {
     };
     let passed = within_threshold && declared_pass;
     object.insert("pass".to_string(), Value::Bool(passed));
+    // A passing record needs no suffix: the whole object, `logs` included, flows on as
+    // the task output. Only the fail note is lossy, so that is where handles are spent.
+    let handles = log_handles(object);
     if passed {
         Attempt {
             outcome: AttemptOutcome::Pass(value),
@@ -176,11 +239,16 @@ fn evaluation_attempt(task: &Task, mut value: Value) -> Attempt {
         }
     } else {
         fail(format!(
-            "evaluation {} did not pass{}",
+            "evaluation {} did not pass{}{}",
             task.name,
             threshold
                 .map(|threshold| format!(" threshold {threshold}"))
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            if handles.is_empty() {
+                String::new()
+            } else {
+                format!(" logs: {}", handles.join(","))
+            }
         ))
     }
 }
@@ -202,6 +270,25 @@ mod tests {
         ShellRunner {
             workdir: std::env::temp_dir(),
             agent_cmd: None,
+        }
+    }
+
+    fn evaluate(name: &str, cmd: &str, threshold: Option<f64>) -> Task {
+        Task {
+            name: name.into(),
+            task: TaskKind::Evaluate {
+                command: cmd.into(),
+                threshold,
+                direction: threshold.map(|_| Direction::Lower),
+            },
+            depends_on: vec![],
+            session: None,
+            needs: "any".into(),
+            required: true,
+            isolation: None,
+            join: Join::default(),
+            stage: Stage::Iteration,
+            emits: Vec::new(),
         }
     }
 
@@ -532,5 +619,106 @@ mod tests {
         let kept = &out.results[&"pick".into()].output.as_ref().unwrap()["kept"];
         // "approach p-short" is shorter than "approach p-longer-name": lower wins.
         assert_eq!(kept[0]["task"], "m-short");
+    }
+
+    #[test]
+    fn stderr_tail_drops_blank_lines_and_keeps_order() {
+        assert_eq!(stderr_tail(""), "");
+        assert_eq!(stderr_tail("\n\n   \n"), "");
+        assert_eq!(stderr_tail("a\n\n  b  \n\nc\n"), "a ⏎ b ⏎ c");
+    }
+
+    #[test]
+    fn stderr_tail_clips_each_line() {
+        let long = "x".repeat(1000);
+        let tail = stderr_tail(&format!("{long}\nverdict\n"));
+        let first = tail.split(" ⏎ ").next().unwrap();
+        assert_eq!(first.chars().count(), TAIL_LINE_CHARS);
+        assert!(tail.ends_with("verdict"), "{tail}");
+    }
+
+    #[test]
+    fn stderr_tail_keeps_only_the_last_lines() {
+        let stderr: String = (0..100).map(|i| format!("line{i}\n")).collect();
+        let tail = stderr_tail(&stderr);
+        let lines: Vec<&str> = tail.split(" ⏎ ").collect();
+        assert_eq!(lines.len(), TAIL_LINES);
+        assert_eq!(lines[0], "line60");
+        assert_eq!(lines[TAIL_LINES - 1], "line99");
+    }
+
+    #[test]
+    fn stderr_tail_truncates_from_the_front() {
+        // 40 lines x 240 chars blows the whole-tail budget; the verdict at the end
+        // is exactly what must survive.
+        let mut stderr: String = (0..39).map(|_| format!("{}\n", "y".repeat(300))).collect();
+        stderr.push_str("error: the actual verdict\n");
+        let tail = stderr_tail(&stderr);
+        assert_eq!(tail.chars().count(), TAIL_CHARS);
+        assert!(tail.starts_with('…'), "{}", &tail[..8]);
+        assert!(tail.ends_with("error: the actual verdict"), "{tail}");
+    }
+
+    #[test]
+    fn stderr_tail_escapes_pipes() {
+        assert_eq!(stderr_tail("a | b\n"), "a \\| b");
+    }
+
+    #[test]
+    fn nonzero_exit_note_carries_a_multi_line_tail() {
+        let out = run_plan(
+            vec![command("boom", "echo err1 >&2; echo err2 >&2; exit 3", &[])],
+            None,
+        );
+        let r = &out.results[&"boom".into()];
+        assert_eq!(r.status, TaskStatus::Fail);
+        assert_eq!(r.note.as_deref(), Some("exit 3: err1 ⏎ err2"));
+    }
+
+    #[test]
+    fn failed_evaluation_note_carries_the_log_handles() {
+        let out = run_plan(
+            vec![evaluate(
+                "gate",
+                r#"echo '{"score": 50, "logs": ["job-a.log", "job-b.log"]}'"#,
+                Some(10.0),
+            )],
+            None,
+        );
+        let note = out.results[&"gate".into()].note.clone().unwrap();
+        assert!(note.contains("threshold 10"), "{note}");
+        assert!(note.ends_with(" logs: job-a.log,job-b.log"), "{note}");
+    }
+
+    #[test]
+    fn evaluation_log_handles_ignore_non_strings_and_escape_pipes() {
+        // One plan per record: a required task's failure blocks whatever follows it.
+        let note = |command: &str| {
+            let out = run_plan(vec![evaluate("gate", command, Some(10.0))], None);
+            out.results[&"gate".into()].note.clone().unwrap()
+        };
+        let mixed = note(r#"echo '{"score": 50, "logs": ["ok.log", 7, null, ""]}'"#);
+        assert!(mixed.ends_with(" logs: ok.log"), "{mixed}");
+        let hostile = note(r#"echo '{"score": 50, "logs": ["a|b.log"]}'"#);
+        assert!(hostile.ends_with(" logs: a\\|b.log"), "{hostile}");
+        let empty = note(r#"echo '{"score": 50, "logs": []}'"#);
+        assert!(!empty.contains("logs:"), "{empty}");
+    }
+
+    #[test]
+    fn passing_evaluation_keeps_the_log_handles_in_its_output() {
+        let out = run_plan(
+            vec![evaluate(
+                "gate",
+                r#"echo '{"score": 5, "logs": ["job-a.log"]}'"#,
+                Some(10.0),
+            )],
+            None,
+        );
+        let r = &out.results[&"gate".into()];
+        assert_eq!(r.status, TaskStatus::Pass);
+        let output = r.output.as_ref().unwrap();
+        assert_eq!(output["pass"], true);
+        assert_eq!(output["logs"][0], "job-a.log");
     }
 }

@@ -51,6 +51,7 @@ mod manifest;
 mod openshell;
 mod plan;
 mod pr_watch;
+mod preflight;
 mod provisioning;
 mod ps;
 mod publish;
@@ -753,6 +754,13 @@ pub(crate) struct Prepared {
     pub identity: identity::RunIdentity,
     /// `[judge].skip_baseline`: baseline (and re-scope re-baseline) snapshots only, no measure.
     pub skip_baseline: bool,
+    /// `[preflight]`: the rung ladder run against the unmodified tree before iteration 1. `None`
+    /// = no preflight.
+    pub preflight: Option<manifest::PreflightCfg>,
+    /// The build modes a `{mode}` preflight rung fans out over, from
+    /// `[measure.build].mutable_kwargs.mode`. Empty when the domain declares none (validation
+    /// already rejected a `{mode}` rung in that case).
+    pub preflight_modes: Vec<String>,
     /// `[agent].seed_diff` content, handed to iteration 1's prompt as labeled seed material (its
     /// content hash rides `identity.seed_hash`). `None` = an unseeded run.
     pub seed_diff: Option<String>,

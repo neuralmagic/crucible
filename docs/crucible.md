@@ -70,6 +70,36 @@ Each command runs in the workspace with the domain's env:
 The accept policy is generic: *keep if `valid` and `score` beats the best per
 `direction`; solved iff `measure` says so.* No per-domain code for the keep/win logic.
 
+### Carrying pipeline artifacts across a discard
+
+A discard resets the workspace and cleans untracked files, so anything an iteration derived
+on the way to its candidate (code traces, a generated port tree) is gone by the next turn and
+gets re-derived. `[workspace] carry_forward` names workspace-relative paths that survive:
+
+```toml
+[workspace]
+carry_forward = ["codegen-out/"]
+```
+
+Each entry is written to `.git/info/exclude` and spared by the discard's clean, so carried
+content never reaches a candidate diff, snapshot commit, or tree hash: a turn that only
+regenerates it still reads as no candidate change.
+
+Limits worth knowing before you use it:
+
+- A path the repo **tracks** is not protected. Git excludes only apply to untracked files, and
+  the discard's `git reset --hard` reverts tracked content regardless. Carry pipeline output
+  the repo doesn't track.
+- A path that doesn't exist yet is fine; the exclude is prospective.
+- Nested paths (`target/codegen-out`) work: the clean descends into the parent instead of
+  deleting it. Entries must be plain relative paths, so no `.`, `..`, or leading `/`.
+- Wide-tournament rounds run in fresh worktrees with no untracked carried dirs, so they don't
+  benefit.
+- Composite manifests reject the key; per-component carry-forward is a non-goal.
+
+Omitting it is the default and keeps today's fresh-start behavior exactly, which is what a
+methodology-sensitive campaign wants.
+
 ### Languages: pick per command, the engine doesn't care
 
 The contract is JSON + exit codes, so each command can be whatever fits:
@@ -115,6 +145,7 @@ Any language works the same way, because the engine reads only the JSON verdict.
 | **Search (wide round)** | optional fan-out of N parallel propose turns, ranked by the same Judge, before the deep loop ([ADR 0010](./adr/0010-candidate-portfolios-and-search.md)) | `crucible/src/wide/` |
 | **Self-test** | `crucible check` proves the Judge can tell a known-good config from a known-bad one before a run trusts it | `[judge.selftest]` + `selftest.rs` |
 | **On-ramp** | `crucible init` scaffolds a manifest + measure stub onto an existing repo; `crucible check` validates it with no agent turn; `crucible scope` ingests a goal and freezes a `SCOPE.md` (ADR-0014 S0) | `init.rs` / `check.rs` / `scope.rs` |
+| **Preflight** | runs the domain's rung ladder against the unmodified tree before iteration 1; a failure refuses the run, and the optional baseline rung seeds `segment.baseline_score` | `[preflight]` + `preflight.rs` |
 
 An optional private control plane can sit above all of this: a controller that discovers
 candidate issues, scopes them into packs, launches runs, and renders run records into
@@ -130,6 +161,36 @@ credential) stays host-side, never in the agent's sandbox.
 <div class="cru-callout">
   <p><strong>Two ways to build a candidate, neither runs in the agent.</strong> When a candidate is a real source build (a compiled service's Dockerfile), <code>forge</code> drives <strong>buildah</strong>. When it's just "the base image plus an edited file or two" (an interpreted-source overlay, e.g. one Python file), <code>forge::oci::derive_layer</code> appends one tar+gzip layer onto the base and pushes an immutable, digest-pinned image with <strong>no container runtime</strong> (<code>oci-client</code> + <code>sha2</code>/<code>tar</code>/<code>flate2</code>): base layers move by a server-side blob <em>mount</em> when the registries match, else a low-memory pull→push stream. That replaces the old runtime configmap-overlay (version skew, <code>subPath</code> mounts, volume juggling on restore) with <code>set image</code> to a digest, so snapshot/restore collapses to a ref. <code>forge-derive-layer</code> is the CLI that validates the round-trip on-cluster.</p>
 </div>
+
+## `[preflight]`: prove the environment before spending an iteration
+
+Every rung a candidate is graded on can fail for reasons that have nothing to do with the
+candidate: a missing dev header, a pip install shadowing the built wheel, an unwritable cache
+dir. Discovering those at iteration 1 costs a full agent turn. `[preflight]` runs the same
+ladder against the *unmodified* tree first, at zero agent cost:
+
+```toml
+[preflight]
+commands = [
+  "python3 tools/gate.py --only-rung 1 --mode {mode}",
+  "python3 tools/gate.py --only-rung 2 --digest {digest} --limit 1",
+]
+baseline = "python3 tools/gate.py --only-rung 3 --digest {digest}"
+```
+
+- Each command runs `sh -c` in the workspace. Its last non-empty stdout line must be a JSON
+  object; the rung passed when it exited 0 and `pass` is absent or true. Recognized keys:
+  `digest`, `score`, `tiebreak`, `note`, `logs`.
+- `{mode}` fans a command out over every build mode declared in
+  `[measure.build].mutable_kwargs.mode`, in declared order. A `{mode}` command without that
+  list is a manifest load error: a derive-only preflight passes while full mode is broken.
+- `{digest}` interpolates the most recent `digest` an earlier rung emitted, so the build rung
+  hands its artifact to the correctness rung. Using it before any rung produced one fails.
+- Any failure is an **environment verdict**: the run refuses to start, logging the failing
+  command, its note, and a stderr tail, as a `preflight-failed` row. No iteration is burned.
+- `baseline` is optional. Its `score`/`tiebreak` become `segment.baseline_score`, so a
+  `skip_baseline` (codegen) domain decides iteration 1 against a real number instead of the
+  direction's worst-score sentinel. Without it, that sentinel stands.
 
 ## The three extension points
 
@@ -179,6 +240,7 @@ git default.
    ```toml
    [repo]      url|path, ref
    [workspace] setup_cmd          # optional; default: git clone + checkout
+               carry_forward      # optional; untracked derived paths a discard keeps
    [agent]     model, method_prompt, goal_file|goal, toolbox_dir, env
    [judge]     measure_cmd, direction = "lower"|"higher"
    [world]     apply_cmd?, snapshot_cmd?, restore_cmd?   # omitted → git

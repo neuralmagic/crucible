@@ -108,9 +108,9 @@ impl Segment {
         judge: &dyn Judge,
         goal: &str,
         regime: String,
-        skip: bool,
+        source: BaselineSource,
     ) -> Result<(Self, Row)> {
-        let (baseline_score, baseline_total, snap, row) = run_baseline(world, judge, skip)?;
+        let (baseline_score, baseline_total, snap, row) = run_baseline(world, judge, source)?;
         let fingerprint = fingerprint(goal, &judge.objective(), &regime);
         let segment = Segment {
             regime,
@@ -557,6 +557,11 @@ fn run_loop_body<R: Reporter>(
     let started = Instant::now();
     let start_iter: u32;
     let is_resume = runtime.resume.is_some();
+    // Held across the whole body: an approved re-scope re-baselines, and re-measuring a rescoped
+    // baseline without an agent turn is impossible for a codegen domain, so it reuses this same
+    // preflight measurement. A resumed run whose baseline was never measured re-runs preflight
+    // and sets this; a resume with a finite baseline skips preflight entirely.
+    let mut preflight_baseline: Option<crate::preflight::PreflightBaseline> = None;
 
     let mut run = if let Some(rs) = runtime.resume {
         // Resume restores state in-memory only: the log already holds the prior
@@ -640,12 +645,104 @@ fn run_loop_body<R: Reporter>(
                 prior.digest, prep.identity.digest
             ));
         }
+        // Only codegen domains (skip_baseline=true) can hit a sentinel baseline after a
+        // preflight failure. Measured-baseline domains keep prior resume behavior: their
+        // baseline comes from the judge, not from preflight.
+        if prep.skip_baseline
+            && let Some(cfg) = &prep.preflight
+            && !run.segment.baseline_score.is_finite()
+        {
+            r.phase(Phase::Preflight);
+            update_control_status(
+                control,
+                "preflight",
+                start_iter.saturating_sub(1),
+                run.segment.best_score,
+                run.spent,
+            );
+            match crate::preflight::run(cfg, &prep.preflight_modes, &p.workspace, r) {
+                Ok(seeded) => preflight_baseline = seeded,
+                Err(e)
+                    if e.downcast_ref::<crate::preflight::PreflightStopped>()
+                        .is_some() =>
+                {
+                    let (outcome, reason) = LoopExit::Stopped.shutdown_reason();
+                    r.shutdown(outcome, reason);
+                    return Ok(Outcome::default());
+                }
+                Err(e) => {
+                    let row = Row {
+                        iter: 0,
+                        decision: "preflight-failed".into(),
+                        note: format!("{e:#}"),
+                        ..Default::default()
+                    };
+                    r.row(&row, false);
+                    run.rows.push(row);
+                    write_results(p, &prep.goal, &prep.prior, &run.rows)?;
+                    return Err(e);
+                }
+            }
+            // Seed baseline_score from preflight. Only overwrite best_score/best_tiebreak/
+            // best_snap when the restored best is also a sentinel: an older codegen session
+            // (pre-preflight) can carry a finite kept best with a sentinel baseline, and
+            // clobbering that best would discard real progress.
+            if let Some(pb) = &preflight_baseline {
+                run.segment.baseline_score = pb.score;
+                if !run.segment.best_score.is_finite() {
+                    let snap = world.snapshot("preflight baseline")?;
+                    run.segment.best_score = pb.score;
+                    run.segment.best_tiebreak = pb.tiebreak;
+                    run.segment.best_snap = Snapshot(snap);
+                }
+                let base_row = Row {
+                    iter: 0,
+                    decision: "baseline".into(),
+                    note: format!("preflight baseline: {}", pb.note),
+                    score: Some(pb.score),
+                    tiebreak: pb.tiebreak,
+                    ..Default::default()
+                };
+                r.row(&base_row, false);
+                run.rows.push(base_row);
+            }
+        }
+
         write_results(p, &prep.goal, &prep.prior, &run.rows)?;
         run
     } else {
         r.start(&prep.goal, &judge.objective());
         r.identity(&prep.identity);
         start_iter = 1;
+
+        if let Some(cfg) = &prep.preflight {
+            r.phase(Phase::Preflight);
+            update_control_status(control, "preflight", 0, f64::INFINITY, 0.0);
+            match crate::preflight::run(cfg, &prep.preflight_modes, &p.workspace, r) {
+                Ok(seeded) => preflight_baseline = seeded,
+                Err(e)
+                    if e.downcast_ref::<crate::preflight::PreflightStopped>()
+                        .is_some() =>
+                {
+                    let (outcome, reason) = LoopExit::Stopped.shutdown_reason();
+                    r.shutdown(outcome, reason);
+                    return Ok(Outcome::default());
+                }
+                Err(e) => {
+                    // The run has no rows yet, so the refusal builds its own one-row log: an
+                    // environment verdict still has to land in RESULTS.md for the postmortem.
+                    let row = Row {
+                        iter: 0,
+                        decision: "preflight-failed".into(),
+                        note: format!("{e:#}"),
+                        ..Default::default()
+                    };
+                    r.row(&row, false);
+                    write_results(p, &prep.goal, &prep.prior, &[row])?;
+                    return Err(e);
+                }
+            }
+        }
 
         r.phase(Phase::Baseline);
         update_control_status(control, "baseline", 0, f64::INFINITY, 0.0);
@@ -654,7 +751,7 @@ fn run_loop_body<R: Reporter>(
             judge,
             &prep.goal,
             "default".to_string(),
-            prep.skip_baseline,
+            baseline_source(prep.skip_baseline, preflight_baseline.as_ref()),
         )?;
         // The pristine base: segment 0's baseline snapshot is the upstream checkout, before any
         // agent commit. Captured here (not at publish time) because a kept iteration advances HEAD,
@@ -812,7 +909,7 @@ fn run_loop_body<R: Reporter>(
                 judge,
                 &prep.goal,
                 new_regime.clone(),
-                prep.skip_baseline,
+                baseline_source(prep.skip_baseline, preflight_baseline.as_ref()),
             )?;
             run.segment = segment;
             if let Some(ledger) = ledger {
@@ -1818,25 +1915,49 @@ fn render_resume_prompt(status: &str, regime: &str, steer: Option<&str>) -> Stri
     out
 }
 
+/// Where segment 0's (or a re-scoped segment's) baseline number comes from.
+enum BaselineSource {
+    /// Measure the pristine tree with the judge.
+    Measure,
+    /// Snapshot only, no measure: a codegen domain has no meaningful pristine baseline, so seed the
+    /// direction's worst score and keep any valid candidate.
+    Skip,
+    /// Snapshot only, but with a real number: preflight already measured the unmodified tree at
+    /// zero agent cost, so iteration 1 decides against it instead of the worst-score sentinel.
+    Preseeded(crate::preflight::PreflightBaseline),
+}
+
 /// Measure a fresh baseline: snapshot the world, measure, validate. Returns `(score, total,
 /// rollback snapshot, baseline Row)`. Shared by the initial baseline and an approved re-scope.
-/// `skip` = snapshot only (base_sha/base_snap provenance kept), no measure: codegen domains have
-/// no meaningful pristine baseline, so seed the direction's worst score and keep any valid candidate.
 fn run_baseline(
     world: &dyn World,
     judge: &dyn Judge,
-    skip: bool,
+    source: BaselineSource,
 ) -> Result<(f64, u64, String, Row)> {
     let snap = world.snapshot("baseline").context("baseline snapshot")?;
-    if skip {
-        let score = worst_score(judge.direction());
-        let row = Row {
-            iter: 0,
-            decision: "baseline-skipped".into(),
-            note: "baseline skipped (codegen)".into(),
-            ..Default::default()
-        };
-        return Ok((score, 0, snap, row));
+    match source {
+        BaselineSource::Measure => {}
+        BaselineSource::Skip => {
+            let score = worst_score(judge.direction());
+            let row = Row {
+                iter: 0,
+                decision: "baseline-skipped".into(),
+                note: "baseline skipped (codegen)".into(),
+                ..Default::default()
+            };
+            return Ok((score, 0, snap, row));
+        }
+        BaselineSource::Preseeded(b) => {
+            let row = Row {
+                iter: 0,
+                decision: "baseline".into(),
+                note: format!("preflight baseline: {}", b.note),
+                score: Some(b.score),
+                tiebreak: b.tiebreak,
+                ..Default::default()
+            };
+            return Ok((b.score, 0, snap, row));
+        }
     }
     let base = judge.measure(&crucible::MeasureCtx::default())?;
     if !base.valid {
@@ -1858,6 +1979,20 @@ fn run_baseline(
         ..Default::default()
     };
     Ok((score, total, snap, row))
+}
+
+/// Which baseline a run's segment opens on. A preflight measurement only substitutes for a
+/// *skipped* baseline; when the judge measures its own baseline, that measurement wins (it is the
+/// gate's own number, on the gate's own axis).
+fn baseline_source(
+    skip: bool,
+    preflight: Option<&crate::preflight::PreflightBaseline>,
+) -> BaselineSource {
+    match preflight {
+        _ if !skip => BaselineSource::Measure,
+        Some(b) => BaselineSource::Preseeded(b.clone()),
+        None => BaselineSource::Skip,
+    }
 }
 
 /// The direction's worst score: the no-valid-candidate sentinel any real measurement beats.
@@ -3153,6 +3288,8 @@ mod tests {
         /// Plays the agent calling `distress(severity=error)`: after this many turns, write the
         /// broker's park marker at the given path with the given reason.
         distress_after_turn: Option<(u32, std::path::PathBuf, String)>,
+        /// `(fingerprint, baseline_score, regime)` per segment boundary.
+        segments: Vec<(String, f64, String)>,
     }
     impl Reporter for RecordingReporter {
         fn start(&mut self, _: &str, _: &str) {}
@@ -3222,6 +3359,10 @@ mod tests {
         fn approval_resolved(&mut self, outcome: &str, reason: &str) {
             self.resolved
                 .push((outcome.to_string(), reason.to_string()));
+        }
+        fn segment(&mut self, fingerprint: &str, baseline_score: f64, regime: &str) {
+            self.segments
+                .push((fingerprint.to_string(), baseline_score, regime.to_string()));
         }
     }
 
@@ -3326,6 +3467,8 @@ mod tests {
             run_id: "fixture-run".into(),
             prior: String::new(),
             skip_baseline: false,
+            preflight: None,
+            preflight_modes: Vec::new(),
             seed_diff: None,
             identity: crate::identity::RunIdentity {
                 components: Vec::new(),
@@ -4410,12 +4553,148 @@ mod tests {
             fail_baseline: true,
         };
         let (score, total, snap, row) =
-            run_baseline(&FakeWorld, &judge, true).expect("skip never measures");
+            run_baseline(&FakeWorld, &judge, BaselineSource::Skip).expect("skip never measures");
         assert_eq!(score, f64::INFINITY);
         assert_eq!(total, 0);
         assert!(!snap.is_empty());
         assert_eq!(row.decision, "baseline-skipped");
         assert_eq!(row.score, None);
+    }
+
+    /// A `[preflight]` block whose rungs are real `sh` commands (no mocks): the ladder plus an
+    /// optional baseline rung.
+    fn preflight_cfg(commands: &[&str], baseline: Option<&str>) -> crate::manifest::PreflightCfg {
+        crate::manifest::PreflightCfg {
+            commands: commands.iter().map(|c| c.to_string()).collect(),
+            baseline: baseline.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn preflight_failure_refuses_to_start_before_any_agent_turn() {
+        let mut f = fixture(3, 0.0, false);
+        f.prepared.preflight = Some(preflight_cfg(
+            &["echo 'libnvrtc.so not found' 1>&2; exit 1"],
+            None,
+        ));
+        let world = FakeWorld;
+        let judge = FakeJudge {
+            keep: false,
+            solved: false,
+            fail_baseline: false,
+        };
+        let mut r = RecordingReporter::default();
+        let err = run_loop(
+            &f.args,
+            &f.paths,
+            &f.prepared,
+            &mut r,
+            &world,
+            &judge,
+            LoopRuntime::default(),
+        )
+        .expect_err("a failing rung is an environment verdict");
+        assert!(
+            format!("{err:#}").contains("libnvrtc.so not found"),
+            "the stderr tail rides the error: {err:#}"
+        );
+        assert_eq!(r.agent_calls, 0, "no iteration may be burned");
+        assert_eq!(r.rows.len(), 1, "just the refusal row: {:?}", r.rows);
+        assert_eq!(r.rows[0].decision, "preflight-failed");
+        assert_eq!(r.rows[0].iter, 0);
+        assert_eq!(r.shutdowns.len(), 1, "{:?}", r.shutdowns);
+        assert_eq!(r.shutdowns[0].0, "error");
+    }
+
+    #[test]
+    fn preflight_baseline_seeds_the_segment_and_iteration_one_decides_against_it() {
+        // skip_baseline is the codegen setting this exists for: without preflight the segment
+        // would open on the worst-score sentinel. FakeJudge measures 100.0 every iteration.
+        let mut f = fixture(1, 0.0, false);
+        f.prepared.skip_baseline = true;
+        f.prepared.preflight = Some(preflight_cfg(
+            &[r#"echo '{"pass":true,"digest":"sha256:base","note":"built"}'"#],
+            Some(r#"echo '{"score":140.0,"tiebreak":0.5,"note":"tpot=140 {digest}"}'"#),
+        ));
+        let world = FakeWorld;
+        let judge = FakeJudge {
+            keep: true,
+            solved: false,
+            fail_baseline: true, // proves the preseeded path never calls measure() for the baseline
+        };
+        let mut r = RecordingReporter::default();
+        run_loop(
+            &f.args,
+            &f.paths,
+            &f.prepared,
+            &mut r,
+            &world,
+            &judge,
+            LoopRuntime::default(),
+        )
+        .expect_err("the iteration's own measure still explodes; the baseline did not");
+        let base = r
+            .rows
+            .iter()
+            .find(|row| row.iter == 0)
+            .expect("a baseline row landed");
+        assert_eq!(base.decision, "baseline", "not baseline-skipped: {base:?}");
+        assert_eq!(base.score, Some(140.0));
+        assert_eq!(base.tiebreak, Some(0.5));
+        assert!(
+            base.note
+                .contains("preflight baseline: tpot=140 sha256:base"),
+            "the note carries the rung's note with the digest substituted: {}",
+            base.note
+        );
+    }
+
+    #[test]
+    fn preseeded_baseline_survives_a_rescope_rebaseline() {
+        // A rescope re-baselines. Re-measuring a rescoped codegen baseline without an agent turn
+        // is impossible, so the new segment must reuse the same preflight number.
+        let mut f = fixture(2, 0.0, false);
+        f.prepared.skip_baseline = true;
+        f.prepared.preflight = Some(preflight_cfg(
+            &[r#"echo '{"pass":true}'"#],
+            Some(r#"echo '{"score":88.0,"note":"seeded"}'"#),
+        ));
+        let control = std::sync::Arc::new(control::ControlState::default());
+        control.set_rescope(AdmissionKey::new("g1"), "concurrency=48".into());
+        let world = FakeWorld;
+        let judge = FakeJudge {
+            keep: false,
+            solved: false,
+            fail_baseline: false,
+        };
+        let mut r = RecordingReporter::default();
+        let runtime = LoopRuntime {
+            control: Some(&control),
+            ..LoopRuntime::default()
+        };
+        run_loop(
+            &f.args,
+            &f.paths,
+            &f.prepared,
+            &mut r,
+            &world,
+            &judge,
+            runtime,
+        )
+        .expect("the rescope re-baselines cleanly");
+        assert!(
+            r.notes.iter().any(|n| n.contains("re-scoping")),
+            "the rescope drained: {:?}",
+            r.notes
+        );
+        // Both `segment` announcements carry the preseeded number, so the goalpost never fell
+        // back to the worst-score sentinel across the boundary.
+        assert!(
+            r.segments.iter().all(|(_, score, _)| *score == 88.0),
+            "every segment opened on the preflight baseline: {:?}",
+            r.segments
+        );
+        assert_eq!(r.segments.len(), 2, "segment 0 plus the rescoped one");
     }
 
     #[test]
@@ -4522,6 +4801,302 @@ mod tests {
             branches.len(),
             1,
             "same kept sha, same branch: {branches:?}"
+        );
+    }
+
+    #[test]
+    fn resume_of_preflight_failed_session_reruns_preflight_and_seeds_baseline() {
+        let mut f = fixture(2, 0.0, false);
+        f.prepared.skip_baseline = true;
+        // A sentinel file proves preflight actually ran on resume.
+        let sentinel = f.paths.workspace.join("preflight-ran");
+        let touch_cmd = format!("touch {} && echo '{{\"pass\":true}}'", sentinel.display());
+        f.prepared.preflight = Some(preflight_cfg(
+            &[&touch_cmd],
+            Some(r#"echo '{"score":42.0,"tiebreak":0.1,"note":"seeded on resume"}'"#),
+        ));
+        // The prior session: exactly one preflight-failed row, no score. This is what
+        // ResumeFold::finish produces when the only row is a preflight refusal.
+        let rs = ResumeState {
+            rows: vec![Row {
+                iter: 0,
+                decision: "preflight-failed".into(),
+                note: "env broken".into(),
+                ..Default::default()
+            }],
+            best_score: f64::INFINITY,
+            best_tiebreak: None,
+            baseline_score: f64::INFINITY,
+            baseline_total: 0,
+            spent: 0.0,
+            next_iter: 1,
+            solved_any: false,
+            identity: None,
+            published_branches: Vec::new(),
+        };
+        let world = FakeWorld;
+        let judge = FakeJudge {
+            keep: false,
+            solved: false,
+            fail_baseline: false,
+        };
+        let mut r = RecordingReporter::default();
+        run_loop(
+            &f.args,
+            &f.paths,
+            &f.prepared,
+            &mut r,
+            &world,
+            &judge,
+            LoopRuntime {
+                resume: Some(rs),
+                ..LoopRuntime::default()
+            },
+        )
+        .expect("resumed run finishes after preflight re-run");
+        assert!(
+            sentinel.exists(),
+            "preflight must have run: sentinel missing"
+        );
+        // The segment must open on the preseeded score, not INFINITY.
+        assert_eq!(
+            r.segments.len(),
+            1,
+            "exactly one segment boundary: {:?}",
+            r.segments
+        );
+        assert_eq!(
+            r.segments[0].1, 42.0,
+            "segment baseline is the preflight score, not the sentinel: {:?}",
+            r.segments
+        );
+        // A baseline row from the preflight seeding must appear in the emitted rows.
+        let base_row = r
+            .rows
+            .iter()
+            .find(|row| row.decision == "baseline" && row.iter == 0);
+        assert!(
+            base_row.is_some(),
+            "a baseline row from the preflight seeding must appear: {:?}",
+            r.rows
+        );
+        let base_row = base_row.unwrap();
+        assert_eq!(base_row.score, Some(42.0));
+        assert_eq!(base_row.tiebreak, Some(0.1));
+        assert!(
+            base_row
+                .note
+                .contains("preflight baseline: seeded on resume"),
+            "note: {}",
+            base_row.note
+        );
+    }
+
+    #[test]
+    fn resume_with_finite_baseline_does_not_rerun_preflight() {
+        let mut f = fixture(2, 0.0, false);
+        f.prepared.skip_baseline = true;
+        // The sentinel file must NOT be created: preflight must not run.
+        let sentinel = f.paths.workspace.join("preflight-must-not-run");
+        let touch_cmd = format!("touch {} && echo '{{\"pass\":true}}'", sentinel.display());
+        f.prepared.preflight = Some(preflight_cfg(
+            &[&touch_cmd],
+            Some(r#"echo '{"score":99.0,"note":"should not run"}'"#),
+        ));
+        // The prior session had a finite baseline (preflight passed and seeded previously).
+        let rs = ResumeState {
+            rows: vec![
+                Row {
+                    iter: 0,
+                    decision: "baseline".into(),
+                    score: Some(200.0),
+                    ..Default::default()
+                },
+                Row {
+                    iter: 1,
+                    decision: "discard".into(),
+                    score: Some(210.0),
+                    ..Default::default()
+                },
+            ],
+            best_score: 200.0,
+            best_tiebreak: None,
+            baseline_score: 200.0,
+            baseline_total: 0,
+            spent: 0.0,
+            next_iter: 2,
+            solved_any: false,
+            identity: None,
+            published_branches: Vec::new(),
+        };
+        let world = FakeWorld;
+        let judge = FakeJudge {
+            keep: false,
+            solved: false,
+            fail_baseline: false,
+        };
+        let mut r = RecordingReporter::default();
+        run_loop(
+            &f.args,
+            &f.paths,
+            &f.prepared,
+            &mut r,
+            &world,
+            &judge,
+            LoopRuntime {
+                resume: Some(rs),
+                ..LoopRuntime::default()
+            },
+        )
+        .expect("resumed run finishes");
+        assert!(
+            !sentinel.exists(),
+            "preflight must NOT re-run when the baseline is finite"
+        );
+        // The segment opens on the original baseline, not a re-seeded value.
+        assert_eq!(r.segments[0].1, 200.0);
+    }
+
+    #[test]
+    fn resume_with_sentinel_baseline_but_finite_best_preserves_best() {
+        // An older codegen session (pre-preflight) can have a sentinel baseline but a
+        // finite kept best. Preflight should re-run and seed baseline_score, but must NOT
+        // clobber the restored best_score/best_tiebreak/best_snap.
+        let mut f = fixture(2, 0.0, false);
+        f.prepared.skip_baseline = true;
+        let sentinel = f.paths.workspace.join("preflight-ran-preserves");
+        let touch_cmd = format!("touch {} && echo '{{\"pass\":true}}'", sentinel.display());
+        f.prepared.preflight = Some(preflight_cfg(
+            &[&touch_cmd],
+            Some(r#"echo '{"score":50.0,"tiebreak":0.2,"note":"seeded"}'"#),
+        ));
+        let rs = ResumeState {
+            rows: vec![
+                Row {
+                    iter: 0,
+                    decision: "baseline-skipped".into(),
+                    note: "baseline skipped (codegen)".into(),
+                    ..Default::default()
+                },
+                Row {
+                    iter: 1,
+                    decision: "keep".into(),
+                    score: Some(77.0),
+                    tiebreak: Some(0.9),
+                    kept_snap: Some("kept-snap".into()),
+                    ..Default::default()
+                },
+            ],
+            best_score: 77.0,
+            best_tiebreak: Some(0.9),
+            baseline_score: f64::INFINITY,
+            baseline_total: 0,
+            spent: 0.0,
+            next_iter: 2,
+            solved_any: false,
+            identity: None,
+            published_branches: Vec::new(),
+        };
+        let world = FakeWorld;
+        let judge = FakeJudge {
+            keep: false,
+            solved: false,
+            fail_baseline: false,
+        };
+        let mut r = RecordingReporter::default();
+        run_loop(
+            &f.args,
+            &f.paths,
+            &f.prepared,
+            &mut r,
+            &world,
+            &judge,
+            LoopRuntime {
+                resume: Some(rs),
+                ..LoopRuntime::default()
+            },
+        )
+        .expect("resumed run finishes");
+        assert!(sentinel.exists(), "preflight must re-run");
+        // baseline_score seeded from preflight
+        assert_eq!(
+            r.segments[0].1, 50.0,
+            "segment baseline is the preflight score: {:?}",
+            r.segments
+        );
+        // A baseline row from preflight seeding was emitted to the reporter.
+        let base_row = r
+            .rows
+            .iter()
+            .find(|row| row.decision == "baseline" && row.iter == 0)
+            .expect("baseline row emitted");
+        assert_eq!(base_row.score, Some(50.0));
+        // The RESULTS.md carries the full row set (restored + new). The prior keep and
+        // the new preflight baseline must both survive.
+        let results = std::fs::read_to_string(f.paths.workspace.join("RESULTS.md"))
+            .expect("RESULTS.md written");
+        assert!(
+            results.contains("| 1 | keep"),
+            "the prior keep row survives in RESULTS.md: {results}"
+        );
+        assert!(
+            results.contains("preflight baseline: seeded"),
+            "the preflight baseline row lands in RESULTS.md: {results}"
+        );
+    }
+
+    #[test]
+    fn resume_skip_baseline_false_with_preflight_does_not_rerun_preflight() {
+        // A measured-baseline domain (skip_baseline=false) with [preflight] declared should
+        // NOT re-run preflight on resume, even with a sentinel baseline.
+        let mut f = fixture(2, 0.0, false);
+        f.prepared.skip_baseline = false;
+        let sentinel = f.paths.workspace.join("preflight-must-not-run-measured");
+        let touch_cmd = format!("touch {} && echo '{{\"pass\":true}}'", sentinel.display());
+        f.prepared.preflight = Some(preflight_cfg(
+            &[&touch_cmd],
+            Some(r#"echo '{"score":99.0,"note":"nope"}'"#),
+        ));
+        let rs = ResumeState {
+            rows: vec![Row {
+                iter: 0,
+                decision: "preflight-failed".into(),
+                note: "env broken".into(),
+                ..Default::default()
+            }],
+            best_score: f64::INFINITY,
+            best_tiebreak: None,
+            baseline_score: f64::INFINITY,
+            baseline_total: 0,
+            spent: 0.0,
+            next_iter: 1,
+            solved_any: false,
+            identity: None,
+            published_branches: Vec::new(),
+        };
+        let world = FakeWorld;
+        let judge = FakeJudge {
+            keep: false,
+            solved: false,
+            fail_baseline: false,
+        };
+        let mut r = RecordingReporter::default();
+        run_loop(
+            &f.args,
+            &f.paths,
+            &f.prepared,
+            &mut r,
+            &world,
+            &judge,
+            LoopRuntime {
+                resume: Some(rs),
+                ..LoopRuntime::default()
+            },
+        )
+        .expect("resumed run finishes");
+        assert!(
+            !sentinel.exists(),
+            "preflight must NOT re-run for a measured-baseline domain"
         );
     }
 }

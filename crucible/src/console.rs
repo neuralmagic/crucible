@@ -21,6 +21,7 @@ impl Reporter for ConsoleReporter {
 
     fn phase(&mut self, phase: Phase) {
         match phase {
+            Phase::Preflight => println!("== preflight =="),
             Phase::Baseline => println!("== baseline =="),
             Phase::Iteration(it) => println!("\n== iteration {it} =="),
         }

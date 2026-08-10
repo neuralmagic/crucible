@@ -191,7 +191,7 @@ pub enum SessionEvent {
         max_cost: f64,
         max_secs: u64,
     },
-    /// `phase` is `baseline` or `iteration`; `iter` is meaningful only for the latter.
+    /// `phase` is `preflight`, `baseline`, or `iteration`; `iter` is meaningful only for the last.
     Phase {
         phase: String,
         #[serde(default)]
@@ -437,6 +437,10 @@ mod tests {
                 iters_total: 3,
                 max_cost: 5.0,
                 max_secs: 1800,
+            },
+            SessionEvent::Phase {
+                phase: "preflight".into(),
+                iter: 0,
             },
             SessionEvent::Phase {
                 phase: "baseline".into(),
