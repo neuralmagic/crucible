@@ -38,6 +38,14 @@ thiserror.workspace = true
 # is ONE curation/field map instead of a fork of it here. We keep our OWN three-tool surface: that
 # crate's nine tools include create/transition/link, which the sandboxed agent must never reach.
 jira-mcp = { git = "https://github.com/wseaton/jira-mcp", tag = "v0.4.0" }
+# The distress tool's one outbound call: a Slack incoming-webhook POST. Blocking client (the tool
+# body already runs on `telemetry::spawn_blocking`), and the same default-features-off + rustls
+# feature set the engine and forge already build, so this adds no second HTTP/TLS stack.
+reqwest = { version = "0.13", default-features = false, features = [
+  "blocking",
+  "json",
+  "rustls",
+] }
 schemars = "0.8"
 # A profile trace is a binary (gzip) artifact; it leaves the GPU pod base64'd on the job log and is
 # handed back to the agent base64'd by `fetch_trace` (the text `fetch_log` would corrupt it).

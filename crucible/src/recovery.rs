@@ -551,6 +551,24 @@ pub(crate) fn resume_approval(
     rec: &ResumeRecovery,
     replay: Option<&crate::admission::ResumeReplay>,
 ) -> ResumeApproval {
+    // A distress suspend borrows the approval bracket, but nothing will ever send a rescope for
+    // it: the grant is the operator clearing the marker (resume in place) or re-rolling the pod
+    // (the marker lives on the forge-storage emptyDir, so the new pod starts clean). Re-parking
+    // here would wait on a signal with no sender.
+    if rec
+        .repark
+        .as_ref()
+        .is_some_and(|pp| pp.handle == crate::distress::HANDLE)
+    {
+        return ResumeApproval {
+            repark: None,
+            pending_regime: None,
+            note: Some(
+                "resumed after a distress suspend: the re-roll is the grant, not re-parking"
+                    .to_string(),
+            ),
+        };
+    }
     let granted = rec.pending_regime.as_deref().filter(|trace| {
         let derived = AdmissionKey::rescope_from(&AdmissionKey::approve(trace));
         replay.is_some_and(|r| {
@@ -1215,6 +1233,35 @@ mod tests {
             "and the ask is closed, so a fresh approve can't grant it twice"
         );
         assert!(action.note.is_some_and(|n| n.contains("already granted")));
+    }
+
+    #[test]
+    fn a_distress_wait_never_reparks() {
+        // The distress bracket has no sender: no rescope is coming, and the marker died with the
+        // old pod's emptyDir. Re-parking would idle the fresh pod until --max-park.
+        let rec = ResumeRecovery {
+            class: RecoveryClass::DiedAwaitingApproval,
+            iter: 4,
+            detail: String::new(),
+            repark: Some(provisioning::PendingProvisioning {
+                mode: WaitMode::Block,
+                trace_id: crate::distress::HANDLE.into(),
+                handle: crate::distress::HANDLE.into(),
+            }),
+            pending_regime: Some(crate::distress::HANDLE.into()),
+        };
+        let action = resume_approval(&rec, None);
+        assert!(action.repark.is_none(), "no signal will ever arrive");
+        assert!(
+            action.pending_regime.is_none(),
+            "distress is not a regime ask"
+        );
+        assert!(
+            action
+                .note
+                .is_some_and(|n| n.contains("re-roll is the grant")),
+            "the log says why it did not park"
+        );
     }
 
     #[test]

@@ -207,8 +207,13 @@ pub struct Cluster {
     /// state dir stays pod-local and a dead pod is a dead run.
     ///
     /// A string names an existing claim; a table is a template the render materializes as
-    /// `<run>-state`. A kept claim must be deleted to start fresh: the wrapper sees the old
-    /// session log and resumes.
+    /// `<run>-state`. A named claim is shared by every run pointed at it, so the mount carries a
+    /// `state/<run>` subPath and concurrent runs cannot interleave their session logs; the claim
+    /// must then be RWX if those runs land on different nodes. A template claim is already per-run
+    /// and mounts at its root.
+    ///
+    /// Either way, state left behind is what resume reads: to start fresh under a run name already
+    /// on the claim, delete that state first, or the wrapper sees the old session log and resumes.
     #[serde(default)]
     pub state_pvc: Option<StatePvc>,
     /// Grant the loop container what in-pod buildah needs on a cluster that gates it with
