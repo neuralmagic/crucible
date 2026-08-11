@@ -274,9 +274,7 @@ pub struct Workspace {
     /// - Composite manifests reject the key: per-component carry-forward is a non-goal.
     #[serde(default)]
     pub carry_forward: Vec<String>,
-    /// Declared pipeline artifacts: like [`Workspace::carry_forward`] (same path rules, carried
-    /// identically) but the loop also PUBLISHES them, instead of the file riding along invisibly.
-    /// See [`Artifact`].
+    /// Carried like `carry_forward`, and also published. See [`Artifact`].
     #[serde(default)]
     pub artifact: Vec<Artifact>,
 }
@@ -307,28 +305,21 @@ impl Default for Workspace {
     }
 }
 
-/// One declared pipeline artifact: a workspace-relative file or directory the domain's tooling
-/// derives on the way to a candidate (an investigation summary, a generated plan). Declaring it
-/// buys three things: the path is carried (never part of a candidate commit, diff, or PR, and a
-/// discard's clean spares it), the newest `embed` match is uploaded with the S3 run record, and
-/// with `embed` set its content lands in the draft PR body, so a reviewer sees the pipeline's own
-/// report without the file itself shipping in the diff.
+/// Derived pipeline output worth publishing: the path is carried (never in a candidate commit
+/// or diff), and publish surfaces the newest file matching `embed`/`upload` so a reviewer sees
+/// the pipeline's report without it shipping in the PR diff.
 #[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Artifact {
-    /// Workspace-relative file or directory, same constraints as `carry_forward` entries.
+    /// Workspace-relative file or directory, same rules as `carry_forward` entries.
     pub path: String,
-    /// Bare file name to surface: the newest file under `path` with this exact name is embedded
-    /// in the PR body and uploaded with the run record. Omitted = the path is carried + ignored
-    /// by publish (equivalent to a `carry_forward` entry).
+    /// Bare file name: newest match under `path` is inlined in the PR body + uploaded.
     #[serde(default)]
     pub embed: Option<String>,
-    /// Bare file name to upload with the run record WITHOUT embedding (binary deliverables — a
-    /// generated .pptx — that a PR body can't inline). Newest match under `path` wins, same as
-    /// `embed`. The two compose: `embed` also uploads, `upload` never embeds.
+    /// Bare file name: newest match is uploaded only (binaries a PR body can't inline).
     #[serde(default)]
     pub upload: Option<String>,
-    /// PR-body section heading for the embedded file. Default: the `path`.
+    /// PR-body section heading for the embed. Default: the `path`.
     #[serde(default)]
     pub title: Option<String>,
 }
@@ -529,9 +520,8 @@ fn validate_carry_forward(entries: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Artifact paths obey the carry_forward rules (they're carried through the same machinery);
-/// `embed` is matched against file NAMES while walking `path`, so a separator in it can never
-/// match and would silently embed nothing.
+/// Paths obey the carry_forward rules; `embed`/`upload` are matched against file names, so a
+/// separator in them could never match.
 fn validate_artifacts(artifacts: &[Artifact]) -> Result<()> {
     validate_carry_forward(&artifacts.iter().map(|a| a.path.clone()).collect::<Vec<_>>())?;
     for a in artifacts {

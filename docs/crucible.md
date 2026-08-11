@@ -102,30 +102,22 @@ methodology-sensitive campaign wants.
 
 ### Declared artifacts: carried AND published
 
-`[[workspace.artifact]]` is `carry_forward` plus publishing. Use it when the pipeline's derived
-output is something a reviewer should *see* (an investigation summary, a generated plan) without
-the file itself riding along in the candidate diff — an operator note and a pipeline config once
-shipped verbatim in a draft PR because nothing declared them.
+`[[workspace.artifact]]` is `carry_forward` plus publishing, for derived output a reviewer
+should see without it riding in the candidate diff:
 
 ```toml
 [[workspace.artifact]]
 path   = "codegen-out/runtime"   # carried, same rules as carry_forward
-embed  = "summary.txt"           # newest file with this name under path → PR body + record
+embed  = "summary.txt"           # newest match → PR body (collapsed, 16 KiB cap) + record
 upload = "summary.pptx"          # newest match → record only (binaries a PR can't inline)
 title  = "Runtime investigation" # PR-body section heading (default: the path)
 ```
 
-Each declared path is carried exactly like a `carry_forward` entry. With `embed` set, publish
-finds the newest file with that name under `path` (pipelines write versioned dirs — `V1 … V7` —
-each with a same-named summary, so newest = the final iteration's), inlines it in the draft PR
-body as a collapsed section (head-truncated to 16 KiB), and uploads it under the S3 run
-record's `artifacts/` prefix. `upload` publishes the same way without the PR-body inline, for
-binary deliverables. Without either, the entry is just carry_forward in different clothes.
-
-The record destination accepts `s3://bucket[/prefix]` or `file:///abs/path` — the file form
-writes the identical layout to a mounted filesystem (an artifacts PVC), for clusters with no
-S3 reach. The PR body also charts the run's per-iteration score trajectory as a mermaid
-`xychart-beta` (GitHub renders it natively) whenever at least two iterations measured.
+Newest match wins, so versioned pipeline dirs (`V1 … V7`, same-named summary in each) surface
+the final iteration's. The record destination accepts `s3://bucket[/prefix]` or
+`file:///abs/path` (the same layout written to a mounted PVC, for clusters with no S3 reach).
+The PR body also charts per-iteration scores as a mermaid `xychart-beta` when at least two
+iterations measured.
 
 ### Languages: pick per command, the engine doesn't care
 
