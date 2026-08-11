@@ -57,6 +57,12 @@ pub enum ManifestError {
     BadCarryForward { entry: String },
     #[error("[workspace].carry_forward is not supported in a composite manifest")]
     CompositeCarryForward,
+    #[error(
+        "[[workspace.artifact]] embed/upload `{embed}` must be a bare file name (no path separators)"
+    )]
+    BadArtifactEmbed { embed: String },
+    #[error("[[workspace.artifact]] is not supported in a composite manifest")]
+    CompositeArtifact,
 }
 
 /// Shared tail of `Manifest`/`CompositeManifest`'s `load_frozen`: given the initial working-tree
@@ -268,6 +274,25 @@ pub struct Workspace {
     /// - Composite manifests reject the key: per-component carry-forward is a non-goal.
     #[serde(default)]
     pub carry_forward: Vec<String>,
+    /// Declared pipeline artifacts: like [`Workspace::carry_forward`] (same path rules, carried
+    /// identically) but the loop also PUBLISHES them, instead of the file riding along invisibly.
+    /// See [`Artifact`].
+    #[serde(default)]
+    pub artifact: Vec<Artifact>,
+}
+
+impl Workspace {
+    /// Every carried path: `carry_forward` plus each declared artifact's path. This is the one
+    /// list the git memory excludes from candidate identity and spares on a discard's clean.
+    pub fn carried_paths(&self) -> Vec<String> {
+        let mut all = self.carry_forward.clone();
+        for a in &self.artifact {
+            if !all.contains(&a.path) {
+                all.push(a.path.clone());
+            }
+        }
+        all
+    }
 }
 
 impl Default for Workspace {
@@ -277,8 +302,35 @@ impl Default for Workspace {
             setup_cmd: None,
             inject: Vec::new(),
             carry_forward: Vec::new(),
+            artifact: Vec::new(),
         }
     }
+}
+
+/// One declared pipeline artifact: a workspace-relative file or directory the domain's tooling
+/// derives on the way to a candidate (an investigation summary, a generated plan). Declaring it
+/// buys three things: the path is carried (never part of a candidate commit, diff, or PR, and a
+/// discard's clean spares it), the newest `embed` match is uploaded with the S3 run record, and
+/// with `embed` set its content lands in the draft PR body, so a reviewer sees the pipeline's own
+/// report without the file itself shipping in the diff.
+#[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct Artifact {
+    /// Workspace-relative file or directory, same constraints as `carry_forward` entries.
+    pub path: String,
+    /// Bare file name to surface: the newest file under `path` with this exact name is embedded
+    /// in the PR body and uploaded with the run record. Omitted = the path is carried + ignored
+    /// by publish (equivalent to a `carry_forward` entry).
+    #[serde(default)]
+    pub embed: Option<String>,
+    /// Bare file name to upload with the run record WITHOUT embedding (binary deliverables — a
+    /// generated .pptx — that a PR body can't inline). Newest match under `path` wins, same as
+    /// `embed`. The two compose: `embed` also uploads, `upload` never embeds.
+    #[serde(default)]
+    pub upload: Option<String>,
+    /// PR-body section heading for the embedded file. Default: the `path`.
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 /// One file copied into the workspace clone. `src` is relative to the manifest dir (the baked
@@ -443,6 +495,7 @@ fn validate_common(c: CommonCfg<'_>) -> Result<()> {
         return Err(ManifestError::BrokerBinRequired.into());
     }
     validate_carry_forward(&c.workspace.carry_forward)?;
+    validate_artifacts(&c.workspace.artifact)?;
     search::validate_search(c.search)?;
     if let Some(w) = c.workflow {
         w.validate()?;
@@ -471,6 +524,24 @@ fn validate_carry_forward(entries: &[String]) -> Result<()> {
                 entry: entry.clone(),
             }
             .into());
+        }
+    }
+    Ok(())
+}
+
+/// Artifact paths obey the carry_forward rules (they're carried through the same machinery);
+/// `embed` is matched against file NAMES while walking `path`, so a separator in it can never
+/// match and would silently embed nothing.
+fn validate_artifacts(artifacts: &[Artifact]) -> Result<()> {
+    validate_carry_forward(&artifacts.iter().map(|a| a.path.clone()).collect::<Vec<_>>())?;
+    for a in artifacts {
+        for name in [&a.embed, &a.upload].into_iter().flatten() {
+            if name.is_empty() || name.contains('/') || name.contains('\\') {
+                return Err(ManifestError::BadArtifactEmbed {
+                    embed: name.clone(),
+                }
+                .into());
+            }
         }
     }
     Ok(())
@@ -697,6 +768,9 @@ impl CompositeManifest {
         // key. Rejecting beats accepting it and silently carrying nothing.
         if !self.workspace.carry_forward.is_empty() {
             return Err(ManifestError::CompositeCarryForward.into());
+        }
+        if !self.workspace.artifact.is_empty() {
+            return Err(ManifestError::CompositeArtifact.into());
         }
         let mut seen = std::collections::BTreeSet::new();
         for c in &self.components {
@@ -990,6 +1064,81 @@ mod tests {
             no_key.workspace.carry_forward.is_empty(),
             "absent key = fresh start"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_validates_and_carries_workspace_artifacts() {
+        let manifest = |artifact: &str| {
+            format!(
+                r#"
+            [repo]
+            path = "."
+            [workspace]
+            carry_forward = ["cross-trace/"]
+            {artifact}
+            [judge]
+            measure_cmd = "m"
+            direction = "higher"
+            [agent]
+            backend = "command"
+            agent_cmd = "a"
+            goal = "g"
+        "#
+            )
+        };
+        let dir = tempdir("workspace-artifact");
+        let path = dir.join("crucible.toml");
+
+        std::fs::write(
+            &path,
+            manifest(
+                r#"[[workspace.artifact]]
+                path = "codegen-out/runtime"
+                embed = "summary.txt"
+                title = "Runtime investigation"
+                [[workspace.artifact]]
+                path = "cross-trace/"
+        "#,
+            ),
+        )
+        .unwrap();
+        let m = Manifest::load(&path).expect("valid artifact loads");
+        assert_eq!(m.workspace.artifact.len(), 2);
+        assert_eq!(
+            m.workspace.artifact[0].embed.as_deref(),
+            Some("summary.txt")
+        );
+        assert!(m.workspace.artifact[1].embed.is_none());
+        // Artifact paths join the carried set, deduped against carry_forward.
+        assert_eq!(
+            m.workspace.carried_paths(),
+            ["cross-trace/", "codegen-out/runtime"]
+        );
+
+        // Artifact paths obey the carry_forward path rules; embed must be a bare file name
+        // (it is matched against file names while walking, so a separator can never match).
+        for (bad, needle) in [
+            (
+                "[[workspace.artifact]]\npath = \"../secrets\"\n",
+                "carry_forward",
+            ),
+            (
+                "[[workspace.artifact]]\npath = \"out\"\nembed = \"a/b.txt\"\n",
+                "embed",
+            ),
+            (
+                "[[workspace.artifact]]\npath = \"out\"\nembed = \"\"\n",
+                "embed",
+            ),
+        ] {
+            std::fs::write(&path, manifest(bad)).unwrap();
+            let err = match Manifest::load(&path) {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("{bad} must be rejected"),
+            };
+            assert!(err.contains(needle), "{bad}: {err}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -3432,6 +3432,7 @@ mod tests {
             manifest: None,
             state_dir: None,
             agent_cmd: None,
+            artifacts: Vec::new(),
             iterations,
             wide: 0,
             wide_keep: 1,

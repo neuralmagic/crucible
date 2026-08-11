@@ -442,6 +442,8 @@ fn run_from_manifest(args: Args) -> Result<()> {
     if let Some(pr_repo) = m.publish.as_ref().and_then(|p| p.pr_repo.clone()) {
         args.pr_repo = pr_repo;
     }
+    // Declared pipeline artifacts, for the publish layer (PR-body embed + S3 upload).
+    args.artifacts = m.workspace.artifact.clone();
 
     let (goal, template) = resolve_goal_template(&args, &m.agent, &manifest_dir)?;
     // Cross-run memory: seed the prior run's tried-ideas ledger for this goal from S3 (best-effort),
