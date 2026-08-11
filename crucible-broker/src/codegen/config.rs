@@ -489,12 +489,13 @@ fn finalize_profile(o: ProfileOverlay) -> Result<ProfileCfg, String> {
         .map(|s| s.trim().trim_start_matches('.').to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "json.gz".to_string());
+    // '-' is load-bearing: nsys's canonical extension is `nsys-rep`.
     if !trace_ext
         .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '.')
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
     {
         return Err(format!(
-            "profile.trace_ext {trace_ext:?} must be a bare extension (letters, digits, '.')"
+            "profile.trace_ext {trace_ext:?} must be a bare extension (letters, digits, '.', '-')"
         ));
     }
     Ok(ProfileCfg {
