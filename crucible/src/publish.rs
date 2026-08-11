@@ -156,10 +156,10 @@ pub fn publish<R: Reporter>(r: &mut R, rec: &Record<'_>) -> Vec<PrLink> {
     let prs = open_prs(r, rec);
 
     if !rec.args.results_bucket.is_empty() {
-        match s3_record(rec, &prs) {
+        match record(rec, &prs) {
             Ok(uri) => r.note(&format!("published run record to {uri}")),
             Err(e) => r.note(&format!(
-                "S3 publish failed (results stay in the workspace): {e:#}"
+                "record publish failed (results stay in the workspace): {e:#}"
             )),
         }
     }
@@ -223,7 +223,7 @@ pub fn publish_progress<R: Reporter>(r: &mut R, rec: &Record<'_>) {
         return;
     }
     // No PRs at this incremental checkpoint, they open only at end-of-run.
-    match s3_record(rec, &[]) {
+    match record(rec, &[]) {
         Ok(_) => r.note("updated cross-run memory (latest.json)"),
         Err(e) => r.note(&format!(
             "progress publish failed (end-of-run will retry): {e:#}"
@@ -423,6 +423,113 @@ fn keys(base: &str, goal_slug: &str, run_id: &str) -> Keys {
     }
 }
 
+/// A publish destination: S3 (`s3://bucket[/prefix]`) or a mounted filesystem
+/// (`file:///abs/path`, e.g. an artifacts PVC on a cluster with no S3 reach). Both write the
+/// exact same key layout, so reporting tools walk either.
+enum Backend {
+    // The S3 half re-parses the URI where it's used (the async block owns bucket/base), so the
+    // variant carries nothing.
+    S3,
+    File { root: std::path::PathBuf },
+}
+
+fn backend(uri: &str) -> Result<Backend, PublishError> {
+    match uri.strip_prefix("file://") {
+        Some(path) if path.starts_with('/') => Ok(Backend::File {
+            root: std::path::PathBuf::from(path),
+        }),
+        Some(_) => Err(PublishError::FileRootRelative {
+            uri: uri.to_owned(),
+        }),
+        None => parse_s3_uri(uri).map(|_| Backend::S3),
+    }
+}
+
+/// Write the run record to whichever backend the results URI names.
+fn record(rec: &Record<'_>, prs: &[PrLink]) -> Result<String> {
+    match backend(&rec.args.results_bucket)? {
+        Backend::S3 => s3_record(rec, prs),
+        Backend::File { root } => file_record(rec, prs, &root),
+    }
+}
+
+/// Newest match per declared artifact name (`embed` and `upload` both publish; `embed` also
+/// inlines in the PR body). Returned as (workspace-relative key, absolute path), deduped so an
+/// artifact naming the same file twice uploads once.
+fn artifact_matches(rec: &Record<'_>) -> Vec<(String, std::path::PathBuf)> {
+    let mut out: Vec<(String, std::path::PathBuf)> = Vec::new();
+    for a in &rec.args.artifacts {
+        for name in [&a.embed, &a.upload].into_iter().flatten() {
+            let Some(p) = newest_named_file(&rec.paths.workspace.join(&a.path), name) else {
+                continue;
+            };
+            let rel = p
+                .strip_prefix(&rec.paths.workspace)
+                .map(|r| r.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| name.clone());
+            if !out.iter().any(|(have, _)| *have == rel) {
+                out.push((rel, p));
+            }
+        }
+    }
+    out
+}
+
+/// A published artifact's content type, from its extension. Text-ish renders in a browser;
+/// everything else (a .pptx) downloads.
+fn artifact_content_type(rel: &str) -> &'static str {
+    match rel.rsplit('.').next() {
+        Some("txt" | "md" | "log") => "text/plain",
+        Some("json") => "application/json",
+        _ => "application/octet-stream",
+    }
+}
+
+/// The filesystem twin of [`s3_record`]: same layout under `root` (a mounted PVC). Everything the
+/// S3 path treats as best-effort reads stays best-effort here; directory creation and the record
+/// writes themselves are real errors (a read-only or missing mount must be loud).
+fn file_record(rec: &Record<'_>, prs: &[PrLink], root: &Path) -> Result<String> {
+    let goal_slug = slug(rec.goal);
+    let k = keys("", &goal_slug, rec.run_id);
+    let record_uri = format!("file://{}/{}", root.display(), k.run_prefix);
+
+    let summary =
+        serde_json::to_vec_pretty(&build_summary(rec, prs)).context("serialize summary.json")?;
+    let index = serde_json::to_vec_pretty(&build_index_entry(rec, &goal_slug, &record_uri))
+        .context("serialize index entry")?;
+
+    let write = |key: &str, bytes: &[u8]| -> Result<()> {
+        let dest = root.join(key);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("mkdir -p {}", parent.display()))?;
+        }
+        std::fs::write(&dest, bytes).with_context(|| format!("writing {}", dest.display()))
+    };
+
+    if let Ok(bytes) = std::fs::read(&rec.paths.session_log) {
+        write(&format!("{}/session.jsonl", k.run_prefix), &bytes)?;
+    }
+    if let Ok(bytes) = std::fs::read(rec.paths.workspace.join("RESULTS.md")) {
+        write(&format!("{}/RESULTS.md", k.run_prefix), &bytes)?;
+    }
+    for (rel, path) in artifact_matches(rec) {
+        if let Ok(bytes) = std::fs::read(&path) {
+            write(&format!("{}/artifacts/{rel}", k.run_prefix), &bytes)?;
+        }
+    }
+    write(&format!("{}/summary.json", k.run_prefix), &summary)?;
+    for row in rec.rows.iter().filter(|r| !r.diff.is_empty()) {
+        write(
+            &format!("{}/diffs/iter-{}.patch", k.run_prefix, row.iter),
+            row.diff.as_bytes(),
+        )?;
+    }
+    write(&k.index_key, &index)?;
+    write(&k.latest_key, &index)?;
+    Ok(record_uri)
+}
+
 fn s3_record(rec: &Record<'_>, prs: &[PrLink]) -> Result<String> {
     let (bucket, base) = parse_s3_uri(&rec.args.results_bucket)?;
     let goal_slug = slug(rec.goal);
@@ -459,6 +566,20 @@ fn s3_record(rec: &Record<'_>, prs: &[PrLink]) -> Result<String> {
                 "text/markdown",
             )
             .await?;
+        }
+        // Declared artifacts (`embed` + `upload` matches), kept with the run record so they
+        // outlive the workspace. Best-effort reads like RESULTS.md.
+        for (rel, path) in artifact_matches(rec) {
+            if let Ok(bytes) = std::fs::read(&path) {
+                put(
+                    &client,
+                    &bucket,
+                    &format!("{}/artifacts/{rel}", k.run_prefix),
+                    bytes,
+                    artifact_content_type(&rel),
+                )
+                .await?;
+            }
         }
         put(
             &client,
@@ -502,6 +623,12 @@ fn s3_record(rec: &Record<'_>, prs: &[PrLink]) -> Result<String> {
 /// is appended to the URI: the caller passes the exact key it wants. Reuses the same IRSA creds the
 /// publisher uses (GetObject is in the role's policy).
 pub fn fetch_object(uri: &str, dest: &std::path::Path) -> Result<()> {
+    if let Backend::File { root } = backend(uri)? {
+        // The file URI IS the object path; a plain copy is the whole fetch.
+        std::fs::copy(&root, dest)
+            .with_context(|| format!("copying {} to {}", root.display(), dest.display()))?;
+        return Ok(());
+    }
     let (bucket, key) = parse_s3_uri(uri)?;
     if key.is_empty() {
         return Err(PublishError::NoKey {
@@ -540,8 +667,24 @@ pub fn fetch_prior_results(results_bucket: &str, goal: &str) -> Option<String> {
     if results_bucket.is_empty() {
         return None;
     }
-    let (bucket, base) = parse_s3_uri(results_bucket).ok()?;
     let goal_slug = slug(goal);
+    if let Ok(Backend::File { root }) = backend(results_bucket) {
+        let latest =
+            std::fs::read_to_string(root.join(&keys("", &goal_slug, "").latest_key)).ok()?;
+        let run_id = serde_json::from_str::<serde_json::Value>(&latest)
+            .ok()?
+            .get("run_id")?
+            .as_str()?
+            .to_string();
+        let md = std::fs::read_to_string(
+            root.join(keys("", &goal_slug, &run_id).run_prefix)
+                .join("RESULTS.md"),
+        )
+        .ok()?;
+        let rows = prior_candidate_rows(&md);
+        return (!rows.is_empty()).then_some(rows);
+    }
+    let (bucket, base) = parse_s3_uri(results_bucket).ok()?;
     // `latest.json` is run-id-independent; it names the most recent prior run for this goal.
     let latest_key = keys(&base, &goal_slug, "").latest_key;
     let md = crate::engine::handle().ok()?.block_on(async {
@@ -610,8 +753,10 @@ async fn put(
 /// publishing refuses on its own terms; everything else is plumbing and stays `anyhow`.
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum PublishError {
-    #[error("results bucket must be an s3:// URI, got `{uri}`")]
+    #[error("results bucket must be an s3:// or file:// URI, got `{uri}`")]
     NotAnS3Uri { uri: String },
+    #[error("file:// results root must be absolute: `{uri}`")]
+    FileRootRelative { uri: String },
     #[error("results bucket URI has no bucket: `{uri}`")]
     NoBucket { uri: String },
     #[error("fetch object URI has no key: `{uri}`")]
@@ -1024,6 +1169,7 @@ fn pr_body(rec: &Record<'_>) -> String {
             rec.seed_hash
         ));
     }
+    s.push_str(&score_chart(rec));
     let kept: Vec<&Row> = rec.rows.iter().filter(|r| r.decision == "keep").collect();
     for row in kept {
         s.push_str(&kept_section(row));
@@ -1047,6 +1193,7 @@ fn pr_body(rec: &Record<'_>) -> String {
         }
         s.push('\n');
     }
+    s.push_str(&artifact_sections(rec));
     s.push_str(&format!(
         "Model `{}` · cost ${:.2} · {}s.\n",
         rec.model,
@@ -1061,6 +1208,121 @@ fn pr_body(rec: &Record<'_>) -> String {
     }
     s.push_str("\n🤖 opened by crucible autoresearch (draft — review and steer).\n");
     s
+}
+
+/// Mermaid xychart of the run's score trajectory: every measured deep-loop iteration's score,
+/// plus a flat series at the baseline. GitHub renders ```mermaid fences natively, so the PR
+/// carries a real chart with no image hosting. Empty under two measured points (no trajectory).
+fn score_chart(rec: &Record<'_>) -> String {
+    let pts: Vec<(u32, f64)> = rec
+        .rows
+        .iter()
+        .filter(|r| r.iter > 0 && r.phase.is_none())
+        .filter_map(|r| r.score.and_then(finite).map(|v| (r.iter, v)))
+        .collect();
+    if pts.len() < 2 {
+        return String::new();
+    }
+    let xs: Vec<String> = pts.iter().map(|(i, _)| i.to_string()).collect();
+    let ys: Vec<String> = pts.iter().map(|(_, v)| trim_num(*v)).collect();
+    // Mermaid quoted strings can't carry quotes; the gate label is free text from the manifest.
+    let label = rec.gate.replace('"', "'");
+    let mut s = format!(
+        "```mermaid\nxychart-beta\n    title \"{label} by iteration\"\n    x-axis [{}]\n    y-axis \"{label}\"\n    line [{}]\n",
+        xs.join(", "),
+        ys.join(", "),
+    );
+    if let Some(b) = finite(rec.baseline_score) {
+        let base = vec![trim_num(b); pts.len()];
+        s.push_str(&format!("    line [{}]\n", base.join(", ")));
+        s.push_str("```\n\n*Per-iteration measured score; the flat line is the baseline.*\n\n");
+    } else {
+        s.push_str("```\n\n*Per-iteration measured score.*\n\n");
+    }
+    s
+}
+
+/// A score formatted for a mermaid data list: fixed 6 decimals, trailing zeros trimmed, so
+/// 8.500000 renders as 8.5 and long float dust doesn't bloat the chart source.
+fn trim_num(v: f64) -> String {
+    let s = format!("{v:.6}");
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    s.to_string()
+}
+
+/// PR-body cap for one embedded artifact. GitHub caps the whole body at 64 KiB and the
+/// CANDIDATE.md writeups already claim a share, so an embed gets a head-truncated slice.
+const EMBED_CAP: usize = 16 * 1024;
+
+/// Declared-artifact PR sections: for each `[[workspace.artifact]]` with an `embed`, the newest
+/// matching file under its path inlined in a collapsed block. The artifact itself is carried
+/// (never in the diff), so this is how its content reaches a reviewer.
+fn artifact_sections(rec: &Record<'_>) -> String {
+    let mut s = String::new();
+    for a in &rec.args.artifacts {
+        let Some(embed) = &a.embed else { continue };
+        let Some(path) = newest_named_file(&rec.paths.workspace.join(&a.path), embed) else {
+            continue;
+        };
+        let Some(content) = read_capped(&path) else {
+            continue;
+        };
+        let title = a
+            .title
+            .clone()
+            .unwrap_or_else(|| a.path.trim_end_matches('/').to_string());
+        let rel = path
+            .strip_prefix(&rec.paths.workspace)
+            .unwrap_or(&path)
+            .display();
+        s.push_str(&format!(
+            "## {title}\n\n<details>\n<summary><code>{rel}</code></summary>\n\n````text\n{content}````\n\n</details>\n\n"
+        ));
+    }
+    s
+}
+
+/// Read a text artifact, lossily and head-truncated to [`EMBED_CAP`], newline-terminated so it
+/// composes into a fenced block. `None` when unreadable (the section is then simply absent).
+fn read_capped(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let mut content = String::from_utf8_lossy(&bytes).into_owned();
+    if content.len() > EMBED_CAP {
+        let mut end = EMBED_CAP;
+        while !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        content.truncate(end);
+        content.push_str("\n… truncated …");
+    }
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
+    Some(content)
+}
+
+/// Newest (by mtime) file named `name` under `root`; `root` may itself be that file. Pipelines
+/// write versioned dirs (`runtime/V1 … V7`) each holding a same-named summary, newest = the
+/// final iteration's.
+fn newest_named_file(root: &Path, name: &str) -> Option<std::path::PathBuf> {
+    let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        let Ok(md) = std::fs::metadata(&p) else {
+            continue;
+        };
+        if md.is_dir() {
+            if let Ok(rd) = std::fs::read_dir(&p) {
+                stack.extend(rd.flatten().map(|e| e.path()));
+            }
+        } else if p.file_name().and_then(|n| n.to_str()) == Some(name) {
+            let t = md.modified().unwrap_or(std::time::UNIX_EPOCH);
+            if best.as_ref().is_none_or(|(bt, _)| t > *bt) {
+                best = Some((t, p));
+            }
+        }
+    }
+    best.map(|(_, p)| p)
 }
 
 /// One kept iteration's PR section: the agent's whole CANDIDATE.md (the row note is its
@@ -1210,6 +1472,273 @@ fn sibling_links(component: &str, opened: &[(String, String, String)]) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The PR body charts the score trajectory as a native mermaid xychart and inlines the
+    /// newest match of a declared artifact's `embed`; the artifact file itself never enters
+    /// the diff (it's carried), so the section is a reviewer's only view of it.
+    #[test]
+    fn pr_body_charts_scores_and_embeds_declared_artifacts() {
+        let ws = std::env::temp_dir().join(format!("pub-artifact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(ws.join("codegen-out/runtime/V1")).unwrap();
+        std::fs::create_dir_all(ws.join("codegen-out/runtime/V2")).unwrap();
+        std::fs::write(
+            ws.join("codegen-out/runtime/V1/summary.txt"),
+            "old investigation",
+        )
+        .unwrap();
+        std::fs::write(
+            ws.join("codegen-out/runtime/V2/summary.txt"),
+            "final investigation",
+        )
+        .unwrap();
+        // Same-second writes tie on coarse filesystems; pin V1 unambiguously older.
+        std::fs::File::open(ws.join("codegen-out/runtime/V1/summary.txt"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap();
+
+        let mut args = <crate::Cli as clap::Parser>::try_parse_from(["crucible"])
+            .unwrap()
+            .run;
+        args.artifacts = vec![crate::manifest::Artifact {
+            path: "codegen-out/runtime".into(),
+            embed: Some("summary.txt".into()),
+            upload: None,
+            title: Some("Runtime investigation".into()),
+        }];
+        let paths = crate::Paths::for_manifest(
+            ws.clone(),
+            std::env::temp_dir(),
+            &std::env::temp_dir(),
+            None,
+        );
+        let rows = vec![
+            Row {
+                iter: 1,
+                decision: "keep".into(),
+                score: Some(8.6),
+                ..Default::default()
+            },
+            Row {
+                iter: 2,
+                decision: "discard".into(),
+                score: Some(8.9),
+                ..Default::default()
+            },
+            Row {
+                iter: 3,
+                decision: "keep".into(),
+                score: Some(8.5),
+                ..Default::default()
+            },
+        ];
+        let body = pr_body(&Record {
+            args: &args,
+            paths: &paths,
+            run_id: "r",
+            goal: "g",
+            model: "m",
+            gate: "tpot_ms".into(),
+            rows: &rows,
+            baseline_score: 9.0,
+            best_score: 8.5,
+            improved: true,
+            kept_shas: &[],
+            base_sha: None,
+            components: &[],
+            published_branches: &[],
+            cost_usd: 0.0,
+            elapsed: std::time::Duration::ZERO,
+            identity_digest: "v2:0",
+            seed_hash: "",
+        });
+
+        assert!(body.contains("```mermaid"), "{body}");
+        assert!(body.contains("x-axis [1, 2, 3]"), "{body}");
+        assert!(body.contains("line [8.6, 8.9, 8.5]"), "{body}");
+        assert!(body.contains("line [9, 9, 9]"), "baseline series: {body}");
+        assert!(body.contains("## Runtime investigation"), "{body}");
+        assert!(
+            body.contains("codegen-out/runtime/V2/summary.txt"),
+            "{body}"
+        );
+        assert!(body.contains("final investigation"), "{body}");
+        assert!(
+            !body.contains("old investigation"),
+            "newest match only: {body}"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// One measured point is no trajectory, and an artifact whose embed never matched
+    /// produces no section: the body degrades to exactly the pre-feature shape.
+    #[test]
+    fn no_chart_or_artifact_section_without_data() {
+        let mut args = <crate::Cli as clap::Parser>::try_parse_from(["crucible"])
+            .unwrap()
+            .run;
+        args.artifacts = vec![crate::manifest::Artifact {
+            path: "does-not-exist".into(),
+            embed: Some("summary.txt".into()),
+            upload: None,
+            title: None,
+        }];
+        let paths = crate::Paths::for_manifest(
+            std::env::temp_dir().join("pub-artifact-none"),
+            std::env::temp_dir(),
+            &std::env::temp_dir(),
+            None,
+        );
+        let rows = vec![Row {
+            iter: 1,
+            decision: "keep".into(),
+            score: Some(8.6),
+            ..Default::default()
+        }];
+        let body = pr_body(&Record {
+            args: &args,
+            paths: &paths,
+            run_id: "r",
+            goal: "g",
+            model: "m",
+            gate: "tpot_ms".into(),
+            rows: &rows,
+            baseline_score: 9.0,
+            best_score: 8.6,
+            improved: true,
+            kept_shas: &[],
+            base_sha: None,
+            components: &[],
+            published_branches: &[],
+            cost_usd: 0.0,
+            elapsed: std::time::Duration::ZERO,
+            identity_digest: "v2:0",
+            seed_hash: "",
+        });
+        assert!(!body.contains("```mermaid"), "{body}");
+        assert!(!body.contains("<details>"), "{body}");
+    }
+
+    /// `file://` backend round trip: the record lands under the root with the same layout as
+    /// S3 (summary, index, latest pointer, diffs, artifacts incl. an upload-only binary), and
+    /// `fetch_prior_results` reads the cross-run memory back from it.
+    #[test]
+    fn file_backend_round_trips_record_and_prior_results() {
+        let base = std::env::temp_dir().join(format!("pub-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let ws = base.join("ws");
+        let root = base.join("results");
+        std::fs::create_dir_all(ws.join("codegen-out")).unwrap();
+        std::fs::write(
+            ws.join("RESULTS.md"),
+            "| 1 | keep | 8.5 | tried X |
+",
+        )
+        .unwrap();
+        std::fs::write(ws.join("codegen-out/summary.txt"), "investigation").unwrap();
+        std::fs::write(ws.join("codegen-out/summary.pptx"), b"PPTX".as_slice()).unwrap();
+
+        let mut args = <crate::Cli as clap::Parser>::try_parse_from(["crucible"])
+            .unwrap()
+            .run;
+        args.results_bucket = format!("file://{}", root.display());
+        args.artifacts = vec![crate::manifest::Artifact {
+            path: "codegen-out".into(),
+            embed: Some("summary.txt".into()),
+            upload: Some("summary.pptx".into()),
+            title: None,
+        }];
+        let paths = crate::Paths::for_manifest(ws.clone(), base.join("state"), &base, None);
+        let rows = vec![Row {
+            iter: 1,
+            decision: "keep".into(),
+            score: Some(8.5),
+            diff: "--- a
++++ b
+"
+            .into(),
+            ..Default::default()
+        }];
+        let rec = Record {
+            args: &args,
+            paths: &paths,
+            run_id: "20260811T000000Z-goal",
+            goal: "goal",
+            model: "m",
+            gate: "tpot_ms".into(),
+            rows: &rows,
+            baseline_score: 9.0,
+            best_score: 8.5,
+            improved: true,
+            kept_shas: &[],
+            base_sha: None,
+            components: &[],
+            published_branches: &[],
+            cost_usd: 0.0,
+            elapsed: std::time::Duration::ZERO,
+            identity_digest: "v2:0",
+            seed_hash: "",
+        };
+
+        let uri = record(&rec, &[]).expect("file record");
+        assert!(uri.starts_with("file://"), "{uri}");
+        let run = root.join("runs/goal/20260811T000000Z-goal");
+        for key in [
+            "RESULTS.md",
+            "summary.json",
+            "diffs/iter-1.patch",
+            "artifacts/codegen-out/summary.txt",
+            "artifacts/codegen-out/summary.pptx",
+        ] {
+            assert!(run.join(key).exists(), "{key} written");
+        }
+        assert!(root.join("index/20260811T000000Z-goal.json").exists());
+        assert!(root.join("runs/goal/latest.json").exists());
+
+        let prior = fetch_prior_results(&args.results_bucket, "goal")
+            .expect("prior results readable from file backend");
+        assert!(prior.contains("tried X"), "{prior}");
+
+        // fetch_object: the file URI is the object path.
+        let dest = base.join("fetched.txt");
+        fetch_object(
+            &format!(
+                "file://{}",
+                run.join("artifacts/codegen-out/summary.txt").display()
+            ),
+            &dest,
+        )
+        .expect("fetch_object file");
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "investigation");
+
+        // A relative file root is refused loudly.
+        drop(rec);
+        let mut bad_args = args;
+        bad_args.results_bucket = "file://relative/path".into();
+        let bad = Record {
+            args: &bad_args,
+            paths: &paths,
+            run_id: "r",
+            goal: "goal",
+            model: "m",
+            gate: "tpot_ms".into(),
+            rows: &rows,
+            baseline_score: 9.0,
+            best_score: 8.5,
+            improved: true,
+            kept_shas: &[],
+            base_sha: None,
+            components: &[],
+            published_branches: &[],
+            cost_usd: 0.0,
+            elapsed: std::time::Duration::ZERO,
+            identity_digest: "v2:0",
+            seed_hash: "",
+        };
+        assert!(record(&bad, &[]).is_err());
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     /// Epilogue rows reach the PR body as an advisory section, with failures shouted.
     #[test]

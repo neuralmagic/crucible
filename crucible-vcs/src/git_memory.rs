@@ -6,19 +6,22 @@ use crate::vcs;
 use anyhow::Result;
 use std::path::Path;
 
-/// Paths a discard must NOT delete: the agent's toolbox (`.claude`) and the results log live
-/// untracked in the workspace and must survive a `git clean`.
-const KEEP_ON_CLEAN: &[&str] = &[".claude", "RESULTS.md"];
+/// Paths a discard must NOT delete: the agent's toolbox (`.claude`), the results log, and any
+/// pending operator note live untracked in the workspace and must survive a `git clean`.
+const KEEP_ON_CLEAN: &[&str] = &[".claude", "RESULTS.md", "OPERATOR_NOTE.md"];
 
 /// Loop-owned files in the workspace root that are not candidate content. No candidate
 /// diff, snapshot commit, or external tree hash may see them, or a turn with zero agent
-/// edits still produces a "changed" candidate.
+/// edits still produces a "changed" candidate. `OPERATOR_NOTE.md` is the operator's steer
+/// side channel; a keep that fires before the agent deletes it must not sweep it into the
+/// kept commit (one shipped verbatim in a vLLM draft PR).
 const HARNESS_EXCLUDES: &[&str] = &[
     ".claude/",
     "RESULTS.md",
     "CANDIDATE.md",
     "ESCALATION.json",
     "PROVISIONING_PENDING.json",
+    "OPERATOR_NOTE.md",
 ];
 
 /// Idempotently append [`HARNESS_EXCLUDES`] plus `extra` to the workspace's `.git/info/exclude`,
@@ -170,6 +173,7 @@ mod tests {
 
         std::fs::write(ws.join("RESULTS.md"), "log").expect("results");
         std::fs::write(ws.join("CANDIDATE.md"), "note").expect("note");
+        std::fs::write(ws.join("OPERATOR_NOTE.md"), "steer").expect("steer");
         std::fs::create_dir_all(ws.join(".claude/skills")).expect("toolbox");
         std::fs::write(ws.join(".claude/skills/S.md"), "skill").expect("skill");
         std::fs::write(ws.join("kernel.cuh"), "__global__").expect("edit");

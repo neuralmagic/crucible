@@ -602,6 +602,10 @@ pub(crate) struct Args {
     /// cross-linked draft PR against its fork.
     #[arg(skip)]
     pub component_pr_repos: Vec<(String, String)>,
+    /// Declared pipeline artifacts (from `[[workspace.artifact]]`), for the publish layer:
+    /// each `embed` match lands in the PR body and the S3 run record. No CLI flag.
+    #[arg(skip)]
+    pub artifacts: Vec<manifest::Artifact>,
     /// Wide-round search config (from `[search]`). No CLI flag, set by `run_from_manifest`.
     #[arg(skip)]
     pub search: Option<manifest::SearchCfg>,

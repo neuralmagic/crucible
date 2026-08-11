@@ -100,6 +100,25 @@ Limits worth knowing before you use it:
 Omitting it is the default and keeps today's fresh-start behavior exactly, which is what a
 methodology-sensitive campaign wants.
 
+### Declared artifacts: carried AND published
+
+`[[workspace.artifact]]` is `carry_forward` plus publishing, for derived output a reviewer
+should see without it riding in the candidate diff:
+
+```toml
+[[workspace.artifact]]
+path   = "codegen-out/runtime"   # carried, same rules as carry_forward
+embed  = "summary.txt"           # newest match → PR body (collapsed, 16 KiB cap) + record
+upload = "summary.pptx"          # newest match → record only (binaries a PR can't inline)
+title  = "Runtime investigation" # PR-body section heading (default: the path)
+```
+
+Newest match wins, so versioned pipeline dirs (`V1 … V7`, same-named summary in each) surface
+the final iteration's. The record destination accepts `s3://bucket[/prefix]` or
+`file:///abs/path` (the same layout written to a mounted PVC, for clusters with no S3 reach).
+The PR body also charts per-iteration scores as a mermaid `xychart-beta` when at least two
+iterations measured.
+
 ### Languages: pick per command, the engine doesn't care
 
 The contract is JSON + exit codes, so each command can be whatever fits:
@@ -241,6 +260,7 @@ git default.
    [repo]      url|path, ref
    [workspace] setup_cmd          # optional; default: git clone + checkout
                carry_forward      # optional; untracked derived paths a discard keeps
+               [[workspace.artifact]] path, embed?, title?   # carried + published to PR/S3
    [agent]     model, method_prompt, goal_file|goal, toolbox_dir, env
    [judge]     measure_cmd, direction = "lower"|"higher"
    [world]     apply_cmd?, snapshot_cmd?, restore_cmd?   # omitted → git
