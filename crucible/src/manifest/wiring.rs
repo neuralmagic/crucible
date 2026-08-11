@@ -14,7 +14,7 @@ impl Manifest {
     /// `CommandWorld` (git memory plus any of apply/snapshot/restore). Boxed `+ Send` so a
     /// front-end can move the world onto a worker thread.
     pub fn build_world(&self, workspace: PathBuf) -> Box<dyn World + Send> {
-        let carry_forward = self.workspace.carry_forward.clone();
+        let carry_forward = self.workspace.carried_paths();
         crucible_vcs::git_memory::install_harness_excludes(&workspace, &carry_forward);
         let w = &self.world;
         if w.apply_cmd.is_none() && w.snapshot_cmd.is_none() && w.restore_cmd.is_none() {
