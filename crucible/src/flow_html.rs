@@ -19,19 +19,46 @@ macro_rules! w {
 // Light-committed palette: explicit backgrounds everywhere so a dark-mode browser
 // renders the page identically. One accent hue (blue) + neutrals; keep/discard/reject
 // always carry a shape or word, never color alone.
-const PAGE_BG: &str = "#f7f7f5";
-const SURFACE: &str = "#fcfcfb";
-const INK: &str = "#1a1917";
-const INK_2: &str = "#52514e";
-const MUTED: &str = "#898781";
-const HAIRLINE: &str = "#e5e4dd";
-const ACCENT: &str = "#2a78d6";
-const ACCENT_DEEP: &str = "#1c5cab";
+//
+// The values are defaults on `:root` and every use site (CSS rules and SVG fill/stroke
+// attributes alike) reads them back as `var(--flow-*)`, so an embedder that injects its
+// own `:root` block repaints the page without touching this emitter. An older page with
+// the hexes baked in just ignores such an override.
+const PALETTE: [(&str, &str); 15] = [
+    ("--flow-bg", "#f7f7f5"),
+    ("--flow-surface", "#fcfcfb"),
+    ("--flow-ink", "#1a1917"),
+    ("--flow-ink-2", "#52514e"),
+    ("--flow-muted", "#898781"),
+    ("--flow-hairline", "#e5e4dd"),
+    ("--flow-accent", "#2a78d6"),
+    ("--flow-accent-deep", "#1c5cab"),
+    ("--flow-pass-fill", "#dddcd4"),
+    ("--flow-fail-fill", "#3a3937"),
+    ("--flow-dot", "#9a9891"),
+    ("--flow-line", "#c3c2b7"),
+    ("--flow-line-soft", "#d0cfc8"),
+    ("--flow-badge-border", "#b8b6ae"),
+    ("--flow-on-accent", "#ffffff"),
+];
+
+const PAGE_BG: &str = "var(--flow-bg)";
+const SURFACE: &str = "var(--flow-surface)";
+const INK: &str = "var(--flow-ink)";
+const INK_2: &str = "var(--flow-ink-2)";
+const MUTED: &str = "var(--flow-muted)";
+const HAIRLINE: &str = "var(--flow-hairline)";
+const ACCENT: &str = "var(--flow-accent)";
+const ACCENT_DEEP: &str = "var(--flow-accent-deep)";
 const ACCENT_WASH: &str = "rgba(42,120,214,0.07)";
 const TURN_FILL: &str = "rgba(42,120,214,0.24)";
-const PASS_FILL: &str = "#dddcd4";
-const FAIL_FILL: &str = "#3a3937";
-const DOT_GRAY: &str = "#9a9891";
+const PASS_FILL: &str = "var(--flow-pass-fill)";
+const FAIL_FILL: &str = "var(--flow-fail-fill)";
+const DOT_GRAY: &str = "var(--flow-dot)";
+const LINE: &str = "var(--flow-line)";
+const LINE_SOFT: &str = "var(--flow-line-soft)";
+const BADGE_BORDER: &str = "var(--flow-badge-border)";
+const ON_ACCENT: &str = "var(--flow-on-accent)";
 
 // Hero SVG geometry.
 const SVG_W: f64 = 1140.0;
@@ -245,11 +272,21 @@ fn head(out: &mut String, m: &FlowModel) {
     );
 }
 
+fn root_vars() -> String {
+    let mut s = String::from(":root {\n");
+    for (name, value) in PALETTE {
+        let _ = writeln!(s, "  {name}: {value};");
+    }
+    s.push('}');
+    s
+}
+
 fn css() -> String {
     // format! only to splice the palette consts; the rules themselves are static.
     format!(
-        r##"* {{ box-sizing: border-box; margin: 0; padding: 0; }}
-html {{ color-scheme: only light; }}
+        r##"{}
+* {{ box-sizing: border-box; margin: 0; padding: 0; }}
+html {{ color-scheme: light; }}
 body {{ background: {PAGE_BG}; color: {INK}; font: 14px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; }}
 .page {{ max-width: 1180px; margin: 0 auto; padding: 44px 28px 56px; }}
 .eyebrow {{ font-size: 11.5px; font-weight: 650; letter-spacing: 0.09em; text-transform: uppercase; color: {MUTED}; margin-bottom: 8px; }}
@@ -292,8 +329,8 @@ details[open] > summary::before {{ transform: rotate(90deg); }}
 .dn {{ font-weight: 650; color: {INK}; font-size: 13.5px; }}
 .dsc {{ color: {INK_2}; }}
 .badge {{ font-size: 10px; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase; border-radius: 9px; padding: 2px 9px; white-space: nowrap; }}
-.badge.k {{ background: {ACCENT}; color: #fff; }}
-.badge.d {{ border: 1px solid #b8b6ae; color: {INK_2}; }}
+.badge.k {{ background: {ACCENT}; color: {ON_ACCENT}; }}
+.badge.d {{ border: 1px solid {BADGE_BORDER}; color: {INK_2}; }}
 .badge.r {{ background: {HAIRLINE}; color: {FAIL_FILL}; }}
 .dbody {{ padding: 6px 2px 22px 18px; }}
 .verdict {{ font-size: 13px; color: {INK_2}; margin-bottom: 14px; max-width: 90ch; }}
@@ -327,7 +364,8 @@ footer a {{ color: {ACCENT_DEEP}; }}
   body {{ background: #fff; }}
   .hint {{ display: none; }}
   .hero-card {{ border: none; padding: 0; overflow: visible; }}
-}}"##
+}}"##,
+        root_vars()
     )
 }
 
@@ -752,7 +790,7 @@ fn score_strip(out: &mut String, m: &FlowModel, cols: &[Col]) {
         let by = y_of(b);
         w!(
             out,
-            "<line x1=\"{GUTTER:.0}\" y1=\"{by:.1}\" x2=\"{:.1}\" y2=\"{by:.1}\" stroke=\"#c3c2b7\" stroke-width=\"1\"/>\n\
+            "<line x1=\"{GUTTER:.0}\" y1=\"{by:.1}\" x2=\"{:.1}\" y2=\"{by:.1}\" stroke=\"{LINE}\" stroke-width=\"1\"/>\n\
              <text x=\"{:.1}\" y=\"{:.1}\" font-size=\"10\" fill=\"{MUTED}\">baseline {}</text>\n",
             GUTTER + PLOT_W,
             GUTTER + 2.0,
@@ -772,7 +810,7 @@ fn score_strip(out: &mut String, m: &FlowModel, cols: &[Col]) {
         if w2[1].0 == w2[0].0 + 1 {
             w!(
                 out,
-                "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" stroke=\"#d0cfc8\" stroke-width=\"1.5\"/>\n",
+                "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" stroke=\"{LINE_SOFT}\" stroke-width=\"1.5\"/>\n",
                 w2[0].1,
                 w2[0].2,
                 w2[1].1,
@@ -1003,9 +1041,9 @@ fn fail_mark(out: &mut String, cx: f64, band_y: f64) {
 
 fn badge(out: &mut String, it: &Iteration, cx: f64, y: f64) {
     let (label, fill, stroke, text_fill) = match it.decision.as_str() {
-        "keep" => ("✓ KEPT", ACCENT, "none", "#ffffff"),
+        "keep" => ("✓ KEPT", ACCENT, "none", ON_ACCENT),
         "rejected" => ("✕ REJECTED", HAIRLINE, "none", FAIL_FILL),
-        _ => ("DISCARDED", "none", "#b8b6ae", INK_2),
+        _ => ("DISCARDED", "none", BADGE_BORDER, INK_2),
     };
     let bw = text_w(label, 9.0) + 18.0;
     w!(
@@ -1045,7 +1083,7 @@ fn time_axis(out: &mut String, m: &FlowModel, cols: &[Col], axis_y: f64) {
 fn tick(out: &mut String, x: f64, axis_y: f64, label: &str) {
     w!(
         out,
-        "<line x1=\"{x:.1}\" y1=\"{axis_y:.1}\" x2=\"{x:.1}\" y2=\"{:.1}\" stroke=\"#c3c2b7\" stroke-width=\"1\"/>\n\
+        "<line x1=\"{x:.1}\" y1=\"{axis_y:.1}\" x2=\"{x:.1}\" y2=\"{:.1}\" stroke=\"{LINE}\" stroke-width=\"1\"/>\n\
          <text x=\"{x:.1}\" y=\"{:.1}\" text-anchor=\"middle\" font-size=\"9.5\" fill=\"{MUTED}\">{label}</text>\n",
         axis_y + 4.0,
         axis_y + 14.0
@@ -1519,8 +1557,31 @@ mod tests {
             );
         }
         // Explicit page background so dark-mode browsers don't repaint it.
-        assert!(h.contains("color-scheme: only light"));
+        assert!(h.contains("color-scheme: light"));
         assert!(h.contains(&format!("background: {PAGE_BG}")));
+    }
+
+    #[test]
+    fn palette_lives_only_in_the_root_block() {
+        let h = html_with_spans();
+        let root = h
+            .split_once(":root {\n")
+            .and_then(|(_, rest)| rest.split_once("\n}"))
+            .map(|(block, _)| block)
+            .expect(":root block missing");
+        assert!(root.contains("--flow-bg: #f7f7f5;"));
+        for (name, value) in PALETTE {
+            assert!(
+                root.contains(&format!("{name}: {value};")),
+                "{name} missing"
+            );
+            assert_eq!(
+                h.matches(value).count(),
+                1,
+                "{value} ({name}) leaks outside :root"
+            );
+            assert!(h.contains(&format!("var({name})")), "{name} unused");
+        }
     }
 
     #[test]
