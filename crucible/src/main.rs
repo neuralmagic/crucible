@@ -39,6 +39,7 @@ mod engine;
 mod errors;
 mod escalation;
 mod event;
+mod flow;
 mod harness;
 mod heartbeat;
 mod hermes_trace;
@@ -299,6 +300,10 @@ pub(crate) enum Cmd {
     /// workflow (introspection) and exits. This is the exact code path the controller dispatches later
     /// (one implementation, two callers).
     Build(build::BuildArgs),
+    /// Post-hoc run explainability: fold a run's `session.jsonl` (plus an optional Datadog span
+    /// export) into a small flow-model IR and emit it as `.json` (the IR itself), `.dot`
+    /// (Graphviz run overview), or `.mmd` (mermaid flowchart) — picked by the `--out` extension.
+    Flow(flow::FlowArgs),
 }
 
 /// `crucible plan <show|run>`: compile and inspect a plan, or execute one.

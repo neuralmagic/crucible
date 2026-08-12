@@ -300,7 +300,7 @@ struct ComponentRecord {
 
 /// Scores can be `INFINITY` (no measurement); `serde_json` refuses non-finite
 /// floats, so drop those to `null` rather than blow up the whole record.
-fn finite(x: f64) -> Option<f64> {
+pub(crate) fn finite(x: f64) -> Option<f64> {
     x.is_finite().then_some(x)
 }
 
@@ -370,7 +370,7 @@ struct IndexEntry {
 }
 
 /// First non-empty goal line, de-hashed and length-capped, for leaderboard display.
-fn goal_line(goal: &str) -> String {
+pub(crate) fn goal_line(goal: &str) -> String {
     let line = goal
         .lines()
         .map(str::trim)

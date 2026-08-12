@@ -151,6 +151,10 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
     if let Some(Cmd::Build(args)) = cli.command {
         return crate::build::run(args);
     }
+    // Pure file-to-file fold: no engine runtime, no workspace.
+    if let Some(Cmd::Flow(args)) = &cli.command {
+        return crate::flow::run(args);
+    }
     if let Some(Cmd::Fetch { uri, out }) = &cli.command {
         // The engine runtime the S3 GetObject block_ons on (published for `publish::fetch_object`).
         let _engine = crate::engine::EngineCtx::new()?;
