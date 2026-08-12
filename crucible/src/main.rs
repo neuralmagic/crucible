@@ -40,6 +40,7 @@ mod errors;
 mod escalation;
 mod event;
 mod flow;
+mod flow_dd;
 mod flow_html;
 mod harness;
 mod heartbeat;

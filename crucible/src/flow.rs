@@ -1,5 +1,6 @@
 //! `crucible flow`: post-hoc run explainability. Folds a finished run's `session.jsonl`
-//! (required) plus a Datadog APM span export (optional) into a small renderer-agnostic
+//! (required) plus a Datadog APM span export (optional, from a `--spans` file or fetched
+//! live with `--dd-trace`, see `flow_dd`) into a small renderer-agnostic
 //! flow model, then emits it as JSON, Graphviz dot, or mermaid — the output format is
 //! picked by the `--out` extension.
 //!
@@ -24,8 +25,16 @@ pub(crate) struct FlowArgs {
     pub session: PathBuf,
     /// Datadog span export for the same run (spans API v2 objects, a JSON array or
     /// `{"data": [...]}`). Optional: adds real timings and the per-tool-call timeline.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "dd_trace")]
     pub spans: Option<PathBuf>,
+    /// Fetch the span export straight from the Datadog API for this trace id instead
+    /// of a `--spans` file. Needs `DD_API_KEY` + `DD_APP_KEY` in the environment
+    /// (`DD_SITE` for a non-US1 org).
+    #[arg(long)]
+    pub dd_trace: Option<String>,
+    /// How far back the `--dd-trace` search looks (a Datadog duration: `48h`, `7d`).
+    #[arg(long, default_value = "48h")]
+    pub dd_window: String,
     /// Output path; the extension picks the format: `.json` (the IR), `.dot`, `.mmd`,
     /// `.html` (self-contained explainer page).
     #[arg(long)]
@@ -183,11 +192,17 @@ pub(crate) struct EpilogueCheck {
 pub(crate) fn run(args: &FlowArgs) -> Result<()> {
     let log = std::fs::read_to_string(&args.session)
         .with_context(|| format!("reading {}", args.session.display()))?;
-    let spans = args
-        .spans
-        .as_ref()
-        .map(|p| std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display())))
-        .transpose()?;
+    // clap rejects --spans + --dd-trace together, so at most one arm produces spans.
+    let spans = match (&args.spans, &args.dd_trace) {
+        (Some(p), _) => {
+            Some(std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?)
+        }
+        (None, Some(trace_id)) => Some(crate::flow_dd::fetch_trace_spans(
+            trace_id,
+            &args.dd_window,
+        )?),
+        (None, None) => None,
+    };
     let model = build_model(&log, spans.as_deref())?;
     let ext = args
         .out
@@ -1216,6 +1231,8 @@ mod tests {
             run(&FlowArgs {
                 session: session.clone(),
                 spans: None,
+                dd_trace: None,
+                dd_window: "48h".into(),
                 out: out.clone(),
             })
             .unwrap();
@@ -1227,9 +1244,59 @@ mod tests {
         let err = run(&FlowArgs {
             session: session.clone(),
             spans: None,
+            dd_trace: None,
+            dd_window: "48h".into(),
             out: dir.path().join("flow.txt"),
         })
         .unwrap_err();
         assert!(err.to_string().contains(".json/.dot/.mmd/.html"), "{err}");
+    }
+
+    #[test]
+    fn spans_and_dd_trace_are_mutually_exclusive() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: FlowArgs,
+        }
+        use clap::Parser;
+        let err = Cli::try_parse_from([
+            "flow",
+            "--session",
+            "s.jsonl",
+            "--spans",
+            "x.json",
+            "--dd-trace",
+            "abc123",
+            "--out",
+            "f.html",
+        ])
+        .err()
+        .expect("--spans + --dd-trace must be rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        let cli = Cli::try_parse_from([
+            "flow",
+            "--session",
+            "s.jsonl",
+            "--dd-trace",
+            "abc123",
+            "--out",
+            "f.html",
+        ])
+        .unwrap();
+        assert_eq!(cli.args.dd_trace.as_deref(), Some("abc123"));
+        assert_eq!(cli.args.dd_window, "48h");
+        assert!(
+            Cli::try_parse_from([
+                "flow",
+                "--session",
+                "s.jsonl",
+                "--spans",
+                "x.json",
+                "--out",
+                "f.html",
+            ])
+            .is_ok()
+        );
     }
 }
