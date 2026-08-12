@@ -1,0 +1,20 @@
+---
+title: "Goal: generalize vLLM's `fused_a_gemm` for the GLM-5.2 QKV-A + Q-B projections"
+---
+flowchart LR
+    B["baseline<br/>8.751"]
+    I1["iter 1 · discard<br/>8.858 (+1.23%)"]
+    I2["iter 2 · rejected<br/>correctness"]
+    I3["iter 3 · keep<br/>8.656 (-1.08%)"]
+    I4["iter 4 · discard<br/>8.754 (+0.04%)"]
+    I5["iter 5 · discard<br/>8.665 (-0.98%)"]
+    I6["iter 6 · discard<br/>8.753 (+0.03%)"]
+    PR0["draft PR<br/>wseaton/vllm#8"]
+    B --> I1 --> I2 --> I3 --> I4 --> I5 --> I6
+    I3 -.-> PR0
+    classDef keep fill:#d5e8d4,stroke:#82b366
+    classDef discard fill:#eeeeee,stroke:#999999
+    classDef rejected fill:#f8cecc,stroke:#b85450
+    class I3 keep
+    class I1,I4,I5,I6 discard
+    class I2 rejected

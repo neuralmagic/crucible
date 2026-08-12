@@ -1259,7 +1259,13 @@ fn window_line(out: &mut String, it: &Iteration) {
 fn footer(out: &mut String, m: &FlowModel) {
     out.push_str("<footer>\n");
     if m.publish.prs.is_empty() {
-        out.push_str("<div>No draft PR — no kept candidate to publish.</div>\n");
+        // A run can keep candidates and still record no PR (the open failed, or publish never
+        // ran); "nothing to publish" is only true when nothing was kept.
+        if m.run.improved {
+            out.push_str("<div>No draft PR recorded — kept commits exist but no PR link reached the session log.</div>\n");
+        } else {
+            out.push_str("<div>No draft PR — no kept candidate to publish.</div>\n");
+        }
     } else {
         for pr in &m.publish.prs {
             w!(

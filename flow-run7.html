@@ -1,0 +1,986 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>crucible run — Goal: generalize vLLM&#39;s fused_a_gemm for the GLM-5.2 QKV-A + Q-B projections</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html { color-scheme: only light; }
+body { background: #f7f7f5; color: #1a1917; font: 14px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; }
+.page { max-width: 1180px; margin: 0 auto; padding: 44px 28px 56px; }
+.eyebrow { font-size: 11.5px; font-weight: 650; letter-spacing: 0.09em; text-transform: uppercase; color: #898781; margin-bottom: 8px; }
+h1 { font-size: 23px; font-weight: 650; letter-spacing: -0.01em; line-height: 1.3; max-width: 60ch; }
+h1 code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.88em; background: rgba(26,25,23,0.05); padding: 0 4px; border-radius: 4px; }
+h2 { font-size: 15px; font-weight: 650; margin-bottom: 4px; }
+.hint { color: #898781; font-size: 12.5px; margin-bottom: 14px; }
+.stats { display: flex; flex-wrap: wrap; gap: 18px 0; margin: 26px 0 8px; }
+.tile { flex: 1 1 150px; padding: 2px 22px; border-left: 1px solid #e5e4dd; min-width: 130px; }
+.tile:first-child { border-left: none; padding-left: 0; }
+.tile.wide { flex: 1.7 1 230px; }
+.lbl { font-size: 11px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: #898781; margin-bottom: 3px; white-space: nowrap; }
+.val { font-size: 21px; font-weight: 650; letter-spacing: -0.01em; white-space: nowrap; }
+.val.sm { font-size: 15px; padding-top: 5px; }
+.val .arr { color: #898781; font-weight: 400; padding: 0 2px; }
+.sub { font-size: 12px; color: #52514e; margin-top: 2px; }
+.sub.good { color: #1c5cab; font-weight: 650; }
+.spark { vertical-align: -3px; margin-right: 6px; }
+section { margin-top: 36px; }
+details.pre { margin-top: 22px; border-top: 1px solid #e5e4dd; border-bottom: 1px solid #e5e4dd; }
+details.pre summary { padding: 9px 2px; }
+details.pre table { margin: 4px 0 14px; }
+summary { cursor: pointer; list-style: none; font-size: 13px; color: #52514e; }
+summary::-webkit-details-marker { display: none; }
+summary::before { content: "▸"; display: inline-block; width: 16px; color: #898781; transition: transform 0.12s; }
+details[open] > summary::before { transform: rotate(90deg); }
+.hero-card { background: #fcfcfb; border: 1px solid #e5e4dd; border-radius: 10px; padding: 18px 14px 10px; overflow-x: auto; }
+.hero-card svg { display: block; min-width: 900px; width: 100%; height: auto; }
+.legend { font-size: 11.5px; color: #52514e; margin: 10px 4px 0; }
+.legend > span { margin-right: 18px; white-space: nowrap; }
+.sw { display: inline-block; width: 14px; height: 9px; border-radius: 2px; vertical-align: -1px; margin-right: 5px; }
+.sw.turn { background: rgba(42,120,214,0.24); }
+.sw.pass { background: #dddcd4; }
+.sw.fail { background: #3a3937; }
+.dotm { display: inline-block; width: 7px; height: 7px; border-radius: 50%; border: 1.5px solid #9a9891; background: #fcfcfb; vertical-align: -1px; margin-right: 5px; }
+.details details { border-top: 1px solid #e5e4dd; }
+.details details:last-child { border-bottom: 1px solid #e5e4dd; }
+.details summary { padding: 11px 2px; display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.details summary:hover { background: rgba(26,25,23,0.025); }
+.dn { font-weight: 650; color: #1a1917; font-size: 13.5px; }
+.dsc { color: #52514e; }
+.badge { font-size: 10px; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase; border-radius: 9px; padding: 2px 9px; white-space: nowrap; }
+.badge.k { background: #2a78d6; color: #fff; }
+.badge.d { border: 1px solid #b8b6ae; color: #52514e; }
+.badge.r { background: #e5e4dd; color: #3a3937; }
+.dbody { padding: 6px 2px 22px 18px; }
+.verdict { font-size: 13px; color: #52514e; margin-bottom: 14px; max-width: 90ch; }
+.verdict b { color: #1a1917; font-weight: 650; }
+.cols2 { display: flex; flex-wrap: wrap; gap: 20px 44px; }
+.cols2 > div { flex: 1 1 320px; min-width: 280px; }
+h4 { font-size: 11px; font-weight: 650; letter-spacing: 0.06em; text-transform: uppercase; color: #898781; margin: 12px 0 6px; }
+.agg { font-size: 13px; margin-bottom: 5px; }
+.files { list-style: none; }
+.files li { font: 12px/1.7 ui-monospace, SFMono-Regular, Menlo, monospace; color: #52514e; }
+table { border-collapse: collapse; font-size: 12.5px; width: 100%; }
+th { text-align: left; font-size: 10.5px; font-weight: 650; letter-spacing: 0.05em; text-transform: uppercase; color: #898781; padding: 3px 14px 3px 0; border-bottom: 1px solid #e5e4dd; }
+td { padding: 4px 14px 4px 0; border-bottom: 1px solid #e5e4dd; vertical-align: top; color: #52514e; }
+td.name { color: #1a1917; font-weight: 600; white-space: nowrap; }
+td.res { white-space: nowrap; }
+td.res.fail { color: #1a1917; font-weight: 650; }
+td.res.skip { color: #898781; font-style: italic; }
+td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+td.cmd { font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.tl { margin-top: 4px; }
+.win { font-size: 12px; color: #898781; margin-top: 10px; }
+footer { margin-top: 42px; padding-top: 16px; border-top: 1px solid #e5e4dd; font-size: 13px; color: #52514e; }
+footer div { margin-bottom: 4px; }
+footer a { color: #1c5cab; }
+.mut { color: #898781; font-size: 12px; }
+.col { cursor: pointer; }
+.col .hit { fill: transparent; }
+.col:hover .hit { fill: rgba(26,25,23,0.035); }
+.col:focus-visible { outline: 2px solid #2a78d6; outline-offset: 2px; }
+@media print {
+  body { background: #fff; }
+  .hint { display: none; }
+  .hero-card { border: none; padding: 0; overflow: visible; }
+}
+</style>
+</head>
+<body>
+<main class="page">
+<header>
+<p class="eyebrow">crucible run</p>
+<h1>generalize vLLM&#39;s <code>fused_a_gemm</code> for the GLM-5.2 QKV-A + Q-B projections</h1>
+<div class="stats">
+<div class="tile wide"><div class="lbl">latency — lower is better</div><div class="val">8.751 <span class="arr">→</span> 8.656</div><div class="sub good">1.08% better · kept at iteration 3</div></div>
+<div class="tile"><div class="lbl">iterations</div><div class="val">6</div><div class="sub">1 kept · 4 discarded · 1 rejected</div></div>
+<div class="tile"><div class="lbl">model</div><div class="val sm">claude-opus-4-6</div></div>
+<div class="tile"><div class="lbl">cost</div><div class="val">$33.32</div><div class="sub"><svg class="spark" width="86" height="22" viewBox="0 0 86 22" role="img" aria-label="cumulative spend"><polyline points="0.0,22.0 14.5,21.9 14.5,21.9 14.6,21.8 14.6,21.7 15.4,19.5 16.2,18.0 17.5,16.8 26.1,16.6 27.0,15.0 27.1,15.0 27.2,14.8 27.3,14.2 27.3,14.1 27.3,13.9 27.4,13.7 27.7,13.3 27.8,12.7 28.0,12.2 28.1,11.6 28.2,11.1 28.3,10.7 28.4,10.0 28.5,9.6 28.6,9.5 32.8,8.8 32.8,8.6 33.1,8.6 33.2,8.3 33.2,8.2 33.3,8.0 33.4,7.9 33.5,7.7 33.6,7.6 33.7,7.4 33.9,7.4 34.0,6.9 34.1,6.8 34.2,6.4 34.4,6.0 34.5,5.5 34.6,5.4 46.5,4.8 46.5,4.8 46.7,4.4 46.9,4.3 47.0,3.8 59.2,3.1 59.3,3.0 59.3,2.9 59.4,2.8 59.6,2.7 59.7,2.5 71.5,2.2 71.6,2.2 71.7,2.0 86.0,2.0" fill="none" stroke="#2a78d6" stroke-width="1.5"/><circle cx="86.0" cy="2" r="2.5" fill="#2a78d6"/></svg>spend over the run</div></div>
+<div class="tile"><div class="lbl">wall-clock</div><div class="val">12h 12m</div></div>
+<div class="tile"><div class="lbl">outcome</div><div class="val sm">finished</div><div class="sub">draft PR opened</div></div>
+</div>
+</header>
+<details class="pre"><summary>Before iteration 1 — 5 environment checks passed, baseline measured</summary>
+<table><tr><th>command</th><th>result</th><th>note</th></tr>
+<tr><td class="cmd">python3 vllm_glm_gate.py --only-rung 1 --mode derive</td><td class="res">passed</td><td>candidate built score=0</td></tr>
+<tr><td class="cmd">python3 vllm_glm_gate.py --only-rung 1 --mode full</td><td class="res">passed</td><td>candidate built score=0</td></tr>
+<tr><td class="cmd">python3 vllm_glm_gate.py --only-rung 2 --digest vllm-candidate@sha256:bbd4256e74…</td><td class="res">passed</td><td>correctness: score=0.938</td></tr>
+<tr><td class="cmd">python3 vllm_glm_gate.py --only-rung 5 --digest vllm-candidate@sha256:bbd4256e74…</td><td class="res">passed</td><td>mechanism: trace captured score=0</td></tr>
+<tr><td class="cmd">python3 vllm_glm_gate.py --only-rung 3 --digest vllm-candidate@sha256:bbd4256e74…</td><td class="res">passed</td><td>latency: tpot_ms=8.751 score=8.751</td></tr>
+</table></details>
+<section>
+<h2>The run, left to right</h2>
+<p class="hint">Each column is one iteration: the agent writes code, then frozen checks grade the candidate — column width is real wall-clock time (the chart covers the iterations only — preflight and post-run time sit outside it). Click a column for its detail.</p>
+<div class="hero-card">
+<svg viewBox="0 0 1140 444" role="img" aria-label="swimlane of 6 iterations: agent turns, checks, and scores over time">
+<rect x="416.8" y="6.0" width="192.6" height="400.0" rx="8" fill="rgba(42,120,214,0.07)" stroke="rgba(42,120,214,0.30)"/>
+<text x="142" y="96" text-anchor="end" font-size="11" font-weight="650" fill="#1a1917">latency</text>
+<text x="142" y="110" text-anchor="end" font-size="10" fill="#898781">lower is better</text>
+<text x="142" y="226" text-anchor="end" font-size="11" font-weight="650" fill="#1a1917">agent writes code</text>
+<text x="142" y="262" text-anchor="end" font-size="9.5" font-weight="650" letter-spacing="0.7" fill="#898781">FROZEN CHECKS</text>
+<text x="142" y="283.5" text-anchor="end" font-size="10.5" fill="#52514e">build</text>
+<text x="142" y="310.5" text-anchor="end" font-size="10.5" fill="#52514e">correctness</text>
+<text x="142" y="337.5" text-anchor="end" font-size="10.5" fill="#52514e">latency</text>
+<text x="142" y="364.5" text-anchor="end" font-size="10.5" fill="#52514e">ab-toggle</text>
+<text x="142" y="391.5" text-anchor="end" font-size="10.5" fill="#52514e">mechanism</text>
+<line x1="158" y1="132.0" x2="1128.0" y2="132.0" stroke="#c3c2b7" stroke-width="1"/>
+<text x="160.0" y="127.0" font-size="10" fill="#898781">baseline 8.751</text>
+<line x1="513.2" y1="161.2" x2="699.1" y2="130.8" stroke="#d0cfc8" stroke-width="1.5"/>
+<line x1="699.1" y1="130.8" x2="876.3" y2="158.6" stroke="#d0cfc8" stroke-width="1.5"/>
+<line x1="876.3" y1="158.6" x2="1048.4" y2="131.1" stroke="#d0cfc8" stroke-width="1.5"/>
+<circle cx="236.9" cy="98.8" r="4.5" fill="#9a9891" stroke="#fcfcfb" stroke-width="2"/>
+<text x="367.9" y="162.0" text-anchor="middle" font-size="11" fill="#9a9891">✕</text>
+<text x="367.9" y="174.0" text-anchor="middle" font-size="9" fill="#898781">not measured</text>
+<circle cx="513.2" cy="161.2" r="5.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="513.2" y="150.2" text-anchor="middle" font-size="11" font-weight="650" fill="#1a1917">8.656 · 1.08% better</text>
+<circle cx="699.1" cy="130.8" r="4.5" fill="#9a9891" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="876.3" cy="158.6" r="4.5" fill="#9a9891" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="1048.4" cy="131.1" r="4.5" fill="#9a9891" stroke="#fcfcfb" stroke-width="2"/>
+<g class="col" data-iter="1" role="button" tabindex="0" aria-expanded="false" aria-label="iteration 1 — discarded: open detail">
+<text x="236.9" y="20" text-anchor="middle" font-size="10" fill="#898781">iter 1 · 1h 39m</text>
+<text x="236.9" y="38" text-anchor="middle" font-size="13" font-weight="650" fill="#1a1917">8.858<tspan font-size="10" font-weight="400" fill="#898781"> +1.23%</tspan></text>
+<rect x="205.7" y="46.0" width="62.6" height="15" rx="7.5" fill="none" stroke="#b8b6ae"/>
+<text x="236.9" y="57.0" text-anchor="middle" font-size="9" font-weight="700" letter-spacing="0.5" fill="#52514e">DISCARDED</text>
+<rect x="158.0" y="210.0" width="43.9" height="24" rx="3" fill="rgba(42,120,214,0.24)"/>
+<text x="206.9" y="225.5" font-size="9.5" fill="#898781">198 calls</text>
+<rect x="201.9" y="270.0" width="3.0" height="20" rx="3" fill="#dddcd4"/>
+<rect x="203.7" y="297.0" width="37.7" height="20" rx="3" fill="#dddcd4"/>
+<rect x="241.4" y="324.0" width="36.0" height="20" rx="3" fill="#dddcd4"/>
+<circle cx="283.4" cy="361.0" r="3.5" fill="#fcfcfb" stroke="#9a9891" stroke-width="1.5"/>
+<rect x="277.4" y="378.0" width="37.5" height="20" rx="3" fill="#dddcd4"/>
+<rect class="hit" x="156.0" y="6.0" width="161.9" height="400.0" rx="6"/>
+</g>
+<g class="col" data-iter="2" role="button" tabindex="0" aria-expanded="false" aria-label="iteration 2 — rejected: open detail">
+<text x="367.9" y="20" text-anchor="middle" font-size="10" fill="#898781">iter 2 · 55m 34s</text>
+<text x="367.9" y="38" text-anchor="middle" font-size="10.5" font-style="italic" fill="#898781">not scored</text>
+<rect x="334.1" y="46.0" width="67.5" height="15" rx="7.5" fill="#e5e4dd" stroke="none"/>
+<text x="367.9" y="57.0" text-anchor="middle" font-size="9" font-weight="700" letter-spacing="0.5" fill="#3a3937">✕ REJECTED</text>
+<rect x="323.9" y="210.0" width="35.7" height="24" rx="3" fill="rgba(42,120,214,0.24)"/>
+<rect x="359.6" y="297.0" width="16.0" height="20" rx="3" fill="#3a3937"/>
+<text x="367.6" y="310.5" text-anchor="middle" font-size="11" font-weight="700" fill="#fcfcfb">✕</text>
+<rect class="hit" x="321.9" y="6.0" width="92.0" height="400.0" rx="6"/>
+</g>
+<g class="col" data-iter="3" role="button" tabindex="0" aria-expanded="false" aria-label="iteration 3 — kept: open detail">
+<text x="513.2" y="20" text-anchor="middle" font-size="10" fill="#898781">iter 3 · 1h 57m</text>
+<text x="513.2" y="38" text-anchor="middle" font-size="13" font-weight="650" fill="#1a1917">8.656<tspan font-size="10" font-weight="400" fill="#898781"> -1.08%</tspan></text>
+<rect x="489.3" y="46.0" width="47.7" height="15" rx="7.5" fill="#2a78d6" stroke="none"/>
+<text x="513.2" y="57.0" text-anchor="middle" font-size="9" font-weight="700" letter-spacing="0.5" fill="#ffffff">✓ KEPT</text>
+<rect x="419.8" y="210.0" width="28.4" height="24" rx="3" fill="rgba(42,120,214,0.24)"/>
+<text x="453.2" y="225.5" font-size="9.5" fill="#898781">79 calls</text>
+<rect x="448.2" y="270.0" width="35.6" height="20" rx="3" fill="#dddcd4"/>
+<rect x="483.8" y="297.0" width="47.9" height="20" rx="3" fill="#dddcd4"/>
+<rect x="531.7" y="324.0" width="35.7" height="20" rx="3" fill="#dddcd4"/>
+<circle cx="573.4" cy="361.0" r="3.5" fill="#fcfcfb" stroke="#9a9891" stroke-width="1.5"/>
+<rect x="567.4" y="378.0" width="38.1" height="20" rx="3" fill="#dddcd4"/>
+<rect class="hit" x="417.8" y="6.0" width="190.6" height="400.0" rx="6"/>
+</g>
+<g class="col" data-iter="4" role="button" tabindex="0" aria-expanded="false" aria-label="iteration 4 — discarded: open detail">
+<text x="699.1" y="20" text-anchor="middle" font-size="10" fill="#898781">iter 4 · 1h 46m</text>
+<text x="699.1" y="38" text-anchor="middle" font-size="13" font-weight="650" fill="#1a1917">8.754<tspan font-size="10" font-weight="400" fill="#898781"> +0.04%</tspan></text>
+<rect x="667.8" y="46.0" width="62.6" height="15" rx="7.5" fill="none" stroke="#b8b6ae"/>
+<text x="699.1" y="57.0" text-anchor="middle" font-size="9" font-weight="700" letter-spacing="0.5" fill="#52514e">DISCARDED</text>
+<rect x="614.5" y="210.0" width="9.7" height="24" rx="3" fill="rgba(42,120,214,0.24)"/>
+<text x="629.2" y="225.5" font-size="9.5" fill="#898781">17 calls</text>
+<rect x="624.2" y="270.0" width="34.3" height="20" rx="3" fill="#dddcd4"/>
+<rect x="658.5" y="297.0" width="50.3" height="20" rx="3" fill="#dddcd4"/>
+<rect x="708.7" y="324.0" width="35.9" height="20" rx="3" fill="#dddcd4"/>
+<circle cx="750.6" cy="361.0" r="3.5" fill="#fcfcfb" stroke="#9a9891" stroke-width="1.5"/>
+<rect x="744.6" y="378.0" width="38.1" height="20" rx="3" fill="#dddcd4"/>
+<rect class="hit" x="612.5" y="6.0" width="173.2" height="400.0" rx="6"/>
+</g>
+<g class="col" data-iter="5" role="button" tabindex="0" aria-expanded="false" aria-label="iteration 5 — discarded: open detail">
+<text x="876.3" y="20" text-anchor="middle" font-size="10" fill="#898781">iter 5 · 1h 46m</text>
+<text x="876.3" y="38" text-anchor="middle" font-size="13" font-weight="650" fill="#1a1917">8.665<tspan font-size="10" font-weight="400" fill="#898781"> -0.98%</tspan></text>
+<rect x="845.0" y="46.0" width="62.6" height="15" rx="7.5" fill="none" stroke="#b8b6ae"/>
+<text x="876.3" y="57.0" text-anchor="middle" font-size="9" font-weight="700" letter-spacing="0.5" fill="#52514e">DISCARDED</text>
+<rect x="791.7" y="210.0" width="11.3" height="24" rx="3" fill="rgba(42,120,214,0.24)"/>
+<text x="808.0" y="225.5" font-size="9.5" fill="#898781">17 calls</text>
+<rect x="803.0" y="270.0" width="33.6" height="20" rx="3" fill="#dddcd4"/>
+<rect x="836.5" y="297.0" width="48.9" height="20" rx="3" fill="#dddcd4"/>
+<rect x="885.4" y="324.0" width="36.3" height="20" rx="3" fill="#dddcd4"/>
+<circle cx="927.8" cy="361.0" r="3.5" fill="#fcfcfb" stroke="#9a9891" stroke-width="1.5"/>
+<rect x="921.8" y="378.0" width="38.1" height="20" rx="3" fill="#dddcd4"/>
+<rect class="hit" x="789.7" y="6.0" width="173.2" height="400.0" rx="6"/>
+</g>
+<g class="col" data-iter="6" role="button" tabindex="0" aria-expanded="false" aria-label="iteration 6 — discarded: open detail">
+<text x="1048.4" y="20" text-anchor="middle" font-size="10" fill="#898781">iter 6 · 1h 40m</text>
+<text x="1048.4" y="38" text-anchor="middle" font-size="13" font-weight="650" fill="#1a1917">8.753<tspan font-size="10" font-weight="400" fill="#898781"> +0.03%</tspan></text>
+<rect x="1017.1" y="46.0" width="62.6" height="15" rx="7.5" fill="none" stroke="#b8b6ae"/>
+<text x="1048.4" y="57.0" text-anchor="middle" font-size="9" font-weight="700" letter-spacing="0.5" fill="#52514e">DISCARDED</text>
+<rect x="968.8" y="210.0" width="3.8" height="24" rx="3" fill="rgba(42,120,214,0.24)"/>
+<text x="977.6" y="225.5" font-size="9.5" fill="#898781">7 calls</text>
+<rect x="972.6" y="270.0" width="34.1" height="20" rx="3" fill="#dddcd4"/>
+<rect x="1006.7" y="297.0" width="47.6" height="20" rx="3" fill="#dddcd4"/>
+<rect x="1054.3" y="324.0" width="35.2" height="20" rx="3" fill="#dddcd4"/>
+<circle cx="1095.4" cy="361.0" r="3.5" fill="#fcfcfb" stroke="#9a9891" stroke-width="1.5"/>
+<rect x="1089.4" y="378.0" width="37.6" height="20" rx="3" fill="#dddcd4"/>
+<rect class="hit" x="966.8" y="6.0" width="163.2" height="400.0" rx="6"/>
+</g>
+<line x1="158" y1="418.0" x2="1128.0" y2="418.0" stroke="#e5e4dd" stroke-width="1"/>
+<text x="142" y="432.0" text-anchor="end" font-size="9.5" fill="#898781">elapsed since iter 1 (h:mm)</text>
+<line x1="158.0" y1="418.0" x2="158.0" y2="422.0" stroke="#c3c2b7" stroke-width="1"/>
+<text x="158.0" y="432.0" text-anchor="middle" font-size="9.5" fill="#898781">+0:00</text>
+<line x1="323.9" y1="418.0" x2="323.9" y2="422.0" stroke="#c3c2b7" stroke-width="1"/>
+<text x="323.9" y="432.0" text-anchor="middle" font-size="9.5" fill="#898781">+1:39</text>
+<line x1="419.8" y1="418.0" x2="419.8" y2="422.0" stroke="#c3c2b7" stroke-width="1"/>
+<text x="419.8" y="432.0" text-anchor="middle" font-size="9.5" fill="#898781">+2:35</text>
+<line x1="614.5" y1="418.0" x2="614.5" y2="422.0" stroke="#c3c2b7" stroke-width="1"/>
+<text x="614.5" y="432.0" text-anchor="middle" font-size="9.5" fill="#898781">+4:33</text>
+<line x1="791.7" y1="418.0" x2="791.7" y2="422.0" stroke="#c3c2b7" stroke-width="1"/>
+<text x="791.7" y="432.0" text-anchor="middle" font-size="9.5" fill="#898781">+6:20</text>
+<line x1="968.8" y1="418.0" x2="968.8" y2="422.0" stroke="#c3c2b7" stroke-width="1"/>
+<text x="968.8" y="432.0" text-anchor="middle" font-size="9.5" fill="#898781">+8:07</text>
+<line x1="1128.0" y1="418.0" x2="1128.0" y2="422.0" stroke="#c3c2b7" stroke-width="1"/>
+<text x="1128.0" y="432.0" text-anchor="middle" font-size="9.5" fill="#898781">+9:47</text>
+</svg>
+</div>
+<p class="legend"><span><span class="sw turn"></span>agent writes code</span><span><span class="sw pass"></span>check passed</span><span><span class="sw fail"></span>check failed ✕</span><span><span class="dotm"></span>check skipped or instant</span></p>
+</section>
+<section class="details">
+<h2>Iteration detail</h2>
+<p class="hint">Click a column above, or expand an iteration here.</p>
+<details id="it-1"><summary><span class="dn">Iteration 1</span><span class="badge d">discarded</span><span class="dsc">8.858 · 1.23% worse vs baseline · 2 files changed</span></summary>
+<div class="dbody">
+<p class="verdict"><b>verdict:</b> latency: tpot_ms=8.858</p>
+<div class="cols2">
+<div>
+<h4>Code changes</h4>
+<p class="agg">2 files · +2 −0</p>
+<ul class="files">
+<li>.pipeline</li>
+<li>.sglang-ref</li>
+</ul>
+</div>
+<div>
+<h4>Checks</h4>
+<table><tr><th>check</th><th>result</th><th>time</th><th>note</th></tr>
+<tr><td class="name">build</td><td class="res">passed</td><td class="num">1m 08s</td><td>candidate built</td></tr>
+<tr><td class="name">correctness</td><td class="res">passed</td><td class="num">23m 47s</td><td>correctness: score=0.93</td></tr>
+<tr><td class="name">latency</td><td class="res">passed</td><td class="num">22m 44s</td><td>latency: tpot_ms=8.858</td></tr>
+<tr><td class="name">ab-toggle</td><td class="res skip">skipped</td><td class="num">—</td><td>ab-toggle skipped: no VLLM_GLM_TOGGLE declared</td></tr>
+<tr><td class="name">mechanism</td><td class="res">passed</td><td class="num">24m 05s</td><td>mechanism: trace captured</td></tr>
+</table>
+</div>
+</div>
+<h4>Agent activity — 198 tool calls over 27m 46s</h4>
+<svg class="tl" viewBox="0 0 1000 140" role="img" aria-label="tool call timeline for iteration 1">
+<text x="140" y="13.0" text-anchor="end" font-size="11" fill="#52514e">Read · 88</text>
+<rect x="208.4" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="210.5" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="212.7" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="224.9" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="257.8" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="257.9" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="262.1" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="262.1" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="263.2" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="263.4" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="263.8" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="268.0" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="268.4" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="269.1" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="269.5" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="270.1" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="270.9" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="273.0" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="274.9" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="276.1" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="276.3" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="276.7" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="278.1" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="278.6" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="278.8" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="281.2" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="281.5" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="285.7" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="286.2" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="286.4" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="288.6" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="291.3" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="293.1" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="293.4" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="293.5" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="296.8" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="298.0" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="298.5" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="306.6" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="307.1" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="313.1" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="315.7" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="317.7" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="321.3" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="457.5" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="457.9" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="458.2" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="459.8" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="460.0" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="460.3" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="466.1" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="466.5" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="466.7" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="467.3" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="467.4" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="469.3" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="469.7" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="470.0" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="476.0" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="476.2" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="480.1" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="480.4" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="488.1" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="491.0" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="493.2" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="658.6" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="658.9" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="659.1" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="659.2" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="661.4" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="661.8" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="662.1" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="666.2" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="666.7" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="666.8" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="670.7" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="672.5" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="674.2" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="674.7" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="674.8" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="676.9" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="677.4" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="680.4" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="680.7" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="685.0" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="691.1" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="879.1" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="879.3" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<text x="140" y="32.0" text-anchor="end" font-size="11" fill="#52514e">Bash · 99</text>
+<rect x="208.9" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="209.1" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="210.7" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="213.1" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="213.4" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="218.9" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="222.5" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="230.5" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="233.5" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="237.2" y="24.0" width="2.4" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="241.7" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="244.3" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="250.1" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="260.3" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="260.6" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="261.1" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="264.7" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="265.1" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="265.6" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="266.2" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="266.3" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="266.9" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="267.3" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="267.8" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="271.0" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="271.2" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="273.5" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="273.7" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="274.3" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="276.9" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="278.5" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="281.0" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="282.4" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="283.9" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="284.1" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="284.3" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="285.1" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="286.5" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="286.9" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="289.0" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="289.2" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="289.6" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="291.2" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="291.7" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="295.5" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="295.7" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="296.2" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="296.6" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="300.7" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="301.8" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="302.3" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="302.7" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="302.7" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="304.3" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="304.5" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="304.8" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="309.3" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="311.2" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="315.4" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="319.8" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="323.0" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="436.0" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="439.0" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="462.7" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="462.9" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="463.0" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="463.2" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="464.6" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="464.7" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="471.8" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="472.2" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="472.5" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="474.0" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="474.2" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="474.7" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="474.9" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="478.0" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="478.4" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="478.8" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="483.3" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="483.5" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="485.2" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="485.4" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="487.5" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="487.8" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="491.2" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="491.4" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="493.0" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="646.5" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="647.6" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="664.5" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="664.9" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="665.1" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="670.3" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="672.2" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="677.1" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="683.0" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="683.5" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="690.9" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<text x="140" y="51.0" text-anchor="end" font-size="11" fill="#52514e">Skill · 2</text>
+<rect x="217.4" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="227.6" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<text x="140" y="70.0" text-anchor="end" font-size="11" fill="#52514e">Edit · 1</text>
+<rect x="226.2" y="62.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<text x="140" y="89.0" text-anchor="end" font-size="11" fill="#52514e">Agent · 4</text>
+<rect x="256.2" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="259.9" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="456.0" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="657.3" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<text x="140" y="108.0" text-anchor="end" font-size="11" fill="#52514e">Write · 4</text>
+<rect x="399.6" y="100.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="426.2" y="100.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="625.1" y="100.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="639.4" y="100.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<line x1="150" y1="122.0" x2="986.0" y2="122.0" stroke="#e5e4dd" stroke-width="1"/>
+<text x="150" y="135.0" font-size="10" fill="#898781">0</text>
+<text x="986.0" y="135.0" text-anchor="end" font-size="10" fill="#898781">27m 46s</text>
+</svg>
+<p class="win">21:28 → 23:08 UTC · iteration wall-clock 1h 39m</p>
+</div>
+</details>
+<details id="it-2"><summary><span class="dn">Iteration 2</span><span class="badge r">rejected</span><span class="dsc">rejected before measuring</span></summary>
+<div class="dbody">
+<p class="verdict"><b>verdict:</b> correctness rejected the candidate: exit 1: [lm_eval] File &quot;/tmp/.local/lib/python3.12/site-packages/lm_eval/evaluator.p…</p>
+<div class="cols2">
+<div>
+<h4>Code changes</h4>
+<p class="agg mut">no edits recorded</p>
+</div>
+<div>
+<h4>Checks</h4>
+<table><tr><th>check</th><th>result</th><th>time</th><th>note</th></tr>
+<tr><td class="name">correctness</td><td class="res fail">failed ✕</td><td class="num">—</td><td>correctness rejected the candidate: exit 1: [lm_eval] File &quot;/tmp/.local/lib/python3.12/site-packages/lm_eval/evaluator.p…</td></tr>
+</table>
+</div>
+</div>
+<h4>Agent activity — 179 tool calls over 22m 32s</h4>
+<svg class="tl" viewBox="0 0 1000 121" role="img" aria-label="tool call timeline for iteration 2">
+<text x="140" y="13.0" text-anchor="end" font-size="11" fill="#52514e">Bash · 94</text>
+<rect x="188.6" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="188.6" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="213.1" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="213.3" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="215.6" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="215.9" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="221.3" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="221.8" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="223.9" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="230.1" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="230.4" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="251.0" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="251.6" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="256.6" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="257.6" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="474.3" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="475.4" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="475.8" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="478.2" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="478.8" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="483.9" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="494.3" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="494.7" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="511.8" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="529.2" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="532.1" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="549.8" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="550.2" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="550.8" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="552.1" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="553.1" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="553.6" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="554.2" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="554.5" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="556.9" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="557.5" y="5.0" width="2.8" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="558.0" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="561.2" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="561.7" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="563.9" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="564.4" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="565.5" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="566.9" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="569.0" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="569.8" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="571.6" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="571.9" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="575.4" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="576.0" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="577.4" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="585.7" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="587.1" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="605.6" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="702.4" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="705.4" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="705.5" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="706.0" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="706.3" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="708.6" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="710.2" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="712.3" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="712.5" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="714.7" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="716.7" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="722.7" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="731.1" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="733.9" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="737.8" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="741.0" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="743.9" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="745.7" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="747.6" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="749.6" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="752.9" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="795.3" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="798.9" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="801.6" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="805.0" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="806.5" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="874.5" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="876.6" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="878.6" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="894.6" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="896.3" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="912.0" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="920.6" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="923.0" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="924.9" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="927.3" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="941.4" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="943.9" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="949.3" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="959.3" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="961.6" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<text x="140" y="32.0" text-anchor="end" font-size="11" fill="#52514e">Agent · 3</text>
+<rect x="204.1" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="547.2" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="700.2" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<text x="140" y="51.0" text-anchor="end" font-size="11" fill="#52514e">Read · 58</text>
+<rect x="205.6" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="205.9" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="206.2" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="206.3" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="209.0" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="209.3" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="210.1" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="210.6" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="218.1" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="218.7" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="219.2" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="224.2" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="226.6" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="229.5" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="233.0" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="233.3" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="236.7" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="236.9" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="239.1" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="242.5" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="244.9" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="268.0" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="480.2" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="513.4" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="549.4" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="549.7" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="550.2" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="554.7" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="556.8" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="559.9" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="560.4" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="563.2" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="564.8" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="566.8" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="567.7" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="569.4" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="571.0" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="572.3" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="573.6" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="578.7" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="585.2" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="588.6" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="599.3" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="610.6" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="701.9" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="702.1" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="708.2" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="713.9" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="716.8" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="718.2" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="797.0" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="803.4" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="807.8" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="815.4" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="880.6" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="885.1" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="913.6" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="951.4" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<text x="140" y="70.0" text-anchor="end" font-size="11" fill="#52514e">Write · 7</text>
+<rect x="421.7" y="62.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="463.7" y="62.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="673.0" y="62.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="684.7" y="62.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="814.0" y="62.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="834.7" y="62.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="939.0" y="62.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<text x="140" y="89.0" text-anchor="end" font-size="11" fill="#52514e">Edit · 17</text>
+<rect x="726.0" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="728.0" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="818.9" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="824.7" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="832.8" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="838.2" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="842.7" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="849.5" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="857.0" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="871.6" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="882.8" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="892.7" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="900.8" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="906.9" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="910.1" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="918.5" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="953.4" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<line x1="150" y1="103.0" x2="986.0" y2="103.0" stroke="#e5e4dd" stroke-width="1"/>
+<text x="150" y="116.0" font-size="10" fill="#898781">0</text>
+<text x="986.0" y="116.0" text-anchor="end" font-size="10" fill="#898781">22m 32s</text>
+</svg>
+<p class="win">23:08 → 00:04 UTC · iteration wall-clock 55m 34s</p>
+</div>
+</details>
+<details id="it-3" open><summary><span class="dn">Iteration 3</span><span class="badge k">kept</span><span class="dsc">8.656 · 1.08% better vs baseline · 5 files changed</span></summary>
+<div class="dbody">
+<p class="verdict"><b>verdict:</b> latency: tpot_ms=8.656</p>
+<div class="cols2">
+<div>
+<h4>Code changes</h4>
+<p class="agg">5 files · +180 −57</p>
+<ul class="files">
+<li>csrc/libtorch_stable/dsv3_fused_a_gemm.cu</li>
+<li>vllm/_custom_ops.py</li>
+<li>vllm/envs.py</li>
+<li>vllm/model_executor/layers/mla.py</li>
+<li>vllm/model_executor/models/deepseek_v2.py</li>
+</ul>
+</div>
+<div>
+<h4>Checks</h4>
+<table><tr><th>check</th><th>result</th><th>time</th><th>note</th></tr>
+<tr><td class="name">build</td><td class="res">passed</td><td class="num">22m 28s</td><td>candidate built</td></tr>
+<tr><td class="name">correctness</td><td class="res">passed</td><td class="num">30m 17s</td><td>correctness: score=0.93</td></tr>
+<tr><td class="name">latency</td><td class="res">passed</td><td class="num">22m 34s</td><td>latency: tpot_ms=8.656</td></tr>
+<tr><td class="name">ab-toggle</td><td class="res skip">skipped</td><td class="num">—</td><td>ab-toggle skipped: no VLLM_GLM_TOGGLE declared</td></tr>
+<tr><td class="name">mechanism</td><td class="res">passed</td><td class="num">24m 28s</td><td>mechanism: trace captured</td></tr>
+</table>
+</div>
+</div>
+<h4>Agent activity — 79 tool calls over 17m 56s</h4>
+<svg class="tl" viewBox="0 0 1000 121" role="img" aria-label="tool call timeline for iteration 3">
+<text x="140" y="13.0" text-anchor="end" font-size="11" fill="#52514e">Bash · 43</text>
+<rect x="285.0" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="285.4" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="294.4" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="294.7" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="295.4" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="417.8" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="418.9" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="428.6" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="434.2" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="436.8" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="445.6" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="446.3" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="465.3" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="465.5" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="467.4" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="471.4" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="486.0" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="493.4" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="510.9" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="527.5" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="532.4" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="540.3" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="584.3" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="603.6" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="628.2" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="653.0" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="705.6" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="722.8" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="725.3" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="752.9" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="755.1" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="833.9" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="842.1" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="844.2" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="847.0" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="876.4" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="878.8" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="903.0" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="905.2" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="926.1" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="927.9" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="949.5" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="952.3" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<text x="140" y="32.0" text-anchor="end" font-size="11" fill="#52514e">Read · 22</text>
+<rect x="297.2" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="438.5" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="448.3" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="452.5" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="483.2" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="487.8" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="554.0" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="601.5" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="616.0" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="630.1" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="708.5" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="728.2" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="730.4" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="796.8" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="807.7" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="811.7" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="837.3" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="853.5" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="880.6" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="907.7" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="915.1" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="920.1" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<text x="140" y="51.0" text-anchor="end" font-size="11" fill="#52514e">ToolSearch · 1</text>
+<rect x="406.1" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<text x="140" y="70.0" text-anchor="end" font-size="11" fill="#52514e">fetch_log · 2</text>
+<rect x="412.9" y="62.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="413.1" y="62.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<text x="140" y="89.0" text-anchor="end" font-size="11" fill="#52514e">Edit · 11</text>
+<rect x="711.5" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="715.3" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="718.1" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="720.7" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="817.7" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="820.5" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="826.0" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="829.0" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="839.7" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="918.0" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="922.8" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<line x1="150" y1="103.0" x2="986.0" y2="103.0" stroke="#e5e4dd" stroke-width="1"/>
+<text x="150" y="116.0" font-size="10" fill="#898781">0</text>
+<text x="986.0" y="116.0" text-anchor="end" font-size="10" fill="#898781">17m 56s</text>
+</svg>
+<p class="win">00:04 → 02:01 UTC · iteration wall-clock 1h 57m</p>
+</div>
+</details>
+<details id="it-4"><summary><span class="dn">Iteration 4</span><span class="badge d">discarded</span><span class="dsc">8.754 · 0.04% worse vs baseline · 1 file changed</span></summary>
+<div class="dbody">
+<p class="verdict"><b>verdict:</b> latency: tpot_ms=8.754</p>
+<div class="cols2">
+<div>
+<h4>Code changes</h4>
+<p class="agg">1 file · +0 −31</p>
+<ul class="files">
+<li>vllm/model_executor/layers/mla.py</li>
+</ul>
+</div>
+<div>
+<h4>Checks</h4>
+<table><tr><th>check</th><th>result</th><th>time</th><th>note</th></tr>
+<tr><td class="name">build</td><td class="res">passed</td><td class="num">21m 40s</td><td>candidate built</td></tr>
+<tr><td class="name">correctness</td><td class="res">passed</td><td class="num">31m 45s</td><td>correctness: score=0.935</td></tr>
+<tr><td class="name">latency</td><td class="res">passed</td><td class="num">22m 39s</td><td>latency: tpot_ms=8.754</td></tr>
+<tr><td class="name">ab-toggle</td><td class="res skip">skipped</td><td class="num">—</td><td>ab-toggle skipped: no VLLM_GLM_TOGGLE declared</td></tr>
+<tr><td class="name">mechanism</td><td class="res">passed</td><td class="num">24m 29s</td><td>mechanism: trace captured</td></tr>
+</table>
+</div>
+</div>
+<h4>Agent activity — 17 tool calls over 6m 08s</h4>
+<svg class="tl" viewBox="0 0 1000 140" role="img" aria-label="tool call timeline for iteration 4">
+<text x="140" y="13.0" text-anchor="end" font-size="11" fill="#52514e">Bash · 10</text>
+<rect x="308.8" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="309.5" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="327.3" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="327.5" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="334.7" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="341.8" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="348.8" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="414.2" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="895.1" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="900.3" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<text x="140" y="32.0" text-anchor="end" font-size="11" fill="#52514e">ToolSearch · 2</text>
+<rect x="394.6" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="617.6" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<text x="140" y="51.0" text-anchor="end" font-size="11" fill="#52514e">fetch_log · 1</text>
+<rect x="401.6" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<text x="140" y="70.0" text-anchor="end" font-size="11" fill="#52514e">profile_query · 1</text>
+<rect x="623.6" y="62.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<text x="140" y="89.0" text-anchor="end" font-size="11" fill="#52514e">Read · 2</text>
+<rect x="858.2" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="868.5" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<text x="140" y="108.0" text-anchor="end" font-size="11" fill="#52514e">Edit · 1</text>
+<rect x="889.0" y="100.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<line x1="150" y1="122.0" x2="986.0" y2="122.0" stroke="#e5e4dd" stroke-width="1"/>
+<text x="150" y="135.0" font-size="10" fill="#898781">0</text>
+<text x="986.0" y="135.0" text-anchor="end" font-size="10" fill="#898781">6m 08s</text>
+</svg>
+<p class="win">02:01 → 03:48 UTC · iteration wall-clock 1h 46m</p>
+</div>
+</details>
+<details id="it-5"><summary><span class="dn">Iteration 5</span><span class="badge d">discarded</span><span class="dsc">8.665 · 0.98% better vs baseline · 1 file changed</span></summary>
+<div class="dbody">
+<p class="verdict"><b>verdict:</b> latency: tpot_ms=8.665</p>
+<div class="cols2">
+<div>
+<h4>Code changes</h4>
+<p class="agg">1 file · +4 −4</p>
+<ul class="files">
+<li>csrc/libtorch_stable/dsv3_fused_a_gemm.cu</li>
+</ul>
+</div>
+<div>
+<h4>Checks</h4>
+<table><tr><th>check</th><th>result</th><th>time</th><th>note</th></tr>
+<tr><td class="name">build</td><td class="res">passed</td><td class="num">21m 12s</td><td>candidate built</td></tr>
+<tr><td class="name">correctness</td><td class="res">passed</td><td class="num">30m 54s</td><td>correctness: score=0.94</td></tr>
+<tr><td class="name">latency</td><td class="res">passed</td><td class="num">22m 57s</td><td>latency: tpot_ms=8.665</td></tr>
+<tr><td class="name">ab-toggle</td><td class="res skip">skipped</td><td class="num">—</td><td>ab-toggle skipped: no VLLM_GLM_TOGGLE declared</td></tr>
+<tr><td class="name">mechanism</td><td class="res">passed</td><td class="num">24m 28s</td><td>mechanism: trace captured</td></tr>
+</table>
+</div>
+</div>
+<h4>Agent activity — 17 tool calls over 7m 08s</h4>
+<svg class="tl" viewBox="0 0 1000 140" role="img" aria-label="tool call timeline for iteration 5">
+<text x="140" y="13.0" text-anchor="end" font-size="11" fill="#52514e">Bash · 6</text>
+<rect x="527.3" y="5.0" width="1.9" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="610.1" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="621.3" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="722.1" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="729.3" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="925.6" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<text x="140" y="32.0" text-anchor="end" font-size="11" fill="#52514e">Read · 6</text>
+<rect x="527.4" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="580.3" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="589.9" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="601.7" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="813.5" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="897.2" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<text x="140" y="51.0" text-anchor="end" font-size="11" fill="#52514e">ToolSearch · 1</text>
+<rect x="572.0" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<text x="140" y="70.0" text-anchor="end" font-size="11" fill="#52514e">profile_query · 1</text>
+<rect x="579.2" y="62.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<text x="140" y="89.0" text-anchor="end" font-size="11" fill="#52514e">fetch_log · 1</text>
+<rect x="592.2" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<text x="140" y="108.0" text-anchor="end" font-size="11" fill="#52514e">Edit · 2</text>
+<rect x="913.2" y="100.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="920.8" y="100.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<line x1="150" y1="122.0" x2="986.0" y2="122.0" stroke="#e5e4dd" stroke-width="1"/>
+<text x="150" y="135.0" font-size="10" fill="#898781">0</text>
+<text x="986.0" y="135.0" text-anchor="end" font-size="10" fill="#898781">7m 08s</text>
+</svg>
+<p class="win">03:48 → 05:35 UTC · iteration wall-clock 1h 46m</p>
+</div>
+</details>
+<details id="it-6"><summary><span class="dn">Iteration 6</span><span class="badge d">discarded</span><span class="dsc">8.753 · 0.03% worse vs baseline · 1 file changed</span></summary>
+<div class="dbody">
+<p class="verdict"><b>verdict:</b> latency: tpot_ms=8.753</p>
+<div class="cols2">
+<div>
+<h4>Code changes</h4>
+<p class="agg">1 file · +4 −4</p>
+<ul class="files">
+<li>csrc/libtorch_stable/dsv3_fused_a_gemm.cu</li>
+</ul>
+</div>
+<div>
+<h4>Checks</h4>
+<table><tr><th>check</th><th>result</th><th>time</th><th>note</th></tr>
+<tr><td class="name">build</td><td class="res">passed</td><td class="num">21m 31s</td><td>candidate built</td></tr>
+<tr><td class="name">correctness</td><td class="res">passed</td><td class="num">30m 04s</td><td>correctness: score=0.95</td></tr>
+<tr><td class="name">latency</td><td class="res">passed</td><td class="num">22m 13s</td><td>latency: tpot_ms=8.753</td></tr>
+<tr><td class="name">ab-toggle</td><td class="res skip">skipped</td><td class="num">—</td><td>ab-toggle skipped: no VLLM_GLM_TOGGLE declared</td></tr>
+<tr><td class="name">mechanism</td><td class="res">passed</td><td class="num">24m 09s</td><td>mechanism: trace captured</td></tr>
+</table>
+</div>
+</div>
+<h4>Agent activity — 7 tool calls over 2m 24s</h4>
+<svg class="tl" viewBox="0 0 1000 83" role="img" aria-label="tool call timeline for iteration 6">
+<text x="140" y="13.0" text-anchor="end" font-size="11" fill="#52514e">Bash · 2</text>
+<rect x="480.6" y="5.0" width="5.5" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="695.4" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<text x="140" y="32.0" text-anchor="end" font-size="11" fill="#52514e">Read · 3</text>
+<rect x="483.0" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="602.1" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="618.4" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<text x="140" y="51.0" text-anchor="end" font-size="11" fill="#52514e">Edit · 2</text>
+<rect x="659.2" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<rect x="679.9" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
+<line x1="150" y1="65.0" x2="986.0" y2="65.0" stroke="#e5e4dd" stroke-width="1"/>
+<text x="150" y="78.0" font-size="10" fill="#898781">0</text>
+<text x="986.0" y="78.0" text-anchor="end" font-size="10" fill="#898781">2m 24s</text>
+</svg>
+<p class="win">05:35 → 07:16 UTC · iteration wall-clock 1h 40m</p>
+</div>
+</details>
+</section>
+<footer>
+<div>Draft PR with the kept commits: <a href="https://github.com/wseaton/vllm/pull/8">wseaton/vllm#8</a> <span class="mut">branch autoresearch/goal-generalize-vllm-s-fused-a-gemm-for/1888313fa9e1</span></div>
+<div>Post-run check: full-eval: ok — passed</div>
+<div class="mut">run record 20260811T192719Z-goal-generalize-vllm-s-fused-a-gemm-for</div>
+<div class="mut">generated by crucible flow</div>
+</footer>
+</main>
+<script>
+for (const g of document.querySelectorAll('[data-iter]')) {
+  const toggle = () => {
+    const d = document.getElementById('it-' + g.dataset.iter);
+    if (!d) return;
+    const was = d.open;
+    for (const x of document.querySelectorAll('.details details')) x.open = false;
+    d.open = !was;
+    for (const c of document.querySelectorAll('[data-iter]'))
+      c.setAttribute('aria-expanded', 'false');
+    g.setAttribute('aria-expanded', String(d.open));
+    if (d.open) d.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  };
+  g.addEventListener('click', toggle);
+  g.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
+  });
+}
+addEventListener('beforeprint', () => {
+  for (const d of document.querySelectorAll('details')) d.open = true;
+});
+</script>
+</body>
+</html>
