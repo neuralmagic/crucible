@@ -26,14 +26,15 @@ pub(crate) struct FlowArgs {
     /// `{"data": [...]}`). Optional: adds real timings and the per-tool-call timeline.
     #[arg(long)]
     pub spans: Option<PathBuf>,
-    /// Output path; the extension picks the format: `.json` (the IR), `.dot`, `.mmd`.
+    /// Output path; the extension picks the format: `.json` (the IR), `.dot`, `.mmd`,
+    /// `.html` (self-contained explainer page).
     #[arg(long)]
     pub out: PathBuf,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum FlowError {
-    #[error("--out needs a .json/.dot/.mmd extension, got `{ext}`")]
+    #[error("--out needs a .json/.dot/.mmd/.html extension, got `{ext}`")]
     UnknownFormat { ext: String },
     #[error("parsing span export")]
     SpanJson(#[source] serde_json::Error),
@@ -197,6 +198,7 @@ pub(crate) fn run(args: &FlowArgs) -> Result<()> {
         }
         "dot" => emit_dot(&model),
         "mmd" => emit_mermaid(&model),
+        "html" => crate::flow_html::emit_html(&model),
         other => return Err(FlowError::UnknownFormat { ext: other.into() }.into()),
     };
     std::fs::write(&args.out, rendered)
@@ -661,7 +663,7 @@ const REJECTED_FILL: &str = "#f8cecc";
 const PR_FILL: &str = "#fff2cc";
 const BASELINE_FILL: &str = "#dae8fc";
 
-fn score3(v: f64) -> String {
+pub(crate) fn score3(v: f64) -> String {
     format!("{v:.3}")
 }
 
@@ -691,7 +693,7 @@ fn fill(decision: &str) -> &'static str {
 }
 
 /// `owner/repo#N` from a GitHub PR URL, or the URL verbatim.
-fn pr_short(url: &str) -> String {
+pub(crate) fn pr_short(url: &str) -> String {
     url.strip_prefix("https://github.com/")
         .map(|r| r.replacen("/pull/", "#", 1))
         .unwrap_or_else(|| url.to_string())
@@ -1119,11 +1121,11 @@ mod tests {
     }
 
     #[test]
-    fn run_writes_all_three_formats_and_json_round_trips() {
+    fn run_writes_all_four_formats_and_json_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let session =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/flow/run7-session.jsonl");
-        for ext in ["json", "dot", "mmd"] {
+        for ext in ["json", "dot", "mmd", "html"] {
             let out = dir.path().join(format!("flow.{ext}"));
             run(&FlowArgs {
                 session: session.clone(),
@@ -1139,9 +1141,9 @@ mod tests {
         let err = run(&FlowArgs {
             session: session.clone(),
             spans: None,
-            out: dir.path().join("flow.html"),
+            out: dir.path().join("flow.txt"),
         })
         .unwrap_err();
-        assert!(err.to_string().contains(".json/.dot/.mmd"), "{err}");
+        assert!(err.to_string().contains(".json/.dot/.mmd/.html"), "{err}");
     }
 }
