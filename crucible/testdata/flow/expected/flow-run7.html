@@ -5,81 +5,98 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>crucible run — Goal: generalize vLLM&#39;s fused_a_gemm for the GLM-5.2 QKV-A + Q-B projections</title>
 <style>
+:root {
+  --flow-bg: #f7f7f5;
+  --flow-surface: #fcfcfb;
+  --flow-ink: #1a1917;
+  --flow-ink-2: #52514e;
+  --flow-muted: #898781;
+  --flow-hairline: #e5e4dd;
+  --flow-accent: #2a78d6;
+  --flow-accent-deep: #1c5cab;
+  --flow-pass-fill: #dddcd4;
+  --flow-fail-fill: #3a3937;
+  --flow-dot: #9a9891;
+  --flow-line: #c3c2b7;
+  --flow-line-soft: #d0cfc8;
+  --flow-badge-border: #b8b6ae;
+  --flow-on-accent: #ffffff;
+}
 * { box-sizing: border-box; margin: 0; padding: 0; }
-html { color-scheme: only light; }
-body { background: #f7f7f5; color: #1a1917; font: 14px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; }
+html { color-scheme: light; }
+body { background: var(--flow-bg); color: var(--flow-ink); font: 14px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; }
 .page { max-width: 1180px; margin: 0 auto; padding: 44px 28px 56px; }
-.eyebrow { font-size: 11.5px; font-weight: 650; letter-spacing: 0.09em; text-transform: uppercase; color: #898781; margin-bottom: 8px; }
+.eyebrow { font-size: 11.5px; font-weight: 650; letter-spacing: 0.09em; text-transform: uppercase; color: var(--flow-muted); margin-bottom: 8px; }
 h1 { font-size: 23px; font-weight: 650; letter-spacing: -0.01em; line-height: 1.3; max-width: 60ch; }
 h1 code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.88em; background: rgba(26,25,23,0.05); padding: 0 4px; border-radius: 4px; }
 h2 { font-size: 15px; font-weight: 650; margin-bottom: 4px; }
-.hint { color: #898781; font-size: 12.5px; margin-bottom: 14px; }
+.hint { color: var(--flow-muted); font-size: 12.5px; margin-bottom: 14px; }
 .stats { display: flex; flex-wrap: wrap; gap: 18px 0; margin: 26px 0 8px; }
-.tile { flex: 1 1 150px; padding: 2px 22px; border-left: 1px solid #e5e4dd; min-width: 130px; }
+.tile { flex: 1 1 150px; padding: 2px 22px; border-left: 1px solid var(--flow-hairline); min-width: 130px; }
 .tile:first-child { border-left: none; padding-left: 0; }
 .tile.wide { flex: 1.7 1 230px; }
-.lbl { font-size: 11px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: #898781; margin-bottom: 3px; white-space: nowrap; }
+.lbl { font-size: 11px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--flow-muted); margin-bottom: 3px; white-space: nowrap; }
 .val { font-size: 21px; font-weight: 650; letter-spacing: -0.01em; white-space: nowrap; }
 .val.sm { font-size: 15px; padding-top: 5px; }
-.val .arr { color: #898781; font-weight: 400; padding: 0 2px; }
-.sub { font-size: 12px; color: #52514e; margin-top: 2px; }
-.sub.good { color: #1c5cab; font-weight: 650; }
+.val .arr { color: var(--flow-muted); font-weight: 400; padding: 0 2px; }
+.sub { font-size: 12px; color: var(--flow-ink-2); margin-top: 2px; }
+.sub.good { color: var(--flow-accent-deep); font-weight: 650; }
 .spark { vertical-align: -3px; margin-right: 6px; }
 section { margin-top: 36px; }
-details.pre { margin-top: 22px; border-top: 1px solid #e5e4dd; border-bottom: 1px solid #e5e4dd; }
+details.pre { margin-top: 22px; border-top: 1px solid var(--flow-hairline); border-bottom: 1px solid var(--flow-hairline); }
 details.pre summary { padding: 9px 2px; }
 details.pre table { margin: 4px 0 14px; }
-summary { cursor: pointer; list-style: none; font-size: 13px; color: #52514e; }
+summary { cursor: pointer; list-style: none; font-size: 13px; color: var(--flow-ink-2); }
 summary::-webkit-details-marker { display: none; }
-summary::before { content: "▸"; display: inline-block; width: 16px; color: #898781; transition: transform 0.12s; }
+summary::before { content: "▸"; display: inline-block; width: 16px; color: var(--flow-muted); transition: transform 0.12s; }
 details[open] > summary::before { transform: rotate(90deg); }
-.hero-card { background: #fcfcfb; border: 1px solid #e5e4dd; border-radius: 10px; padding: 18px 14px 10px; overflow-x: auto; }
+.hero-card { background: var(--flow-surface); border: 1px solid var(--flow-hairline); border-radius: 10px; padding: 18px 14px 10px; overflow-x: auto; }
 .hero-card svg { display: block; min-width: 900px; width: 100%; height: auto; }
-.legend { font-size: 11.5px; color: #52514e; margin: 10px 4px 0; }
+.legend { font-size: 11.5px; color: var(--flow-ink-2); margin: 10px 4px 0; }
 .legend > span { margin-right: 18px; white-space: nowrap; }
 .sw { display: inline-block; width: 14px; height: 9px; border-radius: 2px; vertical-align: -1px; margin-right: 5px; }
 .sw.turn { background: rgba(42,120,214,0.24); }
-.sw.pass { background: #dddcd4; }
-.sw.fail { background: #3a3937; }
-.dotm { display: inline-block; width: 7px; height: 7px; border-radius: 50%; border: 1.5px solid #9a9891; background: #fcfcfb; vertical-align: -1px; margin-right: 5px; }
-.details details { border-top: 1px solid #e5e4dd; }
-.details details:last-child { border-bottom: 1px solid #e5e4dd; }
+.sw.pass { background: var(--flow-pass-fill); }
+.sw.fail { background: var(--flow-fail-fill); }
+.dotm { display: inline-block; width: 7px; height: 7px; border-radius: 50%; border: 1.5px solid var(--flow-dot); background: var(--flow-surface); vertical-align: -1px; margin-right: 5px; }
+.details details { border-top: 1px solid var(--flow-hairline); }
+.details details:last-child { border-bottom: 1px solid var(--flow-hairline); }
 .details summary { padding: 11px 2px; display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
 .details summary:hover { background: rgba(26,25,23,0.025); }
-.dn { font-weight: 650; color: #1a1917; font-size: 13.5px; }
-.dsc { color: #52514e; }
+.dn { font-weight: 650; color: var(--flow-ink); font-size: 13.5px; }
+.dsc { color: var(--flow-ink-2); }
 .badge { font-size: 10px; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase; border-radius: 9px; padding: 2px 9px; white-space: nowrap; }
-.badge.k { background: #2a78d6; color: #fff; }
-.badge.d { border: 1px solid #b8b6ae; color: #52514e; }
-.badge.r { background: #e5e4dd; color: #3a3937; }
+.badge.k { background: var(--flow-accent); color: var(--flow-on-accent); }
+.badge.d { border: 1px solid var(--flow-badge-border); color: var(--flow-ink-2); }
+.badge.r { background: var(--flow-hairline); color: var(--flow-fail-fill); }
 .dbody { padding: 6px 2px 22px 18px; }
-.verdict { font-size: 13px; color: #52514e; margin-bottom: 14px; max-width: 90ch; }
-.verdict b { color: #1a1917; font-weight: 650; }
+.verdict { font-size: 13px; color: var(--flow-ink-2); margin-bottom: 14px; max-width: 90ch; }
+.verdict b { color: var(--flow-ink); font-weight: 650; }
 .cols2 { display: flex; flex-wrap: wrap; gap: 20px 44px; }
 .cols2 > div { flex: 1 1 320px; min-width: 280px; }
-h4 { font-size: 11px; font-weight: 650; letter-spacing: 0.06em; text-transform: uppercase; color: #898781; margin: 12px 0 6px; }
+h4 { font-size: 11px; font-weight: 650; letter-spacing: 0.06em; text-transform: uppercase; color: var(--flow-muted); margin: 12px 0 6px; }
 .agg { font-size: 13px; margin-bottom: 5px; }
 .files { list-style: none; }
-.files li { font: 12px/1.7 ui-monospace, SFMono-Regular, Menlo, monospace; color: #52514e; }
+.files li { font: 12px/1.7 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--flow-ink-2); }
 table { border-collapse: collapse; font-size: 12.5px; width: 100%; }
-th { text-align: left; font-size: 10.5px; font-weight: 650; letter-spacing: 0.05em; text-transform: uppercase; color: #898781; padding: 3px 14px 3px 0; border-bottom: 1px solid #e5e4dd; }
-td { padding: 4px 14px 4px 0; border-bottom: 1px solid #e5e4dd; vertical-align: top; color: #52514e; }
-td.name { color: #1a1917; font-weight: 600; white-space: nowrap; }
+th { text-align: left; font-size: 10.5px; font-weight: 650; letter-spacing: 0.05em; text-transform: uppercase; color: var(--flow-muted); padding: 3px 14px 3px 0; border-bottom: 1px solid var(--flow-hairline); }
+td { padding: 4px 14px 4px 0; border-bottom: 1px solid var(--flow-hairline); vertical-align: top; color: var(--flow-ink-2); }
+td.name { color: var(--flow-ink); font-weight: 600; white-space: nowrap; }
 td.res { white-space: nowrap; }
-td.res.fail { color: #1a1917; font-weight: 650; }
-td.res.skip { color: #898781; font-style: italic; }
+td.res.fail { color: var(--flow-ink); font-weight: 650; }
+td.res.skip { color: var(--flow-muted); font-style: italic; }
 td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
 td.cmd { font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .tl { margin-top: 4px; }
-.win { font-size: 12px; color: #898781; margin-top: 10px; }
-footer { margin-top: 42px; padding-top: 16px; border-top: 1px solid #e5e4dd; font-size: 13px; color: #52514e; }
+.win { font-size: 12px; color: var(--flow-muted); margin-top: 10px; }
+footer { margin-top: 42px; padding-top: 16px; border-top: 1px solid var(--flow-hairline); font-size: 13px; color: var(--flow-ink-2); }
 footer div { margin-bottom: 4px; }
-footer a { color: #1c5cab; }
-.mut { color: #898781; font-size: 12px; }
+footer a { color: var(--flow-accent-deep); }
+.mut { color: var(--flow-muted); font-size: 12px; }
 .col { cursor: pointer; }
 .col .hit { fill: transparent; }
 .col:hover .hit { fill: rgba(26,25,23,0.035); }
-.col:focus-visible { outline: 2px solid #2a78d6; outline-offset: 2px; }
+.col:focus-visible { outline: 2px solid var(--flow-accent); outline-offset: 2px; }
 @media print {
   body { background: #fff; }
   .hint { display: none; }
@@ -96,7 +113,7 @@ footer a { color: #1c5cab; }
 <div class="tile wide"><div class="lbl">latency — lower is better</div><div class="val">8.751 <span class="arr">→</span> 8.656</div><div class="sub good">1.08% better · kept at iteration 3</div></div>
 <div class="tile"><div class="lbl">iterations</div><div class="val">6</div><div class="sub">1 kept · 4 discarded · 1 rejected</div></div>
 <div class="tile"><div class="lbl">model</div><div class="val sm">claude-opus-4-6</div></div>
-<div class="tile"><div class="lbl">cost</div><div class="val">$33.32</div><div class="sub"><svg class="spark" width="86" height="22" viewBox="0 0 86 22" role="img" aria-label="cumulative spend"><polyline points="0.0,22.0 14.5,21.9 14.5,21.9 14.6,21.8 14.6,21.7 15.4,19.5 16.2,18.0 17.5,16.8 26.1,16.6 27.0,15.0 27.1,15.0 27.2,14.8 27.3,14.2 27.3,14.1 27.3,13.9 27.4,13.7 27.7,13.3 27.8,12.7 28.0,12.2 28.1,11.6 28.2,11.1 28.3,10.7 28.4,10.0 28.5,9.6 28.6,9.5 32.8,8.8 32.8,8.6 33.1,8.6 33.2,8.3 33.2,8.2 33.3,8.0 33.4,7.9 33.5,7.7 33.6,7.6 33.7,7.4 33.9,7.4 34.0,6.9 34.1,6.8 34.2,6.4 34.4,6.0 34.5,5.5 34.6,5.4 46.5,4.8 46.5,4.8 46.7,4.4 46.9,4.3 47.0,3.8 59.2,3.1 59.3,3.0 59.3,2.9 59.4,2.8 59.6,2.7 59.7,2.5 71.5,2.2 71.6,2.2 71.7,2.0 86.0,2.0" fill="none" stroke="#2a78d6" stroke-width="1.5"/><circle cx="86.0" cy="2" r="2.5" fill="#2a78d6"/></svg>spend over the run</div></div>
+<div class="tile"><div class="lbl">cost</div><div class="val">$33.32</div><div class="sub"><svg class="spark" width="86" height="22" viewBox="0 0 86 22" role="img" aria-label="cumulative spend"><polyline points="0.0,22.0 14.5,21.9 14.5,21.9 14.6,21.8 14.6,21.7 15.4,19.5 16.2,18.0 17.5,16.8 26.1,16.6 27.0,15.0 27.1,15.0 27.2,14.8 27.3,14.2 27.3,14.1 27.3,13.9 27.4,13.7 27.7,13.3 27.8,12.7 28.0,12.2 28.1,11.6 28.2,11.1 28.3,10.7 28.4,10.0 28.5,9.6 28.6,9.5 32.8,8.8 32.8,8.6 33.1,8.6 33.2,8.3 33.2,8.2 33.3,8.0 33.4,7.9 33.5,7.7 33.6,7.6 33.7,7.4 33.9,7.4 34.0,6.9 34.1,6.8 34.2,6.4 34.4,6.0 34.5,5.5 34.6,5.4 46.5,4.8 46.5,4.8 46.7,4.4 46.9,4.3 47.0,3.8 59.2,3.1 59.3,3.0 59.3,2.9 59.4,2.8 59.6,2.7 59.7,2.5 71.5,2.2 71.6,2.2 71.7,2.0 86.0,2.0" fill="none" stroke="var(--flow-accent)" stroke-width="1.5"/><circle cx="86.0" cy="2" r="2.5" fill="var(--flow-accent)"/></svg>spend over the run</div></div>
 <div class="tile"><div class="lbl">wall-clock</div><div class="val">12h 12m</div></div>
 <div class="tile"><div class="lbl">outcome</div><div class="val sm">finished</div><div class="sub">draft PR opened</div></div>
 </div>
@@ -115,124 +132,124 @@ footer a { color: #1c5cab; }
 <div class="hero-card">
 <svg viewBox="0 0 1140 444" role="img" aria-label="swimlane of 6 iterations: agent turns, checks, and scores over time">
 <rect x="416.8" y="6.0" width="192.6" height="400.0" rx="8" fill="rgba(42,120,214,0.07)" stroke="rgba(42,120,214,0.30)"/>
-<text x="142" y="96" text-anchor="end" font-size="11" font-weight="650" fill="#1a1917">latency</text>
-<text x="142" y="110" text-anchor="end" font-size="10" fill="#898781">lower is better</text>
-<text x="142" y="226" text-anchor="end" font-size="11" font-weight="650" fill="#1a1917">agent writes code</text>
-<text x="142" y="262" text-anchor="end" font-size="9.5" font-weight="650" letter-spacing="0.7" fill="#898781">FROZEN CHECKS</text>
-<text x="142" y="283.5" text-anchor="end" font-size="10.5" fill="#52514e">build</text>
-<text x="142" y="310.5" text-anchor="end" font-size="10.5" fill="#52514e">correctness</text>
-<text x="142" y="337.5" text-anchor="end" font-size="10.5" fill="#52514e">latency</text>
-<text x="142" y="364.5" text-anchor="end" font-size="10.5" fill="#52514e">ab-toggle</text>
-<text x="142" y="391.5" text-anchor="end" font-size="10.5" fill="#52514e">mechanism</text>
-<line x1="158" y1="132.0" x2="1128.0" y2="132.0" stroke="#c3c2b7" stroke-width="1"/>
-<text x="160.0" y="127.0" font-size="10" fill="#898781">baseline 8.751</text>
-<line x1="513.2" y1="161.2" x2="699.1" y2="130.8" stroke="#d0cfc8" stroke-width="1.5"/>
-<line x1="699.1" y1="130.8" x2="876.3" y2="158.6" stroke="#d0cfc8" stroke-width="1.5"/>
-<line x1="876.3" y1="158.6" x2="1048.4" y2="131.1" stroke="#d0cfc8" stroke-width="1.5"/>
-<circle cx="236.9" cy="98.8" r="4.5" fill="#9a9891" stroke="#fcfcfb" stroke-width="2"/>
-<text x="367.9" y="162.0" text-anchor="middle" font-size="11" fill="#9a9891">✕</text>
-<text x="367.9" y="174.0" text-anchor="middle" font-size="9" fill="#898781">not measured</text>
-<circle cx="513.2" cy="161.2" r="5.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
-<text x="513.2" y="150.2" text-anchor="middle" font-size="11" font-weight="650" fill="#1a1917">8.656 · 1.08% better</text>
-<circle cx="699.1" cy="130.8" r="4.5" fill="#9a9891" stroke="#fcfcfb" stroke-width="2"/>
-<circle cx="876.3" cy="158.6" r="4.5" fill="#9a9891" stroke="#fcfcfb" stroke-width="2"/>
-<circle cx="1048.4" cy="131.1" r="4.5" fill="#9a9891" stroke="#fcfcfb" stroke-width="2"/>
+<text x="142" y="96" text-anchor="end" font-size="11" font-weight="650" fill="var(--flow-ink)">latency</text>
+<text x="142" y="110" text-anchor="end" font-size="10" fill="var(--flow-muted)">lower is better</text>
+<text x="142" y="226" text-anchor="end" font-size="11" font-weight="650" fill="var(--flow-ink)">agent writes code</text>
+<text x="142" y="262" text-anchor="end" font-size="9.5" font-weight="650" letter-spacing="0.7" fill="var(--flow-muted)">FROZEN CHECKS</text>
+<text x="142" y="283.5" text-anchor="end" font-size="10.5" fill="var(--flow-ink-2)">build</text>
+<text x="142" y="310.5" text-anchor="end" font-size="10.5" fill="var(--flow-ink-2)">correctness</text>
+<text x="142" y="337.5" text-anchor="end" font-size="10.5" fill="var(--flow-ink-2)">latency</text>
+<text x="142" y="364.5" text-anchor="end" font-size="10.5" fill="var(--flow-ink-2)">ab-toggle</text>
+<text x="142" y="391.5" text-anchor="end" font-size="10.5" fill="var(--flow-ink-2)">mechanism</text>
+<line x1="158" y1="132.0" x2="1128.0" y2="132.0" stroke="var(--flow-line)" stroke-width="1"/>
+<text x="160.0" y="127.0" font-size="10" fill="var(--flow-muted)">baseline 8.751</text>
+<line x1="513.2" y1="161.2" x2="699.1" y2="130.8" stroke="var(--flow-line-soft)" stroke-width="1.5"/>
+<line x1="699.1" y1="130.8" x2="876.3" y2="158.6" stroke="var(--flow-line-soft)" stroke-width="1.5"/>
+<line x1="876.3" y1="158.6" x2="1048.4" y2="131.1" stroke="var(--flow-line-soft)" stroke-width="1.5"/>
+<circle cx="236.9" cy="98.8" r="4.5" fill="var(--flow-dot)" stroke="var(--flow-surface)" stroke-width="2"/>
+<text x="367.9" y="162.0" text-anchor="middle" font-size="11" fill="var(--flow-dot)">✕</text>
+<text x="367.9" y="174.0" text-anchor="middle" font-size="9" fill="var(--flow-muted)">not measured</text>
+<circle cx="513.2" cy="161.2" r="5.5" fill="var(--flow-accent)" stroke="var(--flow-surface)" stroke-width="2"/>
+<text x="513.2" y="150.2" text-anchor="middle" font-size="11" font-weight="650" fill="var(--flow-ink)">8.656 · 1.08% better</text>
+<circle cx="699.1" cy="130.8" r="4.5" fill="var(--flow-dot)" stroke="var(--flow-surface)" stroke-width="2"/>
+<circle cx="876.3" cy="158.6" r="4.5" fill="var(--flow-dot)" stroke="var(--flow-surface)" stroke-width="2"/>
+<circle cx="1048.4" cy="131.1" r="4.5" fill="var(--flow-dot)" stroke="var(--flow-surface)" stroke-width="2"/>
 <g class="col" data-iter="1" role="button" tabindex="0" aria-expanded="false" aria-label="iteration 1 — discarded: open detail">
-<text x="236.9" y="20" text-anchor="middle" font-size="10" fill="#898781">iter 1 · 1h 39m</text>
-<text x="236.9" y="38" text-anchor="middle" font-size="13" font-weight="650" fill="#1a1917">8.858<tspan font-size="10" font-weight="400" fill="#898781"> +1.23%</tspan></text>
-<rect x="205.7" y="46.0" width="62.6" height="15" rx="7.5" fill="none" stroke="#b8b6ae"/>
-<text x="236.9" y="57.0" text-anchor="middle" font-size="9" font-weight="700" letter-spacing="0.5" fill="#52514e">DISCARDED</text>
+<text x="236.9" y="20" text-anchor="middle" font-size="10" fill="var(--flow-muted)">iter 1 · 1h 39m</text>
+<text x="236.9" y="38" text-anchor="middle" font-size="13" font-weight="650" fill="var(--flow-ink)">8.858<tspan font-size="10" font-weight="400" fill="var(--flow-muted)"> +1.23%</tspan></text>
+<rect x="205.7" y="46.0" width="62.6" height="15" rx="7.5" fill="none" stroke="var(--flow-badge-border)"/>
+<text x="236.9" y="57.0" text-anchor="middle" font-size="9" font-weight="700" letter-spacing="0.5" fill="var(--flow-ink-2)">DISCARDED</text>
 <rect x="158.0" y="210.0" width="43.9" height="24" rx="3" fill="rgba(42,120,214,0.24)"/>
-<text x="206.9" y="225.5" font-size="9.5" fill="#898781">198 calls</text>
-<rect x="201.9" y="270.0" width="3.0" height="20" rx="3" fill="#dddcd4"/>
-<rect x="203.7" y="297.0" width="37.7" height="20" rx="3" fill="#dddcd4"/>
-<rect x="241.4" y="324.0" width="36.0" height="20" rx="3" fill="#dddcd4"/>
-<circle cx="283.4" cy="361.0" r="3.5" fill="#fcfcfb" stroke="#9a9891" stroke-width="1.5"/>
-<rect x="277.4" y="378.0" width="37.5" height="20" rx="3" fill="#dddcd4"/>
+<text x="206.9" y="225.5" font-size="9.5" fill="var(--flow-muted)">198 calls</text>
+<rect x="201.9" y="270.0" width="3.0" height="20" rx="3" fill="var(--flow-pass-fill)"/>
+<rect x="203.7" y="297.0" width="37.7" height="20" rx="3" fill="var(--flow-pass-fill)"/>
+<rect x="241.4" y="324.0" width="36.0" height="20" rx="3" fill="var(--flow-pass-fill)"/>
+<circle cx="283.4" cy="361.0" r="3.5" fill="var(--flow-surface)" stroke="var(--flow-dot)" stroke-width="1.5"/>
+<rect x="277.4" y="378.0" width="37.5" height="20" rx="3" fill="var(--flow-pass-fill)"/>
 <rect class="hit" x="156.0" y="6.0" width="161.9" height="400.0" rx="6"/>
 </g>
 <g class="col" data-iter="2" role="button" tabindex="0" aria-expanded="false" aria-label="iteration 2 — rejected: open detail">
-<text x="367.9" y="20" text-anchor="middle" font-size="10" fill="#898781">iter 2 · 55m 34s</text>
-<text x="367.9" y="38" text-anchor="middle" font-size="10.5" font-style="italic" fill="#898781">not scored</text>
-<rect x="334.1" y="46.0" width="67.5" height="15" rx="7.5" fill="#e5e4dd" stroke="none"/>
-<text x="367.9" y="57.0" text-anchor="middle" font-size="9" font-weight="700" letter-spacing="0.5" fill="#3a3937">✕ REJECTED</text>
+<text x="367.9" y="20" text-anchor="middle" font-size="10" fill="var(--flow-muted)">iter 2 · 55m 34s</text>
+<text x="367.9" y="38" text-anchor="middle" font-size="10.5" font-style="italic" fill="var(--flow-muted)">not scored</text>
+<rect x="334.1" y="46.0" width="67.5" height="15" rx="7.5" fill="var(--flow-hairline)" stroke="none"/>
+<text x="367.9" y="57.0" text-anchor="middle" font-size="9" font-weight="700" letter-spacing="0.5" fill="var(--flow-fail-fill)">✕ REJECTED</text>
 <rect x="323.9" y="210.0" width="35.7" height="24" rx="3" fill="rgba(42,120,214,0.24)"/>
-<rect x="359.6" y="297.0" width="16.0" height="20" rx="3" fill="#3a3937"/>
-<text x="367.6" y="310.5" text-anchor="middle" font-size="11" font-weight="700" fill="#fcfcfb">✕</text>
+<rect x="359.6" y="297.0" width="16.0" height="20" rx="3" fill="var(--flow-fail-fill)"/>
+<text x="367.6" y="310.5" text-anchor="middle" font-size="11" font-weight="700" fill="var(--flow-surface)">✕</text>
 <rect class="hit" x="321.9" y="6.0" width="92.0" height="400.0" rx="6"/>
 </g>
 <g class="col" data-iter="3" role="button" tabindex="0" aria-expanded="false" aria-label="iteration 3 — kept: open detail">
-<text x="513.2" y="20" text-anchor="middle" font-size="10" fill="#898781">iter 3 · 1h 57m</text>
-<text x="513.2" y="38" text-anchor="middle" font-size="13" font-weight="650" fill="#1a1917">8.656<tspan font-size="10" font-weight="400" fill="#898781"> -1.08%</tspan></text>
-<rect x="489.3" y="46.0" width="47.7" height="15" rx="7.5" fill="#2a78d6" stroke="none"/>
-<text x="513.2" y="57.0" text-anchor="middle" font-size="9" font-weight="700" letter-spacing="0.5" fill="#ffffff">✓ KEPT</text>
+<text x="513.2" y="20" text-anchor="middle" font-size="10" fill="var(--flow-muted)">iter 3 · 1h 57m</text>
+<text x="513.2" y="38" text-anchor="middle" font-size="13" font-weight="650" fill="var(--flow-ink)">8.656<tspan font-size="10" font-weight="400" fill="var(--flow-muted)"> -1.08%</tspan></text>
+<rect x="489.3" y="46.0" width="47.7" height="15" rx="7.5" fill="var(--flow-accent)" stroke="none"/>
+<text x="513.2" y="57.0" text-anchor="middle" font-size="9" font-weight="700" letter-spacing="0.5" fill="var(--flow-on-accent)">✓ KEPT</text>
 <rect x="419.8" y="210.0" width="28.4" height="24" rx="3" fill="rgba(42,120,214,0.24)"/>
-<text x="453.2" y="225.5" font-size="9.5" fill="#898781">79 calls</text>
-<rect x="448.2" y="270.0" width="35.6" height="20" rx="3" fill="#dddcd4"/>
-<rect x="483.8" y="297.0" width="47.9" height="20" rx="3" fill="#dddcd4"/>
-<rect x="531.7" y="324.0" width="35.7" height="20" rx="3" fill="#dddcd4"/>
-<circle cx="573.4" cy="361.0" r="3.5" fill="#fcfcfb" stroke="#9a9891" stroke-width="1.5"/>
-<rect x="567.4" y="378.0" width="38.1" height="20" rx="3" fill="#dddcd4"/>
+<text x="453.2" y="225.5" font-size="9.5" fill="var(--flow-muted)">79 calls</text>
+<rect x="448.2" y="270.0" width="35.6" height="20" rx="3" fill="var(--flow-pass-fill)"/>
+<rect x="483.8" y="297.0" width="47.9" height="20" rx="3" fill="var(--flow-pass-fill)"/>
+<rect x="531.7" y="324.0" width="35.7" height="20" rx="3" fill="var(--flow-pass-fill)"/>
+<circle cx="573.4" cy="361.0" r="3.5" fill="var(--flow-surface)" stroke="var(--flow-dot)" stroke-width="1.5"/>
+<rect x="567.4" y="378.0" width="38.1" height="20" rx="3" fill="var(--flow-pass-fill)"/>
 <rect class="hit" x="417.8" y="6.0" width="190.6" height="400.0" rx="6"/>
 </g>
 <g class="col" data-iter="4" role="button" tabindex="0" aria-expanded="false" aria-label="iteration 4 — discarded: open detail">
-<text x="699.1" y="20" text-anchor="middle" font-size="10" fill="#898781">iter 4 · 1h 46m</text>
-<text x="699.1" y="38" text-anchor="middle" font-size="13" font-weight="650" fill="#1a1917">8.754<tspan font-size="10" font-weight="400" fill="#898781"> +0.04%</tspan></text>
-<rect x="667.8" y="46.0" width="62.6" height="15" rx="7.5" fill="none" stroke="#b8b6ae"/>
-<text x="699.1" y="57.0" text-anchor="middle" font-size="9" font-weight="700" letter-spacing="0.5" fill="#52514e">DISCARDED</text>
+<text x="699.1" y="20" text-anchor="middle" font-size="10" fill="var(--flow-muted)">iter 4 · 1h 46m</text>
+<text x="699.1" y="38" text-anchor="middle" font-size="13" font-weight="650" fill="var(--flow-ink)">8.754<tspan font-size="10" font-weight="400" fill="var(--flow-muted)"> +0.04%</tspan></text>
+<rect x="667.8" y="46.0" width="62.6" height="15" rx="7.5" fill="none" stroke="var(--flow-badge-border)"/>
+<text x="699.1" y="57.0" text-anchor="middle" font-size="9" font-weight="700" letter-spacing="0.5" fill="var(--flow-ink-2)">DISCARDED</text>
 <rect x="614.5" y="210.0" width="9.7" height="24" rx="3" fill="rgba(42,120,214,0.24)"/>
-<text x="629.2" y="225.5" font-size="9.5" fill="#898781">17 calls</text>
-<rect x="624.2" y="270.0" width="34.3" height="20" rx="3" fill="#dddcd4"/>
-<rect x="658.5" y="297.0" width="50.3" height="20" rx="3" fill="#dddcd4"/>
-<rect x="708.7" y="324.0" width="35.9" height="20" rx="3" fill="#dddcd4"/>
-<circle cx="750.6" cy="361.0" r="3.5" fill="#fcfcfb" stroke="#9a9891" stroke-width="1.5"/>
-<rect x="744.6" y="378.0" width="38.1" height="20" rx="3" fill="#dddcd4"/>
+<text x="629.2" y="225.5" font-size="9.5" fill="var(--flow-muted)">17 calls</text>
+<rect x="624.2" y="270.0" width="34.3" height="20" rx="3" fill="var(--flow-pass-fill)"/>
+<rect x="658.5" y="297.0" width="50.3" height="20" rx="3" fill="var(--flow-pass-fill)"/>
+<rect x="708.7" y="324.0" width="35.9" height="20" rx="3" fill="var(--flow-pass-fill)"/>
+<circle cx="750.6" cy="361.0" r="3.5" fill="var(--flow-surface)" stroke="var(--flow-dot)" stroke-width="1.5"/>
+<rect x="744.6" y="378.0" width="38.1" height="20" rx="3" fill="var(--flow-pass-fill)"/>
 <rect class="hit" x="612.5" y="6.0" width="173.2" height="400.0" rx="6"/>
 </g>
 <g class="col" data-iter="5" role="button" tabindex="0" aria-expanded="false" aria-label="iteration 5 — discarded: open detail">
-<text x="876.3" y="20" text-anchor="middle" font-size="10" fill="#898781">iter 5 · 1h 46m</text>
-<text x="876.3" y="38" text-anchor="middle" font-size="13" font-weight="650" fill="#1a1917">8.665<tspan font-size="10" font-weight="400" fill="#898781"> -0.98%</tspan></text>
-<rect x="845.0" y="46.0" width="62.6" height="15" rx="7.5" fill="none" stroke="#b8b6ae"/>
-<text x="876.3" y="57.0" text-anchor="middle" font-size="9" font-weight="700" letter-spacing="0.5" fill="#52514e">DISCARDED</text>
+<text x="876.3" y="20" text-anchor="middle" font-size="10" fill="var(--flow-muted)">iter 5 · 1h 46m</text>
+<text x="876.3" y="38" text-anchor="middle" font-size="13" font-weight="650" fill="var(--flow-ink)">8.665<tspan font-size="10" font-weight="400" fill="var(--flow-muted)"> -0.98%</tspan></text>
+<rect x="845.0" y="46.0" width="62.6" height="15" rx="7.5" fill="none" stroke="var(--flow-badge-border)"/>
+<text x="876.3" y="57.0" text-anchor="middle" font-size="9" font-weight="700" letter-spacing="0.5" fill="var(--flow-ink-2)">DISCARDED</text>
 <rect x="791.7" y="210.0" width="11.3" height="24" rx="3" fill="rgba(42,120,214,0.24)"/>
-<text x="808.0" y="225.5" font-size="9.5" fill="#898781">17 calls</text>
-<rect x="803.0" y="270.0" width="33.6" height="20" rx="3" fill="#dddcd4"/>
-<rect x="836.5" y="297.0" width="48.9" height="20" rx="3" fill="#dddcd4"/>
-<rect x="885.4" y="324.0" width="36.3" height="20" rx="3" fill="#dddcd4"/>
-<circle cx="927.8" cy="361.0" r="3.5" fill="#fcfcfb" stroke="#9a9891" stroke-width="1.5"/>
-<rect x="921.8" y="378.0" width="38.1" height="20" rx="3" fill="#dddcd4"/>
+<text x="808.0" y="225.5" font-size="9.5" fill="var(--flow-muted)">17 calls</text>
+<rect x="803.0" y="270.0" width="33.6" height="20" rx="3" fill="var(--flow-pass-fill)"/>
+<rect x="836.5" y="297.0" width="48.9" height="20" rx="3" fill="var(--flow-pass-fill)"/>
+<rect x="885.4" y="324.0" width="36.3" height="20" rx="3" fill="var(--flow-pass-fill)"/>
+<circle cx="927.8" cy="361.0" r="3.5" fill="var(--flow-surface)" stroke="var(--flow-dot)" stroke-width="1.5"/>
+<rect x="921.8" y="378.0" width="38.1" height="20" rx="3" fill="var(--flow-pass-fill)"/>
 <rect class="hit" x="789.7" y="6.0" width="173.2" height="400.0" rx="6"/>
 </g>
 <g class="col" data-iter="6" role="button" tabindex="0" aria-expanded="false" aria-label="iteration 6 — discarded: open detail">
-<text x="1048.4" y="20" text-anchor="middle" font-size="10" fill="#898781">iter 6 · 1h 40m</text>
-<text x="1048.4" y="38" text-anchor="middle" font-size="13" font-weight="650" fill="#1a1917">8.753<tspan font-size="10" font-weight="400" fill="#898781"> +0.03%</tspan></text>
-<rect x="1017.1" y="46.0" width="62.6" height="15" rx="7.5" fill="none" stroke="#b8b6ae"/>
-<text x="1048.4" y="57.0" text-anchor="middle" font-size="9" font-weight="700" letter-spacing="0.5" fill="#52514e">DISCARDED</text>
+<text x="1048.4" y="20" text-anchor="middle" font-size="10" fill="var(--flow-muted)">iter 6 · 1h 40m</text>
+<text x="1048.4" y="38" text-anchor="middle" font-size="13" font-weight="650" fill="var(--flow-ink)">8.753<tspan font-size="10" font-weight="400" fill="var(--flow-muted)"> +0.03%</tspan></text>
+<rect x="1017.1" y="46.0" width="62.6" height="15" rx="7.5" fill="none" stroke="var(--flow-badge-border)"/>
+<text x="1048.4" y="57.0" text-anchor="middle" font-size="9" font-weight="700" letter-spacing="0.5" fill="var(--flow-ink-2)">DISCARDED</text>
 <rect x="968.8" y="210.0" width="3.8" height="24" rx="3" fill="rgba(42,120,214,0.24)"/>
-<text x="977.6" y="225.5" font-size="9.5" fill="#898781">7 calls</text>
-<rect x="972.6" y="270.0" width="34.1" height="20" rx="3" fill="#dddcd4"/>
-<rect x="1006.7" y="297.0" width="47.6" height="20" rx="3" fill="#dddcd4"/>
-<rect x="1054.3" y="324.0" width="35.2" height="20" rx="3" fill="#dddcd4"/>
-<circle cx="1095.4" cy="361.0" r="3.5" fill="#fcfcfb" stroke="#9a9891" stroke-width="1.5"/>
-<rect x="1089.4" y="378.0" width="37.6" height="20" rx="3" fill="#dddcd4"/>
+<text x="977.6" y="225.5" font-size="9.5" fill="var(--flow-muted)">7 calls</text>
+<rect x="972.6" y="270.0" width="34.1" height="20" rx="3" fill="var(--flow-pass-fill)"/>
+<rect x="1006.7" y="297.0" width="47.6" height="20" rx="3" fill="var(--flow-pass-fill)"/>
+<rect x="1054.3" y="324.0" width="35.2" height="20" rx="3" fill="var(--flow-pass-fill)"/>
+<circle cx="1095.4" cy="361.0" r="3.5" fill="var(--flow-surface)" stroke="var(--flow-dot)" stroke-width="1.5"/>
+<rect x="1089.4" y="378.0" width="37.6" height="20" rx="3" fill="var(--flow-pass-fill)"/>
 <rect class="hit" x="966.8" y="6.0" width="163.2" height="400.0" rx="6"/>
 </g>
-<line x1="158" y1="418.0" x2="1128.0" y2="418.0" stroke="#e5e4dd" stroke-width="1"/>
-<text x="142" y="432.0" text-anchor="end" font-size="9.5" fill="#898781">elapsed since iter 1 (h:mm)</text>
-<line x1="158.0" y1="418.0" x2="158.0" y2="422.0" stroke="#c3c2b7" stroke-width="1"/>
-<text x="158.0" y="432.0" text-anchor="middle" font-size="9.5" fill="#898781">+0:00</text>
-<line x1="323.9" y1="418.0" x2="323.9" y2="422.0" stroke="#c3c2b7" stroke-width="1"/>
-<text x="323.9" y="432.0" text-anchor="middle" font-size="9.5" fill="#898781">+1:39</text>
-<line x1="419.8" y1="418.0" x2="419.8" y2="422.0" stroke="#c3c2b7" stroke-width="1"/>
-<text x="419.8" y="432.0" text-anchor="middle" font-size="9.5" fill="#898781">+2:35</text>
-<line x1="614.5" y1="418.0" x2="614.5" y2="422.0" stroke="#c3c2b7" stroke-width="1"/>
-<text x="614.5" y="432.0" text-anchor="middle" font-size="9.5" fill="#898781">+4:33</text>
-<line x1="791.7" y1="418.0" x2="791.7" y2="422.0" stroke="#c3c2b7" stroke-width="1"/>
-<text x="791.7" y="432.0" text-anchor="middle" font-size="9.5" fill="#898781">+6:20</text>
-<line x1="968.8" y1="418.0" x2="968.8" y2="422.0" stroke="#c3c2b7" stroke-width="1"/>
-<text x="968.8" y="432.0" text-anchor="middle" font-size="9.5" fill="#898781">+8:07</text>
-<line x1="1128.0" y1="418.0" x2="1128.0" y2="422.0" stroke="#c3c2b7" stroke-width="1"/>
-<text x="1128.0" y="432.0" text-anchor="middle" font-size="9.5" fill="#898781">+9:47</text>
+<line x1="158" y1="418.0" x2="1128.0" y2="418.0" stroke="var(--flow-hairline)" stroke-width="1"/>
+<text x="142" y="432.0" text-anchor="end" font-size="9.5" fill="var(--flow-muted)">elapsed since iter 1 (h:mm)</text>
+<line x1="158.0" y1="418.0" x2="158.0" y2="422.0" stroke="var(--flow-line)" stroke-width="1"/>
+<text x="158.0" y="432.0" text-anchor="middle" font-size="9.5" fill="var(--flow-muted)">+0:00</text>
+<line x1="323.9" y1="418.0" x2="323.9" y2="422.0" stroke="var(--flow-line)" stroke-width="1"/>
+<text x="323.9" y="432.0" text-anchor="middle" font-size="9.5" fill="var(--flow-muted)">+1:39</text>
+<line x1="419.8" y1="418.0" x2="419.8" y2="422.0" stroke="var(--flow-line)" stroke-width="1"/>
+<text x="419.8" y="432.0" text-anchor="middle" font-size="9.5" fill="var(--flow-muted)">+2:35</text>
+<line x1="614.5" y1="418.0" x2="614.5" y2="422.0" stroke="var(--flow-line)" stroke-width="1"/>
+<text x="614.5" y="432.0" text-anchor="middle" font-size="9.5" fill="var(--flow-muted)">+4:33</text>
+<line x1="791.7" y1="418.0" x2="791.7" y2="422.0" stroke="var(--flow-line)" stroke-width="1"/>
+<text x="791.7" y="432.0" text-anchor="middle" font-size="9.5" fill="var(--flow-muted)">+6:20</text>
+<line x1="968.8" y1="418.0" x2="968.8" y2="422.0" stroke="var(--flow-line)" stroke-width="1"/>
+<text x="968.8" y="432.0" text-anchor="middle" font-size="9.5" fill="var(--flow-muted)">+8:07</text>
+<line x1="1128.0" y1="418.0" x2="1128.0" y2="422.0" stroke="var(--flow-line)" stroke-width="1"/>
+<text x="1128.0" y="432.0" text-anchor="middle" font-size="9.5" fill="var(--flow-muted)">+9:47</text>
 </svg>
 </div>
 <p class="legend"><span><span class="sw turn"></span>agent writes code</span><span><span class="sw pass"></span>check passed</span><span><span class="sw fail"></span>check failed ✕</span><span><span class="dotm"></span>check skipped or instant</span></p>
@@ -265,7 +282,7 @@ footer a { color: #1c5cab; }
 </div>
 <h4>Agent activity — 198 tool calls over 27m 46s</h4>
 <svg class="tl" viewBox="0 0 1000 140" role="img" aria-label="tool call timeline for iteration 1">
-<text x="140" y="13.0" text-anchor="end" font-size="11" fill="#52514e">Read · 88</text>
+<text x="140" y="13.0" text-anchor="end" font-size="11" fill="var(--flow-ink-2)">Read · 88</text>
 <rect x="208.4" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="210.5" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="212.7" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
@@ -354,7 +371,7 @@ footer a { color: #1c5cab; }
 <rect x="691.1" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="879.1" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="879.3" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
-<text x="140" y="32.0" text-anchor="end" font-size="11" fill="#52514e">Bash · 99</text>
+<text x="140" y="32.0" text-anchor="end" font-size="11" fill="var(--flow-ink-2)">Bash · 99</text>
 <rect x="208.9" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="209.1" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="210.7" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
@@ -454,24 +471,24 @@ footer a { color: #1c5cab; }
 <rect x="683.0" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="683.5" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="690.9" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
-<text x="140" y="51.0" text-anchor="end" font-size="11" fill="#52514e">Skill · 2</text>
+<text x="140" y="51.0" text-anchor="end" font-size="11" fill="var(--flow-ink-2)">Skill · 2</text>
 <rect x="217.4" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="227.6" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
-<text x="140" y="70.0" text-anchor="end" font-size="11" fill="#52514e">Edit · 1</text>
+<text x="140" y="70.0" text-anchor="end" font-size="11" fill="var(--flow-ink-2)">Edit · 1</text>
 <rect x="226.2" y="62.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
-<text x="140" y="89.0" text-anchor="end" font-size="11" fill="#52514e">Agent · 4</text>
+<text x="140" y="89.0" text-anchor="end" font-size="11" fill="var(--flow-ink-2)">Agent · 4</text>
 <rect x="256.2" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="259.9" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="456.0" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="657.3" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
-<text x="140" y="108.0" text-anchor="end" font-size="11" fill="#52514e">Write · 4</text>
+<text x="140" y="108.0" text-anchor="end" font-size="11" fill="var(--flow-ink-2)">Write · 4</text>
 <rect x="399.6" y="100.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="426.2" y="100.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="625.1" y="100.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="639.4" y="100.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
-<line x1="150" y1="122.0" x2="986.0" y2="122.0" stroke="#e5e4dd" stroke-width="1"/>
-<text x="150" y="135.0" font-size="10" fill="#898781">0</text>
-<text x="986.0" y="135.0" text-anchor="end" font-size="10" fill="#898781">27m 46s</text>
+<line x1="150" y1="122.0" x2="986.0" y2="122.0" stroke="var(--flow-hairline)" stroke-width="1"/>
+<text x="150" y="135.0" font-size="10" fill="var(--flow-muted)">0</text>
+<text x="986.0" y="135.0" text-anchor="end" font-size="10" fill="var(--flow-muted)">27m 46s</text>
 </svg>
 <p class="win">21:28 → 23:08 UTC · iteration wall-clock 1h 39m</p>
 </div>
@@ -493,7 +510,7 @@ footer a { color: #1c5cab; }
 </div>
 <h4>Agent activity — 179 tool calls over 22m 32s</h4>
 <svg class="tl" viewBox="0 0 1000 121" role="img" aria-label="tool call timeline for iteration 2">
-<text x="140" y="13.0" text-anchor="end" font-size="11" fill="#52514e">Bash · 94</text>
+<text x="140" y="13.0" text-anchor="end" font-size="11" fill="var(--flow-ink-2)">Bash · 94</text>
 <rect x="188.6" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="188.6" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="213.1" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
@@ -588,11 +605,11 @@ footer a { color: #1c5cab; }
 <rect x="949.3" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="959.3" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="961.6" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
-<text x="140" y="32.0" text-anchor="end" font-size="11" fill="#52514e">Agent · 3</text>
+<text x="140" y="32.0" text-anchor="end" font-size="11" fill="var(--flow-ink-2)">Agent · 3</text>
 <rect x="204.1" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="547.2" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="700.2" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
-<text x="140" y="51.0" text-anchor="end" font-size="11" fill="#52514e">Read · 58</text>
+<text x="140" y="51.0" text-anchor="end" font-size="11" fill="var(--flow-ink-2)">Read · 58</text>
 <rect x="205.6" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="205.9" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="206.2" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
@@ -651,7 +668,7 @@ footer a { color: #1c5cab; }
 <rect x="885.1" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="913.6" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="951.4" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
-<text x="140" y="70.0" text-anchor="end" font-size="11" fill="#52514e">Write · 7</text>
+<text x="140" y="70.0" text-anchor="end" font-size="11" fill="var(--flow-ink-2)">Write · 7</text>
 <rect x="421.7" y="62.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="463.7" y="62.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="673.0" y="62.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
@@ -659,7 +676,7 @@ footer a { color: #1c5cab; }
 <rect x="814.0" y="62.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="834.7" y="62.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="939.0" y="62.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
-<text x="140" y="89.0" text-anchor="end" font-size="11" fill="#52514e">Edit · 17</text>
+<text x="140" y="89.0" text-anchor="end" font-size="11" fill="var(--flow-ink-2)">Edit · 17</text>
 <rect x="726.0" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="728.0" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="818.9" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
@@ -677,9 +694,9 @@ footer a { color: #1c5cab; }
 <rect x="910.1" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="918.5" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="953.4" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
-<line x1="150" y1="103.0" x2="986.0" y2="103.0" stroke="#e5e4dd" stroke-width="1"/>
-<text x="150" y="116.0" font-size="10" fill="#898781">0</text>
-<text x="986.0" y="116.0" text-anchor="end" font-size="10" fill="#898781">22m 32s</text>
+<line x1="150" y1="103.0" x2="986.0" y2="103.0" stroke="var(--flow-hairline)" stroke-width="1"/>
+<text x="150" y="116.0" font-size="10" fill="var(--flow-muted)">0</text>
+<text x="986.0" y="116.0" text-anchor="end" font-size="10" fill="var(--flow-muted)">22m 32s</text>
 </svg>
 <p class="win">23:08 → 00:04 UTC · iteration wall-clock 55m 34s</p>
 </div>
@@ -712,7 +729,7 @@ footer a { color: #1c5cab; }
 </div>
 <h4>Agent activity — 79 tool calls over 17m 56s</h4>
 <svg class="tl" viewBox="0 0 1000 121" role="img" aria-label="tool call timeline for iteration 3">
-<text x="140" y="13.0" text-anchor="end" font-size="11" fill="#52514e">Bash · 43</text>
+<text x="140" y="13.0" text-anchor="end" font-size="11" fill="var(--flow-ink-2)">Bash · 43</text>
 <rect x="285.0" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="285.4" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="294.4" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
@@ -756,7 +773,7 @@ footer a { color: #1c5cab; }
 <rect x="927.9" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="949.5" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="952.3" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
-<text x="140" y="32.0" text-anchor="end" font-size="11" fill="#52514e">Read · 22</text>
+<text x="140" y="32.0" text-anchor="end" font-size="11" fill="var(--flow-ink-2)">Read · 22</text>
 <rect x="297.2" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="438.5" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="448.3" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
@@ -779,12 +796,12 @@ footer a { color: #1c5cab; }
 <rect x="907.7" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="915.1" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="920.1" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
-<text x="140" y="51.0" text-anchor="end" font-size="11" fill="#52514e">ToolSearch · 1</text>
+<text x="140" y="51.0" text-anchor="end" font-size="11" fill="var(--flow-ink-2)">ToolSearch · 1</text>
 <rect x="406.1" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
-<text x="140" y="70.0" text-anchor="end" font-size="11" fill="#52514e">fetch_log · 2</text>
+<text x="140" y="70.0" text-anchor="end" font-size="11" fill="var(--flow-ink-2)">fetch_log · 2</text>
 <rect x="412.9" y="62.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="413.1" y="62.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
-<text x="140" y="89.0" text-anchor="end" font-size="11" fill="#52514e">Edit · 11</text>
+<text x="140" y="89.0" text-anchor="end" font-size="11" fill="var(--flow-ink-2)">Edit · 11</text>
 <rect x="711.5" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="715.3" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="718.1" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
@@ -796,9 +813,9 @@ footer a { color: #1c5cab; }
 <rect x="839.7" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="918.0" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="922.8" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
-<line x1="150" y1="103.0" x2="986.0" y2="103.0" stroke="#e5e4dd" stroke-width="1"/>
-<text x="150" y="116.0" font-size="10" fill="#898781">0</text>
-<text x="986.0" y="116.0" text-anchor="end" font-size="10" fill="#898781">17m 56s</text>
+<line x1="150" y1="103.0" x2="986.0" y2="103.0" stroke="var(--flow-hairline)" stroke-width="1"/>
+<text x="150" y="116.0" font-size="10" fill="var(--flow-muted)">0</text>
+<text x="986.0" y="116.0" text-anchor="end" font-size="10" fill="var(--flow-muted)">17m 56s</text>
 </svg>
 <p class="win">00:04 → 02:01 UTC · iteration wall-clock 1h 57m</p>
 </div>
@@ -827,7 +844,7 @@ footer a { color: #1c5cab; }
 </div>
 <h4>Agent activity — 17 tool calls over 6m 08s</h4>
 <svg class="tl" viewBox="0 0 1000 140" role="img" aria-label="tool call timeline for iteration 4">
-<text x="140" y="13.0" text-anchor="end" font-size="11" fill="#52514e">Bash · 10</text>
+<text x="140" y="13.0" text-anchor="end" font-size="11" fill="var(--flow-ink-2)">Bash · 10</text>
 <rect x="308.8" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="309.5" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="327.3" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
@@ -838,21 +855,21 @@ footer a { color: #1c5cab; }
 <rect x="414.2" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="895.1" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="900.3" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
-<text x="140" y="32.0" text-anchor="end" font-size="11" fill="#52514e">ToolSearch · 2</text>
+<text x="140" y="32.0" text-anchor="end" font-size="11" fill="var(--flow-ink-2)">ToolSearch · 2</text>
 <rect x="394.6" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="617.6" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
-<text x="140" y="51.0" text-anchor="end" font-size="11" fill="#52514e">fetch_log · 1</text>
+<text x="140" y="51.0" text-anchor="end" font-size="11" fill="var(--flow-ink-2)">fetch_log · 1</text>
 <rect x="401.6" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
-<text x="140" y="70.0" text-anchor="end" font-size="11" fill="#52514e">profile_query · 1</text>
+<text x="140" y="70.0" text-anchor="end" font-size="11" fill="var(--flow-ink-2)">profile_query · 1</text>
 <rect x="623.6" y="62.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
-<text x="140" y="89.0" text-anchor="end" font-size="11" fill="#52514e">Read · 2</text>
+<text x="140" y="89.0" text-anchor="end" font-size="11" fill="var(--flow-ink-2)">Read · 2</text>
 <rect x="858.2" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="868.5" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
-<text x="140" y="108.0" text-anchor="end" font-size="11" fill="#52514e">Edit · 1</text>
+<text x="140" y="108.0" text-anchor="end" font-size="11" fill="var(--flow-ink-2)">Edit · 1</text>
 <rect x="889.0" y="100.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
-<line x1="150" y1="122.0" x2="986.0" y2="122.0" stroke="#e5e4dd" stroke-width="1"/>
-<text x="150" y="135.0" font-size="10" fill="#898781">0</text>
-<text x="986.0" y="135.0" text-anchor="end" font-size="10" fill="#898781">6m 08s</text>
+<line x1="150" y1="122.0" x2="986.0" y2="122.0" stroke="var(--flow-hairline)" stroke-width="1"/>
+<text x="150" y="135.0" font-size="10" fill="var(--flow-muted)">0</text>
+<text x="986.0" y="135.0" text-anchor="end" font-size="10" fill="var(--flow-muted)">6m 08s</text>
 </svg>
 <p class="win">02:01 → 03:48 UTC · iteration wall-clock 1h 46m</p>
 </div>
@@ -881,32 +898,32 @@ footer a { color: #1c5cab; }
 </div>
 <h4>Agent activity — 17 tool calls over 7m 08s</h4>
 <svg class="tl" viewBox="0 0 1000 140" role="img" aria-label="tool call timeline for iteration 5">
-<text x="140" y="13.0" text-anchor="end" font-size="11" fill="#52514e">Bash · 6</text>
+<text x="140" y="13.0" text-anchor="end" font-size="11" fill="var(--flow-ink-2)">Bash · 6</text>
 <rect x="527.3" y="5.0" width="1.9" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="610.1" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="621.3" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="722.1" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="729.3" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="925.6" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
-<text x="140" y="32.0" text-anchor="end" font-size="11" fill="#52514e">Read · 6</text>
+<text x="140" y="32.0" text-anchor="end" font-size="11" fill="var(--flow-ink-2)">Read · 6</text>
 <rect x="527.4" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="580.3" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="589.9" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="601.7" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="813.5" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="897.2" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
-<text x="140" y="51.0" text-anchor="end" font-size="11" fill="#52514e">ToolSearch · 1</text>
+<text x="140" y="51.0" text-anchor="end" font-size="11" fill="var(--flow-ink-2)">ToolSearch · 1</text>
 <rect x="572.0" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
-<text x="140" y="70.0" text-anchor="end" font-size="11" fill="#52514e">profile_query · 1</text>
+<text x="140" y="70.0" text-anchor="end" font-size="11" fill="var(--flow-ink-2)">profile_query · 1</text>
 <rect x="579.2" y="62.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
-<text x="140" y="89.0" text-anchor="end" font-size="11" fill="#52514e">fetch_log · 1</text>
+<text x="140" y="89.0" text-anchor="end" font-size="11" fill="var(--flow-ink-2)">fetch_log · 1</text>
 <rect x="592.2" y="81.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
-<text x="140" y="108.0" text-anchor="end" font-size="11" fill="#52514e">Edit · 2</text>
+<text x="140" y="108.0" text-anchor="end" font-size="11" fill="var(--flow-ink-2)">Edit · 2</text>
 <rect x="913.2" y="100.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="920.8" y="100.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
-<line x1="150" y1="122.0" x2="986.0" y2="122.0" stroke="#e5e4dd" stroke-width="1"/>
-<text x="150" y="135.0" font-size="10" fill="#898781">0</text>
-<text x="986.0" y="135.0" text-anchor="end" font-size="10" fill="#898781">7m 08s</text>
+<line x1="150" y1="122.0" x2="986.0" y2="122.0" stroke="var(--flow-hairline)" stroke-width="1"/>
+<text x="150" y="135.0" font-size="10" fill="var(--flow-muted)">0</text>
+<text x="986.0" y="135.0" text-anchor="end" font-size="10" fill="var(--flow-muted)">7m 08s</text>
 </svg>
 <p class="win">03:48 → 05:35 UTC · iteration wall-clock 1h 46m</p>
 </div>
@@ -935,19 +952,19 @@ footer a { color: #1c5cab; }
 </div>
 <h4>Agent activity — 7 tool calls over 2m 24s</h4>
 <svg class="tl" viewBox="0 0 1000 83" role="img" aria-label="tool call timeline for iteration 6">
-<text x="140" y="13.0" text-anchor="end" font-size="11" fill="#52514e">Bash · 2</text>
+<text x="140" y="13.0" text-anchor="end" font-size="11" fill="var(--flow-ink-2)">Bash · 2</text>
 <rect x="480.6" y="5.0" width="5.5" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="695.4" y="5.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
-<text x="140" y="32.0" text-anchor="end" font-size="11" fill="#52514e">Read · 3</text>
+<text x="140" y="32.0" text-anchor="end" font-size="11" fill="var(--flow-ink-2)">Read · 3</text>
 <rect x="483.0" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="602.1" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="618.4" y="24.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
-<text x="140" y="51.0" text-anchor="end" font-size="11" fill="#52514e">Edit · 2</text>
+<text x="140" y="51.0" text-anchor="end" font-size="11" fill="var(--flow-ink-2)">Edit · 2</text>
 <rect x="659.2" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
 <rect x="679.9" y="43.0" width="1.6" height="9" rx="1.5" fill="rgba(42,120,214,0.55)"/>
-<line x1="150" y1="65.0" x2="986.0" y2="65.0" stroke="#e5e4dd" stroke-width="1"/>
-<text x="150" y="78.0" font-size="10" fill="#898781">0</text>
-<text x="986.0" y="78.0" text-anchor="end" font-size="10" fill="#898781">2m 24s</text>
+<line x1="150" y1="65.0" x2="986.0" y2="65.0" stroke="var(--flow-hairline)" stroke-width="1"/>
+<text x="150" y="78.0" font-size="10" fill="var(--flow-muted)">0</text>
+<text x="986.0" y="78.0" text-anchor="end" font-size="10" fill="var(--flow-muted)">2m 24s</text>
 </svg>
 <p class="win">05:35 → 07:16 UTC · iteration wall-clock 1h 40m</p>
 </div>
