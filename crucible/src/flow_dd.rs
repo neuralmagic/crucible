@@ -182,8 +182,11 @@ pub(crate) fn fetch_trace_spans(trace_id: &str, window: &str) -> Result<String, 
         pages += 1;
         let got = batch.len();
         spans.extend(batch);
+        // A server echoing the cursor it was just given would page forever;
+        // treat a repeated cursor as the end of the results.
+        let repeated = next.is_some() && next == cursor;
         cursor = next;
-        if cursor.is_none() || got == 0 {
+        if cursor.is_none() || got == 0 || repeated {
             break;
         }
         std::thread::sleep(PAGE_PAUSE);
