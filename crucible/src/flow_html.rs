@@ -160,15 +160,80 @@ fn text_w(s: &str, font_px: f64) -> f64 {
     s.chars().count() as f64 * font_px * 0.55
 }
 
+/// Display form of a raw gate note: long float tokens round to 3 decimals (like the
+/// hero numbers) and consecutive duplicate tokens collapse — "score=0.9375
+/// score=0.9375" is a gate echo, not signal.
+fn fmt_note(s: &str) -> String {
+    let mut toks: Vec<String> = Vec::new();
+    for tok in s.split_whitespace() {
+        let tok = round_floats(tok);
+        if toks.last() != Some(&tok) {
+            toks.push(tok);
+        }
+    }
+    toks.join(" ")
+}
+
+/// Round every float with more than three decimals inside a token; anything that
+/// doesn't parse as one number (versions like "1.2.3") stays verbatim.
+fn round_floats(tok: &str) -> String {
+    let mut out = String::with_capacity(tok.len());
+    let mut num = String::new();
+    for c in tok.chars() {
+        if c.is_ascii_digit() || c == '.' {
+            num.push(c);
+        } else {
+            flush_num(&mut out, &mut num);
+            out.push(c);
+        }
+    }
+    flush_num(&mut out, &mut num);
+    out
+}
+
+fn flush_num(out: &mut String, num: &mut String) {
+    let rounded = num
+        .split_once('.')
+        .filter(|(_, frac)| frac.len() > 3)
+        .and_then(|_| num.parse::<f64>().ok())
+        .map(|v| format!("{v:.3}"));
+    match rounded {
+        Some(r) => out.push_str(&r),
+        None => out.push_str(num),
+    }
+    num.clear();
+}
+
+/// The goal line carries markdown backticks; render `code` spans as real <code>
+/// instead of leaking literal backticks. Unbalanced backticks stay verbatim.
+/// Output is escaped HTML.
+fn md_code(s: &str) -> String {
+    if !s.matches('`').count().is_multiple_of(2) {
+        return esc(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    for (i, part) in s.split('`').enumerate() {
+        if i % 2 == 1 {
+            out.push_str("<code>");
+            out.push_str(&esc(part));
+            out.push_str("</code>");
+        } else {
+            out.push_str(&esc(part));
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Page skeleton
 // ---------------------------------------------------------------------------
 
 fn head(out: &mut String, m: &FlowModel) {
+    // A browser tab title renders no markdown, so the backticks just drop.
     let title = if m.run.goal_line.is_empty() {
         "crucible run".to_string()
     } else {
-        format!("crucible run — {}", m.run.goal_line)
+        format!("crucible run — {}", m.run.goal_line.replace('`', ""))
     };
     w!(
         out,
@@ -189,6 +254,7 @@ body {{ background: {PAGE_BG}; color: {INK}; font: 14px/1.55 system-ui, -apple-s
 .page {{ max-width: 1180px; margin: 0 auto; padding: 44px 28px 56px; }}
 .eyebrow {{ font-size: 11.5px; font-weight: 650; letter-spacing: 0.09em; text-transform: uppercase; color: {MUTED}; margin-bottom: 8px; }}
 h1 {{ font-size: 23px; font-weight: 650; letter-spacing: -0.01em; line-height: 1.3; max-width: 60ch; }}
+h1 code {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.88em; background: rgba(26,25,23,0.05); padding: 0 4px; border-radius: 4px; }}
 h2 {{ font-size: 15px; font-weight: 650; margin-bottom: 4px; }}
 .hint {{ color: {MUTED}; font-size: 12.5px; margin-bottom: 14px; }}
 .stats {{ display: flex; flex-wrap: wrap; gap: 18px 0; margin: 26px 0 8px; }}
@@ -244,6 +310,7 @@ td {{ padding: 4px 14px 4px 0; border-bottom: 1px solid {HAIRLINE}; vertical-ali
 td.name {{ color: {INK}; font-weight: 600; white-space: nowrap; }}
 td.res {{ white-space: nowrap; }}
 td.res.fail {{ color: {INK}; font-weight: 650; }}
+td.res.skip {{ color: {MUTED}; font-style: italic; }}
 td.num {{ font-variant-numeric: tabular-nums; white-space: nowrap; }}
 td.cmd {{ font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; }}
 .tl {{ margin-top: 4px; }}
@@ -258,7 +325,7 @@ footer a {{ color: {ACCENT_DEEP}; }}
 .col:focus-visible {{ outline: 2px solid {ACCENT}; outline-offset: 2px; }}
 @media print {{
   body {{ background: #fff; }}
-  .hint, .legend {{ display: none; }}
+  .hint {{ display: none; }}
   .hero-card {{ border: none; padding: 0; overflow: visible; }}
 }}"##
     )
@@ -277,7 +344,7 @@ fn header_strip(out: &mut String, m: &FlowModel) {
         .strip_prefix("Goal:")
         .map(str::trim)
         .unwrap_or(&m.run.goal_line);
-    w!(out, "<h1>{}</h1>\n", esc(goal));
+    w!(out, "<h1>{}</h1>\n", md_code(goal));
     out.push_str("<div class=\"stats\">\n");
 
     // Result tile (the hero number).
@@ -440,7 +507,7 @@ fn preflight(out: &mut String, m: &FlowModel) {
             out,
             "<tr><td class=\"cmd\">{}</td><td class=\"{cls}\">{res}</td><td>{}</td></tr>\n",
             esc(&p.cmd_short),
-            esc(&p.note)
+            esc(&fmt_note(&p.note))
         );
     }
     out.push_str("</table></details>\n");
@@ -556,7 +623,10 @@ fn hero(out: &mut String, m: &FlowModel) {
     }
     let (cols, timed) = layout(m);
     let width_note = if timed {
-        "column width is real wall-clock time"
+        // The header's wall-clock counts preflight and post-run too; say so or the
+        // axis end looks hours short of it.
+        "column width is real wall-clock time (the chart covers the iterations only — \
+         preflight and post-run time sit outside it)"
     } else {
         "columns are equal width (no span timings)"
     };
@@ -851,6 +921,16 @@ fn column(
         };
         let ly = checks_top + lane as f64 * LANE_STEP + (LANE_STEP - LANE_H) / 2.0 - 3.5;
         let band_fill = if r.pass { PASS_FILL } else { FAIL_FILL };
+        if r.skipped {
+            // Never ran: a hollow marker in either mode, never a band.
+            w!(
+                out,
+                "<circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"3.5\" fill=\"{SURFACE}\" stroke=\"{DOT_GRAY}\" stroke-width=\"1.5\"/>\n",
+                c.x + cursor + 6.0,
+                ly + LANE_H / 2.0
+            );
+            continue;
+        }
         if timed {
             match (r.duration_s, c.dur) {
                 (Some(d), Some(total)) if total > 0.0 => {
@@ -868,7 +948,7 @@ fn column(
                     cursor += d / total * c.w;
                 }
                 _ if r.pass => {
-                    // Ran with no measurable duration (declared skipped, or decided
+                    // Ran with no measurable duration (no matching span, or decided
                     // instantly): a hollow marker, not a fabricated band.
                     w!(
                         out,
@@ -945,7 +1025,7 @@ fn time_axis(out: &mut String, m: &FlowModel, cols: &[Col], axis_y: f64) {
     w!(
         out,
         "<line x1=\"{GUTTER:.0}\" y1=\"{axis_y:.1}\" x2=\"{:.1}\" y2=\"{axis_y:.1}\" stroke=\"{HAIRLINE}\" stroke-width=\"1\"/>\n\
-         <text x=\"{:.0}\" y=\"{:.1}\" text-anchor=\"end\" font-size=\"9.5\" fill=\"{MUTED}\">elapsed (h:mm)</text>\n",
+         <text x=\"{:.0}\" y=\"{:.1}\" text-anchor=\"end\" font-size=\"9.5\" fill=\"{MUTED}\">elapsed since iter 1 (h:mm)</text>\n",
         GUTTER + PLOT_W,
         GUTTER - 16.0,
         axis_y + 14.0
@@ -1025,7 +1105,7 @@ fn details(out: &mut String, m: &FlowModel) {
             w!(
                 out,
                 "<p class=\"verdict\"><b>verdict:</b> {}</p>\n",
-                esc(&it.note_short)
+                esc(&fmt_note(&it.note_short))
             );
         }
         out.push_str("<div class=\"cols2\">\n<div>\n<h4>Code changes</h4>\n");
@@ -1052,7 +1132,9 @@ fn details(out: &mut String, m: &FlowModel) {
                 "<table><tr><th>check</th><th>result</th><th>time</th><th>note</th></tr>\n",
             );
             for r in &it.rungs {
-                let (res, cls) = if r.pass {
+                let (res, cls) = if r.skipped {
+                    ("skipped", "res skip")
+                } else if r.pass {
                     ("passed", "res")
                 } else {
                     ("failed ✕", "res fail")
@@ -1063,7 +1145,7 @@ fn details(out: &mut String, m: &FlowModel) {
                     "<tr><td class=\"name\">{}</td><td class=\"{cls}\">{res}</td>\
                      <td class=\"num\">{dur}</td><td>{}</td></tr>\n",
                     esc(&r.name),
-                    esc(&r.note_short)
+                    esc(&fmt_note(&r.note_short))
                 );
             }
             out.push_str("</table>\n");
@@ -1195,7 +1277,7 @@ fn footer(out: &mut String, m: &FlowModel) {
         w!(
             out,
             "<div>Post-run check: {} — {verdict}</div>\n",
-            esc(&e.note)
+            esc(&fmt_note(&e.note))
         );
     }
     if let Some(id) = &m.run.id {
@@ -1258,9 +1340,11 @@ mod tests {
     fn header_strip_shows_goal_gate_model_and_result() {
         let h = html();
         assert!(
-            h.contains("generalize vLLM&#39;s `fused_a_gemm`"),
-            "goal missing"
+            h.contains("generalize vLLM&#39;s <code>fused_a_gemm</code>"),
+            "goal missing or backticks leaked"
         );
+        // The tab title drops the markdown backticks instead of showing them.
+        assert!(h.contains("<title>crucible run — Goal: generalize vLLM&#39;s fused_a_gemm"));
         assert!(h.contains("latency — lower is better"));
         assert!(h.contains("claude-opus-4-6"));
         assert!(h.contains("8.751 <span class=\"arr\">→</span> 8.656"));
@@ -1300,11 +1384,15 @@ mod tests {
         assert!(h.contains("5 files · +180 −57"));
         assert!(h.contains("csrc/libtorch_stable/dsv3_fused_a_gemm.cu"));
         assert!(h.contains("vllm/envs.py"));
-        assert!(h.contains("latency: tpot_ms=8.65613441703772"));
+        // Raw gate floats round to the hero's 3 decimals in the detail tables.
+        assert!(h.contains("latency: tpot_ms=8.656"));
+        assert!(!h.contains("8.65613441703772"));
         assert!(h.contains("correctness: score=0.93"));
         assert!(h.contains("mechanism: trace captured"));
         assert!(h.contains("correctness rejected the candidate"));
+        // A skipped check says so instead of claiming a pass.
         assert!(h.contains("ab-toggle skipped: no VLLM_GLM_TOGGLE declared"));
+        assert_eq!(h.matches("<td class=\"res skip\">skipped</td>").count(), 5);
     }
 
     #[test]
@@ -1312,6 +1400,9 @@ mod tests {
         let h = html();
         assert!(h.contains("Before iteration 1 — 5 environment checks passed"));
         assert!(h.contains("--only-rung 1 --mode derive"));
+        // Preflight notes round their floats and drop the gate's duplicated token.
+        assert!(h.contains("correctness: score=0.938</td>"));
+        assert!(h.contains("latency: tpot_ms=8.751 score=8.751"));
         assert!(
             h.contains("<a href=\"https://github.com/wseaton/vllm/pull/8\">wseaton/vllm#8</a>")
         );
@@ -1324,7 +1415,8 @@ mod tests {
     fn spans_add_time_axis_turn_bands_and_tool_timelines() {
         let h = html_with_spans();
         assert!(h.contains("column width is real wall-clock time"));
-        assert!(h.contains("elapsed (h:mm)"));
+        assert!(h.contains("preflight and post-run time sit outside it"));
+        assert!(h.contains("elapsed since iter 1 (h:mm)"));
         assert!(h.contains("Agent activity — 198 tool calls over"));
         assert!(h.contains("Bash · 99"));
         assert!(h.contains("Read · 88"));
@@ -1338,7 +1430,7 @@ mod tests {
     fn without_spans_the_page_falls_back_to_equal_columns() {
         let h = html();
         assert!(h.contains("columns are equal width (no span timings)"));
-        assert!(!h.contains("elapsed (h:mm)"));
+        assert!(!h.contains("elapsed since iter 1 (h:mm)"));
         assert!(!h.contains("Agent activity"));
     }
 
@@ -1363,6 +1455,7 @@ mod tests {
             rungs: vec![Rung {
                 name: "check<1>".into(),
                 pass: false,
+                skipped: false,
                 note_short: "fail <note>".into(),
                 duration_s: None,
             }],
@@ -1427,6 +1520,35 @@ mod tests {
         assert_eq!(short_tool("Bash"), "Bash");
         assert_eq!(count_noun(1, "file"), "1 file");
         assert_eq!(count_noun(5, "file"), "5 files");
+    }
+
+    #[test]
+    fn fmt_note_rounds_floats_and_drops_echoed_tokens() {
+        assert_eq!(
+            fmt_note("latency: tpot_ms=8.65613441703772"),
+            "latency: tpot_ms=8.656"
+        );
+        assert_eq!(
+            fmt_note("correctness: score=0.9375 score=0.9375"),
+            "correctness: score=0.938"
+        );
+        // Different keys with the same value are signal, not an echo.
+        assert_eq!(
+            fmt_note("tpot_ms=8.750550938259494 score=8.750550938259494"),
+            "tpot_ms=8.751 score=8.751"
+        );
+        assert_eq!(fmt_note("score=0.93"), "score=0.93");
+        assert_eq!(
+            fmt_note("v1.2.3 at 12:44:28.015Z"),
+            "v1.2.3 at 12:44:28.015Z"
+        );
+    }
+
+    #[test]
+    fn md_code_renders_backtick_spans() {
+        assert_eq!(md_code("use `x<y`"), "use <code>x&lt;y</code>");
+        assert_eq!(md_code("odd ` tick"), "odd ` tick");
+        assert_eq!(md_code("plain"), "plain");
     }
 
     #[test]

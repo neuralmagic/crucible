@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>crucible run — Goal: generalize vLLM&#39;s `fused_a_gemm` for the GLM-5.2 QKV-A + Q-B projections</title>
+<title>crucible run — Goal: generalize vLLM&#39;s fused_a_gemm for the GLM-5.2 QKV-A + Q-B projections</title>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 html { color-scheme: only light; }
@@ -11,6 +11,7 @@ body { background: #f7f7f5; color: #1a1917; font: 14px/1.55 system-ui, -apple-sy
 .page { max-width: 1180px; margin: 0 auto; padding: 44px 28px 56px; }
 .eyebrow { font-size: 11.5px; font-weight: 650; letter-spacing: 0.09em; text-transform: uppercase; color: #898781; margin-bottom: 8px; }
 h1 { font-size: 23px; font-weight: 650; letter-spacing: -0.01em; line-height: 1.3; max-width: 60ch; }
+h1 code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.88em; background: rgba(26,25,23,0.05); padding: 0 4px; border-radius: 4px; }
 h2 { font-size: 15px; font-weight: 650; margin-bottom: 4px; }
 .hint { color: #898781; font-size: 12.5px; margin-bottom: 14px; }
 .stats { display: flex; flex-wrap: wrap; gap: 18px 0; margin: 26px 0 8px; }
@@ -66,6 +67,7 @@ td { padding: 4px 14px 4px 0; border-bottom: 1px solid #e5e4dd; vertical-align: 
 td.name { color: #1a1917; font-weight: 600; white-space: nowrap; }
 td.res { white-space: nowrap; }
 td.res.fail { color: #1a1917; font-weight: 650; }
+td.res.skip { color: #898781; font-style: italic; }
 td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
 td.cmd { font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .tl { margin-top: 4px; }
@@ -80,7 +82,7 @@ footer a { color: #1c5cab; }
 .col:focus-visible { outline: 2px solid #2a78d6; outline-offset: 2px; }
 @media print {
   body { background: #fff; }
-  .hint, .legend { display: none; }
+  .hint { display: none; }
   .hero-card { border: none; padding: 0; overflow: visible; }
 }
 </style>
@@ -89,7 +91,7 @@ footer a { color: #1c5cab; }
 <main class="page">
 <header>
 <p class="eyebrow">crucible run</p>
-<h1>generalize vLLM&#39;s `fused_a_gemm` for the GLM-5.2 QKV-A + Q-B projections</h1>
+<h1>generalize vLLM&#39;s <code>fused_a_gemm</code> for the GLM-5.2 QKV-A + Q-B projections</h1>
 <div class="stats">
 <div class="tile wide"><div class="lbl">latency — lower is better</div><div class="val">8.751 <span class="arr">→</span> 8.656</div><div class="sub good">1.08% better · kept at iteration 3</div></div>
 <div class="tile"><div class="lbl">iterations</div><div class="val">6</div><div class="sub">1 kept · 4 discarded · 1 rejected</div></div>
@@ -103,13 +105,13 @@ footer a { color: #1c5cab; }
 <table><tr><th>command</th><th>result</th><th>note</th></tr>
 <tr><td class="cmd">python3 vllm_glm_gate.py --only-rung 1 --mode derive</td><td class="res">passed</td><td>candidate built score=0</td></tr>
 <tr><td class="cmd">python3 vllm_glm_gate.py --only-rung 1 --mode full</td><td class="res">passed</td><td>candidate built score=0</td></tr>
-<tr><td class="cmd">python3 vllm_glm_gate.py --only-rung 2 --digest vllm-candidate@sha256:bbd4256e74…</td><td class="res">passed</td><td>correctness: score=0.9375 score=0.9375</td></tr>
+<tr><td class="cmd">python3 vllm_glm_gate.py --only-rung 2 --digest vllm-candidate@sha256:bbd4256e74…</td><td class="res">passed</td><td>correctness: score=0.938</td></tr>
 <tr><td class="cmd">python3 vllm_glm_gate.py --only-rung 5 --digest vllm-candidate@sha256:bbd4256e74…</td><td class="res">passed</td><td>mechanism: trace captured score=0</td></tr>
-<tr><td class="cmd">python3 vllm_glm_gate.py --only-rung 3 --digest vllm-candidate@sha256:bbd4256e74…</td><td class="res">passed</td><td>latency: tpot_ms=8.750550938259494 score=8.750550938259494</td></tr>
+<tr><td class="cmd">python3 vllm_glm_gate.py --only-rung 3 --digest vllm-candidate@sha256:bbd4256e74…</td><td class="res">passed</td><td>latency: tpot_ms=8.751 score=8.751</td></tr>
 </table></details>
 <section>
 <h2>The run, left to right</h2>
-<p class="hint">Each column is one iteration: the agent writes code, then frozen checks grade the candidate — column width is real wall-clock time. Click a column for its detail.</p>
+<p class="hint">Each column is one iteration: the agent writes code, then frozen checks grade the candidate — column width is real wall-clock time (the chart covers the iterations only — preflight and post-run time sit outside it). Click a column for its detail.</p>
 <div class="hero-card">
 <svg viewBox="0 0 1140 444" role="img" aria-label="swimlane of 6 iterations: agent turns, checks, and scores over time">
 <rect x="416.8" y="6.0" width="192.6" height="400.0" rx="8" fill="rgba(42,120,214,0.07)" stroke="rgba(42,120,214,0.30)"/>
@@ -143,10 +145,10 @@ footer a { color: #1c5cab; }
 <rect x="158.0" y="210.0" width="43.9" height="24" rx="3" fill="rgba(42,120,214,0.24)"/>
 <text x="206.9" y="225.5" font-size="9.5" fill="#898781">198 calls</text>
 <rect x="201.9" y="270.0" width="3.0" height="20" rx="3" fill="#dddcd4"/>
-<rect x="203.7" y="297.0" width="31.7" height="20" rx="3" fill="#dddcd4"/>
-<rect x="235.4" y="324.0" width="31.7" height="20" rx="3" fill="#dddcd4"/>
-<circle cx="273.1" cy="361.0" r="3.5" fill="#fcfcfb" stroke="#9a9891" stroke-width="1.5"/>
-<rect x="267.1" y="378.0" width="31.7" height="20" rx="3" fill="#dddcd4"/>
+<rect x="203.7" y="297.0" width="37.7" height="20" rx="3" fill="#dddcd4"/>
+<rect x="241.4" y="324.0" width="36.0" height="20" rx="3" fill="#dddcd4"/>
+<circle cx="283.4" cy="361.0" r="3.5" fill="#fcfcfb" stroke="#9a9891" stroke-width="1.5"/>
+<rect x="277.4" y="378.0" width="37.5" height="20" rx="3" fill="#dddcd4"/>
 <rect class="hit" x="156.0" y="6.0" width="161.9" height="400.0" rx="6"/>
 </g>
 <g class="col" data-iter="2" role="button" tabindex="0" aria-expanded="false" aria-label="iteration 2 — rejected: open detail">
@@ -167,10 +169,10 @@ footer a { color: #1c5cab; }
 <rect x="419.8" y="210.0" width="28.4" height="24" rx="3" fill="rgba(42,120,214,0.24)"/>
 <text x="453.2" y="225.5" font-size="9.5" fill="#898781">79 calls</text>
 <rect x="448.2" y="270.0" width="35.6" height="20" rx="3" fill="#dddcd4"/>
-<rect x="483.8" y="297.0" width="31.7" height="20" rx="3" fill="#dddcd4"/>
-<rect x="515.4" y="324.0" width="31.7" height="20" rx="3" fill="#dddcd4"/>
-<circle cx="553.1" cy="361.0" r="3.5" fill="#fcfcfb" stroke="#9a9891" stroke-width="1.5"/>
-<rect x="547.1" y="378.0" width="31.7" height="20" rx="3" fill="#dddcd4"/>
+<rect x="483.8" y="297.0" width="47.9" height="20" rx="3" fill="#dddcd4"/>
+<rect x="531.7" y="324.0" width="35.7" height="20" rx="3" fill="#dddcd4"/>
+<circle cx="573.4" cy="361.0" r="3.5" fill="#fcfcfb" stroke="#9a9891" stroke-width="1.5"/>
+<rect x="567.4" y="378.0" width="38.1" height="20" rx="3" fill="#dddcd4"/>
 <rect class="hit" x="417.8" y="6.0" width="190.6" height="400.0" rx="6"/>
 </g>
 <g class="col" data-iter="4" role="button" tabindex="0" aria-expanded="false" aria-label="iteration 4 — discarded: open detail">
@@ -181,10 +183,10 @@ footer a { color: #1c5cab; }
 <rect x="614.5" y="210.0" width="9.7" height="24" rx="3" fill="rgba(42,120,214,0.24)"/>
 <text x="629.2" y="225.5" font-size="9.5" fill="#898781">17 calls</text>
 <rect x="624.2" y="270.0" width="34.3" height="20" rx="3" fill="#dddcd4"/>
-<rect x="658.5" y="297.0" width="31.7" height="20" rx="3" fill="#dddcd4"/>
-<rect x="690.1" y="324.0" width="31.7" height="20" rx="3" fill="#dddcd4"/>
-<circle cx="727.8" cy="361.0" r="3.5" fill="#fcfcfb" stroke="#9a9891" stroke-width="1.5"/>
-<rect x="721.8" y="378.0" width="31.7" height="20" rx="3" fill="#dddcd4"/>
+<rect x="658.5" y="297.0" width="50.3" height="20" rx="3" fill="#dddcd4"/>
+<rect x="708.7" y="324.0" width="35.9" height="20" rx="3" fill="#dddcd4"/>
+<circle cx="750.6" cy="361.0" r="3.5" fill="#fcfcfb" stroke="#9a9891" stroke-width="1.5"/>
+<rect x="744.6" y="378.0" width="38.1" height="20" rx="3" fill="#dddcd4"/>
 <rect class="hit" x="612.5" y="6.0" width="173.2" height="400.0" rx="6"/>
 </g>
 <g class="col" data-iter="5" role="button" tabindex="0" aria-expanded="false" aria-label="iteration 5 — discarded: open detail">
@@ -195,10 +197,10 @@ footer a { color: #1c5cab; }
 <rect x="791.7" y="210.0" width="11.3" height="24" rx="3" fill="rgba(42,120,214,0.24)"/>
 <text x="808.0" y="225.5" font-size="9.5" fill="#898781">17 calls</text>
 <rect x="803.0" y="270.0" width="33.6" height="20" rx="3" fill="#dddcd4"/>
-<rect x="836.5" y="297.0" width="31.7" height="20" rx="3" fill="#dddcd4"/>
-<rect x="868.2" y="324.0" width="31.7" height="20" rx="3" fill="#dddcd4"/>
-<circle cx="905.8" cy="361.0" r="3.5" fill="#fcfcfb" stroke="#9a9891" stroke-width="1.5"/>
-<rect x="899.8" y="378.0" width="31.7" height="20" rx="3" fill="#dddcd4"/>
+<rect x="836.5" y="297.0" width="48.9" height="20" rx="3" fill="#dddcd4"/>
+<rect x="885.4" y="324.0" width="36.3" height="20" rx="3" fill="#dddcd4"/>
+<circle cx="927.8" cy="361.0" r="3.5" fill="#fcfcfb" stroke="#9a9891" stroke-width="1.5"/>
+<rect x="921.8" y="378.0" width="38.1" height="20" rx="3" fill="#dddcd4"/>
 <rect class="hit" x="789.7" y="6.0" width="173.2" height="400.0" rx="6"/>
 </g>
 <g class="col" data-iter="6" role="button" tabindex="0" aria-expanded="false" aria-label="iteration 6 — discarded: open detail">
@@ -209,14 +211,14 @@ footer a { color: #1c5cab; }
 <rect x="968.8" y="210.0" width="3.8" height="24" rx="3" fill="rgba(42,120,214,0.24)"/>
 <text x="977.6" y="225.5" font-size="9.5" fill="#898781">7 calls</text>
 <rect x="972.6" y="270.0" width="34.1" height="20" rx="3" fill="#dddcd4"/>
-<rect x="1006.7" y="297.0" width="31.7" height="20" rx="3" fill="#dddcd4"/>
-<rect x="1038.3" y="324.0" width="31.7" height="20" rx="3" fill="#dddcd4"/>
-<circle cx="1076.0" cy="361.0" r="3.5" fill="#fcfcfb" stroke="#9a9891" stroke-width="1.5"/>
-<rect x="1070.0" y="378.0" width="31.7" height="20" rx="3" fill="#dddcd4"/>
+<rect x="1006.7" y="297.0" width="47.6" height="20" rx="3" fill="#dddcd4"/>
+<rect x="1054.3" y="324.0" width="35.2" height="20" rx="3" fill="#dddcd4"/>
+<circle cx="1095.4" cy="361.0" r="3.5" fill="#fcfcfb" stroke="#9a9891" stroke-width="1.5"/>
+<rect x="1089.4" y="378.0" width="37.6" height="20" rx="3" fill="#dddcd4"/>
 <rect class="hit" x="966.8" y="6.0" width="163.2" height="400.0" rx="6"/>
 </g>
 <line x1="158" y1="418.0" x2="1128.0" y2="418.0" stroke="#e5e4dd" stroke-width="1"/>
-<text x="142" y="432.0" text-anchor="end" font-size="9.5" fill="#898781">elapsed (h:mm)</text>
+<text x="142" y="432.0" text-anchor="end" font-size="9.5" fill="#898781">elapsed since iter 1 (h:mm)</text>
 <line x1="158.0" y1="418.0" x2="158.0" y2="422.0" stroke="#c3c2b7" stroke-width="1"/>
 <text x="158.0" y="432.0" text-anchor="middle" font-size="9.5" fill="#898781">+0:00</text>
 <line x1="323.9" y1="418.0" x2="323.9" y2="422.0" stroke="#c3c2b7" stroke-width="1"/>
@@ -240,7 +242,7 @@ footer a { color: #1c5cab; }
 <p class="hint">Click a column above, or expand an iteration here.</p>
 <details id="it-1"><summary><span class="dn">Iteration 1</span><span class="badge d">discarded</span><span class="dsc">8.858 · 1.23% worse vs baseline · 2 files changed</span></summary>
 <div class="dbody">
-<p class="verdict"><b>verdict:</b> latency: tpot_ms=8.857849192850153</p>
+<p class="verdict"><b>verdict:</b> latency: tpot_ms=8.858</p>
 <div class="cols2">
 <div>
 <h4>Code changes</h4>
@@ -254,10 +256,10 @@ footer a { color: #1c5cab; }
 <h4>Checks</h4>
 <table><tr><th>check</th><th>result</th><th>time</th><th>note</th></tr>
 <tr><td class="name">build</td><td class="res">passed</td><td class="num">1m 08s</td><td>candidate built</td></tr>
-<tr><td class="name">correctness</td><td class="res">passed</td><td class="num">20m 00s</td><td>correctness: score=0.93</td></tr>
-<tr><td class="name">latency</td><td class="res">passed</td><td class="num">20m 00s</td><td>latency: tpot_ms=8.857849192850153</td></tr>
-<tr><td class="name">ab-toggle</td><td class="res">passed</td><td class="num">—</td><td>ab-toggle skipped: no VLLM_GLM_TOGGLE declared</td></tr>
-<tr><td class="name">mechanism</td><td class="res">passed</td><td class="num">20m 00s</td><td>mechanism: trace captured</td></tr>
+<tr><td class="name">correctness</td><td class="res">passed</td><td class="num">23m 47s</td><td>correctness: score=0.93</td></tr>
+<tr><td class="name">latency</td><td class="res">passed</td><td class="num">22m 44s</td><td>latency: tpot_ms=8.858</td></tr>
+<tr><td class="name">ab-toggle</td><td class="res skip">skipped</td><td class="num">—</td><td>ab-toggle skipped: no VLLM_GLM_TOGGLE declared</td></tr>
+<tr><td class="name">mechanism</td><td class="res">passed</td><td class="num">24m 05s</td><td>mechanism: trace captured</td></tr>
 </table>
 </div>
 </div>
@@ -684,7 +686,7 @@ footer a { color: #1c5cab; }
 </details>
 <details id="it-3" open><summary><span class="dn">Iteration 3</span><span class="badge k">kept</span><span class="dsc">8.656 · 1.08% better vs baseline · 5 files changed</span></summary>
 <div class="dbody">
-<p class="verdict"><b>verdict:</b> latency: tpot_ms=8.65613441703772</p>
+<p class="verdict"><b>verdict:</b> latency: tpot_ms=8.656</p>
 <div class="cols2">
 <div>
 <h4>Code changes</h4>
@@ -701,10 +703,10 @@ footer a { color: #1c5cab; }
 <h4>Checks</h4>
 <table><tr><th>check</th><th>result</th><th>time</th><th>note</th></tr>
 <tr><td class="name">build</td><td class="res">passed</td><td class="num">22m 28s</td><td>candidate built</td></tr>
-<tr><td class="name">correctness</td><td class="res">passed</td><td class="num">20m 00s</td><td>correctness: score=0.93</td></tr>
-<tr><td class="name">latency</td><td class="res">passed</td><td class="num">20m 00s</td><td>latency: tpot_ms=8.65613441703772</td></tr>
-<tr><td class="name">ab-toggle</td><td class="res">passed</td><td class="num">—</td><td>ab-toggle skipped: no VLLM_GLM_TOGGLE declared</td></tr>
-<tr><td class="name">mechanism</td><td class="res">passed</td><td class="num">20m 00s</td><td>mechanism: trace captured</td></tr>
+<tr><td class="name">correctness</td><td class="res">passed</td><td class="num">30m 17s</td><td>correctness: score=0.93</td></tr>
+<tr><td class="name">latency</td><td class="res">passed</td><td class="num">22m 34s</td><td>latency: tpot_ms=8.656</td></tr>
+<tr><td class="name">ab-toggle</td><td class="res skip">skipped</td><td class="num">—</td><td>ab-toggle skipped: no VLLM_GLM_TOGGLE declared</td></tr>
+<tr><td class="name">mechanism</td><td class="res">passed</td><td class="num">24m 28s</td><td>mechanism: trace captured</td></tr>
 </table>
 </div>
 </div>
@@ -803,7 +805,7 @@ footer a { color: #1c5cab; }
 </details>
 <details id="it-4"><summary><span class="dn">Iteration 4</span><span class="badge d">discarded</span><span class="dsc">8.754 · 0.04% worse vs baseline · 1 file changed</span></summary>
 <div class="dbody">
-<p class="verdict"><b>verdict:</b> latency: tpot_ms=8.754319360093632</p>
+<p class="verdict"><b>verdict:</b> latency: tpot_ms=8.754</p>
 <div class="cols2">
 <div>
 <h4>Code changes</h4>
@@ -816,10 +818,10 @@ footer a { color: #1c5cab; }
 <h4>Checks</h4>
 <table><tr><th>check</th><th>result</th><th>time</th><th>note</th></tr>
 <tr><td class="name">build</td><td class="res">passed</td><td class="num">21m 40s</td><td>candidate built</td></tr>
-<tr><td class="name">correctness</td><td class="res">passed</td><td class="num">20m 00s</td><td>correctness: score=0.935</td></tr>
-<tr><td class="name">latency</td><td class="res">passed</td><td class="num">20m 00s</td><td>latency: tpot_ms=8.754319360093632</td></tr>
-<tr><td class="name">ab-toggle</td><td class="res">passed</td><td class="num">—</td><td>ab-toggle skipped: no VLLM_GLM_TOGGLE declared</td></tr>
-<tr><td class="name">mechanism</td><td class="res">passed</td><td class="num">20m 00s</td><td>mechanism: trace captured</td></tr>
+<tr><td class="name">correctness</td><td class="res">passed</td><td class="num">31m 45s</td><td>correctness: score=0.935</td></tr>
+<tr><td class="name">latency</td><td class="res">passed</td><td class="num">22m 39s</td><td>latency: tpot_ms=8.754</td></tr>
+<tr><td class="name">ab-toggle</td><td class="res skip">skipped</td><td class="num">—</td><td>ab-toggle skipped: no VLLM_GLM_TOGGLE declared</td></tr>
+<tr><td class="name">mechanism</td><td class="res">passed</td><td class="num">24m 29s</td><td>mechanism: trace captured</td></tr>
 </table>
 </div>
 </div>
@@ -857,7 +859,7 @@ footer a { color: #1c5cab; }
 </details>
 <details id="it-5"><summary><span class="dn">Iteration 5</span><span class="badge d">discarded</span><span class="dsc">8.665 · 0.98% better vs baseline · 1 file changed</span></summary>
 <div class="dbody">
-<p class="verdict"><b>verdict:</b> latency: tpot_ms=8.66481692042953</p>
+<p class="verdict"><b>verdict:</b> latency: tpot_ms=8.665</p>
 <div class="cols2">
 <div>
 <h4>Code changes</h4>
@@ -870,10 +872,10 @@ footer a { color: #1c5cab; }
 <h4>Checks</h4>
 <table><tr><th>check</th><th>result</th><th>time</th><th>note</th></tr>
 <tr><td class="name">build</td><td class="res">passed</td><td class="num">21m 12s</td><td>candidate built</td></tr>
-<tr><td class="name">correctness</td><td class="res">passed</td><td class="num">20m 00s</td><td>correctness: score=0.94</td></tr>
-<tr><td class="name">latency</td><td class="res">passed</td><td class="num">20m 00s</td><td>latency: tpot_ms=8.66481692042953</td></tr>
-<tr><td class="name">ab-toggle</td><td class="res">passed</td><td class="num">—</td><td>ab-toggle skipped: no VLLM_GLM_TOGGLE declared</td></tr>
-<tr><td class="name">mechanism</td><td class="res">passed</td><td class="num">20m 00s</td><td>mechanism: trace captured</td></tr>
+<tr><td class="name">correctness</td><td class="res">passed</td><td class="num">30m 54s</td><td>correctness: score=0.94</td></tr>
+<tr><td class="name">latency</td><td class="res">passed</td><td class="num">22m 57s</td><td>latency: tpot_ms=8.665</td></tr>
+<tr><td class="name">ab-toggle</td><td class="res skip">skipped</td><td class="num">—</td><td>ab-toggle skipped: no VLLM_GLM_TOGGLE declared</td></tr>
+<tr><td class="name">mechanism</td><td class="res">passed</td><td class="num">24m 28s</td><td>mechanism: trace captured</td></tr>
 </table>
 </div>
 </div>
@@ -911,7 +913,7 @@ footer a { color: #1c5cab; }
 </details>
 <details id="it-6"><summary><span class="dn">Iteration 6</span><span class="badge d">discarded</span><span class="dsc">8.753 · 0.03% worse vs baseline · 1 file changed</span></summary>
 <div class="dbody">
-<p class="verdict"><b>verdict:</b> latency: tpot_ms=8.753463029052</p>
+<p class="verdict"><b>verdict:</b> latency: tpot_ms=8.753</p>
 <div class="cols2">
 <div>
 <h4>Code changes</h4>
@@ -924,10 +926,10 @@ footer a { color: #1c5cab; }
 <h4>Checks</h4>
 <table><tr><th>check</th><th>result</th><th>time</th><th>note</th></tr>
 <tr><td class="name">build</td><td class="res">passed</td><td class="num">21m 31s</td><td>candidate built</td></tr>
-<tr><td class="name">correctness</td><td class="res">passed</td><td class="num">20m 00s</td><td>correctness: score=0.95</td></tr>
-<tr><td class="name">latency</td><td class="res">passed</td><td class="num">20m 00s</td><td>latency: tpot_ms=8.753463029052</td></tr>
-<tr><td class="name">ab-toggle</td><td class="res">passed</td><td class="num">—</td><td>ab-toggle skipped: no VLLM_GLM_TOGGLE declared</td></tr>
-<tr><td class="name">mechanism</td><td class="res">passed</td><td class="num">20m 00s</td><td>mechanism: trace captured</td></tr>
+<tr><td class="name">correctness</td><td class="res">passed</td><td class="num">30m 04s</td><td>correctness: score=0.95</td></tr>
+<tr><td class="name">latency</td><td class="res">passed</td><td class="num">22m 13s</td><td>latency: tpot_ms=8.753</td></tr>
+<tr><td class="name">ab-toggle</td><td class="res skip">skipped</td><td class="num">—</td><td>ab-toggle skipped: no VLLM_GLM_TOGGLE declared</td></tr>
+<tr><td class="name">mechanism</td><td class="res">passed</td><td class="num">24m 09s</td><td>mechanism: trace captured</td></tr>
 </table>
 </div>
 </div>

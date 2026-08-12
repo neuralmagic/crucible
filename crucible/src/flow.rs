@@ -126,6 +126,10 @@ pub(crate) struct Edits {
 pub(crate) struct Rung {
     pub name: String,
     pub pass: bool,
+    /// The check never ran (skipped disposition on the wire, or a gate that reports a
+    /// skip as a pass with a "<task> skipped: why" note).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skipped: bool,
     pub note_short: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_s: Option<f64>,
@@ -376,6 +380,7 @@ fn fold_rungs(aux: &mut Aux, row: &RowWire) -> Vec<Rung> {
                 return vec![Rung {
                     name: task.into(),
                     pass: false,
+                    skipped: false,
                     note_short: fold_short(&row.note, 120),
                     duration_s: None,
                 }];
@@ -396,9 +401,17 @@ fn fold_rungs(aux: &mut Aux, row: &RowWire) -> Vec<Rung> {
                 .and_then(|v| v.get("note"))
                 .and_then(Value::as_str)
                 .unwrap_or(&e.note);
+            // Some gates report a skip as a pass with a "<task> skipped: why" note
+            // (nothing ran, so nothing failed); fold it like the wire's skipped
+            // disposition so no emitter claims a check passed that never ran.
+            let skipped = e.disposition == EvidenceDisposition::Skipped
+                || note
+                    .strip_prefix(e.task.as_str())
+                    .is_some_and(|r| r.trim_start().starts_with("skipped"));
             Rung {
                 name: e.task.clone(),
                 pass: e.disposition == EvidenceDisposition::Passed,
+                skipped,
                 note_short: fold_short(note, 120),
                 duration_s: None,
             }
@@ -429,23 +442,50 @@ fn rung_kind(entry: &Value) -> Option<String> {
 }
 
 /// File list + counts from a unified diff; hunks are deliberately never carried.
+/// +/- lines only count inside a hunk, so file headers (`+++ b/…`) are never counted
+/// and an added line whose content itself starts with `++` never gets dropped.
 fn parse_diff(diff: &str) -> Edits {
     let mut e = Edits::default();
+    let mut in_hunk = false;
     for line in diff.lines() {
         if let Some(rest) = line.strip_prefix("diff --git ") {
-            // "a/<path> b/<path>": take the post-image side.
-            if let Some(pos) = rest.rfind(" b/") {
-                e.files.push(rest[pos + 3..].to_string());
+            in_hunk = false;
+            if let Some(path) = diff_b_path(rest) {
+                e.files.push(path);
             }
-        } else if line.starts_with("+++") || line.starts_with("---") {
-        } else if line.starts_with('+') {
+        } else if line.starts_with("@@") {
+            in_hunk = true;
+        } else if in_hunk && line.starts_with('+') {
             e.insertions += 1;
-        } else if line.starts_with('-') {
+        } else if in_hunk && line.starts_with('-') {
             e.deletions += 1;
         }
     }
     e.files_changed = e.files.len();
     e
+}
+
+/// Post-image path from the `a/<old> b/<new>` tail of a `diff --git` line. Git quotes
+/// a path containing specials (`"a/x y" "b/x y"`); the unquoted form is ambiguous when
+/// a path itself contains ` b/`, so the symmetric old == new split is preferred and
+/// `rfind(" b/")` is the rename fallback.
+fn diff_b_path(rest: &str) -> Option<String> {
+    if let Some(stripped) = rest.strip_suffix('"') {
+        let pos = stripped.rfind("\"b/")?;
+        return Some(stripped[pos + 3..].to_string());
+    }
+    let mid = rest.len() / 2;
+    if rest.len() % 2 == 1
+        && rest.as_bytes().get(mid) == Some(&b' ')
+        && let (Some(pa), Some(pb)) = (
+            rest[..mid].strip_prefix("a/"),
+            rest[mid + 1..].strip_prefix("b/"),
+        )
+        && pa == pb
+    {
+        return Some(pb.to_string());
+    }
+    rest.rfind(" b/").map(|pos| rest[pos + 3..].to_string())
 }
 
 /// One-line fold + cap for notes that can carry whole tracebacks.
@@ -589,9 +629,14 @@ fn join_spans(m: &mut FlowModel, aux: &Aux, raw: &str) -> Result<()> {
 
     // Rung durations: broker `mcp.codegen_<kind>` spans bucketed into the iteration whose
     // measure phase (after the turn ended) they started in, then claimed in rung order by
-    // each rung whose extraction-time kind hint matches. Two rungs of one kind (latency +
-    // ab-toggle both benchmark) claim successive spans.
+    // each rung whose extraction-time kind hint matches. One rung run is a long-poll
+    // sequence: every poll that hits the broker's cap emits a `status: pending` span and
+    // the final poll the terminal one, so pending spans extend the open sequence instead
+    // of counting as durations — the duration runs first poll start → terminal end.
+    // Two rungs of one kind (latency + ab-toggle both benchmark) claim successive
+    // sequences.
     let mut buckets: HashMap<u32, HashMap<&str, VecDeque<f64>>> = HashMap::new();
+    let mut open: HashMap<(u32, &str), i128> = HashMap::new();
     let mut measure: Vec<(&DdAttrs, i128, i128)> = spans
         .iter()
         .filter(|s| s.resource_name.starts_with("mcp.codegen_"))
@@ -606,18 +651,28 @@ fn join_spans(m: &mut FlowModel, aux: &Aux, raw: &str) -> Result<()> {
             continue;
         };
         let kind = &s.resource_name["mcp.codegen_".len()..];
+        let seq_start = *open.entry((*n, kind)).or_insert(start_ns);
+        if s.custom.get("status").and_then(Value::as_str) == Some("pending") {
+            continue;
+        }
+        open.remove(&(*n, kind));
         buckets
             .entry(*n)
             .or_default()
             .entry(kind)
             .or_default()
-            .push_back(secs(start_ns, end_ns));
+            .push_back(secs(seq_start, end_ns));
     }
+    // A sequence the export ends inside (pending spans with no terminal one) has no
+    // knowable duration; it stays unclaimed rather than reporting the poll cap.
     for it in &mut m.iterations {
         let Some(kinds) = buckets.get_mut(&it.n) else {
             continue;
         };
         for rung in &mut it.rungs {
+            if rung.skipped {
+                continue;
+            }
             if let Some(kind) = aux.rung_kind.get(&(it.n, rung.name.clone())) {
                 rung.duration_s = kinds.get_mut(kind.as_str()).and_then(VecDeque::pop_front);
             }
@@ -979,6 +1034,14 @@ mod tests {
             m.iterations[2].rungs[1].note_short,
             "correctness: score=0.93"
         );
+        // ab-toggle's wire disposition is "passed" but its note says it never ran.
+        let skipped: Vec<&str> = m.iterations[2]
+            .rungs
+            .iter()
+            .filter(|r| r.skipped)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(skipped, ["ab-toggle"]);
     }
 
     #[test]
@@ -1049,13 +1112,15 @@ mod tests {
                 .find(|r| r.name == n)
                 .unwrap_or_else(|| panic!("no rung {n}"))
         };
-        for name in ["build", "correctness", "latency", "mechanism"] {
-            let d = by_name(name).duration_s;
-            assert!(
-                d.is_some_and(|d| d > 0.0),
-                "rung {name} has no joined duration: {d:?}"
-            );
-        }
+        // Real sequence spans, not the broker's 20-min long-poll cap: a rung that
+        // outlives one poll emits a pending span first, and the duration must cover
+        // pending + terminal, never equal the constant 1200 s poll window.
+        approx(by_name("build").duration_s.unwrap(), 1347.988, 0.01);
+        approx(by_name("correctness").duration_s.unwrap(), 1816.946, 0.01);
+        approx(by_name("latency").duration_s.unwrap(), 1353.859, 0.01);
+        approx(by_name("mechanism").duration_s.unwrap(), 1467.727, 0.01);
+        // The skipped rung never ran, so it must not claim anyone else's span.
+        assert!(by_name("ab-toggle").duration_s.is_none());
         // Without spans no rung has a duration.
         let plain = model();
         assert!(
@@ -1109,6 +1174,27 @@ mod tests {
         let empty = parse_diff("");
         assert_eq!(empty.files_changed, 0);
         assert!(empty.files.is_empty());
+    }
+
+    #[test]
+    fn parse_diff_keeps_content_lines_that_look_like_file_headers() {
+        // Added "++i;" renders as "+++i;", removed "--j;" as "---j;": content, not headers.
+        let diff = "diff --git a/x.c b/x.c\nindex 1..2 100644\n--- a/x.c\n+++ b/x.c\n@@ -1 +1 @@\n---j;\n+++i;\n";
+        let e = parse_diff(diff);
+        assert_eq!(e.files, ["x.c"]);
+        assert_eq!(e.insertions, 1);
+        assert_eq!(e.deletions, 1);
+    }
+
+    #[test]
+    fn parse_diff_handles_quoted_and_spaced_paths() {
+        let quoted = "diff --git \"a/dir/x y.rs\" \"b/dir/x y.rs\"\n--- \"a/dir/x y.rs\"\n+++ \"b/dir/x y.rs\"\n@@ -1 +1 @@\n-a\n+b\n";
+        let e = parse_diff(quoted);
+        assert_eq!(e.files, ["dir/x y.rs"]);
+        assert_eq!((e.insertions, e.deletions), (1, 1));
+        // Unquoted spaces: the symmetric a/P b/P split wins over rfind(" b/").
+        let spaced = "diff --git a/has b/x.rs b/has b/x.rs\n@@ -1 +1 @@\n+z\n";
+        assert_eq!(parse_diff(spaced).files, ["has b/x.rs"]);
     }
 
     #[test]

@@ -66,24 +66,25 @@
           "name": "correctness",
           "pass": true,
           "note_short": "correctness: score=0.93",
-          "duration_s": 1200.0
+          "duration_s": 1427.247
         },
         {
           "name": "latency",
           "pass": true,
           "note_short": "latency: tpot_ms=8.857849192850153",
-          "duration_s": 1200.0
+          "duration_s": 1363.743
         },
         {
           "name": "ab-toggle",
           "pass": true,
+          "skipped": true,
           "note_short": "ab-toggle skipped: no VLLM_GLM_TOGGLE declared"
         },
         {
           "name": "mechanism",
           "pass": true,
           "note_short": "mechanism: trace captured",
-          "duration_s": 1200.0
+          "duration_s": 1445.463
         }
       ],
       "turn": {
@@ -2033,24 +2034,25 @@
           "name": "correctness",
           "pass": true,
           "note_short": "correctness: score=0.93",
-          "duration_s": 1200.001
+          "duration_s": 1816.946
         },
         {
           "name": "latency",
           "pass": true,
           "note_short": "latency: tpot_ms=8.65613441703772",
-          "duration_s": 1200.0
+          "duration_s": 1353.859
         },
         {
           "name": "ab-toggle",
           "pass": true,
+          "skipped": true,
           "note_short": "ab-toggle skipped: no VLLM_GLM_TOGGLE declared"
         },
         {
           "name": "mechanism",
           "pass": true,
           "note_short": "mechanism: trace captured",
-          "duration_s": 1200.001
+          "duration_s": 1467.727
         }
       ],
       "turn": {
@@ -2481,24 +2483,25 @@
           "name": "correctness",
           "pass": true,
           "note_short": "correctness: score=0.935",
-          "duration_s": 1200.0
+          "duration_s": 1905.059
         },
         {
           "name": "latency",
           "pass": true,
           "note_short": "latency: tpot_ms=8.754319360093632",
-          "duration_s": 1200.0
+          "duration_s": 1359.092
         },
         {
           "name": "ab-toggle",
           "pass": true,
+          "skipped": true,
           "note_short": "ab-toggle skipped: no VLLM_GLM_TOGGLE declared"
         },
         {
           "name": "mechanism",
           "pass": true,
           "note_short": "mechanism: trace captured",
-          "duration_s": 1200.0
+          "duration_s": 1469.441
         }
       ],
       "turn": {
@@ -2619,24 +2622,25 @@
           "name": "correctness",
           "pass": true,
           "note_short": "correctness: score=0.94",
-          "duration_s": 1200.0
+          "duration_s": 1854.11
         },
         {
           "name": "latency",
           "pass": true,
           "note_short": "latency: tpot_ms=8.66481692042953",
-          "duration_s": 1200.0
+          "duration_s": 1377.021
         },
         {
           "name": "ab-toggle",
           "pass": true,
+          "skipped": true,
           "note_short": "ab-toggle skipped: no VLLM_GLM_TOGGLE declared"
         },
         {
           "name": "mechanism",
           "pass": true,
           "note_short": "mechanism: trace captured",
-          "duration_s": 1200.0
+          "duration_s": 1468.36
         }
       ],
       "turn": {
@@ -2757,24 +2761,25 @@
           "name": "correctness",
           "pass": true,
           "note_short": "correctness: score=0.95",
-          "duration_s": 1200.0
+          "duration_s": 1804.225
         },
         {
           "name": "latency",
           "pass": true,
           "note_short": "latency: tpot_ms=8.753463029052",
-          "duration_s": 1200.0
+          "duration_s": 1332.563
         },
         {
           "name": "ab-toggle",
           "pass": true,
+          "skipped": true,
           "note_short": "ab-toggle skipped: no VLLM_GLM_TOGGLE declared"
         },
         {
           "name": "mechanism",
           "pass": true,
           "note_short": "mechanism: trace captured",
-          "duration_s": 1200.0
+          "duration_s": 1449.328
         }
       ],
       "turn": {
