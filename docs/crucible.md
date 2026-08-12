@@ -317,6 +317,15 @@ downward-API `CRUCIBLE_POD_NAME` / `CRUCIBLE_POD_NAMESPACE`. Slack is webhook-on
 `DATADOG_BASE_URL` if your Datadog site is not `app.datadoghq.com`. With no webhook configured
 the suspend still happens; delivery is fire-and-forget by design.
 
+## `crucible flow`: explain a finished run
+
+`crucible flow --session state/session.jsonl --out flow.html` folds a finished run into a
+small flow-model IR and renders it; the `--out` extension picks `.json` (the IR itself),
+`.dot`, `.mmd`, or `.html` — a self-contained explainer page: header strip, a swimlane of
+iterations (agent turn + check ladder per column, scores vs baseline), per-iteration
+detail, and the draft-PR footer. An optional `--spans <dd-export.json>` (Datadog APM) adds
+real wall-clock: time-proportional columns, check durations, the agent's tool-call timeline.
+
 ## Concept → code (where to look)
 
 - loop / budget / keep-discard: `crucible/src/run.rs` + `crucible/src/loop_driver.rs`

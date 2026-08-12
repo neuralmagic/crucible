@@ -300,7 +300,7 @@ struct ComponentRecord {
 
 /// Scores can be `INFINITY` (no measurement); `serde_json` refuses non-finite
 /// floats, so drop those to `null` rather than blow up the whole record.
-fn finite(x: f64) -> Option<f64> {
+pub(crate) fn finite(x: f64) -> Option<f64> {
     x.is_finite().then_some(x)
 }
 
@@ -370,7 +370,7 @@ struct IndexEntry {
 }
 
 /// First non-empty goal line, de-hashed and length-capped, for leaderboard display.
-fn goal_line(goal: &str) -> String {
+pub(crate) fn goal_line(goal: &str) -> String {
     let line = goal
         .lines()
         .map(str::trim)
@@ -485,6 +485,13 @@ fn artifact_content_type(rel: &str) -> &'static str {
     }
 }
 
+/// The flow report pair (`flow.json`, `flow.html`) folded from the session log bytes, the
+/// visual twin of `session.jsonl` in the run record. Best-effort like the RESULTS.md read:
+/// a malformed log yields `None` and the record ships without flow files.
+fn flow_report(session: &[u8]) -> Option<(String, String)> {
+    crate::flow::render_report(std::str::from_utf8(session).ok()?).ok()
+}
+
 /// The filesystem twin of [`s3_record`]: same layout under `root` (a mounted PVC). Everything the
 /// S3 path treats as best-effort reads stays best-effort here; directory creation and the record
 /// writes themselves are real errors (a read-only or missing mount must be loud).
@@ -509,6 +516,10 @@ fn file_record(rec: &Record<'_>, prs: &[PrLink], root: &Path) -> Result<String> 
 
     if let Ok(bytes) = std::fs::read(&rec.paths.session_log) {
         write(&format!("{}/session.jsonl", k.run_prefix), &bytes)?;
+        if let Some((json, html)) = flow_report(&bytes) {
+            write(&format!("{}/flow.json", k.run_prefix), json.as_bytes())?;
+            write(&format!("{}/flow.html", k.run_prefix), html.as_bytes())?;
+        }
     }
     if let Ok(bytes) = std::fs::read(rec.paths.workspace.join("RESULTS.md")) {
         write(&format!("{}/RESULTS.md", k.run_prefix), &bytes)?;
@@ -548,6 +559,7 @@ fn s3_record(rec: &Record<'_>, prs: &[PrLink]) -> Result<String> {
         // session.jsonl + RESULTS.md are best-effort reads: a crashed-early run may
         // not have written them yet, and a missing file shouldn't sink the record.
         if let Ok(bytes) = std::fs::read(&rec.paths.session_log) {
+            let flow = flow_report(&bytes);
             put(
                 &client,
                 &bucket,
@@ -556,6 +568,24 @@ fn s3_record(rec: &Record<'_>, prs: &[PrLink]) -> Result<String> {
                 "application/x-ndjson",
             )
             .await?;
+            if let Some((json, html)) = flow {
+                put(
+                    &client,
+                    &bucket,
+                    &format!("{}/flow.json", k.run_prefix),
+                    json.into_bytes(),
+                    "application/json",
+                )
+                .await?;
+                put(
+                    &client,
+                    &bucket,
+                    &format!("{}/flow.html", k.run_prefix),
+                    html.into_bytes(),
+                    "text/html",
+                )
+                .await?;
+            }
         }
         if let Ok(bytes) = std::fs::read(rec.paths.workspace.join("RESULTS.md")) {
             put(
@@ -1141,9 +1171,25 @@ fn pr_title(rec: &Record<'_>) -> String {
     let line = goal_line(rec.goal);
     let line = if line.is_empty() { "candidate" } else { &line };
     match (finite(rec.baseline_score), finite(rec.best_score)) {
-        (Some(b), Some(best)) => format!("[autoresearch] {line} ({b:.0} → {best:.0})"),
+        (Some(b), Some(best)) => {
+            let p = score_precision(b, best);
+            format!("[autoresearch] {line} ({b:.p$} → {best:.p$})")
+        }
         _ => format!("[autoresearch] {line}"),
     }
+}
+
+/// Decimals for a title's `(baseline → best)` pair: the fewest (capped at 3) where the gap is
+/// at least one unit in the last place, so 8.751 → 8.656 renders "(8.75 → 8.66)" instead of
+/// "(9 → 9)" while a genuinely-integer pair stays "(120 → 95)".
+fn score_precision(b: f64, best: f64) -> usize {
+    let delta = (b - best).abs();
+    if delta == 0.0 {
+        return 0;
+    }
+    (0..=3usize)
+        .find(|&p| delta >= 10f64.powi(-(p as i32)))
+        .unwrap_or(3)
 }
 
 /// The PR body: goal, the baseline→best delta, one section per kept iteration (the agent's full
@@ -1200,14 +1246,33 @@ fn pr_body(rec: &Record<'_>) -> String {
         rec.cost_usd,
         rec.elapsed.as_secs()
     ));
-    if !rec.args.results_bucket.is_empty()
-        && let Ok((bucket, base)) = parse_s3_uri(&rec.args.results_bucket)
-    {
-        let k = keys(&base, &slug(rec.goal), rec.run_id);
-        s.push_str(&format!("\nRun record: `s3://{bucket}/{}`\n", k.run_prefix));
+    if let Some(record) = record_uri(rec) {
+        s.push_str(&format!("\nRun record: `{record}`\n"));
+        s.push_str(&format!("Visual run report: `{record}/flow.html`\n"));
     }
     s.push_str("\n🤖 opened by crucible autoresearch (draft — review and steer).\n");
     s
+}
+
+/// The run-record URI the PR body cites, matching what the record writers produce for the
+/// configured backend. `None` when no results bucket is configured or it doesn't parse.
+fn record_uri(rec: &Record<'_>) -> Option<String> {
+    if rec.args.results_bucket.is_empty() {
+        return None;
+    }
+    let goal_slug = slug(rec.goal);
+    match backend(&rec.args.results_bucket).ok()? {
+        Backend::S3 => {
+            let (bucket, base) = parse_s3_uri(&rec.args.results_bucket).ok()?;
+            let k = keys(&base, &goal_slug, rec.run_id);
+            Some(format!("s3://{bucket}/{}", k.run_prefix))
+        }
+        Backend::File { root } => Some(format!(
+            "file://{}/{}",
+            root.display(),
+            keys("", &goal_slug, rec.run_id).run_prefix
+        )),
+    }
 }
 
 /// Mermaid xychart of the run's score trajectory: every measured deep-loop iteration's score,
@@ -1424,7 +1489,8 @@ fn composite_pr_title(rec: &Record<'_>, component: &str) -> String {
     let line = if line.is_empty() { "candidate" } else { &line };
     match (finite(rec.baseline_score), finite(rec.best_score)) {
         (Some(b), Some(best)) => {
-            format!("[autoresearch] {line} — {component} ({b:.0} → {best:.0})")
+            let p = score_precision(b, best);
+            format!("[autoresearch] {line} — {component} ({b:.p$} → {best:.p$})")
         }
         _ => format!("[autoresearch] {line} — {component}"),
     }
@@ -1638,6 +1704,13 @@ mod tests {
         .unwrap();
         std::fs::write(ws.join("codegen-out/summary.txt"), "investigation").unwrap();
         std::fs::write(ws.join("codegen-out/summary.pptx"), b"PPTX".as_slice()).unwrap();
+        // A real session log (the flow fixture) so the record also carries the flow report.
+        std::fs::create_dir_all(base.join("state")).unwrap();
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/flow/run7-session.jsonl"),
+            base.join("state/session.jsonl"),
+        )
+        .unwrap();
 
         let mut args = <crate::Cli as clap::Parser>::try_parse_from(["crucible"])
             .unwrap()
@@ -1685,6 +1758,9 @@ mod tests {
         assert!(uri.starts_with("file://"), "{uri}");
         let run = root.join("runs/goal/20260811T000000Z-goal");
         for key in [
+            "session.jsonl",
+            "flow.json",
+            "flow.html",
             "RESULTS.md",
             "summary.json",
             "diffs/iter-1.patch",
@@ -1695,6 +1771,25 @@ mod tests {
         }
         assert!(root.join("index/20260811T000000Z-goal.json").exists());
         assert!(root.join("runs/goal/latest.json").exists());
+
+        // The flow pair is the rendered report, not copies of the log: the IR parses as JSON
+        // and the page is a complete HTML document.
+        let flow_json = std::fs::read_to_string(run.join("flow.json")).unwrap();
+        serde_json::from_str::<serde_json::Value>(&flow_json).expect("flow.json is valid JSON");
+        let flow_html = std::fs::read_to_string(run.join("flow.html")).unwrap();
+        assert!(flow_html.contains("</html>"), "flow.html is a full page");
+
+        // The PR body points a reviewer at the visual report inside the run record.
+        let body = pr_body(&rec);
+        let record_uri = format!("file://{}", run.display());
+        assert!(
+            body.contains(&format!("Run record: `{record_uri}`")),
+            "{body}"
+        );
+        assert!(
+            body.contains(&format!("Visual run report: `{record_uri}/flow.html`")),
+            "{body}"
+        );
 
         let prior = fetch_prior_results(&args.results_bucket, "goal")
             .expect("prior results readable from file backend");
@@ -1738,6 +1833,116 @@ mod tests {
         };
         assert!(record(&bad, &[]).is_err());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A malformed session log (not UTF-8, so the flow fold can't even start) yields no flow
+    /// files but never a failed publish: the rest of the record still lands.
+    #[test]
+    fn malformed_session_log_publishes_without_flow_files() {
+        let base = std::env::temp_dir().join(format!("pub-badlog-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let ws = base.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(base.join("state")).unwrap();
+        std::fs::write(base.join("state/session.jsonl"), b"\xff\xfe not a log").unwrap();
+
+        let mut args = <crate::Cli as clap::Parser>::try_parse_from(["crucible"])
+            .unwrap()
+            .run;
+        args.results_bucket = format!("file://{}", base.join("results").display());
+        let paths = crate::Paths::for_manifest(ws, base.join("state"), &base, None);
+        let rec = Record {
+            args: &args,
+            paths: &paths,
+            run_id: "20260811T000000Z-goal",
+            goal: "goal",
+            model: "m",
+            gate: "tpot_ms".into(),
+            rows: &[],
+            baseline_score: 9.0,
+            best_score: 8.5,
+            improved: true,
+            kept_shas: &[],
+            base_sha: None,
+            components: &[],
+            published_branches: &[],
+            cost_usd: 0.0,
+            elapsed: std::time::Duration::ZERO,
+            identity_digest: "v2:0",
+            seed_hash: "",
+        };
+        record(&rec, &[]).expect("publish survives a malformed session log");
+        let run = base.join("results/runs/goal/20260811T000000Z-goal");
+        assert!(run.join("session.jsonl").exists(), "raw log still ships");
+        assert!(run.join("summary.json").exists());
+        assert!(!run.join("flow.json").exists(), "no flow IR from garbage");
+        assert!(!run.join("flow.html").exists(), "no flow page from garbage");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Title precision adapts to the score gap: run 7's 8.751 → 8.656 rendered "(9 → 9)" under
+    /// fixed `{:.0}`; it must show enough decimals to tell the scores apart (capped at 3),
+    /// while a genuinely-integer pair stays integer.
+    #[test]
+    fn pr_title_scores_use_enough_decimals_to_differ() {
+        let args = <crate::Cli as clap::Parser>::try_parse_from(["crucible"])
+            .unwrap()
+            .run;
+        let paths = crate::Paths::for_manifest(
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+            &std::env::temp_dir(),
+            None,
+        );
+        let rec = |baseline: f64, best: f64| Record {
+            args: &args,
+            paths: &paths,
+            run_id: "r",
+            goal: "goal",
+            model: "m",
+            gate: "tpot_ms".into(),
+            rows: &[],
+            baseline_score: baseline,
+            best_score: best,
+            improved: true,
+            kept_shas: &[],
+            base_sha: None,
+            components: &[],
+            published_branches: &[],
+            cost_usd: 0.0,
+            elapsed: std::time::Duration::ZERO,
+            identity_digest: "v2:0",
+            seed_hash: "",
+        };
+        let close = rec(8.751, 8.656);
+        assert!(
+            pr_title(&close).ends_with("(8.75 → 8.66)"),
+            "{}",
+            pr_title(&close)
+        );
+        assert!(
+            composite_pr_title(&close, "vllm").ends_with("— vllm (8.75 → 8.66)"),
+            "{}",
+            composite_pr_title(&close, "vllm")
+        );
+        let wide = rec(120.0, 95.0);
+        assert!(
+            pr_title(&wide).ends_with("(120 → 95)"),
+            "{}",
+            pr_title(&wide)
+        );
+        // The cap: scores closer than 3 decimals can resolve still render, at 3.
+        assert!(
+            pr_title(&rec(1.00002, 1.00001)).ends_with("(1.000 → 1.000)"),
+            "{}",
+            pr_title(&rec(1.00002, 1.00001))
+        );
+        // Identical scores need no decimal dust.
+        assert!(
+            pr_title(&rec(7.0, 7.0)).ends_with("(7 → 7)"),
+            "{}",
+            pr_title(&rec(7.0, 7.0))
+        );
     }
 
     /// Epilogue rows reach the PR body as an advisory section, with failures shouted.
