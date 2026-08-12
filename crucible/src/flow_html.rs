@@ -1166,20 +1166,39 @@ fn tool_timeline(out: &mut String, it: &Iteration) {
         }
         return;
     }
-    // Rows in first-use order; a long tail folds into "other".
-    let mut rows: Vec<(String, Vec<(f64, f64)>)> = Vec::new();
+    // Rows in first-use order; a long tail folds into "other". Broker (mcp__*) calls are the
+    // agent↔measurement interplay a reader came to see, so they never fold.
+    struct ToolRow {
+        name: String,
+        broker: bool,
+        calls: Vec<(f64, f64)>,
+    }
+    let mut rows: Vec<ToolRow> = Vec::new();
     for c in &it.turn.tool_calls {
         let name = short_tool(&c.tool).to_string();
-        match rows.iter_mut().find(|(n, _)| *n == name) {
-            Some((_, v)) => v.push((c.at_s, c.duration_s)),
-            None => rows.push((name, vec![(c.at_s, c.duration_s)])),
+        let broker = c.tool.starts_with("mcp__");
+        match rows.iter_mut().find(|r| r.name == name) {
+            Some(r) => r.calls.push((c.at_s, c.duration_s)),
+            None => rows.push(ToolRow {
+                name,
+                broker,
+                calls: vec![(c.at_s, c.duration_s)],
+            }),
         }
     }
     if rows.len() > 9 {
-        let tail = rows.split_off(8);
-        let mut merged: Vec<(f64, f64)> = tail.into_iter().flat_map(|(_, v)| v).collect();
-        merged.sort_by(|a, b| a.0.total_cmp(&b.0));
-        rows.push(("other".into(), merged));
+        let (keep_tail, fold_tail): (Vec<_>, Vec<_>) =
+            rows.split_off(8).into_iter().partition(|r| r.broker);
+        rows.extend(keep_tail);
+        if !fold_tail.is_empty() {
+            let mut merged: Vec<(f64, f64)> = fold_tail.into_iter().flat_map(|r| r.calls).collect();
+            merged.sort_by(|a, b| a.0.total_cmp(&b.0));
+            rows.push(ToolRow {
+                name: "other".into(),
+                broker: false,
+                calls: merged,
+            });
+        }
     }
     let last_end = it
         .turn
@@ -1202,7 +1221,8 @@ fn tool_timeline(out: &mut String, it: &Iteration) {
         fmt_dur(total),
         it.n
     );
-    for (i, (name, calls)) in rows.iter().enumerate() {
+    for (i, row) in rows.iter().enumerate() {
+        let (name, calls) = (&row.name, &row.calls);
         let y = i as f64 * row_h;
         w!(
             out,
