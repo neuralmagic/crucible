@@ -226,6 +226,16 @@ pub(crate) fn run(args: &FlowArgs) -> Result<()> {
     Ok(())
 }
 
+/// Fold a session log into the rendered report pair (`flow.json`, `flow.html`) with no span
+/// export — publish runs on the loop pod, which has no Datadog creds, so the page uses its
+/// no-spans fallback.
+pub(crate) fn render_report(session_log: &str) -> Result<(String, String)> {
+    let model = build_model(session_log, None)?;
+    let mut json = serde_json::to_string_pretty(&model).map_err(FlowError::Model)?;
+    json.push('\n');
+    Ok((json, crate::flow_html::emit_html(&model)))
+}
+
 /// Fold the session log (and, when given, the span export) into the flow model.
 pub(crate) fn build_model(session_log: &str, spans_json: Option<&str>) -> Result<FlowModel> {
     let (mut model, aux) = extract(session_log);
