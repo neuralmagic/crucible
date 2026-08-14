@@ -172,6 +172,37 @@ gracefully. The walker opens one OTLP span per task attempt under the per-turn t
 broker's existing per-tool spans nest beneath it unchanged. "Task 6 running, attempt 2" is visible
 within seconds instead of eight hours after the fact.
 
+### Amendment (2026-08-14): `status` is the task's to declare, not only the walker's
+
+The six-state vocabulary above was specified as telemetry, and `TaskStatus` implements all six. But
+only the walker can reach five of them — `skipped` comes from substrate capability filtering,
+`blocked`/`truncated` from the fold, `transport` from retry exhaustion. A task that **ran** reports
+through `enforce_emits`, whose only exits are `Pass` and `Fail`, derived from the boolean `pass` in
+its `$OUT`. A two-state channel is carrying a six-state vocabulary.
+
+The scar: on the GLM-5.2 NVFP4 revalidation run the A/B attribution rung asked the broker to
+re-measure a digest with the candidate's kill-switch set. The manifest had never declared that
+toggle in `[measure.benchmark].mutable_kwargs`, so the broker rejected the kwarg. The gate, having
+no way to say "I ran and could not measure this", recorded `pass: true` with a note explaining the
+skip — and `RESULTS.md` rendered `ab-toggle ✓`. A six-hour run whose entire stated purpose was
+A/B attribution reported five green rungs and produced no attribution. Every downstream reader
+inherited the lie: the results table, the flow report, the controller UI, and the next iteration's
+agent, which the goal explicitly instructs to read the previous iteration's A/B delta.
+
+The gate's judgment was not the defect. Its two available exits were "green" and "the candidate
+failed this check", and neither was true — the *manifest* was broken, not the candidate. Flipping
+the gate to `pass: false` (done, as a stopgap) only moves the error from flattering to accusatory.
+
+**A task's `$OUT` may carry an explicit `status`. When present it wins over `pass`.** Absent, `pass`
+maps to `pass`/`fail` exactly as today, so every existing gate is unaffected. The state worth
+adding first is `skipped`: *ran, found its check inapplicable, contributes no evidence, and accuses
+nobody*. It is not a pass — `valid = every required task is runnable and passed` is unchanged, so a
+required task returning `skipped` leaves the candidate invalid, which is the safe direction.
+
+The rendering rule matters as much as the wire change: `fail` accuses the candidate, `skipped`
+accuses the setup, and **neither may render as a check mark**. A rung that did not run must be
+visually distinct from one that ran and passed, everywhere a rung is shown.
+
 ## Consequences
 
 - Generic judge policy (classification, retry, truncation, short-circuit, caching) is written
