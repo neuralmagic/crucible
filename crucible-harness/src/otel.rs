@@ -125,12 +125,60 @@ impl RateWindow {
     }
 }
 
+/// Where captured exports are forwarded, and the turn span they are re-parented onto.
+///
+/// The agent exports its own root trace, so without the rewrite its `llm_request` spans land in
+/// Datadog as an orphan trace and the run's spans show a gap where inference happened.
+#[derive(Clone, Debug)]
+pub struct OtelForward {
+    /// OTLP/HTTP base URL, e.g. `http://collector:4318`; the receiver path appends to it. This is
+    /// deliberately not derived from `OTEL_EXPORTER_OTLP_ENDPOINT`: that one is grpc/4317, and
+    /// guessing 4318 from it would silently drop exports against a collector that maps ports
+    /// differently.
+    pub endpoint: String,
+    /// Hex `(trace_id, span_id)` of the turn span. `None` forwards without re-parenting.
+    pub parent: Option<(String, String)>,
+    /// Resource attributes stamped onto every forwarded trace payload (e.g. `crucible.turn`).
+    /// The agent's exporter knows nothing about the loop, so attribution happens here, at the
+    /// same boundary as re-parenting.
+    pub attrs: Vec<(String, String)>,
+}
+
+impl OtelForward {
+    /// Parse the turn's W3C `traceparent` (`00-<trace_id>-<span_id>-<flags>`) into a forward
+    /// target. A malformed header forwards unparented rather than dropping the spans.
+    pub fn new(endpoint: String, traceparent: Option<&str>) -> OtelForward {
+        let parent = traceparent.and_then(|tp| {
+            let f: Vec<&str> = tp.split('-').collect();
+            match f.as_slice() {
+                [_, tid, sid, ..] if tid.len() == 32 && sid.len() == 16 => {
+                    Some((tid.to_string(), sid.to_string()))
+                }
+                _ => None,
+            }
+        });
+        OtelForward {
+            endpoint: endpoint.trim_end_matches('/').to_string(),
+            parent,
+            attrs: Vec::new(),
+        }
+    }
+
+    /// Attach resource attributes to stamp on forwarded trace payloads.
+    pub fn with_attrs(mut self, attrs: Vec<(String, String)>) -> OtelForward {
+        self.attrs = attrs;
+        self
+    }
+}
+
 /// Server-side state shared across handlers.
 struct CollectorState {
     log: Mutex<std::fs::File>,
     meters: LiveMeters,
     window: Mutex<RateWindow>,
     start: Instant,
+    forward: Option<OtelForward>,
+    client: reqwest::Client,
 }
 
 /// A running in-process OTLP collector. Owns a background thread with a current-thread tokio
@@ -145,11 +193,18 @@ pub struct OtelCollector {
 }
 
 impl OtelCollector {
-    /// Bind the collector to `bind_addr` on an OS-assigned port, writing every export raw to
-    /// `log_path`. Returns once the port is known, or a bind error (caller treats it as
-    /// telemetry-off). `bind_addr` is `127.0.0.1` for a local agent, or `0.0.0.0` when a
-    /// sandboxed agent reaches the collector over `host.containers.internal`.
-    pub fn start(log_path: PathBuf, bind_addr: &str) -> std::io::Result<OtelCollector> {
+    /// Bind the collector to `bind_addr:port`, writing every export raw to `log_path`. Returns
+    /// once the port is known, or a bind error (caller treats it as telemetry-off). `bind_addr`
+    /// is `127.0.0.1` for a local agent, or `0.0.0.0` for a sandboxed one. `port` 0 takes an
+    /// OS-assigned port; a sandboxed turn under a NetworkPolicy needs a fixed one the policy can
+    /// name. `forward` mirrors every export on to an upstream OTLP/HTTP receiver, re-parented
+    /// onto the turn span; `None` keeps the collector a terminal sink.
+    pub fn start(
+        log_path: PathBuf,
+        bind_addr: &str,
+        port: u16,
+        forward: Option<OtelForward>,
+    ) -> std::io::Result<OtelCollector> {
         // Fresh log per run.
         let _ = std::fs::remove_file(&log_path);
         let file = std::fs::File::options()
@@ -163,11 +218,16 @@ impl OtelCollector {
             meters: meters.clone(),
             window: Mutex::new(RateWindow::new()),
             start: Instant::now(),
+            forward,
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap_or_default(),
         });
 
         let (port_tx, port_rx) = std::sync::mpsc::channel::<std::io::Result<u16>>();
         let (sd_tx, sd_rx) = oneshot::channel::<()>();
-        let addr = format!("{bind_addr}:0");
+        let addr = format!("{bind_addr}:{port}");
 
         let handle = std::thread::Builder::new()
             .name("otel-collector".into())
@@ -255,15 +315,17 @@ impl OtelCollector {
         format!("http://127.0.0.1:{}", self.port)
     }
 
-    /// The `http://host.containers.internal:<port>` endpoint a sandboxed agent uses to reach a
-    /// collector bound to `0.0.0.0` on the host pod.
-    pub fn sandbox_endpoint(&self) -> String {
-        format!("http://host.containers.internal:{}", self.port)
+    /// The `http://<host>:<port>` endpoint a sandboxed agent uses to reach a collector bound to
+    /// `0.0.0.0` on the host pod. `host` is driver-resolved: podman's bridge alias and the
+    /// kubernetes driver's hostAlias differ, and a hardcoded hostname silently drops every export
+    /// under the other driver.
+    pub fn sandbox_endpoint(&self, host: &str) -> String {
+        format!("http://{host}:{}", self.port)
     }
 
     /// The sandbox egress allowlist entry that lets the sandbox reach the collector.
-    pub fn sandbox_egress(&self) -> String {
-        format!("host.containers.internal:{}:full", self.port)
+    pub fn sandbox_egress(&self, host: &str) -> String {
+        format!("{host}:{}:full", self.port)
     }
 
     /// Roll the captured jsonl up into the `otel_summary`; `None` when no export ever landed.
@@ -305,8 +367,29 @@ async fn ingest(State(state): State<Arc<CollectorState>>, req: Request) -> Respo
         }
     };
 
-    let payload: Value = serde_json::from_slice(&bytes)
+    let mut payload: Value = serde_json::from_slice(&bytes)
         .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(&bytes) }));
+
+    // Traces only. Metrics and logs stay local: the token/cost rollup is already derived here into
+    // `otel_summary`, and the log stream carries user prompts and tool content (`OTEL_LOG_*` in
+    // `otel_env`), which does not leave the turn pod without someone asking for it.
+    if let Some(fwd) = state
+        .forward
+        .as_ref()
+        .filter(|_| path.contains("/v1/traces"))
+    {
+        if let Some((tid, sid)) = &fwd.parent {
+            reparent(&mut payload, tid, sid);
+        }
+        stamp_resource_attrs(&mut payload, &fwd.attrs);
+        // Detached so a slow or dead upstream never backs up the agent's exporter; the jsonl
+        // capture below is the copy the run actually depends on.
+        let (client, url) = (state.client.clone(), format!("{}{path}", fwd.endpoint));
+        let body = payload.clone();
+        tokio::spawn(async move {
+            let _ = client.post(url).json(&body).send().await;
+        });
+    }
 
     let record = json!({
         "ts": jiff::Timestamp::now().to_string(),
@@ -561,6 +644,74 @@ pub fn otel_env(endpoint: &str) -> Vec<(String, String)> {
     .collect()
 }
 
+/// Graft an export's spans onto the turn's trace: every span takes the turn's `traceId`, and the
+/// ones that were roots hang off the turn's `spanId`. The agent's exporter has no way to adopt a
+/// parent (the OTel JS SDK does not read `TRACEPARENT` from the environment), so this is where the
+/// two traces are joined. Non-trace payloads pass through untouched.
+fn reparent(payload: &mut Value, trace_id: &str, span_id: &str) {
+    let Some(resource_spans) = payload
+        .get_mut("resourceSpans")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for scope_spans in resource_spans
+        .iter_mut()
+        .filter_map(|r| r.get_mut("scopeSpans").and_then(Value::as_array_mut))
+        .flatten()
+    {
+        let Some(spans) = scope_spans.get_mut("spans").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for span in spans {
+            // Absent, empty and all-zero all mean "root" across OTLP/JSON encoders.
+            let is_root = span
+                .get("parentSpanId")
+                .and_then(Value::as_str)
+                .is_none_or(|p| p.is_empty() || p.bytes().all(|b| b == b'0'));
+            let Some(obj) = span.as_object_mut() else {
+                continue;
+            };
+            obj.insert("traceId".into(), json!(trace_id));
+            if is_root {
+                obj.insert("parentSpanId".into(), json!(span_id));
+            }
+        }
+    }
+}
+
+/// Append `attrs` to every `resourceSpans[].resource.attributes` in an OTLP/JSON trace payload,
+/// creating the resource object when the exporter omitted it. Non-trace payloads pass through.
+fn stamp_resource_attrs(payload: &mut Value, attrs: &[(String, String)]) {
+    if attrs.is_empty() {
+        return;
+    }
+    let Some(resource_spans) = payload
+        .get_mut("resourceSpans")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for rs in resource_spans {
+        let Some(rs) = rs.as_object_mut() else {
+            continue;
+        };
+        let resource = rs
+            .entry("resource")
+            .or_insert_with(|| json!({ "attributes": [] }));
+        let Some(list) = resource
+            .as_object_mut()
+            .map(|r| r.entry("attributes").or_insert_with(|| json!([])))
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        for (key, value) in attrs {
+            list.push(json!({ "key": key, "value": { "stringValue": value } }));
+        }
+    }
+}
+
 // --- OTLP/JSON shape helpers -------------------------------------------------------------------
 
 /// The `dataPoints` array of a metric, from whichever of `sum`/`gauge`/`histogram` carries it.
@@ -642,6 +793,137 @@ fn round_u64(v: f64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TID: &str = "0af7651916cd43dd8448eb211c80319c";
+    const SID: &str = "b7ad6b7169203331";
+
+    fn trace_payload(parents: &[Value]) -> Value {
+        json!({"resourceSpans": [{"scopeSpans": [{"spans": parents.iter().enumerate().map(|(i, p)| {
+            let mut span = json!({"traceId": "ffffffffffffffffffffffffffffffff", "spanId": format!("{i:016x}")});
+            if !p.is_null() {
+                span["parentSpanId"] = p.clone();
+            }
+            span
+        }).collect::<Vec<_>>()}]}]})
+    }
+
+    fn spans(payload: &Value) -> &Vec<Value> {
+        payload["resourceSpans"][0]["scopeSpans"][0]["spans"]
+            .as_array()
+            .expect("spans array")
+    }
+
+    /// Absent, empty and all-zero `parentSpanId` all mean "root" across OTLP/JSON encoders, and
+    /// every one of them must end up hanging off the turn span.
+    #[test]
+    fn reparent_grafts_every_root_encoding_onto_the_turn_span() {
+        for encoding in [Value::Null, json!(""), json!("0000000000000000")] {
+            let mut payload = trace_payload(std::slice::from_ref(&encoding));
+            reparent(&mut payload, TID, SID);
+            let span = &spans(&payload)[0];
+            assert_eq!(span["traceId"], json!(TID), "encoding {encoding:?}");
+            assert_eq!(span["parentSpanId"], json!(SID), "encoding {encoding:?}");
+        }
+    }
+
+    /// Children keep pointing at their in-export siblings; only the trace id is rewritten. Getting
+    /// this wrong flattens the agent's span tree onto the turn span.
+    #[test]
+    fn reparent_rewrites_child_trace_ids_but_leaves_their_parents_alone() {
+        let mut payload = trace_payload(&[Value::Null, json!("00000000000000ab")]);
+        reparent(&mut payload, TID, SID);
+        let spans = spans(&payload);
+        assert_eq!(spans[0]["parentSpanId"], json!(SID));
+        assert_eq!(spans[1]["parentSpanId"], json!("00000000000000ab"));
+        for s in spans {
+            assert_eq!(s["traceId"], json!(TID));
+        }
+    }
+
+    /// Metrics and logs exports share the handler; re-parenting must not corrupt them.
+    #[test]
+    fn reparent_passes_non_trace_payloads_through() {
+        let mut payload = metrics_record("claude-opus-4-6", "input", 10, None);
+        let before = payload.clone();
+        reparent(&mut payload, TID, SID);
+        assert_eq!(payload, before);
+    }
+
+    #[test]
+    fn forward_parses_traceparent_and_normalizes_the_endpoint() {
+        let f = OtelForward::new(
+            "http://collector:4318/".into(),
+            Some(&format!("00-{TID}-{SID}-01")),
+        );
+        assert_eq!(f.endpoint, "http://collector:4318");
+        assert_eq!(f.parent, Some((TID.to_string(), SID.to_string())));
+    }
+
+    /// A header we can't parse forwards unparented rather than dropping the spans: an orphan trace
+    /// in Datadog beats no trace at all.
+    #[test]
+    fn forward_without_a_usable_traceparent_still_forwards() {
+        for tp in [
+            None,
+            Some("garbage"),
+            Some("00-tooshort-b7ad6b7169203331-01"),
+        ] {
+            let f = OtelForward::new("http://c:4318".into(), tp);
+            assert_eq!(f.parent, None, "traceparent {tp:?}");
+            assert_eq!(f.endpoint, "http://c:4318");
+        }
+    }
+
+    /// Forwarded payloads carry the stamped resource attributes on every resourceSpans entry, so
+    /// backend queries can attribute agent spans to a loop turn.
+    #[test]
+    fn stamp_resource_attrs_reaches_every_resource() {
+        let mut payload = json!({ "resourceSpans": [
+            { "resource": { "attributes": [{ "key": "service.name", "value": { "stringValue": "claude-code" } }] }, "scopeSpans": [] },
+            { "scopeSpans": [] },
+        ]});
+        stamp_resource_attrs(
+            &mut payload,
+            &[("crucible.turn".to_string(), "3".to_string())],
+        );
+        for rs in payload["resourceSpans"].as_array().unwrap() {
+            let attrs = rs["resource"]["attributes"].as_array().unwrap();
+            assert!(
+                attrs
+                    .iter()
+                    .any(|a| a["key"] == "crucible.turn" && a["value"]["stringValue"] == "3"),
+                "{rs}"
+            );
+        }
+        // Non-trace payloads pass through untouched.
+        let mut metrics = json!({ "resourceMetrics": [] });
+        let before = metrics.clone();
+        stamp_resource_attrs(&mut metrics, &[("k".to_string(), "v".to_string())]);
+        assert_eq!(metrics, before);
+    }
+
+    /// The sandbox-facing endpoint and egress rule take the driver-resolved host verbatim: podman
+    /// and kubernetes sandboxes reach the loop pod under different names, and a baked-in hostname
+    /// silently drops every export under the other driver.
+    #[test]
+    fn sandbox_endpoint_and_egress_use_the_given_host() {
+        let c = OtelCollector::start(
+            std::env::temp_dir().join("otel-host-test.jsonl"),
+            "127.0.0.1",
+            0,
+            None,
+        )
+        .expect("collector binds loopback");
+        let port = c.local_endpoint().rsplit(':').next().unwrap().to_string();
+        assert_eq!(
+            c.sandbox_endpoint("host.openshell.internal"),
+            format!("http://host.openshell.internal:{port}")
+        );
+        assert_eq!(
+            c.sandbox_egress("host.containers.internal"),
+            format!("host.containers.internal:{port}:full")
+        );
+    }
 
     fn metrics_record(model: &str, ttype: &str, tokens: i64, cost: Option<f64>) -> Value {
         let mut metrics = vec![json!({
@@ -832,7 +1114,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("otel-e2e-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let log = dir.join("otel.jsonl");
-        let collector = OtelCollector::start(log.clone(), "127.0.0.1").expect("collector binds");
+        let collector =
+            OtelCollector::start(log.clone(), "127.0.0.1", 0, None).expect("collector binds");
         let port = collector.port();
         assert_ne!(port, 0);
 
@@ -865,12 +1148,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The forward path against a real OTLP/HTTP receiver (a second collector, so nothing here is
+    /// a stand-in): traces arrive re-parented onto the turn span, and metrics stay local.
+    #[test]
+    fn forwarding_mirrors_reparented_traces_and_holds_back_metrics() {
+        let dir = std::env::temp_dir().join(format!("otel-fwd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let upstream_log = dir.join("upstream.jsonl");
+        let upstream = OtelCollector::start(upstream_log.clone(), "127.0.0.1", 0, None)
+            .expect("upstream binds");
+        let fwd = OtelForward::new(
+            format!("http://127.0.0.1:{}", upstream.port()),
+            Some(&format!("00-{TID}-{SID}-01")),
+        );
+        let collector = OtelCollector::start(dir.join("otel.jsonl"), "127.0.0.1", 0, Some(fwd))
+            .expect("collector binds");
+
+        let traces = serde_json::to_vec(&trace_payload(&[Value::Null])).unwrap();
+        assert!(post_bytes(collector.port(), "/v1/traces", &traces).contains("partialSuccess"));
+        let metrics =
+            serde_json::to_vec(&metrics_record("claude-opus-4-6", "input", 7, None)).unwrap();
+        assert!(post_bytes(collector.port(), "/v1/metrics", &metrics).contains("partialSuccess"));
+
+        // The forward is detached, so poll rather than assuming it landed by the time POST returns.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let received = loop {
+            let got = std::fs::read_to_string(&upstream_log).unwrap_or_default();
+            if !got.trim().is_empty() || Instant::now() >= deadline {
+                break got;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+
+        let lines: Vec<&str> = received.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 1, "only the trace export forwards: {received}");
+        let record: Value = serde_json::from_str(lines[0]).expect("upstream record is json");
+        assert_eq!(record["path"], json!("/v1/traces"));
+        let span = &record["payload"]["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+        assert_eq!(span["traceId"], json!(TID));
+        assert_eq!(span["parentSpanId"], json!(SID));
+
+        collector.stop();
+        upstream.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn collector_rejects_oversize_body() {
         let dir = std::env::temp_dir().join(format!("otel-big-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let log = dir.join("otel.jsonl");
-        let collector = OtelCollector::start(log, "127.0.0.1").expect("binds");
+        let collector = OtelCollector::start(log, "127.0.0.1", 0, None).expect("binds");
         let port = collector.port();
         let big = vec![b'x'; MAX_EXPORT_BYTES + 1];
         let resp = post_bytes(port, "/v1/metrics", &big);
@@ -907,7 +1236,7 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             let log = dir.join("otel.jsonl");
             let collector =
-                OtelCollector::start(log.clone(), "127.0.0.1").expect("collector binds");
+                OtelCollector::start(log.clone(), "127.0.0.1", 0, None).expect("collector binds");
             let port = collector.port();
 
             for (i, cost) in exports.iter().enumerate() {
@@ -955,8 +1284,8 @@ mod tests {
     fn a_costless_export_does_not_disturb_the_live_total() {
         let dir = std::env::temp_dir().join(format!("otel-nocost-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let collector =
-            OtelCollector::start(dir.join("otel.jsonl"), "127.0.0.1").expect("collector binds");
+        let collector = OtelCollector::start(dir.join("otel.jsonl"), "127.0.0.1", 0, None)
+            .expect("collector binds");
         let port = collector.port();
         let body = serde_json::to_vec(&json!({
             "resourceMetrics": [{"scopeMetrics": [{"metrics": [

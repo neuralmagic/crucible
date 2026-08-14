@@ -12,4 +12,6 @@ jiff.workspace = true
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 # The collector owns a current-thread runtime on its own thread; async never leaks into the loop.
 tokio = { version = "1", features = ["rt", "net", "time", "io-util", "sync", "macros"] }
+# Same version/features crucible and forge already pull, so forwarding adds no new tree entry.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 crucible-contract = { path = "../crucible-contract" }
