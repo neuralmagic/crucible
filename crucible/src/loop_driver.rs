@@ -3433,6 +3433,7 @@ mod tests {
             state_dir: None,
             agent_cmd: None,
             artifacts: Vec::new(),
+            disallowed_tools: Vec::new(),
             iterations,
             wide: 0,
             wide_keep: 1,

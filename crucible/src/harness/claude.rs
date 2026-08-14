@@ -60,6 +60,12 @@ pub(crate) fn claude_base_args(args: &Args) -> Vec<String> {
         a.push("--effort".to_string());
         a.push(effort.as_flag().to_string());
     }
+    // Joined into ONE comma-separated value rather than passed variadically: the flag takes
+    // `<tools...>`, so separate arguments here would swallow the trailing `-p`.
+    if !args.disallowed_tools.is_empty() {
+        a.push("--disallowed-tools".to_string());
+        a.push(args.disallowed_tools.join(","));
+    }
     a.push("-p".to_string());
     a
 }
@@ -230,6 +236,33 @@ mod tests {
         // sandbox path can still insert `--mcp-config` before it).
         let v = claude_base_args(&args(&["--effort", "xhigh"]));
         assert_eq!(&v[v.len() - 3..], &["--effort", "xhigh", "-p"]);
+    }
+
+    /// The flag takes `<tools...>`, so the names must arrive as ONE comma-joined value: pushed
+    /// separately they would consume the trailing `-p` and the turn would hang waiting on a prompt
+    /// it never gets.
+    #[test]
+    fn disallowed_tools_join_into_one_value_and_keep_p_last() {
+        let mut a = args(&[]);
+        assert!(
+            !claude_base_args(&a)
+                .iter()
+                .any(|s| s == "--disallowed-tools")
+        );
+
+        a.disallowed_tools = vec![
+            "mcp__vllm-broker__codegen_build".to_string(),
+            "mcp__vllm-broker__codegen_benchmark".to_string(),
+        ];
+        let v = claude_base_args(&a);
+        assert_eq!(
+            &v[v.len() - 3..],
+            &[
+                "--disallowed-tools",
+                "mcp__vllm-broker__codegen_build,mcp__vllm-broker__codegen_benchmark",
+                "-p",
+            ]
+        );
     }
 
     #[test]
