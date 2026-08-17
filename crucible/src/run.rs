@@ -465,7 +465,7 @@ fn run_from_manifest(args: Args) -> Result<()> {
     let identity = crate::identity::for_manifest(&manifest_path, &manifest_dir, &workspace, &m)
         .context("computing run identity")?;
     let prep = Prepared {
-        run_id: publish::run_id(&goal),
+        run_id: run_identity(&args, &p.session_log, &goal),
         prior,
         goal,
         template,
@@ -575,7 +575,7 @@ fn run_composite(args: Args, manifest_path: PathBuf) -> Result<()> {
     let (goal, template) = resolve_goal_template(&args, &m.agent, &manifest_dir)?;
     let prior = publish::fetch_prior_results(&args.results_bucket, &goal).unwrap_or_default();
     let prep = Prepared {
-        run_id: publish::run_id(&goal),
+        run_id: run_identity(&args, &p.session_log, &goal),
         prior,
         goal,
         template,
@@ -664,6 +664,22 @@ fn apply_agent_cfg(args: &mut Args, agent: &manifest::AgentCfg, workspace: &Path
 
 /// Resolve the run's goal + method-prompt template. `--goal`/`--goal-file` override the manifest (the
 /// forge trigger injects a per-issue goal); otherwise the manifest's inline `goal` / `goal_file`.
+/// The run's identity: recovered from the session log when resuming, minted otherwise.
+///
+/// `--resume` continues a run — same log, same state, same iteration counters — so it must also
+/// continue the run's NAME. It used to mint from the wall clock unconditionally, which published
+/// every resumed segment under a fresh id: one logical run arrived downstream as N runs, each
+/// carrying a longer prefix of the same append-only log.
+fn run_identity(args: &Args, session_log: &Path, goal: &str) -> String {
+    if args.resume
+        && let Some(id) = crate::recovery::run_id_from_log(session_log)
+    {
+        eprintln!("resume: continuing run {id}");
+        return id;
+    }
+    publish::run_id(goal)
+}
+
 fn resolve_goal_template(
     args: &Args,
     agent: &manifest::AgentCfg,
@@ -756,7 +772,7 @@ fn drive_loop(
                         repark,
                         pending_regime,
                     };
-                    let meta = reporter::RunMeta::from_args(&args);
+                    let meta = reporter::RunMeta::from_args(&args, &prep.run_id);
                     let mut r = stream::SessionReporter::resume(&p, meta)?;
                     // Fold the prior run's admissions before the bridge is up, so no
                     // inbound command can land on a half-built index.
@@ -780,7 +796,7 @@ fn drive_loop(
                 }
             }
         } else {
-            let meta = reporter::RunMeta::from_args(&args);
+            let meta = reporter::RunMeta::from_args(&args, &prep.run_id);
             match args.ui {
                 Ui::Jsonl => {
                     let mut r = stream::SessionReporter::stdout(meta);
