@@ -47,6 +47,12 @@ pub enum ManifestError {
         "[agent.broker].bin is required when the broker is enabled (the domain's broker binary)"
     )]
     BrokerBinRequired,
+    #[error("manifest has no [judge] (task mode)")]
+    NoJudge,
+    #[error("{table} requires a [judge]: a task manifest has no scores to rank, grade, or seed")]
+    TaskLaneRejects { table: &'static str },
+    #[error("[judge].objective = \"task\" is reserved as the task lane's wire discriminator")]
+    TaskObjectiveReserved,
     #[error("a composite needs at least two [[component]] entries")]
     CompositeTooSmall,
     #[error("duplicate component domain `{domain}`")]
@@ -187,7 +193,10 @@ pub struct Manifest {
     #[serde(default)]
     pub workspace: Workspace,
     pub agent: AgentCfg,
-    pub judge: JudgeCfg,
+    /// The frozen objective. Absent = the task lane: no baseline, no scoring, every completed
+    /// turn is kept and snapshotted (see [`crate::task_judge::TaskJudge`]).
+    #[serde(default)]
+    pub judge: Option<JudgeCfg>,
     #[serde(default)]
     pub world: WorldCfg,
     /// Build/deploy targets for the deploy renderer. Optional, a config-tuning domain that never
@@ -473,7 +482,7 @@ pub struct HermesCfg {
 struct CommonCfg<'a> {
     workspace: &'a Workspace,
     agent: &'a AgentCfg,
-    judge: &'a JudgeCfg,
+    judge: Option<&'a JudgeCfg>,
     search: &'a Option<SearchCfg>,
     workflow: &'a Option<WorkflowCfg>,
     build: &'a BTreeMap<String, forge::spec::BuildSpec>,
@@ -491,7 +500,25 @@ fn validate_common(c: CommonCfg<'_>) -> Result<()> {
     if let Some(w) = c.workflow {
         w.validate()?;
     }
-    selftest::validate_selftest(&c.judge.selftest)?;
+    match c.judge {
+        Some(judge) => {
+            selftest::validate_selftest(&judge.selftest)?;
+            if judge.objective == "task" {
+                return Err(ManifestError::TaskObjectiveReserved.into());
+            }
+        }
+        None => {
+            for (present, table) in [
+                (c.search.is_some(), "[search]"),
+                (c.workflow.is_some(), "[workflow]"),
+                (c.preflight.is_some(), "[preflight]"),
+            ] {
+                if present {
+                    return Err(ManifestError::TaskLaneRejects { table }.into());
+                }
+            }
+        }
+    }
     forge::spec::validate_builds(c.build)?;
     preflight::validate_preflight(c.preflight, c.measure)?;
     Ok(())
@@ -582,7 +609,7 @@ impl Manifest {
         validate_common(CommonCfg {
             workspace: &self.workspace,
             agent: &self.agent,
-            judge: &self.judge,
+            judge: self.judge.as_ref(),
             search: &self.search,
             workflow: &self.workflow,
             build: &self.build,
@@ -591,12 +618,25 @@ impl Manifest {
         })
     }
 
+    /// No `[judge]` = the task lane: keep every completed turn, no baseline, no scoring.
+    pub fn is_task(&self) -> bool {
+        self.judge.is_none()
+    }
+
+    /// The `[judge]` table, for callers that only make sense on a scored run. Task-lane
+    /// callers must branch on [`Manifest::is_task`] first.
+    pub fn require_judge(&self) -> Result<&JudgeCfg> {
+        self.judge
+            .as_ref()
+            .ok_or_else(|| ManifestError::NoJudge.into())
+    }
+
     pub fn direction(&self) -> Result<Direction> {
-        judge::parse_direction(&self.judge.direction)
+        judge::parse_direction(&self.require_judge()?.direction)
     }
 
     pub fn tiebreak_direction(&self) -> Result<Option<Direction>> {
-        judge::parse_tiebreak_direction(&self.judge)
+        judge::parse_tiebreak_direction(self.require_judge()?)
     }
 
     /// Resolve `[workspace].inject` entries to absolute `(src, dst, frozen)`: `src` under
@@ -774,7 +814,7 @@ impl CompositeManifest {
         validate_common(CommonCfg {
             workspace: &self.workspace,
             agent: &self.agent,
-            judge: &self.judge,
+            judge: Some(&self.judge),
             search: &self.search,
             workflow: &self.workflow,
             build: &self.build,
@@ -861,11 +901,103 @@ mod tests {
         "#,
         )
         .unwrap();
-        assert_eq!(m.judge.measure_cmd, "./measure.nu");
+        assert_eq!(m.judge.as_ref().unwrap().measure_cmd, "./measure.nu");
         assert_eq!(m.direction().unwrap(), Direction::Higher);
         assert_eq!(m.workspace.dir, "workspace"); // default
         assert!(m.world.snapshot_cmd.is_none(), "no [world] -> GitWorld");
         assert!(m.publish.is_none(), "no [publish] -> no PR target");
+        assert!(!m.is_task(), "a [judge] manifest is not a task");
+    }
+
+    #[test]
+    fn no_judge_is_the_task_lane() {
+        let m: Manifest = toml::from_str(
+            r#"
+            [repo]
+            path = "."
+            [agent]
+            backend = "command"
+            agent_cmd = "./chore.sh"
+            goal = "do the chore"
+        "#,
+        )
+        .unwrap();
+        m.validate().expect("a judge-less manifest is valid");
+        assert!(m.is_task());
+        assert!(m.direction().is_err(), "no [judge] -> no direction");
+        assert!(m.require_judge().is_err());
+        let judge = m
+            .build_judge(PathBuf::from("unused"), vec![])
+            .expect("task judge needs no workspace");
+        assert_eq!(judge.objective(), "task", "no [judge] -> TaskJudge");
+    }
+
+    #[test]
+    fn task_lane_rejects_search_workflow_and_preflight() {
+        for table in [
+            "[search]\nwide = 2\napproaches = [\"a\", \"b\"]",
+            "[workflow]\ntype = \"custom\"\nresult = \"t\"\n[[workflow.task]]\nname = \"t\"\nkind = \"evaluate\"\ncommand = \"true\"",
+            "[preflight]\ncommands = [\"true\"]",
+        ] {
+            let toml = format!(
+                r#"
+                [repo]
+                path = "."
+                [agent]
+                backend = "command"
+                agent_cmd = "true"
+                goal = "g"
+                {table}
+            "#
+            );
+            let m: Manifest = toml::from_str(&toml).expect("parses");
+            let err = m.validate().expect_err(table);
+            assert!(
+                err.to_string().contains("requires a [judge]"),
+                "{table}: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn scored_judge_cannot_claim_the_task_objective() {
+        let m: Manifest = toml::from_str(
+            r#"
+            [repo]
+            path = "."
+            [judge]
+            measure_cmd = "m"
+            direction = "higher"
+            objective = "task"
+            [agent]
+            backend = "command"
+            agent_cmd = "a"
+            goal = "g"
+        "#,
+        )
+        .expect("parses");
+        let err = m.validate().expect_err("objective task is reserved");
+        assert!(err.to_string().contains("reserved"), "{err:#}");
+    }
+
+    #[test]
+    fn composite_still_requires_a_judge() {
+        let err = match toml::from_str::<CompositeManifest>(
+            r#"
+            [composite]
+            name = "c"
+            [agent]
+            backend = "command"
+            agent_cmd = "a"
+            goal = "g"
+            [[component]]
+            domain = "x"
+        "#,
+        ) {
+            Ok(_) => panic!("a composite without [judge] must not parse"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("judge"), "{err}");
     }
 
     /// `[preflight]` on a codegen manifest: the rung ladder, the `{mode}` fan-out list it needs,

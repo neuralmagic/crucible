@@ -6,6 +6,7 @@ use crate::command_judge::CommandJudge;
 use crate::command_world::{CommandWorld, CompositeWorld, GitWorld};
 use crate::crucible::{Judge, World};
 use crate::manifest::{CompositeManifest, Manifest};
+use crate::task_judge::TaskJudge;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
@@ -33,17 +34,22 @@ impl Manifest {
         }
     }
 
+    /// `TaskJudge` when there is no `[judge]` at all (the task lane, mirroring
+    /// [`Manifest::build_world`]'s `GitWorld` fallback), else the `CommandJudge`.
     pub fn build_judge(
         &self,
         workspace: PathBuf,
         frozen_injects: Vec<(PathBuf, PathBuf)>,
     ) -> Result<Box<dyn Judge + Send>> {
+        let Some(judge) = self.judge.as_ref() else {
+            return Ok(Box::new(TaskJudge));
+        };
         Ok(Box::new(CommandJudge {
             workspace,
-            measure_cmd: self.judge.measure_cmd.clone(),
+            measure_cmd: judge.measure_cmd.clone(),
             direction: self.direction()?,
             tiebreak_direction: self.tiebreak_direction()?,
-            objective: self.judge.objective.clone(),
+            objective: judge.objective.clone(),
             frozen_injects,
         }))
     }

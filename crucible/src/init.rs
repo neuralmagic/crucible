@@ -118,7 +118,10 @@ mod tests {
         run(&dir).expect("init");
         let m = crate::manifest::Manifest::load(&dir.join(MANIFEST_FILE))
             .expect("freshly-init'd manifest must parse");
-        assert_eq!(m.judge.measure_cmd, "./crucible-measure.sh");
+        assert_eq!(
+            m.judge.as_ref().unwrap().measure_cmd,
+            "./crucible-measure.sh"
+        );
         assert_eq!(m.repo.path.as_deref(), Some("."));
         assert!(
             m.world.snapshot_cmd.is_none() && m.world.apply_cmd.is_none(),

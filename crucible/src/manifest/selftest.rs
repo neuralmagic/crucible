@@ -65,7 +65,13 @@ mod tests {
         "#,
         );
         let m: Manifest = toml::from_str(&toml).expect("parses");
-        let s = m.judge.selftest.as_ref().expect("selftest present");
+        let s = m
+            .judge
+            .as_ref()
+            .unwrap()
+            .selftest
+            .as_ref()
+            .expect("selftest present");
         assert_eq!(s.good_cmd, "apply-known-good");
         assert_eq!(s.bad_cmd, "apply-known-bad");
         assert_eq!(s.runs, 1, "runs defaults to 1");
@@ -76,7 +82,7 @@ mod tests {
     fn selftest_cfg_absent_by_default() {
         let toml = manifest_toml_with_judge_extra("");
         let m: Manifest = toml::from_str(&toml).expect("parses");
-        assert!(m.judge.selftest.is_none());
+        assert!(m.judge.as_ref().unwrap().selftest.is_none());
     }
 
     #[test]
@@ -120,6 +126,6 @@ mod tests {
         "#,
         );
         let m: Manifest = toml::from_str(&toml).expect("parses");
-        assert_eq!(m.judge.selftest.unwrap().runs, 5);
+        assert_eq!(m.judge.unwrap().selftest.unwrap().runs, 5);
     }
 }

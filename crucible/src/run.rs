@@ -457,6 +457,9 @@ fn run_from_manifest(args: Args) -> Result<()> {
         let n = prior.lines().count();
         eprintln!("seeded {n} prior tried-idea row(s) from S3 (cross-run memory)");
     }
+    if m.is_task() {
+        eprintln!("task mode: no [judge] — every completed turn is kept and published unscored");
+    }
     // The world's comparability key, computed once the workspace has a HEAD
     // to pin against.
     let identity = crate::identity::for_manifest(&manifest_path, &manifest_dir, &workspace, &m)
@@ -467,7 +470,7 @@ fn run_from_manifest(args: Args) -> Result<()> {
         goal,
         template,
         identity,
-        skip_baseline: m.judge.skip_baseline,
+        skip_baseline: m.is_task() || m.judge.as_ref().is_some_and(|j| j.skip_baseline),
         preflight: m.preflight.clone(),
         preflight_modes: m
             .measure

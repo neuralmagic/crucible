@@ -182,9 +182,29 @@ fn check_single(manifest_path: &Path) -> Result<CheckOutcome> {
             return Ok(out);
         }
     }
-    check_measure_once(&m.judge.measure_cmd, &workspace, &mut out);
-    if let Some(w) =
-        agent_editable_gate_warning(&m.judge.measure_cmd, &m, &manifest_dir, &workspace)
+    let Some(judge) = m.judge.as_ref() else {
+        // Task lane: no gate to probe, lint, or self-test; require a goal instead.
+        out.warnings.push(
+            "task mode: no [judge] — every completed turn is kept and published unscored"
+                .to_string(),
+        );
+        let has_goal = m
+            .agent
+            .goal
+            .as_deref()
+            .is_some_and(|g| !g.trim().is_empty())
+            || m.agent.goal_file.is_some();
+        if !has_goal {
+            out.findings
+                .push("task manifest has no [agent].goal or goal_file".to_string());
+        }
+        if let Some(f) = unfenced_rig_toolbox_finding(&m.world, &m.agent) {
+            out.findings.push(f);
+        }
+        return Ok(out);
+    };
+    check_measure_once(&judge.measure_cmd, &workspace, &mut out);
+    if let Some(w) = agent_editable_gate_warning(&judge.measure_cmd, &m, &manifest_dir, &workspace)
     {
         out.warnings.push(w);
     }
@@ -192,7 +212,7 @@ fn check_single(manifest_path: &Path) -> Result<CheckOutcome> {
         out.findings.push(f);
     }
     if out.ok() {
-        match &m.judge.selftest {
+        match &judge.selftest {
             Some(cfg) => {
                 let result = (|| -> Result<SelftestReport> {
                     let frozen = frozen_injects(&m, &manifest_dir, &workspace);
@@ -751,6 +771,53 @@ dst = "traces/median_block.txt"
         let outcome = run(&dir.join(MANIFEST)).expect("check runs");
         assert!(!outcome.ok());
         assert!(outcome.findings[0].contains("parse failed"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn task_manifest_passes_without_a_measure_probe() {
+        let dir = tempdir("task-ok");
+        fs::write(
+            dir.join(MANIFEST),
+            "[repo]\npath = \".\"\n[workspace]\ndir = \"workspace\"\nsetup_cmd = \"mkdir -p workspace && git -C workspace init -q && git -C workspace -c user.email=t@t -c user.name=t commit -q --allow-empty -m baseline\"\n[agent]\nbackend=\"command\"\nagent_cmd=\"true\"\ngoal=\"do the chore\"\n",
+        )
+        .unwrap();
+        let outcome = run(&dir.join(MANIFEST)).expect("check runs");
+        assert!(outcome.ok(), "findings: {:?}", outcome.findings);
+        assert!(
+            outcome.warnings.iter().any(|w| w.contains("task mode")),
+            "the task-mode notice is loud: {:?}",
+            outcome.warnings
+        );
+        assert!(
+            !outcome
+                .warnings
+                .iter()
+                .any(|w| w.contains("[judge.selftest]")),
+            "no selftest nag on a task manifest: {:?}",
+            outcome.warnings
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn task_manifest_without_a_goal_is_a_finding() {
+        let dir = tempdir("task-no-goal");
+        fs::write(
+            dir.join(MANIFEST),
+            "[repo]\npath = \".\"\n[workspace]\ndir = \"workspace\"\nsetup_cmd = \"mkdir -p workspace && git -C workspace init -q && git -C workspace -c user.email=t@t -c user.name=t commit -q --allow-empty -m baseline\"\n[agent]\nbackend=\"command\"\nagent_cmd=\"true\"\n",
+        )
+        .unwrap();
+        let outcome = run(&dir.join(MANIFEST)).expect("check runs");
+        assert!(!outcome.ok());
+        assert!(
+            outcome
+                .findings
+                .iter()
+                .any(|f| f.contains("no [agent].goal")),
+            "{:?}",
+            outcome.findings
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

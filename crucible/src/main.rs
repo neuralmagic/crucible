@@ -70,6 +70,7 @@ mod scope;
 mod selftest;
 mod session;
 mod stream;
+mod task_judge;
 mod turn_trace;
 pub(crate) use crucible_harness::stream_json;
 

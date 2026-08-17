@@ -191,6 +191,9 @@ impl Reporter for ConsoleReporter {
         print_rows(rows);
         if best_score.is_finite() {
             println!("\nbest {objective} = {best_score}");
+        } else if objective == "task" {
+            let kept = rows.iter().filter(|r| r.decision == "keep").count();
+            println!("\ntask: {kept} iteration(s) kept");
         } else {
             let solved = rows.iter().any(|r| r.decision == "keep");
             println!(

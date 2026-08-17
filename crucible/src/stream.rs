@@ -257,7 +257,7 @@ impl Reporter for SessionReporter {
     fn segment(&mut self, fingerprint: &str, baseline_score: f64, regime: &str) {
         self.emit(&SessionEvent::Segment {
             fingerprint: fingerprint.to_string(),
-            baseline_score,
+            baseline_score: Some(baseline_score).filter(|s| s.is_finite()),
             regime: regime.to_string(),
         });
     }
@@ -316,7 +316,7 @@ impl Reporter for SessionReporter {
         self.emit(&SessionEvent::Summary {
             rows: rows.iter().map(RowWire::from).collect(),
             gate: objective.to_string(),
-            best_score,
+            best_score: Some(best_score).filter(|s| s.is_finite()),
         });
         self.emit(&SessionEvent::Finished);
     }
