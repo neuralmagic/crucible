@@ -146,11 +146,13 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let bind = std::env::var("BROKER_BIND").unwrap_or_else(|_| DEFAULT_BIND.into());
-    let stateful = std::env::var("BROKER_STATEFUL").is_ok_and(|v| v == "1" || v == "true");
+    // Only reaches clients negotiating a protocol older than 2026-07-28; from that version on,
+    // sessions are gone from the transport and every request is served statelessly regardless.
+    let legacy_sessions = std::env::var("BROKER_STATEFUL").is_ok_and(|v| v == "1" || v == "true");
     // `StreamableHttpServerConfig` is `#[non_exhaustive]`, so build it from `Default` and assign
     // (a struct literal will not compile, `..Default::default()` included).
     let mut config = StreamableHttpServerConfig::default();
-    config.stateful_mode = stateful;
+    config.legacy_session_mode = legacy_sessions;
     config.allowed_hosts = crucible_broker::auth::allowed_hosts(config.allowed_hosts);
     let degraded = std::env::var("BROKER_DEGRADED").is_ok_and(|v| v == "1" || v == "true");
 

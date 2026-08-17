@@ -767,7 +767,7 @@ impl ServerHandler for McpServer {
         &self,
         request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
         use tracing::Instrument as _;
         // Telemetry off (the default): the macro-expansion path exactly; no span build, no
         // turn-file/env reads, no reply re-parse. The instrumented path is opt-in via the endpoint.
@@ -775,7 +775,7 @@ impl ServerHandler for McpServer {
             let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
             return self.tool_router.call(tcc).await;
         }
-        let span = tool_span(&request.name, &context.extensions);
+        let span = tool_span(&request, &context.extensions);
         async {
             let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
             let result = self.tool_router.call(tcc).await;
@@ -791,11 +791,9 @@ impl ServerHandler for McpServer {
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
-        Ok(rmcp::model::ListToolsResult {
-            tools: self.tool_router.list_all(),
-            meta: None,
-            next_cursor: None,
-        })
+        let mut tools = self.tool_router.list_all();
+        tools.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(rmcp::model::ListToolsResult::with_all_items(tools))
     }
 
     fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
@@ -806,17 +804,22 @@ impl ServerHandler for McpServer {
 /// One span per MCP tool invocation, exported as `mcp.<tool>` with the turn token attached so
 /// Tempo queries correlate broker spans with the turn's gateway spans even without a parent link.
 /// Parenting, most specific first:
-/// 1. a W3C `traceparent` HTTP header from the client (rmcp injects the request's
-///    `http::request::Parts` into the extensions);
-/// 2. the engine-written PER-TURN traceparent file (`crate::turn::current_traceparent`, re-read
+/// 1. the request's own `_meta` trace context, which the spec makes the source of truth;
+/// 2. a W3C `traceparent` HTTP header from the client (rmcp injects the request's
+///    `http::request::Parts` into the extensions), the mirror an intermediary can read;
+/// 3. the engine-written PER-TURN traceparent file (`crate::turn::current_traceparent`, re-read
 ///    each call, the primary engine→broker channel, since this process outlives many turns);
-/// 3. the `TRACEPARENT` process env, ONLY meaningful for a process whose whole lifetime is one
+/// 4. the `TRACEPARENT` process env, ONLY meaningful for a process whose whole lifetime is one
 ///    turn (a rendered turn pod); for the long-lived broker it would be turn-blind, which is why
 ///    the file wins.
 ///
 /// No parent found = the span roots itself; a malformed value degrades the same way, never errors.
-fn tool_span(tool: &str, extensions: &rmcp::model::Extensions) -> tracing::Span {
+fn tool_span(
+    request: &rmcp::model::CallToolRequestParams,
+    extensions: &rmcp::model::Extensions,
+) -> tracing::Span {
     use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+    let tool = request.name.as_ref();
     let span = tracing::info_span!(
         "mcp_tool",
         otel.name = format!("mcp.{tool}"),
@@ -833,29 +836,43 @@ fn tool_span(tool: &str, extensions: &rmcp::model::Extensions) -> tracing::Span 
         queue = tracing::field::Empty,
         gpu_minutes = tracing::field::Empty,
     );
-    let headers = extensions
-        .get::<axum::http::request::Parts>()
-        .map(|p| &p.headers);
-    let get = |name: &str| {
-        headers
-            .and_then(|h| h.get(name))
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string)
-    };
-    let parent = extract_parent(get("traceparent"), get("tracestate"))
-        .or_else(|| extract_parent(Some(crate::turn::current_traceparent()), None))
-        .or_else(|| {
-            extract_parent(
-                std::env::var("TRACEPARENT").ok(),
-                std::env::var("TRACESTATE").ok(),
-            )
-        });
-    if let Some(parent) = parent
+    if let Some(parent) = parent_context(request, extensions)
         && let Err(e) = span.set_parent(parent)
     {
         tracing::warn!(error = %e, "parenting the tool span on the traceparent failed");
     }
     span
+}
+
+/// The tool span's remote parent, walking the four sources in the order [`tool_span`] documents.
+fn parent_context(
+    request: &rmcp::model::CallToolRequestParams,
+    extensions: &rmcp::model::Extensions,
+) -> Option<opentelemetry::Context> {
+    use rmcp::model::RequestParamsMeta as _;
+    // `axum::http::request::Parts` must be the SAME `http` crate version rmcp inserts, or this
+    // lookup silently misses and every client-parented span roots itself instead.
+    let headers = extensions
+        .get::<axum::http::request::Parts>()
+        .map(|p| &p.headers);
+    let header = |name: &str| {
+        headers
+            .and_then(|h| h.get(name))
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    extract_parent(
+        request.traceparent().map(str::to_string),
+        request.tracestate().map(str::to_string),
+    )
+    .or_else(|| extract_parent(header("traceparent"), header("tracestate")))
+    .or_else(|| extract_parent(Some(crate::turn::current_traceparent()), None))
+    .or_else(|| {
+        extract_parent(
+            std::env::var("TRACEPARENT").ok(),
+            std::env::var("TRACESTATE").ok(),
+        )
+    })
 }
 
 /// The client's remote parent from W3C carrier values, or `None` when `traceparent` is absent/
@@ -883,10 +900,10 @@ fn extract_parent(
 /// span. An `error`/`job_failed` outcome (or a protocol error) marks the span ERROR for Tempo.
 fn record_outcome(
     span: &tracing::Span,
-    result: &Result<rmcp::model::CallToolResult, rmcp::ErrorData>,
+    result: &Result<rmcp::model::CallToolResponse, rmcp::ErrorData>,
 ) {
     match result {
-        Ok(reply) => {
+        Ok(rmcp::model::CallToolResponse::Complete(reply)) => {
             let Some(text) = reply.content.first().and_then(|c| c.as_text()) else {
                 return;
             };
@@ -901,6 +918,7 @@ fn record_outcome(
                 cap_attr(format!("protocol_error: {}", e.message)).as_str(),
             );
         }
+        Ok(_) => {}
     }
 }
 
@@ -1032,6 +1050,49 @@ mod tests {
         let attrs = reply_attrs(&format!(r#"{{"status":"{}"}}"#, "s".repeat(500)));
         let status = &attrs.iter().find(|(k, _)| *k == "status").unwrap().1;
         assert_eq!(status.chars().count(), ATTR_VALUE_MAX);
+    }
+
+    #[test]
+    fn trace_context_arrives_by_meta_and_by_header() {
+        use opentelemetry::trace::TraceContextExt as _;
+        use rmcp::model::RequestParamsMeta as _;
+
+        let meta_id = "0af7651916cd43dd8448eb211c80319c";
+        let header_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+        let trace_id = |cx: opentelemetry::Context| cx.span().span_context().trace_id().to_string();
+
+        // A 2026-07-28 client puts trace context in the request's `_meta` (SEP-414).
+        let mut request = rmcp::model::CallToolRequestParams::new("build_candidate");
+        request.set_traceparent(&format!("00-{meta_id}-b7ad6b7169203331-01"));
+        let empty = rmcp::model::Extensions::new();
+        assert_eq!(
+            parent_context(&request, &empty).map(trace_id).as_deref(),
+            Some(meta_id)
+        );
+
+        // An older client mirrors it into the HTTP header, which rmcp hands us as `Parts`.
+        let (parts, ()) = axum::http::Request::builder()
+            .header("traceparent", format!("00-{header_id}-00f067aa0ba902b7-01"))
+            .body(())
+            .expect("building a request with a traceparent header")
+            .into_parts();
+        let mut extensions = rmcp::model::Extensions::new();
+        extensions.insert(parts);
+        let bare = rmcp::model::CallToolRequestParams::new("build_candidate");
+        assert_eq!(
+            parent_context(&bare, &extensions).map(trace_id).as_deref(),
+            Some(header_id),
+            "the header lookup missed — check that axum and rmcp agree on the `http` version"
+        );
+
+        // With both present the body wins: the spec makes it the source of truth and the header a
+        // mirror an intermediary may have rewritten.
+        assert_eq!(
+            parent_context(&request, &extensions)
+                .map(trace_id)
+                .as_deref(),
+            Some(meta_id)
+        );
     }
 
     #[test]
