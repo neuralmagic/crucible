@@ -12,7 +12,7 @@ version = "0.2.0"
 # licenses check requires every workspace crate to declare it.
 license = "MIT OR Apache-2.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.dependencies]
 anyhow = "1"
