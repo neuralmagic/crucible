@@ -80,8 +80,14 @@ pub fn for_manifest(
         fnv1a_hex(&[manifest_text.as_bytes()]),
         inject_hash,
         seed_hash,
-        m.judge.measure_cmd.clone(),
-        m.judge.direction.clone(),
+        m.judge
+            .as_ref()
+            .map(|j| j.measure_cmd.clone())
+            .unwrap_or_default(),
+        m.judge
+            .as_ref()
+            .map(|j| j.direction.clone())
+            .unwrap_or_default(),
         RigIdentity::default(),
     ))
 }
@@ -198,7 +204,7 @@ mod tests {
         // Change one input (measure_cmd), the digest must move.
         let (manifest_path2, m2) = manifest_with(&dir, "");
         let mut m2 = m2;
-        m2.judge.measure_cmd = "different".to_string();
+        m2.judge.as_mut().unwrap().measure_cmd = "different".to_string();
         let c = for_manifest(&manifest_path2, &dir, &dir, &m2).expect("identity c");
         assert_ne!(
             a.digest, c.digest,

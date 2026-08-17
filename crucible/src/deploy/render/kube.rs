@@ -159,7 +159,9 @@ pub struct RenderInput<'a> {
     /// an issue overlay); the domain directory name for a single domain.
     pub name: &'a str,
     pub agent: &'a AgentCfg,
-    pub measure_cmd: &'a str,
+    /// `None` for a task-lane manifest (no `[judge]`): BROKER_MEASURE_CMD is omitted entirely,
+    /// so the broker's `measure` tool answers with its "measurement not configured" error.
+    pub measure_cmd: Option<&'a str>,
     pub apply_cmd: Option<&'a str>,
     /// One deploy target per component (a single domain contributes exactly one, itself).
     pub deploy_targets: Vec<DeployCfg>,
@@ -184,7 +186,7 @@ impl<'a> RenderInput<'a> {
         Ok(Self {
             name: &composite.composite.name,
             agent: &composite.agent,
-            measure_cmd: &composite.judge.measure_cmd,
+            measure_cmd: Some(&composite.judge.measure_cmd),
             apply_cmd: composite.world.apply_cmd.as_deref(),
             deploy_targets,
             measure: composite.measure.as_ref(),
@@ -201,7 +203,7 @@ impl<'a> RenderInput<'a> {
         Ok(Self {
             name,
             agent: &manifest.agent,
-            measure_cmd: &manifest.judge.measure_cmd,
+            measure_cmd: manifest.judge.as_ref().map(|j| j.measure_cmd.as_str()),
             apply_cmd: manifest.world.apply_cmd.as_deref(),
             deploy_targets: vec![deploy.clone()],
             measure: manifest.measure.as_ref(),
@@ -733,10 +735,9 @@ impl Renderer<'_> {
             "BROKER_COMPOSITE_CTX",
             format!("{FORGE_STORAGE_ROOT}/composite-ctx"),
         ));
-        env.push(plain(
-            "BROKER_MEASURE_CMD",
-            self.input.measure_cmd.to_string(),
-        ));
+        if let Some(measure_cmd) = self.input.measure_cmd {
+            env.push(plain("BROKER_MEASURE_CMD", measure_cmd.to_string()));
+        }
         if let Some(apply) = self.input.apply_cmd {
             env.push(plain("BROKER_COMPOSITE_APPLY_CMD", apply.to_string()));
         }
@@ -2073,6 +2074,66 @@ mod tests {
         assert!(
             !yaml.contains("initContainers") && !yaml.contains("pack-stage"),
             "no pack-staging init-container on a baked-domain render"
+        );
+    }
+
+    /// A task-lane manifest (no `[judge]`) renders like any single-domain run, minus
+    /// BROKER_MEASURE_CMD.
+    #[test]
+    fn task_manifest_renders_without_broker_measure_cmd() {
+        let manifest: Manifest = toml::from_str(
+            r#"
+            [repo]
+            path = "."
+            [agent]
+            backend = "openshell"
+            goal = "do the chore"
+            sandbox_image = "registry.example.com/alpha-sandbox:latest"
+            [deploy]
+            deploy_name = "alpha"
+            [deploy.buildah]
+            registry = "registry.example.com/alpha-candidate"
+            dockerfile = "Dockerfile"
+        "#,
+        )
+        .expect("manifest parses");
+
+        let profile: DeployProfile = toml::from_str(
+            r#"
+            [cluster]
+            loop_namespace = "autoresearch"
+            rig_namespace = "rig"
+            service_account = "autoresearch-publisher"
+            supervisor_image = "registry.example.com/openshell-supervisor:latest"
+            [image]
+            loop = "registry.example.com/crucible-loop:latest"
+            pull_secret = "quay-pull"
+        "#,
+        )
+        .expect("profile parses");
+
+        let dir = std::path::Path::new("/opt/crucible/domains/alpha");
+        let input = RenderInput::from_manifest(&manifest, "alpha").expect("render input");
+        let yaml = render(
+            input,
+            dir,
+            "crucible.toml",
+            &profile,
+            &RenderOpts {
+                iterations: 1,
+                max_cost: 0.0,
+                pin_digests: false,
+                pr_repo: None,
+                pack: None,
+                clusters_file: None,
+            },
+        )
+        .expect("render");
+
+        assert!(yaml.contains("kind: Pod"));
+        assert!(
+            !yaml.contains("BROKER_MEASURE_CMD"),
+            "no [judge] -> no BROKER_MEASURE_CMD: {yaml}"
         );
     }
 

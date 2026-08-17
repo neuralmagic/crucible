@@ -121,7 +121,7 @@ The main manifest sections are:
 | `[repo]` | yes | Selects one source repository by `url` or `path`, with an optional Git `ref`. |
 | `[workspace]` | no | Configures the workspace directory, setup command, and injected files. |
 | `[agent]` | yes | Configures the backend, harness, model, goal, prompt, environment, and sandbox. |
-| `[judge]` | yes | Defines `measure_cmd`, score `direction`, and optional gate self-tests. |
+| `[judge]` | no | Defines `measure_cmd`, score `direction`, and optional gate self-tests. Omitted entirely, the run is a task: every completed turn is kept, unscored (see [docs/task-lane.md](docs/task-lane.md)). |
 | `[world]` | no | Adds apply, snapshot, and restore commands for state outside Git. |
 | `[search]` | no | Configures a parallel wide round before the iterative deep loop. |
 | `[workflow]` | no | Defines the task graph used by an iteration. |
@@ -153,7 +153,9 @@ objective = "latency_ms"
 ```
 
 With no `[workspace].setup_cmd`, Crucible clones the repository into `workspace/`. With no
-world commands, it uses Git for snapshots and restoration.
+world commands, it uses Git for snapshots and restoration. With no `[judge]` at all, the run
+is a task: unsupervised general-purpose work where every completed turn is kept
+([docs/task-lane.md](docs/task-lane.md)).
 
 ### Workflow DSL
 

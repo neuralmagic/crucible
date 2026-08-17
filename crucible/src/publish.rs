@@ -1637,6 +1637,68 @@ mod tests {
         let _ = std::fs::remove_dir_all(&ws);
     }
 
+    /// A task-lane run: keep rows with no score and non-finite baseline/best. The PR still
+    /// opens (the keep gate fires on decision alone), the body carries the kept sections, and
+    /// no score chart or Result line is fabricated.
+    #[test]
+    fn task_run_pr_body_has_kept_sections_and_no_scores() {
+        let args = <crate::Cli as clap::Parser>::try_parse_from(["crucible"])
+            .unwrap()
+            .run;
+        let paths = crate::Paths::for_manifest(
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+            &std::env::temp_dir(),
+            None,
+        );
+        let rows = vec![
+            Row {
+                iter: 1,
+                decision: "keep".into(),
+                note: "turn complete (task mode: no gate)".into(),
+                ..Default::default()
+            },
+            Row {
+                iter: 2,
+                decision: "keep".into(),
+                note: "turn complete (task mode: no gate)".into(),
+                ..Default::default()
+            },
+        ];
+        assert!(
+            rows.iter().any(|row| row.decision == "keep"),
+            "the open_prs keep gate fires on scoreless task rows"
+        );
+        let body = pr_body(&Record {
+            args: &args,
+            paths: &paths,
+            run_id: "r",
+            goal: "do the chore",
+            model: "m",
+            gate: "task".into(),
+            rows: &rows,
+            baseline_score: f64::INFINITY,
+            best_score: f64::INFINITY,
+            improved: true,
+            kept_shas: &[],
+            base_sha: None,
+            components: &[],
+            published_branches: &[],
+            cost_usd: 0.0,
+            elapsed: std::time::Duration::ZERO,
+            identity_digest: "v2:0",
+            seed_hash: "",
+        });
+        assert!(body.contains("**Gate:** task"), "{body}");
+        assert!(body.contains("## Kept: iter 1"), "{body}");
+        assert!(body.contains("## Kept: iter 2"), "{body}");
+        assert!(!body.contains("```mermaid"), "no fabricated chart: {body}");
+        assert!(
+            !body.contains("**Result:**"),
+            "no fabricated result: {body}"
+        );
+    }
+
     /// One measured point is no trajectory, and an artifact whose embed never matched
     /// produces no section: the body degrades to exactly the pre-feature shape.
     #[test]

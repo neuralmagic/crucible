@@ -925,6 +925,42 @@ mod tests {
         assert!((a - b).abs() < eps, "{a} !~ {b}");
     }
 
+    /// A task-lane run (no `[judge]`): gate "task", a skipped baseline, keep rows with no score.
+    /// Captured from a real `examples/task` run.
+    #[test]
+    fn task_run_folds_scoreless_keeps() {
+        let session = concat!(
+            r#"{"v":1,"kind":"start","goal":"Append a progress line to log.txt each turn.","gate":"task","model":"claude-opus-4-6","namespace":"","iters_total":2,"max_cost":0.0,"max_secs":0}"#,
+            "\n",
+            r#"{"v":1,"kind":"row","row":{"iter":0,"decision":"baseline-skipped","note":"baseline skipped","detail":"","diff":"","diffstat":"","score":null,"total":null},"solved":false}"#,
+            "\n",
+            r#"{"v":1,"kind":"segment","fingerprint":"1d55012690acd92e","baseline_score":null,"regime":"default"}"#,
+            "\n",
+            r#"{"v":1,"kind":"row","row":{"iter":1,"decision":"keep","note":"turn complete (task mode: no gate)","detail":"task","diff":"","diffstat":"1 file changed, 1 insertion(+)","score":null,"total":null,"kept_snap":"69b2492eb3370c434c7dfc623eacafb301c8c685"},"solved":false}"#,
+            "\n",
+            r#"{"v":1,"kind":"row","row":{"iter":2,"decision":"keep","note":"turn complete (task mode: no gate)","detail":"task","diff":"","diffstat":"1 file changed, 1 insertion(+)","score":null,"total":null,"kept_snap":"5cf17726689b69b6406b7ec75ae7f39c09e74a1d"},"solved":false}"#,
+            "\n",
+            r#"{"v":1,"kind":"summary","rows":[],"gate":"task","best_score":null}"#,
+            "\n",
+            r#"{"v":1,"kind":"finished"}"#,
+            "\n",
+            r#"{"v":1,"kind":"shutdown","outcome":"finished","reason":"all iterations completed"}"#,
+            "\n",
+        );
+        let m = build_model(session, None).unwrap();
+        assert_eq!(m.run.gate, "task");
+        assert_eq!(m.run.baseline_score, None);
+        assert_eq!(m.run.best_score, None);
+        assert!(m.run.improved, "keep rows count as improvement");
+        assert_eq!(m.run.outcome.as_deref(), Some("finished"));
+        let got: Vec<(u32, &str, Option<f64>)> = m
+            .iterations
+            .iter()
+            .map(|i| (i.n, i.decision.as_str(), i.score))
+            .collect();
+        assert_eq!(got, vec![(1, "keep", None), (2, "keep", None)]);
+    }
+
     const BASELINE: f64 = 8.750550938259494;
     const BEST: f64 = 8.65613441703772;
 

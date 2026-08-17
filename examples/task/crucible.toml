@@ -1,0 +1,20 @@
+# task — the no-judge lane's litmus domain. No [judge]: no baseline, no scoring, every
+# completed turn is kept and snapshotted, and the run exits 0 when the iterations are spent.
+# The deterministic `command` backend stands in for an LLM, so this runs in milliseconds and
+# doubles as the reference shape for a controller-authored task manifest.
+#
+#   crucible --manifest examples/task/crucible.toml --iterations 3
+
+[repo]
+path = "."
+
+[workspace]
+dir = "workspace"
+# setup runs with cwd = manifest dir (the workspace does not exist yet). Seed a fresh git repo
+# carrying only the files the candidate needs at runtime.
+setup_cmd = "mkdir -p workspace && cp chore.sh workspace/ && git -C workspace init -q && git -C workspace add -A && git -C workspace -c user.email=crucible@local -c user.name=crucible -c commit.gpgsign=false commit -qm baseline"
+
+[agent]
+backend   = "command"
+agent_cmd = "./chore.sh"   # deterministic stand-in: appends one line to log.txt per turn
+goal      = "Append a progress line to log.txt each turn (a stand-in for a real chore)."

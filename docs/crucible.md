@@ -274,6 +274,40 @@ git default.
 The litmus test for "framework, not demo": any second repo runs this way with **no
 new Rust**.
 
+## The task lane: no `[judge]`
+
+Some work has no objective to score: "consolidate the open dependabot PRs", "fix flaky
+tests nightly". Omit `[judge]` entirely and the run becomes a **task**: the loop runs as
+ever (sandbox, broker, session log, publish, resume), but with the built-in keep-everything
+`TaskJudge` — no baseline measure, no score, every completed turn is kept and snapshotted,
+and the run exits 0 when the iterations are spent ([ADR-0026](./adr/0026-no-judge-task-lane.md)).
+
+```toml
+[repo]
+url = "https://github.com/you/repo"
+[agent]
+backend = "openshell"
+goal = "Consolidate the open dependabot PRs into one branch; run the tests."
+[publish]
+pr_repo = "you/repo-fork"   # the deliverable: kept commits as one draft PR
+```
+
+On the wire the run is the normal shape with `gate: "task"` as the discriminator: an iter-0
+`baseline-skipped` row, then `keep` rows with `score: null`, `Summary.best_score` null.
+`crucible check` skips the measure probe and instead requires a goal, printing a loud
+"task mode" notice. Things to know:
+
+- Exit 0 means the run completed, not that the chore succeeded — inspect the rows or the PR.
+- `solved` never fires; the iteration budget is the only terminator (`--no-early-stop` is a
+  no-op).
+- The trust boundary is unchanged: the agent still holds no credentials. Output lands as a
+  draft PR; privileged write actions (merging, closing issues) stay broker-tool material.
+- Composites still require `[judge]`; the scope pipeline still rejects judge-less proposed
+  packs.
+
+`examples/task/` is the runnable reference (deterministic `command` backend, no LLM), and
+[Tasks: general-purpose orchestration](./task-lane.md) is the full how-to.
+
 ## Distress: the agent can page you
 
 A doomed run used to burn its budget quietly. The broker exposes a `distress` tool so the

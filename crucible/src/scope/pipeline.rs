@@ -835,7 +835,7 @@ fn compile_and_validate_round(manifest_path: &Path) -> RoundVerdict {
             });
         }
     };
-    match &m.judge.selftest {
+    match m.judge.as_ref().and_then(|j| j.selftest.as_ref()) {
         None => {
             return RoundVerdict::Failed(FailureEvidence::Structure {
                 detail: "the manifest has no [judge.selftest] table — the controls are how a \
@@ -3841,7 +3841,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         let loaded =
             manifest::Manifest::load_frozen(&out_canon.join(MANIFEST_FILE)).expect("loads");
         assert!(
-            loaded.judge.selftest.is_none(),
+            loaded.judge.as_ref().unwrap().selftest.is_none(),
             "shipped manifest carries no selftest"
         );
         let identity = compute_identity(&out_canon.join(MANIFEST_FILE)).expect("identity");

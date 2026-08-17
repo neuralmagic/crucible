@@ -1959,7 +1959,7 @@ fn run_baseline(
             let row = Row {
                 iter: 0,
                 decision: "baseline-skipped".into(),
-                note: "baseline skipped (codegen)".into(),
+                note: "baseline skipped".into(),
                 ..Default::default()
             };
             return Ok((score, 0, snap, row));
@@ -3782,6 +3782,43 @@ mod tests {
         assert!(results.contains("epilogue-fail"), "{results}");
     }
 
+    /// The task lane at the loop level: the real `TaskJudge` + forced skip_baseline runs N
+    /// iterations, keeps every turn with no score, snapshots each, and finishes improved (exit 0).
+    #[test]
+    fn task_lane_keeps_every_turn_unscored_and_finishes() {
+        let mut f = fixture(3, 0.0, true);
+        f.prepared.skip_baseline = true;
+        let world = FakeWorld;
+        let judge = crate::task_judge::TaskJudge;
+        let mut r = RecordingReporter::default();
+        let outcome = run_loop(
+            &f.args,
+            &f.paths,
+            &f.prepared,
+            &mut r,
+            &world,
+            &judge,
+            LoopRuntime::default(),
+        )
+        .expect("a task run finishes");
+
+        assert!(outcome.improved, "a finished task run exits 0");
+        assert!(!outcome.solved);
+        assert_eq!(r.shutdowns.len(), 1);
+        assert_eq!(r.shutdowns[0].0, "finished");
+        assert_eq!(r.rows[0].decision, "baseline-skipped");
+        let keeps: Vec<&Row> = r.rows.iter().filter(|row| row.decision == "keep").collect();
+        assert_eq!(keeps.len(), 3, "{:?}", r.rows);
+        assert!(
+            keeps.iter().all(|row| row.score.is_none()),
+            "no fabricated scores"
+        );
+        assert!(
+            keeps.iter().all(|row| row.kept_snap.is_some()),
+            "every turn snapshotted"
+        );
+    }
+
     #[test]
     fn shutdown_emitted_once_on_budget() {
         let f = fixture(3, 1.0, false);
@@ -4995,7 +5032,7 @@ mod tests {
                 Row {
                     iter: 0,
                     decision: "baseline-skipped".into(),
-                    note: "baseline skipped (codegen)".into(),
+                    note: "baseline skipped".into(),
                     ..Default::default()
                 },
                 Row {
