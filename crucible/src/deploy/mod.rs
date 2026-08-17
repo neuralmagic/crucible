@@ -39,6 +39,12 @@ pub fn render_yaml(manifest_path: &Path, profile_path: &Path, opts: &RenderOpts)
         render::render(input, manifest_dir, manifest_file, &profile, opts)
     } else {
         let manifest = Manifest::load(manifest_path)?;
+        if manifest.is_task() {
+            eprintln!(
+                "[crucible deploy] WARNING: task mode: no [judge] — this pod keeps and \
+                 publishes every completed turn unscored"
+            );
+        }
         crate::check::ensure_injects_resolve(&manifest, manifest_dir)?;
         let name = manifest_dir
             .file_name()

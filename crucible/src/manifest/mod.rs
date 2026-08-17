@@ -49,6 +49,10 @@ pub enum ManifestError {
     BrokerBinRequired,
     #[error("manifest has no [judge] (task mode)")]
     NoJudge,
+    #[error("{table} requires a [judge]: a task manifest has no scores to rank, grade, or seed")]
+    TaskLaneRejects { table: &'static str },
+    #[error("[judge].objective = \"task\" is reserved as the task lane's wire discriminator")]
+    TaskObjectiveReserved,
     #[error("a composite needs at least two [[component]] entries")]
     CompositeTooSmall,
     #[error("duplicate component domain `{domain}`")]
@@ -496,8 +500,24 @@ fn validate_common(c: CommonCfg<'_>) -> Result<()> {
     if let Some(w) = c.workflow {
         w.validate()?;
     }
-    if let Some(judge) = c.judge {
-        selftest::validate_selftest(&judge.selftest)?;
+    match c.judge {
+        Some(judge) => {
+            selftest::validate_selftest(&judge.selftest)?;
+            if judge.objective == "task" {
+                return Err(ManifestError::TaskObjectiveReserved.into());
+            }
+        }
+        None => {
+            for (present, table) in [
+                (c.search.is_some(), "[search]"),
+                (c.workflow.is_some(), "[workflow]"),
+                (c.preflight.is_some(), "[preflight]"),
+            ] {
+                if present {
+                    return Err(ManifestError::TaskLaneRejects { table }.into());
+                }
+            }
+        }
     }
     forge::spec::validate_builds(c.build)?;
     preflight::validate_preflight(c.preflight, c.measure)?;
@@ -910,6 +930,54 @@ mod tests {
             .build_judge(PathBuf::from("unused"), vec![])
             .expect("task judge needs no workspace");
         assert_eq!(judge.objective(), "task", "no [judge] -> TaskJudge");
+    }
+
+    #[test]
+    fn task_lane_rejects_search_workflow_and_preflight() {
+        for table in [
+            "[search]\nwide = 2\napproaches = [\"a\", \"b\"]",
+            "[workflow]\ntype = \"custom\"\nresult = \"t\"\n[[workflow.task]]\nname = \"t\"\nkind = \"evaluate\"\ncommand = \"true\"",
+            "[preflight]\ncommands = [\"true\"]",
+        ] {
+            let toml = format!(
+                r#"
+                [repo]
+                path = "."
+                [agent]
+                backend = "command"
+                agent_cmd = "true"
+                goal = "g"
+                {table}
+            "#
+            );
+            let m: Manifest = toml::from_str(&toml).expect("parses");
+            let err = m.validate().expect_err(table);
+            assert!(
+                err.to_string().contains("requires a [judge]"),
+                "{table}: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn scored_judge_cannot_claim_the_task_objective() {
+        let m: Manifest = toml::from_str(
+            r#"
+            [repo]
+            path = "."
+            [judge]
+            measure_cmd = "m"
+            direction = "higher"
+            objective = "task"
+            [agent]
+            backend = "command"
+            agent_cmd = "a"
+            goal = "g"
+        "#,
+        )
+        .expect("parses");
+        let err = m.validate().expect_err("objective task is reserved");
+        assert!(err.to_string().contains("reserved"), "{err:#}");
     }
 
     #[test]

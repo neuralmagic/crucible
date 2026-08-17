@@ -1572,7 +1572,7 @@ impl ResumeFold {
                 self.rows.push(row.clone().into_row());
             }
             SessionEvent::Budget { spent, .. } => self.spent = *spent,
-            SessionEvent::Summary { best_score, .. } => self.summary_best = Some(*best_score),
+            SessionEvent::Summary { best_score, .. } => self.summary_best = *best_score,
             // Last one wins: a run resumed more than once re-emits a fresh identity each time.
             SessionEvent::Identity { identity } => self.identity = Some(identity.clone()),
             // Accumulated across segments: every branch any prior publish opened a PR from,
@@ -2334,7 +2334,7 @@ mod tests {
             SessionEvent::Summary {
                 rows: vec![],
                 gate: "bench".into(),
-                best_score: 210.0,
+                best_score: Some(210.0),
             },
             SessionEvent::Finished,
         ]
@@ -2471,7 +2471,7 @@ mod tests {
             SessionEvent::Summary {
                 rows: vec![],
                 gate: "bench".into(),
-                best_score: 180.0,
+                best_score: Some(180.0),
             },
             SessionEvent::Finished,
         ]

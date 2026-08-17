@@ -58,6 +58,7 @@ there is no baseline, no score, no discard. The run exits 0 when the iterations 
 | What does exit 0 mean? | The run completed. It does not certify the chore succeeded — read the rows or the PR. |
 | What's on the wire? | `Start.gate == "task"` is the discriminator; an iter-0 `baseline-skipped` row, then `keep` rows with `score: null`. |
 | Can a composite be a task? | No. Composites exist to combine scored components; `[judge]` stays required there. |
+| What else is off the table? | `[search]`, `[workflow]`, and `[preflight]` — all three need scores, so a task manifest rejects them at load. `objective = "task"` is reserved on scored judges. |
 | Scheduled runs? | Render the pod with `crucible deploy render` and drive it from any scheduler (a Kubernetes CronJob works today); native controller scheduling is planned. |
 
 ## The runnable reference

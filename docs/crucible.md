@@ -302,8 +302,9 @@ On the wire the run is the normal shape with `gate: "task"` as the discriminator
   no-op).
 - The trust boundary is unchanged: the agent still holds no credentials. Output lands as a
   draft PR; privileged write actions (merging, closing issues) stay broker-tool material.
-- Composites still require `[judge]`; the scope pipeline still rejects judge-less proposed
-  packs.
+- Composites still require `[judge]`; so do `[search]`, `[workflow]`, and `[preflight]`,
+  which a task manifest rejects at load. The scope pipeline still rejects judge-less
+  proposed packs, and a scored judge may not claim `objective = "task"`.
 
 `examples/task/` is the runnable reference (deterministic `command` backend, no LLM), and
 [Tasks: general-purpose orchestration](./task-lane.md) is the full how-to.

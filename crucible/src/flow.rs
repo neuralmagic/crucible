@@ -284,7 +284,7 @@ fn extract(log: &str) -> (FlowModel, Aux) {
                 spent,
             }),
             SessionEvent::Summary { best_score, .. } => {
-                m.run.best_score = crate::publish::finite(best_score);
+                m.run.best_score = best_score.and_then(crate::publish::finite);
             }
             SessionEvent::PrLinks { links } => {
                 m.publish.prs = links

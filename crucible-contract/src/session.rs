@@ -227,7 +227,12 @@ pub enum SessionEvent {
     Summary {
         rows: Vec<RowWire>,
         gate: String,
-        best_score: f64,
+        /// `None` when the run never had a finite best (a task run, or a skipped baseline that
+        /// kept nothing). A plain `f64` here made those lines undecodable: the non-finite
+        /// sentinel serializes to JSON `null`, which fails `f64` deserialization and silently
+        /// drops the whole event.
+        #[serde(default)]
+        best_score: Option<f64>,
     },
     /// The agent declared the harness inadequate and the run halted for human review. Mirrors
     /// `crucible::escalation::Escalation`; carried on the wire so the record shows *why* a run
@@ -242,7 +247,11 @@ pub enum SessionEvent {
     /// within the run. Scores before and after the boundary are NOT comparable.
     Segment {
         fingerprint: String,
-        baseline_score: f64,
+        /// `None` when the baseline was skipped (task runs always; codegen domains until a
+        /// preflight seeds one). See [`SessionEvent::Summary::best_score`] for why this is
+        /// not a plain `f64`.
+        #[serde(default)]
+        baseline_score: Option<f64>,
         regime: String,
     },
     /// The run's comparability key, computed once at setup and emitted at run start; emitted again
@@ -390,6 +399,26 @@ mod tests {
     use crate::event::{ModelUsage, RawStream, Tokens};
     use crate::identity::{ComponentIdentity, RigIdentity};
 
+    /// A task run (and a skipped-baseline codegen run) has no finite best/baseline; those
+    /// lines carry `null` and must still decode instead of being silently dropped.
+    #[test]
+    fn null_summary_and_segment_scores_decode() {
+        let summary =
+            decode(r#"{"v":1,"kind":"summary","rows":[],"gate":"task","best_score":null}"#)
+                .expect("summary with null best_score decodes");
+        match summary {
+            SessionEvent::Summary { best_score, .. } => assert_eq!(best_score, None),
+            other => panic!("wrong event: {other:?}"),
+        }
+        let segment =
+            decode(r#"{"v":1,"kind":"segment","fingerprint":"f","baseline_score":null,"regime":"default"}"#)
+                .expect("segment with null baseline_score decodes");
+        match segment {
+            SessionEvent::Segment { baseline_score, .. } => assert_eq!(baseline_score, None),
+            other => panic!("wrong event: {other:?}"),
+        }
+    }
+
     /// Encode → decode → encode and prove the two encodings match. This sidesteps
     /// needing `PartialEq` on `AgentEvent`/`f64` while still proving a lossless trip.
     fn assert_round_trips(ev: SessionEvent) {
@@ -471,7 +500,7 @@ mod tests {
             SessionEvent::Summary {
                 rows: vec![row.clone()],
                 gate: "test".into(),
-                best_score: 210.0,
+                best_score: Some(210.0),
             },
             SessionEvent::Escalation {
                 category: "harness-limitation".into(),
@@ -480,7 +509,7 @@ mod tests {
             },
             SessionEvent::Segment {
                 fingerprint: "a1b2c3d4e5f60718".into(),
-                baseline_score: 277.0,
+                baseline_score: Some(277.0),
                 regime: "concurrency=48".into(),
             },
             SessionEvent::Identity {

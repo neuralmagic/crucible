@@ -35,9 +35,12 @@ Rows stay the ordinary `decision: "keep"` shape with `score: null`, so every kee
 at the non-finite sentinel, the pre-existing skip-baseline convention.
 
 Composites still require `[judge]`: a composite exists to combine scored components. The scope
-pipeline's gaming review still rejects a proposed pack with no judge. The deploy renderer omits
-`BROKER_MEASURE_CMD` entirely for a task manifest, so the broker's `measure` tool answers with its
-"measurement not configured" error instead of running an empty command.
+pipeline's gaming review still rejects a proposed pack with no judge. A task manifest also
+rejects `[search]`, `[workflow]`, and `[preflight]` (no scores to rank, grade, or seed), and a
+scored judge may not claim `objective = "task"` — that string is the wire discriminator. The
+deploy renderer omits `BROKER_MEASURE_CMD` entirely for a task manifest, so the broker's
+`measure` tool answers with its "measurement not configured" error instead of running an empty
+command, and `crucible deploy render` prints the same task-mode warning as `check` and the run.
 
 `crucible check` on a task manifest skips the measure probe, the editable-gate lint, and the
 selftest block (including the missing-selftest warning), and instead requires a non-empty goal and
@@ -65,9 +68,9 @@ unscored". The engine prints the same line at run start.
 - Exit 0 does not mean "the chore succeeded" — it means the run completed. A task run whose every
   turn errored (all rows discarded on apply failure) still exits 0. Consumers must inspect rows or
   PR presence; a later refinement may downgrade the exit when no keep row exists.
-- `Summary.best_score`/`Segment.baseline_score` carry the non-finite sentinel and serialize to
-  `null`; readers must not hard-require a finite summary score (pre-existing for skip-baseline
-  codegen runs).
+- `Summary.best_score` and `Segment.baseline_score` became `Option<f64>` on the wire: the
+  non-finite sentinel serialized to `null`, which a plain `f64` field failed to deserialize,
+  silently dropping those lines for task runs and skip-baseline codegen runs alike.
 - Downstream dashboards that read `decision == "keep"` as "beat the objective" must branch on
   `gate == "task"`.
 
