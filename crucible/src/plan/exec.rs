@@ -34,6 +34,10 @@ pub enum AttemptOutcome {
     Pass(Value),
     /// Measured failure. Never retried: a task that failed, failed.
     Fail(String),
+    /// The task ran and found its check inapplicable: no evidence either way, and nobody accused.
+    /// Declared by the task itself via `"status": "skipped"` in its output — distinct from the
+    /// walker's own skip (a task filtered out by substrate caps, which never ran at all).
+    Skipped(Value, String),
     /// Transport failure (infra, not the work). Retried, bounded, every attempt visible.
     Transport(String),
 }
@@ -365,10 +369,33 @@ pub fn execute(
 
 /// Declared-output check: a passing attempt whose JSON lacks a promised field is a
 /// measured failure at the producing task, not a mystery downstream.
+/// A task's self-declared `status`, which wins over the boolean `pass` when present.
+///
+/// Without this a task that RAN could only report pass or fail, so a rung whose check turned out to
+/// be inapplicable had to pick between claiming success and accusing the candidate. The GLM A/B rung
+/// picked success, and six hours of GPU reported a green attribution rung with no attribution behind
+/// it. `skipped` is the honest third answer: ran, measured nothing, blames nobody.
+fn declared_status(value: &Value) -> Option<&str> {
+    value.get("status").and_then(Value::as_str)
+}
+
 fn enforce_emits(task: &Task, outcome: AttemptOutcome) -> AttemptOutcome {
     let AttemptOutcome::Pass(value) = &outcome else {
         return outcome;
     };
+    // A skipped task produces no evidence, so its declared emits are not owed. Checking them would
+    // turn an honest skip into a spurious failure.
+    if declared_status(value) == Some("skipped") {
+        let note = value
+            .get("note")
+            .and_then(Value::as_str)
+            .unwrap_or("task declared status=skipped")
+            .to_string();
+        let AttemptOutcome::Pass(value) = outcome else {
+            unreachable!("guarded by the let-else above")
+        };
+        return AttemptOutcome::Skipped(value, note);
+    }
     match task
         .emits
         .iter()
@@ -407,6 +434,18 @@ fn run_with_retries(
                         cost_usd: cost,
                         output: Some(output),
                         note: None,
+                    },
+                    *spent > budget,
+                );
+            }
+            AttemptOutcome::Skipped(output, note) => {
+                return (
+                    TaskResult {
+                        status: TaskStatus::Skipped,
+                        attempts,
+                        cost_usd: cost,
+                        output: Some(output),
+                        note: Some(note),
                     },
                     *spent > budget,
                 );
@@ -506,6 +545,18 @@ fn run_batch_with_retries<'a>(
                             cost_usd: cost_so_far[idx],
                             output: Some(output),
                             note: None,
+                        },
+                    );
+                }
+                AttemptOutcome::Skipped(output, note) => {
+                    done.insert(
+                        idx,
+                        TaskResult {
+                            status: TaskStatus::Skipped,
+                            attempts: item.attempt,
+                            cost_usd: cost_so_far[idx],
+                            output: Some(output),
+                            note: Some(note),
                         },
                     );
                 }
@@ -1452,6 +1503,103 @@ mod tests {
             drifted.note
         );
         assert_eq!(out.results[&"child".into()].status, TaskStatus::Blocked);
+    }
+
+    #[test]
+    fn a_declared_skip_is_not_a_pass_and_owes_no_emits() {
+        // The GLM A/B rung's shape: it ran, could not measure, and declares so. Before this it had
+        // to claim a pass (green attribution over nothing) or a fail (accusing the candidate for a
+        // manifest bug). It also carries no `score`, so the emits check must not fire.
+        let plan = valid(vec![emitting("ab-toggle", &[], false, &["score"])], 10.0);
+        let mut r = ScriptRunner::new();
+        r.on(
+            "ab-toggle",
+            1,
+            || {
+                AttemptOutcome::Pass(serde_json::json!({
+                    "status": "skipped",
+                    "note": "broker rejected toggle 'VLLM_GLM_TOGGLE'"
+                }))
+            },
+            0.1,
+        );
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        let ab = &out.results[&"ab-toggle".into()];
+        assert_eq!(ab.status, TaskStatus::Skipped, "not Pass, not Fail");
+        assert_eq!(ab.attempts, 1, "a declared skip never retries");
+        assert!(
+            ab.note.as_ref().unwrap().contains("VLLM_GLM_TOGGLE"),
+            "the reason survives: {:?}",
+            ab.note
+        );
+        assert!(
+            ab.output.is_some(),
+            "the record keeps what the task reported"
+        );
+    }
+
+    #[test]
+    fn a_required_task_that_declares_skipped_leaves_the_reading_invalid() {
+        // Skipped must never satisfy `valid = every required task ran and passed` — a rung that
+        // measured nothing cannot vouch for a candidate.
+        let plan = valid(vec![task("terminal", &[], "any", true)], 10.0);
+        let mut r = ScriptRunner::new();
+        r.on(
+            "terminal",
+            1,
+            || AttemptOutcome::Pass(serde_json::json!({"status": "skipped"})),
+            0.1,
+        );
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        assert_eq!(out.results[&"terminal".into()].status, TaskStatus::Skipped);
+        assert!(!out.valid, "a skipped required task cannot produce a pass");
+    }
+
+    #[test]
+    fn an_unknown_or_absent_status_keeps_the_boolean_contract() {
+        // Back-compat: every gate that emits no `status` behaves exactly as before, and a status
+        // this engine does not know is not silently honoured.
+        let plan = valid(
+            vec![
+                emitting("legacy", &[], false, &["score"]),
+                emitting("odd", &[], false, &["score"]),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.on(
+            "legacy",
+            1,
+            || AttemptOutcome::Pass(serde_json::json!({"score": 1.0})),
+            0.1,
+        );
+        r.on(
+            "odd",
+            1,
+            || AttemptOutcome::Pass(serde_json::json!({"score": 1.0, "status": "banana"})),
+            0.1,
+        );
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        assert_eq!(out.results[&"legacy".into()].status, TaskStatus::Pass);
+        assert_eq!(out.results[&"odd".into()].status, TaskStatus::Pass);
     }
 
     #[test]
