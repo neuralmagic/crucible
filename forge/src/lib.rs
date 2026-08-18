@@ -398,7 +398,7 @@ fn run_streaming_traced(
     args: &[String],
     log: &Path,
 ) -> Result<std::process::ExitStatus> {
-    use std::io::{BufRead, Read, Write};
+    use std::io::{Read, Write};
     use std::sync::{Arc, Mutex};
 
     if let Some(parent) = log.parent() {
@@ -438,26 +438,28 @@ fn run_streaming_traced(
         })
     });
 
-    let stdout_thread = child.stdout.take().map(|out| {
+    let stdout_thread = child.stdout.take().map(|mut out| {
         let file = Arc::clone(&file);
         std::thread::spawn(move || {
-            let mut reader = std::io::BufReader::new(out);
-            let mut line = String::new();
+            // Raw chunks, never `read_line`. A build's stdout is arbitrary bytes — a latin-1 path
+            // in vendored source, nvcc's ANSI noise — and `read_line` returns InvalidData on the
+            // first non-UTF-8 one. Breaking there drops the reader, closes the pipe, and the Go
+            // child takes SIGPIPE on its next write: one stray byte killed a 30-minute build.
+            // Chunks also keep the log honest for `\r`-updated progress bars, which carry no
+            // newline for minutes and so never reached the file (or a live `fetch_log` tail).
+            let mut buf = [0u8; 8192];
+            // Only the trailing partial line is held, for marker scanning. Capped so a child that
+            // never emits a terminator cannot grow it without bound.
+            let mut pending: Vec<u8> = Vec::new();
             // Holding the previous step's span until the next marker makes its close time the
             // next step's start, so span duration is the layer's real wall-clock.
             let mut step_span: Option<tracing::Span> = None;
-            loop {
-                line.clear();
-                match reader.read_line(&mut line) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {}
-                }
-                if let Ok(mut f) = file.lock() {
-                    let _ = f.write_all(line.as_bytes());
-                }
-                if let Some((step, total, instruction)) = parse_step_marker(line.trim_end()) {
+            let on_line = |bytes: &[u8], step_span: &mut Option<tracing::Span>| {
+                // Lossy: marker parsing must never be what decides a build lives or dies.
+                let text = String::from_utf8_lossy(bytes);
+                if let Some((step, total, instruction)) = parse_step_marker(text.trim_end()) {
                     drop(step_span.take());
-                    step_span = Some(tracing::info_span!(
+                    *step_span = Some(tracing::info_span!(
                         parent: &build_span,
                         "buildah.step",
                         step,
@@ -465,6 +467,31 @@ fn run_streaming_traced(
                         instruction,
                     ));
                 }
+            };
+            loop {
+                let n = match out.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    // A real read error ends the tee, but the child keeps its own stderr and exit
+                    // status; the caller still reports honestly.
+                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                };
+                let chunk = &buf[..n];
+                if let Ok(mut f) = file.lock() {
+                    let _ = f.write_all(chunk);
+                }
+                for &b in chunk {
+                    if b == b'\n' || b == b'\r' {
+                        on_line(&pending, &mut step_span);
+                        pending.clear();
+                    } else if pending.len() < 64 * 1024 {
+                        pending.push(b);
+                    }
+                }
+            }
+            if !pending.is_empty() {
+                on_line(&pending, &mut step_span);
             }
             drop(step_span);
         })
@@ -837,5 +864,57 @@ mod tests {
             Some("quay.io/acme/candidate:abc")
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn traced_streaming_survives_non_utf8_and_keeps_reading() {
+        // The regression this guards: `read_line` errors on the first non-UTF-8 byte, the reader
+        // drops, the pipe closes, and the Go child dies of SIGPIPE mid-build. Everything after the
+        // bad byte must still reach the log, and the child must exit 0.
+        let dir = std::env::temp_dir().join(format!("forge-traced-utf8-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("live.log");
+        let status = run_streaming_traced(
+            "sh",
+            &[
+                "-c".into(),
+                // a lone 0xFF, then a real STEP marker, then more output
+                r"printf 'before\n'; printf '\377'; printf '\nSTEP 2/5: RUN make\nafter\n'".into(),
+            ],
+            &log,
+        )
+        .unwrap();
+        assert!(status.success(), "child must not be killed: {status:?}");
+        let body = std::fs::read(&log).unwrap();
+        assert!(
+            body.windows(6).any(|w| w == b"before"),
+            "pre-bad-byte output lost"
+        );
+        assert!(
+            body.contains(&0xFF),
+            "the raw byte must pass through verbatim"
+        );
+        assert!(
+            body.windows(5).any(|w| w == b"after"),
+            "reading stopped at the bad byte"
+        );
+    }
+
+    #[test]
+    fn traced_streaming_flushes_carriage_return_progress_without_a_newline() {
+        // `\r`-updated progress bars carry no newline for minutes. Under read_line they reached
+        // neither the log nor a live `fetch_log` tail until a newline finally landed.
+        let dir = std::env::temp_dir().join(format!("forge-traced-cr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("live.log");
+        let status = run_streaming_traced(
+            "sh",
+            &["-c".into(), r"printf '10%%\r50%%\r100%%'".into()],
+            &log,
+        )
+        .unwrap();
+        assert!(status.success());
+        let body = std::fs::read_to_string(&log).unwrap();
+        assert!(body.contains("10%") && body.contains("100%"), "{body}");
     }
 }

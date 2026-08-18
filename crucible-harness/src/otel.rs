@@ -178,7 +178,10 @@ struct CollectorState {
     window: Mutex<RateWindow>,
     start: Instant,
     forward: Option<OtelForward>,
-    client: reqwest::Client,
+    /// `None` when the client could not be built: forwarding is then off for the run's life.
+    /// Never `Client::default()` as a fallback — that is `Client::new()`, which panics on the
+    /// same failure, and telemetry is documented as never being a run dependency.
+    client: Option<reqwest::Client>,
 }
 
 /// A running in-process OTLP collector. Owns a background thread with a current-thread tokio
@@ -222,7 +225,8 @@ impl OtelCollector {
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
                 .build()
-                .unwrap_or_default(),
+                .inspect_err(|e| eprintln!("otel: forwarding disabled, no http client: {e}"))
+                .ok(),
         });
 
         let (port_tx, port_rx) = std::sync::mpsc::channel::<std::io::Result<u16>>();
@@ -384,11 +388,13 @@ async fn ingest(State(state): State<Arc<CollectorState>>, req: Request) -> Respo
         stamp_resource_attrs(&mut payload, &fwd.attrs);
         // Detached so a slow or dead upstream never backs up the agent's exporter; the jsonl
         // capture below is the copy the run actually depends on.
-        let (client, url) = (state.client.clone(), format!("{}{path}", fwd.endpoint));
-        let body = payload.clone();
-        tokio::spawn(async move {
-            let _ = client.post(url).json(&body).send().await;
-        });
+        if let Some(client) = state.client.clone() {
+            let url = format!("{}{path}", fwd.endpoint);
+            let body = payload.clone();
+            tokio::spawn(async move {
+                let _ = client.post(url).json(&body).send().await;
+            });
+        }
     }
 
     let record = json!({

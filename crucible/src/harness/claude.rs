@@ -60,8 +60,10 @@ pub(crate) fn claude_base_args(args: &Args) -> Vec<String> {
         a.push("--effort".to_string());
         a.push(effort.as_flag().to_string());
     }
-    // Joined into ONE comma-separated value rather than passed variadically: the flag takes
-    // `<tools...>`, so separate arguments here would swallow the trailing `-p`.
+    // One comma-separated value. The CLI accepts either form — it splits each argv entry on
+    // commas and spaces, and its variadic stops at the next option token — so this is a
+    // single-argument invariant for our own sake, not a workaround. Empty stays absent: a bare
+    // flag with no value would consume whatever followed it.
     if !args.disallowed_tools.is_empty() {
         a.push("--disallowed-tools".to_string());
         a.push(args.disallowed_tools.join(","));
@@ -242,7 +244,7 @@ mod tests {
     /// separately they would consume the trailing `-p` and the turn would hang waiting on a prompt
     /// it never gets.
     #[test]
-    fn disallowed_tools_join_into_one_value_and_keep_p_last() {
+    fn disallowed_tools_join_into_one_value_and_are_absent_when_unset() {
         let mut a = args(&[]);
         assert!(
             !claude_base_args(&a)

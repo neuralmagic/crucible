@@ -413,7 +413,7 @@ pub struct AgentCfg {
     /// known-hard domain up to `high`/`max`.
     #[serde(default)]
     pub reasoning_effort: Option<crate::agent::ReasoningEffort>,
-    /// Tools the agent must not call, passed to Claude Code as `--disallowedTools`. Names match
+    /// Tools the agent must not call, passed to Claude Code as `--disallowed-tools`. Names match
     /// Claude Code's own (`Bash`, `mcp__<server>__<tool>`).
     ///
     /// This exists because a prompt cannot enforce a prohibition. A domain whose measurement is
