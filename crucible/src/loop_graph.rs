@@ -1850,7 +1850,8 @@ mod tests {
         let world = m.build_world(workspace.clone());
         let judge = m.build_judge(workspace.clone(), Vec::new()).unwrap();
         let mut r =
-            stream::SessionReporter::stream(&p, reporter::RunMeta::from_args(&args)).unwrap();
+            stream::SessionReporter::stream(&p, reporter::RunMeta::from_args(&args, "test-run"))
+                .unwrap();
         let outcome = run_loop(
             &args,
             &p,

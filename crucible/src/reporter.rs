@@ -84,6 +84,9 @@ pub(crate) fn evidence_line(evidence: &[crate::session::EvidenceEntry]) -> Strin
 /// from [`Args`] so the NDJSON reporters don't each re-derive it.
 #[derive(Clone)]
 pub struct RunMeta {
+    /// The run's identity, echoed into the session log's `Start` so a later `--resume` can
+    /// adopt it rather than minting a second name for the same run.
+    pub run_id: String,
     pub namespace: String,
     pub model: String,
     pub iters_total: u32,
@@ -92,8 +95,9 @@ pub struct RunMeta {
 }
 
 impl RunMeta {
-    pub fn from_args(args: &Args) -> Self {
+    pub fn from_args(args: &Args, run_id: &str) -> Self {
         Self {
+            run_id: run_id.to_string(),
             namespace: args.namespace.clone(),
             model: args.model.clone(),
             iters_total: args.iterations,

@@ -2316,6 +2316,7 @@ mod tests {
         };
         let log = [
             SessionEvent::Start {
+                run_id: "test-run".into(),
                 goal: "g".into(),
                 gate: "bench".into(),
                 model: "m".into(),
@@ -2451,6 +2452,7 @@ mod tests {
         };
         let log = [
             SessionEvent::Start {
+                run_id: "test-run".into(),
                 goal: "g".into(),
                 gate: "bench".into(),
                 model: "m".into(),

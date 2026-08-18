@@ -112,6 +112,7 @@ impl Reporter for SessionReporter {
             iters_total: self.meta.iters_total,
             max_cost: self.meta.max_cost,
             max_secs: self.meta.max_secs,
+            run_id: self.meta.run_id.clone(),
         });
     }
 

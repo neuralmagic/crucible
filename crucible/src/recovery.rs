@@ -425,6 +425,25 @@ pub(crate) struct SessionRecovery {
     pub pending_approval: Option<PendingApproval>,
 }
 
+/// The run id the log was opened under, from its first `Start`. `None` for a log written before
+/// the field existed, or one whose head is torn — both fall back to minting a fresh id.
+///
+/// Read separately from [`classify_session`] because it is needed EARLIER: the id is chosen when
+/// `Prepared` is built, well before the recovery plan is computed. Best-effort by construction —
+/// an unreadable log here is not a resume failure, it just means a new id.
+pub(crate) fn run_id_from_log(session_log: &Path) -> Option<String> {
+    let file = std::fs::File::open(session_log).ok()?;
+    for line in std::io::BufReader::new(file).lines() {
+        let Some(session::SessionEvent::Start { run_id, .. }) =
+            line.ok().as_deref().and_then(session::decode)
+        else {
+            continue;
+        };
+        return (!run_id.is_empty()).then_some(run_id);
+    }
+    None
+}
+
 /// Replay the session log into resume counters and a tail classification. Torn final
 /// lines are skipped; a rowless log is a refusal (`--resume` means continue, not restart).
 pub(crate) fn classify_session(session_log: &Path) -> Result<SessionRecovery> {
@@ -1282,5 +1301,77 @@ mod tests {
             assert!(action.repark.is_some());
             assert_eq!(action.pending_regime.as_deref(), Some("t"));
         }
+    }
+
+    fn raw_log(name: &str, lines: &[&str]) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "crucible-runid-{}-{name}.jsonl",
+            std::process::id()
+        ));
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        path
+    }
+
+    #[test]
+    fn run_id_is_recovered_from_the_logs_first_start() {
+        let f = write_log(
+            "runid-present",
+            &[
+                SessionEvent::Start {
+                    goal: "g".into(),
+                    gate: "bench".into(),
+                    model: "m".into(),
+                    namespace: String::new(),
+                    iters_total: 2,
+                    max_cost: 0.0,
+                    max_secs: 0,
+                    run_id: "20260817T162214Z-goal-x".into(),
+                },
+                SessionEvent::Phase {
+                    phase: "iteration".into(),
+                    iter: 1,
+                },
+            ],
+        );
+        assert_eq!(
+            run_id_from_log(&f).as_deref(),
+            Some("20260817T162214Z-goal-x")
+        );
+    }
+
+    #[test]
+    fn a_log_written_before_the_field_mints_a_fresh_id() {
+        // Back-compat: every session log on disk today predates run_id. Absent and empty must
+        // both fall back to minting rather than resuming a run named "".
+        let old = raw_log(
+            "runid-absent",
+            &[
+                r#"{"v":1,"kind":"start","goal":"g","gate":"bench","model":"m","namespace":"","iters_total":2,"max_cost":0.0,"max_secs":0}"#,
+            ],
+        );
+        assert_eq!(run_id_from_log(&old), None);
+        let empty = raw_log(
+            "runid-empty",
+            &[
+                r#"{"v":1,"kind":"start","goal":"g","gate":"bench","model":"m","namespace":"","iters_total":2,"max_cost":0.0,"max_secs":0,"run_id":""}"#,
+            ],
+        );
+        assert_eq!(run_id_from_log(&empty), None);
+    }
+
+    #[test]
+    fn a_torn_or_missing_log_is_not_a_failure() {
+        assert_eq!(
+            run_id_from_log(&std::env::temp_dir().join("crucible-runid-absent-file.jsonl")),
+            None
+        );
+        let torn = raw_log(
+            "runid-torn",
+            &[
+                "{not json",
+                r#"{"v":1,"kind":"phase","phase":"x","iter":0}"#,
+            ],
+        );
+        assert_eq!(run_id_from_log(&torn), None);
     }
 }

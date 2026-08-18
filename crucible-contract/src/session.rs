@@ -190,6 +190,12 @@ pub enum SessionEvent {
         iters_total: u32,
         max_cost: f64,
         max_secs: u64,
+        /// The run's identity, so `--resume` can adopt it instead of minting a second one.
+        /// Without this the id was only ever the wall clock at process start, so every resume
+        /// published under a new name and one logical run arrived as N runs. Defaulted: logs
+        /// written before this field parse, and fall back to minting.
+        #[serde(default)]
+        run_id: String,
     },
     /// `phase` is `preflight`, `baseline`, or `iteration`; `iter` is meaningful only for the last.
     Phase {
@@ -466,6 +472,7 @@ mod tests {
                 iters_total: 3,
                 max_cost: 5.0,
                 max_secs: 1800,
+                run_id: "20260817T162214Z-lower-p99-latency".into(),
             },
             SessionEvent::Phase {
                 phase: "preflight".into(),
