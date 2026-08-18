@@ -609,6 +609,7 @@ fn apply_agent_cfg(args: &mut Args, agent: &manifest::AgentCfg, workspace: &Path
         args.harness = Some(agent.harness);
     }
     args.hermes = agent.hermes.clone();
+    args.disallowed_tools = agent.disallowed_tools.clone();
     // Reasoning effort: CLI `--effort` wins, else the manifest's `[agent].reasoning_effort`, else
     // `medium`, the loop IS the search, so heavy per-turn thinking mostly duplicates keep/discard.
     // A known-hard domain can still opt up to `high`/`max` in its manifest.

@@ -29,3 +29,4 @@ Expand this section in the sidebar to browse the full list.
 | [0024](./0024-admission-ledger.md) | Admission ledger for external inputs | Implemented |
 | [0025](./0025-durable-tool-steps.md) | Durable tool steps for broker builds and measures | Implemented |
 | [0026](./0026-no-judge-task-lane.md) | The no-judge task lane | Implemented |
+| [0027](./0027-measurement-sessions.md) | Measurement sessions, one warm engine and many observations | Proposed |

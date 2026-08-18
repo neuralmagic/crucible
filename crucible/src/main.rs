@@ -556,6 +556,9 @@ pub(crate) struct Args {
     /// Hermes-harness tuning (from `[agent.hermes]`). No CLI flag.
     #[arg(skip)]
     pub hermes: manifest::HermesCfg,
+    /// Tools the agent must not call (from `[agent].disallowed_tools`). No CLI flag.
+    #[arg(skip)]
+    pub disallowed_tools: Vec<String>,
     /// Reasoning-effort tier for the agent, passed to Claude Code as `--effort <level>`. Overrides
     /// `[agent].reasoning_effort`; when neither is set the engine defaults to `medium` (see
     /// `apply_agent_cfg`).

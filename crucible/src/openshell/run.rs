@@ -124,7 +124,16 @@ fn stage(sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>), msg: &str)
 #[tracing::instrument(
     name = "openshell_turn",
     skip_all,
-    fields(backend = "openshell", workspace = %p.workspace.display(), model = %args.model, sandbox = tracing::field::Empty)
+    fields(
+        backend = "openshell",
+        workspace = %p.workspace.display(),
+        model = %args.model,
+        sandbox = tracing::field::Empty,
+        // Queryable without waiting for the run/iteration ancestors to export (long spans only
+        // reach the backend when they END): which logical session and turn this is.
+        session = session.map(|s| s.logical_name.as_str()).unwrap_or(""),
+        turn = session.map(|s| s.completed_turns + 1).unwrap_or(1),
+    )
 )]
 async fn try_turn(
     args: &Args,
@@ -255,12 +264,30 @@ async fn try_turn(
     }
 
     // In-process OTLP collector for the sandboxed turn: binds `0.0.0.0` on the turn pod so the
-    // sandbox reaches it over the driver-resolved host (same egress pattern as the broker). Opt-in
-    // via `CRUCIBLE_OTEL`; a bind failure degrades to telemetry-off (no `otel_summary`, the
+    // sandbox reaches it over the driver-resolved host (same egress pattern as the broker). The
+    // port is fixed because the loop pod's deny-ingress NetworkPolicy names sandbox-reachable
+    // ports explicitly; an OS-assigned port would be silently dropped there. Opt-in via
+    // `CRUCIBLE_OTEL`; a bind failure degrades to telemetry-off (no `otel_summary`, the
     // pricing-table estimate stays the cost fallback). Its `otel.jsonl` is the `otel-log` Tier 2
     // artifact.
     let collector = if harness.otel_capable() && agent::otel_enabled(args) {
-        match OtelCollector::start(p.state.join("otel.jsonl"), "0.0.0.0") {
+        // The agent's exporter can't attribute its spans to a loop turn; the forwarder stamps
+        // session + turn as resource attributes at the same boundary where it re-parents.
+        let forward = agent::otel_forward(args).map(|f| {
+            let (name, turn) = session
+                .map(|s| (s.logical_name.clone(), s.completed_turns + 1))
+                .unwrap_or((String::new(), 1));
+            f.with_attrs(vec![
+                ("crucible.session".into(), name),
+                ("crucible.turn".into(), turn.to_string()),
+            ])
+        });
+        match OtelCollector::start(
+            p.state.join("otel.jsonl"),
+            "0.0.0.0",
+            crate::openshell::gateway::OTEL_COLLECTOR_PORT,
+            forward,
+        ) {
             Ok(c) => Some(c),
             Err(e) => {
                 let ev = AgentEvent::Raw {
@@ -299,7 +326,7 @@ async fn try_turn(
         };
         let mut endpoints = policy::resolve_endpoints(&args.openshell, broker_ep.as_deref());
         if let Some(c) = &collector {
-            endpoints.push(c.sandbox_egress());
+            endpoints.push(c.sandbox_egress(driver.broker_host()));
         }
         gw.update_policy_wait(
             &name,
@@ -337,7 +364,9 @@ async fn try_turn(
         //    exporter at the driver-resolved host.
         let mut turn_env = args.env.clone();
         if let Some(c) = &collector {
-            turn_env.extend(crucible_harness::otel_env(&c.sandbox_endpoint()));
+            turn_env.extend(crucible_harness::otel_env(
+                &c.sandbox_endpoint(driver.broker_host()),
+            ));
         }
         let env_tmp = write_temp("env", &harness.env_script(&turn_env)).await?;
         run_os(

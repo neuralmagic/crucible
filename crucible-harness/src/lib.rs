@@ -9,6 +9,7 @@ pub mod otel;
 pub mod stream_json;
 
 pub use otel::{
-    CostHandle, LiveMeters, OtelCollector, OtelSummary, RateHandle, build_summary, otel_env,
+    CostHandle, LiveMeters, OtelCollector, OtelForward, OtelSummary, RateHandle, build_summary,
+    otel_env,
 };
 pub use stream_json::StreamJsonParser;

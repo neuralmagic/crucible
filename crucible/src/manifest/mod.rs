@@ -413,6 +413,16 @@ pub struct AgentCfg {
     /// known-hard domain up to `high`/`max`.
     #[serde(default)]
     pub reasoning_effort: Option<crate::agent::ReasoningEffort>,
+    /// Tools the agent must not call, passed to Claude Code as `--disallowed-tools`. Names match
+    /// Claude Code's own (`Bash`, `mcp__<server>__<tool>`).
+    ///
+    /// This exists because a prompt cannot enforce a prohibition. A domain whose measurement is
+    /// owned by the engine's rungs can hand the agent a broker that also exposes those rungs as
+    /// tools; telling it not to call them held for one iteration and not the next, and a turn that
+    /// measures itself spends GPU the engine never sees and runs a second convergence loop under
+    /// the one that counts iterations.
+    #[serde(default)]
+    pub disallowed_tools: Vec<String>,
     #[serde(default)]
     pub method_prompt: Option<String>,
     #[serde(default)]

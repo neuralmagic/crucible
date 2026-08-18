@@ -1,6 +1,8 @@
 use crate::deploy::profile::DeployProfile;
 use crate::manifest::{AgentCfg, CompositeManifest, DeployCfg, Manifest, MeasureCfg};
-use crate::openshell::gateway::{CLIENT_TLS_SECRET, ComputeDriver, GATEWAY_PORT};
+use crate::openshell::gateway::{
+    CLIENT_TLS_SECRET, ComputeDriver, GATEWAY_PORT, OTEL_COLLECTOR_PORT,
+};
 use anyhow::{Context, Result};
 use forge::fleet::ClusterEntry;
 use k8s_openapi::api::core::v1 as core;
@@ -1256,8 +1258,9 @@ exit $rc
     /// NetworkPolicy on the loop pod. Under `podman` the sandbox is nested inside the loop pod and
     /// reaches the broker over the pod-internal bridge (traffic a NetworkPolicy never sees), so this
     /// is a pure deny-all-ingress lockdown. Under `kubernetes` the sandbox is a sibling pod, so
-    /// gateway (:17670) and broker (:8849) traffic becomes real cluster networking. The policy then
-    /// allows ingress **only** from sandbox pods, **only** on those two ports. Sandbox pods are
+    /// gateway (:17670), broker (:8849), and OTLP collector (:17671) traffic becomes real cluster
+    /// networking. The policy then allows ingress **only** from sandbox pods, **only** on those
+    /// three ports. Sandbox pods are
     /// matched by either identity they may carry: the OpenShell managed-by label (the driver only
     /// stamps it on SPIFFE-enabled pods since the CRD path landed), or the agent-sandbox
     /// controller's name-hash label, which every Sandbox-CR pod gets. Dropping either selector
@@ -1304,6 +1307,14 @@ exit $rc
                         port: Some(IntOrString::Int(broker_ingress_port(
                             &self.input.agent.broker.bind,
                         ))),
+                        protocol: Some("TCP".to_string()),
+                        ..Default::default()
+                    },
+                    networking::NetworkPolicyPort {
+                        // The turn's in-process OTLP collector; the agent's exporter posts here
+                        // from the sandbox. Rendered unconditionally: with telemetry off nothing
+                        // listens and the rule is inert.
+                        port: Some(IntOrString::Int(OTEL_COLLECTOR_PORT.into())),
                         protocol: Some("TCP".to_string()),
                         ..Default::default()
                     },
@@ -3435,9 +3446,10 @@ mod tests {
     }
 
     /// The NetworkPolicy under kubernetes allows ingress from sandbox pods (the openshell
-    /// managed-by label) on exactly the gateway port (17670) and broker port (8849).
+    /// managed-by label) on exactly the gateway port (17670), broker port (8849), and OTLP
+    /// collector port (17671).
     #[test]
-    fn kubernetes_netpol_allows_sandbox_ingress_on_two_ports() {
+    fn kubernetes_netpol_allows_sandbox_ingress_on_three_ports() {
         let profile = k8s_profile("");
         let yaml = render_k8s(&profile);
         let docs: Vec<&str> = yaml.split("\n---\n").collect();
@@ -3456,7 +3468,7 @@ mod tests {
             netpol.contains("openshell.ai/managed-by: openshell"),
             "sandbox podSelector: {netpol}"
         );
-        // Exactly two ports: gateway (17670) and broker (8849).
+        // Exactly three ports: gateway (17670), broker (8849), OTLP collector (17671).
         assert!(
             netpol.contains("port: 17670"),
             "gateway port in netpol: {netpol}"
@@ -3464,6 +3476,10 @@ mod tests {
         assert!(
             netpol.contains("port: 8849"),
             "broker port in netpol: {netpol}"
+        );
+        assert!(
+            netpol.contains("port: 17671"),
+            "otel collector port in netpol: {netpol}"
         );
         // policyTypes still declares Ingress.
         assert!(netpol.contains("- Ingress"), "policyTypes: {netpol}");

@@ -19,3 +19,9 @@ __pycache__/
 .DS_Store
 # Live example variants (real-model smokes) keep their own workspace dir.
 examples/*/workspace-*/
+# Local MCP server wiring (machine-specific endpoints, tokens pulled at launch).
+/.mcp.json
+# Run scratch pulled down for analysis, never an input to anything here.
+/run*-session.jsonl
+/run*.diff
+/mergetest/
