@@ -10,4 +10,7 @@ ignore = [
     "RUSTSEC-2026-0104",
     # anyhow Error::downcast_mut unsoundness; not called in this workspace.
     "RUSTSEC-2026-0190",
+    # h2 0.3.x empty-DATA-frame DoS via the same aws-sdk legacy hyper 0.14 stack; no patched
+    # 0.3 release exists. The workspace's own h2 0.4 line is on the patched 0.4.16.
+    "RUSTSEC-2026-0258",
 ]

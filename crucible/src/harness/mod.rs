@@ -189,11 +189,17 @@ impl Harness {
     }
 
     /// Files uploaded into the sandbox before the agent execs (claude: `.mcp.json` when the
-    /// broker is on).
-    pub(crate) fn seed_files(self, args: &Args, broker_url: Option<&str>) -> Vec<SeedFile> {
+    /// broker is on). `broker_token` is what the seeded MCP config sends as its bearer: the raw
+    /// per-run token, or the provider placeholder when the openshell egress proxy resolves it.
+    pub(crate) fn seed_files(
+        self,
+        args: &Args,
+        broker_url: Option<&str>,
+        broker_token: Option<&str>,
+    ) -> Vec<SeedFile> {
         match self {
-            Harness::Claude => claude::seed_files(args, broker_url),
-            Harness::Hermes => hermes::seed_files(args, broker_url),
+            Harness::Claude => claude::seed_files(args, broker_url, broker_token),
+            Harness::Hermes => hermes::seed_files(args, broker_url, broker_token),
         }
     }
 

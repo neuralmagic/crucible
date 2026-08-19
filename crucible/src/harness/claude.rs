@@ -150,12 +150,16 @@ pub(crate) fn env_script(env: &[(String, String)]) -> String {
 
 /// Files seeded into the sandbox before exec: the `.mcp.json` pointing claude at the
 /// provisioning broker, only when the broker is on.
-pub(crate) fn seed_files(args: &Args, broker_url: Option<&str>) -> Vec<SeedFile> {
+pub(crate) fn seed_files(
+    args: &Args,
+    broker_url: Option<&str>,
+    broker_token: Option<&str>,
+) -> Vec<SeedFile> {
     let Some(url) = broker_url else {
         return Vec::new();
     };
     vec![SeedFile {
-        content: mcp_config_json(&args.broker.name, url, args.broker_token.as_deref()),
+        content: mcp_config_json(&args.broker.name, url, broker_token),
         dest: MCP_CONFIG,
     }]
 }
@@ -394,9 +398,9 @@ mod tests {
     #[test]
     fn seed_files_only_when_broker_url_present() {
         let mut a = args(&[]);
-        assert!(seed_files(&a, None).is_empty());
+        assert!(seed_files(&a, None, None).is_empty());
         a.broker.enabled = true;
-        let seeds = seed_files(&a, Some("http://host.containers.internal:8849/mcp"));
+        let seeds = seed_files(&a, Some("http://host.containers.internal:8849/mcp"), None);
         assert_eq!(seeds.len(), 1);
         assert_eq!(seeds[0].dest, MCP_CONFIG);
         let v: serde_json::Value = serde_json::from_str(&seeds[0].content).expect("valid json");
