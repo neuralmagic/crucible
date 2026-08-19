@@ -1,0 +1,22 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-SELFTEST"
+title = "Gate self-test protocol"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = """
+[judge.selftest] declares two controls the gate must tell apart before it is trusted. crucible check must run it pre-loop, never inside a loop iteration.
+
+The protocol must:
+1. Snapshot the pristine workspace.
+2. Restore to pristine, stage good_cmd, measure runs times through the domain's Judge, restore to pristine again.
+3. Same for bad_cmd.
+4. Pass if and only if both controls' readings are all valid and good's mean score is strictly better than bad's per [judge].direction.
+
+The workspace must be restored to pristine on every exit path (pass, fail, or error).
+
+A manifest with no [judge.selftest] must not be an error; crucible check must warn instead."""

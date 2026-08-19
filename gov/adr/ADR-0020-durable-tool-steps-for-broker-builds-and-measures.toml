@@ -1,0 +1,26 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0020"
+title = "Durable tool steps for broker builds and measures"
+status = "accepted"
+date = "2026-08-04"
+refs = [
+    "ADR-0005",
+    "ADR-0017",
+    "ADR-0019",
+]
+
+[content]
+context = "Every completed piece of expensive broker work lived in memory and died with the pod. The codegen memo and built provenance set were in-memory mutexes. Broker restart forced rebuilds; a 90-minute GPU oracle was repaid in full after any restart."
+decision = "A durable step is a unit of work whose completed result is an immutable value, recorded in an append-only NDJSON ledger keyed by content of inputs. Semantics: at-least-once-executed, exactly-once-recorded. Only settled facts are recorded (Ok is recorded, Err/transport is not; a deterministic measured failure IS a fact). Eligibility: values, never state (deploy_candidate is NOT a step). The ledger is a cache, never authoritative. Amends ADR-0017's cache section for the broker half."
+consequences = "Replay covers broker restart within a live pod. Replayed replies carry cached:true. Mid-job pod death orphans the Kueue Job (at-least-once accepted for v1). A cached compile error could mask a fix outside tree+config (narrow exposure window)."
+
+[[content.alternatives]]
+text = "Durable step: immutable value in append-only NDJSON ledger keyed by input content"
+status = "accepted"
+
+[[content.alternatives]]
+text = "In-memory cache with periodic checkpoint to disk"
+status = "rejected"
+rejection_reason = "Periodic checkpoints lose work between snapshots. The append-only ledger records each completed step immediately, so a restart replays from the full history."

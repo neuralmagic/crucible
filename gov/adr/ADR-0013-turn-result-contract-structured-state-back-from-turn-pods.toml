@@ -1,0 +1,24 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0013"
+title = "Turn result contract — structured state back from turn pods"
+status = "proposed"
+date = "2026-07-06"
+refs = ["RFC-0001"]
+
+[content]
+context = """Turn pods return everything via stdout markers scraped from kube logs. Six marker literals are duplicated across crates with "keep in sync" comments. 2026-07-05 production incidents exposed fragility: openshell event stream glued messages breaking parse contracts; payloads fight kubelet's 10 MiB log-rotation budget; binary artifacts ride logs as base64; markers duplicate across a crate DAG that forbids sharing. The OTLP collector was lost when vendored agentic-ci was dropped, and harness logic was trapped in a binary."""
+decision = "Two-tier result contract in a shared crucible-contract crate. Tier 1: verdict rides the Kubernetes termination message (4096 B, self-capped at 3584 B). Tier 2: artifacts POST to the controller's evidence drop-box via an authenticated endpoint (pod-bound projected SA token validated by TokenReview). Stdout demotes to a human-facing live/debug channel. The crucible-harness crate is extracted as the agentic-ci replacement; the OTLP collector is restored in-process."
+consequences = """
+Positive: verdict path stops depending on log rotation, newline discipline, or base64-in-logs. Scope turns survive controller downtime. Artifact caps become honest HTTP limits. Six keep-in-sync literal pairs collapse into one typed crate (crucible-contract). Authoritative cost returns to the ledger. Harness becomes a consumable crate.
+
+Negative: requires a controller endpoint and projected SA token infrastructure. Two transport tiers add operational complexity versus the single-channel stdout approach."""
+
+[[content.alternatives]]
+text = "Two-tier result contract: verdict in termination message (4096 B), artifacts via authenticated HTTP POST to controller evidence drop-box"
+status = "accepted"
+
+[[content.alternatives]]
+text = "Continue using stdout markers scraped from kube logs for all result communication"
+status = "rejected"

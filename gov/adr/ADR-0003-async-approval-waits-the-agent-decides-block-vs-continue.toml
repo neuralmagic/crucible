@@ -1,0 +1,35 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0003"
+title = "Async approval waits — the agent decides block vs continue"
+status = "accepted"
+date = "2026-06-25"
+refs = [
+    "ADR-0001",
+    "ADR-0002",
+    "RFC-0001",
+]
+
+[content]
+context = "ADR-0002 specified the approval mechanism (draft PR, poll for /approve-capture) but not what the run does between the ask and the answer, nor how it resumes. The agent turn is ephemeral (a per-turn OpenShell sandbox torn down when the turn ends) and cannot sit and wait — making it spin-poll burns tokens on a paid sandbox to do nothing. The long-lived thing is the loop (crucible, the pod's entrypoint). Two things need pinning: (1) where the wait lives (the loop's, not the turn's), and (2) whether to block the whole run (only the agent has the context to know — sometimes the pending regime is its only path, sometimes it has other frozen-regime hypotheses to test)."
+decision = "The broker decides whether a regime change is allowed (privilege + evaluation, server-side, ADR-0002). The agent decides how to spend the wait (solution-space, ADR-0001). The loop owns the wait and the resume. Seven concrete decisions: (1) The wait is the loop's, not the turn's — on pending_approval the agent ends its turn, never spin-waits. (2) The agent chooses the wait mode via a marker: block (this regime is my only path, loop parks) or continue (I have other frozen-regime work, loop keeps iterating). (3) One wake mechanism for both modes — the broker watches approval and sends a rescope command to the control bridge when provisioning is ready. (4) The decision rides on a PROVISIONING_PENDING.json marker consumed by the loop post-turn. (5) Budget treatment follows the mode — block pauses the cost/time clock, continue keeps spending. (6) Two interchangeable human channels (forge draft PR or control-bridge keystroke), same rescope. (7) Deny/timeout is not a harness failure — the loop discards the regime change and resumes in the frozen regime, except when the agent declared block with no fallback, which escalate-halts."
+consequences = "Positive: the run can genuinely wait for a human and resume, headless or attended, without the agent burning paid sandbox time. The block vs continue call sits with the only actor that has the context — the agent. Almost entirely reuses existing infrastructure: the wake is the existing re-scope path, the transport is the control bridge, the marker is the escalate pattern, the channels are ADR-0002's two backends. Negative/cost: a parked pod idles on a human (cheap — no tokens, paused budget — but a real pod-hour, bounded by max-park timeout). Continue mode interleaves frozen-regime and re-scoped segments in the same run; the session log models segments so the story stays readable, but scores across segments are not comparable."
+
+[[content.alternatives]]
+text = "The loop owns the wait; the agent chooses block vs continue mode; the broker watches approval and sends rescope via the control bridge"
+status = "accepted"
+pros = [
+    "Run can genuinely wait for a human and resume without burning paid sandbox time",
+    "The block vs continue decision sits with the only actor that has the context — the agent",
+    "Almost entirely reuses existing infrastructure: re-scope path, control bridge, escalate pattern",
+]
+cons = [
+    "A parked pod idles on a human (cheap but a real pod-hour); bounded by max-park timeout",
+    "Continue mode interleaves frozen-regime and re-scoped segments in the same run",
+]
+
+[[content.alternatives]]
+text = "Agent spin-waits inside the turn for the approval to resolve"
+status = "rejected"
+rejection_reason = "Turns are ephemeral and paid; spinning burns tokens on a paid sandbox to do nothing while waiting on a human"

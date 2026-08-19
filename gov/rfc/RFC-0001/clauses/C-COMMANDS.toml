@@ -1,0 +1,22 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-COMMANDS"
+title = "Command protocol"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = """
+Every command (measure_cmd, apply_cmd, snapshot_cmd, restore_cmd, setup_cmd) must be a string executed via sh -c with cwd = the agent workspace, except setup_cmd which must run with cwd = manifest dir (the workspace does not exist yet).
+
+PATH must be inherited so a command may be a bare installed tool or a workspace-relative script.
+
+measure_cmd is required when [judge] is present. It must inject CRUCIBLE_BASELINE_SCORE, CRUCIBLE_BASELINE_TOTAL, and CRUCIBLE_BEST_SCORE into env when those values are available (absent on baseline measurement). The engine must read the last stdout line that starts with { and parse it as JSON with fields: valid (bool, required), score (number or null), tiebreak (number, optional), solved (bool, optional, default false), note (string, optional), detail (object, optional). A nonzero exit code must force the reading to valid:false regardless of stdout.
+
+apply_cmd, if present, must run after the agent turn and before measure. Nonzero exit must treat the iteration as an invalid candidate (discard).
+
+snapshot_cmd must emit one opaque token on its last stdout line. restore_cmd must receive the token in CRUCIBLE_TOKEN env. snapshot_cmd and restore_cmd must come as a pair.
+
+setup_cmd default when omitted: the engine must git clone [repo] into [workspace].dir and git checkout [ref]. The workspace must end up a git repo."""

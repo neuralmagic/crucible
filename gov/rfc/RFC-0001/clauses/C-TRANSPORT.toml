@@ -1,0 +1,22 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-TRANSPORT"
+title = "Agent transport backends"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = """
+The engine must render a prompt (method_prompt with {{GOAL}}/{{STATUS}}/{{STEER}} filled), hand it + the workspace to an agent that edits the workspace, and must never hand it the Judge.
+
+Three backends, selected by [agent].backend:
+
+local: must run the selected harness directly on the host in the workspace with [agent].env.
+
+openshell: must run the selected harness in a sandboxed pod driven by the OpenShell driver. Two execution environments: the engine and its contract commands always run where crucible runs; only the agent turn is sandboxed. The OpenShell driver must upload the workspace into the sandbox and sync edits back.
+
+command: must run [agent].agent_cmd via sh -c in the workspace as the proposal. This is a deterministic, free proposer (no LLM). It makes the minimal example a fast, deterministic e2e test.
+
+Flipping local to openshell must be config, not code. Reversibility commands (snapshot/restore) must run engine-side regardless of backend."""

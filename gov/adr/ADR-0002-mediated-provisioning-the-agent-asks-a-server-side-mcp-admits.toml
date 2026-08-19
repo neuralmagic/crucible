@@ -1,0 +1,34 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0002"
+title = "Mediated provisioning — the agent asks, a server-side MCP admits"
+status = "accepted"
+date = "2026-06-25"
+refs = [
+    "ADR-0001",
+    "RFC-0001",
+]
+
+[content]
+context = """ADR-0001 drew the trust wall: the agent may change its solution, never its evaluation. But a blocked agent has a legitimate need the loop can't yet serve cleanly — it discovers it must measure a regime it has no calibrated trace for (a new model, a higher request concurrency, a novel workload), and the only honest GPU-free answer is capture/calibrate a new trace. Today that means either the agent reaches the cluster directly (unacceptable — we will not give the sandboxed agent direct authority to spend GPU, submit a Kueue Workload, or dispatch a GitHub Actions workflow) or it writes ESCALATION.json and the whole run halts for a human (too coarse for a need that is often grantable). The missing piece is a mediation layer: a place that holds the privilege and the admission logic, exposes only a narrow "ask" to the agent, and decides whether/how to grant."""
+decision = "The agent asks; a server-side MCP on the loop pod admits. Provisioning privilege and the admission logic live in the MCP, never in the sandbox. Six concrete decisions: (1) Privilege separation by identity — solution-space ops stay direct under the agent's scoped rig credential, provisioning ops are removed from the agent's reach and gated by the MCP's own identity. (2) The MCP is the only privileged endpoint the sandbox can reach — OpenShell egress is deny-by-default with only the loop pod's MCP endpoint allowlisted. (3) Requests are classified by whether they touch the judge: in-scope (cache fill, no judge change) resolves synchronously; judge-changing triggers a governed re-scope (re-derive baseline, bump fingerprint, run gate self-test). (4) Admission gating is server-side and opportunistic with GPU headroom logic. (5) Human-in-the-loop is pluggable and headless-first via two interchangeable approval backends: forge-native draft PRs (headless default) or control-channel operator keystroke (attended). (6) Degraded mode is escalate-halt, never auto-admit — when a judge-changing request arrives with no approval surface reachable, it falls back to the escalate hatch."
+consequences = "Positive: the agent literally cannot provision — no GPU spend, no Kueue, no CI dispatch from the sandbox — yet it is no longer dead-ended on a grantable need. The choke point is one auditable server-side process. Admission and approval are policy, not code scattered across tools; headless runs get a real forge-native async CODEOWNERS-gated approval path, attended runs keep the keystroke path, both record provenance. Reuses existing infrastructure. Negative/cost: a real MCP server on the loop pod with lifecycle and concentrated privilege to guard, MCP plumbing into the sandbox config, and an egress allowlist entry. RBAC must be tightened so the agent identity loses any latent provisioning rights. The judge-changing re-scope is real engine work."
+
+[[content.alternatives]]
+text = "Server-side MCP broker as the sole privileged mediation layer between agent and cluster provisioning"
+status = "accepted"
+pros = [
+    "Agent literally cannot provision — no GPU spend, no Kueue, no CI dispatch from the sandbox",
+    "Admission and approval are policy in one auditable server-side process",
+    "Reuses existing infrastructure: control bridge, gpu-check, request-trace cache, session MCP",
+]
+cons = [
+    "Real MCP server on the loop pod with lifecycle and concentrated privilege to guard",
+    "Judge-changing re-scope (auto re-baseline + fingerprint + gate self-test) is real engine work",
+]
+
+[[content.alternatives]]
+text = "Give the agent direct cluster access (kubeconfig for capture namespace, forge token in sandbox)"
+status = "rejected"
+rejection_reason = "Unacceptable blast radius — gives the sandboxed agent direct authority to spend GPU, submit Kueue Workloads, or dispatch CI; privilege cannot be scoped narrowly enough"

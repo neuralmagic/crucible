@@ -1,0 +1,38 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0017"
+title = "Measure task DAGs — the engine walks the ladder"
+status = "proposed"
+date = "2026-07-18"
+refs = [
+    "ADR-0001",
+    "ADR-0005",
+    "ADR-0013",
+    "ADR-0016",
+    "RFC-0001",
+]
+
+[content]
+context = "GPU-measured code domains grade through a sequence of oracles (CPU self-check, single-GPU diff, ncu capture, multi-GPU equality, compute-sanitizer). The sequence lives inside an opaque 800-line domain gate script. Three incidents exposed the cost: no per-step resume (run 13 repaid all proven steps after a pod restart), silent 8-hour Kubernetes retries on transient failures, and generic judge policy reimplemented independently per domain."
+decision = "The manifest declares the measurement DAG as data ([[measure.task]]), and the engine walks it. Named job templates replace the fixed benchmark/lm_eval/profile trio. Tasks are connected by depends_on edges with a typed validity model (required vs advisory, substrate capabilities, hardware truncation computed before dispatch). TaskDagJudge sits behind the existing Judge trait. The walker is a ready-set loop; v1 pins max_inflight=1. Retry policy splits on classification: measured failure is never retried, transport failures get bounded auto-retry. Cache keys derive from session log fold. Amendment: a task's $OUT may carry explicit status (including skipped)."
+consequences = "Generic judge policy written once in Rust. The next codegen domain declares ~40 TOML lines instead of copying the 800-line walker. Per-task cache keys make regrade incremental. Single-shot domains keep measure_cmd unchanged. Cost: the DAG walker adds engine complexity and the typed validity model introduces new failure modes (hardware truncation, substrate mismatch)."
+
+[[content.alternatives]]
+text = "Engine-owned DAG walker with typed task validity model"
+status = "accepted"
+
+[[content.alternatives]]
+text = "Broker-side orchestration: let the broker walk the measurement sequence"
+status = "rejected"
+rejection_reason = "Recreates the opaque single-call problem; the broker becomes the new 800-line script."
+
+[[content.alternatives]]
+text = "Gate script as thin grader: keep opaque script but thin it to a grading wrapper"
+status = "rejected"
+rejection_reason = "Preserves the copy-paste channel between domains; thin wrapper still duplicates judge policy."
+
+[[content.alternatives]]
+text = "Generic engine DAG framework: full-featured DAG execution engine"
+status = "rejected"
+rejection_reason = "Scope creep; the measurement ladder is specific enough that a narrow walker outperforms a generic framework."

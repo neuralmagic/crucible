@@ -1,0 +1,20 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-WORLD"
+title = "World reversibility"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = '''
+World::Snapshot = String, opaque to the engine. The engine must only round-trip it back to restore.
+
+GitWorld (default, no [world] commands): snapshot() must stage+commit the workspace and return the commit SHA. restore(sha) must git reset --hard <sha> + git clean (excluding .claude/, RESULTS.md). The kept-commit chain is the memory.
+
+CommandWorld (any [world] command given): must always own git memory as above and layer the domain commands. The snapshot token must be the composite "<git-sha>\t<domain-token>". Keep: commit (git half), then run snapshot_cmd and capture its token (domain half), then join. Discard: split, git reset --hard <sha> + clean, then run restore_cmd with CRUCIBLE_TOKEN=<domain-token>.
+
+The engine must expose last_commit_sha() (the git half) for kept_shas/publish; the domain half must never be inspected.
+
+The engine's loop body must call only world.snapshot() / world.restore(&snap). It must contain no git/vcs calls and no kubectl.'''

@@ -1,0 +1,21 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-SURFACE"
+title = "Domain author surface"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = """
+A domain author must write:
+1. A crucible.toml manifest.
+2. A measure command emitting { valid, score, solved? } (any language), when [judge] is present.
+3. Optionally apply/snapshot/restore commands.
+4. A method prompt + goal.
+5. Agent credentials in [agent].env.
+
+Everything else (loop, budget, keep/discard, all reporters + remote viewer, steer/stop/resume, session log, escalation, git memory) is the engine's, provided for free.
+
+The litmus test (examples/counter/) must exercise items 1, 2, 4 with GitWorld and the command backend, requiring no Rust."""

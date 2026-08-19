@@ -1,0 +1,24 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-LEDGER"
+title = "Admission ledger"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = """
+Every external input into a run (steer, approve, deny, rescope, set-budget, pause, resume, stop, abort) must be recorded in state/admissions.jsonl before it takes effect.
+
+Two event kinds: admitted { key, seq, ts, input, ...payload } and settled { key, outcome, ts, note } with outcome one of applied/superseded/rejected.
+
+Per idempotency key: exactly one admitted, then at most one settled. The first terminal outcome wins.
+
+A key with no settled line is an input the run still owes. --resume must re-arm exactly those and close out the ones a resume overrides.
+
+admissions.jsonl is authoritative for what an operator asked for; the session log is authoritative for what the loop was waiting on. Where they disagree, the ledger wins.
+
+Control-bridge commands must accept an optional id (string, non-empty, <= 256 bytes) on every mutating command. Redelivering the same id with the same payload must converge on the original admission. Same id with different payload must be refused. Omitting id must generate a key and every delivery is a fresh input.
+
+A stop/abort whose record cannot be written must still stop the run. Every other command must fail closed if its admission cannot be recorded."""

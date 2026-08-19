@@ -1,0 +1,9 @@
+#:schema ../schema/guard.schema.json
+
+[govctl]
+id = "GUARD-CARGO-CLIPPY"
+title = "cargo clippy"
+
+[check]
+command = "cargo clippy --all --benches --tests --examples --all-features -- -D warnings"
+timeout_secs = 300

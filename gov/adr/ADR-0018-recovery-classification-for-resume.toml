@@ -1,0 +1,26 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0018"
+title = "Recovery classification for --resume"
+status = "accepted"
+date = "2026-08-04"
+refs = [
+    "ADR-0003",
+    "ADR-0004",
+    "RFC-0001",
+]
+
+[content]
+context = "Resume was a pure counter fold that discarded all information about how the run died. A shutdown line's absence (pod died mid-run) was never read. Dangling agent_start/done brackets were invisible. A pod that died while parked lost the approval entirely."
+decision = "One streaming pass over the log produces both resume counters (ResumeFold) and a typed Classification of the tail. plan_recovery maps classification to RecoveryPlan (NoOp/Refuse/Continue). Classification is derived from the log tail, never markers. New wire events (approval_wait/approval_resolved) bracket every approval. Policy: finished/solved is a clean no-op; escalated refuses to resume; budget honors a raised cap."
+consequences = "Old logs lacking the approval bracket degrade to died_between_iterations (preserving old behavior). Unknown shutdown.outcome or approval_wait.mode tokens degrade rather than error. The classifier encodes the emission grammar; tests live next to the scanner. Cost: new wire events must be emitted at every approval boundary."
+
+[[content.alternatives]]
+text = "Streaming classifier over log tail with typed RecoveryPlan"
+status = "accepted"
+
+[[content.alternatives]]
+text = "Marker-based recovery: write explicit resume markers at crash sites"
+status = "rejected"
+rejection_reason = "Markers are written before the crash, so a crash that prevents the marker write is invisible. Log-tail classification reads the emission grammar and degrades gracefully for old logs."

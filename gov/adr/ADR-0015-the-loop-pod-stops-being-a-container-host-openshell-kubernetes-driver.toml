@@ -1,0 +1,30 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0015"
+title = "The loop pod stops being a container host — OpenShell Kubernetes driver"
+status = "proposed"
+date = "2026-07-08"
+refs = [
+    "ADR-0002",
+    "ADR-0005",
+    "ADR-0011",
+    "ADR-0014",
+    "RFC-0001",
+]
+
+[content]
+context = "The openshell backend runs the sandbox as a container nested inside the loop pod via podman. This forces privileged:true on the loop pod, requires podman/buildah/fuse-overlayfs in the loop image, needs KUBERNETES_SERVICE_* env scrubbing, and requires bespoke credential paths. OpenShell ships a Kubernetes driver that runs the sandbox as a sibling pod, already present in the fork commit."
+decision = "Make the compute driver a configuration knob, defaulting in-cluster to the Kubernetes driver. The sandbox becomes a sibling pod instead of a nested container. Five changes: broker reach contract (transport-agnostic hostname resolution), NetworkPolicy update (sandbox reaches broker over real cluster networking), agent-sandbox CRD prerequisite, RBAC updates (ClusterRole for tokenreviews and nodes), and supervisor delivery via init-container. The podman driver stays supported for laptop and EC2 use."
+consequences = """
+Positive: loop pod stops being a container host. Sandbox gets ordinary Kubernetes scheduling, limits, and GPU admission. The upstream patch retires. Path to privileged:false opens (combined with declarative image builds).
+
+Negative: agent-sandbox CRD serves v1alpha1 (deprecated); driver's README labels its schema "RFC 0005 POC." Sibling pod networking adds real cluster network hops versus localhost. RBAC surface grows (ClusterRole for tokenreviews, nodes)."""
+
+[[content.alternatives]]
+text = "Make compute driver a configuration knob, default in-cluster to Kubernetes; sandbox becomes a sibling pod with broker reach over cluster networking"
+status = "accepted"
+
+[[content.alternatives]]
+text = "Keep podman driver as the default, running sandbox as nested container inside the loop pod"
+status = "rejected"

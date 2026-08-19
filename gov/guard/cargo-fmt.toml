@@ -1,0 +1,9 @@
+#:schema ../schema/guard.schema.json
+
+[govctl]
+id = "GUARD-CARGO-FMT"
+title = "cargo fmt"
+
+[check]
+command = "cargo fmt --check"
+timeout_secs = 300

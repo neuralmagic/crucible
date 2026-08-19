@@ -1,0 +1,22 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-BUILD-MODE"
+title = "Build modes"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = """
+Between "the agent edited a file" and "measure_cmd read a score" sits a build step whose shape must be declared per component.
+
+Four modes: no artifact (compile+run in place), no rebuild (config tuning), derive-layer (interpreted sources appended as OCI layer), image (full container build).
+
+derive-layer must require that the base image and push target share a registry. derive-layer must not carry compiled sources.
+
+A compile failure must be distinguishable from a bad score. In image mode, compile error must be returned to the agent as a free retry with no candidate spent.
+
+A Containerfile on the measured path is part of the judge, not part of the solution. If the build recipe lives in the agent's workspace, it must be a frozen = true inject, re-copied before every scored measure.
+
+crucible check should enforce these preconditions before a turn is spent."""

@@ -1,0 +1,30 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0011"
+title = "Crucible-rendered deployments — generate the loop/broker/rig manifests from the manifest + a deploy profile"
+status = "accepted"
+date = "2026-06-28"
+refs = [
+    "ADR-0002",
+    "ADR-0005",
+    "ADR-0008",
+    "ADR-0009",
+    "RFC-0001",
+]
+
+[content]
+context = "Loop pod specs (~250 lines YAML each) duplicate manifest values, require manual digest pinning, and are ~90% identical across domains. Three structural problems drove this decision: pod env duplicates the manifest (every manifest field change requires a matching YAML edit), manual digest pinning is error-prone (stale digests caused production incidents), and the pod spec is copy-pasted across domains with hand-maintained divergence."
+decision = "`crucible deploy render`/`apply` generates the loop pod + broker wiring + RBAC from two inputs: the domain manifest (already the source of truth) and a thin deploy profile (environment-specific facts like cluster endpoints and image overrides). The renderer projects manifest config into pod env, resolves and pins image digests at render time via oci-client, shares a template per backend, and emits RBAC references. Implemented as a native Rust renderer with real k8s-openapi types, including a kube-rs migration that removed the kubectl dependency from the engine."
+consequences = """
+Positive: one source of truth (manifest edit + re-render replaces yaml safari). Reproducible deploys with digests computed at render time, eliminating the stale-binary bug class. Composes cleanly with the controller. Lowers domain onboarding bar.
+
+Negative: the renderer must track every manifest field the pod spec consumes, and a new field requires a renderer update. The deploy profile is a new artifact to maintain per environment."""
+
+[[content.alternatives]]
+text = "Native Rust renderer with k8s-openapi types, projecting manifest config into pod env with digest pinning at render time"
+status = "accepted"
+
+[[content.alternatives]]
+text = "Use kustomize or Helm templates to generate deployment YAML"
+status = "rejected"

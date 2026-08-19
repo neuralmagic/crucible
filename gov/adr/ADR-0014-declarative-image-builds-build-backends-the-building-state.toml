@@ -1,0 +1,28 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0014"
+title = "Declarative image builds — build backends + the building state"
+status = "proposed"
+date = "2026-07-08"
+refs = [
+    "ADR-0005",
+    "ADR-0008",
+    "ADR-0011",
+]
+
+[content]
+context = "Four tiers of image production exist. Only CI-built and in-loop candidate builds are automated. Hand-built images (sandboxes, loop-openshell) use mutable tags and hand-plumbed digests. Version-knob choreography (VLLM_VERSION, REPO_SHA, WORLD_BASE) is synchronized by convention, not tooling."
+decision = 'One BuildBackend contract with two implementations: Cluster (detached rootless-buildah Job) and GithubActions (workflow_dispatch + poll). Named builds are declared in the domain manifest as [build.<name>]. Digests are resolved by crucible itself via the registry. watch.paths defines when a build is needed. The template vocabulary is closed (no string injection). The controller blocks measurement on an explicit "building" state. crucible build <name> provides a CLI for human-invoked builds.'
+consequences = """
+Positive: onboarding domain images becomes a manifest edit. Digests flow mechanically from the registry. Measurement rig can never run on a stale or half-built image because the controller blocks measurement on the explicit "building" state.
+
+Negative: two build backends to maintain. The template vocabulary is deliberately closed, which limits extensibility. The "building" state adds a new controller lifecycle phase."""
+
+[[content.alternatives]]
+text = "One BuildBackend contract with Cluster and GithubActions implementations; named builds in manifest [build.<name>]; digest resolved via registry; controller blocks measurement on building state"
+status = "accepted"
+
+[[content.alternatives]]
+text = "Generate workflow files on the fly per domain"
+status = "rejected"
