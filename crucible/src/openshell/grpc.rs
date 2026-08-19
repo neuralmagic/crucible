@@ -14,11 +14,12 @@ use openshell_core::proto::{
     AddNetworkRule, ConfigureProviderRefreshRequest, CreateProviderRequest, CreateSandboxRequest,
     DeleteSandboxRequest, ExecSandboxRequest, FilesystemPolicy, GetProviderRequest,
     GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest,
-    NetworkBinary, NetworkEndpoint, NetworkPolicyRule, PolicyMergeOperation, PolicyStatus,
-    Provider, ProviderCredentialRefreshStrategy, RotateProviderCredentialRequest, SandboxCondition,
-    SandboxLogLine, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate, ServiceStatus,
-    UpdateConfigRequest, UpdateProviderRequest, exec_sandbox_event::Payload as ExecPayload,
-    policy_merge_operation::Operation as MergeOp,
+    ImportProviderProfilesRequest, NetworkBinary, NetworkCredentialBinding, NetworkEndpoint,
+    NetworkPolicyRule, PolicyMergeOperation, PolicyStatus, Provider,
+    ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileImportItem,
+    RotateProviderCredentialRequest, SandboxCondition, SandboxLogLine, SandboxPhase, SandboxPolicy,
+    SandboxSpec, SandboxTemplate, ServiceStatus, UpdateConfigRequest, UpdateProviderRequest,
+    exec_sandbox_event::Payload as ExecPayload, policy_merge_operation::Operation as MergeOp,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -690,6 +691,53 @@ impl Gateway {
             .map_err(Into::into)
     }
 
+    /// Register a provider carrying one static credential and no config
+    /// (`CreateProvider`). `provider_type` names the provider profile that declares the
+    /// credential's env key; for an endpointless profile the credential boundary comes from a
+    /// policy endpoint's `credential_binding` instead of profile endpoints.
+    #[tracing::instrument(skip_all, fields(rpc = "create_provider", provider = name))]
+    pub async fn create_static_provider(
+        &self,
+        name: &str,
+        cred_key: &str,
+        token: &str,
+        provider_type: &str,
+    ) -> Result<()> {
+        let mut provider = build_provider(name, cred_key, token);
+        provider.r#type = provider_type.to_string();
+        let mut client = self.client();
+        client
+            .create_provider(CreateProviderRequest {
+                provider: Some(provider),
+                ..Default::default()
+            })
+            .await
+            .map(|_| ())
+            .map_err(GrpcError::rpc(format!("create_provider({name})")))
+            .map_err(Into::into)
+    }
+
+    /// Import (or refresh) a custom provider profile, platform-scoped
+    /// (`ImportProviderProfiles`). Existing custom profiles with the same id are replaced, so
+    /// re-running per turn is idempotent.
+    #[tracing::instrument(skip_all, fields(rpc = "import_provider_profiles", profile = profile.id.as_str()))]
+    pub async fn import_provider_profile(&self, profile: ProviderProfile) -> Result<()> {
+        let id = profile.id.clone();
+        let mut client = self.client();
+        client
+            .import_provider_profiles(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(profile),
+                    source: "crucible".to_string(),
+                }],
+                ..Default::default()
+            })
+            .await
+            .map(|_| ())
+            .map_err(GrpcError::rpc(format!("import_provider_profiles({id})")))
+            .map_err(Into::into)
+    }
+
     /// Register a provider whose credentials are gateway-minted (`CreateProvider` with an EMPTY
     /// credentials map): the refresh worker populates them once a refresh is configured. `r#type`
     /// names a provider profile (e.g. `aws-s3`), whose SigV4-signed egress endpoints attach with
@@ -821,8 +869,9 @@ impl Gateway {
         name: &str,
         binaries: &[String],
         endpoints: &[String],
+        credential_binding: Option<&EndpointCredentialBinding>,
     ) -> Result<()> {
-        let merge_operations = build_merge_operations(binaries, endpoints)?;
+        let merge_operations = build_merge_operations(binaries, endpoints, credential_binding)?;
         let version = self
             .client()
             .update_config(UpdateConfigRequest {
@@ -1051,12 +1100,24 @@ fn is_deny_action(action: &str) -> bool {
     a.contains("deny") || a.contains("denied") || a.contains("block")
 }
 
+/// A static-credential binding to graft onto one policy endpoint: requests to `host:port` get
+/// provider `provider`'s credential placeholders resolved at the egress proxy. The endpoint is
+/// upgraded to `protocol: rest` if it was L4-only — placeholder rewrite happens in the L7 relay,
+/// a CONNECT tunnel never sees the header.
+#[derive(Debug)]
+pub struct EndpointCredentialBinding {
+    pub host: String,
+    pub port: u32,
+    pub provider: String,
+}
+
 /// Build the incremental `UpdateConfig` merge operations: one add-rule per endpoint, each rule
 /// carrying every agent binary. Mirrors the CLI's `policy update --binary … --add-endpoint …`
 /// plan (the binaries attach to each added rule; descendants inherit egress from a parent).
 fn build_merge_operations(
     binaries: &[String],
     endpoints: &[String],
+    credential_binding: Option<&EndpointCredentialBinding>,
 ) -> Result<Vec<PolicyMergeOperation>> {
     let net_binaries: Vec<NetworkBinary> = dedup(binaries)
         .into_iter()
@@ -1068,7 +1129,18 @@ fn build_merge_operations(
     endpoints
         .iter()
         .map(|spec| {
-            let endpoint = parse_endpoint_spec(spec)?;
+            let mut endpoint = parse_endpoint_spec(spec)?;
+            if let Some(b) = credential_binding
+                && endpoint.host == b.host
+                && endpoint.port == b.port
+            {
+                if endpoint.protocol.is_empty() {
+                    endpoint.protocol = "rest".to_string();
+                }
+                endpoint.credential_binding = Some(NetworkCredentialBinding {
+                    provider: b.provider.clone(),
+                });
+            }
             let rule_name = generated_rule_name(&endpoint.host, endpoint.port);
             let rule = NetworkPolicyRule {
                 name: rule_name.clone(),
@@ -1461,6 +1533,7 @@ pYBZ
                 "github.com:443:full".to_string(),
                 "aiplatform.googleapis.com:443:read-write".to_string(),
             ],
+            None,
         )
         .unwrap();
         assert_eq!(ops.len(), 2);
@@ -1492,6 +1565,61 @@ pYBZ
     }
 
     #[test]
+    fn merge_operations_bind_the_broker_endpoint_only() {
+        let binding = EndpointCredentialBinding {
+            host: "host.openshell.internal".to_string(),
+            port: 8849,
+            provider: "crucible-broker".to_string(),
+        };
+        let ops = build_merge_operations(
+            &["/usr/local/bin/claude".to_string()],
+            &[
+                "github.com:443:full".to_string(),
+                "host.openshell.internal:8849:full".to_string(),
+            ],
+            Some(&binding),
+        )
+        .unwrap();
+        let eps: Vec<&NetworkEndpoint> = ops
+            .iter()
+            .filter_map(|o| match &o.operation {
+                Some(MergeOp::AddRule(a)) => a.rule.as_ref()?.endpoints.first(),
+                _ => None,
+            })
+            .collect();
+        // The broker endpoint gets the binding and an L7 upgrade; everything else is untouched.
+        assert_eq!(eps[0].credential_binding, None);
+        assert_eq!(eps[0].protocol, "");
+        assert_eq!(
+            eps[1]
+                .credential_binding
+                .as_ref()
+                .map(|b| b.provider.as_str()),
+            Some("crucible-broker")
+        );
+        assert_eq!(eps[1].protocol, "rest");
+        assert_eq!(eps[1].access, "full");
+    }
+
+    #[test]
+    fn merge_operations_preserve_an_explicit_protocol_on_the_bound_endpoint() {
+        let binding = EndpointCredentialBinding {
+            host: "h".to_string(),
+            port: 8849,
+            provider: "crucible-broker".to_string(),
+        };
+        let ops =
+            build_merge_operations(&[], &["h:8849:full:websocket".to_string()], Some(&binding))
+                .unwrap();
+        let Some(MergeOp::AddRule(add)) = &ops[0].operation else {
+            panic!("expected an add-rule op");
+        };
+        let ep = &add.rule.as_ref().unwrap().endpoints[0];
+        assert_eq!(ep.protocol, "websocket");
+        assert!(ep.credential_binding.is_some());
+    }
+
+    #[test]
     fn merge_operations_dedupe_binaries() {
         let ops = build_merge_operations(
             &[
@@ -1500,6 +1628,7 @@ pYBZ
                 "".to_string(),
             ],
             &["github.com:443:full".to_string()],
+            None,
         )
         .unwrap();
         let Some(MergeOp::AddRule(add)) = &ops[0].operation else {

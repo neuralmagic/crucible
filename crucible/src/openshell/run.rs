@@ -195,6 +195,19 @@ async fn try_turn(
         _ => false,
     };
 
+    // 2c. Broker token hardening: the per-run bearer token becomes a static credential on the
+    //     `crucible-broker` provider, and the sandbox's `.mcp.json` carries only the
+    //     `openshell:resolve:env:` placeholder. The proxy resolves it at egress, solely for the
+    //     policy endpoint bound to this provider (the step-4 `credential_binding`), so the real
+    //     token never enters the sandbox and a leaked placeholder resolves nowhere else.
+    let broker_provider = match args.broker_token.as_deref() {
+        Some(token) if args.broker.enabled => {
+            ensure_broker_provider(&gw, token).await?;
+            true
+        }
+        _ => false,
+    };
+
     // 3. Create the sandbox, attaching the managed provider. Best-effort delete first: a prior
     //    turn whose create failed (e.g. ContainerExited mid-provision) leaves the name behind,
     //    and a bare create then fails "already exists" for the rest of the run. Clearing it
@@ -226,6 +239,9 @@ async fn try_turn(
     };
     if aws_provider {
         providers.push(provider::AWS_PROVIDER_NAME.to_string());
+    }
+    if broker_provider {
+        providers.push(provider::BROKER_PROVIDER_NAME.to_string());
     }
     gw.create_sandbox(
         &name,
@@ -328,10 +344,24 @@ async fn try_turn(
         if let Some(c) = &collector {
             endpoints.push(c.sandbox_egress(driver.broker_host()));
         }
+        let broker_binding = broker_ep
+            .as_deref()
+            .filter(|_| broker_provider)
+            .and_then(|ep| {
+                let mut it = ep.split(':');
+                let host = it.next()?.to_string();
+                let port: u32 = it.next()?.parse().ok()?;
+                Some(grpc::EndpointCredentialBinding {
+                    host,
+                    port,
+                    provider: provider::BROKER_PROVIDER_NAME.to_string(),
+                })
+            });
         gw.update_policy_wait(
             &name,
             &policy::resolve_binaries(&args.openshell, harness.default_binaries()),
             &endpoints,
+            broker_binding.as_ref(),
         )
         .await
         .context("applying the sandbox egress policy")?;
@@ -394,7 +424,12 @@ async fn try_turn(
         // 7b. Seed the harness's pre-exec files (claude: `.mcp.json` toward the provisioning
         //     broker, loaded via `--mcp-config`). `broker_url` was already resolved above
         //     (step 4) so the URL and egress entry agree.
-        let seeds = harness.seed_files(args, broker_url.as_deref());
+        let seed_token = if broker_provider {
+            Some(provider::broker_token_placeholder())
+        } else {
+            args.broker_token.clone()
+        };
+        let seeds = harness.seed_files(args, broker_url.as_deref(), seed_token.as_deref());
         for seed in &seeds {
             let seed_tmp = write_temp("seed", &seed.content).await?;
             run_os(
@@ -551,6 +586,33 @@ async fn ensure_provider(gw: &Gateway, token: &str, project: &str, region: &str)
 /// web-identity STS refresh, then rotate once so the credentials exist BEFORE the sandbox's
 /// first request, the proxy fails closed on unminted credentials and the refresh worker's
 /// tick is up to 60s away. Re-configuring each turn keeps a rotated role ARN current.
+/// Import the endpointless broker profile and set this run's token on the `crucible-broker`
+/// provider, update-or-create like the Vertex provider: the token changes every run, the
+/// provider object survives across runs on a shared gateway.
+async fn ensure_broker_provider(gw: &Gateway, token: &str) -> Result<()> {
+    gw.import_provider_profile(provider::broker_profile())
+        .await
+        .context("importing the broker provider profile")?;
+    if gw.provider_exists(provider::BROKER_PROVIDER_NAME).await {
+        gw.update_provider(
+            provider::BROKER_PROVIDER_NAME,
+            provider::BROKER_CRED_KEY,
+            token,
+        )
+        .await
+        .context("updating the broker provider token")
+    } else {
+        gw.create_static_provider(
+            provider::BROKER_PROVIDER_NAME,
+            provider::BROKER_CRED_KEY,
+            token,
+            provider::BROKER_PROFILE_ID,
+        )
+        .await
+        .context("creating the broker provider")
+    }
+}
+
 async fn ensure_aws_provider(gw: &Gateway, role_arn: &str) -> Result<()> {
     use openshell_core::proto::ProviderCredentialRefreshStrategy;
     // The STS refresh strategy is gated behind the gateway's providers-v2 global setting
