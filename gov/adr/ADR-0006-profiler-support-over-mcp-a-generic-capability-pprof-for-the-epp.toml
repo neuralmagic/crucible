@@ -1,0 +1,34 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0006"
+title = "Profiler support over MCP — a generic capability, pprof for the EPP"
+status = "accepted"
+date = "2026-06-26"
+refs = [
+    "ADR-0002",
+    "ADR-0005",
+]
+
+[content]
+context = """The TTFT gate cannot isolate the EPP or resolve small EPP wins. The measured path includes Envoy's body handling, data-plane transfer, backend ingest, and queueing at c=150. Every micro-optimization the agent tried came back "within noise" because it was optimizing a low-single-digit percent sliver that the c=150 measurement noise swamps. The gate is right for scoring a candidate but wrong for finding what to change. A profile (pprof) attributes CPU/allocations/contention to specific EPP functions and source lines, isolated by construction and far more sensitive than a noisy end-to-end delta. The EPP ships pprof but the port is token-gated on the secure metrics server and the sandbox has no cluster reach or Go toolchain."""
+decision = """Add a generic Profiler capability to the broker — mediated "observe the candidate's internals" — with the concrete profiler as a domain-configured backend. Two generic tools: profile(kind, seconds) captures a profile by shelling BROKER_PROFILE_CAPTURE_CMD, and profile_query(query) runs a query against the stored profile by shelling BROKER_PROFILE_QUERY_CMD. The broker knows nothing about pprof, Go, or the EPP — only "capture a profile, then query it," delegated to configured commands. The EPP domain sets the two commands (capture = authed GET of the pprof endpoint; query = go tool pprof). Extensible to multiple targets via BROKER_PROFILE_TARGETS for composite deployments, with per-target capture/query/extension commands. The loop becomes: profile to find the hot lines, fix them, re-profile to confirm the hotspot shrank, then measure to score."""
+consequences = "Positive: the agent optimizes the measured hot path instead of theorizing in the noise; the isolation/sensitivity problem the TTFT gate cannot solve is solved by direct observation; generic across domains (pprof, torch-trace, py-spy, eBPF); composes with measure/build/deploy; strengthens the case for broker extraction. Negative/cost: small RBAC grant, a binary in the loop image, two more broker tools, and a rebuild; profiling adds minor overhead during capture; the query pass-through needs a deny-list to prevent the agent from starting servers or writing files."
+
+[[content.alternatives]]
+text = "Generic Profiler capability in the broker with domain-configured backends (BROKER_PROFILE_CAPTURE_CMD / BROKER_PROFILE_QUERY_CMD), concrete pprof backend for the EPP"
+status = "accepted"
+pros = [
+    "Agent optimizes the measured hot path instead of theorizing in the noise",
+    "Generic: any domain can swap in py-spy, perf, eBPF, or torch-trace via the same two env commands",
+    "Composes with measure/build/deploy and strengthens the case for broker extraction",
+]
+cons = [
+    "RBAC grant, binary in the loop image, two more broker tools, and a rebuild",
+    "Needs a command deny-list so the agent cannot start servers or write files via profile_query",
+]
+
+[[content.alternatives]]
+text = "Give the agent direct access to the pprof endpoint from the sandbox"
+status = "rejected"
+rejection_reason = "The sandbox has no cluster reach (egress wall) and no Go toolchain; would require punching holes in the egress policy and baking Go tools into the sandbox"

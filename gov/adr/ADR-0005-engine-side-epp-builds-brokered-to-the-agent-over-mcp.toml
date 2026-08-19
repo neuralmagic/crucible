@@ -1,0 +1,34 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0005"
+title = "Engine-side EPP builds, brokered to the agent over MCP"
+status = "accepted"
+date = "2026-06-26"
+refs = [
+    "ADR-0001",
+    "ADR-0002",
+]
+
+[content]
+context = "The first domain that needs in-loop EPP code rebuilds (#1109) exposed that the sandboxed agent cannot build or see the measurement. It can't build because build-image shells out to an out-of-sandbox remote-build script, and a kaniko build needs build-namespace kubectl, a push credential, and egress the deny-by-default sandbox does not have. It can't see the measurement because the sandbox predates the TTFT bench, so the agent reverse-engineers the binary and spirals. Putting build creds in the sandbox enlarges the attack surface and fights the World trait, which already says build+deploy is apply's job (engine-side)."
+decision = "Move build+deploy off the agent to the loop pod (engine-side), and expose it to the agent as broker (MCP) tools — the ADR-0002 pattern. The agent calls build_epp and deploy_candidate over the existing MCP bridge; the loop pod runs the container build (buildah) with its own push credential for the candidate registry and returns compile errors or success. A backstop apply_cmd ensures the latest built candidate is deployed before the judge measures. The agent's sandbox loses build creds entirely — it only edits code and calls the broker. Components to build: loop-pod build capability, epp-mcp build tools, workspace sync (the agent commits and pushes its branch to the loop pod's workspace as a git remote), rebuilt sandbox image with current tools, and manifest wiring."
+consequences = "Positive: build creds never enter the sandbox (ADR-0001/0002 aligned); the agent gets real compile feedback; the loop pod is the one trusted place for push creds; apply_cmd guarantees the measured candidate is the built one; code-change domains become first-class. Negative/cost: real infra needed (push cred, RBAC, builder in the loop image, workspace sync mechanism, sandbox rebuild) and per-iteration build latency."
+
+[[content.alternatives]]
+text = "Move build+deploy off the agent to the loop pod (engine-side) and expose it as broker MCP tools — the agent asks, the loop pod holds the keys"
+status = "accepted"
+pros = [
+    "Build creds never enter the sandbox (ADR-0001/0002 aligned)",
+    "Agent gets real compile feedback within the turn",
+    "Code-change domains become first-class, not just config tuning",
+]
+cons = [
+    "Real infra needed: push cred, RBAC, builder in the loop image, workspace sync mechanism",
+    "Per-iteration build latency",
+]
+
+[[content.alternatives]]
+text = "Put build credentials directly in the sandbox so the agent builds itself"
+status = "rejected"
+rejection_reason = "Enlarges the attack surface and fights the World trait which says build+deploy is the engine's job"

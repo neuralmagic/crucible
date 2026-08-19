@@ -1,0 +1,31 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0001"
+title = "Adaptive harness — adapt the setup, freeze the judge"
+status = "accepted"
+date = "2026-06-23"
+refs = ["RFC-0001"]
+
+[content]
+context = """The loop's integrity rests on one thing: the gate (fitness) must be trustworthy and outside the agent's reach. A kept "win" is only as honest as the harness that judged it. Tailoring the harness to each issue is valuable, but adaptivity aimed at the wrong layer turns the loop into a reward-hacking machine — if the harness can reshape itself toward the thing being optimized, the agent (or the adaptation itself) will make the workload easy, move the baseline, or pick a metric it already passes."""
+decision = "Adapt the setup. Freeze the judge. The agent may change its solution; it must never change its evaluation. Split the system into two phases with a hard wall: (1) Scoping (adaptive, once, then frozen) — analyze the issue and decide the workload, baseline, and gate; output is pinned, content-hashed, validated via gate self-test, and human-approved. (2) The loop (immutable gate) — the optimizing agent runs against the frozen harness with only solution-space tools and a read-only gate. Every tool is classified as either evaluation/setup (frozen, not in the loop agent's toolbox) or solution (agent may use). Safeguards: gate self-test with negative controls, harness fingerprint on every result, fixed baseline derived once during scoping, multi-seed gating, and cost/blast-radius gating. The agent may declare the judge inadequate via a structured escalation (escalate --category ... --reason ... --evidence ...) which stops the loop and surfaces the report for human review, but it can never edit the evaluation."
+consequences = "Positive: keeps the appealing part — the harness meets each issue where it is — while the optimization loop stays trustworthy and its results stay comparable and reproducible. Clear capability boundary; the loop agent literally cannot reward-hack its evaluation because it has no tool to reach it. Negative/cost: scoping becomes a real, gated step (validation + approval), not a side-effect of running the loop. The loop's tool wiring splits the toolbox into setup vs solution, emits a harness manifest + fingerprint, and runs the gate self-test as a scoping precondition."
+
+[[content.alternatives]]
+text = "Adapt the setup, freeze the judge — two-phase system with a hard capability wall between scoping (adaptive) and the loop (immutable gate)"
+status = "accepted"
+pros = [
+    "Keeps harness tailoring while the optimization loop stays trustworthy",
+    "Clear capability boundary prevents reward-hacking",
+    "Results remain comparable and reproducible via fingerprinting",
+]
+cons = [
+    "Scoping becomes a real gated step requiring validation and approval",
+    "Tool wiring complexity increases with the setup/solution split",
+]
+
+[[content.alternatives]]
+text = "Allow the agent to adapt the judge during the loop — no phase boundary between scoping and optimization"
+status = "rejected"
+rejection_reason = "Turns the loop into a reward-hacking machine; the agent or adaptation can make the workload easy, move the baseline, or pick a metric it already passes"

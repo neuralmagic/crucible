@@ -1,0 +1,22 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-PATHS"
+title = "Path resolution"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = """
+method_prompt, goal_file, and toolbox_dir must resolve relative to the manifest directory.
+
+The agent workspace must resolve to manifest_dir / [workspace].dir.
+
+Runtime state (session.jsonl, admissions.jsonl, control.json) must resolve to --state-dir, default manifest_dir/state.
+
+STEER.md must resolve to --steer, default manifest_dir/STEER.md.
+
+ESCALATION.json must resolve to <workspace>/ESCALATION.json: written by escalate, consumed by the engine post-turn.
+
+The binary's own install location must never be used to resolve anything."""

@@ -1,0 +1,39 @@
+#:schema ../../schema/rfc.schema.json
+
+[govctl]
+id = "RFC-0001"
+title = "Crucible implementation contract"
+version = "0.1.0"
+status = "normative"
+phase = "stable"
+owners = ["@Will Eaton"]
+created = "2026-08-19"
+updated = "2026-08-19"
+signature = "ff8072ad4fecc176564e2ffbbf52c069b261c784901d2028972e8a983ac8b969"
+
+[[sections]]
+title = "Summary"
+
+[[sections]]
+title = "Specification"
+clauses = [
+    "clauses/C-MANIFEST.toml",
+    "clauses/C-SELFTEST.toml",
+    "clauses/C-SEARCH.toml",
+    "clauses/C-WORKFLOW.toml",
+    "clauses/C-PATHS.toml",
+    "clauses/C-COMMANDS.toml",
+    "clauses/C-BUILD-MODE.toml",
+    "clauses/C-DECIDE.toml",
+    "clauses/C-WORLD.toml",
+    "clauses/C-TRANSPORT.toml",
+    "clauses/C-EGRESS.toml",
+    "clauses/C-WIRE.toml",
+    "clauses/C-LEDGER.toml",
+    "clauses/C-SURFACE.toml",
+]
+
+[[changelog]]
+version = "0.1.0"
+date = "2026-08-19"
+notes = "Initial draft"

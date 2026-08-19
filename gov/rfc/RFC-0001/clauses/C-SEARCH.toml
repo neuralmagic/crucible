@@ -1,0 +1,18 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-SEARCH"
+title = "Wide-round search protocol"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = """
+[search].wide > 0 (or --wide N on the CLI, which overrides the manifest) must fan out N independent PROPOSE turns in per-candidate git worktrees before the deep loop starts, one turn per approaches entry biased into its prompt.
+
+Each candidate's diff must be applied (cherry-picked) into the shared main workspace and measured serially (measurement must never run concurrently; only proposal does).
+
+The scored set must be ranked by [search].policy (v1: top-k); the policy_k winners must seed the deep loop.
+
+Session rows from the wide round must carry an additive phase: "wide" field so a consumer can distinguish a wide-round row from a deep-loop row without a wire-shape change. The field must be skip_serializing_if None so a deep-only run's wire bytes are unchanged."""

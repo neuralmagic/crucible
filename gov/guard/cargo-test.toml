@@ -1,0 +1,9 @@
+#:schema ../schema/guard.schema.json
+
+[govctl]
+id = "GUARD-CARGO-TEST"
+title = "cargo test"
+
+[check]
+command = "cargo test --workspace"
+timeout_secs = 300

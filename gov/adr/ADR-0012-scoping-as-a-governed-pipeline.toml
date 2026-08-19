@@ -1,0 +1,30 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0012"
+title = "Scoping as a governed pipeline"
+status = "proposed"
+date = "2026-07-02"
+refs = [
+    "ADR-0001",
+    "ADR-0007",
+    "ADR-0008",
+    "ADR-0010",
+    "RFC-0001",
+]
+
+[content]
+context = "Every run starts from a hand-authored harness (~one day expert work per issue), the throughput bottleneck. Also the most dangerous manual step: #1109 burned a loop on a gate that could not isolate its target, #1489's reward hack lived in a gate that under-counted a path. [[ADR-0001]] designed the answer (adaptive scoping, once, then frozen) but only the freeze was built; the scoping automation remained manual."
+decision = "Five-stage pipeline via crucible scope: 1) Ingest and triage (goal extraction, judge-tier ranking T0/T1/T2/N), 2) Propose (one agent turn drafts the harness), 3) Validate mechanically (crucible check + gate self-test + isolation preflight), 4) Approve (draft PR, human signs off), 5) Freeze (manifest pinned, RunIdentity digest computed). The proposer is never the optimizer. Validation is mechanical. A human approves. The freeze is stamped."
+consequences = """
+Positive: onboarding drops from a day to review-of-a-draft-PR. Two known harness failure modes (#1109 isolation, #1489 under-counting) caught by construction via gate self-test and isolation preflight. Gate self-test becomes a first-class engine contract.
+
+Negative: scope turns cost real tokens on issues that may die at stage 3 (mechanical validation). The five-stage pipeline introduces ceremony that lightweight runs do not need."""
+
+[[content.alternatives]]
+text = "Five-stage governed pipeline (ingest, propose, validate, approve, freeze) with trust separation between proposer and optimizer"
+status = "accepted"
+
+[[content.alternatives]]
+text = "Continue hand-authoring harnesses with manual validation"
+status = "rejected"

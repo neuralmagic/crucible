@@ -1,0 +1,24 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-WORKFLOW"
+title = "Scope-authored workflow DSL"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = """
+A scoped pack may include workflow.star beside crucible.toml. It is authoring syntax; scope must compile it to [[workflow.task]] manifest IR before validation and again before freeze. The generated TOML is the runtime authority.
+
+The DSL must accept: assignments, scalar values, lists, list concatenation, and direct calls to the defined constructors (propose, apply, measure, evaluate, grade, decide, agent, command, top_k, deps, prompt_file, workflow, default_autoresearch, session). It must not provide load(), control flow, user-defined functions, comprehensions, mutation, filesystem access other than prompt_file(), processes, network, time, or randomness.
+
+Topology is authorable; authority is not. A workflow must declare type = "autoresearch" or type = "custom". An autoresearch workflow's result must be a decide task sourced from a frozen measure or authored grade, with apply and propose ancestors. A custom workflow has no autoresearch-shape requirement; universal DAG, source-typing, and operation-capability rules still apply.
+
+Tasks marked isolated = True must run concurrently in disposable worktrees; their file changes must be discarded and only their JSON outputs continue through the graph.
+
+session = "name" must preserve one logical agent conversation across dependency-ordered tasks and loop iterations. Tasks sharing a session must not be isolated and must be dependency-ordered.
+
+A task constructed in workflow.star but omitted from workflow(tasks = ...) must be a compile error.
+
+Compile errors must carry file:line:col and a did-you-mean suggestion for unknown functions, kwargs, variables, and session names."""

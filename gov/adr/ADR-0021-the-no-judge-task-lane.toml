@@ -1,0 +1,37 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0021"
+title = "The no-judge task lane"
+status = "accepted"
+date = "2026-08-17"
+refs = [
+    "ADR-0001",
+    "ADR-0004",
+    "ADR-0018",
+    "RFC-0001",
+]
+
+[content]
+context = 'Crucible had no lane for unsupervised agent chores with no objective ("consolidate dependabot PRs", "fix flaky tests nightly"). [judge] was required at the type level. Teams reached for external runners that hand the agent credentials and keep no durable state.'
+decision = 'A manifest with no [judge] table builds TaskJudge: measure emits Reading with valid:true, score:None; decide keeps unconditionally; improved is unconditionally true; objective() returns "task". Rows keep the ordinary decision:"keep" shape with score:null. skip_baseline is forced on. Composites still require [judge]. A task manifest rejects [search], [workflow], and [preflight]. crucible check skips measure probe, editable-gate lint, and selftest, but requires a non-empty goal and prints a loud notice.'
+consequences = 'Trust boundary untouched. Exit 0 means "run completed" not "chore succeeded". Summary.best_score and Segment.baseline_score became Option<f64> on the wire. Downstream dashboards reading decision=="keep" as "beat objective" must branch on gate=="task".'
+
+[[content.alternatives]]
+text = "Absent [judge] = the task lane, with TaskJudge that keeps unconditionally"
+status = "accepted"
+
+[[content.alternatives]]
+text = "[judge] mode = none: add a mode field to the existing judge config"
+status = "rejected"
+rejection_reason = "Adds a concept, makes every JudgeCfg field conditionally required."
+
+[[content.alternatives]]
+text = "[agent] mode = task: put the run semantics on the agent section"
+status = "rejected"
+rejection_reason = "Conflates proposal-policy with run semantics."
+
+[[content.alternatives]]
+text = "Separate one-shot subcommand for unjudged work"
+status = "rejected"
+rejection_reason = "Re-implements session Start/Row/Summary/Shutdown/publish/resume from scratch."

@@ -1,0 +1,33 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0022"
+title = "Measurement sessions — one warm engine, many observations"
+status = "proposed"
+date = "2026-08-14"
+refs = [
+    "ADR-0005",
+    "ADR-0006",
+    "ADR-0008",
+    "ADR-0017",
+    "ADR-0020",
+]
+
+[content]
+context = "Every brokered measure call boots the engine from cold, measures, and dies. GLM-5.2 NVFP4 revalidation measured ~25 min per rung, of which ~9 min is actual measurement. Four GPU jobs per iteration pay that cold-boot toll four times."
+decision = "A measurement session is a broker-owned engine process serving ordered measurement points against one candidate digest. Independence contract: declared resets between points, declared residue (accepted drift), bounded drift (max point count per session), fixed order, failed reset is not a measurement. Sessions are state (never a durable step), but points remain durable steps (identity includes reset-protocol digest and ordinal). A/B legs driven by import-time toggles stay one-shot jobs. Domains that declare nothing keep today's behavior."
+consequences = "Comparability breaks at the switch (session-era numbers are not comparable to pre-session). Mechanism rung becomes a point inside the session. Expected saving: ~50 min per iteration. A new way to be wrong: dirty sessions (mitigated by reset record in each point's result)."
+
+[[content.alternatives]]
+text = "Broker-owned measurement session serving ordered points against one candidate digest"
+status = "accepted"
+
+[[content.alternatives]]
+text = "Fat single job: combine all measurement points into one large job"
+status = "rejected"
+rejection_reason = "Loses per-point isolation, retry, and memo. Accepted as a prototype to validate the independence contract, but rejected as the end state."
+
+[[content.alternatives]]
+text = "Standing server outside the run: long-lived measurement process shared across runs"
+status = "rejected"
+rejection_reason = "[[ADR-0008]]'s frozen world requires the candidate's own build; a standing server outside the run cannot serve a candidate-specific engine."

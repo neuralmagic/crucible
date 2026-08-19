@@ -1,0 +1,36 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0008"
+title = "Domains as immutable composes — the rpm-ostree model for the frozen world"
+status = "accepted"
+date = "2026-06-26"
+refs = [
+    "ADR-0001",
+    "ADR-0005",
+    "ADR-0006",
+    "ADR-0007",
+]
+
+[content]
+context = "Launching the first two local go-test domains surfaced a cluster of failures sharing one root cause: runtime mutation of the environment drifting from what was authored against. libgit2 had no TLS, image Go was wrong version, the harness didn't match the code signatures, a stale baked workspace caused wrong commit, cold go mod download caused crashes, and the agent sandbox had no Go toolchain. The judge was frozen (ADR-0001), but the world it runs in was not: the loop clones a moving target, downloads deps on the fly, and gets patched at runtime. A frozen judge measuring an unfrozen world measures different code on every run, which also makes cross-run memory meaningless."
+decision = "Treat each autoresearch domain as an rpm-ostree-style immutable compose. The world — upstream source@SHA + matched toolchain + pre-fetched dependencies + frozen judge harness — is composed ahead of time into a single content-addressed image. The loop runs that image; it does not clone, fetch, or get patched at runtime. To change the world you re-compose and rebase to a new digest, atomically. The agent's edits are the only mutable layer, realized as git commits on top of the pinned SHA (the CoW overlay). The compose input digest (a hash-of-hashes over source SHA, toolchain, go.sum, frozen harness, and recipe) is the canonical identity for cross-run memory. Dependencies are part of the overlay and can be added mid-turn; the toolchain is hard-frozen and requires a re-compose to change. Detection is continuous, application is deliberate via a Kubernetes-shaped reconcile loop."
+consequences = "Positive: the build/world-definition mismatch class is designed out (cross-run memory compares identical bytes); measurement is offline and fast (no per-run dep fetch); validation moves to build time (fail the compose, not the paid loop); it is the natural unit for the controller to manage and version. Negative/cost: a per-domain compose build and re-compose to pick up upstream changes (deliberate, atomic); larger images with deps baked in; the agent-edits-as-overlay relies on git history on top of repo@SHA; pinning means the kept patch is against SHA not live main, so upstreaming a win is a separate rebase. Supersedes the runtime patching (emptyDir, configMap) used for the first launch."
+
+[[content.alternatives]]
+text = "Treat each domain as an rpm-ostree-style immutable compose — source@SHA + toolchain + deps + frozen harness composed ahead of time into a content-addressed image; the agent's edits are the only mutable overlay (git commits on top of the pinned SHA)"
+status = "accepted"
+pros = [
+    "Build/world-definition mismatch class is designed out, not patched around",
+    "Cross-run memory finally compares identical bytes; two runs of the same compose input digest compile identical bytes",
+    "Measurement is offline and fast (no per-run dep fetch); validation moves to build time",
+]
+cons = [
+    "Per-domain compose build and re-compose to pick up upstream changes (deliberate, atomic)",
+    "Larger images (deps baked in); pinning means the kept patch is against SHA, not live main",
+]
+
+[[content.alternatives]]
+text = "Always clone fresh main at runtime and download deps on the fly"
+status = "rejected"
+rejection_reason = "Re-introduces the moving-target drift this ADR exists to kill; cross-run memory compares different bytes; network-dependent and slow"

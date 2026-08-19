@@ -1,0 +1,26 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0019"
+title = "Admission ledger for external inputs"
+status = "accepted"
+date = "2026-08-04"
+refs = [
+    "ADR-0003",
+    "ADR-0018",
+    "RFC-0001",
+]
+
+[content]
+context = "Every external input was volatile, unrecorded, or both. Steer text was lost on pod death after read-then-blank. Approve/deny/rescope were in-memory mutex slots (double approve, silent overwrite, lost on pod death). Set-budget/pause reverted on resume. No idempotency keys existed."
+decision = """Append-only NDJSON file (state/admissions.jsonl) with a two-state machine per idempotency key: exactly one "admitted", then at most one "settled". Adapted from flue's AgentSubmissionStore. Three rules: admission precedes effect (fsync before mutation), idempotency converges (same key+payload returns original), ledger is authoritative for operator inputs. Derived grant keys link approvals to asks. Settlement is keyed to turn completion. File mechanics live in forge::ndjson (flock-guarded append, torn-tail-tolerant fold)."""
+consequences = "The control bridge no longer writes STEER.md. Two durable logs can disagree after a crash (one declared authoritative). Each admission costs an fsync. The file is never compacted."
+
+[[content.alternatives]]
+text = "Append-only NDJSON ledger with two-state machine per idempotency key"
+status = "accepted"
+
+[[content.alternatives]]
+text = "In-memory mutex slots with checkpoint snapshots to disk"
+status = "rejected"
+rejection_reason = "Snapshots are point-in-time and lose inputs between checkpoints. The append-only ledger records every admission with fsync-before-effect, so no input is lost on crash."

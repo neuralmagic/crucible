@@ -1,0 +1,32 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0016"
+title = "Candidate build modes — how a proposal becomes a measured artifact"
+status = "proposed"
+date = "2026-07-09"
+refs = [
+    "ADR-0001",
+    "ADR-0005",
+    "ADR-0008",
+    "ADR-0009",
+    "ADR-0014",
+    "ADR-0015",
+    "RFC-0001",
+]
+
+[content]
+context = 'The step between "agent edited a file" and "judge read a score" is undocumented. Three modes exist in practice: no artifact (compile and run in place), no rebuild (config tuning only), and build and roll (derive-layer for Python, full image build for compiled). Two critical properties are unenforceable without naming the modes: compile errors should be free (not spend a candidate), and unchanged components should not rebuild.'
+decision = "Name the modes, declare per component, engine enforces preconditions. mode is a typed per-component manifest field (none/derive-layer/image). crucible check enforces preconditions (same-registry for derive-layer, no compiled sources in derive-layer paths, frozen Containerfile for image mode). The build recipe is part of the judge (Containerfile must be a frozen inject). Modes live in the contract, not only the ADR. Per-iteration builds stay on-cluster (dispatch latency rules out GH Actions for per-turn builds)."
+consequences = """
+Positive: mode becomes readable, checkable, and reviewable in the manifest. Silent 20-minute or no-op failure modes become crucible check errors. The reward-hacking hole in the build recipe closes (Containerfile must be a frozen inject). [[ADR-0015]]'s P5 gains its precondition.
+
+Negative: mode is a new per-component field every domain must declare. crucible check's precondition enforcement adds validation complexity. The closed set of modes (none/derive-layer/image) may not cover future build strategies."""
+
+[[content.alternatives]]
+text = "Name the modes as a typed per-component manifest field (none/derive-layer/image), engine enforces preconditions via crucible check, build recipe is part of the frozen judge"
+status = "accepted"
+
+[[content.alternatives]]
+text = "Leave build mode as implicit bash in apply hooks with no engine enforcement"
+status = "rejected"

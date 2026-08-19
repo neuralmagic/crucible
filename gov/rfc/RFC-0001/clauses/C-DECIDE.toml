@@ -1,0 +1,27 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-DECIDE"
+title = "Decide rule"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = """
+Given a Reading { valid, score, solved, note, detail }, the current best_score, and the manifest direction, the decide rule must be:
+
+keep = valid AND score.is_some() AND (better(score, best_score, direction) OR (score == best_score AND tiebreak_better) OR solved)
+
+better(s, b, lower) = s < b
+better(s, b, higher) = s > b
+
+tiebreak_better applies only when the reading carries a tiebreak field: better(tiebreak, best_tiebreak, tiebreak_direction). A best with no recorded tiebreak must count as the worst value.
+
+solved must imply keep. A candidate the measure command declares solved must be kept and must terminate the loop even if its score does not strictly beat best. solved must never rescue an invalid reading.
+
+The first valid reading must set the baseline (best_score, and baseline_total = detail.total if present) and must always be kept.
+
+The loop must terminate when a kept iteration is solved, or budget/iterations exhausted, or stop/escalate.
+
+No domain Rust may decide anything. Complex win conditions must be computed inside the measure command using CRUCIBLE_BASELINE_TOTAL and emitting solved."""

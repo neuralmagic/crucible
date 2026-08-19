@@ -25,3 +25,5 @@ examples/*/workspace-*/
 /run*-session.jsonl
 /run*.diff
 /mergetest/
+.govctl.lock
+.govctl/

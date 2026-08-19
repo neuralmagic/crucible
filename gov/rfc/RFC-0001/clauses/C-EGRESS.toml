@@ -1,0 +1,18 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-EGRESS"
+title = "Sandbox egress policy"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = """
+The sandbox must be deny-by-default. Two lists open it: endpoints (host:port:access) and binaries (only these may open a socket).
+
+With inherit_defaults = true (the default), the lists must be appended and de-duplicated to the built-ins (public forges, PyPI, Vertex, Anthropic, agent CLIs). Appending must never remove a built-in.
+
+With inherit_defaults = false, the resolved allowlist must be exactly what the manifest names, binaries included. This is the only way to subtract a default and is required for air-gapped/private-registry runs and contamination control.
+
+The broker endpoint must be auto-appended by the engine when [agent.broker].enabled is true. The engine must first resolve the broker URL, then derive the egress host:port:full entry from that URL's authority. The broker endpoint must be appended regardless of inherit_defaults because it is engine plumbing, not a built-in the domain can subtract."""

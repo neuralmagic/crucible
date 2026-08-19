@@ -1,0 +1,22 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-WIRE"
+title = "Session wire format"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = """
+The NDJSON session log (state/session.jsonl) must keep its existing event kinds (start/phase/row/budget/summary/finished) and field names unchanged. The objective label must be written under the JSON key "gate" (now carrying a free-text label). This must not be renamed (keeps --resume, the remote viewer, and published S3 runs loading).
+
+Additive event kinds:
+- identity: the run's RunIdentity, emitted once at setup and again on --resume.
+- shutdown: { outcome, reason }, emitted exactly once as the last line of every run (after finished/summary). outcome must be one of finished/solved/budget/stopped/escalated/stalled/error. A dead stream with no shutdown line means the pod died mid-run.
+- agent_session: { session, action, turn }, emitted before a persistent agent turn. Must not contain the provider cursor or native transcript content.
+- approval_wait: { handle, trace_id, mode }, emitted when the loop reads a pending-provisioning marker. Every approval_wait must be closed by an approval_resolved except on stop-while-parked and process death.
+- approval_resolved: { outcome, reason } with outcome one of granted/denied/timeout.
+- recovery: { class, iter, detail }, emitted once per --resume.
+
+RunIdentity is the comparability key: two runs' scores are comparable only if it matches. It must be a hash-of-hashes over: repo URL/path + pristine base commit SHA, frozen manifest text hash, inject content+destination hashes, measure_cmd, and direction."""
