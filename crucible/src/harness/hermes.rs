@@ -97,15 +97,14 @@ pub(crate) fn env_script(env: &[(String, String)]) -> String {
 /// and tool-progress display). When the broker is on, its remote HTTP MCP server is merged in with a
 /// bearer header, since the broker binds `0.0.0.0` and the header is what makes the sandbox its only
 /// caller.
-pub(crate) fn seed_files(args: &Args, broker_url: Option<&str>) -> Vec<SeedFile> {
+pub(crate) fn seed_files(
+    args: &Args,
+    broker_url: Option<&str>,
+    broker_token: Option<&str>,
+) -> Vec<SeedFile> {
     let model = args.hermes.model.as_deref().unwrap_or(&args.model);
     vec![SeedFile {
-        content: config_yaml(
-            model,
-            &args.broker.name,
-            broker_url,
-            args.broker_token.as_deref(),
-        ),
+        content: config_yaml(model, &args.broker.name, broker_url, broker_token),
         dest: CONFIG,
     }]
 }
@@ -228,7 +227,7 @@ mod tests {
     #[test]
     fn config_yaml_always_seeds_model_and_display() {
         let a = args();
-        let seeds = seed_files(&a, None);
+        let seeds = seed_files(&a, None, None);
         assert_eq!(seeds.len(), 1, "config.yaml is always seeded");
         assert_eq!(seeds[0].dest, CONFIG);
         let v: serde_json::Value = serde_norway::from_str(&seeds[0].content).expect("valid yaml");
@@ -243,7 +242,11 @@ mod tests {
         let mut a = args();
         a.broker.name = "epp-broker".into();
         a.broker_token = Some("s3cr3t".into());
-        let seeds = seed_files(&a, Some("http://host.containers.internal:8849/mcp"));
+        let seeds = seed_files(
+            &a,
+            Some("http://host.containers.internal:8849/mcp"),
+            a.broker_token.as_deref(),
+        );
         let v: serde_json::Value = serde_norway::from_str(&seeds[0].content).expect("valid yaml");
         assert_eq!(
             v["mcp_servers"]["epp-broker"]["url"],
@@ -259,7 +262,7 @@ mod tests {
     fn config_yaml_omits_headers_without_a_token() {
         let mut a = args();
         a.broker.name = "b".into();
-        let seeds = seed_files(&a, Some("http://x/mcp"));
+        let seeds = seed_files(&a, Some("http://x/mcp"), None);
         let v: serde_json::Value = serde_norway::from_str(&seeds[0].content).expect("valid yaml");
         assert_eq!(v["mcp_servers"]["b"]["url"], "http://x/mcp");
         assert!(v["mcp_servers"]["b"].get("headers").is_none());

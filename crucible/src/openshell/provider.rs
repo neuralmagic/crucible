@@ -103,6 +103,48 @@ pub const AWS_PROVIDER_TYPE: &str = "aws-s3";
 /// session token siblings.
 pub const AWS_PRIMARY_CRED: &str = "AWS_ACCESS_KEY_ID";
 
+/// The static provider carrying the broker's per-run bearer token. Its profile is endpointless:
+/// the credential boundary comes from the sandbox policy's broker endpoint, which carries a
+/// `credential_binding` naming this provider. The sandbox only ever sees the
+/// `openshell:resolve:env:` placeholder; the proxy resolves it to the real token at egress, for
+/// the broker endpoint alone.
+pub const BROKER_PROVIDER_NAME: &str = "crucible-broker";
+
+/// The custom (crucible-imported) profile id backing [`BROKER_PROVIDER_NAME`].
+pub const BROKER_PROFILE_ID: &str = "crucible-broker";
+
+/// The credential env key the profile declares; also the placeholder key the sandbox's
+/// `.mcp.json` header resolves through.
+pub const BROKER_CRED_KEY: &str = "BROKER_TOKEN";
+
+/// The placeholder the sandbox sends in place of the broker token.
+pub fn broker_token_placeholder() -> String {
+    format!(
+        "{}{}",
+        openshell_core::secrets::PLACEHOLDER_PREFIX_PUBLIC,
+        BROKER_CRED_KEY
+    )
+}
+
+/// The endpointless `crucible-broker` profile: one required bearer credential, no endpoints, no
+/// refresh (the token is per-run static).
+pub fn broker_profile() -> openshell_core::proto::ProviderProfile {
+    openshell_core::proto::ProviderProfile {
+        id: BROKER_PROFILE_ID.to_string(),
+        display_name: "Crucible broker".to_string(),
+        description: "Per-run bearer token for the loop-pod provisioning broker".to_string(),
+        category: openshell_core::proto::ProviderProfileCategory::Agent as i32,
+        credentials: vec![openshell_core::proto::ProviderProfileCredential {
+            name: "token".to_string(),
+            description: "Broker bearer token".to_string(),
+            env_vars: vec![BROKER_CRED_KEY.to_string()],
+            required: true,
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
