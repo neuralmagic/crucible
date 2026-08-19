@@ -173,16 +173,24 @@ impl KubernetesDriverConfig {
 
 /// Render `~/.config/openshell/gateway.toml` for `driver`. Under `Podman` an optional supervisor
 /// image override appends a `[openshell.drivers.podman]` block (the in-pod sandbox image source);
-/// under `Kubernetes` it flows into the typed `[openshell.drivers.kubernetes]` block.
+/// under `Kubernetes` it flows into the typed `[openshell.drivers.kubernetes]` block. An
+/// `otlp_endpoint` appends `[openshell.gateway.otlp]` — the gateway's span export is switched
+/// on by that table's presence, not by the `OTEL_*` env vars it leaves to the SDK.
 pub fn gateway_toml(
     port: u16,
     driver: ComputeDriver,
     supervisor_image: Option<&str>,
+    otlp_endpoint: Option<&str>,
 ) -> Result<String> {
     let mut s = format!(
         "[openshell]\nversion = 1\n\n[openshell.gateway]\nbind_address = \"0.0.0.0:{port}\"\ncompute_drivers = [\"{}\"]\n",
         driver.as_str()
     );
+    if let Some(endpoint) = otlp_endpoint {
+        s.push_str(&format!(
+            "\n[openshell.gateway.otlp]\nendpoint = \"{endpoint}\"\n"
+        ));
+    }
     match driver {
         ComputeDriver::Podman => {
             if let Some(img) = supervisor_image {
@@ -636,7 +644,16 @@ fn write_config(driver: ComputeDriver, supervisor_image: Option<&str>) -> Result
     let dir = PathBuf::from(home).join(".config/openshell");
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = dir.join("gateway.toml");
-    let rendered = gateway_toml(GATEWAY_PORT, driver, supervisor_image)?;
+    let otlp_endpoint = std::env::var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+        .or_else(|_| std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT"))
+        .ok()
+        .filter(|s| !s.is_empty());
+    let rendered = gateway_toml(
+        GATEWAY_PORT,
+        driver,
+        supervisor_image,
+        otlp_endpoint.as_deref(),
+    )?;
     if std::fs::read_to_string(&path).ok().as_deref() == Some(rendered.as_str()) {
         return Ok(());
     }
@@ -669,7 +686,7 @@ mod tests {
 
     #[test]
     fn podman_rendering_is_byte_identical_without_image() {
-        let t = gateway_toml(17670, ComputeDriver::Podman, None).unwrap();
+        let t = gateway_toml(17670, ComputeDriver::Podman, None, None).unwrap();
         assert_eq!(t, PODMAN_NO_IMAGE);
     }
 
@@ -679,9 +696,26 @@ mod tests {
             17670,
             ComputeDriver::Podman,
             Some("registry.example.com/epp-sandbox:x"),
+            None,
         )
         .unwrap();
         assert_eq!(t, PODMAN_WITH_IMAGE);
+    }
+
+    #[test]
+    fn otlp_endpoint_renders_gateway_otlp_table() {
+        let t = gateway_toml(
+            17670,
+            ComputeDriver::Podman,
+            None,
+            Some("http://localhost:4317"),
+        )
+        .unwrap();
+        let parsed: toml::Value = toml::from_str(&t).expect("gateway.toml must parse");
+        assert_eq!(
+            parsed["openshell"]["gateway"]["otlp"]["endpoint"].as_str(),
+            Some("http://localhost:4317")
+        );
     }
 
     #[test]
@@ -690,6 +724,7 @@ mod tests {
             17670,
             ComputeDriver::Kubernetes,
             Some("registry.example.com/epp-sandbox:x"),
+            None,
         )
         .unwrap();
         let parsed: toml::Value = toml::from_str(&t).expect("kubernetes gateway.toml must parse");
@@ -724,7 +759,7 @@ mod tests {
     /// singleplayer-driver auto-default, and the escape hatch would only widen it.
     #[test]
     fn kubernetes_rendering_allows_unauthenticated_local_users_podman_does_not() {
-        let k8s = gateway_toml(17670, ComputeDriver::Kubernetes, None).unwrap();
+        let k8s = gateway_toml(17670, ComputeDriver::Kubernetes, None, None).unwrap();
         let parsed: toml::Value = toml::from_str(&k8s).unwrap();
         assert_eq!(
             parsed["openshell"]["gateway"]["auth"]["allow_unauthenticated_users"].as_bool(),
@@ -732,7 +767,7 @@ mod tests {
             "{k8s}"
         );
 
-        let podman = gateway_toml(17670, ComputeDriver::Podman, None).unwrap();
+        let podman = gateway_toml(17670, ComputeDriver::Podman, None, None).unwrap();
         assert!(!podman.contains("allow_unauthenticated_users"), "{podman}");
     }
 
@@ -743,7 +778,7 @@ mod tests {
     /// and the secret name must be exactly what `boot()` publishes.
     #[test]
     fn kubernetes_rendering_pins_the_sandbox_dial_back_endpoint() {
-        let t = gateway_toml(17670, ComputeDriver::Kubernetes, None).unwrap();
+        let t = gateway_toml(17670, ComputeDriver::Kubernetes, None, None).unwrap();
         let parsed: toml::Value = toml::from_str(&t).unwrap();
         let k8s = &parsed["openshell"]["drivers"]["kubernetes"];
         assert_eq!(
@@ -756,13 +791,13 @@ mod tests {
         );
 
         // Podman stays untouched (the frozen snapshots above also guard this).
-        let podman = gateway_toml(17670, ComputeDriver::Podman, None).unwrap();
+        let podman = gateway_toml(17670, ComputeDriver::Podman, None, None).unwrap();
         assert!(!podman.contains("grpc_endpoint"), "{podman}");
     }
 
     #[test]
     fn kubernetes_rendering_omits_supervisor_image_when_absent() {
-        let t = gateway_toml(17670, ComputeDriver::Kubernetes, None).unwrap();
+        let t = gateway_toml(17670, ComputeDriver::Kubernetes, None, None).unwrap();
         assert!(!t.contains("supervisor_image"), "{t}");
         assert!(
             t.contains("supervisor_sideload_method = \"init-container\""),
@@ -804,6 +839,7 @@ mod tests {
             17670,
             ComputeDriver::Kubernetes,
             Some("registry.example.com/epp-sandbox:x"),
+            None,
         )
         .unwrap();
         let parsed: toml::Value = toml::from_str(&t).unwrap();
