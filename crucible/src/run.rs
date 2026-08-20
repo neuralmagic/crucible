@@ -223,6 +223,8 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                     gaming_refine_rounds: a.gaming_refine_rounds,
                     skip_gaming_review: a.skip_gaming_review,
                     authoritative: a.authoritative,
+                    harness: a.harness,
+                    model: a.model,
                 },
             );
         }
@@ -252,6 +254,8 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
             pr_repo: args.pr_repo.clone(),
             pack,
             clusters_file: args.clusters.clone(),
+            harness: args.harness,
+            model: args.model.clone(),
         };
         if args.controller {
             // Deprecated in favor of the `crucible-controller` Helm chart (the one packaging path).
@@ -609,6 +613,7 @@ fn apply_agent_cfg(args: &mut Args, agent: &manifest::AgentCfg, workspace: &Path
         args.harness = Some(agent.harness);
     }
     args.hermes = agent.hermes.clone();
+    args.codex = agent.codex.clone();
     args.disallowed_tools = agent.disallowed_tools.clone();
     // Reasoning effort: CLI `--effort` wins, else the manifest's `[agent].reasoning_effort`, else
     // `medium`, the loop IS the search, so heavy per-turn thinking mostly duplicates keep/discard.
@@ -640,8 +645,9 @@ fn apply_agent_cfg(args: &mut Args, agent: &manifest::AgentCfg, workspace: &Path
     // Vertex config at all: it emits a synthetic "Not logged in" result claiming subtype=success,
     // turns=1, $0, a silent no-op run. Relay the standard Vertex keys from the pod env (the
     // deploy profile's `[env]`), exactly like the scope/rank turn paths; manifest values win.
-    // Only for a Vertex-authenticated harness, hermes uses an env API key instead.
-    if args.agent_backend == agent::AgentBackend::Openshell && args.harness().uses_vertex_provider()
+    // Only for a Vertex-authenticated harness; codex authenticates against the ChatGPT backend.
+    if args.agent_backend == agent::AgentBackend::Openshell
+        && args.harness().auth_provider() == crate::harness::AuthProvider::Vertex
     {
         crate::openshell::relay_vertex_env(&mut args.env);
     }
@@ -1089,6 +1095,27 @@ mod tests {
             manifest_toml("")
         ));
         assert!(err.is_err(), "unknown [agent.hermes] key must be rejected");
+    }
+
+    /// `[agent.codex]` is the codex twin of the block above: the shared `[agent].model` names a
+    /// Claude model, so a codex domain overrides it here.
+    #[test]
+    fn codex_subtable_parses_and_denies_unknown_fields() {
+        let m: manifest::Manifest = toml::from_str(&format!(
+            "{}\n[agent.codex]\nmodel = \"gpt-5.6-sol\"\n",
+            manifest_toml("harness = \"codex\"")
+        ))
+        .unwrap();
+        let mut a = args_from(&["crucible"]);
+        apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
+        assert_eq!(a.harness(), crate::harness::Harness::Codex);
+        assert_eq!(a.codex.model.as_deref(), Some("gpt-5.6-sol"));
+
+        let err = toml::from_str::<manifest::Manifest>(&format!(
+            "{}\n[agent.codex]\nmodle = \"typo\"\n",
+            manifest_toml("")
+        ));
+        assert!(err.is_err(), "unknown [agent.codex] key must be rejected");
     }
 
     #[test]

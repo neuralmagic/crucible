@@ -26,6 +26,9 @@ pub(crate) const MCP_CONFIG: &str = "/tmp/.crucible-mcp.json";
 /// `CLAUDE_CONFIG_DIR=/sandbox/.claude` (see [`env_script`]).
 pub(crate) const CLAUDE_PROJECTS: &str = "/sandbox/.claude/projects";
 
+/// The transcript's glob relative to [`CLAUDE_PROJECTS`]: one project-slug segment, then the file.
+pub(crate) const TRANSCRIPT_GLOB: &str = "*/*.jsonl";
+
 /// The transcript fetch is pure telemetry for claude and must never wedge the turn:
 /// elapsed = silent no-op, the turn's tree just stays at the root span.
 pub(crate) const TRANSCRIPT_FETCH_TIMEOUT: Duration = Duration::from_secs(30);

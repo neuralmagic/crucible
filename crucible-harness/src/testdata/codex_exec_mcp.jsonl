@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"01a01bd3-0589-7df0-899e-d91af6f50f2f"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_0","type":"mcp_tool_call","server":"crucible-broker","tool":"add","arguments":{"a":2,"b":3},"result":null,"error":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_0","type":"mcp_tool_call","server":"crucible-broker","tool":"add","arguments":{"a":2,"b":3},"result":{"content":[{"type":"text","text":"5"}],"_meta":{"fastmcp":{"wrap_result":true}},"structured_content":{"result":5}},"error":null,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"5"}}
+{"type":"turn.completed","usage":{"input_tokens":95897,"cached_input_tokens":48384,"cache_write_input_tokens":0,"output_tokens":228,"reasoning_output_tokens":74}}

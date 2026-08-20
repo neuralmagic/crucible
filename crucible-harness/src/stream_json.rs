@@ -16,7 +16,7 @@ const TOKEN_EMIT_STEP: u64 = 5_000;
 
 /// Byte bound on each verbose tool input / result excerpt, so one giant Write or
 /// Read cannot balloon the session log.
-const TOOL_IO_LIMIT: usize = 2_048;
+pub(crate) const TOOL_IO_LIMIT: usize = 2_048;
 
 /// Which streamed text block is currently open (its deltas buffer to line boundaries).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -462,7 +462,7 @@ fn retry_error(msg: &Value) -> String {
 }
 
 /// Char-truncate with an ellipsis marker; identity when already within `limit`.
-fn truncate_chars(s: &str, limit: usize) -> String {
+pub(crate) fn truncate_chars(s: &str, limit: usize) -> String {
     if s.chars().count() <= limit {
         s.to_string()
     } else {
@@ -475,7 +475,7 @@ fn truncate_chars(s: &str, limit: usize) -> String {
 /// Bound a verbose tool input: pass small inputs through verbatim; large ones become
 /// a truncated string of their serialization (truncated JSON is not valid JSON, so it
 /// cannot stay a structured value).
-fn bounded_input(v: &Value) -> Value {
+pub(crate) fn bounded_input(v: &Value) -> Value {
     let s = v.to_string();
     if s.len() <= TOOL_IO_LIMIT {
         v.clone()
@@ -499,11 +499,11 @@ fn result_text(block: &Value) -> String {
     }
 }
 
-fn str_field(v: &Value, key: &str) -> String {
+pub(crate) fn str_field(v: &Value, key: &str) -> String {
     v.get(key).and_then(Value::as_str).unwrap_or("").to_string()
 }
 
-fn u64_field(v: &Value, key: &str) -> u64 {
+pub(crate) fn u64_field(v: &Value, key: &str) -> u64 {
     v.get(key).and_then(Value::as_u64).unwrap_or(0)
 }
 

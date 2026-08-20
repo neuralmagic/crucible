@@ -352,6 +352,8 @@ mod tests {
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
+                harness: None,
+                model: None,
             },
         )
         .expect("render");
@@ -429,6 +431,8 @@ mod tests {
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
+                harness: None,
+                model: None,
             },
         )
         .expect("render");
@@ -469,6 +473,8 @@ mod tests {
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
+                harness: None,
+                model: None,
             },
         ) {
             Ok(_) => panic!("expected an error: no [controller] table"),

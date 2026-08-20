@@ -117,6 +117,12 @@ pub struct RenderOpts {
     /// Explicit fleet-file path (`--clusters`), overriding the `clusters.toml` sibling of the
     /// profile. `None` = the sibling, when it exists.
     pub clusters_file: Option<std::path::PathBuf>,
+    /// The agent harness the loop runs, rendered as `--harness=<h>` into the wrapper's `crucible`
+    /// invocation. `None` emits no flag, the loop keeps the manifest's `[agent].harness`.
+    pub harness: Option<crate::harness::Harness>,
+    /// The model the loop runs, rendered as `--model=<m>` into the wrapper's `crucible` invocation.
+    /// `None` emits no flag, the loop derives the model from the resolved harness.
+    pub model: Option<String>,
 }
 
 /// The knobs the controller supplies for a pack render (see [`RenderOpts::pack`]).
@@ -938,6 +944,8 @@ impl Renderer<'_> {
             ComputeDriver::Kubernetes => " --compute-driver=kubernetes",
             ComputeDriver::Podman => "",
         };
+        let harness_flag = crate::deploy::render::turn::harness_flag(self.opts.harness, '=');
+        let model_flag = crate::deploy::render::turn::model_flag(self.opts.model.as_ref(), '=');
         // Persistent state: a non-empty session log on the mounted PVC means a prior pod of this
         // run already produced rows, so this start is a continuation, not a fresh run.
         let resume_flag = if self.profile.cluster.state_pvc.is_some() {
@@ -948,7 +956,7 @@ impl Renderer<'_> {
         format!(
             r#"D={domain_dir}
 crucible --manifest="$D/{manifest_file}" --ui=stream --agent-backend=openshell \
-  --sandbox-image={sandbox_image} --control-port={CONTROL_PORT} --iterations={iterations} --max-cost={max_cost}{results_bucket_flag}{pr_repo_flag}{compute_driver_flag}{resume_flag}
+  --sandbox-image={sandbox_image} --control-port={CONTROL_PORT} --iterations={iterations} --max-cost={max_cost}{results_bucket_flag}{pr_repo_flag}{compute_driver_flag}{harness_flag}{model_flag}{resume_flag}
 rc=$?
 if [ -z "${{CRUCIBLE_INGEST_URL:-}}" ]; then
   echo "=================== {session_delimiter}$rc) ==================="
@@ -1711,6 +1719,8 @@ mod tests {
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
+                harness: None,
+                model: None,
             },
         )
         .expect("render");
@@ -1867,6 +1877,8 @@ mod tests {
                     pr_repo: pr_repo.map(str::to_string),
                     pack: None,
                     clusters_file: None,
+                    harness: None,
+                    model: None,
                 },
             )
             .expect("render")
@@ -1884,6 +1896,45 @@ mod tests {
             !empty.contains("--pr-repo"),
             "an empty pr_repo renders no flag: {empty}"
         );
+    }
+
+    /// A run-level harness/model reaches the loop wrapper's `crucible` invocation; unset, the
+    /// wrapper carries neither flag and the manifest's `[agent].harness` still decides.
+    #[test]
+    fn wrapper_emits_harness_and_model_flags_when_set() {
+        let dir = fixture_gamma_dir();
+        let manifest = dir.join("crucible.delta.toml");
+        let profile = DeployProfile::load(&fixture_profile("delta")).expect("profile parses");
+
+        let render_with = |harness: Option<crate::harness::Harness>, model: Option<&str>| {
+            let composite = CompositeManifest::load(&manifest).expect("composite parses");
+            let input = RenderInput::from_composite(&composite, &dir).expect("render input");
+            render(
+                input,
+                &dir,
+                "crucible.delta.toml",
+                &profile,
+                &RenderOpts {
+                    iterations: 1,
+                    max_cost: 0.0,
+                    pin_digests: false,
+                    pr_repo: None,
+                    pack: None,
+                    clusters_file: None,
+                    harness,
+                    model: model.map(str::to_string),
+                },
+            )
+            .expect("render")
+        };
+
+        let set = render_with(Some(crate::harness::Harness::Hermes), Some("hermes-4-70b"));
+        assert!(set.contains("--harness=hermes"), "{set}");
+        assert!(set.contains("--model=hermes-4-70b"), "{set}");
+
+        let unset = render_with(None, None);
+        assert!(!unset.contains("--harness"), "no harness, no flag: {unset}");
+        assert!(!unset.contains("--model"), "no model, no flag: {unset}");
     }
 
     /// A second overlay + a podman-driver profile must render the same way delta does, plus the
@@ -1910,6 +1961,8 @@ mod tests {
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
+                harness: None,
+                model: None,
             },
         )
         .expect("render");
@@ -2022,6 +2075,8 @@ mod tests {
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
+                harness: None,
+                model: None,
             },
         )
         .expect("render");
@@ -2137,6 +2192,8 @@ mod tests {
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
+                harness: None,
+                model: None,
             },
         )
         .expect("render");
@@ -2191,6 +2248,8 @@ mod tests {
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
+                harness: None,
+                model: None,
             },
         )
         .expect("render")
@@ -2380,6 +2439,8 @@ mod tests {
                     configmap_name: "crucible-run-llm-d-1650-pack".to_string(),
                 }),
                 clusters_file: None,
+                harness: None,
+                model: None,
             },
         )
         .expect("render");
@@ -2454,6 +2515,8 @@ mod tests {
                     configmap_name: "pack-cm-name".to_string(),
                 }),
                 clusters_file: None,
+                harness: None,
+                model: None,
             },
         )
         .expect("render");
@@ -2537,6 +2600,8 @@ mod tests {
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
+                harness: None,
+                model: None,
             },
         )
         .expect("render");
@@ -2560,6 +2625,8 @@ mod tests {
                 gaming_refine_rounds: 1,
                 skip_gaming_review: false,
                 authoritative: false,
+                harness: None,
+                model: None,
             },
         )
         .expect("render turn");
@@ -2625,6 +2692,8 @@ mod tests {
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
+                harness: None,
+                model: None,
             },
         )
         .expect("render");
@@ -2732,6 +2801,8 @@ mod tests {
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
+                harness: None,
+                model: None,
             },
         )
         .expect("render");
@@ -2844,6 +2915,8 @@ mod tests {
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
+                harness: None,
+                model: None,
             },
         )
         .expect("render");
@@ -2892,6 +2965,8 @@ mod tests {
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
+                harness: None,
+                model: None,
             },
         ) {
             Err(e) => e,
@@ -2994,6 +3069,8 @@ mod tests {
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
+                harness: None,
+                model: None,
             },
         )
         .expect("render")
@@ -3177,6 +3254,8 @@ mod tests {
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
+                harness: None,
+                model: None,
             },
         )
         .expect("render");

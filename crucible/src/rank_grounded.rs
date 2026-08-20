@@ -327,8 +327,10 @@ fn run_grounded_turn(
     args.sandbox_image = a.sandbox_image.clone();
     args.compute_driver = a.compute_driver;
     // Manifest-less turn: the Vertex agent env normally supplied by `[agent].env` comes from the
-    // turn pod's own env instead.
-    crate::openshell::relay_vertex_env(&mut args.env);
+    // turn pod's own env instead. Only for a Vertex-authenticated harness.
+    if args.harness().auth_provider() == crate::harness::AuthProvider::Vertex {
+        crate::openshell::relay_vertex_env(&mut args.env);
+    }
     // Flag wins; CRUCIBLE_RANK_MODEL lets a parent (rank-compare, the controller's escalation
     // arm) pin the model without threading a parameter through every layer.
     let model = a.model.clone().or_else(|| {

@@ -17,6 +17,7 @@
 - [Implementation contract](./crucible-contract.md)
 - [Work graphs](./work-graphs.md)
 - [Hand-rolled codegen pipelines](./hand-rolled-pipelines.md)
+- [The codex harness](./codex-harness.md)
 - [The OpenShell fork](./openshell-fork.md)
 - [JIRA tools (mediated)](./jira-proxy.md)
 
