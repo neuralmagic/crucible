@@ -3454,6 +3454,7 @@ mod tests {
             model: "test-model".into(),
             harness: None,
             hermes: Default::default(),
+            codex: Default::default(),
             disallowed_tools: Vec::new(),
             reasoning_effort: None,
             agent_backend: crate::agent::AgentBackend::Command,

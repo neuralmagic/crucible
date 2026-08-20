@@ -545,7 +545,8 @@ pub(crate) fn truncate(s: &str, cap: usize) -> String {
 }
 
 /// Parse an RFC3339 transcript timestamp into a `SystemTime` via jiff, `None` when unparseable.
-fn parse_ts(s: &str) -> Option<SystemTime> {
+/// `pub(crate)` so the codex rollout reader dates its spans the same way.
+pub(crate) fn parse_ts(s: &str) -> Option<SystemTime> {
     s.parse::<Timestamp>().ok().map(SystemTime::from)
 }
 

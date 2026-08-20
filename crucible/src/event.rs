@@ -27,10 +27,16 @@ pub fn cost_of(ev: &AgentEvent) -> Option<f64> {
 }
 
 /// Per-token USD prices: (input, output, cache_read, cache_write).
-/// cache_read ≈ 0.1× input, cache_write ≈ 1.25× input (default 5-min ephemeral).
-/// Source: claude-api pricing (Opus 4.x $5/$25, Sonnet 4.6 $3/$15, Haiku 4.5 $1/$5 per MTok).
+/// Anthropic: cache_read ≈ 0.1× input, cache_write ≈ 1.25× input (default 5-min ephemeral).
+/// OpenAI: cached input is 0.1× input and there is no cache-write premium (1.0× input).
+/// Sources: claude-api pricing (Opus 4.x $5/$25, Sonnet 4.6 $3/$15, Haiku 4.5 $1/$5 per MTok) and
+/// OpenAI's published per-MTok rates (see [`openai_prices`]).
 fn model_prices(model: &str) -> (f64, f64, f64, f64) {
     let m = model.to_ascii_lowercase();
+    let per = 1e-6;
+    if let Some((input, output)) = openai_prices(&m) {
+        return (input * per, output * per, input * 0.1 * per, input * per);
+    }
     let (input, output) = if m.contains("haiku") {
         (1.0, 5.0)
     } else if m.contains("sonnet") {
@@ -39,13 +45,31 @@ fn model_prices(model: &str) -> (f64, f64, f64, f64) {
         // Opus (and unknown, Opus is the loop default).
         (5.0, 25.0)
     };
-    let per = 1e-6;
     (
         input * per,
         output * per,
         input * 0.1 * per,
         input * 1.25 * per,
     )
+}
+
+/// The (input, output) per-MTok rate for an OpenAI model the codex harness can run, or `None` when
+/// the name is not OpenAI's and the Anthropic table answers. Short-context standard rates as of
+/// August 2026: codex $1.75/$14, GPT-5.6 Luna $0.20/$1.20, Terra $2/$12, Sol $5/$30. Any other
+/// `gpt-*` prices as Sol, the family's most expensive tier, so an unrecognized name never
+/// under-charges the budget line.
+fn openai_prices(m: &str) -> Option<(f64, f64)> {
+    if m.contains("codex") {
+        Some((1.75, 14.0))
+    } else if m.contains("luna") {
+        Some((0.20, 1.20))
+    } else if m.contains("terra") {
+        Some((2.0, 12.0))
+    } else if m.contains("sol") || m.starts_with("gpt") {
+        Some((5.0, 30.0))
+    } else {
+        None
+    }
 }
 
 /// The turn's provisional cost from one mid-turn token sample: the OTEL number when
@@ -96,6 +120,35 @@ mod tests {
             let got = estimate_cost(model, &sample());
             assert!((got - want).abs() < 1e-9, "{model}: got {got}, want {want}");
         }
+    }
+
+    /// OpenAI bills cached input at 0.1x and charges no cache-write premium, so a codex turn's
+    /// buckets price differently from claude's even at the same headline rates.
+    #[test]
+    fn openai_rows_price_at_the_published_per_mtok_rates() {
+        for (model, input, output) in [
+            ("gpt-5.6-sol", 5.0, 30.0),
+            ("gpt-5.6-terra", 2.0, 12.0),
+            ("gpt-5.6-luna", 0.20, 1.20),
+            ("gpt-5.3-codex", 1.75, 14.0),
+            // An unrecognized OpenAI name prices as Sol, the priciest tier of the family.
+            ("gpt-6-whatever", 5.0, 30.0),
+        ] {
+            let want = input + output + input * 0.1 + input;
+            let got = estimate_cost(model, &sample());
+            assert!((got - want).abs() < 1e-9, "{model}: got {got}, want {want}");
+        }
+    }
+
+    /// The OpenAI rows must not shadow the Anthropic table, and vice versa.
+    #[test]
+    fn the_pricing_tables_stay_on_their_own_side() {
+        assert_eq!(openai_prices("claude-opus-4-6"), None);
+        assert_eq!(openai_prices("claude-sonnet-4-6"), None);
+        assert_eq!(openai_prices("mystery-model"), None);
+        assert_eq!(openai_prices("gpt-5.6-sol"), Some((5.0, 30.0)));
+        // Codex wins over the family default however the name is spelled.
+        assert_eq!(openai_prices("gpt-5.2-codex"), Some((1.75, 14.0)));
     }
 
     #[test]

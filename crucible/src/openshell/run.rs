@@ -14,7 +14,7 @@
 
 use crate::agent;
 use crate::event::{AgentEvent, RawStream, cost_of, estimate_cost};
-use crate::harness::{Harness, SandboxLayout, TranscriptLocator, TurnArtifacts};
+use crate::harness::{AuthProvider, Harness, SandboxLayout, TranscriptLocator, TurnArtifacts};
 use crate::openshell::grpc::Gateway;
 use crate::openshell::{gateway, grpc, policy, provider, sandbox};
 use crate::{Args, Paths, relay};
@@ -172,16 +172,26 @@ async fn try_turn(
     // file transfer stays on the CLI). Constructed in this runtime context (`connect_lazy`).
     let gw = Gateway::connect().context("connecting to the openshell gateway over gRPC")?;
 
-    // 2. Mint a fresh Vertex token and create/update the provider with it (the static
-    //    credential the metadata emulator serves to claude, see `provider` docs). A harness
-    //    that authenticates via an env API key (hermes) skips the provider machinery entirely.
-    if harness.uses_vertex_provider() {
-        let token = provider::mint_vertex_token()
-            .await
-            .context("minting the Vertex access token")?;
-        let (project, region) = vertex_config(&args.env);
-        ensure_provider(&gw, &token, &project, &region).await?;
-    }
+    // 2. Mint this harness's model credential: Vertex's static credential becomes a gateway
+    //    provider the metadata emulator serves to claude/hermes (see `provider` docs); codex gets
+    //    a ChatGPT OAuth access token minted from the host's refresh material and seeded into the
+    //    sandbox as auth.json (step 5's seed files), no gateway provider, since codex reads the
+    //    real bytes off disk and its L4 WebSocket never crosses a placeholder-resolving proxy hop.
+    let codex_token = match harness.auth_provider() {
+        AuthProvider::Vertex => {
+            let token = provider::mint_vertex_token()
+                .await
+                .context("minting the Vertex access token")?;
+            let (project, region) = vertex_config(&args.env);
+            ensure_provider(&gw, &token, &project, &region).await?;
+            None
+        }
+        AuthProvider::Codex => Some(
+            provider::mint_codex_token()
+                .await
+                .context("minting the codex access token")?,
+        ),
+    };
 
     // 2b. Sandbox S3 reads (the read half of the S3 role split): a gateway-minted `aws-s3`
     //     provider signs sandbox S3 egress at the proxy via a read-only role assumed with the
@@ -232,10 +242,9 @@ async fn try_turn(
         ("crucible-pid".to_string(), std::process::id().to_string()),
         ("crucible-workspace".to_string(), basename.clone()),
     ];
-    let mut providers = if harness.uses_vertex_provider() {
-        vec![provider::PROVIDER_NAME.to_string()]
-    } else {
-        Vec::new()
+    let mut providers = match harness.auth_provider() {
+        AuthProvider::Vertex => vec![provider::PROVIDER_NAME.to_string()],
+        AuthProvider::Codex => Vec::new(),
     };
     if aws_provider {
         providers.push(provider::AWS_PROVIDER_NAME.to_string());
@@ -340,7 +349,11 @@ async fn try_turn(
             ),
             None => None,
         };
-        let mut endpoints = policy::resolve_endpoints(&args.openshell, broker_ep.as_deref());
+        let mut endpoints = policy::resolve_endpoints(
+            &args.openshell,
+            &harness.default_endpoints(),
+            broker_ep.as_deref(),
+        );
         if let Some(c) = &collector {
             endpoints.push(c.sandbox_egress(driver.broker_host()));
         }
@@ -429,7 +442,12 @@ async fn try_turn(
         } else {
             args.broker_token.clone()
         };
-        let seeds = harness.seed_files(args, broker_url.as_deref(), seed_token.as_deref());
+        let seeds = harness.seed_files(
+            args,
+            broker_url.as_deref(),
+            seed_token.as_deref(),
+            codex_token.as_ref(),
+        );
         for seed in &seeds {
             let seed_tmp = write_temp("seed", &seed.content).await?;
             run_os(
@@ -465,29 +483,41 @@ async fn try_turn(
         };
         // A deep self-check turn outlives the ~1h Vertex token (the agent waits on many
         // multi-minute GPU jobs), so re-mint into the provider slot while claude runs, its
-        // google-auth re-queries the metadata emulator as the cached token nears expiry.
-        let refresher = tokio::spawn({
-            let gw = gw.clone();
-            async move {
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(25 * 60)).await;
-                    match provider::mint_vertex_token().await {
-                        Ok(t) => {
-                            if let Err(e) = gw
-                                .update_provider(provider::PROVIDER_NAME, provider::CRED_KEY, &t)
-                                .await
-                            {
-                                tracing::warn!("mid-turn Vertex token refresh failed: {e:#}");
+        // google-auth re-queries the metadata emulator as the cached token nears expiry. Codex has
+        // no mid-turn refresh: the sandbox read its seeded auth.json at exec and nothing re-reads
+        // it, so a re-mint could not land anywhere (it would only burn a rotated refresh token)
+        // and a turn that outlives the access token fails loudly.
+        let refresher = match harness.auth_provider() {
+            AuthProvider::Vertex => Some(tokio::spawn({
+                let gw = gw.clone();
+                async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(25 * 60)).await;
+                        match provider::mint_vertex_token().await {
+                            Ok(t) => {
+                                if let Err(e) = gw
+                                    .update_provider(
+                                        provider::PROVIDER_NAME,
+                                        provider::CRED_KEY,
+                                        &t,
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!("mid-turn Vertex token refresh failed: {e:#}");
+                                }
                             }
+                            Err(e) => tracing::warn!("mid-turn Vertex token mint failed: {e:#}"),
                         }
-                        Err(e) => tracing::warn!("mid-turn Vertex token mint failed: {e:#}"),
                     }
                 }
-            }
-        });
-        let decoder = harness.decoder(meters.as_ref(), crate::agent::tool_io_full(args));
+            })),
+            AuthProvider::Codex => None,
+        };
+        let decoder = harness.decoder(args, meters.as_ref(), crate::agent::tool_io_full(args));
         let exec_result = exec_and_stream(&gw, &name, &wrapper, decoder, &exec_opts, sink).await;
-        refresher.abort();
+        if let Some(refresher) = &refresher {
+            refresher.abort();
+        }
         let mut cost = exec_result?;
 
         // 8a. Agent exited: roll the captured OTLP jsonl up into the `otel_summary` event
@@ -917,9 +947,15 @@ async fn persist_private_session(
     name: &str,
     cancel: &CancellationToken,
 ) -> Result<()> {
-    let remote = newest_transcript_path(gw, name, crate::harness::claude::CLAUDE_PROJECTS, cancel)
-        .await
-        .context("Claude turn produced no resumable private transcript")?;
+    let remote = newest_transcript_path(
+        gw,
+        name,
+        crate::harness::claude::CLAUDE_PROJECTS,
+        crate::harness::claude::TRANSCRIPT_GLOB,
+        cancel,
+    )
+    .await
+    .context("Claude turn produced no resumable private transcript")?;
     if !valid_private_remote(&remote, session) {
         return Err(OpenshellCliError::TranscriptSessionMismatch.into());
     }
@@ -978,8 +1014,8 @@ async fn fetch_transcript(
 ) -> Option<Vec<u8>> {
     let locator = harness.transcript_locator();
     let remote = match &locator {
-        TranscriptLocator::NewestJsonl { sandbox_root } => {
-            newest_transcript_path(gw, name, sandbox_root, cancel).await?
+        TranscriptLocator::NewestJsonl { sandbox_root, glob } => {
+            newest_transcript_path(gw, name, sandbox_root, glob, cancel).await?
         }
         TranscriptLocator::File { sandbox_path } => (*sandbox_path).to_string(),
     };
@@ -1005,15 +1041,18 @@ async fn fetch_transcript(
 }
 
 /// The sandbox-side path of the newest session transcript (claude writes one per session under
-/// `projects/<slug>/`), or `None` when there is none. The returned path is sanity-checked to sit
-/// under the pinned config dir before anything downloads it.
+/// `projects/<slug>/`, codex one per session under `sessions/YYYY/MM/DD/`), or `None` when there
+/// is none. `glob` is the harness's path shape below `sandbox_root` (see [`TranscriptLocator`]).
+/// The returned path is sanity-checked to sit under the pinned config dir before anything
+/// downloads it.
 async fn newest_transcript_path(
     gw: &Gateway,
     name: &str,
     sandbox_root: &str,
+    glob: &str,
     cancel: &CancellationToken,
 ) -> Option<String> {
-    let script = format!("ls -1t {sandbox_root}/*/*.jsonl 2>/dev/null | head -n 1");
+    let script = newest_jsonl_script(sandbox_root, glob);
     let command = vec!["bash".to_string(), "-lc".to_string(), script];
     let mut found: Option<String> = None;
     gw.exec(name, &command, cancel, |line| {
@@ -1025,6 +1064,11 @@ async fn newest_transcript_path(
     .await
     .ok()?;
     found.filter(|p| p.starts_with(sandbox_root) && p.ends_with(".jsonl") && !p.contains(".."))
+}
+
+/// The in-sandbox shell that names the newest transcript, newest-mtime first.
+fn newest_jsonl_script(sandbox_root: &str, glob: &str) -> String {
+    format!("ls -1t {sandbox_root}/{glob} 2>/dev/null | head -n 1")
 }
 
 /// The `*.jsonl` under `root` (recursively) with the newest mtime, the transcript of the session
@@ -1099,6 +1143,40 @@ async fn write_temp(tag: &str, content: &str) -> Result<tempfile::NamedTempFile>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The locator's glob reaches each harness's transcript at its real depth: claude one segment
+    /// below the projects root, codex three below the sessions root.
+    #[test]
+    fn the_newest_jsonl_script_matches_each_harness_tree() {
+        for harness in [Harness::Claude, Harness::Codex] {
+            let TranscriptLocator::NewestJsonl { sandbox_root, glob } =
+                harness.transcript_locator()
+            else {
+                panic!("{harness:?} reads a jsonl tree");
+            };
+            let script = newest_jsonl_script(sandbox_root, glob);
+            assert!(script.starts_with("ls -1t "), "{script}");
+            assert!(script.ends_with(" 2>/dev/null | head -n 1"), "{script}");
+            let pattern = script
+                .trim_start_matches("ls -1t ")
+                .trim_end_matches(" 2>/dev/null | head -n 1");
+            assert_eq!(pattern, format!("{sandbox_root}/{glob}"));
+        }
+        assert_eq!(
+            newest_jsonl_script(
+                crate::harness::claude::CLAUDE_PROJECTS,
+                crate::harness::claude::TRANSCRIPT_GLOB
+            ),
+            "ls -1t /sandbox/.claude/projects/*/*.jsonl 2>/dev/null | head -n 1"
+        );
+        assert_eq!(
+            newest_jsonl_script(
+                crate::harness::codex::SESSIONS,
+                crate::harness::codex::TRANSCRIPT_GLOB
+            ),
+            "ls -1t /sandbox/.codex/sessions/*/*/*/rollout-*.jsonl 2>/dev/null | head -n 1"
+        );
+    }
 
     #[test]
     fn vertex_config_reads_manifest_keys_with_fallback() {

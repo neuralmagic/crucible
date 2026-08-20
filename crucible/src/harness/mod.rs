@@ -10,23 +10,36 @@
 //! signature changes.
 
 pub(crate) mod claude;
+pub(crate) mod codex;
 pub(crate) mod hermes;
 
 use crate::Args;
 use crate::event::{AgentEvent, RawStream};
 use crate::stream_json::StreamJsonParser;
 use crate::turn_trace::{GenAiRecord, ToolInvocation};
-use crucible_harness::LiveMeters;
+use crucible_harness::{CodexJsonParser, LiveMeters};
 use std::time::Duration;
 
-/// Which agent harness runs the turn. `claude` is the default everywhere; `hermes` is the
-/// second harness (Nous Research's hermes-agent), selected per-domain for harness ablations.
+/// Which agent harness runs the turn. `claude` is the default everywhere; `hermes` (Nous
+/// Research's hermes-agent) and `codex` (OpenAI's Codex CLI) are selected per-domain for harness
+/// ablations.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Harness {
     #[default]
     Claude,
     Hermes,
+    Codex,
+}
+
+/// How a sandbox turn gets its model credential. Vertex mints a `cloud-platform` access token from
+/// ADC and serves it through the gateway's metadata emulator; Codex mints a ChatGPT OAuth access
+/// token from the host's refresh material and seeds it as the sandbox's `auth.json`. Both mint at
+/// turn start through the same provider machinery; only the mint and the delivery differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AuthProvider {
+    Vertex,
+    Codex,
 }
 
 /// The filesystem contract between crucible and the agent harness inside the sandbox: where
@@ -53,8 +66,12 @@ pub(crate) struct SeedFile {
 /// fetch. Claude writes one jsonl per session under a projects tree (newest wins); hermes keeps
 /// a single SQLite db at a fixed path.
 pub(crate) enum TranscriptLocator {
-    /// The newest `*.jsonl` under `<sandbox_root>/*/` (claude's `projects/<slug>/<session>.jsonl`).
-    NewestJsonl { sandbox_root: &'static str },
+    /// The newest file matching `<sandbox_root>/<glob>`: claude's `projects/<slug>/<session>.jsonl`
+    /// sits one segment down, codex's `sessions/YYYY/MM/DD/rollout-*.jsonl` three.
+    NewestJsonl {
+        sandbox_root: &'static str,
+        glob: &'static str,
+    },
     /// One fixed file (hermes's `state.db`).
     File { sandbox_path: &'static str },
 }
@@ -77,6 +94,7 @@ pub(crate) enum StreamDecoder {
     /// Boxed: the stateful parser dwarfs the empty variant, and the decoder is constructed once
     /// per turn, so the indirection costs nothing that matters.
     StreamJson(Box<StreamJsonParser>),
+    CodexJson(Box<CodexJsonParser>),
     RawLines,
 }
 
@@ -85,6 +103,7 @@ impl StreamDecoder {
     pub(crate) fn push(&mut self, line: &str) -> Vec<AgentEvent> {
         match self {
             StreamDecoder::StreamJson(parser) => parser.push(line),
+            StreamDecoder::CodexJson(parser) => parser.push(line),
             StreamDecoder::RawLines => {
                 let text = line.trim();
                 if text.is_empty() {
@@ -106,6 +125,7 @@ impl Harness {
         match self {
             Harness::Claude => claude::local_argv(args, prompt),
             Harness::Hermes => hermes::local_argv(args, prompt),
+            Harness::Codex => codex::local_argv(args, prompt),
         }
     }
 
@@ -120,6 +140,7 @@ impl Harness {
             Harness::Hermes => Err(std::io::Error::other(
                 "hermes does not yet expose a Crucible-managed opaque session id",
             )),
+            Harness::Codex => Err(std::io::Error::other("codex sessions not wired in v1")),
         }
     }
 
@@ -129,6 +150,7 @@ impl Harness {
         match self {
             Harness::Claude => claude::LOCAL_ENV_DEFAULTS,
             Harness::Hermes => hermes::LOCAL_ENV_DEFAULTS,
+            Harness::Codex => codex::LOCAL_ENV_DEFAULTS,
         }
     }
 
@@ -140,6 +162,7 @@ impl Harness {
         match self {
             Harness::Claude => claude::sandbox_argv(args, mcp_seeded),
             Harness::Hermes => hermes::sandbox_argv(args, mcp_seeded),
+            Harness::Codex => codex::sandbox_argv(args, mcp_seeded),
         }
     }
 
@@ -155,6 +178,7 @@ impl Harness {
             Harness::Hermes => Err(std::io::Error::other(
                 "hermes does not yet expose a Crucible-managed opaque session id",
             )),
+            Harness::Codex => Err(std::io::Error::other("codex sessions not wired in v1")),
         }
     }
 
@@ -164,17 +188,19 @@ impl Harness {
         match self {
             Harness::Claude => claude::env_script(env),
             Harness::Hermes => hermes::env_script(env),
+            Harness::Codex => codex::env_script(env),
         }
     }
 
-    /// Whether the sandbox turn authenticates via the openshell Vertex provider (token mint +
-    /// provider create/attach + the pod-env Vertex relay). Both harnesses use it: hermes resolves
-    /// Vertex ADC through the gateway's metadata emulator (its config.yaml `provider: vertex-anthropic`),
-    /// key-free like claude, so the same token-mint + provider machinery serves it.
-    pub(crate) fn uses_vertex_provider(self) -> bool {
+    /// Which credential the sandbox turn attaches (token mint + provider create/attach + the
+    /// pod-env relay). Claude and hermes both resolve Vertex ADC through the gateway's metadata
+    /// emulator (hermes via its config.yaml `provider: vertex-anthropic`), key-free; codex
+    /// authenticates against the ChatGPT backend instead.
+    pub(crate) fn auth_provider(self) -> AuthProvider {
         match self {
-            Harness::Claude => true,
-            Harness::Hermes => true,
+            Harness::Claude => AuthProvider::Vertex,
+            Harness::Hermes => AuthProvider::Vertex,
+            Harness::Codex => AuthProvider::Codex,
         }
     }
 
@@ -185,21 +211,26 @@ impl Harness {
         match self {
             Harness::Claude => true,
             Harness::Hermes => false,
+            Harness::Codex => false,
         }
     }
 
     /// Files uploaded into the sandbox before the agent execs (claude: `.mcp.json` when the
     /// broker is on). `broker_token` is what the seeded MCP config sends as its bearer: the raw
     /// per-run token, or the provider placeholder when the openshell egress proxy resolves it.
+    /// `auth` is this turn's minted ChatGPT token, which only the codex arm seeds (as its
+    /// `auth.json`); the Vertex harnesses resolve their credential through the gateway instead.
     pub(crate) fn seed_files(
         self,
         args: &Args,
         broker_url: Option<&str>,
         broker_token: Option<&str>,
+        auth: Option<&crate::openshell::provider::CodexToken>,
     ) -> Vec<SeedFile> {
         match self {
             Harness::Claude => claude::seed_files(args, broker_url, broker_token),
             Harness::Hermes => hermes::seed_files(args, broker_url, broker_token),
+            Harness::Codex => codex::seed_files(args, broker_url, broker_token, auth),
         }
     }
 
@@ -207,7 +238,12 @@ impl Harness {
     /// OTLP collector's live readings (60 s-window token rate and running cost) stamped onto each
     /// `tokens` sample; `tool_io` opts tool events into carrying bounded inputs and result excerpts
     /// (see [`crate::agent::tool_io_full`]).
-    pub(crate) fn decoder(self, meters: Option<&LiveMeters>, tool_io: bool) -> StreamDecoder {
+    pub(crate) fn decoder(
+        self,
+        args: &Args,
+        meters: Option<&LiveMeters>,
+        tool_io: bool,
+    ) -> StreamDecoder {
         match self {
             Harness::Claude => StreamDecoder::StreamJson(Box::new(
                 match meters {
@@ -217,6 +253,11 @@ impl Harness {
                 .with_tool_io(tool_io),
             )),
             Harness::Hermes => StreamDecoder::RawLines,
+            Harness::Codex => StreamDecoder::CodexJson(Box::new(
+                CodexJsonParser::new(codex::model(args))
+                    .with_price(crate::event::estimate_cost)
+                    .with_tool_io(tool_io),
+            )),
         }
     }
 
@@ -225,9 +266,14 @@ impl Harness {
         match self {
             Harness::Claude => TranscriptLocator::NewestJsonl {
                 sandbox_root: claude::CLAUDE_PROJECTS,
+                glob: claude::TRANSCRIPT_GLOB,
             },
             Harness::Hermes => TranscriptLocator::File {
                 sandbox_path: hermes::STATE_DB,
+            },
+            Harness::Codex => TranscriptLocator::NewestJsonl {
+                sandbox_root: codex::SESSIONS,
+                glob: codex::TRANSCRIPT_GLOB,
             },
         }
     }
@@ -242,6 +288,7 @@ impl Harness {
         match self {
             Harness::Claude => claude::parse_transcript(content),
             Harness::Hermes => hermes::parse_transcript(content),
+            Harness::Codex => codex::parse_transcript(content),
         }
     }
 
@@ -252,6 +299,7 @@ impl Harness {
         match self {
             Harness::Claude => claude::content_records(content),
             Harness::Hermes => hermes::content_records(content),
+            Harness::Codex => codex::content_records(content),
         }
     }
 
@@ -262,6 +310,7 @@ impl Harness {
         match self {
             Harness::Claude => false,
             Harness::Hermes => true,
+            Harness::Codex => false,
         }
     }
 
@@ -272,6 +321,7 @@ impl Harness {
         match self {
             Harness::Claude => None,
             Harness::Hermes => hermes::local_backfill(paths),
+            Harness::Codex => None,
         }
     }
 
@@ -282,6 +332,7 @@ impl Harness {
         match self {
             Harness::Claude => claude::TRANSCRIPT_FETCH_TIMEOUT,
             Harness::Hermes => hermes::TRANSCRIPT_FETCH_TIMEOUT,
+            Harness::Codex => codex::TRANSCRIPT_FETCH_TIMEOUT,
         }
     }
 
@@ -293,6 +344,7 @@ impl Harness {
         match self {
             Harness::Claude => claude::DEFAULT_BINARIES,
             Harness::Hermes => hermes::DEFAULT_BINARIES,
+            Harness::Codex => codex::DEFAULT_BINARIES,
         }
     }
 
@@ -301,6 +353,7 @@ impl Harness {
         match self {
             Harness::Claude => claude::SKILLS_DIR,
             Harness::Hermes => hermes::SKILLS_DIR,
+            Harness::Codex => codex::SKILLS_DIR,
         }
     }
 
@@ -309,7 +362,19 @@ impl Harness {
         match self {
             Harness::Claude => claude::DEFAULT_MODEL,
             Harness::Hermes => hermes::DEFAULT_MODEL,
+            Harness::Codex => codex::DEFAULT_MODEL,
         }
+    }
+
+    /// The egress allowlist built-ins for this harness: the shared defaults, plus the model
+    /// backend's own hosts for a harness that does not talk to Vertex. Per-harness so a claude
+    /// turn's allowlist never grows the OpenAI hosts a codex turn needs.
+    pub(crate) fn default_endpoints(self) -> Vec<&'static str> {
+        let mut out = crate::openshell::policy::DEFAULT_ENDPOINTS.to_vec();
+        if self == Harness::Codex {
+            out.extend_from_slice(codex::EXTRA_ENDPOINTS);
+        }
+        out
     }
 }
 
@@ -355,6 +420,7 @@ pub(crate) fn append_manifest_env(mut lines: Vec<String>, env: &[(String, String
 mod tests {
     use super::*;
     use crate::event::AgentEvent;
+    use clap::Parser;
 
     #[test]
     fn exec_wrapper_cds_sources_and_redirects_stdin() {
@@ -392,7 +458,141 @@ mod tests {
         assert_eq!(t.harness, Harness::Hermes);
         let t: T = toml::from_str("harness = \"claude\"").expect("parse");
         assert_eq!(t.harness, Harness::Claude);
+        let t: T = toml::from_str("harness = \"codex\"").expect("parse");
+        assert_eq!(t.harness, Harness::Codex);
         assert!(toml::from_str::<T>("harness = \"Claude\"").is_err());
+    }
+
+    #[test]
+    fn harness_value_enum_accepts_codex_on_the_cli() {
+        use clap::ValueEnum;
+        assert_eq!(
+            Harness::from_str("codex", true).expect("--harness codex"),
+            Harness::Codex
+        );
+        assert!(Harness::from_str("Codex", false).is_err());
+    }
+
+    #[test]
+    fn each_harness_names_its_own_default_model() {
+        assert_eq!(Harness::Claude.default_model(), claude::DEFAULT_MODEL);
+        assert_eq!(Harness::Hermes.default_model(), hermes::DEFAULT_MODEL);
+        assert_eq!(Harness::Codex.default_model(), codex::DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn only_the_codex_harness_grows_the_openai_endpoints() {
+        // A claude turn's allowlist must stay byte-identical to the shared defaults.
+        assert_eq!(
+            Harness::Claude.default_endpoints(),
+            crate::openshell::policy::DEFAULT_ENDPOINTS
+        );
+        assert_eq!(
+            Harness::Hermes.default_endpoints(),
+            crate::openshell::policy::DEFAULT_ENDPOINTS
+        );
+        let codex = Harness::Codex.default_endpoints();
+        assert_eq!(
+            &codex[..crate::openshell::policy::DEFAULT_ENDPOINTS.len()],
+            crate::openshell::policy::DEFAULT_ENDPOINTS,
+            "the shared defaults come first, unchanged"
+        );
+        for host in ["chatgpt.com", "auth.openai.com", "api.openai.com"] {
+            assert!(
+                codex.iter().any(|e| e.starts_with(&format!("{host}:443:"))),
+                "codex needs {host}: {codex:?}"
+            );
+            assert!(
+                !Harness::Claude
+                    .default_endpoints()
+                    .iter()
+                    .any(|e| e.contains(host)),
+                "claude must not reach {host}"
+            );
+        }
+        // L4 only: an entry carrying `protocol=rest` would break CONNECT tunneling.
+        assert!(!codex.iter().any(|e| e.contains("protocol=rest")));
+    }
+
+    #[test]
+    fn codex_sessions_are_stubbed_and_its_transcript_is_the_rollout_tree() {
+        let args = crate::Cli::parse_from(["crucible"]).run;
+        let session = crate::agent_session::SessionTurn {
+            logical_name: "solver".to_string(),
+            provider_id: "id".to_string(),
+            completed_turns: 0,
+        };
+        assert!(
+            Harness::Codex
+                .local_session_argv(&args, "p", &session)
+                .is_err()
+        );
+        assert!(
+            Harness::Codex
+                .sandbox_session_argv(&args, false, &session)
+                .is_err()
+        );
+        match Harness::Codex.transcript_locator() {
+            TranscriptLocator::NewestJsonl { sandbox_root, glob } => {
+                assert_eq!(sandbox_root, codex::SESSIONS);
+                assert_eq!(glob, "*/*/*/rollout-*.jsonl");
+            }
+            _ => panic!("codex reads its rollout jsonl tree"),
+        }
+    }
+
+    /// Each harness gets the decoder its stdout speaks, and the codex parser is handed the model
+    /// it will actually be invoked with (it keys the pricing estimate off that string).
+    #[test]
+    fn each_harness_decodes_its_own_stdout() {
+        let mut args = crate::Cli::parse_from(["crucible"]).run;
+        assert!(matches!(
+            Harness::Claude.decoder(&args, None, false),
+            StreamDecoder::StreamJson(_)
+        ));
+        assert!(matches!(
+            Harness::Hermes.decoder(&args, None, false),
+            StreamDecoder::RawLines
+        ));
+        args.codex.model = Some("gpt-5.6-terra".to_string());
+        match Harness::Codex.decoder(&args, None, false) {
+            StreamDecoder::CodexJson(mut parser) => {
+                let events = parser.push("{\"type\":\"thread.started\",\"thread_id\":\"t1\"}");
+                assert!(
+                    matches!(&events[0], AgentEvent::Init { model, .. } if model == "gpt-5.6-terra"),
+                    "{events:?}"
+                );
+            }
+            _ => panic!("codex speaks its own json event stream"),
+        }
+    }
+
+    /// Each `NewestJsonl` harness names the glob its transcript tree actually needs: claude's
+    /// project slug is one segment, codex's `YYYY/MM/DD` is three.
+    #[test]
+    fn the_transcript_globs_match_each_harness_tree() {
+        for (harness, root, glob) in [
+            (
+                Harness::Claude,
+                claude::CLAUDE_PROJECTS,
+                claude::TRANSCRIPT_GLOB,
+            ),
+            (Harness::Codex, codex::SESSIONS, codex::TRANSCRIPT_GLOB),
+        ] {
+            match harness.transcript_locator() {
+                TranscriptLocator::NewestJsonl {
+                    sandbox_root,
+                    glob: g,
+                } => {
+                    assert_eq!(sandbox_root, root);
+                    assert_eq!(g, glob);
+                    assert_eq!(g.matches('/').count() + 1, g.split('/').count());
+                }
+                _ => panic!("{harness:?} reads a jsonl tree"),
+            }
+        }
+        assert_eq!(claude::TRANSCRIPT_GLOB, "*/*.jsonl");
+        assert_eq!(codex::TRANSCRIPT_GLOB, "*/*/*/rollout-*.jsonl");
     }
 
     #[test]
@@ -413,12 +613,17 @@ mod tests {
 
     #[test]
     fn capability_split_between_the_harnesses() {
-        assert!(Harness::Claude.uses_vertex_provider());
+        assert_eq!(Harness::Claude.auth_provider(), AuthProvider::Vertex);
         // Hermes also authenticates via Vertex ADC (metadata emulator), key-free.
-        assert!(Harness::Hermes.uses_vertex_provider());
+        assert_eq!(Harness::Hermes.auth_provider(), AuthProvider::Vertex);
+        // Codex talks to the ChatGPT backend on an OAuth access token instead.
+        assert_eq!(Harness::Codex.auth_provider(), AuthProvider::Codex);
         assert!(Harness::Claude.otel_capable());
         assert!(!Harness::Hermes.otel_capable());
+        assert!(!Harness::Codex.otel_capable());
         assert!(!Harness::Claude.backfill_required());
         assert!(Harness::Hermes.backfill_required());
+        // The codex `--json` stream carries result + usage, so the rollout is garnish.
+        assert!(!Harness::Codex.backfill_required());
     }
 }

@@ -87,6 +87,29 @@ pub struct TurnOpts {
     /// The goal is an authoritative brief, rendered into the scope wrapper as
     /// `crucible scope --propose --authoritative`. Ignored by a rank turn.
     pub authoritative: bool,
+    /// The agent harness the in-pod turn runs, rendered as `--harness <h>` into both wrapper
+    /// commands. `None` emits no flag, the in-pod engine keeps its manifest/default harness.
+    pub harness: Option<crate::harness::Harness>,
+    /// The model the in-pod turn runs, rendered as `--model <m>` into both wrapper commands.
+    /// `None` emits no flag, the in-pod engine derives the model from the resolved harness.
+    pub model: Option<String>,
+}
+
+/// Render an optional `--harness <h>` wrapper flag. The value is clap's own `ValueEnum` name, so
+/// the string the wrapper emits is by construction the one the in-pod CLI parses back.
+pub(super) fn harness_flag(harness: Option<crate::harness::Harness>, sep: char) -> String {
+    use clap::ValueEnum as _;
+    harness
+        .and_then(|h| h.to_possible_value())
+        .map(|v| format!(" --harness{sep}{}", v.get_name()))
+        .unwrap_or_default()
+}
+
+/// Render an optional `--model <m>` wrapper flag.
+pub(super) fn model_flag(model: Option<&String>, sep: char) -> String {
+    model
+        .map(|m| format!(" --model{sep}{m}"))
+        .unwrap_or_default()
 }
 
 /// The `crucible.io/work-kind` label value a grounded-rank turn pod carries, the selector a
@@ -187,8 +210,12 @@ pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
         gaming_refine_rounds,
         skip_gaming_review,
         authoritative,
+        harness,
+        model,
         ..
     } = opts;
+    let harness_flag = harness_flag(*harness, ' ');
+    let model_flag = model_flag(model.as_ref(), ' ');
     // Same flag the loop wrapper passes (`Renderer::wrapper_script`): without it the turn's
     // subcommand synthesizes a fresh `Args` (`Cli::parse_from(["crucible"])`) that always defaults
     // to the podman compute driver, so the gateway resolves `sandbox_image` through the nested
@@ -203,7 +230,7 @@ pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
 CHECKOUT=/tmp/crucible-turn-checkout
 rm -rf "$CHECKOUT"
 git clone --depth 50 {repo_url} "$CHECKOUT"
-crucible rank-grounded --issue {issue} --workspace "$CHECKOUT" --max-cost {max_cost} \
+crucible rank-grounded --issue {issue} --workspace "$CHECKOUT" --max-cost {max_cost}{harness_flag}{model_flag} \
   --json --marker --agent-backend openshell --sandbox-image {sandbox_image}{compute_driver_flag}
 "#
         ),
@@ -255,7 +282,7 @@ git clone --depth 50 {repo_url} "$CHECKOUT"
 SCOPE_OUT=/tmp/crucible-scope-out
 rm -rf "$SCOPE_OUT"
 {goal_source}crucible scope --propose --json --force --marker {goal_flag}{goal_arg} \
-  --repo "$CHECKOUT" --out "$SCOPE_OUT" --max-cost {max_cost}{tier_flag}{gaming_flag}{authoritative_flag} \
+  --repo "$CHECKOUT" --out "$SCOPE_OUT" --max-cost {max_cost}{tier_flag}{gaming_flag}{authoritative_flag}{harness_flag}{model_flag} \
   --agent-backend openshell --sandbox-image {sandbox_image}{compute_driver_flag}
 "#
             )
@@ -425,6 +452,8 @@ mod tests {
                 gaming_refine_rounds: 1,
                 skip_gaming_review: false,
                 authoritative: false,
+                harness: None,
+                model: None,
             },
         )
         .expect("render turn");
@@ -519,6 +548,8 @@ mod tests {
                 gaming_refine_rounds: 1,
                 skip_gaming_review: false,
                 authoritative: false,
+                harness: None,
+                model: None,
             },
         )
         .expect("render turn");
@@ -596,6 +627,8 @@ mod tests {
                 gaming_refine_rounds: 1,
                 skip_gaming_review: false,
                 authoritative: false,
+                harness: None,
+                model: None,
             },
         )
         .expect("render turn");
@@ -655,6 +688,8 @@ mod tests {
                 gaming_refine_rounds: 3,
                 skip_gaming_review: false,
                 authoritative: false,
+                harness: None,
+                model: None,
             },
         )
         .expect("render scope turn");
@@ -743,6 +778,8 @@ mod tests {
                 gaming_refine_rounds: 1,
                 skip_gaming_review: false,
                 authoritative: false,
+                harness: None,
+                model: None,
             },
         )
         .expect("render scope turn");
@@ -796,6 +833,8 @@ mod tests {
                 gaming_refine_rounds: 1,
                 skip_gaming_review: false,
                 authoritative: false,
+                harness: None,
+                model: None,
             },
         )
         .expect("render scope turn");
@@ -839,6 +878,8 @@ mod tests {
                 gaming_refine_rounds: 2,
                 skip_gaming_review: true,
                 authoritative: true,
+                harness: None,
+                model: None,
             },
         )
         .expect("render scope turn");
@@ -854,5 +895,94 @@ mod tests {
             yaml.contains("--authoritative"),
             "the authoritative flag is forwarded: {yaml}"
         );
+    }
+
+    fn minimal_profile() -> DeployProfile {
+        toml::from_str(
+            r#"
+            [cluster]
+            loop_namespace = "autoresearch"
+            rig_namespace = "rig"
+            service_account = "autoresearch-publisher"
+            supervisor_image = "registry.example.com/openshell-supervisor:latest"
+            [image]
+            loop = "ghcr.io/neuralmagic/crucible:latest"
+            pull_secret = "example-pull"
+        "#,
+        )
+        .expect("profile parses")
+    }
+
+    fn opts_with_run_config(
+        kind: TurnKind,
+        harness: Option<crate::harness::Harness>,
+        model: Option<&str>,
+    ) -> TurnOpts {
+        TurnOpts {
+            kind,
+            name: "crucible-turn-owner-repo-45-abcd".to_string(),
+            issue: "owner/repo#45".to_string(),
+            goal_text: None,
+            repo_url: "https://github.com/owner/repo.git".to_string(),
+            sandbox_image: "registry.example.com/epp-sandbox:latest".to_string(),
+            max_cost: 5.0,
+            pin_digests: false,
+            tier: None,
+            gaming_refine_rounds: 1,
+            skip_gaming_review: false,
+            authoritative: false,
+            harness,
+            model: model.map(str::to_string),
+        }
+    }
+
+    /// A run-level harness/model reaches the in-pod invocation of both turn kinds, spelled the way
+    /// the in-pod CLI parses it back.
+    #[test]
+    fn turn_pod_forwards_the_run_harness_and_model() {
+        let profile = minimal_profile();
+        for kind in [TurnKind::Rank, TurnKind::Scope] {
+            let yaml = render_turn(
+                &profile,
+                &opts_with_run_config(
+                    kind,
+                    Some(crate::harness::Harness::Hermes),
+                    Some("hermes-4-70b"),
+                ),
+            )
+            .expect("render turn");
+            assert!(
+                yaml.contains("--harness hermes"),
+                "the run harness is forwarded: {yaml}"
+            );
+            assert!(
+                yaml.contains("--model hermes-4-70b"),
+                "the run model is forwarded: {yaml}"
+            );
+        }
+    }
+
+    /// Either half can ride alone: a model override on the default harness emits `--model` only.
+    #[test]
+    fn turn_pod_forwards_a_model_without_a_harness() {
+        let yaml = render_turn(
+            &minimal_profile(),
+            &opts_with_run_config(TurnKind::Scope, None, Some("claude-opus-4-6")),
+        )
+        .expect("render turn");
+        assert!(yaml.contains("--model claude-opus-4-6"), "{yaml}");
+        assert!(!yaml.contains("--harness"), "no harness, no flag: {yaml}");
+    }
+
+    /// Unset run config emits neither flag, so a pre-existing render stays byte-identical.
+    #[test]
+    fn turn_pod_without_run_config_omits_both_flags() {
+        let profile = minimal_profile();
+        for kind in [TurnKind::Rank, TurnKind::Scope] {
+            let yaml = render_turn(&profile, &opts_with_run_config(kind, None, None))
+                .expect("render turn");
+            assert!(!yaml.contains("--harness"), "no harness, no flag: {yaml}");
+            assert!(!yaml.contains("--model"), "no model, no flag: {yaml}");
+        }
     }
 }

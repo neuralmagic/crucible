@@ -349,7 +349,9 @@ fn run_turn_with(
         if matches!(source, AgentSource::LocalClaude) {
             // Local agent: decode via the harness's stream decoder (shared with the openshell
             // exec path).
-            let decoder = args.harness().decoder(meters.as_ref(), tool_io_full(args));
+            let decoder = args
+                .harness()
+                .decoder(args, meters.as_ref(), tool_io_full(args));
             let (c, bt) = pump_stream(out, json, decoder, &mut sink);
             cost = c;
             best_tokens = bt;

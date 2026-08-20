@@ -428,6 +428,14 @@ pub(crate) struct RenderTurnArgs {
     /// --authoritative`. `scope` turn kind only.
     #[arg(long)]
     pub authoritative: bool,
+    /// The agent harness the in-pod turn runs, forwarded as `--harness …`. Absent = the in-pod
+    /// engine's own default.
+    #[arg(long, value_enum)]
+    pub harness: Option<crate::harness::Harness>,
+    /// The model the in-pod turn runs, forwarded as `--model …`. Absent = the model the in-pod
+    /// engine derives from its harness.
+    #[arg(long)]
+    pub model: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -477,6 +485,14 @@ pub(crate) struct DeployArgs {
     /// sibling of `--profile`.
     #[arg(long)]
     pub clusters: Option<PathBuf>,
+    /// The agent harness the rendered loop runs, emitted as the wrapper's `--harness=…`. Absent =
+    /// the manifest's `[agent].harness`.
+    #[arg(long, value_enum)]
+    pub harness: Option<crate::harness::Harness>,
+    /// The model the rendered loop runs, emitted as the wrapper's `--model=…`. Absent = the model
+    /// the loop derives from its harness.
+    #[arg(long)]
+    pub model: Option<String>,
 }
 
 #[derive(clap::Args, Clone)]
@@ -548,14 +564,17 @@ pub(crate) struct Args {
     /// Vertex Claude model for the agent (set from `[agent].model`).
     #[arg(long, default_value = harness::claude::DEFAULT_MODEL)]
     pub model: String,
-    /// The agent harness that runs each turn: `claude` (default) or `hermes`. Overrides the
-    /// manifest's `[agent].harness`; when neither is set the engine defaults to claude (see
+    /// The agent harness that runs each turn: `claude` (default), `hermes`, or `codex`. Overrides
+    /// the manifest's `[agent].harness`; when neither is set the engine defaults to claude (see
     /// `apply_agent_cfg`).
     #[arg(long, value_enum)]
     pub harness: Option<harness::Harness>,
     /// Hermes-harness tuning (from `[agent.hermes]`). No CLI flag.
     #[arg(skip)]
     pub hermes: manifest::HermesCfg,
+    /// Codex-harness tuning (from `[agent.codex]`). No CLI flag.
+    #[arg(skip)]
+    pub codex: manifest::CodexCfg,
     /// Tools the agent must not call (from `[agent].disallowed_tools`). No CLI flag.
     #[arg(skip)]
     pub disallowed_tools: Vec<String>,

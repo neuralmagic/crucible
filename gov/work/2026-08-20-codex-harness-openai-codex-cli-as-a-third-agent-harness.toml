@@ -1,0 +1,62 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-08-20-001"
+title = "Codex harness: OpenAI Codex CLI as a third agent harness"
+status = "done"
+created = "2026-08-20"
+started = "2026-08-20"
+completed = "2026-08-20"
+
+[content]
+description = """
+Add OpenAI's Codex CLI as a third agent harness so sandbox and local turns can run on a
+ChatGPT-backend model instead of Claude. Scope: the Harness::Codex arm (argv, env script,
+config.toml and auth.json seeding, rollout transcript parsing), a live JSONL decoder for
+`codex exec --json`, host-side ChatGPT OAuth mint with refresh-token rotation persisted to a
+state file, per-harness egress endpoint defaults, OpenAI pricing rows for cost estimation,
+transcript-locator glob widening, and run-level `--harness`/`--model` flags on deploy
+render-turn. Sessions and OTEL cost are out of scope (stubbed like the hermes harness)."""
+notes = ["Auth is a personal-ChatGPT-subscription bridge by design: once an OPENAI_API_KEY exists, delete the OAuth mint/rotation/seeding path rather than migrating it. Sandbox images must carry the vendored native codex binary at /usr/local/bin/codex (npm's JS launcher never matches the egress binary allowlist and every connection 403s) plus its codex-code-mode-host sibling. Sessions are stubbed: admission refuses session-requiring workflows on this harness."]
+
+[[content.acceptance_criteria]]
+text = "--harness codex runs a sandbox turn end to end: codex argv with stdin prompt, seeded config.toml/auth.json, live stream decoded to AgentEvents, estimator cost stamped, transcript parsed from the rollout tree"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "CodexJsonParser maps the codex exec --json event schema (items, usage, errors, turn.failed) onto AgentEvent, pinned by golden tests on real captures including an MCP tool call"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "host-side OAuth mint performs the refresh_token grant, hands the sandbox only short-lived material, and persists the rotated refresh token to a state file that takes precedence over CODEX_CREDENTIALS on later mints"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "codex turns get the ChatGPT-backend egress endpoints via per-harness defaults while claude and hermes turns keep the shared defaults byte-identical"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "deploy render-turn accepts --harness/--model and threads them into rendered wrapper commands; absent flags leave existing renders byte-identical"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "cost estimation prices OpenAI models from their own table with cached-input discount; Anthropic rows unchanged"
+status = "done"
+category = "changed"
+
+[[content.acceptance_criteria]]
+text = "live verification recorded: local turn and openshell sandbox turn each solved the counter domain on gpt-5.6-sol with nonzero estimator cost"
+status = "done"
+category = "chore"
+
+[verification]
+required_guards = [
+    "GUARD-CARGO-FMT",
+    "GUARD-CARGO-CLIPPY",
+    "GUARD-CARGO-TEST",
+]

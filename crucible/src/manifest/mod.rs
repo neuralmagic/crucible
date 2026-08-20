@@ -408,6 +408,9 @@ pub struct AgentCfg {
     /// Hermes-harness tuning; ignored (and harmless) when `harness = "claude"`.
     #[serde(default)]
     pub hermes: HermesCfg,
+    /// Codex-harness tuning; ignored (and harmless) when `harness = "claude"`.
+    #[serde(default)]
+    pub codex: CodexCfg,
     /// Reasoning-effort tier passed to Claude Code as `--effort <level>` (low|medium|high|xhigh|max).
     /// Unset = the engine default (`medium`); a `--effort` CLI flag overrides both. Set this to opt a
     /// known-hard domain up to `high`/`max`.
@@ -482,6 +485,16 @@ fn default_backend() -> String {
 #[serde(deny_unknown_fields)]
 pub struct HermesCfg {
     /// Model override for hermes turns; unset = the resolved `[agent].model`.
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+/// `[agent.codex]`: codex-harness tuning. The shared `[agent].model` names a Claude model by
+/// default, so a codex domain sets its OpenAI model here rather than retuning every other arm.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodexCfg {
+    /// Model override for codex turns; unset = the resolved `[agent].model`.
     #[serde(default)]
     pub model: Option<String>,
 }
@@ -893,6 +906,39 @@ impl CompositeManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `[agent].model` defaults to the DEFAULT harness's model, not to whatever `[agent].harness`
+    /// says: a codex domain names its model in `[agent.codex]` (or `[agent].model`), and the
+    /// unset default stays claude's so every existing manifest keeps its resolved model.
+    #[test]
+    fn an_unset_model_derives_from_the_default_harness() {
+        assert_eq!(
+            default_model(),
+            crate::harness::Harness::Claude.default_model()
+        );
+        let m: Manifest = toml::from_str(
+            r#"
+            [repo]
+            path = "."
+            [judge]
+            measure_cmd = "./m.nu"
+            direction = "higher"
+            objective = "value"
+            [agent]
+            backend = "command"
+            agent_cmd = "./bump.nu"
+            goal = "g"
+            harness = "codex"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(m.agent.harness, crate::harness::Harness::Codex);
+        assert_eq!(
+            m.agent.model,
+            crate::harness::Harness::Claude.default_model()
+        );
+        assert!(m.agent.codex.model.is_none());
+    }
 
     #[test]
     fn parses_a_minimal_gitworld_manifest() {
