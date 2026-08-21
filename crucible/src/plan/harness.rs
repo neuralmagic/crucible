@@ -228,7 +228,7 @@ fn run_in(
         Ok(prepared) => prepared,
         Err(note) => return transport(note),
     };
-    let cost = crate::agent::run_turn_with_session(
+    let turn = crate::agent::run_turn_with_session(
         &args,
         paths,
         &full_prompt,
@@ -243,6 +243,10 @@ fn run_in(
             }
         },
     );
+    let cost = turn.cost_usd;
+    if let Some(failure) = turn.failure() {
+        transport_error = Some(failure.to_string());
+    }
     if let Some(note) = crate::agent_session::commit_if_ok(
         &paths.state,
         prepared.as_ref(),

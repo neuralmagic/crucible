@@ -2,8 +2,9 @@
 //!
 //! The loop consumes a stream of [`AgentEvent`]s and does not care where they came
 //! from. [`run_turn`] picks an [`AgentSource`] (resolved once from [`Args`]), hands
-//! each line + decoded event to a `sink`, and returns the turn's cost (the max
-//! authoritative cost the agent reported, so the loop can budget on it).
+//! each line + decoded event to a `sink`, and returns a [`TurnOutcome`]: the turn's cost (the max
+//! authoritative cost the agent reported, so the loop can budget on it) plus the transport failure
+//! that stopped it, if any, so a turn that never ran is not mistaken for one that answered badly.
 //!
 //! Sources today, more by design:
 //!
@@ -84,6 +85,49 @@ pub enum AgentSource {
     /// The `command` backend: run a fixed shell command in the workspace as the proposal
     /// (deterministic, no LLM). Its stdout flows through the same sink; cost is 0.
     Command(String),
+}
+
+/// How a turn ended when it did not complete: the agent never produced output because the
+/// transport itself failed. Distinct from a turn that ran and answered badly.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum TurnFailure {
+    /// The local transport could not be launched (bad argv, missing binary, harness error).
+    #[error("agent spawn failed: {0}")]
+    Spawn(String),
+    /// The openshell driver's multi-step flow failed (gateway, provider, sandbox, exec, transfer).
+    #[error("openshell orchestration failed: {0}")]
+    Orchestration(String),
+}
+
+/// One turn's result: what it cost, and whether it ran at all. `failure` is `Some` when the turn
+/// never completed; `cost_usd` still carries whatever the turn spent before it broke, so a partial
+/// turn is not silently free.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TurnOutcome {
+    pub cost_usd: f64,
+    pub failure: Option<TurnFailure>,
+}
+
+impl TurnOutcome {
+    /// A turn that ran to completion at `cost_usd`. Says nothing about the quality of its output.
+    pub fn completed(cost_usd: f64) -> Self {
+        Self {
+            cost_usd,
+            failure: None,
+        }
+    }
+
+    /// A turn that broke at `failure` after spending `cost_usd`.
+    pub fn failed(cost_usd: f64, failure: TurnFailure) -> Self {
+        Self {
+            cost_usd,
+            failure: Some(failure),
+        }
+    }
+
+    pub fn failure(&self) -> Option<&TurnFailure> {
+        self.failure.as_ref()
+    }
 }
 
 pub(crate) fn supports_persistent_sessions(args: &Args) -> bool {
@@ -235,15 +279,15 @@ fn spawn_local(
 }
 
 /// Run one agent turn against the source resolved from `args`. `sink(raw_line, stream,
-/// event)` is called per output line; returns the highest cost the agent reported
-/// during the turn (0 if none).
+/// event)` is called per output line; returns the turn's [`TurnOutcome`]: the highest cost the
+/// agent reported (0 if none) plus the transport failure that stopped it, if any.
 pub fn run_turn(
     args: &Args,
     p: &Paths,
     prompt: &str,
     json: bool,
     sink: impl FnMut(&str, RawStream, Option<&AgentEvent>),
-) -> f64 {
+) -> TurnOutcome {
     run_turn_with_session(args, p, prompt, json, None, sink)
 }
 
@@ -255,7 +299,7 @@ pub(crate) fn run_turn_with_session(
     json: bool,
     session: Option<&crate::agent_session::SessionTurn>,
     sink: impl FnMut(&str, RawStream, Option<&AgentEvent>),
-) -> f64 {
+) -> TurnOutcome {
     let source = args.agent_source();
     // The openshell driver owns a multi-step turn (gateway/provider/sandbox/exec/download),
     // not a single streamed child, delegate to its module rather than the generic path. It
@@ -276,7 +320,7 @@ fn run_turn_with(
     json: bool,
     session: Option<&crate::agent_session::SessionTurn>,
     mut sink: impl FnMut(&str, RawStream, Option<&AgentEvent>),
-) -> f64 {
+) -> TurnOutcome {
     // Start the in-process OTLP collector for a local claude turn when telemetry is opted in
     // . A bind failure degrades to telemetry-off: no collector, no otel_summary, the
     // pricing-table estimate stays the cost fallback. The `otel.jsonl` lands next to the session
@@ -313,12 +357,13 @@ fn run_turn_with(
     let spawned = match source.spawn(args, p, prompt, &extra_env, session) {
         Ok(s) => s,
         Err(e) => {
+            let message = format!("failed to launch agent source: {e}");
             let ev = AgentEvent::Error {
                 error_type: "spawn".into(),
-                message: format!("failed to launch agent source: {e}"),
+                message: message.clone(),
             };
             sink("", RawStream::Stderr, Some(&ev));
-            return 0.0;
+            return TurnOutcome::failed(0.0, TurnFailure::Spawn(message));
         }
     };
     let Spawned {
@@ -415,7 +460,7 @@ fn run_turn_with(
     {
         cost = estimate_cost(&args.model, t);
     }
-    cost
+    TurnOutcome::completed(cost)
 }
 
 /// Whether the in-process OTLP collector should run for this turn. Opt-in ("result bundling": "result
@@ -632,6 +677,67 @@ mod tests {
         a.env
             .push(("CRUCIBLE_SESSION_TOOL_IO".to_string(), "yes".to_string()));
         assert!(!tool_io_full(&a));
+    }
+
+    /// A temp workspace for a real turn (the `command` backend shells out for real).
+    fn workspace(name: &str) -> Paths {
+        let dir = std::env::temp_dir().join(format!(
+            "crucible-agent-test-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(dir.join("state")).expect("mkdir workspace");
+        Paths::for_worktree(dir, None)
+    }
+
+    #[test]
+    fn a_turn_that_ran_reports_no_failure() {
+        let a = args(&[]);
+        let p = workspace("ran");
+        let src = AgentSource::Command("echo ran".to_string());
+        let mut lines = Vec::new();
+        let outcome = run_turn_with(&src, &a, &p, "prompt", false, None, |line, _s, _ev| {
+            lines.push(line.to_string())
+        });
+        let _ = std::fs::remove_dir_all(&p.workspace);
+        assert_eq!(outcome.failure(), None, "the command ran to completion");
+        assert_eq!(outcome.cost_usd, 0.0, "the command backend is free");
+        assert!(lines.iter().any(|l| l == "ran"), "stdout reached the sink");
+    }
+
+    /// A turn whose transport never launches is a failure, not a $0 turn that answered nothing.
+    /// `OpenshellDriver` is the one source whose `spawn` always errors (its flow is driven
+    /// elsewhere), so it exercises the launch-failure path without a broken fixture binary.
+    #[test]
+    fn a_turn_that_never_launched_reports_a_spawn_failure() {
+        let a = args(&[]);
+        let p = workspace("nospawn");
+        let mut errors = Vec::new();
+        let outcome = run_turn_with(
+            &AgentSource::OpenshellDriver,
+            &a,
+            &p,
+            "prompt",
+            false,
+            None,
+            |_line, _s, ev| {
+                if let Some(AgentEvent::Error { message, .. }) = ev {
+                    errors.push(message.clone());
+                }
+            },
+        );
+        let _ = std::fs::remove_dir_all(&p.workspace);
+        assert_eq!(outcome.cost_usd, 0.0);
+        match outcome.failure() {
+            Some(TurnFailure::Spawn(msg)) => {
+                assert!(msg.contains("failed to launch agent source"), "{msg}")
+            }
+            other => panic!("expected a spawn failure, got {other:?}"),
+        }
+        assert_eq!(errors.len(), 1, "the sink still sees the error event");
     }
 
     #[test]

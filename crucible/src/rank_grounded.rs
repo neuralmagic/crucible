@@ -15,7 +15,8 @@
 //! laptop, `openshell` in-pod (the sandbox image carries the claude CLI the loop image does not).
 
 use crate::Paths;
-use crate::agent::{self, AgentBackend};
+use crate::activity::ActivityFeed;
+use crate::agent::{self, AgentBackend, TurnFailure, TurnOutcome};
 use crate::event::{AgentEvent, RawStream};
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -78,6 +79,30 @@ pub struct Verdict {
     pub confidence: String,
 }
 
+/// Why a grounded turn yielded no verdict. The two cases are not interchangeable: a turn that
+/// never started tells the caller to look at the pod, a completed turn without a verdict tells it
+/// to look at the model.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum GroundedError {
+    /// The turn itself failed; there was no agent output to parse.
+    #[error("the turn never completed: {0}")]
+    Turn(#[from] TurnFailure),
+    /// The turn ran and its last line was not a verdict.
+    #[error("the agent produced no parseable verdict on its last line")]
+    NoVerdict,
+}
+
+impl GroundedError {
+    /// The machine-readable discriminant on the verdict marker, so the controller records which
+    /// failure it was instead of re-deriving it from prose.
+    fn kind(&self) -> &'static str {
+        match self {
+            GroundedError::Turn(_) => "turn_failed",
+            GroundedError::NoVerdict => "no_verdict",
+        }
+    }
+}
+
 /// The turn's outcome: the parsed verdict (absent when the agent produced no parseable one on its
 /// last line), the turn's cost, and whether that cost blew the budget.
 #[derive(Debug, Clone)]
@@ -86,7 +111,7 @@ pub struct GroundedReport {
     pub cost_usd: f64,
     pub over_budget: bool,
     /// Set when no verdict was parsed, the reason, for the human/stderr path.
-    pub error: Option<String>,
+    pub error: Option<GroundedError>,
 }
 
 impl GroundedReport {
@@ -102,7 +127,12 @@ impl GroundedReport {
                 "over_budget": self.over_budget,
             }),
             None => serde_json::json!({
-                "error": self.error.as_deref().unwrap_or("no verdict"),
+                "error": self
+                    .error
+                    .as_ref()
+                    .map(GroundedError::to_string)
+                    .unwrap_or_else(|| "no verdict".to_string()),
+                "error_kind": self.error.as_ref().map(GroundedError::kind).unwrap_or("no_verdict"),
                 "cost_usd": self.cost_usd,
                 "over_budget": self.over_budget,
             }),
@@ -294,15 +324,15 @@ fn grounded_paths(scratch: &Path) -> Paths {
     }
 }
 
-/// Run the grounded turn in a throwaway worktree of `workspace` and return its cost plus the agent's
-/// accumulated output. The worktree (detached at HEAD) is the read-only-intent mechanism: any write
-/// the agent makes lands here and is discarded on `worktree remove --force`, so the caller's checkout
-/// is never touched.
+/// Run the grounded turn in a throwaway worktree of `workspace` and return its outcome plus the
+/// agent's accumulated output. The worktree (detached at HEAD) is the read-only-intent mechanism:
+/// any write the agent makes lands here and is discarded on `worktree remove --force`, so the
+/// caller's checkout is never touched.
 fn run_grounded_turn(
     workspace: &Path,
     prompt: &str,
     a: &RankGroundedArgs,
-) -> Result<(f64, String)> {
+) -> Result<(TurnOutcome, String)> {
     let scratch = worktree_path();
     git(
         workspace,
@@ -345,7 +375,15 @@ fn run_grounded_turn(
     let _ = std::fs::create_dir_all(&paths.state);
 
     let mut buf = String::new();
-    let cost = agent::run_turn(&args, &paths, prompt, false, |_line, _stream, ev| {
+    // The turn's own narration on stdout: stage banners, tool calls and the agent's stderr, so a
+    // turn that dies mid-orchestration leaves more than a 7-line pod log. Bounded by the feed's
+    // caps and byte budget, and always before the verdict marker `run` prints last.
+    let model = args.model.clone();
+    let mut activity = ActivityFeed::new(crucible_contract::RANK_ACTIVITY_MARKER, a.marker);
+    let outcome = agent::run_turn(&args, &paths, prompt, false, |_line, _stream, ev| {
+        if let Some(ev) = ev {
+            activity.observe(&model, ev);
+        }
         accumulate(ev, &mut buf)
     });
 
@@ -356,7 +394,7 @@ fn run_grounded_turn(
         &["worktree", "remove", "--force", &scratch.to_string_lossy()],
     );
     let _ = std::fs::remove_dir_all(&scratch);
-    Ok((cost, buf))
+    Ok((outcome, buf))
 }
 
 /// Drive one grounded ranking turn and return its report. Pure of process exit / printing, [`run`]
@@ -366,18 +404,27 @@ pub fn execute(a: &RankGroundedArgs) -> Result<GroundedReport> {
     let issue = crate::issue::fetch(&repo, number, "crucible-rank-grounded")
         .with_context(|| format!("fetching {} for grounded ranking", a.issue))?;
     let prompt = render_prompt(&issue.title, &issue.body, &issue.labels);
-    let (cost, buf) = run_grounded_turn(&a.workspace, &prompt, a)?;
-    let over_budget = a.max_cost > 0.0 && cost > a.max_cost;
-    let verdict = extract_verdict(&buf);
-    let error = verdict
-        .is_none()
-        .then(|| "the agent produced no parseable verdict on its last line".to_string());
-    Ok(GroundedReport {
+    let (outcome, buf) = run_grounded_turn(&a.workspace, &prompt, a)?;
+    Ok(report_from_turn(outcome, &buf, a.max_cost))
+}
+
+/// Classify one finished turn into a report. A transport failure outranks the verdict scrape: an
+/// agent that never ran cannot have written a bad last line.
+fn report_from_turn(outcome: TurnOutcome, buf: &str, max_cost: f64) -> GroundedReport {
+    let over_budget = max_cost > 0.0 && outcome.cost_usd > max_cost;
+    let (verdict, error) = match outcome.failure {
+        Some(failure) => (None, Some(GroundedError::Turn(failure))),
+        None => match extract_verdict(buf) {
+            Some(v) => (Some(v), None),
+            None => (None, Some(GroundedError::NoVerdict)),
+        },
+    };
+    GroundedReport {
         verdict,
-        cost_usd: cost,
+        cost_usd: outcome.cost_usd,
         over_budget,
         error,
-    })
+    }
 }
 
 /// CLI entry point: run the turn, print the verdict (JSON or human lines), and exit nonzero if the
@@ -413,7 +460,11 @@ pub fn run(a: RankGroundedArgs) -> Result<()> {
             None => eprintln!(
                 "[crucible rank-grounded] no verdict (turn cost ${:.4}): {}",
                 report.cost_usd,
-                report.error.as_deref().unwrap_or("unknown")
+                report
+                    .error
+                    .as_ref()
+                    .map(GroundedError::to_string)
+                    .unwrap_or_else(|| "unknown".to_string())
             ),
         }
         if report.over_budget {
@@ -531,6 +582,73 @@ mod tests {
     /// crate-wide guard shared with `scope`/`run` so cross-module env races can't happen.
     fn github_env_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::test_env_lock()
+    }
+
+    /// The turn's two no-verdict cases must not collapse into one: a failed turn names the
+    /// transport, a completed one names the model. The controller reads `error_kind` to tell them
+    /// apart without parsing prose.
+    #[test]
+    fn a_failed_turn_and_a_verdictless_turn_are_different_reports() {
+        let failed = report_from_turn(
+            TurnOutcome::failed(0.0, TurnFailure::Spawn("no such binary".into())),
+            "",
+            0.0,
+        );
+        assert!(failed.verdict.is_none());
+        assert_eq!(
+            failed.error,
+            Some(GroundedError::Turn(TurnFailure::Spawn(
+                "no such binary".into()
+            )))
+        );
+        assert_eq!(failed.to_json()["error_kind"], "turn_failed");
+        assert!(
+            failed.to_json()["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no such binary"),
+            "the real reason survives into the marker payload"
+        );
+
+        let verdictless = report_from_turn(TurnOutcome::completed(0.12), "thinking out loud", 0.0);
+        assert!(verdictless.verdict.is_none());
+        assert_eq!(verdictless.error, Some(GroundedError::NoVerdict));
+        assert_eq!(verdictless.to_json()["error_kind"], "no_verdict");
+        assert_eq!(verdictless.cost_usd, 0.12);
+    }
+
+    /// A turn that broke after billing tokens reports what it spent, and its output is never
+    /// scraped for a verdict.
+    #[test]
+    fn a_partial_turn_keeps_its_cost_and_ignores_stale_output() {
+        let buf = "{\"tier\":\"T1\",\"rationale\":\"leftovers\"}";
+        let report = report_from_turn(
+            TurnOutcome::failed(
+                0.42,
+                TurnFailure::Orchestration("sandbox exec failed".into()),
+            ),
+            buf,
+            0.25,
+        );
+        assert!(report.verdict.is_none(), "a broken turn has no verdict");
+        assert_eq!(report.cost_usd, 0.42);
+        assert!(report.over_budget, "0.42 > 0.25 max-cost");
+        assert_eq!(report.to_json()["error_kind"], "turn_failed");
+    }
+
+    #[test]
+    fn a_completed_turn_with_a_verdict_reports_no_error() {
+        let report = report_from_turn(
+            TurnOutcome::completed(0.3),
+            "{\"tier\":\"T1\",\"rationale\":\"one file\"}",
+            0.0,
+        );
+        assert_eq!(report.error, None);
+        assert_eq!(
+            report.verdict.as_ref().map(|v| v.disposition),
+            Some(Disposition::Tier(Tier::T1))
+        );
+        assert!(report.to_json().get("error_kind").is_none());
     }
 
     fn args(workspace: &Path, script: &Path, max_cost: f64) -> RankGroundedArgs {

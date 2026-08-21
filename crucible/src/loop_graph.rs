@@ -1264,7 +1264,11 @@ fn wide_propose(
     }
     let cand_paths = Paths::for_worktree(worktree.clone(), skills);
     let _ = std::fs::create_dir_all(&cand_paths.state);
-    let _cost = agent::run_turn(args, &cand_paths, prompt, false, |_line, _stream, _ev| {});
+    let turn = agent::run_turn(args, &cand_paths, prompt, false, |_line, _stream, _ev| {});
+    if let Some(failure) = turn.failure() {
+        let _ = std::fs::remove_dir_all(&worktree);
+        return fail(turn.cost_usd, failure.to_string());
+    }
     let diff = crate::plan::worktree::capture_diff(&worktree);
     let _ = std::fs::remove_dir_all(&worktree);
     match diff {

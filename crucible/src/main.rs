@@ -22,6 +22,7 @@
 //! - Ctrl+C never just dies: it stops cleanly after the current step and prints a summary. Headless offers a steer/quit prompt.
 //! - Steering: drop guidance in STEER.md (or via the prompt) and it is injected into the next iteration's prompt, the lever for when the agent goes off the rails.
 
+mod activity;
 mod admission;
 mod agent;
 mod agent_session;

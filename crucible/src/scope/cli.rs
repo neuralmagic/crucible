@@ -1,3 +1,4 @@
+use crate::activity::ActivityFeed;
 use crate::agent::AgentBackend;
 use crate::init::MANIFEST_FILE;
 use crate::refine::RoundRecord;
@@ -5,7 +6,6 @@ use crate::scope::pack::{SCOPE_PACK_MARKER, pack_gz, pack_marker_line};
 use crate::scope::pipeline::{
     Freeze, Ingest, Propose, ProposeOpts, ProposeTier, ScopeCtx, Stage, StageResult, Validate,
 };
-use crate::scope::progress::ActivityFeed;
 use crate::scope::transcript::{
     SCOPE_TRANSCRIPT_MARKER, TRANSCRIPT_CAP_BYTES, cap_transcript, gzip_transcript,
 };
@@ -59,7 +59,10 @@ pub fn execute(
         propose_cost: None,
         refine_rounds: Vec::new(),
         transcript: String::new(),
-        activity: ActivityFeed::new(propose.as_ref().is_some_and(|o| o.progress)),
+        activity: ActivityFeed::new(
+            crucible_contract::SCOPE_ACTIVITY_MARKER,
+            propose.as_ref().is_some_and(|o| o.progress),
+        ),
     };
 
     let mut stages: Vec<Box<dyn Stage>> = vec![Box::new(Ingest {
