@@ -64,8 +64,32 @@ pub const GATEWAY_NAME: &str = "ci";
 
 /// The Secret name carrying the generated client mTLS material to sandbox pods (see
 /// [`KubernetesDriverConfig::client_tls_secret_name`]). Published by `boot()` into the sandbox
-/// namespace from the local certgen output.
+/// namespace from the local certgen output. Used verbatim only where one gateway owns the
+/// namespace; in a pod, [`client_tls_secret_name`] scopes it per gateway.
 pub const CLIENT_TLS_SECRET: &str = "crucible-openshell-client-tls";
+
+/// The Secret this gateway publishes its client mTLS material under: [`CLIENT_TLS_SECRET`] suffixed
+/// with the pod name when running as one.
+///
+/// Every gateway generates its own CA, so a fixed name means concurrent turns overwrite each
+/// other's material and a sandbox presents a credential its own gateway's CA never signed.
+pub fn client_tls_secret_name() -> String {
+    secret_name(pod_identity().as_ref().map(|(name, _)| name.as_str()))
+}
+
+fn secret_name(pod: Option<&str>) -> String {
+    match pod {
+        Some(pod) => format!("{CLIENT_TLS_SECRET}-{pod}"),
+        None => CLIENT_TLS_SECRET.to_string(),
+    }
+}
+
+/// This pod's `(name, uid)` from the downward API, `None` off-cluster.
+fn pod_identity() -> Option<(String, String)> {
+    let name = std::env::var(crucible_contract::ENV_POD_NAME).ok()?;
+    let uid = std::env::var("CRUCIBLE_POD_UID").ok()?;
+    (!name.is_empty() && !uid.is_empty()).then_some((name, uid))
+}
 
 /// In-cluster k8s detection vars to strip from the gateway's environment before launch.
 /// (See the module docs, load-bearing under the podman driver in a pod, a no-op on a laptop;
@@ -218,7 +242,7 @@ pub fn gateway_toml(
             // fail SAN verification.
             cfg.grpc_endpoint =
                 format!("https://{}:{port}", ComputeDriver::Kubernetes.broker_host());
-            cfg.client_tls_secret_name = CLIENT_TLS_SECRET.to_owned();
+            cfg.client_tls_secret_name = client_tls_secret_name();
             // At runtime the render-projected env vars fill the driver config fields that
             // are unknowable at render time or vary per profile.
             if let Ok(ip) = std::env::var("CRUCIBLE_POD_IP")
@@ -597,38 +621,73 @@ fn tail_gateway_log(path: &std::path::Path) -> String {
     }
 }
 
-/// Server-side apply the [`CLIENT_TLS_SECRET`] Secret from the certgen output at `tls_dir`
+/// Server-side apply this gateway's client mTLS Secret from the certgen output at `tls_dir`
 /// (`ca.crt`, `client/tls.crt`, `client/tls.key` → the `ca.crt`/`tls.crt`/`tls.key` keys the
-/// driver's mount points `OPENSHELL_TLS_CA/CERT/KEY` at). Idempotent across turns; re-applying
-/// after a cert refresh converges the mounted material. The namespace mirrors the driver
-/// config: `CRUCIBLE_SANDBOX_NAMESPACE`, falling back to the driver's own default.
+/// driver's mount points `OPENSHELL_TLS_CA/CERT/KEY` at). The name is [`client_tls_secret_name`],
+/// so concurrent gateways never share one. The namespace mirrors the driver config:
+/// `CRUCIBLE_SANDBOX_NAMESPACE`, falling back to the driver's own default.
+///
+/// In a pod the Secret is owned by that pod, so it is garbage-collected with the turn rather than
+/// accumulating one per dispatch.
 fn publish_client_tls_secret(tls_dir: &std::path::Path) -> Result<()> {
     let read = |rel: &str| -> Result<String> {
         let p = tls_dir.join(rel);
         std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))
     };
+    let name = client_tls_secret_name();
     let ns = std::env::var("CRUCIBLE_SANDBOX_NAMESPACE")
         .ok()
         .filter(|s| !s.is_empty())
         // The kubernetes driver's DEFAULT_K8S_NAMESPACE, used when the config omits `namespace`.
         .unwrap_or_else(|| "openshell".to_string());
-    let secret = k8s_openapi::api::core::v1::Secret {
-        metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
-            name: Some(CLIENT_TLS_SECRET.to_string()),
-            namespace: Some(ns.clone()),
-            ..Default::default()
-        },
-        string_data: Some(std::collections::BTreeMap::from([
+    let secret = client_tls_secret(
+        &name,
+        &ns,
+        pod_identity(),
+        [
             ("ca.crt".to_string(), read("ca.crt")?),
             ("tls.crt".to_string(), read("client/tls.crt")?),
             ("tls.key".to_string(), read("client/tls.key")?),
-        ])),
-        type_: Some("Opaque".to_string()),
-        ..Default::default()
-    };
+        ],
+    );
     let yaml = serde_norway::to_string(&secret).context("serializing the client TLS secret")?;
     forge::kube::apply_yaml(&yaml)
-        .with_context(|| format!("publishing Secret {CLIENT_TLS_SECRET} to namespace {ns}"))
+        .with_context(|| format!("publishing Secret {name} to namespace {ns}"))
+}
+
+/// The Secret object `publish_client_tls_secret` applies. `owner` present sets this gateway's pod
+/// as the owner so collection cascades; absent leaves the Secret standing (off-cluster, where
+/// nothing would collect it anyway).
+fn client_tls_secret(
+    name: &str,
+    ns: &str,
+    owner: Option<(String, String)>,
+    material: [(String, String); 3],
+) -> k8s_openapi::api::core::v1::Secret {
+    k8s_openapi::api::core::v1::Secret {
+        metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+            name: Some(name.to_string()),
+            namespace: Some(ns.to_string()),
+            owner_references: owner.map(|(pod, uid)| {
+                vec![
+                    k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+                        api_version: "v1".to_string(),
+                        kind: "Pod".to_string(),
+                        name: pod,
+                        uid,
+                        controller: Some(false),
+                        // Collection already cascades from the ownerReference; setting this would
+                        // demand `update` on pods/finalizers, which the turn pod's SA lacks.
+                        block_owner_deletion: None,
+                    },
+                ]
+            }),
+            ..Default::default()
+        },
+        string_data: Some(std::collections::BTreeMap::from(material)),
+        type_: Some("Opaque".to_string()),
+        ..Default::default()
+    }
 }
 
 /// `~/.local/state/openshell`, the gateway's state/cert home.
@@ -683,6 +742,43 @@ mod tests {
     // became a knob. These are frozen snapshots.
     const PODMAN_NO_IMAGE: &str = "[openshell]\nversion = 1\n\n[openshell.gateway]\nbind_address = \"0.0.0.0:17670\"\ncompute_drivers = [\"podman\"]\n";
     const PODMAN_WITH_IMAGE: &str = "[openshell]\nversion = 1\n\n[openshell.gateway]\nbind_address = \"0.0.0.0:17670\"\ncompute_drivers = [\"podman\"]\n\n[openshell.drivers.podman]\nsupervisor_image = \"registry.example.com/epp-sandbox:x\"\n";
+
+    #[test]
+    fn each_pod_publishes_its_client_material_under_its_own_name() {
+        let a = secret_name(Some("crucible-turn-router-2316-abc"));
+        let b = secret_name(Some("crucible-turn-router-2399-def"));
+        assert_ne!(a, b, "concurrent turns must not share one secret");
+        assert!(a.starts_with(CLIENT_TLS_SECRET));
+        assert_eq!(secret_name(None), CLIENT_TLS_SECRET);
+    }
+
+    #[test]
+    fn a_published_secret_is_owned_by_the_pod_that_published_it() {
+        let material = || {
+            [
+                ("ca.crt".to_string(), "ca".to_string()),
+                ("tls.crt".to_string(), "crt".to_string()),
+                ("tls.key".to_string(), "key".to_string()),
+            ]
+        };
+        let owned = client_tls_secret(
+            "s",
+            "ns",
+            Some(("turn-pod".to_string(), "uid-1".to_string())),
+            material(),
+        );
+        let refs = owned.metadata.owner_references.expect("owner set in a pod");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].kind, "Pod");
+        assert_eq!(refs[0].name, "turn-pod");
+        assert_eq!(refs[0].uid, "uid-1");
+        assert_eq!(refs[0].controller, Some(false));
+        // Setting it would require `update` on pods/finalizers, which the turn pod's SA lacks.
+        assert_eq!(refs[0].block_owner_deletion, None);
+
+        let unowned = client_tls_secret("s", "ns", None, material());
+        assert!(unowned.metadata.owner_references.is_none());
+    }
 
     #[test]
     fn podman_rendering_is_byte_identical_without_image() {
