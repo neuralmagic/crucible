@@ -18,6 +18,10 @@ pub const SCOPE_PROGRESS_MARKER: &str = "CRUCIBLE_SCOPE_PROGRESS:";
 /// (tool calls, text snippets, usage samples). Relayed live and never persisted.
 pub const SCOPE_ACTIVITY_MARKER: &str = "CRUCIBLE_SCOPE_ACTIVITY:";
 
+/// Prefix of the within-turn activity marker the grounded ranking turn prints while the agent
+/// streams (stage narration, tool calls, agent stderr). Relayed live and never persisted.
+pub const RANK_ACTIVITY_MARKER: &str = "CRUCIBLE_RANK_ACTIVITY:";
+
 /// Prefix of the transcript marker a scope turn prints just before its report marker: base64 of
 /// the gzipped session NDJSON the propose/refine/adversary turns streamed.
 pub const SCOPE_TRANSCRIPT_MARKER: &str = "CRUCIBLE_SCOPE_TRANSCRIPT:";

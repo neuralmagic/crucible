@@ -12,7 +12,7 @@
 //! The sandbox name is derived per (process, workspace), so parallel wide-round candidates and parallel
 //! crucible processes sharing one gateway never collide on a fixed name.
 
-use crate::agent;
+use crate::agent::{self, TurnFailure, TurnOutcome};
 use crate::event::{AgentEvent, RawStream, cost_of, estimate_cost};
 use crate::harness::{AuthProvider, Harness, SandboxLayout, TranscriptLocator, TurnArtifacts};
 use crate::openshell::grpc::Gateway;
@@ -40,9 +40,9 @@ use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
 /// Run one openshell turn. Mirrors `agent::run_turn`'s contract: drives `sink` per output
-/// line/event and returns the turn's cost. Any orchestration failure surfaces as an
-/// [`AgentEvent::Error`] through the sink and returns 0 (the loop treats it as a no-op turn,
-/// exactly as the local path does on a spawn failure).
+/// line/event and returns the turn's [`TurnOutcome`]. Any orchestration failure surfaces as an
+/// [`AgentEvent::Error`] through the sink and lands in the outcome's
+/// [`TurnFailure::Orchestration`], carrying whatever the turn had already spent.
 pub fn turn(
     args: &Args,
     p: &Paths,
@@ -50,7 +50,7 @@ pub fn turn(
     json: bool,
     session: Option<&crate::agent_session::SessionTurn>,
     mut sink: impl FnMut(&str, RawStream, Option<&AgentEvent>),
-) -> f64 {
+) -> TurnOutcome {
     // The whole turn is async; the engine runtime drives it. The one `block_on` in the openshell
     // path, reached from the published handle rather than threaded through `run_turn` and the
     // reporter trait (see `crate::engine`). A missing runtime surfaces like any orchestration
@@ -58,24 +58,43 @@ pub fn turn(
     let handle = match crate::engine::handle() {
         Ok(h) => h,
         Err(e) => {
+            let message = format!("{e:#}");
             let ev = AgentEvent::Error {
                 error_type: "openshell".into(),
-                message: format!("{e:#}"),
+                message: message.clone(),
             };
             sink("", RawStream::Stderr, Some(&ev));
-            return 0.0;
+            return TurnOutcome::failed(0.0, TurnFailure::Orchestration(message));
         }
     };
-    match handle.block_on(try_turn(args, p, prompt, json, session, &mut sink)) {
-        Ok(cost) => cost,
+    let spent = CostMeter::default();
+    match handle.block_on(try_turn(args, p, prompt, json, session, &spent, &mut sink)) {
+        Ok(cost) => TurnOutcome::completed(cost),
         Err(e) => {
+            let message = format!("{e:#}");
             let ev = AgentEvent::Error {
                 error_type: "openshell".into(),
-                message: format!("{e:#}"),
+                message: message.clone(),
             };
             sink("", RawStream::Stderr, Some(&ev));
-            0.0
+            TurnOutcome::failed(spent.get(), TurnFailure::Orchestration(message))
         }
+    }
+}
+
+/// The turn's cost as it becomes known, readable after a later step's error has unwound the flow.
+/// The agent can exit having billed real tokens and the workspace download can still fail; without
+/// this the turn would report $0.
+#[derive(Default)]
+struct CostMeter(std::cell::Cell<f64>);
+
+impl CostMeter {
+    fn raise(&self, cost: f64) {
+        self.0.set(self.0.get().max(cost));
+    }
+
+    fn get(&self) -> f64 {
+        self.0.get()
     }
 }
 
@@ -141,6 +160,7 @@ async fn try_turn(
     prompt: &str,
     json: bool,
     session: Option<&crate::agent_session::SessionTurn>,
+    spent: &CostMeter,
     sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
 ) -> Result<f64> {
     // Ctrl-C plumbing for the whole turn: STOP → this token, tripped by a bridge task; the exec
@@ -519,6 +539,7 @@ async fn try_turn(
             refresher.abort();
         }
         let mut cost = exec_result?;
+        spent.raise(cost);
 
         // 8a. Agent exited: roll the captured OTLP jsonl up into the `otel_summary` event
         //     (authoritative cost, per-model usage, API latency). `cost_of`'s prefer-OTEL rule
@@ -528,6 +549,7 @@ async fn try_turn(
         {
             let ev = summary.to_event();
             cost = cost.max(cost_of(&ev).unwrap_or(0.0));
+            spent.raise(cost);
             sink("", RawStream::Stdout, Some(&ev));
         }
 
@@ -557,6 +579,7 @@ async fn try_turn(
         // unconditionally and a failure is loud (see `graft_turn_telemetry`).
         if harness.backfill_required() || crate::engine::TurnExport::resolve().emits_anything() {
             cost = graft_turn_telemetry(harness, &gw, &name, &cancel, cost, sink).await;
+            spent.raise(cost);
         }
         Ok(cost)
     }

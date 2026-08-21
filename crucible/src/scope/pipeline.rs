@@ -1,5 +1,6 @@
 use crate::Paths;
-use crate::agent::{self, AgentBackend};
+use crate::activity::ActivityFeed;
+use crate::agent::{self, AgentBackend, TurnOutcome};
 use crate::check::{self, CheckOutcome};
 use crate::event::{AgentEvent, RawStream};
 use crate::identity::{self, RunIdentity};
@@ -12,7 +13,7 @@ use crate::scope::pack::{
     PACK_WORK_DIR, drop_repo_checkouts, ensure_out_dir, frozen_workspace_dir,
     normalize_frozen_manifest, scratch_dir, strip_controls_and_selftest, sync_pack_from_workspace,
 };
-use crate::scope::progress::{ActivityFeed, emit_progress};
+use crate::scope::progress::emit_progress;
 use crate::scope::transcript::{transcript_event, transcript_note, write_seed_context};
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
@@ -367,14 +368,16 @@ impl Propose {
                 &format!("round {round}: {} turn", kind.label()),
             );
             ctx.activity.begin_turn(total_cost);
-            let cost = run_propose_turn(
+            let turn = run_propose_turn(
                 scratch,
                 &prompt,
                 &self.opts,
                 &mut ctx.transcript,
                 &mut ctx.activity,
             );
+            let cost = turn.cost_usd;
             total_cost += cost;
+            note_turn_failure(&mut ctx.transcript, round, &turn);
             ctx.propose_cost = Some(total_cost);
             sync_pack_from_workspace(scratch, &ctx.pack)?;
 
@@ -604,14 +607,16 @@ impl Propose {
                 &format!("round {refine_round}: refine turn (gaming-review concerns)"),
             );
             ctx.activity.begin_turn(*total_cost);
-            let cost = run_propose_turn(
+            let turn = run_propose_turn(
                 scratch,
                 &prompt,
                 &self.opts,
                 &mut ctx.transcript,
                 &mut ctx.activity,
             );
+            let cost = turn.cost_usd;
             *total_cost += cost;
+            note_turn_failure(&mut ctx.transcript, refine_round, &turn);
             ctx.propose_cost = Some(*total_cost);
             sync_pack_from_workspace(scratch, &ctx.pack)?;
 
@@ -687,14 +692,16 @@ impl Propose {
             &format!("round {round}: adversary turn (gaming review)"),
         );
         ctx.activity.begin_turn(*total_cost);
-        let (cost, transcript) = run_adversary_turn(
+        let (turn, transcript) = run_adversary_turn(
             &ctx.pack,
             &prompt,
             &self.opts,
             &mut ctx.transcript,
             &mut ctx.activity,
         );
+        let cost = turn.cost_usd;
         *total_cost += cost;
+        note_turn_failure(&mut ctx.transcript, round, &turn);
         ctx.propose_cost = Some(*total_cost);
         let judge_block = read_judge_block(&ctx.manifest_path);
 
@@ -738,7 +745,7 @@ enum AdversaryOutcome {
 
 /// Run the adversary turn against `pack` itself (its cwd, it reads the manifest, the measure
 /// script, and the workspace directly rather than having file contents embedded in the prompt) and
-/// return its cost plus the concatenated stdout text, for [`refine::parse_adversary_verdict`] to
+/// return its outcome plus the concatenated stdout text, for [`refine::parse_adversary_verdict`] to
 /// read the final line from. Uses a throwaway scratch dir for the turn's own state/steer/session
 /// bookkeeping so nothing extra lands in the frozen pack directory.
 fn run_adversary_turn(
@@ -747,7 +754,7 @@ fn run_adversary_turn(
     opts: &ProposeOpts,
     session: &mut String,
     activity: &mut ActivityFeed,
-) -> (f64, String) {
+) -> (TurnOutcome, String) {
     let args = turn_args(opts);
     let model = args.model.clone();
     let meta = scratch_dir("scope-adversary-meta");
@@ -764,7 +771,7 @@ fn run_adversary_turn(
     };
     let _ = std::fs::create_dir_all(&paths.state);
     let mut transcript = String::new();
-    let cost = agent::run_turn(&args, &paths, prompt, false, |_line, stream, ev| {
+    let outcome = agent::run_turn(&args, &paths, prompt, false, |_line, stream, ev| {
         forward_error(ev);
         if let Some(ev) = ev {
             transcript_event(session, ev);
@@ -783,7 +790,7 @@ fn run_adversary_turn(
         }
     });
     let _ = std::fs::remove_dir_all(&meta);
-    (cost, transcript)
+    (outcome, transcript)
 }
 
 /// Write `REJECTED.md` for a gaming-review outcome that has no [`FailureEvidence`] to speak of (a
@@ -967,7 +974,15 @@ fn forward_error(ev: Option<&AgentEvent>) {
     }
 }
 
-/// Run the propose turn in `scratch` (cwd = the `--repo` checkout) and return its cost. The
+/// Record a turn that never ran in the preserved transcript. The sink's [`forward_error`] already
+/// put the reason on stderr; this keeps it in the trail a reviewer reads afterwards.
+fn note_turn_failure(session: &mut String, round: u32, turn: &TurnOutcome) {
+    if let Some(failure) = turn.failure() {
+        transcript_note(session, &format!("round {round}: turn failed: {failure}"));
+    }
+}
+
+/// Run the propose turn in `scratch` (cwd = the `--repo` checkout) and return its outcome. The
 /// backend comes from `opts` via [`turn_args`]; the real turn is the same `agent::run_turn` every
 /// domain loop iteration uses. Every decoded event is preserved into `session`, the scratch dir
 /// (and any session file in it) is deleted when the turn ends, so this recording is the only
@@ -978,7 +993,7 @@ fn run_propose_turn(
     opts: &ProposeOpts,
     session: &mut String,
     activity: &mut ActivityFeed,
-) -> f64 {
+) -> TurnOutcome {
     let args = turn_args(opts);
     let model = args.model.clone();
     let paths = propose_paths(scratch);
@@ -1304,6 +1319,7 @@ fn render_refine_section(rounds: &[RoundRecord]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::activity::{ACTIVITY_MIN_INTERVAL, ACTIVITY_TEXT_CAP, ACTIVITY_TOOL_CAP};
     use crate::agent::AgentBackend;
     use crate::event::Tokens;
     use crate::refine::{FailureEvidence, RoundKind, RoundOutcome, RoundRecord, parse_rounds};
@@ -1313,11 +1329,11 @@ mod tests {
         pack_marker_line, pack_marker_payload, repo_pin, tar_pack_dir,
     };
     use crate::scope::progress::{
-        ACTIVITY_MIN_INTERVAL, ACTIVITY_TEXT_CAP, ACTIVITY_TOOL_CAP, PROGRESS_DOING_CAP,
-        SCOPE_ACTIVITY_MARKER, SCOPE_PROGRESS_MARKER, ScopeProgress, cap_doing,
+        PROGRESS_DOING_CAP, SCOPE_PROGRESS_MARKER, ScopeProgress, cap_doing,
     };
     use crate::scope::transcript::{cap_transcript, gzip_transcript};
     use base64::Engine as _;
+    use crucible_contract::SCOPE_ACTIVITY_MARKER;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
@@ -2487,7 +2503,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
 
     #[test]
     fn activity_feed_is_silent_without_the_marker_flag() {
-        let mut feed = ActivityFeed::new(false);
+        let mut feed = ActivityFeed::new(SCOPE_ACTIVITY_MARKER, false);
         let now = std::time::Instant::now();
         assert!(
             feed.line_for("claude-opus-4-6", &tool_event("Edit", "x"), now)
@@ -2505,7 +2521,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
 
     #[test]
     fn activity_tool_lines_cap_the_summary_and_carry_the_running_cost() {
-        let mut feed = ActivityFeed::new(true);
+        let mut feed = ActivityFeed::new(SCOPE_ACTIVITY_MARKER, true);
         feed.begin_turn(0.5);
         let now = std::time::Instant::now();
         // An authoritative in-turn cost sample rides subsequent lines on top of the base.
@@ -2529,7 +2545,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
 
     #[test]
     fn activity_text_and_usage_share_one_rate_limit() {
-        let mut feed = ActivityFeed::new(true);
+        let mut feed = ActivityFeed::new(SCOPE_ACTIVITY_MARKER, true);
         let t0 = std::time::Instant::now();
         let text = AgentEvent::Text {
             delta: "working on the manifest".into(),
@@ -2563,7 +2579,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
 
     #[test]
     fn activity_text_caps_the_snippet_and_skips_whitespace() {
-        let mut feed = ActivityFeed::new(true);
+        let mut feed = ActivityFeed::new(SCOPE_ACTIVITY_MARKER, true);
         let now = std::time::Instant::now();
         assert!(
             feed.line_for(
@@ -2588,7 +2604,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
 
     #[test]
     fn activity_usage_estimates_cost_from_tokens_when_none_rides_the_event() {
-        let mut feed = ActivityFeed::new(true);
+        let mut feed = ActivityFeed::new(SCOPE_ACTIVITY_MARKER, true);
         let tokens = Tokens {
             output: 1000,
             total: 1000,
@@ -2610,7 +2626,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
 
     #[test]
     fn activity_relays_openshell_stage_banners_but_not_other_logs() {
-        let mut feed = ActivityFeed::new(true);
+        let mut feed = ActivityFeed::new(SCOPE_ACTIVITY_MARKER, true);
         let now = std::time::Instant::now();
         let stage = AgentEvent::Log {
             level: "stage".into(),
@@ -2635,7 +2651,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
 
     #[test]
     fn activity_budget_exhaustion_emits_one_truncation_line_then_silence() {
-        let mut feed = ActivityFeed::new(true);
+        let mut feed = ActivityFeed::new(SCOPE_ACTIVITY_MARKER, true);
         feed.bytes_left = 120; // room for roughly one line
         let now = std::time::Instant::now();
         let mut lines = Vec::new();

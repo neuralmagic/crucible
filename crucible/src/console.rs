@@ -87,7 +87,7 @@ impl Reporter for ConsoleReporter {
                 turn.completed_turns + 1
             );
         }
-        let cost = agent::run_turn_with_session(
+        let turn = agent::run_turn_with_session(
             args,
             p,
             crate::agent_session::effective_prompt(prepared.as_ref(), prompt, resume_prompt),
@@ -127,6 +127,12 @@ impl Reporter for ConsoleReporter {
                 }
             },
         );
+        // The turn's own failure channel: a transport that never produced a turn is an error
+        // even when no event carried one.
+        if let Some(failure) = turn.failure() {
+            is_error = true;
+            error = Some(failure.to_string());
+        }
         if let Some(note) =
             crate::agent_session::commit_if_ok(&p.state, prepared.as_ref(), !is_error)
         {
@@ -134,7 +140,7 @@ impl Reporter for ConsoleReporter {
             error = Some(note);
         }
         AgentTurn {
-            cost,
+            cost: turn.cost_usd,
             is_error,
             error,
         }
