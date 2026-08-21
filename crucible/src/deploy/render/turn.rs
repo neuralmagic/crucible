@@ -186,18 +186,22 @@ pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
             format!("{INGEST_TOKEN_DIR}/token"),
         ));
         // The pod learns its own name from the downward API, so the `{pod}` path segment it POSTs to
-        // equals the token's bound-pod claim by construction (pod-binding = turn-scoping).
-        env.push(core::EnvVar {
-            name: crucible_contract::ENV_POD_NAME.to_string(),
+        // equals the token's bound-pod claim by construction (pod-binding = turn-scoping). The uid
+        // rides along so the in-pod gateway can own the objects it publishes, which is what gets
+        // them garbage-collected with the turn.
+        let downward = |name: &str, field_path: &str| core::EnvVar {
+            name: name.to_string(),
             value: None,
             value_from: Some(core::EnvVarSource {
                 field_ref: Some(core::ObjectFieldSelector {
-                    field_path: "metadata.name".to_string(),
+                    field_path: field_path.to_string(),
                     api_version: None,
                 }),
                 ..Default::default()
             }),
-        });
+        };
+        env.push(downward(crucible_contract::ENV_POD_NAME, "metadata.name"));
+        env.push(downward("CRUCIBLE_POD_UID", "metadata.uid"));
     }
 
     let TurnOpts {
@@ -639,6 +643,10 @@ mod tests {
         assert!(yaml.contains("CRUCIBLE_INGEST_TOKEN_PATH"));
         assert!(yaml.contains("CRUCIBLE_POD_NAME"));
         assert!(yaml.contains("metadata.name"), "downward-API pod name");
+        // The uid is what lets the in-pod gateway own what it publishes, so that material is
+        // collected with the turn instead of outliving it.
+        assert!(yaml.contains("CRUCIBLE_POD_UID"));
+        assert!(yaml.contains("metadata.uid"), "downward-API pod uid");
         // The projected, audience-locked token volume + its read-only mount.
         assert!(yaml.contains("crucible-ingest-token"));
         assert!(yaml.contains("audience: crucible-ingest"));
