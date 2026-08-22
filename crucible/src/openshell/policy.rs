@@ -22,6 +22,14 @@ use crate::manifest::OpenshellCfg;
 /// Built-in egress endpoints in openshell's `host:port:access[:proto[:enforcement]]` form.
 /// No protocol is given, so these are L4-only (CONNECT tunneling): `protocol=rest` would
 /// enable L7 inspection, which blocks the CONNECT that Vertex streaming/gRPC clients use.
+/// The Vertex hosts a claude turn's access token is scoped to. The `google-cloud` provider profile
+/// declares no endpoints, so its credential is only delivered to a sandbox when a policy endpoint
+/// names the provider: unbound, openshell fails closed and the sandbox's metadata emulator answers
+/// 503 with no token. Must stay a subset of the aiplatform hosts in `DEFAULT_ENDPOINTS`, matched
+/// there by exact host and port.
+pub const VERTEX_CREDENTIAL_HOSTS: &[&str] =
+    &["aiplatform.googleapis.com", "*.aiplatform.googleapis.com"];
+
 pub const DEFAULT_ENDPOINTS: &[&str] = &[
     "github.com:443:full",
     "*.github.com:443:full",
