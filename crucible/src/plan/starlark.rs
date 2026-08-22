@@ -87,6 +87,14 @@ impl PathKind {
         }
     }
 
+    /// The constructor the author wrote, quoted back in the diagnostic.
+    fn call(self) -> &'static str {
+        match self {
+            PathKind::Prompt => "prompt_file",
+            PathKind::Module => "load",
+        }
+    }
+
     fn resolving(self) -> &'static str {
         match self {
             PathKind::Prompt => "resolving prompt file",
@@ -107,50 +115,38 @@ enum PathRejection {
     File(FileError),
 }
 
-impl PathRejection {
-    fn prompt(self, raw: &str) -> CompileError {
+impl std::fmt::Display for PathRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PathRejection::Empty => CompileError::PromptPathEmpty,
-            PathRejection::Traversal => CompileError::PromptPathTraversal,
-            PathRejection::Symlink => CompileError::PromptSymlink {
-                raw: raw.to_owned(),
-            },
-            PathRejection::HardLink { links } => CompileError::PromptHardLink {
-                raw: raw.to_owned(),
-                links,
-            },
-            PathRejection::NotRegularFile => CompileError::PromptNotRegularFile {
-                raw: raw.to_owned(),
-            },
-            PathRejection::EscapesPack => CompileError::PromptEscapesPack {
-                raw: raw.to_owned(),
-            },
-            PathRejection::File(error) => CompileError::File(error),
+            PathRejection::Empty => f.write_str("path must be a non-empty pack-relative path"),
+            PathRejection::Traversal => f.write_str("may not contain `..` or escape the pack"),
+            PathRejection::Symlink => f.write_str("may not traverse symlinks"),
+            PathRejection::HardLink { links } => write!(
+                f,
+                "has {links} names; a pack's files have one. A second name is how a file outside \
+                 the pack is read from inside it, and resolving the path cannot see it"
+            ),
+            PathRejection::NotRegularFile => f.write_str("must name a regular, non-symlink file"),
+            PathRejection::EscapesPack => f.write_str("escapes the pack directory"),
+            PathRejection::File(error) => write!(f, "{error}"),
         }
     }
+}
 
-    fn module(self, raw: &str) -> CompileError {
+impl PathRejection {
+    /// Phrase the refusal for whichever constructor asked.
+    ///
+    /// `prompt_file` and `load` used to carry parallel sets of error variants differing only in
+    /// that word, which meant every new refusal had to be added twice, and the hard-link one
+    /// nearly was not. The reason is the enum's own Display; the caller only supplies its name.
+    fn at(self, kind: PathKind, raw: &str) -> CompileError {
         match self {
-            PathRejection::Empty => CompileError::LoadPathEmpty {
-                raw: raw.to_owned(),
-            },
-            PathRejection::Traversal => CompileError::LoadPathTraversal {
-                raw: raw.to_owned(),
-            },
-            PathRejection::Symlink => CompileError::LoadSymlink {
-                raw: raw.to_owned(),
-            },
-            PathRejection::HardLink { links } => CompileError::LoadHardLink {
-                raw: raw.to_owned(),
-                links,
-            },
-            PathRejection::NotRegularFile => CompileError::LoadNotRegularFile {
-                raw: raw.to_owned(),
-            },
-            PathRejection::EscapesPack => CompileError::LoadEscapesPack {
-                raw: raw.to_owned(),
-            },
             PathRejection::File(error) => CompileError::File(error),
+            why => CompileError::PathRejected {
+                call: kind.call(),
+                raw: raw.to_owned(),
+                why: why.to_string(),
+            },
         }
     }
 }
@@ -211,7 +207,7 @@ impl CompileContext {
     fn prompt_file(&mut self, raw: &str) -> Result<String> {
         let (relative, canonical) = self
             .resolve_in_pack(raw, PathKind::Prompt)
-            .map_err(|rejection| rejection.prompt(raw))?;
+            .map_err(|rejection| rejection.at(PathKind::Prompt, raw))?;
         // Size comes from the directory entry, before the bytes are read. Reading a file whole
         // and refusing it afterwards is the read the limit exists to prevent.
         let declared = std::fs::metadata(&canonical)
@@ -382,30 +378,10 @@ pub enum CompileError {
     #[error("serializing the compiled workflow")]
     Json(#[from] serde_json::Error),
 
-    #[error("prompt_file({raw:?}) may not traverse symlinks")]
-    PromptSymlink { raw: String },
-    #[error("prompt_file({raw:?}) must name a regular, non-symlink file")]
-    PromptNotRegularFile { raw: String },
-    #[error("prompt_file({raw:?}) escapes the pack directory")]
-    PromptEscapesPack { raw: String },
     #[error("prompt_file({raw:?}) is {bytes} bytes; maximum is {MAX_PROMPT_BYTES}")]
     PromptTooLarge { raw: String, bytes: usize },
     #[error("workflow embeds more than {MAX_TOTAL_PROMPT_BYTES} bytes of prompt files")]
     PromptBudgetSpent,
-    #[error("prompt_file path must be a non-empty pack-relative path")]
-    PromptPathEmpty,
-    #[error("prompt_file path may not contain `..` or escape the pack")]
-    PromptPathTraversal,
-    #[error(
-        "prompt_file({raw:?}) has {links} names; a pack's files have one. A second name is how a \
-         file outside the pack is read from inside it, and resolving the path cannot see it."
-    )]
-    PromptHardLink { raw: String, links: u64 },
-    #[error(
-        "load({raw:?}) has {links} names; a pack's files have one. A second name is how a file \
-         outside the pack is read from inside it, and resolving the path cannot see it."
-    )]
-    LoadHardLink { raw: String, links: u64 },
 
     #[error(
         "an argument nests {depth} levels deep; maximum is {MAX_NESTING_DEPTH}. A loop can build \
@@ -443,6 +419,12 @@ pub enum CompileError {
         suggestion: Option<String>,
         declared: String,
     },
+    #[error("{call}({raw:?}) {why}")]
+    PathRejected {
+        call: &'static str,
+        raw: String,
+        why: String,
+    },
     #[error("workflow evaluation failed: {0}")]
     Eval(String),
     #[error("workflow evaluation called fail(): {0}")]
@@ -450,16 +432,6 @@ pub enum CompileError {
     #[error("{function} expands to {count} tasks; maximum is {MAX_TASKS}")]
     TooManyTasks { function: String, count: usize },
 
-    #[error("load({raw:?}) path must be a non-empty pack-relative path")]
-    LoadPathEmpty { raw: String },
-    #[error("load({raw:?}) may not contain `..` or escape the pack")]
-    LoadPathTraversal { raw: String },
-    #[error("load({raw:?}) may not traverse symlinks")]
-    LoadSymlink { raw: String },
-    #[error("load({raw:?}) must name a regular, non-symlink file")]
-    LoadNotRegularFile { raw: String },
-    #[error("load({raw:?}) escapes the pack directory")]
-    LoadEscapesPack { raw: String },
     #[error("workflow loads more than {MAX_LOAD_MODULES} modules")]
     LoadBudgetSpent,
     #[error("load({raw:?}) forms a cycle")]

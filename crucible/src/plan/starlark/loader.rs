@@ -96,7 +96,7 @@ impl Resolver<'_, '_> {
             .state
             .context_mut()
             .resolve_in_pack(raw, dsl::PathKind::Module)
-            .map_err(|rejection| located(rejection.module(raw)))?;
+            .map_err(|rejection| located(rejection.at(dsl::PathKind::Module, raw)))?;
         if self.active.contains(&canonical) {
             return Err(located(dsl::CompileError::LoadCycle {
                 raw: raw.to_owned(),
