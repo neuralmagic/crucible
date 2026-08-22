@@ -50,6 +50,7 @@ changed = [
     "deps() is removed: depends_on already accepts task values, so the wrapper was ceremony",
     "the declared lane scopes the constructor namespace, so a playbook cannot name or be offered a scored constructor",
     "session log gains asks_emitted, so what a run proposed is auditable apart from what an orchestrator admitted",
+    "skill joins the enumerated constructors: an agent task whose prompt is assembled from a shipped SKILL.md and the invocation's arguments",
 ]
 
 [[changelog]]

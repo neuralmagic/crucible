@@ -372,6 +372,8 @@ enum Value {
     String(String),
     /// Text whose spans remember whether they came from outside the pack.
     External(Vec<values::Segment>),
+    /// A dictionary, ordered by key so a rendered prompt is the same on every compile.
+    Map(BTreeMap<String, Value>),
     List(Vec<Value>),
     Task(Task),
     /// `producer.field`, already checked against the producer's declared emits.
@@ -637,6 +639,12 @@ pub enum CompileError {
          to the task as a file or an environment variable instead of building it into {argument:?}."
     )]
     ExternalOutsidePrompt { argument: String },
+    #[error("task {task:?} argument \"args\" must be a dictionary")]
+    SkillArgsNotDict { task: String },
+    #[error("task {task:?} argument {key:?} is not something a prompt can render")]
+    SkillArgNotRenderable { task: String, key: String },
+    #[error("a dictionary key must be a string")]
+    DictKeyNotString,
     #[error("\"emits_files\" must be a list of workspace-relative path strings")]
     EmitsFilesNotList,
     #[error(
@@ -728,6 +736,7 @@ pub enum MaterializeError {
 const COMMON_FUNCTIONS: &[&str] = &[
     "agent",
     "command",
+    "skill",
     "evaluate",
     "param",
     "prompt_file",
@@ -765,6 +774,25 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
         "agent" => &[
             "name",
             "prompt",
+            "harness",
+            "model",
+            "effort",
+            "session",
+            "emits",
+            "depends_on",
+            "needs",
+            "required",
+            "isolated",
+            "join",
+            "stage",
+            "over",
+            "max_fanout",
+            "emits_files",
+        ],
+        "skill" => &[
+            "name",
+            "skill",
+            "args",
             "harness",
             "model",
             "effort",
@@ -888,9 +916,13 @@ fn constructor(
     }
 
     let task = match function {
-        "agent" => {
+        "agent" | "skill" => {
             let name = TaskName(take_string(&mut named, "name")?);
-            let prompt = take_prompt(&mut named, "prompt")?;
+            let prompt = if function == "skill" {
+                skill_prompt(&mut named, state, &name.0)?
+            } else {
+                take_prompt(&mut named, "prompt")?
+            };
             let mut harness = take_optional_string(&mut named, "harness")?;
             let mut model = take_optional_string(&mut named, "model")?;
             let mut effort = take_optional_string(&mut named, "effort")?;
@@ -1390,22 +1422,109 @@ const EXTERNAL_CLOSE: &str = "\n<<<END EXTERNAL INPUT>>>\n";
 fn take_prompt(named: &mut BTreeMap<String, Value>, name: &str) -> Result<String> {
     match take_value(named, name)? {
         Value::String(value) => Ok(value),
-        Value::External(segments) => {
-            let mut prompt = String::new();
-            for segment in segments {
-                if segment.external {
-                    prompt.push_str(EXTERNAL_OPEN);
-                    // A span that contains the closing marker could otherwise end the region
-                    // early and have the rest read as instructions.
-                    prompt.push_str(&segment.text.replace(EXTERNAL_CLOSE.trim(), ""));
-                    prompt.push_str(EXTERNAL_CLOSE);
-                } else {
-                    prompt.push_str(&segment.text);
-                }
-            }
-            Ok(prompt)
-        }
+        Value::External(segments) => Ok(render_prompt(&segments)),
         _ => Err(wrong_type(name, "a string")),
+    }
+}
+
+/// Assemble a prompt, marking every span that came from outside the pack.
+fn render_prompt(segments: &[values::Segment]) -> String {
+    let mut prompt = String::new();
+    for segment in segments {
+        if segment.external {
+            prompt.push_str(EXTERNAL_OPEN);
+            // A span containing the closing marker could otherwise end the region early and
+            // have the rest of itself read as instructions.
+            prompt.push_str(&segment.text.replace(EXTERNAL_CLOSE.trim(), ""));
+            prompt.push_str(EXTERNAL_CLOSE);
+        } else {
+            prompt.push_str(&segment.text);
+        }
+    }
+    prompt
+}
+
+/// The file a skill's instructions live in, inside the directory the task names.
+const SKILL_FILE: &str = "SKILL.md";
+
+/// Build a skill task's prompt: the skill's own instructions, then the arguments this
+/// invocation supplies.
+///
+/// A skill is a named, reusable phase. Naming it beats inlining the same prompt in three packs,
+/// and the arguments are rendered rather than interpolated so an argument that came from outside
+/// the pack is still marked as such.
+fn skill_prompt(
+    named: &mut BTreeMap<String, Value>,
+    state: &CompileState,
+    task: &str,
+) -> Result<String> {
+    let directory = take_string(named, "skill")?;
+    let path = format!("{}/{SKILL_FILE}", directory.trim_end_matches('/'));
+    let body = state.context_mut().prompt_file(&path)?;
+
+    let mut segments = vec![values::Segment {
+        text: body,
+        external: false,
+    }];
+    let args = match named.remove("args") {
+        None | Some(Value::None) => BTreeMap::new(),
+        Some(Value::Map(args)) => args,
+        Some(_) => {
+            return Err(CompileError::SkillArgsNotDict {
+                task: task.to_owned(),
+            });
+        }
+    };
+    if !args.is_empty() {
+        segments.push(values::Segment {
+            text: "\n\n## Inputs\n\n".to_string(),
+            external: false,
+        });
+        for (key, value) in args {
+            segments.push(values::Segment {
+                text: format!("- {key}: "),
+                external: false,
+            });
+            segments.extend(argument_segments(&value, task, &key)?);
+            segments.push(values::Segment {
+                text: "\n".to_string(),
+                external: false,
+            });
+        }
+    }
+    Ok(render_prompt(&segments))
+}
+
+fn argument_segments(value: &Value, task: &str, key: &str) -> Result<Vec<values::Segment>> {
+    let plain = |text: String| {
+        Ok(vec![values::Segment {
+            text,
+            external: false,
+        }])
+    };
+    match value {
+        Value::String(text) => plain(text.clone()),
+        Value::Int(n) => plain(n.to_string()),
+        Value::Float(n) => plain(n.to_string()),
+        Value::Bool(b) => plain(b.to_string()),
+        Value::External(segments) => Ok(segments.clone()),
+        Value::List(items) => {
+            let mut out = Vec::new();
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(values::Segment {
+                        text: ", ".to_string(),
+                        external: false,
+                    });
+                }
+                out.extend(argument_segments(item, task, key)?);
+            }
+            Ok(out)
+        }
+        _ => Err(CompileError::SkillArgNotRenderable {
+            task: task.to_owned(),
+            key: key.to_owned(),
+        }),
     }
 }
 
@@ -2654,6 +2773,8 @@ workflow(type = "custom", tasks = [e], result = e)
     #[test]
     fn every_declared_kwarg_compiles_and_an_unlisted_one_errors() {
         let pack = temp_pack("kwarg-slices");
+        std::fs::create_dir_all(pack.join("skills/demo")).unwrap();
+        std::fs::write(pack.join("skills/demo/SKILL.md"), "demo\n").unwrap();
         let cases: &[(&str, &str)] = &[
             (
                 "agent",
@@ -2666,6 +2787,10 @@ workflow(type = "custom", tasks = [e], result = e)
             (
                 "evaluate",
                 "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\ne = evaluate(name = \"e\", run = \"true\", threshold = 1, direction = \"higher\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4{extra})\nworkflow(type = \"custom\", tasks = [u, e], result = e)\n",
+            ),
+            (
+                "skill",
+                "s = session(name = \"sess\")\nu = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = skill(name = \"a\", skill = \"skills/demo\", args = {\"k\": 1}, harness = \"claude\", model = \"m\", effort = \"high\", session = s, emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
             ),
             (
                 "top_k",
@@ -3394,6 +3519,122 @@ workflow(type = "playbook", tasks = [a])
                 "{what}: {error}"
             );
         }
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// A skill is a named, reusable phase: its instructions live in a file the pack ships, and
+    /// an invocation supplies the arguments. Naming it beats inlining the same prompt in three
+    /// packs, and rendering the arguments rather than interpolating them keeps an argument that
+    /// came from outside the pack marked as such.
+    #[test]
+    fn a_skill_builds_its_prompt_from_the_file_and_its_arguments() {
+        let pack = temp_pack("skill");
+        std::fs::create_dir_all(pack.join("skills/analyze")).unwrap();
+        std::fs::write(
+            pack.join("skills/analyze/SKILL.md"),
+            "# Analyze\n\nRead it and write SPEC.md.\n",
+        )
+        .unwrap();
+        let source = r#"
+params = {
+    "url": {"type": "string", "required": True},
+    "verifier": {"type": "string", "default": "qwen"},
+    "rounds": {"type": "int", "default": 3},
+}
+a = skill(
+    name = "a",
+    skill = "skills/analyze",
+    args = {"url": param("url"), "verifier": param("verifier"), "rounds": param("rounds")},
+    emits_files = ["SPEC.md"],
+)
+workflow(type = "playbook", tasks = [a])
+"#;
+        let supplied = BTreeMap::from([("url".to_string(), "https://x.test/p".to_string())]);
+        let compiled = compile_source_with(source, &pack.join("workflow.star"), &pack, &supplied)
+            .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
+        let task = &compiled.workflow.tasks[0];
+        let TaskKind::Agent { prompt, .. } = &task.task else {
+            panic!("a skill is an agent task")
+        };
+
+        // The skill's own instructions lead, then this invocation's arguments.
+        assert!(prompt.starts_with("# Analyze\n"), "{prompt}");
+        assert!(prompt.contains("## Inputs"), "{prompt}");
+        // Ordered by key, so two compiles of one source render identically and the frozen
+        // artifact's digest does not move for a reason nobody wrote.
+        let inputs = &prompt[prompt.find("## Inputs").unwrap()..];
+        let order: Vec<usize> = ["rounds", "url", "verifier"]
+            .iter()
+            .map(|k| {
+                inputs
+                    .find(&format!("- {k}: "))
+                    .unwrap_or_else(|| panic!("{k}: {inputs}"))
+            })
+            .collect();
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "{inputs}");
+        assert!(inputs.contains("- verifier: qwen\n"), "{inputs}");
+        assert!(inputs.contains("- rounds: 3\n"), "{inputs}");
+
+        // A supplied argument stays marked; a defaulted one does not.
+        let open = prompt.find(EXTERNAL_OPEN).expect("the url was not marked");
+        let close = prompt.find(EXTERNAL_CLOSE).expect("no end marker");
+        assert_eq!(
+            &prompt[open + EXTERNAL_OPEN.len()..close],
+            "https://x.test/p"
+        );
+        assert_eq!(prompt.matches(EXTERNAL_OPEN).count(), 1, "{prompt}");
+
+        // It is an ordinary agent task in every other respect.
+        assert_eq!(task.emits_files, ["SPEC.md"]);
+        assert_eq!(
+            compiled.prompt_files,
+            [PathBuf::from("skills/analyze/SKILL.md")]
+        );
+
+        // A skill with no arguments is just its file.
+        let bare = "a = skill(name = \"a\", skill = \"skills/analyze\")\nworkflow(type = \"playbook\", tasks = [a])\n";
+        let compiled =
+            compile_source_with(bare, &pack.join("workflow.star"), &pack, &BTreeMap::new())
+                .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
+        let TaskKind::Agent { prompt, .. } = &compiled.workflow.tasks[0].task else {
+            panic!("expected an agent task")
+        };
+        assert_eq!(prompt, "# Analyze\n\nRead it and write SPEC.md.\n");
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// A skill names a directory under the pack; the confinement is prompt_file's, because it
+    /// is prompt_file that reads it.
+    #[test]
+    fn a_skill_is_confined_to_the_pack_like_any_other_prompt() {
+        let pack = temp_pack("skill-refused");
+        let cases = [
+            ("skills/absent", "reading prompt"),
+            ("../outside", "may not contain"),
+            ("/etc", "non-empty pack-relative"),
+        ];
+        for (directory, expected) in cases {
+            let source = format!(
+                "a = skill(name = \"a\", skill = {directory:?})\nworkflow(type = \"playbook\", tasks = [a])\n"
+            );
+            let error = crate::errors::report(
+                &compile_source(&source, &pack.join("workflow.star"), &pack)
+                    .err()
+                    .unwrap_or_else(|| panic!("{directory}: compiled")),
+            );
+            assert!(error.contains(expected), "{directory}: {error}");
+        }
+
+        // `args` has to be a dictionary, and its values have to be renderable.
+        std::fs::create_dir_all(pack.join("skills/ok")).unwrap();
+        std::fs::write(pack.join("skills/ok/SKILL.md"), "do it\n").unwrap();
+        let not_a_dict = "a = skill(name = \"a\", skill = \"skills/ok\", args = [1])\nworkflow(type = \"playbook\", tasks = [a])\n";
+        let error = crate::errors::report(
+            &compile_source(not_a_dict, &pack.join("workflow.star"), &pack).unwrap_err(),
+        );
+        assert!(error.contains("must be a dictionary"), "{error}");
+
         let _ = std::fs::remove_dir_all(&pack);
     }
 

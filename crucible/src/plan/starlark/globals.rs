@@ -9,6 +9,7 @@ use starlark::collections::SmallMap;
 use starlark::environment::GlobalsBuilder;
 use starlark::eval::Evaluator;
 use starlark::starlark_module;
+use starlark::values::dict::DictRef;
 use starlark::values::float::StarlarkFloat;
 use starlark::values::list::{AllocList, ListRef};
 use starlark::values::tuple::{TupleRef, UnpackTuple};
@@ -65,6 +66,14 @@ pub(crate) fn common(builder: &mut GlobalsBuilder) {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Value<'v>> {
         dispatch("prompt_file", args, kwargs, eval)
+    }
+
+    fn skill<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("skill", args, kwargs, eval)
     }
 
     fn session<'v>(
@@ -294,6 +303,18 @@ fn convert_at(value: Value<'_>, depth: usize) -> dsl::Result<dsl::Value> {
             .collect::<dsl::Result<Vec<_>>>()
             .map(dsl::Value::List);
     }
+    if let Some(dict) = DictRef::from_value(value) {
+        // Ordered by key, so two compiles of one source render a prompt identically and the
+        // frozen artifact's hash does not move for a reason nobody wrote.
+        return dict
+            .iter()
+            .map(|(key, value)| match key.unpack_str() {
+                Some(key) => Ok((key.to_owned(), convert_at(value, depth + 1)?)),
+                None => Err(dsl::CompileError::DictKeyNotString),
+            })
+            .collect::<dsl::Result<BTreeMap<String, dsl::Value>>>()
+            .map(dsl::Value::Map);
+    }
     if let Some(external) = ExternalText::from_value(value) {
         return Ok(dsl::Value::External(external.0.clone()));
     }
@@ -337,6 +358,8 @@ fn alloc_at<'v>(heap: Heap<'v>, value: dsl::Value, depth: usize) -> Value<'v> {
             heap.alloc(AllocList(items))
         }
         dsl::Value::External(segments) => heap.alloc(ExternalText(segments)),
+        // A dictionary never travels back out: the constructors consume it.
+        dsl::Value::Map(_) => Value::new_none(),
         dsl::Value::Task(task) => heap.alloc(TaskValue(task)),
         dsl::Value::Output(reference) => heap.alloc(OutputRefValue {
             declared: vec![reference.field.0.clone()],
