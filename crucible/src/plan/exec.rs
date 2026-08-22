@@ -65,6 +65,13 @@ pub trait TaskRunner {
     /// batches tasks that are simultaneously ready, so items never depend on each other.
     /// The default runs them serially through [`TaskRunner::run`]; a runner that can
     /// parallelize (per-task worktrees) overrides this.
+    /// Stage every declared file produced by the tasks named, into the workspace this task is
+    /// about to run in. An error refuses the dispatch rather than running a task whose inputs
+    /// are not there.
+    fn stage(&mut self, _task: &Task, _producers: &[&Task]) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Called once per task after it settles, with whether it passed. A runner that owns
     /// durable state records what a passing task did and drops what a failing one did; the
     /// default keeps nothing, which is what a stateless runner wants.
@@ -194,6 +201,24 @@ pub struct PlanOutcome {
 /// The tasks that can run on this substrate. Runnability is transitive: `needs` satisfied and
 /// every dependency runnable. Computed for the whole plan before anything dispatches, so
 /// truncation costs zero spend; the CLI preview folds the same set so it can't drift.
+/// Every task reachable backwards from `task`, in topological order.
+///
+/// Declared files stage from every ancestor, not only direct dependencies: a pipeline whose
+/// third stage needs the first stage's artifact is the ordinary case, and requiring each hop to
+/// re-emit what it received would reproduce by hand the state files this replaces.
+fn ancestors<'a>(plan: &'a ValidPlan, task: &Task) -> Vec<&'a Task> {
+    let mut wanted: BTreeSet<&TaskName> = task.depends_on.iter().collect();
+    let mut found = Vec::new();
+    for candidate in plan.tasks_topo().collect::<Vec<_>>().into_iter().rev() {
+        if wanted.contains(&candidate.name) {
+            wanted.extend(candidate.depends_on.iter());
+            found.push(candidate);
+        }
+    }
+    found.reverse();
+    found
+}
+
 pub(crate) fn runnable_set<'a>(
     plan: &'a ValidPlan,
     substrate: &Substrate,
@@ -370,6 +395,20 @@ pub fn execute(
                 .collect::<BTreeMap<TaskName, Value>>()
         };
 
+        // Inputs are staged before anything is dispatched. A task whose declared inputs are not
+        // there has not failed, it was never runnable, so this refuses rather than reports.
+        if let Some(first) = dispatch.first() {
+            let producers = ancestors(plan, first);
+            if producers.iter().any(|p| !p.emits_files.is_empty())
+                && let Err(why) = runner.stage(first, &producers)
+            {
+                let r = TaskResult::undispatched(TaskStatus::Blocked, why);
+                let first = *first;
+                record(first, r, &mut results, &mut halted, true);
+                continue;
+            }
+        }
+
         if let Some(node) = dispatch.first().filter(|t| t.over.is_some()) {
             let node = *node;
             let base = inputs_for(node, &results);
@@ -390,6 +429,7 @@ pub fn execute(
                         .iter()
                         .map(|key| Task {
                             name: instance_name(&node.name, key),
+                            emits_files: Vec::new(),
                             over: None,
                             max_fanout: None,
                             ..node.clone()
@@ -964,6 +1004,7 @@ mod tests {
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
+            emits_files: Vec::new(),
             over: None,
             max_fanout: None,
         }
@@ -1393,6 +1434,7 @@ mod tests {
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
+            emits_files: Vec::new(),
             over: None,
             max_fanout: None,
         });
@@ -1450,6 +1492,7 @@ mod tests {
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
+            emits_files: Vec::new(),
             over: None,
             max_fanout: None,
         });
@@ -1640,6 +1683,7 @@ mod tests {
             join: Join::Passed,
             stage: Stage::Iteration,
             emits: Vec::new(),
+            emits_files: Vec::new(),
             over: None,
             max_fanout: None,
         };

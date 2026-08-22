@@ -289,6 +289,7 @@ mod tests {
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
+            emits_files: Vec::new(),
             over: None,
             max_fanout: None,
         }
@@ -308,6 +309,7 @@ mod tests {
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
+            emits_files: Vec::new(),
             over: None,
             max_fanout: None,
         }
@@ -392,6 +394,7 @@ mod tests {
             join: Join::All,
             stage: Stage::Iteration,
             emits: Vec::new(),
+            emits_files: Vec::new(),
             over: None,
             max_fanout: None,
         };
@@ -422,6 +425,7 @@ mod tests {
             join: Join::All,
             stage: Stage::Iteration,
             emits: Vec::new(),
+            emits_files: Vec::new(),
             over: None,
             max_fanout: None,
         };
@@ -459,6 +463,7 @@ mod tests {
             join: Join::All,
             stage: Stage::Iteration,
             emits: Vec::new(),
+            emits_files: Vec::new(),
             over: None,
             max_fanout: None,
         };
@@ -485,6 +490,7 @@ mod tests {
             join: Join::All,
             stage: Stage::Iteration,
             emits: Vec::new(),
+            emits_files: Vec::new(),
             over: None,
             max_fanout: None,
         };
@@ -519,6 +525,7 @@ mod tests {
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
+            emits_files: Vec::new(),
             over: None,
             max_fanout: None,
         };
@@ -545,6 +552,7 @@ mod tests {
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
+            emits_files: Vec::new(),
             over: None,
             max_fanout: None,
         };
@@ -597,6 +605,7 @@ mod tests {
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
+            emits_files: Vec::new(),
             over: None,
             max_fanout: None,
         };
@@ -622,6 +631,7 @@ mod tests {
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
+            emits_files: Vec::new(),
             over: None,
             max_fanout: None,
         };

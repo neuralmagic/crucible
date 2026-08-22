@@ -232,6 +232,11 @@ pub struct Task {
     /// undeclared.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub emits: Vec<OutputField>,
+    /// Workspace-relative paths this task's output includes as files. A declared file is part
+    /// of the task's output, not part of the workspace state that isolation discards, so a
+    /// dependent receives it either way.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub emits_files: Vec<String>,
     /// An upstream list this task runs once per element of. The task is one node in the graph
     /// however many elements arrive, so the graph stays renderable before any spend; only the
     /// number of instances is decided at run time.
@@ -655,6 +660,7 @@ mod tests {
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
+            emits_files: Vec::new(),
             over: None,
             max_fanout: None,
         }
@@ -805,6 +811,7 @@ mod tests {
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
+            emits_files: Vec::new(),
             over: None,
             max_fanout: None,
         };
@@ -931,6 +938,7 @@ mod tests {
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
+            emits_files: Vec::new(),
             over: None,
             max_fanout: None,
         }

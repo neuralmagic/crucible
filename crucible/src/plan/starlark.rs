@@ -609,6 +609,13 @@ pub enum CompileError {
          `over = producer.field`"
     )]
     OverNotOutputField,
+    #[error("\"emits_files\" must be a list of workspace-relative path strings")]
+    EmitsFilesNotList,
+    #[error(
+        "emits_files entry {path:?} is not workspace-relative; a declared output cannot be an \
+         absolute path or reach outside the workspace with `..`"
+    )]
+    EmitsFileNotRelative { path: String },
     #[error("\"max_fanout\" must be an integer")]
     FanoutNotInteger,
     #[error("max_fanout = {got} is outside 1..={MAX_FANOUT_CEILING}")]
@@ -743,6 +750,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "stage",
             "over",
             "max_fanout",
+            "emits_files",
         ],
         "command" => &[
             "name",
@@ -756,6 +764,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "stage",
             "over",
             "max_fanout",
+            "emits_files",
         ],
         "evaluate" => &[
             "name",
@@ -771,6 +780,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "stage",
             "over",
             "max_fanout",
+            "emits_files",
         ],
         "top_k" => &["name", "k", "direction", "depends_on", "required"],
         "propose" => &["name", "session", "depends_on"],
@@ -937,6 +947,7 @@ fn constructor(
                 join: Join::Passed,
                 stage: Stage::Iteration,
                 emits: Vec::new(),
+                emits_files: Vec::new(),
                 over: None,
                 max_fanout: None,
             }
@@ -1175,6 +1186,7 @@ fn dsl_task(
         join: parse_join(&take_string_default(named, "join", "all")?)?,
         stage: parse_stage(&take_string_default(named, "stage", "iteration")?)?,
         emits: take_output_fields(named)?,
+        emits_files: take_emitted_files(named)?,
         over: take_over(named)?,
         max_fanout: take_optional_fanout(named)?,
     };
@@ -1212,6 +1224,27 @@ fn check_fanout(task: &Task) -> Result<()> {
 /// The maximum a pack may declare for `max_fanout`. Operator-owned, not author-owned: a bound a
 /// pack could raise is not a bound.
 pub(crate) const MAX_FANOUT_CEILING: u32 = 256;
+
+/// The paths a task promises as output. Shape is checked here, where the author wrote them: an
+/// absolute path or a `..` cannot be a workspace-relative output whatever the filesystem says.
+fn take_emitted_files(named: &mut BTreeMap<String, Value>) -> Result<Vec<String>> {
+    let Some(value) = named.remove("emits_files") else {
+        return Ok(Vec::new());
+    };
+    let Value::List(items) = value else {
+        return Err(CompileError::EmitsFilesNotList);
+    };
+    let mut paths = Vec::new();
+    for item in items {
+        let Value::String(path) = item else {
+            return Err(CompileError::EmitsFilesNotList);
+        };
+        let relative = safe_relative_path(&path)
+            .map_err(|_| CompileError::EmitsFileNotRelative { path: path.clone() })?;
+        paths.push(relative.display().to_string());
+    }
+    Ok(paths)
+}
 
 fn take_over(named: &mut BTreeMap<String, Value>) -> Result<Option<OutputRef>> {
     match named.remove("over") {
@@ -1256,6 +1289,7 @@ fn engine(name: &str, op: EngineOp, source: Option<TaskName>, depends_on: Vec<Ta
         join: Join::All,
         stage: Stage::Iteration,
         emits: Vec::new(),
+        emits_files: Vec::new(),
         over: None,
         max_fanout: None,
     }
@@ -2549,15 +2583,15 @@ workflow(type = "custom", tasks = [e], result = e)
         let cases: &[(&str, &str)] = &[
             (
                 "agent",
-                "s = session(name = \"sess\")\nu = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = agent(name = \"a\", prompt = \"p\", harness = \"claude\", model = \"m\", effort = \"high\", session = s, emits = [\"score\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
+                "s = session(name = \"sess\")\nu = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = agent(name = \"a\", prompt = \"p\", harness = \"claude\", model = \"m\", effort = \"high\", session = s, emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
             ),
             (
                 "command",
-                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\nc = command(name = \"c\", run = \"true\", emits = [\"score\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4{extra})\nworkflow(type = \"custom\", tasks = [u, c], result = c)\n",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\nc = command(name = \"c\", run = \"true\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4{extra})\nworkflow(type = \"custom\", tasks = [u, c], result = c)\n",
             ),
             (
                 "evaluate",
-                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\ne = evaluate(name = \"e\", run = \"true\", threshold = 1, direction = \"higher\", emits = [\"score\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4{extra})\nworkflow(type = \"custom\", tasks = [u, e], result = e)\n",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\ne = evaluate(name = \"e\", run = \"true\", threshold = 1, direction = \"higher\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4{extra})\nworkflow(type = \"custom\", tasks = [u, e], result = e)\n",
             ),
             (
                 "top_k",

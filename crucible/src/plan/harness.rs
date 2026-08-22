@@ -17,9 +17,74 @@ use crate::event::{AgentEvent, RawStream};
 use crate::plan::exec::{Attempt, AttemptOutcome, BatchItem, TaskRunner};
 use crate::plan::ir::{Isolation, Task, TaskKind, TaskName};
 use crate::plan::runner::ShellRunner;
+use std::path::{Path, PathBuf};
+
 use crate::{Args, Paths};
 
 const RESULT_FILE: &str = "PLAN_TASK_RESULT.json";
+
+/// Where a consumer finds what its ancestors declared. Under the workspace so a task reaches it
+/// with a relative path, and named so it is obviously not the task's own work.
+pub(crate) const STAGED_INPUTS: &str = "inputs";
+
+/// The most a single run may capture. Operator-owned, and the run's bound rather than any one
+/// task's: a pipeline that captures a little at every stage can still fill a disk.
+const MAX_CAPTURED_BYTES: u64 = 256 * 1024 * 1024;
+
+/// A declared path resolved inside the workspace, or why it is refused. Symlinks are refused per
+/// component and a second name is refused outright, for the same reason the pack's own paths are:
+/// resolving a path cannot see a hard link.
+fn confined(workspace: &Path, declared: &str) -> Result<PathBuf, String> {
+    let mut path = workspace.to_path_buf();
+    for component in Path::new(declared).components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(format!(
+                "declared file {declared:?} is not workspace-relative"
+            ));
+        };
+        path.push(component);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!("declared file {declared:?} traverses a symlink"));
+            }
+            Ok(metadata) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if metadata.is_file() && metadata.nlink() > 1 {
+                        return Err(format!(
+                            "declared file {declared:?} has {} names; a captured file has one",
+                            metadata.nlink()
+                        ));
+                    }
+                }
+                let _ = metadata;
+            }
+            Err(_) => {}
+        }
+    }
+    Ok(path)
+}
+
+fn captured_path(state: &Path, task: &str, declared: &str) -> PathBuf {
+    state.join("files").join(task).join(declared)
+}
+
+fn read_only(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444));
+    }
+    #[cfg(not(unix))]
+    {
+        if let Ok(metadata) = std::fs::metadata(path) {
+            let mut permissions = metadata.permissions();
+            permissions.set_readonly(true);
+            let _ = std::fs::set_permissions(path, permissions);
+        }
+    }
+}
 
 pub struct HarnessRunner {
     pub args: Args,
@@ -33,6 +98,35 @@ pub struct HarnessRunner {
 impl TaskRunner for HarnessRunner {
     fn run(&mut self, task: &Task, attempt: u32, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
         run_task(&self.args, &self.paths, task, attempt, inputs, None)
+    }
+
+    /// Stage every ancestor's captured files under `inputs/<producer>/`.
+    ///
+    /// Namespaced by producer so two tasks declaring the same path cannot collide, and made
+    /// read-only so a consumer cannot edit what it was handed and pass the edit on as if the
+    /// producer had said it.
+    fn stage(&mut self, _task: &Task, producers: &[&Task]) -> Result<(), String> {
+        let inputs = self.paths.workspace.join(STAGED_INPUTS);
+        let _ = std::fs::remove_dir_all(&inputs);
+        for producer in producers {
+            for declared in &producer.emits_files {
+                let from = captured_path(&self.paths.state, &producer.name.0, declared);
+                if !from.exists() {
+                    continue;
+                }
+                let to = inputs.join(&producer.name.0).join(declared);
+                if let Some(parent) = to.parent()
+                    && let Err(error) = std::fs::create_dir_all(parent)
+                {
+                    return Err(format!("staging {}: {error}", to.display()));
+                }
+                if let Err(error) = std::fs::copy(&from, &to) {
+                    return Err(format!("staging {}: {error}", to.display()));
+                }
+                read_only(&to);
+            }
+        }
+        Ok(())
     }
 
     /// Commit what a passing task did, and discard what a failing one did.
@@ -126,7 +220,8 @@ fn run_task(
     pending: Option<&str>,
 ) -> Attempt {
     let Some(Isolation::Worktree) = task.isolation else {
-        return prepare_and_run(args, paths, task, attempt, inputs);
+        let attempt_out = prepare_and_run(args, paths, task, attempt, inputs);
+        return capture_declared(paths, &paths.workspace, task, attempt_out);
     };
     // A private clone of the workspace. Its edits are discarded on cleanup: what leaves an
     // isolated task is its declared output, so this is for review/analysis work, not for
@@ -158,8 +253,61 @@ fn run_task(
     let iso = Paths::for_worktree(worktree.clone(), paths.skills.clone());
     let _ = std::fs::create_dir_all(&iso.state);
     let attempt_out = prepare_and_run(args, &iso, task, attempt, inputs);
+    // Before the worktree goes: a declared file is part of the task's output, not part of the
+    // workspace state isolation discards, so it has to be taken while the tree is still there.
+    let attempt_out = capture_declared(paths, &iso.workspace, task, attempt_out);
     let _ = std::fs::remove_dir_all(&worktree);
     attempt_out
+}
+
+/// Take a passing attempt's declared files, or turn it into a measured failure.
+///
+/// A declared file that is absent after an otherwise-passing attempt is output drift, and it
+/// fails at the task that promised it rather than as a mystery in whatever depended on it. It is
+/// not retried: a task that ran and did not produce what it promised will not produce it twice.
+fn capture_declared(paths: &Paths, workspace: &Path, task: &Task, attempt: Attempt) -> Attempt {
+    if task.emits_files.is_empty() || !matches!(attempt.outcome, AttemptOutcome::Pass(_)) {
+        return attempt;
+    }
+    let mut total = 0u64;
+    for declared in &task.emits_files {
+        let from = match confined(workspace, declared) {
+            Ok(path) => path,
+            Err(why) => return fail(attempt.cost_usd, why),
+        };
+        let size = match std::fs::metadata(&from) {
+            Ok(metadata) if metadata.is_file() => metadata.len(),
+            Ok(_) => {
+                return fail(
+                    attempt.cost_usd,
+                    format!("declared file {declared:?} is not a regular file"),
+                );
+            }
+            Err(_) => {
+                return fail(
+                    attempt.cost_usd,
+                    format!("declared file {declared:?} is absent after a passing attempt"),
+                );
+            }
+        };
+        total = total.saturating_add(size);
+        if total > MAX_CAPTURED_BYTES {
+            return fail(
+                attempt.cost_usd,
+                format!("declared files exceed {MAX_CAPTURED_BYTES} bytes"),
+            );
+        }
+        let to = captured_path(&paths.state, &task.name.0, declared);
+        let copied = to
+            .parent()
+            .map(std::fs::create_dir_all)
+            .unwrap_or(Ok(()))
+            .and_then(|()| std::fs::copy(&from, &to).map(|_| ()));
+        if let Err(error) = copied {
+            return fail(attempt.cost_usd, format!("capturing {declared:?}: {error}"));
+        }
+    }
+    attempt
 }
 
 fn prepare_and_run(
@@ -1104,6 +1252,145 @@ workflow(type = "playbook", tasks = [good, bad, after])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A declared file is part of a task's output, not part of the workspace state isolation
+    /// discards, and it reaches every descendant rather than only the next one.
+    ///
+    /// Three things are proven here that nothing else covers: an isolated task's file survives
+    /// the deletion of its worktree, a task two hops downstream still receives it, and a task
+    /// that passes without writing what it promised fails where it promised it.
+    #[test]
+    fn a_declared_file_outlives_isolation_and_reaches_every_descendant() {
+        let dir = std::env::temp_dir().join(format!("crucible-emits-files-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        let fake = root.join("tools/fake-agent.py");
+
+        std::fs::write(
+            dir.join("agents.json"),
+            r#"{
+              "analyze": {"writes": {"SPEC.md": "the algorithm\n"}, "result": {"ok": true}},
+              "implement": {"reads": ["inputs/analyze/SPEC.md"],
+                            "writes": {"NOTES.md": "built it\n"}, "result": {"ok": true}},
+              "report": {"reads": ["inputs/analyze/SPEC.md", "inputs/implement/NOTES.md"],
+                         "result": {"saw_both": true}},
+              "forgetful": {"result": {"ok": true}}
+            }"#,
+        )
+        .unwrap();
+
+        // `analyze` is isolated: its worktree is deleted the moment it settles, so SPEC.md can
+        // only reach anyone if a declared file is captured rather than left in a tree.
+        std::fs::write(
+            dir.join("workflow.star"),
+            r#"
+analyze = agent(
+    name = "analyze",
+    prompt = "analyze",
+    isolated = True,
+    emits_files = ["SPEC.md"],
+)
+implement = agent(
+    name = "implement",
+    prompt = "implement",
+    depends_on = [analyze],
+    emits_files = ["NOTES.md"],
+)
+report = agent(name = "report", prompt = "report", depends_on = [implement])
+workflow(type = "playbook", tasks = [analyze, implement, report])
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("crucible.toml"),
+            format!(
+                r#"
+                [repo]
+                path = "."
+                [workspace]
+                dir = "workspace"
+                setup_cmd = "mkdir -p workspace && git -C workspace init -q && git -C workspace -c user.email=c@l -c user.name=c -c commit.gpgsign=false commit -q --allow-empty -m baseline"
+                [agent]
+                backend = "command"
+                agent_cmd = "python3 {}"
+                goal = "pass artifacts along"
+                [agent.env]
+                FAKE_AGENT_SCRIPT = "{}"
+                [workflow]
+                type = "playbook"
+                file = "workflow.star"
+                "#,
+                fake.display(),
+                dir.join("agents.json").display(),
+            ),
+        )
+        .unwrap();
+
+        let run = |dir: &std::path::Path| {
+            let mut manifest = crate::manifest::Manifest::load(&dir.join("crucible.toml")).unwrap();
+            manifest.resolve_workflow(dir).unwrap();
+            let workflow = manifest.workflow.as_ref().unwrap();
+            let plan = crate::loop_graph::iteration_template(
+                Some(workflow),
+                &crate::manifest::WorkflowCaps::for_lane(workflow.workflow_type),
+            )
+            .unwrap();
+            let mut runner = crate::run::prep_plan_runner(&dir.join("crucible.toml"))
+                .unwrap()
+                .0;
+            execute(
+                &plan,
+                &Substrate::default(),
+                ExecCfg::default(),
+                &mut runner,
+                |_, _| {},
+            )
+        };
+
+        let out = run(&dir);
+        assert!(out.valid, "{:?}", out.results);
+        // `report` declared `reads` on both, two hops and one hop back. It passed, so staging
+        // reached past the direct dependency.
+        assert_eq!(
+            out.results[&"report".into()].output.as_ref().unwrap()["saw_both"],
+            true
+        );
+        // The captured copy is kept beside the run, not in the workspace it came from.
+        assert!(
+            dir.join("state/files/analyze/SPEC.md").exists(),
+            "an isolated task's declared file was not captured"
+        );
+        assert!(
+            !dir.join("workspace/SPEC.md").exists(),
+            "an isolated task's file leaked into the shared workspace"
+        );
+
+        // A task that passes without writing what it promised fails where it promised it.
+        std::fs::write(
+            dir.join("workflow.star"),
+            "forgetful = agent(name = \"forgetful\", prompt = \"p\", emits_files = [\"MISSING.md\"])\nworkflow(type = \"playbook\", tasks = [forgetful])\n",
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(dir.join("workspace"));
+        let _ = std::fs::remove_dir_all(dir.join("state"));
+        let out = run(&dir);
+        let result = &out.results[&"forgetful".into()];
+        assert_eq!(result.status, TaskStatus::Fail);
+        assert_eq!(result.attempts, 1, "output drift must not be retried");
+        assert!(
+            result
+                .note
+                .as_ref()
+                .is_some_and(|n| n.contains("MISSING.md") && n.contains("absent")),
+            "{:?}",
+            result.note
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_turn_that_writes_no_result_fails_but_still_advances_the_session() {
         let dir = std::env::temp_dir().join(format!(
@@ -1410,6 +1697,7 @@ workflow(type = "playbook", tasks = [good, bad, after])
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
+            emits_files: Vec::new(),
             over: None,
             max_fanout: None,
         };

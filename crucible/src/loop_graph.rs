@@ -235,6 +235,7 @@ pub(crate) fn iteration_template(
                 join: Join::default(),
                 stage: Stage::Iteration,
                 emits: Vec::new(),
+                emits_files: Vec::new(),
                 over: None,
                 max_fanout: None,
             }
@@ -968,6 +969,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
             join: Join::All,
             stage: Stage::Iteration,
             emits: Vec::new(),
+            emits_files: Vec::new(),
             over: None,
             max_fanout: None,
         });
@@ -988,6 +990,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
             join: Join::All,
             stage: Stage::Iteration,
             emits: Vec::new(),
+            emits_files: Vec::new(),
             over: None,
             max_fanout: None,
         });
@@ -1008,6 +1011,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
         join: Join::Passed,
         stage: Stage::Iteration,
         emits: Vec::new(),
+        emits_files: Vec::new(),
         over: None,
         max_fanout: None,
     });
