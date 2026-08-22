@@ -17,7 +17,9 @@ use starlark_syntax::codemap::FileSpan;
 
 use crate::manifest::{WorkflowCfg, WorkflowType};
 use crate::plan::starlark as dsl;
-use crate::plan::starlark::values::{OutputRefValue, SessionValue, TaskValue, WorkflowValue};
+use crate::plan::starlark::values::{
+    ExternalText, OutputRefValue, SessionValue, TaskValue, WorkflowValue,
+};
 
 /// Constructors that historically took one positional argument. Everything else is named-only.
 const POSITIONAL: &[&str] = &["prompt_file", "param", "workflow", "default_autoresearch"];
@@ -292,6 +294,9 @@ fn convert_at(value: Value<'_>, depth: usize) -> dsl::Result<dsl::Value> {
             .collect::<dsl::Result<Vec<_>>>()
             .map(dsl::Value::List);
     }
+    if let Some(external) = ExternalText::from_value(value) {
+        return Ok(dsl::Value::External(external.0.clone()));
+    }
     if let Some(task) = TaskValue::from_value(value) {
         return Ok(dsl::Value::Task(task.0.clone()));
     }
@@ -331,6 +336,7 @@ fn alloc_at<'v>(heap: Heap<'v>, value: dsl::Value, depth: usize) -> Value<'v> {
                 .collect();
             heap.alloc(AllocList(items))
         }
+        dsl::Value::External(segments) => heap.alloc(ExternalText(segments)),
         dsl::Value::Task(task) => heap.alloc(TaskValue(task)),
         dsl::Value::Output(reference) => heap.alloc(OutputRefValue {
             declared: vec![reference.field.0.clone()],

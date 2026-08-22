@@ -86,6 +86,85 @@ impl Display for OutputRefValue {
 #[starlark_value(type = "output")]
 impl<'v> StarlarkValue<'v> for OutputRefValue {}
 
+/// Text that carries where each of its spans came from.
+///
+/// A value a launcher supplied did not originate inside the pack, so a prompt containing it has
+/// to say which span is which: an agent reading `Read the paper at <url>` cannot otherwise tell
+/// the pack's instruction from whatever the URL's author put there. Concatenation keeps the
+/// spans apart, which is what lets the rendered prompt mark exactly the outside text and nothing
+/// else.
+///
+/// A defaulted value is not external. It was written in the pack by the same author as the
+/// prompt around it.
+#[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
+pub(crate) struct ExternalText(pub(crate) Vec<Segment>);
+
+/// One run of text, and whether it came from outside the pack.
+#[derive(Debug, Clone, PartialEq, Eq, Allocative)]
+pub(crate) struct Segment {
+    pub(crate) text: String,
+    pub(crate) external: bool,
+}
+
+impl ExternalText {
+    pub(crate) fn external(text: impl Into<String>) -> Self {
+        ExternalText(vec![Segment {
+            text: text.into(),
+            external: true,
+        }])
+    }
+
+    fn joined(before: &[Segment], after: &[Segment]) -> Self {
+        let mut segments: Vec<Segment> = Vec::with_capacity(before.len() + after.len());
+        for segment in before.iter().chain(after) {
+            match segments.last_mut() {
+                Some(last) if last.external == segment.external => {
+                    last.text.push_str(&segment.text)
+                }
+                _ => segments.push(segment.clone()),
+            }
+        }
+        ExternalText(segments)
+    }
+
+    fn plain(text: &str) -> Vec<Segment> {
+        vec![Segment {
+            text: text.to_owned(),
+            external: false,
+        }]
+    }
+}
+
+starlark_simple_value!(ExternalText);
+
+impl Display for ExternalText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for segment in &self.0 {
+            f.write_str(&segment.text)?;
+        }
+        Ok(())
+    }
+}
+
+#[starlark_value(type = "external")]
+impl<'v> StarlarkValue<'v> for ExternalText {
+    /// `external + "text"`. Nothing else is offered: a string method on external text would
+    /// hand back a plain string and quietly lose the fact that it came from outside.
+    fn add(&self, rhs: Value<'v>, heap: Heap<'v>) -> Option<starlark::Result<Value<'v>>> {
+        let after = match rhs.unpack_str() {
+            Some(text) => ExternalText::plain(text),
+            None => ExternalText::from_value(rhs)?.0.clone(),
+        };
+        Some(Ok(heap.alloc(ExternalText::joined(&self.0, &after))))
+    }
+
+    /// `"text" + external`.
+    fn radd(&self, lhs: Value<'v>, heap: Heap<'v>) -> Option<starlark::Result<Value<'v>>> {
+        let before = ExternalText::plain(lhs.unpack_str()?);
+        Some(Ok(heap.alloc(ExternalText::joined(&before, &self.0))))
+    }
+}
+
 #[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
 pub(crate) struct SessionValue(#[allocative(skip)] pub(crate) SessionDecl);
 
