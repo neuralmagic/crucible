@@ -1,0 +1,32 @@
+#:schema ../../schema/rfc.schema.json
+
+[govctl]
+id = "RFC-0002"
+title = "Cascade workflows"
+version = "0.1.0"
+status = "draft"
+phase = "spec"
+owners = ["@Will Eaton"]
+created = "2026-08-21"
+
+[[sections]]
+title = "Summary"
+clauses = ["clauses/C-SCOPE.toml"]
+
+[[sections]]
+title = "Specification"
+clauses = [
+    "clauses/C-CASCADE-LANE.toml",
+    "clauses/C-CASCADE-PARAMS.toml",
+    "clauses/C-TASK-FILES.toml",
+    "clauses/C-CASCADE-CAPS.toml",
+    "clauses/C-CASCADE-COMPOSITE.toml",
+    "clauses/C-ASKS.toml",
+    "clauses/C-CASCADE-BUDGET.toml",
+    "clauses/C-CASCADE-RESUME.toml",
+]
+
+[[changelog]]
+version = "0.1.0"
+date = "2026-08-21"
+notes = "Initial draft"

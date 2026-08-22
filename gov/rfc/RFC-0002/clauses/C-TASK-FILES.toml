@@ -1,0 +1,23 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-TASK-FILES"
+title = "Declared file outputs between tasks"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+A task MAY declare emits_files: the workspace-relative paths its output includes as files. Each declared path MUST be relative, MUST NOT traverse outside the workspace, and MUST NOT resolve through a symbolic link.
+
+When a task passes, the engine MUST capture each declared file. A declared file absent after an otherwise-passing attempt MUST convert that attempt to a measured failure at the producing task, MUST NOT be retried, and MUST block its dependents. This mirrors the rule for declared JSON output fields: output drift fails where it happened.
+
+Captured files MUST be staged into a task's workspace before it is dispatched, for every ancestor on its dependency paths and not only its direct dependencies. A pipeline whose later stages need an earlier stage's artifact is the ordinary case, and requiring each hop to re-emit what it received would reproduce by hand the state files this replaces. JSON outputs keep the narrower direct-dependency rule.
+
+Staged files MUST be namespaced by the producing task's name, so that two producers declaring the same path cannot collide. Staged files MUST be read-only to the consuming task.
+
+Captured files MUST be staged for a dependent even when the producing task ran in disposable isolation. A declared file is part of a task's output, not part of the workspace state that isolation discards.
+
+The total size of files captured in one run MUST be bounded, the bound MUST be operator-configurable and discoverable before a run starts, and exceeding it MUST fail the producing task naming the bound rather than truncating silently.
+
+emits_files MUST NOT be used as a channel between runs. Material that must outlive its run MUST be referenced by published artifact location instead."""

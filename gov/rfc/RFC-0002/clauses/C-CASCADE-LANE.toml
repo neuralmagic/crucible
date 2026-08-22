@@ -1,0 +1,35 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-CASCADE-LANE"
+title = "Cascade lane admission and execution"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+A manifest with no [judge] MUST accept a [workflow] whose type is "cascade". A manifest with no [judge] MUST reject every other workflow type, and a manifest with [judge] MUST reject type = "cascade".
+
+A cascade graph MUST NOT contain a task naming an engine operation: an operation the scored loop's orchestrator owns rather than the plan author, namely producing a candidate, applying one, measuring one, grading evidence, deciding keep or discard, and measuring one differentially against another. A task that runs an author-supplied command and grades its own result is not an engine operation and MUST be permitted, because it asserts something about the work rather than advancing a scored loop.
+
+A cascade MUST execute its graph exactly once per run. The engine MUST reject a requested iteration count greater than one rather than silently ignoring it.
+
+A cascade's verdict MUST be valid when every required task has settled with a passing outcome, and MUST be valid when a task declared early completion and no required task had already settled with a failing outcome. It MUST be invalid when any required task failed, was truncated, or was left blocked, and when a cost or time ceiling was exhausted. A required task left undispatched by early completion MUST NOT affect the verdict; a required task that had already failed MUST invalidate the run whatever a later early-completion signal says, so that a concurrent task cannot launder a failure into a success. The verdict MUST NOT depend on the outcome of any advisory task or of any epilogue task.
+
+The run MUST exit zero if and only if its verdict is valid, and MUST exit nonzero otherwise. This is a stronger obligation than the task lane's, where exit zero means only that the run completed. The exit code alone does not say why a run ended, so the shutdown outcome MUST distinguish an exhausted graph, an early completion, a failure, an operator stop, and an exhausted ceiling. That outcome MUST be drawn from the vocabulary [[RFC-0001:C-WIRE]] defines for the shutdown event, which a cascade extends by exactly one value for early completion.
+
+Any task MAY declare early completion by returning the boolean field "complete" as true in its output, optionally alongside a "reason" string. Both names are reserved, and a task MUST NOT name either in its declared outputs: a declared output must be present on every passing attempt, whereas these appear only on the attempt that ends the run, so declaring them would fail every ordinary run. The engine MUST reject a graph that declares either. The engine MUST then stop dispatching further tasks, MUST record the reason where one was given, and MUST NOT treat undispatched tasks as blocked. Determining that there is nothing to do is a successful outcome, and a cascade that cannot say so has no way to end a scheduled run quietly. The shutdown outcome says how dispatch stopped and the verdict says whether the run succeeded; they are independent axes, so a run whose dispatch stopped on early completion after a required task had already failed records the early-completion outcome and an invalid verdict.
+
+A task's workspace changes MUST be committed to the run's git memory when, and only when, it settles with a passing outcome. A task that failed, was cut short by a deadline, or never settled MUST NOT contribute commits. This is what lets a resumed run rebuild from settled work alone, and what keeps a run that stopped early from publishing a half-finished tree: publication keys on commits beyond the base, and unsettled work never became one.
+
+Every settled task MUST produce exactly one session row identifying the task by name. Rows MUST be written as tasks settle, so a reader tailing the log sees progress live; row order is therefore completion order, which concurrent tasks make distinct from graph order. A row's score MUST be null.
+
+A cascade MUST NOT be required to declare a result task. Its verdict is defined above, so there is no single task whose output stands for the run.
+
+A task declared required = false MUST NOT affect the run's verdict, and its failure MUST block only its dependents. The choice of which tasks are advisory is the author's; the engine MUST NOT infer it.
+
+A task declared stage = "epilogue" MUST be excluded from the main graph, MUST run once after the main graph settles, and MUST NOT change the verdict. It MUST run when the main graph completed, when it failed, and when a task declared early completion. It MUST NOT run when the run was stopped by an operator or ended by an exhausted ceiling: continuing to spend after either would defeat the control that ended the run.
+
+An epilogue task MUST NOT depend on a main-graph task. It MUST instead receive the main graph's outcome as a reserved input carrying the run's shutdown outcome, and one entry per settled task giving that task's name, terminal status, and note. This is what makes an epilogue task reachable on the failure path, where dependencies would not have passed.
+
+A cascade MUST carry the task lane's gate label, written under the key [[RFC-0001:C-WIRE]] reserves for it. The engine MUST NOT introduce a third gate label; a consumer needing the graph MUST read the admitted-plan event, which a cascade always emits."""

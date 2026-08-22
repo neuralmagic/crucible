@@ -1,0 +1,17 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-CASCADE-RESUME"
+title = "Resumption"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+A resumed cascade MUST NOT re-dispatch a task that already settled. The engine MUST fold prior task results from the session log and MUST treat them as terminal, feeding their outputs to dependents exactly as a live execution would.
+
+A resumed cascade MUST reconstruct its workspace from the pristine checkout plus the declared file outputs of every folded task, staged under the rules in [[RFC-0002:C-TASK-FILES]]. It MUST NOT attempt to reconstruct the workspace as some particular task left it: when concurrent tasks were in flight at the interruption, no such state is well defined, and a task's declared output is the only part of its work the contract ever promised would survive.
+
+Spend and elapsed time recorded before the interruption MUST count against the ceilings on resumption. A crash MUST NOT reset either.
+
+A resumed run MUST exit without re-running the finish path when the folded results already cover every task, and equally when any folded result declared early completion. Early completion leaves tasks undispatched by design, so a resume that only checked for full coverage would publish the same result again on every restart."""
