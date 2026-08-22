@@ -485,37 +485,118 @@ pub fn render_png_to(
 /// semantics. With `--manifest`, agent tasks run through the real harness path; otherwise
 /// the shell runner handles everything (`--agent-cmd` as the agent stand-in). Exits nonzero
 /// when the plan is not valid.
+/// What the launcher supplies. A cascade's source may not declare either, so a pack cannot
+/// raise a limit its operator set; the engine refuses to dispatch one that arrives without both.
+#[derive(Debug, Clone, Default)]
+pub struct Ceilings {
+    pub usd: Option<f64>,
+    pub wall_clock: Option<std::time::Duration>,
+    /// What the operator typed, so a rejection can quote it back rather than say "invalid".
+    pub wall_clock_raw: Option<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "a cascade needs {missing} from whoever launches it. Its source may not declare a limit its \
+     operator set, so the engine will not dispatch a task without one."
+)]
+struct MissingCeiling {
+    missing: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("--max-time {raw:?} is not a duration (try `90s`, `30m`, `2h`)")]
+struct BadDuration {
+    raw: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{manifest} declares no [workflow]; pass --file, or give the manifest a graph to compile")]
+struct NoGraph {
+    manifest: String,
+}
+
 pub fn run(
-    path: &Path,
+    path: Option<&Path>,
     caps: &BTreeSet<String>,
     agent_cmd: Option<String>,
     manifest: Option<&Path>,
+    ceilings: Ceilings,
 ) -> Result<()> {
     use crate::plan::exec::{ExecCfg, PlanExit, TaskRunner, execute};
     use crate::plan::runner::ShellRunner;
 
-    let plan = load(path)?;
-    let substrate = Substrate { caps: caps.clone() };
+    if let (None, Some(raw)) = (ceilings.wall_clock, ceilings.wall_clock_raw.as_ref()) {
+        return Err(BadDuration { raw: raw.clone() }.into());
+    }
+
+    // Either the plan was handed to us, or the manifest names the graph and we compile it.
+    let (plan, mut runner, events): (ValidPlan, Box<dyn TaskRunner>, Option<std::fs::File>) =
+        match (path, manifest) {
+            (_, Some(m)) => {
+                let (prepared, loaded) = crate::run::prep_plan_runner(m)?;
+                let session_log = prepared.paths.session_log.clone();
+                let cascade = loaded
+                    .workflow
+                    .as_ref()
+                    .is_some_and(|w| w.workflow_type == crate::manifest::WorkflowType::Cascade);
+                if cascade {
+                    let missing = match (ceilings.usd, ceilings.wall_clock) {
+                        (None, None) => Some("--max-cost and --max-time"),
+                        (None, Some(_)) => Some("--max-cost"),
+                        (Some(_), None) => Some("--max-time"),
+                        (Some(_), Some(_)) => None,
+                    };
+                    if let Some(missing) = missing {
+                        return Err(MissingCeiling {
+                            missing: missing.to_string(),
+                        }
+                        .into());
+                    }
+                }
+                let mut plan = match path {
+                    Some(p) => load(p)?,
+                    None => {
+                        let workflow = loaded.workflow.as_ref().ok_or_else(|| NoGraph {
+                            manifest: m.display().to_string(),
+                        })?;
+                        crate::loop_graph::iteration_template(
+                            Some(workflow),
+                            &crate::manifest::WorkflowCaps::for_lane(workflow.workflow_type)
+                                .with_persistent_sessions(),
+                        )?
+                    }
+                };
+                if let Some(usd) = ceilings.usd {
+                    plan = plan.with_budget(usd)?;
+                }
+                let f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&session_log)
+                    .with_context(|| format!("opening {}", session_log.display()))?;
+                (plan, Box::new(prepared), Some(f))
+            }
+            (Some(p), None) => {
+                let mut plan = load(p)?;
+                if let Some(usd) = ceilings.usd {
+                    plan = plan.with_budget(usd)?;
+                }
+                (
+                    plan,
+                    Box::new(ShellRunner {
+                        workdir: std::env::current_dir()
+                            .context("resolving the working directory")?,
+                        agent_cmd,
+                    }),
+                    None,
+                )
+            }
+            (None, None) => unreachable!("clap requires --file without --manifest"),
+        };
     // Manifest runs append plan wire events to the run's session log so tailers (and the
     // controller's ingest) see the graph and its live progress; shell runs have no state dir.
-    let (mut runner, events): (Box<dyn TaskRunner>, Option<std::fs::File>) = match manifest {
-        Some(m) => {
-            let r = crate::run::prep_plan_runner(m)?;
-            let f = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&r.paths.session_log)
-                .with_context(|| format!("opening {}", r.paths.session_log.display()))?;
-            (Box::new(r), Some(f))
-        }
-        None => (
-            Box::new(ShellRunner {
-                workdir: std::env::current_dir().context("resolving the working directory")?,
-                agent_cmd,
-            }),
-            None,
-        ),
-    };
+    let substrate = Substrate { caps: caps.clone() };
     let append = |f: &std::fs::File, ev: &crate::session::SessionEvent| {
         use std::io::Write;
         let mut w = f;
@@ -527,7 +608,10 @@ pub fn run(
     let out = execute(
         &plan,
         &substrate,
-        ExecCfg::default(),
+        ExecCfg {
+            wall_clock: ceilings.wall_clock,
+            ..ExecCfg::default()
+        },
         runner.as_mut(),
         |task, result| {
             if let Some(f) = &events {

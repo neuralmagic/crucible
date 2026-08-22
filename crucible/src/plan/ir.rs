@@ -276,6 +276,13 @@ impl ValidPlan {
         &self.plan
     }
 
+    /// Replace the plan's budget with the launcher's. A pack's own figure is authoring data;
+    /// a ceiling is the operator's, and this is where the second overrides the first.
+    pub fn with_budget(mut self, usd: f64) -> Result<Self, PlanError> {
+        self.plan.budget = PlanBudget { usd };
+        self.plan.validate()
+    }
+
     pub fn tasks_topo(&self) -> impl Iterator<Item = &Task> {
         self.topo.iter().map(|&i| &self.plan.tasks[i])
     }

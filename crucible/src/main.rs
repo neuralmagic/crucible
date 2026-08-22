@@ -345,9 +345,19 @@ pub(crate) enum PlanAction {
     /// `agent` tasks run `--agent-cmd` (the command-backend stand-in). Exits nonzero when
     /// the plan does not reach a valid verdict.
     Run {
-        /// The plan file to execute.
+        /// The plan file to execute. Omit it to build the plan from `--manifest`'s own
+        /// `[workflow]`, which is how a cascade runs: the pack names its graph and the engine
+        /// compiles it per run.
+        #[arg(long, required_unless_present = "manifest")]
+        file: Option<PathBuf>,
+        /// Total cost ceiling for the run, in USD. A cascade must be given one: its source may
+        /// not declare a limit its operator set.
         #[arg(long)]
-        file: PathBuf,
+        max_cost: Option<f64>,
+        /// Total wall-clock ceiling for the run (`90s`, `30m`, `2h`). A cascade must be given
+        /// one, for the same reason.
+        #[arg(long)]
+        max_time: Option<String>,
         /// Substrate capabilities (repeatable). `any`-needs tasks always run.
         #[arg(long = "cap")]
         caps: Vec<String>,
@@ -693,7 +703,7 @@ impl Args {
 /// Parse a short duration like `90s`, `30m`, `1h`. Empty, garbage, negative, and anything
 /// `Duration` cannot hold all yield `None`. `Duration::from_secs_f64` panics on a negative or
 /// non-finite argument, so both are refused before it is reached.
-fn parse_duration(s: &str) -> Option<Duration> {
+pub(crate) fn parse_duration(s: &str) -> Option<Duration> {
     let s = s.trim();
     if s.is_empty() {
         return None;

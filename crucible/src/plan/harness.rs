@@ -471,7 +471,9 @@ mod tests {
         .validate()
         .unwrap();
 
-        let mut runner = crate::run::prep_plan_runner(&dir.join("crucible.toml")).unwrap();
+        let mut runner = crate::run::prep_plan_runner(&dir.join("crucible.toml"))
+            .unwrap()
+            .0;
         let out = execute(
             &plan,
             &Substrate::default(),
@@ -613,7 +615,9 @@ workflow(type = "cascade", tasks = [draft, shape, polish, audit_a, audit_b, roun
         .unwrap();
 
         let mut settled: Vec<(String, &'static str)> = Vec::new();
-        let mut runner = crate::run::prep_plan_runner(&dir.join("crucible.toml")).unwrap();
+        let mut runner = crate::run::prep_plan_runner(&dir.join("crucible.toml"))
+            .unwrap()
+            .0;
         let out = execute(
             &plan,
             &Substrate::default(),
@@ -754,7 +758,9 @@ workflow(type = "cascade", tasks = [discover, audit, roundup])
         assert_eq!(plan.plan().tasks.len(), 3);
 
         let mut rows: Vec<(String, &'static str)> = Vec::new();
-        let mut runner = crate::run::prep_plan_runner(&dir.join("crucible.toml")).unwrap();
+        let mut runner = crate::run::prep_plan_runner(&dir.join("crucible.toml"))
+            .unwrap()
+            .0;
         let out = execute(
             &plan,
             &Substrate::default(),
@@ -824,7 +830,9 @@ workflow(type = "cascade", tasks = [discover, audit, roundup])
             &crate::manifest::WorkflowCaps::for_lane(crate::manifest::WorkflowType::Cascade),
         )
         .unwrap();
-        let mut runner = crate::run::prep_plan_runner(&dir.join("crucible.toml")).unwrap();
+        let mut runner = crate::run::prep_plan_runner(&dir.join("crucible.toml"))
+            .unwrap()
+            .0;
         let out = execute(
             &plan,
             &Substrate::default(),
@@ -914,7 +922,9 @@ workflow(type = "cascade", tasks = [good, bad, after])
             &crate::manifest::WorkflowCaps::for_lane(workflow.workflow_type),
         )
         .unwrap();
-        let mut runner = crate::run::prep_plan_runner(&dir.join("crucible.toml")).unwrap();
+        let mut runner = crate::run::prep_plan_runner(&dir.join("crucible.toml"))
+            .unwrap()
+            .0;
         assert!(
             runner.commit_per_task,
             "a cascade manifest must turn per-task git memory on"
@@ -964,6 +974,122 @@ workflow(type = "cascade", tasks = [good, bad, after])
         assert!(
             !tracked.contains("junk.txt"),
             "a failed task's file reached the index: {tracked}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cascade runs from its manifest: the pack names its graph, the engine compiles it, and
+    /// the ceilings come from whoever launched it. There is no plan file anywhere.
+    #[test]
+    fn a_cascade_launches_from_its_manifest_under_supplied_ceilings() {
+        let dir = std::env::temp_dir().join(format!("crucible-launch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        let fake = root.join("tools/fake-agent.py");
+
+        std::fs::write(
+            dir.join("agents.json"),
+            r#"{"work": {"writes": {"out.txt": "done\n"}, "result": {"ok": true}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("workflow.star"),
+            "work = agent(name = \"work\", prompt = \"do it\")\nworkflow(type = \"cascade\", tasks = [work])\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("crucible.toml"),
+            format!(
+                r#"
+                [repo]
+                path = "."
+                [workspace]
+                dir = "workspace"
+                setup_cmd = "mkdir -p workspace && git -C workspace init -q && git -C workspace -c user.email=c@l -c user.name=c -c commit.gpgsign=false commit -q --allow-empty -m baseline"
+                [agent]
+                backend = "command"
+                agent_cmd = "python3 {}"
+                goal = "launch a cascade"
+                [agent.env]
+                FAKE_AGENT_SCRIPT = "{}"
+                [workflow]
+                type = "cascade"
+                file = "workflow.star"
+                "#,
+                fake.display(),
+                dir.join("agents.json").display(),
+            ),
+        )
+        .unwrap();
+        let manifest = dir.join("crucible.toml");
+        let caps = std::collections::BTreeSet::new();
+
+        // Neither ceiling, one ceiling, and a duration that is not one: all refused before any
+        // task is dispatched, which is the point. A ceiling checked at the first overrun has
+        // already spent whatever it was meant to bound.
+        for (ceilings, expected) in [
+            (
+                crate::plan::cli::Ceilings::default(),
+                "--max-cost and --max-time",
+            ),
+            (
+                crate::plan::cli::Ceilings {
+                    usd: Some(1.0),
+                    ..Default::default()
+                },
+                "--max-time",
+            ),
+            (
+                crate::plan::cli::Ceilings {
+                    wall_clock: Some(std::time::Duration::from_secs(60)),
+                    wall_clock_raw: Some("1m".into()),
+                    ..Default::default()
+                },
+                "--max-cost",
+            ),
+            (
+                crate::plan::cli::Ceilings {
+                    usd: Some(1.0),
+                    wall_clock: None,
+                    wall_clock_raw: Some("later".into()),
+                },
+                "is not a duration",
+            ),
+        ] {
+            let error = crate::plan::cli::run(None, &caps, None, Some(&manifest), ceilings)
+                .expect_err("a cascade without ceilings must not dispatch");
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+        }
+        assert!(
+            !dir.join("workspace/out.txt").exists(),
+            "a refused launch dispatched a task anyway"
+        );
+
+        crate::plan::cli::run(
+            None,
+            &caps,
+            None,
+            Some(&manifest),
+            crate::plan::cli::Ceilings {
+                usd: Some(1.0),
+                wall_clock: Some(std::time::Duration::from_secs(600)),
+                wall_clock_raw: Some("10m".into()),
+            },
+        )
+        .expect("a cascade with both ceilings runs");
+        assert!(dir.join("workspace/out.txt").exists(), "the task never ran");
+
+        // The graph reached the session log, so a reader sees it without a plan file existing.
+        let log = std::fs::read_to_string(dir.join("state/session.jsonl")).unwrap();
+        assert!(log.contains("plan_admitted"), "{log}");
+        assert!(log.contains("\"name\":\"work\""), "{log}");
+        assert!(
+            !dir.join("plan.toml").exists(),
+            "the launcher wrote a plan file"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1020,7 +1146,9 @@ workflow(type = "cascade", tasks = [good, bad, after])
         .validate()
         .unwrap();
 
-        let mut runner = crate::run::prep_plan_runner(&dir.join("crucible.toml")).unwrap();
+        let mut runner = crate::run::prep_plan_runner(&dir.join("crucible.toml"))
+            .unwrap()
+            .0;
         let state = runner.paths.state.clone();
         assert!(
             !crate::agent_session::prepare(&state, "solver")
@@ -1084,7 +1212,9 @@ workflow(type = "cascade", tasks = [good, bad, after])
 
     fn run_review_plan(dir: &std::path::Path, plan_file: &str) -> crate::plan::exec::PlanOutcome {
         let plan = crate::plan::cli::load(&dir.join(plan_file)).unwrap();
-        let mut runner = crate::run::prep_plan_runner(&dir.join("crucible.toml")).unwrap();
+        let mut runner = crate::run::prep_plan_runner(&dir.join("crucible.toml"))
+            .unwrap()
+            .0;
         execute(
             &plan,
             &Substrate::default(),

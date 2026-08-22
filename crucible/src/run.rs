@@ -183,14 +183,21 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
             } => crate::plan::cli::show(file, &caps.iter().cloned().collect(), *mermaid, *render),
             crate::PlanAction::Run {
                 file,
+                max_cost,
+                max_time,
                 caps,
                 agent_cmd,
                 manifest,
             } => crate::plan::cli::run(
-                file,
+                file.as_deref(),
                 &caps.iter().cloned().collect(),
                 agent_cmd.clone(),
                 manifest.as_deref(),
+                crate::plan::cli::Ceilings {
+                    usd: *max_cost,
+                    wall_clock: max_time.as_deref().and_then(crate::parse_duration),
+                    wall_clock_raw: max_time.clone(),
+                },
             ),
         };
     }
@@ -359,9 +366,11 @@ pub(crate) fn clone_repo(src: &str, git_ref: Option<&str>, dest: &Path) -> Resul
 /// exactly as a loop run would, and `Agent` tasks run through the real harness path with the
 /// manifest's `[agent]` defaults. Shares the loop's setup helpers so a plan run and a loop
 /// run see the same world.
+/// The runner for a manifest, and the manifest it was built from. Both, because the caller needs
+/// the graph and the lane off the manifest and compiling it twice would compile the pack twice.
 pub(crate) fn prep_plan_runner(
     manifest_path: &Path,
-) -> Result<crate::plan::harness::HarnessRunner> {
+) -> Result<(crate::plan::harness::HarnessRunner, manifest::Manifest)> {
     let mut m = manifest::Manifest::load_frozen(manifest_path)?;
     let manifest_dir = manifest_path
         .parent()
@@ -399,11 +408,14 @@ pub(crate) fn prep_plan_runner(
         .workflow
         .as_ref()
         .is_some_and(|w| w.workflow_type == manifest::WorkflowType::Cascade);
-    Ok(crate::plan::harness::HarnessRunner {
-        args,
-        paths: p,
-        commit_per_task,
-    })
+    Ok((
+        crate::plan::harness::HarnessRunner {
+            args,
+            paths: p,
+            commit_per_task,
+        },
+        m,
+    ))
 }
 
 /// Load a `crucible.toml`, build the World + Judge from it, and drive the loop. The one run
