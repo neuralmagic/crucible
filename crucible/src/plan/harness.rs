@@ -1351,6 +1351,21 @@ workflow(type = "playbook", tasks = [analyze, implement, report])
 
         let out = run(&dir);
         assert!(out.valid, "{:?}", out.results);
+        // Staged inputs are not the consuming task's work: a per-task commit that swept them in
+        // would read as though this task had produced what its ancestors handed it.
+        let tracked = std::process::Command::new("git")
+            .args([
+                "-C",
+                &dir.join("workspace").display().to_string(),
+                "ls-files",
+            ])
+            .output()
+            .expect("git ls-files");
+        let tracked = String::from_utf8_lossy(&tracked.stdout);
+        assert!(
+            !tracked.contains("inputs/"),
+            "staged inputs reached git memory: {tracked}"
+        );
         // `report` declared `reads` on both, two hops and one hop back. It passed, so staging
         // reached past the direct dependency.
         assert_eq!(

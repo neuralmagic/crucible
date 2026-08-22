@@ -415,6 +415,13 @@ pub(crate) fn prep_plan_runner_with_params(
         }
     }
     vcs::ensure_repo(&workspace).context("ensuring workspace is a git repo")?;
+    // The harness's own files, plus where a task's staged inputs land. Without this a playbook's
+    // per-task commit sweeps in the toolbox, the results log, and every artifact an ancestor
+    // handed this task, and each task's commit reads as though it produced all of them.
+    crucible_vcs::git_memory::install_harness_excludes(
+        &workspace,
+        &[format!("{}/", crate::plan::harness::STAGED_INPUTS)],
+    );
     std::fs::create_dir_all(&p.state)
         .with_context(|| format!("creating state dir {}", p.state.display()))?;
     install_toolbox(&p, &m.agent.toolbox_exclude, m.agent.harness.skills_dir())?;
