@@ -84,7 +84,8 @@ pub struct Verdict {
 /// to look at the model.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum GroundedError {
-    /// The turn itself failed; there was no agent output to parse.
+    /// The turn itself failed. The agent may still have printed something on its way down;
+    /// that tail rides on [`GroundedReport::output_tail`].
     #[error("the turn never completed: {0}")]
     Turn(#[from] TurnFailure),
     /// The turn ran and its last line was not a verdict.
@@ -112,6 +113,10 @@ pub struct GroundedReport {
     pub over_budget: bool,
     /// Set when no verdict was parsed, the reason, for the human/stderr path.
     pub error: Option<GroundedError>,
+    /// The tail of whatever the agent printed, carried only on the failure path. A turn that dies
+    /// during startup prints its diagnostic and nothing else; without this the report says the
+    /// turn failed and drops the one line that says why.
+    pub output_tail: Option<String>,
 }
 
 impl GroundedReport {
@@ -133,6 +138,7 @@ impl GroundedReport {
                     .map(GroundedError::to_string)
                     .unwrap_or_else(|| "no verdict".to_string()),
                 "error_kind": self.error.as_ref().map(GroundedError::kind).unwrap_or("no_verdict"),
+                "output_tail": self.output_tail,
                 "cost_usd": self.cost_usd,
                 "over_budget": self.over_budget,
             }),
@@ -419,12 +425,36 @@ fn report_from_turn(outcome: TurnOutcome, buf: &str, max_cost: f64) -> GroundedR
             None => (None, Some(GroundedError::NoVerdict)),
         },
     };
+    let output_tail = error.is_some().then(|| tail_of(buf)).flatten();
     GroundedReport {
         verdict,
         cost_usd: outcome.cost_usd,
         over_budget,
         error,
+        output_tail,
     }
+}
+
+/// Bound on the replayed agent output: enough for a startup diagnostic and its context, small
+/// enough that a chatty turn cannot flood the marker line the controller scrapes.
+const OUTPUT_TAIL_LINES: usize = 20;
+const OUTPUT_TAIL_BYTES: usize = 4_096;
+
+/// The last non-blank lines of the agent's accumulated output, or `None` if it printed nothing.
+fn tail_of(buf: &str) -> Option<String> {
+    let lines: Vec<&str> = buf.lines().filter(|l| !l.trim().is_empty()).collect();
+    let start = lines.len().saturating_sub(OUTPUT_TAIL_LINES);
+    let tail = lines[start..].join("\n");
+    let tail = if tail.len() > OUTPUT_TAIL_BYTES {
+        let mut cut = tail.len() - OUTPUT_TAIL_BYTES;
+        while cut < tail.len() && !tail.is_char_boundary(cut) {
+            cut += 1;
+        }
+        tail[cut..].to_string()
+    } else {
+        tail
+    };
+    (!tail.is_empty()).then_some(tail)
 }
 
 /// CLI entry point: run the turn, print the verdict (JSON or human lines), and exit nonzero if the
@@ -466,6 +496,12 @@ pub fn run(a: RankGroundedArgs) -> Result<()> {
                     .map(GroundedError::to_string)
                     .unwrap_or_else(|| "unknown".to_string())
             ),
+        }
+        if let Some(tail) = &report.output_tail {
+            eprintln!("[crucible rank-grounded] agent output tail:");
+            for line in tail.lines() {
+                eprintln!("  {line}");
+            }
         }
         if report.over_budget {
             eprintln!(
@@ -649,6 +685,62 @@ mod tests {
             Some(Disposition::Tier(Tier::T1))
         );
         assert!(report.to_json().get("error_kind").is_none());
+    }
+
+    /// The outage shape: the turn fails and the agent's only output is the diagnostic it
+    /// printed on its way down. Reporting "the turn never completed" while dropping that line
+    /// is what made this class of failure unreadable.
+    #[test]
+    fn a_failed_turn_replays_what_the_agent_printed() {
+        let report = report_from_turn(
+            TurnOutcome::failed(0.0, TurnFailure::Spawn("the agent exited 1".to_string())),
+            "Error: could not fetch an access token\n",
+            0.0,
+        );
+        assert_eq!(
+            report.output_tail.as_deref(),
+            Some("Error: could not fetch an access token")
+        );
+        assert_eq!(
+            report.to_json().get("output_tail").and_then(|v| v.as_str()),
+            Some("Error: could not fetch an access token")
+        );
+    }
+
+    #[test]
+    fn a_failed_turn_that_printed_nothing_carries_no_tail() {
+        let report = report_from_turn(
+            TurnOutcome::failed(0.0, TurnFailure::Spawn("boom".to_string())),
+            "   \n\n",
+            0.0,
+        );
+        assert_eq!(report.output_tail, None);
+    }
+
+    /// A turn that produced a verdict is the success path: no tail, so the marker line the
+    /// controller scrapes stays lean.
+    #[test]
+    fn a_successful_turn_carries_no_tail() {
+        let report = report_from_turn(
+            TurnOutcome::completed(0.3),
+            "{\"tier\":\"T1\",\"rationale\":\"one file\"}",
+            0.0,
+        );
+        assert_eq!(report.output_tail, None);
+    }
+
+    #[test]
+    fn the_replayed_tail_is_bounded_to_the_last_lines() {
+        let buf: String = (0..100).map(|i| format!("line {i}\n")).collect();
+        let report = report_from_turn(
+            TurnOutcome::failed(0.0, TurnFailure::Spawn("boom".to_string())),
+            &buf,
+            0.0,
+        );
+        let tail = report.output_tail.expect("tail");
+        assert_eq!(tail.lines().count(), OUTPUT_TAIL_LINES);
+        assert!(tail.starts_with("line 80"), "{tail}");
+        assert!(tail.ends_with("line 99"), "{tail}");
     }
 
     fn args(workspace: &Path, script: &Path, max_cost: f64) -> RankGroundedArgs {
