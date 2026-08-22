@@ -629,6 +629,175 @@ workflow(type = "cascade", tasks = [draft, shape, polish, audit_a, audit_b, roun
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A fan-out over items nobody knew about when the graph was written, run end to end with
+    /// no model. The graph has three nodes whatever `discover` returns; only the instance count
+    /// is decided at run time, and each instance is named by its item rather than its position.
+    #[test]
+    fn a_fanout_runs_one_instance_per_discovered_item() {
+        let dir = std::env::temp_dir().join(format!("crucible-fanout-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        let fake = root.join("tools/fake-agent.py");
+
+        std::fs::write(
+            dir.join("agents.json"),
+            r#"{
+              "audit[alpha]": {"result": {"item": "{ENV:CRUCIBLE_TASK}", "findings": 0}},
+              "audit[beta]":  {"result": {"item": "{ENV:CRUCIBLE_TASK}", "findings": 2}},
+              "audit[gamma]": {"exit": 1, "stderr": "gamma has no baseline"}
+            }"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            dir.join("workflow.star"),
+            r##"
+discover = command(
+    name = "discover",
+    run = "printf '{\"targets\": [\"alpha\", \"beta\", \"gamma\"]}\n'",
+    emits = ["targets"],
+)
+audit = agent(
+    name = "audit",
+    prompt = "audit one target",
+    depends_on = [discover],
+    over = discover.targets,
+    max_fanout = 8,
+    isolated = True,
+    required = False,
+    emits = ["findings"],
+)
+roundup = command(
+    name = "roundup",
+    run = "printf '{\"seen\": %s}\n' \"$(printf '%s' \"$CRUCIBLE_INPUTS\" | grep -o passed | wc -l | tr -d ' ')\"",
+    depends_on = [audit],
+    join = "passed",
+)
+workflow(type = "cascade", tasks = [discover, audit, roundup])
+"##,
+        )
+        .unwrap();
+
+        std::fs::write(
+            dir.join("crucible.toml"),
+            format!(
+                r#"
+                [repo]
+                path = "."
+                [workspace]
+                dir = "workspace"
+                setup_cmd = "mkdir -p workspace && git -C workspace init -q && git -C workspace -c user.email=c@l -c user.name=c -c commit.gpgsign=false commit -q --allow-empty -m baseline"
+                [agent]
+                backend = "command"
+                agent_cmd = "python3 {}"
+                goal = "audit each discovered target"
+                [agent.env]
+                FAKE_AGENT_SCRIPT = "{}"
+                [workflow]
+                type = "cascade"
+                file = "workflow.star"
+                "#,
+                fake.display(),
+                dir.join("agents.json").display(),
+            ),
+        )
+        .unwrap();
+
+        let mut manifest = crate::manifest::Manifest::load(&dir.join("crucible.toml")).unwrap();
+        manifest.resolve_workflow(&dir).unwrap();
+        let workflow = manifest.workflow.as_ref().expect("workflow");
+        let plan = crate::loop_graph::iteration_template(
+            Some(workflow),
+            &crate::manifest::WorkflowCaps::for_lane(workflow.workflow_type),
+        )
+        .unwrap();
+        // Three nodes, before anything runs and whatever `discover` finds.
+        assert_eq!(plan.plan().tasks.len(), 3);
+
+        let mut rows: Vec<(String, &'static str)> = Vec::new();
+        let mut runner = crate::run::prep_plan_runner(&dir.join("crucible.toml")).unwrap();
+        let out = execute(
+            &plan,
+            &Substrate::default(),
+            ExecCfg::default(),
+            &mut runner,
+            |task, result| rows.push((task.name.0.clone(), result.status.as_str())),
+        );
+
+        // One row per item, named by the item. A reader can tell which target failed.
+        assert!(
+            rows.contains(&("audit[alpha]".to_string(), "pass")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.contains(&("audit[beta]".to_string(), "pass")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.contains(&("audit[gamma]".to_string(), "fail")),
+            "{rows:?}"
+        );
+
+        // The node folds them: advisory, so one failed instance does not gate the run.
+        let node = &out.results[&"audit".into()];
+        assert_eq!(node.status, TaskStatus::Fail, "one instance failed");
+        let folded = node.output.as_ref().expect("folded output");
+        assert_eq!(folded["instances"], 3);
+        assert_eq!(folded["passed"], 2);
+        assert_eq!(folded["failed"], 1);
+        assert_eq!(folded["outputs"]["alpha"]["item"], "audit[alpha]");
+        assert!(
+            node.note.as_ref().is_some_and(|n| n.contains("gamma")),
+            "the note must name what failed: {:?}",
+            node.note
+        );
+
+        assert!(
+            out.valid,
+            "an advisory fan-out cannot invalidate: {:?}",
+            out.exit
+        );
+        assert_eq!(out.results[&"roundup".into()].status, TaskStatus::Pass);
+
+        // A wider result than declared is refused rather than run.
+        std::fs::write(
+            dir.join("workflow.star"),
+            std::fs::read_to_string(dir.join("workflow.star"))
+                .unwrap()
+                .replace("max_fanout = 8", "max_fanout = 2"),
+        )
+        .unwrap();
+        let mut narrow = crate::manifest::Manifest::load(&dir.join("crucible.toml")).unwrap();
+        narrow.resolve_workflow(&dir).unwrap();
+        let plan = crate::loop_graph::iteration_template(
+            Some(narrow.workflow.as_ref().unwrap()),
+            &crate::manifest::WorkflowCaps::for_lane(crate::manifest::WorkflowType::Cascade),
+        )
+        .unwrap();
+        let mut runner = crate::run::prep_plan_runner(&dir.join("crucible.toml")).unwrap();
+        let out = execute(
+            &plan,
+            &Substrate::default(),
+            ExecCfg::default(),
+            &mut runner,
+            |_, _| {},
+        );
+        let node = &out.results[&"audit".into()];
+        assert_eq!(node.status, TaskStatus::Fail);
+        assert!(
+            node.note
+                .as_ref()
+                .is_some_and(|n| n.contains("max_fanout is 2")),
+            "the bound must be named: {:?}",
+            node.note
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_turn_that_writes_no_result_fails_but_still_advances_the_session() {
         let dir = std::env::temp_dir().join(format!(
@@ -931,6 +1100,8 @@ workflow(type = "cascade", tasks = [draft, shape, polish, audit_a, audit_b, roun
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
+            over: None,
+            max_fanout: None,
         };
         let mut runner = HarnessRunner {
             args: <crate::Cli as clap::Parser>::try_parse_from(["crucible"])

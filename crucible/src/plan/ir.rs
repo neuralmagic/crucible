@@ -26,6 +26,19 @@ impl From<&str> for TaskName {
 #[serde(transparent)]
 pub struct OutputField(pub String);
 
+/// One declared output field of one task: what a mapped task fans out over.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputRef {
+    pub task: TaskName,
+    pub field: OutputField,
+}
+
+impl std::fmt::Display for OutputRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.task, self.field.0)
+    }
+}
+
 /// Grading direction for reducers, mirroring the judge's convention.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -219,6 +232,17 @@ pub struct Task {
     /// undeclared.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub emits: Vec<OutputField>,
+    /// An upstream list this task runs once per element of. The task is one node in the graph
+    /// however many elements arrive, so the graph stays renderable before any spend; only the
+    /// number of instances is decided at run time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub over: Option<OutputRef>,
+    /// The most instances `over` may produce. Required alongside it and never defaulted: an
+    /// author who has not said how wide their fan-out gets has not thought about it, and a
+    /// discovery task that returns more than expected should fail loudly rather than fan out to
+    /// whatever a global default happened to be.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_fanout: Option<u32>,
 }
 
 /// Executor-enforced accounting limit; overruns fail the plan.
@@ -624,6 +648,8 @@ mod tests {
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
+            over: None,
+            max_fanout: None,
         }
     }
 
@@ -772,6 +798,8 @@ mod tests {
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
+            over: None,
+            max_fanout: None,
         };
         let err = plan(vec![t]).validate().unwrap_err();
         assert_eq!(
@@ -896,6 +924,8 @@ mod tests {
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
+            over: None,
+            max_fanout: None,
         }
     }
 

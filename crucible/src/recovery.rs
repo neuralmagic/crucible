@@ -800,6 +800,8 @@ mod tests {
                     required: true,
                     join: String::new(),
                     stage: String::new(),
+                    over: String::new(),
+                    max_fanout: 0,
                 },
                 PlanTaskWire {
                     name: "measure".into(),
@@ -810,6 +812,8 @@ mod tests {
                     required: true,
                     join: String::new(),
                     stage: String::new(),
+                    over: String::new(),
+                    max_fanout: 0,
                 },
             ],
         });

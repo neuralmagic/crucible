@@ -133,6 +133,15 @@ pub struct PlanTaskWire {
     /// `iteration` or `epilogue`. A consumer computing a verdict must skip the epilogue.
     #[serde(default)]
     pub stage: String,
+    /// `producer.field` when this task runs once per element of an upstream list, empty
+    /// otherwise. The node is one node however many instances it produces, so a renderer draws
+    /// the graph from this without waiting to see how wide it gets.
+    #[serde(default)]
+    pub over: String,
+    /// The most instances `over` may produce; 0 when the task is not mapped. A reader knows the
+    /// worst-case width before any spend.
+    #[serde(default)]
+    pub max_fanout: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -682,6 +691,8 @@ mod tests {
                 required: true,
                 join: "all".into(),
                 stage: "iteration".into(),
+                over: "discover.targets".into(),
+                max_fanout: 8,
             }],
         });
     }

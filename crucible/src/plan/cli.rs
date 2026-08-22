@@ -305,6 +305,12 @@ pub(crate) fn plan_admitted_event(plan: &ValidPlan) -> crate::session::SessionEv
                 required: t.required,
                 join: t.join.as_str().to_string(),
                 stage: t.stage.as_str().to_string(),
+                over: t
+                    .over
+                    .as_ref()
+                    .map(crate::plan::ir::OutputRef::to_string)
+                    .unwrap_or_default(),
+                max_fanout: t.max_fanout.unwrap_or_default(),
             })
             .collect(),
     }
@@ -806,6 +812,7 @@ mod tests {
             cost_usd: 0.25,
             output: Some(serde_json::json!({"score": 3})),
             note: None,
+            fanout: None,
         };
         let back = crate::session::decode(&crate::session::encode(&task_result_event(1, 0, t, &r)))
             .unwrap();

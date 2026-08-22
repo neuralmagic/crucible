@@ -17,7 +17,7 @@ use starlark_syntax::codemap::FileSpan;
 
 use crate::manifest::{WorkflowCfg, WorkflowType};
 use crate::plan::starlark as dsl;
-use crate::plan::starlark::values::{SessionValue, TaskValue, WorkflowValue};
+use crate::plan::starlark::values::{OutputRefValue, SessionValue, TaskValue, WorkflowValue};
 
 /// Constructors that historically took one positional argument. Everything else is named-only.
 const POSITIONAL: &[&str] = &["prompt_file", "workflow", "default_autoresearch"];
@@ -286,6 +286,9 @@ fn convert_at(value: Value<'_>, depth: usize) -> dsl::Result<dsl::Value> {
     if let Some(task) = TaskValue::from_value(value) {
         return Ok(dsl::Value::Task(task.0.clone()));
     }
+    if let Some(output) = OutputRefValue::from_value(value) {
+        return output.resolve().map(dsl::Value::Output);
+    }
     if let Some(session) = SessionValue::from_value(value) {
         return Ok(dsl::Value::Session(session.0.clone()));
     }
@@ -320,6 +323,10 @@ fn alloc_at<'v>(heap: Heap<'v>, value: dsl::Value, depth: usize) -> Value<'v> {
             heap.alloc(AllocList(items))
         }
         dsl::Value::Task(task) => heap.alloc(TaskValue(task)),
+        dsl::Value::Output(reference) => heap.alloc(OutputRefValue {
+            declared: vec![reference.field.0.clone()],
+            reference,
+        }),
         dsl::Value::Session(session) => heap.alloc(SessionValue(session)),
         dsl::Value::Workflow(workflow) => heap.alloc(WorkflowValue(workflow)),
     }

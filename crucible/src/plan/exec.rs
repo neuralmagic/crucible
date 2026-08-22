@@ -117,7 +117,14 @@ impl TaskStatus {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
+pub struct FanoutSummary {
+    pub instances: usize,
+    pub passed: usize,
+    pub failed: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct TaskResult {
     pub status: TaskStatus,
     pub attempts: u32,
@@ -126,6 +133,20 @@ pub struct TaskResult {
     pub output: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Present only on a mapped node. A node's single status cannot say "two of three survived",
+    /// which is exactly what a `join = "passed"` dependent needs to know, so the counts travel
+    /// with the result rather than being inferred from its output's shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fanout: Option<FanoutSummary>,
+}
+
+impl TaskResult {
+    /// Whether anything downstream can be built on this result. A plain task contributes when
+    /// it passed; a mapped node contributes when any instance passed, which is what makes
+    /// `join = "passed"` mean the same thing over a fan-out as over a set of siblings.
+    fn contributed(&self) -> bool {
+        self.status == TaskStatus::Pass || self.fanout.as_ref().is_some_and(|f| f.passed > 0)
+    }
 }
 
 impl TaskResult {
@@ -136,6 +157,7 @@ impl TaskResult {
             cost_usd: 0.0,
             output: None,
             note: Some(note.into()),
+            fanout: None,
         }
     }
 }
@@ -229,14 +251,18 @@ pub fn execute(
     // the first ready task and restarts, or, when the first ready task is
     // isolation-marked, the whole simultaneously-ready isolated set as one batch. For a
     // plan with no isolated tasks this reproduces the serial topo walk exactly.
+    // `gates` is false for one mapped instance: an instance is not a node of the graph, so its
+    // failure is folded into the node's result and it is the node that short-circuits or does
+    // not. Reporting still happens, because a reader wants the row per item.
     let mut record = |t: &Task,
                       r: TaskResult,
                       results: &mut BTreeMap<TaskName, TaskResult>,
-                      halted: &mut Option<PlanExit>| {
+                      halted: &mut Option<PlanExit>,
+                      gates: bool| {
         let failed = r.status != TaskStatus::Pass;
         on_result(t, &r);
         results.insert(t.name.clone(), r);
-        if failed && t.required && halted.is_none() {
+        if gates && failed && t.required && halted.is_none() {
             *halted = Some(PlanExit::ShortCircuit {
                 task: t.name.clone(),
             });
@@ -256,13 +282,13 @@ pub fn execute(
                     _ => "halted".to_string(),
                 };
                 let r = TaskResult::undispatched(TaskStatus::Blocked, why);
-                record(t, r, &mut results, &mut halted);
+                record(t, r, &mut results, &mut halted, true);
                 continue;
             }
             if !runnable.contains(&t.name) {
                 let r =
                     TaskResult::undispatched(TaskStatus::Skipped, "unrunnable on this substrate");
-                record(t, r, &mut results, &mut halted);
+                record(t, r, &mut results, &mut halted, true);
                 continue;
             }
             if t.depends_on.iter().any(|d| !results.contains_key(d)) {
@@ -273,23 +299,24 @@ pub fn execute(
                     .depends_on
                     .iter()
                     .all(|d| results.get(d).map(|r| r.status) == Some(TaskStatus::Pass)),
-                // Only passing outputs feed a lossy join.
+                // Only passing outputs feed a lossy join. A mapped node contributes when any
+                // of its instances passed, so a fan-out reads the same as a set of siblings.
                 Join::Passed => t
                     .depends_on
                     .iter()
-                    .any(|d| results.get(d).map(|r| r.status) == Some(TaskStatus::Pass)),
+                    .any(|d| results.get(d).is_some_and(TaskResult::contributed)),
             };
             if !deps_ok {
                 // Nothing runs on top of a failure (or a skip): advisory failures gate
                 // their dependents even though they never gate validity.
                 let r = TaskResult::undispatched(TaskStatus::Blocked, "dependency did not pass");
-                record(t, r, &mut results, &mut halted);
+                record(t, r, &mut results, &mut halted, true);
                 continue;
             }
             if spent >= budget {
                 halted = Some(PlanExit::BudgetExceeded);
                 let r = TaskResult::undispatched(TaskStatus::Blocked, "budget ceiling reached");
-                record(t, r, &mut results, &mut halted);
+                record(t, r, &mut results, &mut halted, true);
                 continue;
             }
             // Elapsed time is known continuously, unlike a cost total, so the ceiling is
@@ -300,11 +327,15 @@ pub fn execute(
             {
                 halted = Some(PlanExit::TimeExceeded);
                 let r = TaskResult::undispatched(TaskStatus::Blocked, "wall-clock ceiling reached");
-                record(t, r, &mut results, &mut halted);
+                record(t, r, &mut results, &mut halted, true);
                 continue;
             }
             if dispatch.is_empty() {
                 dispatch.push(t);
+                if t.over.is_some() {
+                    // A mapped task is dispatched alone: its own instances are the batch.
+                    break;
+                }
                 if t.isolation.is_none() {
                     // Serial task: dispatch it alone, in strict topo position.
                     break;
@@ -334,7 +365,69 @@ pub fn execute(
                 .collect::<BTreeMap<TaskName, Value>>()
         };
 
-        if dispatch.len() == 1 {
+        if let Some(node) = dispatch.first().filter(|t| t.over.is_some()) {
+            let node = *node;
+            let base = inputs_for(node, &results);
+            match fanout_items(node, &results) {
+                Err(why) => {
+                    let r = TaskResult {
+                        status: TaskStatus::Fail,
+                        attempts: 1,
+                        cost_usd: 0.0,
+                        output: None,
+                        note: Some(why),
+                        fanout: None,
+                    };
+                    record(node, r, &mut results, &mut halted, true);
+                }
+                Ok(keys) => {
+                    let instances: Vec<Task> = keys
+                        .iter()
+                        .map(|key| Task {
+                            name: instance_name(&node.name, key),
+                            over: None,
+                            max_fanout: None,
+                            ..node.clone()
+                        })
+                        .collect();
+                    let batch: Vec<BatchItem<'_>> = instances
+                        .iter()
+                        .zip(&keys)
+                        .map(|(task, key)| {
+                            let mut inputs = base.clone();
+                            inputs.insert(
+                                TaskName(ITEM_INPUT.to_string()),
+                                Value::String(key.clone()),
+                            );
+                            BatchItem {
+                                task,
+                                attempt: 1,
+                                inputs,
+                            }
+                        })
+                        .collect();
+                    let (batch_results, budget_exceeded) =
+                        run_batch_with_retries(batch, cfg, runner, &mut spent, budget);
+                    if budget_exceeded {
+                        halted = Some(PlanExit::BudgetExceeded);
+                    }
+                    // Each instance settles in its own right, so a reader sees one row per item
+                    // rather than one row standing for all of them.
+                    let mut settled: Vec<(String, TaskResult)> = Vec::new();
+                    for ((task, result), key) in batch_results.into_iter().zip(&keys) {
+                        settled.push((key.clone(), result.clone()));
+                        record(task, result, &mut results, &mut halted, false);
+                    }
+                    record(
+                        node,
+                        fold_instances(settled),
+                        &mut results,
+                        &mut halted,
+                        true,
+                    );
+                }
+            }
+        } else if dispatch.len() == 1 {
             let t = first;
             let inputs = inputs_for(t, &results);
             let (result, budget_exceeded) = match &t.task {
@@ -349,7 +442,7 @@ pub fn execute(
             if budget_exceeded {
                 halted = Some(PlanExit::BudgetExceeded);
             }
-            record(t, result, &mut results, &mut halted);
+            record(t, result, &mut results, &mut halted, true);
         } else {
             // A concurrent batch of independent isolated tasks; results are recorded in
             // declaration order regardless of completion order, so the event stream
@@ -368,7 +461,7 @@ pub fn execute(
                 halted = Some(PlanExit::BudgetExceeded);
             }
             for (t, result) in batch_results {
-                record(t, result, &mut results, &mut halted);
+                record(t, result, &mut results, &mut halted, true);
             }
         }
     }
@@ -384,6 +477,114 @@ pub fn execute(
         exit,
         spent_usd: spent,
         results,
+    }
+}
+
+/// The reserved input a mapped instance receives its own item under. Reserved like the
+/// epilogue's kept-candidate input: a task may not declare a dependency by this name.
+pub const ITEM_INPUT: &str = "item";
+
+/// One instance's name, `node[key]`. The key is the item, never its position: a list that comes
+/// back reordered or shorter still names the same work the same way, which is what makes a
+/// folded result on resume safe to match. Airflow's mapped tasks key on the index, and clearing
+/// one after its input shifted reprocesses the wrong item.
+fn instance_name(node: &TaskName, key: &str) -> TaskName {
+    TaskName(format!("{}[{}]", node.0, key))
+}
+
+/// Read the items a mapped task fans out over, or say why it cannot.
+fn fanout_items(
+    node: &Task,
+    results: &BTreeMap<TaskName, TaskResult>,
+) -> Result<Vec<String>, String> {
+    let Some(reference) = node.over.as_ref() else {
+        return Err("not a mapped task".to_string());
+    };
+    let bound = node.max_fanout.unwrap_or(0) as usize;
+    let produced = results
+        .get(&reference.task)
+        .and_then(|r| r.output.as_ref())
+        .ok_or_else(|| format!("{} produced no output to map over", reference.task))?;
+    let list = produced
+        .get(&reference.field.0)
+        .ok_or_else(|| format!("{reference} is absent from what {} emitted", reference.task))?
+        .as_array()
+        .ok_or_else(|| format!("{reference} is not a list"))?;
+    if list.len() > bound {
+        return Err(format!(
+            "{reference} has {} items; max_fanout is {bound}. A discovery that returns more than \
+             expected is a fact about the discovery, not a licence to run wider",
+            list.len()
+        ));
+    }
+    let mut keys: Vec<String> = Vec::with_capacity(list.len());
+    for (position, item) in list.iter().enumerate() {
+        let key = item.as_str().ok_or_else(|| {
+            format!("{reference}[{position}] is not a string; a mapped item is its own key")
+        })?;
+        if key.is_empty() || key.contains(['[', ']']) {
+            return Err(format!(
+                "{reference}[{position}] = {key:?} cannot name an instance"
+            ));
+        }
+        if keys.iter().any(|seen| seen == key) {
+            return Err(format!(
+                "{reference} repeats {key:?}; two instances cannot share a key"
+            ));
+        }
+        keys.push(key.to_owned());
+    }
+    Ok(keys)
+}
+
+/// Fold what the instances did into the one result the graph sees for the node.
+///
+/// The node is required or advisory as a whole, so every instance has to pass for it to pass. A
+/// dependent that wants whatever survived says so with `join = "passed"`, which is the vocabulary
+/// that already exists; a fan-out needs no join of its own.
+fn fold_instances(settled: Vec<(String, TaskResult)>) -> TaskResult {
+    let passed = settled
+        .iter()
+        .filter(|(_, r)| r.status == TaskStatus::Pass)
+        .count();
+    let failed = settled.len() - passed;
+    let cost: f64 = settled.iter().map(|(_, r)| r.cost_usd).sum();
+    let outputs: serde_json::Map<String, Value> = settled
+        .iter()
+        .map(|(key, r)| (key.clone(), r.output.clone().unwrap_or(Value::Null)))
+        .collect();
+    let note = (failed > 0).then(|| {
+        let names: Vec<&str> = settled
+            .iter()
+            .filter(|(_, r)| r.status != TaskStatus::Pass)
+            .map(|(key, _)| key.as_str())
+            .collect();
+        format!(
+            "{failed} of {} instances failed: {}",
+            settled.len(),
+            names.join(", ")
+        )
+    });
+    TaskResult {
+        status: if failed == 0 {
+            TaskStatus::Pass
+        } else {
+            TaskStatus::Fail
+        },
+        attempts: 1,
+        cost_usd: cost,
+        output: Some(serde_json::json!({
+            "instances": settled.len(),
+            "passed": passed,
+            "failed": failed,
+            "outputs": Value::Object(outputs),
+        })),
+        note,
+        fanout: Some(FanoutSummary {
+            instances: settled.len(),
+            passed,
+            failed,
+        }),
     }
 }
 
@@ -454,6 +655,7 @@ fn run_with_retries(
                         cost_usd: cost,
                         output: Some(output),
                         note: None,
+                        fanout: None,
                     },
                     *spent > budget,
                 );
@@ -466,6 +668,7 @@ fn run_with_retries(
                         cost_usd: cost,
                         output: Some(output),
                         note: Some(note),
+                        fanout: None,
                     },
                     *spent > budget,
                 );
@@ -478,6 +681,7 @@ fn run_with_retries(
                         cost_usd: cost,
                         output: None,
                         note: Some(note),
+                        fanout: None,
                     },
                     *spent > budget,
                 );
@@ -493,6 +697,7 @@ fn run_with_retries(
                             note: Some(format!(
                                 "budget ceiling reached after transport attempt: {note}"
                             )),
+                            fanout: None,
                         },
                         true,
                     );
@@ -510,6 +715,7 @@ fn run_with_retries(
             note: Some(format!(
                 "transport retries exhausted ({max_attempts} attempts): {last_transport_note}"
             )),
+            fanout: None,
         },
         *spent > budget,
     )
@@ -565,6 +771,7 @@ fn run_batch_with_retries<'a>(
                             cost_usd: cost_so_far[idx],
                             output: Some(output),
                             note: None,
+                            fanout: None,
                         },
                     );
                 }
@@ -577,6 +784,7 @@ fn run_batch_with_retries<'a>(
                             cost_usd: cost_so_far[idx],
                             output: Some(output),
                             note: Some(note),
+                            fanout: None,
                         },
                     );
                 }
@@ -589,6 +797,7 @@ fn run_batch_with_retries<'a>(
                             cost_usd: cost_so_far[idx],
                             output: None,
                             note: Some(note),
+                            fanout: None,
                         },
                     );
                 }
@@ -622,6 +831,7 @@ fn run_batch_with_retries<'a>(
                                         "transport retries exhausted ({max_attempts} attempts): {note}"
                                     )
                                 }),
+                                fanout: None,
                             },
                         );
                     }
@@ -650,6 +860,7 @@ fn reduce_top_k(inputs: &BTreeMap<TaskName, Value>, k: u32, direction: Direction
                     cost_usd: 0.0,
                     output: None,
                     note: Some(format!("input {name} has no finite numeric `score` field")),
+                    fanout: None,
                 };
             }
         }
@@ -669,6 +880,7 @@ fn reduce_top_k(inputs: &BTreeMap<TaskName, Value>, k: u32, direction: Direction
         cost_usd: 0.0,
         output: Some(serde_json::json!({ "kept": kept })),
         note: None,
+        fanout: None,
     }
 }
 
@@ -741,6 +953,8 @@ mod tests {
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
+            over: None,
+            max_fanout: None,
         }
     }
 
@@ -1168,6 +1382,8 @@ mod tests {
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
+            over: None,
+            max_fanout: None,
         });
         let plan = valid(tasks, 10.0);
         let mut r = ScriptRunner::new();
@@ -1223,6 +1439,8 @@ mod tests {
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
+            over: None,
+            max_fanout: None,
         });
         let plan = valid(tasks, 10.0);
         let mut r = ScriptRunner::new();
@@ -1411,6 +1629,8 @@ mod tests {
             join: Join::Passed,
             stage: Stage::Iteration,
             emits: Vec::new(),
+            over: None,
+            max_fanout: None,
         };
         tasks.push(pick);
         let plan = valid(tasks, 10.0);

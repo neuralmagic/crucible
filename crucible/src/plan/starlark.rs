@@ -22,7 +22,7 @@ use crate::errors::FileError;
 use crate::manifest::{WorkflowCfg, WorkflowError, WorkflowType};
 use crate::plan::diag;
 use crate::plan::ir::{
-    Direction, EngineOp, Isolation, Join, OutputField, Stage, Task, TaskKind, TaskName,
+    Direction, EngineOp, Isolation, Join, OutputField, OutputRef, Stage, Task, TaskKind, TaskName,
 };
 use crate::plan::starlark::values::WorkflowValue;
 
@@ -331,6 +331,8 @@ enum Value {
     String(String),
     List(Vec<Value>),
     Task(Task),
+    /// `producer.field`, already checked against the producer's declared emits.
+    Output(OutputRef),
     Session(SessionDecl),
     Workflow(WorkflowCfg),
     /// A starlark value outside the DSL's own space: a dict, a function, a struct. The `take_*`
@@ -426,6 +428,21 @@ pub enum CompileError {
          the workflow, but the workflow is what reached it."
     )]
     EvalPanic { detail: String },
+    #[error(
+        "task {task:?} declares no output field {field:?}{}{}",
+        suggestion.as_ref().map(|s| format!("; did you mean {s:?}?")).unwrap_or_default(),
+        if declared.is_empty() {
+            " (it declares no emits at all)".to_string()
+        } else {
+            format!(" (it emits: {declared})")
+        }
+    )]
+    UndeclaredOutputField {
+        task: String,
+        field: String,
+        suggestion: Option<String>,
+        declared: String,
+    },
     #[error("workflow evaluation failed: {0}")]
     Eval(String),
     #[error("workflow evaluation called fail(): {0}")]
@@ -522,6 +539,31 @@ pub enum CompileError {
     UnknownStage { got: String },
     #[error("join must be `all` or `passed`, got {got:?}")]
     UnknownJoin { got: String },
+    #[error(
+        "\"over\" must name a declared output field of a task this one depends on, as \
+         `over = producer.field`"
+    )]
+    OverNotOutputField,
+    #[error("\"max_fanout\" must be an integer")]
+    FanoutNotInteger,
+    #[error("max_fanout = {got} is outside 1..={MAX_FANOUT_CEILING}")]
+    FanoutOutOfRange { got: i32 },
+    #[error(
+        "task {task:?} maps over {reference} but does not depend on {producer:?}; a fan-out \
+         reads its items from a dependency's output"
+    )]
+    OverNotADependency {
+        task: String,
+        reference: String,
+        producer: String,
+    },
+    #[error(
+        "task {task:?} maps over {reference} without max_fanout; a fan-out states how wide it \
+         may get before it runs, not after"
+    )]
+    OverWithoutFanout { task: String, reference: String },
+    #[error("task {task:?} declares max_fanout without \"over\"; there is nothing to bound")]
+    FanoutWithoutOver { task: String },
     #[error("emits entries must be strings")]
     EmitsEntryNotString,
     #[error("argument \"emits\" must be a list of field-name strings")]
@@ -633,6 +675,8 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "isolated",
             "join",
             "stage",
+            "over",
+            "max_fanout",
         ],
         "command" => &[
             "name",
@@ -644,6 +688,8 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "isolated",
             "join",
             "stage",
+            "over",
+            "max_fanout",
         ],
         "evaluate" => &[
             "name",
@@ -657,6 +703,8 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "isolated",
             "join",
             "stage",
+            "over",
+            "max_fanout",
         ],
         "top_k" => &["name", "k", "direction", "depends_on", "required"],
         "propose" => &["name", "session", "depends_on"],
@@ -823,6 +871,8 @@ fn constructor(
                 join: Join::Passed,
                 stage: Stage::Iteration,
                 emits: Vec::new(),
+                over: None,
+                max_fanout: None,
             }
         }
         "propose" => {
@@ -1048,7 +1098,7 @@ fn dsl_task(
     kind: TaskKind,
     session: Option<String>,
 ) -> Result<Task> {
-    Ok(Task {
+    let task = Task {
         name,
         task: kind,
         depends_on: take_task_names(named)?,
@@ -1059,7 +1109,59 @@ fn dsl_task(
         join: parse_join(&take_string_default(named, "join", "all")?)?,
         stage: parse_stage(&take_string_default(named, "stage", "iteration")?)?,
         emits: take_output_fields(named)?,
-    })
+        over: take_over(named)?,
+        max_fanout: take_optional_fanout(named)?,
+    };
+    check_fanout(&task)?;
+    Ok(task)
+}
+
+/// A fan-out reads its items from a dependency and states its width before it runs. Both are
+/// checked here, where the task is whole, rather than at plan validation, so the diagnostic
+/// carries the source location the constructor was written at.
+fn check_fanout(task: &Task) -> Result<()> {
+    match (&task.over, task.max_fanout) {
+        (None, None) => Ok(()),
+        (None, Some(_)) => Err(CompileError::FanoutWithoutOver {
+            task: task.name.0.clone(),
+        }),
+        (Some(reference), None) => Err(CompileError::OverWithoutFanout {
+            task: task.name.0.clone(),
+            reference: reference.to_string(),
+        }),
+        (Some(reference), Some(_)) => {
+            if task.depends_on.contains(&reference.task) {
+                Ok(())
+            } else {
+                Err(CompileError::OverNotADependency {
+                    task: task.name.0.clone(),
+                    reference: reference.to_string(),
+                    producer: reference.task.0.clone(),
+                })
+            }
+        }
+    }
+}
+
+/// The maximum a pack may declare for `max_fanout`. Operator-owned, not author-owned: a bound a
+/// pack could raise is not a bound.
+pub(crate) const MAX_FANOUT_CEILING: u32 = 256;
+
+fn take_over(named: &mut BTreeMap<String, Value>) -> Result<Option<OutputRef>> {
+    match named.remove("over") {
+        None | Some(Value::None) => Ok(None),
+        Some(Value::Output(reference)) => Ok(Some(reference)),
+        Some(_) => Err(CompileError::OverNotOutputField),
+    }
+}
+
+fn take_optional_fanout(named: &mut BTreeMap<String, Value>) -> Result<Option<u32>> {
+    match named.remove("max_fanout") {
+        None | Some(Value::None) => Ok(None),
+        Some(Value::Int(n)) if n >= 1 && n as u32 <= MAX_FANOUT_CEILING => Ok(Some(n as u32)),
+        Some(Value::Int(n)) => Err(CompileError::FanoutOutOfRange { got: n }),
+        Some(_) => Err(CompileError::FanoutNotInteger),
+    }
 }
 
 fn parse_stage(value: &str) -> Result<Stage> {
@@ -1088,6 +1190,8 @@ fn engine(name: &str, op: EngineOp, source: Option<TaskName>, depends_on: Vec<Ta
         join: Join::All,
         stage: Stage::Iteration,
         emits: Vec::new(),
+        over: None,
+        max_fanout: None,
     }
 }
 
@@ -2318,15 +2422,15 @@ workflow(type = "custom", tasks = [e], result = e)
         let cases: &[(&str, &str)] = &[
             (
                 "agent",
-                "s = session(name = \"sess\")\na = agent(name = \"a\", prompt = \"p\", harness = \"claude\", model = \"m\", effort = \"high\", session = s, emits = [\"score\"], depends_on = [], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\"{extra})\nworkflow(type = \"custom\", tasks = [a], result = a)\n",
+                "s = session(name = \"sess\")\nu = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = agent(name = \"a\", prompt = \"p\", harness = \"claude\", model = \"m\", effort = \"high\", session = s, emits = [\"score\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
             ),
             (
                 "command",
-                "c = command(name = \"c\", run = \"true\", emits = [\"score\"], depends_on = [], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\"{extra})\nworkflow(type = \"custom\", tasks = [c], result = c)\n",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\nc = command(name = \"c\", run = \"true\", emits = [\"score\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4{extra})\nworkflow(type = \"custom\", tasks = [u, c], result = c)\n",
             ),
             (
                 "evaluate",
-                "e = evaluate(name = \"e\", run = \"true\", threshold = 1, direction = \"higher\", emits = [\"score\"], depends_on = [], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\"{extra})\nworkflow(type = \"custom\", tasks = [e], result = e)\n",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\ne = evaluate(name = \"e\", run = \"true\", threshold = 1, direction = \"higher\", emits = [\"score\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4{extra})\nworkflow(type = \"custom\", tasks = [u, e], result = e)\n",
             ),
             (
                 "top_k",
@@ -2676,6 +2780,101 @@ workflow(branches + [curate])
             .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
 
         let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// One node in the graph however many items arrive: the fan-out's width is decided at run
+    /// time, its shape is not. `producer.field` is checked against what the producer declares,
+    /// so a typo is a compile error rather than an empty list on the day it runs.
+    #[test]
+    fn a_mapped_task_names_a_declared_field_of_a_dependency() {
+        let pack = temp_pack("over");
+        let good = r#"
+discover = command(name = "discover", run = "./find.sh", emits = ["targets"])
+audit = agent(
+    name = "audit",
+    prompt = "audit it",
+    depends_on = [discover],
+    over = discover.targets,
+    max_fanout = 16,
+    isolated = True,
+)
+workflow(type = "cascade", tasks = [discover, audit])
+"#;
+        let compiled = compile_source(good, &pack.join("workflow.star"), &pack)
+            .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
+        let audit = compiled
+            .workflow
+            .tasks
+            .iter()
+            .find(|t| t.name.0 == "audit")
+            .expect("audit");
+        let reference = audit.over.as_ref().expect("over");
+        assert_eq!(reference.task.0, "discover");
+        assert_eq!(reference.field.0, "targets");
+        assert_eq!(audit.max_fanout, Some(16));
+        // The graph has two nodes, not seventeen.
+        assert_eq!(compiled.workflow.tasks.len(), 2);
+
+        let refusals = [
+            ("over = discover.tagrets", "declares no output field"),
+            (
+                "over = discover.targets,\n    max_fanout = 0",
+                "outside 1..=",
+            ),
+            (
+                "over = discover.targets,\n    max_fanout = 9999",
+                "outside 1..=",
+            ),
+            (
+                "over = \"discover.targets\",\n    max_fanout = 4",
+                "must name a declared output field",
+            ),
+        ];
+        for (clause, expected) in refusals {
+            let source = good.replace(
+                "over = discover.targets,\n    max_fanout = 16,",
+                &format!("{clause},"),
+            );
+            let error = crate::errors::report(
+                &compile_source(&source, &pack.join("workflow.star"), &pack)
+                    .err()
+                    .unwrap_or_else(|| panic!("{clause}: compiled")),
+            );
+            assert!(error.contains(expected), "{clause}: {error}");
+        }
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// A fan-out reads its items from a dependency, and says how wide it may get before it runs.
+    #[test]
+    fn a_fanout_must_depend_on_its_producer_and_declare_its_width() {
+        let pack = temp_pack("over-coherence");
+        let cases = [
+            (
+                "depends_on = [],\n    over = discover.targets,\n    max_fanout = 4",
+                "does not depend on",
+            ),
+            (
+                "depends_on = [discover],\n    over = discover.targets",
+                "without max_fanout",
+            ),
+            (
+                "depends_on = [discover],\n    max_fanout = 4",
+                "without \"over\"",
+            ),
+        ];
+        for (clause, expected) in cases {
+            let source = format!(
+                "discover = command(name = \"discover\", run = \"./f.sh\", emits = [\"targets\"])\naudit = agent(\n    name = \"audit\",\n    prompt = \"p\",\n    {clause},\n)\nworkflow(type = \"cascade\", tasks = [discover, audit])\n"
+            );
+            let error = crate::errors::report(
+                &compile_source(&source, &pack.join("workflow.star"), &pack)
+                    .err()
+                    .unwrap_or_else(|| panic!("{clause}: compiled")),
+            );
+            assert!(error.contains(expected), "{clause}: {error}");
+        }
         let _ = std::fs::remove_dir_all(&pack);
     }
 
