@@ -362,12 +362,13 @@ pub(crate) fn clone_repo(src: &str, git_ref: Option<&str>, dest: &Path) -> Resul
 pub(crate) fn prep_plan_runner(
     manifest_path: &Path,
 ) -> Result<crate::plan::harness::HarnessRunner> {
-    let m = manifest::Manifest::load_frozen(manifest_path)?;
+    let mut m = manifest::Manifest::load_frozen(manifest_path)?;
     let manifest_dir = manifest_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
+    m.resolve_workflow(&manifest_dir)?;
     let workspace = manifest_dir.join(&m.workspace.dir);
     let state = manifest_dir.join("state");
     let skills = m.agent.toolbox_dir.as_ref().map(|d| manifest_dir.join(d));
@@ -407,7 +408,7 @@ fn run_from_manifest(args: Args) -> Result<()> {
     if manifest::is_composite(&manifest_path) {
         return run_composite(args, manifest_path);
     }
-    let m = manifest::Manifest::load_frozen(&manifest_path)?;
+    let mut m = manifest::Manifest::load_frozen(&manifest_path)?;
     // `parent()` of a bare `crucible.toml` is `Some("")`, which is not a usable cwd, treat
     // an empty parent as the current directory.
     let manifest_dir = manifest_path
@@ -415,6 +416,7 @@ fn run_from_manifest(args: Args) -> Result<()> {
         .filter(|p| !p.as_os_str().is_empty())
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
+    m.resolve_workflow(&manifest_dir)?;
     let workspace = manifest_dir.join(&m.workspace.dir);
     let state = args
         .state_dir

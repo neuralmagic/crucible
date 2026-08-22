@@ -798,6 +798,8 @@ mod tests {
                     session: String::new(),
                     needs: String::new(),
                     required: true,
+                    join: String::new(),
+                    stage: String::new(),
                 },
                 PlanTaskWire {
                     name: "measure".into(),
@@ -806,6 +808,8 @@ mod tests {
                     session: String::new(),
                     needs: String::new(),
                     required: true,
+                    join: String::new(),
+                    stage: String::new(),
                 },
             ],
         });

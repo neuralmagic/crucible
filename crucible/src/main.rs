@@ -690,7 +690,9 @@ impl Args {
     }
 }
 
-/// Parse a short duration like `90s`, `30m`, `1h`. Empty/garbage → None.
+/// Parse a short duration like `90s`, `30m`, `1h`. Empty, garbage, negative, and anything
+/// `Duration` cannot hold all yield `None`. `Duration::from_secs_f64` panics on a negative or
+/// non-finite argument, so both are refused before it is reached.
 fn parse_duration(s: &str) -> Option<Duration> {
     let s = s.trim();
     if s.is_empty() {
@@ -704,7 +706,7 @@ fn parse_duration(s: &str) -> Option<Duration> {
         "h" | "hr" => n * 3600.0,
         _ => return None,
     };
-    Some(Duration::from_secs_f64(secs))
+    Duration::try_from_secs_f64(secs).ok()
 }
 
 /// Runtime paths for a manifest run. Everything anchors off the manifest dir + an explicit
@@ -833,5 +835,24 @@ mod tests {
         assert_eq!(parse_duration(""), None);
         assert_eq!(parse_duration("garbage"), None);
         assert_eq!(parse_duration("10x"), None);
+    }
+
+    /// Every input reaches `Duration::try_from_secs_f64`, which refuses what
+    /// `Duration::from_secs_f64` would have panicked on.
+    #[test]
+    fn parse_duration_refuses_what_a_duration_cannot_hold() {
+        for hostile in [
+            "-5",
+            "-5s",
+            "-0.001h",
+            "99999999999999999999h",
+            "1e400",
+            "nan",
+            "inf",
+            "-inf",
+        ] {
+            assert_eq!(parse_duration(hostile), None, "{hostile}");
+        }
+        assert_eq!(parse_duration("0"), Some(Duration::ZERO));
     }
 }

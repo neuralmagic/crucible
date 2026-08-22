@@ -10,6 +10,7 @@
 //! stream stays deterministic regardless of completion order.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -76,12 +77,16 @@ pub trait TaskRunner {
 pub struct ExecCfg {
     /// Bounded auto-retry for transport failures (measured failures never retry).
     pub transport_retries: u32,
+    /// How long the whole run may take. `None` means unbounded, which the scored loop
+    /// tolerates because an operator is watching it; a cascade must supply one.
+    pub wall_clock: Option<Duration>,
 }
 
 impl Default for ExecCfg {
     fn default() -> Self {
         ExecCfg {
             transport_retries: 2,
+            wall_clock: None,
         }
     }
 }
@@ -148,6 +153,8 @@ pub enum PlanExit {
     },
     /// The budget ceiling was hit; undispatched tasks were blocked.
     BudgetExceeded,
+    /// The wall-clock ceiling was reached; undispatched tasks were blocked.
+    TimeExceeded,
 }
 
 pub struct PlanOutcome {
@@ -211,6 +218,7 @@ pub fn execute(
         };
     }
 
+    let started = Instant::now();
     let mut results: BTreeMap<TaskName, TaskResult> = BTreeMap::new();
     let mut spent = 0.0f64;
     let budget = plan.plan().budget.usd;
@@ -244,6 +252,7 @@ pub fn execute(
                 let why = match exit {
                     PlanExit::ShortCircuit { task } => format!("required task {task} failed"),
                     PlanExit::BudgetExceeded => "budget ceiling reached".to_string(),
+                    PlanExit::TimeExceeded => "wall-clock ceiling reached".to_string(),
                     _ => "halted".to_string(),
                 };
                 let r = TaskResult::undispatched(TaskStatus::Blocked, why);
@@ -280,6 +289,17 @@ pub fn execute(
             if spent >= budget {
                 halted = Some(PlanExit::BudgetExceeded);
                 let r = TaskResult::undispatched(TaskStatus::Blocked, "budget ceiling reached");
+                record(t, r, &mut results, &mut halted);
+                continue;
+            }
+            // Elapsed time is known continuously, unlike a cost total, so the ceiling is
+            // checked before every dispatch rather than after an attempt settles.
+            if cfg
+                .wall_clock
+                .is_some_and(|limit| started.elapsed() >= limit)
+            {
+                halted = Some(PlanExit::TimeExceeded);
+                let r = TaskResult::undispatched(TaskStatus::Blocked, "wall-clock ceiling reached");
                 record(t, r, &mut results, &mut halted);
                 continue;
             }
@@ -757,6 +777,54 @@ mod tests {
         assert_eq!(out.exit, PlanExit::Completed);
         assert_eq!(out.results[&"b".into()].status, TaskStatus::Pass);
         assert_eq!(r.seen_inputs["b"], vec!["a".to_string()]);
+    }
+
+    /// The wall-clock ceiling blocks every task not yet dispatched and invalidates the run.
+    /// Unlike the cost ceiling it is checked before dispatch, because elapsed time is known
+    /// continuously while a cost total is only known once an attempt finishes.
+    #[test]
+    fn an_exhausted_wall_clock_ceiling_blocks_dispatch_and_invalidates() {
+        let plan = valid(
+            vec![
+                task("a", &[], "any", true),
+                task("b", &["a"], "any", true),
+                task("c", &["b"], "any", true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        let cfg = ExecCfg {
+            wall_clock: Some(Duration::ZERO),
+            ..ExecCfg::default()
+        };
+        let out = execute(&plan, &any_substrate(), cfg, &mut r, |_, _| {});
+        assert_eq!(out.exit, PlanExit::TimeExceeded);
+        assert!(!out.valid, "an exhausted ceiling invalidates whatever ran");
+        for name in ["a", "b", "c"] {
+            assert_eq!(
+                out.results[&name.into()].status,
+                TaskStatus::Blocked,
+                "{name} should never have been dispatched"
+            );
+        }
+        assert_eq!(out.spent_usd, 0.0);
+    }
+
+    /// A ceiling that has not been reached changes nothing, and no ceiling at all is the
+    /// scored loop's existing behavior.
+    #[test]
+    fn a_wall_clock_ceiling_with_time_left_is_invisible() {
+        let plan = valid(vec![task("a", &[], "any", true)], 10.0);
+        for wall_clock in [None, Some(Duration::from_secs(3600))] {
+            let mut r = ScriptRunner::new();
+            let cfg = ExecCfg {
+                wall_clock,
+                ..ExecCfg::default()
+            };
+            let out = execute(&plan, &any_substrate(), cfg, &mut r, |_, _| {});
+            assert!(out.valid, "{wall_clock:?}");
+            assert_eq!(out.exit, PlanExit::Completed, "{wall_clock:?}");
+        }
     }
 
     #[test]

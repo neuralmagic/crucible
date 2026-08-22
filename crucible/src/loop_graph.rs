@@ -68,7 +68,11 @@ pub(crate) struct IterCtx<'a> {
 
 /// Run one admitted autoresearch iteration and return its step and cost.
 pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(IterStep, f64)> {
-    let mut caps = WorkflowCaps::autoresearch_engine();
+    let mut caps = WorkflowCaps::for_lane(
+        cx.workflow
+            .map(|workflow| workflow.workflow_type)
+            .unwrap_or_default(),
+    );
     if agent::supports_persistent_sessions(cx.args) {
         caps = caps.with_persistent_sessions();
     }
@@ -267,6 +271,8 @@ pub(crate) fn iteration_template(
         workflow_type: WorkflowType::Autoresearch,
         result: Some("decide".into()),
         tasks,
+        file: None,
+        resolved_from: None,
     };
     workflow
         .admit(caps)

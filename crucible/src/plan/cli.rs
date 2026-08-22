@@ -303,6 +303,8 @@ pub(crate) fn plan_admitted_event(plan: &ValidPlan) -> crate::session::SessionEv
                 session: t.session.clone().unwrap_or_default(),
                 needs: t.needs.clone(),
                 required: t.required,
+                join: t.join.as_str().to_string(),
+                stage: t.stage.as_str().to_string(),
             })
             .collect(),
     }
@@ -551,6 +553,7 @@ pub fn run(
         PlanExit::Truncated { task } => format!("truncated at {task}"),
         PlanExit::ShortCircuit { task } => format!("short-circuited at {task}"),
         PlanExit::BudgetExceeded => "budget exceeded".to_string(),
+        PlanExit::TimeExceeded => "wall-clock ceiling reached".to_string(),
     };
     println!(
         "plan v{}: {} — spent ${:.4} of ${}",

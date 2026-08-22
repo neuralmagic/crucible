@@ -23,13 +23,27 @@ pub enum WorkflowType {
     Autoresearch,
     /// An arbitrary capability-admitted DAG.
     Custom,
+    /// One pass over the graph, no score, no judge.
+    Cascade,
 }
 
 impl WorkflowType {
+    /// The wire spelling, parsed. `None` for anything else, so a caller can leave the real
+    /// diagnostic to whoever owns it.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "autoresearch" => Some(WorkflowType::Autoresearch),
+            "custom" => Some(WorkflowType::Custom),
+            "cascade" => Some(WorkflowType::Cascade),
+            _ => None,
+        }
+    }
+
     pub fn capability(self) -> &'static str {
         match self {
             WorkflowType::Autoresearch => "workflow.autoresearch",
             WorkflowType::Custom => "workflow.custom",
+            WorkflowType::Cascade => "workflow.cascade",
         }
     }
 }
@@ -70,6 +84,22 @@ impl WorkflowCaps {
             "engine.grade",
             "engine.decide",
         ])
+    }
+
+    /// Capabilities the one-pass cascade lane implements. No engine operations: a cascade has
+    /// no scored loop to run them in, and [`WorkflowCfg::validate`] refuses a task naming one.
+    pub fn cascade_engine() -> Self {
+        Self::new(["workflow.cascade"])
+    }
+
+    /// What the engine implements for the lane a workflow declares. Granting the scored loop's
+    /// capabilities to every lane would admit a cascade whose type the engine never checked,
+    /// and refuse one whose type it did.
+    pub fn for_lane(lane: WorkflowType) -> Self {
+        match lane {
+            WorkflowType::Cascade => Self::cascade_engine(),
+            WorkflowType::Autoresearch | WorkflowType::Custom => Self::autoresearch_engine(),
+        }
     }
 
     pub fn with_persistent_sessions(mut self) -> Self {
@@ -131,6 +161,8 @@ pub enum WorkflowError {
     TiebreakNotAncestor { tiebreak: String, task: String },
     #[error("custom workflow result {result:?} names an unknown task")]
     UnknownCustomResult { result: String },
+    #[error("cascade task {task:?} names engine operation {op:?}: a cascade has no scored loop")]
+    CascadeEngineTask { task: String, op: EngineOp },
     #[error("engine task {task:?} cannot run in the epilogue (the loop is over)")]
     EngineTaskInEpilogue { task: String },
     #[error("epilogue task name {KEPT_INPUT:?} is reserved for the kept-candidate input")]
@@ -171,6 +203,10 @@ pub enum WorkflowError {
     AutoresearchNoApply { measurement: String },
     #[error("autoresearch apply path requires an engine propose ancestor")]
     AutoresearchNoPropose,
+    #[error("[workflow] declares both file = {file:?} and inline tasks; it is one or the other")]
+    FileAndTasks { file: String },
+    #[error("[workflow].file is empty")]
+    FileEmpty,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -182,13 +218,45 @@ pub struct WorkflowCfg {
     /// Result task; absent selects the compatibility splice format.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<TaskName>,
+    /// A workflow source to compile, relative to the manifest directory, instead of inline
+    /// tasks. A parameterised graph is a function of its launch arguments, so it cannot be a
+    /// committed artifact and must be compiled per run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// Set when [`file`] has been compiled into `tasks`, and never read from or written to
+    /// TOML. The graph is then absent from the manifest text, so whatever hashes a run has to
+    /// hash the graph itself or the hash stops discriminating between two different graphs.
+    #[serde(skip)]
+    pub resolved_from: Option<String>,
     #[serde(rename = "task", default)]
     pub tasks: Vec<Task>,
 }
 
 impl WorkflowCfg {
+    /// True while the graph is still a path rather than tasks. The manifest is valid in this
+    /// state and the graph is validated once [`WorkflowCfg::file`] has been compiled into it.
+    pub fn is_unresolved(&self) -> bool {
+        self.file.is_some() && self.tasks.is_empty()
+    }
+
+    /// True once a named source has been compiled into tasks.
+    pub fn resolved_from_file(&self) -> bool {
+        self.resolved_from.is_some()
+    }
+
     /// Validate structure and type-specific invariants, without granting authority.
     pub fn validate(&self) -> Result<(), WorkflowError> {
+        if let Some(file) = &self.file {
+            if file.is_empty() {
+                return Err(WorkflowError::FileEmpty);
+            }
+            if !self.tasks.is_empty() {
+                return Err(WorkflowError::FileAndTasks { file: file.clone() });
+            }
+            // Nothing to check until it is compiled; the compiled graph validates then.
+            return Ok(());
+        }
+
         if self.is_legacy_splice() {
             self.validate_stages()?;
             return self.validate_legacy_splice();
@@ -300,6 +368,17 @@ impl WorkflowCfg {
                             task: name(),
                         });
                     }
+                }
+            }
+        }
+
+        if self.workflow_type == WorkflowType::Cascade {
+            for task in &self.tasks {
+                if let TaskKind::Engine { op, .. } = task.task {
+                    return Err(WorkflowError::CascadeEngineTask {
+                        task: task.name.0.clone(),
+                        op,
+                    });
                 }
             }
         }

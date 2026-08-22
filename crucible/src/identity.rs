@@ -53,6 +53,20 @@ fn hash_seed(manifest_dir: &Path, seed_diff: Option<&str>) -> Result<String> {
     Ok(fnv1a_hex(&[&content]))
 }
 
+/// The compiled graph, when it is not already inside the manifest text.
+///
+/// A manifest carrying `[[workflow.task]]` tables inline has its graph in that text, so hashing
+/// it again would add nothing and would move every existing run's digest. A manifest naming
+/// `[workflow].file` carries only a path, and two entirely different graphs behind the same
+/// path would otherwise share a digest, which is the one thing the comparability key must never
+/// allow.
+fn workflow_graph_text(m: &manifest::Manifest) -> Result<String> {
+    let Some(workflow) = m.workflow.as_ref().filter(|w| w.resolved_from_file()) else {
+        return Ok(String::new());
+    };
+    serde_json::to_string(workflow).context("serializing the compiled workflow for run identity")
+}
+
 /// Build the identity for a single-domain run.
 pub fn for_manifest(
     manifest_path: &Path,
@@ -72,12 +86,13 @@ pub fn for_manifest(
         base_sha: workspace_head_sha(workspace).unwrap_or_default(),
     }];
     let manifest_text = manifest::frozen_manifest_text(manifest_path, workspace)?;
+    let graph_text = workflow_graph_text(m)?;
     let injects = m.resolved_injects(manifest_dir, workspace);
     let inject_hash = hash_injects(&injects)?;
     let seed_hash = hash_seed(manifest_dir, m.agent.seed_diff.as_deref())?;
     Ok(RunIdentity::new(
         components,
-        fnv1a_hex(&[manifest_text.as_bytes()]),
+        fnv1a_hex(&[manifest_text.as_bytes(), graph_text.as_bytes()]),
         inject_hash,
         seed_hash,
         m.judge
@@ -394,5 +409,62 @@ mod tests {
         assert_eq!(first.components[1].base_sha, sha_b);
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A manifest that names its graph carries only a path, so two different graphs behind one
+    /// path must not share a digest. A manifest carrying its tasks inline already has the graph
+    /// in its text, and its digest must not move.
+    #[test]
+    fn a_named_graph_reaches_the_digest_and_an_inline_one_is_unchanged() {
+        let dir = tempdir();
+        let sha = init_repo(&dir);
+        assert!(!sha.is_empty());
+        fs::write(
+            dir.join("crucible.toml"),
+            "[repo]\npath = \".\"\n[agent]\nbackend = \"command\"\nagent_cmd = \"true\"\ngoal = \"g\"\n[workflow]\ntype = \"cascade\"\nfile = \"graph.star\"\n",
+        )
+        .expect("write manifest");
+
+        let digest_for = |source: &str| {
+            fs::write(dir.join("graph.star"), source).expect("write source");
+            let mut m = manifest::Manifest::load(&dir.join("crucible.toml")).expect("load");
+            m.resolve_workflow(&dir).expect("resolve");
+            for_manifest(&dir.join("crucible.toml"), &dir, &dir, &m)
+                .expect("identity")
+                .digest
+        };
+
+        let one = digest_for(
+            "a = command(name = \"a\", run = \"true\")\nworkflow(type = \"cascade\", tasks = [a])\n",
+        );
+        let two = digest_for(
+            "a = command(name = \"a\", run = \"false\")\nworkflow(type = \"cascade\", tasks = [a])\n",
+        );
+        assert_ne!(
+            one, two,
+            "two graphs behind one path must not be comparable"
+        );
+        let again = digest_for(
+            "a = command(name = \"a\", run = \"true\")\nworkflow(type = \"cascade\", tasks = [a])\n",
+        );
+        assert_eq!(
+            one, again,
+            "the same graph must stay comparable with itself"
+        );
+
+        // An inline graph is already inside the manifest text: nothing is appended, so a
+        // digest computed today matches one computed before the graph was hashed at all.
+        fs::write(
+            dir.join("crucible.toml"),
+            "[repo]\npath = \".\"\n[agent]\nbackend = \"command\"\nagent_cmd = \"true\"\ngoal = \"g\"\n",
+        )
+        .expect("write bare manifest");
+        let bare = manifest::Manifest::load(&dir.join("crucible.toml")).expect("load bare");
+        assert!(
+            workflow_graph_text(&bare).expect("graph text").is_empty(),
+            "an inline or absent graph appends nothing to the hash"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -53,6 +53,15 @@ pub enum ManifestError {
     TaskLaneRejects { table: &'static str },
     #[error("[judge].objective = \"task\" is reserved as the task lane's wire discriminator")]
     TaskObjectiveReserved,
+    #[error("[workflow] type = \"cascade\" runs once and scores nothing; remove [judge]")]
+    CascadeNeedsNoJudge,
+    #[error(
+        "[workflow].file compiled a {compiled:?} workflow but the manifest declares {declared:?}"
+    )]
+    WorkflowTypeMismatch {
+        declared: WorkflowType,
+        compiled: WorkflowType,
+    },
     #[error("a composite needs at least two [[component]] entries")]
     CompositeTooSmall,
     #[error("duplicate component domain `{domain}`")]
@@ -529,11 +538,21 @@ fn validate_common(c: CommonCfg<'_>) -> Result<()> {
             if judge.objective == "task" {
                 return Err(ManifestError::TaskObjectiveReserved.into());
             }
+            if c.workflow
+                .as_ref()
+                .is_some_and(|w| w.workflow_type == WorkflowType::Cascade)
+            {
+                return Err(ManifestError::CascadeNeedsNoJudge.into());
+            }
         }
         None => {
+            let cascade = c
+                .workflow
+                .as_ref()
+                .is_some_and(|w| w.workflow_type == WorkflowType::Cascade);
             for (present, table) in [
                 (c.search.is_some(), "[search]"),
-                (c.workflow.is_some(), "[workflow]"),
+                (c.workflow.is_some() && !cascade, "[workflow]"),
                 (c.preflight.is_some(), "[preflight]"),
             ] {
                 if present {
@@ -639,6 +658,38 @@ impl Manifest {
             preflight: &self.preflight,
             measure: &self.measure,
         })
+    }
+
+    /// Compile `[workflow].file` into the graph it names. A manifest that carries its tasks
+    /// inline is left alone, so this is safe to call on any manifest and callers do not branch.
+    ///
+    /// Compilation happens per run rather than once at authoring time because a parameterised
+    /// graph is a function of its launch arguments: the frozen result is still the runtime
+    /// authority, what changes is when it is produced.
+    pub fn resolve_workflow(&mut self, manifest_dir: &Path) -> Result<()> {
+        let Some(workflow) = &self.workflow else {
+            return Ok(());
+        };
+        if !workflow.is_unresolved() {
+            return Ok(());
+        }
+        let declared = workflow.workflow_type;
+        let file = workflow.file.clone().unwrap_or_default();
+        let source = manifest_dir.join(&file);
+        let compiled = crate::plan::starlark::compile_file(&source, manifest_dir)
+            .with_context(|| format!("compiling [workflow].file = {file:?}"))?;
+        if compiled.workflow.workflow_type != declared {
+            return Err(ManifestError::WorkflowTypeMismatch {
+                declared,
+                compiled: compiled.workflow.workflow_type,
+            }
+            .into());
+        }
+        let mut resolved = compiled.workflow;
+        resolved.resolved_from = Some(file);
+        self.workflow = Some(resolved);
+        self.validate()?;
+        Ok(())
     }
 
     /// No `[judge]` = the task lane: keep every completed turn, no baseline, no scoring.
@@ -1013,6 +1064,134 @@ mod tests {
                 "{table}: {err:#}"
             );
         }
+    }
+
+    #[test]
+    fn a_judgeless_manifest_admits_a_cascade_workflow_and_still_refuses_the_others() {
+        let cascade = "[workflow]\ntype = \"cascade\"\n[[workflow.task]]\nname = \"t\"\nkind = \"evaluate\"\ncommand = \"true\"";
+        let m: Manifest = toml::from_str(&task_manifest(cascade)).expect("parses");
+        m.validate()
+            .expect("a cascade is the one [workflow] the task lane takes");
+        assert!(m.is_task(), "a cascade manifest is still judgeless");
+
+        let custom = "[workflow]\ntype = \"custom\"\nresult = \"t\"\n[[workflow.task]]\nname = \"t\"\nkind = \"evaluate\"\ncommand = \"true\"";
+        let err = toml::from_str::<Manifest>(&task_manifest(custom))
+            .expect("parses")
+            .validate()
+            .expect_err("custom still needs a judge");
+        assert!(err.to_string().contains("requires a [judge]"), "{err:#}");
+    }
+
+    /// A manifest may name its source instead of carrying its output. The graph is compiled
+    /// on resolve and validated then, so an unresolved manifest is valid and an unreadable
+    /// source fails where it is read rather than where it is used.
+    #[test]
+    fn a_manifest_may_name_its_workflow_source_instead_of_carrying_it() {
+        let dir = std::env::temp_dir().join(format!("crucible-wf-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("graph.star"),
+            "a = command(name = \"a\", run = \"true\")\nworkflow(type = \"cascade\", tasks = [a])\n",
+        )
+        .unwrap();
+
+        let table = "[workflow]\ntype = \"cascade\"\nfile = \"graph.star\"";
+        let mut m: Manifest = toml::from_str(&task_manifest(table)).expect("parses");
+        m.validate().expect("an unresolved manifest is valid");
+        assert!(
+            m.workflow.as_ref().unwrap().is_unresolved(),
+            "the graph is still a path"
+        );
+        m.resolve_workflow(&dir).expect("compiles");
+        let workflow = m.workflow.as_ref().unwrap();
+        assert!(!workflow.is_unresolved());
+        assert_eq!(workflow.tasks.len(), 1);
+        assert_eq!(workflow.tasks[0].name.0, "a");
+
+        // Resolving again is a no-op, so a caller never has to ask whether it already ran.
+        m.resolve_workflow(&dir).expect("idempotent");
+        assert_eq!(m.workflow.as_ref().unwrap().tasks.len(), 1);
+
+        // The lane the source compiles must be the lane the manifest admitted.
+        let mismatched = "[workflow]\ntype = \"custom\"\nfile = \"graph.star\"";
+        let err = toml::from_str::<Manifest>(&task_manifest(mismatched))
+            .expect("parses")
+            .resolve_workflow(&dir)
+            .expect_err("custom manifest, cascade source");
+        assert!(
+            err.to_string().contains("but the manifest declares"),
+            "{err:#}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_workflow_declaring_both_a_file_and_tasks_is_refused() {
+        let both = "[workflow]\ntype = \"cascade\"\nfile = \"graph.star\"\n[[workflow.task]]\nname = \"a\"\nkind = \"command\"\ncommand = \"true\"";
+        let err = toml::from_str::<Manifest>(&task_manifest(both))
+            .expect("parses")
+            .validate()
+            .expect_err("one or the other");
+        assert!(
+            err.to_string().contains("it is one or the other"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn a_cascade_is_refused_beside_a_judge() {
+        let toml = r#"
+            [repo]
+            path = "."
+            [agent]
+            backend = "command"
+            agent_cmd = "true"
+            goal = "g"
+            [judge]
+            objective = "latency"
+            direction = "minimize"
+            measure_cmd = "true"
+            [workflow]
+            type = "cascade"
+            [[workflow.task]]
+            name = "t"
+            kind = "evaluate"
+            command = "true"
+        "#;
+        let err = toml::from_str::<Manifest>(toml)
+            .expect("parses")
+            .validate()
+            .expect_err("a scored cascade is a contradiction");
+        assert!(err.to_string().contains("remove [judge]"), "{err:#}");
+    }
+
+    #[test]
+    fn a_cascade_refuses_a_task_naming_an_engine_operation() {
+        let cascade = "[workflow]\ntype = \"cascade\"\n[[workflow.task]]\nname = \"p\"\nkind = \"engine\"\nop = \"propose\"";
+        let err = toml::from_str::<Manifest>(&task_manifest(cascade))
+            .expect("parses")
+            .validate()
+            .expect_err("propose belongs to the scored loop");
+        assert!(
+            err.to_string().contains("names engine operation"),
+            "{err:#}"
+        );
+    }
+
+    fn task_manifest(table: &str) -> String {
+        format!(
+            r#"
+            [repo]
+            path = "."
+            [agent]
+            backend = "command"
+            agent_cmd = "true"
+            goal = "g"
+            {table}
+        "#
+        )
     }
 
     #[test]

@@ -1074,7 +1074,13 @@ impl Stage for Validate {
 /// Render the validated workflow; agents cannot supply this artifact.
 fn render_workflow_preview(manifest_path: &Path, pack: &Path) -> Result<(u32, u32)> {
     let manifest = manifest::Manifest::load(manifest_path)?;
-    let mut workflow_caps = manifest::WorkflowCaps::autoresearch_engine();
+    let mut workflow_caps = manifest::WorkflowCaps::for_lane(
+        manifest
+            .workflow
+            .as_ref()
+            .map(|workflow| workflow.workflow_type)
+            .unwrap_or_default(),
+    );
     if AgentBackend::from_str(&manifest.agent.backend, true)
         .ok()
         .is_some_and(|backend| {

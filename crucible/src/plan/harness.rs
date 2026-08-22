@@ -184,6 +184,10 @@ fn run_in(
     // are a measured failure: a plan naming a harness we can't parse is wrong, not
     // unlucky.
     let mut args = args.clone();
+    // Name the task to the turn. A deterministic stand-in needs to know which task it is
+    // without matching prompt prose, and a real harness gets it for free in its transcript.
+    args.env
+        .push(("CRUCIBLE_TASK".to_string(), task.name.0.clone()));
     if let Some(h) = harness {
         match crate::harness::Harness::from_str(h, true) {
             Ok(h) => args.harness = Some(h),
@@ -456,6 +460,172 @@ mod tests {
                 .trim(),
             "3"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The whole cascade concept, end to end, with no model and no controller: a real graph
+    /// compiled from a real pack, real processes for every turn, and a verdict. Only the model
+    /// is absent, and it is absent by substitution at the process boundary rather than by
+    /// stubbing anything inside the engine.
+    #[test]
+    fn a_cascade_runs_end_to_end_with_no_model_and_no_controller() {
+        let dir = std::env::temp_dir().join(format!("crucible-cascade-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        let fake = root.join("tools/fake-agent.py");
+        assert!(fake.exists(), "{} is missing", fake.display());
+
+        std::fs::write(
+            dir.join("agents.json"),
+            r#"{
+              "draft":   {"writes": {"NOTES.md": "- one\n- two\n"},
+                          "appends": {"TURNS.txt": "draft {ENV:CRUCIBLE_AGENT_SESSION_ID}\n"},
+                          "result": {"entries": 2}},
+              "polish":  {"reads": ["NOTES.md", "TURNS.txt"],
+                          "appends": {"TURNS.txt": "polish {ENV:CRUCIBLE_AGENT_SESSION_ID}\n"},
+                          "result": {"session": "{ENV:CRUCIBLE_AGENT_SESSION}",
+                                     "action": "{ENV:CRUCIBLE_AGENT_SESSION_ACTION}"}},
+              "audit-a": {"reads": ["NOTES.md"], "result": {"findings": []}},
+              "audit-b": {"exit": 1, "stderr": "no baseline to compare against"}
+            }"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            dir.join("workflow.star"),
+            r##"
+scribe = session(name = "scribe")
+
+draft = agent(name = "draft", prompt = "draft the notes", session = scribe, emits = ["entries"])
+shape = command(
+    name = "shape",
+    run = "test -s NOTES.md && printf '{\"lines\": %s}\n' \"$(wc -l < NOTES.md | tr -d ' ')\"",
+    depends_on = [draft],
+)
+polish = agent(name = "polish", prompt = "polish them", session = scribe, depends_on = [shape])
+
+audit_a = agent(
+    name = "audit-a",
+    prompt = "audit headings",
+    depends_on = [polish],
+    isolated = True,
+    emits = ["findings"],
+)
+audit_b = agent(
+    name = "audit-b",
+    prompt = "audit freshness",
+    depends_on = [polish],
+    isolated = True,
+    required = False,
+)
+
+roundup = command(
+    name = "roundup",
+    run = "printf '{\"reporting\": %s}\n' \"$(printf '%s' \"$CRUCIBLE_INPUTS\" | grep -c audit-a)\"",
+    depends_on = [audit_a, audit_b],
+    join = "passed",
+)
+
+workflow(type = "cascade", tasks = [draft, shape, polish, audit_a, audit_b, roundup])
+"##,
+        )
+        .unwrap();
+
+        std::fs::write(
+            dir.join("crucible.toml"),
+            format!(
+                r#"
+                [repo]
+                path = "."
+                [workspace]
+                dir = "workspace"
+                setup_cmd = "mkdir -p workspace && git -C workspace init -q && git -C workspace -c user.email=c@l -c user.name=c -c commit.gpgsign=false commit -q --allow-empty -m baseline"
+                [agent]
+                backend = "command"
+                agent_cmd = "python3 {}"
+                goal = "draft release notes, then audit them"
+                [agent.env]
+                FAKE_AGENT_SCRIPT = "{}"
+                [workflow]
+                type = "cascade"
+                file = "workflow.star"
+                "#,
+                fake.display(),
+                dir.join("agents.json").display(),
+            ),
+        )
+        .unwrap();
+
+        // The pack names its graph; the engine compiles it. No controller supplies anything.
+        let mut manifest = crate::manifest::Manifest::load(&dir.join("crucible.toml")).unwrap();
+        manifest.resolve_workflow(&dir).unwrap();
+        let workflow = manifest.workflow.as_ref().expect("a cascade workflow");
+        assert_eq!(
+            workflow.workflow_type,
+            crate::manifest::WorkflowType::Cascade
+        );
+        assert!(manifest.is_task(), "a cascade carries no judge");
+
+        let plan = crate::loop_graph::iteration_template(
+            Some(workflow),
+            &crate::manifest::WorkflowCaps::for_lane(workflow.workflow_type)
+                .with_persistent_sessions(),
+        )
+        .unwrap();
+
+        let mut settled: Vec<(String, &'static str)> = Vec::new();
+        let mut runner = crate::run::prep_plan_runner(&dir.join("crucible.toml")).unwrap();
+        let out = execute(
+            &plan,
+            &Substrate::default(),
+            ExecCfg::default(),
+            &mut runner,
+            |task, result| settled.push((task.name.0.clone(), result.status.as_str())),
+        );
+
+        // The verdict: every required task passed, so the run is valid despite an advisory
+        // failure. That is the whole difference from the scored lane, and it carries no score.
+        assert!(out.valid, "{:?}", out.results);
+        assert_eq!(out.exit, PlanExit::Completed);
+        assert_eq!(out.spent_usd, 0.0, "no model was called");
+
+        assert_eq!(out.results[&"audit-b".into()].status, TaskStatus::Fail);
+        assert_eq!(
+            out.results[&"roundup".into()].status,
+            TaskStatus::Pass,
+            "join = passed folds whoever survived"
+        );
+        assert_eq!(
+            out.results[&"roundup".into()].output.as_ref().unwrap()["reporting"],
+            1,
+            "the advisory auditor's output must not reach the join"
+        );
+
+        // Every task settled exactly once, and the reporter saw each as it settled.
+        assert_eq!(settled.len(), 6, "{settled:?}");
+
+        // Session continuity, proven by the agent rather than asserted about it: `polish` read
+        // a TURNS.txt only `draft` could have written, in the same conversation.
+        let polish = out.results[&"polish".into()].output.as_ref().unwrap();
+        assert_eq!(polish["session"], "scribe");
+        let turns = std::fs::read_to_string(dir.join("workspace/TURNS.txt")).unwrap();
+        let ids: Vec<&str> = turns
+            .lines()
+            .filter_map(|l| l.split_whitespace().nth(1))
+            .collect();
+        assert_eq!(ids.len(), 2, "{turns}");
+        assert_eq!(
+            ids[0], ids[1],
+            "one conversation spanned both turns: {turns}"
+        );
+
+        // `audit-a` declared `reads` on a file it never wrote, in a disposable worktree. It
+        // passed, so isolation staged the workspace rather than starting from nothing.
+        assert_eq!(out.results[&"audit-a".into()].status, TaskStatus::Pass);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

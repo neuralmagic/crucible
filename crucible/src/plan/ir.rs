@@ -85,6 +85,13 @@ impl Stage {
     fn is_iteration(&self) -> bool {
         *self == Stage::Iteration
     }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Stage::Iteration => "iteration",
+            Stage::Epilogue => "epilogue",
+        }
+    }
 }
 
 /// How dependency outputs join into a task's inputs (`join = "all" | "passed"`).
@@ -99,6 +106,15 @@ pub enum Join {
     /// reducer over a lossy fan-out (the wide `top_k`: skipped/failed candidates just
     /// don't rank), or a join over reviewers where one being advisory must not stop the run.
     Passed,
+}
+
+impl Join {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Join::All => "all",
+            Join::Passed => "passed",
+        }
+    }
 }
 
 /// What a task *is*. The executor owns advancement; agents only ever run inside `Agent` tasks.
