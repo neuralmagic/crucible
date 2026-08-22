@@ -7,6 +7,7 @@
 
 pub mod admission;
 pub mod artifact;
+pub mod ask;
 pub mod envelope;
 pub mod event;
 pub mod identity;
@@ -22,6 +23,7 @@ pub use admission::{
 pub use artifact::{
     ArtifactKind, ArtifactRef, IngestError, IngestPath, IngestResponse, content_digest,
 };
+pub use ask::{Ask, AskKey, AskKeyError};
 pub use envelope::{Envelope, EnvelopeKind, SCHEMA_VERSION, TERMINATION_MESSAGE_CAP, Usage};
 pub use event::{AgentEvent, ModelUsage, RawStream, Tokens};
 pub use identity::{ComponentIdentity, RigIdentity, RunIdentity};
