@@ -871,9 +871,9 @@ impl Gateway {
         name: &str,
         binaries: &[String],
         endpoints: &[String],
-        credential_binding: Option<&EndpointCredentialBinding>,
+        credential_bindings: &[EndpointCredentialBinding],
     ) -> Result<()> {
-        let merge_operations = build_merge_operations(binaries, endpoints, credential_binding)?;
+        let merge_operations = build_merge_operations(binaries, endpoints, credential_bindings)?;
         let version = self
             .client()
             .update_config(UpdateConfigRequest {
@@ -1124,7 +1124,7 @@ pub struct EndpointCredentialBinding {
 fn build_merge_operations(
     binaries: &[String],
     endpoints: &[String],
-    credential_binding: Option<&EndpointCredentialBinding>,
+    credential_bindings: &[EndpointCredentialBinding],
 ) -> Result<Vec<PolicyMergeOperation>> {
     let net_binaries: Vec<NetworkBinary> = dedup(binaries)
         .into_iter()
@@ -1137,9 +1137,9 @@ fn build_merge_operations(
         .iter()
         .map(|spec| {
             let mut endpoint = parse_endpoint_spec(spec)?;
-            if let Some(b) = credential_binding
-                && endpoint.host == b.host
-                && endpoint.port == b.port
+            if let Some(b) = credential_bindings
+                .iter()
+                .find(|b| endpoint.host == b.host && endpoint.port == b.port)
             {
                 if endpoint.protocol.is_empty() {
                     endpoint.protocol = "rest".to_string();
@@ -1540,7 +1540,7 @@ pYBZ
                 "github.com:443:full".to_string(),
                 "aiplatform.googleapis.com:443:read-write".to_string(),
             ],
-            None,
+            &[],
         )
         .unwrap();
         assert_eq!(ops.len(), 2);
@@ -1584,7 +1584,7 @@ pYBZ
                 "github.com:443:full".to_string(),
                 "host.openshell.internal:8849:full".to_string(),
             ],
-            Some(&binding),
+            std::slice::from_ref(&binding),
         )
         .unwrap();
         let eps: Vec<&NetworkEndpoint> = ops
@@ -1615,15 +1615,76 @@ pYBZ
             port: 8849,
             provider: "crucible-broker".to_string(),
         };
-        let ops =
-            build_merge_operations(&[], &["h:8849:full:websocket".to_string()], Some(&binding))
-                .unwrap();
+        let ops = build_merge_operations(
+            &[],
+            &["h:8849:full:websocket".to_string()],
+            std::slice::from_ref(&binding),
+        )
+        .unwrap();
         let Some(MergeOp::AddRule(add)) = &ops[0].operation else {
             panic!("expected an add-rule op");
         };
         let ep = &add.rule.as_ref().unwrap().endpoints[0];
         assert_eq!(ep.protocol, "websocket");
         assert!(ep.credential_binding.is_some());
+    }
+
+    /// The outage shape: the `google-cloud` provider profile declares no endpoints, so its
+    /// credential reaches a sandbox only through a policy endpoint naming the provider. Both
+    /// Vertex hosts must bind, or a turn whose region resolves to the wildcard form gets no
+    /// token and its agent retries until it gives up. The expected hosts are spelled out here
+    /// on purpose: deriving them from the constant under test would assert nothing.
+    #[test]
+    fn every_vertex_host_binds_the_gcp_provider() {
+        const EXPECTED: [&str; 2] = ["aiplatform.googleapis.com", "*.aiplatform.googleapis.com"];
+
+        let bindings: Vec<EndpointCredentialBinding> =
+            crate::openshell::policy::VERTEX_CREDENTIAL_HOSTS
+                .iter()
+                .map(|h| EndpointCredentialBinding {
+                    host: (*h).to_string(),
+                    port: 443,
+                    provider: "ci-gcp".to_string(),
+                })
+                .collect();
+        let endpoints: Vec<String> = crate::openshell::policy::DEFAULT_ENDPOINTS
+            .iter()
+            .map(|e| (*e).to_string())
+            .collect();
+        let ops = build_merge_operations(&[], &endpoints, &bindings).unwrap();
+
+        let mut bound: Vec<String> = ops
+            .iter()
+            .filter_map(|op| match &op.operation {
+                Some(MergeOp::AddRule(add)) => add.rule.as_ref(),
+                _ => None,
+            })
+            .flat_map(|r| r.endpoints.iter())
+            .filter(|ep| {
+                ep.credential_binding
+                    .as_ref()
+                    .is_some_and(|b| b.provider == "ci-gcp")
+            })
+            .map(|ep| ep.host.clone())
+            .collect();
+        bound.sort();
+        let mut expected: Vec<String> = EXPECTED.iter().map(|h| (*h).to_string()).collect();
+        expected.sort();
+        assert_eq!(bound, expected);
+    }
+
+    /// Each Vertex host in the binding list must exist verbatim in the policy, since the graft
+    /// matches on exact host and port. A typo would bind nothing and fail closed in production.
+    #[test]
+    fn vertex_credential_hosts_are_real_policy_endpoints() {
+        for host in crate::openshell::policy::VERTEX_CREDENTIAL_HOSTS {
+            assert!(
+                crate::openshell::policy::DEFAULT_ENDPOINTS
+                    .iter()
+                    .any(|e| e.starts_with(&format!("{host}:443:"))),
+                "{host} is not a :443 endpoint in DEFAULT_ENDPOINTS"
+            );
+        }
     }
 
     #[test]
@@ -1635,7 +1696,7 @@ pYBZ
                 "".to_string(),
             ],
             &["github.com:443:full".to_string()],
-            None,
+            &[],
         )
         .unwrap();
         let Some(MergeOp::AddRule(add)) = &ops[0].operation else {

@@ -383,7 +383,7 @@ async fn try_turn(
         if let Some(c) = &collector {
             endpoints.push(c.sandbox_egress(driver.broker_host()));
         }
-        let broker_binding = broker_ep
+        let mut credential_bindings: Vec<grpc::EndpointCredentialBinding> = broker_ep
             .as_deref()
             .filter(|_| broker_provider)
             .and_then(|ep| {
@@ -395,12 +395,23 @@ async fn try_turn(
                     port,
                     provider: provider::BROKER_PROVIDER_NAME.to_string(),
                 })
-            });
+            })
+            .into_iter()
+            .collect();
+        if harness.auth_provider() == AuthProvider::Vertex {
+            credential_bindings.extend(policy::VERTEX_CREDENTIAL_HOSTS.iter().map(|host| {
+                grpc::EndpointCredentialBinding {
+                    host: (*host).to_string(),
+                    port: 443,
+                    provider: provider::PROVIDER_NAME.to_string(),
+                }
+            }));
+        }
         gw.update_policy_wait(
             &name,
             &policy::resolve_binaries(&args.openshell, harness.default_binaries()),
             &endpoints,
-            broker_binding.as_ref(),
+            &credential_bindings,
         )
         .await
         .context("applying the sandbox egress policy")?;
