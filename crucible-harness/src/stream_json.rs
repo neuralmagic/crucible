@@ -2,11 +2,13 @@
 //!
 //! The parser is stateful: token totals accrue across messages, a `tool_use` block's JSON input
 //! arrives in `input_json_delta` chunks and is only complete at `content_block_stop`, and
-//! text/thinking deltas buffer to line boundaries so one event is one line. Unknown top-level
-//! and event types are ignored, so schema drift in claude's output cannot break a viewer.
+//! text/thinking deltas buffer to line boundaries so one event is one line. Lines with an
+//! unmodeled top-level `type`, and non-JSON lines, pass through as [`AgentEvent::Raw`] so a
+//! viewer never loses output to schema drift, and so a startup failure claude prints as bare
+//! text reaches the turn's log instead of being dropped.
 
 use crate::otel::{CostHandle, LiveMeters, RateHandle};
-use crucible_contract::event::{AgentEvent, Tokens};
+use crucible_contract::event::{AgentEvent, RawStream, Tokens};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -93,7 +95,8 @@ impl StreamJsonParser {
             return out;
         }
         let Ok(msg) = serde_json::from_str::<Value>(line) else {
-            return out; // non-JSON stdout is dropped without raising an error
+            out.push(raw(line));
+            return out;
         };
 
         match msg.get("type").and_then(Value::as_str) {
@@ -126,8 +129,10 @@ impl StreamJsonParser {
             Some("stream_event") => self.stream_event(&msg, &mut out),
             // `user` echoes carry the tool results; only read under verbose tool IO.
             Some("user") => self.tool_results(&msg, &mut out),
-            // `assistant` message echoes, `rate_limit_event`, unknown kinds: no-op.
-            _ => {}
+            // `assistant` echoes duplicate the text already streamed via `stream_event`, and
+            // `rate_limit_event` carries nothing the turn accounts for.
+            Some("assistant") | Some("rate_limit_event") => {}
+            _ => out.push(raw(line)),
         }
         out
     }
@@ -521,6 +526,14 @@ fn array_len(v: &Value, key: &str) -> u32 {
         .map_or(0, |a| a.len() as u32)
 }
 
+/// An undecoded stdout line, kept verbatim so nothing the agent printed is lost.
+fn raw(line: &str) -> AgentEvent {
+    AgentEvent::Raw {
+        text: line.to_string(),
+        stream: RawStream::Stdout,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,6 +542,39 @@ mod tests {
     fn run(lines: &[&str]) -> Vec<AgentEvent> {
         let mut p = StreamJsonParser::default();
         lines.iter().flat_map(|l| p.push(l)).collect()
+    }
+
+    /// The outage shape: claude prints a bare-text failure to stdout and exits non-zero. The
+    /// line must reach the caller, not vanish for failing to parse as JSON.
+    #[test]
+    fn non_json_stdout_passes_through_as_raw() {
+        let evs = run(&["Error: connection refused (os error 111)"]);
+        assert!(
+            matches!(
+                evs.as_slice(),
+                [AgentEvent::Raw { text, stream: RawStream::Stdout }]
+                    if text == "Error: connection refused (os error 111)"
+            ),
+            "{evs:?}"
+        );
+    }
+
+    #[test]
+    fn blank_stdout_lines_stay_silent() {
+        assert!(run(&["", "   "]).is_empty());
+    }
+
+    #[test]
+    fn unmodeled_json_type_passes_through_as_raw() {
+        let line = r#"{"type":"some_future_kind","detail":"x"}"#;
+        let evs = run(&[line]);
+        assert!(
+            matches!(
+                evs.as_slice(),
+                [AgentEvent::Raw { text, stream: RawStream::Stdout }] if text == line
+            ),
+            "{evs:?}"
+        );
     }
 
     #[test]
@@ -543,14 +589,14 @@ mod tests {
     }
 
     #[test]
-    fn unknown_top_level_types_are_ignored() {
+    fn known_ignored_types_emit_nothing() {
         // Real capture shapes the parser deliberately ignores.
         let ev = run(&[
             r#"{"type":"system","subtype":"status","model":"","tools":[]}"#,
             r#"{"type":"rate_limit_event","rate_limit_info":{},"uuid":"u","session_id":"s"}"#,
             r#"{"type":"assistant","message":{"content":[{"type":"text"}]}}"#,
         ]);
-        assert!(ev.is_empty(), "no events for unmodeled types, got {ev:?}");
+        assert!(ev.is_empty(), "no events for ignored types, got {ev:?}");
     }
 
     #[test]
