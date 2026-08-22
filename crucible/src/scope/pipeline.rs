@@ -1628,6 +1628,81 @@ mod tests {
     /// silently `Local`/`Podman` before). A `Cli::parse_from(["crucible"])`-synthesized `Args`
     /// defaults every unset field, so `compute_driver` must be set explicitly or the turn's
     /// gateway boots the wrong compute driver regardless of the caller's deployment.
+    /// The reason a hostile pack must be refused rather than abort: `scope` turns a compile
+    /// failure into a `RoundVerdict::Failed` and hands the evidence back to the refine loop, so
+    /// a bad pack is an ordinary round the agent can fix. A process that aborts never reaches
+    /// this function, and the run dies with it.
+    ///
+    /// This runs in-process, so an abort would take the test runner down instead of failing.
+    #[test]
+    fn a_hostile_workflow_fails_the_round_instead_of_the_process() {
+        let dir = std::env::temp_dir().join(format!(
+            "crucible-scope-hostile-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest_path = dir.join(MANIFEST_FILE);
+        std::fs::write(
+            &manifest_path,
+            "[repo]\npath = \".\"\n[agent]\nbackend = \"command\"\nagent_cmd = \"true\"\ngoal = \"g\"\n",
+        )
+        .unwrap();
+
+        let hostile = [
+            ("parse nesting", format!("x = {}{}\n", "[".repeat(3000), "]".repeat(3000))),
+            (
+                "operator chain",
+                format!("x = {}True\n", "not ".repeat(3000)),
+            ),
+            (
+                "value nested by a loop",
+                "x = [1]\nfor i in range(3000):\n    x = [x]\ncommand(name = \"a\", run = \"true\", emits = x)\nworkflow([])\n"
+                    .to_string(),
+            ),
+        ];
+
+        for (what, source) in hostile {
+            std::fs::write(dir.join("workflow.star"), &source).unwrap();
+            match compile_and_validate_round(&manifest_path) {
+                RoundVerdict::Failed(FailureEvidence::Structure { detail }) => {
+                    assert!(
+                        detail.contains("workflow.star did not compile"),
+                        "{what}: wrong evidence: {detail}"
+                    );
+                    // The agent is told what to change, not merely that something broke.
+                    assert!(
+                        detail.contains("maximum is"),
+                        "{what}: the evidence names no bound: {detail}"
+                    );
+                }
+                RoundVerdict::Failed(other) => {
+                    panic!("{what}: failed for an unrelated reason: {other:?}")
+                }
+                RoundVerdict::Passed(_) => panic!("{what}: a hostile pack passed the round"),
+            }
+        }
+
+        // The loop is still usable afterwards: a well-formed pack in the same directory
+        // reaches validation and fails on its own merits, not on the wreckage of the last one.
+        std::fs::write(
+            dir.join("workflow.star"),
+            "workflow([command(name = \"a\", run = \"true\")])\n",
+        )
+        .unwrap();
+        if let RoundVerdict::Failed(FailureEvidence::Structure { detail }) =
+            compile_and_validate_round(&manifest_path)
+        {
+            assert!(
+                !detail.contains("did not compile"),
+                "a valid workflow was reported as a compile failure: {detail}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn turn_args_thread_the_backend_sandbox_image_and_compute_driver() {
         let mut opts = propose_opts(Path::new("unused"), Path::new("unused"));

@@ -101,6 +101,7 @@ enum PathRejection {
     Empty,
     Traversal,
     Symlink,
+    HardLink { links: u64 },
     NotRegularFile,
     EscapesPack,
     File(FileError),
@@ -113,6 +114,10 @@ impl PathRejection {
             PathRejection::Traversal => CompileError::PromptPathTraversal,
             PathRejection::Symlink => CompileError::PromptSymlink {
                 raw: raw.to_owned(),
+            },
+            PathRejection::HardLink { links } => CompileError::PromptHardLink {
+                raw: raw.to_owned(),
+                links,
             },
             PathRejection::NotRegularFile => CompileError::PromptNotRegularFile {
                 raw: raw.to_owned(),
@@ -134,6 +139,10 @@ impl PathRejection {
             },
             PathRejection::Symlink => CompileError::LoadSymlink {
                 raw: raw.to_owned(),
+            },
+            PathRejection::HardLink { links } => CompileError::LoadHardLink {
+                raw: raw.to_owned(),
+                links,
             },
             PathRejection::NotRegularFile => CompileError::LoadNotRegularFile {
                 raw: raw.to_owned(),
@@ -174,8 +183,21 @@ impl CompileContext {
             }
             metadata = Some(current);
         }
-        if !metadata.is_some_and(|metadata| metadata.is_file()) {
+        let Some(metadata) = metadata.filter(|metadata| metadata.is_file()) else {
             return Err(PathRejection::NotRegularFile);
+        };
+        // Canonicalizing resolves symlinks and cannot see a hard link at all: a second name for
+        // a file outside the pack sits fully inside it and passes every check above. A pack is a
+        // fresh checkout or an unpacked tarball, where no file has a second name, so an extra
+        // link is the signature of one having been made.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.nlink() > 1 {
+                return Err(PathRejection::HardLink {
+                    links: metadata.nlink(),
+                });
+            }
         }
         let canonical = std::fs::canonicalize(&path)
             .map_err(FileError::at(kind.resolving(), &path))
@@ -372,6 +394,16 @@ pub enum CompileError {
     PromptPathEmpty,
     #[error("prompt_file path may not contain `..` or escape the pack")]
     PromptPathTraversal,
+    #[error(
+        "prompt_file({raw:?}) has {links} names; a pack's files have one. A second name is how a \
+         file outside the pack is read from inside it, and resolving the path cannot see it."
+    )]
+    PromptHardLink { raw: String, links: u64 },
+    #[error(
+        "load({raw:?}) has {links} names; a pack's files have one. A second name is how a file \
+         outside the pack is read from inside it, and resolving the path cannot see it."
+    )]
+    LoadHardLink { raw: String, links: u64 },
 
     #[error(
         "an argument nests {depth} levels deep; maximum is {MAX_NESTING_DEPTH}. A loop can build \
@@ -2607,6 +2639,44 @@ workflow(branches + [curate])
 
         let fine = catching_panics(|| 7).expect("a value must pass straight through");
         assert_eq!(fine, 7);
+    }
+
+    /// A hard link is a second name for one file. Canonicalizing a path resolves symlinks and
+    /// cannot see one, so a link made inside the pack to a file outside it passes every path
+    /// check and reads the target anyway.
+    #[cfg(unix)]
+    #[test]
+    fn a_second_name_for_an_outside_file_is_refused() {
+        let pack = temp_pack("hardlink");
+        let outside = pack
+            .parent()
+            .unwrap()
+            .join(format!("crucible-outside-{}.md", std::process::id()));
+        std::fs::write(&outside, "a secret\n").unwrap();
+        std::fs::hard_link(&outside, pack.join("prompts/linked.md")).unwrap();
+        std::fs::hard_link(&outside, pack.join("linked.star")).unwrap();
+
+        let prompt =
+            "workflow([agent(name = \"r\", prompt = prompt_file(\"prompts/linked.md\"))])\n";
+        let error = crate::errors::report(
+            &compile_source(prompt, &pack.join("workflow.star"), &pack).unwrap_err(),
+        );
+        assert!(error.contains("a pack's files have one"), "{error}");
+
+        let loaded = "load(\"linked.star\", \"x\")\nworkflow([])\n";
+        let error = crate::errors::report(
+            &compile_source(loaded, &pack.join("workflow.star"), &pack).unwrap_err(),
+        );
+        assert!(error.contains("a pack's files have one"), "{error}");
+
+        // An ordinary file in the same pack is unaffected.
+        std::fs::write(pack.join("prompts/plain.md"), "fine\n").unwrap();
+        let plain = "workflow([agent(name = \"r\", prompt = prompt_file(\"prompts/plain.md\"))])\n";
+        compile_source(plain, &pack.join("workflow.star"), &pack)
+            .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
+
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&pack);
     }
 
     #[test]

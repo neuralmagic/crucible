@@ -3,8 +3,10 @@
 [govctl]
 id = "WI-2026-08-22-001"
 title = "Bound DSL compilation so no pack can abort the engine"
-status = "queue"
+status = "done"
 created = "2026-08-22"
+started = "2026-08-22"
+completed = "2026-08-22"
 refs = [
     "RFC-0001:C-WORKFLOW",
     "RFC-0002:C-TASK-FILES",
@@ -25,47 +27,47 @@ notes = ["The refine-loop channel is the point: a compile error is a recoverable
 
 [[content.acceptance_criteria]]
 text = "parse depth is bounded before AstModule::parse can recurse, for the root source and every load()ed module, and the rejection is a compile error carrying file:line:col"
-status = "pending"
+status = "done"
 category = "fixed"
 
 [[content.acceptance_criteria]]
 text = "convert() and alloc() bound nesting depth low enough that starlark's own value machinery cannot overflow underneath them"
-status = "pending"
+status = "done"
 category = "fixed"
 
 [[content.acceptance_criteria]]
 text = "load() resolution is bounded in Rust recursion depth across the module graph, distinct from MAX_CALLSTACK"
-status = "pending"
+status = "done"
 category = "fixed"
 
 [[content.acceptance_criteria]]
 text = "an allocation that would exceed starlark's u32 length assertion fails the heap budget first, so no declared budget is satisfiable by a source that panics"
-status = "pending"
+status = "done"
 category = "fixed"
 
 [[content.acceptance_criteria]]
 text = "MAX_LOAD_MODULES counts a module as it is admitted rather than after evaluate() returns, so a chain is bounded like a fan-out"
-status = "pending"
+status = "done"
 category = "fixed"
 
 [[content.acceptance_criteria]]
 text = "prompt_file() and the loader check a file's size before reading it"
-status = "pending"
+status = "done"
 category = "fixed"
 
 [[content.acceptance_criteria]]
 text = "pack and workspace confinement holds against a hard link, for load(), prompt_file(), and emits_files"
-status = "pending"
+status = "done"
 category = "fixed"
 
 [[content.acceptance_criteria]]
 text = "a hostile-pack corpus compiles every listed source in-process and asserts a CompileError, so a regression is a test failure rather than a dead test runner"
-status = "pending"
+status = "done"
 category = "chore"
 
 [[content.acceptance_criteria]]
 text = "scope/pipeline.rs turns each hostile source into RoundVerdict::Failed and the refine loop continues"
-status = "pending"
+status = "done"
 category = "chore"
 
 [verification]
