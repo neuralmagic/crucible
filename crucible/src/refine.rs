@@ -150,7 +150,7 @@ pub fn parse_adversary_verdict(transcript: &str) -> Result<AdversaryVerdict, Str
         .find(|l| !l.trim().is_empty())
         .ok_or_else(|| "the adversary turn produced no output".to_string())?
         .trim();
-    let line_err = match serde_json::from_str(last) {
+    let line_err = match crucible_contract::json::from_str(last) {
         Ok(v) => return Ok(v),
         Err(e) => e,
     };
@@ -162,7 +162,7 @@ pub fn parse_adversary_verdict(transcript: &str) -> Result<AdversaryVerdict, Str
     }
     let tail = &transcript[start..];
     for (i, _) in tail.char_indices().rev().filter(|(_, c)| *c == '{') {
-        if let Ok(v) = serde_json::from_str::<AdversaryVerdict>(tail[i..].trim_end()) {
+        if let Ok(v) = crucible_contract::json::from_str::<AdversaryVerdict>(tail[i..].trim_end()) {
             return Ok(v);
         }
     }
@@ -399,7 +399,7 @@ pub fn parse_rounds(fenced: &str) -> Result<Vec<RoundRecord>, serde_json::Error>
         .trim_start_matches("```")
         .trim_end_matches("```")
         .trim();
-    serde_json::from_str(inner)
+    crucible_contract::json::from_str(inner)
 }
 
 /// Slice the `[judge]`/`[judge.selftest]` region out of a manifest's raw TOML for the round

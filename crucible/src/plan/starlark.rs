@@ -1,15 +1,21 @@
 //! Deterministic Starlark frontend for [`WorkflowCfg`]. Scope freezes the compiled IR, so runtime
-//! never evaluates the source. Only `prompt_file` can read files; process, environment, network,
-//! clock, and randomness APIs are unavailable.
+//! never evaluates the source. Only `prompt_file` and `load` can read files, and both are confined
+//! to the pack directory; process, environment, network, clock, and randomness APIs are
+//! unavailable.
 
+mod globals;
+mod idents;
+mod loader;
+mod values;
+
+use std::cell::{RefCell, RefMut};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
-use starlark_syntax::codemap::{FileSpan, Span};
-use starlark_syntax::lexer::TokenInt;
-use starlark_syntax::syntax::ast::{
-    Argument, AssignTarget, AstLiteral, AstStmt, BinOp, CallArgsP, Expr, Stmt,
-};
+use starlark::environment::{Globals, GlobalsBuilder, Module};
+use starlark::eval::Evaluator;
+use starlark::values::ProvidesStaticType;
+use starlark_syntax::codemap::{CodeMap, FileSpan};
 use starlark_syntax::syntax::{AstModule, Dialect};
 
 use crate::errors::FileError;
@@ -18,6 +24,7 @@ use crate::plan::diag;
 use crate::plan::ir::{
     Direction, EngineOp, Isolation, Join, OutputField, Stage, Task, TaskKind, TaskName,
 };
+use crate::plan::starlark::values::WorkflowValue;
 
 type Result<T> = std::result::Result<T, CompileError>;
 
@@ -25,7 +32,16 @@ const MAX_SOURCE_BYTES: usize = 256 * 1024;
 const MAX_PROMPT_BYTES: usize = 256 * 1024;
 const MAX_TOTAL_PROMPT_BYTES: usize = 1024 * 1024;
 const MAX_TASKS: usize = 128;
-const MAX_EVAL_STEPS: usize = 10_000;
+/// Tasks a source may build before `workflow(...)` picks the ones that ship. Loops and
+/// comprehensions can construct far more than they include; these live on the Rust heap, which
+/// [`MAX_EVAL_HEAP_BYTES`] does not bound.
+const MAX_CONSTRUCTED_TASKS: usize = MAX_TASKS * 8;
+/// A tick is one function call or one loop backedge. A hand-written workflow spends tens.
+const MAX_EVAL_TICKS: u64 = 100_000;
+const MAX_EVAL_HEAP_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CALLSTACK: usize = 64;
+const MAX_LOAD_MODULES: usize = 32;
+const MAX_TOTAL_SOURCE_BYTES: usize = 4 * MAX_SOURCE_BYTES;
 
 #[derive(Debug)]
 pub struct CompiledWorkflow {
@@ -41,7 +57,6 @@ struct CompileContext {
     pack_dir: PathBuf,
     prompt_files: BTreeSet<PathBuf>,
     total_prompt_bytes: usize,
-    eval_steps: usize,
     /// Every task a DSL constructor built, keyed by name. A constructed-but-dropped task
     /// silently never runs, so it is a compile error.
     constructed_tasks: BTreeMap<String, FileSpan>,
@@ -52,13 +67,98 @@ struct CompileContext {
     /// Bare-string session refs made before any declaration. A later declaration makes
     /// these errors: a session must be declared before use.
     string_session_refs: BTreeMap<String, FileSpan>,
+    /// The first [`CompileError`] a constructor raised, parked while the marker error unwinds
+    /// the evaluator.
+    thrown: Option<CompileError>,
+}
+
+/// What a pack-relative path is being resolved for. Only the `FileError` context strings differ.
+#[derive(Clone, Copy)]
+enum PathKind {
+    Prompt,
+    Module,
+}
+
+impl PathKind {
+    fn metadata(self) -> &'static str {
+        match self {
+            PathKind::Prompt => "reading prompt metadata",
+            PathKind::Module => "reading module metadata",
+        }
+    }
+
+    fn resolving(self) -> &'static str {
+        match self {
+            PathKind::Prompt => "resolving prompt file",
+            PathKind::Module => "resolving module file",
+        }
+    }
+}
+
+/// Why a path under the pack was refused, before [`PathRejection::prompt`] or
+/// [`PathRejection::module`] phrases it for the caller that asked.
+enum PathRejection {
+    Empty,
+    Traversal,
+    Symlink,
+    NotRegularFile,
+    EscapesPack,
+    File(FileError),
+}
+
+impl PathRejection {
+    fn prompt(self, raw: &str) -> CompileError {
+        match self {
+            PathRejection::Empty => CompileError::PromptPathEmpty,
+            PathRejection::Traversal => CompileError::PromptPathTraversal,
+            PathRejection::Symlink => CompileError::PromptSymlink {
+                raw: raw.to_owned(),
+            },
+            PathRejection::NotRegularFile => CompileError::PromptNotRegularFile {
+                raw: raw.to_owned(),
+            },
+            PathRejection::EscapesPack => CompileError::PromptEscapesPack {
+                raw: raw.to_owned(),
+            },
+            PathRejection::File(error) => CompileError::File(error),
+        }
+    }
+
+    fn module(self, raw: &str) -> CompileError {
+        match self {
+            PathRejection::Empty => CompileError::LoadPathEmpty {
+                raw: raw.to_owned(),
+            },
+            PathRejection::Traversal => CompileError::LoadPathTraversal {
+                raw: raw.to_owned(),
+            },
+            PathRejection::Symlink => CompileError::LoadSymlink {
+                raw: raw.to_owned(),
+            },
+            PathRejection::NotRegularFile => CompileError::LoadNotRegularFile {
+                raw: raw.to_owned(),
+            },
+            PathRejection::EscapesPack => CompileError::LoadEscapesPack {
+                raw: raw.to_owned(),
+            },
+            PathRejection::File(error) => CompileError::File(error),
+        }
+    }
 }
 
 impl CompileContext {
-    fn prompt_file(&mut self, raw: &str) -> Result<String> {
+    /// The pack-relative and canonical forms of `raw`, or why the pack refuses it. Every
+    /// component is stat'd with `symlink_metadata`, so a symlinked intermediate directory is
+    /// refused as well as a symlinked leaf.
+    fn resolve_in_pack(
+        &self,
+        raw: &str,
+        kind: PathKind,
+    ) -> std::result::Result<(PathBuf, PathBuf), PathRejection> {
         let relative = safe_relative_path(raw)?;
         let root = std::fs::canonicalize(&self.pack_dir)
-            .map_err(FileError::at("resolving pack directory", &self.pack_dir))?;
+            .map_err(FileError::at("resolving pack directory", &self.pack_dir))
+            .map_err(PathRejection::File)?;
         let mut path = self.pack_dir.clone();
         let mut metadata = None;
         for component in relative.components() {
@@ -67,26 +167,29 @@ impl CompileContext {
             };
             path.push(component);
             let current = std::fs::symlink_metadata(&path)
-                .map_err(FileError::at("reading prompt metadata", &path))?;
+                .map_err(FileError::at(kind.metadata(), &path))
+                .map_err(PathRejection::File)?;
             if current.file_type().is_symlink() {
-                return Err(CompileError::PromptSymlink {
-                    raw: raw.to_owned(),
-                });
+                return Err(PathRejection::Symlink);
             }
             metadata = Some(current);
         }
         if !metadata.is_some_and(|metadata| metadata.is_file()) {
-            return Err(CompileError::PromptNotRegularFile {
-                raw: raw.to_owned(),
-            });
+            return Err(PathRejection::NotRegularFile);
         }
-        let canonical =
-            std::fs::canonicalize(&path).map_err(FileError::at("resolving prompt file", &path))?;
+        let canonical = std::fs::canonicalize(&path)
+            .map_err(FileError::at(kind.resolving(), &path))
+            .map_err(PathRejection::File)?;
         if !canonical.starts_with(&root) {
-            return Err(CompileError::PromptEscapesPack {
-                raw: raw.to_owned(),
-            });
+            return Err(PathRejection::EscapesPack);
         }
+        Ok((relative, canonical))
+    }
+
+    fn prompt_file(&mut self, raw: &str) -> Result<String> {
+        let (relative, canonical) = self
+            .resolve_in_pack(raw, PathKind::Prompt)
+            .map_err(|rejection| rejection.prompt(raw))?;
         let bytes =
             std::fs::read(&canonical).map_err(FileError::at("reading prompt file", &canonical))?;
         if bytes.len() > MAX_PROMPT_BYTES {
@@ -102,20 +205,78 @@ impl CompileContext {
         self.prompt_files.insert(relative);
         Ok(String::from_utf8(bytes)?)
     }
+}
 
-    fn step(&mut self) -> Result<()> {
-        self.eval_steps += 1;
-        if self.eval_steps > MAX_EVAL_STEPS {
-            return Err(CompileError::EvalStepsSpent);
+/// The marker a native constructor returns once its real [`CompileError`] is parked in
+/// [`CompileContext::thrown`]; `starlark::Error` cannot carry our type.
+#[derive(Debug, thiserror::Error)]
+#[error("workflow compile error")]
+struct Thrown;
+
+/// A DSL constructor ran without [`CompileState`] on `Evaluator::extra`.
+#[derive(Debug, thiserror::Error)]
+#[error("workflow compile state is unreachable from the evaluator")]
+struct StateMissing;
+
+/// Compile state the native constructors share. `Evaluator::extra` hands out a shared reference,
+/// so every mutation goes through the `RefCell`.
+#[derive(Debug, ProvidesStaticType)]
+pub(crate) struct CompileState {
+    /// Stands in when the evaluator cannot name a call site.
+    site: FileSpan,
+    inner: RefCell<CompileContext>,
+}
+
+impl CompileState {
+    fn new(pack_dir: &Path, filename: &Path) -> Self {
+        let file = CodeMap::new(filename.display().to_string(), String::new());
+        let span = file.full_span();
+        CompileState {
+            site: FileSpan { file, span },
+            inner: RefCell::new(CompileContext {
+                pack_dir: pack_dir.to_path_buf(),
+                prompt_files: BTreeSet::new(),
+                total_prompt_bytes: 0,
+                constructed_tasks: BTreeMap::new(),
+                sessions: BTreeMap::new(),
+                bound_sessions: BTreeSet::new(),
+                string_session_refs: BTreeMap::new(),
+                thrown: None,
+            }),
         }
-        Ok(())
+    }
+
+    fn site(&self) -> FileSpan {
+        self.site.clone()
+    }
+
+    fn context_mut(&self) -> RefMut<'_, CompileContext> {
+        self.inner.borrow_mut()
+    }
+
+    /// Park `error` and hand the evaluator a marker to unwind with. The first error wins: later
+    /// frames cannot overwrite the innermost authoring site.
+    fn throw(&self, error: CompileError) -> starlark::Error {
+        let mut context = self.inner.borrow_mut();
+        if context.thrown.is_none() {
+            context.thrown = Some(error);
+        }
+        starlark::Error::new_native(anyhow::Error::new(Thrown))
+    }
+
+    fn take_thrown(&self) -> Option<CompileError> {
+        self.inner.borrow_mut().thrown.take()
+    }
+
+    fn into_context(self) -> CompileContext {
+        self.inner.into_inner()
     }
 }
 
-fn safe_relative_path(raw: &str) -> Result<PathBuf> {
+fn safe_relative_path(raw: &str) -> std::result::Result<PathBuf, PathRejection> {
     let path = Path::new(raw);
     if raw.trim().is_empty() || path.is_absolute() {
-        return Err(CompileError::PromptPathEmpty);
+        return Err(PathRejection::Empty);
     }
     if path.components().any(|part| {
         matches!(
@@ -123,7 +284,7 @@ fn safe_relative_path(raw: &str) -> Result<PathBuf> {
             Component::ParentDir | Component::RootDir | Component::Prefix(_)
         )
     }) {
-        return Err(CompileError::PromptPathTraversal);
+        return Err(PathRejection::Traversal);
     }
     Ok(path.to_path_buf())
 }
@@ -139,12 +300,15 @@ enum Value {
     Task(Task),
     Session(SessionDecl),
     Workflow(WorkflowCfg),
+    /// A starlark value outside the DSL's own space: a dict, a function, a struct. The `take_*`
+    /// helpers report it with the same wrong-type sentence a wrong scalar gets.
+    Opaque,
 }
 
 /// A `session(...)` declaration: a durable conversation name plus optional agent
 /// defaults that materialize onto the agent tasks bound to it.
 #[derive(Clone, Debug)]
-struct SessionDecl {
+pub(crate) struct SessionDecl {
     name: String,
     harness: Option<String>,
     model: Option<String>,
@@ -158,8 +322,8 @@ impl SessionDecl {
 }
 
 /// Everything the Starlark frontend can reject. [`CompileError::At`] carries the
-/// `file:line:col` prefix, so [`Compiler::locate`] can tell a located error from a bare one
-/// instead of sniffing a formatted string.
+/// `file:line:col` prefix, so a located error is told from a bare one instead of sniffing a
+/// formatted string.
 ///
 /// Causes are real `source()` links, so the message a user reads comes from
 /// [`crate::errors::report`] (or anyhow's `{:#}`), not from `Display` alone.
@@ -200,19 +364,31 @@ pub enum CompileError {
 
     #[error("workflow source is {bytes} bytes; maximum is {MAX_SOURCE_BYTES}")]
     SourceTooLarge { bytes: usize },
-    #[error("workflow evaluation exceeds {MAX_EVAL_STEPS} expression steps")]
-    EvalStepsSpent,
+    #[error("workflow evaluation failed: {0}")]
+    Eval(String),
+    #[error("workflow evaluation called fail(): {0}")]
+    Failed(String),
     #[error("{function} expands to {count} tasks; maximum is {MAX_TASKS}")]
     TooManyTasks { function: String, count: usize },
 
-    #[error("workflow assignments must target a single variable name")]
-    NonIdentifierAssignment,
-    #[error("workflow Starlark may not use load(); use pack-local prompt_file() for prompts")]
-    LoadUnsupported,
-    #[error(
-        "workflow Starlark is declarative: use assignments, lists, list concatenation, and DSL calls"
-    )]
-    NonDeclarativeStatement,
+    #[error("load({raw:?}) path must be a non-empty pack-relative path")]
+    LoadPathEmpty { raw: String },
+    #[error("load({raw:?}) may not contain `..` or escape the pack")]
+    LoadPathTraversal { raw: String },
+    #[error("load({raw:?}) may not traverse symlinks")]
+    LoadSymlink { raw: String },
+    #[error("load({raw:?}) must name a regular, non-symlink file")]
+    LoadNotRegularFile { raw: String },
+    #[error("load({raw:?}) escapes the pack directory")]
+    LoadEscapesPack { raw: String },
+    #[error("workflow loads more than {MAX_LOAD_MODULES} modules")]
+    LoadBudgetSpent,
+    #[error("load({raw:?}) forms a cycle")]
+    LoadCycle { raw: String },
+    #[error("workflow and its loaded modules exceed {MAX_TOTAL_SOURCE_BYTES} bytes of source")]
+    LoadSourceBudgetSpent,
+    #[error("load({raw:?}) resolved to no module")]
+    LoadUnresolved { raw: String },
     #[error("unknown workflow variable {name:?}{}", diag::hint(.suggestion.as_deref()))]
     UnknownVariable {
         name: String,
@@ -220,14 +396,6 @@ pub enum CompileError {
     },
     #[error("workflow integers must fit in 32 bits")]
     IntegerTooWide,
-    #[error("workflow `+` is supported only for task or dependency lists")]
-    UnsupportedAddition,
-    #[error("workflow calls must name a DSL constructor directly")]
-    IndirectCall,
-    #[error(
-        "unsupported workflow expression; use strings, integers, booleans, lists, list concatenation, and DSL calls"
-    )]
-    UnsupportedExpression,
 
     #[error("unknown workflow DSL function {function:?}{}", diag::hint(.suggestion.as_deref()))]
     UnknownFunction {
@@ -240,8 +408,6 @@ pub enum CompileError {
     WrongPositionalType { function: String },
     #[error("{function}() task constructor arguments must be named")]
     PositionalArgument { function: String },
-    #[error("{function}() repeats argument {argument:?}")]
-    RepeatedArgument { function: String, argument: String },
     #[error("{function}() has unknown argument {argument:?}{}", diag::hint(.suggestion.as_deref()))]
     UnknownArgument {
         function: String,
@@ -428,505 +594,288 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
     }
 }
 
-struct Compiler<'a> {
-    module: &'a AstModule,
-    context: CompileContext,
-    variables: BTreeMap<String, Value>,
-}
-
-impl Compiler<'_> {
-    fn err_at(&self, span: Span, error: CompileError) -> CompileError {
-        CompileError::At {
-            at: self.module.file_span(span),
-            inner: Box::new(error),
-        }
-    }
-
-    /// Attach the call site to an error that does not already carry a location.
-    fn locate(&self, span: Span, error: CompileError) -> CompileError {
-        match error {
-            located @ CompileError::At { .. } => located,
-            error => self.err_at(span, error),
-        }
-    }
-
-    fn statement(&mut self, statement: &AstStmt) -> Result<Option<Value>> {
-        self.context.step()?;
-        match &statement.node {
-            Stmt::Statements(statements) => {
-                let mut last = None;
-                for statement in statements {
-                    last = self.statement(statement)?;
-                }
-                Ok(last)
-            }
-            Stmt::Assign(assign) => {
-                let AssignTarget::Identifier(name) = &assign.lhs.node else {
-                    return Err(self.err_at(assign.lhs.span, CompileError::NonIdentifierAssignment));
-                };
-                let value = self.expression(&assign.rhs)?;
-                self.variables.insert(name.node.ident.clone(), value);
-                Ok(None)
-            }
-            Stmt::Expression(expression) => self.expression(expression).map(Some),
-            Stmt::Load(_) => Err(self.err_at(statement.span, CompileError::LoadUnsupported)),
-            _ => Err(self.err_at(statement.span, CompileError::NonDeclarativeStatement)),
-        }
-    }
-
-    fn expression(&mut self, expression: &starlark_syntax::syntax::ast::AstExpr) -> Result<Value> {
-        self.context.step()?;
-        match &expression.node {
-            Expr::Identifier(identifier) => match identifier.node.ident.as_str() {
-                "True" => Ok(Value::Bool(true)),
-                "False" => Ok(Value::Bool(false)),
-                "None" => Ok(Value::None),
-                name => match self.variables.get(name) {
-                    Some(value) => Ok(value.clone()),
-                    None => Err(self.err_at(
-                        expression.span,
-                        CompileError::UnknownVariable {
-                            name: name.to_owned(),
-                            suggestion: diag::suggest(
-                                name,
-                                self.variables.keys().map(String::as_str),
-                            )
-                            .map(str::to_owned),
-                        },
-                    )),
-                },
-            },
-            Expr::Literal(AstLiteral::String(value)) => Ok(Value::String(value.node.clone())),
-            Expr::Literal(AstLiteral::Int(value)) => match &value.node {
-                TokenInt::I32(value) => Ok(Value::Int(*value)),
-                TokenInt::BigInt(_) => {
-                    Err(self.err_at(expression.span, CompileError::IntegerTooWide))
-                }
-            },
-            Expr::Literal(AstLiteral::Float(value)) => Ok(Value::Float(value.node)),
-            Expr::List(items) | Expr::Tuple(items) => items
-                .iter()
-                .map(|item| self.expression(item))
-                .collect::<Result<Vec<_>>>()
-                .map(Value::List),
-            Expr::Op(left, BinOp::Add, right) => {
-                let (Value::List(mut left), Value::List(right)) =
-                    (self.expression(left)?, self.expression(right)?)
-                else {
-                    return Err(self.err_at(expression.span, CompileError::UnsupportedAddition));
-                };
-                left.extend(right);
-                Ok(Value::List(left))
-            }
-            Expr::Call(function, args) => {
-                let Expr::Identifier(identifier) = &function.node else {
-                    return Err(self.err_at(function.span, CompileError::IndirectCall));
-                };
-                self.call(&identifier.node.ident, function.span, args)
-            }
-            _ => Err(self.err_at(expression.span, CompileError::UnsupportedExpression)),
-        }
-    }
-
-    fn call(
-        &mut self,
-        function: &str,
-        function_span: Span,
-        args: &CallArgsP<starlark_syntax::syntax::ast::AstNoPayload>,
-    ) -> Result<Value> {
-        if !DSL_FUNCTIONS.contains(&function) {
-            return Err(self.err_at(
-                function_span,
-                CompileError::UnknownFunction {
-                    function: function.to_owned(),
-                    suggestion: diag::suggest(function, DSL_FUNCTIONS.iter().copied())
-                        .map(str::to_owned),
-                },
-            ));
-        }
-        if matches!(
-            function,
-            "prompt_file" | "deps" | "workflow" | "default_autoresearch"
-        ) && args
-            .args
-            .iter()
-            .all(|argument| matches!(argument.node, Argument::Positional(_)))
+/// Build the value for a named-argument DSL call. Every kwarg an arm consumes must
+/// appear in [`known_kwargs`], which the leftover check reports against.
+fn constructor(
+    function: &str,
+    mut named: BTreeMap<String, Value>,
+    state: &CompileState,
+    at: &FileSpan,
+) -> Result<Value> {
+    if function == "workflow" {
+        let workflow_type = match take_string_default(&mut named, "type", "autoresearch")?.as_str()
         {
-            let one_positional = || CompileError::NotOnePositional {
-                function: function.to_owned(),
-            };
-            let [argument] = args.args.as_slice() else {
-                return Err(self.err_at(function_span, one_positional()));
-            };
-            let Argument::Positional(argument) = &argument.node else {
-                return Err(self.err_at(function_span, one_positional()));
-            };
-            let value = self.expression(argument)?;
-            return match (function, value) {
-                ("prompt_file", Value::String(path)) => {
-                    self.context.prompt_file(&path).map(Value::String)
-                }
-                ("deps", Value::List(tasks)) => tasks
-                    .into_iter()
-                    .map(|task| match task {
-                        Value::Task(task) => Ok(Value::String(task.name.0)),
-                        _ => Err(CompileError::DepsEntryNotTask),
-                    })
-                    .collect::<Result<Vec<_>>>()
-                    .map(Value::List),
-                ("workflow", Value::List(tasks)) => {
-                    let tasks = task_list("workflow", tasks)?;
-                    let workflow = WorkflowCfg {
-                        workflow_type: WorkflowType::Autoresearch,
-                        result: None,
-                        tasks,
-                    };
-                    workflow.validate()?;
-                    Ok(Value::Workflow(workflow))
-                }
-                ("default_autoresearch", Value::List(tasks)) => {
-                    default_autoresearch(task_list("default_autoresearch", tasks)?)
-                        .map(Value::Workflow)
-                }
-                _ => Err(self.err_at(
-                    function_span,
-                    CompileError::WrongPositionalType {
-                        function: function.to_owned(),
-                    },
-                )),
-            };
-        }
-
-        let mut named = BTreeMap::new();
-        let mut arg_spans: BTreeMap<String, Span> = BTreeMap::new();
-        for argument in &args.args {
-            let Argument::Named(name, value) = &argument.node else {
-                return Err(self.err_at(
-                    argument.span,
-                    CompileError::PositionalArgument {
-                        function: function.to_owned(),
-                    },
-                ));
-            };
-            let value = self.expression(value)?;
-            if named.insert(name.node.clone(), value).is_some() {
-                return Err(self.err_at(
-                    argument.span,
-                    CompileError::RepeatedArgument {
-                        function: function.to_owned(),
-                        argument: name.node.clone(),
-                    },
-                ));
-            }
-            arg_spans.insert(name.node.clone(), argument.span);
-        }
-        self.constructor(function, function_span, named, arg_spans)
-            .map_err(|error| self.locate(function_span, error))
-    }
-
-    /// Build the value for a named-argument DSL call. Every kwarg an arm consumes must
-    /// appear in [`known_kwargs`], which the leftover check reports against.
-    fn constructor(
-        &mut self,
-        function: &str,
-        span: Span,
-        mut named: BTreeMap<String, Value>,
-        arg_spans: BTreeMap<String, Span>,
-    ) -> Result<Value> {
-        if function == "workflow" {
-            let workflow_type =
-                match take_string_default(&mut named, "type", "autoresearch")?.as_str() {
-                    "autoresearch" => WorkflowType::Autoresearch,
-                    "custom" => WorkflowType::Custom,
-                    other => {
-                        return Err(CompileError::UnknownWorkflowType {
-                            got: other.to_owned(),
-                        });
-                    }
-                };
-            let tasks = match take_value(&mut named, "tasks")? {
-                Value::List(tasks) => task_list("workflow", tasks)?,
-                _ => return Err(CompileError::TasksNotList),
-            };
-            let result = take_optional_task_name(&mut named, "result")?;
-            self.no_unknown_kwargs(function, span, &named, &arg_spans)?;
-            let workflow = WorkflowCfg {
-                workflow_type,
-                result,
-                tasks,
-            };
-            workflow.validate()?;
-            return Ok(Value::Workflow(workflow));
-        }
-        if function == "session" {
-            let name = take_string(&mut named, "name")?;
-            if !is_valid_session_name(&name) {
-                return Err(CompileError::InvalidSessionName { name });
-            }
-            let decl = SessionDecl {
-                harness: take_optional_string(&mut named, "harness")?,
-                model: take_optional_string(&mut named, "model")?,
-                effort: take_optional_string(&mut named, "effort")?,
-                name,
-            };
-            self.no_unknown_kwargs(function, span, &named, &arg_spans)?;
-            if let Some((_, first)) = self.context.sessions.get(&decl.name) {
-                return Err(self.err_at(
-                    span,
-                    CompileError::DuplicateSession {
-                        name: decl.name.clone(),
-                        first: first.clone(),
-                    },
-                ));
-            }
-            self.context.sessions.insert(
-                decl.name.clone(),
-                (decl.clone(), self.module.file_span(span)),
-            );
-            return Ok(Value::Session(decl));
-        }
-        if matches!(function, "prompt_file" | "deps" | "default_autoresearch") {
-            return Err(CompileError::NotOnePositional {
-                function: function.to_owned(),
-            });
-        }
-
-        let task = match function {
-            "agent" => {
-                let name = TaskName(take_string(&mut named, "name")?);
-                let prompt = take_string(&mut named, "prompt")?;
-                let mut harness = take_optional_string(&mut named, "harness")?;
-                let mut model = take_optional_string(&mut named, "model")?;
-                let mut effort = take_optional_string(&mut named, "effort")?;
-                let session = self.take_session(&mut named, &arg_spans, span)?;
-                if let Some(decl) = &session {
-                    // A session is one serial conversation under one agent config, so
-                    // declared defaults fill unset knobs and conflicts are errors.
-                    for (knob, own, default) in [
-                        ("harness", &mut harness, &decl.harness),
-                        ("model", &mut model, &decl.model),
-                        ("effort", &mut effort, &decl.effort),
-                    ] {
-                        let Some(theirs) = default else { continue };
-                        match own {
-                            None => *own = Some(theirs.clone()),
-                            Some(mine) if mine.as_str() != theirs.as_str() => {
-                                return Err(self.err_at(
-                                    span,
-                                    CompileError::SessionConfigConflict {
-                                        task: name.0.clone(),
-                                        knob,
-                                        mine: mine.clone(),
-                                        session: decl.name.clone(),
-                                        theirs: theirs.clone(),
-                                    },
-                                ));
-                            }
-                            Some(_) => {}
-                        }
-                    }
-                }
-                let kind = TaskKind::Agent {
-                    prompt,
-                    harness,
-                    model,
-                    effort,
-                };
-                dsl_task(&mut named, name, kind, session.map(|decl| decl.name))?
-            }
-            "command" => {
-                let name = TaskName(take_string(&mut named, "name")?);
-                let kind = TaskKind::Command {
-                    command: take_string(&mut named, "run")?,
-                };
-                dsl_task(&mut named, name, kind, None)?
-            }
-            "evaluate" => {
-                let name = TaskName(take_string(&mut named, "name")?);
-                let kind = TaskKind::Evaluate {
-                    command: take_string(&mut named, "run")?,
-                    threshold: take_optional_number(&mut named, "threshold")?,
-                    direction: take_optional_direction(&mut named, "direction")?,
-                };
-                dsl_task(&mut named, name, kind, None)?
-            }
-            "top_k" => {
-                let k = take_int(&mut named, "k")?;
-                if k <= 0 {
-                    return Err(CompileError::TopKZero);
-                }
-                let direction = match take_string(&mut named, "direction")?.as_str() {
-                    "lower" => Direction::Lower,
-                    "higher" => Direction::Higher,
-                    other => {
-                        return Err(CompileError::UnknownTopKDirection {
-                            got: other.to_owned(),
-                        });
-                    }
-                };
-                let depends_on = take_task_names(&mut named)?;
-                if depends_on.is_empty() {
-                    return Err(CompileError::TopKWithoutDependencies);
-                }
-                Task {
-                    name: TaskName(take_string(&mut named, "name")?),
-                    task: TaskKind::TopK {
-                        k: k as u32,
-                        direction,
-                    },
-                    depends_on,
-                    session: None,
-                    needs: "any".to_owned(),
-                    required: take_bool_default(&mut named, "required", true)?,
-                    isolation: None,
-                    join: Join::Passed,
-                    stage: Stage::Iteration,
-                    emits: Vec::new(),
-                }
-            }
-            "propose" => {
-                let session = self.take_session(&mut named, &arg_spans, span)?;
-                if let Some(decl) = &session
-                    && decl.has_defaults()
-                {
-                    // The engine propose turn's agent config is owned by the manifest's
-                    // [agent]; accepting the defaults here would silently ignore them.
-                    return Err(self.err_at(
-                        arg_spans.get("session").copied().unwrap_or(span),
-                        CompileError::ProposeSessionDefaults {
-                            name: decl.name.clone(),
-                        },
-                    ));
-                }
-                let mut task = engine_task(&mut named, EngineOp::Propose, None)?;
-                task.session = session.map(|decl| decl.name);
-                task
-            }
-            "apply" => engine_task(&mut named, EngineOp::Apply, None)?,
-            "measure" => engine_task(&mut named, EngineOp::Measure, None)?,
-            "grade" => {
-                let source = take_task_name(&mut named, "score")?;
-                // Optional secondary axis: the named task's score breaks primary-score ties.
-                let tiebreak = take_optional_task_name(&mut named, "tiebreak")?;
-                let mut evidence = take_named_task_names(&mut named, "evidence")?;
-                if !evidence.contains(&source) {
-                    evidence.push(source.clone());
-                }
-                if let Some(t) = &tiebreak
-                    && !evidence.contains(t)
-                {
-                    evidence.push(t.clone());
-                }
-                let mut task = engine(
-                    &take_string(&mut named, "name")?,
-                    EngineOp::Grade,
-                    Some(source),
-                    evidence,
-                );
-                if let TaskKind::Engine { tiebreak: slot, .. } = &mut task.task {
-                    *slot = tiebreak;
-                }
-                task.join = parse_join(&take_string_default(&mut named, "join", "passed")?)?;
-                task
-            }
-            "decide" => {
-                let source = take_task_name(&mut named, "measurement")?;
-                let depends_on = match named.remove("depends_on") {
-                    None => vec![source.clone()],
-                    Some(value) => task_names("depends_on", value)?,
-                };
-                engine(
-                    &take_string(&mut named, "name")?,
-                    EngineOp::Decide,
-                    Some(source),
-                    depends_on,
-                )
-            }
-            _ => {
-                return Err(CompileError::UnknownFunction {
-                    function: function.to_owned(),
-                    suggestion: None,
+            "autoresearch" => WorkflowType::Autoresearch,
+            "custom" => WorkflowType::Custom,
+            other => {
+                return Err(CompileError::UnknownWorkflowType {
+                    got: other.to_owned(),
                 });
             }
         };
-        self.no_unknown_kwargs(function, span, &named, &arg_spans)?;
-        self.context
-            .constructed_tasks
-            .insert(task.name.0.clone(), self.module.file_span(span));
-        Ok(Value::Task(task))
-    }
-
-    fn no_unknown_kwargs(
-        &self,
-        function: &str,
-        span: Span,
-        named: &BTreeMap<String, Value>,
-        arg_spans: &BTreeMap<String, Span>,
-    ) -> Result<()> {
-        let Some(unknown) = named.keys().next() else {
-            return Ok(());
+        let tasks = match take_value(&mut named, "tasks")? {
+            Value::List(tasks) => task_list("workflow", tasks)?,
+            _ => return Err(CompileError::TasksNotList),
         };
-        let at = arg_spans.get(unknown).copied().unwrap_or(span);
-        Err(self.err_at(
-            at,
-            CompileError::UnknownArgument {
-                function: function.to_owned(),
-                argument: unknown.clone(),
-                suggestion: diag::suggest(unknown, known_kwargs(function).iter().copied())
-                    .map(str::to_owned),
-            },
-        ))
+        let result = take_optional_task_name(&mut named, "result")?;
+        no_unknown_kwargs(function, &named)?;
+        let workflow = WorkflowCfg {
+            workflow_type,
+            result,
+            tasks,
+        };
+        workflow.validate()?;
+        return Ok(Value::Workflow(workflow));
+    }
+    if function == "session" {
+        let name = take_string(&mut named, "name")?;
+        if !is_valid_session_name(&name) {
+            return Err(CompileError::InvalidSessionName { name });
+        }
+        let decl = SessionDecl {
+            harness: take_optional_string(&mut named, "harness")?,
+            model: take_optional_string(&mut named, "model")?,
+            effort: take_optional_string(&mut named, "effort")?,
+            name,
+        };
+        no_unknown_kwargs(function, &named)?;
+        let mut context = state.context_mut();
+        if let Some((_, first)) = context.sessions.get(&decl.name) {
+            return Err(CompileError::DuplicateSession {
+                name: decl.name.clone(),
+                first: first.clone(),
+            });
+        }
+        context
+            .sessions
+            .insert(decl.name.clone(), (decl.clone(), at.clone()));
+        return Ok(Value::Session(decl));
+    }
+    if matches!(function, "prompt_file" | "deps" | "default_autoresearch") {
+        return Err(CompileError::NotOnePositional {
+            function: function.to_owned(),
+        });
     }
 
-    /// A `session(...)` value, or a bare string. Strings keep the historical
-    /// pass-through only while the file declares no sessions; once any `session()`
-    /// exists every string must name a declared one.
-    fn take_session(
-        &mut self,
-        named: &mut BTreeMap<String, Value>,
-        arg_spans: &BTreeMap<String, Span>,
-        call_span: Span,
-    ) -> Result<Option<SessionDecl>> {
-        let span = arg_spans.get("session").copied().unwrap_or(call_span);
-        match named.remove("session").unwrap_or(Value::None) {
-            Value::None => Ok(None),
-            Value::Session(decl) => {
-                self.context.bound_sessions.insert(decl.name.clone());
-                Ok(Some(decl))
-            }
-            Value::String(name) => {
-                if let Some((decl, _)) = self.context.sessions.get(&name) {
-                    let decl = decl.clone();
-                    self.context.bound_sessions.insert(name);
-                    Ok(Some(decl))
-                } else if self.context.sessions.is_empty() {
-                    let site = self.module.file_span(span);
-                    self.context
-                        .string_session_refs
-                        .entry(name.clone())
-                        .or_insert(site);
-                    Ok(Some(SessionDecl {
-                        name,
-                        harness: None,
-                        model: None,
-                        effort: None,
-                    }))
-                } else {
-                    Err(self.err_at(
-                        span,
-                        CompileError::UndeclaredSession {
-                            suggestion: diag::suggest(
-                                &name,
-                                self.context.sessions.keys().map(String::as_str),
-                            )
-                            .map(str::to_owned),
-                            name,
-                        },
-                    ))
+    let task = match function {
+        "agent" => {
+            let name = TaskName(take_string(&mut named, "name")?);
+            let prompt = take_string(&mut named, "prompt")?;
+            let mut harness = take_optional_string(&mut named, "harness")?;
+            let mut model = take_optional_string(&mut named, "model")?;
+            let mut effort = take_optional_string(&mut named, "effort")?;
+            let session = take_session(&mut named, state, at)?;
+            if let Some(decl) = &session {
+                // A session is one serial conversation under one agent config, so
+                // declared defaults fill unset knobs and conflicts are errors.
+                for (knob, own, default) in [
+                    ("harness", &mut harness, &decl.harness),
+                    ("model", &mut model, &decl.model),
+                    ("effort", &mut effort, &decl.effort),
+                ] {
+                    let Some(theirs) = default else { continue };
+                    match own {
+                        None => *own = Some(theirs.clone()),
+                        Some(mine) if mine.as_str() != theirs.as_str() => {
+                            return Err(CompileError::SessionConfigConflict {
+                                task: name.0.clone(),
+                                knob,
+                                mine: mine.clone(),
+                                session: decl.name.clone(),
+                                theirs: theirs.clone(),
+                            });
+                        }
+                        Some(_) => {}
+                    }
                 }
             }
-            _ => Err(self.err_at(span, CompileError::SessionWrongType)),
+            let kind = TaskKind::Agent {
+                prompt,
+                harness,
+                model,
+                effort,
+            };
+            dsl_task(&mut named, name, kind, session.map(|decl| decl.name))?
         }
+        "command" => {
+            let name = TaskName(take_string(&mut named, "name")?);
+            let kind = TaskKind::Command {
+                command: take_string(&mut named, "run")?,
+            };
+            dsl_task(&mut named, name, kind, None)?
+        }
+        "evaluate" => {
+            let name = TaskName(take_string(&mut named, "name")?);
+            let kind = TaskKind::Evaluate {
+                command: take_string(&mut named, "run")?,
+                threshold: take_optional_number(&mut named, "threshold")?,
+                direction: take_optional_direction(&mut named, "direction")?,
+            };
+            dsl_task(&mut named, name, kind, None)?
+        }
+        "top_k" => {
+            let k = take_int(&mut named, "k")?;
+            if k <= 0 {
+                return Err(CompileError::TopKZero);
+            }
+            let direction = match take_string(&mut named, "direction")?.as_str() {
+                "lower" => Direction::Lower,
+                "higher" => Direction::Higher,
+                other => {
+                    return Err(CompileError::UnknownTopKDirection {
+                        got: other.to_owned(),
+                    });
+                }
+            };
+            let depends_on = take_task_names(&mut named)?;
+            if depends_on.is_empty() {
+                return Err(CompileError::TopKWithoutDependencies);
+            }
+            Task {
+                name: TaskName(take_string(&mut named, "name")?),
+                task: TaskKind::TopK {
+                    k: k as u32,
+                    direction,
+                },
+                depends_on,
+                session: None,
+                needs: "any".to_owned(),
+                required: take_bool_default(&mut named, "required", true)?,
+                isolation: None,
+                join: Join::Passed,
+                stage: Stage::Iteration,
+                emits: Vec::new(),
+            }
+        }
+        "propose" => {
+            let session = take_session(&mut named, state, at)?;
+            if let Some(decl) = &session
+                && decl.has_defaults()
+            {
+                // The engine propose turn's agent config is owned by the manifest's
+                // [agent]; accepting the defaults here would silently ignore them.
+                return Err(CompileError::ProposeSessionDefaults {
+                    name: decl.name.clone(),
+                });
+            }
+            let mut task = engine_task(&mut named, EngineOp::Propose, None)?;
+            task.session = session.map(|decl| decl.name);
+            task
+        }
+        "apply" => engine_task(&mut named, EngineOp::Apply, None)?,
+        "measure" => engine_task(&mut named, EngineOp::Measure, None)?,
+        "grade" => {
+            let source = take_task_name(&mut named, "score")?;
+            // Optional secondary axis: the named task's score breaks primary-score ties.
+            let tiebreak = take_optional_task_name(&mut named, "tiebreak")?;
+            let mut evidence = take_named_task_names(&mut named, "evidence")?;
+            if !evidence.contains(&source) {
+                evidence.push(source.clone());
+            }
+            if let Some(t) = &tiebreak
+                && !evidence.contains(t)
+            {
+                evidence.push(t.clone());
+            }
+            let mut task = engine(
+                &take_string(&mut named, "name")?,
+                EngineOp::Grade,
+                Some(source),
+                evidence,
+            );
+            if let TaskKind::Engine { tiebreak: slot, .. } = &mut task.task {
+                *slot = tiebreak;
+            }
+            task.join = parse_join(&take_string_default(&mut named, "join", "passed")?)?;
+            task
+        }
+        "decide" => {
+            let source = take_task_name(&mut named, "measurement")?;
+            let depends_on = match named.remove("depends_on") {
+                None => vec![source.clone()],
+                Some(value) => task_names("depends_on", value)?,
+            };
+            engine(
+                &take_string(&mut named, "name")?,
+                EngineOp::Decide,
+                Some(source),
+                depends_on,
+            )
+        }
+        _ => {
+            return Err(CompileError::UnknownFunction {
+                function: function.to_owned(),
+                suggestion: None,
+            });
+        }
+    };
+    no_unknown_kwargs(function, &named)?;
+    let constructed = {
+        let mut context = state.context_mut();
+        context
+            .constructed_tasks
+            .insert(task.name.0.clone(), at.clone());
+        context.constructed_tasks.len()
+    };
+    if constructed > MAX_CONSTRUCTED_TASKS {
+        return Err(CompileError::TooManyTasks {
+            function: function.to_owned(),
+            count: constructed,
+        });
+    }
+    Ok(Value::Task(task))
+}
+
+fn no_unknown_kwargs(function: &str, named: &BTreeMap<String, Value>) -> Result<()> {
+    let Some(unknown) = named.keys().next() else {
+        return Ok(());
+    };
+    Err(CompileError::UnknownArgument {
+        function: function.to_owned(),
+        argument: unknown.clone(),
+        suggestion: diag::suggest(unknown, known_kwargs(function).iter().copied())
+            .map(str::to_owned),
+    })
+}
+
+/// A `session(...)` value, or a bare string. Strings keep the historical
+/// pass-through only while the file declares no sessions; once any `session()`
+/// exists every string must name a declared one.
+fn take_session(
+    named: &mut BTreeMap<String, Value>,
+    state: &CompileState,
+    at: &FileSpan,
+) -> Result<Option<SessionDecl>> {
+    match named.remove("session").unwrap_or(Value::None) {
+        Value::None => Ok(None),
+        Value::Session(decl) => {
+            state.context_mut().bound_sessions.insert(decl.name.clone());
+            Ok(Some(decl))
+        }
+        Value::String(name) => {
+            let mut context = state.context_mut();
+            if let Some((decl, _)) = context.sessions.get(&name) {
+                let decl = decl.clone();
+                context.bound_sessions.insert(name);
+                Ok(Some(decl))
+            } else if context.sessions.is_empty() {
+                context
+                    .string_session_refs
+                    .entry(name.clone())
+                    .or_insert_with(|| at.clone());
+                Ok(Some(SessionDecl {
+                    name,
+                    harness: None,
+                    model: None,
+                    effort: None,
+                }))
+            } else {
+                let suggestion = diag::suggest(&name, context.sessions.keys().map(String::as_str))
+                    .map(str::to_owned);
+                Err(CompileError::UndeclaredSession { name, suggestion })
+            }
+        }
+        _ => Err(CompileError::SessionWrongType),
     }
 }
 
@@ -1336,27 +1285,29 @@ pub fn compile_source(source: &str, filename: &Path, pack_dir: &Path) -> Result<
     let ast = AstModule::parse(
         &filename.display().to_string(),
         source.to_owned(),
-        &Dialect::Standard,
+        &dialect(),
     )
     .map_err(|error| CompileError::Parse(error.to_string()))?;
-    let mut compiler = Compiler {
-        module: &ast,
-        context: CompileContext {
-            pack_dir: pack_dir.to_path_buf(),
-            prompt_files: BTreeSet::new(),
-            total_prompt_bytes: 0,
-            eval_steps: 0,
-            constructed_tasks: BTreeMap::new(),
-            sessions: BTreeMap::new(),
-            bound_sessions: BTreeSet::new(),
-            string_session_refs: BTreeMap::new(),
-        },
-        variables: BTreeMap::new(),
-    };
-    let Some(Value::Workflow(workflow)) = compiler.statement(ast.statement())? else {
-        return Err(CompileError::NoWorkflowResult);
-    };
-    let context = compiler.context;
+    let idents = idents::scan(&ast);
+    let globals: Globals = GlobalsBuilder::standard().with(globals::builtins).build();
+    let state = CompileState::new(pack_dir, filename);
+    let loader = loader::resolve(&ast, &state, &globals, source.len())?;
+    let workflow = Module::with_temp_heap(|module| -> Result<WorkflowCfg> {
+        let mut eval = Evaluator::new(&module);
+        eval.extra = Some(&state);
+        eval.set_loader(&loader);
+        budgets(&mut eval)?;
+        match eval.eval_module(ast, &globals) {
+            Ok(value) => match WorkflowValue::from_value(value) {
+                Some(workflow) => Ok(workflow.0.clone()),
+                None => Err(CompileError::NoWorkflowResult),
+            },
+            Err(error) => Err(state
+                .take_thrown()
+                .unwrap_or_else(|| idents::map_error(&error, &idents))),
+        }
+    })?;
+    let context = state.into_context();
     let included: BTreeSet<&str> = workflow.tasks.iter().map(|t| t.name.0.as_str()).collect();
     let dropped: Vec<String> = context
         .constructed_tasks
@@ -1390,6 +1341,28 @@ pub fn compile_source(source: &str, filename: &Path, pack_dir: &Path) -> Result<
         prompt_files: context.prompt_files.into_iter().collect(),
         canonical_json,
     })
+}
+
+/// The evaluation ceilings every module runs under. A budget setter only fails when it is set
+/// twice, which a fresh [`Evaluator`] cannot be.
+fn budgets(eval: &mut Evaluator<'_, '_, '_>) -> Result<()> {
+    let budget = |error: anyhow::Error| CompileError::Eval(error.to_string());
+    eval.set_max_tick_count(MAX_EVAL_TICKS).map_err(budget)?;
+    eval.set_max_heap_size(MAX_EVAL_HEAP_BYTES)
+        .map_err(budget)?;
+    eval.set_max_callstack_size(MAX_CALLSTACK).map_err(budget)?;
+    Ok(())
+}
+
+/// `def`, `if`, `for`, and comprehensions at any level; `load()` resolved by
+/// [`loader`] against the pack. Re-export is off, so a symbol a library loads does not
+/// leak through it, and types stay disabled.
+fn dialect() -> Dialect {
+    Dialect {
+        enable_top_level_stmt: true,
+        enable_load_reexport: false,
+        ..Dialect::Standard
+    }
 }
 
 #[cfg(test)]
@@ -1557,6 +1530,35 @@ default_autoresearch([racecheck])
     }
 
     #[test]
+    fn an_advisory_sink_cannot_gate_the_synthesized_apply() {
+        let pack = temp_pack("advisory-sink");
+        let rejected = r#"
+review = command(name = "review", run = "./review.sh", required = False)
+default_autoresearch([review])
+"#;
+        let error = crate::errors::report(
+            &compile_source(rejected, &pack.join("rejected.star"), &pack).unwrap_err(),
+        );
+        assert!(error.contains("\"apply\""), "{error}");
+        assert!(error.contains("\"review\""), "{error}");
+
+        let gated = r#"
+review = command(name = "review", run = "./review.sh", required = False)
+gate = command(name = "gate", run = "./gate.sh", depends_on = [review], join = "passed")
+default_autoresearch([review, gate])
+"#;
+        let compiled = compile_source(gated, &pack.join("gated.star"), &pack).unwrap();
+        let apply = compiled
+            .workflow
+            .tasks
+            .iter()
+            .find(|task| task.name.0 == "apply")
+            .unwrap();
+        assert_eq!(apply.depends_on, ["gate".into()]);
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
     fn compiles_parallel_measurement_rungs_and_grade() {
         let pack = temp_pack("measurement");
         let source = r#"
@@ -1687,15 +1689,8 @@ workflow(type = "custom", tasks = [score, strict, lossy], result = strict)
     }
 
     #[test]
-    fn rejects_loads_and_runaway_evaluation() {
+    fn rejects_runaway_evaluation() {
         let pack = temp_pack("bounds");
-        let load = "load(\"x.star\", \"x\")\nworkflow([])\n";
-        assert!(
-            crate::errors::report(
-                &compile_source(load, &pack.join("workflow.star"), &pack).unwrap_err()
-            )
-            .contains("may not use load")
-        );
         let runaway = "xs = []\nfor i in range(1000000):\n    xs.append(i)\nworkflow([])\n";
         assert!(compile_source(runaway, &pack.join("workflow.star"), &pack).is_err());
         let _ = std::fs::remove_dir_all(&pack);
@@ -1715,6 +1710,29 @@ workflow(type = "custom", tasks = [score, strict, lossy], result = strict)
             serde_json::to_value(&compiled.workflow).unwrap(),
             serde_json::to_value(&manifest.workflow).unwrap()
         );
+    }
+
+    /// The cascade pack carries its graph twice: `workflow.star` for the lane it is waiting
+    /// on, `plan.toml` for the runner that executes it today. Drift between them would make
+    /// the pack a reference to nothing.
+    #[test]
+    fn cascade_example_matches_its_golden_and_runnable_plan() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let pack = root.join("examples/cascade");
+        let compiled = compile_file(&pack.join("workflow.star"), &pack).unwrap();
+        assert_eq!(
+            compiled.canonical_json,
+            std::fs::read_to_string(pack.join("expected-workflow.json")).unwrap()
+        );
+        let plan = crate::plan::ir::Plan::from_toml_str(
+            &std::fs::read_to_string(pack.join("plan.toml")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&compiled.workflow.tasks).unwrap(),
+            serde_json::to_value(&plan.tasks).unwrap()
+        );
+        plan.validate().unwrap();
     }
 
     #[cfg(unix)]
@@ -2053,5 +2071,392 @@ workflow(type = "custom", tasks = [e], result = e)
             compiled.workflow.tasks[0].session.as_deref(),
             Some("solver")
         );
+    }
+
+    fn task_names(compiled: &CompiledWorkflow) -> Vec<&str> {
+        compiled
+            .workflow
+            .tasks
+            .iter()
+            .map(|task| task.name.0.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn a_def_macro_expands_into_the_workflow_task_list() {
+        let pack = temp_pack("def-macro");
+        let source = r#"
+def critic(topic):
+    review = agent(
+        name = "review-" + topic,
+        prompt = "Review the " + topic + ".",
+        isolated = True,
+        required = False,
+    )
+    gate = command(
+        name = "gate-" + topic,
+        run = "./gate.sh " + topic,
+        depends_on = [review],
+        join = "passed",
+    )
+    return [review, gate]
+
+tasks = critic("correctness") + critic("copy")
+workflow(tasks)
+"#;
+        let compiled = compile_source(source, &pack.join("workflow.star"), &pack).unwrap();
+        assert_eq!(
+            task_names(&compiled),
+            [
+                "review-correctness",
+                "gate-correctness",
+                "review-copy",
+                "gate-copy"
+            ]
+        );
+        assert_eq!(
+            compiled.workflow.tasks[1].depends_on,
+            ["review-correctness".into()]
+        );
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// The same fan-out three ways: a `for` loop, a comprehension, and the hand-written list all
+    /// compile to identical IR, so the widened grammar is sugar and nothing more.
+    #[test]
+    fn a_for_loop_and_a_comprehension_build_the_same_parallel_branches() {
+        let pack = temp_pack("fanout");
+        let treatments = ["surreal", "minimal", "documentary"];
+        let looped = r#"
+branches = []
+for treatment in ["surreal", "minimal", "documentary"]:
+    branches.append(agent(
+        name = "draft-" + treatment,
+        prompt = "Draft in the " + treatment + " register.",
+        isolated = True,
+    ))
+curate = command(
+    name = "curate",
+    run = "./curate.sh",
+    depends_on = deps(branches),
+    join = "passed",
+)
+workflow(branches + [curate])
+"#;
+        let comprehension = r#"
+branches = [
+    agent(
+        name = "draft-" + treatment,
+        prompt = "Draft in the " + treatment + " register.",
+        isolated = True,
+    )
+    for treatment in ["surreal", "minimal", "documentary"]
+]
+curate = command(
+    name = "curate",
+    run = "./curate.sh",
+    depends_on = deps(branches),
+    join = "passed",
+)
+workflow(branches + [curate])
+"#;
+        let literal = r#"
+branches = [
+    agent(name = "draft-surreal", prompt = "Draft in the surreal register.", isolated = True),
+    agent(name = "draft-minimal", prompt = "Draft in the minimal register.", isolated = True),
+    agent(
+        name = "draft-documentary",
+        prompt = "Draft in the documentary register.",
+        isolated = True,
+    ),
+]
+curate = command(
+    name = "curate",
+    run = "./curate.sh",
+    depends_on = deps(branches),
+    join = "passed",
+)
+workflow(branches + [curate])
+"#;
+        let compile = |source: &str| {
+            compile_source(source, &pack.join("workflow.star"), &pack)
+                .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)))
+        };
+        let looped = compile(looped);
+        let comprehension = compile(comprehension);
+        let literal = compile(literal);
+        assert_eq!(
+            task_names(&looped),
+            [
+                "draft-surreal",
+                "draft-minimal",
+                "draft-documentary",
+                "curate"
+            ]
+        );
+        assert_eq!(looped.canonical_json, comprehension.canonical_json);
+        assert_eq!(looped.canonical_json, literal.canonical_json);
+        let curate = looped.workflow.tasks.last().unwrap();
+        let expected: Vec<TaskName> = treatments
+            .iter()
+            .map(|treatment| TaskName(format!("draft-{treatment}")))
+            .collect();
+        assert_eq!(curate.depends_on, expected);
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn a_top_level_if_selects_between_task_lists() {
+        let pack = temp_pack("top-level-if");
+        let source = r#"
+thorough = True
+if thorough:
+    panel = [
+        agent(name = "review-correctness", prompt = "Correctness.", isolated = True),
+        agent(name = "review-copy", prompt = "Copy.", isolated = True),
+    ]
+else:
+    panel = [agent(name = "review-correctness", prompt = "Correctness.", isolated = True)]
+workflow(panel)
+"#;
+        let compiled = compile_source(source, &pack.join("workflow.star"), &pack).unwrap();
+        assert_eq!(task_names(&compiled), ["review-correctness", "review-copy"]);
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// A branch that is never taken must not leave a constructed-but-dropped task behind: only the
+    /// executed arm runs its constructors.
+    #[test]
+    fn an_untaken_branch_constructs_nothing() {
+        let pack = temp_pack("untaken");
+        let source = r#"
+if False:
+    extra = command(name = "never", run = "false")
+panel = [agent(name = "review", prompt = "Review.", isolated = True)]
+workflow(panel)
+"#;
+        let compiled = compile_source(source, &pack.join("workflow.star"), &pack).unwrap();
+        assert_eq!(task_names(&compiled), ["review"]);
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn a_loop_may_not_construct_unbounded_tasks() {
+        let pack = temp_pack("task-cap");
+        let source = r#"
+for i in range(2000):
+    command(name = "t" + str(i), run = "true")
+workflow([])
+"#;
+        let error = crate::errors::report(
+            &compile_source(source, &pack.join("workflow.star"), &pack).unwrap_err(),
+        );
+        assert!(error.contains("maximum is 128"), "{error}");
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn load_pulls_a_helper_from_a_sibling_file_in_the_pack() {
+        let pack = temp_pack("load-sibling");
+        std::fs::create_dir_all(pack.join("lib")).unwrap();
+        std::fs::write(
+            pack.join("lib/gate.star"),
+            "def gate(name, sources):\n    return command(\n        name = name,\n        run = \"./gate.sh\",\n        depends_on = deps(sources),\n        join = \"passed\",\n    )\n",
+        )
+        .unwrap();
+        std::fs::write(
+            pack.join("panel.star"),
+            "load(\"lib/gate.star\", \"gate\")\n\ndef panel(topics):\n    return [\n        agent(name = \"review-\" + topic, prompt = \"Review \" + topic, isolated = True)\n        for topic in topics\n    ]\n",
+        )
+        .unwrap();
+        let source = r#"
+load("panel.star", "panel")
+load("lib/gate.star", "gate")
+
+reviews = panel(["correctness", "copy"])
+workflow(reviews + [gate("gate", reviews)])
+"#;
+        let compiled = compile_source(source, &pack.join("workflow.star"), &pack).unwrap();
+        assert_eq!(
+            task_names(&compiled),
+            ["review-correctness", "review-copy", "gate"]
+        );
+        let gate = compiled.workflow.tasks.last().unwrap();
+        assert_eq!(gate.join, Join::Passed);
+        assert_eq!(
+            gate.depends_on,
+            ["review-correctness".into(), "review-copy".into()]
+        );
+
+        // `enable_load_reexport` is off: `panel.star` loads `gate`, but loading `panel.star`
+        // does not hand `gate` through it.
+        let leaked = "load(\"panel.star\", \"gate\")\nworkflow([])\n";
+        assert!(compile_source(leaked, &pack.join("workflow.star"), &pack).is_err());
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// A library's own `prompt_file` resolves against the pack root, and its tasks land in the
+    /// same constructed-task ledger the root is checked against.
+    #[test]
+    fn a_loaded_module_shares_the_pack_and_the_dropped_task_check() {
+        let pack = temp_pack("load-shared");
+        std::fs::write(pack.join("prompts/review.md"), "Review it.\n").unwrap();
+        std::fs::write(
+            pack.join("lib.star"),
+            "reviewer = agent(\n    name = \"review\",\n    prompt = prompt_file(\"prompts/review.md\"),\n    isolated = True,\n)\n",
+        )
+        .unwrap();
+        let source = "load(\"lib.star\", \"reviewer\")\nworkflow([reviewer])\n";
+        let compiled = compile_source(source, &pack.join("workflow.star"), &pack).unwrap();
+        assert_eq!(compiled.prompt_files, [PathBuf::from("prompts/review.md")]);
+        let TaskKind::Agent { prompt, .. } = &compiled.workflow.tasks[0].task else {
+            panic!("expected agent task")
+        };
+        assert_eq!(prompt, "Review it.\n");
+
+        let dropped = "load(\"lib.star\", \"reviewer\")\nworkflow([])\n";
+        let error = crate::errors::report(
+            &compile_source(dropped, &pack.join("workflow.star"), &pack).unwrap_err(),
+        );
+        assert!(error.contains("constructed but not included"), "{error}");
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_refuses_absolute_parent_symlink_and_cyclic_paths() {
+        let pack = temp_pack("load-refusals");
+        let outside = pack
+            .parent()
+            .unwrap()
+            .join("crucible-starlark-outside.star");
+        std::fs::write(&outside, "smuggled = 1\n").unwrap();
+        std::os::unix::fs::symlink(&outside, pack.join("link.star")).unwrap();
+        std::fs::write(
+            pack.join("cycle-a.star"),
+            "load(\"cycle-b.star\", \"b\")\na = b\n",
+        )
+        .unwrap();
+        std::fs::write(
+            pack.join("cycle-b.star"),
+            "load(\"cycle-a.star\", \"a\")\nb = a\n",
+        )
+        .unwrap();
+        let cases = [
+            (
+                "load(\"/etc/passwd\", \"x\")\nworkflow([])\n",
+                "must be a non-empty pack-relative path",
+                "workflow.star:1:",
+            ),
+            (
+                "load(\"../crucible-starlark-outside.star\", \"smuggled\")\nworkflow([])\n",
+                "may not contain `..` or escape the pack",
+                "workflow.star:1:",
+            ),
+            (
+                "load(\"link.star\", \"smuggled\")\nworkflow([])\n",
+                "may not traverse symlinks",
+                "workflow.star:1:",
+            ),
+            (
+                "load(\"prompts\", \"x\")\nworkflow([])\n",
+                "must name a regular, non-symlink file",
+                "workflow.star:1:",
+            ),
+            (
+                "load(\"cycle-a.star\", \"a\")\nworkflow([])\n",
+                "load(\"cycle-a.star\") forms a cycle",
+                "cycle-b.star:1:",
+            ),
+        ];
+        for (source, expected, at) in cases {
+            let error = crate::errors::report(
+                &compile_source(source, &pack.join("workflow.star"), &pack).unwrap_err(),
+            );
+            assert!(error.contains(expected), "{source}: {error}");
+            assert!(error.contains(at), "{source}: {error}");
+        }
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// The widened grammar buys expressiveness, not reach: the global surface is the starlark
+    /// standard plus the DSL, and nothing in it touches a process, a socket, a clock, or a PRNG.
+    #[test]
+    fn no_process_network_clock_or_randomness_is_reachable() {
+        let globals: Globals = GlobalsBuilder::standard().with(globals::builtins).build();
+        let names: BTreeSet<String> = globals
+            .names()
+            .map(|name| name.as_str().to_owned())
+            .collect();
+        for function in DSL_FUNCTIONS {
+            assert!(names.contains(*function), "{function} is not callable");
+        }
+        for forbidden in [
+            "open",
+            "read",
+            "write",
+            "print",
+            "input",
+            "time",
+            "now",
+            "clock",
+            "random",
+            "exec",
+            "eval",
+            "compile",
+            "import",
+            "os",
+            "sys",
+            "subprocess",
+            "getenv",
+            "environ",
+            "host",
+            "http",
+            "socket",
+            "struct",
+            "json",
+        ] {
+            assert!(!names.contains(forbidden), "{forbidden} is reachable");
+        }
+
+        let pack = temp_pack("sandbox");
+        for probe in [
+            "open(\"/etc/passwd\")",
+            "time()",
+            "random()",
+            "exec(\"/bin/sh\")",
+            "getenv(\"HOME\")",
+            "print(\"leak\")",
+        ] {
+            let source = format!("x = {probe}\nworkflow([])\n");
+            let error = crate::errors::report(
+                &compile_source(&source, &pack.join("workflow.star"), &pack).unwrap_err(),
+            );
+            assert!(error.contains("unknown workflow"), "{probe}: {error}");
+        }
+        // Loaded modules run under the same globals, so a library cannot smuggle reach in.
+        std::fs::write(pack.join("lib.star"), "x = open(\"/etc/passwd\")\n").unwrap();
+        let error = crate::errors::report(
+            &compile_source(
+                "load(\"lib.star\", \"x\")\nworkflow([])\n",
+                &pack.join("workflow.star"),
+                &pack,
+            )
+            .unwrap_err(),
+        );
+        assert!(error.contains("unknown workflow"), "{error}");
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// Two compiles of the same pack in one process must agree byte for byte.
+    #[test]
+    fn compiling_the_adversarial_example_twice_is_byte_identical() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let pack = root.join("examples/adversarial-review");
+        let first = compile_file(&pack.join("workflow.star"), &pack).unwrap();
+        let second = compile_file(&pack.join("workflow.star"), &pack).unwrap();
+        assert_eq!(first.canonical_json, second.canonical_json);
+        assert_eq!(first.prompt_files, second.prompt_files);
     }
 }

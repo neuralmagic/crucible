@@ -1,0 +1,110 @@
+#   draft ──> shape ──> polish ─┬─> audit-headings  (isolated) ─┐
+#  (agent)   (command)  (agent) ├─> audit-bullets   (isolated) ─┼─> roundup
+#     └── session "scribe" ──┘  └─> audit-freshness (advisory) ─┘
+#
+# The runnable form of workflow.star, task for task, for the one-shot plan runner. `shape`
+# gates between the two scribe turns; the three auditors are isolated, so they run
+# concurrently against private clones; `roundup` joins on "passed", so the advisory
+# auditor's failure costs the run a finding rather than its verdict.
+
+version = 1
+
+[budget]
+usd = 1.0
+
+[[task]]
+name = "draft"
+kind = "agent"
+prompt = """
+DRAFT NOTES
+
+Read every file in `inbox/`. Each holds one line describing a change.
+
+Write `NOTES.md`: one `- ` bullet per entry, in filename order, nothing else. Record the
+turn in `TURNS.txt` so a later turn can tell whether it is the same conversation.
+
+Result: `{"entries": <bullets written>}`.
+"""
+session = "scribe"
+emits = ["entries"]
+
+[[task]]
+name = "shape"
+kind = "command"
+command = "./shape.sh"
+depends_on = ["draft"]
+
+[[task]]
+name = "polish"
+kind = "agent"
+prompt = """
+POLISH NOTES
+
+You drafted `NOTES.md` earlier in this conversation. Give it a title: prepend
+`# Release notes` and a blank line, leaving the bullets alone. Append your turn to
+`TURNS.txt`.
+
+Result: `{"session": <session name>, "continued": <same conversation as the draft turn>,
+"titled": true}`.
+"""
+depends_on = ["shape"]
+session = "scribe"
+
+[[task]]
+name = "audit-headings"
+kind = "agent"
+prompt = """
+AUDIT NOTES
+
+You hold a private copy of the workspace. Read `NOTES.md` and report on the single topic
+named below. Do not edit any file; only your result leaves this task.
+
+Result: `{"topic": <topic>, "findings": [<one string per defect, empty when clean>]}`.
+
+AUDIT: HEADINGS
+"""
+depends_on = ["polish"]
+isolation = "worktree"
+emits = ["findings"]
+
+[[task]]
+name = "audit-bullets"
+kind = "agent"
+prompt = """
+AUDIT NOTES
+
+You hold a private copy of the workspace. Read `NOTES.md` and report on the single topic
+named below. Do not edit any file; only your result leaves this task.
+
+Result: `{"topic": <topic>, "findings": [<one string per defect, empty when clean>]}`.
+
+AUDIT: BULLETS
+"""
+depends_on = ["polish"]
+isolation = "worktree"
+emits = ["findings"]
+
+[[task]]
+name = "audit-freshness"
+kind = "agent"
+prompt = """
+AUDIT NOTES
+
+You hold a private copy of the workspace. Read `NOTES.md` and report on the single topic
+named below. Do not edit any file; only your result leaves this task.
+
+Result: `{"topic": <topic>, "findings": [<one string per defect, empty when clean>]}`.
+
+AUDIT: FRESHNESS
+"""
+depends_on = ["polish"]
+required = false
+isolation = "worktree"
+emits = ["findings"]
+
+[[task]]
+name = "roundup"
+kind = "command"
+command = "./roundup.sh"
+depends_on = ["audit-headings", "audit-bullets", "audit-freshness"]
+join = "passed"

@@ -577,6 +577,56 @@ mod tests {
     }
 
     #[test]
+    fn a_required_gate_joining_all_on_an_advisory_reviewer_is_rejected() {
+        let workflow = parse(
+            "type = \"custom\"\nresult = \"gate\"\n\
+             [[task]]\nname = \"implement\"\nkind = \"command\"\ncommand = \"true\"\n\
+             [[task]]\nname = \"review-copy\"\nkind = \"agent\"\nprompt = \"copy\"\ndepends_on = [\"implement\"]\nrequired = false\n\
+             [[task]]\nname = \"gate\"\nkind = \"command\"\ncommand = \"./join_gate.sh\"\ndepends_on = [\"review-copy\"]\n",
+        );
+        assert_eq!(
+            workflow.validate().unwrap_err(),
+            WorkflowError::Plan(PlanError::AdvisoryGatesRequired {
+                task: "gate".to_owned(),
+                dependency: "review-copy".to_owned(),
+            })
+        );
+
+        let folded = parse(
+            "type = \"custom\"\nresult = \"gate\"\n\
+             [[task]]\nname = \"implement\"\nkind = \"command\"\ncommand = \"true\"\n\
+             [[task]]\nname = \"review-copy\"\nkind = \"agent\"\nprompt = \"copy\"\ndepends_on = [\"implement\"]\nrequired = false\n\
+             [[task]]\nname = \"gate\"\nkind = \"command\"\ncommand = \"./join_gate.sh\"\ndepends_on = [\"review-copy\"]\njoin = \"passed\"\n",
+        );
+        folded.validate().unwrap();
+    }
+
+    /// The shipped panel is the shape the rule must not fire on: an advisory copy editor
+    /// reaching a required gate through `join = "passed"`.
+    #[test]
+    fn the_shipped_adversarial_review_panel_still_validates() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crate dir has a parent")
+            .join("examples/adversarial-review/crucible.toml");
+        let workflow = crate::manifest::Manifest::load(&manifest)
+            .unwrap()
+            .workflow
+            .expect("the panel manifest declares a workflow");
+        workflow.validate().unwrap();
+        let task = |name: &str| {
+            workflow
+                .tasks
+                .iter()
+                .find(|t| t.name.0 == name)
+                .unwrap_or_else(|| panic!("{name} is missing from the panel"))
+        };
+        assert!(!task("review-copy").required);
+        assert!(task("gate").required);
+        assert_eq!(task("gate").join, Join::Passed);
+    }
+
+    #[test]
     fn custom_graph_needs_no_autoresearch_shape() {
         let workflow = parse(
             "type = \"custom\"\nresult = \"publish\"\n[[task]]\nname = \"publish\"\nkind = \"command\"\ncommand = \"true\"\n",

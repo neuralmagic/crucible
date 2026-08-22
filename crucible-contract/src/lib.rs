@@ -10,6 +10,7 @@ pub mod artifact;
 pub mod envelope;
 pub mod event;
 pub mod identity;
+pub mod json;
 pub mod markers;
 pub mod session;
 pub mod tier;

@@ -1,0 +1,38 @@
+# cascade — the one-shot, measurement-free litmus domain. No [judge]: nothing is scored,
+# nothing is kept or discarded, the graph runs once. The `command` backend (role.sh) stands
+# in for every agent turn, so the whole pack runs in milliseconds with no model and no cost.
+#
+#   crucible plan run --file examples/cascade/plan.toml \
+#                     --manifest examples/cascade/crucible.toml
+#
+# No [workflow] block: a judge-free manifest rejects one today. `workflow.star` is the same
+# graph in the authoring syntax, compiled and checked against expected-workflow.json.
+
+[repo]
+path = "."
+
+[workspace]
+dir = "workspace"
+# setup runs with cwd = manifest dir (the workspace does not exist yet). Seed a fresh git
+# repo carrying the inbox and the scripts the graph shells.
+setup_cmd = "mkdir -p workspace/inbox && cp role.sh shape.sh roundup.sh workspace/ && cp inbox/*.md workspace/inbox/ && git -C workspace init -q && git -C workspace add -A && git -C workspace -c user.email=crucible@local -c user.name=crucible -c commit.gpgsign=false commit -qm baseline"
+
+[[workspace.inject]]
+src = "role.sh"
+dst = "role.sh"
+frozen = true
+
+[[workspace.inject]]
+src = "shape.sh"
+dst = "shape.sh"
+frozen = true
+
+[[workspace.inject]]
+src = "roundup.sh"
+dst = "roundup.sh"
+frozen = true
+
+[agent]
+backend   = "command"
+agent_cmd = "./role.sh"
+goal      = "Draft release notes from the inbox, then audit them."

@@ -268,6 +268,12 @@ pub enum PlanError {
     RepeatedDependency { task: String, dependency: String },
     #[error("task {task:?}: join = \"passed\" needs at least one dependency")]
     JoinPassedWithoutDependencies { task: String },
+    #[error(
+        "task {task:?} is required and joins on {dependency:?} with join = \"all\", but \
+         {dependency:?} is advisory and allowed to fail. Set join = \"passed\" on {task:?}, or \
+         make {dependency:?} required"
+    )]
+    AdvisoryGatesRequired { task: String, dependency: String },
     #[error("task {task:?}: top_k k must be >= 1")]
     TopKZero { task: String },
     #[error("task {task:?}: top_k needs at least one dependency to fold")]
@@ -377,6 +383,16 @@ impl Plan {
             }
             if t.join == Join::Passed && t.depends_on.is_empty() {
                 return Err(PlanError::JoinPassedWithoutDependencies { task: task() });
+            }
+            if t.required && t.join == Join::All {
+                for d in &t.depends_on {
+                    if index.get(d).is_some_and(|&i| !self.tasks[i].required) {
+                        return Err(PlanError::AdvisoryGatesRequired {
+                            task: task(),
+                            dependency: d.0.clone(),
+                        });
+                    }
+                }
             }
             if let TaskKind::TopK { k, .. } = &t.task {
                 if *k == 0 {
@@ -990,6 +1006,80 @@ mod tests {
 
         t.emits.push(OutputField("score".into()));
         assert!(plan(vec![t]).validate().is_ok());
+    }
+
+    fn advisory(name: &str, deps: &[&str]) -> Task {
+        let mut t = agent(name, deps);
+        t.required = false;
+        t
+    }
+
+    fn folding(name: &str, deps: &[&str]) -> Task {
+        let mut t = agent(name, deps);
+        t.join = Join::Passed;
+        t
+    }
+
+    #[test]
+    fn a_required_task_cannot_join_all_on_an_advisory_dependency() {
+        let err = plan(vec![advisory("copy", &[]), agent("gate", &["copy"])])
+            .validate()
+            .unwrap_err();
+        assert_eq!(
+            err,
+            PlanError::AdvisoryGatesRequired {
+                task: "gate".to_owned(),
+                dependency: "copy".to_owned(),
+            }
+        );
+        let rendered = err.to_string();
+        assert!(rendered.contains("\"gate\""), "{rendered}");
+        assert!(rendered.contains("\"copy\""), "{rendered}");
+    }
+
+    #[test]
+    fn advisory_gating_through_all_join_hops_is_reported_at_the_closest_edge() {
+        // root -> mid -> near -> copy, every hop join = "all" and everything but the
+        // advisory tail required: the violation is the near/copy edge.
+        let err = plan(vec![
+            advisory("copy", &[]),
+            agent("near", &["copy"]),
+            agent("mid", &["near"]),
+            agent("root", &["mid"]),
+        ])
+        .validate()
+        .unwrap_err();
+        assert_eq!(
+            err,
+            PlanError::AdvisoryGatesRequired {
+                task: "near".to_owned(),
+                dependency: "copy".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_passed_join_exempts_the_gate_and_everything_above_it() {
+        let p = plan(vec![
+            agent("propose", &[]),
+            agent("correctness", &["propose"]),
+            advisory("copy", &["propose"]),
+            folding("gate", &["correctness", "copy"]),
+            agent("apply", &["gate"]),
+            agent("measure", &["apply"]),
+        ]);
+        assert!(p.validate().is_ok());
+    }
+
+    #[test]
+    fn advisory_work_may_gate_advisory_consumers() {
+        let p = plan(vec![
+            agent("propose", &[]),
+            advisory("copy", &["propose"]),
+            advisory("summarize", &["copy"]),
+            agent("apply", &["propose"]),
+        ]);
+        assert!(p.validate().is_ok());
     }
 
     #[test]

@@ -185,7 +185,7 @@ impl AgentEvent {
                 return None;
             }
         }
-        serde_json::from_str::<AgentEvent>(t).ok()
+        crate::json::from_str::<AgentEvent>(t).ok()
     }
 }
 

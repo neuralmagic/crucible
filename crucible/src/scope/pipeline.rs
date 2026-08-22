@@ -1917,7 +1917,7 @@ mod tests {
         fs::write(dir.join("prompts/review.md"), "Review the candidate.\n").unwrap();
         fs::write(
             dir.join("workflow.star"),
-            "workflow([agent(name = \"review\", prompt = prompt_file(\"prompts/review.md\"), required = False)])\n",
+            "workflow([agent(name = \"review\", prompt = prompt_file(\"prompts/review.md\"))])\n",
         )
         .unwrap();
 

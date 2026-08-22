@@ -1,0 +1,119 @@
+{
+  "type": "custom",
+  "result": "roundup",
+  "task": [
+    {
+      "name": "draft",
+      "kind": "agent",
+      "prompt": "DRAFT NOTES\n\nRead every file in `inbox/`. Each holds one line describing a change.\n\nWrite `NOTES.md`: one `- ` bullet per entry, in filename order, nothing else. Record the\nturn in `TURNS.txt` so a later turn can tell whether it is the same conversation.\n\nResult: `{\"entries\": <bullets written>}`.\n",
+      "harness": null,
+      "model": null,
+      "effort": null,
+      "depends_on": [],
+      "session": "scribe",
+      "needs": "any",
+      "required": true,
+      "isolation": null,
+      "join": "all",
+      "emits": [
+        "entries"
+      ]
+    },
+    {
+      "name": "shape",
+      "kind": "command",
+      "command": "./shape.sh",
+      "depends_on": [
+        "draft"
+      ],
+      "needs": "any",
+      "required": true,
+      "isolation": null,
+      "join": "all"
+    },
+    {
+      "name": "polish",
+      "kind": "agent",
+      "prompt": "POLISH NOTES\n\nYou drafted `NOTES.md` earlier in this conversation. Give it a title: prepend\n`# Release notes` and a blank line, leaving the bullets alone. Append your turn to\n`TURNS.txt`.\n\nResult: `{\"session\": <session name>, \"continued\": <same conversation as the draft turn>,\n\"titled\": true}`.\n",
+      "harness": null,
+      "model": null,
+      "effort": null,
+      "depends_on": [
+        "shape"
+      ],
+      "session": "scribe",
+      "needs": "any",
+      "required": true,
+      "isolation": null,
+      "join": "all"
+    },
+    {
+      "name": "audit-headings",
+      "kind": "agent",
+      "prompt": "AUDIT NOTES\n\nYou hold a private copy of the workspace. Read `NOTES.md` and report on the single topic\nnamed below. Do not edit any file; only your result leaves this task.\n\nResult: `{\"topic\": <topic>, \"findings\": [<one string per defect, empty when clean>]}`.\n\nAUDIT: HEADINGS\n",
+      "harness": null,
+      "model": null,
+      "effort": null,
+      "depends_on": [
+        "polish"
+      ],
+      "needs": "any",
+      "required": true,
+      "isolation": "worktree",
+      "join": "all",
+      "emits": [
+        "findings"
+      ]
+    },
+    {
+      "name": "audit-bullets",
+      "kind": "agent",
+      "prompt": "AUDIT NOTES\n\nYou hold a private copy of the workspace. Read `NOTES.md` and report on the single topic\nnamed below. Do not edit any file; only your result leaves this task.\n\nResult: `{\"topic\": <topic>, \"findings\": [<one string per defect, empty when clean>]}`.\n\nAUDIT: BULLETS\n",
+      "harness": null,
+      "model": null,
+      "effort": null,
+      "depends_on": [
+        "polish"
+      ],
+      "needs": "any",
+      "required": true,
+      "isolation": "worktree",
+      "join": "all",
+      "emits": [
+        "findings"
+      ]
+    },
+    {
+      "name": "audit-freshness",
+      "kind": "agent",
+      "prompt": "AUDIT NOTES\n\nYou hold a private copy of the workspace. Read `NOTES.md` and report on the single topic\nnamed below. Do not edit any file; only your result leaves this task.\n\nResult: `{\"topic\": <topic>, \"findings\": [<one string per defect, empty when clean>]}`.\n\nAUDIT: FRESHNESS\n",
+      "harness": null,
+      "model": null,
+      "effort": null,
+      "depends_on": [
+        "polish"
+      ],
+      "needs": "any",
+      "required": false,
+      "isolation": "worktree",
+      "join": "all",
+      "emits": [
+        "findings"
+      ]
+    },
+    {
+      "name": "roundup",
+      "kind": "command",
+      "command": "./roundup.sh",
+      "depends_on": [
+        "audit-headings",
+        "audit-bullets",
+        "audit-freshness"
+      ],
+      "needs": "any",
+      "required": true,
+      "isolation": null,
+      "join": "passed"
+    }
+  ]
+}
