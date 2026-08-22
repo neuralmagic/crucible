@@ -485,7 +485,7 @@ pub fn render_png_to(
 /// semantics. With `--manifest`, agent tasks run through the real harness path; otherwise
 /// the shell runner handles everything (`--agent-cmd` as the agent stand-in). Exits nonzero
 /// when the plan is not valid.
-/// What the launcher supplies. A cascade's source may not declare either, so a pack cannot
+/// What the launcher supplies. A playbook's source may not declare either, so a pack cannot
 /// raise a limit its operator set; the engine refuses to dispatch one that arrives without both.
 #[derive(Debug, Clone, Default)]
 pub struct Ceilings {
@@ -497,7 +497,7 @@ pub struct Ceilings {
 
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "a cascade needs {missing} from whoever launches it. Its source may not declare a limit its \
+    "a playbook needs {missing} from whoever launches it. Its source may not declare a limit its \
      operator set, so the engine will not dispatch a task without one."
 )]
 struct MissingCeiling {
@@ -536,11 +536,11 @@ pub fn run(
             (_, Some(m)) => {
                 let (prepared, loaded) = crate::run::prep_plan_runner(m)?;
                 let session_log = prepared.paths.session_log.clone();
-                let cascade = loaded
+                let playbook = loaded
                     .workflow
                     .as_ref()
-                    .is_some_and(|w| w.workflow_type == crate::manifest::WorkflowType::Cascade);
-                if cascade {
+                    .is_some_and(|w| w.workflow_type == crate::manifest::WorkflowType::Playbook);
+                if playbook {
                     let missing = match (ceilings.usd, ceilings.wall_clock) {
                         (None, None) => Some("--max-cost and --max-time"),
                         (None, Some(_)) => Some("--max-cost"),

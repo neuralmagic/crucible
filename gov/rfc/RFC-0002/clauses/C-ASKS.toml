@@ -9,7 +9,7 @@ since = "0.1.0"
 
 [content]
 text = """
-A cascade MAY emit asks: descriptions of work for another run to perform. An ask MUST carry a key, the workflow it names, and that workflow's parameter values. An ask's parameter values MUST satisfy the named workflow's declared schema, and the receiving orchestrator MUST reject an ask that does not.
+A playbook MAY emit asks: descriptions of work for another run to perform. An ask MUST carry a key, the workflow it names, and that workflow's parameter values. An ask's parameter values MUST satisfy the named workflow's declared schema, and the receiving orchestrator MUST reject an ask that does not.
 
 The key MUST be supplied by the emitter and MUST be stable across runs for the same underlying item, so that a receiving orchestrator can recognize a repeat without interpreting the ask's contents. What counts as the same item is the emitter's judgment and cannot be checked by the engine; the obligation is verified by auditing emitted keys on the session log against what they referred to.
 

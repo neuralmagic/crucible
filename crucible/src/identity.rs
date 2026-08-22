@@ -421,7 +421,7 @@ mod tests {
         assert!(!sha.is_empty());
         fs::write(
             dir.join("crucible.toml"),
-            "[repo]\npath = \".\"\n[agent]\nbackend = \"command\"\nagent_cmd = \"true\"\ngoal = \"g\"\n[workflow]\ntype = \"cascade\"\nfile = \"graph.star\"\n",
+            "[repo]\npath = \".\"\n[agent]\nbackend = \"command\"\nagent_cmd = \"true\"\ngoal = \"g\"\n[workflow]\ntype = \"playbook\"\nfile = \"graph.star\"\n",
         )
         .expect("write manifest");
 
@@ -435,17 +435,17 @@ mod tests {
         };
 
         let one = digest_for(
-            "a = command(name = \"a\", run = \"true\")\nworkflow(type = \"cascade\", tasks = [a])\n",
+            "a = command(name = \"a\", run = \"true\")\nworkflow(type = \"playbook\", tasks = [a])\n",
         );
         let two = digest_for(
-            "a = command(name = \"a\", run = \"false\")\nworkflow(type = \"cascade\", tasks = [a])\n",
+            "a = command(name = \"a\", run = \"false\")\nworkflow(type = \"playbook\", tasks = [a])\n",
         );
         assert_ne!(
             one, two,
             "two graphs behind one path must not be comparable"
         );
         let again = digest_for(
-            "a = command(name = \"a\", run = \"true\")\nworkflow(type = \"cascade\", tasks = [a])\n",
+            "a = command(name = \"a\", run = \"true\")\nworkflow(type = \"playbook\", tasks = [a])\n",
         );
         assert_eq!(
             one, again,

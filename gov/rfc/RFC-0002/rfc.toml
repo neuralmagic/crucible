@@ -2,7 +2,7 @@
 
 [govctl]
 id = "RFC-0002"
-title = "Cascade workflows"
+title = "Playbook workflows"
 version = "0.1.0"
 status = "normative"
 phase = "spec"
@@ -17,16 +17,16 @@ clauses = ["clauses/C-SCOPE.toml"]
 [[sections]]
 title = "Specification"
 clauses = [
-    "clauses/C-CASCADE-SURFACE.toml",
-    "clauses/C-CASCADE-LANE.toml",
-    "clauses/C-CASCADE-SHAPE.toml",
-    "clauses/C-CASCADE-PARAMS.toml",
+    "clauses/C-PLAYBOOK-SURFACE.toml",
+    "clauses/C-PLAYBOOK-LANE.toml",
+    "clauses/C-PLAYBOOK-SHAPE.toml",
+    "clauses/C-PLAYBOOK-PARAMS.toml",
     "clauses/C-TASK-FILES.toml",
-    "clauses/C-CASCADE-CAPS.toml",
-    "clauses/C-CASCADE-COMPOSITE.toml",
+    "clauses/C-PLAYBOOK-CAPS.toml",
+    "clauses/C-PLAYBOOK-COMPOSITE.toml",
     "clauses/C-ASKS.toml",
-    "clauses/C-CASCADE-BUDGET.toml",
-    "clauses/C-CASCADE-RESUME.toml",
+    "clauses/C-PLAYBOOK-BUDGET.toml",
+    "clauses/C-PLAYBOOK-RESUME.toml",
 ]
 
 [[changelog]]

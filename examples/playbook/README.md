@@ -1,8 +1,8 @@
-# cascade
+# playbook
 
 The litmus domain for one-shot, measurement-free workflows: a graph that runs once, keeps no
 score, and either reaches a valid verdict or does not. The manifest declares
-`[workflow] type = "cascade"` and carries no `[judge]`, which is the whole of what the lane
+`[workflow] type = "playbook"` and carries no `[judge]`, which is the whole of what the lane
 asks of an author.
 
 ```text
@@ -21,8 +21,8 @@ for every agent turn, so the whole graph runs in under two seconds with no model
 ## Run
 
 ```sh
-crucible plan run --file examples/cascade/plan.toml \
-                  --manifest examples/cascade/crucible.toml
+crucible plan run --file examples/playbook/plan.toml \
+                  --manifest examples/playbook/crucible.toml
 ```
 
 Expected, exactly:
@@ -46,8 +46,8 @@ stand-in rewrites what it owns.
 The graph in its authoring syntax, and its checked-in compiler golden:
 
 ```sh
-crucible plan compile-workflow --file examples/cascade/workflow.star
-crucible plan show --file examples/cascade/plan.toml --mermaid
+crucible plan compile-workflow --file examples/playbook/workflow.star
+crucible plan show --file examples/playbook/plan.toml --mermaid
 ```
 
 `--agent-cmd ./role.sh` is the other stand-in spelling, and it cannot run this pack: that
@@ -98,7 +98,7 @@ ledger, so `polish` reports `continued: false`. Isolation and durable sessions n
 
 ## Why it runs on the plan runner
 
-The manifest is the cascade: `[workflow] type = "cascade"`, no `[judge]`, task tables generated
+The manifest is the playbook: `[workflow] type = "playbook"`, no `[judge]`, task tables generated
 from `workflow.star`. What it still lacks is the engine-side launch path, so `plan.toml` remains
 the executable form and `plan run` is what executes it. A test compiles `workflow.star`, checks
 it against the golden, and asserts its tasks equal `plan.toml`'s, so the two forms cannot drift.

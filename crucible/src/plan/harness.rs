@@ -24,7 +24,7 @@ const RESULT_FILE: &str = "PLAN_TASK_RESULT.json";
 pub struct HarnessRunner {
     pub args: Args,
     pub paths: Paths,
-    /// Whether a settled task commits the shared workspace. True for a cascade, whose git
+    /// Whether a settled task commits the shared workspace. True for a playbook, whose git
     /// memory is per task; false for the scored loop, which owns the same repository for
     /// keep/discard of whole candidates and would find per-task commits in the middle of it.
     pub commit_per_task: bool,
@@ -501,13 +501,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The whole cascade concept, end to end, with no model and no controller: a real graph
+    /// The whole playbook concept, end to end, with no model and no controller: a real graph
     /// compiled from a real pack, real processes for every turn, and a verdict. Only the model
     /// is absent, and it is absent by substitution at the process boundary rather than by
     /// stubbing anything inside the engine.
     #[test]
-    fn a_cascade_runs_end_to_end_with_no_model_and_no_controller() {
-        let dir = std::env::temp_dir().join(format!("crucible-cascade-e2e-{}", std::process::id()));
+    fn a_playbook_runs_end_to_end_with_no_model_and_no_controller() {
+        let dir =
+            std::env::temp_dir().join(format!("crucible-playbook-e2e-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -567,7 +568,7 @@ roundup = command(
     join = "passed",
 )
 
-workflow(type = "cascade", tasks = [draft, shape, polish, audit_a, audit_b, roundup])
+workflow(type = "playbook", tasks = [draft, shape, polish, audit_a, audit_b, roundup])
 "##,
         )
         .unwrap();
@@ -588,7 +589,7 @@ workflow(type = "cascade", tasks = [draft, shape, polish, audit_a, audit_b, roun
                 [agent.env]
                 FAKE_AGENT_SCRIPT = "{}"
                 [workflow]
-                type = "cascade"
+                type = "playbook"
                 file = "workflow.star"
                 "#,
                 fake.display(),
@@ -600,12 +601,12 @@ workflow(type = "cascade", tasks = [draft, shape, polish, audit_a, audit_b, roun
         // The pack names its graph; the engine compiles it. No controller supplies anything.
         let mut manifest = crate::manifest::Manifest::load(&dir.join("crucible.toml")).unwrap();
         manifest.resolve_workflow(&dir).unwrap();
-        let workflow = manifest.workflow.as_ref().expect("a cascade workflow");
+        let workflow = manifest.workflow.as_ref().expect("a playbook workflow");
         assert_eq!(
             workflow.workflow_type,
-            crate::manifest::WorkflowType::Cascade
+            crate::manifest::WorkflowType::Playbook
         );
-        assert!(manifest.is_task(), "a cascade carries no judge");
+        assert!(manifest.is_task(), "a playbook carries no judge");
 
         let plan = crate::loop_graph::iteration_template(
             Some(workflow),
@@ -716,7 +717,7 @@ roundup = command(
     depends_on = [audit],
     join = "passed",
 )
-workflow(type = "cascade", tasks = [discover, audit, roundup])
+workflow(type = "playbook", tasks = [discover, audit, roundup])
 "##,
         )
         .unwrap();
@@ -737,7 +738,7 @@ workflow(type = "cascade", tasks = [discover, audit, roundup])
                 [agent.env]
                 FAKE_AGENT_SCRIPT = "{}"
                 [workflow]
-                type = "cascade"
+                type = "playbook"
                 file = "workflow.star"
                 "#,
                 fake.display(),
@@ -827,7 +828,7 @@ workflow(type = "cascade", tasks = [discover, audit, roundup])
         narrow.resolve_workflow(&dir).unwrap();
         let plan = crate::loop_graph::iteration_template(
             Some(narrow.workflow.as_ref().unwrap()),
-            &crate::manifest::WorkflowCaps::for_lane(crate::manifest::WorkflowType::Cascade),
+            &crate::manifest::WorkflowCaps::for_lane(crate::manifest::WorkflowType::Playbook),
         )
         .unwrap();
         let mut runner = crate::run::prep_plan_runner(&dir.join("crucible.toml"))
@@ -884,7 +885,7 @@ workflow(type = "cascade", tasks = [discover, audit, roundup])
 good = agent(name = "good", prompt = "p")
 bad = agent(name = "bad", prompt = "p", depends_on = [good], required = False)
 after = agent(name = "after", prompt = "p", depends_on = [good], join = "passed")
-workflow(type = "cascade", tasks = [good, bad, after])
+workflow(type = "playbook", tasks = [good, bad, after])
 "#,
         )
         .unwrap();
@@ -905,7 +906,7 @@ workflow(type = "cascade", tasks = [good, bad, after])
                 [agent.env]
                 FAKE_AGENT_SCRIPT = "{}"
                 [workflow]
-                type = "cascade"
+                type = "playbook"
                 file = "workflow.star"
                 "#,
                 fake.display(),
@@ -927,7 +928,7 @@ workflow(type = "cascade", tasks = [good, bad, after])
             .0;
         assert!(
             runner.commit_per_task,
-            "a cascade manifest must turn per-task git memory on"
+            "a playbook manifest must turn per-task git memory on"
         );
         let out = execute(
             &plan,
@@ -979,10 +980,10 @@ workflow(type = "cascade", tasks = [good, bad, after])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A cascade runs from its manifest: the pack names its graph, the engine compiles it, and
+    /// A playbook runs from its manifest: the pack names its graph, the engine compiles it, and
     /// the ceilings come from whoever launched it. There is no plan file anywhere.
     #[test]
-    fn a_cascade_launches_from_its_manifest_under_supplied_ceilings() {
+    fn a_playbook_launches_from_its_manifest_under_supplied_ceilings() {
         let dir = std::env::temp_dir().join(format!("crucible-launch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -998,7 +999,7 @@ workflow(type = "cascade", tasks = [good, bad, after])
         .unwrap();
         std::fs::write(
             dir.join("workflow.star"),
-            "work = agent(name = \"work\", prompt = \"do it\")\nworkflow(type = \"cascade\", tasks = [work])\n",
+            "work = agent(name = \"work\", prompt = \"do it\")\nworkflow(type = \"playbook\", tasks = [work])\n",
         )
         .unwrap();
         std::fs::write(
@@ -1013,11 +1014,11 @@ workflow(type = "cascade", tasks = [good, bad, after])
                 [agent]
                 backend = "command"
                 agent_cmd = "python3 {}"
-                goal = "launch a cascade"
+                goal = "launch a playbook"
                 [agent.env]
                 FAKE_AGENT_SCRIPT = "{}"
                 [workflow]
-                type = "cascade"
+                type = "playbook"
                 file = "workflow.star"
                 "#,
                 fake.display(),
@@ -1061,7 +1062,7 @@ workflow(type = "cascade", tasks = [good, bad, after])
             ),
         ] {
             let error = crate::plan::cli::run(None, &caps, None, Some(&manifest), ceilings)
-                .expect_err("a cascade without ceilings must not dispatch");
+                .expect_err("a playbook without ceilings must not dispatch");
             assert!(format!("{error:#}").contains(expected), "{error:#}");
         }
         assert!(
@@ -1080,7 +1081,7 @@ workflow(type = "cascade", tasks = [good, bad, after])
                 wall_clock_raw: Some("10m".into()),
             },
         )
-        .expect("a cascade with both ceilings runs");
+        .expect("a playbook with both ceilings runs");
         assert!(dir.join("workspace/out.txt").exists(), "the task never ran");
 
         // The graph reached the session log, so a reader sees it without a plan file existing.

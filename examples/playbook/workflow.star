@@ -1,4 +1,4 @@
-# A cascade: one pass, no score. No result task: the run's verdict is the graph's, not any
+# A playbook: one pass, no score. No result task: the run's verdict is the graph's, not any
 # single task's.
 
 scribe = session(name = "scribe")
@@ -52,6 +52,6 @@ roundup = command(
 )
 
 workflow(
-    type = "cascade",
+    type = "playbook",
     tasks = [draft, shape, polish] + auditors + [roundup],
 )

@@ -74,7 +74,7 @@ pub(crate) fn common(builder: &mut GlobalsBuilder) {
     }
 }
 
-/// The scored loop's own constructors. A cascade never sees these, so a cascade author
+/// The scored loop's own constructors. A playbook never sees these, so a playbook author
 /// cannot name one and cannot be offered one by a did-you-mean.
 #[starlark_module]
 pub(crate) fn scored(builder: &mut GlobalsBuilder) {

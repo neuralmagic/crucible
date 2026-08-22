@@ -17,7 +17,7 @@ An author-supplied source is untrusted input. Compilation must terminate, and no
 
 load() must resolve only within the pack directory and must refuse absolute paths, parent traversal, and any path reaching a file outside the pack through a link. The number of modules loaded and their total size must be bounded, and each bound must be counted as a module is admitted rather than once it returns. Loaded content must reach the generated TOML, which remains the runtime authority and the hashed artifact.
 
-Topology is authorable; authority is not. A workflow must declare type = "autoresearch", "custom", or "cascade". An autoresearch workflow's result must be a decide task sourced from a frozen measure or authored grade, with apply and propose ancestors. A custom workflow has no autoresearch-shape requirement. A cascade workflow runs its graph once and carries no judge; [[RFC-0002]] states the rules particular to it. Universal DAG, source-typing, and operation-capability rules apply to all three.
+Topology is authorable; authority is not. A workflow must declare type = "autoresearch", "custom", or "playbook". An autoresearch workflow's result must be a decide task sourced from a frozen measure or authored grade, with apply and propose ancestors. A custom workflow has no autoresearch-shape requirement. A playbook workflow runs its graph once and carries no judge; [[RFC-0002]] states the rules particular to it. Universal DAG, source-typing, and operation-capability rules apply to all three.
 
 Tasks marked isolated = True must run concurrently in disposable worktrees; their workspace state must be discarded. Only a task's declared output continues through the graph: its JSON output, and any files it declared under emits_files.
 

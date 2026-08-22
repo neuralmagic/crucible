@@ -19,7 +19,7 @@ Replace the bool with one kwarg that names what the task needs of the workspace,
 
 The author says what is true about their task; the engine decides what can run at once. That is the rule the rest of the DSL follows and this kwarg does not.
 
-Two things have to land first. The task result file must be namespaced per task, so two readonly peers do not collide on it, and PLAN_TASK_RESULT.json is named in the agent-facing prompts (`prompts/scope-propose.md:205`), so the change reaches the harness contract and not only the executor. Expect 78 `isolated` sites across 14 files, including the scored lane, which is why this is not folded into the cascade prototype: it would destabilize the loop that already works.
+Two things have to land first. The task result file must be namespaced per task, so two readonly peers do not collide on it, and PLAN_TASK_RESULT.json is named in the agent-facing prompts (`prompts/scope-propose.md:205`), so the change reaches the harness contract and not only the executor. Expect 78 `isolated` sites across 14 files, including the scored lane, which is why this is not folded into the playbook prototype: it would destabilize the loop that already works.
 
 Deliberately not proposed: a separate `read_only` flag alongside `isolated`. It adds a sixth scalar to a set an author already finds hard to hold, and it leaves the lie in place."""
 

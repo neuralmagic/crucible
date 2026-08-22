@@ -1,0 +1,16 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-PLAYBOOK-COMPOSITE"
+title = "Judgeless composite domains"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = """
+A composite domain MUST be permitted without [judge] when its workflow type is playbook. A playbook over several repositories combines work, not scores, so a composite MUST NOT be required to carry a judge merely because it has more than one component.
+
+A judgeless composite MUST NOT produce a combined score, and the engine MUST NOT construct one.
+
+A component MAY carry its own publish target. A component whose workspace holds commits beyond the base it started from, and that carries a target, MUST publish one draft pull request; a playbook has no propose-and-apply cycle, so this commit comparison is what stands in for the scored loop's notion of a change. A component with no target MUST publish nothing, which is the ordinary case for a playbook whose output is a review, a report, or a filed ask rather than a diff."""

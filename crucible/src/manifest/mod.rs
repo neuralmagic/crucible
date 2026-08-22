@@ -53,8 +53,8 @@ pub enum ManifestError {
     TaskLaneRejects { table: &'static str },
     #[error("[judge].objective = \"task\" is reserved as the task lane's wire discriminator")]
     TaskObjectiveReserved,
-    #[error("[workflow] type = \"cascade\" runs once and scores nothing; remove [judge]")]
-    CascadeNeedsNoJudge,
+    #[error("[workflow] type = \"playbook\" runs once and scores nothing; remove [judge]")]
+    PlaybookNeedsNoJudge,
     #[error(
         "[workflow].file compiled a {compiled:?} workflow but the manifest declares {declared:?}"
     )]
@@ -540,19 +540,19 @@ fn validate_common(c: CommonCfg<'_>) -> Result<()> {
             }
             if c.workflow
                 .as_ref()
-                .is_some_and(|w| w.workflow_type == WorkflowType::Cascade)
+                .is_some_and(|w| w.workflow_type == WorkflowType::Playbook)
             {
-                return Err(ManifestError::CascadeNeedsNoJudge.into());
+                return Err(ManifestError::PlaybookNeedsNoJudge.into());
             }
         }
         None => {
-            let cascade = c
+            let playbook = c
                 .workflow
                 .as_ref()
-                .is_some_and(|w| w.workflow_type == WorkflowType::Cascade);
+                .is_some_and(|w| w.workflow_type == WorkflowType::Playbook);
             for (present, table) in [
                 (c.search.is_some(), "[search]"),
-                (c.workflow.is_some() && !cascade, "[workflow]"),
+                (c.workflow.is_some() && !playbook, "[workflow]"),
                 (c.preflight.is_some(), "[preflight]"),
             ] {
                 if present {
@@ -1067,12 +1067,12 @@ mod tests {
     }
 
     #[test]
-    fn a_judgeless_manifest_admits_a_cascade_workflow_and_still_refuses_the_others() {
-        let cascade = "[workflow]\ntype = \"cascade\"\n[[workflow.task]]\nname = \"t\"\nkind = \"evaluate\"\ncommand = \"true\"";
-        let m: Manifest = toml::from_str(&task_manifest(cascade)).expect("parses");
+    fn a_judgeless_manifest_admits_a_playbook_workflow_and_still_refuses_the_others() {
+        let playbook = "[workflow]\ntype = \"playbook\"\n[[workflow.task]]\nname = \"t\"\nkind = \"evaluate\"\ncommand = \"true\"";
+        let m: Manifest = toml::from_str(&task_manifest(playbook)).expect("parses");
         m.validate()
-            .expect("a cascade is the one [workflow] the task lane takes");
-        assert!(m.is_task(), "a cascade manifest is still judgeless");
+            .expect("a playbook is the one [workflow] the task lane takes");
+        assert!(m.is_task(), "a playbook manifest is still judgeless");
 
         let custom = "[workflow]\ntype = \"custom\"\nresult = \"t\"\n[[workflow.task]]\nname = \"t\"\nkind = \"evaluate\"\ncommand = \"true\"";
         let err = toml::from_str::<Manifest>(&task_manifest(custom))
@@ -1092,11 +1092,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("graph.star"),
-            "a = command(name = \"a\", run = \"true\")\nworkflow(type = \"cascade\", tasks = [a])\n",
+            "a = command(name = \"a\", run = \"true\")\nworkflow(type = \"playbook\", tasks = [a])\n",
         )
         .unwrap();
 
-        let table = "[workflow]\ntype = \"cascade\"\nfile = \"graph.star\"";
+        let table = "[workflow]\ntype = \"playbook\"\nfile = \"graph.star\"";
         let mut m: Manifest = toml::from_str(&task_manifest(table)).expect("parses");
         m.validate().expect("an unresolved manifest is valid");
         assert!(
@@ -1118,7 +1118,7 @@ mod tests {
         let err = toml::from_str::<Manifest>(&task_manifest(mismatched))
             .expect("parses")
             .resolve_workflow(&dir)
-            .expect_err("custom manifest, cascade source");
+            .expect_err("custom manifest, playbook source");
         assert!(
             err.to_string().contains("but the manifest declares"),
             "{err:#}"
@@ -1129,7 +1129,7 @@ mod tests {
 
     #[test]
     fn a_workflow_declaring_both_a_file_and_tasks_is_refused() {
-        let both = "[workflow]\ntype = \"cascade\"\nfile = \"graph.star\"\n[[workflow.task]]\nname = \"a\"\nkind = \"command\"\ncommand = \"true\"";
+        let both = "[workflow]\ntype = \"playbook\"\nfile = \"graph.star\"\n[[workflow.task]]\nname = \"a\"\nkind = \"command\"\ncommand = \"true\"";
         let err = toml::from_str::<Manifest>(&task_manifest(both))
             .expect("parses")
             .validate()
@@ -1141,7 +1141,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cascade_is_refused_beside_a_judge() {
+    fn a_playbook_is_refused_beside_a_judge() {
         let toml = r#"
             [repo]
             path = "."
@@ -1154,7 +1154,7 @@ mod tests {
             direction = "minimize"
             measure_cmd = "true"
             [workflow]
-            type = "cascade"
+            type = "playbook"
             [[workflow.task]]
             name = "t"
             kind = "evaluate"
@@ -1163,14 +1163,14 @@ mod tests {
         let err = toml::from_str::<Manifest>(toml)
             .expect("parses")
             .validate()
-            .expect_err("a scored cascade is a contradiction");
+            .expect_err("a scored playbook is a contradiction");
         assert!(err.to_string().contains("remove [judge]"), "{err:#}");
     }
 
     #[test]
-    fn a_cascade_refuses_a_task_naming_an_engine_operation() {
-        let cascade = "[workflow]\ntype = \"cascade\"\n[[workflow.task]]\nname = \"p\"\nkind = \"engine\"\nop = \"propose\"";
-        let err = toml::from_str::<Manifest>(&task_manifest(cascade))
+    fn a_playbook_refuses_a_task_naming_an_engine_operation() {
+        let playbook = "[workflow]\ntype = \"playbook\"\n[[workflow.task]]\nname = \"p\"\nkind = \"engine\"\nop = \"propose\"";
+        let err = toml::from_str::<Manifest>(&task_manifest(playbook))
             .expect("parses")
             .validate()
             .expect_err("propose belongs to the scored loop");

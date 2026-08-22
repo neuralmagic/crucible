@@ -346,15 +346,15 @@ pub(crate) enum PlanAction {
     /// the plan does not reach a valid verdict.
     Run {
         /// The plan file to execute. Omit it to build the plan from `--manifest`'s own
-        /// `[workflow]`, which is how a cascade runs: the pack names its graph and the engine
+        /// `[workflow]`, which is how a playbook runs: the pack names its graph and the engine
         /// compiles it per run.
         #[arg(long, required_unless_present = "manifest")]
         file: Option<PathBuf>,
-        /// Total cost ceiling for the run, in USD. A cascade must be given one: its source may
+        /// Total cost ceiling for the run, in USD. A playbook must be given one: its source may
         /// not declare a limit its operator set.
         #[arg(long)]
         max_cost: Option<f64>,
-        /// Total wall-clock ceiling for the run (`90s`, `30m`, `2h`). A cascade must be given
+        /// Total wall-clock ceiling for the run (`90s`, `30m`, `2h`). A playbook must be given
         /// one, for the same reason.
         #[arg(long)]
         max_time: Option<String>,

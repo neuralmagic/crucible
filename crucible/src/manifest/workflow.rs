@@ -24,7 +24,7 @@ pub enum WorkflowType {
     /// An arbitrary capability-admitted DAG.
     Custom,
     /// One pass over the graph, no score, no judge.
-    Cascade,
+    Playbook,
 }
 
 impl WorkflowType {
@@ -34,7 +34,7 @@ impl WorkflowType {
         match name {
             "autoresearch" => Some(WorkflowType::Autoresearch),
             "custom" => Some(WorkflowType::Custom),
-            "cascade" => Some(WorkflowType::Cascade),
+            "playbook" => Some(WorkflowType::Playbook),
             _ => None,
         }
     }
@@ -43,7 +43,7 @@ impl WorkflowType {
         match self {
             WorkflowType::Autoresearch => "workflow.autoresearch",
             WorkflowType::Custom => "workflow.custom",
-            WorkflowType::Cascade => "workflow.cascade",
+            WorkflowType::Playbook => "workflow.playbook",
         }
     }
 }
@@ -86,18 +86,18 @@ impl WorkflowCaps {
         ])
     }
 
-    /// Capabilities the one-pass cascade lane implements. No engine operations: a cascade has
+    /// Capabilities the one-pass playbook lane implements. No engine operations: a playbook has
     /// no scored loop to run them in, and [`WorkflowCfg::validate`] refuses a task naming one.
-    pub fn cascade_engine() -> Self {
-        Self::new(["workflow.cascade"])
+    pub fn playbook_engine() -> Self {
+        Self::new(["workflow.playbook"])
     }
 
     /// What the engine implements for the lane a workflow declares. Granting the scored loop's
-    /// capabilities to every lane would admit a cascade whose type the engine never checked,
+    /// capabilities to every lane would admit a playbook whose type the engine never checked,
     /// and refuse one whose type it did.
     pub fn for_lane(lane: WorkflowType) -> Self {
         match lane {
-            WorkflowType::Cascade => Self::cascade_engine(),
+            WorkflowType::Playbook => Self::playbook_engine(),
             WorkflowType::Autoresearch | WorkflowType::Custom => Self::autoresearch_engine(),
         }
     }
@@ -161,8 +161,8 @@ pub enum WorkflowError {
     TiebreakNotAncestor { tiebreak: String, task: String },
     #[error("custom workflow result {result:?} names an unknown task")]
     UnknownCustomResult { result: String },
-    #[error("cascade task {task:?} names engine operation {op:?}: a cascade has no scored loop")]
-    CascadeEngineTask { task: String, op: EngineOp },
+    #[error("playbook task {task:?} names engine operation {op:?}: a playbook has no scored loop")]
+    PlaybookEngineTask { task: String, op: EngineOp },
     #[error("engine task {task:?} cannot run in the epilogue (the loop is over)")]
     EngineTaskInEpilogue { task: String },
     #[error("epilogue task name {KEPT_INPUT:?} is reserved for the kept-candidate input")]
@@ -372,10 +372,10 @@ impl WorkflowCfg {
             }
         }
 
-        if self.workflow_type == WorkflowType::Cascade {
+        if self.workflow_type == WorkflowType::Playbook {
             for task in &self.tasks {
                 if let TaskKind::Engine { op, .. } = task.task {
-                    return Err(WorkflowError::CascadeEngineTask {
+                    return Err(WorkflowError::PlaybookEngineTask {
                         task: task.name.0.clone(),
                         op,
                     });

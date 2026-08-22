@@ -1,12 +1,12 @@
-# cascade — the one-shot, measurement-free litmus domain. No [judge]: nothing is scored,
+# playbook — the one-shot, measurement-free litmus domain. No [judge]: nothing is scored,
 # nothing is kept or discarded, the graph runs once. The `command` backend (role.sh) stands
 # in for every agent turn, so the whole pack runs in milliseconds with no model and no cost.
 #
-#   crucible plan run --file examples/cascade/plan.toml \
-#                     --manifest examples/cascade/crucible.toml
+#   crucible plan run --file examples/playbook/plan.toml \
+#                     --manifest examples/playbook/crucible.toml
 #
-# type = "cascade" is the one workflow table a judge-free manifest takes. The graph is named,
-# not carried: it compiles per run, which is what a parameterised cascade needs.
+# type = "playbook" is the one workflow table a judge-free manifest takes. The graph is named,
+# not carried: it compiles per run, which is what a parameterised playbook needs.
 
 [repo]
 path = "."
@@ -38,5 +38,5 @@ agent_cmd = "./role.sh"
 goal      = "Draft release notes from the inbox, then audit them."
 
 [workflow]
-type = "cascade"
+type = "playbook"
 file = "workflow.star"

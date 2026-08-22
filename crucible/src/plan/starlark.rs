@@ -606,7 +606,7 @@ const COMMON_FUNCTIONS: &[&str] = &[
     "workflow",
 ];
 
-/// The scored loop's own constructors, absent from a cascade.
+/// The scored loop's own constructors, absent from a playbook.
 const SCORED_FUNCTIONS: &[&str] = &[
     "apply",
     "decide",
@@ -617,12 +617,12 @@ const SCORED_FUNCTIONS: &[&str] = &[
     "top_k",
 ];
 
-/// The callable surface of one lane, for unknown-function suggestions. A cascade author is
+/// The callable surface of one lane, for unknown-function suggestions. A playbook author is
 /// never offered a constructor the lane would then refuse. Built from the two tables above so a
 /// constructor cannot be added to one and forgotten in the other.
 fn dsl_functions(lane: WorkflowType) -> Vec<&'static str> {
     let mut names = COMMON_FUNCTIONS.to_vec();
-    if lane != WorkflowType::Cascade {
+    if lane != WorkflowType::Playbook {
         names.extend_from_slice(SCORED_FUNCTIONS);
     }
     names.sort_unstable();
@@ -702,7 +702,7 @@ fn constructor(
         {
             "autoresearch" => WorkflowType::Autoresearch,
             "custom" => WorkflowType::Custom,
-            "cascade" => WorkflowType::Cascade,
+            "playbook" => WorkflowType::Playbook,
             other => {
                 return Err(CompileError::UnknownWorkflowType {
                     got: other.to_owned(),
@@ -1692,13 +1692,13 @@ fn catching_panics<T>(evaluate: impl FnOnce() -> T) -> Result<T> {
     })
 }
 
-/// The globals one lane sees. The scored constructors are not merely refused for a cascade,
-/// they are absent, so `measure` in a cascade is an unknown name rather than a name that
+/// The globals one lane sees. The scored constructors are not merely refused for a playbook,
+/// they are absent, so `measure` in a playbook is an unknown name rather than a name that
 /// compiles and fails validation later.
 fn lane_globals(lane: WorkflowType) -> Globals {
     let builder = GlobalsBuilder::standard().with(globals::common);
     match lane {
-        WorkflowType::Cascade => builder.build(),
+        WorkflowType::Playbook => builder.build(),
         _ => builder.with(globals::scored).build(),
     }
 }
@@ -2058,13 +2058,13 @@ workflow(type = "custom", tasks = [score, strict, lossy], result = strict)
         );
     }
 
-    /// The cascade pack carries its graph twice: `workflow.star` for the lane it is waiting
+    /// The playbook pack carries its graph twice: `workflow.star` for the lane it is waiting
     /// on, `plan.toml` for the runner that executes it today. Drift between them would make
     /// the pack a reference to nothing.
     #[test]
-    fn cascade_example_matches_its_golden_and_runnable_plan() {
+    fn playbook_example_matches_its_golden_and_runnable_plan() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let pack = root.join("examples/cascade");
+        let pack = root.join("examples/playbook");
         let compiled = compile_file(&pack.join("workflow.star"), &pack).unwrap();
         assert_eq!(
             compiled.canonical_json,
@@ -2126,7 +2126,7 @@ workflow(type = "custom", tasks = [score, strict, lossy], result = strict)
     #[test]
     fn an_unknown_kwarg_points_at_the_argument_not_the_whole_call() {
         let pack = temp_pack("arg-span");
-        let source = "\ndraft = agent(\n    name = \"draft\",\n    prompt = \"write it\",\n    promt = \"typo\",\n)\nworkflow(type = \"cascade\", tasks = [draft])\n";
+        let source = "\ndraft = agent(\n    name = \"draft\",\n    prompt = \"write it\",\n    promt = \"typo\",\n)\nworkflow(type = \"playbook\", tasks = [draft])\n";
         let error = crate::errors::report(
             &compile_source(source, &pack.join("workflow.star"), &pack).unwrap_err(),
         );
@@ -2142,7 +2142,7 @@ workflow(type = "custom", tasks = [score, strict, lossy], result = strict)
         assert!(error.contains("prompt"), "no suggestion: {error}");
 
         // Two calls to one constructor with the same bad kwarg: the call site has to pick.
-        let twice = "\na = agent(\n    name = \"a\",\n    prompt = \"p\",\n)\nb = agent(\n    name = \"b\",\n    prompt = \"p\",\n    promt = \"typo\",\n)\nworkflow(type = \"cascade\", tasks = [a, b])\n";
+        let twice = "\na = agent(\n    name = \"a\",\n    prompt = \"p\",\n)\nb = agent(\n    name = \"b\",\n    prompt = \"p\",\n    promt = \"typo\",\n)\nworkflow(type = \"playbook\", tasks = [a, b])\n";
         let error = crate::errors::report(
             &compile_source(twice, &pack.join("workflow.star"), &pack).unwrap_err(),
         );
@@ -2157,7 +2157,7 @@ workflow(type = "custom", tasks = [score, strict, lossy], result = strict)
     #[test]
     fn an_undeclared_session_points_at_the_session_argument() {
         let pack = temp_pack("session-span");
-        let source = "\nscribe = session(name = \"scribe\")\n\ndraft = agent(\n    name = \"draft\",\n    prompt = \"write it\",\n    session = \"scrib\",\n)\nworkflow(type = \"cascade\", tasks = [draft])\n";
+        let source = "\nscribe = session(name = \"scribe\")\n\ndraft = agent(\n    name = \"draft\",\n    prompt = \"write it\",\n    session = \"scrib\",\n)\nworkflow(type = \"playbook\", tasks = [draft])\n";
         let error = crate::errors::report(
             &compile_source(source, &pack.join("workflow.star"), &pack).unwrap_err(),
         );
@@ -2607,7 +2607,7 @@ workflow(branches + [curate])
         let _ = std::fs::remove_dir_all(&pack);
     }
 
-    /// The lane owns the namespace. A cascade cannot name a scored constructor, and the
+    /// The lane owns the namespace. A playbook cannot name a scored constructor, and the
     /// did-you-mean never offers one, so the author is not sent toward a name the lane refuses.
     /// Every source here aborted the engine process before it was bounded, and each is a
     /// different way in: parse-time nesting through five grammar shapes, a value nested by a
@@ -2771,7 +2771,7 @@ audit = agent(
     max_fanout = 16,
     isolated = True,
 )
-workflow(type = "cascade", tasks = [discover, audit])
+workflow(type = "playbook", tasks = [discover, audit])
 "#;
         let compiled = compile_source(good, &pack.join("workflow.star"), &pack)
             .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
@@ -2838,7 +2838,7 @@ workflow(type = "cascade", tasks = [discover, audit])
         ];
         for (clause, expected) in cases {
             let source = format!(
-                "discover = command(name = \"discover\", run = \"./f.sh\", emits = [\"targets\"])\naudit = agent(\n    name = \"audit\",\n    prompt = \"p\",\n    {clause},\n)\nworkflow(type = \"cascade\", tasks = [discover, audit])\n"
+                "discover = command(name = \"discover\", run = \"./f.sh\", emits = [\"targets\"])\naudit = agent(\n    name = \"audit\",\n    prompt = \"p\",\n    {clause},\n)\nworkflow(type = \"playbook\", tasks = [discover, audit])\n"
             );
             let error = crate::errors::report(
                 &compile_source(&source, &pack.join("workflow.star"), &pack)
@@ -2851,11 +2851,11 @@ workflow(type = "cascade", tasks = [discover, audit])
     }
 
     #[test]
-    fn a_cascade_cannot_see_the_scored_constructors() {
+    fn a_playbook_cannot_see_the_scored_constructors() {
         let pack = temp_pack("lane-scope");
         for scored in SCORED_FUNCTIONS {
             let source = format!(
-                "t = command(name = \"t\", run = \"true\")\nx = {scored}(name = \"s\")\nworkflow(type = \"cascade\", tasks = [t])\n"
+                "t = command(name = \"t\", run = \"true\")\nx = {scored}(name = \"s\")\nworkflow(type = \"playbook\", tasks = [t])\n"
             );
             let error = crate::errors::report(
                 &compile_source(&source, &pack.join("workflow.star"), &pack).unwrap_err(),
@@ -2871,16 +2871,15 @@ workflow(type = "cascade", tasks = [discover, audit])
         compile_source(scored, &pack.join("workflow.star"), &pack)
             .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
 
-        // A near-miss in a cascade is corrected toward a cascade name, never a scored one.
-        let typo =
-            "t = commnd(name = \"t\", run = \"true\")\nworkflow(type = \"cascade\", tasks = [t])\n";
+        // A near-miss in a playbook is corrected toward a playbook name, never a scored one.
+        let typo = "t = commnd(name = \"t\", run = \"true\")\nworkflow(type = \"playbook\", tasks = [t])\n";
         let error = crate::errors::report(
             &compile_source(typo, &pack.join("workflow.star"), &pack).unwrap_err(),
         );
         assert!(error.contains("command"), "{error}");
 
         // And a typo'd call to the source's own helper is corrected toward that helper.
-        let helper = "def auditor(topic):\n    return command(name = topic, run = \"true\")\nt = auditr(\"a\")\nworkflow(type = \"cascade\", tasks = [t])\n";
+        let helper = "def auditor(topic):\n    return command(name = topic, run = \"true\")\nt = auditr(\"a\")\nworkflow(type = \"playbook\", tasks = [t])\n";
         let error = crate::errors::report(
             &compile_source(helper, &pack.join("workflow.star"), &pack).unwrap_err(),
         );

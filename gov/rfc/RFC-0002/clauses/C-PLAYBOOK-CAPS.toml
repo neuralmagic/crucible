@@ -1,7 +1,7 @@
 #:schema ../../../schema/clause.schema.json
 
 [govctl]
-id = "C-CASCADE-CAPS"
+id = "C-PLAYBOOK-CAPS"
 title = "Task capability requirements"
 kind = "normative"
 status = "active"
@@ -9,7 +9,7 @@ since = "0.1.0"
 
 [content]
 text = """
-A cascade MUST execute on one substrate for its whole life. A task therefore cannot be moved to reach a capability, and privileged or specialized work MUST be reached by asking a mediated broker instead.
+A playbook MUST execute on one substrate for its whole life. A task therefore cannot be moved to reach a capability, and privileged or specialized work MUST be reached by asking a mediated broker instead.
 
 A needs declaration on a task MUST name a capability that the run can verify is available before dispatch. Whether a substrate provides that capability directly or a broker provides it on request is not the task's concern.
 

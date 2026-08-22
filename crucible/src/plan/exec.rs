@@ -83,7 +83,7 @@ pub struct ExecCfg {
     /// Bounded auto-retry for transport failures (measured failures never retry).
     pub transport_retries: u32,
     /// How long the whole run may take. `None` means unbounded, which the scored loop
-    /// tolerates because an operator is watching it; a cascade must supply one.
+    /// tolerates because an operator is watching it; a playbook must supply one.
     pub wall_clock: Option<Duration>,
 }
 

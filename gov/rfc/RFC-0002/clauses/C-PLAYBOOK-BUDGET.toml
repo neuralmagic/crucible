@@ -1,7 +1,7 @@
 #:schema ../../../schema/clause.schema.json
 
 [govctl]
-id = "C-CASCADE-BUDGET"
+id = "C-PLAYBOOK-BUDGET"
 title = "Cost and time ceilings"
 kind = "normative"
 status = "active"
@@ -9,9 +9,9 @@ since = "0.1.0"
 
 [content]
 text = """
-A cascade MUST run under two ceilings supplied by whatever launched it: a total cost ceiling and a total wall-clock ceiling. A cascade source MUST NOT declare either, so that a pack cannot raise a limit its operator set.
+A playbook MUST run under two ceilings supplied by whatever launched it: a total cost ceiling and a total wall-clock ceiling. A playbook source MUST NOT declare either, so that a pack cannot raise a limit its operator set.
 
-The engine MUST refuse to dispatch any task of a cascade for which either ceiling is missing. Unsupervised scheduled work with no stated limit is the failure this rule exists to prevent, so the refusal MUST come before any spend rather than at the first overrun. A run that ends because a ceiling was exhausted MUST name which one in its shutdown outcome.
+The engine MUST refuse to dispatch any task of a playbook for which either ceiling is missing. Unsupervised scheduled work with no stated limit is the failure this rule exists to prevent, so the refusal MUST come before any spend rather than at the first overrun. A run that ends because a ceiling was exhausted MUST name which one in its shutdown outcome.
 
 The engine MUST NOT terminate an attempt already in flight on cost grounds, so a completed attempt MAY carry the total past the cost ceiling. Any cost overrun MUST invalidate the run and MUST block all further dispatch and retries.
 

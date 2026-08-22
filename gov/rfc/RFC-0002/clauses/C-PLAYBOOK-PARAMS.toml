@@ -1,7 +1,7 @@
 #:schema ../../../schema/clause.schema.json
 
 [govctl]
-id = "C-CASCADE-PARAMS"
+id = "C-PLAYBOOK-PARAMS"
 title = "Workflow parameters and launch schema"
 kind = "normative"
 status = "active"

@@ -402,12 +402,12 @@ pub(crate) fn prep_plan_runner(
     apply_agent_cfg(&mut args, &m.agent, &p.workspace)?;
     args.workflow_frozen_injects = m.frozen_inject_pairs(&manifest_dir);
     args.workflow_toolbox_exclude = m.agent.toolbox_exclude.clone();
-    // A cascade's git memory is per task; the scored loop owns the same repository for
+    // A playbook's git memory is per task; the scored loop owns the same repository for
     // keep/discard of whole candidates and must not find per-task commits inside an iteration.
     let commit_per_task = m
         .workflow
         .as_ref()
-        .is_some_and(|w| w.workflow_type == manifest::WorkflowType::Cascade);
+        .is_some_and(|w| w.workflow_type == manifest::WorkflowType::Playbook);
     Ok((
         crate::plan::harness::HarnessRunner {
             args,
