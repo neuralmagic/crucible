@@ -136,6 +136,32 @@ impl ActivityFeed {
                 detail: cap_chars(value.as_deref().unwrap_or_default(), ACTIVITY_TEXT_CAP),
                 cost_so_far: self.cost_so_far(),
             },
+            // A retry carries the API error that provoked it. An agent that never gets a usable
+            // credential retries until it exhausts its budget and exits having printed nothing,
+            // so this is the only place the reason is ever stated.
+            AgentEvent::Retry {
+                attempt,
+                max,
+                error,
+            } => ActivityLine {
+                kind: "retry",
+                name: None,
+                detail: cap_chars(
+                    &format!("attempt {attempt}/{max}: {}", error.trim()),
+                    ACTIVITY_TEXT_CAP,
+                ),
+                cost_so_far: self.cost_so_far(),
+            },
+            // A backend that dies at spawn/auth: the turn has no other record of it.
+            AgentEvent::Error {
+                error_type,
+                message,
+            } => ActivityLine {
+                kind: "error",
+                name: Some(error_type.clone()),
+                detail: cap_chars(message.trim(), ACTIVITY_TEXT_CAP),
+                cost_so_far: self.cost_so_far(),
+            },
             // The agent's own stderr, replayed after it exits: the diagnostic a dying agent
             // prints on its way out.
             AgentEvent::Raw {
@@ -214,6 +240,40 @@ mod tests {
     }
 
     /// An agent that starts, prints a diagnostic and dies leaves that diagnostic in the log.
+    /// The outage shape: an agent that never gets a usable credential retries until its budget
+    /// is gone, then exits having printed nothing on either stream. The retry's error is the only
+    /// statement of why, so it must not be rate limited away either.
+    #[test]
+    fn an_api_retry_states_its_error() {
+        let mut feed = ActivityFeed::new(RANK_ACTIVITY_MARKER, true);
+        let now = std::time::Instant::now();
+        let ev = AgentEvent::Retry {
+            attempt: 3,
+            max: 20,
+            error: "  could not refresh access token  ".to_string(),
+        };
+        let line = feed.line_for("m", &ev, now).expect("retry emits");
+        let v = detail(&line);
+        assert_eq!(v["kind"], "retry");
+        assert_eq!(v["detail"], "attempt 3/20: could not refresh access token");
+        assert!(feed.line_for("m", &ev, now).is_some());
+    }
+
+    #[test]
+    fn an_agent_error_earns_a_line() {
+        let mut feed = ActivityFeed::new(RANK_ACTIVITY_MARKER, true);
+        let now = std::time::Instant::now();
+        let ev = AgentEvent::Error {
+            error_type: "openshell".to_string(),
+            message: "the agent exited 1".to_string(),
+        };
+        let line = feed.line_for("m", &ev, now).expect("error emits");
+        let v = detail(&line);
+        assert_eq!(v["kind"], "error");
+        assert_eq!(v["name"], "openshell");
+        assert_eq!(v["detail"], "the agent exited 1");
+    }
+
     #[test]
     fn agent_stderr_earns_a_line() {
         let mut feed = ActivityFeed::new(RANK_ACTIVITY_MARKER, true);
