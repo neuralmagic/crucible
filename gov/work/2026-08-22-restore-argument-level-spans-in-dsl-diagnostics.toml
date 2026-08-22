@@ -3,8 +3,10 @@
 [govctl]
 id = "WI-2026-08-22-002"
 title = "Restore argument-level spans in DSL diagnostics"
-status = "queue"
+status = "done"
 created = "2026-08-22"
+started = "2026-08-22"
+completed = "2026-08-22"
 refs = ["RFC-0001:C-WORKFLOW"]
 
 [content]
