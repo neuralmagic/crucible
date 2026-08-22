@@ -3,12 +3,12 @@
 [govctl]
 id = "RFC-0001"
 title = "Crucible implementation contract"
-version = "0.1.0"
+version = "0.2.0"
 status = "normative"
-phase = "stable"
+phase = "spec"
 owners = ["@Will Eaton"]
 created = "2026-08-19"
-updated = "2026-08-19"
+updated = "2026-08-22"
 signature = "ff8072ad4fecc176564e2ffbbf52c069b261c784901d2028972e8a983ac8b969"
 
 [[sections]]
@@ -31,6 +31,25 @@ clauses = [
     "clauses/C-WIRE.toml",
     "clauses/C-LEDGER.toml",
     "clauses/C-SURFACE.toml",
+]
+
+[[changelog]]
+version = "0.2.0"
+date = "2026-08-22"
+notes = "Admit the cascade lane"
+changed = [
+    "DSL grammar admits dictionaries, conditionals, comprehensions, iteration, user-defined functions, load() and the pure standard library",
+    "compilation must be bounded in depth and size and must not abort the process on an author-supplied source",
+    "workflow type may be cascade",
+    "a task's declared files continue through the graph alongside its JSON output, isolation notwithstanding",
+    "a required task may not depend on an advisory one through all-join edges",
+    "param joins the enumerated constructors",
+    "shutdown outcome gains complete for a run a task ended with no work left",
+    "a named-argument diagnostic must locate the argument, and suggestions draw on source bindings",
+    "session log gains the plan_admitted event, so a consumer reads the graph instead of inferring it from a gate label",
+    "deps() is removed: depends_on already accepts task values, so the wrapper was ceremony",
+    "the declared lane scopes the constructor namespace, so a cascade cannot name or be offered a scored constructor",
+    "session log gains asks_emitted, so what a run proposed is auditable apart from what an orchestrator admitted",
 ]
 
 [[changelog]]

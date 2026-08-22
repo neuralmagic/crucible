@@ -1,0 +1,61 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-08-22-003"
+title = "Let a task say what it needs of the workspace, not that it is isolated"
+status = "queue"
+created = "2026-08-22"
+refs = ["RFC-0001:C-WORKFLOW"]
+
+[content]
+description = """
+`isolated = True` is the word an author writes when they mean "runs in parallel". That is a lie the surface tells: isolation is a disposable worktree, and concurrency is only a side effect of it, because non-isolated peers would race on the single PLAN_TASK_RESULT.json in the shared workspace (`plan/harness.rs:36`). Read-only fan-out, which is the common case for a review panel or a context-gathering sweep, therefore pays for worktrees it does not need and cannot ask for concurrency without them.
+
+Replace the bool with one kwarg that names what the task needs of the workspace, and derive concurrency from it rather than making the author declare it:
+
+    workspace = "shared"     (default) writes the shared tree, runs serially
+    workspace = "readonly"   does not write, runs concurrently in the shared tree
+    workspace = "worktree"   writes, disposably, runs concurrently in a clone
+
+The author says what is true about their task; the engine decides what can run at once. That is the rule the rest of the DSL follows and this kwarg does not.
+
+Two things have to land first. The task result file must be namespaced per task, so two readonly peers do not collide on it, and PLAN_TASK_RESULT.json is named in the agent-facing prompts (`prompts/scope-propose.md:205`), so the change reaches the harness contract and not only the executor. Expect 78 `isolated` sites across 14 files, including the scored lane, which is why this is not folded into the cascade prototype: it would destabilize the loop that already works.
+
+Deliberately not proposed: a separate `read_only` flag alongside `isolated`. It adds a sixth scalar to a set an author already finds hard to hold, and it leaves the lie in place."""
+
+[[content.acceptance_criteria]]
+text = "isolated is replaced by workspace with shared, readonly, and worktree; the author never declares concurrency"
+status = "pending"
+category = "changed"
+
+[[content.acceptance_criteria]]
+text = "the task result file is namespaced per task, so concurrent peers in the shared tree cannot collide"
+status = "pending"
+category = "changed"
+
+[[content.acceptance_criteria]]
+text = "the agent-facing result contract and the prompts that name it agree with the new file layout"
+status = "pending"
+category = "changed"
+
+[[content.acceptance_criteria]]
+text = "two readonly peers run concurrently in the shared workspace and both results are read back"
+status = "pending"
+category = "chore"
+
+[[content.acceptance_criteria]]
+text = "a shared-workspace task never runs concurrently with a peer"
+status = "pending"
+category = "chore"
+
+[[content.acceptance_criteria]]
+text = "the scored lane's existing graphs compile and run byte-identically after the rename"
+status = "pending"
+category = "chore"
+
+[verification]
+required_guards = [
+    "GUARD-CARGO-FMT",
+    "GUARD-CARGO-CLIPPY",
+    "GUARD-CARGO-TEST",
+]

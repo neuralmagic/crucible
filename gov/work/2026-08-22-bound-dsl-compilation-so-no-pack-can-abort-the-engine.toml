@@ -1,0 +1,77 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-08-22-001"
+title = "Bound DSL compilation so no pack can abort the engine"
+status = "queue"
+created = "2026-08-22"
+refs = [
+    "RFC-0001:C-WORKFLOW",
+    "RFC-0002:C-TASK-FILES",
+]
+
+[content]
+description = """
+[[RFC-0001:C-WORKFLOW]] 0.2.0 requires that an author-supplied workflow.star never abort the engine: parsing, module resolution, argument marshalling, and value allocation must each be bounded in depth and size, and every bound must be checked before the work it bounds is done. The current compiler meets none of that, and five sources each kill the process outright.
+
+This matters more than a generic denial of service. scope/pipeline.rs turns a compile failure into a recoverable RoundVerdict::Failed and feeds it back to the refine loop, so a bad pack is an ordinary round. A panic or a SIGABRT bypasses that channel and takes the run with it.
+
+The five: (1) AstModule::parse recurses without a depth cap and runs before any budget exists, so roughly 600 bytes of nesting kills the compiler, reachable through a load()ed module too. (2) convert() and alloc() in starlark/globals.rs recurse over nested lists; depth 2000 satisfies every declared budget while the native stack dies, and starlark's own value machinery has the same problem about 5000 deep, so a cap in convert() alone is not enough. (3) resolve_one -> evaluate -> resolve_all -> resolve_one in starlark/loader.rs is unbounded Rust recursion over the load graph; MAX_CALLSTACK bounds the starlark stack inside one module, not this. (4) starlark-0.14.2 str_type.rs asserts len as u32 as usize == len, which fires at the 4GiB boundary before the lazily-checked 64MiB heap budget is consulted, so the heap budget is not size-monotonic and the panic wins deterministically. (5) MAX_LOAD_MODULES reads by_path.len(), but by_path.insert() runs only after the recursive evaluate() returns, so the map is empty at every level while descending; 33 siblings are refused and a 500-module chain compiles clean.
+
+Adjacent and in the same class: prompt_file() and the loader read a whole file before checking its size limit, and a hard link escapes pack confinement because symlinks are refused per component and canonicalize() cannot distinguish a hard link. [[RFC-0002:C-TASK-FILES]] carries the same obligation for emits_files.
+
+Item 2 is partly pre-existing: HEAD crashes identically, but comprehensions make it far easier to author."""
+notes = ["The refine-loop channel is the point: a compile error is a recoverable round, a SIGABRT is a dead run. Any fix that trades a panic for a process abort has not fixed anything."]
+
+[[content.acceptance_criteria]]
+text = "parse depth is bounded before AstModule::parse can recurse, for the root source and every load()ed module, and the rejection is a compile error carrying file:line:col"
+status = "pending"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "convert() and alloc() bound nesting depth low enough that starlark's own value machinery cannot overflow underneath them"
+status = "pending"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "load() resolution is bounded in Rust recursion depth across the module graph, distinct from MAX_CALLSTACK"
+status = "pending"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "an allocation that would exceed starlark's u32 length assertion fails the heap budget first, so no declared budget is satisfiable by a source that panics"
+status = "pending"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "MAX_LOAD_MODULES counts a module as it is admitted rather than after evaluate() returns, so a chain is bounded like a fan-out"
+status = "pending"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "prompt_file() and the loader check a file's size before reading it"
+status = "pending"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "pack and workspace confinement holds against a hard link, for load(), prompt_file(), and emits_files"
+status = "pending"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "a hostile-pack corpus compiles every listed source in-process and asserts a CompileError, so a regression is a test failure rather than a dead test runner"
+status = "pending"
+category = "chore"
+
+[[content.acceptance_criteria]]
+text = "scope/pipeline.rs turns each hostile source into RoundVerdict::Failed and the refine loop continues"
+status = "pending"
+category = "chore"
+
+[verification]
+required_guards = [
+    "GUARD-CARGO-FMT",
+    "GUARD-CARGO-CLIPPY",
+    "GUARD-CARGO-TEST",
+    "GUARD-GOVCTL-CHECK",
+]

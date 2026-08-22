@@ -5,10 +5,11 @@ id = "C-TASK-FILES"
 title = "Declared file outputs between tasks"
 kind = "normative"
 status = "active"
+since = "0.1.0"
 
 [content]
 text = """
-A task MAY declare emits_files: the workspace-relative paths its output includes as files. Each declared path MUST be relative, MUST NOT traverse outside the workspace, and MUST NOT resolve through a symbolic link.
+A task MAY declare emits_files: the workspace-relative paths its output includes as files. Each declared path MUST be relative, MUST NOT traverse outside the workspace, and MUST NOT reach a file outside the workspace through a link of any kind. A symbolic link is refused per path component; a hard link is not distinguishable by resolving the path, so the engine MUST establish confinement by a means that does not rely on resolution alone.
 
 When a task passes, the engine MUST capture each declared file. A declared file absent after an otherwise-passing attempt MUST convert that attempt to a measured failure at the producing task, MUST NOT be retried, and MUST block its dependents. This mirrors the rule for declared JSON output fields: output drift fails where it happened.
 

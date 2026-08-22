@@ -1,0 +1,70 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-08-22-005"
+title = "Launch a cascade from the engine instead of the plan runner"
+status = "queue"
+created = "2026-08-22"
+refs = [
+    "RFC-0002:C-CASCADE-BUDGET",
+    "RFC-0002:C-CASCADE-LANE",
+]
+depends_on = ["WI-2026-08-22-004"]
+
+[content]
+description = """
+`examples/cascade` is a cascade manifest now: `[workflow] type = "cascade"`, no `[judge]`, task tables generated from workflow.star. What executes it is still `crucible plan run --file plan.toml`, because the engine has no cascade launch path. The plan runner already produces the verdict [[RFC-0002:C-CASCADE-LANE]] asks for (every required task passing over a completed graph, nonzero exit otherwise) and now honors a run-wide wall-clock ceiling, so what is missing is the engine around it.
+
+Four obligations have nowhere to land until that path exists:
+
+The engine must refuse to dispatch a cascade for which either ceiling is missing, before any spend ([[RFC-0002:C-CASCADE-BUDGET]]). Both ceilings come from the launcher; a cascade source may not declare either. The executor takes a wall-clock ceiling today but nothing supplies one and nothing refuses a run without one.
+
+Every task must execute under a bounded wall-clock deadline, and exceeding it settles that task as a failure rather than ending the run ([[RFC-0002:C-CASCADE-BUDGET]]). A hung task spends nothing, so the cost ceiling cannot bound it. The deadline must be clamped so it never extends past the run's ceiling, which is also what discharges the requirement to terminate every attempt in flight when that ceiling falls. `plan/harness.rs` spawns processes with no timeout of any kind, so this is new plumbing rather than a parameter.
+
+The engine must emit `plan_admitted` once after the graph is admitted and before any dispatch ([[RFC-0001:C-WIRE]]). The plan runner writes no session log at all, so there is nowhere to put it.
+
+A requested iteration count greater than one must be rejected rather than silently ignored ([[RFC-0002:C-CASCADE-LANE]]). Iteration is the loop driver's, and a cascade never reaches it today.
+
+Depends on the manifest naming its source ([[WI-2026-08-22-004]]): a parameterised cascade is compiled per launch, so the launch path and the compile path arrive together."""
+
+[[content.acceptance_criteria]]
+text = "the engine refuses to dispatch a cascade missing either ceiling, naming which one, before any spend"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "every task runs under a wall-clock deadline clamped to the run ceiling; exceeding it settles that task as a failure and blocks its dependents"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "plan_admitted is emitted once after admission and before dispatch, carrying each task's name, kind, dependencies, join, required flag, and stage"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "a requested iteration count greater than one is rejected for a cascade rather than ignored"
+status = "pending"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "examples/cascade runs from its manifest with no plan.toml, and plan.toml is deleted"
+status = "pending"
+category = "changed"
+
+[[content.acceptance_criteria]]
+text = "a run whose wall-clock ceiling falls mid-task terminates that attempt and exits nonzero naming the ceiling"
+status = "pending"
+category = "chore"
+
+[[content.acceptance_criteria]]
+text = "a hung task is settled by its own deadline while the run's cost total stays at zero"
+status = "pending"
+category = "chore"
+
+[verification]
+required_guards = [
+    "GUARD-CARGO-FMT",
+    "GUARD-CARGO-CLIPPY",
+    "GUARD-CARGO-TEST",
+]

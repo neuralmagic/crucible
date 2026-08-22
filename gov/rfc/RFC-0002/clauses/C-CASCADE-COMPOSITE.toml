@@ -5,6 +5,7 @@ id = "C-CASCADE-COMPOSITE"
 title = "Judgeless composite domains"
 kind = "normative"
 status = "active"
+since = "0.1.0"
 
 [content]
 text = """

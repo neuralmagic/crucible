@@ -1,0 +1,23 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-CASCADE-SURFACE"
+title = "Cascade author surface"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = """
+A cascade author must write:
+1. A crucible.toml manifest with no [judge] and a [workflow] whose type is "cascade".
+2. The graph: a workflow.star, or the [[workflow.task]] tables it would compile to.
+3. A goal, and a prompt for each agent task.
+4. The commands its command and evaluate tasks run, where it has any (any language).
+5. Agent credentials in [agent].env.
+
+A cascade author must not be required to write a measure command, a judge, a baseline, an apply command, a snapshot or restore command, or a result task. No obligation in this RFC may be conditioned on one of them, and the manifest check must not demand one of a cascade. This is the whole difference from [[RFC-0001:C-SURFACE]]: the scored lane's author writes a gate and gets a loop, and the cascade author writes a graph and gets one pass.
+
+Everything else is the engine's, provided for free: dispatch and concurrency, ceilings and per-task deadlines, git memory, the session log and every reporter, steer, stop, resume, publish, and ask emission.
+
+The litmus test (examples/cascade/) must exercise items 1 through 4 on the command backend, requiring no Rust, no judge, and no credentials."""

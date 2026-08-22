@@ -4,10 +4,11 @@
 id = "RFC-0002"
 title = "Cascade workflows"
 version = "0.1.0"
-status = "draft"
+status = "normative"
 phase = "spec"
 owners = ["@Will Eaton"]
 created = "2026-08-21"
+updated = "2026-08-22"
 
 [[sections]]
 title = "Summary"
@@ -16,7 +17,9 @@ clauses = ["clauses/C-SCOPE.toml"]
 [[sections]]
 title = "Specification"
 clauses = [
+    "clauses/C-CASCADE-SURFACE.toml",
     "clauses/C-CASCADE-LANE.toml",
+    "clauses/C-CASCADE-SHAPE.toml",
     "clauses/C-CASCADE-PARAMS.toml",
     "clauses/C-TASK-FILES.toml",
     "clauses/C-CASCADE-CAPS.toml",

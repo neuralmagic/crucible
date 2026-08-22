@@ -5,6 +5,7 @@ id = "C-CASCADE-RESUME"
 title = "Resumption"
 kind = "normative"
 status = "active"
+since = "0.1.0"
 
 [content]
 text = """
@@ -14,4 +15,4 @@ A resumed cascade MUST reconstruct its workspace from the pristine checkout plus
 
 Spend and elapsed time recorded before the interruption MUST count against the ceilings on resumption. A crash MUST NOT reset either.
 
-A resumed run MUST exit without re-running the finish path when the folded results already cover every task, and equally when any folded result declared early completion. Early completion leaves tasks undispatched by design, so a resume that only checked for full coverage would publish the same result again on every restart."""
+A resumed run MUST NOT re-dispatch the main graph when the folded results cover every main-graph task, and equally when any folded result declared early completion. Early completion leaves tasks undispatched by design, so a resume that only checked for full coverage would dispatch them again on every restart. It MUST still dispatch any epilogue task that has no folded result, under the conditions in [[RFC-0002:C-CASCADE-LANE]]. The run's summary, shutdown, and publication MUST each happen exactly once across the original run and all of its resumptions."""
