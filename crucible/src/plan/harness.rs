@@ -1061,8 +1061,15 @@ workflow(type = "playbook", tasks = [good, bad, after])
                 "is not a duration",
             ),
         ] {
-            let error = crate::plan::cli::run(None, &caps, None, Some(&manifest), ceilings)
-                .expect_err("a playbook without ceilings must not dispatch");
+            let error = crate::plan::cli::run(
+                None,
+                &BTreeMap::new(),
+                &caps,
+                None,
+                Some(&manifest),
+                ceilings,
+            )
+            .expect_err("a playbook without ceilings must not dispatch");
             assert!(format!("{error:#}").contains(expected), "{error:#}");
         }
         assert!(
@@ -1072,6 +1079,7 @@ workflow(type = "playbook", tasks = [good, bad, after])
 
         crate::plan::cli::run(
             None,
+            &BTreeMap::new(),
             &caps,
             None,
             Some(&manifest),

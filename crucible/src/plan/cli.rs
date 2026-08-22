@@ -25,12 +25,18 @@ const MERMAID_COMMAND_PREVIEW_CHARS: usize = 72;
 
 /// Compile scope-time workflow authoring syntax. JSON on stdout is stable enough for a
 /// checked-in golden; `--manifest` additionally materializes the runtime TOML authority.
-pub fn compile_workflow(file: &Path, manifest: Option<&Path>) -> Result<()> {
+pub fn compile_workflow(
+    file: &Path,
+    manifest: Option<&Path>,
+    params: &BTreeMap<String, String>,
+) -> Result<()> {
     let compiled = match manifest {
-        Some(manifest) => crate::plan::starlark::materialize_manifest(file, manifest)?,
-        None => {
-            crate::plan::starlark::compile_file(file, crate::plan::starlark::parent_or_cwd(file))?
-        }
+        Some(manifest) => crate::plan::starlark::materialize_manifest(file, manifest, params)?,
+        None => crate::plan::starlark::compile_file_with(
+            file,
+            crate::plan::starlark::parent_or_cwd(file),
+            params,
+        )?,
     };
     for prompt_file in &compiled.prompt_files {
         eprintln!("embedded prompt: {}", prompt_file.display());
@@ -516,8 +522,26 @@ struct NoGraph {
     manifest: String,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("--param {got:?} is not name=value")]
+struct BadParam {
+    got: String,
+}
+
+/// Split `name=value` pairs. The value may contain `=`; the name may not, so the first one wins.
+pub fn parse_params(pairs: &[String]) -> Result<BTreeMap<String, String>> {
+    pairs
+        .iter()
+        .map(|pair| match pair.split_once('=') {
+            Some((name, value)) if !name.is_empty() => Ok((name.to_string(), value.to_string())),
+            _ => Err(BadParam { got: pair.clone() }.into()),
+        })
+        .collect()
+}
+
 pub fn run(
     path: Option<&Path>,
+    params: &BTreeMap<String, String>,
     caps: &BTreeSet<String>,
     agent_cmd: Option<String>,
     manifest: Option<&Path>,
@@ -534,7 +558,7 @@ pub fn run(
     let (plan, mut runner, events): (ValidPlan, Box<dyn TaskRunner>, Option<std::fs::File>) =
         match (path, manifest) {
             (_, Some(m)) => {
-                let (prepared, loaded) = crate::run::prep_plan_runner(m)?;
+                let (prepared, loaded) = crate::run::prep_plan_runner_with_params(m, params)?;
                 let session_log = prepared.paths.session_log.clone();
                 let playbook = loaded
                     .workflow

@@ -6,6 +6,7 @@
 mod globals;
 mod idents;
 mod loader;
+pub(crate) mod params;
 mod values;
 
 use std::cell::{RefCell, RefMut};
@@ -55,6 +56,9 @@ pub struct CompiledWorkflow {
 #[derive(Debug)]
 struct CompileContext {
     pack_dir: PathBuf,
+    /// Parameter values bound before evaluation, so `param()` is a lookup and the compiled graph
+    /// carries no unresolved reference.
+    params: BTreeMap<String, params::ParamValue>,
     prompt_files: BTreeSet<PathBuf>,
     total_prompt_bytes: usize,
     /// Every task a DSL constructor built, keyed by name. A constructed-but-dropped task
@@ -204,6 +208,26 @@ impl CompileContext {
         Ok((relative, canonical))
     }
 
+    /// The bound value of a declared parameter. A name the block never declared is a compile
+    /// error rather than an empty string: a playbook that silently ran on a typo would be worse
+    /// than one that refused to compile.
+    fn param(&mut self, name: &str) -> Result<Value> {
+        match self.params.get(name) {
+            Some(value) => Ok(match value {
+                params::ParamValue::String(s) => Value::String(s.clone()),
+                params::ParamValue::Int(n) => Value::Int(*n),
+                params::ParamValue::Number(n) => Value::Float(*n),
+                params::ParamValue::Bool(b) => Value::Bool(*b),
+                params::ParamValue::StringList(items) => {
+                    Value::List(items.iter().cloned().map(Value::String).collect())
+                }
+            }),
+            None => Err(CompileError::ParamNotDeclared {
+                name: name.to_owned(),
+            }),
+        }
+    }
+
     fn prompt_file(&mut self, raw: &str) -> Result<String> {
         let (relative, canonical) = self
             .resolve_in_pack(raw, PathKind::Prompt)
@@ -264,6 +288,7 @@ impl CompileState {
             site: FileSpan { file, span },
             inner: RefCell::new(CompileContext {
                 pack_dir: pack_dir.to_path_buf(),
+                params: BTreeMap::new(),
                 prompt_files: BTreeSet::new(),
                 total_prompt_bytes: 0,
                 constructed_tasks: BTreeMap::new(),
@@ -425,6 +450,74 @@ pub enum CompileError {
         raw: String,
         why: String,
     },
+    #[error("params must be the source's first statement")]
+    ParamsNotFirst,
+    #[error("params must be readable without evaluating the source: {detail}")]
+    ParamsNotLiteral { detail: String },
+    #[error("parameter {param:?} declares no type")]
+    ParamNeedsType { param: String },
+    #[error(
+        "parameter {param:?} has unknown type {got:?}{}",
+        suggestion.as_ref().map(|s| format!("; did you mean {s:?}?")).unwrap_or_default()
+    )]
+    UnknownParamType {
+        param: String,
+        got: String,
+        suggestion: Option<String>,
+    },
+    #[error(
+        "parameter {param:?} has unknown field {field:?}{}",
+        suggestion.as_ref().map(|s| format!("; did you mean {s:?}?")).unwrap_or_default()
+    )]
+    UnknownParamField {
+        param: String,
+        field: String,
+        suggestion: Option<String>,
+    },
+    #[error("parameter {param:?} is required and also has a default; it is one or the other")]
+    ParamRequiredWithDefault { param: String },
+    #[error(
+        "parameter {param:?} is neither required nor defaulted, so a run that omits it has no \
+         value to use"
+    )]
+    ParamNeedsDefault { param: String },
+    #[error("parameter {param:?} default is not a {ty}")]
+    ParamDefaultWrongType { param: String, ty: &'static str },
+    #[error("parameter {param:?} declares {constraint} but is a {ty}")]
+    ParamConstraintMismatch {
+        param: String,
+        constraint: &'static str,
+        ty: &'static str,
+    },
+    #[error("parameter {param:?} pattern does not compile: {detail}")]
+    ParamBadPattern { param: String, detail: String },
+    #[error(
+        "no value for required parameter {name:?}{}",
+        if doc.is_empty() { String::new() } else { format!(" ({doc})") }
+    )]
+    MissingParam { name: String, doc: String },
+    #[error(
+        "no parameter {name:?} is declared{}",
+        suggestion.as_ref().map(|s| format!("; did you mean {s:?}?")).unwrap_or_default()
+    )]
+    UnknownParam {
+        name: String,
+        suggestion: Option<String>,
+    },
+    #[error("parameter {param:?} value {got:?} is not {expected}")]
+    ParamValueWrongType {
+        param: String,
+        got: String,
+        expected: String,
+    },
+    #[error("parameter {param:?} value {got:?} {detail}")]
+    ParamConstraintFailed {
+        param: String,
+        got: String,
+        detail: String,
+    },
+    #[error("param({name:?}) names no declared parameter")]
+    ParamNotDeclared { name: String },
     #[error("workflow evaluation failed: {0}")]
     Eval(String),
     #[error("workflow evaluation called fail(): {0}")]
@@ -601,6 +694,7 @@ const COMMON_FUNCTIONS: &[&str] = &[
     "agent",
     "command",
     "evaluate",
+    "param",
     "prompt_file",
     "session",
     "workflow",
@@ -1352,16 +1446,27 @@ fn parse_join(join: &str) -> Result<Join> {
     }
 }
 
+#[cfg(test)]
 pub fn compile_file(path: &Path, pack_dir: &Path) -> Result<CompiledWorkflow> {
+    compile_file_with(path, pack_dir, &BTreeMap::new())
+}
+
+/// Compile a file with the values a launcher supplied.
+pub fn compile_file_with(
+    path: &Path,
+    pack_dir: &Path,
+    supplied: &BTreeMap<String, String>,
+) -> Result<CompiledWorkflow> {
     let source =
         std::fs::read_to_string(path).map_err(FileError::at("reading workflow source", path))?;
-    compile_source(&source, path, pack_dir)
+    compile_source_with(&source, path, pack_dir, supplied)
 }
 
 /// Compile `workflow.star` into the manifest's generated `[workflow]` block.
 pub fn materialize_manifest(
     source_path: &Path,
     manifest_path: &Path,
+    params: &BTreeMap<String, String>,
 ) -> std::result::Result<CompiledWorkflow, MaterializeError> {
     use toml_edit::DocumentMut;
 
@@ -1370,7 +1475,7 @@ pub fn materialize_manifest(
         workflow: &'a WorkflowCfg,
     }
 
-    let compiled = compile_file(source_path, parent_or_cwd(manifest_path))?;
+    let compiled = compile_file_with(source_path, parent_or_cwd(manifest_path), params)?;
     let manifest = std::fs::read_to_string(manifest_path)
         .map_err(FileError::at("reading manifest", manifest_path))?;
     let mut document: DocumentMut =
@@ -1428,8 +1533,24 @@ pub fn materialize_sibling_manifest(
     let source_path = parent_or_cwd(manifest_path).join("workflow.star");
     source_path
         .exists()
-        .then(|| materialize_manifest(&source_path, manifest_path))
+        .then(|| materialize_manifest(&source_path, manifest_path, &BTreeMap::new()))
         .transpose()
+}
+
+/// The parameters a source declares, read without evaluating it.
+///
+/// A launcher, a form, or an orchestrator validating an ask all need to know what a pack accepts
+/// before running a line of it, which is why the block is a literal and why this never reaches
+/// the evaluator.
+pub fn declared_params(source: &str, filename: &Path) -> Result<serde_json::Value> {
+    reject_deep_nesting(source, filename)?;
+    let ast = AstModule::parse(
+        &filename.display().to_string(),
+        source.to_owned(),
+        &dialect(),
+    )
+    .map_err(|error| CompileError::Parse(error.to_string()))?;
+    Ok(params::Params::read(&ast)?.json_schema())
 }
 
 /// Stack for the compile thread.
@@ -1447,12 +1568,30 @@ const COMPILE_STACK_BYTES: usize = 256 * 1024 * 1024;
 /// The thread is the answer to recursion the compiler cannot refuse in advance. Where it can
 /// refuse in advance it does: [`reject_deep_nesting`] bounds the parser, because a 256KB source
 /// can nest further than any stack would cover.
+/// Compile with no supplied parameters. Every production path has a launcher behind it and so
+/// has values to pass; this is the shape the tests want, and gating it keeps an uncalled
+/// function out of the binary.
+#[cfg(test)]
 pub fn compile_source(source: &str, filename: &Path, pack_dir: &Path) -> Result<CompiledWorkflow> {
+    compile_source_with(source, filename, pack_dir, &BTreeMap::new())
+}
+
+/// Compile with the values a launcher supplied. Binding happens before evaluation, so a missing
+/// required parameter is a compile error and nothing is dispatched, and the compiled graph is
+/// what those values produced rather than a template of them.
+pub fn compile_source_with(
+    source: &str,
+    filename: &Path,
+    pack_dir: &Path,
+    supplied: &BTreeMap<String, String>,
+) -> Result<CompiledWorkflow> {
     std::thread::scope(|scope| {
         let handle = std::thread::Builder::new()
             .stack_size(COMPILE_STACK_BYTES)
             .name("crucible-compile".to_string())
-            .spawn_scoped(scope, || compile_source_here(source, filename, pack_dir))
+            .spawn_scoped(scope, || {
+                compile_source_here(source, filename, pack_dir, supplied)
+            })
             .map_err(|error| CompileError::Eval(format!("spawning the compile thread: {error}")))?;
         handle.join().map_err(|_| CompileError::EvalPanic {
             detail: "the compile thread died".to_owned(),
@@ -1460,7 +1599,12 @@ pub fn compile_source(source: &str, filename: &Path, pack_dir: &Path) -> Result<
     })
 }
 
-fn compile_source_here(source: &str, filename: &Path, pack_dir: &Path) -> Result<CompiledWorkflow> {
+fn compile_source_here(
+    source: &str,
+    filename: &Path,
+    pack_dir: &Path,
+    supplied: &BTreeMap<String, String>,
+) -> Result<CompiledWorkflow> {
     if source.len() > MAX_SOURCE_BYTES {
         return Err(CompileError::SourceTooLarge {
             bytes: source.len(),
@@ -1477,6 +1621,7 @@ fn compile_source_here(source: &str, filename: &Path, pack_dir: &Path) -> Result
     let idents = idents::scan(&ast, lane);
     let globals = lane_globals(lane);
     let state = CompileState::new(pack_dir, filename);
+    state.context_mut().params = params::Params::read(&ast)?.bind(supplied)?;
     let loader = loader::resolve(&ast, &state, &globals, source.len(), lane)?;
     let workflow = catching_panics(|| {
         Module::with_temp_heap(|module| -> Result<WorkflowCfg> {
@@ -1771,7 +1916,12 @@ workflow(reviews + [
         )
         .unwrap();
         std::fs::write(pack.join("workflow.star"), source).unwrap();
-        materialize_manifest(&pack.join("workflow.star"), &pack.join("crucible.toml")).unwrap();
+        materialize_manifest(
+            &pack.join("workflow.star"),
+            &pack.join("crucible.toml"),
+            &BTreeMap::new(),
+        )
+        .unwrap();
         let manifest = std::fs::read_to_string(pack.join("crucible.toml")).unwrap();
         assert!(manifest.contains("# preserved"));
         assert!(manifest.contains("Generated from workflow.star"));
@@ -2097,7 +2247,12 @@ workflow(type = "custom", tasks = [score, strict, lossy], result = strict)
         std::fs::write(&manifest_path, "# preserved\n[repo]\npath = \".\"\n").unwrap();
         std::fs::set_permissions(&manifest_path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-        materialize_manifest(&pack.join("workflow.star"), &manifest_path).unwrap();
+        materialize_manifest(
+            &pack.join("workflow.star"),
+            &manifest_path,
+            &BTreeMap::new(),
+        )
+        .unwrap();
 
         let mode = std::fs::metadata(&manifest_path)
             .unwrap()
@@ -2847,6 +3002,171 @@ workflow(type = "playbook", tasks = [discover, audit])
             );
             assert!(error.contains(expected), "{clause}: {error}");
         }
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// A launcher, a form, or an orchestrator validating an ask all need to know what a pack
+    /// accepts before running a line of it. That is the whole reason the block is a literal, so
+    /// the test reads the schema from a source that would fail loudly if it were evaluated.
+    #[test]
+    fn a_params_block_is_readable_without_evaluating_the_source() {
+        let pack = temp_pack("params-schema");
+        let source = r#"
+params = {
+    "paper_url": {"type": "string", "required": True, "doc": "an arxiv URL",
+                  "pattern": "^https://arxiv\\.org/"},
+    "verifier": {"type": "string", "default": "Qwen/Qwen3-0.6B"},
+    "max_steps": {"type": "int", "default": 100, "min": 10, "max": 2000},
+    "split": {"type": "bool", "default": True},
+    "topics": {"type": "list<string>", "default": ["a", "b"]},
+}
+
+fail("evaluating this source is a bug")
+"#;
+        let schema = declared_params(source, &pack.join("workflow.star"))
+            .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
+        assert_eq!(schema["required"], serde_json::json!(["paper_url"]));
+        assert_eq!(schema["properties"]["paper_url"]["type"], "string");
+        assert_eq!(
+            schema["properties"]["paper_url"]["description"],
+            "an arxiv URL"
+        );
+        assert_eq!(schema["properties"]["max_steps"]["type"], "integer");
+        assert_eq!(schema["properties"]["max_steps"]["default"], 100);
+        assert_eq!(schema["properties"]["split"]["type"], "boolean");
+        assert_eq!(schema["properties"]["topics"]["type"], "array");
+        assert_eq!(schema["properties"]["topics"]["items"]["type"], "string");
+        assert_eq!(schema["additionalProperties"], false);
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// Values bind before evaluation, so the compiled graph is what they produced rather than a
+    /// template of them: nothing downstream has a parameter left to resolve.
+    #[test]
+    fn parameter_values_are_bound_into_the_compiled_graph() {
+        let pack = temp_pack("params-bind");
+        let source = r#"
+params = {
+    "url": {"type": "string", "required": True},
+    "verifier": {"type": "string", "default": "qwen"},
+    "rounds": {"type": "int", "default": 3},
+    "deep": {"type": "bool", "default": False},
+    "topics": {"type": "list<string>", "default": ["x"]},
+}
+a = command(
+    name = "a",
+    run = "./go.sh " + param("url") + " " + param("verifier") + " " + str(param("rounds")),
+)
+b = command(name = "b", run = "./b.sh " + str(param("deep")) + " " + param("topics")[0])
+workflow(type = "playbook", tasks = [a, b])
+"#;
+        let supplied = BTreeMap::from([
+            ("url".to_string(), "https://example.test/p".to_string()),
+            ("rounds".to_string(), "7".to_string()),
+            ("topics".to_string(), "one,two".to_string()),
+        ]);
+        let compiled = compile_source_with(source, &pack.join("workflow.star"), &pack, &supplied)
+            .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
+        let command_of = |name: &str| match &compiled
+            .workflow
+            .tasks
+            .iter()
+            .find(|t| t.name.0 == name)
+            .expect(name)
+            .task
+        {
+            TaskKind::Command { command } => command.clone(),
+            other => panic!("{other:?}"),
+        };
+        // Supplied where supplied, defaulted where not, and the whole of it is literal text.
+        assert_eq!(command_of("a"), "./go.sh https://example.test/p qwen 7");
+        assert_eq!(command_of("b"), "./b.sh False one");
+        assert!(
+            !compiled.canonical_json.contains("param("),
+            "a parameter reference survived into the graph"
+        );
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// Everything the declaration promises is enforced before compilation, so a bad value never
+    /// reaches a task. A required parameter with no value is the one that matters most: without
+    /// it a playbook would run against an empty string and look like it worked.
+    #[test]
+    fn a_declaration_is_enforced_before_anything_compiles() {
+        let pack = temp_pack("params-refuse");
+        let head = r#"
+params = {
+    "url": {"type": "string", "required": True, "doc": "the paper"},
+    "rounds": {"type": "int", "default": 3, "min": 1, "max": 10},
+    "mode": {"type": "string", "default": "fast", "choices": ["fast", "thorough"]},
+}
+a = command(name = "a", run = "./go.sh " + param("url"))
+workflow(type = "playbook", tasks = [a])
+"#;
+        let cases: &[(&[(&str, &str)], &str)] = &[
+            (&[], "no value for required parameter \"url\" (the paper)"),
+            (
+                &[("url", "u"), ("rounds", "99")],
+                "must be between 1 and 10",
+            ),
+            (&[("url", "u"), ("rounds", "half")], "is not a whole number"),
+            (
+                &[("url", "u"), ("mode", "quick")],
+                "must be one of fast, thorough",
+            ),
+            (&[("url", "u"), ("round", "2")], "did you mean \"rounds\"?"),
+        ];
+        for (supplied, expected) in cases {
+            let supplied: BTreeMap<String, String> = supplied
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect();
+            let error = crate::errors::report(
+                &compile_source_with(head, &pack.join("workflow.star"), &pack, &supplied)
+                    .err()
+                    .unwrap_or_else(|| panic!("{supplied:?}: compiled")),
+            );
+            assert!(error.contains(expected), "{supplied:?}: {error}");
+        }
+
+        // And the declaration itself has to be coherent.
+        let bad: &[(&str, &str)] = &[
+            (
+                "\"x\": {\"type\": \"string\", \"required\": True, \"default\": \"d\"}",
+                "one or the other",
+            ),
+            ("\"x\": {\"type\": \"str\"}", "unknown type"),
+            ("\"x\": {\"default\": \"d\"}", "declares no type"),
+            (
+                "\"x\": {\"type\": \"int\", \"default\": 1, \"pattern\": \"^a\"}",
+                "declares pattern but is a int",
+            ),
+            (
+                "\"x\": {\"type\": \"string\", \"default\": \"d\", \"patern\": \"^a\"}",
+                "did you mean \"pattern\"?",
+            ),
+            (
+                "\"x\": {\"type\": \"string\"}",
+                "neither required nor defaulted",
+            ),
+        ];
+        for (decl, expected) in bad {
+            let source =
+                format!("params = {{{decl}}}\nworkflow(type = \"playbook\", tasks = [])\n");
+            let error = crate::errors::report(
+                &declared_params(&source, &pack.join("workflow.star"))
+                    .err()
+                    .unwrap_or_else(|| panic!("{decl}: accepted")),
+            );
+            assert!(error.contains(expected), "{decl}: {error}");
+        }
+
+        // The block has to come first, or a launcher reading only the head would miss it.
+        let late = "x = 1\nparams = {\"a\": {\"type\": \"string\", \"default\": \"d\"}}\nworkflow(type = \"playbook\", tasks = [])\n";
+        let error =
+            crate::errors::report(&declared_params(late, &pack.join("workflow.star")).unwrap_err());
+        assert!(error.contains("first statement"), "{error}");
+
         let _ = std::fs::remove_dir_all(&pack);
     }
 

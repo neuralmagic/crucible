@@ -1464,6 +1464,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "regex-lite",
  "reqwest",
  "rusqlite",
  "rustix",

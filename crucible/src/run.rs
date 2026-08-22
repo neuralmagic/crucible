@@ -172,17 +172,31 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
 
     if let Some(Cmd::Plan { action }) = &cli.command {
         return match action {
-            crate::PlanAction::CompileWorkflow { file, manifest } => {
-                crate::plan::cli::compile_workflow(file, manifest.as_deref())
-            }
+            crate::PlanAction::CompileWorkflow {
+                file,
+                manifest,
+                params,
+            } => crate::plan::cli::compile_workflow(
+                file,
+                manifest.as_deref(),
+                &crate::plan::cli::parse_params(params)?,
+            ),
             crate::PlanAction::Show {
                 file,
                 caps,
                 mermaid,
                 render,
             } => crate::plan::cli::show(file, &caps.iter().cloned().collect(), *mermaid, *render),
+            crate::PlanAction::Params { file } => {
+                let source = std::fs::read_to_string(file)
+                    .with_context(|| format!("reading {}", file.display()))?;
+                let schema = crate::plan::starlark::declared_params(&source, file)?;
+                println!("{}", serde_json::to_string_pretty(&schema)?);
+                Ok(())
+            }
             crate::PlanAction::Run {
                 file,
+                params,
                 max_cost,
                 max_time,
                 caps,
@@ -190,6 +204,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                 manifest,
             } => crate::plan::cli::run(
                 file.as_deref(),
+                &crate::plan::cli::parse_params(params)?,
                 &caps.iter().cloned().collect(),
                 agent_cmd.clone(),
                 manifest.as_deref(),
@@ -368,8 +383,18 @@ pub(crate) fn clone_repo(src: &str, git_ref: Option<&str>, dest: &Path) -> Resul
 /// run see the same world.
 /// The runner for a manifest, and the manifest it was built from. Both, because the caller needs
 /// the graph and the lane off the manifest and compiling it twice would compile the pack twice.
+/// Prepare with no supplied parameters: the shape the tests want, gated so an uncalled function
+/// stays out of the binary.
+#[cfg(test)]
 pub(crate) fn prep_plan_runner(
     manifest_path: &Path,
+) -> Result<(crate::plan::harness::HarnessRunner, manifest::Manifest)> {
+    prep_plan_runner_with_params(manifest_path, &std::collections::BTreeMap::new())
+}
+
+pub(crate) fn prep_plan_runner_with_params(
+    manifest_path: &Path,
+    params: &std::collections::BTreeMap<String, String>,
 ) -> Result<(crate::plan::harness::HarnessRunner, manifest::Manifest)> {
     let mut m = manifest::Manifest::load_frozen(manifest_path)?;
     let manifest_dir = manifest_path
@@ -377,7 +402,7 @@ pub(crate) fn prep_plan_runner(
         .filter(|p| !p.as_os_str().is_empty())
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
-    m.resolve_workflow(&manifest_dir)?;
+    m.resolve_workflow_with(&manifest_dir, params)?;
     let workspace = manifest_dir.join(&m.workspace.dir);
     let state = manifest_dir.join("state");
     let skills = m.agent.toolbox_dir.as_ref().map(|d| manifest_dir.join(d));

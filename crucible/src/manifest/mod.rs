@@ -667,6 +667,16 @@ impl Manifest {
     /// graph is a function of its launch arguments: the frozen result is still the runtime
     /// authority, what changes is when it is produced.
     pub fn resolve_workflow(&mut self, manifest_dir: &Path) -> Result<()> {
+        self.resolve_workflow_with(manifest_dir, &std::collections::BTreeMap::new())
+    }
+
+    /// Resolve with the values a launcher supplied. They are bound during compilation, so a
+    /// missing required parameter refuses the run before any task is dispatched.
+    pub fn resolve_workflow_with(
+        &mut self,
+        manifest_dir: &Path,
+        params: &std::collections::BTreeMap<String, String>,
+    ) -> Result<()> {
         let Some(workflow) = &self.workflow else {
             return Ok(());
         };
@@ -676,7 +686,7 @@ impl Manifest {
         let declared = workflow.workflow_type;
         let file = workflow.file.clone().unwrap_or_default();
         let source = manifest_dir.join(&file);
-        let compiled = crate::plan::starlark::compile_file(&source, manifest_dir)
+        let compiled = crate::plan::starlark::compile_file_with(&source, manifest_dir, params)
             .with_context(|| format!("compiling [workflow].file = {file:?}"))?;
         if compiled.workflow.workflow_type != declared {
             return Err(ManifestError::WorkflowTypeMismatch {

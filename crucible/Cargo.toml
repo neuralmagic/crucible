@@ -18,6 +18,11 @@ serde_json.workspace = true
 clap.workspace = true
 # Manifest parsing: crucible.toml -> the domain config (the standard TOML crate).
 toml = "0.8"
+# Validating a `params` pattern constraint. regex-lite over regex because the pattern comes from
+# an agent-authored pack: both guarantee linear-time matching (a backtracking engine would be a
+# denial-of-service vector here), and the lite build has no dependencies and is already in the
+# lockfile via the AWS SDK, so it costs nothing new.
+regex-lite = "0.1"
 # Comment-preserving TOML surgery for the pack freeze rewrite (pin [repo], inject [deploy], pin the
 # sandboxed [agent] backend); the deserialize-only `Manifest` can't round-trip, so a targeted edit
 # keeps the agent's authored comments. Already in the tree as `toml`'s own backing crate.

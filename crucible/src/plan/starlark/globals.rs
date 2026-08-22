@@ -20,7 +20,7 @@ use crate::plan::starlark as dsl;
 use crate::plan::starlark::values::{OutputRefValue, SessionValue, TaskValue, WorkflowValue};
 
 /// Constructors that historically took one positional argument. Everything else is named-only.
-const POSITIONAL: &[&str] = &["prompt_file", "workflow", "default_autoresearch"];
+const POSITIONAL: &[&str] = &["prompt_file", "param", "workflow", "default_autoresearch"];
 
 /// The constructors every lane has.
 #[starlark_module]
@@ -47,6 +47,14 @@ pub(crate) fn common(builder: &mut GlobalsBuilder) {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Value<'v>> {
         dispatch("evaluate", args, kwargs, eval)
+    }
+
+    fn param<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("param", args, kwargs, eval)
     }
 
     fn prompt_file<'v>(
@@ -183,6 +191,7 @@ fn call<'v>(
                 .context_mut()
                 .prompt_file(&path)
                 .map(dsl::Value::String),
+            ("param", dsl::Value::String(name)) => state.context_mut().param(&name),
             ("workflow", dsl::Value::List(tasks)) => {
                 let tasks = dsl::task_list("workflow", tasks)?;
                 let workflow = WorkflowCfg {

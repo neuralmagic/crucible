@@ -322,6 +322,10 @@ pub(crate) enum PlanAction {
         /// Manifest to materialize in place for validation and freeze.
         #[arg(long)]
         manifest: Option<PathBuf>,
+        /// A parameter value, `name=value`, repeatable. Values bind during compilation, so the
+        /// compiled graph is what they produced rather than a template of them.
+        #[arg(long = "param", value_name = "NAME=VALUE")]
+        params: Vec<String>,
     },
     /// Print the compiled plan (tasks in dependency-first order) and the truncation verdict
     /// for the given substrate caps. TOML by `.toml` extension, JSON otherwise.
@@ -341,6 +345,14 @@ pub(crate) enum PlanAction {
         #[arg(long)]
         render: bool,
     },
+    /// Print a workflow source's `params` block as a JSON Schema document, without evaluating
+    /// the source. One declaration serves command-line validation, ask validation, and a
+    /// generated launch form.
+    Params {
+        /// The workflow source to read.
+        #[arg(long)]
+        file: PathBuf,
+    },
     /// Execute a plan with the shell runner: `command` tasks run as real subprocesses,
     /// `agent` tasks run `--agent-cmd` (the command-backend stand-in). Exits nonzero when
     /// the plan does not reach a valid verdict.
@@ -350,6 +362,10 @@ pub(crate) enum PlanAction {
         /// compiles it per run.
         #[arg(long, required_unless_present = "manifest")]
         file: Option<PathBuf>,
+        /// A parameter value, `name=value`, repeatable. What the pack's `params` block declares
+        /// is what it accepts; `crucible plan params --file <source>` prints the schema.
+        #[arg(long = "param", value_name = "NAME=VALUE")]
+        params: Vec<String>,
         /// Total cost ceiling for the run, in USD. A playbook must be given one: its source may
         /// not declare a limit its operator set.
         #[arg(long)]
