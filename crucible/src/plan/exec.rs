@@ -549,8 +549,11 @@ fn fold_instances(settled: Vec<(String, TaskResult)>) -> TaskResult {
         .count();
     let failed = settled.len() - passed;
     let cost: f64 = settled.iter().map(|(_, r)| r.cost_usd).sum();
+    // Only passing instances feed a downstream join. A failed instance contributed nothing, and
+    // a null under its key reads as "it ran and found nothing", which is a different claim.
     let outputs: serde_json::Map<String, Value> = settled
         .iter()
+        .filter(|(_, r)| r.status == TaskStatus::Pass)
         .map(|(key, r)| (key.clone(), r.output.clone().unwrap_or(Value::Null)))
         .collect();
     let note = (failed > 0).then(|| {

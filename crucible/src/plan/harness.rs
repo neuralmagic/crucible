@@ -749,6 +749,17 @@ workflow(type = "cascade", tasks = [discover, audit, roundup])
         assert_eq!(folded["passed"], 2);
         assert_eq!(folded["failed"], 1);
         assert_eq!(folded["outputs"]["alpha"]["item"], "audit[alpha]");
+        // A failed instance contributes no entry at all: a null under its key would read as
+        // "it ran and found nothing", which is a different claim from "it did not run".
+        assert!(
+            folded["outputs"].get("gamma").is_none(),
+            "a failed instance leaked into the join: {folded}"
+        );
+        assert_eq!(
+            folded["outputs"].as_object().map(|o| o.len()),
+            Some(2),
+            "{folded}"
+        );
         assert!(
             node.note.as_ref().is_some_and(|n| n.contains("gamma")),
             "the note must name what failed: {:?}",
