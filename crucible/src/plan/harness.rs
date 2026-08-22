@@ -24,11 +24,47 @@ const RESULT_FILE: &str = "PLAN_TASK_RESULT.json";
 pub struct HarnessRunner {
     pub args: Args,
     pub paths: Paths,
+    /// Whether a settled task commits the shared workspace. True for a cascade, whose git
+    /// memory is per task; false for the scored loop, which owns the same repository for
+    /// keep/discard of whole candidates and would find per-task commits in the middle of it.
+    pub commit_per_task: bool,
 }
 
 impl TaskRunner for HarnessRunner {
     fn run(&mut self, task: &Task, attempt: u32, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
         run_task(&self.args, &self.paths, task, attempt, inputs, None)
+    }
+
+    /// Commit what a passing task did, and discard what a failing one did.
+    ///
+    /// The "only when" half is the load-bearing one. Leaving a failed task's edits in the shared
+    /// tree does not merely fail to commit them: the next task to pass sweeps them into its own
+    /// commit, so the failed task contributes after all. Discarding at the point of failure is
+    /// what keeps that from happening.
+    ///
+    /// An isolated task contributes nothing either way. Its worktree is discarded by contract
+    /// and only its declared output continues, so there is no workspace change to record.
+    fn settled(&mut self, task: &Task, passed: bool) {
+        if !self.commit_per_task || task.isolation.is_some() {
+            return;
+        }
+        let workspace = &self.paths.workspace;
+        let outcome = if passed {
+            crucible_vcs::git_memory::snapshot(workspace, &format!("task {}", task.name))
+                .map(|_| ())
+        } else {
+            crucible_vcs::vcs::head_sha(workspace)
+                .and_then(|head| crucible_vcs::git_memory::restore(workspace, &head, &[]))
+        };
+        if let Err(error) = outcome {
+            // Git memory failing is worth saying out loud: a resumed run rebuilds from these
+            // commits, so a silent miss here is a silent gap there.
+            eprintln!(
+                "[{}] git memory ({}) failed: {error:#}",
+                task.name,
+                if passed { "commit" } else { "discard" }
+            );
+        }
     }
 
     /// Isolated tasks that are ready together run concurrently, each in its own worktree.
@@ -809,6 +845,130 @@ workflow(type = "cascade", tasks = [discover, audit, roundup])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Git memory, per task: what a passing task did becomes a commit, and what a failing task
+    /// did is dropped. The second half is what needs proving. Leaving a failed task's edits in
+    /// the shared tree does not merely fail to commit them; the next task to pass sweeps them
+    /// into its own commit, and the failed task has contributed after all.
+    #[test]
+    fn a_passing_task_commits_and_a_failing_one_leaves_nothing_behind() {
+        let dir = std::env::temp_dir().join(format!("crucible-gitmem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        let fake = root.join("tools/fake-agent.py");
+
+        std::fs::write(
+            dir.join("agents.json"),
+            r#"{
+              "good":  {"writes": {"kept.txt": "survives\n"}, "result": {"ok": true}},
+              "bad":   {"writes": {"junk.txt": "must not survive\n"}, "exit": 1,
+                        "stderr": "wrote then failed"},
+              "after": {"writes": {"later.txt": "also survives\n"}, "result": {"ok": true}}
+            }"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            dir.join("workflow.star"),
+            r#"
+good = agent(name = "good", prompt = "p")
+bad = agent(name = "bad", prompt = "p", depends_on = [good], required = False)
+after = agent(name = "after", prompt = "p", depends_on = [good], join = "passed")
+workflow(type = "cascade", tasks = [good, bad, after])
+"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            dir.join("crucible.toml"),
+            format!(
+                r#"
+                [repo]
+                path = "."
+                [workspace]
+                dir = "workspace"
+                setup_cmd = "mkdir -p workspace && git -C workspace init -q && git -C workspace -c user.email=c@l -c user.name=c -c commit.gpgsign=false commit -q --allow-empty -m baseline"
+                [agent]
+                backend = "command"
+                agent_cmd = "python3 {}"
+                goal = "prove git memory"
+                [agent.env]
+                FAKE_AGENT_SCRIPT = "{}"
+                [workflow]
+                type = "cascade"
+                file = "workflow.star"
+                "#,
+                fake.display(),
+                dir.join("agents.json").display(),
+            ),
+        )
+        .unwrap();
+
+        let mut manifest = crate::manifest::Manifest::load(&dir.join("crucible.toml")).unwrap();
+        manifest.resolve_workflow(&dir).unwrap();
+        let workflow = manifest.workflow.as_ref().unwrap();
+        let plan = crate::loop_graph::iteration_template(
+            Some(workflow),
+            &crate::manifest::WorkflowCaps::for_lane(workflow.workflow_type),
+        )
+        .unwrap();
+        let mut runner = crate::run::prep_plan_runner(&dir.join("crucible.toml")).unwrap();
+        assert!(
+            runner.commit_per_task,
+            "a cascade manifest must turn per-task git memory on"
+        );
+        let out = execute(
+            &plan,
+            &Substrate::default(),
+            ExecCfg::default(),
+            &mut runner,
+            |_, _| {},
+        );
+
+        let workspace = dir.join("workspace");
+        assert_eq!(out.results[&"good".into()].status, TaskStatus::Pass);
+        assert_eq!(out.results[&"bad".into()].status, TaskStatus::Fail);
+        assert_eq!(out.results[&"after".into()].status, TaskStatus::Pass);
+
+        // What passed is on disk and in the history.
+        assert!(
+            workspace.join("kept.txt").exists(),
+            "a passing task's work vanished"
+        );
+        assert!(workspace.join("later.txt").exists());
+        // What failed is gone from both, even though a later task passed and committed after it.
+        assert!(
+            !workspace.join("junk.txt").exists(),
+            "a failed task's file survived in the tree"
+        );
+
+        let log = std::process::Command::new("git")
+            .args(["-C", &workspace.display().to_string(), "log", "--oneline"])
+            .output()
+            .expect("git log");
+        let log = String::from_utf8_lossy(&log.stdout);
+        assert!(
+            log.contains("task good"),
+            "no commit for the passing task: {log}"
+        );
+        assert!(log.contains("task after"), "{log}");
+        assert!(!log.contains("task bad"), "a failed task committed: {log}");
+
+        let tracked = std::process::Command::new("git")
+            .args(["-C", &workspace.display().to_string(), "ls-files"])
+            .output()
+            .expect("git ls-files");
+        let tracked = String::from_utf8_lossy(&tracked.stdout);
+        assert!(
+            !tracked.contains("junk.txt"),
+            "a failed task's file reached the index: {tracked}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_turn_that_writes_no_result_fails_but_still_advances_the_session() {
         let dir = std::env::temp_dir().join(format!(
@@ -1124,6 +1284,7 @@ workflow(type = "cascade", tasks = [discover, audit, roundup])
                 &std::env::temp_dir(),
                 None,
             ),
+            commit_per_task: false,
         };
         let a = runner.run(&t, 1, &BTreeMap::new());
         match a.outcome {

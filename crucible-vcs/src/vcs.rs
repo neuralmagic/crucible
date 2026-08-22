@@ -157,7 +157,7 @@ pub(crate) fn reset_to(ws: &Path, sha: &str) -> Result<()> {
 }
 
 /// The current `HEAD` commit sha (the snapshot token when nothing changed to commit).
-pub(crate) fn head_sha(ws: &Path) -> Result<String> {
+pub fn head_sha(ws: &Path) -> Result<String> {
     let repo = Repository::open(ws).context("open workspace repo")?;
     let commit = repo
         .head()

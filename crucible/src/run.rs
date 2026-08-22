@@ -393,7 +393,17 @@ pub(crate) fn prep_plan_runner(
     apply_agent_cfg(&mut args, &m.agent, &p.workspace)?;
     args.workflow_frozen_injects = m.frozen_inject_pairs(&manifest_dir);
     args.workflow_toolbox_exclude = m.agent.toolbox_exclude.clone();
-    Ok(crate::plan::harness::HarnessRunner { args, paths: p })
+    // A cascade's git memory is per task; the scored loop owns the same repository for
+    // keep/discard of whole candidates and must not find per-task commits inside an iteration.
+    let commit_per_task = m
+        .workflow
+        .as_ref()
+        .is_some_and(|w| w.workflow_type == manifest::WorkflowType::Cascade);
+    Ok(crate::plan::harness::HarnessRunner {
+        args,
+        paths: p,
+        commit_per_task,
+    })
 }
 
 /// Load a `crucible.toml`, build the World + Judge from it, and drive the loop. The one run

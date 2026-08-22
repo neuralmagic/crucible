@@ -113,6 +113,7 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
         workflow_runner: crate::plan::harness::HarnessRunner {
             args: cx.args.clone(),
             paths: cx.p.clone(),
+            commit_per_task: false,
         },
     };
     // The runner and the on_result hook both need the reporter; collect the wire lines
@@ -355,6 +356,7 @@ pub(crate) fn run_epilogue<R: Reporter>(
         inner: crate::plan::harness::HarnessRunner {
             args: args.clone(),
             paths: p.clone(),
+            commit_per_task: false,
         },
         kept: kept.to_value(),
     };

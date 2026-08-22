@@ -65,6 +65,11 @@ pub trait TaskRunner {
     /// batches tasks that are simultaneously ready, so items never depend on each other.
     /// The default runs them serially through [`TaskRunner::run`]; a runner that can
     /// parallelize (per-task worktrees) overrides this.
+    /// Called once per task after it settles, with whether it passed. A runner that owns
+    /// durable state records what a passing task did and drops what a failing one did; the
+    /// default keeps nothing, which is what a stateless runner wants.
+    fn settled(&mut self, _task: &Task, _passed: bool) {}
+
     fn run_many(&mut self, batch: &[BatchItem<'_>]) -> Vec<Attempt> {
         batch
             .iter()
@@ -415,6 +420,7 @@ pub fn execute(
                     // rather than one row standing for all of them.
                     let mut settled: Vec<(String, TaskResult)> = Vec::new();
                     for ((task, result), key) in batch_results.into_iter().zip(&keys) {
+                        runner.settled(task, result.status == TaskStatus::Pass);
                         settled.push((key.clone(), result.clone()));
                         record(task, result, &mut results, &mut halted, false);
                     }
@@ -442,6 +448,7 @@ pub fn execute(
             if budget_exceeded {
                 halted = Some(PlanExit::BudgetExceeded);
             }
+            runner.settled(t, result.status == TaskStatus::Pass);
             record(t, result, &mut results, &mut halted, true);
         } else {
             // A concurrent batch of independent isolated tasks; results are recorded in
@@ -461,6 +468,7 @@ pub fn execute(
                 halted = Some(PlanExit::BudgetExceeded);
             }
             for (t, result) in batch_results {
+                runner.settled(t, result.status == TaskStatus::Pass);
                 record(t, result, &mut results, &mut halted, true);
             }
         }
