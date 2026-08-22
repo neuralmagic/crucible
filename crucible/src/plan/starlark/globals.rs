@@ -237,6 +237,20 @@ fn located(at: &FileSpan, error: dsl::CompileError) -> dsl::CompileError {
 /// A starlark argument as the constructor tables see it. Anything outside the DSL's own value
 /// space becomes [`dsl::Value::Opaque`], which every `take_*` helper reports as a wrong type.
 fn convert(value: Value<'_>) -> dsl::Result<dsl::Value> {
+    convert_at(value, 0)
+}
+
+/// Marshal one argument, refusing a value nested deeper than a source is allowed to nest.
+///
+/// A loop can build a value far deeper than any literal: `for i in range(3000): x = [x]` is four
+/// shallow lines. Both this and [`alloc`] recurse once per level, so an unbounded value
+/// overflows the native stack and aborts the process while every declared budget is still
+/// satisfied. A value deeper than [`dsl::MAX_NESTING_DEPTH`] has no legitimate origin, since a
+/// source may not nest that far either.
+fn convert_at(value: Value<'_>, depth: usize) -> dsl::Result<dsl::Value> {
+    if depth > dsl::MAX_NESTING_DEPTH {
+        return Err(dsl::CompileError::ValueTooDeep { depth });
+    }
     if value.is_none() {
         return Ok(dsl::Value::None);
     }
@@ -258,14 +272,14 @@ fn convert(value: Value<'_>) -> dsl::Result<dsl::Value> {
     if let Some(list) = ListRef::from_value(value) {
         return list
             .iter()
-            .map(convert)
+            .map(|item| convert_at(item, depth + 1))
             .collect::<dsl::Result<Vec<_>>>()
             .map(dsl::Value::List);
     }
     if let Some(tuple) = TupleRef::from_value(value) {
         return tuple
             .iter()
-            .map(convert)
+            .map(|item| convert_at(item, depth + 1))
             .collect::<dsl::Result<Vec<_>>>()
             .map(dsl::Value::List);
     }
@@ -282,6 +296,16 @@ fn convert(value: Value<'_>) -> dsl::Result<dsl::Value> {
 }
 
 fn alloc<'v>(heap: Heap<'v>, value: dsl::Value) -> Value<'v> {
+    alloc_at(heap, value, 0)
+}
+
+/// The mirror of [`convert_at`]. A value that reached the tables is already bounded, so a level
+/// past the bound means the tables themselves built one and the list is truncated rather than
+/// the process aborted.
+fn alloc_at<'v>(heap: Heap<'v>, value: dsl::Value, depth: usize) -> Value<'v> {
+    if depth > dsl::MAX_NESTING_DEPTH {
+        return Value::new_none();
+    }
     match value {
         dsl::Value::None | dsl::Value::Opaque => Value::new_none(),
         dsl::Value::Bool(boolean) => Value::new_bool(boolean),
@@ -289,7 +313,10 @@ fn alloc<'v>(heap: Heap<'v>, value: dsl::Value) -> Value<'v> {
         dsl::Value::Float(float) => heap.alloc(float),
         dsl::Value::String(text) => heap.alloc(text),
         dsl::Value::List(items) => {
-            let items: Vec<Value<'v>> = items.into_iter().map(|item| alloc(heap, item)).collect();
+            let items: Vec<Value<'v>> = items
+                .into_iter()
+                .map(|item| alloc_at(heap, item, depth + 1))
+                .collect();
             heap.alloc(AllocList(items))
         }
         dsl::Value::Task(task) => heap.alloc(TaskValue(task)),

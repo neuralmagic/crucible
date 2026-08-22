@@ -190,6 +190,17 @@ impl CompileContext {
         let (relative, canonical) = self
             .resolve_in_pack(raw, PathKind::Prompt)
             .map_err(|rejection| rejection.prompt(raw))?;
+        // Size comes from the directory entry, before the bytes are read. Reading a file whole
+        // and refusing it afterwards is the read the limit exists to prevent.
+        let declared = std::fs::metadata(&canonical)
+            .map_err(FileError::at("reading prompt file", &canonical))?
+            .len();
+        if declared > MAX_PROMPT_BYTES as u64 {
+            return Err(CompileError::PromptTooLarge {
+                raw: raw.to_owned(),
+                bytes: declared as usize,
+            });
+        }
         let bytes =
             std::fs::read(&canonical).map_err(FileError::at("reading prompt file", &canonical))?;
         if bytes.len() > MAX_PROMPT_BYTES {
@@ -362,8 +373,27 @@ pub enum CompileError {
     #[error("prompt_file path may not contain `..` or escape the pack")]
     PromptPathTraversal,
 
+    #[error(
+        "an argument nests {depth} levels deep; maximum is {MAX_NESTING_DEPTH}. A loop can build \
+         a value deeper than a source may be written."
+    )]
+    ValueTooDeep { depth: usize },
+    #[error(
+        "{path}:{line}: nests {depth} levels deep; maximum is {MAX_NESTING_DEPTH}. A source this \
+         nested overflows the parser before any budget applies."
+    )]
+    SourceTooDeep {
+        depth: usize,
+        line: usize,
+        path: String,
+    },
     #[error("workflow source is {bytes} bytes; maximum is {MAX_SOURCE_BYTES}")]
     SourceTooLarge { bytes: usize },
+    #[error(
+        "the workflow evaluator panicked: {detail}. This is a defect in the evaluator, not in \
+         the workflow, but the workflow is what reached it."
+    )]
+    EvalPanic { detail: String },
     #[error("workflow evaluation failed: {0}")]
     Eval(String),
     #[error("workflow evaluation called fail(): {0}")]
@@ -1294,12 +1324,41 @@ pub fn materialize_sibling_manifest(
         .transpose()
 }
 
+/// Stack for the compile thread.
+///
+/// Two recursions are not bounded by anything the compiler can check first. Dropping a value the
+/// evaluator built recurses once per level, and a loop can nest a value as deep as it has ticks
+/// to spend: `for i in range(n): x = [x]` costs a handful of ticks per level, so
+/// [`MAX_EVAL_TICKS`] is what bounds the depth, and the stack has to cover that bound. Measured
+/// at roughly 1.3KB per level, 100k levels needs ~130MB. This is virtual, committed only if
+/// touched, so an ordinary compile pays nothing for it.
+const COMPILE_STACK_BYTES: usize = 256 * 1024 * 1024;
+
+/// Compile a source on a stack large enough for the depths the evaluator's own budgets permit.
+///
+/// The thread is the answer to recursion the compiler cannot refuse in advance. Where it can
+/// refuse in advance it does: [`reject_deep_nesting`] bounds the parser, because a 256KB source
+/// can nest further than any stack would cover.
 pub fn compile_source(source: &str, filename: &Path, pack_dir: &Path) -> Result<CompiledWorkflow> {
+    std::thread::scope(|scope| {
+        let handle = std::thread::Builder::new()
+            .stack_size(COMPILE_STACK_BYTES)
+            .name("crucible-compile".to_string())
+            .spawn_scoped(scope, || compile_source_here(source, filename, pack_dir))
+            .map_err(|error| CompileError::Eval(format!("spawning the compile thread: {error}")))?;
+        handle.join().map_err(|_| CompileError::EvalPanic {
+            detail: "the compile thread died".to_owned(),
+        })?
+    })
+}
+
+fn compile_source_here(source: &str, filename: &Path, pack_dir: &Path) -> Result<CompiledWorkflow> {
     if source.len() > MAX_SOURCE_BYTES {
         return Err(CompileError::SourceTooLarge {
             bytes: source.len(),
         });
     }
+    reject_deep_nesting(source, filename)?;
     let ast = AstModule::parse(
         &filename.display().to_string(),
         source.to_owned(),
@@ -1311,22 +1370,24 @@ pub fn compile_source(source: &str, filename: &Path, pack_dir: &Path) -> Result<
     let globals = lane_globals(lane);
     let state = CompileState::new(pack_dir, filename);
     let loader = loader::resolve(&ast, &state, &globals, source.len(), lane)?;
-    let workflow = Module::with_temp_heap(|module| -> Result<WorkflowCfg> {
-        let mut eval = Evaluator::new(&module);
-        eval.extra = Some(&state);
-        eval.set_loader(&loader);
-        budgets(&mut eval)?;
-        match eval.eval_module(ast, &globals) {
-            Ok(value) => match WorkflowValue::from_value(value) {
-                Some(workflow) => Ok(workflow.0.clone()),
-                None => Err(CompileError::NoWorkflowResult),
-            },
-            Err(error) => Err(state
-                .take_thrown()
-                .map(|thrown| idents::narrow(thrown, &idents))
-                .unwrap_or_else(|| idents::map_error(&error, &idents))),
-        }
-    })?;
+    let workflow = catching_panics(|| {
+        Module::with_temp_heap(|module| -> Result<WorkflowCfg> {
+            let mut eval = Evaluator::new(&module);
+            eval.extra = Some(&state);
+            eval.set_loader(&loader);
+            budgets(&mut eval)?;
+            match eval.eval_module(ast, &globals) {
+                Ok(value) => match WorkflowValue::from_value(value) {
+                    Some(workflow) => Ok(workflow.0.clone()),
+                    None => Err(CompileError::NoWorkflowResult),
+                },
+                Err(error) => Err(state
+                    .take_thrown()
+                    .map(|thrown| idents::narrow(thrown, &idents))
+                    .unwrap_or_else(|| idents::map_error(&error, &idents))),
+            }
+        })
+    })??;
     let context = state.into_context();
     let included: BTreeSet<&str> = workflow.tasks.iter().map(|t| t.name.0.as_str()).collect();
     let dropped: Vec<String> = context
@@ -1377,6 +1438,152 @@ fn budgets(eval: &mut Evaluator<'_, '_, '_>) -> Result<()> {
 /// `def`, `if`, `for`, and comprehensions at any level; `load()` resolved by
 /// [`loader`] against the pack. Re-export is off, so a symbol a library loads does not
 /// leak through it, and types stay disabled.
+/// How deep a source may nest before it is refused, counted before parsing.
+///
+/// `AstModule::parse` recurses on the shape of an expression and has no bound of its own, so a
+/// few hundred levels overflow the native stack and abort the process. That happens before any
+/// evaluation budget exists, and an abort bypasses the channel that turns a bad pack into a
+/// recoverable round. Measured, a debug build dies between 200 and 400 levels on every nesting
+/// shape the grammar has; this leaves better than a factor of two.
+pub(crate) const MAX_NESTING_DEPTH: usize = 128;
+
+/// Refuse a source whose shape could overflow the parser, without parsing it.
+///
+/// The measure is deliberately an over-approximation of the AST depth the parser will build:
+/// bracket nesting at the point of measurement, plus every operator in the statement, since an
+/// operator chain nests one level per operator whether or not it carries brackets
+/// (`not not not x`, `1 + 1 + 1`, `1 if c else 1 if c else 1` all recurse and none of them
+/// bracket). Over-counting only refuses sources no author writes: a real statement is a handful
+/// of operators inside two or three brackets.
+pub(crate) fn reject_deep_nesting(source: &str, filename: &Path) -> Result<()> {
+    let mut depth: usize = 0;
+    let mut operators: usize = 0;
+    let mut line: usize = 1;
+    let mut worst: usize = 0;
+    let mut worst_line: usize = 1;
+
+    let bytes: Vec<char> = source.chars().collect();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match c {
+            '\n' => {
+                line += 1;
+                // A statement ends at a newline outside brackets and outside a continuation,
+                // and its operator count starts again. Nesting across statements is bounded by
+                // the dialect's own indentation limit, which already refuses cleanly.
+                if depth == 0 && !(i > 0 && bytes[i - 1] == '\\') {
+                    operators = 0;
+                }
+                i += 1;
+            }
+            '#' => {
+                while i < bytes.len() && bytes[i] != '\n' {
+                    i += 1;
+                }
+            }
+            '"' | '\'' => {
+                let quote = c;
+                let triple = bytes.get(i + 1) == Some(&quote) && bytes.get(i + 2) == Some(&quote);
+                i += if triple { 3 } else { 1 };
+                while let Some(&ch) = bytes.get(i) {
+                    if ch == '\\' {
+                        if bytes.get(i + 1) == Some(&'\n') {
+                            line += 1;
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    if ch == '\n' {
+                        line += 1;
+                        // An unterminated single-quoted string is the parser's error to
+                        // report, not ours; stop consuming so the line count stays honest.
+                        if !triple {
+                            break;
+                        }
+                    }
+                    if ch == quote {
+                        if !triple {
+                            i += 1;
+                            break;
+                        }
+                        if bytes.get(i + 1) == Some(&quote) && bytes.get(i + 2) == Some(&quote) {
+                            i += 3;
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+            }
+            '(' | '[' | '{' => {
+                depth += 1;
+                i += 1;
+            }
+            ')' | ']' | '}' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            '+' | '-' | '*' | '/' | '%' | '<' | '>' | '=' | '!' | '|' | '&' | '^' | '~' | '.' => {
+                // `=` counts only as part of a comparison: a kwarg or an assignment builds no
+                // expression node, and counting it would punish a wide constructor call.
+                let comparison = c != '=' || bytes.get(i + 1) == Some(&'=');
+                let assignment_target =
+                    c == '=' && i > 0 && !matches!(bytes[i - 1], '=' | '<' | '>' | '!');
+                if comparison || !assignment_target {
+                    operators += 1;
+                }
+                i += 1;
+            }
+            _ if c.is_alphabetic() || c == '_' => {
+                let start = i;
+                while i < bytes.len() && (bytes[i].is_alphanumeric() || bytes[i] == '_') {
+                    i += 1;
+                }
+                let word: String = bytes[start..i].iter().collect();
+                if matches!(word.as_str(), "not" | "and" | "or" | "if" | "else" | "in") {
+                    operators += 1;
+                }
+            }
+            _ => i += 1,
+        }
+        let here = depth + operators;
+        if here > worst {
+            worst = here;
+            worst_line = line;
+        }
+        if here > MAX_NESTING_DEPTH {
+            return Err(CompileError::SourceTooDeep {
+                depth: here,
+                line: worst_line,
+                path: filename.display().to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Run the evaluator with a panic caught and turned into a compile error.
+///
+/// The evaluator is a boundary around untrusted input, so a panic behind it has to arrive as a
+/// diagnostic rather than as a dead process: `scope` turns a compile error into a recoverable
+/// round and has nothing to do with a corpse. One panic is reachable from four tokens of
+/// starlark (`"abcd" * 2000000000` asserts on a length that does not fit a `u32`, before it
+/// allocates anything), and the existence of one says nothing useful about the number of others.
+///
+/// A caught panic abandons the whole compile, so no partially-mutated state is read afterwards
+/// and the unwind-safety assertion holds. A stack overflow is not caught here because it does
+/// not unwind, which is why depth is bounded before parsing instead.
+fn catching_panics<T>(evaluate: impl FnOnce() -> T) -> Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(evaluate)).map_err(|payload| {
+        let detail = payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_owned())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "a panic with no message".to_owned());
+        CompileError::EvalPanic { detail }
+    })
+}
+
 /// The globals one lane sees. The scored constructors are not merely refused for a cascade,
 /// they are absent, so `measure` in a cascade is an unknown name rather than a name that
 /// compiles and fails validation later.
@@ -2294,6 +2501,114 @@ workflow(branches + [curate])
 
     /// The lane owns the namespace. A cascade cannot name a scored constructor, and the
     /// did-you-mean never offers one, so the author is not sent toward a name the lane refuses.
+    /// Every source here aborted the engine process before it was bounded, and each is a
+    /// different way in: parse-time nesting through five grammar shapes, a value nested by a
+    /// loop rather than written, and a load graph that walked past its own budget.
+    ///
+    /// They run in-process on purpose. An abort takes the test runner with it, so a regression
+    /// here is a failed assertion rather than a suite that stops reporting.
+    #[test]
+    fn a_hostile_pack_is_refused_rather_than_aborting_the_process() {
+        let pack = temp_pack("hostile");
+        let deep = |open: &str, close: &str, n: usize| {
+            format!("x = {}{}\nworkflow([])\n", open.repeat(n), close.repeat(n))
+        };
+        let cases: Vec<(&str, String)> = vec![
+            ("list nesting", deep("[", "]", 3000)),
+            ("paren nesting", deep("(", ")", 3000)),
+            ("dict nesting", deep("{'k': ", "}", 3000)),
+            (
+                "call nesting",
+                format!(
+                    "x = {}\"\"{}\nworkflow([])\n",
+                    "len(".repeat(3000),
+                    ")".repeat(3000)
+                ),
+            ),
+            (
+                "unary chain",
+                format!("x = {}True\nworkflow([])\n", "not ".repeat(3000)),
+            ),
+            (
+                "binary chain",
+                format!(
+                    "x = {}\nworkflow([])\n",
+                    std::iter::repeat_n("1", 3000).collect::<Vec<_>>().join("+")
+                ),
+            ),
+            (
+                "ternary chain",
+                format!("x = {}1\nworkflow([])\n", "1 if True else ".repeat(3000)),
+            ),
+            (
+                // Four shallow lines that build a value no literal is allowed to express. The
+                // parse guard cannot see this one: the source is trivial.
+                "value nested by a loop",
+                "x = [1]\nfor i in range(3000):\n    x = [x]\ncommand(name = \"a\", run = \"true\", emits = x)\nworkflow([])\n"
+                    .to_string(),
+            ),
+            (
+                "nesting inside a constructor argument",
+                format!(
+                    "command(name = \"a\", run = \"true\", emits = {}{})\nworkflow([])\n",
+                    "[".repeat(3000),
+                    "]".repeat(3000)
+                ),
+            ),
+        ];
+        for (what, source) in cases {
+            let error = compile_source(&source, &pack.join("workflow.star"), &pack)
+                .err()
+                .unwrap_or_else(|| panic!("{what}: compiled instead of being refused"));
+            let report = crate::errors::report(&error);
+            assert!(
+                report.contains("levels deep") && report.contains("maximum is"),
+                "{what}: refused for the wrong reason: {report}"
+            );
+            assert!(
+                report.contains("128"),
+                "{what}: the bound is not named: {report}"
+            );
+        }
+
+        // A chain of loads walks past the module budget one level at a time; the budget has to
+        // be spent on the way down, not counted on the way back up.
+        std::fs::create_dir_all(pack.join("chain")).unwrap();
+        for i in 0..200 {
+            let body = if i == 199 {
+                "v = 1\n".to_string()
+            } else {
+                format!("load(\"chain/m{}.star\", \"v\")\n", i + 1)
+            };
+            std::fs::write(pack.join(format!("chain/m{i}.star")), body).unwrap();
+        }
+        let chained = "load(\"chain/m0.star\", \"v\")\nworkflow([])\n";
+        let error = crate::errors::report(
+            &compile_source(chained, &pack.join("workflow.star"), &pack).unwrap_err(),
+        );
+        assert!(
+            error.contains("loads more than"),
+            "a load chain outran its budget: {error}"
+        );
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// A panic behind the evaluator has to arrive as a diagnostic. One is reachable from four
+    /// tokens of starlark (`"abcd" * 2000000000` asserts on a length that will not fit a
+    /// `u32`), but that source spends a minute inside starlark before it gets there, so the
+    /// mechanism is pinned directly and the source is left to the corpus that runs out of band.
+    #[test]
+    fn a_panic_behind_the_evaluator_becomes_a_compile_error() {
+        let caught = catching_panics(|| panic!("len overflow"));
+        let report = crate::errors::report(&caught.expect_err("the panic escaped"));
+        assert!(report.contains("evaluator panicked"), "{report}");
+        assert!(report.contains("len overflow"), "{report}");
+
+        let fine = catching_panics(|| 7).expect("a value must pass straight through");
+        assert_eq!(fine, 7);
+    }
+
     #[test]
     fn a_cascade_cannot_see_the_scored_constructors() {
         let pack = temp_pack("lane-scope");
