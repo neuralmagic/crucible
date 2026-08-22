@@ -396,10 +396,12 @@ pub struct Gateway {
     channel: Channel,
 }
 
-/// The tail of a completed sandbox exec: the command's stderr, replayed as lines after the
-/// agent exits (the exit code is not surfaced, matching the old CLI-child path).
+/// The tail of a completed sandbox exec: the command's stderr, replayed as lines after the agent
+/// exits, plus its exit status. `None` when the stream ended without one (cancelled, or a
+/// transport error), which is not the same as a clean exit.
 pub struct ExecResult {
     pub stderr_lines: Vec<String>,
+    pub exit_code: Option<i32>,
 }
 
 impl Gateway {
@@ -1008,6 +1010,7 @@ impl Gateway {
         let mut stdout = LineSplitter::default();
         let mut stderr = LineSplitter::default();
         let mut stderr_lines: Vec<String> = Vec::new();
+        let mut exit_code: Option<i32> = None;
         loop {
             tokio::select! {
                 // `biased`: poll the stream arm first so a final output line that is already
@@ -1022,7 +1025,8 @@ impl Gateway {
                         Some(ExecPayload::Stderr(err)) => {
                             stderr.push(&err.data, |line| stderr_lines.push(line.to_string()));
                         }
-                        Some(ExecPayload::Exit(_)) | None => {}
+                        Some(ExecPayload::Exit(e)) => exit_code = Some(e.exit_code),
+                        None => {}
                     },
                     Ok(None) => break,     // stream ended cleanly
                     Err(_status) => break, // transport/RPC error, end the pump
@@ -1035,7 +1039,10 @@ impl Gateway {
         // Flush any trailing (unterminated) partial lines.
         stdout.finish(&mut on_stdout_line);
         stderr.finish(|line| stderr_lines.push(line.to_string()));
-        Ok(ExecResult { stderr_lines })
+        Ok(ExecResult {
+            stderr_lines,
+            exit_code,
+        })
     }
 }
 
