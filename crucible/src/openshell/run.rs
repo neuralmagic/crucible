@@ -28,6 +28,12 @@ pub enum OpenshellCliError {
     Cancelled { label: String },
     #[error("openshell {label} failed: {stderr}")]
     Failed { label: String, stderr: String },
+    #[error(
+        "the agent exited {code} without producing a verdict; its stderr is replayed above (the \
+         sandbox wrapper cds, sources the env script, then redirects the prompt, so a non-zero \
+         exit can mean any of those failed before the agent ran)"
+    )]
+    AgentExit { code: i32 },
     #[error("private session locator is outside Claude's pinned config directory")]
     LocatorOutsideConfigDir,
     #[error("Claude transcript path does not match the admitted session id")]
@@ -730,6 +736,7 @@ async fn exec_and_stream(
         })
         .await?;
     let (mut cost, best_tokens) = pump.finish();
+    let exit_code = exec.exit_code;
 
     if cost == 0.0
         && let Some(t) = &best_tokens
@@ -747,6 +754,14 @@ async fn exec_and_stream(
             };
             sink(&line, RawStream::Stderr, Some(&ev));
         }
+    }
+    // The wrapper `cd`s, sources the env script, then redirects the prompt into the agent. Any of
+    // those failing exits non-zero having written nothing to stdout, which is indistinguishable
+    // from a turn that ran and produced no verdict unless the status is checked.
+    if let Some(code) = exit_code
+        && code != 0
+    {
+        return Err(OpenshellCliError::AgentExit { code }.into());
     }
     Ok(cost)
 }
@@ -1166,6 +1181,22 @@ async fn write_temp(tag: &str, content: &str) -> Result<tempfile::NamedTempFile>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A non-zero agent exit names the code and says the wrapper may have failed before the agent
+    /// ran, rather than being reported as a turn that produced no verdict.
+    #[test]
+    fn a_non_zero_agent_exit_is_its_own_error() {
+        let e = OpenshellCliError::AgentExit { code: 127 };
+        let msg = e.to_string();
+        assert!(
+            msg.contains("127"),
+            "the exit code must reach the operator: {msg}"
+        );
+        assert!(
+            msg.contains("without producing a verdict"),
+            "must distinguish itself from a parse failure: {msg}"
+        );
+    }
 
     /// The locator's glob reaches each harness's transcript at its real depth: claude one segment
     /// below the projects root, codex three below the sessions root.
