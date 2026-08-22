@@ -21,22 +21,22 @@ The material is already there: idents::scan walks every Expr::Call(function, arg
 
 [[content.acceptance_criteria]]
 text = "an unknown-kwarg error points at the offending argument's own span, not the enclosing call"
-status = "pending"
+status = "done"
 category = "fixed"
 
 [[content.acceptance_criteria]]
 text = "a session error naming an unknown session points at the session argument"
-status = "pending"
+status = "done"
 category = "fixed"
 
 [[content.acceptance_criteria]]
 text = "a typo'd call to a user-defined def helper suggests from the source's own bindings instead of reporting an unknown DSL function with no suggestion"
-status = "pending"
+status = "done"
 category = "fixed"
 
 [[content.acceptance_criteria]]
 text = "the span assertions use a multi-line source and assert line and column, so an argument span and a whole-call span are distinguishable and this cannot silently regress again"
-status = "pending"
+status = "done"
 category = "chore"
 
 [verification]

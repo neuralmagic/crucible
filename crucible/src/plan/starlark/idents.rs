@@ -5,21 +5,36 @@
 //! DSL constructor or a variable. Reading the callee names out of the AST answers that, and the
 //! module's bindings feed the did-you-mean.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
+use starlark_syntax::codemap::CodeMap;
+use starlark_syntax::codemap::FileSpan;
 use starlark_syntax::syntax::AstModule;
 use starlark_syntax::syntax::ast::{ArgumentP, AssignTarget, AstLiteral, AstNoPayload, Expr, Stmt};
+use starlark_syntax::syntax::module::AstModuleFields;
 use starlark_syntax::syntax::uniplate::Visit;
 
 use crate::manifest::WorkflowType;
 use crate::plan::diag;
 use crate::plan::starlark::{CompileError, dsl_functions};
 
+/// One call's named arguments, and where each was written.
+#[derive(Debug)]
+struct CallArgs {
+    call: FileSpan,
+    function: String,
+    named: BTreeMap<String, FileSpan>,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct Idents {
     callees: BTreeSet<String>,
     bindings: BTreeSet<String>,
     lane: WorkflowType,
+    /// The evaluator knows only the call site, so an unknown-kwarg error can point at the whole
+    /// call and nothing narrower. A multi-line `agent(...)` then underlines fourteen lines to
+    /// say one of them is misspelled. The AST knows where each argument was written.
+    calls: Vec<CallArgs>,
 }
 
 pub(crate) fn scan(module: &AstModule, lane: WorkflowType) -> Idents {
@@ -27,7 +42,11 @@ pub(crate) fn scan(module: &AstModule, lane: WorkflowType) -> Idents {
         lane,
         ..Idents::default()
     };
-    walk(Visit::Stmt(module.statement()), &mut idents);
+    walk(
+        Visit::Stmt(module.statement()),
+        module.codemap(),
+        &mut idents,
+    );
     idents
 }
 
@@ -60,7 +79,7 @@ fn find_lane<'a>(node: Visit<'a, AstNoPayload>, lane: &mut WorkflowType) {
     node.visit_children(|child| find_lane(child, lane));
 }
 
-fn walk<'a>(node: Visit<'a, AstNoPayload>, idents: &mut Idents) {
+fn walk<'a>(node: Visit<'a, AstNoPayload>, codemap: &CodeMap, idents: &mut Idents) {
     match &node {
         Visit::Stmt(statement) => match &statement.node {
             Stmt::Assign(assign) => {
@@ -79,17 +98,92 @@ fn walk<'a>(node: Visit<'a, AstNoPayload>, idents: &mut Idents) {
             _ => {}
         },
         Visit::Expr(expression) => {
-            if let Expr::Call(function, _) = &expression.node
+            if let Expr::Call(function, arguments) = &expression.node
                 && let Expr::Identifier(name) = &function.node
             {
                 idents.callees.insert(name.node.ident.clone());
+                let named: BTreeMap<String, FileSpan> = arguments
+                    .args
+                    .iter()
+                    .filter_map(|argument| match &argument.node {
+                        ArgumentP::Named(key, _) => {
+                            Some((key.node.clone(), codemap.file_span(argument.span)))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if !named.is_empty() {
+                    idents.calls.push(CallArgs {
+                        call: codemap.file_span(expression.span),
+                        function: name.node.ident.clone(),
+                        named,
+                    });
+                }
             }
         }
     }
-    node.visit_children(|child| walk(child, idents));
+    node.visit_children(|child| walk(child, codemap, idents));
+}
+
+/// Re-point a whole-call error at the argument it is actually about.
+///
+/// The evaluator throws with the call site, which is all it knows. This walks the AST's record
+/// of where each named argument was written and swaps in the narrower span, so a misspelled
+/// kwarg in a multi-line call underlines the kwarg rather than the call.
+pub(crate) fn narrow(error: CompileError, idents: &Idents) -> CompileError {
+    let CompileError::At { at, inner } = error else {
+        return error;
+    };
+    let (function, argument) = match inner.as_ref() {
+        CompileError::UnknownArgument {
+            function, argument, ..
+        } => (Some(function.as_str()), argument.as_str()),
+        // Both come from the `session =` argument of an agent or propose call, and `session`
+        // is a kwarg on nothing else, so the call site alone identifies it.
+        CompileError::UndeclaredSession { .. } | CompileError::SessionWrongType => {
+            (None, "session")
+        }
+        _ => {
+            return CompileError::At { at, inner };
+        }
+    };
+    match idents.argument_span(&at, function, argument) {
+        Some(narrower) => CompileError::At {
+            at: narrower,
+            inner,
+        },
+        None => CompileError::At { at, inner },
+    }
 }
 
 impl Idents {
+    /// The span of `argument` in the call the evaluator reported. Several calls to one
+    /// constructor can carry the same argument name, so the call site picks between them; a
+    /// call that cannot be identified falls back to the only unambiguous candidate, and to
+    /// nothing when there is more than one.
+    fn argument_span(
+        &self,
+        call: &FileSpan,
+        function: Option<&str>,
+        argument: &str,
+    ) -> Option<FileSpan> {
+        let candidates: Vec<&CallArgs> = self
+            .calls
+            .iter()
+            .filter(|c| function.is_none_or(|f| c.function == f))
+            .filter(|c| c.named.contains_key(argument))
+            .collect();
+        let containing = candidates.iter().find(|c| {
+            c.call.file.filename() == call.file.filename()
+                && c.call.span.begin() <= call.span.begin()
+                && c.call.span.end() >= call.span.end()
+        });
+        match containing.or(candidates.first().filter(|_| candidates.len() == 1)) {
+            Some(found) => found.named.get(argument).cloned(),
+            None => None,
+        }
+    }
+
     fn undefined(&self, name: &str) -> CompileError {
         if self.callees.contains(name) {
             let lane = dsl_functions(self.lane);

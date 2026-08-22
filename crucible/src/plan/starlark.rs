@@ -1323,6 +1323,7 @@ pub fn compile_source(source: &str, filename: &Path, pack_dir: &Path) -> Result<
             },
             Err(error) => Err(state
                 .take_thrown()
+                .map(|thrown| idents::narrow(thrown, &idents))
                 .unwrap_or_else(|| idents::map_error(&error, &idents))),
         }
     })?;
@@ -1798,6 +1799,62 @@ workflow(type = "custom", tasks = [score, strict, lossy], result = strict)
             .filter(|name| name.to_string_lossy().starts_with(".tmp"))
             .collect();
         assert!(strays.is_empty(), "left temp files: {strays:?}");
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// A misspelled kwarg must underline the kwarg, not the call it sits in.
+    ///
+    /// Every other span assertion in this file uses a single-line source, where an
+    /// argument span and a whole-call span are indistinguishable, which is how this
+    /// regressed unnoticed once already. The source here is deliberately multi-line and
+    /// the assertion is on the column as well as the line.
+    #[test]
+    fn an_unknown_kwarg_points_at_the_argument_not_the_whole_call() {
+        let pack = temp_pack("arg-span");
+        let source = "\ndraft = agent(\n    name = \"draft\",\n    prompt = \"write it\",\n    promt = \"typo\",\n)\nworkflow(type = \"cascade\", tasks = [draft])\n";
+        let error = crate::errors::report(
+            &compile_source(source, &pack.join("workflow.star"), &pack).unwrap_err(),
+        );
+        // `promt` is on line 5, indented four spaces.
+        assert!(
+            error.contains("workflow.star:5:5"),
+            "expected the argument's own span, got: {error}"
+        );
+        assert!(
+            !error.contains("workflow.star:2:"),
+            "the whole call was underlined instead of the argument: {error}"
+        );
+        assert!(error.contains("prompt"), "no suggestion: {error}");
+
+        // Two calls to one constructor with the same bad kwarg: the call site has to pick.
+        let twice = "\na = agent(\n    name = \"a\",\n    prompt = \"p\",\n)\nb = agent(\n    name = \"b\",\n    prompt = \"p\",\n    promt = \"typo\",\n)\nworkflow(type = \"cascade\", tasks = [a, b])\n";
+        let error = crate::errors::report(
+            &compile_source(twice, &pack.join("workflow.star"), &pack).unwrap_err(),
+        );
+        assert!(
+            error.contains("workflow.star:9:5"),
+            "the second call's argument, not the first call's: {error}"
+        );
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// A session error is about the `session =` argument, so it underlines that argument.
+    #[test]
+    fn an_undeclared_session_points_at_the_session_argument() {
+        let pack = temp_pack("session-span");
+        let source = "\nscribe = session(name = \"scribe\")\n\ndraft = agent(\n    name = \"draft\",\n    prompt = \"write it\",\n    session = \"scrib\",\n)\nworkflow(type = \"cascade\", tasks = [draft])\n";
+        let error = crate::errors::report(
+            &compile_source(source, &pack.join("workflow.star"), &pack).unwrap_err(),
+        );
+        assert!(
+            error.contains("workflow.star:7:5"),
+            "expected the session argument's own span, got: {error}"
+        );
+        assert!(
+            !error.contains("workflow.star:4:"),
+            "the whole call was underlined instead of the argument: {error}"
+        );
+        assert!(error.contains("scribe"), "no suggestion: {error}");
         let _ = std::fs::remove_dir_all(&pack);
     }
 

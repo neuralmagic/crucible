@@ -146,6 +146,7 @@ impl Resolver<'_, '_> {
                 eval.eval_module(ast, globals).map_err(|error| {
                     state
                         .take_thrown()
+                        .map(|thrown| dsl::idents::narrow(thrown, &idents))
                         .unwrap_or_else(|| dsl::idents::map_error(&error, &idents))
                 })?;
             }
