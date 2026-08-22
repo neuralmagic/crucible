@@ -1,6 +1,5 @@
 {
-  "type": "custom",
-  "result": "roundup",
+  "type": "cascade",
   "task": [
     {
       "name": "draft",

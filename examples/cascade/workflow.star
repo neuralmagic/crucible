@@ -1,5 +1,5 @@
-# A cascade: one pass, no score. `type = "custom"` is what the engine admits today; the
-# graph is already the cascade shape, so the lane costs this file one word.
+# A cascade: one pass, no score. No result task: the run's verdict is the graph's, not any
+# single task's.
 
 scribe = session(name = "scribe")
 
@@ -47,12 +47,11 @@ for topic, blocking in AUDITS:
 roundup = command(
     name = "roundup",
     run = "./roundup.sh",
-    depends_on = deps(auditors),
+    depends_on = auditors,
     join = "passed",
 )
 
 workflow(
-    type = "custom",
+    type = "cascade",
     tasks = [draft, shape, polish] + auditors + [roundup],
-    result = roundup,
 )

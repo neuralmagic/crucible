@@ -40,9 +40,11 @@ pub(crate) fn resolve<'a>(
     state: &'a dsl::CompileState,
     globals: &Globals,
     root_bytes: usize,
+    lane: crate::manifest::WorkflowType,
 ) -> dsl::Result<PackLoader<'a>> {
     let mut resolver = Resolver {
         state,
+        lane,
         globals,
         modules: HashMap::new(),
         by_path: HashMap::new(),
@@ -58,6 +60,7 @@ pub(crate) fn resolve<'a>(
 
 struct Resolver<'a, 'g> {
     state: &'a dsl::CompileState,
+    lane: crate::manifest::WorkflowType,
     globals: &'g Globals,
     modules: HashMap<String, FrozenModule>,
     /// Frozen modules by canonical path, so two spellings of one file are evaluated once.
@@ -127,7 +130,7 @@ impl Resolver<'_, '_> {
     /// Resolve the module's own loads, evaluate it, and freeze it.
     fn evaluate(&mut self, ast: AstModule) -> dsl::Result<FrozenModule> {
         self.resolve_all(&ast)?;
-        let idents = dsl::idents::scan(&ast);
+        let idents = dsl::idents::scan(&ast, self.lane);
         let loader = PackLoader {
             state: self.state,
             modules: self.modules.clone(),

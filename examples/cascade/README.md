@@ -1,7 +1,9 @@
 # cascade
 
 The litmus domain for one-shot, measurement-free workflows: a graph that runs once, keeps no
-score, and either reaches a valid verdict or does not.
+score, and either reaches a valid verdict or does not. The manifest declares
+`[workflow] type = "cascade"` and carries no `[judge]`, which is the whole of what the lane
+asks of an author.
 
 ```text
                                   ┌─> audit-headings  (isolated) ─┐
@@ -96,17 +98,16 @@ ledger, so `polish` reports `continued: false`. Isolation and durable sessions n
 
 ## Why it runs on the plan runner
 
-The cascade lane does not exist yet. A judge-free manifest rejects a `[workflow]` block today,
-so `crucible.toml` carries none and `plan.toml` is the executable form. When the lane lands,
-`workflow.star` becomes the authority: `type = "custom"` becomes `type = "cascade"`, the block
-materializes into the manifest, and `plan.toml` goes away. A test compiles `workflow.star`,
-checks it against the golden, and asserts its tasks equal `plan.toml`'s, so the two forms
-cannot drift in the meantime.
+The manifest is the cascade: `[workflow] type = "cascade"`, no `[judge]`, task tables generated
+from `workflow.star`. What it still lacks is the engine-side launch path, so `plan.toml` remains
+the executable form and `plan run` is what executes it. A test compiles `workflow.star`, checks
+it against the golden, and asserts its tasks equal `plan.toml`'s, so the two forms cannot drift.
 
 ## Limits
 
-- `plan run` gives no per-task wall time or token count; `cost_usd` is all it accounts.
-- A run's verdict is the plan runner's: every required task passed and the graph completed.
-  The cascade lane's own vocabulary — early completion, epilogue tasks, the shutdown outcome —
-  has nowhere to land here yet.
+- The executor takes a run-wide wall-clock ceiling, but there is no per-task deadline and no
+  token count; `cost_usd` is all it otherwise accounts.
+- A run's verdict is every required task passing and the graph completing, which is already
+  what the lane requires. Early completion, epilogue tasks, and the shutdown outcome have
+  nowhere to land until the engine-side launch path exists.
 - The stand-in auditors are regex-grade. They demonstrate the graph, not review quality.

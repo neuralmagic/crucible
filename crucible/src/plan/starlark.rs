@@ -419,8 +419,6 @@ pub enum CompileError {
     UnknownWorkflowType { got: String },
     #[error("workflow tasks must be a list of task constructor values")]
     TasksNotList,
-    #[error("deps() entries must be task constructor values")]
-    DepsEntryNotTask,
     #[error("{function} entries must be task constructor values")]
     TaskListEntryNotTask { function: String },
 
@@ -522,23 +520,38 @@ pub enum MaterializeError {
     Serialize(#[from] toml::ser::Error),
 }
 
-/// The callable DSL surface, for unknown-function suggestions.
-const DSL_FUNCTIONS: &[&str] = &[
+/// The constructors every lane has.
+const COMMON_FUNCTIONS: &[&str] = &[
     "agent",
-    "apply",
     "command",
-    "decide",
-    "default_autoresearch",
-    "deps",
     "evaluate",
-    "grade",
-    "measure",
     "prompt_file",
-    "propose",
     "session",
-    "top_k",
     "workflow",
 ];
+
+/// The scored loop's own constructors, absent from a cascade.
+const SCORED_FUNCTIONS: &[&str] = &[
+    "apply",
+    "decide",
+    "default_autoresearch",
+    "grade",
+    "measure",
+    "propose",
+    "top_k",
+];
+
+/// The callable surface of one lane, for unknown-function suggestions. A cascade author is
+/// never offered a constructor the lane would then refuse. Built from the two tables above so a
+/// constructor cannot be added to one and forgotten in the other.
+fn dsl_functions(lane: WorkflowType) -> Vec<&'static str> {
+    let mut names = COMMON_FUNCTIONS.to_vec();
+    if lane != WorkflowType::Cascade {
+        names.extend_from_slice(SCORED_FUNCTIONS);
+    }
+    names.sort_unstable();
+    names
+}
 
 /// Every kwarg a constructor accepts. Unknown-kwarg errors suggest from this table; a
 /// test compiles every listed kwarg per constructor so it cannot drift from the arms.
@@ -607,6 +620,7 @@ fn constructor(
         {
             "autoresearch" => WorkflowType::Autoresearch,
             "custom" => WorkflowType::Custom,
+            "cascade" => WorkflowType::Cascade,
             other => {
                 return Err(CompileError::UnknownWorkflowType {
                     got: other.to_owned(),
@@ -623,6 +637,8 @@ fn constructor(
             workflow_type,
             result,
             tasks,
+            file: None,
+            resolved_from: None,
         };
         workflow.validate()?;
         return Ok(Value::Workflow(workflow));
@@ -944,6 +960,8 @@ fn default_autoresearch(mut extras: Vec<Task>) -> Result<WorkflowCfg> {
         workflow_type: WorkflowType::Autoresearch,
         result: Some("decide".into()),
         tasks,
+        file: None,
+        resolved_from: None,
     };
     workflow.validate()?;
     Ok(workflow)
@@ -1288,10 +1306,11 @@ pub fn compile_source(source: &str, filename: &Path, pack_dir: &Path) -> Result<
         &dialect(),
     )
     .map_err(|error| CompileError::Parse(error.to_string()))?;
-    let idents = idents::scan(&ast);
-    let globals: Globals = GlobalsBuilder::standard().with(globals::builtins).build();
+    let lane = idents::declared_lane(&ast);
+    let idents = idents::scan(&ast, lane);
+    let globals = lane_globals(lane);
     let state = CompileState::new(pack_dir, filename);
-    let loader = loader::resolve(&ast, &state, &globals, source.len())?;
+    let loader = loader::resolve(&ast, &state, &globals, source.len(), lane)?;
     let workflow = Module::with_temp_heap(|module| -> Result<WorkflowCfg> {
         let mut eval = Evaluator::new(&module);
         eval.extra = Some(&state);
@@ -1357,6 +1376,17 @@ fn budgets(eval: &mut Evaluator<'_, '_, '_>) -> Result<()> {
 /// `def`, `if`, `for`, and comprehensions at any level; `load()` resolved by
 /// [`loader`] against the pack. Re-export is off, so a symbol a library loads does not
 /// leak through it, and types stay disabled.
+/// The globals one lane sees. The scored constructors are not merely refused for a cascade,
+/// they are absent, so `measure` in a cascade is an unknown name rather than a name that
+/// compiles and fails validation later.
+fn lane_globals(lane: WorkflowType) -> Globals {
+    let builder = GlobalsBuilder::standard().with(globals::common);
+    match lane {
+        WorkflowType::Cascade => builder.build(),
+        _ => builder.with(globals::scored).build(),
+    }
+}
+
 fn dialect() -> Dialect {
     Dialect {
         enable_top_level_stmt: true,
@@ -1402,7 +1432,7 @@ workflow(reviews + [
     command(
         name = "gate",
         run = "./join_gate.sh",
-        depends_on = deps(reviews),
+        depends_on = reviews,
         join = "passed",
     ),
 ])
@@ -2138,7 +2168,7 @@ for treatment in ["surreal", "minimal", "documentary"]:
 curate = command(
     name = "curate",
     run = "./curate.sh",
-    depends_on = deps(branches),
+    depends_on = branches,
     join = "passed",
 )
 workflow(branches + [curate])
@@ -2155,7 +2185,7 @@ branches = [
 curate = command(
     name = "curate",
     run = "./curate.sh",
-    depends_on = deps(branches),
+    depends_on = branches,
     join = "passed",
 )
 workflow(branches + [curate])
@@ -2173,7 +2203,7 @@ branches = [
 curate = command(
     name = "curate",
     run = "./curate.sh",
-    depends_on = deps(branches),
+    depends_on = branches,
     join = "passed",
 )
 workflow(branches + [curate])
@@ -2202,6 +2232,46 @@ workflow(branches + [curate])
             .map(|treatment| TaskName(format!("draft-{treatment}")))
             .collect();
         assert_eq!(curate.depends_on, expected);
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// The lane owns the namespace. A cascade cannot name a scored constructor, and the
+    /// did-you-mean never offers one, so the author is not sent toward a name the lane refuses.
+    #[test]
+    fn a_cascade_cannot_see_the_scored_constructors() {
+        let pack = temp_pack("lane-scope");
+        for scored in SCORED_FUNCTIONS {
+            let source = format!(
+                "t = command(name = \"t\", run = \"true\")\nx = {scored}(name = \"s\")\nworkflow(type = \"cascade\", tasks = [t])\n"
+            );
+            let error = crate::errors::report(
+                &compile_source(&source, &pack.join("workflow.star"), &pack).unwrap_err(),
+            );
+            assert!(
+                error.contains("unknown workflow DSL function") && error.contains(*scored),
+                "{scored}: {error}"
+            );
+        }
+
+        // The same source compiles once the lane is one that has the constructor.
+        let scored = "p = propose(name = \"p\")\na = apply(name = \"a\", depends_on = [p])\nm = measure(name = \"m\", depends_on = [a])\nd = decide(name = \"d\", measurement = m)\nworkflow(type = \"autoresearch\", tasks = [p, a, m, d], result = d)\n";
+        compile_source(scored, &pack.join("workflow.star"), &pack)
+            .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
+
+        // A near-miss in a cascade is corrected toward a cascade name, never a scored one.
+        let typo =
+            "t = commnd(name = \"t\", run = \"true\")\nworkflow(type = \"cascade\", tasks = [t])\n";
+        let error = crate::errors::report(
+            &compile_source(typo, &pack.join("workflow.star"), &pack).unwrap_err(),
+        );
+        assert!(error.contains("command"), "{error}");
+
+        // And a typo'd call to the source's own helper is corrected toward that helper.
+        let helper = "def auditor(topic):\n    return command(name = topic, run = \"true\")\nt = auditr(\"a\")\nworkflow(type = \"cascade\", tasks = [t])\n";
+        let error = crate::errors::report(
+            &compile_source(helper, &pack.join("workflow.star"), &pack).unwrap_err(),
+        );
+        assert!(error.contains("auditor"), "{error}");
         let _ = std::fs::remove_dir_all(&pack);
     }
 
@@ -2261,7 +2331,7 @@ workflow([])
         std::fs::create_dir_all(pack.join("lib")).unwrap();
         std::fs::write(
             pack.join("lib/gate.star"),
-            "def gate(name, sources):\n    return command(\n        name = name,\n        run = \"./gate.sh\",\n        depends_on = deps(sources),\n        join = \"passed\",\n    )\n",
+            "def gate(name, sources):\n    return command(\n        name = name,\n        run = \"./gate.sh\",\n        depends_on = sources,\n        join = \"passed\",\n    )\n",
         )
         .unwrap();
         std::fs::write(
@@ -2384,13 +2454,13 @@ workflow(reviews + [gate("gate", reviews)])
     /// standard plus the DSL, and nothing in it touches a process, a socket, a clock, or a PRNG.
     #[test]
     fn no_process_network_clock_or_randomness_is_reachable() {
-        let globals: Globals = GlobalsBuilder::standard().with(globals::builtins).build();
+        let globals = lane_globals(WorkflowType::Autoresearch);
         let names: BTreeSet<String> = globals
             .names()
             .map(|name| name.as_str().to_owned())
             .collect();
-        for function in DSL_FUNCTIONS {
-            assert!(names.contains(*function), "{function} is not callable");
+        for function in dsl_functions(WorkflowType::Autoresearch) {
+            assert!(names.contains(function), "{function} is not callable");
         }
         for forbidden in [
             "open",

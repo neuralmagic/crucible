@@ -20,10 +20,11 @@ use crate::plan::starlark as dsl;
 use crate::plan::starlark::values::{SessionValue, TaskValue, WorkflowValue};
 
 /// Constructors that historically took one positional argument. Everything else is named-only.
-const POSITIONAL: &[&str] = &["prompt_file", "deps", "workflow", "default_autoresearch"];
+const POSITIONAL: &[&str] = &["prompt_file", "workflow", "default_autoresearch"];
 
+/// The constructors every lane has.
 #[starlark_module]
-pub(crate) fn builtins(builder: &mut GlobalsBuilder) {
+pub(crate) fn common(builder: &mut GlobalsBuilder) {
     fn agent<'v>(
         #[starlark(args)] args: UnpackTuple<Value<'v>>,
         #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
@@ -32,20 +33,57 @@ pub(crate) fn builtins(builder: &mut GlobalsBuilder) {
         dispatch("agent", args, kwargs, eval)
     }
 
-    fn apply<'v>(
-        #[starlark(args)] args: UnpackTuple<Value<'v>>,
-        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
-        eval: &mut Evaluator<'v, '_, '_>,
-    ) -> starlark::Result<Value<'v>> {
-        dispatch("apply", args, kwargs, eval)
-    }
-
     fn command<'v>(
         #[starlark(args)] args: UnpackTuple<Value<'v>>,
         #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Value<'v>> {
         dispatch("command", args, kwargs, eval)
+    }
+
+    fn evaluate<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("evaluate", args, kwargs, eval)
+    }
+
+    fn prompt_file<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("prompt_file", args, kwargs, eval)
+    }
+
+    fn session<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("session", args, kwargs, eval)
+    }
+
+    fn workflow<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("workflow", args, kwargs, eval)
+    }
+}
+
+/// The scored loop's own constructors. A cascade never sees these, so a cascade author
+/// cannot name one and cannot be offered one by a did-you-mean.
+#[starlark_module]
+pub(crate) fn scored(builder: &mut GlobalsBuilder) {
+    fn apply<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("apply", args, kwargs, eval)
     }
 
     fn decide<'v>(
@@ -64,22 +102,6 @@ pub(crate) fn builtins(builder: &mut GlobalsBuilder) {
         dispatch("default_autoresearch", args, kwargs, eval)
     }
 
-    fn deps<'v>(
-        #[starlark(args)] args: UnpackTuple<Value<'v>>,
-        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
-        eval: &mut Evaluator<'v, '_, '_>,
-    ) -> starlark::Result<Value<'v>> {
-        dispatch("deps", args, kwargs, eval)
-    }
-
-    fn evaluate<'v>(
-        #[starlark(args)] args: UnpackTuple<Value<'v>>,
-        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
-        eval: &mut Evaluator<'v, '_, '_>,
-    ) -> starlark::Result<Value<'v>> {
-        dispatch("evaluate", args, kwargs, eval)
-    }
-
     fn grade<'v>(
         #[starlark(args)] args: UnpackTuple<Value<'v>>,
         #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
@@ -96,14 +118,6 @@ pub(crate) fn builtins(builder: &mut GlobalsBuilder) {
         dispatch("measure", args, kwargs, eval)
     }
 
-    fn prompt_file<'v>(
-        #[starlark(args)] args: UnpackTuple<Value<'v>>,
-        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
-        eval: &mut Evaluator<'v, '_, '_>,
-    ) -> starlark::Result<Value<'v>> {
-        dispatch("prompt_file", args, kwargs, eval)
-    }
-
     fn propose<'v>(
         #[starlark(args)] args: UnpackTuple<Value<'v>>,
         #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
@@ -112,28 +126,12 @@ pub(crate) fn builtins(builder: &mut GlobalsBuilder) {
         dispatch("propose", args, kwargs, eval)
     }
 
-    fn session<'v>(
-        #[starlark(args)] args: UnpackTuple<Value<'v>>,
-        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
-        eval: &mut Evaluator<'v, '_, '_>,
-    ) -> starlark::Result<Value<'v>> {
-        dispatch("session", args, kwargs, eval)
-    }
-
     fn top_k<'v>(
         #[starlark(args)] args: UnpackTuple<Value<'v>>,
         #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Value<'v>> {
         dispatch("top_k", args, kwargs, eval)
-    }
-
-    fn workflow<'v>(
-        #[starlark(args)] args: UnpackTuple<Value<'v>>,
-        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
-        eval: &mut Evaluator<'v, '_, '_>,
-    ) -> starlark::Result<Value<'v>> {
-        dispatch("workflow", args, kwargs, eval)
     }
 }
 
@@ -185,20 +183,14 @@ fn call<'v>(
                 .context_mut()
                 .prompt_file(&path)
                 .map(dsl::Value::String),
-            ("deps", dsl::Value::List(tasks)) => tasks
-                .into_iter()
-                .map(|task| match task {
-                    dsl::Value::Task(task) => Ok(dsl::Value::String(task.name.0)),
-                    _ => Err(dsl::CompileError::DepsEntryNotTask),
-                })
-                .collect::<dsl::Result<Vec<_>>>()
-                .map(dsl::Value::List),
             ("workflow", dsl::Value::List(tasks)) => {
                 let tasks = dsl::task_list("workflow", tasks)?;
                 let workflow = WorkflowCfg {
                     workflow_type: WorkflowType::Autoresearch,
                     result: None,
                     tasks,
+                    file: None,
+                    resolved_from: None,
                 };
                 workflow.validate()?;
                 Ok(dsl::Value::Workflow(workflow))

@@ -168,7 +168,7 @@ synthesize = agent(
     name = "synthesize",
     prompt = prompt_file("prompts/synthesize.md"),
     session = "solver",
-    depends_on = deps(critics),
+    depends_on = critics,
     join = "passed",
 )
 smoke = command(name = "smoke", run = "./smoke.sh", depends_on = [synthesize])
@@ -295,7 +295,7 @@ treatments = [
 curate = agent(
     name = "curate",
     prompt = prompt_file("prompts/curate.md"),
-    depends_on = deps(treatments),
+    depends_on = treatments,
     join = "passed",
 )
 publish = command(name = "contact-sheet", run = "./render.sh", depends_on = [curate])
@@ -312,8 +312,15 @@ workflow values are opaque and immutable, so they can be referenced directly in 
 `measurement`, and `result` without repeating names, and a library cannot mutate one after
 handing it back.
 
+The declared lane decides which constructors exist. Every lane has `agent`, `command`,
+`evaluate`, `session`, `prompt_file`, and `workflow`. `type = "autoresearch"` and
+`type = "custom"` add the scored loop's own: `propose`, `apply`, `measure`, `grade`, `decide`,
+`top_k`, and `default_autoresearch`. A cascade has none of those in scope at all, so naming one
+is an unknown-name error where it was written, and a did-you-mean never offers one.
+
 - `propose(...)`, `apply(...)`, `measure(...)`, `grade(...)`, and `decide(...)` create
   capability-owned engine tasks. `decide(measurement = score)` selects its measurement.
+  Scored lanes only.
 - `agent(...)` creates an agent task. `isolated = True` gives it a disposable worktree, ideal for
   concurrent read-only critics; leave it false for a synthesizer whose edits must survive.
   `session = "name"` opts into an engine-managed durable conversation.
@@ -321,8 +328,7 @@ handing it back.
   optional agent defaults, bindable as the `session =` value on `agent()` and `propose()`.
 - `command(...)` creates a deterministic shell task in the candidate workspace.
 - `evaluate(...)` creates a typed measurement command with optional threshold grading.
-- `top_k(...)` creates a reducer for wider authored graphs.
-- `deps(tasks)` returns constructor task names, avoiding repeated string wiring.
+- `top_k(...)` creates a reducer for wider authored graphs. Scored lanes only.
 - `prompt_file(path)` reads a regular UTF-8 file below the pack directory and embeds its contents
   in the generated manifest. Absolute paths, `..`, symlinks, non-files, and oversized inputs are
   rejected.
@@ -333,8 +339,28 @@ handing it back.
   `session()` declarations precede every root reference, and a task they construct at module level
   must still appear in `workflow(tasks = ...)`. Re-export is off, so a symbol a library loads is
   not visible through it.
-- `workflow(type = ..., tasks = ..., result = ...)` is the explicit final expression.
+- `workflow(type = ..., tasks = ..., result = ...)` is the explicit final expression. A list of
+  tasks is accepted anywhere a list of task names is, in `tasks` and in `depends_on` alike, so a
+  list never needs wrapping to be passed.
 - `default_autoresearch(extra_tasks)` expands the historical loop into fully visible nodes.
+  Scored lanes only.
+
+Five kwargs govern how a task runs and what its failure costs. They are independent, and this
+is the whole of it:
+
+| kwarg | values | what it decides |
+| --- | --- | --- |
+| `required` | `True` (default), `False` | whether this task's failure invalidates the run. An advisory task's failure blocks only its dependents. |
+| `join` | `"all"` (default), `"passed"` | what this task needs of its dependencies. `"all"` needs every one to have passed; `"passed"` runs on whatever survived. |
+| `isolated` | `False` (default), `True` | whether the task gets a disposable worktree. Today this is also what buys concurrency, because non-isolated peers would race on the shared result file. |
+| `needs` | `"any"` (default), a capability name | a capability the run must have before this task is dispatched. |
+| `stage` | `"iteration"` (default), `"epilogue"` | whether the task is in the main graph, or runs once after it settles. |
+
+`required = False` and `join = "all"` do not compose: a required task may not depend, through a
+path of `"all"`-join edges, on an advisory one. That graph says a failure is both tolerable and
+disqualifying, and no run of it yields an honest verdict. Validation rejects it before dispatch,
+naming both tasks. `join = "passed"` is the exemption, because it declares up front that the task
+runs on whatever survived.
 
 Agent tasks receive upstream results in their prompt and write one JSON object to
 `PLAN_TASK_RESULT.json`. Required failures discard the candidate; advisory tasks use

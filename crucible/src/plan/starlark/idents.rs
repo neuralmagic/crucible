@@ -8,22 +8,56 @@
 use std::collections::BTreeSet;
 
 use starlark_syntax::syntax::AstModule;
-use starlark_syntax::syntax::ast::{AssignTarget, AstNoPayload, Expr, Stmt};
+use starlark_syntax::syntax::ast::{ArgumentP, AssignTarget, AstLiteral, AstNoPayload, Expr, Stmt};
 use starlark_syntax::syntax::uniplate::Visit;
 
+use crate::manifest::WorkflowType;
 use crate::plan::diag;
-use crate::plan::starlark::{CompileError, DSL_FUNCTIONS};
+use crate::plan::starlark::{CompileError, dsl_functions};
 
 #[derive(Debug, Default)]
 pub(crate) struct Idents {
     callees: BTreeSet<String>,
     bindings: BTreeSet<String>,
+    lane: WorkflowType,
 }
 
-pub(crate) fn scan(module: &AstModule) -> Idents {
-    let mut idents = Idents::default();
+pub(crate) fn scan(module: &AstModule, lane: WorkflowType) -> Idents {
+    let mut idents = Idents {
+        lane,
+        ..Idents::default()
+    };
     walk(Visit::Stmt(module.statement()), &mut idents);
     idents
+}
+
+/// The lane a source declares, read from `workflow(type = ...)` before the source is evaluated.
+/// The lane decides which constructors exist, so it has to be known before the globals are built.
+/// An unreadable or absent declaration yields the default and the evaluator reports the real
+/// error, which keeps this pre-pass out of the business of diagnosing anything.
+pub(crate) fn declared_lane(module: &AstModule) -> WorkflowType {
+    let mut lane = WorkflowType::default();
+    find_lane(Visit::Stmt(module.statement()), &mut lane);
+    lane
+}
+
+fn find_lane<'a>(node: Visit<'a, AstNoPayload>, lane: &mut WorkflowType) {
+    if let Visit::Expr(expression) = &node
+        && let Expr::Call(function, arguments) = &expression.node
+        && let Expr::Identifier(name) = &function.node
+        && name.node.ident == "workflow"
+    {
+        for argument in arguments.args.iter() {
+            if let ArgumentP::Named(key, value) = &argument.node
+                && key.node == "type"
+                && let Expr::Literal(AstLiteral::String(declared)) = &value.node
+                && let Some(declared) = WorkflowType::parse(&declared.node)
+            {
+                *lane = declared;
+            }
+        }
+    }
+    node.visit_children(|child| find_lane(child, lane));
 }
 
 fn walk<'a>(node: Visit<'a, AstNoPayload>, idents: &mut Idents) {
@@ -58,9 +92,14 @@ fn walk<'a>(node: Visit<'a, AstNoPayload>, idents: &mut Idents) {
 impl Idents {
     fn undefined(&self, name: &str) -> CompileError {
         if self.callees.contains(name) {
+            let lane = dsl_functions(self.lane);
+            let reachable = lane
+                .iter()
+                .copied()
+                .chain(self.bindings.iter().map(String::as_str));
             return CompileError::UnknownFunction {
                 function: name.to_owned(),
-                suggestion: diag::suggest(name, DSL_FUNCTIONS.iter().copied()).map(str::to_owned),
+                suggestion: diag::suggest(name, reachable).map(str::to_owned),
             };
         }
         CompileError::UnknownVariable {
@@ -111,7 +150,7 @@ mod tests {
     fn a_live_scope_error_still_yields_the_undefined_name() {
         let source = "candidate = 1\nmissing_name\n";
         let ast = AstModule::parse("workflow.star", source.to_owned(), &Dialect::Standard).unwrap();
-        let idents = scan(&ast);
+        let idents = scan(&ast, WorkflowType::default());
         let globals: Globals = GlobalsBuilder::standard().build();
         let error = Module::with_temp_heap(|module| {
             let mut eval = Evaluator::new(&module);
@@ -133,7 +172,7 @@ mod tests {
     fn callees_are_told_apart_from_variables() {
         let source = "a = agnt(name = \"a\")\nworkflow([candidat])\n";
         let ast = AstModule::parse("workflow.star", source.to_owned(), &Dialect::Standard).unwrap();
-        let idents = scan(&ast);
+        let idents = scan(&ast, WorkflowType::default());
         assert!(matches!(
             idents.undefined("agnt"),
             CompileError::UnknownFunction { .. }

@@ -5,8 +5,8 @@
 #   crucible plan run --file examples/cascade/plan.toml \
 #                     --manifest examples/cascade/crucible.toml
 #
-# No [workflow] block: a judge-free manifest rejects one today. `workflow.star` is the same
-# graph in the authoring syntax, compiled and checked against expected-workflow.json.
+# type = "cascade" is the one workflow table a judge-free manifest takes. The graph is named,
+# not carried: it compiles per run, which is what a parameterised cascade needs.
 
 [repo]
 path = "."
@@ -36,3 +36,7 @@ frozen = true
 backend   = "command"
 agent_cmd = "./role.sh"
 goal      = "Draft release notes from the inbox, then audit them."
+
+[workflow]
+type = "cascade"
+file = "workflow.star"

@@ -24,7 +24,7 @@ reviewers = [
 gate = command(
     name = "gate",
     run = "./join_gate.sh",
-    depends_on = deps(reviewers),
+    depends_on = reviewers,
     join = "passed",
 )
 
