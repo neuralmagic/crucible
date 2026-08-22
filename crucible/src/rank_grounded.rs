@@ -743,6 +743,23 @@ mod tests {
         assert!(tail.ends_with("line 99"), "{tail}");
     }
 
+    /// The seam between the parser and the report: a line claude prints that is not stream-json
+    /// must survive decoding as `Raw{Stdout}` AND be accumulated, or the failure path has nothing
+    /// to replay. Driven through the real parser, not a hand-built event.
+    #[test]
+    fn undecodable_agent_stdout_reaches_the_verdict_buffer() {
+        let mut parser = crucible_harness::StreamJsonParser::default();
+        let mut buf = String::new();
+        for ev in parser.push("Error: could not fetch an access token") {
+            accumulate(Some(&ev), &mut buf);
+        }
+        assert_eq!(buf, "Error: could not fetch an access token\n");
+        assert_eq!(
+            tail_of(&buf).as_deref(),
+            Some("Error: could not fetch an access token")
+        );
+    }
+
     fn args(workspace: &Path, script: &Path, max_cost: f64) -> RankGroundedArgs {
         RankGroundedArgs {
             issue: "owner/repo#42".to_string(),
