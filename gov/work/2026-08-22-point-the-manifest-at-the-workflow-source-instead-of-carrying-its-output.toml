@@ -3,8 +3,9 @@
 [govctl]
 id = "WI-2026-08-22-004"
 title = "Point the manifest at the workflow source instead of carrying its output"
-status = "queue"
+status = "active"
 created = "2026-08-22"
+started = "2026-08-22"
 refs = [
     "RFC-0002:C-PLAYBOOK-PARAMS",
     "RFC-0001:C-WORKFLOW",
@@ -22,22 +23,22 @@ This also settles where the lane is declared. It stays in the source, read befor
 
 [[content.acceptance_criteria]]
 text = "[workflow].file names a .star source under the pack, resolved by the same policy as prompt_file and load"
-status = "pending"
+status = "done"
 category = "added"
 
 [[content.acceptance_criteria]]
 text = "a manifest naming a source compiles it at launch, with parameter values bound, and freezes the result as the runtime authority"
-status = "pending"
+status = "done"
 category = "added"
 
 [[content.acceptance_criteria]]
 text = "a manifest carrying inline [[workflow.task]] tables keeps working unchanged"
-status = "pending"
+status = "done"
 category = "changed"
 
 [[content.acceptance_criteria]]
 text = "file and inline tasks together is a manifest error naming both"
-status = "pending"
+status = "done"
 category = "fixed"
 
 [[content.acceptance_criteria]]
@@ -47,7 +48,7 @@ category = "chore"
 
 [[content.acceptance_criteria]]
 text = "examples/playbook runs from its manifest with no --file argument"
-status = "pending"
+status = "done"
 category = "chore"
 
 [verification]

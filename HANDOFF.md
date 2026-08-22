@@ -1,133 +1,161 @@
 # Playbook lane: handoff
 
-Date: 2026-08-22. Branch `playbook-dsl`, rebased onto `main` (`7c2c1a5`), rebase
-verified: 41 files, identical logical diff. Nothing committed since the rebase;
-the governance edits below are in the working tree.
+Date: 2026-08-22. Branch is still `cascade-dsl` (the rename touched the text, not
+the ref). 20 commits off `main` (`7c2c1a5`). `cargo test --all` green
+(954 + 153 + 39 + 62 + 14), clippy silent, `govctl check` clean. Nothing pushed.
 
 ## What a playbook is
 
 A workflow that runs its graph **once** and produces **no score**. The lane for
-work whose value is the work itself: skill pipelines, scheduled chores,
-discovery sweeps. No propose/apply/measure/decide, no frozen judge.
+work whose value is the work itself. No propose/apply/measure/decide, no frozen
+judge. The contrast in one sentence: the other lane is a search, this one is a
+playbook.
 
-Fan-out over items discovered at run time is **one run per item**, never graph
-expansion. The graph stays static and renderable before any spend. A run emits
-"asks"; a receiving orchestrator admits them.
+It was called `cascade` until today. That named the wrong property (every workflow
+here is a DAG) and competed with a name ADR-0021 had already given it, "the task
+lane". Three uses of "cascade" survive in the tree and mean Kubernetes cascading
+deletion; leave them.
 
-## State
+## It works. Run it
 
-The design is finalized. `govctl check` passes clean.
+```sh
+crucible plan run --manifest examples/playbook/crucible.toml \
+                  --max-cost 1 --max-time 5m
+```
 
-| Artifact | Status |
+A pack fanning out over runtime-discovered items, keyed by item:
+
+```
+discover  pass  out={"files":["legacy.py","main.py","notes.md","README.md"]}
+review    fail  out={"instances":4,"passed":3,"failed":1,...}  (1 of 4 failed: legacy.py)
+roundup   pass  out={"reviewed":3,"skipped":1,"total_issues":4}
+plan v1: completed — verdict: valid                                    exit 0
+```
+
+Drop another file in the workspace and re-run: five instances, no code or graph
+change.
+
+## Built and tested
+
+| | where |
 | --- | --- |
-| RFC-0001 "Crucible implementation contract" | **0.2.0**, normative, phase `spec` (reopened by the bump) |
-| RFC-0002 "Playbook workflows" | **normative**, 0.1.0, 11 clauses |
-| ADR-0021, ADR-0009 | reconciled, both now ref RFC-0002 |
-| DSL implementation | committed on the branch, full suite green |
-| Litmus pack `examples/playbook/` | runs free on the command backend |
-| WI-2026-08-22-001 / -002 | queued, the DSL compiler gaps |
+| Lane admission, `type = "playbook"` | `manifest/workflow.rs`, `manifest/mod.rs` |
+| Lane-scoped DSL namespace (6 constructors, not 13) | `plan/starlark/globals.rs`, `idents.rs` |
+| `params` + `param()`, JSON Schema, bound pre-evaluation | `plan/starlark/params.rs` |
+| External-input marking in prompts | `plan/starlark.rs` (`take_prompt`), `values.rs` |
+| `over =` fan-out, keyed by item | `plan/exec.rs`, `plan/ir.rs` |
+| `emits_files`, captured through isolation, staged from every ancestor | `plan/harness.rs` |
+| Git memory, per task, on pass only | `plan/harness.rs` (`settled`) |
+| Launcher + ceilings (`--max-cost`, `--max-time`) | `plan/cli.rs` |
+| Bounded compilation (no pack can abort the engine) | `plan/starlark.rs` |
+| `tools/fake-agent.py`, a deterministic stand-in | `tools/` |
 
-## What landed in RFC-0001 0.2.0
+## The four things most likely to be got wrong later
 
-C-WORKFLOW, rewritten:
+**Capture happens at attempt time, not at settle time.** An isolated task's
+worktree is `remove_dir_all`'d the instant `run_in` returns, so a `TaskRunner` hook
+called by the executor is too late: there is nothing left to copy. This was built
+the wrong way round first.
 
-- grammar admits dictionaries, conditionals, comprehensions, iteration,
-  user-defined functions, `load()`, and starlark's pure standard library; any
-  builtin reaching the filesystem, a process, the network, the clock, or
-  randomness must be absent
-- compilation must be bounded in depth and size and must not abort the process
-  on an author-supplied source; bounds are checked before the work they bound
-- `load()` confinement covers links of any kind; module count and total size are
-  counted on admission, not on return
-- `type = "playbook"` admitted, delegating to RFC-0002
-- a task's declared files continue through the graph alongside its JSON output,
-  isolation notwithstanding
-- a required task may not depend on an advisory one through all-join edges
-  (`join = "passed"` is the exemption)
-- `param` joins the enumerated constructors
-- a named-argument diagnostic must locate the argument; suggestions draw on the
-  source's own bindings
+**Instances are keyed by item, never by position.** Airflow keys mapped tasks on
+`map_index`, which is why clearing one after its input shifted reprocesses the
+wrong thing. `audit[gamma]` names the same work on every run that finds gamma,
+which is what will make resume's folded results matchable.
 
-C-WIRE: shutdown `outcome` gains `complete` (a task said there was no work left;
-the unscored counterpart of `solved`).
+**Per-task git memory is playbook-only.** The scored loop owns the same repository
+for keep/discard of whole candidates and must not find per-task commits inside an
+iteration. The runner takes the behaviour from the manifest's declared lane.
 
-## What changed in RFC-0002 before finalizing
+**A join looks *through* a mapped node.** A node has one status, which cannot say
+"two of three survived", and that is exactly what `join = "passed"` needs.
+`FanoutSummary` rides on the result. The first design claimed the existing
+vocabulary sufficed; the end-to-end test disproved it.
 
-- C-SCOPE dropped the contingency paragraph; RFC-0001 0.2.0 admits both
-  obligations it was waiting on
-- new **C-CASCADE-SURFACE** (normative): what a playbook author writes, and the
-  explicit refusal to condition any obligation on a measure command, judge,
-  baseline, apply/snapshot/restore, or result task
-- new **C-CASCADE-SHAPE** (informative): the graph expresses ordering and
-  gating, never iteration; a repair loop is one task, a discovered item set is
-  asks
-- C-CASCADE-LANE now names `complete` instead of promising a value C-WIRE lacked
-- C-TASK-FILES confinement extended to hard links
+## Open work, in the order I would take it
 
-## Deliberately not done
+**`skill()` is next, and it needs a clause first.** No clause defines what a skill
+task *is*, which is why it was deliberately kept out of C-WORKFLOW's constructor
+list. The decision: is a skill a prompt-file indirection (read `SKILL.md`, use it
+as the prompt), or does it carry tool and permission scope? The speculators pack's
+`skill(name=, skill=, args={...})` suggests the latter. An hour or a day depending
+which.
 
-- **`skill()` is not in C-WORKFLOW's constructor list.** The amendment draft
-  listed it, but no clause defines what a skill task is, and the enumerated list
-  is a permission list. `param` went in because C-CASCADE-PARAMS requires it.
-  Decide whether `skill` gets a clause or stays out.
-- **RFC-0002's implementation is not decomposed into work items.** Only the two
-  DSL-compiler WIs are filed. The lane itself (admit `type = "playbook"`, params
-  and `param()`, `emits_files`, epilogue, early completion, verdict and exit
-  code, resume folding, ceilings, ask emission) still needs scoping by `gov`.
-- **`examples/playbook` still says `type = "custom"`** and its manifest carries no
-  `[workflow]` block. C-CASCADE-SURFACE's litmus obligation is not yet met.
-- **`govctl render` writes `docs/rfc/*.md`**, which this repo has never tracked
-  (`docs/` is the mdbook source with its own hand-maintained naming). The
-  rendered output was removed. Decide whether to adopt it into `docs/SUMMARY.md`
-  or point `docs_output` somewhere else.
+**Task output is not marked as external.** `param()` produces marked text; a value
+from a task's JSON output or a fan-out `over` item does not. That is precisely the
+discovery-to-implement path: when `discover` finds a URL and hands it to a mapped
+`implement`, the URL reaches the prompt unmarked. The machinery exists
+(`values::ExternalText`); the open question is where the line goes, because marking
+*all* task output would mark most of every prompt and train readers to ignore the
+marks.
+
+**WI-2026-08-22-005, the rest of it.** Ceiling refusal and `plan_admitted` are
+done. Outstanding: per-task deadlines (`plan/harness.rs` spawns with no timeout of
+any kind), terminating an attempt already in flight, rejecting `iterations > 1`,
+and deleting `examples/playbook/plan.toml`.
+
+**WI-2026-08-22-003, `isolated` becomes `workspace`.** `isolated = True` is the
+word an author writes when they mean "runs in parallel". Needs per-task
+result-file namespacing first. 78 sites, reaches the scored lane.
+
+**Unbuilt from RFC-0002:** early completion, the epilogue for a playbook, resume
+folding, asks emission (the contract landed in `crucible-contract/src/ask.rs`, the
+engine side did not), and `C-PLAYBOOK-COMPOSITE`.
+
+## Decisions made, do not relitigate
+
+- **Ceilings are the launcher's.** A source may not declare one; the engine
+  refuses to dispatch without both. Cost accounting is the orchestrator's too: a
+  task never reports what it spent, so `ShellRunner`'s `cost_usd: 0.0` is correct
+  rather than a gap.
+- **`max_fanout` is required alongside `over`** and capped by the engine at 256.
+- **Only passing instances feed a join.** A null under a failed key would read as
+  "ran, found nothing", which is a different claim.
+- **External text is refused outside a prompt.** Nothing else can mark provenance,
+  and a shell command built from outside text is an injection.
+- **The engine compiles the graph, not the controller.** Confirmed against the
+  controller's actual shape.
+- **`errand` and `routine` were considered and rejected** in favour of `playbook`.
+
+## The controller
+
+`~/git/agentic-epp-autoresearch` (the name has outlived its scope). Rust,
+in-cluster at `crucible-controller.autoresearch.svc:8080`, Postgres, a bors-style
+queue; it launches work pods and injects their env. It consumes this repo as an
+**exact git pin** in `core-pin.toml`, currently `7c2c1a5`, and CI asserts every git
+dependency resolves to it.
+
+Three findings that shape the asks work:
+
+- **`InputKind` is the extension point** (`GitHub`/`Scenario`/`Jira`/`Unknown`).
+  An ask is a fifth variant.
+- **The queue already implements C-ASKS' orchestrator half.** Coalescing is
+  dedupe, exponential backoff is rate limiting, park-after-N is the blacklist.
+- **`Unknown { tag }` degrades to inert**, so the engine can emit ask rows against
+  the running controller *before* it understands them. No flag day: land in core,
+  bump the pin, teach the controller.
+
+One tension to resolve when writing it. The queue's frozen rule is that a dequeued
+key carries no payload, because the worker re-reads state; C-ASKS says an ask
+carries its parameter values. The precedent is there: `Jira` fetches title and body
+once at adopt time, so params are stored on adopt and the key re-reads them.
 
 ## Non-obvious things that cost time
 
 - **`starlark` turns on `serde_json/arbitrary_precision` for the whole binary.**
-  Cargo features unify across the graph, and under that flag serde's
-  internally-tagged enums and `#[serde(flatten)]` structs cannot decode floats
-  (`invalid type: map, expected f64`). `SessionEvent` is tagged and carries
-  floats; `Envelope` flattens. Unfixed, the swap silently breaks `--resume`, the
-  viewer, S3 records and controller ingest with no compile error. Fixed via
-  `crucible_contract::json::from_str` (a `Value` round-trip).
-- **`load()` needs no separate identity hashing.** C-WORKFLOW already requires
-  compiling to manifest IR before freeze with the generated TOML as runtime
-  authority, and C-WIRE hashes the frozen manifest text. Loaded content bakes in.
-- The DSL is Rust-2018 module style: `starlark.rs` and `starlark/` coexist
-  deliberately, so `mod tests` never moved and "zero test edits" stays checkable
-  with `git diff --stat`.
-- The earlier handoff pointed at "ADR-0026" for the composite-requires-judge
-  rationale. There is no ADR-0026. It is **ADR-0021**, and the conflict was
-  sharper than a missing link: its decision text refused `[workflow]` in a
-  judgeless manifest and required `[judge]` of composites, both of which
-  RFC-0002 reopens. ADR-0009 carries the combined-gate rationale.
-
-## Decisions already made, do not relitigate
-
-- **Budget lives with the controller.** A playbook source may not declare a
-  ceiling at all; the engine refuses to dispatch without one supplied by the
-  launcher.
-- **Composites are permitted without `[judge]`** for playbooks.
-- **Failure semantics are the author's** via `required`, and a required task may
-  not depend through all-join edges on an advisory one (now universal, in
-  `plan/ir.rs` and in C-WORKFLOW).
-- **GPU is reached by delegation, not placement.** `needs` names a brokered
-  capability; a playbook runs on one substrate for its whole life.
-- **Gate label stays `"task"`.** No third label; consumers needing the graph read
-  the admitted-plan event.
-- **Dedupe/blacklist state lives in the controller DB**, keyed by the ask key.
-
-## Out of scope, tracked
-
-The broker needs a `file_issue` tool (publish opens PRs, the broker has only
-`draft_pr`). The controller side (cron rows, deterministic admission filter,
-blacklist predicate) wants its own RFC; RFC-0002 deliberately stops at C-ASKS.
-
-## Reference
-
-- Domain: `vllm-project/speculators`. Autopilot skills on the fork
-  `orestis-z/speculators@4da14f6`. The designed pack (`discover.star`,
-  `paper.star`, `papers.star`, `lib/speculators.star`) is a design artifact, not
-  runnable, and is the source of the `param()`/`skill()` surface.
-- Old scratchpad (session-local, will not last):
-  `/private/tmp/claude-501/-Users-weaton-git-crucible/703e6b48-c6ae-40b0-9d53-5f6819d93515/scratchpad`
+  Under that flag serde's internally-tagged enums and `#[serde(flatten)]` structs
+  cannot decode floats. Fixed via `crucible_contract::json::from_str`.
+- **`crucible` is bin-only.** No `[lib]`, so `pub` does not exempt an item from
+  `dead_code`, and the clippy guard runs `-D warnings`. Nothing lands without a
+  production caller; three convenience wrappers are `#[cfg(test)]` for exactly this.
+- **Compilation runs on a 256MB thread.** Dropping a value the evaluator built
+  recurses once per level and cannot be refused in advance; `MAX_EVAL_TICKS` bounds
+  the achievable depth and the stack is sized to that bound. Parse depth *is*
+  refused in advance, because a 256KB source can nest deeper than any stack covers.
+- **The parse-depth measure counts operators, not only brackets.** `not not not x`
+  and `1+1+1+…` overflow with no bracket in sight. A bracket-only check catches
+  four of seven shapes and looks finished.
+- **`govctl` refuses to delete a referenced clause.** The rename needed the ADR and
+  work-item references repointed first, and `clause new` appends to the section
+  list while a sed rewrites the existing entries, so check for duplicates.
+- **`otel::forwarding_mirrors_reparented_traces_and_holds_back_metrics` is flaky.**
+  Three sightings, full-suite runs only, passes in isolation every time. Not ours.

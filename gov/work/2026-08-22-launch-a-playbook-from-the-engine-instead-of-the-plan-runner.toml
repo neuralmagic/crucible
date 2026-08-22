@@ -3,8 +3,9 @@
 [govctl]
 id = "WI-2026-08-22-005"
 title = "Launch a playbook from the engine instead of the plan runner"
-status = "queue"
+status = "active"
 created = "2026-08-22"
+started = "2026-08-22"
 refs = [
     "RFC-0002:C-PLAYBOOK-BUDGET",
     "RFC-0002:C-PLAYBOOK-LANE",
@@ -29,7 +30,7 @@ Depends on the manifest naming its source ([[WI-2026-08-22-004]]): a parameteris
 
 [[content.acceptance_criteria]]
 text = "the engine refuses to dispatch a playbook missing either ceiling, naming which one, before any spend"
-status = "pending"
+status = "done"
 category = "added"
 
 [[content.acceptance_criteria]]
@@ -39,7 +40,7 @@ category = "added"
 
 [[content.acceptance_criteria]]
 text = "plan_admitted is emitted once after admission and before dispatch, carrying each task's name, kind, dependencies, join, required flag, and stage"
-status = "pending"
+status = "done"
 category = "added"
 
 [[content.acceptance_criteria]]
