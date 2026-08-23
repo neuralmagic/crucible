@@ -180,6 +180,12 @@ impl Params {
         Ok(bound)
     }
 
+    /// Whether the source declares no parameters at all. A graph that is not a function of its
+    /// launch arguments can be frozen; one that is must be compiled per run.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     /// The declaration as a JSON Schema document, so one source serves command-line validation,
     /// ask validation, and a generated launch form.
     pub(crate) fn json_schema(&self) -> serde_json::Value {
@@ -252,11 +258,11 @@ fn spec(name: &str, expression: &Expr) -> Result<ParamSpec> {
         declared.insert(field, &value.node);
     }
 
-    let ty_name = declared
-        .get("type")
-        .and_then(|e| literal_string(e))
-        .ok_or_else(|| CompileError::ParamNeedsType {
-            param: name.to_owned(),
+    let ty_name =
+        field(&declared, name, "type", "a string literal", literal_string)?.ok_or_else(|| {
+            CompileError::ParamNeedsType {
+                param: name.to_owned(),
+            }
         })?;
     let ty = ParamType::parse(&ty_name).ok_or_else(|| CompileError::UnknownParamType {
         param: name.to_owned(),
@@ -268,10 +274,8 @@ fn spec(name: &str, expression: &Expr) -> Result<ParamSpec> {
         .map(str::to_owned),
     })?;
 
-    let required = declared
-        .get("required")
-        .and_then(|e| literal_bool(e))
-        .unwrap_or(false);
+    let required =
+        field(&declared, name, "required", "True or False", literal_bool)?.unwrap_or(false);
     let default = declared
         .get("default")
         .map(|e| literal_value(ty, e, name))
@@ -287,7 +291,13 @@ fn spec(name: &str, expression: &Expr) -> Result<ParamSpec> {
         });
     }
 
-    let pattern = declared.get("pattern").and_then(|e| literal_string(e));
+    let pattern = field(
+        &declared,
+        name,
+        "pattern",
+        "a string literal",
+        literal_string,
+    )?;
     if pattern.is_some() && ty != ParamType::String {
         return Err(CompileError::ParamConstraintMismatch {
             param: name.to_owned(),
@@ -303,8 +313,8 @@ fn spec(name: &str, expression: &Expr) -> Result<ParamSpec> {
             detail: error.to_string(),
         });
     }
-    let min = declared.get("min").and_then(|e| literal_number(e));
-    let max = declared.get("max").and_then(|e| literal_number(e));
+    let min = field(&declared, name, "min", "a number literal", literal_number)?;
+    let max = field(&declared, name, "max", "a number literal", literal_number)?;
     if (min.is_some() || max.is_some()) && !ty.numeric() {
         return Err(CompileError::ParamConstraintMismatch {
             param: name.to_owned(),
@@ -330,15 +340,35 @@ fn spec(name: &str, expression: &Expr) -> Result<ParamSpec> {
         ty,
         required,
         default,
-        doc: declared
-            .get("doc")
-            .and_then(|e| literal_string(e))
-            .unwrap_or_default(),
+        doc: field(&declared, name, "doc", "a string literal", literal_string)?.unwrap_or_default(),
         pattern,
         min,
         max,
         choices,
     })
+}
+
+/// Read one declared field. A field that is absent and a field whose value is not the literal
+/// shape the declaration needs are different facts, so a wrong shape is refused rather than
+/// falling back to the absent case's default.
+fn field<T>(
+    declared: &BTreeMap<String, &Expr>,
+    param: &str,
+    name: &'static str,
+    expected: &'static str,
+    read: impl Fn(&Expr) -> Option<T>,
+) -> Result<Option<T>> {
+    match declared.get(name) {
+        None => Ok(None),
+        Some(expression) => match read(expression) {
+            Some(value) => Ok(Some(value)),
+            None => Err(CompileError::ParamFieldWrongShape {
+                param: param.to_owned(),
+                field: name,
+                expected,
+            }),
+        },
+    }
 }
 
 fn literal_string(expression: &Expr) -> Option<String> {

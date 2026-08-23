@@ -78,6 +78,24 @@ pub enum ManifestError {
     BadArtifactEmbed { embed: String },
     #[error("[[workspace.artifact]] is not supported in a composite manifest")]
     CompositeArtifact,
+    #[error(
+        "nothing can consume the supplied parameter(s) {}: this manifest carries its tasks \
+         inline or declares no [workflow], so there is no source to bind them against",
+        .names.join(", ")
+    )]
+    UnconsumableParams { names: Vec<String> },
+}
+
+/// Refuse values no compilation will see. Binding happens only while a named source is compiled,
+/// so a run shape that never compiles has to say so rather than discard what a launcher supplied.
+fn refuse_unconsumable(params: &std::collections::BTreeMap<String, String>) -> Result<()> {
+    if params.is_empty() {
+        return Ok(());
+    }
+    Err(ManifestError::UnconsumableParams {
+        names: params.keys().cloned().collect(),
+    }
+    .into())
 }
 
 /// Shared tail of `Manifest`/`CompositeManifest`'s `load_frozen`: given the initial working-tree
@@ -678,10 +696,10 @@ impl Manifest {
         params: &std::collections::BTreeMap<String, String>,
     ) -> Result<()> {
         let Some(workflow) = &self.workflow else {
-            return Ok(());
+            return refuse_unconsumable(params);
         };
         if !workflow.is_unresolved() {
-            return Ok(());
+            return refuse_unconsumable(params);
         }
         let declared = workflow.workflow_type;
         let file = workflow.file.clone().unwrap_or_default();
@@ -1135,6 +1153,37 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Binding happens only while a named source is compiled. A run shape with nothing to
+    /// compile therefore refuses the values a launcher supplied instead of dropping them, so
+    /// the same `--param` behaves the same whichever way a pack spells its graph.
+    #[test]
+    fn supplied_parameters_no_compilation_can_consume_are_refused() {
+        let supplied = std::collections::BTreeMap::from([
+            ("depth".to_string(), "3".to_string()),
+            ("mode".to_string(), "fast".to_string()),
+        ]);
+        let dir =
+            std::env::temp_dir().join(format!("crucible-wf-unbindable-{}", std::process::id()));
+
+        let inline = "[workflow]\ntype = \"playbook\"\n[[workflow.task]]\nname = \"a\"\nkind = \"command\"\ncommand = \"true\"";
+        let err = toml::from_str::<Manifest>(&task_manifest(inline))
+            .expect("parses")
+            .resolve_workflow_with(&dir, &supplied)
+            .expect_err("inline tasks bind nothing");
+        assert!(err.to_string().contains("depth, mode"), "{err:#}");
+
+        let err = toml::from_str::<Manifest>(&task_manifest(""))
+            .expect("parses")
+            .resolve_workflow_with(&dir, &supplied)
+            .expect_err("no [workflow] binds nothing");
+        assert!(err.to_string().contains("depth, mode"), "{err:#}");
+
+        toml::from_str::<Manifest>(&task_manifest(inline))
+            .expect("parses")
+            .resolve_workflow_with(&dir, &std::collections::BTreeMap::new())
+            .expect("nothing supplied, nothing to refuse");
     }
 
     #[test]

@@ -24,7 +24,9 @@ struct NoValidVerdict {
 const MERMAID_COMMAND_PREVIEW_CHARS: usize = 72;
 
 /// Compile scope-time workflow authoring syntax. JSON on stdout is stable enough for a
-/// checked-in golden; `--manifest` additionally materializes the runtime TOML authority.
+/// checked-in golden; `--manifest` additionally materializes the runtime TOML authority. A
+/// source that declares params materializes as a file reference instead of frozen tasks, since
+/// its graph is a function of arguments no materialization has.
 pub fn compile_workflow(
     file: &Path,
     manifest: Option<&Path>,
@@ -705,6 +707,107 @@ mod tests {
         depends_on = ["propose"]
         needs = "gpu"
     "#;
+
+    /// How a pack spells its graph is not a launcher's business. An undeclared `--param` is a
+    /// mistake against the inline spelling exactly as it is against the file-backed one, and
+    /// neither run reaches a task.
+    #[test]
+    fn an_undeclared_parameter_refuses_both_spellings_of_the_same_pack() {
+        let dir =
+            std::env::temp_dir().join(format!("crucible-param-parity-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sentinel = dir.join("dispatched");
+        let head = format!(
+            "[repo]\npath = \".\"\n[agent]\nbackend = \"command\"\nagent_cmd = \"true\"\ngoal = \"g\"\n[workspace]\ndir = \"{}\"\n",
+            dir.join("workspace").display()
+        );
+        let run_with_undeclared = |manifest: &Path| {
+            run(
+                None,
+                &BTreeMap::from([("nope".to_string(), "1".to_string())]),
+                &BTreeSet::new(),
+                None,
+                Some(manifest),
+                Ceilings {
+                    usd: Some(1.0),
+                    wall_clock: Some(std::time::Duration::from_secs(60)),
+                    wall_clock_raw: Some("60s".to_string()),
+                },
+            )
+            .expect_err("an undeclared parameter is a mistake either way")
+        };
+
+        let inline = dir.join("inline.toml");
+        std::fs::write(
+            &inline,
+            format!(
+                "{head}[workflow]\ntype = \"playbook\"\n[[workflow.task]]\nname = \"a\"\nkind = \"command\"\ncommand = \"touch {}\"\n",
+                sentinel.display()
+            ),
+        )
+        .unwrap();
+        let inline_error = format!("{:#}", run_with_undeclared(&inline));
+
+        std::fs::write(
+            dir.join("workflow.star"),
+            format!(
+                "workflow(type = \"playbook\", tasks = [command(name = \"a\", run = \"touch {}\")])\n",
+                sentinel.display()
+            ),
+        )
+        .unwrap();
+        let backed = dir.join("backed.toml");
+        std::fs::write(
+            &backed,
+            format!("{head}[workflow]\ntype = \"playbook\"\nfile = \"workflow.star\"\n"),
+        )
+        .unwrap();
+        let backed_error = format!("{:#}", run_with_undeclared(&backed));
+
+        assert!(inline_error.contains("nope"), "{inline_error}");
+        assert!(backed_error.contains("nope"), "{backed_error}");
+        assert!(!sentinel.exists(), "neither run may dispatch a task");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `--file` is a compiled plan, which binds nothing; only a `--manifest` run compiles a
+    /// graph. Refusing at parse time keeps a supplied value from being dropped downstream.
+    #[test]
+    fn a_precompiled_plan_takes_no_parameters() {
+        use clap::Parser;
+        let parse = |args: &[&str]| <crate::Cli>::try_parse_from(args).is_ok();
+        assert!(
+            !parse(&[
+                "crucible", "plan", "run", "--file", "p.toml", "--param", "a=b"
+            ]),
+            "a compiled plan cannot bind parameters"
+        );
+        assert!(
+            parse(&[
+                "crucible",
+                "plan",
+                "run",
+                "--manifest",
+                "m.toml",
+                "--param",
+                "a=b"
+            ]),
+            "a manifest run compiles its graph"
+        );
+        assert!(
+            parse(&[
+                "crucible",
+                "plan",
+                "compile-workflow",
+                "--file",
+                "s.star",
+                "--param",
+                "a=b",
+            ]),
+            "compile-workflow's file is the source, not a plan"
+        );
+    }
 
     #[test]
     fn render_flags_truncation_without_caps() {

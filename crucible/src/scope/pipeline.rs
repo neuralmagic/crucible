@@ -829,7 +829,7 @@ fn compile_and_validate_round(manifest_path: &Path) -> RoundVerdict {
     if let Err(error) = crate::plan::starlark::materialize_sibling_manifest(manifest_path) {
         return RoundVerdict::Failed(FailureEvidence::Structure {
             detail: format!(
-                "workflow.star did not compile into [[workflow.task]]: {}",
+                "workflow.star did not compile: {}",
                 crate::errors::report(&error)
             ),
         });
@@ -1073,7 +1073,8 @@ impl Stage for Validate {
 
 /// Render the validated workflow; agents cannot supply this artifact.
 fn render_workflow_preview(manifest_path: &Path, pack: &Path) -> Result<(u32, u32)> {
-    let manifest = manifest::Manifest::load(manifest_path)?;
+    let mut manifest = manifest::Manifest::load(manifest_path)?;
+    manifest.resolve_workflow(crate::plan::starlark::parent_or_cwd(manifest_path))?;
     let mut workflow_caps = manifest::WorkflowCaps::for_lane(
         manifest
             .workflow
@@ -2016,6 +2017,36 @@ mod tests {
         assert!(manifest.contains("[[workflow.task]]"), "{manifest}");
         assert!(manifest.contains("Review the candidate."), "{manifest}");
         assert!(report.digest.is_some(), "compiled manifest must freeze");
+        assert!(dir.join("WORKFLOW.png").is_file());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A pack whose graph depends on launch arguments keeps naming its source: freezing one
+    /// set of defaults into the tracked manifest would commit a graph no run necessarily uses.
+    #[test]
+    fn a_parameterised_pack_keeps_its_workflow_source_in_the_tracked_manifest() {
+        let dir = tempdir("params-workflow");
+        scaffold_pack(&dir);
+        fs::create_dir_all(dir.join("prompts")).unwrap();
+        fs::write(dir.join("prompts/review.md"), "Review the candidate.\n").unwrap();
+        fs::write(
+            dir.join("workflow.star"),
+            r#"params = {"focus": {"type": "string", "default": "correctness"}}
+workflow([agent(name = "review", prompt = prompt_file("prompts/review.md") + param("focus"))])
+"#,
+        )
+        .unwrap();
+
+        let report = execute(&dir, None, None, false, None);
+        assert!(
+            report.stages.iter().all(|stage| stage.passed),
+            "{:?}",
+            report.stages
+        );
+        let manifest = fs::read_to_string(dir.join(MANIFEST_FILE)).unwrap();
+        assert!(manifest.contains("file = \"workflow.star\""), "{manifest}");
+        assert!(!manifest.contains("[[workflow.task]]"), "{manifest}");
+        assert!(!manifest.contains("correctness"), "{manifest}");
         assert!(dir.join("WORKFLOW.png").is_file());
         let _ = fs::remove_dir_all(&dir);
     }

@@ -51,6 +51,9 @@ pub struct CompiledWorkflow {
     pub prompt_files: Vec<PathBuf>,
     /// Stable, pretty JSON used by golden tests and review tooling.
     pub canonical_json: String,
+    /// Whether the source declares a `params` block. Such a graph is a function of its launch
+    /// arguments, so it is compiled per run instead of frozen into the manifest.
+    pub declares_params: bool,
 }
 
 #[derive(Debug)]
@@ -480,6 +483,12 @@ pub enum CompileError {
     ParamsNotLiteral { detail: String },
     #[error("parameter {param:?} declares no type")]
     ParamNeedsType { param: String },
+    #[error("parameter {param:?} field {field} must be {expected}")]
+    ParamFieldWrongShape {
+        param: String,
+        field: &'static str,
+        expected: &'static str,
+    },
     #[error(
         "parameter {param:?} has unknown type {got:?}{}",
         suggestion.as_ref().map(|s| format!("; did you mean {s:?}?")).unwrap_or_default()
@@ -742,6 +751,18 @@ pub enum MaterializeError {
     },
     #[error("serializing the workflow block")]
     Serialize(#[from] toml::ser::Error),
+    #[error(
+        "workflow source {} is outside the manifest directory {}; a parameterised graph is \
+         referenced by a manifest-relative path, so it must live under the pack",
+        .source_path.display(),
+        .manifest_dir.display()
+    )]
+    SourceOutsideManifest {
+        source_path: PathBuf,
+        manifest_dir: PathBuf,
+    },
+    #[error("workflow source path {} is not UTF-8", .path.display())]
+    SourceNotUtf8 { path: PathBuf },
 }
 
 /// The constructors every lane has.
@@ -1743,7 +1764,13 @@ pub fn compile_file_with(
     compile_source_with(&source, path, pack_dir, supplied)
 }
 
-/// Compile `workflow.star` into the manifest's generated `[workflow]` block.
+/// Compile `workflow.star` into the manifest's `[workflow]` block.
+///
+/// A source that declares no parameters is a constant, so its graph is frozen into the manifest
+/// and the manifest is the artifact. A source that declares parameters is a function of its
+/// launch arguments, so the manifest keeps naming the source and every run compiles it: the
+/// compile still happens here, to validate the graph and to refuse a source whose required
+/// parameters no unattended launcher can supply.
 pub fn materialize_manifest(
     source_path: &Path,
     manifest_path: &Path,
@@ -1756,7 +1783,39 @@ pub fn materialize_manifest(
         workflow: &'a WorkflowCfg,
     }
 
-    let compiled = compile_file_with(source_path, parent_or_cwd(manifest_path), params)?;
+    #[derive(serde::Serialize)]
+    struct WorkflowReference<'a> {
+        #[serde(rename = "type")]
+        workflow_type: WorkflowType,
+        file: &'a str,
+    }
+
+    #[derive(serde::Serialize)]
+    struct ManifestWorkflowReference<'a> {
+        workflow: WorkflowReference<'a>,
+    }
+
+    let manifest_dir = parent_or_cwd(manifest_path);
+    let compiled = compile_file_with(source_path, manifest_dir, params)?;
+    let (banner, workflow_toml) = if compiled.declares_params {
+        let file = manifest_relative_source(source_path, manifest_dir)?;
+        (
+            "\n# Compiled per run from workflow.star, which declares params.\n",
+            toml::to_string(&ManifestWorkflowReference {
+                workflow: WorkflowReference {
+                    workflow_type: compiled.workflow.workflow_type,
+                    file: &file,
+                },
+            })?,
+        )
+    } else {
+        (
+            "\n# Generated from workflow.star. Edit the Starlark source; scope recompiles it.\n",
+            toml::to_string(&ManifestWorkflow {
+                workflow: &compiled.workflow,
+            })?,
+        )
+    };
     let manifest = std::fs::read_to_string(manifest_path)
         .map_err(FileError::at("reading manifest", manifest_path))?;
     let mut document: DocumentMut =
@@ -1766,20 +1825,41 @@ pub fn materialize_manifest(
                 path: manifest_path.to_path_buf(),
                 cause,
             })?;
-    let workflow_toml = toml::to_string(&ManifestWorkflow {
-        workflow: &compiled.workflow,
-    })?;
     document.remove("workflow");
     let mut materialized = document.to_string();
     if !materialized.ends_with('\n') {
         materialized.push('\n');
     }
-    materialized.push_str(
-        "\n# Generated from workflow.star. Edit the Starlark source; scope recompiles it.\n",
-    );
+    materialized.push_str(banner);
     materialized.push_str(&workflow_toml);
     write_atomically(manifest_path, &materialized)?;
     Ok(compiled)
+}
+
+/// The source as the manifest names it: a path relative to the manifest's own directory.
+fn manifest_relative_source(
+    source_path: &Path,
+    manifest_dir: &Path,
+) -> std::result::Result<String, MaterializeError> {
+    let source = source_path
+        .canonicalize()
+        .map_err(FileError::at("resolving workflow source", source_path))?;
+    let dir = manifest_dir
+        .canonicalize()
+        .map_err(FileError::at("resolving manifest directory", manifest_dir))?;
+    let relative =
+        source
+            .strip_prefix(&dir)
+            .map_err(|_| MaterializeError::SourceOutsideManifest {
+                source_path: source.clone(),
+                manifest_dir: dir.clone(),
+            })?;
+    relative
+        .to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| MaterializeError::SourceNotUtf8 {
+            path: relative.to_path_buf(),
+        })
 }
 
 fn write_atomically(path: &Path, body: &str) -> std::result::Result<(), FileError> {
@@ -1912,9 +1992,11 @@ fn compile_source_here(
     let idents = idents::scan(&ast, lane);
     let globals = lane_globals(lane);
     let state = CompileState::new(pack_dir, filename);
+    let declared_params = params::Params::read(&ast)?;
+    let declares_params = !declared_params.is_empty();
     {
         let mut context = state.context_mut();
-        context.params = params::Params::read(&ast)?.bind(supplied)?;
+        context.params = declared_params.bind(supplied)?;
         context.supplied = supplied.keys().cloned().collect();
     }
     let loader = loader::resolve(&ast, &state, &globals, source.len(), lane)?;
@@ -1969,6 +2051,7 @@ fn compile_source_here(
         workflow,
         prompt_files: context.prompt_files.into_iter().collect(),
         canonical_json,
+        declares_params,
     })
 }
 
@@ -3613,6 +3696,158 @@ workflow(type = "playbook", tasks = [a])
             crate::errors::report(&declared_params(late, &pack.join("workflow.star")).unwrap_err());
         assert!(error.contains("first statement"), "{error}");
 
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// A field written in a shape the reader cannot use is a mistake, not an omission. Falling
+    /// back to the absent case's default drops a constraint the author asked for.
+    #[test]
+    fn a_params_field_of_the_wrong_shape_is_refused_not_defaulted() {
+        let pack = temp_pack("params-shape");
+        let bad: &[(&str, &str)] = &[
+            (
+                "\"x\": {\"type\": \"string\", \"default\": \"d\", \"required\": \"yes\"}",
+                "field required must be True or False",
+            ),
+            (
+                "\"x\": {\"type\": \"string\", \"default\": \"d\", \"pattern\": 5}",
+                "field pattern must be a string literal",
+            ),
+            (
+                "\"x\": {\"type\": \"int\", \"default\": 1, \"min\": \"0\"}",
+                "field min must be a number literal",
+            ),
+            (
+                "\"x\": {\"type\": \"int\", \"default\": 1, \"max\": [1]}",
+                "field max must be a number literal",
+            ),
+            (
+                "\"x\": {\"type\": \"string\", \"default\": \"d\", \"doc\": 3}",
+                "field doc must be a string literal",
+            ),
+            (
+                "\"x\": {\"type\": 5, \"default\": \"d\"}",
+                "field type must be a string literal",
+            ),
+        ];
+        for (decl, expected) in bad {
+            let source =
+                format!("params = {{{decl}}}\nworkflow(type = \"playbook\", tasks = [])\n");
+            let error = crate::errors::report(
+                &compile_source(&source, &pack.join("workflow.star"), &pack)
+                    .err()
+                    .unwrap_or_else(|| panic!("{decl}: accepted")),
+            );
+            assert!(error.contains(expected), "{decl}: {error}");
+            assert!(error.contains("parameter \"x\""), "{decl}: {error}");
+        }
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// A parameterised graph is a function of its launch arguments, so freezing one launcher's
+    /// values into the tracked manifest would make the pack lie about what it runs. The manifest
+    /// keeps naming the source and every run compiles it.
+    #[test]
+    fn a_parameterised_source_materializes_as_a_file_reference() {
+        let pack = temp_pack("materialize-params");
+        let source = r#"
+params = {"greeting": {"type": "string", "default": "hi"}}
+a = command(name = "a", run = "echo " + param("greeting"))
+workflow(type = "playbook", tasks = [a])
+"#;
+        std::fs::write(pack.join("workflow.star"), source).unwrap();
+        std::fs::write(
+            pack.join("crucible.toml"),
+            "# preserved\n[repo]\npath = \".\"\n\n[[workflow.task]]\nname = \"stale\"\nkind = \"command\"\ncommand = \"false\"\n",
+        )
+        .unwrap();
+
+        let compiled = materialize_manifest(
+            &pack.join("workflow.star"),
+            &pack.join("crucible.toml"),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert!(compiled.declares_params);
+        assert_eq!(compiled.workflow.tasks.len(), 1);
+
+        let manifest = std::fs::read_to_string(pack.join("crucible.toml")).unwrap();
+        assert!(manifest.contains("# preserved"), "{manifest}");
+        assert!(manifest.contains("file = \"workflow.star\""), "{manifest}");
+        assert!(manifest.contains("type = \"playbook\""), "{manifest}");
+        assert!(!manifest.contains("[[workflow.task]]"), "{manifest}");
+        assert!(!manifest.contains("stale"), "{manifest}");
+
+        // The written manifest is what a run loads, and materializing it again says the same.
+        let loaded: crate::manifest::WorkflowCfg = toml::from_str::<toml::Value>(&manifest)
+            .unwrap()
+            .get("workflow")
+            .cloned()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert!(loaded.is_unresolved());
+        materialize_manifest(
+            &pack.join("workflow.star"),
+            &pack.join("crucible.toml"),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(pack.join("crucible.toml")).unwrap(),
+            manifest
+        );
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// Materialization runs unattended, so it has no value for a parameter the author left
+    /// required. Refusing there is the only honest answer.
+    #[test]
+    fn a_required_parameter_refuses_materialization() {
+        let pack = temp_pack("materialize-required");
+        std::fs::write(
+            pack.join("workflow.star"),
+            "params = {\"url\": {\"type\": \"string\", \"required\": True}}\na = command(name = \"a\", run = \"echo \" + param(\"url\"))\nworkflow(type = \"playbook\", tasks = [a])\n",
+        )
+        .unwrap();
+        std::fs::write(pack.join("crucible.toml"), "[repo]\npath = \".\"\n").unwrap();
+
+        let error = crate::errors::report(
+            &materialize_manifest(
+                &pack.join("workflow.star"),
+                &pack.join("crucible.toml"),
+                &BTreeMap::new(),
+            )
+            .unwrap_err(),
+        );
+        assert!(error.contains("no value for required parameter"), "{error}");
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// The manifest names its source by a manifest-relative path, so a source it cannot name
+    /// that way cannot be referenced.
+    #[test]
+    fn a_source_outside_the_manifest_directory_cannot_be_referenced() {
+        let pack = temp_pack("materialize-outside");
+        let manifest_dir = pack.join("pack");
+        std::fs::create_dir_all(&manifest_dir).unwrap();
+        std::fs::write(
+            pack.join("workflow.star"),
+            "params = {\"g\": {\"type\": \"string\", \"default\": \"hi\"}}\nworkflow(type = \"playbook\", tasks = [command(name = \"a\", run = \"echo \" + param(\"g\"))])\n",
+        )
+        .unwrap();
+        std::fs::write(manifest_dir.join("crucible.toml"), "[repo]\npath = \".\"\n").unwrap();
+
+        let error = crate::errors::report(
+            &materialize_manifest(
+                &pack.join("workflow.star"),
+                &manifest_dir.join("crucible.toml"),
+                &BTreeMap::new(),
+            )
+            .unwrap_err(),
+        );
+        assert!(error.contains("outside the manifest directory"), "{error}");
         let _ = std::fs::remove_dir_all(&pack);
     }
 

@@ -363,8 +363,9 @@ pub(crate) enum PlanAction {
         #[arg(long, required_unless_present = "manifest")]
         file: Option<PathBuf>,
         /// A parameter value, `name=value`, repeatable. What the pack's `params` block declares
-        /// is what it accepts; `crucible plan params --file <source>` prints the schema.
-        #[arg(long = "param", value_name = "NAME=VALUE")]
+        /// is what it accepts; `crucible plan params --file <source>` prints the schema. Only a
+        /// `--manifest` run compiles a graph, so a precompiled `--file` plan takes none.
+        #[arg(long = "param", value_name = "NAME=VALUE", conflicts_with = "file")]
         params: Vec<String>,
         /// Total cost ceiling for the run, in USD. A playbook must be given one: its source may
         /// not declare a limit its operator set.
