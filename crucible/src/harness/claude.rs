@@ -41,6 +41,12 @@ pub(crate) const LOCAL_ENV_DEFAULTS: &[(&str, &str)] = &[
     ("CLAUDE_CODE_ENTRYPOINT", "sdk-cli"),
 ];
 
+/// Ends option parsing, so a prompt is a prompt however it starts.
+///
+/// Without it a prompt beginning with `-` is read as a flag and the turn dies before it starts.
+/// A SKILL.md opens with `---` (its YAML frontmatter), which is how this was found.
+const END_OF_OPTIONS: &str = "--";
+
 /// The `claude` args up to and including `-p`, without the prompt. Pure and unit-testable.
 /// The local path appends the prompt as an argument; the openshell path leaves it off and
 /// feeds the prompt over stdin (openshell exec rejects newlines in argv), which claude's
@@ -79,6 +85,7 @@ pub(crate) fn claude_base_args(args: &Args) -> Vec<String> {
 /// the base args plus the prompt.
 pub(crate) fn local_argv(args: &Args, prompt: &str) -> Vec<String> {
     let mut a = claude_base_args(args);
+    a.push(END_OF_OPTIONS.to_string());
     a.push(prompt.to_string());
     a
 }
@@ -91,6 +98,7 @@ pub(crate) fn local_session_argv(
 ) -> Vec<String> {
     let mut a = claude_base_args(args);
     insert_session_flags(&mut a, session);
+    a.push(END_OF_OPTIONS.to_string());
     a.push(prompt.to_string());
     a
 }
@@ -217,12 +225,35 @@ mod tests {
         crate::Cli::parse_from(argv).run
     }
 
+    /// A prompt is a prompt however it starts. Without the end-of-options marker a prompt
+    /// beginning with `-` is read as a flag and the turn dies before it starts; a SKILL.md opens
+    /// with `---`, which is how this was found, and it cost a real run to find.
+    #[test]
+    fn a_prompt_that_starts_with_a_dash_is_not_read_as_a_flag() {
+        let a = args(&[]);
+        for prompt in ["---\nname: analyze\n---\n\nDo it.\n", "-p", "--help", "-"] {
+            let v = local_argv(&a, prompt);
+            let end = v.iter().position(|s| s == "--").expect("no end-of-options");
+            assert_eq!(v.last().unwrap(), prompt, "{prompt:?}");
+            assert_eq!(v.len(), end + 2, "argv continues past the prompt: {v:?}");
+
+            let session = crate::agent_session::SessionTurn {
+                logical_name: "s".into(),
+                provider_id: "11111111-1111-1111-1111-111111111111".into(),
+                completed_turns: 0,
+            };
+            let v = local_session_argv(&a, prompt, &session);
+            let end = v.iter().position(|s| s == "--").expect("no end-of-options");
+            assert_eq!(v.len(), end + 2, "session argv: {v:?}");
+        }
+    }
+
     #[test]
     fn claude_args_are_stream_json_print_mode() {
         let a = args(&[]);
         let v = local_argv(&a, "do the thing");
         assert_eq!(v.last().unwrap(), "do the thing");
-        assert!(v.windows(2).any(|w| w == ["-p", "do the thing"]));
+        assert!(v.windows(3).any(|w| w == ["-p", "--", "do the thing"]));
         assert!(
             v.windows(2)
                 .any(|w| w == ["--output-format", "stream-json"])

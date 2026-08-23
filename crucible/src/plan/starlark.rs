@@ -1447,6 +1447,22 @@ fn render_prompt(segments: &[values::Segment]) -> String {
 /// The file a skill's instructions live in, inside the directory the task names.
 const SKILL_FILE: &str = "SKILL.md";
 
+/// Drop a SKILL.md's leading YAML frontmatter.
+///
+/// The frontmatter is metadata for whoever loads the skill: its name, its description, when to
+/// use it. None of that is an instruction to the model, and a prompt that opens with `---` is
+/// also read as a flag by every agent CLI that takes its prompt in argv. Unterminated
+/// frontmatter is left alone, because a document that merely starts with `---` is not one.
+fn strip_frontmatter(body: &str) -> String {
+    let Some(rest) = body.strip_prefix("---\n") else {
+        return body.to_owned();
+    };
+    match rest.split_once("\n---\n") {
+        Some((_, after)) => after.trim_start_matches('\n').to_owned(),
+        None => body.to_owned(),
+    }
+}
+
 /// Build a skill task's prompt: the skill's own instructions, then the arguments this
 /// invocation supplies.
 ///
@@ -1460,7 +1476,7 @@ fn skill_prompt(
 ) -> Result<String> {
     let directory = take_string(named, "skill")?;
     let path = format!("{}/{SKILL_FILE}", directory.trim_end_matches('/'));
-    let body = state.context_mut().prompt_file(&path)?;
+    let body = strip_frontmatter(&state.context_mut().prompt_file(&path)?);
 
     let mut segments = vec![values::Segment {
         text: body,
@@ -3601,6 +3617,46 @@ workflow(type = "playbook", tasks = [a])
         };
         assert_eq!(prompt, "# Analyze\n\nRead it and write SPEC.md.\n");
 
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// A SKILL.md's frontmatter is metadata for whoever loads the skill, not an instruction to
+    /// the model. Shipping it wastes the prompt's opening on a name the model cannot act on, and
+    /// a prompt that opens with `---` is read as a flag by every agent CLI that takes its prompt
+    /// in argv. A real run died on exactly that before this existed.
+    #[test]
+    fn a_skills_frontmatter_does_not_reach_the_prompt() {
+        let pack = temp_pack("skill-frontmatter");
+        std::fs::create_dir_all(pack.join("skills/s")).unwrap();
+        let source = "a = skill(name = \"a\", skill = \"skills/s\")\nworkflow(type = \"playbook\", tasks = [a])\n";
+        let prompt_of = |body: &str| {
+            std::fs::write(pack.join("skills/s/SKILL.md"), body).unwrap();
+            let compiled = compile_source(source, &pack.join("workflow.star"), &pack)
+                .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
+            let TaskKind::Agent { prompt, .. } = &compiled.workflow.tasks[0].task else {
+                panic!("expected an agent task")
+            };
+            prompt.clone()
+        };
+
+        assert_eq!(
+            prompt_of("---\nname: s\ndescription: does a thing\n---\n\n# Do it\n\nGo.\n"),
+            "# Do it\n\nGo.\n"
+        );
+        // No frontmatter, and a body that merely opens with a rule, are both left alone.
+        assert_eq!(prompt_of("# Do it\n\nGo.\n"), "# Do it\n\nGo.\n");
+        assert_eq!(
+            prompt_of("---\n\nnot frontmatter\n"),
+            "---\n\nnot frontmatter\n"
+        );
+        // Whatever survives, it never opens with a dash.
+        for body in ["---\nname: s\n---\n# Go\n", "# Go\n", "---\nunterminated\n"] {
+            let prompt = prompt_of(body);
+            assert!(
+                !prompt.starts_with('-') || body.starts_with("---\nunterminated"),
+                "{prompt:?}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&pack);
     }
 
