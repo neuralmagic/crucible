@@ -3,8 +3,10 @@
 [govctl]
 id = "WI-2026-08-22-009"
 title = "Make the external-input markers unforgeable"
-status = "queue"
+status = "done"
 created = "2026-08-22"
+started = "2026-08-22"
+completed = "2026-08-22"
 refs = ["RFC-0002:C-PLAYBOOK-PARAMS"]
 
 [content]
@@ -25,15 +27,15 @@ Adjacent, same area: string formatting launders external text back to a plain st
 
 [[content.acceptance_criteria]]
 text = "an external span cannot produce a working marker, however it is crafted, including by the strip itself"
-status = "pending"
+status = "done"
 category = "fixed"
 
 [[content.acceptance_criteria]]
 text = "an inspector counting markers sees each region opened and closed exactly once"
-status = "pending"
+status = "done"
 category = "fixed"
 
 [[content.acceptance_criteria]]
 text = "a value carrying a nested close marker, a value carrying an open marker, and a value carrying both"
-status = "pending"
+status = "done"
 category = "chore"
