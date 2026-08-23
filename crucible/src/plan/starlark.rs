@@ -1811,14 +1811,21 @@ pub fn materialize_sibling_manifest(
 /// before running a line of it, which is why the block is a literal and why this never reaches
 /// the evaluator.
 pub fn declared_params(source: &str, filename: &Path) -> Result<serde_json::Value> {
-    reject_deep_nesting(source, filename)?;
-    let ast = AstModule::parse(
-        &filename.display().to_string(),
-        source.to_owned(),
-        &dialect(),
-    )
-    .map_err(|error| CompileError::Parse(error.to_string()))?;
-    Ok(params::Params::read(&ast)?.json_schema())
+    on_compile_stack(|| {
+        if source.len() > MAX_SOURCE_BYTES {
+            return Err(CompileError::SourceTooLarge {
+                bytes: source.len(),
+            });
+        }
+        reject_deep_nesting(source, filename)?;
+        let ast = AstModule::parse(
+            &filename.display().to_string(),
+            source.to_owned(),
+            &dialect(),
+        )
+        .map_err(|error| CompileError::Parse(error.to_string()))?;
+        Ok(params::Params::read(&ast)?.json_schema())
+    })
 }
 
 /// Stack for the compile thread.
@@ -1853,13 +1860,16 @@ pub fn compile_source_with(
     pack_dir: &Path,
     supplied: &BTreeMap<String, String>,
 ) -> Result<CompiledWorkflow> {
+    on_compile_stack(|| compile_source_here(source, filename, pack_dir, supplied))
+}
+
+/// Run `work` on a thread whose stack covers the depths the budgets permit.
+fn on_compile_stack<T: Send>(work: impl FnOnce() -> Result<T> + Send) -> Result<T> {
     std::thread::scope(|scope| {
         let handle = std::thread::Builder::new()
             .stack_size(COMPILE_STACK_BYTES)
             .name("crucible-compile".to_string())
-            .spawn_scoped(scope, || {
-                compile_source_here(source, filename, pack_dir, supplied)
-            })
+            .spawn_scoped(scope, work)
             .map_err(|error| CompileError::Eval(format!("spawning the compile thread: {error}")))?;
         handle.join().map_err(|_| CompileError::EvalPanic {
             detail: "the compile thread died".to_owned(),
@@ -2065,7 +2075,10 @@ pub(crate) fn reject_deep_nesting(source: &str, filename: &Path) -> Result<()> {
                     i += 1;
                 }
                 let word: String = bytes[start..i].iter().collect();
-                if matches!(word.as_str(), "not" | "and" | "or" | "if" | "else" | "in") {
+                if matches!(
+                    word.as_str(),
+                    "not" | "and" | "or" | "if" | "else" | "in" | "lambda"
+                ) {
                     operators += 1;
                 }
             }
@@ -3106,6 +3119,12 @@ workflow(branches + [curate])
                 format!("x = {}1\nworkflow([])\n", "1 if True else ".repeat(3000)),
             ),
             (
+                // The overflow here is starlark's module-compile pass, not the parser, so the
+                // scanner is the only thing standing between this and an abort.
+                "lambda chain",
+                format!("x = {}1\nworkflow([])\n", "lambda: ".repeat(4800)),
+            ),
+            (
                 // Four shallow lines that build a value no literal is allowed to express. The
                 // parse guard cannot see this one: the source is trivial.
                 "value nested by a loop",
@@ -3155,6 +3174,18 @@ workflow(branches + [curate])
             error.contains("loads more than"),
             "a load chain outran its budget: {error}"
         );
+
+        // `plan params` reads a source with no launcher behind it, so declared_params needs
+        // the same bounds as the compiler: the scanner, the size cap, and the big stack.
+        let chain = format!("x = {}1\n", "lambda: ".repeat(4800));
+        let report = crate::errors::report(
+            &declared_params(&chain, &pack.join("workflow.star")).unwrap_err(),
+        );
+        assert!(report.contains("levels deep"), "{report}");
+        let big = format!("x = 1{}\n", " ".repeat(MAX_SOURCE_BYTES));
+        let report =
+            crate::errors::report(&declared_params(&big, &pack.join("workflow.star")).unwrap_err());
+        assert!(report.contains("maximum is"), "{report}");
 
         let _ = std::fs::remove_dir_all(&pack);
     }

@@ -1657,6 +1657,10 @@ mod tests {
                 format!("x = {}True\n", "not ".repeat(3000)),
             ),
             (
+                "lambda chain",
+                format!("x = {}1\n", "lambda: ".repeat(4800)),
+            ),
+            (
                 "value nested by a loop",
                 "x = [1]\nfor i in range(3000):\n    x = [x]\ncommand(name = \"a\", run = \"true\", emits = x)\nworkflow([])\n"
                     .to_string(),

@@ -3,9 +3,10 @@
 [govctl]
 id = "WI-2026-08-22-001"
 title = "Bound DSL compilation so no pack can abort the engine"
-status = "active"
+status = "done"
 created = "2026-08-22"
 started = "2026-08-22"
+completed = "2026-08-22"
 refs = [
     "RFC-0001:C-WORKFLOW",
     "RFC-0002:C-TASK-FILES",
@@ -74,12 +75,12 @@ category = "chore"
 
 [[content.acceptance_criteria]]
 text = "lambda counts as a nesting level in the scanner"
-status = "pending"
+status = "done"
 category = "fixed"
 
 [[content.acceptance_criteria]]
 text = "declared_params applies the source size cap and runs on the large-stack thread"
-status = "pending"
+status = "done"
 category = "fixed"
 
 [verification]
