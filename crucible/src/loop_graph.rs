@@ -114,6 +114,7 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
             args: cx.args.clone(),
             paths: cx.p.clone(),
             commit_per_task: false,
+            captured_bytes: std::sync::atomic::AtomicU64::new(0),
         },
     };
     // The runner and the on_result hook both need the reporter; collect the wire lines
@@ -358,6 +359,7 @@ pub(crate) fn run_epilogue<R: Reporter>(
             args: args.clone(),
             paths: p.clone(),
             commit_per_task: false,
+            captured_bytes: std::sync::atomic::AtomicU64::new(0),
         },
         kept: kept.to_value(),
     };

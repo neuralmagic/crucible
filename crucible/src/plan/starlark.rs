@@ -355,15 +355,20 @@ fn safe_relative_path(raw: &str) -> std::result::Result<PathBuf, PathRejection> 
     if raw.trim().is_empty() || path.is_absolute() {
         return Err(PathRejection::Empty);
     }
-    if path.components().any(|part| {
-        matches!(
-            part,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-        )
-    }) {
-        return Err(PathRejection::Traversal);
+    let mut normalized = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(PathRejection::Traversal);
+            }
+        }
     }
-    Ok(path.to_path_buf())
+    if normalized.as_os_str().is_empty() {
+        return Err(PathRejection::Empty);
+    }
+    Ok(normalized)
 }
 
 #[derive(Clone, Debug)]
@@ -4548,5 +4553,37 @@ workflow(reviews + [gate("gate", reviews)])
         let second = compile_file(&pack.join("workflow.star"), &pack).unwrap();
         assert_eq!(first.canonical_json, second.canonical_json);
         assert_eq!(first.prompt_files, second.prompt_files);
+    }
+
+    /// A leading `./` is a spelling of the same path, and the runner's capture demands plain
+    /// components. Normalizing here means the pack that spells it that way captures rather
+    /// than failing after the turn it declared the file in has already been paid for.
+    #[test]
+    fn a_declared_path_is_normalized_at_compile_time() {
+        assert_eq!(
+            safe_relative_path("./A.md").ok(),
+            Some(PathBuf::from("A.md")),
+            "a leading ./ names the same file"
+        );
+        assert_eq!(
+            safe_relative_path("./docs/./A.md").ok(),
+            Some(PathBuf::from("docs/A.md"))
+        );
+        for raw in [".", "./", "././"] {
+            assert!(
+                matches!(safe_relative_path(raw), Err(PathRejection::Empty)),
+                "{raw} names no file"
+            );
+        }
+        assert!(matches!(
+            safe_relative_path("./../A.md"),
+            Err(PathRejection::Traversal)
+        ));
+
+        let pack = temp_pack("declared-path");
+        let source = "a = agent(name = \"a\", prompt = \"p\", emits_files = [\"./A.md\"])\nworkflow(type = \"playbook\", tasks = [a])\n";
+        let compiled = compile_source(source, &pack.join("workflow.star"), &pack).unwrap();
+        assert_eq!(compiled.workflow.tasks[0].emits_files, ["A.md"]);
+        let _ = std::fs::remove_dir_all(&pack);
     }
 }

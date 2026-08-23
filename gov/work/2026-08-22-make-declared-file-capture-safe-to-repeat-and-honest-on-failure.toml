@@ -3,8 +3,10 @@
 [govctl]
 id = "WI-2026-08-22-007"
 title = "Make declared-file capture safe to repeat and honest on failure"
-status = "queue"
+status = "done"
 created = "2026-08-22"
+started = "2026-08-22"
+completed = "2026-08-22"
 refs = ["RFC-0002:C-TASK-FILES"]
 
 [content]
@@ -23,35 +25,35 @@ An isolated task never receives its ancestors' declared inputs. `inputs/` is in 
 
 [[content.acceptance_criteria]]
 text = "a task that did not settle passing contributes nothing on the file channel, as it already contributes nothing on the JSON channel"
-status = "pending"
+status = "done"
 category = "fixed"
 
 [[content.acceptance_criteria]]
 text = "a capturing task stays runnable across repeated runs; the captured file's mode is the engine's choice, not the source's"
-status = "pending"
+status = "done"
 category = "fixed"
 
 [[content.acceptance_criteria]]
 text = "an isolated task receives the files its ancestors declared"
-status = "pending"
+status = "done"
 category = "fixed"
 
 [[content.acceptance_criteria]]
 text = "the captured-bytes bound counts a run, not a task"
-status = "pending"
+status = "done"
 category = "fixed"
 
 [[content.acceptance_criteria]]
 text = "a declared path with a leading ./ is normalized at compile time rather than failing after a paid turn"
-status = "pending"
+status = "done"
 category = "fixed"
 
 [[content.acceptance_criteria]]
 text = "a pack that captures runs three times without cleaning and passes every time"
-status = "pending"
+status = "done"
 category = "chore"
 
 [[content.acceptance_criteria]]
 text = "a serial producer's declared file reaches an isolated consumer"
-status = "pending"
+status = "done"
 category = "chore"

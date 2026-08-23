@@ -445,6 +445,7 @@ pub(crate) fn prep_plan_runner_with_params(
             args,
             paths: p,
             commit_per_task,
+            captured_bytes: std::sync::atomic::AtomicU64::new(0),
         },
         m,
     ))

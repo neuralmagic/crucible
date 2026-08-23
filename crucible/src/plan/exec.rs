@@ -30,6 +30,7 @@ impl Substrate {
 }
 
 /// One attempt's result, as reported by the runner.
+#[derive(Debug)]
 pub enum AttemptOutcome {
     /// Measured success with the task's structured output (the edge payload).
     Pass(Value),
@@ -398,14 +399,25 @@ pub fn execute(
         // Inputs are staged before anything is dispatched. A task whose declared inputs are not
         // there has not failed, it was never runnable, so this refuses rather than reports.
         if let Some(first) = dispatch.first() {
-            let producers = ancestors(plan, first);
-            if producers.iter().any(|p| !p.emits_files.is_empty())
-                && let Err(why) = runner.stage(first, &producers)
-            {
-                let r = TaskResult::undispatched(TaskStatus::Blocked, why);
-                let first = *first;
-                record(first, r, &mut results, &mut halted, true);
-                continue;
+            let reachable = ancestors(plan, first);
+            if reachable.iter().any(|p| !p.emits_files.is_empty()) {
+                // Only an ancestor that settled passing contributes. The file channel says what
+                // the JSON channel says: a failed task's output does not reach a descendant, and
+                // whatever a previous run left in `state/files` is not this run's evidence.
+                let producers: Vec<&Task> = reachable
+                    .into_iter()
+                    .filter(|p| {
+                        results
+                            .get(&p.name)
+                            .is_some_and(|r| r.status == TaskStatus::Pass)
+                    })
+                    .collect();
+                if let Err(why) = runner.stage(first, &producers) {
+                    let r = TaskResult::undispatched(TaskStatus::Blocked, why);
+                    let first = *first;
+                    record(first, r, &mut results, &mut halted, true);
+                    continue;
+                }
             }
         }
 
