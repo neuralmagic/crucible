@@ -298,6 +298,10 @@ impl ValidPlan {
     }
 }
 
+/// The most instances one mapped node may produce. Operator-owned, not author-owned: a bound a
+/// pack could raise is not a bound.
+pub const MAX_FANOUT_CEILING: u32 = 256;
+
 /// Everything [`Plan::validate`] can reject. Structural only: capability admission and
 /// autoresearch shape live in [`crate::manifest::WorkflowCfg`].
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -364,6 +368,38 @@ pub enum PlanError {
         "task {task:?} sets session {session:?}, but durable sessions cannot use disposable isolation"
     )]
     SessionWithIsolation { task: String, session: String },
+    #[error(
+        "task {task:?} contains `[` or `]`; those are reserved for a mapped node's instance \
+         names, which are synthesized as `node[item]`"
+    )]
+    BracketInTaskName { task: String },
+    #[error(
+        "task {task:?} maps over {reference} but does not depend on {producer:?}; a fan-out \
+         reads its items from a dependency's output"
+    )]
+    OverNotADependency {
+        task: String,
+        reference: String,
+        producer: String,
+    },
+    #[error(
+        "task {task:?} maps over {reference} without max_fanout; a fan-out states how wide it \
+         may get before it runs, not after"
+    )]
+    OverWithoutFanout { task: String, reference: String },
+    #[error("task {task:?} declares max_fanout without `over`; there is nothing to bound")]
+    FanoutWithoutOver { task: String },
+    #[error("task {task:?}: max_fanout = {got} is outside 1..={MAX_FANOUT_CEILING}")]
+    FanoutOutOfRange { task: String, got: u32 },
+    #[error(
+        "task {task:?} maps over {reference} and resumes session {session:?}; instances run one \
+         at a time and would interleave a single transcript"
+    )]
+    OverWithSession {
+        task: String,
+        reference: String,
+        session: String,
+    },
     #[error("plan has a dependency cycle involving: {}", .tasks.join(", "))]
     DependencyCycle { tasks: Vec<String> },
     #[error(
@@ -406,6 +442,11 @@ impl Plan {
         for (i, t) in self.tasks.iter().enumerate() {
             if t.name.0.trim().is_empty() {
                 return Err(PlanError::EmptyTaskName { index: i });
+            }
+            if t.name.0.contains(['[', ']']) {
+                return Err(PlanError::BracketInTaskName {
+                    task: t.name.0.clone(),
+                });
             }
             if index.insert(&t.name, i).is_some() {
                 return Err(PlanError::DuplicateTask {
@@ -561,6 +602,38 @@ impl Plan {
                         task: task(),
                         session: session.clone(),
                     });
+                }
+            }
+            match (&t.over, t.max_fanout) {
+                (None, None) => {}
+                (None, Some(_)) => return Err(PlanError::FanoutWithoutOver { task: task() }),
+                (Some(reference), None) => {
+                    return Err(PlanError::OverWithoutFanout {
+                        task: task(),
+                        reference: reference.to_string(),
+                    });
+                }
+                (Some(reference), Some(width)) => {
+                    if !t.depends_on.contains(&reference.task) {
+                        return Err(PlanError::OverNotADependency {
+                            task: task(),
+                            reference: reference.to_string(),
+                            producer: reference.task.0.clone(),
+                        });
+                    }
+                    if width == 0 || width > MAX_FANOUT_CEILING {
+                        return Err(PlanError::FanoutOutOfRange {
+                            task: task(),
+                            got: width,
+                        });
+                    }
+                    if let Some(session) = &t.session {
+                        return Err(PlanError::OverWithSession {
+                            task: task(),
+                            reference: reference.to_string(),
+                            session: session.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -1155,5 +1228,91 @@ mod tests {
             back.plan().tasks[0].emits,
             vec![OutputField("score".into())]
         );
+    }
+    /// A plan that arrives as JSON never passes through the starlark front end, so the
+    /// structural facts about a mapped node are checked here or nowhere.
+    #[test]
+    fn validate_checks_a_mapped_node_on_the_json_route() {
+        let mapped = |over: Option<OutputRef>, max_fanout: Option<u32>, deps: &[&str]| {
+            let mut t = agent("audit", deps);
+            t.over = over;
+            t.max_fanout = max_fanout;
+            t
+        };
+        let targets = OutputRef {
+            task: "discover".into(),
+            field: OutputField("targets".into()),
+        };
+        let refuse = |tasks: Vec<Task>| -> PlanError {
+            let json = serde_json::to_string(&plan(tasks)).unwrap();
+            Plan::from_json_str(&json)
+                .unwrap()
+                .validate()
+                .expect_err("the plan validated")
+        };
+
+        assert_eq!(
+            refuse(vec![agent("audit[x]", &[])]),
+            PlanError::BracketInTaskName {
+                task: "audit[x]".into()
+            }
+        );
+        assert_eq!(
+            refuse(vec![
+                emitting("discover", &[], &["targets"]),
+                mapped(Some(targets.clone()), Some(4), &[]),
+            ]),
+            PlanError::OverNotADependency {
+                task: "audit".into(),
+                reference: "discover.targets".into(),
+                producer: "discover".into(),
+            }
+        );
+        assert_eq!(
+            refuse(vec![
+                emitting("discover", &[], &["targets"]),
+                mapped(Some(targets.clone()), None, &["discover"]),
+            ]),
+            PlanError::OverWithoutFanout {
+                task: "audit".into(),
+                reference: "discover.targets".into(),
+            }
+        );
+        assert_eq!(
+            refuse(vec![agent("a", &[]), mapped(None, Some(4), &["a"])]),
+            PlanError::FanoutWithoutOver {
+                task: "audit".into()
+            }
+        );
+        for got in [0, MAX_FANOUT_CEILING + 1] {
+            assert_eq!(
+                refuse(vec![
+                    emitting("discover", &[], &["targets"]),
+                    mapped(Some(targets.clone()), Some(got), &["discover"]),
+                ]),
+                PlanError::FanoutOutOfRange {
+                    task: "audit".into(),
+                    got
+                }
+            );
+        }
+        let mut with_session = mapped(Some(targets.clone()), Some(4), &["discover"]);
+        with_session.session = Some("scribe".into());
+        assert_eq!(
+            refuse(vec![emitting("discover", &[], &["targets"]), with_session]),
+            PlanError::OverWithSession {
+                task: "audit".into(),
+                reference: "discover.targets".into(),
+                session: "scribe".into(),
+            }
+        );
+
+        let json = serde_json::to_string(&plan(vec![
+            emitting("discover", &[], &["targets"]),
+            mapped(Some(targets), Some(MAX_FANOUT_CEILING), &["discover"]),
+        ]))
+        .unwrap();
+        let ok = Plan::from_json_str(&json).unwrap().validate().unwrap();
+        assert_eq!(ok.plan().tasks.len(), 2);
     }
 }

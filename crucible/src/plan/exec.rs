@@ -399,16 +399,37 @@ pub fn execute(
         // Only an ancestor that settled passing contributes. The file channel says what the
         // JSON channel says: a failed task's output does not reach a descendant, and whatever a
         // previous run left in `state/files` is not this run's evidence.
+        //
+        // A mapped ancestor is expanded into one stand-in per passing instance, so a consumer is
+        // handed `inputs/node[key]/<declared>` and the runner never has to know what `over` is.
         let passing_producers = |t: &Task, results: &BTreeMap<TaskName, TaskResult>| {
-            ancestors(plan, t)
-                .into_iter()
-                .filter(|p| {
-                    !p.emits_files.is_empty()
-                        && results
-                            .get(&p.name)
-                            .is_some_and(|r| r.status == TaskStatus::Pass)
-                })
-                .collect::<Vec<&Task>>()
+            let mut producers: Vec<Task> = Vec::new();
+            for p in ancestors(plan, t) {
+                if p.emits_files.is_empty() {
+                    continue;
+                }
+                if p.over.is_some() {
+                    producers.extend(
+                        results
+                            .iter()
+                            .filter(|(name, r)| {
+                                r.status == TaskStatus::Pass && is_instance_of(&p.name, name)
+                            })
+                            .map(|(name, _)| Task {
+                                name: name.clone(),
+                                over: None,
+                                max_fanout: None,
+                                ..p.clone()
+                            }),
+                    );
+                } else if results
+                    .get(&p.name)
+                    .is_some_and(|r| r.status == TaskStatus::Pass)
+                {
+                    producers.push(p.clone());
+                }
+            }
+            producers
         };
 
         // Every dispatched task is staged, in its own right and with its own ancestors: batched
@@ -417,6 +438,7 @@ pub fn execute(
         let mut refused = None;
         for t in &dispatch {
             let producers = passing_producers(t, &results);
+            let producers: Vec<&Task> = producers.iter().collect();
             if let Err(why) = runner.stage(t, &producers) {
                 refused = Some((*t, why));
                 break;
@@ -448,7 +470,7 @@ pub fn execute(
                         .iter()
                         .map(|key| Task {
                             name: instance_name(&node.name, key),
-                            emits_files: Vec::new(),
+                            emits_files: node.emits_files.clone(),
                             over: None,
                             max_fanout: None,
                             ..node.clone()
@@ -457,6 +479,7 @@ pub fn execute(
                     // An instance is staged under its own name: it runs in its own root, and
                     // the node itself never runs.
                     let producers = passing_producers(node, &results);
+                    let producers: Vec<&Task> = producers.iter().collect();
                     let refused = instances
                         .iter()
                         .find_map(|instance| runner.stage(instance, &producers).err());
@@ -465,34 +488,75 @@ pub fn execute(
                         record(node, r, &mut results, &mut halted, true);
                         continue;
                     }
-                    let batch: Vec<BatchItem<'_>> = instances
-                        .iter()
-                        .zip(&keys)
-                        .map(|(task, key)| {
-                            let mut inputs = base.clone();
-                            inputs.insert(
-                                TaskName(ITEM_INPUT.to_string()),
-                                Value::String(key.clone()),
-                            );
-                            BatchItem {
-                                task,
-                                attempt: 1,
-                                inputs,
-                            }
-                        })
-                        .collect();
-                    let (batch_results, budget_exceeded) =
-                        run_batch_with_retries(batch, cfg, runner, &mut spent, budget);
-                    if budget_exceeded {
-                        halted = Some(PlanExit::BudgetExceeded);
-                    }
+                    let item_inputs = |key: &String| {
+                        let mut inputs = base.clone();
+                        inputs.insert(TaskName(ITEM_INPUT.to_string()), Value::String(key.clone()));
+                        inputs
+                    };
                     // Each instance settles in its own right, so a reader sees one row per item
                     // rather than one row standing for all of them.
                     let mut settled: Vec<(String, TaskResult)> = Vec::new();
-                    for ((task, result), key) in batch_results.into_iter().zip(&keys) {
-                        runner.settled(task, result.status == TaskStatus::Pass);
-                        settled.push((key.clone(), result.clone()));
-                        record(task, result, &mut results, &mut halted, false);
+                    if node.isolation.is_some() {
+                        let batch: Vec<BatchItem<'_>> = instances
+                            .iter()
+                            .zip(&keys)
+                            .map(|(task, key)| BatchItem {
+                                task,
+                                attempt: 1,
+                                inputs: item_inputs(key),
+                            })
+                            .collect();
+                        let (batch_results, budget_exceeded) =
+                            run_batch_with_retries(batch, cfg, runner, &mut spent, budget);
+                        if budget_exceeded {
+                            halted = Some(PlanExit::BudgetExceeded);
+                        }
+                        for ((task, result), key) in batch_results.into_iter().zip(&keys) {
+                            runner.settled(task, result.status == TaskStatus::Pass);
+                            settled.push((key.clone(), result.clone()));
+                            record(task, result, &mut results, &mut halted, false);
+                        }
+                    } else {
+                        // Instances of a shared-workspace node are one serial task each: they
+                        // write the same tree and the same result file, so the next one is not
+                        // dispatched until this one has settled.
+                        for (instance, key) in instances.iter().zip(&keys) {
+                            if halted.is_none() {
+                                if spent >= budget {
+                                    halted = Some(PlanExit::BudgetExceeded);
+                                } else if cfg
+                                    .wall_clock
+                                    .is_some_and(|limit| started.elapsed() >= limit)
+                                {
+                                    halted = Some(PlanExit::TimeExceeded);
+                                }
+                            }
+                            if let Some(exit) = &halted {
+                                let why = match exit {
+                                    PlanExit::BudgetExceeded => "budget ceiling reached",
+                                    PlanExit::TimeExceeded => "wall-clock ceiling reached",
+                                    _ => "halted",
+                                };
+                                let r = TaskResult::undispatched(TaskStatus::Blocked, why);
+                                settled.push((key.clone(), r.clone()));
+                                record(instance, r, &mut results, &mut halted, false);
+                                continue;
+                            }
+                            let (result, budget_exceeded) = run_with_retries(
+                                instance,
+                                &item_inputs(key),
+                                cfg,
+                                runner,
+                                &mut spent,
+                                budget,
+                            );
+                            if budget_exceeded {
+                                halted = Some(PlanExit::BudgetExceeded);
+                            }
+                            runner.settled(instance, result.status == TaskStatus::Pass);
+                            settled.push((key.clone(), result.clone()));
+                            record(instance, result, &mut results, &mut halted, false);
+                        }
                     }
                     record(
                         node,
@@ -568,6 +632,15 @@ pub const ITEM_INPUT: &str = "item";
 /// one after its input shifted reprocesses the wrong item.
 fn instance_name(node: &TaskName, key: &str) -> TaskName {
     TaskName(format!("{}[{}]", node.0, key))
+}
+
+/// Whether `name` is an instance of the mapped node `node`. Declared names may not contain a
+/// bracket ([`crate::plan::ir::PlanError::BracketInTaskName`]), so the match is exact.
+fn is_instance_of(node: &TaskName, name: &TaskName) -> bool {
+    name.0
+        .strip_prefix(&node.0)
+        .and_then(|rest| rest.strip_prefix('['))
+        .is_some_and(|rest| rest.ends_with(']'))
 }
 
 /// Read the items a mapped task fans out over, or say why it cannot.
@@ -2051,5 +2124,226 @@ mod tests {
         let out = execute(&plan, &substrate, ExecCfg::default(), &mut r, |_, _| {});
         assert!(out.valid);
         assert_eq!(out.results[&"gpu".into()].status, TaskStatus::Pass);
+    }
+    /// A runner that records the order it was asked to do things in, so a test can assert on
+    /// dispatch shape rather than on the results dispatch happened to produce.
+    struct FanoutRunner {
+        items: Vec<String>,
+        fail: BTreeSet<String>,
+        cost: f64,
+        log: Vec<String>,
+        staged: BTreeMap<String, Vec<String>>,
+    }
+
+    impl FanoutRunner {
+        fn new(items: &[&str]) -> Self {
+            FanoutRunner {
+                items: items.iter().map(|i| (*i).to_string()).collect(),
+                fail: BTreeSet::new(),
+                cost: 0.0,
+                log: Vec::new(),
+                staged: BTreeMap::new(),
+            }
+        }
+    }
+
+    impl TaskRunner for FanoutRunner {
+        fn run(
+            &mut self,
+            task: &Task,
+            _attempt: u32,
+            inputs: &BTreeMap<TaskName, Value>,
+        ) -> Attempt {
+            self.log.push(format!("run {}", task.name));
+            if task.name.0 == "discover" {
+                return Attempt {
+                    outcome: AttemptOutcome::Pass(serde_json::json!({"targets": self.items})),
+                    cost_usd: 0.0,
+                };
+            }
+            let item = inputs
+                .get(&TaskName(ITEM_INPUT.to_string()))
+                .cloned()
+                .unwrap_or(Value::Null);
+            let outcome = if self.fail.contains(&task.name.0) {
+                AttemptOutcome::Fail(format!("{} was programmed to fail", task.name))
+            } else {
+                AttemptOutcome::Pass(serde_json::json!({"item": item, "ran": task.name.0}))
+            };
+            Attempt {
+                outcome,
+                cost_usd: self.cost,
+            }
+        }
+
+        fn run_many(&mut self, batch: &[BatchItem<'_>]) -> Vec<Attempt> {
+            self.log.push(format!("batch of {}", batch.len()));
+            batch
+                .iter()
+                .map(|b| self.run(b.task, b.attempt, &b.inputs))
+                .collect()
+        }
+
+        fn stage(&mut self, task: &Task, producers: &[&Task]) -> Result<(), String> {
+            self.staged.insert(
+                task.name.0.clone(),
+                producers.iter().map(|p| p.name.0.clone()).collect(),
+            );
+            Ok(())
+        }
+
+        fn settled(&mut self, task: &Task, passed: bool) {
+            self.log.push(format!("settled {} {passed}", task.name));
+        }
+    }
+
+    fn mapped_node(name: &str, producer: &str, field: &str, required: bool) -> Task {
+        let mut t = task(name, &[producer], "any", required);
+        t.over = Some(crate::plan::ir::OutputRef {
+            task: producer.into(),
+            field: crate::plan::ir::OutputField(field.to_string()),
+        });
+        t.max_fanout = Some(8);
+        t
+    }
+
+    /// Instances of a node with no worktree write one workspace and one result file, so they run
+    /// one at a time and each settles before the next is dispatched.
+    #[test]
+    fn shared_workspace_instances_run_and_settle_one_at_a_time() {
+        let plan = valid(
+            vec![
+                task("discover", &[], "any", true),
+                mapped_node("audit", "discover", "targets", true),
+            ],
+            5.0,
+        );
+        let mut runner = FanoutRunner::new(&["alpha", "beta", "gamma", "delta"]);
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut runner,
+            |_, _| {},
+        );
+        assert!(out.valid, "{:?}", out.results);
+        assert_eq!(
+            runner.log,
+            vec![
+                "run discover".to_string(),
+                "settled discover true".to_string(),
+                "run audit[alpha]".to_string(),
+                "settled audit[alpha] true".to_string(),
+                "run audit[beta]".to_string(),
+                "settled audit[beta] true".to_string(),
+                "run audit[gamma]".to_string(),
+                "settled audit[gamma] true".to_string(),
+                "run audit[delta]".to_string(),
+                "settled audit[delta] true".to_string(),
+            ]
+        );
+        // Each instance received its own item, not whichever sibling ran last.
+        let folded = out.results[&"audit".into()].output.clone().unwrap();
+        for key in ["alpha", "beta", "gamma", "delta"] {
+            assert_eq!(folded["outputs"][key]["item"], key);
+            assert_eq!(folded["outputs"][key]["ran"], format!("audit[{key}]"));
+        }
+    }
+
+    /// An isolated mapped node keeps its worktree-per-instance batch: concurrency is what
+    /// isolation buys, and a private tree is what makes it safe.
+    #[test]
+    fn isolated_instances_still_go_to_the_runner_as_one_batch() {
+        let mut node = mapped_node("audit", "discover", "targets", true);
+        node.isolation = Some(crate::plan::ir::Isolation::Worktree);
+        let plan = valid(vec![task("discover", &[], "any", true), node], 5.0);
+        let mut runner = FanoutRunner::new(&["alpha", "beta"]);
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut runner,
+            |_, _| {},
+        );
+        assert!(out.valid, "{:?}", out.results);
+        assert!(
+            runner.log.contains(&"batch of 2".to_string()),
+            "{:?}",
+            runner.log
+        );
+    }
+
+    /// The budget is checked before every instance, exactly as it is before every serial task:
+    /// the ones that never ran are Blocked rows the fold counts as failures.
+    #[test]
+    fn a_budget_hit_mid_fanout_blocks_the_instances_that_never_ran() {
+        let plan = valid(
+            vec![
+                task("discover", &[], "any", true),
+                mapped_node("audit", "discover", "targets", false),
+            ],
+            0.25,
+        );
+        let mut runner = FanoutRunner::new(&["alpha", "beta", "gamma", "delta"]);
+        runner.cost = 0.15;
+        let mut rows: Vec<(String, TaskStatus)> = Vec::new();
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut runner,
+            |t, r| rows.push((t.name.0.clone(), r.status)),
+        );
+        assert_eq!(out.exit, PlanExit::BudgetExceeded);
+        assert!(!out.valid);
+        assert!(
+            !runner.log.contains(&"run audit[gamma]".to_string()),
+            "a blocked instance was dispatched anyway: {:?}",
+            runner.log
+        );
+        assert_eq!(
+            rows,
+            vec![
+                ("discover".to_string(), TaskStatus::Pass),
+                ("audit[alpha]".to_string(), TaskStatus::Pass),
+                ("audit[beta]".to_string(), TaskStatus::Pass),
+                ("audit[gamma]".to_string(), TaskStatus::Blocked),
+                ("audit[delta]".to_string(), TaskStatus::Blocked),
+                ("audit".to_string(), TaskStatus::Fail),
+            ]
+        );
+        let node = &out.results[&"audit".into()];
+        let fanout = node.fanout.as_ref().expect("a mapped node folds counts");
+        assert_eq!((fanout.instances, fanout.passed, fanout.failed), (4, 2, 2));
+    }
+
+    /// A mapped producer reaches a consumer as one stand-in per passing instance: the file
+    /// channel says what the join says, and the runner never learns what `over` is.
+    #[test]
+    fn only_passing_instances_stage_their_files_downstream() {
+        let mut node = mapped_node("audit", "discover", "targets", false);
+        node.emits_files = vec!["OUT.md".to_string()];
+        let mut consumer = task("roundup", &["audit"], "any", true);
+        consumer.join = Join::Passed;
+        let plan = valid(
+            vec![task("discover", &[], "any", true), node, consumer],
+            5.0,
+        );
+        let mut runner = FanoutRunner::new(&["alpha", "beta", "gamma"]);
+        runner.fail.insert("audit[beta]".to_string());
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut runner,
+            |_, _| {},
+        );
+        assert_eq!(out.exit, PlanExit::Completed);
+        assert_eq!(out.results[&"roundup".into()].status, TaskStatus::Pass);
+        assert_eq!(
+            runner.staged["roundup"],
+            vec!["audit[alpha]".to_string(), "audit[gamma]".to_string()],
+            "the failed instance's files reached a descendant"
+        );
     }
 }

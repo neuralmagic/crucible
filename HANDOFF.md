@@ -128,8 +128,10 @@ pin in `core-pin.toml`, currently `7c2c1a5`, CI-asserted.
   `#[cfg(test)]` for this.
 - **A prompt starting with `-` was read as a flag** by the agent CLI. A SKILL.md opens with
   `---`. Fixed with an end-of-options marker; it was latent for the scored lane too.
-- **`over` requires `isolated`, which forbids a `session`.** The kwarg-coverage test can no
-  longer put every kwarg in one call; coverage is the union across a function's templates.
+- **`over` excludes only `session`.** Instances of a shared-workspace node run one at a time,
+  so a mapped node no longer needs `isolated`, but N instances cannot resume one transcript.
+  The kwarg-coverage test needs two templates for a constructor taking both; coverage is the
+  union across a function's templates.
 - **`govctl` refuses to delete a referenced clause**, and `clause new` appends to the section
   list while a sed rewrites the existing entries. Check for duplicates after a rename.
 - **`otel::forwarding_mirrors_reparented_traces_and_holds_back_metrics` is flaky.** Three

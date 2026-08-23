@@ -2257,4 +2257,247 @@ workflow(type = "playbook", tasks = [analyze, implement, report])
             _ => panic!("expected a measured failure"),
         }
     }
+    /// A fan-out in the shared workspace, run end to end with no model. The instances write one
+    /// tree and one result file, so each has to be a serial task in its own right: every item is
+    /// attributed to the instance that produced it, and the instance that fails takes its own
+    /// edits with it and nobody else's.
+    #[test]
+    fn shared_workspace_instances_keep_their_own_items_and_commits() {
+        let dir =
+            std::env::temp_dir().join(format!("crucible-fanout-shared-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        let fake = root.join("tools/fake-agent.py");
+
+        let mut agents = serde_json::Map::new();
+        for key in ["alpha", "beta", "gamma", "delta"] {
+            let mut spec = serde_json::json!({
+                "writes": {format!("FILE-{key}.md"): format!("{key} was here\n")},
+                "result": {"item": "{ENV:CRUCIBLE_TASK}", "key": key},
+            });
+            if key == "gamma" {
+                spec["exit"] = serde_json::json!(1);
+                spec["stderr"] = serde_json::json!("gamma has no baseline");
+            }
+            agents.insert(format!("audit[{key}]"), spec);
+        }
+        std::fs::write(
+            dir.join("agents.json"),
+            serde_json::to_string(&Value::Object(agents)).unwrap(),
+        )
+        .unwrap();
+
+        std::fs::write(
+            dir.join("workflow.star"),
+            r##"
+discover = command(
+    name = "discover",
+    run = "printf '{\"targets\": [\"alpha\", \"beta\", \"gamma\", \"delta\"]}\n'",
+    emits = ["targets"],
+)
+audit = agent(
+    name = "audit",
+    prompt = "audit one target",
+    depends_on = [discover],
+    over = discover.targets,
+    max_fanout = 8,
+    required = False,
+    emits = ["item"],
+)
+workflow(type = "playbook", tasks = [discover, audit])
+"##,
+        )
+        .unwrap();
+        write_fanout_manifest(&dir, &fake);
+
+        let mut runner = crate::run::prep_plan_runner(&dir.join("crucible.toml"))
+            .unwrap()
+            .0;
+        assert!(runner.commit_per_task, "a playbook commits per task");
+        let out = execute(
+            &fanout_plan(&dir),
+            &Substrate::default(),
+            ExecCfg::default(),
+            &mut runner,
+            |_, _| {},
+        );
+
+        // Every item reported by the instance that ran it, and the one that exited 1 folded as
+        // failed rather than carrying a sibling's payload.
+        let node = &out.results[&"audit".into()];
+        let folded = node.output.as_ref().expect("folded output");
+        for key in ["alpha", "beta", "delta"] {
+            assert_eq!(folded["outputs"][key]["item"], format!("audit[{key}]"));
+            assert_eq!(folded["outputs"][key]["key"], key);
+        }
+        assert_eq!(folded["passed"], 3);
+        assert_eq!(folded["failed"], 1);
+        assert_eq!(
+            out.results[&"audit[gamma]".into()].status,
+            TaskStatus::Fail,
+            "an instance that exited 1 must not fold in as a pass"
+        );
+
+        // The failing instance's edits are gone; its siblings' survive, including the one that
+        // ran after it.
+        let workspace = dir.join("workspace");
+        for key in ["alpha", "beta", "delta"] {
+            assert_eq!(
+                std::fs::read_to_string(workspace.join(format!("FILE-{key}.md"))).unwrap(),
+                format!("{key} was here\n"),
+                "a passing instance's file was swept away"
+            );
+        }
+        assert!(
+            !workspace.join("FILE-gamma.md").exists(),
+            "the failing instance's edits stayed in the tree"
+        );
+        let log = std::process::Command::new("git")
+            .args(["-C", &workspace.display().to_string(), "log", "--format=%s"])
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&log.stdout);
+        for key in ["alpha", "beta", "delta"] {
+            assert!(log.contains(&format!("task audit[{key}]")), "{log}");
+        }
+        assert!(!log.contains("task audit[gamma]"), "{log}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A mapped node's declared files are captured per instance and reach a consumer under the
+    /// instance's own namespace. A failed instance has no namespace: its files are not evidence.
+    #[test]
+    fn a_mapped_node_captures_and_stages_declared_files_per_instance() {
+        let dir =
+            std::env::temp_dir().join(format!("crucible-fanout-files-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        let fake = root.join("tools/fake-agent.py");
+
+        let mut agents = serde_json::Map::new();
+        for key in ["alpha", "beta", "gamma"] {
+            let mut spec = serde_json::json!({
+                "writes": {"OUT.md": format!("findings for {key}\n")},
+                "result": {"item": "{ENV:CRUCIBLE_TASK}"},
+            });
+            if key == "beta" {
+                spec["exit"] = serde_json::json!(1);
+            }
+            agents.insert(format!("audit[{key}]"), spec);
+        }
+        std::fs::write(
+            dir.join("agents.json"),
+            serde_json::to_string(&Value::Object(agents)).unwrap(),
+        )
+        .unwrap();
+
+        std::fs::write(
+            dir.join("workflow.star"),
+            r##"
+discover = command(
+    name = "discover",
+    run = "printf '{\"targets\": [\"alpha\", \"beta\", \"gamma\"]}\n'",
+    emits = ["targets"],
+)
+audit = agent(
+    name = "audit",
+    prompt = "audit one target",
+    depends_on = [discover],
+    over = discover.targets,
+    max_fanout = 8,
+    required = False,
+    emits = ["item"],
+    emits_files = ["OUT.md"],
+)
+roundup = command(
+    name = "roundup",
+    run = "printf '{\"staged\": \"%s\"}\n' \"$(ls inputs | sort | tr '\\n' ' ')\"",
+    depends_on = [audit],
+    join = "passed",
+)
+workflow(type = "playbook", tasks = [discover, audit, roundup])
+"##,
+        )
+        .unwrap();
+        write_fanout_manifest(&dir, &fake);
+
+        let mut runner = crate::run::prep_plan_runner(&dir.join("crucible.toml"))
+            .unwrap()
+            .0;
+        let out = execute(
+            &fanout_plan(&dir),
+            &Substrate::default(),
+            ExecCfg::default(),
+            &mut runner,
+            |_, _| {},
+        );
+
+        // One capture namespace per passing instance, each holding that instance's own file.
+        let files = dir.join("state/files");
+        for key in ["alpha", "gamma"] {
+            assert_eq!(
+                std::fs::read_to_string(files.join(format!("audit[{key}]/OUT.md"))).unwrap(),
+                format!("findings for {key}\n"),
+                "instance capture is not per instance"
+            );
+        }
+        assert!(
+            !files.join("audit[beta]").exists(),
+            "a failed instance published its declared file"
+        );
+
+        // The consumer is handed the passing instances, and only those.
+        let staged = out.results[&"roundup".into()].output.as_ref().unwrap()["staged"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(staged.contains("audit[alpha]"), "{staged}");
+        assert!(staged.contains("audit[gamma]"), "{staged}");
+        assert!(!staged.contains("audit[beta]"), "{staged}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn write_fanout_manifest(dir: &std::path::Path, fake: &std::path::Path) {
+        std::fs::write(
+            dir.join("crucible.toml"),
+            format!(
+                r#"
+                [repo]
+                path = "."
+                [workspace]
+                dir = "workspace"
+                setup_cmd = "mkdir -p workspace && git -C workspace init -q && git -C workspace -c user.email=c@l -c user.name=c -c commit.gpgsign=false commit -q --allow-empty -m baseline"
+                [agent]
+                backend = "command"
+                agent_cmd = "python3 {}"
+                goal = "audit each discovered target"
+                [agent.env]
+                FAKE_AGENT_SCRIPT = "{}"
+                [workflow]
+                type = "playbook"
+                file = "workflow.star"
+                "#,
+                fake.display(),
+                dir.join("agents.json").display(),
+            ),
+        )
+        .unwrap();
+    }
+
+    fn fanout_plan(dir: &std::path::Path) -> crate::plan::ir::ValidPlan {
+        let mut manifest = crate::manifest::Manifest::load(&dir.join("crucible.toml")).unwrap();
+        manifest.resolve_workflow(dir).unwrap();
+        let workflow = manifest.workflow.as_ref().expect("workflow");
+        crate::loop_graph::iteration_template(
+            Some(workflow),
+            &crate::manifest::WorkflowCaps::for_lane(workflow.workflow_type),
+        )
+        .unwrap()
+    }
 }
