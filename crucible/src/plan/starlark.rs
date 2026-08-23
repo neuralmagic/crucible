@@ -3275,6 +3275,56 @@ workflow(type = "playbook", tasks = [discover, audit])
         let _ = std::fs::remove_dir_all(&pack);
     }
 
+    /// The paper pack compiles, so it cannot rot silently between real runs.
+    ///
+    /// It is the only example that calls a real model, so nothing else exercises it and a
+    /// change to `skill`, `params` or the marking would break it unnoticed. Compiling is free;
+    /// running it is not.
+    #[test]
+    fn the_paper_example_compiles_with_a_supplied_paper() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let pack = root.join("examples/paper");
+        let supplied = BTreeMap::from([(
+            "paper_url".to_string(),
+            "https://arxiv.org/abs/2503.01840".to_string(),
+        )]);
+        let compiled = compile_file_with(&pack.join("workflow.star"), &pack, &supplied)
+            .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
+        assert_eq!(
+            compiled.workflow.workflow_type,
+            crate::manifest::WorkflowType::Playbook
+        );
+        let analyze = compiled
+            .workflow
+            .tasks
+            .iter()
+            .find(|t| t.name.0 == "analyze")
+            .expect("analyze");
+        assert_eq!(analyze.emits_files, ["SPEC.md"]);
+        let TaskKind::Agent { prompt, .. } = &analyze.task else {
+            panic!("a skill is an agent task")
+        };
+        // The supplied URL is marked; the skill's frontmatter is not shipped.
+        assert!(!prompt.starts_with("---"), "frontmatter reached the prompt");
+        let open = prompt
+            .find(EXTERNAL_OPEN)
+            .expect("the paper url is unmarked");
+        let close = prompt.find(EXTERNAL_CLOSE).expect("no end marker");
+        assert_eq!(
+            &prompt[open + EXTERNAL_OPEN.len()..close],
+            "https://arxiv.org/abs/2503.01840"
+        );
+
+        // The required parameter is required: no value, no run.
+        let error = crate::errors::report(
+            &compile_file_with(&pack.join("workflow.star"), &pack, &BTreeMap::new()).unwrap_err(),
+        );
+        assert!(
+            error.contains("required parameter \"paper_url\""),
+            "{error}"
+        );
+    }
+
     /// Two combinations produce a wrong answer under a passing node, so they are refused until
     /// the executor can run them correctly.
     ///
