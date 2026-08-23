@@ -1,0 +1,21 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-08-23-003"
+title = "Refuse formatting operations that launder external text"
+status = "queue"
+created = "2026-08-23"
+refs = ["RFC-0002:C-PLAYBOOK-PARAMS"]
+
+[content]
+description = 'ExternalText implements only add/radd, but str(param("x")), "%s" % param("x"), and any Display-reachable path convert a supplied value to a plain unmarked string before render_prompt sees it, so a hostile value bypasses the external-input markers entirely; reproduced live through compile_source_with (the rendered prompt carried a forged close marker and instruction text outside any marked region). Refuse these operations the way external text is already refused outside a prompt. Found by the [[WI-2026-08-22-009]] verifier. Consider also making a stripped marker loud: today a value carrying markers is silently rewritten, so an operator never learns an injection was attempted.'
+
+[[content.acceptance_criteria]]
+text = "str(), %-formatting, and every other Display-reachable conversion of external text is a compile error, with a test per operator"
+status = "pending"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "a value that carried a marker is surfaced loudly, not silently rewritten"
+status = "pending"
+category = "fixed"

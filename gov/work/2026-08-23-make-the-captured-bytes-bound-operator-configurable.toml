@@ -1,0 +1,21 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-08-23-002"
+title = "Make the captured-bytes bound operator-configurable"
+status = "queue"
+created = "2026-08-23"
+refs = ["RFC-0002:C-TASK-FILES"]
+
+[content]
+description = "[[RFC-0002:C-TASK-FILES]] requires the captured-bytes bound to be operator-configurable and discoverable before a run starts. The bound is a hardcoded const (MAX_CAPTURED_BYTES in plan/harness.rs) with no manifest field, flag, or pre-run disclosure; the run-scoped counting and the loud failure naming the bound already conform. Found by the compliance audit of the playbook-lane branch. Also within reach while in the file: capture_declared adds a file's size to captured_bytes before the copy and never rolls it back when the capture fails unpublished, so a failed capture eats budget no output consumed."
+
+[[content.acceptance_criteria]]
+text = "the captured-bytes bound is settable by the launcher and disclosed before the first task runs"
+status = "pending"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "a failed capture does not consume captured-bytes budget"
+status = "pending"
+category = "fixed"
