@@ -1,0 +1,57 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-08-22-007"
+title = "Make declared-file capture safe to repeat and honest on failure"
+status = "queue"
+created = "2026-08-22"
+refs = ["RFC-0002:C-TASK-FILES"]
+
+[content]
+description = """
+Five defects in declared-file capture and staging, all reproduced.
+
+A failed task's partial output reaches its descendants. `capture_declared` copies one file at a time and returns on the first missing one, leaving what it already copied in `state/files/<task>/`. `stage` checks only `from.exists()`, never the producer's status. The JSON channel correctly withholds a failed task's output while the file channel leaks it, so the two channels disagree about the same task. `settled` git-restores a failed task's workspace, but `state/files` is outside the workspace, so the discard misses it. Smallest fix: skip a producer whose recorded status is not Pass. Capturing to a temp directory and publishing on full success is the better fix.
+
+One successful run makes a capturing task permanently unrunnable. `fs::copy` propagates the source's mode, and a declared output derived from a staged input is 0444 because `read_only` made it so. It lands in `state/files/` as 0444 and every later run fails that task with EACCES. Re-running is a supported flow. Smallest fix: remove the destination before the copy and set the mode explicitly after.
+
+An isolated task never receives its ancestors' declared inputs. `inputs/` is in `.git/info/exclude` so per-task commits do not sweep it in; `capture_diff`'s `git add -A` therefore skips it and the pending patch that populates a worktree carries nothing. Isolated producer to serial consumer works; serial producer to isolated consumer fails 100%. Nothing refuses the combination. Smallest fix: copy `workspace/inputs/` into the worktree after the clone and patch, on a route that does not consult the exclude file.
+
+`MAX_CAPTURED_BYTES` bounds one task, not a run: the accumulator is local to `capture_declared`. C-TASK-FILES says the total for one run.
+
+`emits_files = ["./A.md"]` compiles and can never capture. `safe_relative_path` rejects only ParentDir/RootDir/Prefix and Rust's Components preserves a leading CurDir; `confined` then demands Normal for every component. The failure lands after the agent turn, so a real turn's spend is burned, and the message asserts something false about the path. Smallest fix: filter CurDir in `safe_relative_path`."""
+
+[[content.acceptance_criteria]]
+text = "a task that did not settle passing contributes nothing on the file channel, as it already contributes nothing on the JSON channel"
+status = "pending"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "a capturing task stays runnable across repeated runs; the captured file's mode is the engine's choice, not the source's"
+status = "pending"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "an isolated task receives the files its ancestors declared"
+status = "pending"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "the captured-bytes bound counts a run, not a task"
+status = "pending"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "a declared path with a leading ./ is normalized at compile time rather than failing after a paid turn"
+status = "pending"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "a pack that captures runs three times without cleaning and passes every time"
+status = "pending"
+category = "chore"
+
+[[content.acceptance_criteria]]
+text = "a serial producer's declared file reaches an isolated consumer"
+status = "pending"
+category = "chore"

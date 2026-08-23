@@ -1,0 +1,53 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-08-22-006"
+title = "Run a mapped node's instances correctly"
+status = "queue"
+created = "2026-08-22"
+refs = ["RFC-0002:C-TASK-FILES"]
+
+[content]
+description = """
+`over` without `isolated = True`, and `over` with `emits_files`, are refused at compile time as of b30949f. This is the work that lets the refusals be lifted.
+
+Three defects, one root: a mapped node is dispatched through the concurrent batch path regardless of isolation.
+
+Instances share one workspace and one PLAN_TASK_RESULT.json. Measured on four: alpha reported audit[beta]'s payload, beta reported gamma's, delta reported alpha's, and an instance that ran fine was folded in as failed. `run_in` returns Pass whenever the result file is readable and consults the exit code only when it is absent, so the inverse holds too: an instance that exits 1 can be folded in as a pass carrying a sibling's output.
+
+`runner.settled()` is called per instance only after `run_batch_with_retries` returns for the whole wave, so instance i settles after i+1..n have already mutated the same tree. A failing instance's `settled(false)` hard-resets and cleans the entire workspace, deleting its passing siblings' completed work; the run still reports valid. The mirror case commits a failing instance's edits under an earlier instance's name, which is what settled's "only when it passed" rule exists to prevent. Serializing `run_many` alone does not fix this: the batch is still one Vec and settle is still deferred.
+
+Instances are constructed with `emits_files: Vec::new()`, so capture is a no-op and the absent-file failure C-TASK-FILES requires cannot fire. The identical pack without `over` captures and stages correctly.
+
+Adjacent, same file: an instance name `node[key]` is synthesized without checking the graph, so a real task literally named `audit[x]` is preempted. And `Plan::validate` / `WorkflowCfg::validate` never look at `over` at all, so nothing structural knows a mapped node exists."""
+notes = ["Found by adversarial review and reproduced; the end-to-end test missed it because its pack marks the mapped node isolated."]
+
+[[content.acceptance_criteria]]
+text = "instances of a node without a worktree each run serially in the shared workspace, or the refusal stands"
+status = "pending"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "each instance's workspace outcome settles before the next instance runs"
+status = "pending"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "a mapped node captures its declared files per instance, under a per-instance namespace"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "a synthesized instance name cannot collide with a task the graph declares"
+status = "pending"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "four concurrent instances each report their own item, proven by a stand-in that echoes CRUCIBLE_TASK"
+status = "pending"
+category = "chore"
+
+[[content.acceptance_criteria]]
+text = "a failing instance leaves its passing siblings' files and commits intact"
+status = "pending"
+category = "chore"

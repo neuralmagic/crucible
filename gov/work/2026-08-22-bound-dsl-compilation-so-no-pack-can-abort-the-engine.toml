@@ -3,10 +3,9 @@
 [govctl]
 id = "WI-2026-08-22-001"
 title = "Bound DSL compilation so no pack can abort the engine"
-status = "done"
+status = "active"
 created = "2026-08-22"
 started = "2026-08-22"
-completed = "2026-08-22"
 refs = [
     "RFC-0001:C-WORKFLOW",
     "RFC-0002:C-TASK-FILES",
@@ -23,7 +22,10 @@ The five: (1) AstModule::parse recurses without a depth cap and runs before any 
 Adjacent and in the same class: prompt_file() and the loader read a whole file before checking its size limit, and a hard link escapes pack confinement because symlinks are refused per component and canonicalize() cannot distinguish a hard link. [[RFC-0002:C-TASK-FILES]] carries the same obligation for emits_files.
 
 Item 2 is partly pre-existing: HEAD crashes identically, but comprehensions make it far easier to author."""
-notes = ["The refine-loop channel is the point: a compile error is a recoverable round, a SIGABRT is a dead run. Any fix that trades a panic for a process abort has not fixed anything."]
+notes = [
+    "The refine-loop channel is the point: a compile error is a recoverable round, a SIGABRT is a dead run. Any fix that trades a panic for a process abort has not fixed anything.",
+    "REOPENED. The nesting scanner does not count `lambda` (`:` is not a counted character and `lambda` is not in the operator word list), so 'lambda: ' * 4800 scores 0 and aborts the process with exit 134. Separately, `declared_params` parses on the caller's thread and never applies MAX_SOURCE_BYTES, so 'lambda: ' * 60000 through `plan params` overflows the 8MB main stack and is reachable in release. The recursion that blows up is starlark's module-compile pass, not the parser, which the original fix's reasoning had wrong.",
+]
 
 [[content.acceptance_criteria]]
 text = "parse depth is bounded before AstModule::parse can recurse, for the root source and every load()ed module, and the rejection is a compile error carrying file:line:col"
@@ -69,6 +71,16 @@ category = "chore"
 text = "scope/pipeline.rs turns each hostile source into RoundVerdict::Failed and the refine loop continues"
 status = "done"
 category = "chore"
+
+[[content.acceptance_criteria]]
+text = "lambda counts as a nesting level in the scanner"
+status = "pending"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "declared_params applies the source size cap and runs on the large-stack thread"
+status = "pending"
+category = "fixed"
 
 [verification]
 required_guards = [
