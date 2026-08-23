@@ -112,6 +112,12 @@ fn read_only(path: &Path) {
     }
 }
 
+/// One file an ancestor declared, as the producer's name and the path it declared.
+pub struct StagedInput {
+    pub producer: String,
+    pub declared: String,
+}
+
 pub struct HarnessRunner {
     pub args: Args,
     pub paths: Paths,
@@ -122,14 +128,21 @@ pub struct HarnessRunner {
     /// Bytes captured by this run so far. C-TASK-FILES bounds the run, not any one task: a
     /// pipeline capturing a little at every stage can still fill a disk.
     pub captured_bytes: AtomicU64,
+    /// What each dispatched task is owed on the file channel, recorded by [`TaskRunner::stage`]
+    /// and materialized into that task's own root when it runs. A task with no entry is one the
+    /// executor never staged, and its `inputs/` is left alone.
+    pub staged: BTreeMap<TaskName, Vec<StagedInput>>,
 }
 
 impl TaskRunner for HarnessRunner {
     fn run(&mut self, task: &Task, attempt: u32, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
         run_task(
-            &self.args,
-            &self.paths,
-            &self.captured_bytes,
+            &Dispatch {
+                args: &self.args,
+                paths: &self.paths,
+                captured_bytes: &self.captured_bytes,
+                staged: self.staged.get(&task.name).map(Vec::as_slice),
+            },
             task,
             attempt,
             inputs,
@@ -137,32 +150,23 @@ impl TaskRunner for HarnessRunner {
         )
     }
 
-    /// Stage every ancestor's captured files under `inputs/<producer>/`.
+    /// Record what this task's ancestors declared, for [`run_task`] to lay down under
+    /// `inputs/<producer>/` in whichever root the task runs in.
     ///
-    /// Namespaced by producer so two tasks declaring the same path cannot collide, and made
-    /// read-only so a consumer cannot edit what it was handed and pass the edit on as if the
-    /// producer had said it.
-    fn stage(&mut self, _task: &Task, producers: &[&Task]) -> Result<(), String> {
-        let inputs = self.paths.workspace.join(STAGED_INPUTS);
-        let _ = std::fs::remove_dir_all(&inputs);
-        for producer in producers {
-            for declared in &producer.emits_files {
-                let from = captured_path(&self.paths.state, &producer.name.0, declared);
-                if !from.exists() {
-                    continue;
-                }
-                let to = inputs.join(&producer.name.0).join(declared);
-                if let Some(parent) = to.parent()
-                    && let Err(error) = std::fs::create_dir_all(parent)
-                {
-                    return Err(format!("staging {}: {error}", to.display()));
-                }
-                if let Err(error) = std::fs::copy(&from, &to) {
-                    return Err(format!("staging {}: {error}", to.display()));
-                }
-                read_only(&to);
-            }
-        }
+    /// It is recorded rather than copied because the root is not known yet: an isolated task's
+    /// worktree does not exist until it is dispatched, and a batch of isolated tasks has one
+    /// root each with a different ancestor set, so a single shared `inputs/` cannot serve them.
+    fn stage(&mut self, task: &Task, producers: &[&Task]) -> Result<(), String> {
+        let files = producers
+            .iter()
+            .flat_map(|producer| {
+                producer.emits_files.iter().map(|declared| StagedInput {
+                    producer: producer.name.0.clone(),
+                    declared: declared.clone(),
+                })
+            })
+            .collect();
+        self.staged.insert(task.name.clone(), files);
         Ok(())
     }
 
@@ -205,9 +209,12 @@ impl TaskRunner for HarnessRunner {
         if batch.len() == 1 {
             let b = &batch[0];
             return vec![run_task(
-                &self.args,
-                &self.paths,
-                &self.captured_bytes,
+                &Dispatch {
+                    args: &self.args,
+                    paths: &self.paths,
+                    captured_bytes: &self.captured_bytes,
+                    staged: self.staged.get(&b.task.name).map(Vec::as_slice),
+                },
                 b.task,
                 b.attempt,
                 &b.inputs,
@@ -224,6 +231,7 @@ impl TaskRunner for HarnessRunner {
             }
         };
         let captured = &self.captured_bytes;
+        let staged = &self.staged;
         std::thread::scope(|scope| {
             let handles: Vec<_> = batch
                 .iter()
@@ -233,9 +241,12 @@ impl TaskRunner for HarnessRunner {
                     let pending = pending.as_str();
                     scope.spawn(move || {
                         run_task(
-                            &args,
-                            &paths,
-                            captured,
+                            &Dispatch {
+                                args: &args,
+                                paths: &paths,
+                                captured_bytes: captured,
+                                staged: staged.get(&b.task.name).map(Vec::as_slice),
+                            },
                             b.task,
                             b.attempt,
                             &b.inputs,
@@ -255,19 +266,35 @@ impl TaskRunner for HarnessRunner {
     }
 }
 
+/// What one dispatch needs besides the task: the run's configuration and paths, the run's
+/// captured-byte total, and the files this task's ancestors declared.
+struct Dispatch<'a> {
+    args: &'a Args,
+    paths: &'a Paths,
+    captured_bytes: &'a AtomicU64,
+    staged: Option<&'a [StagedInput]>,
+}
+
 /// Dispatch one task, in the shared workspace or in a private worktree. `pending` is the
 /// shared workspace's uncommitted patch when a concurrent caller already captured it for
 /// the whole batch; `None` means capture it here.
 fn run_task(
-    args: &Args,
-    paths: &Paths,
-    captured_bytes: &AtomicU64,
+    cx: &Dispatch<'_>,
     task: &Task,
     attempt: u32,
     inputs: &BTreeMap<TaskName, Value>,
     pending: Option<&str>,
 ) -> Attempt {
+    let Dispatch {
+        args,
+        paths,
+        captured_bytes,
+        staged,
+    } = *cx;
     let Some(Isolation::Worktree) = task.isolation else {
+        if let Err(e) = materialize_inputs(&paths.state, &paths.workspace, staged) {
+            return transport(e);
+        }
         let attempt_out = prepare_and_run(args, paths, task, attempt, inputs);
         return capture_declared(paths, &paths.workspace, task, attempt_out, captured_bytes);
     };
@@ -299,13 +326,10 @@ fn run_task(
         return transport(format!("worktree setup failed: {e:#}"));
     }
     // `inputs/` is excluded from the workspace's git memory, so neither the clone nor the
-    // pending patch carries it. Copy it in directly or an isolated consumer never sees what
-    // its ancestors declared.
-    if let Err(e) = copy_tree(
-        &paths.workspace.join(STAGED_INPUTS),
-        &worktree.join(STAGED_INPUTS),
-    ) {
-        return transport(format!("staging inputs into the worktree failed: {e}"));
+    // pending patch carries it. Lay this task's own staged set down here, or an isolated
+    // consumer never sees what its ancestors declared.
+    if let Err(e) = materialize_inputs(&paths.state, &worktree, staged) {
+        return transport(e);
     }
     let iso = Paths::for_worktree(worktree.clone(), paths.skills.clone());
     let _ = std::fs::create_dir_all(&iso.state);
@@ -338,6 +362,7 @@ fn capture_declared(
     }
     let staging = paths.state.join("files.tmp").join(&task.name.0);
     let _ = std::fs::remove_dir_all(&staging);
+    let mut charged = 0u64;
     let taken = (|| -> Result<(), String> {
         for declared in &task.emits_files {
             let from = confined(workspace, declared)?;
@@ -355,6 +380,7 @@ fn capture_declared(
             let total = captured
                 .fetch_add(size, Ordering::Relaxed)
                 .saturating_add(size);
+            charged = charged.saturating_add(size);
             if total > MAX_CAPTURED_BYTES {
                 return Err(format!(
                     "this run's declared files exceed {MAX_CAPTURED_BYTES} bytes"
@@ -373,6 +399,7 @@ fn capture_declared(
     })();
     if let Err(why) = taken {
         let _ = std::fs::remove_dir_all(&staging);
+        captured.fetch_sub(charged, Ordering::Relaxed);
         return fail(attempt.cost_usd, why);
     }
     let published = captured_dir(&paths.state, &task.name.0);
@@ -380,6 +407,7 @@ fn capture_declared(
         && let Err(error) = std::fs::create_dir_all(parent)
     {
         let _ = std::fs::remove_dir_all(&staging);
+        captured.fetch_sub(charged, Ordering::Relaxed);
         return fail(
             attempt.cost_usd,
             format!("publishing the files {} declared: {error}", task.name),
@@ -388,6 +416,7 @@ fn capture_declared(
     let _ = std::fs::remove_dir_all(&published);
     if let Err(error) = std::fs::rename(&staging, &published) {
         let _ = std::fs::remove_dir_all(&staging);
+        captured.fetch_sub(charged, Ordering::Relaxed);
         return fail(
             attempt.cost_usd,
             format!("publishing the files {} declared: {error}", task.name),
@@ -396,24 +425,38 @@ fn capture_declared(
     attempt
 }
 
-/// Copy a directory tree file by file, skipping anything that is neither a file nor a
-/// directory. Each copied file is made read-only, as it is where it came from.
-fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
-    if !from.is_dir() {
+/// Lay a task's staged inputs down under `<root>/inputs/<producer>/`, replacing whatever a
+/// previous dispatch left there.
+///
+/// Namespaced by producer so two tasks declaring the same path cannot collide, and made
+/// read-only so a consumer cannot edit what it was handed and pass the edit on as if the
+/// producer had said it. `None` is a task the executor never staged: its root is left alone.
+fn materialize_inputs(
+    state: &Path,
+    root: &Path,
+    staged: Option<&[StagedInput]>,
+) -> Result<(), String> {
+    let Some(staged) = staged else {
         return Ok(());
-    }
-    std::fs::create_dir_all(to)?;
-    for entry in std::fs::read_dir(from)? {
-        let entry = entry?;
-        let kind = entry.file_type()?;
-        let target = to.join(entry.file_name());
-        if kind.is_dir() {
-            copy_tree(&entry.path(), &target)?;
-        } else if kind.is_file() {
-            let _ = std::fs::remove_file(&target);
-            std::fs::copy(entry.path(), &target)?;
-            read_only(&target);
+    };
+    let inputs = root.join(STAGED_INPUTS);
+    let _ = std::fs::remove_dir_all(&inputs);
+    for file in staged {
+        let from = captured_path(state, &file.producer, &file.declared);
+        if !from.exists() {
+            continue;
         }
+        let to = inputs.join(&file.producer).join(&file.declared);
+        if let Some(parent) = to.parent()
+            && let Err(error) = std::fs::create_dir_all(parent)
+        {
+            return Err(format!("staging {}: {error}", to.display()));
+        }
+        let _ = std::fs::remove_file(&to);
+        if let Err(error) = std::fs::copy(&from, &to) {
+            return Err(format!("staging {}: {error}", to.display()));
+        }
+        read_only(&to);
     }
     Ok(())
 }
@@ -739,6 +782,11 @@ mod tests {
             !paths.state.join("files/polish").exists(),
             "a capture past the run's bound was published"
         );
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            MAX_CAPTURED_BYTES - 1,
+            "a capture that was never published still spent the run's budget"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -917,6 +965,120 @@ workflow(type = "playbook", tasks = [seed, produce, check])
             out.results[&"check".into()].note
         );
         assert!(!dir.join("workspace/inputs/produce").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Isolated tasks that are ready together run as one batch, and they do not share an
+    /// ancestor set: each one is owed exactly what its own ancestors declared.
+    #[test]
+    fn batched_isolated_consumers_each_get_their_own_ancestors_files() {
+        let dir =
+            std::env::temp_dir().join(format!("crucible-batch-inputs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("agents.json"),
+            r#"{"prod_a": {"writes": {"a.md": "a\n"}, "result": {"ok": true}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("workflow.star"),
+            r#"
+prod_a = agent(name = "prod_a", prompt = "produce", emits_files = ["a.md"])
+prod_b = command(
+    name = "prod_b",
+    run = "printf 'b\n' > b.md && printf '{\"ok\": true}\n'",
+    depends_on = [prod_a],
+    emits_files = ["b.md"],
+)
+con_a = command(
+    name = "con_a",
+    run = "test -e inputs/prod_a/a.md && test ! -e inputs/prod_b/b.md && printf '{\"ok\": true}\n'",
+    depends_on = [prod_a],
+    isolated = True,
+)
+con_b = command(
+    name = "con_b",
+    run = "test -e inputs/prod_a/a.md && test -e inputs/prod_b/b.md && printf '{\"ok\": true}\n'",
+    depends_on = [prod_b],
+    isolated = True,
+)
+workflow(type = "playbook", tasks = [prod_a, prod_b, con_a, con_b])
+"#,
+        )
+        .unwrap();
+        fake_agent_manifest(&dir);
+
+        let out = run_playbook(&dir);
+        assert_eq!(
+            out.results[&"con_b".into()].status,
+            TaskStatus::Pass,
+            "a batched consumer missed its own ancestor's file: {:?}",
+            out.results[&"con_b".into()].note
+        );
+        assert_eq!(
+            out.results[&"con_a".into()].status,
+            TaskStatus::Pass,
+            "a batched consumer was handed a file no ancestor of its declared: {:?}",
+            out.results[&"con_a".into()].note
+        );
+        assert!(out.valid, "{:?}", out.results);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Staged inputs belong to the task they were staged for. A task that is nobody's descendant
+    /// gets nothing on the file channel, whatever the dispatch before it was handed.
+    #[test]
+    fn a_previous_dispatchs_inputs_do_not_reach_a_non_descendant() {
+        let dir =
+            std::env::temp_dir().join(format!("crucible-stale-inputs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("agents.json"),
+            r#"{"prod": {"writes": {"a.md": "a\n"}, "result": {"ok": true}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("workflow.star"),
+            r#"
+prod = agent(name = "prod", prompt = "produce", emits_files = ["a.md"])
+cons = command(
+    name = "cons",
+    run = "test -e inputs/prod/a.md && printf '{\"ok\": true}\n'",
+    depends_on = [prod],
+)
+serial_stranger = command(
+    name = "serial_stranger",
+    run = "test ! -e inputs/prod/a.md && printf '{\"ok\": true}\n'",
+)
+isolated_stranger = command(
+    name = "isolated_stranger",
+    run = "test ! -e inputs/prod/a.md && printf '{\"ok\": true}\n'",
+    isolated = True,
+)
+workflow(type = "playbook", tasks = [prod, cons, serial_stranger, isolated_stranger])
+"#,
+        )
+        .unwrap();
+        fake_agent_manifest(&dir);
+
+        let out = run_playbook(&dir);
+        assert_eq!(
+            out.results[&"cons".into()].status,
+            TaskStatus::Pass,
+            "a descendant missed what its ancestor declared: {:?}",
+            out.results[&"cons".into()].note
+        );
+        for stranger in ["serial_stranger", "isolated_stranger"] {
+            assert_eq!(
+                out.results[&stranger.into()].status,
+                TaskStatus::Pass,
+                "{stranger} was handed a stranger's declared file: {:?}",
+                out.results[&stranger.into()].note
+            );
+        }
+        assert!(out.valid, "{:?}", out.results);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2087,6 +2249,7 @@ workflow(type = "playbook", tasks = [analyze, implement, report])
             ),
             commit_per_task: false,
             captured_bytes: AtomicU64::new(0),
+            staged: Default::default(),
         };
         let a = runner.run(&t, 1, &BTreeMap::new());
         match a.outcome {

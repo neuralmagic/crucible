@@ -396,29 +396,36 @@ pub fn execute(
                 .collect::<BTreeMap<TaskName, Value>>()
         };
 
-        // Inputs are staged before anything is dispatched. A task whose declared inputs are not
-        // there has not failed, it was never runnable, so this refuses rather than reports.
-        if let Some(first) = dispatch.first() {
-            let reachable = ancestors(plan, first);
-            if reachable.iter().any(|p| !p.emits_files.is_empty()) {
-                // Only an ancestor that settled passing contributes. The file channel says what
-                // the JSON channel says: a failed task's output does not reach a descendant, and
-                // whatever a previous run left in `state/files` is not this run's evidence.
-                let producers: Vec<&Task> = reachable
-                    .into_iter()
-                    .filter(|p| {
-                        results
+        // Only an ancestor that settled passing contributes. The file channel says what the
+        // JSON channel says: a failed task's output does not reach a descendant, and whatever a
+        // previous run left in `state/files` is not this run's evidence.
+        let passing_producers = |t: &Task, results: &BTreeMap<TaskName, TaskResult>| {
+            ancestors(plan, t)
+                .into_iter()
+                .filter(|p| {
+                    !p.emits_files.is_empty()
+                        && results
                             .get(&p.name)
                             .is_some_and(|r| r.status == TaskStatus::Pass)
-                    })
-                    .collect();
-                if let Err(why) = runner.stage(first, &producers) {
-                    let r = TaskResult::undispatched(TaskStatus::Blocked, why);
-                    let first = *first;
-                    record(first, r, &mut results, &mut halted, true);
-                    continue;
-                }
+                })
+                .collect::<Vec<&Task>>()
+        };
+
+        // Every dispatched task is staged, in its own right and with its own ancestors: batched
+        // isolated tasks do not share an ancestor set, and a task with no producers still has to
+        // say so, or the previous dispatch's inputs are still lying there when it runs.
+        let mut refused = None;
+        for t in &dispatch {
+            let producers = passing_producers(t, &results);
+            if let Err(why) = runner.stage(t, &producers) {
+                refused = Some((*t, why));
+                break;
             }
+        }
+        if let Some((t, why)) = refused {
+            let r = TaskResult::undispatched(TaskStatus::Blocked, why);
+            record(t, r, &mut results, &mut halted, true);
+            continue;
         }
 
         if let Some(node) = dispatch.first().filter(|t| t.over.is_some()) {
@@ -447,6 +454,17 @@ pub fn execute(
                             ..node.clone()
                         })
                         .collect();
+                    // An instance is staged under its own name: it runs in its own root, and
+                    // the node itself never runs.
+                    let producers = passing_producers(node, &results);
+                    let refused = instances
+                        .iter()
+                        .find_map(|instance| runner.stage(instance, &producers).err());
+                    if let Some(why) = refused {
+                        let r = TaskResult::undispatched(TaskStatus::Blocked, why);
+                        record(node, r, &mut results, &mut halted, true);
+                        continue;
+                    }
                     let batch: Vec<BatchItem<'_>> = instances
                         .iter()
                         .zip(&keys)
