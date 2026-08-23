@@ -670,6 +670,18 @@ pub enum CompileError {
          may get before it runs, not after"
     )]
     OverWithoutFanout { task: String, reference: String },
+    #[error(
+        "task {task:?} maps over a list without isolated = True. Instances run concurrently, and \
+         without a worktree each they share one workspace and one result file, so every instance \
+         reads back whichever sibling wrote last."
+    )]
+    OverNeedsIsolation { task: String },
+    #[error(
+        "task {task:?} declares both \"over\" and \"emits_files\". A mapped node's declared files \
+         are not captured per instance yet, and a declaration that is silently voided is worse \
+         than one that is refused."
+    )]
+    OverWithEmitsFiles { task: String },
     #[error("task {task:?} declares max_fanout without \"over\"; there is nothing to bound")]
     FanoutWithoutOver { task: String },
     #[error("emits entries must be strings")]
@@ -1268,15 +1280,32 @@ fn check_fanout(task: &Task) -> Result<()> {
             reference: reference.to_string(),
         }),
         (Some(reference), Some(_)) => {
-            if task.depends_on.contains(&reference.task) {
-                Ok(())
-            } else {
-                Err(CompileError::OverNotADependency {
+            if !task.depends_on.contains(&reference.task) {
+                return Err(CompileError::OverNotADependency {
                     task: task.name.0.clone(),
                     reference: reference.to_string(),
                     producer: reference.task.0.clone(),
-                })
+                });
             }
+            // Instances run concurrently. Without a worktree each they share one tree and one
+            // result file, and each instance reads back whichever sibling wrote last: measured,
+            // every item was attributed to the wrong one under a passing node. Refusing the
+            // combination is the honest state until instances of a shared-workspace node are
+            // serialized and settled one at a time.
+            if task.isolation.is_none() {
+                return Err(CompileError::OverNeedsIsolation {
+                    task: task.name.0.clone(),
+                });
+            }
+            // A mapped node's declared files are captured per instance or not at all, and today
+            // it is not at all: the instances carry no emits_files and the node never runs. A
+            // silently voided declaration is worse than a refused one.
+            if !task.emits_files.is_empty() {
+                return Err(CompileError::OverWithEmitsFiles {
+                    task: task.name.0.clone(),
+                });
+            }
+            Ok(())
         }
     }
 }
@@ -2794,19 +2823,35 @@ workflow(type = "custom", tasks = [e], result = e)
         let cases: &[(&str, &str)] = &[
             (
                 "agent",
-                "s = session(name = \"sess\")\nu = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = agent(name = \"a\", prompt = \"p\", harness = \"claude\", model = \"m\", effort = \"high\", session = s, emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = agent(name = \"a\", prompt = \"p\", harness = \"claude\", model = \"m\", effort = \"high\", emits = [\"score\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
+            ),
+            (
+                "agent",
+                "s = session(name = \"sess\")\nu = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = agent(name = \"a\", prompt = \"p\", harness = \"claude\", model = \"m\", effort = \"high\", session = s, emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\"{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
             ),
             (
                 "command",
-                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\nc = command(name = \"c\", run = \"true\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4{extra})\nworkflow(type = \"custom\", tasks = [u, c], result = c)\n",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\nc = command(name = \"c\", run = \"true\", emits = [\"score\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4{extra})\nworkflow(type = \"custom\", tasks = [u, c], result = c)\n",
+            ),
+            (
+                "command",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\nc = command(name = \"c\", run = \"true\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\"{extra})\nworkflow(type = \"custom\", tasks = [u, c], result = c)\n",
             ),
             (
                 "evaluate",
-                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\ne = evaluate(name = \"e\", run = \"true\", threshold = 1, direction = \"higher\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4{extra})\nworkflow(type = \"custom\", tasks = [u, e], result = e)\n",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\ne = evaluate(name = \"e\", run = \"true\", threshold = 1, direction = \"higher\", emits = [\"score\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4{extra})\nworkflow(type = \"custom\", tasks = [u, e], result = e)\n",
+            ),
+            (
+                "evaluate",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\ne = evaluate(name = \"e\", run = \"true\", threshold = 1, direction = \"higher\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\"{extra})\nworkflow(type = \"custom\", tasks = [u, e], result = e)\n",
             ),
             (
                 "skill",
-                "s = session(name = \"sess\")\nu = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = skill(name = \"a\", skill = \"skills/demo\", args = {\"k\": 1}, harness = \"claude\", model = \"m\", effort = \"high\", session = s, emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = skill(name = \"a\", skill = \"skills/demo\", args = {\"k\": 1}, harness = \"claude\", model = \"m\", effort = \"high\", emits = [\"score\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
+            ),
+            (
+                "skill",
+                "s = session(name = \"sess\")\nu = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = skill(name = \"a\", skill = \"skills/demo\", args = {\"k\": 1}, harness = \"claude\", model = \"m\", effort = \"high\", session = s, emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\"{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
             ),
             (
                 "top_k",
@@ -2841,13 +2886,21 @@ workflow(type = "custom", tasks = [e], result = e)
                 "c = command(name = \"c\", run = \"true\")\nworkflow(type = \"custom\", tasks = [c], result = c{extra})\n",
             ),
         ];
+        // `over` excludes `emits_files` and requires `isolated = True`, so one call can no
+        // longer carry every kwarg. Coverage is the union across a function's templates.
+        let mut by_function: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
         for (function, template) in cases {
+            by_function.entry(function).or_default().push(template);
+        }
+        for (function, templates) in &by_function {
             for kwarg in known_kwargs(function) {
                 assert!(
-                    template.contains(&format!("{kwarg} = ")),
-                    "{function} template does not exercise kwarg {kwarg:?}"
+                    templates.iter().any(|t| t.contains(&format!("{kwarg} = "))),
+                    "no {function} template exercises kwarg {kwarg:?}"
                 );
             }
+        }
+        for (function, template) in cases {
             let ok = template.replace("{extra}", "");
             compile_source(&ok, &pack.join("workflow.star"), &pack)
                 .unwrap_or_else(|e| panic!("{function} full-kwarg call must compile: {e}"));
@@ -3219,6 +3272,51 @@ workflow(type = "playbook", tasks = [discover, audit])
             );
             assert!(error.contains(expected), "{clause}: {error}");
         }
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// Two combinations produce a wrong answer under a passing node, so they are refused until
+    /// the executor can run them correctly.
+    ///
+    /// Without a worktree per instance, instances share one workspace and one result file. Run
+    /// four of them and every item is attributed to the wrong one: measured, `alpha` reported
+    /// `audit[beta]`'s payload while an instance that ran fine was folded in as failed.
+    ///
+    /// `emits_files` on a mapped node is voided rather than honoured: the instances are built
+    /// without it and the node itself never runs, so the declaration evaporates. A refused
+    /// declaration beats a silently ignored one.
+    #[test]
+    fn a_fanout_is_refused_where_the_executor_would_get_it_wrong() {
+        let pack = temp_pack("over-refused");
+        let head = "discover = command(name = \"discover\", run = \"./f.sh\", emits = [\"t\"])\n";
+        let cases = [
+            (
+                "over = discover.t,\n    max_fanout = 4",
+                "without isolated = True",
+            ),
+            (
+                "over = discover.t,\n    max_fanout = 4,\n    isolated = True,\n    emits_files = [\"a.md\"]",
+                "not captured per instance yet",
+            ),
+        ];
+        for (clause, expected) in cases {
+            let source = format!(
+                "{head}a = agent(\n    name = \"a\",\n    prompt = \"p\",\n    depends_on = [discover],\n    {clause},\n)\nworkflow(type = \"playbook\", tasks = [discover, a])\n"
+            );
+            let error = crate::errors::report(
+                &compile_source(&source, &pack.join("workflow.star"), &pack)
+                    .err()
+                    .unwrap_or_else(|| panic!("{clause}: compiled")),
+            );
+            assert!(error.contains(expected), "{clause}: {error}");
+        }
+
+        // The isolated, file-less shape still compiles.
+        let ok = format!(
+            "{head}a = agent(name = \"a\", prompt = \"p\", depends_on = [discover], over = discover.t, max_fanout = 4, isolated = True)\nworkflow(type = \"playbook\", tasks = [discover, a])\n"
+        );
+        compile_source(&ok, &pack.join("workflow.star"), &pack)
+            .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
         let _ = std::fs::remove_dir_all(&pack);
     }
 
