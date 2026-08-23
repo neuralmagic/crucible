@@ -1,0 +1,30 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-08-23-001"
+title = "Issue-triage example pack"
+status = "active"
+created = "2026-08-23"
+started = "2026-08-23"
+refs = [
+    "RFC-0002:C-PLAYBOOK-LANE",
+    "RFC-0002:C-PLAYBOOK-PARAMS",
+]
+
+[content]
+description = "The first real-sandbox example pack, workflow automation over GitHub issues: a scan agent discovers the newest open issues, over = scan.issues fans out one isolated triage instance per issue (classification, severity, evidence, draft maintainer response), and a deterministic roundup command assembles REPORT.md from the aggregated fan-out result and the per-instance staged TRIAGE.md files. Curl-first against the public API so a public repository needs no token; openshell backend on the stock claude-sandbox image. The pack is also the live acceptance case for per-instance capture on a mapped node."
+
+[[content.acceptance_criteria]]
+text = "examples/triage compiles; the fan-out is keyed by issue number, isolated, bounded by max_fanout"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "a model-less fake-agent run proves discovery, a failed instance folding without poisoning the join, per-instance file staging, and the assembled report"
+status = "done"
+category = "chore"
+
+[[content.acceptance_criteria]]
+text = "a real run against a public repository in the openshell sandbox, cost and verdict recorded in the README"
+status = "pending"
+category = "chore"
