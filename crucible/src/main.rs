@@ -387,6 +387,11 @@ pub(crate) enum PlanAction {
         /// workspace.
         #[arg(long)]
         manifest: Option<PathBuf>,
+        /// OpenShell compute driver for an agent task's sandbox: `podman` (default, nests it
+        /// beside the runner) or `kubernetes` (schedules it as a sibling pod in-cluster). Fixed
+        /// per deployment, so a rendered wrapper passes it; the manifest cannot declare it.
+        #[arg(long, value_enum, default_value_t = openshell::gateway::ComputeDriver::Podman)]
+        compute_driver: openshell::gateway::ComputeDriver,
     },
 }
 

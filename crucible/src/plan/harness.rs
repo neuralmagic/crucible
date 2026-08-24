@@ -1787,6 +1787,7 @@ workflow(type = "playbook", tasks = [good, bad, after])
                 None,
                 Some(&manifest),
                 ceilings,
+                crate::openshell::gateway::ComputeDriver::Podman,
             )
             .expect_err("a playbook without ceilings must not dispatch");
             assert!(format!("{error:#}").contains(expected), "{error:#}");
@@ -1807,6 +1808,7 @@ workflow(type = "playbook", tasks = [good, bad, after])
                 wall_clock: Some(std::time::Duration::from_secs(600)),
                 wall_clock_raw: Some("10m".into()),
             },
+            crate::openshell::gateway::ComputeDriver::Podman,
         )
         .expect("a playbook with both ceilings runs");
         assert!(dir.join("workspace/out.txt").exists(), "the task never ran");

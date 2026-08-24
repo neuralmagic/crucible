@@ -562,6 +562,7 @@ pub fn run(
     agent_cmd: Option<String>,
     manifest: Option<&Path>,
     ceilings: Ceilings,
+    compute_driver: crate::openshell::gateway::ComputeDriver,
 ) -> Result<()> {
     use crate::plan::exec::{ExecCfg, PlanExit, TaskRunner, execute};
     use crate::plan::runner::ShellRunner;
@@ -575,7 +576,8 @@ pub fn run(
     let (plan, mut runner, events): (ValidPlan, Box<dyn TaskRunner>, Option<std::fs::File>) =
         match (path, manifest) {
             (_, Some(m)) => {
-                let (prepared, loaded) = crate::run::prep_plan_runner_with_params(m, params)?;
+                let (prepared, loaded) =
+                    crate::run::prep_plan_runner_with_params(m, params, compute_driver)?;
                 let session_log = prepared.paths.session_log.clone();
                 evidence = Some(prepared.paths.clone());
                 let playbook = loaded
@@ -762,6 +764,7 @@ mod tests {
                     wall_clock: Some(std::time::Duration::from_secs(60)),
                     wall_clock_raw: Some("60s".to_string()),
                 },
+                crate::openshell::gateway::ComputeDriver::Podman,
             )
             .expect_err("an undeclared parameter is a mistake either way")
         };
@@ -1223,6 +1226,7 @@ mod tests {
             None,
             Some(&passing),
             ceilings(),
+            crate::openshell::gateway::ComputeDriver::Podman,
         )
         .expect("the passing playbook reaches a verdict");
         run(
@@ -1232,6 +1236,7 @@ mod tests {
             None,
             Some(&failing),
             ceilings(),
+            crate::openshell::gateway::ComputeDriver::Podman,
         )
         .expect_err("the failing playbook has no valid verdict");
 
