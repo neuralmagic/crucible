@@ -31,6 +31,7 @@ ignore = [
     { id = "RUSTSEC-2025-0057", reason = "fxhash via starlark_map; interpreter-internal hashing, not a security boundary" },
     { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill via starlark_syntax's postcard/heapless; interpreter-internal" },
     { id = "RUSTSEC-2024-0388", reason = "derivative proc-macro via starlark_syntax; compile-time only" },
+    { id = "RUSTSEC-2024-0436", reason = "paste proc-macro via starlark; compile-time only" },
     # h2 0.3.x empty-DATA-frame DoS; no patched 0.3 release. Reached only through the aws-sdk
     # legacy hyper 0.14 client (fixed-endpoint S3/STS); the workspace's h2 0.4 line is on 0.4.16.
     { id = "RUSTSEC-2026-0258", reason = "h2 0.3 via legacy aws-sdk hyper stack; client to fixed AWS endpoints, 0.4 line patched" },
@@ -51,6 +52,9 @@ allow = [
     "MPL-2.0",
     "OpenSSL",
     "CDLA-Permissive-2.0",
+    # clipboard-win/error-code via starlark's rustyline (Windows-only clipboard). OSI-approved,
+    # permissive.
+    "BSL-1.0",
 ]
 
 # ring's license file is the historical OpenSSL/ISC/MIT aggregate; declare it so the checker
