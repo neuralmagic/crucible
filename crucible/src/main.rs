@@ -503,6 +503,18 @@ pub(crate) struct DeployArgs {
     /// pod volume that mounts it. Defaults to `<domain>-pack`; the controller passes a run-unique name.
     #[arg(long)]
     pub pack_configmap_name: Option<String>,
+    /// Playbook launch: the rendered pod runs `crucible plan run` over the manifest's `[workflow]`
+    /// instead of the agent loop.
+    #[arg(long, conflicts_with_all = ["iterations", "controller", "pr_repo", "harness", "model"], requires = "max_time")]
+    pub playbook: bool,
+    /// Wall-clock ceiling the launched playbook runs under (`90s`, `30m`, `2h`), emitted as the
+    /// in-pod `plan run --max-time`. Required with `--playbook`.
+    #[arg(long, requires = "playbook", value_parser = clap::value_parser!(crate::MaxTime))]
+    pub max_time: Option<crate::MaxTime>,
+    /// A playbook parameter value, `name=value`, repeatable. What the pack's `params` block declares
+    /// is what it accepts.
+    #[arg(long = "param", value_name = "NAME=VALUE", requires = "playbook")]
+    pub params: Vec<String>,
     /// Publish-on-keep: the `owner/repo` fork the rendered loop opens its kept-commits draft PR against
     /// (emitted as the loop's `--pr-repo`). The controller passes its per-repo default so a dispatched
     /// run publishes; omit for a manual render (the manifest's `[publish] pr_repo` still applies). The
@@ -736,6 +748,36 @@ pub(crate) fn parse_duration(s: &str) -> Option<Duration> {
     Duration::try_from_secs_f64(secs).ok()
 }
 
+/// A positive wall-clock ceiling, parsed at the CLI boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MaxTime(Duration);
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum BadMaxTime {
+    #[error("--max-time {raw:?} is not a duration (try `90s`, `30m`, `2h`)")]
+    NotADuration { raw: String },
+    #[error("--max-time must be positive, got {raw:?}")]
+    NotPositive { raw: String },
+}
+
+impl std::str::FromStr for MaxTime {
+    type Err = BadMaxTime;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let d = parse_duration(s).ok_or_else(|| BadMaxTime::NotADuration { raw: s.to_string() })?;
+        if d.is_zero() {
+            return Err(BadMaxTime::NotPositive { raw: s.to_string() });
+        }
+        Ok(MaxTime(d))
+    }
+}
+
+impl std::fmt::Display for MaxTime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}s", self.0.as_secs_f64())
+    }
+}
+
 /// Runtime paths for a manifest run. Everything anchors off the manifest dir + an explicit
 /// state dir, never the binary's install location (contract §2): a target repo is
 /// self-describing, drop a `crucible.toml` at its root and run `crucible` inside it.
@@ -881,5 +923,124 @@ mod tests {
             assert_eq!(parse_duration(hostile), None, "{hostile}");
         }
         assert_eq!(parse_duration("0"), Some(Duration::ZERO));
+    }
+
+    fn deploy_render(extra: &[&str]) -> Result<Cli, clap::Error> {
+        let mut argv = vec![
+            "crucible",
+            "deploy",
+            "render",
+            "--manifest",
+            "pack/crucible.toml",
+            "--profile",
+            "profile.toml",
+        ];
+        argv.extend_from_slice(extra);
+        <Cli as clap::Parser>::try_parse_from(argv)
+    }
+
+    fn deploy_args(cli: Cli) -> DeployArgs {
+        match cli.command {
+            Some(Cmd::Deploy {
+                action: DeployAction::Render(a),
+            }) => a,
+            _ => panic!("deploy render"),
+        }
+    }
+
+    #[test]
+    fn playbook_requires_a_max_time() {
+        assert!(deploy_render(&["--playbook"]).is_err());
+    }
+
+    #[test]
+    fn max_time_requires_playbook() {
+        assert!(deploy_render(&["--max-time", "30m"]).is_err());
+    }
+
+    #[test]
+    fn param_requires_playbook() {
+        assert!(deploy_render(&["--param", "topic=sinks"]).is_err());
+    }
+
+    /// `iterations` carries a default, and clap fires a conflict only on a value the operator
+    /// actually typed, so the default must not trip it while an explicit flag must.
+    #[test]
+    fn playbook_rejects_iterations() {
+        assert!(deploy_render(&["--playbook", "--max-time", "30m"]).is_ok());
+        assert!(deploy_render(&["--playbook", "--max-time", "30m", "--iterations", "3"]).is_err());
+    }
+
+    #[test]
+    fn playbook_rejects_controller() {
+        assert!(deploy_render(&["--playbook", "--max-time", "30m", "--controller"]).is_err());
+    }
+
+    /// `plan run` accepts none of these; silently dropping them is the class of bug this mode exists
+    /// to remove.
+    #[test]
+    fn playbook_rejects_harness_model_and_pr_repo() {
+        for flag in [
+            ["--harness", "claude"],
+            ["--model", "claude-opus-4-6"],
+            ["--pr-repo", "example/fork"],
+        ] {
+            assert!(
+                deploy_render(&["--playbook", "--max-time", "30m", flag[0], flag[1]]).is_err(),
+                "{flag:?}"
+            );
+        }
+    }
+
+    /// The argv the controller's playbook dispatch actually shells, parsed by the real CLI.
+    #[test]
+    fn playbook_render_accepts_the_controllers_argv() {
+        let cli = deploy_render(&[
+            "--pack",
+            "--pack-configmap-name",
+            "crucible-run-42-pack",
+            "--playbook",
+            "--max-cost",
+            "4.5",
+            "--max-time",
+            "30m",
+            "--param",
+            "topic=attention sinks",
+            "--param",
+            "depth=--deep",
+        ])
+        .expect("the controller's argv parses");
+        let args = deploy_args(cli);
+        assert!(args.playbook);
+        assert!(args.pack);
+        assert_eq!(
+            args.pack_configmap_name.as_deref(),
+            Some("crucible-run-42-pack")
+        );
+        assert_eq!(args.max_cost, 4.5);
+        assert_eq!(
+            args.max_time.map(|t| t.to_string()).as_deref(),
+            Some("1800s")
+        );
+        assert_eq!(args.params, vec!["topic=attention sinks", "depth=--deep"]);
+    }
+
+    #[test]
+    fn max_time_parses_and_round_trips() {
+        let t: MaxTime = "30m".parse().expect("30m parses");
+        assert_eq!(t.to_string(), "1800s");
+        assert_eq!(parse_duration(&t.to_string()), parse_duration("30m"));
+        for bad in ["garbage", "", "-5m"] {
+            assert!(
+                matches!(bad.parse::<MaxTime>(), Err(BadMaxTime::NotADuration { .. })),
+                "{bad}"
+            );
+        }
+        for zero in ["0", "0s", "0m"] {
+            assert!(
+                matches!(zero.parse::<MaxTime>(), Err(BadMaxTime::NotPositive { .. })),
+                "{zero}"
+            );
+        }
     }
 }

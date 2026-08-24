@@ -296,6 +296,20 @@ fn render_mermaid_styled(
 }
 
 /// Serialize an admitted plan for the event stream.
+/// The `Shutdown.outcome` token a finished plan reports, in the vocabulary
+/// [`crate::recovery::ShutdownOutcome`] parses. Only a plan that ran its whole graph is
+/// `finished`.
+fn shutdown_outcome(out: &crate::plan::exec::PlanOutcome) -> &'static str {
+    use crate::plan::exec::PlanExit;
+    if out.valid {
+        return "finished";
+    }
+    match out.exit {
+        PlanExit::BudgetExceeded | PlanExit::TimeExceeded => "budget",
+        PlanExit::Completed | PlanExit::Truncated { .. } | PlanExit::ShortCircuit { .. } => "error",
+    }
+}
+
 pub(crate) fn plan_admitted_event(plan: &ValidPlan) -> crate::session::SessionEvent {
     let p = plan.plan();
     crate::session::SessionEvent::PlanAdmitted {
@@ -557,11 +571,13 @@ pub fn run(
     }
 
     // Either the plan was handed to us, or the manifest names the graph and we compile it.
+    let mut evidence: Option<crate::Paths> = None;
     let (plan, mut runner, events): (ValidPlan, Box<dyn TaskRunner>, Option<std::fs::File>) =
         match (path, manifest) {
             (_, Some(m)) => {
                 let (prepared, loaded) = crate::run::prep_plan_runner_with_params(m, params)?;
                 let session_log = prepared.paths.session_log.clone();
+                evidence = Some(prepared.paths.clone());
                 let playbook = loaded
                     .workflow
                     .as_ref()
@@ -671,6 +687,18 @@ pub fn run(
         PlanExit::BudgetExceeded => "budget exceeded".to_string(),
         PlanExit::TimeExceeded => "wall-clock ceiling reached".to_string(),
     };
+    if let Some(f) = &events {
+        append(
+            f,
+            &crate::session::SessionEvent::Shutdown {
+                outcome: shutdown_outcome(&out).to_string(),
+                reason: exit.clone(),
+            },
+        );
+    }
+    if let Some(p) = &evidence {
+        crate::run::deliver_run_evidence(p);
+    }
     println!(
         "plan v{}: {} — spent ${:.4} of ${}",
         plan.plan().version,
@@ -1054,6 +1082,182 @@ mod tests {
         std::fs::write(&path, "version = 1\n[budget]\nusd = 1.0\n").unwrap();
         let err = load(&path).unwrap_err();
         assert!(format!("{err:#}").contains("no tasks"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Process-global env vars, removed on drop so a panicking assertion cannot leak the drop-box
+    /// URL into every later test in this process. Pair with [`crate::test_env_lock`].
+    struct ScopedEnv(Vec<&'static str>);
+
+    impl ScopedEnv {
+        fn set(vars: &[(&'static str, String)]) -> Self {
+            for (k, v) in vars {
+                unsafe { std::env::set_var(k, v) };
+            }
+            Self(vars.iter().map(|(k, _)| *k).collect())
+        }
+    }
+
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            for k in &self.0 {
+                unsafe { std::env::remove_var(k) };
+            }
+        }
+    }
+
+    /// Read one HTTP POST off `s`, answer 200, and return `(path, body)`. The drop-box client is
+    /// real `reqwest`, so the receiver has to be a real socket.
+    fn read_one_post(s: &mut std::net::TcpStream) -> (String, Vec<u8>) {
+        use std::io::{Read, Write};
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 8192];
+        let (head_end, len) = loop {
+            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buf[..i]).to_ascii_lowercase();
+                let len: usize = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok())
+                    .expect("a content-length");
+                if buf.len() >= i + 4 + len {
+                    break (i, len);
+                }
+            }
+            let n = s.read(&mut chunk).expect("read");
+            assert!(n > 0, "the client hung up mid-request");
+            buf.extend_from_slice(&chunk[..n]);
+        };
+        let path = String::from_utf8_lossy(&buf[..head_end])
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .expect("a request line")
+            .to_string();
+        let body = buf[head_end + 4..head_end + 4 + len].to_vec();
+        s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .expect("respond");
+        let _ = s.flush();
+        (path, body)
+    }
+
+    /// The ingest contract a pod-dispatched playbook rides: a manifest `plan run` publishes its
+    /// session to the Tier 2 drop-box exactly as a loop run does, on the failing path too.
+    #[test]
+    fn manifest_plan_run_delivers_its_session_to_the_dropbox() {
+        let _guard = crate::test_env_lock();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let receiver = std::thread::spawn(move || {
+            listener
+                .incoming()
+                .take(2)
+                .map(|s| read_one_post(&mut s.expect("accept")))
+                .collect::<Vec<_>>()
+        });
+
+        let dir = std::env::temp_dir().join(format!("crucible-dropbox-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let token = dir.join("token");
+        std::fs::write(&token, "fake-token").expect("token");
+
+        let manifest_for = |name: &str, script: &str| {
+            let pack = dir.join(name);
+            std::fs::create_dir_all(&pack).expect("mkdir pack");
+            let probe = pack.join("probe.sh");
+            std::fs::write(&probe, script).expect("probe");
+            std::fs::write(
+                pack.join("workflow.star"),
+                format!(
+                    "workflow(type = \"playbook\", tasks = [command(name = \"probe\", run = \"sh {}\")])\n",
+                    probe.display()
+                ),
+            )
+            .expect("workflow");
+            std::fs::write(
+                pack.join("crucible.toml"),
+                r#"
+                [repo]
+                path = "."
+                [workspace]
+                dir = "workspace"
+                setup_cmd = "mkdir -p workspace && git -C workspace init -q && git -C workspace -c user.email=c@l -c user.name=c -c commit.gpgsign=false commit -q --allow-empty -m baseline"
+                [agent]
+                backend = "command"
+                agent_cmd = "true"
+                goal = "deliver the session"
+                [workflow]
+                type = "playbook"
+                file = "workflow.star"
+                "#,
+            )
+            .expect("manifest");
+            pack.join("crucible.toml")
+        };
+
+        let passing = manifest_for("pass", "echo '{\"ok\": true}'\n");
+        let failing = manifest_for("fail", "echo '{\"ok\": false}'\nexit 1\n");
+
+        let _ingest = ScopedEnv::set(&[
+            (
+                crucible_contract::ENV_INGEST_URL,
+                format!("http://127.0.0.1:{port}"),
+            ),
+            (
+                crucible_contract::ENV_INGEST_TOKEN_PATH,
+                token.display().to_string(),
+            ),
+            (crucible_contract::ENV_POD_NAME, "crucible-run-pod".into()),
+        ]);
+
+        let ceilings = || Ceilings {
+            usd: Some(1.0),
+            wall_clock: Some(std::time::Duration::from_secs(60)),
+            wall_clock_raw: Some("60s".to_string()),
+        };
+        run(
+            None,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            Some(&passing),
+            ceilings(),
+        )
+        .expect("the passing playbook reaches a verdict");
+        run(
+            None,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            Some(&failing),
+            ceilings(),
+        )
+        .expect_err("the failing playbook has no valid verdict");
+
+        drop(_ingest);
+
+        let posts = receiver.join().expect("receiver");
+        assert_eq!(posts.len(), 2, "both runs deliver");
+        for ((path, body), outcome) in posts.iter().zip(["finished", "error"]) {
+            assert_eq!(path, "/api/pods/crucible-run-pod/artifacts/run-session");
+            assert_eq!(&body[..2], b"\x1f\x8b", "the body is gzip");
+            let mut text = String::new();
+            std::io::Read::read_to_string(
+                &mut flate2::read::GzDecoder::new(body.as_slice()),
+                &mut text,
+            )
+            .expect("gunzip");
+            assert!(text.contains("probe"), "the session's tasks: {text}");
+            let last = text.lines().last().expect("a delivered session");
+            let ev = crate::session::decode(last).expect("the last line decodes");
+            match ev {
+                crate::session::SessionEvent::Shutdown { outcome: got, .. } => {
+                    assert_eq!(got, outcome, "{text}")
+                }
+                other => panic!("the session must end in a shutdown, got {other:?}: {text}"),
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

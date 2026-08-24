@@ -48,6 +48,8 @@ pub enum RenderError {
         path: std::path::PathBuf,
         bytes: usize,
     },
+    #[error("the openshell-loop deploy template needs [agent].sandbox_image (the agent's sandbox)")]
+    MissingSandboxImage,
 }
 
 /// In-pod paths fixed by the openshell-loop template (the volume mounts the renderer always emits).
@@ -123,6 +125,9 @@ pub struct RenderOpts {
     /// The model the loop runs, rendered as `--model=<m>` into the wrapper's `crucible` invocation.
     /// `None` emits no flag, the loop derives the model from the resolved harness.
     pub model: Option<String>,
+    /// Playbook launch: the wrapper runs `crucible plan run` over the manifest's `[workflow]` rather
+    /// than the agent loop. `None` renders the loop.
+    pub playbook: Option<PlaybookLaunch>,
 }
 
 /// The knobs the controller supplies for a pack render (see [`RenderOpts::pack`]).
@@ -132,6 +137,14 @@ pub struct PackDelivery {
     /// it, so the two never drift. The controller creates the CM under exactly this name and owner-refs
     /// it to the created pod for cascade GC.
     pub configmap_name: String,
+}
+
+/// The knobs a playbook launch supplies (see [`RenderOpts::playbook`]).
+#[derive(Debug)]
+pub struct PlaybookLaunch {
+    pub max_time: crate::MaxTime,
+    pub max_cost: f64,
+    pub params: BTreeMap<String, String>,
 }
 
 /// The in-pod mount dir for the projected Tier 2 ingest ServiceAccount token (Tier 2 ingest). The turn
@@ -156,6 +169,11 @@ const PACK_WORKDIR_VOLUME: &str = "pack-workdir";
 /// A ConfigMap's hard size limit (1 MiB of keys). Packs are capped well under this upstream (#134);
 /// this is a defensive floor so an oversize pack fails the render loudly, not the kubelet silently.
 const CONFIGMAP_MAX_BYTES: usize = 900 * 1024;
+
+/// POSIX single-quote one argv element for the `/bin/sh -c` wrapper.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
 
 /// The renderer's manifest-derived inputs, factored so a plain [`crate::manifest::Manifest`]
 /// (single domain) and a [`crate::manifest::CompositeManifest`] both produce one, a single domain
@@ -208,15 +226,33 @@ impl<'a> RenderInput<'a> {
         let deploy = manifest.deploy.as_ref().ok_or_else(|| MissingDeployBlock {
             name: name.to_owned(),
         })?;
-        Ok(Self {
+        Ok(Self::with_deploy_targets(
+            manifest,
+            name,
+            vec![deploy.clone()],
+        ))
+    }
+
+    /// Project a manifest launched as a playbook: `plan run` builds and deploys nothing, so
+    /// `[deploy]` is optional and its targets are whatever the manifest happens to declare.
+    pub fn from_playbook_manifest(manifest: &'a Manifest, name: &'a str) -> Self {
+        Self::with_deploy_targets(manifest, name, manifest.deploy.iter().cloned().collect())
+    }
+
+    fn with_deploy_targets(
+        manifest: &'a Manifest,
+        name: &'a str,
+        deploy_targets: Vec<DeployCfg>,
+    ) -> Self {
+        Self {
             name,
             agent: &manifest.agent,
             measure_cmd: manifest.judge.as_ref().map(|j| j.measure_cmd.as_str()),
             apply_cmd: manifest.world.apply_cmd.as_deref(),
-            deploy_targets: vec![deploy.clone()],
+            deploy_targets,
             measure: manifest.measure.as_ref(),
             workspace_dir: &manifest.workspace.dir,
-        })
+        }
     }
 }
 
@@ -242,9 +278,10 @@ pub fn render(
         .and_then(|n| n.to_str())
         .context("manifest dir has a name")?;
     // The openshell-loop template runs a sandboxed agent turn, so the sandbox image is required.
-    let sandbox_image = input.agent.sandbox_image.clone().context(
-        "the openshell-loop deploy template needs [agent].sandbox_image (the agent's sandbox)",
-    )?;
+    let sandbox_image = input.agent.sandbox_image.clone();
+    if sandbox_image.is_none() && opts.playbook.is_none() {
+        return Err(RenderError::MissingSandboxImage.into());
+    }
     // Delegated GPU jobs: the [measure].cluster spoke, resolved + validated up front. Only a
     // measuring domain reads it; a bastioned spoke has no tunnel yet, so refuse it loudly.
     let spoke = match input.measure {
@@ -457,8 +494,9 @@ struct Renderer<'a> {
     opts: &'a RenderOpts,
     /// The loop image, digest-resolved when pinning is on.
     image: String,
-    /// The agent's sandbox image (required for the openshell template).
-    sandbox_image: String,
+    /// The agent's sandbox image. Always present for the openshell-loop template; a playbook
+    /// declares one only when a task runs sandboxed.
+    sandbox_image: Option<String>,
     /// The compute driver governing sandbox scheduling.
     driver: ComputeDriver,
     /// The resolved `[measure].cluster` spoke (name + entry), when the domain measures remotely.
@@ -531,10 +569,19 @@ impl Renderer<'_> {
         sc
     }
 
+    /// The profile's run-state claim, or None when this render persists nothing. A playbook
+    /// persists none: `plan run` neither resumes nor truncates the session log it appends to.
+    fn state_pvc(&self) -> Option<&crate::deploy::profile::StatePvc> {
+        match self.opts.playbook {
+            Some(_) => None,
+            None => self.profile.cluster.state_pvc.as_ref(),
+        }
+    }
+
     /// The profile-named existing claim, or `<run>-state` when the profile carries a template.
     /// None = no persistence.
     fn state_claim_name(&self) -> Option<String> {
-        match self.profile.cluster.state_pvc.as_ref()? {
+        match self.state_pvc()? {
             crate::deploy::profile::StatePvc::Existing(name) => Some(name.clone()),
             crate::deploy::profile::StatePvc::Template(_) => {
                 Some(format!("{}-state", self.input.name))
@@ -546,7 +593,7 @@ impl Renderer<'_> {
     /// pointed at it, so each run gets its own `state/<run>` subtree or two runs would interleave
     /// their session.jsonl. A template claim is already per-run, so it mounts at the root.
     fn state_sub_path(&self) -> Option<String> {
-        match self.profile.cluster.state_pvc.as_ref()? {
+        match self.state_pvc()? {
             crate::deploy::profile::StatePvc::Existing(_) => {
                 Some(format!("state/{}", self.input.name))
             }
@@ -557,9 +604,7 @@ impl Renderer<'_> {
     /// Generated when `state_pvc` is a template. No ownerReferences: a static render has no owner
     /// UID to point at, and the claim outliving the pod is the point.
     fn state_pvc_doc(&self) -> Option<core::PersistentVolumeClaim> {
-        let crate::deploy::profile::StatePvc::Template(t) =
-            self.profile.cluster.state_pvc.as_ref()?
-        else {
+        let crate::deploy::profile::StatePvc::Template(t) = self.state_pvc()? else {
             return None;
         };
         let mut labels = BTreeMap::from([
@@ -605,7 +650,7 @@ impl Renderer<'_> {
             image: Some(self.image.clone()),
             image_pull_policy: Some("IfNotPresent".to_string()),
             command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
-            args: Some(vec![self.wrapper_script()]),
+            args: Some(vec![self.wrapper_script()?]),
             security_context: self.loop_security_context(),
             env: Some(self.env()?),
             volume_mounts: Some(self.volume_mounts()),
@@ -643,7 +688,7 @@ impl Renderer<'_> {
                 // (the wrapper detects the session log and passes --resume). Without it a restart
                 // would silently start a fresh run on a blank emptyDir, so the pod stays one-shot.
                 restart_policy: Some(
-                    if self.profile.cluster.state_pvc.is_some() {
+                    if self.state_pvc().is_some() {
                         "OnFailure"
                     } else {
                         "Never"
@@ -837,8 +882,10 @@ impl Renderer<'_> {
 
         // Under the kubernetes driver, project the config the runtime `gateway_toml()` reads to
         // build the `[openshell.drivers.kubernetes]` block.
-        if self.driver == ComputeDriver::Kubernetes {
-            env.extend(kubernetes_sandbox_env(self.profile, &self.sandbox_image));
+        if self.driver == ComputeDriver::Kubernetes
+            && let Some(sandbox_image) = self.sandbox_image.as_deref()
+        {
+            env.extend(kubernetes_sandbox_env(self.profile, sandbox_image));
         }
 
         let downward = |name: &str, field_path: &str| core::EnvVar {
@@ -922,13 +969,36 @@ impl Renderer<'_> {
     /// When it is absent (an old controller, or a local run) the wrapper falls back to the
     /// `SESSION (rc=…)` delimiter contract, the controller scrapes everything after the shared
     /// [`crucible_contract::RUN_SESSION_DELIMITER`] line as the run's session log.
-    fn wrapper_script(&self) -> String {
+    fn wrapper_script(&self) -> Result<String> {
         let domain_dir = self.domain_dir();
-        let sandbox_image = &self.sandbox_image;
-        let iterations = self.opts.iterations;
-        let max_cost = self.opts.max_cost;
         let manifest_file = self.manifest_file;
         let session_delimiter = crucible_contract::RUN_SESSION_DELIMITER;
+        if let Some(pb) = &self.opts.playbook {
+            let max_cost = pb.max_cost;
+            let max_time = pb.max_time;
+            let param_flags: String = pb
+                .params
+                .iter()
+                .map(|(name, value)| format!(" --param {}", sh_quote(&format!("{name}={value}"))))
+                .collect();
+            return Ok(format!(
+                r#"D={domain_dir}
+crucible plan run --manifest "$D/{manifest_file}" --max-cost {max_cost} --max-time {max_time}{param_flags}
+rc=$?
+if [ -z "${{CRUCIBLE_INGEST_URL:-}}" ]; then
+  echo "=================== {session_delimiter}$rc) ==================="
+  cat "$D/state/session.jsonl" 2>/dev/null
+fi
+exit $rc
+"#
+            ));
+        }
+        let sandbox_image = self
+            .sandbox_image
+            .as_deref()
+            .ok_or(RenderError::MissingSandboxImage)?;
+        let iterations = self.opts.iterations;
+        let max_cost = self.opts.max_cost;
         // Publish-on-keep: when the profile names a bucket, the loop pod publishes its run record.
         let results_bucket_flag = match &self.profile.cluster.results_bucket {
             Some(b) if !b.is_empty() => format!(" --results-bucket={b}"),
@@ -948,12 +1018,12 @@ impl Renderer<'_> {
         let model_flag = crate::deploy::render::turn::model_flag(self.opts.model.as_ref(), '=');
         // Persistent state: a non-empty session log on the mounted PVC means a prior pod of this
         // run already produced rows, so this start is a continuation, not a fresh run.
-        let resume_flag = if self.profile.cluster.state_pvc.is_some() {
+        let resume_flag = if self.state_pvc().is_some() {
             r#" $([ -s "$D/state/session.jsonl" ] && echo --resume)"#
         } else {
             ""
         };
-        format!(
+        Ok(format!(
             r#"D={domain_dir}
 crucible --manifest="$D/{manifest_file}" --ui=stream --agent-backend=openshell \
   --sandbox-image={sandbox_image} --control-port={CONTROL_PORT} --iterations={iterations} --max-cost={max_cost}{results_bucket_flag}{pr_repo_flag}{compute_driver_flag}{harness_flag}{model_flag}{resume_flag}
@@ -964,7 +1034,7 @@ if [ -z "${{CRUCIBLE_INGEST_URL:-}}" ]; then
 fi
 exit $rc
 "#
-        )
+        ))
     }
 
     fn volume_mounts(&self) -> Vec<core::VolumeMount> {
@@ -1008,7 +1078,7 @@ exit $rc
         }
         // Persistent run state: mounted OVER the domain dir's state/ subdir so session.jsonl and
         // the agent-session files outlive the pod (the wrapper's `--resume` reads them back).
-        if self.profile.cluster.state_pvc.is_some() {
+        if self.state_pvc().is_some() {
             mounts.push(core::VolumeMount {
                 name: "run-state".to_string(),
                 mount_path: format!("{}/state", self.domain_dir()),
@@ -1721,6 +1791,7 @@ mod tests {
                 clusters_file: None,
                 harness: None,
                 model: None,
+                playbook: None,
             },
         )
         .expect("render");
@@ -1879,6 +1950,7 @@ mod tests {
                     clusters_file: None,
                     harness: None,
                     model: None,
+                    playbook: None,
                 },
             )
             .expect("render")
@@ -1923,6 +1995,7 @@ mod tests {
                     clusters_file: None,
                     harness,
                     model: model.map(str::to_string),
+                    playbook: None,
                 },
             )
             .expect("render")
@@ -1963,6 +2036,7 @@ mod tests {
                 clusters_file: None,
                 harness: None,
                 model: None,
+                playbook: None,
             },
         )
         .expect("render");
@@ -2077,6 +2151,7 @@ mod tests {
                 clusters_file: None,
                 harness: None,
                 model: None,
+                playbook: None,
             },
         )
         .expect("render");
@@ -2194,6 +2269,7 @@ mod tests {
                 clusters_file: None,
                 harness: None,
                 model: None,
+                playbook: None,
             },
         )
         .expect("render");
@@ -2250,6 +2326,7 @@ mod tests {
                 clusters_file: None,
                 harness: None,
                 model: None,
+                playbook: None,
             },
         )
         .expect("render")
@@ -2441,6 +2518,7 @@ mod tests {
                 clusters_file: None,
                 harness: None,
                 model: None,
+                playbook: None,
             },
         )
         .expect("render");
@@ -2517,6 +2595,7 @@ mod tests {
                 clusters_file: None,
                 harness: None,
                 model: None,
+                playbook: None,
             },
         )
         .expect("render");
@@ -2602,6 +2681,7 @@ mod tests {
                 clusters_file: None,
                 harness: None,
                 model: None,
+                playbook: None,
             },
         )
         .expect("render");
@@ -2694,6 +2774,7 @@ mod tests {
                 clusters_file: None,
                 harness: None,
                 model: None,
+                playbook: None,
             },
         )
         .expect("render");
@@ -2803,6 +2884,7 @@ mod tests {
                 clusters_file: None,
                 harness: None,
                 model: None,
+                playbook: None,
             },
         )
         .expect("render");
@@ -2917,6 +2999,7 @@ mod tests {
                 clusters_file: None,
                 harness: None,
                 model: None,
+                playbook: None,
             },
         )
         .expect("render");
@@ -2967,6 +3050,7 @@ mod tests {
                 clusters_file: None,
                 harness: None,
                 model: None,
+                playbook: None,
             },
         ) {
             Err(e) => e,
@@ -3071,6 +3155,7 @@ mod tests {
                 clusters_file: None,
                 harness: None,
                 model: None,
+                playbook: None,
             },
         )
         .expect("render")
@@ -3256,6 +3341,7 @@ mod tests {
                 clusters_file: None,
                 harness: None,
                 model: None,
+                playbook: None,
             },
         )
         .expect("render");
@@ -3810,5 +3896,286 @@ mod tests {
         // A bind the engine cannot parse falls back to the default, never to 0 (which would render a
         // policy that drops every broker call).
         assert_eq!(broker_ingress_port("garbage"), 8849);
+    }
+
+    /// A judge-free playbook pack, the shape the packs in `examples/` actually take: no `[deploy]`
+    /// block (a playbook builds and deploys nothing) and no `[judge]`. `[workflow] type` is here
+    /// only to keep the fixture honest, the renderer is told the mode by `RenderOpts::playbook`.
+    fn playbook_manifest() -> Manifest {
+        toml::from_str(
+            r#"
+            [repo]
+            path = "."
+            [agent]
+            backend = "openshell"
+            goal = "draft the roundup"
+            sandbox_image = "registry.example.com/alpha-sandbox:latest"
+            [workflow]
+            type = "playbook"
+            file = "workflow.star"
+        "#,
+        )
+        .expect("playbook manifest parses")
+    }
+
+    /// The other shape the controller admits in Pod mode: a `command`-backend pack, which declares
+    /// no sandbox image because no task runs sandboxed.
+    fn sandboxless_playbook_manifest() -> Manifest {
+        toml::from_str(
+            r#"
+            [repo]
+            path = "."
+            [agent]
+            backend = "command"
+            agent_cmd = "./role.sh"
+            goal = "draft the roundup"
+            [workflow]
+            type = "playbook"
+            file = "workflow.star"
+        "#,
+        )
+        .expect("playbook manifest parses")
+    }
+
+    fn playbook_launch() -> PlaybookLaunch {
+        PlaybookLaunch {
+            max_time: "30m".parse().expect("30m is a duration"),
+            max_cost: 4.5,
+            params: BTreeMap::from([
+                ("topic".to_string(), "attention sinks".to_string()),
+                ("depth".to_string(), "--deep".to_string()),
+            ]),
+        }
+    }
+
+    fn render_playbook(profile: &DeployProfile, playbook: PlaybookLaunch) -> String {
+        render_playbook_manifest(&playbook_manifest(), profile, playbook)
+    }
+
+    fn render_playbook_manifest(
+        manifest: &Manifest,
+        profile: &DeployProfile,
+        playbook: PlaybookLaunch,
+    ) -> String {
+        let input = RenderInput::from_playbook_manifest(manifest, "alpha");
+        render(
+            input,
+            std::path::Path::new("/opt/crucible/domains/alpha"),
+            "crucible.toml",
+            profile,
+            &RenderOpts {
+                iterations: 1,
+                max_cost: 0.0,
+                pin_digests: false,
+                pr_repo: None,
+                pack: None,
+                clusters_file: None,
+                harness: None,
+                model: None,
+                playbook: Some(playbook),
+            },
+        )
+        .expect("render")
+    }
+
+    /// The whole point: a playbook pod runs the plan runner, not the agent loop. Every loop-only
+    /// flag `plan run` would reject as an unexpected argument is absent.
+    #[test]
+    fn playbook_render_runs_plan_run_not_the_loop() {
+        let yaml = render_playbook(&k8s_profile(""), playbook_launch());
+        assert!(
+            yaml.contains(r#"crucible plan run --manifest "$D/crucible.toml""#),
+            "{yaml}"
+        );
+        for loop_only in [
+            "--ui=stream",
+            "--agent-backend",
+            "--iterations",
+            "--control-port",
+        ] {
+            assert!(
+                !yaml.contains(loop_only),
+                "{loop_only} in a playbook: {yaml}"
+            );
+        }
+    }
+
+    /// The ceilings ride as `plan run` spells them: space-separated, the duration canonicalized to
+    /// seconds by the CLI's own parse.
+    #[test]
+    fn playbook_wrapper_carries_the_ceilings() {
+        let yaml = render_playbook(&k8s_profile(""), playbook_launch());
+        assert!(yaml.contains("--max-cost 4.5"), "{yaml}");
+        assert!(yaml.contains("--max-time 1800s"), "{yaml}");
+    }
+
+    /// Params are operator text landing in a `/bin/sh -c` string: single-quoted, glued before
+    /// quoting so a `-`-leading value cannot read as a flag, and emitted in map order.
+    #[test]
+    fn playbook_params_are_single_quoted_in_deterministic_order() {
+        let yaml = render_playbook(&k8s_profile(""), playbook_launch());
+        assert!(
+            yaml.contains("--param 'depth=--deep' --param 'topic=attention sinks'"),
+            "{yaml}"
+        );
+
+        let hostile = PlaybookLaunch {
+            params: BTreeMap::from([("name".to_string(), "it's".to_string())]),
+            ..playbook_launch()
+        };
+        let yaml = render_playbook(&k8s_profile(""), hostile);
+        assert!(yaml.contains(r#"--param 'name=it'\''s'"#), "{yaml}");
+    }
+
+    /// A profile that would make a loop render emit every optional flag must still render a
+    /// playbook command carrying none of them.
+    #[test]
+    fn playbook_render_omits_every_loop_only_flag() {
+        let profile = k8s_profile(
+            r#"results_bucket = "s3://crucible-results"
+            state_pvc = "deepgemm-state"
+            "#,
+        );
+        let yaml = render_playbook(&profile, playbook_launch());
+        for loop_only in [
+            "--results-bucket",
+            "--pr-repo",
+            "--compute-driver",
+            "--harness",
+            "--model",
+            "--resume",
+        ] {
+            assert!(
+                !yaml.contains(loop_only),
+                "{loop_only} in a playbook: {yaml}"
+            );
+        }
+    }
+
+    /// The ingest contract: a playbook pod publishes its session at the same path a loop pod does,
+    /// under the same two tiers (drop-box when the profile names one, the delimiter otherwise).
+    #[test]
+    fn playbook_pod_keeps_the_session_path_and_delimiter() {
+        let yaml = render_playbook(&k8s_profile(""), playbook_launch());
+        assert!(yaml.contains(r#"cat "$D/state/session.jsonl""#), "{yaml}");
+        assert!(
+            yaml.contains(crucible_contract::RUN_SESSION_DELIMITER),
+            "{yaml}"
+        );
+        assert!(
+            yaml.contains(r#"if [ -z "${CRUCIBLE_INGEST_URL:-}" ]; then"#),
+            "{yaml}"
+        );
+
+        let ingesting = k8s_profile(r#"ingest_url = "https://controller.example/ingest""#);
+        let yaml = render_playbook(&ingesting, playbook_launch());
+        assert!(
+            yaml.contains(r#"if [ -z "${CRUCIBLE_INGEST_URL:-}" ]; then"#),
+            "the delimiter stays guarded, never unconditional: {yaml}"
+        );
+        assert!(
+            yaml.contains(crucible_contract::ENV_INGEST_URL),
+            "the drop-box env: {yaml}"
+        );
+        assert!(
+            yaml.contains(INGEST_TOKEN_VOLUME),
+            "token projection: {yaml}"
+        );
+    }
+
+    /// `plan run` has no `--resume` and opens the session log in append mode, so a playbook must
+    /// neither restart nor reuse a name-keyed subPath a previous launch already wrote.
+    #[test]
+    fn playbook_pod_never_restarts_or_mounts_persistent_state() {
+        let profile = k8s_profile(r#"state_pvc = "deepgemm-state""#);
+        let yaml = render_playbook(&profile, playbook_launch());
+        assert!(yaml.contains("restartPolicy: Never"), "{yaml}");
+        assert!(!yaml.contains("run-state"), "{yaml}");
+        assert!(!yaml.contains("deepgemm-state"), "{yaml}");
+
+        let templated = k8s_profile(
+            r#"[cluster.state_pvc]
+            storage_class = "shared-vast"
+            size = "2Gi"
+            "#,
+        );
+        let yaml = render_playbook(&templated, playbook_launch());
+        assert!(!yaml.contains("kind: PersistentVolumeClaim"), "{yaml}");
+
+        assert!(render_k8s(&profile).contains("restartPolicy: OnFailure"));
+    }
+
+    /// The two shapes a playbook pack actually takes must render: no `[deploy]` block, and (for a
+    /// non-sandboxed backend) no `[agent].sandbox_image`. Both are loop-deployment concepts.
+    #[test]
+    fn playbook_renders_without_a_deploy_block_or_a_sandbox_image() {
+        let profile = k8s_profile("");
+        for manifest in [playbook_manifest(), sandboxless_playbook_manifest()] {
+            assert!(manifest.deploy.is_none());
+            let yaml = render_playbook_manifest(&manifest, &profile, playbook_launch());
+            assert!(yaml.contains("crucible plan run --manifest"), "{yaml}");
+        }
+
+        let sandboxless = sandboxless_playbook_manifest();
+        assert!(
+            RenderInput::from_manifest(&sandboxless, "alpha").is_err(),
+            "the loop path still needs [deploy]"
+        );
+    }
+
+    /// `CRUCIBLE_SANDBOX_DEFAULT_IMAGE` is what the in-pod gateway resolves an openshell task's
+    /// sandbox from: emitted when the pack declares one, absent (never empty) when it does not.
+    #[test]
+    fn playbook_projects_the_sandbox_env_only_when_the_pack_declares_an_image() {
+        let profile = k8s_profile("");
+        let with = render_playbook_manifest(&playbook_manifest(), &profile, playbook_launch());
+        assert!(with.contains("CRUCIBLE_SANDBOX_DEFAULT_IMAGE"), "{with}");
+        let without = render_playbook_manifest(
+            &sandboxless_playbook_manifest(),
+            &profile,
+            playbook_launch(),
+        );
+        assert!(
+            !without.contains("CRUCIBLE_SANDBOX_DEFAULT_IMAGE"),
+            "{without}"
+        );
+    }
+
+    /// Delivery (`--pack`) and command (`--playbook`) are orthogonal, and the controller sends both.
+    #[test]
+    fn playbook_composes_with_pack_delivery() {
+        let (_, profile) = pack_manifest_and_profile();
+        let tmp = Scratch::new("playbook-pack");
+        let dir = tmp.path().join("alpha");
+        std::fs::create_dir_all(&dir).expect("mkdir pack");
+        write_pack_dir(&dir);
+
+        let manifest = playbook_manifest();
+        let input = RenderInput::from_playbook_manifest(&manifest, "alpha");
+        let yaml = render(
+            input,
+            &dir,
+            "crucible.toml",
+            &profile,
+            &RenderOpts {
+                iterations: 1,
+                max_cost: 0.0,
+                pin_digests: false,
+                pr_repo: None,
+                pack: Some(PackDelivery {
+                    configmap_name: "alpha-pack".to_string(),
+                }),
+                clusters_file: None,
+                harness: None,
+                model: None,
+                playbook: Some(playbook_launch()),
+            },
+        )
+        .expect("render");
+
+        assert!(yaml.contains("kind: ConfigMap"), "{yaml}");
+        assert!(yaml.contains("pack-stage"), "{yaml}");
+        assert!(yaml.contains(PACK_WORKDIR_VOLUME), "{yaml}");
+        assert!(yaml.contains("crucible plan run --manifest"), "{yaml}");
     }
 }

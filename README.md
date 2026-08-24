@@ -311,7 +311,7 @@ Running `crucible` without a subcommand starts an optimization loop and requires
 | `crucible check` | Parses and validates a manifest, resolves referenced files, probes the judge, and runs configured gate self-tests. |
 | `crucible scope` | Ingests a goal, optionally proposes a domain pack, validates it, and writes the frozen scope artifacts. |
 | `crucible ps` | Lists rendered Crucible loop pods visible to the current Kubernetes client. |
-| `crucible deploy render` | Writes digest-pinned loop-pod and RBAC YAML to stdout. |
+| `crucible deploy render` | Writes digest-pinned loop-pod (or, with `--playbook`, plan-runner-pod) and RBAC YAML to stdout. |
 | `crucible deploy apply` | Renders the deployment and passes it to `kubectl apply`. |
 | `crucible deploy render-turn` | Renders a one-shot grounded-ranking or scoping pod. |
 | `crucible plan compile-workflow` | Compiles a Starlark workflow and can materialize it in a manifest. |

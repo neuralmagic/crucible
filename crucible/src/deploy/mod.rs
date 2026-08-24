@@ -13,7 +13,7 @@ mod controller;
 pub(crate) mod profile;
 mod render;
 
-pub use render::{MANAGED_BY_LABEL, PackDelivery, RenderOpts, TurnKind, TurnOpts};
+pub use render::{MANAGED_BY_LABEL, PackDelivery, PlaybookLaunch, RenderOpts, TurnKind, TurnOpts};
 
 use crate::manifest::{self, CompositeManifest, Manifest};
 use anyhow::{Context, Result};
@@ -50,7 +50,10 @@ pub fn render_yaml(manifest_path: &Path, profile_path: &Path, opts: &RenderOpts)
             .file_name()
             .and_then(|n| n.to_str())
             .context("manifest dir has a name")?;
-        let input = RenderInput::from_manifest(&manifest, name)?;
+        let input = match opts.playbook {
+            Some(_) => RenderInput::from_playbook_manifest(&manifest, name),
+            None => RenderInput::from_manifest(&manifest, name)?,
+        };
         render::render(input, manifest_dir, manifest_file, &profile, opts)
     }
 }

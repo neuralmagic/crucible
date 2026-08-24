@@ -172,8 +172,7 @@ mod tests {
 
     #[test]
     fn from_env_needs_all_three_vars() {
-        // Serialize env mutation with the rest of the process (no cross-test races on the environ).
-        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = crate::test_env_lock();
         for k in [
             crucible_contract::ENV_INGEST_URL,
             crucible_contract::ENV_INGEST_TOKEN_PATH,
@@ -242,6 +241,4 @@ mod tests {
         assert_eq!(art.bytes, bytes.len() as u64);
         let _ = std::fs::remove_file(&tok);
     }
-
-    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }
