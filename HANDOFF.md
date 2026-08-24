@@ -68,6 +68,42 @@ registered pack, backend flipped to local in the studio) proved 4-instance fan-o
 speculators issues. Runs live under `state/local-runs/`. The agent e2e is committed:
 `MCP_AGENT_E2E=1 just mcp-agent-e2e`.
 
+## Session 2026-08-24 (pm): what landed and what is next
+
+**Merged:** crucible #63 (playbook lane), **#64** (engine renders a playbook pod behind an
+explicit `--playbook`; `e0759da`, image `sha256:b2d7dea4…`); crucible-domains #427 (the whole
+launch surface), **#428** (runs-filter regression + dispatch-retry collision; `b2bc7fd`, image
+`sha256:00ae867e…`, which is what prod runs now).
+
+**Open:** crucible-domains **#430** — core pin to `e0759da` plus the controller sending
+`--playbook`. This is the gate for prod pod dispatch; #429 was closed into it because the flag
+alone breaks against the pinned engine. crucible **#65** (fips-watch example pack, rebased,
+awaiting CI). crucible branch `rfc-scheduled-parameterized-loops` — RFC-0003 draft, no PR.
+
+**Next, in order:** merge #430 → controller image → roll prod (image and turn-profile pin move
+together; revert digest is `00ae867e…`) → **prove one real prod pod run completes before
+recording the demo.** Three things no test could prove: that the render produces a pod, that the
+pod publishes `session.jsonl` where the controller reads it, and that the run settles `finished`
+rather than `incomplete`.
+
+**Found by driving prod, all real:** playbook pod dispatch had **never worked** — the controller
+shelled `deploy render` with `--max-time`/`--param`, which the engine did not have, and the
+renderer had no notion of playbooks at all. Registration **cannot clone a private repo**:
+`repo_clone_url` injects no credentials, so crucible-domains 502s and only public packs register.
+`plan run --manifest` wrote no shutdown event, so every launch settled `incomplete` and a
+schedule's cursor never advanced — fixed in #64, and it was not the cosmetic wording earlier
+notes called it. The runs leaderboard's `kind=autoresearch` meant `scope IS NOT NULL`, hiding
+every goal and adopted run (5 of 8 on MPP).
+
+**Known gap:** the runtime image carries **no Rust toolchain**, so fips-watch's `cargo tree`
+probes cannot run on prod as merged. Needs cargo in the loop image, the sandbox image, or both.
+
+**Note for the next session:** another session is working live in the controller checkout
+(ADR-0028/29/30, native OIDC in `auth.rs`, secrets/grant WIs). Its `deploy/mpp/controller.values.yaml`
+edits sequence the oauth2-proxy roll **before** the controller image; coordinate before rolling.
+A snapshot of prod objects and that session's uncommitted work is under the scratchpad
+(`prod-snapshot-*`).
+
 ## Open work, ranked
 
 1. **Merge train**: push + PR the controller branch; merge crucible #63; pin bump; deploy.
