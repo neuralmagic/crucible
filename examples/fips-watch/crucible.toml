@@ -1,0 +1,43 @@
+# FIPS early warning: per shipped (target, feature-set) variant, does the compiled dependency
+# graph still resolve crypto to the system OpenSSL?
+[repo]
+path = "."
+
+[workspace]
+dir = "workspace"
+setup_cmd = "mkdir -p workspace && cp variants.json blockers.json required.json scan.py probe.py pick_dirty.py roundup.py file_issues.py workspace/ && git clone -q --depth 1 --branch \"${FIPS_WATCH_REF:-main}\" \"https://github.com/${FIPS_WATCH_REPO:-ai-dynamo/modelexpress}.git\" workspace/checkout && git -C workspace/checkout rev-parse HEAD > workspace/WATCHED_REV && rm -rf workspace/checkout/.git && git -C workspace init -q && git -C workspace add -A && git -C workspace -c user.email=crucible@local -c user.name=crucible commit -qm baseline"
+
+[[workspace.inject]]
+src = "variants.json"
+dst = "variants.json"
+frozen = true
+
+[[workspace.inject]]
+src = "blockers.json"
+dst = "blockers.json"
+frozen = true
+
+[[workspace.inject]]
+src = "required.json"
+dst = "required.json"
+frozen = true
+
+[[workspace.inject]]
+src = "file_issues.py"
+dst = "file_issues.py"
+frozen = true
+
+[agent]
+backend = "openshell"
+harness = "claude"
+model = "claude-opus-4-6"
+sandbox_image = "quay.io/aipcc/agentic-ci/claude-sandbox:0.3.11"
+goal = "Explain why a Rust build stopped resolving crypto to the system OpenSSL, and propose the minimal fix."
+
+[agent.openshell]
+binaries = ["/usr/bin/git", "/usr/bin/cargo", "/usr/bin/curl", "/usr/bin/gh", "/usr/local/bin/gh"]
+
+# Compiled per run from workflow.star, which declares params.
+[workflow]
+type = "playbook"
+file = "workflow.star"

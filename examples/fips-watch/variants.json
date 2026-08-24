@@ -1,0 +1,23 @@
+{
+  "linux-default": {
+    "target": "x86_64-unknown-linux-gnu",
+    "package": "modelexpress-common",
+    "features": [],
+    "default_features": true,
+    "note": "what a plain cargo build produces"
+  },
+  "linux-openssl": {
+    "target": "x86_64-unknown-linux-gnu",
+    "package": "modelexpress-common",
+    "features": ["openssl"],
+    "default_features": false,
+    "note": "the intended FIPS posture: system OpenSSL, no vendored crypto"
+  },
+  "linux-server-openssl": {
+    "target": "x86_64-unknown-linux-gnu",
+    "package": "modelexpress-server",
+    "features": ["openssl"],
+    "default_features": false,
+    "note": "the shipped server binary under the FIPS posture"
+  }
+}
