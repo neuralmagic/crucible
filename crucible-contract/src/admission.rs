@@ -184,7 +184,7 @@ pub fn decode(line: &str) -> Option<AdmissionEvent> {
     if t.is_empty() {
         return None;
     }
-    serde_json::from_str::<Envelope>(t).ok().map(|e| e.event)
+    crate::json::from_str::<Envelope>(t).ok().map(|e| e.event)
 }
 
 #[cfg(test)]

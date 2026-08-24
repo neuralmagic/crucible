@@ -829,7 +829,7 @@ fn compile_and_validate_round(manifest_path: &Path) -> RoundVerdict {
     if let Err(error) = crate::plan::starlark::materialize_sibling_manifest(manifest_path) {
         return RoundVerdict::Failed(FailureEvidence::Structure {
             detail: format!(
-                "workflow.star did not compile into [[workflow.task]]: {}",
+                "workflow.star did not compile: {}",
                 crate::errors::report(&error)
             ),
         });
@@ -1073,8 +1073,15 @@ impl Stage for Validate {
 
 /// Render the validated workflow; agents cannot supply this artifact.
 fn render_workflow_preview(manifest_path: &Path, pack: &Path) -> Result<(u32, u32)> {
-    let manifest = manifest::Manifest::load(manifest_path)?;
-    let mut workflow_caps = manifest::WorkflowCaps::autoresearch_engine();
+    let mut manifest = manifest::Manifest::load(manifest_path)?;
+    manifest.resolve_workflow(crate::plan::starlark::parent_or_cwd(manifest_path))?;
+    let mut workflow_caps = manifest::WorkflowCaps::for_lane(
+        manifest
+            .workflow
+            .as_ref()
+            .map(|workflow| workflow.workflow_type)
+            .unwrap_or_default(),
+    );
     if AgentBackend::from_str(&manifest.agent.backend, true)
         .ok()
         .is_some_and(|backend| {
@@ -1622,6 +1629,85 @@ mod tests {
     /// silently `Local`/`Podman` before). A `Cli::parse_from(["crucible"])`-synthesized `Args`
     /// defaults every unset field, so `compute_driver` must be set explicitly or the turn's
     /// gateway boots the wrong compute driver regardless of the caller's deployment.
+    /// The reason a hostile pack must be refused rather than abort: `scope` turns a compile
+    /// failure into a `RoundVerdict::Failed` and hands the evidence back to the refine loop, so
+    /// a bad pack is an ordinary round the agent can fix. A process that aborts never reaches
+    /// this function, and the run dies with it.
+    ///
+    /// This runs in-process, so an abort would take the test runner down instead of failing.
+    #[test]
+    fn a_hostile_workflow_fails_the_round_instead_of_the_process() {
+        let dir = std::env::temp_dir().join(format!(
+            "crucible-scope-hostile-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest_path = dir.join(MANIFEST_FILE);
+        std::fs::write(
+            &manifest_path,
+            "[repo]\npath = \".\"\n[agent]\nbackend = \"command\"\nagent_cmd = \"true\"\ngoal = \"g\"\n",
+        )
+        .unwrap();
+
+        let hostile = [
+            ("parse nesting", format!("x = {}{}\n", "[".repeat(3000), "]".repeat(3000))),
+            (
+                "operator chain",
+                format!("x = {}True\n", "not ".repeat(3000)),
+            ),
+            (
+                "lambda chain",
+                format!("x = {}1\n", "lambda: ".repeat(4800)),
+            ),
+            (
+                "value nested by a loop",
+                "x = [1]\nfor i in range(3000):\n    x = [x]\ncommand(name = \"a\", run = \"true\", emits = x)\nworkflow([])\n"
+                    .to_string(),
+            ),
+        ];
+
+        for (what, source) in hostile {
+            std::fs::write(dir.join("workflow.star"), &source).unwrap();
+            match compile_and_validate_round(&manifest_path) {
+                RoundVerdict::Failed(FailureEvidence::Structure { detail }) => {
+                    assert!(
+                        detail.contains("workflow.star did not compile"),
+                        "{what}: wrong evidence: {detail}"
+                    );
+                    // The agent is told what to change, not merely that something broke.
+                    assert!(
+                        detail.contains("maximum is"),
+                        "{what}: the evidence names no bound: {detail}"
+                    );
+                }
+                RoundVerdict::Failed(other) => {
+                    panic!("{what}: failed for an unrelated reason: {other:?}")
+                }
+                RoundVerdict::Passed(_) => panic!("{what}: a hostile pack passed the round"),
+            }
+        }
+
+        // The loop is still usable afterwards: a well-formed pack in the same directory
+        // reaches validation and fails on its own merits, not on the wreckage of the last one.
+        std::fs::write(
+            dir.join("workflow.star"),
+            "workflow([command(name = \"a\", run = \"true\")])\n",
+        )
+        .unwrap();
+        if let RoundVerdict::Failed(FailureEvidence::Structure { detail }) =
+            compile_and_validate_round(&manifest_path)
+        {
+            assert!(
+                !detail.contains("did not compile"),
+                "a valid workflow was reported as a compile failure: {detail}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn turn_args_thread_the_backend_sandbox_image_and_compute_driver() {
         let mut opts = propose_opts(Path::new("unused"), Path::new("unused"));
@@ -1917,7 +2003,7 @@ mod tests {
         fs::write(dir.join("prompts/review.md"), "Review the candidate.\n").unwrap();
         fs::write(
             dir.join("workflow.star"),
-            "workflow([agent(name = \"review\", prompt = prompt_file(\"prompts/review.md\"), required = False)])\n",
+            "workflow([agent(name = \"review\", prompt = prompt_file(\"prompts/review.md\"))])\n",
         )
         .unwrap();
 
@@ -1931,6 +2017,36 @@ mod tests {
         assert!(manifest.contains("[[workflow.task]]"), "{manifest}");
         assert!(manifest.contains("Review the candidate."), "{manifest}");
         assert!(report.digest.is_some(), "compiled manifest must freeze");
+        assert!(dir.join("WORKFLOW.png").is_file());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A pack whose graph depends on launch arguments keeps naming its source: freezing one
+    /// set of defaults into the tracked manifest would commit a graph no run necessarily uses.
+    #[test]
+    fn a_parameterised_pack_keeps_its_workflow_source_in_the_tracked_manifest() {
+        let dir = tempdir("params-workflow");
+        scaffold_pack(&dir);
+        fs::create_dir_all(dir.join("prompts")).unwrap();
+        fs::write(dir.join("prompts/review.md"), "Review the candidate.\n").unwrap();
+        fs::write(
+            dir.join("workflow.star"),
+            r#"params = {"focus": {"type": "string", "default": "correctness"}}
+workflow([agent(name = "review", prompt = prompt_file("prompts/review.md") + param("focus"))])
+"#,
+        )
+        .unwrap();
+
+        let report = execute(&dir, None, None, false, None);
+        assert!(
+            report.stages.iter().all(|stage| stage.passed),
+            "{:?}",
+            report.stages
+        );
+        let manifest = fs::read_to_string(dir.join(MANIFEST_FILE)).unwrap();
+        assert!(manifest.contains("file = \"workflow.star\""), "{manifest}");
+        assert!(!manifest.contains("[[workflow.task]]"), "{manifest}");
+        assert!(!manifest.contains("correctness"), "{manifest}");
         assert!(dir.join("WORKFLOW.png").is_file());
         let _ = fs::remove_dir_all(&dir);
     }

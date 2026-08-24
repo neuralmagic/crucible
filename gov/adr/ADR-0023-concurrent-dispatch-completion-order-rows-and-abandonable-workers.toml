@@ -1,0 +1,48 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0023"
+title = "Concurrent dispatch: completion-order rows and abandonable workers"
+status = "accepted"
+date = "2026-08-22"
+refs = [
+    "RFC-0002",
+    "ADR-0021",
+]
+
+[content]
+context = """
+Both playbook obligations that concern concurrent dispatch run into the same executor code, and both were left undesignable by the implementation review until the tradeoff was settled.
+
+Row liveness. [[RFC-0002:C-PLAYBOOK-LANE]] requires that rows be written as tasks settle, so a reader tailing the log sees progress live, and states that row order is therefore completion order. `execute` does the opposite on purpose: it collects a whole batch from `run_many` and records the results in declaration order so the scored lane's event stream is reproducible run to run. For the litmus pack's three isolated auditors, all three rows land at once in declaration order however the reporter behaves.
+
+Termination. [[RFC-0002:C-PLAYBOOK-BUDGET]] requires terminating every attempt in flight when the wall-clock ceiling is reached. Clamping each task's deadline to the run ceiling and killing the process group discharges that for a child tree that responds to signals. It does not for a grandchild that calls setsid, which escapes killpg, or for a process in uninterruptible sleep, which ignores SIGKILL. Either wedges the calling thread's stdout pump, and both concurrent runners use `std::thread::scope`, where a worker cannot be abandoned. `execute` then never returns, the ceiling is never observed, and nothing reports at all. This hang is reachable on the scored lane today and is worse than anything the deadline work fixes."""
+decision = """
+Row ordering becomes a property of the lane, not of the executor. `run_many` hands results back as they complete, and the executor records them in that order only when the caller asks for it; the scored lane does not ask and keeps declaration order. Live progress is most of what a scheduled chore's log is for, and a reproducible event stream is most of what a scored run's log is for, so neither lane gives up the property it depends on.
+
+Batch workers become 'static so `run_many` can join with a bounded wait, settle a wedged item as a failure, and abandon its thread. An abandoned worker must never touch run state again: worktree removal moves off the worker onto the run, or onto a later sweep. This closes a hang that exists on the scored lane now, which is why it is worth the concurrency risk rather than being deferred with the rest of the playbook work."""
+consequences = """
+Positive: the playbook's log becomes tailable, which is the difference between watching a scheduled sweep and waiting for it. The scored lane's determinism is untouched, so nothing that pins its row order moves. A run can no longer be wedged forever by one unkillable child, on either lane.
+
+Negative: two batch orderings exist where there was one, and a test that reads rows must know which lane it is on. Abandoned threads are a new class of leak: a worker outliving its run holds a worktree and file handles, and the ownership rule that keeps it away from run state is a convention the type system does not enforce. Bounded-wait joins introduce a second timeout to tune beside the task deadline and the run ceiling.
+
+The abandonment path must land with its worktree-ownership change in one commit. Split, it leaks a worktree per wedged task with nothing to collect it."""
+
+[[content.alternatives]]
+text = "Per-lane row ordering, and abandonable batch workers whose worktrees the run owns"
+status = "accepted"
+
+[[content.alternatives]]
+text = "Move both lanes to completion order: one batch path, no flag"
+status = "rejected"
+rejection_reason = "Costs the scored lane a determinism its event stream guarantees today, to fix a problem only the playbook has."
+
+[[content.alternatives]]
+text = "Weaken C-PLAYBOOK-LANE to drop the completion-order promise, and record the wedge as a known hang"
+status = "rejected"
+rejection_reason = "Gives up live progress on exactly the fan-out where a reader most wants it, and leaves a reachable hang undocumented in code."
+
+[[content.alternatives]]
+text = "Terminate the engine process when the ceiling falls, and let the pod restart"
+status = "rejected"
+rejection_reason = "Loses the shutdown event and the reporting C-PLAYBOOK-LANE requires; a run that cannot say why it ended is worse than one that ends late."

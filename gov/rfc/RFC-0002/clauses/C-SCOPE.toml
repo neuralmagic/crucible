@@ -1,0 +1,16 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-SCOPE"
+title = "Scope"
+kind = "informative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = """
+A playbook is a workflow that runs exactly once and produces no score. It exists for work whose value is the work itself: a skill pipeline, a scheduled chore, a discovery sweep. The optimization loop's propose, apply, measure, and decide protocol does not participate, and no frozen judge is constructed.
+
+[[RFC-0001]] governs the engine's manifest, command, world, transport, wire, and workflow-authoring contracts. This RFC adds the playbook lane on top of them and does not restate their universal rules. The two changes this lane needed there landed in version 0.2.0 of that RFC: [[RFC-0001:C-WORKFLOW]] admits "playbook" as a workflow type and treats a task's declared files as output rather than as workspace state that isolation discards, and [[RFC-0001:C-WIRE]] carries the shutdown outcome an early-completing run reports.
+
+Fan-out over an item set that is not known until a task has run is expressed as one run per item rather than as graph expansion. The graph stays static and fully renderable before any spend; [[RFC-0002:C-ASKS]] defines the boundary where new work leaves a run."""

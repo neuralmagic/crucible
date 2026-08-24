@@ -26,6 +26,19 @@ impl From<&str> for TaskName {
 #[serde(transparent)]
 pub struct OutputField(pub String);
 
+/// One declared output field of one task: what a mapped task fans out over.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputRef {
+    pub task: TaskName,
+    pub field: OutputField,
+}
+
+impl std::fmt::Display for OutputRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.task, self.field.0)
+    }
+}
+
 /// Grading direction for reducers, mirroring the judge's convention.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -85,6 +98,13 @@ impl Stage {
     fn is_iteration(&self) -> bool {
         *self == Stage::Iteration
     }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Stage::Iteration => "iteration",
+            Stage::Epilogue => "epilogue",
+        }
+    }
 }
 
 /// How dependency outputs join into a task's inputs (`join = "all" | "passed"`).
@@ -99,6 +119,15 @@ pub enum Join {
     /// reducer over a lossy fan-out (the wide `top_k`: skipped/failed candidates just
     /// don't rank), or a join over reviewers where one being advisory must not stop the run.
     Passed,
+}
+
+impl Join {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Join::All => "all",
+            Join::Passed => "passed",
+        }
+    }
 }
 
 /// What a task *is*. The executor owns advancement; agents only ever run inside `Agent` tasks.
@@ -203,6 +232,22 @@ pub struct Task {
     /// undeclared.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub emits: Vec<OutputField>,
+    /// Workspace-relative paths this task's output includes as files. A declared file is part
+    /// of the task's output, not part of the workspace state that isolation discards, so a
+    /// dependent receives it either way.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub emits_files: Vec<String>,
+    /// An upstream list this task runs once per element of. The task is one node in the graph
+    /// however many elements arrive, so the graph stays renderable before any spend; only the
+    /// number of instances is decided at run time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub over: Option<OutputRef>,
+    /// The most instances `over` may produce. Required alongside it and never defaulted: an
+    /// author who has not said how wide their fan-out gets has not thought about it, and a
+    /// discovery task that returns more than expected should fail loudly rather than fan out to
+    /// whatever a global default happened to be.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_fanout: Option<u32>,
 }
 
 /// Executor-enforced accounting limit; overruns fail the plan.
@@ -236,6 +281,13 @@ impl ValidPlan {
         &self.plan
     }
 
+    /// Replace the plan's budget with the launcher's. A pack's own figure is authoring data;
+    /// a ceiling is the operator's, and this is where the second overrides the first.
+    pub fn with_budget(mut self, usd: f64) -> Result<Self, PlanError> {
+        self.plan.budget = PlanBudget { usd };
+        self.plan.validate()
+    }
+
     pub fn tasks_topo(&self) -> impl Iterator<Item = &Task> {
         self.topo.iter().map(|&i| &self.plan.tasks[i])
     }
@@ -245,6 +297,10 @@ impl ValidPlan {
         self.plan.tasks.iter().find(|t| &t.name == name)
     }
 }
+
+/// The most instances one mapped node may produce. Operator-owned, not author-owned: a bound a
+/// pack could raise is not a bound.
+pub const MAX_FANOUT_CEILING: u32 = 256;
 
 /// Everything [`Plan::validate`] can reject. Structural only: capability admission and
 /// autoresearch shape live in [`crate::manifest::WorkflowCfg`].
@@ -268,6 +324,12 @@ pub enum PlanError {
     RepeatedDependency { task: String, dependency: String },
     #[error("task {task:?}: join = \"passed\" needs at least one dependency")]
     JoinPassedWithoutDependencies { task: String },
+    #[error(
+        "task {task:?} is required and joins on {dependency:?} with join = \"all\", but \
+         {dependency:?} is advisory and allowed to fail. Set join = \"passed\" on {task:?}, or \
+         make {dependency:?} required"
+    )]
+    AdvisoryGatesRequired { task: String, dependency: String },
     #[error("task {task:?}: top_k k must be >= 1")]
     TopKZero { task: String },
     #[error("task {task:?}: top_k needs at least one dependency to fold")]
@@ -306,6 +368,38 @@ pub enum PlanError {
         "task {task:?} sets session {session:?}, but durable sessions cannot use disposable isolation"
     )]
     SessionWithIsolation { task: String, session: String },
+    #[error(
+        "task {task:?} contains `[` or `]`; those are reserved for a mapped node's instance \
+         names, which are synthesized as `node[item]`"
+    )]
+    BracketInTaskName { task: String },
+    #[error(
+        "task {task:?} maps over {reference} but does not depend on {producer:?}; a fan-out \
+         reads its items from a dependency's output"
+    )]
+    OverNotADependency {
+        task: String,
+        reference: String,
+        producer: String,
+    },
+    #[error(
+        "task {task:?} maps over {reference} without max_fanout; a fan-out states how wide it \
+         may get before it runs, not after"
+    )]
+    OverWithoutFanout { task: String, reference: String },
+    #[error("task {task:?} declares max_fanout without `over`; there is nothing to bound")]
+    FanoutWithoutOver { task: String },
+    #[error("task {task:?}: max_fanout = {got} is outside 1..={MAX_FANOUT_CEILING}")]
+    FanoutOutOfRange { task: String, got: u32 },
+    #[error(
+        "task {task:?} maps over {reference} and resumes session {session:?}; instances run one \
+         at a time and would interleave a single transcript"
+    )]
+    OverWithSession {
+        task: String,
+        reference: String,
+        session: String,
+    },
     #[error("plan has a dependency cycle involving: {}", .tasks.join(", "))]
     DependencyCycle { tasks: Vec<String> },
     #[error(
@@ -349,6 +443,11 @@ impl Plan {
             if t.name.0.trim().is_empty() {
                 return Err(PlanError::EmptyTaskName { index: i });
             }
+            if t.name.0.contains(['[', ']']) {
+                return Err(PlanError::BracketInTaskName {
+                    task: t.name.0.clone(),
+                });
+            }
             if index.insert(&t.name, i).is_some() {
                 return Err(PlanError::DuplicateTask {
                     task: t.name.0.clone(),
@@ -377,6 +476,16 @@ impl Plan {
             }
             if t.join == Join::Passed && t.depends_on.is_empty() {
                 return Err(PlanError::JoinPassedWithoutDependencies { task: task() });
+            }
+            if t.required && t.join == Join::All {
+                for d in &t.depends_on {
+                    if index.get(d).is_some_and(|&i| !self.tasks[i].required) {
+                        return Err(PlanError::AdvisoryGatesRequired {
+                            task: task(),
+                            dependency: d.0.clone(),
+                        });
+                    }
+                }
             }
             if let TaskKind::TopK { k, .. } = &t.task {
                 if *k == 0 {
@@ -495,6 +604,38 @@ impl Plan {
                     });
                 }
             }
+            match (&t.over, t.max_fanout) {
+                (None, None) => {}
+                (None, Some(_)) => return Err(PlanError::FanoutWithoutOver { task: task() }),
+                (Some(reference), None) => {
+                    return Err(PlanError::OverWithoutFanout {
+                        task: task(),
+                        reference: reference.to_string(),
+                    });
+                }
+                (Some(reference), Some(width)) => {
+                    if !t.depends_on.contains(&reference.task) {
+                        return Err(PlanError::OverNotADependency {
+                            task: task(),
+                            reference: reference.to_string(),
+                            producer: reference.task.0.clone(),
+                        });
+                    }
+                    if width == 0 || width > MAX_FANOUT_CEILING {
+                        return Err(PlanError::FanoutOutOfRange {
+                            task: task(),
+                            got: width,
+                        });
+                    }
+                    if let Some(session) = &t.session {
+                        return Err(PlanError::OverWithSession {
+                            task: task(),
+                            reference: reference.to_string(),
+                            session: session.clone(),
+                        });
+                    }
+                }
+            }
         }
         // Kahn's algorithm; leftovers mean a cycle. The ready set is a min-heap on the
         // declaration index so the order is deterministic and declaration-stable: ties
@@ -592,6 +733,9 @@ mod tests {
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
+            emits_files: Vec::new(),
+            over: None,
+            max_fanout: None,
         }
     }
 
@@ -740,6 +884,9 @@ mod tests {
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
+            emits_files: Vec::new(),
+            over: None,
+            max_fanout: None,
         };
         let err = plan(vec![t]).validate().unwrap_err();
         assert_eq!(
@@ -864,6 +1011,9 @@ mod tests {
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
+            emits_files: Vec::new(),
+            over: None,
+            max_fanout: None,
         }
     }
 
@@ -992,6 +1142,80 @@ mod tests {
         assert!(plan(vec![t]).validate().is_ok());
     }
 
+    fn advisory(name: &str, deps: &[&str]) -> Task {
+        let mut t = agent(name, deps);
+        t.required = false;
+        t
+    }
+
+    fn folding(name: &str, deps: &[&str]) -> Task {
+        let mut t = agent(name, deps);
+        t.join = Join::Passed;
+        t
+    }
+
+    #[test]
+    fn a_required_task_cannot_join_all_on_an_advisory_dependency() {
+        let err = plan(vec![advisory("copy", &[]), agent("gate", &["copy"])])
+            .validate()
+            .unwrap_err();
+        assert_eq!(
+            err,
+            PlanError::AdvisoryGatesRequired {
+                task: "gate".to_owned(),
+                dependency: "copy".to_owned(),
+            }
+        );
+        let rendered = err.to_string();
+        assert!(rendered.contains("\"gate\""), "{rendered}");
+        assert!(rendered.contains("\"copy\""), "{rendered}");
+    }
+
+    #[test]
+    fn advisory_gating_through_all_join_hops_is_reported_at_the_closest_edge() {
+        // root -> mid -> near -> copy, every hop join = "all" and everything but the
+        // advisory tail required: the violation is the near/copy edge.
+        let err = plan(vec![
+            advisory("copy", &[]),
+            agent("near", &["copy"]),
+            agent("mid", &["near"]),
+            agent("root", &["mid"]),
+        ])
+        .validate()
+        .unwrap_err();
+        assert_eq!(
+            err,
+            PlanError::AdvisoryGatesRequired {
+                task: "near".to_owned(),
+                dependency: "copy".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_passed_join_exempts_the_gate_and_everything_above_it() {
+        let p = plan(vec![
+            agent("propose", &[]),
+            agent("correctness", &["propose"]),
+            advisory("copy", &["propose"]),
+            folding("gate", &["correctness", "copy"]),
+            agent("apply", &["gate"]),
+            agent("measure", &["apply"]),
+        ]);
+        assert!(p.validate().is_ok());
+    }
+
+    #[test]
+    fn advisory_work_may_gate_advisory_consumers() {
+        let p = plan(vec![
+            agent("propose", &[]),
+            advisory("copy", &["propose"]),
+            advisory("summarize", &["copy"]),
+            agent("apply", &["propose"]),
+        ]);
+        assert!(p.validate().is_ok());
+    }
+
     #[test]
     fn empty_emits_is_omitted_from_the_wire_and_round_trips() {
         let bare = serde_json::to_value(agent("a", &[])).unwrap();
@@ -1004,5 +1228,91 @@ mod tests {
             back.plan().tasks[0].emits,
             vec![OutputField("score".into())]
         );
+    }
+    /// A plan that arrives as JSON never passes through the starlark front end, so the
+    /// structural facts about a mapped node are checked here or nowhere.
+    #[test]
+    fn validate_checks_a_mapped_node_on_the_json_route() {
+        let mapped = |over: Option<OutputRef>, max_fanout: Option<u32>, deps: &[&str]| {
+            let mut t = agent("audit", deps);
+            t.over = over;
+            t.max_fanout = max_fanout;
+            t
+        };
+        let targets = OutputRef {
+            task: "discover".into(),
+            field: OutputField("targets".into()),
+        };
+        let refuse = |tasks: Vec<Task>| -> PlanError {
+            let json = serde_json::to_string(&plan(tasks)).unwrap();
+            Plan::from_json_str(&json)
+                .unwrap()
+                .validate()
+                .expect_err("the plan validated")
+        };
+
+        assert_eq!(
+            refuse(vec![agent("audit[x]", &[])]),
+            PlanError::BracketInTaskName {
+                task: "audit[x]".into()
+            }
+        );
+        assert_eq!(
+            refuse(vec![
+                emitting("discover", &[], &["targets"]),
+                mapped(Some(targets.clone()), Some(4), &[]),
+            ]),
+            PlanError::OverNotADependency {
+                task: "audit".into(),
+                reference: "discover.targets".into(),
+                producer: "discover".into(),
+            }
+        );
+        assert_eq!(
+            refuse(vec![
+                emitting("discover", &[], &["targets"]),
+                mapped(Some(targets.clone()), None, &["discover"]),
+            ]),
+            PlanError::OverWithoutFanout {
+                task: "audit".into(),
+                reference: "discover.targets".into(),
+            }
+        );
+        assert_eq!(
+            refuse(vec![agent("a", &[]), mapped(None, Some(4), &["a"])]),
+            PlanError::FanoutWithoutOver {
+                task: "audit".into()
+            }
+        );
+        for got in [0, MAX_FANOUT_CEILING + 1] {
+            assert_eq!(
+                refuse(vec![
+                    emitting("discover", &[], &["targets"]),
+                    mapped(Some(targets.clone()), Some(got), &["discover"]),
+                ]),
+                PlanError::FanoutOutOfRange {
+                    task: "audit".into(),
+                    got
+                }
+            );
+        }
+        let mut with_session = mapped(Some(targets.clone()), Some(4), &["discover"]);
+        with_session.session = Some("scribe".into());
+        assert_eq!(
+            refuse(vec![emitting("discover", &[], &["targets"]), with_session]),
+            PlanError::OverWithSession {
+                task: "audit".into(),
+                reference: "discover.targets".into(),
+                session: "scribe".into(),
+            }
+        );
+
+        let json = serde_json::to_string(&plan(vec![
+            emitting("discover", &[], &["targets"]),
+            mapped(Some(targets), Some(MAX_FANOUT_CEILING), &["discover"]),
+        ]))
+        .unwrap();
+        let ok = Plan::from_json_str(&json).unwrap().validate().unwrap();
+        assert_eq!(ok.plan().tasks.len(), 2);
     }
 }

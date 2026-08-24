@@ -24,13 +24,21 @@ struct NoValidVerdict {
 const MERMAID_COMMAND_PREVIEW_CHARS: usize = 72;
 
 /// Compile scope-time workflow authoring syntax. JSON on stdout is stable enough for a
-/// checked-in golden; `--manifest` additionally materializes the runtime TOML authority.
-pub fn compile_workflow(file: &Path, manifest: Option<&Path>) -> Result<()> {
+/// checked-in golden; `--manifest` additionally materializes the runtime TOML authority. A
+/// source that declares params materializes as a file reference instead of frozen tasks, since
+/// its graph is a function of arguments no materialization has.
+pub fn compile_workflow(
+    file: &Path,
+    manifest: Option<&Path>,
+    params: &BTreeMap<String, String>,
+) -> Result<()> {
     let compiled = match manifest {
-        Some(manifest) => crate::plan::starlark::materialize_manifest(file, manifest)?,
-        None => {
-            crate::plan::starlark::compile_file(file, crate::plan::starlark::parent_or_cwd(file))?
-        }
+        Some(manifest) => crate::plan::starlark::materialize_manifest(file, manifest, params)?,
+        None => crate::plan::starlark::compile_file_with(
+            file,
+            crate::plan::starlark::parent_or_cwd(file),
+            params,
+        )?,
     };
     for prompt_file in &compiled.prompt_files {
         eprintln!("embedded prompt: {}", prompt_file.display());
@@ -303,6 +311,14 @@ pub(crate) fn plan_admitted_event(plan: &ValidPlan) -> crate::session::SessionEv
                 session: t.session.clone().unwrap_or_default(),
                 needs: t.needs.clone(),
                 required: t.required,
+                join: t.join.as_str().to_string(),
+                stage: t.stage.as_str().to_string(),
+                over: t
+                    .over
+                    .as_ref()
+                    .map(crate::plan::ir::OutputRef::to_string)
+                    .unwrap_or_default(),
+                max_fanout: t.max_fanout.unwrap_or_default(),
             })
             .collect(),
     }
@@ -477,37 +493,136 @@ pub fn render_png_to(
 /// semantics. With `--manifest`, agent tasks run through the real harness path; otherwise
 /// the shell runner handles everything (`--agent-cmd` as the agent stand-in). Exits nonzero
 /// when the plan is not valid.
+/// What the launcher supplies. A playbook's source may not declare either, so a pack cannot
+/// raise a limit its operator set; the engine refuses to dispatch one that arrives without both.
+#[derive(Debug, Clone, Default)]
+pub struct Ceilings {
+    pub usd: Option<f64>,
+    pub wall_clock: Option<std::time::Duration>,
+    /// What the operator typed, so a rejection can quote it back rather than say "invalid".
+    pub wall_clock_raw: Option<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "a playbook needs {missing} from whoever launches it. Its source may not declare a limit its \
+     operator set, so the engine will not dispatch a task without one."
+)]
+struct MissingCeiling {
+    missing: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("--max-time {raw:?} is not a duration (try `90s`, `30m`, `2h`)")]
+struct BadDuration {
+    raw: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{manifest} declares no [workflow]; pass --file, or give the manifest a graph to compile")]
+struct NoGraph {
+    manifest: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("--param {got:?} is not name=value")]
+struct BadParam {
+    got: String,
+}
+
+/// Split `name=value` pairs. The value may contain `=`; the name may not, so the first one wins.
+pub fn parse_params(pairs: &[String]) -> Result<BTreeMap<String, String>> {
+    pairs
+        .iter()
+        .map(|pair| match pair.split_once('=') {
+            Some((name, value)) if !name.is_empty() => Ok((name.to_string(), value.to_string())),
+            _ => Err(BadParam { got: pair.clone() }.into()),
+        })
+        .collect()
+}
+
 pub fn run(
-    path: &Path,
+    path: Option<&Path>,
+    params: &BTreeMap<String, String>,
     caps: &BTreeSet<String>,
     agent_cmd: Option<String>,
     manifest: Option<&Path>,
+    ceilings: Ceilings,
 ) -> Result<()> {
     use crate::plan::exec::{ExecCfg, PlanExit, TaskRunner, execute};
     use crate::plan::runner::ShellRunner;
 
-    let plan = load(path)?;
-    let substrate = Substrate { caps: caps.clone() };
+    if let (None, Some(raw)) = (ceilings.wall_clock, ceilings.wall_clock_raw.as_ref()) {
+        return Err(BadDuration { raw: raw.clone() }.into());
+    }
+
+    // Either the plan was handed to us, or the manifest names the graph and we compile it.
+    let (plan, mut runner, events): (ValidPlan, Box<dyn TaskRunner>, Option<std::fs::File>) =
+        match (path, manifest) {
+            (_, Some(m)) => {
+                let (prepared, loaded) = crate::run::prep_plan_runner_with_params(m, params)?;
+                let session_log = prepared.paths.session_log.clone();
+                let playbook = loaded
+                    .workflow
+                    .as_ref()
+                    .is_some_and(|w| w.workflow_type == crate::manifest::WorkflowType::Playbook);
+                if playbook {
+                    let missing = match (ceilings.usd, ceilings.wall_clock) {
+                        (None, None) => Some("--max-cost and --max-time"),
+                        (None, Some(_)) => Some("--max-cost"),
+                        (Some(_), None) => Some("--max-time"),
+                        (Some(_), Some(_)) => None,
+                    };
+                    if let Some(missing) = missing {
+                        return Err(MissingCeiling {
+                            missing: missing.to_string(),
+                        }
+                        .into());
+                    }
+                }
+                let mut plan = match path {
+                    Some(p) => load(p)?,
+                    None => {
+                        let workflow = loaded.workflow.as_ref().ok_or_else(|| NoGraph {
+                            manifest: m.display().to_string(),
+                        })?;
+                        crate::loop_graph::iteration_template(
+                            Some(workflow),
+                            &crate::manifest::WorkflowCaps::for_lane(workflow.workflow_type)
+                                .with_persistent_sessions(),
+                        )?
+                    }
+                };
+                if let Some(usd) = ceilings.usd {
+                    plan = plan.with_budget(usd)?;
+                }
+                let f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&session_log)
+                    .with_context(|| format!("opening {}", session_log.display()))?;
+                (plan, Box::new(prepared), Some(f))
+            }
+            (Some(p), None) => {
+                let mut plan = load(p)?;
+                if let Some(usd) = ceilings.usd {
+                    plan = plan.with_budget(usd)?;
+                }
+                (
+                    plan,
+                    Box::new(ShellRunner {
+                        workdir: std::env::current_dir()
+                            .context("resolving the working directory")?,
+                        agent_cmd,
+                    }),
+                    None,
+                )
+            }
+            (None, None) => unreachable!("clap requires --file without --manifest"),
+        };
     // Manifest runs append plan wire events to the run's session log so tailers (and the
     // controller's ingest) see the graph and its live progress; shell runs have no state dir.
-    let (mut runner, events): (Box<dyn TaskRunner>, Option<std::fs::File>) = match manifest {
-        Some(m) => {
-            let r = crate::run::prep_plan_runner(m)?;
-            let f = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&r.paths.session_log)
-                .with_context(|| format!("opening {}", r.paths.session_log.display()))?;
-            (Box::new(r), Some(f))
-        }
-        None => (
-            Box::new(ShellRunner {
-                workdir: std::env::current_dir().context("resolving the working directory")?,
-                agent_cmd,
-            }),
-            None,
-        ),
-    };
+    let substrate = Substrate { caps: caps.clone() };
     let append = |f: &std::fs::File, ev: &crate::session::SessionEvent| {
         use std::io::Write;
         let mut w = f;
@@ -519,7 +634,10 @@ pub fn run(
     let out = execute(
         &plan,
         &substrate,
-        ExecCfg::default(),
+        ExecCfg {
+            wall_clock: ceilings.wall_clock,
+            ..ExecCfg::default()
+        },
         runner.as_mut(),
         |task, result| {
             if let Some(f) = &events {
@@ -551,6 +669,7 @@ pub fn run(
         PlanExit::Truncated { task } => format!("truncated at {task}"),
         PlanExit::ShortCircuit { task } => format!("short-circuited at {task}"),
         PlanExit::BudgetExceeded => "budget exceeded".to_string(),
+        PlanExit::TimeExceeded => "wall-clock ceiling reached".to_string(),
     };
     println!(
         "plan v{}: {} — spent ${:.4} of ${}",
@@ -588,6 +707,107 @@ mod tests {
         depends_on = ["propose"]
         needs = "gpu"
     "#;
+
+    /// How a pack spells its graph is not a launcher's business. An undeclared `--param` is a
+    /// mistake against the inline spelling exactly as it is against the file-backed one, and
+    /// neither run reaches a task.
+    #[test]
+    fn an_undeclared_parameter_refuses_both_spellings_of_the_same_pack() {
+        let dir =
+            std::env::temp_dir().join(format!("crucible-param-parity-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sentinel = dir.join("dispatched");
+        let head = format!(
+            "[repo]\npath = \".\"\n[agent]\nbackend = \"command\"\nagent_cmd = \"true\"\ngoal = \"g\"\n[workspace]\ndir = \"{}\"\n",
+            dir.join("workspace").display()
+        );
+        let run_with_undeclared = |manifest: &Path| {
+            run(
+                None,
+                &BTreeMap::from([("nope".to_string(), "1".to_string())]),
+                &BTreeSet::new(),
+                None,
+                Some(manifest),
+                Ceilings {
+                    usd: Some(1.0),
+                    wall_clock: Some(std::time::Duration::from_secs(60)),
+                    wall_clock_raw: Some("60s".to_string()),
+                },
+            )
+            .expect_err("an undeclared parameter is a mistake either way")
+        };
+
+        let inline = dir.join("inline.toml");
+        std::fs::write(
+            &inline,
+            format!(
+                "{head}[workflow]\ntype = \"playbook\"\n[[workflow.task]]\nname = \"a\"\nkind = \"command\"\ncommand = \"touch {}\"\n",
+                sentinel.display()
+            ),
+        )
+        .unwrap();
+        let inline_error = format!("{:#}", run_with_undeclared(&inline));
+
+        std::fs::write(
+            dir.join("workflow.star"),
+            format!(
+                "workflow(type = \"playbook\", tasks = [command(name = \"a\", run = \"touch {}\")])\n",
+                sentinel.display()
+            ),
+        )
+        .unwrap();
+        let backed = dir.join("backed.toml");
+        std::fs::write(
+            &backed,
+            format!("{head}[workflow]\ntype = \"playbook\"\nfile = \"workflow.star\"\n"),
+        )
+        .unwrap();
+        let backed_error = format!("{:#}", run_with_undeclared(&backed));
+
+        assert!(inline_error.contains("nope"), "{inline_error}");
+        assert!(backed_error.contains("nope"), "{backed_error}");
+        assert!(!sentinel.exists(), "neither run may dispatch a task");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `--file` is a compiled plan, which binds nothing; only a `--manifest` run compiles a
+    /// graph. Refusing at parse time keeps a supplied value from being dropped downstream.
+    #[test]
+    fn a_precompiled_plan_takes_no_parameters() {
+        use clap::Parser;
+        let parse = |args: &[&str]| <crate::Cli>::try_parse_from(args).is_ok();
+        assert!(
+            !parse(&[
+                "crucible", "plan", "run", "--file", "p.toml", "--param", "a=b"
+            ]),
+            "a compiled plan cannot bind parameters"
+        );
+        assert!(
+            parse(&[
+                "crucible",
+                "plan",
+                "run",
+                "--manifest",
+                "m.toml",
+                "--param",
+                "a=b"
+            ]),
+            "a manifest run compiles its graph"
+        );
+        assert!(
+            parse(&[
+                "crucible",
+                "plan",
+                "compile-workflow",
+                "--file",
+                "s.star",
+                "--param",
+                "a=b",
+            ]),
+            "compile-workflow's file is the source, not a plan"
+        );
+    }
 
     #[test]
     fn render_flags_truncation_without_caps() {
@@ -803,6 +1023,7 @@ mod tests {
             cost_usd: 0.25,
             output: Some(serde_json::json!({"score": 3})),
             note: None,
+            fanout: None,
         };
         let back = crate::session::decode(&crate::session::encode(&task_result_event(1, 0, t, &r)))
             .unwrap();

@@ -1,0 +1,49 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-08-22-002"
+title = "Restore argument-level spans in DSL diagnostics"
+status = "done"
+created = "2026-08-22"
+started = "2026-08-22"
+completed = "2026-08-22"
+refs = ["RFC-0001:C-WORKFLOW"]
+
+[content]
+description = """
+[[RFC-0001:C-WORKFLOW]] 0.2.0 requires that a diagnostic about a named argument locate that argument rather than the whole call, and that a did-you-mean suggestion draw on the names the source itself binds as well as on the DSL's own. The evaluator-based compiler meets neither.
+
+Unknown-kwarg and session errors lost argument-level spans when the AST walker was replaced. The old compiler threaded arg_spans: BTreeMap<String, Span> into no_unknown_kwargs; the new signature takes no spans, and `grep -rn arg_spans crucible/src/plan/` returns nothing. A realistic multi-line agent() call now underlines fourteen lines where it used to underline one.
+
+The tests did not catch it and were not loosened to let it pass. They were already too loose: every source in unknown_kwarg_function_and_variable_errors_carry_location_and_suggestion is a single-line call asserting contains("workflow.star:1:"), and on one line an argument span and a whole-call span are indistinguishable. Without a multi-line source and a column assertion the next rewrite loses this again.
+
+Separately, a typo'd call to a user-defined def helper is reported as an unknown DSL function with no suggestion, though the name is already in Idents::bindings; idents.rs fuzzy-matches only DSL_FUNCTIONS.
+
+The material is already there: idents::scan walks every Expr::Call(function, args), and ArgumentP::Named is Spanned."""
+
+[[content.acceptance_criteria]]
+text = "an unknown-kwarg error points at the offending argument's own span, not the enclosing call"
+status = "done"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "a session error naming an unknown session points at the session argument"
+status = "done"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "a typo'd call to a user-defined def helper suggests from the source's own bindings instead of reporting an unknown DSL function with no suggestion"
+status = "done"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "the span assertions use a multi-line source and assert line and column, so an argument span and a whole-call span are distinguishable and this cannot silently regress again"
+status = "done"
+category = "chore"
+
+[verification]
+required_guards = [
+    "GUARD-CARGO-FMT",
+    "GUARD-CARGO-CLIPPY",
+    "GUARD-CARGO-TEST",
+]

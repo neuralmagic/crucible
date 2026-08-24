@@ -1,0 +1,31 @@
+# Issue triage against a real repository, in a real sandbox. Discovery fans out into one
+# isolated triage instance per open issue, and a free command assembles the report from
+# what the passing instances captured.
+[repo]
+path = "."
+
+[workspace]
+dir = "workspace"
+setup_cmd = "mkdir -p workspace && cp roundup.py workspace/ && git -C workspace init -q && git -C workspace add -A && git -C workspace -c user.email=crucible@local -c user.name=crucible -c commit.gpgsign=false commit -qm baseline"
+
+[[workspace.inject]]
+src = "roundup.py"
+dst = "roundup.py"
+frozen = true
+
+[agent]
+backend = "openshell"
+harness = "claude"
+model = "claude-opus-4-6"
+sandbox_image = "quay.io/aipcc/agentic-ci/claude-sandbox:0.3.11"
+goal = "Triage open GitHub issues and draft maintainer responses."
+
+[agent.openshell]
+# The skills read the public GitHub API with curl; gh is the authenticated path when a
+# token is present. Both paths are listed because the two images disagree on where gh
+# lives, and an entry for a binary the image lacks is inert.
+binaries = ["/usr/bin/curl", "/usr/bin/gh", "/usr/local/bin/gh"]
+
+[workflow]
+type = "playbook"
+file = "workflow.star"

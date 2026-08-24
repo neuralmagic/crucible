@@ -289,6 +289,9 @@ mod tests {
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
+            emits_files: Vec::new(),
+            over: None,
+            max_fanout: None,
         }
     }
 
@@ -306,6 +309,9 @@ mod tests {
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
+            emits_files: Vec::new(),
+            over: None,
+            max_fanout: None,
         }
     }
 
@@ -388,6 +394,9 @@ mod tests {
             join: Join::All,
             stage: Stage::Iteration,
             emits: Vec::new(),
+            emits_files: Vec::new(),
+            over: None,
+            max_fanout: None,
         };
         let passed = run_plan(vec![evaluate("latency", 9.5)], None);
         assert_eq!(passed.results[&"latency".into()].status, TaskStatus::Pass);
@@ -416,6 +425,9 @@ mod tests {
             join: Join::All,
             stage: Stage::Iteration,
             emits: Vec::new(),
+            emits_files: Vec::new(),
+            over: None,
+            max_fanout: None,
         };
         let over = run_plan(
             vec![evaluate("over", r#"{"score": 100, "pass": true}"#)],
@@ -451,6 +463,9 @@ mod tests {
             join: Join::All,
             stage: Stage::Iteration,
             emits: Vec::new(),
+            emits_files: Vec::new(),
+            over: None,
+            max_fanout: None,
         };
         let green = run_plan(vec![evaluate("green", r#"{"pass": true}"#)], None);
         assert_eq!(green.results[&"green".into()].status, TaskStatus::Pass);
@@ -475,6 +490,9 @@ mod tests {
             join: Join::All,
             stage: Stage::Iteration,
             emits: Vec::new(),
+            emits_files: Vec::new(),
+            over: None,
+            max_fanout: None,
         };
         let out = run_plan(vec![task], None);
         let result = &out.results[&"malformed".into()];
@@ -507,6 +525,9 @@ mod tests {
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
+            emits_files: Vec::new(),
+            over: None,
+            max_fanout: None,
         };
         let out = run_plan(vec![t], None);
         assert_eq!(out.results[&"a".into()].status, TaskStatus::Fail);
@@ -531,6 +552,9 @@ mod tests {
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
+            emits_files: Vec::new(),
+            over: None,
+            max_fanout: None,
         };
         let out = run_plan(
             vec![t],
@@ -581,6 +605,9 @@ mod tests {
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
+            emits_files: Vec::new(),
+            over: None,
+            max_fanout: None,
         };
         let measure = |name: &str, dep: &str| {
             command(
@@ -604,6 +631,9 @@ mod tests {
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
+            emits_files: Vec::new(),
+            over: None,
+            max_fanout: None,
         };
         let out = run_plan(
             vec![

@@ -13,10 +13,12 @@ The NDJSON session log (state/session.jsonl) must keep its existing event kinds 
 
 Additive event kinds:
 - identity: the run's RunIdentity, emitted once at setup and again on --resume.
-- shutdown: { outcome, reason }, emitted exactly once as the last line of every run (after finished/summary). outcome must be one of finished/solved/budget/stopped/escalated/stalled/error. A dead stream with no shutdown line means the pod died mid-run.
+- shutdown: { outcome, reason }, emitted exactly once as the last line of every run (after finished/summary). outcome must be one of finished/solved/budget/complete/stopped/escalated/stalled/error. finished means the graph or the loop ran out of work; complete means a task declared there was no work left to do and dispatch stopped short of that, the unscored counterpart of solved. The outcome says how dispatch stopped, not whether the run succeeded. A dead stream with no shutdown line means the pod died mid-run.
 - agent_session: { session, action, turn }, emitted before a persistent agent turn. Must not contain the provider cursor or native transcript content.
 - approval_wait: { handle, trace_id, mode }, emitted when the loop reads a pending-provisioning marker. Every approval_wait must be closed by an approval_resolved except on stop-while-parked and process death.
 - approval_resolved: { outcome, reason } with outcome one of granted/denied/timeout.
+- plan_admitted: { plan_version, reason, budget_usd, tasks }, emitted once after the graph is admitted and before any dispatch. Each task carries its name, kind, dependencies, session, needs, required flag, join, and stage. This is the consumer's route to the graph, so no gate label has to encode it. A consumer computing a verdict must skip tasks whose stage is epilogue, which is why the field is on the wire rather than inferable.
+- asks_emitted: { task, asks }, emitted once per task that emitted any, as that task settles. Each ask carries an emitter-supplied key, the workflow it names, and that workflow's parameter values. The key must be rejected on decode, not only on construction, so the wire is where the key rules are enforced rather than a way around them.
 - recovery: { class, iter, detail }, emitted once per --resume.
 
 RunIdentity is the comparability key: two runs' scores are comparable only if it matches. It must be a hash-of-hashes over: repo URL/path + pristine base commit SHA, frozen manifest text hash, inject content+destination hashes, measure_cmd, and direction."""

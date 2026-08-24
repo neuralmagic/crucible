@@ -17,18 +17,189 @@ use crate::event::{AgentEvent, RawStream};
 use crate::plan::exec::{Attempt, AttemptOutcome, BatchItem, TaskRunner};
 use crate::plan::ir::{Isolation, Task, TaskKind, TaskName};
 use crate::plan::runner::ShellRunner;
+use std::path::{Path, PathBuf};
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::{Args, Paths};
 
 const RESULT_FILE: &str = "PLAN_TASK_RESULT.json";
 
+/// Where a consumer finds what its ancestors declared. Under the workspace so a task reaches it
+/// with a relative path, and named so it is obviously not the task's own work.
+pub(crate) const STAGED_INPUTS: &str = "inputs";
+
+/// The most a single run may capture. Operator-owned, and the run's bound rather than any one
+/// task's: a pipeline that captures a little at every stage can still fill a disk.
+const MAX_CAPTURED_BYTES: u64 = 256 * 1024 * 1024;
+
+/// A declared path resolved inside the workspace, or why it is refused. Symlinks are refused per
+/// component and a second name is refused outright, for the same reason the pack's own paths are:
+/// resolving a path cannot see a hard link.
+fn confined(workspace: &Path, declared: &str) -> Result<PathBuf, String> {
+    let mut path = workspace.to_path_buf();
+    for component in Path::new(declared).components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(format!(
+                "declared file {declared:?} is not workspace-relative"
+            ));
+        };
+        path.push(component);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!("declared file {declared:?} traverses a symlink"));
+            }
+            Ok(metadata) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if metadata.is_file() && metadata.nlink() > 1 {
+                        return Err(format!(
+                            "declared file {declared:?} has {} names; a captured file has one",
+                            metadata.nlink()
+                        ));
+                    }
+                }
+                let _ = metadata;
+            }
+            Err(_) => {}
+        }
+    }
+    Ok(path)
+}
+
+fn captured_dir(state: &Path, task: &str) -> PathBuf {
+    state.join("files").join(task)
+}
+
+fn captured_path(state: &Path, task: &str, declared: &str) -> PathBuf {
+    captured_dir(state, task).join(declared)
+}
+
+/// The mode the engine gives a captured file, regardless of what the source carried. A
+/// declared output derived from a staged input arrives 0444, and a capture that kept that mode
+/// would make the next run's copy fail with EACCES.
+fn engine_mode(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644));
+    }
+    #[cfg(not(unix))]
+    {
+        if let Ok(metadata) = std::fs::metadata(path) {
+            let mut permissions = metadata.permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            permissions.set_readonly(false);
+            let _ = std::fs::set_permissions(path, permissions);
+        }
+    }
+}
+
+fn read_only(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444));
+    }
+    #[cfg(not(unix))]
+    {
+        if let Ok(metadata) = std::fs::metadata(path) {
+            let mut permissions = metadata.permissions();
+            permissions.set_readonly(true);
+            let _ = std::fs::set_permissions(path, permissions);
+        }
+    }
+}
+
+/// One file an ancestor declared, as the producer's name and the path it declared.
+pub struct StagedInput {
+    pub producer: String,
+    pub declared: String,
+}
+
 pub struct HarnessRunner {
     pub args: Args,
     pub paths: Paths,
+    /// Whether a settled task commits the shared workspace. True for a playbook, whose git
+    /// memory is per task; false for the scored loop, which owns the same repository for
+    /// keep/discard of whole candidates and would find per-task commits in the middle of it.
+    pub commit_per_task: bool,
+    /// Bytes captured by this run so far. C-TASK-FILES bounds the run, not any one task: a
+    /// pipeline capturing a little at every stage can still fill a disk.
+    pub captured_bytes: AtomicU64,
+    /// What each dispatched task is owed on the file channel, recorded by [`TaskRunner::stage`]
+    /// and materialized into that task's own root when it runs. A task with no entry is one the
+    /// executor never staged, and its `inputs/` is left alone.
+    pub staged: BTreeMap<TaskName, Vec<StagedInput>>,
 }
 
 impl TaskRunner for HarnessRunner {
     fn run(&mut self, task: &Task, attempt: u32, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
-        run_task(&self.args, &self.paths, task, attempt, inputs, None)
+        run_task(
+            &Dispatch {
+                args: &self.args,
+                paths: &self.paths,
+                captured_bytes: &self.captured_bytes,
+                staged: self.staged.get(&task.name).map(Vec::as_slice),
+            },
+            task,
+            attempt,
+            inputs,
+            None,
+        )
+    }
+
+    /// Record what this task's ancestors declared, for [`run_task`] to lay down under
+    /// `inputs/<producer>/` in whichever root the task runs in.
+    ///
+    /// It is recorded rather than copied because the root is not known yet: an isolated task's
+    /// worktree does not exist until it is dispatched, and a batch of isolated tasks has one
+    /// root each with a different ancestor set, so a single shared `inputs/` cannot serve them.
+    fn stage(&mut self, task: &Task, producers: &[&Task]) -> Result<(), String> {
+        let files = producers
+            .iter()
+            .flat_map(|producer| {
+                producer.emits_files.iter().map(|declared| StagedInput {
+                    producer: producer.name.0.clone(),
+                    declared: declared.clone(),
+                })
+            })
+            .collect();
+        self.staged.insert(task.name.clone(), files);
+        Ok(())
+    }
+
+    /// Commit what a passing task did, and discard what a failing one did.
+    ///
+    /// The "only when" half is the load-bearing one. Leaving a failed task's edits in the shared
+    /// tree does not merely fail to commit them: the next task to pass sweeps them into its own
+    /// commit, so the failed task contributes after all. Discarding at the point of failure is
+    /// what keeps that from happening.
+    ///
+    /// An isolated task contributes nothing either way. Its worktree is discarded by contract
+    /// and only its declared output continues, so there is no workspace change to record.
+    fn settled(&mut self, task: &Task, passed: bool) {
+        if !self.commit_per_task || task.isolation.is_some() {
+            return;
+        }
+        let workspace = &self.paths.workspace;
+        let outcome = if passed {
+            crucible_vcs::git_memory::snapshot(workspace, &format!("task {}", task.name))
+                .map(|_| ())
+        } else {
+            crucible_vcs::vcs::head_sha(workspace)
+                .and_then(|head| crucible_vcs::git_memory::restore(workspace, &head, &[]))
+        };
+        if let Err(error) = outcome {
+            // Git memory failing is worth saying out loud: a resumed run rebuilds from these
+            // commits, so a silent miss here is a silent gap there.
+            eprintln!(
+                "[{}] git memory ({}) failed: {error:#}",
+                task.name,
+                if passed { "commit" } else { "discard" }
+            );
+        }
     }
 
     /// Isolated tasks that are ready together run concurrently, each in its own worktree.
@@ -38,8 +209,12 @@ impl TaskRunner for HarnessRunner {
         if batch.len() == 1 {
             let b = &batch[0];
             return vec![run_task(
-                &self.args,
-                &self.paths,
+                &Dispatch {
+                    args: &self.args,
+                    paths: &self.paths,
+                    captured_bytes: &self.captured_bytes,
+                    staged: self.staged.get(&b.task.name).map(Vec::as_slice),
+                },
                 b.task,
                 b.attempt,
                 &b.inputs,
@@ -55,6 +230,8 @@ impl TaskRunner for HarnessRunner {
                 return batch.iter().map(|_| fail(0.0, note.clone())).collect();
             }
         };
+        let captured = &self.captured_bytes;
+        let staged = &self.staged;
         std::thread::scope(|scope| {
             let handles: Vec<_> = batch
                 .iter()
@@ -63,7 +240,18 @@ impl TaskRunner for HarnessRunner {
                     let paths = self.paths.clone();
                     let pending = pending.as_str();
                     scope.spawn(move || {
-                        run_task(&args, &paths, b.task, b.attempt, &b.inputs, Some(pending))
+                        run_task(
+                            &Dispatch {
+                                args: &args,
+                                paths: &paths,
+                                captured_bytes: captured,
+                                staged: staged.get(&b.task.name).map(Vec::as_slice),
+                            },
+                            b.task,
+                            b.attempt,
+                            &b.inputs,
+                            Some(pending),
+                        )
                     })
                 })
                 .collect();
@@ -78,19 +266,37 @@ impl TaskRunner for HarnessRunner {
     }
 }
 
+/// What one dispatch needs besides the task: the run's configuration and paths, the run's
+/// captured-byte total, and the files this task's ancestors declared.
+struct Dispatch<'a> {
+    args: &'a Args,
+    paths: &'a Paths,
+    captured_bytes: &'a AtomicU64,
+    staged: Option<&'a [StagedInput]>,
+}
+
 /// Dispatch one task, in the shared workspace or in a private worktree. `pending` is the
 /// shared workspace's uncommitted patch when a concurrent caller already captured it for
 /// the whole batch; `None` means capture it here.
 fn run_task(
-    args: &Args,
-    paths: &Paths,
+    cx: &Dispatch<'_>,
     task: &Task,
     attempt: u32,
     inputs: &BTreeMap<TaskName, Value>,
     pending: Option<&str>,
 ) -> Attempt {
+    let Dispatch {
+        args,
+        paths,
+        captured_bytes,
+        staged,
+    } = *cx;
     let Some(Isolation::Worktree) = task.isolation else {
-        return prepare_and_run(args, paths, task, attempt, inputs);
+        if let Err(e) = materialize_inputs(&paths.state, &paths.workspace, staged) {
+            return transport(e);
+        }
+        let attempt_out = prepare_and_run(args, paths, task, attempt, inputs);
+        return capture_declared(paths, &paths.workspace, task, attempt_out, captured_bytes);
     };
     // A private clone of the workspace. Its edits are discarded on cleanup: what leaves an
     // isolated task is its declared output, so this is for review/analysis work, not for
@@ -119,11 +325,140 @@ fn run_task(
     if let Err(e) = crate::plan::worktree::setup(&paths.workspace, &worktree, pending) {
         return transport(format!("worktree setup failed: {e:#}"));
     }
+    // `inputs/` is excluded from the workspace's git memory, so neither the clone nor the
+    // pending patch carries it. Lay this task's own staged set down here, or an isolated
+    // consumer never sees what its ancestors declared.
+    if let Err(e) = materialize_inputs(&paths.state, &worktree, staged) {
+        return transport(e);
+    }
     let iso = Paths::for_worktree(worktree.clone(), paths.skills.clone());
     let _ = std::fs::create_dir_all(&iso.state);
     let attempt_out = prepare_and_run(args, &iso, task, attempt, inputs);
+    // Before the worktree goes: a declared file is part of the task's output, not part of the
+    // workspace state isolation discards, so it has to be taken while the tree is still there.
+    let attempt_out = capture_declared(paths, &iso.workspace, task, attempt_out, captured_bytes);
     let _ = std::fs::remove_dir_all(&worktree);
     attempt_out
+}
+
+/// Take a passing attempt's declared files, or turn it into a measured failure.
+///
+/// A declared file that is absent after an otherwise-passing attempt is output drift, and it
+/// fails at the task that promised it rather than as a mystery in whatever depended on it. It is
+/// not retried: a task that ran and did not produce what it promised will not produce it twice.
+///
+/// Capture goes to a temporary directory and is published with a rename, so `state/files/<task>`
+/// exists only for a task that delivered everything it declared: a partial capture cannot reach
+/// a descendant, and the rename replaces the previous run's copy rather than writing into it.
+fn capture_declared(
+    paths: &Paths,
+    workspace: &Path,
+    task: &Task,
+    attempt: Attempt,
+    captured: &AtomicU64,
+) -> Attempt {
+    if task.emits_files.is_empty() || !matches!(attempt.outcome, AttemptOutcome::Pass(_)) {
+        return attempt;
+    }
+    let staging = paths.state.join("files.tmp").join(&task.name.0);
+    let _ = std::fs::remove_dir_all(&staging);
+    let mut charged = 0u64;
+    let taken = (|| -> Result<(), String> {
+        for declared in &task.emits_files {
+            let from = confined(workspace, declared)?;
+            let size = match std::fs::metadata(&from) {
+                Ok(metadata) if metadata.is_file() => metadata.len(),
+                Ok(_) => {
+                    return Err(format!("declared file {declared:?} is not a regular file"));
+                }
+                Err(_) => {
+                    return Err(format!(
+                        "declared file {declared:?} is absent after a passing attempt"
+                    ));
+                }
+            };
+            let total = captured
+                .fetch_add(size, Ordering::Relaxed)
+                .saturating_add(size);
+            charged = charged.saturating_add(size);
+            if total > MAX_CAPTURED_BYTES {
+                return Err(format!(
+                    "this run's declared files exceed {MAX_CAPTURED_BYTES} bytes"
+                ));
+            }
+            let to = staging.join(declared);
+            if let Some(parent) = to.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|error| format!("capturing {declared:?}: {error}"))?;
+            }
+            std::fs::copy(&from, &to)
+                .map_err(|error| format!("capturing {declared:?}: {error}"))?;
+            engine_mode(&to);
+        }
+        Ok(())
+    })();
+    if let Err(why) = taken {
+        let _ = std::fs::remove_dir_all(&staging);
+        captured.fetch_sub(charged, Ordering::Relaxed);
+        return fail(attempt.cost_usd, why);
+    }
+    let published = captured_dir(&paths.state, &task.name.0);
+    if let Some(parent) = published.parent()
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        let _ = std::fs::remove_dir_all(&staging);
+        captured.fetch_sub(charged, Ordering::Relaxed);
+        return fail(
+            attempt.cost_usd,
+            format!("publishing the files {} declared: {error}", task.name),
+        );
+    }
+    let _ = std::fs::remove_dir_all(&published);
+    if let Err(error) = std::fs::rename(&staging, &published) {
+        let _ = std::fs::remove_dir_all(&staging);
+        captured.fetch_sub(charged, Ordering::Relaxed);
+        return fail(
+            attempt.cost_usd,
+            format!("publishing the files {} declared: {error}", task.name),
+        );
+    }
+    attempt
+}
+
+/// Lay a task's staged inputs down under `<root>/inputs/<producer>/`, replacing whatever a
+/// previous dispatch left there.
+///
+/// Namespaced by producer so two tasks declaring the same path cannot collide, and made
+/// read-only so a consumer cannot edit what it was handed and pass the edit on as if the
+/// producer had said it. `None` is a task the executor never staged: its root is left alone.
+fn materialize_inputs(
+    state: &Path,
+    root: &Path,
+    staged: Option<&[StagedInput]>,
+) -> Result<(), String> {
+    let Some(staged) = staged else {
+        return Ok(());
+    };
+    let inputs = root.join(STAGED_INPUTS);
+    let _ = std::fs::remove_dir_all(&inputs);
+    for file in staged {
+        let from = captured_path(state, &file.producer, &file.declared);
+        if !from.exists() {
+            continue;
+        }
+        let to = inputs.join(&file.producer).join(&file.declared);
+        if let Some(parent) = to.parent()
+            && let Err(error) = std::fs::create_dir_all(parent)
+        {
+            return Err(format!("staging {}: {error}", to.display()));
+        }
+        let _ = std::fs::remove_file(&to);
+        if let Err(error) = std::fs::copy(&from, &to) {
+            return Err(format!("staging {}: {error}", to.display()));
+        }
+        read_only(&to);
+    }
+    Ok(())
 }
 
 fn prepare_and_run(
@@ -184,6 +519,10 @@ fn run_in(
     // are a measured failure: a plan naming a harness we can't parse is wrong, not
     // unlucky.
     let mut args = args.clone();
+    // Name the task to the turn. A deterministic stand-in needs to know which task it is
+    // without matching prompt prose, and a real harness gets it for free in its transcript.
+    args.env
+        .push(("CRUCIBLE_TASK".to_string(), task.name.0.clone()));
     if let Some(h) = harness {
         match crate::harness::Harness::from_str(h, true) {
             Ok(h) => args.harness = Some(h),
@@ -324,6 +663,425 @@ mod tests {
     use crate::plan::exec::{ExecCfg, PlanExit, Substrate, TaskStatus, execute};
     use crate::plan::ir::{Join, Plan, Stage};
 
+    fn scratch(tag: &str) -> (std::path::PathBuf, Paths) {
+        let dir = std::env::temp_dir().join(format!("crucible-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("workspace")).unwrap();
+        std::fs::create_dir_all(dir.join("state")).unwrap();
+        let paths =
+            crate::Paths::for_manifest(dir.join("workspace"), dir.join("state"), &dir, None);
+        (dir, paths)
+    }
+
+    fn emitting(name: &str, files: &[&str]) -> crate::plan::ir::Task {
+        crate::plan::ir::Task {
+            name: name.into(),
+            task: TaskKind::Command {
+                command: "true".into(),
+            },
+            depends_on: vec![],
+            session: None,
+            needs: "any".into(),
+            required: true,
+            isolation: None,
+            join: Join::default(),
+            stage: Stage::Iteration,
+            emits: Vec::new(),
+            emits_files: files.iter().map(|f| (*f).to_string()).collect(),
+            over: None,
+            max_fanout: None,
+        }
+    }
+
+    fn passing() -> Attempt {
+        Attempt {
+            outcome: AttemptOutcome::Pass(Value::Null),
+            cost_usd: 0.0,
+        }
+    }
+
+    fn note(attempt: &Attempt) -> String {
+        match &attempt.outcome {
+            AttemptOutcome::Fail(note) => note.clone(),
+            other => panic!("expected a measured failure, got {other:?}"),
+        }
+    }
+
+    /// A task that delivered some of what it declared delivered none of it. Publishing what was
+    /// copied before the missing file would hand a descendant a partial output from a task the
+    /// JSON channel reports as failed.
+    #[test]
+    fn a_partial_capture_publishes_nothing() {
+        let (dir, paths) = scratch("capture-partial");
+        std::fs::write(paths.workspace.join("A.md"), "present\n").unwrap();
+        let task = emitting("draft", &["A.md", "B.md"]);
+        let counter = AtomicU64::new(0);
+        let out = capture_declared(&paths, &paths.workspace, &task, passing(), &counter);
+        let note = note(&out);
+        assert!(note.contains("B.md") && note.contains("absent"), "{note}");
+        assert!(
+            !paths.state.join("files/draft").exists(),
+            "a partial capture was published"
+        );
+        assert!(
+            !paths.state.join("files.tmp/draft").exists(),
+            "the staging directory outlived the failure"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A declared output copied from a staged input carries the staged input's 0444. Capturing
+    /// that mode makes every later run of the same task fail with EACCES, and re-running is a
+    /// supported flow.
+    #[test]
+    fn a_captured_file_takes_the_engines_mode_not_the_sources() {
+        let (dir, paths) = scratch("capture-mode");
+        let source = paths.workspace.join("A.md");
+        std::fs::write(&source, "read-only\n").unwrap();
+        read_only(&source);
+        let task = emitting("draft", &["A.md"]);
+        let counter = AtomicU64::new(0);
+        for round in 1..=3 {
+            let out = capture_declared(&paths, &paths.workspace, &task, passing(), &counter);
+            assert!(
+                matches!(out.outcome, AttemptOutcome::Pass(_)),
+                "round {round}: {:?}",
+                out.outcome
+            );
+            let captured = paths.state.join("files/draft/A.md");
+            assert_eq!(std::fs::read_to_string(&captured).unwrap(), "read-only\n");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&captured).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o644, "round {round}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The captured-bytes bound is the run's, not one task's: a pipeline capturing a little at
+    /// every stage still has to hit it.
+    #[test]
+    fn the_captured_bytes_bound_counts_the_run() {
+        let (dir, paths) = scratch("capture-bound");
+        std::fs::write(paths.workspace.join("A.md"), vec![b'x'; 4096]).unwrap();
+        let task = emitting("draft", &["A.md"]);
+        let counter = AtomicU64::new(0);
+        let out = capture_declared(&paths, &paths.workspace, &task, passing(), &counter);
+        assert!(matches!(out.outcome, AttemptOutcome::Pass(_)));
+        assert_eq!(counter.load(Ordering::Relaxed), 4096);
+
+        // A second task, itself far under the bound, lands on a run that is already there.
+        let later = emitting("polish", &["A.md"]);
+        counter.store(MAX_CAPTURED_BYTES - 1, Ordering::Relaxed);
+        let out = capture_declared(&paths, &paths.workspace, &later, passing(), &counter);
+        let note = note(&out);
+        assert!(note.contains("this run's declared files exceed"), "{note}");
+        assert!(
+            !paths.state.join("files/polish").exists(),
+            "a capture past the run's bound was published"
+        );
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            MAX_CAPTURED_BYTES - 1,
+            "a capture that was never published still spent the run's budget"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Boilerplate every e2e in this module shares: a manifest whose agent is the fake harness
+    /// and whose workflow is `workflow.star`.
+    fn fake_agent_manifest(dir: &std::path::Path) {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root");
+        std::fs::write(
+            dir.join("crucible.toml"),
+            format!(
+                r#"
+                [repo]
+                path = "."
+                [workspace]
+                dir = "workspace"
+                setup_cmd = "mkdir -p workspace && git -C workspace init -q && git -C workspace -c user.email=c@l -c user.name=c -c commit.gpgsign=false commit -q --allow-empty -m baseline"
+                [agent]
+                backend = "command"
+                agent_cmd = "python3 {}"
+                goal = "pass artifacts along"
+                [agent.env]
+                FAKE_AGENT_SCRIPT = "{}"
+                [workflow]
+                type = "playbook"
+                file = "workflow.star"
+                "#,
+                root.join("tools/fake-agent.py").display(),
+                dir.join("agents.json").display(),
+            ),
+        )
+        .unwrap();
+    }
+
+    fn run_playbook(dir: &std::path::Path) -> crate::plan::exec::PlanOutcome {
+        let mut manifest = crate::manifest::Manifest::load(&dir.join("crucible.toml")).unwrap();
+        manifest.resolve_workflow(dir).unwrap();
+        let workflow = manifest.workflow.as_ref().unwrap();
+        let plan = crate::loop_graph::iteration_template(
+            Some(workflow),
+            &crate::manifest::WorkflowCaps::for_lane(workflow.workflow_type),
+        )
+        .unwrap();
+        let mut runner = crate::run::prep_plan_runner(&dir.join("crucible.toml"))
+            .unwrap()
+            .0;
+        execute(
+            &plan,
+            &Substrate::default(),
+            ExecCfg::default(),
+            &mut runner,
+            |_, _| {},
+        )
+    }
+
+    /// A serial producer's declared file has to reach an isolated consumer, whose worktree is a
+    /// clone that cannot carry `inputs/` (it is excluded from the workspace's git memory on
+    /// purpose), and the whole pack has to stay runnable: the middle task's declared output is a
+    /// copy of a staged input, so it carries the staged copy's read-only mode.
+    #[test]
+    fn a_capturing_pack_runs_three_times_and_reaches_an_isolated_consumer() {
+        let dir = std::env::temp_dir().join(format!("crucible-recapture-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("agents.json"),
+            r#"{
+              "write": {"writes": {"A.md": "the source\n"}, "result": {"ok": true}},
+              "review": {"reads": ["inputs/write/A.md", "inputs/copy/B.md"],
+                         "result": {"saw_both": true}}
+            }"#,
+        )
+        .unwrap();
+        // `copy` reads what a serial ancestor declared and declares the result, so its own
+        // captured file inherits the staged input's mode. `review` is isolated, so it can only
+        // see either file if staged inputs are carried into the worktree directly.
+        std::fs::write(
+            dir.join("workflow.star"),
+            r#"
+write = agent(name = "write", prompt = "write", emits_files = ["A.md"])
+copy = command(
+    name = "copy",
+    run = "cp -f inputs/write/A.md B.md && printf '{\"copied\": true}\n'",
+    depends_on = [write],
+    emits_files = ["B.md"],
+)
+review = agent(name = "review", prompt = "review", depends_on = [copy], isolated = True)
+workflow(type = "playbook", tasks = [write, copy, review])
+"#,
+        )
+        .unwrap();
+        fake_agent_manifest(&dir);
+
+        for round in 1..=3 {
+            let out = run_playbook(&dir);
+            assert!(out.valid, "round {round}: {:?}", out.results);
+            assert_eq!(
+                out.results[&"review".into()].output.as_ref().unwrap()["saw_both"],
+                true,
+                "round {round}: an isolated consumer missed a serial producer's file"
+            );
+            assert!(
+                dir.join("state/files/copy/B.md").exists(),
+                "round {round}: nothing was captured"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The file channel says what the JSON channel says. A producer that failed contributes
+    /// nothing, including what a previous run of the same pack captured under its name.
+    #[test]
+    fn a_failed_producer_contributes_nothing_on_the_file_channel() {
+        let dir = std::env::temp_dir().join(format!("crucible-stale-files-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = |produce_fails: bool| {
+            format!(
+                r#"{{
+                  "seed": {{"result": {{"ok": true}}}},
+                  "produce": {{{}"writes": {{"A.md": "the source\n"}}, "result": {{"ok": true}}}}
+                }}"#,
+                if produce_fails { "\"exit\": 1, " } else { "" }
+            )
+        };
+        std::fs::write(dir.join("agents.json"), script(false)).unwrap();
+        // `check` passes only when nothing of `produce` is staged, and a lossy join plus an
+        // advisory producer is what gets it dispatched after the failure.
+        std::fs::write(
+            dir.join("workflow.star"),
+            r#"
+seed = agent(name = "seed", prompt = "seed")
+produce = agent(
+    name = "produce",
+    prompt = "produce",
+    depends_on = [seed],
+    emits_files = ["A.md"],
+    required = False,
+)
+check = command(
+    name = "check",
+    run = "test ! -e inputs/produce && printf '{\"clean\": true}\n'",
+    depends_on = [seed, produce],
+    join = "passed",
+    required = False,
+)
+workflow(type = "playbook", tasks = [seed, produce, check])
+"#,
+        )
+        .unwrap();
+        fake_agent_manifest(&dir);
+
+        // A passing producer stages, which is what makes the second round's assertion mean
+        // something: the check is live, and the capture it must not see now exists.
+        let out = run_playbook(&dir);
+        assert_eq!(out.results[&"produce".into()].status, TaskStatus::Pass);
+        assert!(dir.join("state/files/produce/A.md").exists());
+        assert_eq!(
+            out.results[&"check".into()].status,
+            TaskStatus::Fail,
+            "a passing producer's file was not staged"
+        );
+
+        std::fs::write(dir.join("agents.json"), script(true)).unwrap();
+        let out = run_playbook(&dir);
+        assert_eq!(out.results[&"produce".into()].status, TaskStatus::Fail);
+        assert!(
+            dir.join("state/files/produce/A.md").exists(),
+            "the previous run's capture was expected to still be on disk"
+        );
+        assert_eq!(
+            out.results[&"check".into()].status,
+            TaskStatus::Pass,
+            "a failed producer's file reached its descendant: {:?}",
+            out.results[&"check".into()].note
+        );
+        assert!(!dir.join("workspace/inputs/produce").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Isolated tasks that are ready together run as one batch, and they do not share an
+    /// ancestor set: each one is owed exactly what its own ancestors declared.
+    #[test]
+    fn batched_isolated_consumers_each_get_their_own_ancestors_files() {
+        let dir =
+            std::env::temp_dir().join(format!("crucible-batch-inputs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("agents.json"),
+            r#"{"prod_a": {"writes": {"a.md": "a\n"}, "result": {"ok": true}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("workflow.star"),
+            r#"
+prod_a = agent(name = "prod_a", prompt = "produce", emits_files = ["a.md"])
+prod_b = command(
+    name = "prod_b",
+    run = "printf 'b\n' > b.md && printf '{\"ok\": true}\n'",
+    depends_on = [prod_a],
+    emits_files = ["b.md"],
+)
+con_a = command(
+    name = "con_a",
+    run = "test -e inputs/prod_a/a.md && test ! -e inputs/prod_b/b.md && printf '{\"ok\": true}\n'",
+    depends_on = [prod_a],
+    isolated = True,
+)
+con_b = command(
+    name = "con_b",
+    run = "test -e inputs/prod_a/a.md && test -e inputs/prod_b/b.md && printf '{\"ok\": true}\n'",
+    depends_on = [prod_b],
+    isolated = True,
+)
+workflow(type = "playbook", tasks = [prod_a, prod_b, con_a, con_b])
+"#,
+        )
+        .unwrap();
+        fake_agent_manifest(&dir);
+
+        let out = run_playbook(&dir);
+        assert_eq!(
+            out.results[&"con_b".into()].status,
+            TaskStatus::Pass,
+            "a batched consumer missed its own ancestor's file: {:?}",
+            out.results[&"con_b".into()].note
+        );
+        assert_eq!(
+            out.results[&"con_a".into()].status,
+            TaskStatus::Pass,
+            "a batched consumer was handed a file no ancestor of its declared: {:?}",
+            out.results[&"con_a".into()].note
+        );
+        assert!(out.valid, "{:?}", out.results);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Staged inputs belong to the task they were staged for. A task that is nobody's descendant
+    /// gets nothing on the file channel, whatever the dispatch before it was handed.
+    #[test]
+    fn a_previous_dispatchs_inputs_do_not_reach_a_non_descendant() {
+        let dir =
+            std::env::temp_dir().join(format!("crucible-stale-inputs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("agents.json"),
+            r#"{"prod": {"writes": {"a.md": "a\n"}, "result": {"ok": true}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("workflow.star"),
+            r#"
+prod = agent(name = "prod", prompt = "produce", emits_files = ["a.md"])
+cons = command(
+    name = "cons",
+    run = "test -e inputs/prod/a.md && printf '{\"ok\": true}\n'",
+    depends_on = [prod],
+)
+serial_stranger = command(
+    name = "serial_stranger",
+    run = "test ! -e inputs/prod/a.md && printf '{\"ok\": true}\n'",
+)
+isolated_stranger = command(
+    name = "isolated_stranger",
+    run = "test ! -e inputs/prod/a.md && printf '{\"ok\": true}\n'",
+    isolated = True,
+)
+workflow(type = "playbook", tasks = [prod, cons, serial_stranger, isolated_stranger])
+"#,
+        )
+        .unwrap();
+        fake_agent_manifest(&dir);
+
+        let out = run_playbook(&dir);
+        assert_eq!(
+            out.results[&"cons".into()].status,
+            TaskStatus::Pass,
+            "a descendant missed what its ancestor declared: {:?}",
+            out.results[&"cons".into()].note
+        );
+        for stranger in ["serial_stranger", "isolated_stranger"] {
+            assert_eq!(
+                out.results[&stranger.into()].status,
+                TaskStatus::Pass,
+                "{stranger} was handed a stranger's declared file: {:?}",
+                out.results[&stranger.into()].note
+            );
+        }
+        assert!(out.valid, "{:?}", out.results);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn isolation_worktree_names_do_not_collide_after_display_sanitization() {
         let slash = task_worktree_name(&"review/a".into());
@@ -431,7 +1189,9 @@ mod tests {
         .validate()
         .unwrap();
 
-        let mut runner = crate::run::prep_plan_runner(&dir.join("crucible.toml")).unwrap();
+        let mut runner = crate::run::prep_plan_runner(&dir.join("crucible.toml"))
+            .unwrap()
+            .0;
         let out = execute(
             &plan,
             &Substrate::default(),
@@ -456,6 +1216,714 @@ mod tests {
                 .trim(),
             "3"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The whole playbook concept, end to end, with no model and no controller: a real graph
+    /// compiled from a real pack, real processes for every turn, and a verdict. Only the model
+    /// is absent, and it is absent by substitution at the process boundary rather than by
+    /// stubbing anything inside the engine.
+    #[test]
+    fn a_playbook_runs_end_to_end_with_no_model_and_no_controller() {
+        let dir =
+            std::env::temp_dir().join(format!("crucible-playbook-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        let fake = root.join("tools/fake-agent.py");
+        assert!(fake.exists(), "{} is missing", fake.display());
+
+        std::fs::write(
+            dir.join("agents.json"),
+            r#"{
+              "draft":   {"writes": {"NOTES.md": "- one\n- two\n"},
+                          "appends": {"TURNS.txt": "draft {ENV:CRUCIBLE_AGENT_SESSION_ID}\n"},
+                          "result": {"entries": 2}},
+              "polish":  {"reads": ["NOTES.md", "TURNS.txt"],
+                          "appends": {"TURNS.txt": "polish {ENV:CRUCIBLE_AGENT_SESSION_ID}\n"},
+                          "result": {"session": "{ENV:CRUCIBLE_AGENT_SESSION}",
+                                     "action": "{ENV:CRUCIBLE_AGENT_SESSION_ACTION}"}},
+              "audit-a": {"reads": ["NOTES.md"], "result": {"findings": []}},
+              "audit-b": {"exit": 1, "stderr": "no baseline to compare against"}
+            }"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            dir.join("workflow.star"),
+            r##"
+scribe = session(name = "scribe")
+
+draft = agent(name = "draft", prompt = "draft the notes", session = scribe, emits = ["entries"])
+shape = command(
+    name = "shape",
+    run = "test -s NOTES.md && printf '{\"lines\": %s}\n' \"$(wc -l < NOTES.md | tr -d ' ')\"",
+    depends_on = [draft],
+)
+polish = agent(name = "polish", prompt = "polish them", session = scribe, depends_on = [shape])
+
+audit_a = agent(
+    name = "audit-a",
+    prompt = "audit headings",
+    depends_on = [polish],
+    isolated = True,
+    emits = ["findings"],
+)
+audit_b = agent(
+    name = "audit-b",
+    prompt = "audit freshness",
+    depends_on = [polish],
+    isolated = True,
+    required = False,
+)
+
+roundup = command(
+    name = "roundup",
+    run = "printf '{\"reporting\": %s}\n' \"$(printf '%s' \"$CRUCIBLE_INPUTS\" | grep -c audit-a)\"",
+    depends_on = [audit_a, audit_b],
+    join = "passed",
+)
+
+workflow(type = "playbook", tasks = [draft, shape, polish, audit_a, audit_b, roundup])
+"##,
+        )
+        .unwrap();
+
+        std::fs::write(
+            dir.join("crucible.toml"),
+            format!(
+                r#"
+                [repo]
+                path = "."
+                [workspace]
+                dir = "workspace"
+                setup_cmd = "mkdir -p workspace && git -C workspace init -q && git -C workspace -c user.email=c@l -c user.name=c -c commit.gpgsign=false commit -q --allow-empty -m baseline"
+                [agent]
+                backend = "command"
+                agent_cmd = "python3 {}"
+                goal = "draft release notes, then audit them"
+                [agent.env]
+                FAKE_AGENT_SCRIPT = "{}"
+                [workflow]
+                type = "playbook"
+                file = "workflow.star"
+                "#,
+                fake.display(),
+                dir.join("agents.json").display(),
+            ),
+        )
+        .unwrap();
+
+        // The pack names its graph; the engine compiles it. No controller supplies anything.
+        let mut manifest = crate::manifest::Manifest::load(&dir.join("crucible.toml")).unwrap();
+        manifest.resolve_workflow(&dir).unwrap();
+        let workflow = manifest.workflow.as_ref().expect("a playbook workflow");
+        assert_eq!(
+            workflow.workflow_type,
+            crate::manifest::WorkflowType::Playbook
+        );
+        assert!(manifest.is_task(), "a playbook carries no judge");
+
+        let plan = crate::loop_graph::iteration_template(
+            Some(workflow),
+            &crate::manifest::WorkflowCaps::for_lane(workflow.workflow_type)
+                .with_persistent_sessions(),
+        )
+        .unwrap();
+
+        let mut settled: Vec<(String, &'static str)> = Vec::new();
+        let mut runner = crate::run::prep_plan_runner(&dir.join("crucible.toml"))
+            .unwrap()
+            .0;
+        let out = execute(
+            &plan,
+            &Substrate::default(),
+            ExecCfg::default(),
+            &mut runner,
+            |task, result| settled.push((task.name.0.clone(), result.status.as_str())),
+        );
+
+        // The verdict: every required task passed, so the run is valid despite an advisory
+        // failure. That is the whole difference from the scored lane, and it carries no score.
+        assert!(out.valid, "{:?}", out.results);
+        assert_eq!(out.exit, PlanExit::Completed);
+        assert_eq!(out.spent_usd, 0.0, "no model was called");
+
+        assert_eq!(out.results[&"audit-b".into()].status, TaskStatus::Fail);
+        assert_eq!(
+            out.results[&"roundup".into()].status,
+            TaskStatus::Pass,
+            "join = passed folds whoever survived"
+        );
+        assert_eq!(
+            out.results[&"roundup".into()].output.as_ref().unwrap()["reporting"],
+            1,
+            "the advisory auditor's output must not reach the join"
+        );
+
+        // Every task settled exactly once, and the reporter saw each as it settled.
+        assert_eq!(settled.len(), 6, "{settled:?}");
+
+        // Session continuity, proven by the agent rather than asserted about it: `polish` read
+        // a TURNS.txt only `draft` could have written, in the same conversation.
+        let polish = out.results[&"polish".into()].output.as_ref().unwrap();
+        assert_eq!(polish["session"], "scribe");
+        let turns = std::fs::read_to_string(dir.join("workspace/TURNS.txt")).unwrap();
+        let ids: Vec<&str> = turns
+            .lines()
+            .filter_map(|l| l.split_whitespace().nth(1))
+            .collect();
+        assert_eq!(ids.len(), 2, "{turns}");
+        assert_eq!(
+            ids[0], ids[1],
+            "one conversation spanned both turns: {turns}"
+        );
+
+        // `audit-a` declared `reads` on a file it never wrote, in a disposable worktree. It
+        // passed, so isolation staged the workspace rather than starting from nothing.
+        assert_eq!(out.results[&"audit-a".into()].status, TaskStatus::Pass);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fan-out over items nobody knew about when the graph was written, run end to end with
+    /// no model. The graph has three nodes whatever `discover` returns; only the instance count
+    /// is decided at run time, and each instance is named by its item rather than its position.
+    #[test]
+    fn a_fanout_runs_one_instance_per_discovered_item() {
+        let dir = std::env::temp_dir().join(format!("crucible-fanout-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        let fake = root.join("tools/fake-agent.py");
+
+        std::fs::write(
+            dir.join("agents.json"),
+            r#"{
+              "audit[alpha]": {"result": {"item": "{ENV:CRUCIBLE_TASK}", "findings": 0}},
+              "audit[beta]":  {"result": {"item": "{ENV:CRUCIBLE_TASK}", "findings": 2}},
+              "audit[gamma]": {"exit": 1, "stderr": "gamma has no baseline"}
+            }"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            dir.join("workflow.star"),
+            r##"
+discover = command(
+    name = "discover",
+    run = "printf '{\"targets\": [\"alpha\", \"beta\", \"gamma\"]}\n'",
+    emits = ["targets"],
+)
+audit = agent(
+    name = "audit",
+    prompt = "audit one target",
+    depends_on = [discover],
+    over = discover.targets,
+    max_fanout = 8,
+    isolated = True,
+    required = False,
+    emits = ["findings"],
+)
+roundup = command(
+    name = "roundup",
+    run = "printf '{\"seen\": %s}\n' \"$(printf '%s' \"$CRUCIBLE_INPUTS\" | grep -o passed | wc -l | tr -d ' ')\"",
+    depends_on = [audit],
+    join = "passed",
+)
+workflow(type = "playbook", tasks = [discover, audit, roundup])
+"##,
+        )
+        .unwrap();
+
+        std::fs::write(
+            dir.join("crucible.toml"),
+            format!(
+                r#"
+                [repo]
+                path = "."
+                [workspace]
+                dir = "workspace"
+                setup_cmd = "mkdir -p workspace && git -C workspace init -q && git -C workspace -c user.email=c@l -c user.name=c -c commit.gpgsign=false commit -q --allow-empty -m baseline"
+                [agent]
+                backend = "command"
+                agent_cmd = "python3 {}"
+                goal = "audit each discovered target"
+                [agent.env]
+                FAKE_AGENT_SCRIPT = "{}"
+                [workflow]
+                type = "playbook"
+                file = "workflow.star"
+                "#,
+                fake.display(),
+                dir.join("agents.json").display(),
+            ),
+        )
+        .unwrap();
+
+        let mut manifest = crate::manifest::Manifest::load(&dir.join("crucible.toml")).unwrap();
+        manifest.resolve_workflow(&dir).unwrap();
+        let workflow = manifest.workflow.as_ref().expect("workflow");
+        let plan = crate::loop_graph::iteration_template(
+            Some(workflow),
+            &crate::manifest::WorkflowCaps::for_lane(workflow.workflow_type),
+        )
+        .unwrap();
+        // Three nodes, before anything runs and whatever `discover` finds.
+        assert_eq!(plan.plan().tasks.len(), 3);
+
+        let mut rows: Vec<(String, &'static str)> = Vec::new();
+        let mut runner = crate::run::prep_plan_runner(&dir.join("crucible.toml"))
+            .unwrap()
+            .0;
+        let out = execute(
+            &plan,
+            &Substrate::default(),
+            ExecCfg::default(),
+            &mut runner,
+            |task, result| rows.push((task.name.0.clone(), result.status.as_str())),
+        );
+
+        // One row per item, named by the item. A reader can tell which target failed.
+        assert!(
+            rows.contains(&("audit[alpha]".to_string(), "pass")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.contains(&("audit[beta]".to_string(), "pass")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.contains(&("audit[gamma]".to_string(), "fail")),
+            "{rows:?}"
+        );
+
+        // The node folds them: advisory, so one failed instance does not gate the run.
+        let node = &out.results[&"audit".into()];
+        assert_eq!(node.status, TaskStatus::Fail, "one instance failed");
+        let folded = node.output.as_ref().expect("folded output");
+        assert_eq!(folded["instances"], 3);
+        assert_eq!(folded["passed"], 2);
+        assert_eq!(folded["failed"], 1);
+        assert_eq!(folded["outputs"]["alpha"]["item"], "audit[alpha]");
+        // A failed instance contributes no entry at all: a null under its key would read as
+        // "it ran and found nothing", which is a different claim from "it did not run".
+        assert!(
+            folded["outputs"].get("gamma").is_none(),
+            "a failed instance leaked into the join: {folded}"
+        );
+        assert_eq!(
+            folded["outputs"].as_object().map(|o| o.len()),
+            Some(2),
+            "{folded}"
+        );
+        assert!(
+            node.note.as_ref().is_some_and(|n| n.contains("gamma")),
+            "the note must name what failed: {:?}",
+            node.note
+        );
+
+        assert!(
+            out.valid,
+            "an advisory fan-out cannot invalidate: {:?}",
+            out.exit
+        );
+        assert_eq!(out.results[&"roundup".into()].status, TaskStatus::Pass);
+
+        // A wider result than declared is refused rather than run.
+        std::fs::write(
+            dir.join("workflow.star"),
+            std::fs::read_to_string(dir.join("workflow.star"))
+                .unwrap()
+                .replace("max_fanout = 8", "max_fanout = 2"),
+        )
+        .unwrap();
+        let mut narrow = crate::manifest::Manifest::load(&dir.join("crucible.toml")).unwrap();
+        narrow.resolve_workflow(&dir).unwrap();
+        let plan = crate::loop_graph::iteration_template(
+            Some(narrow.workflow.as_ref().unwrap()),
+            &crate::manifest::WorkflowCaps::for_lane(crate::manifest::WorkflowType::Playbook),
+        )
+        .unwrap();
+        let mut runner = crate::run::prep_plan_runner(&dir.join("crucible.toml"))
+            .unwrap()
+            .0;
+        let out = execute(
+            &plan,
+            &Substrate::default(),
+            ExecCfg::default(),
+            &mut runner,
+            |_, _| {},
+        );
+        let node = &out.results[&"audit".into()];
+        assert_eq!(node.status, TaskStatus::Fail);
+        assert!(
+            node.note
+                .as_ref()
+                .is_some_and(|n| n.contains("max_fanout is 2")),
+            "the bound must be named: {:?}",
+            node.note
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Git memory, per task: what a passing task did becomes a commit, and what a failing task
+    /// did is dropped. The second half is what needs proving. Leaving a failed task's edits in
+    /// the shared tree does not merely fail to commit them; the next task to pass sweeps them
+    /// into its own commit, and the failed task has contributed after all.
+    #[test]
+    fn a_passing_task_commits_and_a_failing_one_leaves_nothing_behind() {
+        let dir = std::env::temp_dir().join(format!("crucible-gitmem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        let fake = root.join("tools/fake-agent.py");
+
+        std::fs::write(
+            dir.join("agents.json"),
+            r#"{
+              "good":  {"writes": {"kept.txt": "survives\n"}, "result": {"ok": true}},
+              "bad":   {"writes": {"junk.txt": "must not survive\n"}, "exit": 1,
+                        "stderr": "wrote then failed"},
+              "after": {"writes": {"later.txt": "also survives\n"}, "result": {"ok": true}}
+            }"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            dir.join("workflow.star"),
+            r#"
+good = agent(name = "good", prompt = "p")
+bad = agent(name = "bad", prompt = "p", depends_on = [good], required = False)
+after = agent(name = "after", prompt = "p", depends_on = [good], join = "passed")
+workflow(type = "playbook", tasks = [good, bad, after])
+"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            dir.join("crucible.toml"),
+            format!(
+                r#"
+                [repo]
+                path = "."
+                [workspace]
+                dir = "workspace"
+                setup_cmd = "mkdir -p workspace && git -C workspace init -q && git -C workspace -c user.email=c@l -c user.name=c -c commit.gpgsign=false commit -q --allow-empty -m baseline"
+                [agent]
+                backend = "command"
+                agent_cmd = "python3 {}"
+                goal = "prove git memory"
+                [agent.env]
+                FAKE_AGENT_SCRIPT = "{}"
+                [workflow]
+                type = "playbook"
+                file = "workflow.star"
+                "#,
+                fake.display(),
+                dir.join("agents.json").display(),
+            ),
+        )
+        .unwrap();
+
+        let mut manifest = crate::manifest::Manifest::load(&dir.join("crucible.toml")).unwrap();
+        manifest.resolve_workflow(&dir).unwrap();
+        let workflow = manifest.workflow.as_ref().unwrap();
+        let plan = crate::loop_graph::iteration_template(
+            Some(workflow),
+            &crate::manifest::WorkflowCaps::for_lane(workflow.workflow_type),
+        )
+        .unwrap();
+        let mut runner = crate::run::prep_plan_runner(&dir.join("crucible.toml"))
+            .unwrap()
+            .0;
+        assert!(
+            runner.commit_per_task,
+            "a playbook manifest must turn per-task git memory on"
+        );
+        let out = execute(
+            &plan,
+            &Substrate::default(),
+            ExecCfg::default(),
+            &mut runner,
+            |_, _| {},
+        );
+
+        let workspace = dir.join("workspace");
+        assert_eq!(out.results[&"good".into()].status, TaskStatus::Pass);
+        assert_eq!(out.results[&"bad".into()].status, TaskStatus::Fail);
+        assert_eq!(out.results[&"after".into()].status, TaskStatus::Pass);
+
+        // What passed is on disk and in the history.
+        assert!(
+            workspace.join("kept.txt").exists(),
+            "a passing task's work vanished"
+        );
+        assert!(workspace.join("later.txt").exists());
+        // What failed is gone from both, even though a later task passed and committed after it.
+        assert!(
+            !workspace.join("junk.txt").exists(),
+            "a failed task's file survived in the tree"
+        );
+
+        let log = std::process::Command::new("git")
+            .args(["-C", &workspace.display().to_string(), "log", "--oneline"])
+            .output()
+            .expect("git log");
+        let log = String::from_utf8_lossy(&log.stdout);
+        assert!(
+            log.contains("task good"),
+            "no commit for the passing task: {log}"
+        );
+        assert!(log.contains("task after"), "{log}");
+        assert!(!log.contains("task bad"), "a failed task committed: {log}");
+
+        let tracked = std::process::Command::new("git")
+            .args(["-C", &workspace.display().to_string(), "ls-files"])
+            .output()
+            .expect("git ls-files");
+        let tracked = String::from_utf8_lossy(&tracked.stdout);
+        assert!(
+            !tracked.contains("junk.txt"),
+            "a failed task's file reached the index: {tracked}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A playbook runs from its manifest: the pack names its graph, the engine compiles it, and
+    /// the ceilings come from whoever launched it. There is no plan file anywhere.
+    #[test]
+    fn a_playbook_launches_from_its_manifest_under_supplied_ceilings() {
+        let dir = std::env::temp_dir().join(format!("crucible-launch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        let fake = root.join("tools/fake-agent.py");
+
+        std::fs::write(
+            dir.join("agents.json"),
+            r#"{"work": {"writes": {"out.txt": "done\n"}, "result": {"ok": true}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("workflow.star"),
+            "work = agent(name = \"work\", prompt = \"do it\")\nworkflow(type = \"playbook\", tasks = [work])\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("crucible.toml"),
+            format!(
+                r#"
+                [repo]
+                path = "."
+                [workspace]
+                dir = "workspace"
+                setup_cmd = "mkdir -p workspace && git -C workspace init -q && git -C workspace -c user.email=c@l -c user.name=c -c commit.gpgsign=false commit -q --allow-empty -m baseline"
+                [agent]
+                backend = "command"
+                agent_cmd = "python3 {}"
+                goal = "launch a playbook"
+                [agent.env]
+                FAKE_AGENT_SCRIPT = "{}"
+                [workflow]
+                type = "playbook"
+                file = "workflow.star"
+                "#,
+                fake.display(),
+                dir.join("agents.json").display(),
+            ),
+        )
+        .unwrap();
+        let manifest = dir.join("crucible.toml");
+        let caps = std::collections::BTreeSet::new();
+
+        // Neither ceiling, one ceiling, and a duration that is not one: all refused before any
+        // task is dispatched, which is the point. A ceiling checked at the first overrun has
+        // already spent whatever it was meant to bound.
+        for (ceilings, expected) in [
+            (
+                crate::plan::cli::Ceilings::default(),
+                "--max-cost and --max-time",
+            ),
+            (
+                crate::plan::cli::Ceilings {
+                    usd: Some(1.0),
+                    ..Default::default()
+                },
+                "--max-time",
+            ),
+            (
+                crate::plan::cli::Ceilings {
+                    wall_clock: Some(std::time::Duration::from_secs(60)),
+                    wall_clock_raw: Some("1m".into()),
+                    ..Default::default()
+                },
+                "--max-cost",
+            ),
+            (
+                crate::plan::cli::Ceilings {
+                    usd: Some(1.0),
+                    wall_clock: None,
+                    wall_clock_raw: Some("later".into()),
+                },
+                "is not a duration",
+            ),
+        ] {
+            let error = crate::plan::cli::run(
+                None,
+                &BTreeMap::new(),
+                &caps,
+                None,
+                Some(&manifest),
+                ceilings,
+            )
+            .expect_err("a playbook without ceilings must not dispatch");
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+        }
+        assert!(
+            !dir.join("workspace/out.txt").exists(),
+            "a refused launch dispatched a task anyway"
+        );
+
+        crate::plan::cli::run(
+            None,
+            &BTreeMap::new(),
+            &caps,
+            None,
+            Some(&manifest),
+            crate::plan::cli::Ceilings {
+                usd: Some(1.0),
+                wall_clock: Some(std::time::Duration::from_secs(600)),
+                wall_clock_raw: Some("10m".into()),
+            },
+        )
+        .expect("a playbook with both ceilings runs");
+        assert!(dir.join("workspace/out.txt").exists(), "the task never ran");
+
+        // The graph reached the session log, so a reader sees it without a plan file existing.
+        let log = std::fs::read_to_string(dir.join("state/session.jsonl")).unwrap();
+        assert!(log.contains("plan_admitted"), "{log}");
+        assert!(log.contains("\"name\":\"work\""), "{log}");
+        assert!(
+            !dir.join("plan.toml").exists(),
+            "the launcher wrote a plan file"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A declared file is part of a task's output, not part of the workspace state isolation
+    /// discards, and it reaches every descendant rather than only the next one.
+    ///
+    /// Three things are proven here that nothing else covers: an isolated task's file survives
+    /// the deletion of its worktree, a task two hops downstream still receives it, and a task
+    /// that passes without writing what it promised fails where it promised it.
+    #[test]
+    fn a_declared_file_outlives_isolation_and_reaches_every_descendant() {
+        let dir = std::env::temp_dir().join(format!("crucible-emits-files-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("agents.json"),
+            r#"{
+              "analyze": {"writes": {"SPEC.md": "the algorithm\n"}, "result": {"ok": true}},
+              "implement": {"reads": ["inputs/analyze/SPEC.md"],
+                            "writes": {"NOTES.md": "built it\n"}, "result": {"ok": true}},
+              "report": {"reads": ["inputs/analyze/SPEC.md", "inputs/implement/NOTES.md"],
+                         "result": {"saw_both": true}},
+              "forgetful": {"result": {"ok": true}}
+            }"#,
+        )
+        .unwrap();
+
+        // `analyze` is isolated: its worktree is deleted the moment it settles, so SPEC.md can
+        // only reach anyone if a declared file is captured rather than left in a tree.
+        std::fs::write(
+            dir.join("workflow.star"),
+            r#"
+analyze = agent(
+    name = "analyze",
+    prompt = "analyze",
+    isolated = True,
+    emits_files = ["SPEC.md"],
+)
+implement = agent(
+    name = "implement",
+    prompt = "implement",
+    depends_on = [analyze],
+    emits_files = ["NOTES.md"],
+)
+report = agent(name = "report", prompt = "report", depends_on = [implement])
+workflow(type = "playbook", tasks = [analyze, implement, report])
+"#,
+        )
+        .unwrap();
+        fake_agent_manifest(&dir);
+
+        let out = run_playbook(&dir);
+        assert!(out.valid, "{:?}", out.results);
+        // Staged inputs are not the consuming task's work: a per-task commit that swept them in
+        // would read as though this task had produced what its ancestors handed it.
+        let tracked = std::process::Command::new("git")
+            .args([
+                "-C",
+                &dir.join("workspace").display().to_string(),
+                "ls-files",
+            ])
+            .output()
+            .expect("git ls-files");
+        let tracked = String::from_utf8_lossy(&tracked.stdout);
+        assert!(
+            !tracked.contains("inputs/"),
+            "staged inputs reached git memory: {tracked}"
+        );
+        // `report` declared `reads` on both, two hops and one hop back. It passed, so staging
+        // reached past the direct dependency.
+        assert_eq!(
+            out.results[&"report".into()].output.as_ref().unwrap()["saw_both"],
+            true
+        );
+        // The captured copy is kept beside the run, not in the workspace it came from.
+        assert!(
+            dir.join("state/files/analyze/SPEC.md").exists(),
+            "an isolated task's declared file was not captured"
+        );
+        assert!(
+            !dir.join("workspace/SPEC.md").exists(),
+            "an isolated task's file leaked into the shared workspace"
+        );
+
+        // A task that passes without writing what it promised fails where it promised it.
+        std::fs::write(
+            dir.join("workflow.star"),
+            "forgetful = agent(name = \"forgetful\", prompt = \"p\", emits_files = [\"MISSING.md\"])\nworkflow(type = \"playbook\", tasks = [forgetful])\n",
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(dir.join("workspace"));
+        let _ = std::fs::remove_dir_all(dir.join("state"));
+        let out = run_playbook(&dir);
+        let result = &out.results[&"forgetful".into()];
+        assert_eq!(result.status, TaskStatus::Fail);
+        assert_eq!(result.attempts, 1, "output drift must not be retried");
+        assert!(
+            result
+                .note
+                .as_ref()
+                .is_some_and(|n| n.contains("MISSING.md") && n.contains("absent")),
+            "{:?}",
+            result.note
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -510,7 +1978,9 @@ mod tests {
         .validate()
         .unwrap();
 
-        let mut runner = crate::run::prep_plan_runner(&dir.join("crucible.toml")).unwrap();
+        let mut runner = crate::run::prep_plan_runner(&dir.join("crucible.toml"))
+            .unwrap()
+            .0;
         let state = runner.paths.state.clone();
         assert!(
             !crate::agent_session::prepare(&state, "solver")
@@ -574,7 +2044,9 @@ mod tests {
 
     fn run_review_plan(dir: &std::path::Path, plan_file: &str) -> crate::plan::exec::PlanOutcome {
         let plan = crate::plan::cli::load(&dir.join(plan_file)).unwrap();
-        let mut runner = crate::run::prep_plan_runner(&dir.join("crucible.toml")).unwrap();
+        let mut runner = crate::run::prep_plan_runner(&dir.join("crucible.toml"))
+            .unwrap()
+            .0;
         execute(
             &plan,
             &Substrate::default(),
@@ -761,6 +2233,9 @@ mod tests {
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
+            emits_files: Vec::new(),
+            over: None,
+            max_fanout: None,
         };
         let mut runner = HarnessRunner {
             args: <crate::Cli as clap::Parser>::try_parse_from(["crucible"])
@@ -772,11 +2247,257 @@ mod tests {
                 &std::env::temp_dir(),
                 None,
             ),
+            commit_per_task: false,
+            captured_bytes: AtomicU64::new(0),
+            staged: Default::default(),
         };
         let a = runner.run(&t, 1, &BTreeMap::new());
         match a.outcome {
             AttemptOutcome::Fail(note) => assert!(note.contains("unknown harness")),
             _ => panic!("expected a measured failure"),
         }
+    }
+    /// A fan-out in the shared workspace, run end to end with no model. The instances write one
+    /// tree and one result file, so each has to be a serial task in its own right: every item is
+    /// attributed to the instance that produced it, and the instance that fails takes its own
+    /// edits with it and nobody else's.
+    #[test]
+    fn shared_workspace_instances_keep_their_own_items_and_commits() {
+        let dir =
+            std::env::temp_dir().join(format!("crucible-fanout-shared-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        let fake = root.join("tools/fake-agent.py");
+
+        let mut agents = serde_json::Map::new();
+        for key in ["alpha", "beta", "gamma", "delta"] {
+            let mut spec = serde_json::json!({
+                "writes": {format!("FILE-{key}.md"): format!("{key} was here\n")},
+                "result": {"item": "{ENV:CRUCIBLE_TASK}", "key": key},
+            });
+            if key == "gamma" {
+                spec["exit"] = serde_json::json!(1);
+                spec["stderr"] = serde_json::json!("gamma has no baseline");
+            }
+            agents.insert(format!("audit[{key}]"), spec);
+        }
+        std::fs::write(
+            dir.join("agents.json"),
+            serde_json::to_string(&Value::Object(agents)).unwrap(),
+        )
+        .unwrap();
+
+        std::fs::write(
+            dir.join("workflow.star"),
+            r##"
+discover = command(
+    name = "discover",
+    run = "printf '{\"targets\": [\"alpha\", \"beta\", \"gamma\", \"delta\"]}\n'",
+    emits = ["targets"],
+)
+audit = agent(
+    name = "audit",
+    prompt = "audit one target",
+    depends_on = [discover],
+    over = discover.targets,
+    max_fanout = 8,
+    required = False,
+    emits = ["item"],
+)
+workflow(type = "playbook", tasks = [discover, audit])
+"##,
+        )
+        .unwrap();
+        write_fanout_manifest(&dir, &fake);
+
+        let mut runner = crate::run::prep_plan_runner(&dir.join("crucible.toml"))
+            .unwrap()
+            .0;
+        assert!(runner.commit_per_task, "a playbook commits per task");
+        let out = execute(
+            &fanout_plan(&dir),
+            &Substrate::default(),
+            ExecCfg::default(),
+            &mut runner,
+            |_, _| {},
+        );
+
+        // Every item reported by the instance that ran it, and the one that exited 1 folded as
+        // failed rather than carrying a sibling's payload.
+        let node = &out.results[&"audit".into()];
+        let folded = node.output.as_ref().expect("folded output");
+        for key in ["alpha", "beta", "delta"] {
+            assert_eq!(folded["outputs"][key]["item"], format!("audit[{key}]"));
+            assert_eq!(folded["outputs"][key]["key"], key);
+        }
+        assert_eq!(folded["passed"], 3);
+        assert_eq!(folded["failed"], 1);
+        assert_eq!(
+            out.results[&"audit[gamma]".into()].status,
+            TaskStatus::Fail,
+            "an instance that exited 1 must not fold in as a pass"
+        );
+
+        // The failing instance's edits are gone; its siblings' survive, including the one that
+        // ran after it.
+        let workspace = dir.join("workspace");
+        for key in ["alpha", "beta", "delta"] {
+            assert_eq!(
+                std::fs::read_to_string(workspace.join(format!("FILE-{key}.md"))).unwrap(),
+                format!("{key} was here\n"),
+                "a passing instance's file was swept away"
+            );
+        }
+        assert!(
+            !workspace.join("FILE-gamma.md").exists(),
+            "the failing instance's edits stayed in the tree"
+        );
+        let log = std::process::Command::new("git")
+            .args(["-C", &workspace.display().to_string(), "log", "--format=%s"])
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&log.stdout);
+        for key in ["alpha", "beta", "delta"] {
+            assert!(log.contains(&format!("task audit[{key}]")), "{log}");
+        }
+        assert!(!log.contains("task audit[gamma]"), "{log}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A mapped node's declared files are captured per instance and reach a consumer under the
+    /// instance's own namespace. A failed instance has no namespace: its files are not evidence.
+    #[test]
+    fn a_mapped_node_captures_and_stages_declared_files_per_instance() {
+        let dir =
+            std::env::temp_dir().join(format!("crucible-fanout-files-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        let fake = root.join("tools/fake-agent.py");
+
+        let mut agents = serde_json::Map::new();
+        for key in ["alpha", "beta", "gamma"] {
+            let mut spec = serde_json::json!({
+                "writes": {"OUT.md": format!("findings for {key}\n")},
+                "result": {"item": "{ENV:CRUCIBLE_TASK}"},
+            });
+            if key == "beta" {
+                spec["exit"] = serde_json::json!(1);
+            }
+            agents.insert(format!("audit[{key}]"), spec);
+        }
+        std::fs::write(
+            dir.join("agents.json"),
+            serde_json::to_string(&Value::Object(agents)).unwrap(),
+        )
+        .unwrap();
+
+        std::fs::write(
+            dir.join("workflow.star"),
+            r##"
+discover = command(
+    name = "discover",
+    run = "printf '{\"targets\": [\"alpha\", \"beta\", \"gamma\"]}\n'",
+    emits = ["targets"],
+)
+audit = agent(
+    name = "audit",
+    prompt = "audit one target",
+    depends_on = [discover],
+    over = discover.targets,
+    max_fanout = 8,
+    required = False,
+    emits = ["item"],
+    emits_files = ["OUT.md"],
+)
+roundup = command(
+    name = "roundup",
+    run = "printf '{\"staged\": \"%s\"}\n' \"$(ls inputs | sort | tr '\\n' ' ')\"",
+    depends_on = [audit],
+    join = "passed",
+)
+workflow(type = "playbook", tasks = [discover, audit, roundup])
+"##,
+        )
+        .unwrap();
+        write_fanout_manifest(&dir, &fake);
+
+        let mut runner = crate::run::prep_plan_runner(&dir.join("crucible.toml"))
+            .unwrap()
+            .0;
+        let out = execute(
+            &fanout_plan(&dir),
+            &Substrate::default(),
+            ExecCfg::default(),
+            &mut runner,
+            |_, _| {},
+        );
+
+        // One capture namespace per passing instance, each holding that instance's own file.
+        let files = dir.join("state/files");
+        for key in ["alpha", "gamma"] {
+            assert_eq!(
+                std::fs::read_to_string(files.join(format!("audit[{key}]/OUT.md"))).unwrap(),
+                format!("findings for {key}\n"),
+                "instance capture is not per instance"
+            );
+        }
+        assert!(
+            !files.join("audit[beta]").exists(),
+            "a failed instance published its declared file"
+        );
+
+        // The consumer is handed the passing instances, and only those.
+        let staged = out.results[&"roundup".into()].output.as_ref().unwrap()["staged"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(staged.contains("audit[alpha]"), "{staged}");
+        assert!(staged.contains("audit[gamma]"), "{staged}");
+        assert!(!staged.contains("audit[beta]"), "{staged}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn write_fanout_manifest(dir: &std::path::Path, fake: &std::path::Path) {
+        std::fs::write(
+            dir.join("crucible.toml"),
+            format!(
+                r#"
+                [repo]
+                path = "."
+                [workspace]
+                dir = "workspace"
+                setup_cmd = "mkdir -p workspace && git -C workspace init -q && git -C workspace -c user.email=c@l -c user.name=c -c commit.gpgsign=false commit -q --allow-empty -m baseline"
+                [agent]
+                backend = "command"
+                agent_cmd = "python3 {}"
+                goal = "audit each discovered target"
+                [agent.env]
+                FAKE_AGENT_SCRIPT = "{}"
+                [workflow]
+                type = "playbook"
+                file = "workflow.star"
+                "#,
+                fake.display(),
+                dir.join("agents.json").display(),
+            ),
+        )
+        .unwrap();
+    }
+
+    fn fanout_plan(dir: &std::path::Path) -> crate::plan::ir::ValidPlan {
+        let mut manifest = crate::manifest::Manifest::load(&dir.join("crucible.toml")).unwrap();
+        manifest.resolve_workflow(dir).unwrap();
+        let workflow = manifest.workflow.as_ref().expect("workflow");
+        crate::loop_graph::iteration_template(
+            Some(workflow),
+            &crate::manifest::WorkflowCaps::for_lane(workflow.workflow_type),
+        )
+        .unwrap()
     }
 }

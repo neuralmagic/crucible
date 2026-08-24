@@ -1,0 +1,60 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-08-22-004"
+title = "Point the manifest at the workflow source instead of carrying its output"
+status = "active"
+created = "2026-08-22"
+started = "2026-08-22"
+refs = [
+    "RFC-0002:C-PLAYBOOK-PARAMS",
+    "RFC-0001:C-WORKFLOW",
+]
+
+[content]
+description = """
+Today a pack's `[workflow]` block in crucible.toml carries the compiled graph, committed, with a "Generated from workflow.star" header (`examples/adversarial-review/crucible.toml:45`). There is no way for the manifest to name its source: the only compile entry point is `crucible plan run --file`, which is handed the .star path directly (`plan/cli.rs:32`).
+
+That model cannot survive parameters. [[RFC-0002:C-PLAYBOOK-PARAMS]] requires parameter values bound during compilation and no unresolved parameter reference in the compiled graph, so the graph is a function of the launch arguments and cannot be a static committed artifact. A parameterised playbook must be compiled per launch.
+
+Add `file` to the `[workflow]` table, naming a .star source under the pack, and compile it at launch. The generated TOML stays the runtime authority and the hashed artifact exactly as [[RFC-0001:C-WORKFLOW]] requires; what changes is when it is produced. A committed `[workflow.task]` block remains valid for a parameterless pack, so this is additive.
+
+This also settles where the lane is declared. It stays in the source, read before evaluation so it can scope the constructor namespace, and the manifest's copy is generated output rather than a second declaration an author must keep in sync."""
+
+[[content.acceptance_criteria]]
+text = "[workflow].file names a .star source under the pack, resolved by the same policy as prompt_file and load"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "a manifest naming a source compiles it at launch, with parameter values bound, and freezes the result as the runtime authority"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "a manifest carrying inline [[workflow.task]] tables keeps working unchanged"
+status = "done"
+category = "changed"
+
+[[content.acceptance_criteria]]
+text = "file and inline tasks together is a manifest error naming both"
+status = "done"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "the same pack compiled at two different parameter values produces two different frozen graphs with different hashes"
+status = "pending"
+category = "chore"
+
+[[content.acceptance_criteria]]
+text = "examples/playbook runs from its manifest with no --file argument"
+status = "done"
+category = "chore"
+
+[verification]
+required_guards = [
+    "GUARD-CARGO-FMT",
+    "GUARD-CARGO-CLIPPY",
+    "GUARD-CARGO-TEST",
+    "GUARD-GOVCTL-CHECK",
+]

@@ -168,7 +168,7 @@ synthesize = agent(
     name = "synthesize",
     prompt = prompt_file("prompts/synthesize.md"),
     session = "solver",
-    depends_on = deps(critics),
+    depends_on = critics,
     join = "passed",
 )
 smoke = command(name = "smoke", run = "./smoke.sh", depends_on = [synthesize])
@@ -295,7 +295,7 @@ treatments = [
 curate = agent(
     name = "curate",
     prompt = prompt_file("prompts/curate.md"),
-    depends_on = deps(treatments),
+    depends_on = treatments,
     join = "passed",
 )
 publish = command(name = "contact-sheet", run = "./render.sh", depends_on = [curate])
@@ -305,14 +305,22 @@ workflow(type = "custom", tasks = treatments + [curate, publish], result = publi
 That graph requires `workflow.custom`; it does not pretend to satisfy autoresearch just because it
 uses agents and commands.
 
-This is a declarative Starlark subset: assignments, strings, numbers, booleans, lists, list
-concatenation, and direct calls to the functions below. Control flow, function definitions,
-comprehensions, mutation, arbitrary operators, and `load()` are rejected. Task values are opaque;
-they can be referenced directly in `depends_on`, `measurement`, and `result` without repeating
-names.
+This is Starlark over a constructor-only global surface: assignments, strings, numbers, booleans,
+lists, `def`, `if`/`else`, `for`, comprehensions, and calls to the functions below, at the top
+level or inside a `def`. `load()` resolves against the pack directory only. Task, session, and
+workflow values are opaque and immutable, so they can be referenced directly in `depends_on`,
+`measurement`, and `result` without repeating names, and a library cannot mutate one after
+handing it back.
+
+The declared lane decides which constructors exist. Every lane has `agent`, `command`,
+`evaluate`, `session`, `prompt_file`, and `workflow`. `type = "autoresearch"` and
+`type = "custom"` add the scored loop's own: `propose`, `apply`, `measure`, `grade`, `decide`,
+`top_k`, and `default_autoresearch`. A playbook has none of those in scope at all, so naming one
+is an unknown-name error where it was written, and a did-you-mean never offers one.
 
 - `propose(...)`, `apply(...)`, `measure(...)`, `grade(...)`, and `decide(...)` create
   capability-owned engine tasks. `decide(measurement = score)` selects its measurement.
+  Scored lanes only.
 - `agent(...)` creates an agent task. `isolated = True` gives it a disposable worktree, ideal for
   concurrent read-only critics; leave it false for a synthesizer whose edits must survive.
   `session = "name"` opts into an engine-managed durable conversation.
@@ -320,23 +328,57 @@ names.
   optional agent defaults, bindable as the `session =` value on `agent()` and `propose()`.
 - `command(...)` creates a deterministic shell task in the candidate workspace.
 - `evaluate(...)` creates a typed measurement command with optional threshold grading.
-- `top_k(...)` creates a reducer for wider authored graphs.
-- `deps(tasks)` returns constructor task names, avoiding repeated string wiring.
+- `top_k(...)` creates a reducer for wider authored graphs. Scored lanes only.
 - `prompt_file(path)` reads a regular UTF-8 file below the pack directory and embeds its contents
   in the generated manifest. Absolute paths, `..`, symlinks, non-files, and oversized inputs are
   rejected.
-- `workflow(type = ..., tasks = ..., result = ...)` is the explicit final expression.
+- `load(path, name, ...)` pulls symbols from another `.star` file under the pack, resolved by the
+  same policy as `prompt_file` and refused for absolute paths, `..`, symlinks, non-files, and
+  cycles. Loaded modules run before the root against the same globals and the same compile state:
+  their `prompt_file()` calls resolve against the pack root and charge the same byte budget, their
+  `session()` declarations precede every root reference, and a task they construct at module level
+  must still appear in `workflow(tasks = ...)`. Re-export is off, so a symbol a library loads is
+  not visible through it.
+- `workflow(type = ..., tasks = ..., result = ...)` is the explicit final expression. A list of
+  tasks is accepted anywhere a list of task names is, in `tasks` and in `depends_on` alike, so a
+  list never needs wrapping to be passed.
 - `default_autoresearch(extra_tasks)` expands the historical loop into fully visible nodes.
+  Scored lanes only.
+
+Five kwargs govern how a task runs and what its failure costs. They are independent, and this
+is the whole of it:
+
+| kwarg | values | what it decides |
+| --- | --- | --- |
+| `required` | `True` (default), `False` | whether this task's failure invalidates the run. An advisory task's failure blocks only its dependents. |
+| `join` | `"all"` (default), `"passed"` | what this task needs of its dependencies. `"all"` needs every one to have passed; `"passed"` runs on whatever survived. |
+| `isolated` | `False` (default), `True` | whether the task gets a disposable worktree. Today this is also what buys concurrency, because non-isolated peers would race on the shared result file. |
+| `needs` | `"any"` (default), a capability name | a capability the run must have before this task is dispatched. |
+| `stage` | `"iteration"` (default), `"epilogue"` | whether the task is in the main graph, or runs once after it settles. |
+
+`required = False` and `join = "all"` do not compose: a required task may not depend, through a
+path of `"all"`-join edges, on an advisory one. That graph says a failure is both tolerable and
+disqualifying, and no run of it yields an honest verdict. Validation rejects it before dispatch,
+naming both tasks. `join = "passed"` is the exemption, because it declares up front that the task
+runs on whatever survived.
 
 Agent tasks receive upstream results in their prompt and write one JSON object to
 `PLAN_TASK_RESULT.json`. Required failures discard the candidate; advisory tasks use
 `required = False`. `join = "passed"` waits for all dependencies, then receives their non-empty set
 of successful results. No passing input blocks the task.
 
+The two settings must agree: a required task may not depend on an advisory task with
+`join = "all"`, and validation rejects the graph naming both tasks. An advisory task is allowed to
+fail, and a `join = "all"` dependent blocks on that failure, so the `required = False` would buy
+nothing. Consume advisory work through a `join = "passed"` task, which is exempt along with
+everything reachable only through it. The legacy positional `workflow(tasks)` splice has no lever
+for this: its tasks feed the loop's required `apply`, so a spliced sink cannot be advisory.
+
 For local review, `crucible plan compile-workflow --file workflow.star` prints stable canonical
 JSON. Add `--manifest crucible.toml` to also replace the generated `[workflow]` block. Compilation
-applies source, task-count, evaluation-step, and prompt-size ceilings. The compiler exposes no
-filesystem API except `prompt_file`, and no process, environment, network, clock, or randomness API.
+applies source-size, loaded-module, task-count, constructed-task, evaluation-tick, heap, call-depth,
+and prompt-size ceilings. The compiler exposes no filesystem API except `prompt_file` and `load`,
+and no process, environment, network, clock, or randomness API.
 Scope validation renders the admitted graph to `WORKFLOW.png` for the scope PR, grouping
 `evaluate` and `grade` as Measurement.
 

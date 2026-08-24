@@ -68,7 +68,11 @@ pub(crate) struct IterCtx<'a> {
 
 /// Run one admitted autoresearch iteration and return its step and cost.
 pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(IterStep, f64)> {
-    let mut caps = WorkflowCaps::autoresearch_engine();
+    let mut caps = WorkflowCaps::for_lane(
+        cx.workflow
+            .map(|workflow| workflow.workflow_type)
+            .unwrap_or_default(),
+    );
     if agent::supports_persistent_sessions(cx.args) {
         caps = caps.with_persistent_sessions();
     }
@@ -109,6 +113,9 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
         workflow_runner: crate::plan::harness::HarnessRunner {
             args: cx.args.clone(),
             paths: cx.p.clone(),
+            commit_per_task: false,
+            captured_bytes: std::sync::atomic::AtomicU64::new(0),
+            staged: Default::default(),
         },
     };
     // The runner and the on_result hook both need the reporter; collect the wire lines
@@ -230,6 +237,9 @@ pub(crate) fn iteration_template(
                 join: Join::default(),
                 stage: Stage::Iteration,
                 emits: Vec::new(),
+                emits_files: Vec::new(),
+                over: None,
+                max_fanout: None,
             }
         };
     let mut tasks = vec![engine("propose", EngineOp::Propose, None, vec![])];
@@ -267,6 +277,8 @@ pub(crate) fn iteration_template(
         workflow_type: WorkflowType::Autoresearch,
         result: Some("decide".into()),
         tasks,
+        file: None,
+        resolved_from: None,
     };
     workflow
         .admit(caps)
@@ -347,6 +359,9 @@ pub(crate) fn run_epilogue<R: Reporter>(
         inner: crate::plan::harness::HarnessRunner {
             args: args.clone(),
             paths: p.clone(),
+            commit_per_task: false,
+            captured_bytes: std::sync::atomic::AtomicU64::new(0),
+            staged: Default::default(),
         },
         kept: kept.to_value(),
     };
@@ -958,6 +973,9 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
             join: Join::All,
             stage: Stage::Iteration,
             emits: Vec::new(),
+            emits_files: Vec::new(),
+            over: None,
+            max_fanout: None,
         });
     }
     for id in 0..cfg.n {
@@ -976,6 +994,9 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
             join: Join::All,
             stage: Stage::Iteration,
             emits: Vec::new(),
+            emits_files: Vec::new(),
+            over: None,
+            max_fanout: None,
         });
     }
     tasks.push(Task {
@@ -994,6 +1015,9 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
         join: Join::Passed,
         stage: Stage::Iteration,
         emits: Vec::new(),
+        emits_files: Vec::new(),
+        over: None,
+        max_fanout: None,
     });
     Plan {
         version: 1,

@@ -53,6 +53,15 @@ pub enum ManifestError {
     TaskLaneRejects { table: &'static str },
     #[error("[judge].objective = \"task\" is reserved as the task lane's wire discriminator")]
     TaskObjectiveReserved,
+    #[error("[workflow] type = \"playbook\" runs once and scores nothing; remove [judge]")]
+    PlaybookNeedsNoJudge,
+    #[error(
+        "[workflow].file compiled a {compiled:?} workflow but the manifest declares {declared:?}"
+    )]
+    WorkflowTypeMismatch {
+        declared: WorkflowType,
+        compiled: WorkflowType,
+    },
     #[error("a composite needs at least two [[component]] entries")]
     CompositeTooSmall,
     #[error("duplicate component domain `{domain}`")]
@@ -69,6 +78,24 @@ pub enum ManifestError {
     BadArtifactEmbed { embed: String },
     #[error("[[workspace.artifact]] is not supported in a composite manifest")]
     CompositeArtifact,
+    #[error(
+        "nothing can consume the supplied parameter(s) {}: this manifest carries its tasks \
+         inline or declares no [workflow], so there is no source to bind them against",
+        .names.join(", ")
+    )]
+    UnconsumableParams { names: Vec<String> },
+}
+
+/// Refuse values no compilation will see. Binding happens only while a named source is compiled,
+/// so a run shape that never compiles has to say so rather than discard what a launcher supplied.
+fn refuse_unconsumable(params: &std::collections::BTreeMap<String, String>) -> Result<()> {
+    if params.is_empty() {
+        return Ok(());
+    }
+    Err(ManifestError::UnconsumableParams {
+        names: params.keys().cloned().collect(),
+    }
+    .into())
 }
 
 /// Shared tail of `Manifest`/`CompositeManifest`'s `load_frozen`: given the initial working-tree
@@ -529,11 +556,21 @@ fn validate_common(c: CommonCfg<'_>) -> Result<()> {
             if judge.objective == "task" {
                 return Err(ManifestError::TaskObjectiveReserved.into());
             }
+            if c.workflow
+                .as_ref()
+                .is_some_and(|w| w.workflow_type == WorkflowType::Playbook)
+            {
+                return Err(ManifestError::PlaybookNeedsNoJudge.into());
+            }
         }
         None => {
+            let playbook = c
+                .workflow
+                .as_ref()
+                .is_some_and(|w| w.workflow_type == WorkflowType::Playbook);
             for (present, table) in [
                 (c.search.is_some(), "[search]"),
-                (c.workflow.is_some(), "[workflow]"),
+                (c.workflow.is_some() && !playbook, "[workflow]"),
                 (c.preflight.is_some(), "[preflight]"),
             ] {
                 if present {
@@ -639,6 +676,48 @@ impl Manifest {
             preflight: &self.preflight,
             measure: &self.measure,
         })
+    }
+
+    /// Compile `[workflow].file` into the graph it names. A manifest that carries its tasks
+    /// inline is left alone, so this is safe to call on any manifest and callers do not branch.
+    ///
+    /// Compilation happens per run rather than once at authoring time because a parameterised
+    /// graph is a function of its launch arguments: the frozen result is still the runtime
+    /// authority, what changes is when it is produced.
+    pub fn resolve_workflow(&mut self, manifest_dir: &Path) -> Result<()> {
+        self.resolve_workflow_with(manifest_dir, &std::collections::BTreeMap::new())
+    }
+
+    /// Resolve with the values a launcher supplied. They are bound during compilation, so a
+    /// missing required parameter refuses the run before any task is dispatched.
+    pub fn resolve_workflow_with(
+        &mut self,
+        manifest_dir: &Path,
+        params: &std::collections::BTreeMap<String, String>,
+    ) -> Result<()> {
+        let Some(workflow) = &self.workflow else {
+            return refuse_unconsumable(params);
+        };
+        if !workflow.is_unresolved() {
+            return refuse_unconsumable(params);
+        }
+        let declared = workflow.workflow_type;
+        let file = workflow.file.clone().unwrap_or_default();
+        let source = manifest_dir.join(&file);
+        let compiled = crate::plan::starlark::compile_file_with(&source, manifest_dir, params)
+            .with_context(|| format!("compiling [workflow].file = {file:?}"))?;
+        if compiled.workflow.workflow_type != declared {
+            return Err(ManifestError::WorkflowTypeMismatch {
+                declared,
+                compiled: compiled.workflow.workflow_type,
+            }
+            .into());
+        }
+        let mut resolved = compiled.workflow;
+        resolved.resolved_from = Some(file);
+        self.workflow = Some(resolved);
+        self.validate()?;
+        Ok(())
     }
 
     /// No `[judge]` = the task lane: keep every completed turn, no baseline, no scoring.
@@ -1013,6 +1092,165 @@ mod tests {
                 "{table}: {err:#}"
             );
         }
+    }
+
+    #[test]
+    fn a_judgeless_manifest_admits_a_playbook_workflow_and_still_refuses_the_others() {
+        let playbook = "[workflow]\ntype = \"playbook\"\n[[workflow.task]]\nname = \"t\"\nkind = \"evaluate\"\ncommand = \"true\"";
+        let m: Manifest = toml::from_str(&task_manifest(playbook)).expect("parses");
+        m.validate()
+            .expect("a playbook is the one [workflow] the task lane takes");
+        assert!(m.is_task(), "a playbook manifest is still judgeless");
+
+        let custom = "[workflow]\ntype = \"custom\"\nresult = \"t\"\n[[workflow.task]]\nname = \"t\"\nkind = \"evaluate\"\ncommand = \"true\"";
+        let err = toml::from_str::<Manifest>(&task_manifest(custom))
+            .expect("parses")
+            .validate()
+            .expect_err("custom still needs a judge");
+        assert!(err.to_string().contains("requires a [judge]"), "{err:#}");
+    }
+
+    /// A manifest may name its source instead of carrying its output. The graph is compiled
+    /// on resolve and validated then, so an unresolved manifest is valid and an unreadable
+    /// source fails where it is read rather than where it is used.
+    #[test]
+    fn a_manifest_may_name_its_workflow_source_instead_of_carrying_it() {
+        let dir = std::env::temp_dir().join(format!("crucible-wf-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("graph.star"),
+            "a = command(name = \"a\", run = \"true\")\nworkflow(type = \"playbook\", tasks = [a])\n",
+        )
+        .unwrap();
+
+        let table = "[workflow]\ntype = \"playbook\"\nfile = \"graph.star\"";
+        let mut m: Manifest = toml::from_str(&task_manifest(table)).expect("parses");
+        m.validate().expect("an unresolved manifest is valid");
+        assert!(
+            m.workflow.as_ref().unwrap().is_unresolved(),
+            "the graph is still a path"
+        );
+        m.resolve_workflow(&dir).expect("compiles");
+        let workflow = m.workflow.as_ref().unwrap();
+        assert!(!workflow.is_unresolved());
+        assert_eq!(workflow.tasks.len(), 1);
+        assert_eq!(workflow.tasks[0].name.0, "a");
+
+        // Resolving again is a no-op, so a caller never has to ask whether it already ran.
+        m.resolve_workflow(&dir).expect("idempotent");
+        assert_eq!(m.workflow.as_ref().unwrap().tasks.len(), 1);
+
+        // The lane the source compiles must be the lane the manifest admitted.
+        let mismatched = "[workflow]\ntype = \"custom\"\nfile = \"graph.star\"";
+        let err = toml::from_str::<Manifest>(&task_manifest(mismatched))
+            .expect("parses")
+            .resolve_workflow(&dir)
+            .expect_err("custom manifest, playbook source");
+        assert!(
+            err.to_string().contains("but the manifest declares"),
+            "{err:#}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Binding happens only while a named source is compiled. A run shape with nothing to
+    /// compile therefore refuses the values a launcher supplied instead of dropping them, so
+    /// the same `--param` behaves the same whichever way a pack spells its graph.
+    #[test]
+    fn supplied_parameters_no_compilation_can_consume_are_refused() {
+        let supplied = std::collections::BTreeMap::from([
+            ("depth".to_string(), "3".to_string()),
+            ("mode".to_string(), "fast".to_string()),
+        ]);
+        let dir =
+            std::env::temp_dir().join(format!("crucible-wf-unbindable-{}", std::process::id()));
+
+        let inline = "[workflow]\ntype = \"playbook\"\n[[workflow.task]]\nname = \"a\"\nkind = \"command\"\ncommand = \"true\"";
+        let err = toml::from_str::<Manifest>(&task_manifest(inline))
+            .expect("parses")
+            .resolve_workflow_with(&dir, &supplied)
+            .expect_err("inline tasks bind nothing");
+        assert!(err.to_string().contains("depth, mode"), "{err:#}");
+
+        let err = toml::from_str::<Manifest>(&task_manifest(""))
+            .expect("parses")
+            .resolve_workflow_with(&dir, &supplied)
+            .expect_err("no [workflow] binds nothing");
+        assert!(err.to_string().contains("depth, mode"), "{err:#}");
+
+        toml::from_str::<Manifest>(&task_manifest(inline))
+            .expect("parses")
+            .resolve_workflow_with(&dir, &std::collections::BTreeMap::new())
+            .expect("nothing supplied, nothing to refuse");
+    }
+
+    #[test]
+    fn a_workflow_declaring_both_a_file_and_tasks_is_refused() {
+        let both = "[workflow]\ntype = \"playbook\"\nfile = \"graph.star\"\n[[workflow.task]]\nname = \"a\"\nkind = \"command\"\ncommand = \"true\"";
+        let err = toml::from_str::<Manifest>(&task_manifest(both))
+            .expect("parses")
+            .validate()
+            .expect_err("one or the other");
+        assert!(
+            err.to_string().contains("it is one or the other"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn a_playbook_is_refused_beside_a_judge() {
+        let toml = r#"
+            [repo]
+            path = "."
+            [agent]
+            backend = "command"
+            agent_cmd = "true"
+            goal = "g"
+            [judge]
+            objective = "latency"
+            direction = "minimize"
+            measure_cmd = "true"
+            [workflow]
+            type = "playbook"
+            [[workflow.task]]
+            name = "t"
+            kind = "evaluate"
+            command = "true"
+        "#;
+        let err = toml::from_str::<Manifest>(toml)
+            .expect("parses")
+            .validate()
+            .expect_err("a scored playbook is a contradiction");
+        assert!(err.to_string().contains("remove [judge]"), "{err:#}");
+    }
+
+    #[test]
+    fn a_playbook_refuses_a_task_naming_an_engine_operation() {
+        let playbook = "[workflow]\ntype = \"playbook\"\n[[workflow.task]]\nname = \"p\"\nkind = \"engine\"\nop = \"propose\"";
+        let err = toml::from_str::<Manifest>(&task_manifest(playbook))
+            .expect("parses")
+            .validate()
+            .expect_err("propose belongs to the scored loop");
+        assert!(
+            err.to_string().contains("names engine operation"),
+            "{err:#}"
+        );
+    }
+
+    fn task_manifest(table: &str) -> String {
+        format!(
+            r#"
+            [repo]
+            path = "."
+            [agent]
+            backend = "command"
+            agent_cmd = "true"
+            goal = "g"
+            {table}
+        "#
+        )
     }
 
     #[test]

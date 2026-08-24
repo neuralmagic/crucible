@@ -1,0 +1,24 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-PLAYBOOK-BUDGET"
+title = "Cost and time ceilings"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = """
+A playbook MUST run under two ceilings supplied by whatever launched it: a total cost ceiling and a total wall-clock ceiling. A playbook source MUST NOT declare either, so that a pack cannot raise a limit its operator set.
+
+The engine MUST refuse to dispatch any task of a playbook for which either ceiling is missing. Unsupervised scheduled work with no stated limit is the failure this rule exists to prevent, so the refusal MUST come before any spend rather than at the first overrun. A run that ends because a ceiling was exhausted MUST name which one in its shutdown outcome.
+
+The engine MUST NOT terminate an attempt already in flight on cost grounds, so a completed attempt MAY carry the total past the cost ceiling. Any cost overrun MUST invalidate the run and MUST block all further dispatch and retries.
+
+The engine MUST terminate every attempt in flight when the wall-clock ceiling is reached, MUST invalidate the run, and MUST block all further dispatch and retries. This is deliberately the opposite of the cost rule, and a reader who pattern-matches from one to the other will get it wrong: a cost total is known only once an attempt finishes, so killing that attempt would spend the money and learn nothing, whereas elapsed time is known continuously and a run past its window is over no matter what any task is still doing.
+
+Separately from the run's ceilings, every task MUST execute under a bounded wall-clock deadline. Exceeding it MUST settle that task as a failure, which propagates like any other failure rather than ending the run directly: a hung task spends nothing, so the cost ceiling cannot bound it. The operator MUST set a default deadline and a maximum; a task MAY declare a shorter one, and a declared deadline exceeding the operator's maximum MUST be rejected before dispatch. A deadline MUST NOT extend a task past the run's wall-clock ceiling; whichever bound falls first settles the task.
+
+A ceiling reached while an epilogue task is in flight MUST terminate that attempt and MUST block further dispatch, and MUST NOT change a verdict already determined by the main graph. The epilogue exists to report on the run, so letting its own spend rewrite the run's verdict would defeat it.
+
+Every ceiling and deadline in force MUST be discoverable by the pack author and the operator before a run starts."""

@@ -163,7 +163,7 @@ impl AgentSource {
     ) -> std::io::Result<Spawned> {
         match self {
             AgentSource::LocalClaude => spawn_local(args, p, prompt, extra_env, session),
-            AgentSource::Command(cmd) => spawn_command(cmd, p, prompt, session),
+            AgentSource::Command(cmd) => spawn_command(cmd, args, p, prompt, extra_env, session),
             // The openshell driver runs a multi-step flow, not a single child; `run_turn`
             // intercepts it before `spawn`, so this is never reached.
             AgentSource::OpenshellDriver => Err(std::io::Error::other(
@@ -177,8 +177,10 @@ impl AgentSource {
 /// its output is echoed through the sink like any other turn.
 fn spawn_command(
     cmd: &str,
+    args: &Args,
     p: &Paths,
     prompt: &str,
+    extra_env: &[(String, String)],
     session: Option<&crate::agent_session::SessionTurn>,
 ) -> std::io::Result<Spawned> {
     let mut c = Command::new("sh");
@@ -189,6 +191,10 @@ fn spawn_command(
         // (a plan's coder vs its reviewer) by branching on it — the same env contract
         // as the shell runner's `--agent-cmd` stand-in.
         .env("CRUCIBLE_PROMPT", prompt)
+        // The manifest's `[agent].env` and the harness's own vars, in the same precedence the
+        // local backend uses. Without these a `command` pack's declared env silently vanished.
+        .envs(args.env.iter().map(|(k, v)| (k, v)))
+        .envs(extra_env.iter().map(|(k, v)| (k, v)))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(session) = session {

@@ -172,25 +172,47 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
 
     if let Some(Cmd::Plan { action }) = &cli.command {
         return match action {
-            crate::PlanAction::CompileWorkflow { file, manifest } => {
-                crate::plan::cli::compile_workflow(file, manifest.as_deref())
-            }
+            crate::PlanAction::CompileWorkflow {
+                file,
+                manifest,
+                params,
+            } => crate::plan::cli::compile_workflow(
+                file,
+                manifest.as_deref(),
+                &crate::plan::cli::parse_params(params)?,
+            ),
             crate::PlanAction::Show {
                 file,
                 caps,
                 mermaid,
                 render,
             } => crate::plan::cli::show(file, &caps.iter().cloned().collect(), *mermaid, *render),
+            crate::PlanAction::Params { file } => {
+                let source = std::fs::read_to_string(file)
+                    .with_context(|| format!("reading {}", file.display()))?;
+                let schema = crate::plan::starlark::declared_params(&source, file)?;
+                println!("{}", serde_json::to_string_pretty(&schema)?);
+                Ok(())
+            }
             crate::PlanAction::Run {
                 file,
+                params,
+                max_cost,
+                max_time,
                 caps,
                 agent_cmd,
                 manifest,
             } => crate::plan::cli::run(
-                file,
+                file.as_deref(),
+                &crate::plan::cli::parse_params(params)?,
                 &caps.iter().cloned().collect(),
                 agent_cmd.clone(),
                 manifest.as_deref(),
+                crate::plan::cli::Ceilings {
+                    usd: *max_cost,
+                    wall_clock: max_time.as_deref().and_then(crate::parse_duration),
+                    wall_clock_raw: max_time.clone(),
+                },
             ),
         };
     }
@@ -359,15 +381,28 @@ pub(crate) fn clone_repo(src: &str, git_ref: Option<&str>, dest: &Path) -> Resul
 /// exactly as a loop run would, and `Agent` tasks run through the real harness path with the
 /// manifest's `[agent]` defaults. Shares the loop's setup helpers so a plan run and a loop
 /// run see the same world.
+/// The runner for a manifest, and the manifest it was built from. Both, because the caller needs
+/// the graph and the lane off the manifest and compiling it twice would compile the pack twice.
+/// Prepare with no supplied parameters: the shape the tests want, gated so an uncalled function
+/// stays out of the binary.
+#[cfg(test)]
 pub(crate) fn prep_plan_runner(
     manifest_path: &Path,
-) -> Result<crate::plan::harness::HarnessRunner> {
-    let m = manifest::Manifest::load_frozen(manifest_path)?;
+) -> Result<(crate::plan::harness::HarnessRunner, manifest::Manifest)> {
+    prep_plan_runner_with_params(manifest_path, &std::collections::BTreeMap::new())
+}
+
+pub(crate) fn prep_plan_runner_with_params(
+    manifest_path: &Path,
+    params: &std::collections::BTreeMap<String, String>,
+) -> Result<(crate::plan::harness::HarnessRunner, manifest::Manifest)> {
+    let mut m = manifest::Manifest::load_frozen(manifest_path)?;
     let manifest_dir = manifest_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
+    m.resolve_workflow_with(&manifest_dir, params)?;
     let workspace = manifest_dir.join(&m.workspace.dir);
     let state = manifest_dir.join("state");
     let skills = m.agent.toolbox_dir.as_ref().map(|d| manifest_dir.join(d));
@@ -380,6 +415,13 @@ pub(crate) fn prep_plan_runner(
         }
     }
     vcs::ensure_repo(&workspace).context("ensuring workspace is a git repo")?;
+    // The harness's own files, plus where a task's staged inputs land. Without this a playbook's
+    // per-task commit sweeps in the toolbox, the results log, and every artifact an ancestor
+    // handed this task, and each task's commit reads as though it produced all of them.
+    crucible_vcs::git_memory::install_harness_excludes(
+        &workspace,
+        &[format!("{}/", crate::plan::harness::STAGED_INPUTS)],
+    );
     std::fs::create_dir_all(&p.state)
         .with_context(|| format!("creating state dir {}", p.state.display()))?;
     install_toolbox(&p, &m.agent.toolbox_exclude, m.agent.harness.skills_dir())?;
@@ -392,7 +434,22 @@ pub(crate) fn prep_plan_runner(
     apply_agent_cfg(&mut args, &m.agent, &p.workspace)?;
     args.workflow_frozen_injects = m.frozen_inject_pairs(&manifest_dir);
     args.workflow_toolbox_exclude = m.agent.toolbox_exclude.clone();
-    Ok(crate::plan::harness::HarnessRunner { args, paths: p })
+    // A playbook's git memory is per task; the scored loop owns the same repository for
+    // keep/discard of whole candidates and must not find per-task commits inside an iteration.
+    let commit_per_task = m
+        .workflow
+        .as_ref()
+        .is_some_and(|w| w.workflow_type == manifest::WorkflowType::Playbook);
+    Ok((
+        crate::plan::harness::HarnessRunner {
+            args,
+            paths: p,
+            commit_per_task,
+            captured_bytes: std::sync::atomic::AtomicU64::new(0),
+            staged: Default::default(),
+        },
+        m,
+    ))
 }
 
 /// Load a `crucible.toml`, build the World + Judge from it, and drive the loop. The one run
@@ -407,7 +464,7 @@ fn run_from_manifest(args: Args) -> Result<()> {
     if manifest::is_composite(&manifest_path) {
         return run_composite(args, manifest_path);
     }
-    let m = manifest::Manifest::load_frozen(&manifest_path)?;
+    let mut m = manifest::Manifest::load_frozen(&manifest_path)?;
     // `parent()` of a bare `crucible.toml` is `Some("")`, which is not a usable cwd, treat
     // an empty parent as the current directory.
     let manifest_dir = manifest_path
@@ -415,6 +472,7 @@ fn run_from_manifest(args: Args) -> Result<()> {
         .filter(|p| !p.as_os_str().is_empty())
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
+    m.resolve_workflow(&manifest_dir)?;
     let workspace = manifest_dir.join(&m.workspace.dir);
     let state = args
         .state_dir

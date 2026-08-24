@@ -1,0 +1,19 @@
+# One real paper, one phase. The graph is deliberately small: it proves the whole path
+# (parameter -> marked prompt -> skill -> declared file -> git memory -> verdict) on a real
+# model and a real repository, without spending an implementation run to do it.
+[repo]
+path = "."
+
+[workspace]
+dir = "workspace"
+setup_cmd = "test -d workspace/.git || git clone --depth 1 https://github.com/vllm-project/speculators workspace"
+
+[agent]
+backend = "local"
+harness = "claude"
+model = "claude-opus-4-6"
+goal = "Read the paper and produce an implementation spec for the speculators codebase."
+
+[workflow]
+type = "playbook"
+file = "workflow.star"

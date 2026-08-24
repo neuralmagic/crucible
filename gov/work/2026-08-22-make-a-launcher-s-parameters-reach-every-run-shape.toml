@@ -1,0 +1,40 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-08-22-008"
+title = "Make a launcher's parameters reach every run shape"
+status = "done"
+created = "2026-08-22"
+started = "2026-08-22"
+completed = "2026-08-22"
+refs = ["RFC-0002:C-PLAYBOOK-PARAMS"]
+
+[content]
+description = """
+Whether a launcher's `--param` is honoured, validated, or silently dropped depends on how the pack's graph happens to be spelled.
+
+`resolve_workflow_with` returns Ok before binding anything when the workflow is already resolved, and that is the only place `plan run`'s `--param` values are consumed. Against a manifest carrying inline tasks, every supplied parameter is discarded without a diagnostic, including a name no `params` block declares. Against a `file`-backed manifest the same undeclared name is refused. The run reports valid either way, with the prompt the agent saw carrying whatever was baked in at compile time.
+
+`materialize_manifest` is what makes that routine rather than exotic: it writes the compiled graph over `[workflow]`, deleting `file = "workflow.star"` and freezing one launcher's parameter values into the task tables. `scope/pipeline.rs` calls it with an empty parameter map, so a scope run rewrites the pack's tracked crucible.toml with the declared defaults frozen in, unattended. `WorkflowCfg::resolved_from` is `#[serde(skip)]`, so the written manifest keeps no pointer back to its source. `manifest/workflow.rs:222` states the contract this violates in its own words.
+
+Also: a `params` field whose value is not a literal of the expected shape is dropped silently rather than refused, because the readers are `and_then(literal_*)` chains that fall back to a default on a shape mismatch. A pattern written as a non-string, or `required` written as anything but True/False, disappears."""
+
+[[content.acceptance_criteria]]
+text = "a supplied parameter that nothing can consume refuses the run rather than being discarded"
+status = "done"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "a file-backed workflow survives materialization as a file reference, or materialization is refused when the source declares params"
+status = "done"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "a params field of the wrong shape is a compile error, not a silent default"
+status = "done"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "the same pack run against an inline manifest and a file-backed one treats an undeclared --param identically"
+status = "done"
+category = "chore"

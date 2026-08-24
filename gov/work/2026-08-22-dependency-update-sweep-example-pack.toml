@@ -1,0 +1,34 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-08-22-010"
+title = "Dependency-update sweep example pack"
+status = "queue"
+created = "2026-08-22"
+refs = [
+    "RFC-0002:C-PLAYBOOK-LANE",
+    "RFC-0002:C-PLAYBOOK-PARAMS",
+]
+
+[content]
+description = "A second real-sandbox example pack, workflow automation over dependency updates: scan discovers the open dependabot PRs of a target repository (params: repo, and a merge gate defaulting to off), a fan-out instance per PR researches it (changelog and release notes of the bumped crate or action, breaking-change surface against the repo's usage, CI status), and each instance ends with a verdict and a draft decision; a deterministic roundup assembles the report and, only when the merge gate is on and the instance verdict allows it, the merge commands. A cargo-update variant swaps discovery for running cargo update in the workspace and fans out over the changed crates. First target is the vllm-vcr repository. Same skill-porting pattern as the paper and triage packs: unattended output contracts, no approval steps."
+
+[[content.acceptance_criteria]]
+text = "examples/dep-sweep pack compiles and its fan-out is keyed by PR number with a bounded max_fanout"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "merge behavior is gated by a param defaulting to report-only, and a failed research instance can never reach a merge command"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "cargo-update variant fans out over the crates a cargo update actually changed"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "README documents token requirements, egress, and a real run against vllm-vcr"
+status = "pending"
+category = "chore"

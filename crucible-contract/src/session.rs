@@ -127,6 +127,21 @@ pub struct PlanTaskWire {
     pub needs: String,
     #[serde(default)]
     pub required: bool,
+    /// What the task needs of its dependencies: `all` or `passed`.
+    #[serde(default)]
+    pub join: String,
+    /// `iteration` or `epilogue`. A consumer computing a verdict must skip the epilogue.
+    #[serde(default)]
+    pub stage: String,
+    /// `producer.field` when this task runs once per element of an upstream list, empty
+    /// otherwise. The node is one node however many instances it produces, so a renderer draws
+    /// the graph from this without waiting to see how wide it gets.
+    #[serde(default)]
+    pub over: String,
+    /// The most instances `over` may produce; 0 when the task is not mapped. A reader knows the
+    /// worst-case width before any spend.
+    #[serde(default)]
+    pub max_fanout: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -274,6 +289,13 @@ pub enum SessionEvent {
         budget_usd: f64,
         tasks: Vec<PlanTaskWire>,
     },
+    /// What a task proposed for a receiving orchestrator to admit. Emitted once per task that
+    /// emitted any, as it settles, so what a run proposed is auditable independently of what was
+    /// admitted. The emitting run never dispatches these.
+    AsksEmitted {
+        task: String,
+        asks: Vec<crate::ask::Ask>,
+    },
     /// One work-graph task attempt reached a terminal status. Covers both the plan executor
     /// (`plan_version` + `kind` + `output`) and measure-DAG walks (`iter` + `digest` + `job` +
     /// `metric`); fields outside the emitting context default to empty. `status` is one of
@@ -390,7 +412,7 @@ pub fn decode(line: &str) -> Option<SessionEvent> {
     if t.is_empty() {
         return None;
     }
-    serde_json::from_str::<Envelope>(t).ok().map(|e| e.event)
+    crate::json::from_str::<Envelope>(t).ok().map(|e| e.event)
 }
 
 #[cfg(test)]
@@ -667,8 +689,37 @@ mod tests {
                 session: "solver".into(),
                 needs: "any".into(),
                 required: true,
+                join: "all".into(),
+                stage: "iteration".into(),
+                over: "discover.targets".into(),
+                max_fanout: 8,
             }],
         });
+    }
+
+    /// Asks reach the log as their emitting task settles, so an auditor can compare what a run
+    /// proposed against what an orchestrator actually admitted.
+    #[test]
+    fn asks_emitted_round_trips() {
+        assert_round_trips(SessionEvent::AsksEmitted {
+            task: "classify".into(),
+            asks: vec![
+                crate::ask::Ask::new(
+                    crate::ask::AskKey::new("arxiv.org/abs/2401.12345").expect("valid key"),
+                    "implement-paper",
+                    serde_json::json!({"paper_url": "https://arxiv.org/abs/2401.12345"}),
+                )
+                .expect("valid ask"),
+            ],
+        });
+    }
+
+    /// A hand-written line carrying a key the constructor would refuse must not decode. Without
+    /// this the wire would be a way around the key rules rather than the place they are enforced.
+    #[test]
+    fn an_ask_with_an_unusable_key_does_not_decode() {
+        let line = r#"{"v":1,"kind":"asks_emitted","task":"classify","asks":[{"key":"with space","workflow":"w","params":null}]}"#;
+        assert!(decode(line).is_none(), "a bad key decoded");
     }
 
     #[test]

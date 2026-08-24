@@ -322,6 +322,10 @@ pub(crate) enum PlanAction {
         /// Manifest to materialize in place for validation and freeze.
         #[arg(long)]
         manifest: Option<PathBuf>,
+        /// A parameter value, `name=value`, repeatable. Values bind during compilation, so the
+        /// compiled graph is what they produced rather than a template of them.
+        #[arg(long = "param", value_name = "NAME=VALUE")]
+        params: Vec<String>,
     },
     /// Print the compiled plan (tasks in dependency-first order) and the truncation verdict
     /// for the given substrate caps. TOML by `.toml` extension, JSON otherwise.
@@ -341,13 +345,36 @@ pub(crate) enum PlanAction {
         #[arg(long)]
         render: bool,
     },
+    /// Print a workflow source's `params` block as a JSON Schema document, without evaluating
+    /// the source. One declaration serves command-line validation, ask validation, and a
+    /// generated launch form.
+    Params {
+        /// The workflow source to read.
+        #[arg(long)]
+        file: PathBuf,
+    },
     /// Execute a plan with the shell runner: `command` tasks run as real subprocesses,
     /// `agent` tasks run `--agent-cmd` (the command-backend stand-in). Exits nonzero when
     /// the plan does not reach a valid verdict.
     Run {
-        /// The plan file to execute.
+        /// The plan file to execute. Omit it to build the plan from `--manifest`'s own
+        /// `[workflow]`, which is how a playbook runs: the pack names its graph and the engine
+        /// compiles it per run.
+        #[arg(long, required_unless_present = "manifest")]
+        file: Option<PathBuf>,
+        /// A parameter value, `name=value`, repeatable. What the pack's `params` block declares
+        /// is what it accepts; `crucible plan params --file <source>` prints the schema. Only a
+        /// `--manifest` run compiles a graph, so a precompiled `--file` plan takes none.
+        #[arg(long = "param", value_name = "NAME=VALUE", conflicts_with = "file")]
+        params: Vec<String>,
+        /// Total cost ceiling for the run, in USD. A playbook must be given one: its source may
+        /// not declare a limit its operator set.
         #[arg(long)]
-        file: PathBuf,
+        max_cost: Option<f64>,
+        /// Total wall-clock ceiling for the run (`90s`, `30m`, `2h`). A playbook must be given
+        /// one, for the same reason.
+        #[arg(long)]
+        max_time: Option<String>,
         /// Substrate capabilities (repeatable). `any`-needs tasks always run.
         #[arg(long = "cap")]
         caps: Vec<String>,
@@ -690,8 +717,10 @@ impl Args {
     }
 }
 
-/// Parse a short duration like `90s`, `30m`, `1h`. Empty/garbage → None.
-fn parse_duration(s: &str) -> Option<Duration> {
+/// Parse a short duration like `90s`, `30m`, `1h`. Empty, garbage, negative, and anything
+/// `Duration` cannot hold all yield `None`. `Duration::from_secs_f64` panics on a negative or
+/// non-finite argument, so both are refused before it is reached.
+pub(crate) fn parse_duration(s: &str) -> Option<Duration> {
     let s = s.trim();
     if s.is_empty() {
         return None;
@@ -704,7 +733,7 @@ fn parse_duration(s: &str) -> Option<Duration> {
         "h" | "hr" => n * 3600.0,
         _ => return None,
     };
-    Some(Duration::from_secs_f64(secs))
+    Duration::try_from_secs_f64(secs).ok()
 }
 
 /// Runtime paths for a manifest run. Everything anchors off the manifest dir + an explicit
@@ -833,5 +862,24 @@ mod tests {
         assert_eq!(parse_duration(""), None);
         assert_eq!(parse_duration("garbage"), None);
         assert_eq!(parse_duration("10x"), None);
+    }
+
+    /// Every input reaches `Duration::try_from_secs_f64`, which refuses what
+    /// `Duration::from_secs_f64` would have panicked on.
+    #[test]
+    fn parse_duration_refuses_what_a_duration_cannot_hold() {
+        for hostile in [
+            "-5",
+            "-5s",
+            "-0.001h",
+            "99999999999999999999h",
+            "1e400",
+            "nan",
+            "inf",
+            "-inf",
+        ] {
+            assert_eq!(parse_duration(hostile), None, "{hostile}");
+        }
+        assert_eq!(parse_duration("0"), Some(Duration::ZERO));
     }
 }

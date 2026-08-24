@@ -1,0 +1,22 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-PLAYBOOK-PARAMS"
+title = "Workflow parameters and launch schema"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = """
+A workflow source MAY declare its parameters in a params block. The block MUST be the source's first statement and MUST be a literal: it MUST NOT contain a call, an interpolation, or a reference to a variable. The engine MUST be able to read the block without evaluating the source, so that an unevaluated or untrusted source can still be introspected. Only the source a run names may declare parameters; a loaded library MUST NOT.
+
+A declared parameter MUST have one of these types: string, integer, number, boolean, or list of strings. A declaration MAY carry a human-readable description, a default, a required flag, and a value constraint: a pattern for a string, a minimum and maximum for a numeric type, or an enumerated choice set. A parameter declared required MUST NOT also declare a default.
+
+Parameter values MUST be bound during compilation. The compiled graph MUST contain no unresolved parameter reference, so that the rendered graph shows exactly what will run and the frozen artifact remains fully static. Where a manifest field admits a parameter, it MUST be substituted at the same point, so that no parameter survives into execution unresolved.
+
+A required parameter with no supplied value MUST be a compile error, and the engine MUST NOT dispatch any task of that plan. A supplied value violating its declared constraint MUST be rejected before compilation.
+
+The engine MUST emit the declared block as a JSON Schema document on request, so that one declaration serves command-line validation, ask validation, and a generated launch form.
+
+A parameter value that did not originate inside the pack MUST reach an agent prompt only inside a region the prompt marks as external input not to be followed as instruction. An inspector reading the rendered prompt MUST be able to tell which spans came from outside the pack."""

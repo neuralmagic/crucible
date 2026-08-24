@@ -1,0 +1,16 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-PLAYBOOK-CAPS"
+title = "Task capability requirements"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = """
+A playbook MUST execute on one substrate for its whole life. A task therefore cannot be moved to reach a capability, and privileged or specialized work MUST be reached by asking a mediated broker instead.
+
+A needs declaration on a task MUST name a capability that the run can verify is available before dispatch. Whether a substrate provides that capability directly or a broker provides it on request is not the task's concern.
+
+A required task whose needs is not available MUST truncate the whole plan before dispatch, and the engine MUST report that verdict before any spend. An advisory task in the same position MUST be skipped along with its dependents, leaving the verdict unaffected."""
