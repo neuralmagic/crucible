@@ -53,10 +53,12 @@ rough order:
 | Molten masthead logo (WebGPU port of `just demo-logo`, 30px, transparent ground, static fallback) | `133ee7b` |
 | Fixes: upstream-filter `$8/$9` bind collision (mine, verifier-caught), operator authoring gates | `02720fc` `3639c89` |
 
-**In flight right now:** the resumed polish wave's last leg, WI-2026-08-23-011 (co-draft hint +
-served SKILL.md at `GET /api/playbooks/drafts/skill`); the first attempt died on a transient
-529 with nothing written. Check `/workflows` or the journal under
-`subagents/workflows/wf_f4cd3d3c-67c/`.
+**Nothing in flight.** The polish wave closed complete: WI-011 landed as `61908df` (one
+`CoDraft` renderer feeds both the served SKILL.md and the hint commands, so human and agent
+can never see different URLs; break-glass lines render only on a local deployment) and the
+invisible DOWNLOAD SKILL label it exposed was a pre-existing unlayered `a{color:inherit}`
+beating Tailwind utilities — fixed by layering the rule (`global.css`, own commit). UI is
+pencils-down by decree.
 
 **Proven live on this laptop:** the whole loop. An opus agent authored "fences" (a Chesterton's
 Fence archaeology pack, draft v7) through the MCP tools; a human edit landed mid-loop and the
@@ -68,7 +70,6 @@ speculators issues. Runs live under `state/local-runs/`. The agent e2e is commit
 
 ## Open work, ranked
 
-1. **WI-011** (running) — then UI is done by decree.
 2. **Demo kit** (promised, not started): `just demo` seeded boot; a Playwright-recorded
    talk-over video — scene list agreed: registry → MCP import hardlink → studio co-edit +
    stale-base diff → local launch → fan-out graph → evidence panel → schedule toggle; a
