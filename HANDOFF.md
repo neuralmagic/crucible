@@ -68,6 +68,44 @@ registered pack, backend flipped to local in the studio) proved 4-instance fan-o
 speculators issues. Runs live under `state/local-runs/`. The agent e2e is committed:
 `MCP_AGENT_E2E=1 just mcp-agent-e2e`.
 
+## NEXT SESSION: start here
+
+**One thing gates everything: crucible#66.** The first pod-dispatched playbook ever launched
+(on MPP, `playbook:triage:01a03555…`) reached a real pod on waldorf and died at its first agent
+task: `managed podman API socket did not appear`. The playbook wrapper never emitted
+`--compute-driver`, and `plan run` had no such flag, so the plan path took clap's podman default.
+#66 fixes it (1007 tests, clippy clean). Everything else on that path is proven working: the
+render produced a pod, the pack ConfigMap staged, the session reached the drop-box, and the
+controller ingested it and settled the run.
+
+**The chain to a working prod run, in order:** merge #66 -> engine image on crucible main -> bump
+the controller pin (`core-pin.toml`, both `Cargo.toml` revs, `Cargo.lock`,
+`Containerfile.crucible-selfcontained`; `tools/check-core-pin.sh` is the guard) -> controller
+image -> roll prod (image AND the turn-profile loop pin together) -> relaunch `triage` and confirm
+it settles **`finished`**, not `incomplete`. Prod is on `sha256:0c668e89...`; `03b2aae6...` is the
+rollback. Reach the API with
+`oc --context mpp-crucible-deployer -n crucible--runtime-ext port-forward svc/crucible-crucible-controller 8897:8080`
+and the bearer from the `crucible-api-token` secret. To reach waldorf, `podman stop
+batch-gateway-dev-control-plane` first: it squats on port 8000, which kubelogin's registered
+redirect URI needs. Restart it after.
+
+**Then: refine the FIPS pack (crucible#65).** It runs green end to end locally and correctly
+reports upstream `ai-dynamo/modelexpress` dirty (ring via `object_store`) while the midstream fork
+`opendatahub-io/modelexpress` is clean, which is a known-answer regression case worth keeping.
+Open items: **it cannot run on prod, because the runtime image carries no Rust toolchain** and its
+probes shell `cargo tree`; the triage skill also wants cargo in the sandbox image to verify its
+proposed fix. Decide whether Rust lands in the loop image, the sandbox image, or both. The fix the
+pack should be proposing is already verified by hand: drop `"ring"` from the workspace
+`object_store` feature list and add `object_store/ring` to `tls-rustls` and `gcs`. That clears all
+three variants and leaves the default variant unchanged.
+
+**Also queued:** RFC-0003 (scheduled parameterized loops) is drafted on this branch, no PR. Its
+cursor-advance rule and its pack-carries-its-contract clause both need checking against what the
+broker actually guarantees. The wire-contract work for `neuralmagic/vllm-vcr` is the motivating
+instance and should be a **broker-mediated loop, not a playbook**: bumping is already well
+automated there (`vllm-release-watch.yml`, `compat.toml`, a bumper bot), and the unautomated part
+is diagnosing and patching when a bump breaks conformance.
+
 ## Session 2026-08-24 (pm): what landed and what is next
 
 **Merged:** crucible #63 (playbook lane), **#64** (engine renders a playbook pod behind an
