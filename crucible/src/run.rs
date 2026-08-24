@@ -27,6 +27,10 @@ pub(crate) enum RunError {
     WatchPrNoSink,
     #[error("watch-pr takes exactly one of --control-addr or --reseed, not both")]
     WatchPrTwoSinks,
+    #[error(
+        "a playbook needs a positive --max-cost; its source may not declare a limit its operator set"
+    )]
+    PlaybookNeedsBudget,
     #[error("[agent].backend must be local|openshell|command, got {got:?}")]
     UnknownAgentBackend { got: String },
     #[error("running setup_cmd: {cmd}")]
@@ -202,18 +206,21 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                 caps,
                 agent_cmd,
                 manifest,
-            } => crate::plan::cli::run(
-                file.as_deref(),
-                &crate::plan::cli::parse_params(params)?,
-                &caps.iter().cloned().collect(),
-                agent_cmd.clone(),
-                manifest.as_deref(),
-                crate::plan::cli::Ceilings {
-                    usd: *max_cost,
-                    wall_clock: max_time.as_deref().and_then(crate::parse_duration),
-                    wall_clock_raw: max_time.clone(),
-                },
-            ),
+            } => {
+                let _engine = crate::engine::EngineCtx::new()?;
+                crate::plan::cli::run(
+                    file.as_deref(),
+                    &crate::plan::cli::parse_params(params)?,
+                    &caps.iter().cloned().collect(),
+                    agent_cmd.clone(),
+                    manifest.as_deref(),
+                    crate::plan::cli::Ceilings {
+                        usd: *max_cost,
+                        wall_clock: max_time.as_deref().and_then(crate::parse_duration),
+                        wall_clock_raw: max_time.clone(),
+                    },
+                )
+            }
         };
     }
 
@@ -269,6 +276,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
             });
             deploy::PackDelivery { configmap_name }
         });
+        let playbook = playbook_launch(&args)?;
         let opts = deploy::RenderOpts {
             iterations: args.iterations,
             max_cost: args.max_cost,
@@ -278,6 +286,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
             clusters_file: args.clusters.clone(),
             harness: args.harness,
             model: args.model.clone(),
+            playbook,
         };
         if args.controller {
             // Deprecated in favor of the `crucible-controller` Helm chart (the one packaging path).
@@ -308,6 +317,23 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
     // exits via `process::exit`), so the runtime stays alive under the loop.
     let _engine = crate::engine::EngineCtx::new()?;
     run_from_manifest(cli.run)
+}
+
+/// Fold `--playbook`'s flags into the renderer's launch knobs. clap enforces the flag
+/// combinations; `--max-cost` carries a loop default of 0, so the budget is checked here.
+fn playbook_launch(args: &crate::DeployArgs) -> Result<Option<deploy::PlaybookLaunch>> {
+    if !args.playbook {
+        return Ok(None);
+    }
+    let max_time = args.max_time.context("--playbook requires --max-time")?;
+    if !args.max_cost.is_finite() || args.max_cost <= 0.0 {
+        return Err(RunError::PlaybookNeedsBudget.into());
+    }
+    Ok(Some(deploy::PlaybookLaunch {
+        max_time,
+        max_cost: args.max_cost,
+        params: crate::plan::cli::parse_params(&args.params)?,
+    }))
 }
 
 fn parse_backend(s: &str) -> Result<agent::AgentBackend, RunError> {
@@ -917,7 +943,7 @@ fn drive_loop(
 /// no-op and the wrapper's `SESSION` delimiter is the controller's fallback; a failed POST is already
 /// logged loudly inside [`crate::ingest_client::post_artifact`]. The run-session is the loop's
 /// authoritative record; the otel log rides along only when the collector produced one.
-fn deliver_run_evidence(p: &Paths) {
+pub(crate) fn deliver_run_evidence(p: &Paths) {
     let Some(cfg) = crate::ingest_client::IngestConfig::from_env() else {
         return;
     };
@@ -1426,5 +1452,58 @@ mod tests {
     fn no_workflow_does_not_imply_graph_loop() {
         let a = args_from(&["crucible"]);
         assert!(!workflow_implies_graph_loop(&a));
+    }
+
+    fn deploy_args(extra: &[&str]) -> crate::DeployArgs {
+        let mut argv = vec![
+            "crucible",
+            "deploy",
+            "render",
+            "--manifest",
+            "pack/crucible.toml",
+            "--profile",
+            "profile.toml",
+        ];
+        argv.extend_from_slice(extra);
+        match Cli::try_parse_from(argv).expect("argv parses").command {
+            Some(Cmd::Deploy {
+                action: crate::DeployAction::Render(a),
+            }) => a,
+            _ => panic!("deploy render"),
+        }
+    }
+
+    #[test]
+    fn playbook_render_refuses_a_zero_budget() {
+        for budget in ["--max-cost=0", "--max-cost=0.0", "--max-cost=-1"] {
+            let args = deploy_args(&["--playbook", "--max-time", "30m", budget]);
+            let err = playbook_launch(&args).expect_err(budget);
+            assert!(
+                err.to_string().contains("positive --max-cost"),
+                "{budget}: {err:#}"
+            );
+        }
+        let args = deploy_args(&["--playbook", "--max-time", "30m", "--max-cost", "4.5"]);
+        let launch = playbook_launch(&args)
+            .expect("a positive budget")
+            .expect("a playbook launch");
+        assert_eq!(launch.max_cost, 4.5);
+        assert_eq!(launch.max_time.to_string(), "1800s");
+    }
+
+    /// A malformed `--param` is rejected once, at the CLI, so the renderer holds a map that cannot
+    /// be malformed.
+    #[test]
+    fn playbook_render_refuses_a_param_without_a_value() {
+        let args = deploy_args(&[
+            "--playbook",
+            "--max-time",
+            "30m",
+            "--max-cost",
+            "4.5",
+            "--param",
+            "topic",
+        ]);
+        assert!(playbook_launch(&args).is_err());
     }
 }

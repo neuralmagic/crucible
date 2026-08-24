@@ -1702,6 +1702,7 @@ workflow(type = "playbook", tasks = [good, bad, after])
     /// the ceilings come from whoever launched it. There is no plan file anywhere.
     #[test]
     fn a_playbook_launches_from_its_manifest_under_supplied_ceilings() {
+        let _guard = crate::test_env_lock();
         let dir = std::env::temp_dir().join(format!("crucible-launch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

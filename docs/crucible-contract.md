@@ -758,11 +758,21 @@ noted here tersely so this doc stays the map of what's authoritative:
 - **`crucible ps [--namespace <ns>] [--json]`**: lists loop pods across the cluster, selecting on
   the `app.kubernetes.io/managed-by=crucible` label every rendered loop pod carries. `ITER` ships
   as `-` (reserved, see `ps.rs`'s module doc for why it isn't wired up yet).
-- **`crucible deploy render|apply --manifest <path> --profile <path> [--iterations N] [--no-pin]`**:
-  renders (or renders-then-applies) the loop pod + a cross-namespace RoleBinding from the
-  manifest + a deploy profile, image tags resolved to `@sha256:…` digests. Works for a composite
-  manifest **or** a plain single-domain one (the latter needs its own `[deploy]` block naming the
-  build/deploy target, a single domain is a degenerate composite of one).
+- **`crucible deploy render|apply --manifest <path> --profile <path> [--iterations N]
+  [--max-cost USD] [--no-pin] [--pack [--pack-configmap-name <name>]] [--pr-repo <owner/repo>]
+  [--clusters <path>] [--harness <h>] [--model <m>] [--playbook --max-time <dur> [--param
+  NAME=VALUE]…]`**: renders (or renders-then-applies) the loop pod + a cross-namespace RoleBinding
+  from the manifest + a deploy profile, image tags resolved to `@sha256:…` digests. Works for a
+  composite manifest **or** a plain single-domain one (the latter needs its own `[deploy]` block
+  naming the build/deploy target, a single domain is a degenerate composite of one).
+  `--playbook` renders the second mode: the pod runs `crucible plan run` over the manifest's
+  `[workflow]` under the given ceilings and parameters instead of the agent loop. It is an
+  explicit flag, never inferred from the manifest, and it conflicts with the loop-only knobs
+  (`--iterations`, `--controller`, `--pr-repo`, `--harness`, `--model`). It requires a positive
+  `--max-cost` and `--max-time`, and needs neither a `[deploy]` block nor
+  `[agent].sandbox_image` (both describe a deployment a playbook never performs). `--pack` is
+  orthogonal: it controls delivery, `--playbook` controls the command, and a
+  controller-dispatched playbook passes both.
 - **`crucible watch-pr --pr <url> [--pr <url> ...] (--control-addr <host:port> | --reseed <path>)
   [--once] [--poll-secs N] [--bot-user <login>] [--allow-user <login> ...]`**: watches one or
   more draft PRs' review comments (`--pr` repeatable: a kept composite candidate opens one linked

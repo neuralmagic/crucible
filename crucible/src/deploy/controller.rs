@@ -354,6 +354,7 @@ mod tests {
                 clusters_file: None,
                 harness: None,
                 model: None,
+                playbook: None,
             },
         )
         .expect("render");
@@ -433,6 +434,7 @@ mod tests {
                 clusters_file: None,
                 harness: None,
                 model: None,
+                playbook: None,
             },
         )
         .expect("render");
@@ -475,6 +477,7 @@ mod tests {
                 clusters_file: None,
                 harness: None,
                 model: None,
+                playbook: None,
             },
         ) {
             Ok(_) => panic!("expected an error: no [controller] table"),

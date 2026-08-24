@@ -134,6 +134,31 @@ Scope held to **the run** (loop pod + RBAC). Single-domain (non-composite) rende
 (a plain manifest renders as a degenerate composite of one; it needs its own `[deploy]` block).
 Still deferred: a `local`-backend template, and modeling the rig (since answered by ADR-0013).
 
+### Second mode: a playbook pod
+
+The renderer emits one of two wrapper commands. The default is the agent loop (`crucible
+--manifest … --iterations …`). With `--playbook` it is the plan runner (`crucible plan run
+--manifest … --max-cost … --max-time … --param …`), which is what a `[workflow] type = "playbook"`
+pack needs: no iterations, no agent-loop flags, and ceilings + parameters supplied per launch.
+
+The mode is an **explicit flag**, consistent with this ADR's stance that the renderer is told what
+to render and never infers it. The renderer does not read `[workflow].type`; the launcher (the
+controller's playbook dispatch, or a human) states the mode, exactly as `--pack` states delivery.
+The two compose: `--pack` decides how the manifest reaches the pod, `--playbook` decides what the
+pod runs, and a controller-dispatched playbook passes both.
+
+Both modes publish the run's session at `<domain>/state/session.jsonl` and deliver it the same two
+ways (the Tier 2 drop-box when the profile names one, the `SESSION` delimiter otherwise), and both
+end that log with a `shutdown` line, so completion ingest cannot tell them apart.
+
+A playbook render relaxes two loop-template requirements, because both describe a deployment a
+playbook never performs: `[deploy]` is optional (it builds and deploys nothing) and
+`[agent].sandbox_image` is optional (its tasks pick their own backend; a pack with a sandboxed task
+still declares one). It also persists nothing. `plan run` has no `--resume` and opens the session
+log in append mode, so a run-state claim would leave a second launch publishing the first launch's
+events too; a playbook pod is one-shot and mounts no run-state volume even under a profile that
+names a claim.
+
 ### kube-rs migration — the engine no longer *depends* on `kubectl`
 
 The goal here is that the engine and the `[world]` hooks never *depend* on shelling `kubectl` — not to
