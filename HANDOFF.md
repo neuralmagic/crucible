@@ -3,7 +3,7 @@
 Date: 2026-08-24. Two repos, one arc: the engine's playbook lane (here, branch
 `playbook-lane`) is finished and up as **PR neuralmagic/crucible#63**; the controller
 (`~/git/agentic-epp-autoresearch`, branch `playbook-launcher`, ~30 commits, unpushed) grew the
-entire launch surface on top of it and is one in-flight workflow leg short of UI pencils-down.
+entire launch surface on top of it; UI is pencils-down.
 Everything below was adversarially verified by a paired skeptic agent unless marked otherwise.
 
 ## Engine (this repo)
@@ -70,17 +70,17 @@ speculators issues. Runs live under `state/local-runs/`. The agent e2e is commit
 
 ## Open work, ranked
 
-2. **Demo kit** (promised, not started): `just demo` seeded boot; a Playwright-recorded
+1. **Demo kit** (promised, not started): `just demo` seeded boot; a Playwright-recorded
    talk-over video — scene list agreed: registry → MCP import hardlink → studio co-edit +
    stale-base diff → local launch → fan-out graph → evidence panel → schedule toggle; a
    walkthrough artifact with the session's screenshots.
-3. **Merge train**: push + PR the controller branch; merge crucible #63; pin bump; deploy.
-4. Small reds on the branch: two `PackDispatchNotice` Playwright specs (import.spec.ts:89,
+2. **Merge train**: push + PR the controller branch; merge crucible #63; pin bump; deploy.
+3. Small reds on the branch: two `PackDispatchNotice` Playwright specs (import.spec.ts:89,
    launch.spec.ts:130); merge-diff caption says left/right while Monaco renders inline under
    900px panes; `design.spec.ts` baselines stale (own WI-worthy chore); `engine.log` mirror in
    `local_run.rs` never exercised by a fresh run; audit W1: `register()` doesn't refuse a live
    draft's id (drafts refuse registered ids, not vice versa).
-5. Queued WIs: controller — secrets (WI-2026-08-23-006, ADR-gated; **another session** is
+4. Queued WIs: controller — secrets (WI-2026-08-23-006, ADR-gated; **another session** is
    drafting ADR-0028/0029/0030 as untracked files in gov/adr — leave them alone),
    ADR-0026 phase 5; crucible — dep-sweep pack, captured-bytes knob, laundering fix,
    WI-2026-08-22-006 v2 seen-set (cursor write-back hole noted on the WI).
