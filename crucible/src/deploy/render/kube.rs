@@ -981,9 +981,13 @@ impl Renderer<'_> {
                 .iter()
                 .map(|(name, value)| format!(" --param {}", sh_quote(&format!("{name}={value}"))))
                 .collect();
+            let driver_flag = match self.driver {
+                ComputeDriver::Kubernetes => " --compute-driver=kubernetes",
+                ComputeDriver::Podman => "",
+            };
             return Ok(format!(
                 r#"D={domain_dir}
-crucible plan run --manifest "$D/{manifest_file}" --max-cost {max_cost} --max-time {max_time}{param_flags}
+crucible plan run --manifest "$D/{manifest_file}" --max-cost {max_cost} --max-time {max_time}{driver_flag}{param_flags}
 rc=$?
 if [ -z "${{CRUCIBLE_INGEST_URL:-}}" ]; then
   echo "=================== {session_delimiter}$rc) ==================="
@@ -3978,6 +3982,19 @@ mod tests {
         .expect("render")
     }
 
+    /// The compute driver is a substrate fact the pod cannot infer. Without it the plan runner
+    /// takes clap's podman default, hunts for a socket no work pod has, and the first agent task
+    /// dies on transport retries.
+    #[test]
+    fn playbook_wrapper_passes_the_compute_driver() {
+        let yaml = render_playbook(&k8s_profile(""), playbook_launch());
+        assert!(
+            yaml.contains("crucible plan run --manifest")
+                && yaml.contains("--compute-driver=kubernetes"),
+            "a kubernetes render must tell the plan runner which driver to use: {yaml}"
+        );
+    }
+
     /// The whole point: a playbook pod runs the plan runner, not the agent loop. Every loop-only
     /// flag `plan run` would reject as an unexpected argument is absent.
     #[test]
@@ -4040,7 +4057,6 @@ mod tests {
         for loop_only in [
             "--results-bucket",
             "--pr-repo",
-            "--compute-driver",
             "--harness",
             "--model",
             "--resume",

@@ -206,6 +206,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                 caps,
                 agent_cmd,
                 manifest,
+                compute_driver,
             } => {
                 let _engine = crate::engine::EngineCtx::new()?;
                 crate::plan::cli::run(
@@ -219,6 +220,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                         wall_clock: max_time.as_deref().and_then(crate::parse_duration),
                         wall_clock_raw: max_time.clone(),
                     },
+                    *compute_driver,
                 )
             }
         };
@@ -415,12 +417,17 @@ pub(crate) fn clone_repo(src: &str, git_ref: Option<&str>, dest: &Path) -> Resul
 pub(crate) fn prep_plan_runner(
     manifest_path: &Path,
 ) -> Result<(crate::plan::harness::HarnessRunner, manifest::Manifest)> {
-    prep_plan_runner_with_params(manifest_path, &std::collections::BTreeMap::new())
+    prep_plan_runner_with_params(
+        manifest_path,
+        &std::collections::BTreeMap::new(),
+        crate::openshell::gateway::ComputeDriver::Podman,
+    )
 }
 
 pub(crate) fn prep_plan_runner_with_params(
     manifest_path: &Path,
     params: &std::collections::BTreeMap<String, String>,
+    compute_driver: crate::openshell::gateway::ComputeDriver,
 ) -> Result<(crate::plan::harness::HarnessRunner, manifest::Manifest)> {
     let mut m = manifest::Manifest::load_frozen(manifest_path)?;
     let manifest_dir = manifest_path
@@ -457,6 +464,7 @@ pub(crate) fn prep_plan_runner_with_params(
         .context("constructing default args")?
         .run;
     args.manifest = Some(manifest_path.to_path_buf());
+    args.compute_driver = compute_driver;
     apply_agent_cfg(&mut args, &m.agent, &p.workspace)?;
     args.workflow_frozen_injects = m.frozen_inject_pairs(&manifest_dir);
     args.workflow_toolbox_exclude = m.agent.toolbox_exclude.clone();
