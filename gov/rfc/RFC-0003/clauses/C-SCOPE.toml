@@ -1,0 +1,18 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-SCOPE"
+title = "Scope"
+kind = "informative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = """
+Two dispatch shapes exist today. A playbook is parameterized, schedulable, and one-shot: it fans a declared graph out over discovered work and reaches a verdict once. A loop iterates propose, apply, measure and decide against a broker-mediated objective, and is dispatched when an issue reaches a scope.
+
+Neither covers recurring work whose answer is a measurement rather than a report. Maintaining a wire contract against an upstream that moves daily is the motivating case: for each supported version line, iterate patches until a conformance objective passes or the attempt is exhausted, then pick up only the drift that arrived since the last firing.
+
+This RFC specifies the missing quadrant: a loop that carries declared parameters, can be launched from a schedule, and advances dedupe state on its own verdict. It does not introduce a new execution machine. It generalizes three things that are presently spelled for playbooks alone: parameter binding, recurrence, and cursor advance.
+
+Out of scope: the objective grammar a loop measures against, which C-MEASURE already governs; and the broker's tool surface, except where a contract must travel with a pack rather than a deployment."""

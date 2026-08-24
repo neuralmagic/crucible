@@ -1,0 +1,20 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-LOOP-CURSOR"
+title = "Cursor advance on a loop verdict"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = """
+A loop schedule MAY declare a cursor, naming the result path whose scalar advances and the parameter that carries it into the next firing, under the same grammar a playbook schedule uses.
+
+The cursor MUST advance only on a terminal verdict that means the window was actually processed. A loop that exhausted its iterations without reaching its objective MUST NOT advance: the drift it failed to absorb is precisely what the next firing must see again. A loop that reached its objective, and a loop that proved the window needs no change, both MUST advance.
+
+A result carrying no scalar at the declared path MUST leave the cursor where it is and say so on the event log, rather than advancing to a null and silently skipping a window.
+
+An ad-hoc launch MUST NOT advance a schedule's cursor unless it was explicitly opted in and names that schedule, so that a manual investigation cannot eat the next scheduled firing's inputs.
+
+A loop's verdict MUST reach the launcher through the same ingest a one-shot uses. Where a dispatch publishes no terminal event, the launcher MUST treat the run as incomplete and MUST NOT advance; an absent verdict is not a passing one."""

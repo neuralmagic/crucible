@@ -1,0 +1,29 @@
+#:schema ../../schema/rfc.schema.json
+
+[govctl]
+id = "RFC-0003"
+title = "Scheduled parameterized loops"
+version = "0.1.0"
+status = "draft"
+phase = "spec"
+owners = ["@Will Eaton"]
+created = "2026-08-24"
+updated = "2026-08-24"
+
+[[sections]]
+title = "Summary"
+clauses = ["clauses/C-SCOPE.toml"]
+
+[[sections]]
+title = "Specification"
+clauses = [
+    "clauses/C-LOOP-PARAMS.toml",
+    "clauses/C-LOOP-SCHEDULE.toml",
+    "clauses/C-LOOP-CURSOR.toml",
+    "clauses/C-PACK-CONTRACT.toml",
+]
+
+[[changelog]]
+version = "0.1.0"
+date = "2026-08-24"
+notes = "Initial draft"

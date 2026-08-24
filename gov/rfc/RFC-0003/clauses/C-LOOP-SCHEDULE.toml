@@ -1,0 +1,18 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-LOOP-SCHEDULE"
+title = "Recurrence over a loop"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = """
+A schedule MUST be able to name a loop pack as its target, with the same cron expression, zone, frozen parameter values and ceilings a playbook schedule carries. The launcher MUST authorize a scheduled loop firing exactly as it authorizes an ad-hoc one: against the pack's stored parameter schema at the digest the schedule was created against, refusing a firing whose schema has drifted rather than launching under values nobody reviewed.
+
+A firing MUST NOT start while a previous firing of the same schedule is still running. A loop occupies substrate for the length of its iterations, so overlapping firings would contend for the same measurement capacity and make each other's results unattributable. The launcher MUST skip rather than queue, and MUST record the skip.
+
+A schedule MUST carry the same ceilings a loop dispatch requires, including the iteration bound. A recurring loop with no iteration bound is unbounded spend on a timer.
+
+The consecutive-failure disable that governs playbook schedules MUST govern loop schedules identically: a schedule whose pack no longer compiles, or whose ceilings no longer render, MUST leave the rotation rather than fail every window forever."""

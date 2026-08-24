@@ -1,0 +1,18 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-LOOP-PARAMS"
+title = "Parameters on a loop dispatch"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = """
+A pack whose workflow is a loop MAY declare parameters under the same block C-PLAYBOOK-PARAMS governs, with the same literal-only, introspectable-without-evaluation guarantees. The declaration MUST be readable by the same command that reads a playbook's, so that one schema serves both a generated launch form and command-line validation regardless of dispatch shape.
+
+Parameter values MUST be bound before the loop's first turn, and the bound values MUST be frozen for the life of the run: an iteration MUST NOT observe a different value than the iteration before it, so that a measurement is attributable to the candidate rather than to a moved input.
+
+A parameter value that did not originate inside the pack MUST reach an agent prompt only inside a region marked as external input, exactly as C-PLAYBOOK-PARAMS requires. The loop's additional turns do not relax this: every turn that renders a parameter MUST mark it.
+
+The engine MUST reject a parameter declaration on a loop pack that names a value the loop's dispatch cannot bind, rather than binding it silently at the first turn and leaving later turns unparameterized."""

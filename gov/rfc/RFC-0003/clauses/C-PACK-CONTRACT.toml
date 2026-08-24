@@ -1,0 +1,18 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-PACK-CONTRACT"
+title = "A measurement contract travels with the pack"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = """
+A loop measures through a broker-mediated tool surface. Today the contract that describes that surface is configured per deployment, so a pack cannot be launched anywhere its contract has not been installed by an operator, and two packs cannot disagree about what a measurement means.
+
+A pack that declares a loop workflow MUST be able to declare the contract it measures against, by name and by shape, as part of the pack. The launcher MUST resolve a launch against the contract the pack declares at the rev it was registered at, so that a measurement is reproducible from the frozen artifact alone.
+
+A deployment MUST retain the ability to refuse a declared contract it cannot satisfy, and MUST refuse at launch with a reason naming the substrate it lacks, rather than at the first measurement turn. Ceilings on a contract's cost remain the deployment's: a pack MUST NOT be able to raise the call, wall-clock or accelerator bounds an operator set.
+
+A declared contract MUST NOT widen what a task may reach. It names the tools a turn may call and their parameters; it does not grant access the pack's substrate would otherwise deny."""
