@@ -70,20 +70,36 @@ speculators issues. Runs live under `state/local-runs/`. The agent e2e is commit
 
 ## Open work, ranked
 
-1. **Demo kit** (promised, not started): `just demo` seeded boot; a Playwright-recorded
-   talk-over video — scene list agreed: registry → MCP import hardlink → studio co-edit +
-   stale-base diff → local launch → fan-out graph → evidence panel → schedule toggle; a
-   walkthrough artifact with the session's screenshots.
-2. **Merge train**: push + PR the controller branch; merge crucible #63; pin bump; deploy.
-3. Small reds on the branch: two `PackDispatchNotice` Playwright specs (import.spec.ts:89,
-   launch.spec.ts:130); merge-diff caption says left/right while Monaco renders inline under
-   900px panes; `design.spec.ts` baselines stale (own WI-worthy chore); `engine.log` mirror in
-   `local_run.rs` never exercised by a fresh run; audit W1: `register()` doesn't refuse a live
-   draft's id (drafts refuse registered ids, not vice versa).
-4. Queued WIs: controller — secrets (WI-2026-08-23-006, ADR-gated; **another session** is
+1. **Merge train**: push + PR the controller branch; merge crucible #63; pin bump; deploy.
+   The demo rides after: roll the UI on prod, then record there with
+   `demo-auth.mjs`/`demo-record.mjs` (`DEMO_BASE=https://<host>`).
+2. Queued WIs: controller — secrets (WI-2026-08-23-006, ADR-gated; **another session** is
    drafting ADR-0028/0029/0030 as untracked files in gov/adr — leave them alone),
-   ADR-0026 phase 5; crucible — dep-sweep pack, captured-bytes knob, laundering fix,
+   ADR-0026 phase 5, design baselines for the playbook surfaces (WI-2026-08-24-003);
+   crucible — dep-sweep pack, captured-bytes knob, laundering fix,
    WI-2026-08-22-006 v2 seen-set (cursor write-back hole noted on the WI).
+
+**Demo kit shipped** (WI-2026-08-24-002): `just demo` boots a fresh seeded stack on its own
+ports (API 8898, SPA 5183; refuses to start over a squatter, `KUBECONFIG=/dev/null` dodges
+the 30s kube stall) and seeds through the public API — demo-sweep (a cheap runnable pack:
+one haiku scan, free 5-way isolated command fan-out with a designed billing failure, free
+roundup), triage (the undispatchable notice), a pending import, a co-edited draft, a
+disabled schedule. `just demo-run` mints the finished run (~$0.04). `demo-record.mjs`
+walks the nine scenes (registry → approvals → import review → studio → stale-base merge →
+launch form → run graph → evidence → schedule) into walkthrough.webm + screenshots;
+against a hosted instance, `demo-auth.mjs` captures the oauth2-proxy session once and
+`DEMO_BASE` points the recorder at it. Walkthrough artifact published (Playbook Launcher
+Walkthrough). Playbook local runs settle as `incomplete` in `runs` — pre-existing ingest
+wording, the run page still reads DONE. Seeding earlier hit the stale dev daemon once:
+the dev DB gained a demo-sweep row and triage was re-pinned to the branch tip (benign).
+
+**Small reds closed** (WI-2026-08-24-001, `ab8f437`): the substrate notice quotes
+`[agent] backend = …` so both PackDispatchNotice specs pass; the merge/rebase captions no
+longer say left/right (Monaco goes inline under narrow panes); `register()` refuses a live
+draft's id with a 409 on both API paths (graduation-target exempt, the registration
+retires the draft) with a test proving both halves; the engine.log mirror is covered.
+design.spec.ts is green (18/18) but covers no playbook route — that gap is
+WI-2026-08-24-003.
 
 ## Decisions made, do not relitigate
 
