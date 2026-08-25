@@ -75,9 +75,31 @@ switch "$argv[1]"
         echo
         echo "when that prints $P you can delete the key: rm $KEY"
 
+    case knobs
+        step "run_iterations=10 run_max_cost=40 in the overrides ConfigMap (Argo sync resets these)"
+        set -l f /tmp/claude-501/overrides.json
+        test -s $f; or begin; echo "no $f"; exit 1; end
+        oc --context mpp-crucible-deployer -n crucible--runtime-ext create cm crucible-controller-overrides \
+            --from-file=overrides.json=$f --dry-run=client -o yaml \
+            | oc --context mpp-crucible-deployer -n crucible--runtime-ext apply -f -; or exit 1
+
+    case park
+        set -l T (oc --context mpp-crucible-deployer -n crucible--runtime-ext get secret crucible-api-token -o jsonpath='{.data.token}' | base64 -d)
+        test -n "$T"; or begin; echo "no API token"; exit 1; end
+        set -l key (string escape --style=url "$argv[2]")
+        test -n "$argv[2]"; or begin; echo "usage: park <issue-key>"; exit 2; end
+        step "park $argv[2]"
+        curl -sS -X POST "http://127.0.0.1:8899/api/issues/$key/park" \
+            -H "authorization: Bearer $T" -H "x-auth-request-user: weaton" \
+            -H "content-type: application/json" \
+            -d '{"reason":"adopted with a git_ref the pinned engine cannot clone at (no --repo-ref on render-turn); superseded by a default-branch adoption"}'
+        echo
+
     case adopt
         set -l T (oc --context mpp-crucible-deployer -n crucible--runtime-ext get secret crucible-api-token -o jsonpath='{.data.token}' | base64 -d)
         test -n "$T"; or begin; echo "no API token"; exit 1; end
+        curl -s -m 5 -o /dev/null -H "authorization: Bearer $T" -H "x-auth-request-user: weaton" http://127.0.0.1:8899/api/config
+        or begin; echo "port-forward on 8899 is down (the pod restarted); rerun: oc --context mpp-crucible-deployer -n crucible--runtime-ext port-forward svc/crucible-crucible-controller 8899:8080 &"; exit 1; end
         step "adopt examples/selfhost/scenario.json"
         curl -sS -X POST http://127.0.0.1:8899/api/scenarios \
             -H "authorization: Bearer $T" -H "x-auth-request-user: weaton" \
@@ -86,6 +108,6 @@ switch "$argv[1]"
         echo
 
     case '*'
-        echo "usage: roll-vertex-project.fish sa|secrets|sync|restart|adopt"
+        echo "usage: roll-vertex-project.fish sa|secrets|sync|restart|knobs|park <key>|adopt"
         exit 2
 end
