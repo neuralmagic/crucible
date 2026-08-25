@@ -923,7 +923,7 @@ fn turn_args(opts: &ProposeOpts) -> crate::Args {
     args.compute_driver = opts.compute_driver;
     // Manifest-less turn: the Vertex agent env normally supplied by `[agent].env` comes from the
     // turn pod's own env instead.
-    crate::openshell::relay_vertex_env(&mut args.env);
+    crate::openshell::run::relay_vertex_env(&mut args.env);
     args
 }
 

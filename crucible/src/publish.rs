@@ -73,7 +73,7 @@ fn slug(goal: &str) -> String {
 
 /// One resolved per-component publish target for a composite run: a component's checkout plus the
 /// base/head shas (from the snapshot tokens) and the fork it PRs against (from the manifest). Built by
-/// [`composite_targets`] zipping the world's [`crate::crucible::PublishComponent`]s with the manifest
+/// [`composite_targets`] zipping the world's [`crucible::crucible::PublishComponent`]s with the manifest
 /// fork map; an empty list means "single-repo run" (the `base_sha`/`kept_shas` path handles it).
 pub struct PublishTarget {
     pub name: String,
@@ -86,7 +86,7 @@ pub struct PublishTarget {
 /// Join the world's per-component publish set with the manifest's `(name, owner/repo)` fork map: a
 /// component with no fork mapping is dropped (it doesn't get a PR). Order follows the world's components.
 pub fn composite_targets(
-    components: Vec<crate::crucible::PublishComponent>,
+    components: Vec<crucible::crucible::PublishComponent>,
     repos: &[(String, String)],
 ) -> Vec<PublishTarget> {
     components
@@ -2228,7 +2228,7 @@ mod tests {
 
     #[test]
     fn composite_targets_join_drops_unmapped_components() {
-        use crate::crucible::PublishComponent;
+        use crucible::crucible::PublishComponent;
         let components = vec![
             PublishComponent {
                 name: "vllm".into(),

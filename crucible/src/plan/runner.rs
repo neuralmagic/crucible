@@ -39,7 +39,7 @@ impl TaskRunner for ShellRunner {
 
 impl ShellRunner {
     /// Run in a worktree prepared by the outer runner without clearing its isolation marker.
-    pub(crate) fn run_in_prepared_worktree(
+    pub fn run_in_prepared_worktree(
         &mut self,
         task: &Task,
         inputs: &BTreeMap<TaskName, Value>,

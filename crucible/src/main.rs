@@ -29,21 +29,13 @@ mod agent_session;
 mod broker;
 mod build;
 mod check;
-mod command_judge;
-mod command_world;
 mod console;
 pub(crate) mod control;
-mod crucible;
-mod deploy;
 mod distress;
-mod duration;
 mod engine;
-mod errors;
 mod escalation;
 mod event;
-mod flow;
 mod flow_dd;
-mod flow_html;
 mod harness;
 mod heartbeat;
 mod hermes_trace;
@@ -53,9 +45,6 @@ mod init;
 mod issue;
 mod loop_driver;
 mod loop_graph;
-mod manifest;
-mod openshell;
-mod plan;
 mod pr_watch;
 mod preflight;
 mod provisioning;
@@ -72,9 +61,29 @@ mod scope;
 mod selftest;
 mod session;
 mod stream;
-mod task_judge;
-mod turn_trace;
 pub(crate) use crucible_harness::stream_json;
+
+use crucible::{command_judge, deploy, duration, errors, flow, manifest, turn_trace};
+
+/// The OpenShell turn runtime. The gateway client and the egress policy are library code (the
+/// deploy renderer needs their constants); the per-turn flow, provider, and sandbox helpers run
+/// only here.
+mod openshell {
+    pub use crucible::openshell::{gateway, grpc, policy};
+
+    pub mod provider;
+    pub mod run;
+    pub mod sandbox;
+}
+
+/// The plan runtime: the CLI and the agent-harness task runner over the library's plan IR,
+/// compiler, and executor.
+mod plan {
+    pub use crucible::plan::{exec, ir, runner, starlark, term_img, worktree};
+
+    pub mod cli;
+    pub mod harness;
+}
 
 use crate::duration::parse_duration;
 use anyhow::Result;

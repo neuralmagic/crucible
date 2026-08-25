@@ -4,7 +4,7 @@
 //! bounded by a budget, steerable mid-flight, abortable from either side. An LLM agent
 //! is the proposal policy; a frozen objective is the judge. Everything domain-specific
 //! lives behind two traits, so a new problem is "implement [`World`] + [`Judge`]", the
-//! engine ([`crate::run_loop`]), the reporters, the session log, and the control plane
+//! engine (`run_loop`), the reporters, the session log, and the control plane
 //! don't change.
 //!
 //! The two traits are deliberately split along the trust boundary its freeze demands

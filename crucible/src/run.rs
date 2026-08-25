@@ -4,7 +4,6 @@
 //! run path: a `crucible.toml` builds the [`World`] + [`Judge`], anchors every path, picks a
 //! front-end, and calls [`crate::loop_driver::run_loop`].
 
-use crate::crucible::{Judge, World};
 use crate::errors::FileError;
 use crate::harness::HarnessRuntime;
 use crate::loop_driver::{LoopRuntime, run_loop};
@@ -15,6 +14,7 @@ use crate::{
     stream,
 };
 use anyhow::{Context, Result};
+use crucible::crucible::{Judge, World};
 use crucible_vcs::vcs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -782,7 +782,7 @@ fn apply_agent_cfg(args: &mut Args, agent: &manifest::AgentCfg, workspace: &Path
     if args.agent_backend == agent::AgentBackend::Openshell
         && args.harness().auth_provider() == crate::harness::AuthProvider::Vertex
     {
-        crate::openshell::relay_vertex_env(&mut args.env);
+        crate::openshell::run::relay_vertex_env(&mut args.env);
     }
     args.relay = agent.relay.clone();
     args.openshell = agent.openshell.clone();

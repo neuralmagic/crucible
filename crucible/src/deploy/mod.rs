@@ -10,7 +10,7 @@
 //! naming that one target (see [`render::RenderInput::from_manifest`]).
 
 mod controller;
-pub(crate) mod profile;
+pub mod profile;
 mod render;
 
 pub use render::{

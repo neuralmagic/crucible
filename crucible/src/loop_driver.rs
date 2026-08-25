@@ -8,9 +8,9 @@
 
 use crate::reporter::{AgentTurn, Outcome, Phase, Reporter, Row, Stop, TurnBudget};
 use crate::{Args, Paths, Prepared, STOP};
-use crate::{control, crucible, escalation, provisioning, publish, session};
+use crate::{control, escalation, provisioning, publish, session};
 use anyhow::{Context, Result};
-use crucible::{Judge, World};
+use crucible::crucible::{Judge, World};
 use crucible_contract::admission::AdmissionOutcome;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -25,10 +25,10 @@ struct BaselineInvalid {
     note: String,
 }
 
-/// The secondary numeric a [`crucible::Reading`] may carry in its detail JSON (a test
+/// The secondary numeric a [`crucible::crucible::Reading`] may carry in its detail JSON (a test
 /// gate's total test count). The engine threads it as `baseline_total` into the judge; a
 /// domain without it just reports `None`.
-fn reading_total(r: &crucible::Reading) -> Option<u64> {
+fn reading_total(r: &crucible::crucible::Reading) -> Option<u64> {
     r.detail.get("total").and_then(|v| v.as_u64())
 }
 
@@ -209,7 +209,7 @@ impl LoopExit {
 
 /// One turn's linear protocol, typed so its illegal orderings stop compiling: the candidate
 /// moves `Proposed → Applied → Measured`, and only a `Measured` can be decided. You cannot
-/// `measure` before `apply` (no method), nor `decide` without a [`crucible::Reading`] (the
+/// `measure` before `apply` (no method), nor `decide` without a [`crucible::crucible::Reading`] (the
 /// `Measured` carries it). The outer loop owns the cyclic shell + shared [`Run`]; this owns
 /// the straight line through the middle of each iteration.
 struct Iteration<S> {
@@ -224,7 +224,7 @@ struct Applied;
 /// The judge measured the live candidate. Holds everything the decision and the results row need,
 /// so a kept row carries its reading by construction.
 pub(crate) struct Measured {
-    pub(crate) reading: crucible::Reading,
+    pub(crate) reading: crucible::crucible::Reading,
     pub(crate) note: String,
     pub(crate) diff: String,
     pub(crate) diffstat: String,
@@ -239,8 +239,8 @@ pub(crate) struct Measured {
 /// the keep path commits (its score becomes `best_score`, its note labels the snapshot).
 pub(crate) struct Decided {
     pub(crate) row: Row,
-    pub(crate) verdict: crucible::Decision,
-    pub(crate) reading: crucible::Reading,
+    pub(crate) verdict: crucible::crucible::Decision,
+    pub(crate) reading: crucible::crucible::Reading,
 }
 
 /// One iteration's outcome in driver vocabulary, produced by either path (the typestate
@@ -403,7 +403,7 @@ pub(crate) fn drain_turn_markers<R: Reporter>(
 /// both measure identically.
 pub(crate) fn measure_candidate(
     judge: &dyn Judge,
-    ctx: &crucible::MeasureCtx,
+    ctx: &crucible::crucible::MeasureCtx,
     p: &Paths,
     world: &dyn World,
 ) -> Result<Measured> {
@@ -413,7 +413,7 @@ pub(crate) fn measure_candidate(
 
 /// Attach the candidate note and diff to an authored reading.
 pub(crate) fn measured_from_reading(
-    reading: crucible::Reading,
+    reading: crucible::crucible::Reading,
     p: &Paths,
     world: &dyn World,
 ) -> Measured {
@@ -501,7 +501,7 @@ impl Iteration<Applied> {
     fn measure(
         self,
         judge: &dyn Judge,
-        ctx: &crucible::MeasureCtx,
+        ctx: &crucible::crucible::MeasureCtx,
         p: &Paths,
         world: &dyn World,
     ) -> Result<Iteration<Measured>> {
@@ -1120,7 +1120,7 @@ fn run_loop_body<R: Reporter>(
                     // apply is an unscoreable candidate: roll back to best and move on.
                     match Iteration::proposed(it).apply(world) {
                         Ok(applied) => {
-                            let ctx = crucible::MeasureCtx {
+                            let ctx = crucible::crucible::MeasureCtx {
                                 baseline_score: Some(run.segment.baseline_score),
                                 baseline_total: Some(run.segment.baseline_total),
                                 best_score: Some(run.segment.best_score),
@@ -1981,7 +1981,7 @@ fn run_baseline(
             return Ok((b.score, 0, snap, row));
         }
     }
-    let base = judge.measure(&crucible::MeasureCtx::default())?;
+    let base = judge.measure(&crucible::crucible::MeasureCtx::default())?;
     if !base.valid {
         return Err(BaselineInvalid {
             note: base.note.clone(),
@@ -3245,11 +3245,14 @@ mod tests {
         fail_baseline: bool,
     }
     impl Judge for FakeJudge {
-        fn measure(&self, _ctx: &crucible::MeasureCtx) -> Result<crucible::Reading> {
+        fn measure(
+            &self,
+            _ctx: &crucible::crucible::MeasureCtx,
+        ) -> Result<crucible::crucible::Reading> {
             if self.fail_baseline {
                 anyhow::bail!("measure command exploded");
             }
-            Ok(crucible::Reading {
+            Ok(crucible::crucible::Reading {
                 valid: true,
                 score: Some(100.0),
                 tiebreak: None,
@@ -3260,11 +3263,11 @@ mod tests {
         }
         fn decide(
             &self,
-            _reading: &crucible::Reading,
+            _reading: &crucible::crucible::Reading,
             _best_score: f64,
             _best_tiebreak: Option<f64>,
-        ) -> crucible::Decision {
-            crucible::Decision {
+        ) -> crucible::crucible::Decision {
+            crucible::crucible::Decision {
                 keep: self.keep,
                 solved: self.solved,
             }
@@ -3278,7 +3281,7 @@ mod tests {
         fn direction(&self) -> crate::command_judge::Direction {
             crate::command_judge::Direction::Lower
         }
-        fn detail(&self, _reading: &crucible::Reading) -> String {
+        fn detail(&self, _reading: &crucible::crucible::Reading) -> String {
             String::new()
         }
         fn objective(&self) -> String {
@@ -3796,7 +3799,7 @@ mod tests {
         let mut f = fixture(3, 0.0, true);
         f.prepared.skip_baseline = true;
         let world = FakeWorld;
-        let judge = crate::task_judge::TaskJudge;
+        let judge = crucible::task_judge::TaskJudge;
         let mut r = RecordingReporter::default();
         let outcome = run_loop(
             &f.args,

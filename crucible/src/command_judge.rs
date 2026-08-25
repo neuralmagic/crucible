@@ -18,7 +18,7 @@ pub enum Direction {
 
 impl Direction {
     /// Strictly-better test for the keep rule (and the gate self-test's discrimination check).
-    pub(crate) fn better(self, score: f64, best: f64) -> bool {
+    pub fn better(self, score: f64, best: f64) -> bool {
         match self {
             Direction::Lower => score < best,
             Direction::Higher => score > best,

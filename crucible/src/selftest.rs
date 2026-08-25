@@ -4,9 +4,9 @@
 //! (`crucible check`); it never runs inside a loop iteration.
 
 use crate::command_judge::Direction;
-use crate::crucible::{Judge, MeasureCtx, World};
 use crate::manifest::SelftestCfg;
 use anyhow::{Context, Result};
+use crucible::crucible::{Judge, MeasureCtx, World};
 use std::path::Path;
 
 #[derive(Debug, thiserror::Error)]
@@ -145,8 +145,8 @@ fn stage(workspace: &Path, cmd: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command_world::GitWorld;
     use crate::manifest::SelftestCfg;
+    use crucible::command_world::GitWorld;
     use std::fs;
     use std::path::PathBuf;
 
@@ -189,11 +189,11 @@ mod tests {
     }
 
     impl Judge for ValueJudge {
-        fn measure(&self, _ctx: &MeasureCtx) -> Result<crate::crucible::Reading> {
+        fn measure(&self, _ctx: &MeasureCtx) -> Result<crucible::crucible::Reading> {
             let text = fs::read_to_string(self.workspace.join("value.txt"))
                 .context("reading value.txt")?;
             let score: f64 = text.trim().parse().context("parsing value.txt")?;
-            Ok(crate::crucible::Reading {
+            Ok(crucible::crucible::Reading {
                 valid: true,
                 score: Some(score),
                 tiebreak: None,
@@ -204,10 +204,10 @@ mod tests {
         }
         fn decide(
             &self,
-            _r: &crate::crucible::Reading,
+            _r: &crucible::crucible::Reading,
             _best_score: f64,
             _best_tiebreak: Option<f64>,
-        ) -> crate::crucible::Decision {
+        ) -> crucible::crucible::Decision {
             unreachable!("selftest doesn't call decide")
         }
         fn status(&self, _best_score: f64) -> String {
@@ -216,7 +216,7 @@ mod tests {
         fn improved(&self, _best_score: f64, _baseline_score: f64, _solved_any: bool) -> bool {
             false
         }
-        fn detail(&self, _r: &crate::crucible::Reading) -> String {
+        fn detail(&self, _r: &crucible::crucible::Reading) -> String {
             String::new()
         }
         fn objective(&self) -> String {

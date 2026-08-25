@@ -1881,7 +1881,7 @@ fn write_atomically(path: &Path, body: &str) -> std::result::Result<(), FileErro
 }
 
 /// A bare filename has an empty parent; tempfiles and prompt resolution need a real directory.
-pub(crate) fn parent_or_cwd(path: &Path) -> &Path {
+pub fn parent_or_cwd(path: &Path) -> &Path {
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))

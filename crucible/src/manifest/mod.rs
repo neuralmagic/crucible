@@ -261,7 +261,7 @@ pub struct Manifest {
 /// The composite analogue is `[[component]].pr_repo`; this is the single-domain manifest's version, so
 /// a scoped single-repo pack (or a hand-written domain) can name its own fork instead of relying on a
 /// `--pr-repo` flag. When set it takes precedence over any `--pr-repo` the caller passes (see
-/// [`crate::run`]'s `run_from_manifest`).
+/// `run`'s `run_from_manifest`).
 #[derive(Deserialize, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub struct PublishCfg {
@@ -536,7 +536,7 @@ pub struct AgentCfg {
     pub env: BTreeMap<String, String>,
     /// Files to materialize into the agent's sandbox before each turn (e.g. a cluster
     /// kubeconfig), each rendered host-side and targeted-uploaded to its `dest`. See
-    /// [`crate::relay`].
+    /// `relay`.
     #[serde(default)]
     pub relay: Vec<RelayFile>,
     /// OpenShell sandbox tuning (egress allowlist) for the `openshell` backend. Empty for
