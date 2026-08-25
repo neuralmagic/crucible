@@ -449,7 +449,7 @@ pub(crate) struct RenderTurnArgs {
     /// The issue's confirmed tier, forwarded to the in-pod `crucible scope --propose --tier …`.
     /// `scope` turn kind only; absent = the engine's t0 default.
     #[arg(long, value_enum)]
-    pub tier: Option<crate::scope::ProposeTier>,
+    pub tier: Option<crate::deploy::ProposeTier>,
     /// Max gaming-review concern→refine→re-review cycles, forwarded to the in-pod
     /// `crucible scope --propose --gaming-refine-rounds …`. `scope` turn kind only.
     #[arg(long, default_value_t = 1)]

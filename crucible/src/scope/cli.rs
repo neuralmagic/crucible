@@ -1,10 +1,11 @@
 use crate::activity::ActivityFeed;
 use crate::agent::AgentBackend;
+use crate::deploy::ProposeTier;
 use crate::init::MANIFEST_FILE;
 use crate::refine::RoundRecord;
 use crate::scope::pack::{SCOPE_PACK_MARKER, pack_gz, pack_marker_line};
 use crate::scope::pipeline::{
-    Freeze, Ingest, Propose, ProposeOpts, ProposeTier, ScopeCtx, Stage, StageResult, Validate,
+    Freeze, Ingest, Propose, ProposeOpts, ScopeCtx, Stage, StageResult, Validate,
 };
 use crate::scope::transcript::{
     SCOPE_TRANSCRIPT_MARKER, TRANSCRIPT_CAP_BYTES, cap_transcript, gzip_transcript,

@@ -48,6 +48,42 @@ impl TurnKind {
     }
 }
 
+/// The confirmed tier a propose turn drafts against: threaded from the controller's ranker verdict
+/// (`--tier t0|t1`) into the prompt's `{{TIER}}` slot, so the agent follows the right section of
+/// `scope-propose.md` instead of guessing.
+/// `T0` is the engine default when the flag is absent, every call site predating this flag never set
+/// it, and a bare `crucible scope --propose` (no controller in front of it) should keep behaving exactly
+/// as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum ProposeTier {
+    #[default]
+    #[value(name = "t0")]
+    T0,
+    #[value(name = "t1")]
+    T1,
+}
+
+impl ProposeTier {
+    /// The `{{TIER}}` spelling the prompt substitutes, matches the ranker/DB vocabulary
+    /// (`Tier::as_str` in the controller crate) so a human reading the rendered prompt recognizes
+    /// it as the same tier the ledger shows.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProposeTier::T0 => "T0",
+            ProposeTier::T1 => "T1",
+        }
+    }
+
+    /// The `--tier` CLI spelling (the clap `#[value(name)]`s above), what the turn-pod wrapper
+    /// renders into its `crucible scope --propose --tier …` invocation.
+    pub fn cli_value(self) -> &'static str {
+        match self {
+            ProposeTier::T0 => "t0",
+            ProposeTier::T1 => "t1",
+        }
+    }
+}
+
 /// Options for [`render_turn`]: a single one-shot agent-turn pod (WorkPod
 /// primitive). Unlike the loop pod it runs no manifest, the wrapper clones `repo_url`, then runs
 /// the kind-specific command over that checkout and prints the marker its logs are scraped for.
@@ -75,7 +111,7 @@ pub struct TurnOpts {
     /// The issue's confirmed tier (The confirmed tier), rendered into the scope wrapper's
     /// `crucible scope --propose --tier …`. `None` (or a rank turn) emits no flag, the engine
     /// defaults to t0.
-    pub tier: Option<crate::scope::ProposeTier>,
+    pub tier: Option<ProposeTier>,
     /// Max gaming-review concern→refine→re-review cycles, rendered into the scope wrapper's
     /// `crucible scope --propose --gaming-refine-rounds …`. Ignored by a rank turn.
     pub gaming_refine_rounds: u32,
@@ -692,7 +728,7 @@ mod tests {
                 sandbox_image: "registry.example.com/epp-sandbox:latest".to_string(),
                 max_cost: 8.0,
                 pin_digests: false,
-                tier: Some(crate::scope::ProposeTier::T1),
+                tier: Some(ProposeTier::T1),
                 gaming_refine_rounds: 3,
                 skip_gaming_review: false,
                 authoritative: false,

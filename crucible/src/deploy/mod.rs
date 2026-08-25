@@ -13,7 +13,9 @@ mod controller;
 pub(crate) mod profile;
 mod render;
 
-pub use render::{MANAGED_BY_LABEL, PackDelivery, PlaybookLaunch, RenderOpts, TurnKind, TurnOpts};
+pub use render::{
+    MANAGED_BY_LABEL, PackDelivery, PlaybookLaunch, ProposeTier, RenderOpts, TurnKind, TurnOpts,
+};
 
 use crate::manifest::{self, CompositeManifest, Manifest};
 use anyhow::{Context, Result};

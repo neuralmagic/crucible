@@ -2,6 +2,7 @@ use crate::Paths;
 use crate::activity::ActivityFeed;
 use crate::agent::{self, AgentBackend, TurnOutcome};
 use crate::check::{self, CheckOutcome};
+use crate::deploy::ProposeTier;
 use crate::event::{AgentEvent, RawStream};
 use crate::identity::{self, RunIdentity};
 use crate::init::MANIFEST_FILE;
@@ -27,42 +28,6 @@ const SCOPE_PROPOSE_PROMPT: &str = include_str!("../prompts/scope-propose.md");
 const GOAL_CONTRACT: &str = include_str!("../prompts/scope-goal-contract.md");
 const GOAL_CONTRACT_AUTHORITATIVE: &str =
     include_str!("../prompts/scope-goal-contract-authoritative.md");
-
-/// The confirmed tier a propose turn drafts against: threaded from the controller's ranker verdict
-/// (`--tier t0|t1`) into the prompt's `{{TIER}}` slot, so the agent follows the right section of
-/// `scope-propose.md` instead of guessing.
-/// `T0` is the engine default when the flag is absent, every call site predating this flag never set
-/// it, and a bare `crucible scope --propose` (no controller in front of it) should keep behaving exactly
-/// as before.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
-pub enum ProposeTier {
-    #[default]
-    #[value(name = "t0")]
-    T0,
-    #[value(name = "t1")]
-    T1,
-}
-
-impl ProposeTier {
-    /// The `{{TIER}}` spelling the prompt substitutes, matches the ranker/DB vocabulary
-    /// (`Tier::as_str` in the controller crate) so a human reading the rendered prompt recognizes
-    /// it as the same tier the ledger shows.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ProposeTier::T0 => "T0",
-            ProposeTier::T1 => "T1",
-        }
-    }
-
-    /// The `--tier` CLI spelling (the clap `#[value(name)]`s above), what the turn-pod wrapper
-    /// renders into its `crucible scope --propose --tier …` invocation.
-    pub fn cli_value(self) -> &'static str {
-        match self {
-            ProposeTier::T0 => "t0",
-            ProposeTier::T1 => "t1",
-        }
-    }
-}
 
 /// Why a scope stage refused. The [`Stage`] trait stays `anyhow`-typed (stages are
 /// heterogeneous and each carries its own plumbing errors); these are the pipeline's own

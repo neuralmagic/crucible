@@ -21,4 +21,4 @@ mod turn;
 
 pub use kube::{MANAGED_BY_LABEL, PackDelivery, PlaybookLaunch, RenderInput, RenderOpts, render};
 pub(in crate::deploy) use kube::{node_avoid_affinity, role_binding};
-pub use turn::{TurnKind, TurnOpts, render_turn};
+pub use turn::{ProposeTier, TurnKind, TurnOpts, render_turn};
