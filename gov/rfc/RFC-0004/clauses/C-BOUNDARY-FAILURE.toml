@@ -8,8 +8,11 @@ status = "active"
 
 [content]
 text = """
-A failure at the controller-engine boundary (a refused request, a rejected contract version, an undecodable reply, a render that errors) MUST be recorded on the issue or run ledger with the request kind, the controller and engine contract versions, and the engine's own error text. It MUST NOT be reduced to a generic "produced no result" outcome.
+A failure at the controller-engine boundary MUST be recorded on the issue or run ledger with the request kind, the dispatch image or linked engine revision involved, the controller and engine contract versions, and the engine's own error text. It MUST NOT be reduced to a generic no-result outcome; the ledger entry alone MUST be enough to tell what was sent and why it was refused.
 
-A boundary failure MUST NOT be retried automatically: the same request against the same engine cannot succeed, and a retry hides the fault behind a moving timestamp.
+Boundary failures are of two kinds, and the ledger entry MUST say which:
 
-Rationale: the motivating failure was visible only to someone who read the raw ledger event; the summary said nothing, and the item stayed in its initial state as if never attempted."""
+- **contract rejections** are deterministic: a rejected contract version, an unknown field, a render option the engine does not define, a reply the controller cannot decode because its shape is wrong. The same request against the same engine cannot succeed, so a contract rejection MUST NOT be retried automatically.
+- **transport failures** are not: a process killed before it replied, a truncated reply, an I/O error reading or writing the request document. These MAY be retried under the retry policy that already governs the launch in question, and the retry MUST be ledgered as a retry, not as a fresh attempt.
+
+Rationale: the motivating failure was visible only to someone who read the raw ledger event; the summary said nothing, and the item stayed in its initial state as if never attempted. Retrying a deterministic rejection would have hidden the same fault behind a moving timestamp."""
