@@ -1,4 +1,5 @@
-//! `crucible --contract-version` prints the crate constant the runtime image is labelled with.
+//! `crucible --contract-version` prints the crate constant the runtime image is labelled with,
+//! and that constant moves whenever any per-document wire version does.
 
 use std::process::Command;
 
@@ -26,4 +27,23 @@ fn contract_version_is_semver() {
         .map(|p| p.parse().expect("numeric semver component"))
         .collect();
     assert_eq!(parts.len(), 3, "{}", crucible_contract::CONTRACT_VERSION);
+}
+
+#[test]
+fn wire_versions_are_pinned_to_contract_version() {
+    use crucible_contract::{
+        ADMISSION_WIRE_VERSION, CONTRACT_VERSION, IDENTITY_FORMAT_VERSION, SCHEMA_VERSION,
+        WIRE_VERSION,
+    };
+    let wire = (
+        SCHEMA_VERSION,
+        ADMISSION_WIRE_VERSION,
+        WIRE_VERSION,
+        IDENTITY_FORMAT_VERSION,
+    );
+    assert_eq!(
+        (CONTRACT_VERSION, wire),
+        ("1.0.0", (1, 1, 1, "v2")),
+        "a wire version changed without bumping CONTRACT_VERSION"
+    );
 }

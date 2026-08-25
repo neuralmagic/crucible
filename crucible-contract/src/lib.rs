@@ -34,7 +34,9 @@ pub use artifact::{
 pub use ask::{Ask, AskKey, AskKeyError};
 pub use envelope::{Envelope, EnvelopeKind, SCHEMA_VERSION, TERMINATION_MESSAGE_CAP, Usage};
 pub use event::{AgentEvent, ModelUsage, RawStream, Tokens};
-pub use identity::{ComponentIdentity, RigIdentity, RunIdentity};
+pub use identity::{
+    ComponentIdentity, FORMAT_VERSION as IDENTITY_FORMAT_VERSION, RigIdentity, RunIdentity,
+};
 pub use markers::{
     ENV_INGEST_TOKEN_PATH, ENV_INGEST_URL, ENV_POD_NAME, INGEST_POD_NAME_CLAIM,
     INGEST_TOKEN_AUDIENCE, MANAGED_BY_KEY, MANAGED_BY_SELECTOR, MANAGED_BY_VALUE,
