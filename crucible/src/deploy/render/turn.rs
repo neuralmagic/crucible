@@ -151,6 +151,7 @@ impl TurnOpts {
             issue: issue.into(),
             goal_text: None,
             repo_url: repo_url.into(),
+            repo_ref: None,
             sandbox_image: sandbox_image.into(),
             max_cost: 0.0,
             digests: None,
