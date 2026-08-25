@@ -252,7 +252,9 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                     repo_url: a.repo_url,
                     sandbox_image: a.sandbox_image,
                     max_cost: a.max_cost,
-                    pin_digests: !a.no_pin,
+                    digests: (!a.no_pin).then(|| {
+                        Box::new(deploy::RegistryDigests) as Box<dyn deploy::DigestResolver>
+                    }),
                     tier: a.tier,
                     gaming_refine_rounds: a.gaming_refine_rounds,
                     skip_gaming_review: a.skip_gaming_review,
@@ -285,7 +287,8 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
         let opts = deploy::RenderOpts {
             iterations: args.iterations,
             max_cost: args.max_cost,
-            pin_digests: !args.no_pin,
+            digests: (!args.no_pin)
+                .then(|| Box::new(deploy::RegistryDigests) as Box<dyn deploy::DigestResolver>),
             pr_repo: args.pr_repo.clone(),
             pack,
             clusters_file: args.clusters.clone(),

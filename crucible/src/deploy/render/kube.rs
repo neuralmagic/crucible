@@ -1,4 +1,5 @@
 use crate::deploy::profile::DeployProfile;
+use crate::deploy::render::{DigestResolver, pin_image};
 use crate::manifest::{AgentCfg, CompositeManifest, DeployCfg, Manifest, MeasureCfg};
 use crate::openshell::gateway::{
     CLIENT_TLS_SECRET, ComputeDriver, GATEWAY_PORT, OTEL_COLLECTOR_PORT,
@@ -99,9 +100,9 @@ pub struct RenderOpts {
     /// controller passes its `run_max_cost` knob so a dispatched run has a real budget; a manual
     /// render defaults to 0.
     pub max_cost: f64,
-    /// Resolve image tags to `@sha256:…` via the in-process registry client (the footgun fix). Off
-    /// emits the tag verbatim, for an air-gapped render where the registry isn't reachable.
-    pub pin_digests: bool,
+    /// Resolve image tags to `@sha256:…` through this resolver (the footgun fix). `None` emits the
+    /// tag verbatim, for an air-gapped render where the registry isn't reachable.
+    pub digests: Option<Box<dyn DigestResolver>>,
     /// Publish-on-keep single-repo fork (`owner/repo`): the loop opens its kept-commits draft PR here.
     /// The controller passes its per-repo default so a dispatched run publishes; a manual render leaves
     /// it `None` (no `--pr-repo`, so `crucible run` opens no PR unless the manifest's `[publish] pr_repo`
@@ -264,12 +265,11 @@ pub fn render(
     profile: &DeployProfile,
     opts: &RenderOpts,
 ) -> Result<String> {
-    let image = if opts.pin_digests {
-        forge::oci::pin_digest(&profile.image.loop_image, None)
-            .with_context(|| format!("pinning loop image {}", profile.image.loop_image))?
-    } else {
-        profile.image.loop_image.clone()
-    };
+    let image = pin_image(
+        opts.digests.as_deref(),
+        "loop image",
+        &profile.image.loop_image,
+    )?;
     // The loop image bakes the domain pack at its DIRECTORY name, which is
     // not the composite's `[composite].name` (an issue overlay may rename it). The wrapper resolves
     // `<domains_root>/<domain-dir>`.
@@ -1789,7 +1789,7 @@ mod tests {
             &RenderOpts {
                 iterations: 1,
                 max_cost: 0.0,
-                pin_digests: false,
+                digests: None,
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
@@ -1948,7 +1948,7 @@ mod tests {
                 &RenderOpts {
                     iterations: 1,
                     max_cost: 0.0,
-                    pin_digests: false,
+                    digests: None,
                     pr_repo: pr_repo.map(str::to_string),
                     pack: None,
                     clusters_file: None,
@@ -1993,7 +1993,7 @@ mod tests {
                 &RenderOpts {
                     iterations: 1,
                     max_cost: 0.0,
-                    pin_digests: false,
+                    digests: None,
                     pr_repo: None,
                     pack: None,
                     clusters_file: None,
@@ -2034,7 +2034,7 @@ mod tests {
             &RenderOpts {
                 iterations: 1,
                 max_cost: 0.0,
-                pin_digests: false,
+                digests: None,
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
@@ -2149,7 +2149,7 @@ mod tests {
             &RenderOpts {
                 iterations: 1,
                 max_cost: 0.0,
-                pin_digests: false,
+                digests: None,
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
@@ -2267,7 +2267,7 @@ mod tests {
             &RenderOpts {
                 iterations: 1,
                 max_cost: 0.0,
-                pin_digests: false,
+                digests: None,
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
@@ -2324,7 +2324,7 @@ mod tests {
             &RenderOpts {
                 iterations: 1,
                 max_cost: 0.0,
-                pin_digests: false,
+                digests: None,
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
@@ -2514,7 +2514,7 @@ mod tests {
             &RenderOpts {
                 iterations: 7,
                 max_cost: 25.0,
-                pin_digests: false,
+                digests: None,
                 pr_repo: None,
                 pack: Some(PackDelivery {
                     configmap_name: "crucible-run-llm-d-1650-pack".to_string(),
@@ -2591,7 +2591,7 @@ mod tests {
             &RenderOpts {
                 iterations: 1,
                 max_cost: 0.0,
-                pin_digests: false,
+                digests: None,
                 pr_repo: None,
                 pack: Some(PackDelivery {
                     configmap_name: "pack-cm-name".to_string(),
@@ -2679,7 +2679,7 @@ mod tests {
             &RenderOpts {
                 iterations: 1,
                 max_cost: 0.0,
-                pin_digests: false,
+                digests: None,
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
@@ -2704,7 +2704,7 @@ mod tests {
                 repo_url: "https://github.com/owner/repo.git".to_string(),
                 sandbox_image: "registry.example.com/alpha-sandbox:latest".to_string(),
                 max_cost: 5.0,
-                pin_digests: false,
+                digests: None,
                 tier: None,
                 gaming_refine_rounds: 1,
                 skip_gaming_review: false,
@@ -2772,7 +2772,7 @@ mod tests {
             &RenderOpts {
                 iterations: 1,
                 max_cost: 0.0,
-                pin_digests: false,
+                digests: None,
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
@@ -2882,7 +2882,7 @@ mod tests {
             &RenderOpts {
                 iterations: 1,
                 max_cost: 0.0,
-                pin_digests: false,
+                digests: None,
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
@@ -2997,7 +2997,7 @@ mod tests {
             &RenderOpts {
                 iterations: 1,
                 max_cost: 0.0,
-                pin_digests: false,
+                digests: None,
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
@@ -3048,7 +3048,7 @@ mod tests {
             &RenderOpts {
                 iterations: 1,
                 max_cost: 0.0,
-                pin_digests: false,
+                digests: None,
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
@@ -3153,7 +3153,7 @@ mod tests {
             &RenderOpts {
                 iterations: 1,
                 max_cost: 0.0,
-                pin_digests: false,
+                digests: None,
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
@@ -3339,7 +3339,7 @@ mod tests {
             &RenderOpts {
                 iterations: 1,
                 max_cost: 0.0,
-                pin_digests: false,
+                digests: None,
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
@@ -3970,7 +3970,7 @@ mod tests {
             &RenderOpts {
                 iterations: 1,
                 max_cost: 0.0,
-                pin_digests: false,
+                digests: None,
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
@@ -4176,7 +4176,7 @@ mod tests {
             &RenderOpts {
                 iterations: 1,
                 max_cost: 0.0,
-                pin_digests: false,
+                digests: None,
                 pr_repo: None,
                 pack: Some(PackDelivery {
                     configmap_name: "alpha-pack".to_string(),

@@ -11,7 +11,9 @@
 //! `ControllerCfg` (env-fallback) reads.
 
 use crate::deploy::profile::{ControllerCfg, DeployProfile};
-use crate::deploy::render::{MANAGED_BY_LABEL, RenderOpts, node_avoid_affinity, role_binding};
+use crate::deploy::render::{
+    MANAGED_BY_LABEL, RenderOpts, node_avoid_affinity, pin_image, role_binding,
+};
 use anyhow::{Context, Result};
 use k8s_openapi::api::apps::v1 as apps;
 use k8s_openapi::api::core::v1 as core;
@@ -46,12 +48,7 @@ pub struct MissingControllerTable;
 pub fn render(profile: &DeployProfile, opts: &RenderOpts) -> Result<String> {
     let cfg = profile.controller.as_ref().ok_or(MissingControllerTable)?;
 
-    let image = if opts.pin_digests {
-        forge::oci::pin_digest(&cfg.image, None)
-            .with_context(|| format!("pinning controller image {}", cfg.image))?
-    } else {
-        cfg.image.clone()
-    };
+    let image = pin_image(opts.digests.as_deref(), "controller image", &cfg.image)?;
 
     let mut docs = vec![
         serde_norway::to_string(&pvc(profile, cfg)).context("serializing the state PVC")?,
@@ -348,7 +345,7 @@ mod tests {
             &RenderOpts {
                 iterations: 1,
                 max_cost: 0.0,
-                pin_digests: false,
+                digests: None,
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
@@ -428,7 +425,7 @@ mod tests {
             &RenderOpts {
                 iterations: 1,
                 max_cost: 0.0,
-                pin_digests: false,
+                digests: None,
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
@@ -471,7 +468,7 @@ mod tests {
             &RenderOpts {
                 iterations: 1,
                 max_cost: 0.0,
-                pin_digests: false,
+                digests: None,
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,

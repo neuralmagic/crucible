@@ -14,7 +14,8 @@ pub(crate) mod profile;
 mod render;
 
 pub use render::{
-    MANAGED_BY_LABEL, PackDelivery, PlaybookLaunch, ProposeTier, RenderOpts, TurnKind, TurnOpts,
+    DigestResolver, MANAGED_BY_LABEL, PackDelivery, PlaybookLaunch, ProposeTier, RegistryDigests,
+    RenderOpts, TurnKind, TurnOpts,
 };
 
 use crate::manifest::{self, CompositeManifest, Manifest};

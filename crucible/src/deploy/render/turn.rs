@@ -3,6 +3,7 @@ use crate::deploy::render::kube::{
     FORGE_STORAGE_ROOT, INGEST_TOKEN_DIR, INGEST_TOKEN_TTL_SECS, INGEST_TOKEN_VOLUME,
     PULL_AUTHFILE_PATH, kubernetes_sandbox_env, node_avoid_affinity, resources, secret_env_vars,
 };
+use crate::deploy::render::{DigestResolver, pin_image};
 use crate::openshell::gateway::ComputeDriver;
 use anyhow::{Context, Result};
 use k8s_openapi::api::core::v1 as core;
@@ -106,8 +107,8 @@ pub struct TurnOpts {
     pub sandbox_image: String,
     /// Cap on the turn's cost in USD.
     pub max_cost: f64,
-    /// Resolve image tags to `@sha256:…` at render time (off for an air-gapped render).
-    pub pin_digests: bool,
+    /// Resolve image tags to `@sha256:…` through this resolver; `None` for an air-gapped render.
+    pub digests: Option<Box<dyn DigestResolver>>,
     /// The issue's confirmed tier (The confirmed tier), rendered into the scope wrapper's
     /// `crucible scope --propose --tier …`. `None` (or a rank turn) emits no flag, the engine
     /// defaults to t0.
@@ -164,18 +165,16 @@ pub const SCOPE_WORK_KIND: &str = "scope";
 /// driver: `false` under podman (no API calls), `true` under kubernetes (the in-pod gateway needs
 /// the token to reach the API server for Sandbox CRs).
 pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
-    let image = if opts.pin_digests {
-        forge::oci::pin_digest(&profile.image.loop_image, None)
-            .with_context(|| format!("pinning loop image {}", profile.image.loop_image))?
-    } else {
-        profile.image.loop_image.clone()
-    };
-    let sandbox_image = if opts.pin_digests {
-        forge::oci::pin_digest(&opts.sandbox_image, None)
-            .with_context(|| format!("pinning turn sandbox image {}", opts.sandbox_image))?
-    } else {
-        opts.sandbox_image.clone()
-    };
+    let image = pin_image(
+        opts.digests.as_deref(),
+        "loop image",
+        &profile.image.loop_image,
+    )?;
+    let sandbox_image = pin_image(
+        opts.digests.as_deref(),
+        "turn sandbox image",
+        &opts.sandbox_image,
+    )?;
 
     let mut env = secret_env_vars(profile);
     let plain = |name: &str, value: String| core::EnvVar {
@@ -487,7 +486,7 @@ mod tests {
                 repo_url: "https://github.com/owner/repo.git".to_string(),
                 sandbox_image: "registry.example.com/epp-sandbox:latest".to_string(),
                 max_cost: 5.0,
-                pin_digests: false,
+                digests: None,
                 tier: None,
                 gaming_refine_rounds: 1,
                 skip_gaming_review: false,
@@ -583,7 +582,7 @@ mod tests {
                 repo_url: "https://github.com/owner/repo.git".to_string(),
                 sandbox_image: "registry.example.com/epp-sandbox:latest".to_string(),
                 max_cost: 5.0,
-                pin_digests: false,
+                digests: None,
                 tier: None,
                 gaming_refine_rounds: 1,
                 skip_gaming_review: false,
@@ -662,7 +661,7 @@ mod tests {
                 repo_url: "https://github.com/owner/repo.git".to_string(),
                 sandbox_image: "registry.example.com/epp-sandbox:latest".to_string(),
                 max_cost: 5.0,
-                pin_digests: false,
+                digests: None,
                 tier: None,
                 gaming_refine_rounds: 1,
                 skip_gaming_review: false,
@@ -727,7 +726,7 @@ mod tests {
                 repo_url: "https://github.com/owner/repo.git".to_string(),
                 sandbox_image: "registry.example.com/epp-sandbox:latest".to_string(),
                 max_cost: 8.0,
-                pin_digests: false,
+                digests: None,
                 tier: Some(ProposeTier::T1),
                 gaming_refine_rounds: 3,
                 skip_gaming_review: false,
@@ -817,7 +816,7 @@ mod tests {
                 repo_url: "https://github.com/owner/repo.git".to_string(),
                 sandbox_image: "registry.example.com/epp-sandbox:latest".to_string(),
                 max_cost: 8.0,
-                pin_digests: false,
+                digests: None,
                 tier: None,
                 gaming_refine_rounds: 1,
                 skip_gaming_review: false,
@@ -872,7 +871,7 @@ mod tests {
                 repo_url: "https://github.com/owner/repo.git".to_string(),
                 sandbox_image: "registry.example.com/epp-sandbox:latest".to_string(),
                 max_cost: 8.0,
-                pin_digests: false,
+                digests: None,
                 tier: None,
                 gaming_refine_rounds: 1,
                 skip_gaming_review: false,
@@ -917,7 +916,7 @@ mod tests {
                 repo_url: "https://github.com/owner/repo.git".to_string(),
                 sandbox_image: "registry.example.com/epp-sandbox:latest".to_string(),
                 max_cost: 8.0,
-                pin_digests: false,
+                digests: None,
                 tier: None,
                 gaming_refine_rounds: 2,
                 skip_gaming_review: true,
@@ -970,7 +969,7 @@ mod tests {
             repo_url: "https://github.com/owner/repo.git".to_string(),
             sandbox_image: "registry.example.com/epp-sandbox:latest".to_string(),
             max_cost: 5.0,
-            pin_digests: false,
+            digests: None,
             tier: None,
             gaming_refine_rounds: 1,
             skip_gaming_review: false,
