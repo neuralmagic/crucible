@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use k8s_openapi::api::core::v1 as core;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 #[derive(Debug, thiserror::Error)]
 #[error("unknown --turn-kind `{got}` (expected `rank` or `scope`)")]
@@ -88,6 +89,8 @@ impl ProposeTier {
 /// Options for [`render_turn`]: a single one-shot agent-turn pod (WorkPod
 /// primitive). Unlike the loop pod it runs no manifest, the wrapper clones `repo_url`, then runs
 /// the kind-specific command over that checkout and prints the marker its logs are scraped for.
+/// [`TurnOpts::new`] takes the fields every turn needs; the rest default to "no flag".
+#[derive(Clone)]
 pub struct TurnOpts {
     /// What the turn pod does (rank vs scope), governing the wrapper command + the work-kind label.
     pub kind: TurnKind,
@@ -108,7 +111,7 @@ pub struct TurnOpts {
     /// Cap on the turn's cost in USD.
     pub max_cost: f64,
     /// Resolve image tags to `@sha256:…` through this resolver; `None` for an air-gapped render.
-    pub digests: Option<Box<dyn DigestResolver>>,
+    pub digests: Option<Arc<dyn DigestResolver>>,
     /// The issue's confirmed tier (The confirmed tier), rendered into the scope wrapper's
     /// `crucible scope --propose --tier …`. `None` (or a rank turn) emits no flag, the engine
     /// defaults to t0.
@@ -130,6 +133,33 @@ pub struct TurnOpts {
     /// The model the in-pod turn runs, rendered as `--model <m>` into both wrapper commands.
     /// `None` emits no flag, the in-pod engine derives the model from the resolved harness.
     pub model: Option<String>,
+}
+
+impl TurnOpts {
+    pub fn new(
+        kind: TurnKind,
+        name: impl Into<String>,
+        issue: impl Into<String>,
+        repo_url: impl Into<String>,
+        sandbox_image: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind,
+            name: name.into(),
+            issue: issue.into(),
+            goal_text: None,
+            repo_url: repo_url.into(),
+            sandbox_image: sandbox_image.into(),
+            max_cost: 0.0,
+            digests: None,
+            tier: None,
+            gaming_refine_rounds: 0,
+            skip_gaming_review: false,
+            authoritative: false,
+            harness: None,
+            model: None,
+        }
+    }
 }
 
 /// Render an optional `--harness <h>` wrapper flag. The value is clap's own `ValueEnum` name, so

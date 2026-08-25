@@ -16,6 +16,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 
 #[derive(Debug, thiserror::Error)]
 #[error(
@@ -91,7 +92,9 @@ const SANDBOX_NAME_HASH_LABEL: &str = "agents.x-k8s.io/sandbox-name-hash";
 /// the right `hostAliases` on sandbox pods.
 pub(super) const POD_IP_ENV: &str = "CRUCIBLE_POD_IP";
 
-/// Options that vary per render invocation (not per cluster).
+/// Options that vary per render invocation (not per cluster). `Default` is a manual
+/// `crucible deploy render`: one iteration, no budget, no pin, baked domain, the loop.
+#[derive(Clone)]
 pub struct RenderOpts {
     /// Agent iterations the wrapper runs. The controller passes its `run_iterations` knob; a manual
     /// `crucible deploy render` defaults to 1.
@@ -102,7 +105,7 @@ pub struct RenderOpts {
     pub max_cost: f64,
     /// Resolve image tags to `@sha256:…` through this resolver (the footgun fix). `None` emits the
     /// tag verbatim, for an air-gapped render where the registry isn't reachable.
-    pub digests: Option<Box<dyn DigestResolver>>,
+    pub digests: Option<Arc<dyn DigestResolver>>,
     /// Publish-on-keep single-repo fork (`owner/repo`): the loop opens its kept-commits draft PR here.
     /// The controller passes its per-repo default so a dispatched run publishes; a manual render leaves
     /// it `None` (no `--pr-repo`, so `crucible run` opens no PR unless the manifest's `[publish] pr_repo`
@@ -131,7 +134,24 @@ pub struct RenderOpts {
     pub playbook: Option<PlaybookLaunch>,
 }
 
+impl Default for RenderOpts {
+    fn default() -> Self {
+        Self {
+            iterations: 1,
+            max_cost: 0.0,
+            digests: None,
+            pr_repo: None,
+            pack: None,
+            clusters_file: None,
+            harness: None,
+            model: None,
+            playbook: None,
+        }
+    }
+}
+
 /// The knobs the controller supplies for a pack render (see [`RenderOpts::pack`]).
+#[derive(Debug, Clone)]
 pub struct PackDelivery {
     /// The ConfigMap object name, the controller owns it (run-unique, derived from the pod name), and
     /// it is used for BOTH the emitted ConfigMap's `metadata.name` AND the pod volume that references
@@ -141,7 +161,7 @@ pub struct PackDelivery {
 }
 
 /// The knobs a playbook launch supplies (see [`RenderOpts::playbook`]).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PlaybookLaunch {
     pub max_time: crate::duration::MaxTime,
     pub max_cost: f64,

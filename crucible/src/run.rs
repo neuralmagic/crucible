@@ -17,6 +17,7 @@ use anyhow::{Context, Result};
 use crucible::crucible::{Judge, World};
 use crucible_vcs::vcs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 /// The run layer's own failures: CLI-flag combinations the parser can't express, workspace
@@ -258,7 +259,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                     sandbox_image: a.sandbox_image,
                     max_cost: a.max_cost,
                     digests: (!a.no_pin).then(|| {
-                        Box::new(deploy::RegistryDigests) as Box<dyn deploy::DigestResolver>
+                        Arc::new(deploy::RegistryDigests) as Arc<dyn deploy::DigestResolver>
                     }),
                     tier: a.tier,
                     gaming_refine_rounds: a.gaming_refine_rounds,
@@ -293,7 +294,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
             iterations: args.iterations,
             max_cost: args.max_cost,
             digests: (!args.no_pin)
-                .then(|| Box::new(deploy::RegistryDigests) as Box<dyn deploy::DigestResolver>),
+                .then(|| Arc::new(deploy::RegistryDigests) as Arc<dyn deploy::DigestResolver>),
             pr_repo: args.pr_repo.clone(),
             pack,
             clusters_file: args.clusters.clone(),
