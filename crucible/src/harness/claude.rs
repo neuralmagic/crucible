@@ -8,7 +8,6 @@ use crate::harness::{SeedFile, TurnArtifacts, append_manifest_env};
 use crate::turn_trace::GenAiRecord;
 use std::time::Duration;
 
-/// The default Vertex Claude model (`[agent].model` / `--model` when unset).
 /// Binaries always allowed to open egress for a claude sandbox turn.
 pub(crate) const DEFAULT_BINARIES: &[&str] = &["/usr/local/bin/claude", "/usr/local/bin/opencode"];
 

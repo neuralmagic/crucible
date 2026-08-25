@@ -22,7 +22,6 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
-/// The default model when neither the CLI nor the manifest names one.
 /// The codex CLI's path in the sandbox image.
 pub(crate) const DEFAULT_BINARIES: &[&str] = &["/usr/local/bin/codex"];
 

@@ -43,7 +43,7 @@ struct Calls {
 /// Whether to scrub credential-shaped fragments from span hints. Defaults ON; set
 /// `CRUCIBLE_TURN_TRACE_REDACT` to `0`/`false`/`off` to disable it (e.g. when the harness already
 /// sanitizes tool inputs and the extra scrub just muddies the trace).
-/// `pub(crate)` so the hermes reader defaults to the same toggle.
+/// `pub` so the hermes reader defaults to the same toggle.
 pub fn redact_enabled() -> bool {
     !matches!(
         std::env::var("CRUCIBLE_TURN_TRACE_REDACT").ok().as_deref(),
@@ -421,7 +421,7 @@ impl HintField {
 
 /// The sanitized one-line input hint for a tool: the [`HintField`] value, redacted (when `redact`)
 /// then truncated (see [`redact`]). Empty when the tool has no hint field or the field is absent.
-/// `pub(crate)` so the hermes reader synthesizes span hints through the same whitelist.
+/// `pub` so the hermes reader synthesizes span hints through the same whitelist.
 pub fn summarize_input(name: &str, input: Option<&Value>, redact: bool) -> String {
     let Some(field) = HintField::for_tool(name) else {
         return String::new();
@@ -452,7 +452,7 @@ const SECRET_MARKERS: [&str; 5] = ["TOKEN", "KEY", "SECRET", "PASSWORD", "PASSWD
 /// - URL userinfo `scheme://user:pass@host` → `scheme://***@host`
 ///
 /// Whitespace runs collapse to single spaces, this is a display hint, not a replayable command.
-/// `pub(crate)` so the hermes reader scrubs its tool-result bodies through the same gate.
+/// `pub` so the hermes reader scrubs its tool-result bodies through the same gate.
 pub fn redact(s: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut mask_next = 0u8; // pending Authorization-value tokens to mask
@@ -536,7 +536,7 @@ fn redact_url_userinfo(token: &str) -> String {
 
 /// Truncate to at most `cap` chars, appending an ellipsis when clipped. `char_indices` keeps the
 /// cut on a char boundary (std's `String::truncate` is byte-indexed and panics off-boundary).
-/// `pub(crate)` so the hermes reader caps its span hints identically.
+/// `pub` so the hermes reader caps its span hints identically.
 pub fn truncate(s: &str, cap: usize) -> String {
     match s.char_indices().nth(cap) {
         Some((i, _)) => format!("{}…", &s[..i]),
@@ -545,7 +545,7 @@ pub fn truncate(s: &str, cap: usize) -> String {
 }
 
 /// Parse an RFC3339 transcript timestamp into a `SystemTime` via jiff, `None` when unparseable.
-/// `pub(crate)` so the codex rollout reader dates its spans the same way.
+/// `pub` so the codex rollout reader dates its spans the same way.
 pub fn parse_ts(s: &str) -> Option<SystemTime> {
     s.parse::<Timestamp>().ok().map(SystemTime::from)
 }

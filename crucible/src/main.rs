@@ -325,7 +325,6 @@ pub(crate) enum Cmd {
     Flow(FlowArgs),
 }
 
-/// `crucible plan <show|run>`: compile and inspect a plan, or execute one.
 /// `crucible flow`: post-hoc run explainability, a file-to-file fold over the session log (see
 /// [`flow::render`]).
 #[derive(clap::Args)]
@@ -351,6 +350,7 @@ pub(crate) struct FlowArgs {
     pub out: PathBuf,
 }
 
+/// `crucible plan <show|run>`: compile and inspect a plan, or execute one.
 #[derive(clap::Subcommand)]
 pub(crate) enum PlanAction {
     /// Compile `workflow.star`; optionally materialize it into a manifest.
