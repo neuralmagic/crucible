@@ -2702,6 +2702,7 @@ mod tests {
                 issue: "owner/repo#42".to_string(),
                 goal_text: None,
                 repo_url: "https://github.com/owner/repo.git".to_string(),
+                repo_ref: None,
                 sandbox_image: "registry.example.com/alpha-sandbox:latest".to_string(),
                 max_cost: 5.0,
                 pin_digests: false,
