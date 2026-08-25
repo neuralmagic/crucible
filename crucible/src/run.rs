@@ -9,9 +9,9 @@ use crate::errors::FileError;
 use crate::harness::HarnessRuntime;
 use crate::loop_driver::{LoopRuntime, run_loop};
 use crate::recovery::{RecoveryPlan, ResumeRecovery, classify_session, plan_recovery};
-use crate::{Args, Cli, Cmd, Paths, Prepared, STOP, Ui};
+use crate::{Args, Cli, Cmd, FlowArgs, Paths, Prepared, STOP, Ui};
 use crate::{
-    agent, broker, check, console, control, deploy, init, manifest, publish, reporter, scope,
+    agent, broker, check, console, control, deploy, flow, init, manifest, publish, reporter, scope,
     stream,
 };
 use anyhow::{Context, Result};
@@ -158,7 +158,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
     }
     // Pure file-to-file fold: no engine runtime, no workspace.
     if let Some(Cmd::Flow(args)) = &cli.command {
-        return crate::flow::run(args);
+        return flow_cmd(args);
     }
     if let Some(Cmd::Fetch { uri, out }) = &cli.command {
         // The engine runtime the S3 GetObject block_ons on (published for `publish::fetch_object`).
@@ -322,6 +322,41 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
     // exits via `process::exit`), so the runtime stays alive under the loop.
     let _engine = crate::engine::EngineCtx::new()?;
     run_from_manifest(cli.run)
+}
+
+/// `crucible flow`: gather the inputs (the session log, the span export from a file or Datadog),
+/// render, and write `--out`.
+fn flow_cmd(args: &FlowArgs) -> Result<()> {
+    let session_log = std::fs::read_to_string(&args.session)
+        .with_context(|| format!("reading {}", args.session.display()))?;
+    // clap rejects --spans + --dd-trace together, so at most one arm produces spans.
+    let spans_json = match (&args.spans, &args.dd_trace) {
+        (Some(p), _) => {
+            Some(std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?)
+        }
+        (None, Some(trace_id)) => Some(crate::flow_dd::fetch_trace_spans(
+            trace_id,
+            &args.dd_window,
+        )?),
+        (None, None) => None,
+    };
+    let ext = args
+        .out
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default();
+    let format = flow::FlowFormat::from_extension(ext)?;
+    let rendered = flow::render(
+        &flow::FlowInput {
+            session_log,
+            spans_json,
+        },
+        format,
+    )?;
+    std::fs::write(&args.out, rendered)
+        .with_context(|| format!("writing {}", args.out.display()))?;
+    println!("[crucible flow] wrote {}", args.out.display());
+    Ok(())
 }
 
 /// Fold `--playbook`'s flags into the renderer's launch knobs. clap enforces the flag

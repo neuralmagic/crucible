@@ -310,10 +310,35 @@ pub(crate) enum Cmd {
     /// export) into a small flow-model IR and emit it as `.json` (the IR itself), `.dot`
     /// (Graphviz run overview), `.mmd` (mermaid flowchart), or `.html` (self-contained
     /// explainer page) — picked by the `--out` extension.
-    Flow(flow::FlowArgs),
+    Flow(FlowArgs),
 }
 
 /// `crucible plan <show|run>`: compile and inspect a plan, or execute one.
+/// `crucible flow`: post-hoc run explainability, a file-to-file fold over the session log (see
+/// [`flow::render`]).
+#[derive(clap::Args)]
+pub(crate) struct FlowArgs {
+    /// The run's session log (`state/session.jsonl`).
+    #[arg(long)]
+    pub session: PathBuf,
+    /// Datadog span export for the same run (spans API v2 objects, a JSON array or
+    /// `{"data": [...]}`). Optional: adds real timings and the per-tool-call timeline.
+    #[arg(long, conflicts_with = "dd_trace")]
+    pub spans: Option<PathBuf>,
+    /// Fetch the span export straight from the Datadog API for this trace id instead
+    /// of a `--spans` file. Needs `DD_API_KEY` + `DD_APP_KEY` in the environment
+    /// (`DD_SITE` for a non-US1 org).
+    #[arg(long)]
+    pub dd_trace: Option<String>,
+    /// How far back the `--dd-trace` search looks (a Datadog duration: `48h`, `7d`).
+    #[arg(long, default_value = "48h")]
+    pub dd_window: String,
+    /// Output path; the extension picks the format: `.json` (the IR), `.dot`, `.mmd`,
+    /// `.html` (self-contained explainer page).
+    #[arg(long)]
+    pub out: PathBuf,
+}
+
 #[derive(clap::Subcommand)]
 pub(crate) enum PlanAction {
     /// Compile `workflow.star`; optionally materialize it into a manifest.
@@ -951,5 +976,53 @@ mod tests {
             Some("1800s")
         );
         assert_eq!(args.params, vec!["topic=attention sinks", "depth=--deep"]);
+    }
+
+    #[test]
+    fn spans_and_dd_trace_are_mutually_exclusive() {
+        let err = Cli::try_parse_from([
+            "crucible",
+            "flow",
+            "--session",
+            "s.jsonl",
+            "--spans",
+            "x.json",
+            "--dd-trace",
+            "abc123",
+            "--out",
+            "f.html",
+        ])
+        .err()
+        .expect("--spans + --dd-trace must be rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        let cli = Cli::try_parse_from([
+            "crucible",
+            "flow",
+            "--session",
+            "s.jsonl",
+            "--dd-trace",
+            "abc123",
+            "--out",
+            "f.html",
+        ])
+        .unwrap();
+        let Some(Cmd::Flow(args)) = cli.command else {
+            panic!("flow parses as its subcommand");
+        };
+        assert_eq!(args.dd_trace.as_deref(), Some("abc123"));
+        assert_eq!(args.dd_window, "48h");
+        assert!(
+            Cli::try_parse_from([
+                "crucible",
+                "flow",
+                "--session",
+                "s.jsonl",
+                "--spans",
+                "x.json",
+                "--out",
+                "f.html",
+            ])
+            .is_ok()
+        );
     }
 }

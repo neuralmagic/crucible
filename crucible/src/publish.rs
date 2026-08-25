@@ -15,6 +15,7 @@
 //! `run_id` (`<YYYYMMDDTHHMMSSZ>-<goal-slug>`) is the join key for the S3 prefix and the
 //! PR↔S3 cross-reference. Time-first so keys sort chronologically.
 
+use crate::flow::{finite, goal_line};
 use crate::reporter::{Reporter, Row};
 use crate::{Args, Paths};
 use anyhow::{Context, Result};
@@ -298,12 +299,6 @@ struct ComponentRecord {
     head_sha: String,
 }
 
-/// Scores can be `INFINITY` (no measurement); `serde_json` refuses non-finite
-/// floats, so drop those to `null` rather than blow up the whole record.
-pub(crate) fn finite(x: f64) -> Option<f64> {
-    x.is_finite().then_some(x)
-}
-
 fn build_summary(rec: &Record<'_>, prs: &[PrLink]) -> Summary {
     Summary {
         run_id: rec.run_id.to_string(),
@@ -367,18 +362,6 @@ struct IndexEntry {
     repo: Option<String>,
     /// `s3://…` URI of the full run record (session.jsonl, summary.json, diffs).
     record: String,
-}
-
-/// First non-empty goal line, de-hashed and length-capped, for leaderboard display.
-pub(crate) fn goal_line(goal: &str) -> String {
-    let line = goal
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .unwrap_or("")
-        .trim_start_matches('#')
-        .trim();
-    line.chars().take(120).collect()
 }
 
 fn build_index_entry(rec: &Record<'_>, goal_slug: &str, record_uri: &str) -> IndexEntry {
@@ -2532,12 +2515,5 @@ mod tests {
         );
         assert!(parse_s3_uri("https://nope").is_err());
         assert!(parse_s3_uri("s3:///just-prefix").is_err());
-    }
-
-    #[test]
-    fn finite_drops_non_finite() {
-        assert_eq!(finite(1.5), Some(1.5));
-        assert_eq!(finite(f64::INFINITY), None);
-        assert_eq!(finite(f64::NAN), None);
     }
 }
