@@ -16,6 +16,14 @@ pub mod markers;
 pub mod session;
 pub mod tier;
 
+/// The controller/engine contract version, as semver. Bump it on any change to a typed document
+/// that crosses the controller/engine boundary: the termination envelope, the ingest bodies, the
+/// admission and session wire types, the identity digests. The engine prints it via
+/// `crucible --contract-version` and the runtime image carries it as the
+/// `io.crucible.contract-version` OCI label, so a deployed image can be matched against the
+/// controller it talks to without a probe.
+pub const CONTRACT_VERSION: &str = "1.0.0";
+
 pub use admission::{
     ADMISSION_WIRE_VERSION, AdmissionEvent, AdmissionKey, AdmissionOutcome, AdmittedInput,
     SteerSource,

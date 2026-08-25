@@ -74,6 +74,11 @@ pub(crate) enum RunError {
 
 /// Route the parsed CLI: subcommands run standalone; everything else is a manifest run.
 pub(crate) fn dispatch(cli: Cli) -> Result<()> {
+    if cli.contract_version {
+        println!("{}", crucible_contract::CONTRACT_VERSION);
+        return Ok(());
+    }
+
     if let Some(Cmd::Init { dir }) = &cli.command {
         let dir = dir.clone().unwrap_or_else(|| PathBuf::from("."));
         return init::run(&dir);

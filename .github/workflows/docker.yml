@@ -96,6 +96,10 @@ jobs:
               echo "smoke ok"
             '
 
+      - name: Read the contract version from the staged binary
+        id: contract
+        run: echo "version=$(prebuilt/bin/crucible --contract-version)" >> "$GITHUB_OUTPUT"
+
       - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
 
       - name: Log in to GHCR
@@ -145,6 +149,7 @@ jobs:
             OPENSHELL_REV=${{ steps.openshell.outputs.rev }}
             VERSION=${{ steps.meta.outputs.version }}
             REVISION=${{ github.sha }}
+            CONTRACT_VERSION=${{ steps.contract.outputs.version }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache
