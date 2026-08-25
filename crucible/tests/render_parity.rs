@@ -225,6 +225,7 @@ fn deploy_render_turn_matches_render_turn() {
             issue: "example/router#7".to_string(),
             goal_text: Some(std::fs::read_to_string(&goal).expect("goal")),
             repo_url: "https://github.com/example/router.git".to_string(),
+            repo_ref: None,
             sandbox_image: "registry.example.com/router-sandbox:latest".to_string(),
             max_cost: 2.5,
             digests: None,
