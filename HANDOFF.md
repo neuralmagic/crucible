@@ -68,6 +68,48 @@ registered pack, backend flipped to local in the studio) proved 4-instance fan-o
 speculators issues. Runs live under `state/local-runs/`. The agent e2e is committed:
 `MCP_AGENT_E2E=1 just mcp-agent-e2e`.
 
+## Session 2026-08-25: remote playbooks run and settle; deploys are pulls
+
+**Proven on prod:** the first pod-dispatched playbook ever completed (`playbook:triage:01a0365b…`,
+`done`, run `finished`, $0.28). Two bugs stood between the #66 roll and that: the controller could
+never settle a pod playbook run (`runs` had no issue link, every "live run for this issue" lookup
+joined through `scopes`, playbook runs have none: the issue self-healed to `awaiting-approval` a
+minute after launch and the run row stayed `running` forever; crucible-domains #433, migration
+0017 adds `runs.issue`, backfills, and repairs the wedged launches), and the fan-out instances
+could not get a sandbox (`task-<sha256>` workspace basename as a 69-char label value; crucible #69
+bounds the label at the boundary). The #69 image was not yet on prod at handoff.
+
+**Deploys are Argo now.** MPP's API is private-network only (`10.30.x`), and the self-hosted
+runner VPC (`10.64.0.0/16`, no TGW) cannot reach it either, so push-based CD is dead. The
+namespace runs its own OpenShift GitOps instance (`deploy/mpp/gitops/`: `ArgoCD/crucible`,
+`Application/crucible-controller` on the chart + `deploy/mpp/controller.values.yaml`, an
+`ImageUpdater` following `crucible-loop:main` by digest into the new `image.ref` chart value; the
+turn-profile pin renders from the same helper). The merge queue builds the loop image, main's
+push only retags, the updater writes `image.ref` within ~2 min. **Sync is still manual**: patch
+`.operation.sync.resources` on the Application (Deployment + turn-profile + overrides CM); the
+oauth2-proxy alpha-template CM must not sync until the groups-header values from the auth work
+are committed. Flip `automated` (no prune) after that. `argocd` CLI core mode fails (redis
+NOAUTH); `oc diff -f <helm template>` is the honest diff.
+
+**Pin bumps are a bot.** crucible-domains `core-pin-bump.yml` polls the public core every 15 min
+and opens `core-pin-<short>` as the App (secrets `CRUCIBLE_APP_ID`/`CRUCIBLE_APP_PRIVATE_KEY`),
+queued with `--auto`. It must never live in the public repo. crucible #69 is its first real
+exercise.
+
+**CI:** engine Docker builds on the image pool with sccache (12.6 → ~3 min); controller image
+builds on `merge_group`; sqlx-cli cached; the tracing-interest test runs alone (`#[ignore]` +
+its own invocation) after it dequeued three merges. A spot reclaim mid-test also costs a queue
+cycle; there is no retry.
+
+**Laptop access** (`docs/internal/api-access.md`): static API token over a port-forward, or
+`crucible-mcp` in break-glass mode with its own supervised forward. SSO is not usable yet (no
+JWT bearer on the proxy, no `crucible-cli` client in EmployeeIDP); native SSO in the controller
+is the fix and is in flight in the other session's auth work (ADR-0028/29/30).
+
+**Open:** FIPS pack (#65) still needs a Rust toolchain in an image; RFC-0003 draft, no PR; the
+`cd-deploy` branch's quay mirror job is worth salvaging separately; Tyler's `oc` access to the
+namespace is a people decision.
+
 ## NEXT SESSION: start here
 
 **One thing gates everything: crucible#66.** The first pod-dispatched playbook ever launched
