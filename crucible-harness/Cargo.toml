@@ -15,3 +15,7 @@ tokio = { version = "1", features = ["rt", "net", "time", "io-util", "sync", "ma
 # Same version/features crucible and forge already pull, so forwarding adds no new tree entry.
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 crucible-contract = { path = "../crucible-contract" }
+
+[[bench]]
+name = "stream_json"
+harness = false

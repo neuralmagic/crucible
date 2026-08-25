@@ -1,0 +1,8 @@
+{
+  "title": "selfhost: cut StreamJsonParser ns/line with the hash-guarded bench",
+  "body": "Use the pack already in the repo at examples/selfhost/ VERBATIM: copy crucible.toml, measure.sh, method.md, workflow.star, and README.md into the out dir unchanged. Do not redesign the gate, the goal, or the selftest; the bench it injects (crucible-harness/benches/stream_json.rs) hashes the emitted event stream and refuses to score a candidate whose events changed. The candidate is crucible-harness/src/stream_json.rs; the score is ns per input line over the bench corpus, lower wins, target under 450 from a ~890 baseline.",
+  "affected_repos": ["neuralmagic/crucible"],
+  "git_ref": "rfc-scheduled-parameterized-loops",
+  "justification": "Demo: crucible optimizing its own agent-stream decoder with a gate it cannot game.",
+  "authoritative": true
+}
