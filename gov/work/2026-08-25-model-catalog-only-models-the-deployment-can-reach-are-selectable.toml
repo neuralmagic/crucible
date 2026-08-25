@@ -1,0 +1,33 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-08-25-004"
+title = "Model catalog: only models the deployment can reach are selectable"
+status = "queue"
+created = "2026-08-25"
+refs = [
+    "RFC-0002:C-PLAYBOOK-LANE",
+]
+
+[content]
+description = "A launch or adoption can name any model string today, and an unreachable one (not enabled for the Vertex project, a dated version the project is not served, a typo) fails inside the pod after the clone and the cold build. The controller should know which models its own credentials can reach and refuse anything else at the API, so the GUI picker cannot offer an invalid choice. The reliable signal is a one-token completion per candidate with the deployment's token (a catalog listing does not prove project entitlement), cached and refreshed on a timer, served on a read endpoint the picker and the validators share."
+
+[[content.acceptance_criteria]]
+text = "the controller probes each candidate model id (the harness's known list) with a minimal completion using its own credentials at startup and on a fixed interval, and keeps {id, reachable, checked_at, last_error}"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "GET /api/models returns the cached catalog; the launch form and the scenario/playbook launch handlers select from it, and a model outside the reachable set is a field-level 422 naming the model and the last probe error"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "a probe failure never blocks serving: an empty or stale catalog is reported as such on the endpoint, and the daily cost of probing is bounded and visible in metrics"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "tests cover the refusal path and the cache refresh; a live check against the deployment's Vertex project records which of opus-4-6, opus-4-6[1m], sonnet-5, haiku-4-5@20251001 are reachable"
+status = "pending"
+category = "chore"
