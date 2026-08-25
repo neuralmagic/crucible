@@ -1,0 +1,26 @@
+# produces: ghcr.io/neuralmagic/crucible-rust
+# The loop-pod image for a Rust domain (examples/selfhost): the domain-neutral runtime plus the
+# rustup toolchain `measure_cmd` needs to build and run the bench, with the workspace's lockfile
+# deps pre-fetched so the first measure does not go to crates.io. Build with the runtime tag to
+# derive from: --build-arg CRUCIBLE_TAG=<tag>.
+ARG CRUCIBLE_TAG=latest
+FROM ghcr.io/neuralmagic/crucible:${CRUCIBLE_TAG}
+
+USER root
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+
+COPY rust-toolchain.toml /tmp/rust-toolchain.toml
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal \
+        --default-toolchain "$(sed -n 's/^channel *= *"\(.*\)"/\1/p' /tmp/rust-toolchain.toml)" \
+    && rm /tmp/rust-toolchain.toml
+
+COPY . /tmp/ws
+RUN cd /tmp/ws && cargo fetch --locked \
+    && cd /tmp && cargo new --quiet warm && cd warm \
+    && cargo add --quiet criterion divan >/dev/null && cargo fetch \
+    && rm -rf /tmp/ws /tmp/warm \
+    && chmod -R a+rwX "$CARGO_HOME" "$RUSTUP_HOME"
+
+WORKDIR /opt/crucible

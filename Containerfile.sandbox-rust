@@ -1,0 +1,40 @@
+# produces: ghcr.io/neuralmagic/crucible-sandbox-rust
+# The agent sandbox for Rust candidates (examples/selfhost): the stock claude sandbox plus a
+# rustup toolchain, the profiling tools an optimization turn reaches for, and a warm cargo cache
+# for this workspace so the agent's first `cargo test` is not a cold fetch through the egress
+# allowlist. The sandbox base is a stripped UBI10 (rpm, no dnf), so the native build deps are
+# installed into a rootfs on a full UBI10 stage of the same release and overlaid. Toolchain +
+# cargo home live under /usr/local so they are shared by any uid.
+FROM registry.access.redhat.com/ubi10/ubi:10.2 AS pkgs
+RUN dnf install -y --nodocs --installroot /mnt/rootfs --releasever 10 \
+        --setopt install_weak_deps=false \
+        gcc glibc-devel binutils openssl-devel pkgconfig jq git \
+    && dnf clean all --installroot /mnt/rootfs \
+    && rm -rf /mnt/rootfs/var/cache /mnt/rootfs/var/log/*
+
+FROM quay.io/aipcc/agentic-ci/claude-sandbox:0.3.11
+COPY --from=pkgs /mnt/rootfs/ /
+
+USER root
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+
+COPY rust-toolchain.toml /tmp/rust-toolchain.toml
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal \
+        --default-toolchain "$(sed -n 's/^channel *= *"\(.*\)"/\1/p' /tmp/rust-toolchain.toml)" \
+        --component clippy --component rustfmt \
+    && rm /tmp/rust-toolchain.toml \
+    && cargo install --locked samply hyperfine cargo-bloat cargo-criterion \
+    && rm -rf "$CARGO_HOME/registry/src"
+
+# Warm the registry/git caches for the workspace's lockfile plus the bench crates an agent is
+# likely to add, then drop the source copy: only the caches stay.
+COPY . /tmp/ws
+RUN cd /tmp/ws && cargo fetch --locked \
+    && cd /tmp && cargo new --quiet warm && cd warm \
+    && cargo add --quiet criterion divan >/dev/null && cargo fetch \
+    && rm -rf /tmp/ws /tmp/warm \
+    && chmod -R a+rwX "$CARGO_HOME" "$RUSTUP_HOME"
+
+USER sandbox

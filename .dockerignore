@@ -1,0 +1,10 @@
+.git/
+target/
+**/target/
+.claude/
+mergetest/
+examples/*/workspace/
+examples/*/workspace-*/
+examples/*/state/
+book/
+*.jsonl

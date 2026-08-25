@@ -11,6 +11,7 @@
 
 - [Zero to a running loop](./getting-started.md)
 - [Tasks: general-purpose orchestration](./task-lane.md)
+- [Images for a new domain](./domain-images.md)
 
 # Reference
 
