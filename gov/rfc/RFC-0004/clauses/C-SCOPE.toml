@@ -1,0 +1,15 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-SCOPE"
+title = "Scope"
+kind = "informative"
+status = "active"
+
+[content]
+text = """
+This RFC governs how the controller obtains work from the engine: rendered Kubernetes objects for turn and run pods, compiled workflows and their parameter schemas, run explainability documents, and the launching of an engine process for an agent turn or a local run. It applies to every deployment shape (pod dispatch, the local executor, the registry) and to both directions of version drift between a controller build and the engine it is paired with.
+
+It does not govern what runs inside a pod once launched (the wrapper script, the loop, the judge), nor the human API the controller serves. Those keep their own contracts ([[RFC-0001]], [[RFC-0002]]).
+
+The motivating failure: the controller began sending a flag for a scenario's git ref weeks before any engine build accepted it. Nothing failed until a scenario with a ref was adopted in production, and then every one of them failed at argument parsing, ledgered only as a turn that produced no result."""

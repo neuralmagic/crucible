@@ -1,0 +1,17 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-CONTRACT-VERSION"
+title = "One contract version, checked before dispatch"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+The shared contract crate MUST expose one contract version. A controller build MUST record the contract version it was compiled against, and an engine build MUST record the one it implements; both MUST be readable from the running binary and, for an image, from the image's labels.
+
+A controller MUST compare its contract version with the engine's in the loop image it is configured to dispatch, at startup and whenever the image pin changes, and MUST publish the comparison on its configuration surface. A mismatch MUST NOT stop the controller from serving, but the controller MUST refuse to dispatch a pod or a process against a mismatched engine, and the refusal MUST be ledgered per [[RFC-0004:C-BOUNDARY-FAILURE]].
+
+A controller build whose pinned engine revision does not carry the contract version the controller links MUST fail its build, so the mismatch is found in CI and not in production.
+
+Rationale: linking removes drift for renders; a version check removes it for everything a link cannot cover, and it turns a runtime surprise into a visible, explainable refusal."""
