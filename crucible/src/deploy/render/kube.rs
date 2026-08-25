@@ -142,7 +142,7 @@ pub struct PackDelivery {
 /// The knobs a playbook launch supplies (see [`RenderOpts::playbook`]).
 #[derive(Debug)]
 pub struct PlaybookLaunch {
-    pub max_time: crate::MaxTime,
+    pub max_time: crate::duration::MaxTime,
     pub max_cost: f64,
     pub params: BTreeMap<String, String>,
 }

@@ -217,7 +217,9 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                     manifest.as_deref(),
                     crate::plan::cli::Ceilings {
                         usd: *max_cost,
-                        wall_clock: max_time.as_deref().and_then(crate::parse_duration),
+                        wall_clock: max_time
+                            .as_deref()
+                            .and_then(crate::duration::parse_duration),
                         wall_clock_raw: max_time.clone(),
                     },
                     *compute_driver,
