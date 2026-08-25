@@ -471,6 +471,9 @@ pub(crate) struct RenderTurnArgs {
     /// The clone URL of the repo under test (cloned fresh into the turn pod).
     #[arg(long)]
     pub repo_url: String,
+    /// Branch or tag to clone `--repo-url` at. Omitted: the repo's default branch.
+    #[arg(long)]
+    pub repo_ref: Option<String>,
     /// The agent sandbox image carrying the claude CLI (the openshell backend pulls it).
     #[arg(long)]
     pub sandbox_image: String,

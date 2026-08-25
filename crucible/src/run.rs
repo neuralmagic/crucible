@@ -256,6 +256,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                     issue: a.issue,
                     goal_text,
                     repo_url: a.repo_url,
+                    repo_ref: a.repo_ref,
                     sandbox_image: a.sandbox_image,
                     max_cost: a.max_cost,
                     digests: (!a.no_pin).then(|| {
