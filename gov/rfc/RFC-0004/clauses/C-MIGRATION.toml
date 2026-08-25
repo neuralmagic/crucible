@@ -1,0 +1,17 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-MIGRATION"
+title = "Migration and flag ordering"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+Until a render is served by the linked library, adding or changing a flag on an engine command the controller invokes MUST land in the engine first, and the controller change MUST NOT be released before the engine pin it depends on is deployed. A controller change that would send a flag the pinned engine does not accept MUST fail the controller's pin guard.
+
+Moving a render to the linked library MUST NOT change the rendered document for the same inputs; the existing rendered fixtures are the acceptance test.
+
+Existing typed-request kinds MAY keep their current flags during migration, but a new request kind MUST be introduced only as a typed document per [[RFC-0004:C-TYPED-INVOCATION]].
+
+The contract version starts at the version the shared contract crate carries when this RFC is finalized; a controller or engine that cannot report one MUST be treated as mismatched."""

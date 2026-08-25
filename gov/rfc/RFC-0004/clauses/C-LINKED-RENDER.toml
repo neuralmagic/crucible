@@ -1,0 +1,17 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-LINKED-RENDER"
+title = "Renders are linked, not spawned"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+A render or compilation the controller needs (a turn pod, a run pod and its pack ConfigMap, a compiled workflow, a workflow's parameter schema, a flow document) MUST be produced in the controller's own process by the engine's render library at the engine revision the controller build pins. The controller MUST NOT obtain any of these by spawning an engine executable.
+
+The options a render takes MUST be a typed value defined by the render library, so that a controller build that names an option the pinned engine does not have fails to compile rather than to dispatch. The same value MUST be what the engine's own command line parses into, so a render produced by the controller and one produced by hand from the CLI cannot differ for the same inputs.
+
+A render MUST NOT depend on the filesystem beyond the inputs it is handed (the profile, the pack, the workflow source). A render MUST NOT resolve image tags to digests, contact a cluster, or read environment, unless the caller passes that capability in explicitly; the controller decides when a render is allowed to reach the network.
+
+Rationale: a render is a function of its inputs. Putting a process boundary and an argument parser between the caller and that function adds a contract nobody checks and removes the compiler, which was the only tool able to check it."""

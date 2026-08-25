@@ -1,0 +1,17 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-BOUNDARY-INVENTORY"
+title = "The controller-engine boundary"
+kind = "informative"
+status = "active"
+
+[content]
+text = """
+The controller reaches the engine in two ways today, and this RFC treats them differently.
+
+**Renders and compilations** are pure: given a profile, a manifest or workflow source, and a set of options, they produce a document (pod YAML, a pack ConfigMap, a workflow graph, a params schema, a flow document). Today the controller spawns the engine binary for each of these and parses its stdout: turn-pod render, run-pod render, workflow compile, params schema, and flow.
+
+**Process launches** are not pure: an agent turn or a plan run holds a checkout, spends money, streams a session, and must be killable. Today the controller spawns the engine for these too: scope, grounded rank, a local playbook run, and artifact fetch.
+
+Both paths share one contract surface, the engine's command line, and one enforcement point, the engine's argument parser at dispatch time. This RFC replaces the first path with a linked library and constrains the second to a typed request whose version is checked before any work happens."""

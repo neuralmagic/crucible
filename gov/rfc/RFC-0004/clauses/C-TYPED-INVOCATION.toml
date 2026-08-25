@@ -1,0 +1,17 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-TYPED-INVOCATION"
+title = "Typed requests across a process boundary"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+Where the engine MUST run as a separate process (an agent turn, a local plan run, work inside a pod), the request MUST be a single typed document owned by the shared contract crate, carrying a contract version. The engine MUST reject a request whose document has an unknown field or a contract version it does not implement, before it clones, spends, or writes anything, with an error that names the field or both versions.
+
+The command line of such an invocation MUST carry only the request kind and the location of the request document; it MUST NOT carry request fields as flags. An environment variable MAY carry the document location where a file cannot (a pod wrapper), and the same rejection rules apply.
+
+The engine's reply for an invocation MUST be a typed document of the same contract version, so that the controller parses a result the way it built the request, and a reply the controller cannot decode is a contract error, not a missing result.
+
+Rationale: a process boundary is unavoidable for work that must be isolated or killed, but the boundary can still be a document with a schema and a version instead of a flag list whose only validator is the parser on the far side."""
