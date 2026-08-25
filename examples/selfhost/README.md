@@ -27,7 +27,7 @@ Re-bake the hash after an intentional event-shape change:
 
 Needs `cargo` + `jq` + `claude` on PATH: `--agent-backend local` runs the agent here instead of
 in the pack's sandbox image, and the measure runs here either way. The workspace is a fresh
-clone of `[repo] url` at `git_ref`, so local commits must be pushed to be under test.
+clone of `[repo] url` (the default branch), so local commits must be merged to be under test.
 `just bench-stream` runs the bench by itself.
 
 First proven run (2026-08-25, local backend, 3 iterations): 891 -> 224.7 -> 200.5 -> 176.6

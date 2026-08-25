@@ -12,8 +12,7 @@
 [repo]
 # A real clone, never a worktree of the running checkout: the candidate's git memory must not
 # touch the repo the loop is running from, and a pod has no checkout beside the pack anyway.
-url     = "https://github.com/neuralmagic/crucible.git"
-ref     = "rfc-scheduled-parameterized-loops"
+url = "https://github.com/neuralmagic/crucible.git"
 
 [workspace]
 dir = "workspace"
