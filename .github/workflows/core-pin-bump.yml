@@ -1,0 +1,110 @@
+name: Core pin bump
+
+# Every runtime image published from main becomes a pin-bump PR in crucible-domains: the rev,
+# its image digest, the Cargo revs and lockfile, and the self-contained Containerfile's ARG move
+# together (tools/check-core-pin.sh there is the gate). The PR is queued to merge once the
+# controller's CI is green.
+on:
+  workflow_run:
+    workflows: [Docker]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      rev:
+        description: crucible commit to pin (its sha-* runtime image must already exist)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  bump:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: [self-hosted, linux, x64, beefy, rust]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app
+        with:
+          app-id: ${{ secrets.CRUCIBLE_APP_ID }}
+          private-key: ${{ secrets.CRUCIBLE_APP_PRIVATE_KEY }}
+          owner: neuralmagic
+          repositories: crucible-domains
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: neuralmagic/crucible-domains
+          token: ${{ steps.app.outputs.token }}
+
+      - name: Resolve the rev and its runtime image digest
+        id: core
+        env:
+          REV: ${{ inputs.rev || github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          short=${REV:0:7}
+          token=$(curl -sSf "https://ghcr.io/token?scope=repository:neuralmagic/crucible:pull" | jq -r .token)
+          digest=$(curl -sSfI \
+            -H "Authorization: Bearer $token" \
+            -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json" \
+            "https://ghcr.io/v2/neuralmagic/crucible/manifests/sha-$short" \
+            | tr -d '\r' | awk -F': ' 'tolower($1) == "docker-content-digest" { print $2 }')
+          [ -n "$digest" ] || { echo "ghcr.io/neuralmagic/crucible:sha-$short does not exist" >&2; exit 1; }
+          current=$(sed -n 's/^rev = "\([0-9a-f]\{40\}\)"$/\1/p' core-pin.toml)
+          {
+            echo "rev=$REV"
+            echo "short=$short"
+            echo "digest=$digest"
+            echo "current=$current"
+          } >> "$GITHUB_OUTPUT"
+          echo "pin $current -> $REV ($digest)"
+
+      - name: Bump the pin
+        if: steps.core.outputs.current != steps.core.outputs.rev
+        env:
+          REV: ${{ steps.core.outputs.rev }}
+          SHORT: ${{ steps.core.outputs.short }}
+          DIGEST: ${{ steps.core.outputs.digest }}
+          CURRENT: ${{ steps.core.outputs.current }}
+        run: |
+          set -euo pipefail
+          current_digest=$(sed -n 's/^runtime-image = ".*@\(sha256:[0-9a-f]*\)"$/\1/p' core-pin.toml)
+          current_short=${CURRENT:0:7}
+          files="core-pin.toml Containerfile.crucible-selfcontained $(grep -rl 'https://github.com/neuralmagic/crucible' --include=Cargo.toml .)"
+          for f in $files; do
+            sed -i "s/$CURRENT/$REV/g; s/sha-$current_short/sha-$SHORT/g; s/$current_digest/$DIGEST/g" "$f"
+          done
+          for crate in $(grep -B2 'git+https://github.com/neuralmagic/crucible' Cargo.lock | awk -F'"' '/^name/ { print $2 }' | sort -u); do
+            cargo update -p "$crate"
+          done
+          tools/check-core-pin.sh
+          git status --short
+
+      - name: Open or refresh the PR
+        if: steps.core.outputs.current != steps.core.outputs.rev
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REV: ${{ steps.core.outputs.rev }}
+          SHORT: ${{ steps.core.outputs.short }}
+          DIGEST: ${{ steps.core.outputs.digest }}
+          BOT: ${{ steps.app.outputs.app-slug }}[bot]
+        run: |
+          set -euo pipefail
+          branch="core-pin-$SHORT"
+          git config user.name "$BOT"
+          git config user.email "$BOT@users.noreply.github.com"
+          git checkout -b "$branch"
+          git commit -qam "Bump the core pin to $SHORT"
+          git push --force-with-lease origin "HEAD:$branch"
+          body="Pins neuralmagic/crucible@$REV (runtime image \`$DIGEST\`). Opened by the Docker workflow that published it."
+          if [ -z "$(gh pr list --head "$branch" --state open --json number --jq '.[0].number')" ]; then
+            gh pr create --head "$branch" --title "Bump the core pin to $SHORT" --body "$body"
+          fi
+          gh pr merge "$branch" --auto --merge
