@@ -27,8 +27,17 @@ use crate::manifest::OpenshellCfg;
 /// names the provider: unbound, openshell fails closed and the sandbox's metadata emulator answers
 /// 503 with no token. Must stay a subset of the aiplatform hosts in `DEFAULT_ENDPOINTS`, matched
 /// there by exact host and port.
-pub const VERTEX_CREDENTIAL_HOSTS: &[&str] =
-    &["aiplatform.googleapis.com", "*.aiplatform.googleapis.com"];
+///
+/// A region other than `global` moves the API to its own apex domain, `<region>-aiplatform.
+/// googleapis.com` for a region and `aiplatform.<multi-region>.rep.googleapis.com` for `us`/`eu`,
+/// neither of which is a subdomain of the global host.
+pub const VERTEX_CREDENTIAL_HOSTS: &[&str] = &[
+    "aiplatform.googleapis.com",
+    "*.aiplatform.googleapis.com",
+    "*-aiplatform.googleapis.com",
+    "aiplatform.us.rep.googleapis.com",
+    "aiplatform.eu.rep.googleapis.com",
+];
 
 pub const DEFAULT_ENDPOINTS: &[&str] = &[
     "github.com:443:full",
@@ -39,6 +48,9 @@ pub const DEFAULT_ENDPOINTS: &[&str] = &[
     "files.pythonhosted.org:443:read-only",
     "aiplatform.googleapis.com:443:read-write",
     "*.aiplatform.googleapis.com:443:read-write",
+    "*-aiplatform.googleapis.com:443:read-write",
+    "aiplatform.us.rep.googleapis.com:443:read-write",
+    "aiplatform.eu.rep.googleapis.com:443:read-write",
     "oauth2.googleapis.com:443:read-write",
     "api.anthropic.com:443:read-write",
 ];
@@ -387,5 +399,36 @@ mod tests {
             resolve_binaries(&c, DEFAULT_BINARIES),
             ["/usr/local/bin/claude"]
         );
+    }
+    #[test]
+    fn the_credential_hosts_cover_every_endpoint_the_gateway_builds() {
+        // openshell-server builds `global` -> aiplatform.googleapis.com, `us`/`eu` ->
+        // aiplatform.<mr>.rep.googleapis.com, anything else -> <region>-aiplatform.googleapis.com.
+        let covered = |host: &str| {
+            VERTEX_CREDENTIAL_HOSTS
+                .iter()
+                .any(|p| match p.strip_prefix('*') {
+                    Some(suffix) => host.ends_with(suffix) && host.len() > suffix.len(),
+                    None => *p == host,
+                })
+        };
+        for region in [
+            "global",
+            "us",
+            "eu",
+            "us-east5",
+            "us-central1",
+            "europe-west1",
+        ] {
+            let host = match region {
+                "global" => "aiplatform.googleapis.com".to_string(),
+                "us" | "eu" => format!("aiplatform.{region}.rep.googleapis.com"),
+                _ => format!("{region}-aiplatform.googleapis.com"),
+            };
+            assert!(
+                covered(&host),
+                "{region} resolves to {host}, which is unbound"
+            );
+        }
     }
 }

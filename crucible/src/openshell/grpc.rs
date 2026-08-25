@@ -1630,13 +1630,20 @@ pYBZ
     }
 
     /// The outage shape: the `google-cloud` provider profile declares no endpoints, so its
-    /// credential reaches a sandbox only through a policy endpoint naming the provider. Both
-    /// Vertex hosts must bind, or a turn whose region resolves to the wildcard form gets no
-    /// token and its agent retries until it gives up. The expected hosts are spelled out here
-    /// on purpose: deriving them from the constant under test would assert nothing.
+    /// credential reaches a sandbox only through a policy endpoint naming the provider. Every
+    /// Vertex host must bind, global and regional alike, or a turn whose region resolves to one
+    /// of the others gets no token and its agent exits before its first tool call. The expected
+    /// hosts are spelled out here on purpose: deriving them from the constant under test would
+    /// assert nothing.
     #[test]
     fn every_vertex_host_binds_the_gcp_provider() {
-        const EXPECTED: [&str; 2] = ["aiplatform.googleapis.com", "*.aiplatform.googleapis.com"];
+        const EXPECTED: [&str; 5] = [
+            "aiplatform.googleapis.com",
+            "*.aiplatform.googleapis.com",
+            "*-aiplatform.googleapis.com",
+            "aiplatform.us.rep.googleapis.com",
+            "aiplatform.eu.rep.googleapis.com",
+        ];
 
         let bindings: Vec<EndpointCredentialBinding> =
             crate::openshell::policy::VERTEX_CREDENTIAL_HOSTS
