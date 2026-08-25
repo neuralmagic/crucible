@@ -6,6 +6,7 @@
 
 use crate::crucible::{Judge, World};
 use crate::errors::FileError;
+use crate::harness::HarnessRuntime;
 use crate::loop_driver::{LoopRuntime, run_loop};
 use crate::recovery::{RecoveryPlan, ResumeRecovery, classify_session, plan_recovery};
 use crate::{Args, Cli, Cmd, Paths, Prepared, STOP, Ui};
@@ -716,7 +717,7 @@ fn apply_agent_cfg(args: &mut Args, agent: &manifest::AgentCfg, workspace: &Path
         args.reasoning_effort = agent.reasoning_effort;
     }
     if args.reasoning_effort.is_none() {
-        args.reasoning_effort = Some(agent::ReasoningEffort::Medium);
+        args.reasoning_effort = Some(crate::manifest::ReasoningEffort::Medium);
     }
     // Backend: the manifest decides by default, but a CLI `--agent-backend openshell` overrides it
     // (the same manifest runs `local` on a laptop and `openshell` in the pod). Default
@@ -1045,7 +1046,7 @@ fn open_admission_ledger(
 }
 
 /// Copy every non-excluded skill under `p.skills` into the workspace's `skills_dir` (the
-/// harness's discovery path, see [`crate::harness::Harness::skills_dir`]).
+/// harness's discovery path, see [`crate::manifest::Harness::skills_dir`]).
 /// `exclude` names setup-only skills (deployment config, workload capture) that the loop agent must
 /// never see, see [`manifest::AgentCfg::toolbox_exclude`]. A name in `exclude` that doesn't
 /// exist under the toolbox dir is a manifest bug (the exclusion is silently doing nothing), so
@@ -1135,7 +1136,10 @@ mod tests {
         let m: manifest::Manifest = toml::from_str(&manifest_toml("")).unwrap();
         let mut a = args_from(&["crucible"]);
         apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
-        assert_eq!(a.reasoning_effort, Some(agent::ReasoningEffort::Medium));
+        assert_eq!(
+            a.reasoning_effort,
+            Some(crate::manifest::ReasoningEffort::Medium)
+        );
     }
 
     #[test]
@@ -1144,7 +1148,10 @@ mod tests {
             toml::from_str(&manifest_toml("reasoning_effort = \"max\"")).unwrap();
         let mut a = args_from(&["crucible"]);
         apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
-        assert_eq!(a.reasoning_effort, Some(agent::ReasoningEffort::Max));
+        assert_eq!(
+            a.reasoning_effort,
+            Some(crate::manifest::ReasoningEffort::Max)
+        );
     }
 
     #[test]
@@ -1152,12 +1159,12 @@ mod tests {
         let m: manifest::Manifest = toml::from_str(&manifest_toml("")).unwrap();
         let mut a = args_from(&["crucible"]);
         apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
-        assert_eq!(a.harness(), crate::harness::Harness::Claude);
+        assert_eq!(a.harness(), crate::manifest::Harness::Claude);
 
         let m: manifest::Manifest = toml::from_str(&manifest_toml("harness = \"hermes\"")).unwrap();
         let mut a = args_from(&["crucible"]);
         apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
-        assert_eq!(a.harness(), crate::harness::Harness::Hermes);
+        assert_eq!(a.harness(), crate::manifest::Harness::Hermes);
     }
 
     #[test]
@@ -1165,7 +1172,7 @@ mod tests {
         let m: manifest::Manifest = toml::from_str(&manifest_toml("harness = \"hermes\"")).unwrap();
         let mut a = args_from(&["crucible", "--harness", "claude"]);
         apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
-        assert_eq!(a.harness(), crate::harness::Harness::Claude);
+        assert_eq!(a.harness(), crate::manifest::Harness::Claude);
     }
 
     /// `[agent.hermes]` parses (and rides onto Args), and an unknown key inside it is a manifest
@@ -1202,7 +1209,7 @@ mod tests {
         .unwrap();
         let mut a = args_from(&["crucible"]);
         apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
-        assert_eq!(a.harness(), crate::harness::Harness::Codex);
+        assert_eq!(a.harness(), crate::manifest::Harness::Codex);
         assert_eq!(a.codex.model.as_deref(), Some("gpt-5.6-sol"));
 
         let err = toml::from_str::<manifest::Manifest>(&format!(
@@ -1218,7 +1225,10 @@ mod tests {
             toml::from_str(&manifest_toml("reasoning_effort = \"high\"")).unwrap();
         let mut a = args_from(&["crucible", "--effort", "low"]);
         apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
-        assert_eq!(a.reasoning_effort, Some(agent::ReasoningEffort::Low));
+        assert_eq!(
+            a.reasoning_effort,
+            Some(crate::manifest::ReasoningEffort::Low)
+        );
     }
 
     /// A manifest without `[agent.env]` (a controller-drafted pack) still gets the pod's Vertex

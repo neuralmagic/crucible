@@ -466,7 +466,7 @@ pub(crate) struct RenderTurnArgs {
     /// The agent harness the in-pod turn runs, forwarded as `--harness …`. Absent = the in-pod
     /// engine's own default.
     #[arg(long, value_enum)]
-    pub harness: Option<crate::harness::Harness>,
+    pub harness: Option<crate::manifest::Harness>,
     /// The model the in-pod turn runs, forwarded as `--model …`. Absent = the model the in-pod
     /// engine derives from its harness.
     #[arg(long)]
@@ -535,7 +535,7 @@ pub(crate) struct DeployArgs {
     /// The agent harness the rendered loop runs, emitted as the wrapper's `--harness=…`. Absent =
     /// the manifest's `[agent].harness`.
     #[arg(long, value_enum)]
-    pub harness: Option<crate::harness::Harness>,
+    pub harness: Option<crate::manifest::Harness>,
     /// The model the rendered loop runs, emitted as the wrapper's `--model=…`. Absent = the model
     /// the loop derives from its harness.
     #[arg(long)]
@@ -609,13 +609,13 @@ pub(crate) struct Args {
     #[arg(skip)]
     pub broker_token: Option<String>,
     /// Vertex Claude model for the agent (set from `[agent].model`).
-    #[arg(long, default_value = harness::claude::DEFAULT_MODEL)]
+    #[arg(long, default_value = crate::manifest::Harness::Claude.default_model())]
     pub model: String,
     /// The agent harness that runs each turn: `claude` (default), `hermes`, or `codex`. Overrides
     /// the manifest's `[agent].harness`; when neither is set the engine defaults to claude (see
     /// `apply_agent_cfg`).
     #[arg(long, value_enum)]
-    pub harness: Option<harness::Harness>,
+    pub harness: Option<crate::manifest::Harness>,
     /// Hermes-harness tuning (from `[agent.hermes]`). No CLI flag.
     #[arg(skip)]
     pub hermes: manifest::HermesCfg,
@@ -629,7 +629,7 @@ pub(crate) struct Args {
     /// `[agent].reasoning_effort`; when neither is set the engine defaults to `medium` (see
     /// `apply_agent_cfg`).
     #[arg(long = "effort", value_enum)]
-    pub reasoning_effort: Option<agent::ReasoningEffort>,
+    pub reasoning_effort: Option<crate::manifest::ReasoningEffort>,
     /// Backend for the agent turn: `local` (default) runs it here; `openshell` runs
     /// it in an OpenShell sandbox (what an in-pod loop uses). Needs `--sandbox-image`.
     #[arg(long, value_enum, default_value_t = agent::AgentBackend::Local)]
@@ -718,7 +718,7 @@ impl Args {
     /// The resolved agent harness: CLI `--harness` > manifest `[agent].harness` (folded on by
     /// `apply_agent_cfg`) > claude. Paths that never see a manifest (rank-grounded, scope) get
     /// the claude default.
-    pub(crate) fn harness(&self) -> harness::Harness {
+    pub(crate) fn harness(&self) -> crate::manifest::Harness {
         self.harness.unwrap_or_default()
     }
 

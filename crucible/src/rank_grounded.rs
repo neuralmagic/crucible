@@ -18,6 +18,7 @@ use crate::Paths;
 use crate::activity::ActivityFeed;
 use crate::agent::{self, AgentBackend, TurnFailure, TurnOutcome};
 use crate::event::{AgentEvent, RawStream};
+use crate::harness::HarnessRuntime;
 use anyhow::{Context, Result};
 use clap::Parser;
 use crucible_contract::Disposition;

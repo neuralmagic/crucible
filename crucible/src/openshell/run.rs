@@ -14,7 +14,10 @@
 
 use crate::agent::{self, TurnFailure, TurnOutcome};
 use crate::event::{AgentEvent, RawStream, cost_of, estimate_cost};
-use crate::harness::{AuthProvider, Harness, SandboxLayout, TranscriptLocator, TurnArtifacts};
+use crate::harness::{
+    AuthProvider, HarnessRuntime, SandboxLayout, TranscriptLocator, TurnArtifacts,
+};
+use crate::manifest::Harness;
 use crate::openshell::grpc::Gateway;
 use crate::openshell::{gateway, grpc, policy, provider, sandbox};
 use crate::{Args, Paths, relay};

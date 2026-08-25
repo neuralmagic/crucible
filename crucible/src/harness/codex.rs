@@ -13,8 +13,8 @@
 //! performs the refresh grant.
 
 use crate::Args;
-use crate::agent::ReasoningEffort;
 use crate::harness::{SeedFile, TurnArtifacts, append_manifest_env};
+use crate::manifest::{Harness, ReasoningEffort};
 use crate::openshell::provider::CodexToken;
 use crate::turn_trace::{self, GenAiRecord, ToolCall, ToolInvocation};
 use jiff::Timestamp;
@@ -23,8 +23,6 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 /// The default model when neither the CLI nor the manifest names one.
-pub(crate) const DEFAULT_MODEL: &str = "gpt-5.6-sol";
-
 /// The codex CLI's path in the sandbox image.
 pub(crate) const DEFAULT_BINARIES: &[&str] = &["/usr/local/bin/codex"];
 
@@ -65,13 +63,13 @@ pub(crate) const EXTRA_ENDPOINTS: &[&str] = &[
 ];
 
 /// The model for this turn: `[agent.codex].model` overrides the shared `[agent].model`, and a
-/// Claude name in the shared slot falls back to [`DEFAULT_MODEL`]. Both `--model` and the
+/// Claude name in the shared slot falls back to the codex default model. Both `--model` and the
 /// manifest's `[agent].model` default to a Claude model (the default harness owns that default),
 /// and the ChatGPT backend rejects an Anthropic model name with a 400.
 pub(crate) fn model(args: &Args) -> &str {
     match args.codex.model.as_deref() {
         Some(m) => m,
-        None if args.model.starts_with("claude") => DEFAULT_MODEL,
+        None if args.model.starts_with("claude") => Harness::Codex.default_model(),
         None => &args.model,
     }
 }
@@ -543,11 +541,15 @@ mod tests {
     /// default never reaches it: `gpt-5.2-codex` and `claude-*` are both 400s on a ChatGPT account.
     #[test]
     fn a_claude_model_never_reaches_the_chatgpt_backend() {
-        assert_eq!(DEFAULT_MODEL, "gpt-5.6-sol");
+        assert_eq!(Harness::Codex.default_model(), "gpt-5.6-sol");
         let mut a = args();
         a.model = "claude-opus-4-6".to_string();
         let v = sandbox_argv(&a, false);
-        assert!(v.windows(2).any(|w| w == ["-m", DEFAULT_MODEL]), "{v:?}");
+        assert!(
+            v.windows(2)
+                .any(|w| w == ["-m", Harness::Codex.default_model()]),
+            "{v:?}"
+        );
         a.model = "gpt-5.6-terra".to_string();
         assert!(
             sandbox_argv(&a, false)

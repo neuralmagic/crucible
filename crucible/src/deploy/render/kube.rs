@@ -121,7 +121,7 @@ pub struct RenderOpts {
     pub clusters_file: Option<std::path::PathBuf>,
     /// The agent harness the loop runs, rendered as `--harness=<h>` into the wrapper's `crucible`
     /// invocation. `None` emits no flag, the loop keeps the manifest's `[agent].harness`.
-    pub harness: Option<crate::harness::Harness>,
+    pub harness: Option<crate::manifest::Harness>,
     /// The model the loop runs, rendered as `--model=<m>` into the wrapper's `crucible` invocation.
     /// `None` emits no flag, the loop derives the model from the resolved harness.
     pub model: Option<String>,
@@ -1982,7 +1982,7 @@ mod tests {
         let manifest = dir.join("crucible.delta.toml");
         let profile = DeployProfile::load(&fixture_profile("delta")).expect("profile parses");
 
-        let render_with = |harness: Option<crate::harness::Harness>, model: Option<&str>| {
+        let render_with = |harness: Option<crate::manifest::Harness>, model: Option<&str>| {
             let composite = CompositeManifest::load(&manifest).expect("composite parses");
             let input = RenderInput::from_composite(&composite, &dir).expect("render input");
             render(
@@ -2005,7 +2005,7 @@ mod tests {
             .expect("render")
         };
 
-        let set = render_with(Some(crate::harness::Harness::Hermes), Some("hermes-4-70b"));
+        let set = render_with(Some(crate::manifest::Harness::Hermes), Some("hermes-4-70b"));
         assert!(set.contains("--harness=hermes"), "{set}");
         assert!(set.contains("--model=hermes-4-70b"), "{set}");
 

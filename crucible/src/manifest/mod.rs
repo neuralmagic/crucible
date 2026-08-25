@@ -422,6 +422,57 @@ pub fn apply_inject(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Which agent harness runs the turn. `claude` is the default everywhere; `hermes` (Nous
+/// Research's hermes-agent) and `codex` (OpenAI's Codex CLI) are selected per-domain for harness
+/// ablations.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Harness {
+    #[default]
+    Claude,
+    Hermes,
+    Codex,
+}
+
+impl Harness {
+    /// The default model when neither the CLI nor the manifest names one.
+    pub const fn default_model(self) -> &'static str {
+        match self {
+            Harness::Claude => "claude-opus-4-6",
+            Harness::Hermes => "claude-opus-4-6",
+            Harness::Codex => "gpt-5.6-sol",
+        }
+    }
+}
+
+/// The agent's reasoning-effort tier, passed to Claude Code as `--effort <level>`. A closed set
+/// (Claude Code 2.1: low|medium|high|xhigh|max); unset means we don't pass the flag and Claude
+/// Code picks its own default. Per-domain because the right tier is task-dependent (mechanical
+/// remove-deprecated fixes need ~none; algorithmic issues want real reasoning), and it's a harness
+/// hyperparameter worth ablating: does more thinking find better fixes, or just better reward hacks?
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl ReasoningEffort {
+    /// The exact token Claude Code's `--effort` flag expects.
+    pub fn as_flag(self) -> &'static str {
+        match self {
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+            ReasoningEffort::Xhigh => "xhigh",
+            ReasoningEffort::Max => "max",
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentCfg {
@@ -431,7 +482,7 @@ pub struct AgentCfg {
     /// harness swap is a manifest edit (and an ablation axis), not engine surgery; the CLI
     /// `--harness` overrides it.
     #[serde(default)]
-    pub harness: crate::harness::Harness,
+    pub harness: Harness,
     /// Hermes-harness tuning; ignored (and harmless) when `harness = "claude"`.
     #[serde(default)]
     pub hermes: HermesCfg,
@@ -442,7 +493,7 @@ pub struct AgentCfg {
     /// Unset = the engine default (`medium`); a `--effort` CLI flag overrides both. Set this to opt a
     /// known-hard domain up to `high`/`max`.
     #[serde(default)]
-    pub reasoning_effort: Option<crate::agent::ReasoningEffort>,
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// Tools the agent must not call, passed to Claude Code as `--disallowed-tools`. Names match
     /// Claude Code's own (`Bash`, `mcp__<server>__<tool>`).
     ///
@@ -498,9 +549,7 @@ pub struct AgentCfg {
 }
 
 fn default_model() -> String {
-    crate::harness::Harness::default()
-        .default_model()
-        .to_string()
+    Harness::default().default_model().to_string()
 }
 fn default_backend() -> String {
     "local".to_string()
@@ -1012,10 +1061,7 @@ mod tests {
     /// unset default stays claude's so every existing manifest keeps its resolved model.
     #[test]
     fn an_unset_model_derives_from_the_default_harness() {
-        assert_eq!(
-            default_model(),
-            crate::harness::Harness::Claude.default_model()
-        );
+        assert_eq!(default_model(), Harness::Claude.default_model());
         let m: Manifest = toml::from_str(
             r#"
             [repo]
@@ -1032,11 +1078,8 @@ mod tests {
         "#,
         )
         .unwrap();
-        assert_eq!(m.agent.harness, crate::harness::Harness::Codex);
-        assert_eq!(
-            m.agent.model,
-            crate::harness::Harness::Claude.default_model()
-        );
+        assert_eq!(m.agent.harness, Harness::Codex);
+        assert_eq!(m.agent.model, Harness::Claude.default_model());
         assert!(m.agent.codex.model.is_none());
     }
 
@@ -1627,10 +1670,7 @@ mod tests {
             )
         };
         let m: Manifest = toml::from_str(&toml_with("xhigh")).unwrap();
-        assert_eq!(
-            m.agent.reasoning_effort,
-            Some(crate::agent::ReasoningEffort::Xhigh)
-        );
+        assert_eq!(m.agent.reasoning_effort, Some(ReasoningEffort::Xhigh));
         // Closed set: a bogus tier is a parse error, not a silent default.
         assert!(toml::from_str::<Manifest>(&toml_with("turbo")).is_err());
     }

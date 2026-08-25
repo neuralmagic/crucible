@@ -89,7 +89,7 @@ pub struct TurnOpts {
     pub authoritative: bool,
     /// The agent harness the in-pod turn runs, rendered as `--harness <h>` into both wrapper
     /// commands. `None` emits no flag, the in-pod engine keeps its manifest/default harness.
-    pub harness: Option<crate::harness::Harness>,
+    pub harness: Option<crate::manifest::Harness>,
     /// The model the in-pod turn runs, rendered as `--model <m>` into both wrapper commands.
     /// `None` emits no flag, the in-pod engine derives the model from the resolved harness.
     pub model: Option<String>,
@@ -97,7 +97,7 @@ pub struct TurnOpts {
 
 /// Render an optional `--harness <h>` wrapper flag. The value is clap's own `ValueEnum` name, so
 /// the string the wrapper emits is by construction the one the in-pod CLI parses back.
-pub(super) fn harness_flag(harness: Option<crate::harness::Harness>, sep: char) -> String {
+pub(super) fn harness_flag(harness: Option<crate::manifest::Harness>, sep: char) -> String {
     use clap::ValueEnum as _;
     harness
         .and_then(|h| h.to_possible_value())
@@ -923,7 +923,7 @@ mod tests {
 
     fn opts_with_run_config(
         kind: TurnKind,
-        harness: Option<crate::harness::Harness>,
+        harness: Option<crate::manifest::Harness>,
         model: Option<&str>,
     ) -> TurnOpts {
         TurnOpts {
@@ -954,7 +954,7 @@ mod tests {
                 &profile,
                 &opts_with_run_config(
                     kind,
-                    Some(crate::harness::Harness::Hermes),
+                    Some(crate::manifest::Harness::Hermes),
                     Some("hermes-4-70b"),
                 ),
             )
