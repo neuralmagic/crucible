@@ -266,7 +266,7 @@ async fn try_turn(
     );
     let labels = [
         ("crucible-pid".to_string(), std::process::id().to_string()),
-        ("crucible-workspace".to_string(), basename.clone()),
+        ("crucible-workspace".to_string(), label_value(&basename)),
     ];
     let mut providers = match harness.auth_provider() {
         AuthProvider::Vertex => vec![provider::PROVIDER_NAME.to_string()],
@@ -1169,6 +1169,26 @@ fn workdir_basename(p: &Paths) -> Result<String> {
         .context("workspace path has no final component")
 }
 
+/// A Kubernetes label value for `raw`: the label charset only, at most 63 characters, and an
+/// alphanumeric at both ends. An isolated task's workspace basename is `task-` plus a full
+/// sha256, which the gateway rejects verbatim.
+fn label_value(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(63)
+        .collect();
+    cleaned
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric())
+        .to_string()
+}
+
 /// Write `content` to a `tempfile` guard (unique name, 0600 on unix, unlinked on drop), the
 /// rendered cred / env / prompt / mcp-config staged for upload. `tempfile` is a blocking crate, so
 /// the create+write runs on a blocking thread rather than stalling the runtime.
@@ -1316,5 +1336,16 @@ mod tests {
         assert!(!tp.exists(), "stale traceparent cleared");
         assert!(!ts.exists());
         let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    #[test]
+    fn label_values_fit_the_kubernetes_limit_and_charset() {
+        let digest = "4c2b536afd886a46bac8276a9c5e03370c3d715adc8332ffbfc3b575cc5bc6ab";
+        let long = label_value(&format!("task-{digest}"));
+        assert_eq!(long.len(), 63);
+        assert!(long.starts_with("task-4c2b536a"));
+        assert_eq!(label_value("my workspace/v2"), "my-workspace-v2");
+        assert_eq!(label_value("-.trimmed.-"), "trimmed");
+        assert_eq!(label_value("vllm"), "vllm");
     }
 }
