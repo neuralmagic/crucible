@@ -982,6 +982,27 @@ impl CompositeManifest {
     }
 }
 
+/// Every `[[workspace.inject]].src` must resolve under `manifest_dir`, as a hard error rather than a
+/// `crucible check` finding. `deploy render` calls this: a dangling inject renders a perfectly valid-looking pack
+/// whose missing file only surfaces inside the sandbox, mid-turn, as whatever the agent was supposed
+/// to read not being there.
+pub fn ensure_injects_resolve(m: &Manifest, manifest_dir: &Path) -> Result<(), ManifestError> {
+    let missing: Vec<String> = m
+        .workspace
+        .inject
+        .iter()
+        .filter(|inject| !manifest_dir.join(&inject.src).exists())
+        .map(|inject| format!("  {} -> {}", inject.src, inject.dst))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(ManifestError::InjectSrcMissing {
+        manifest_dir: manifest_dir.to_path_buf(),
+        missing,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2077,6 +2098,55 @@ mod tests {
         "#,
         );
         assert!(bad.is_err(), "deny_unknown_fields should reject typos");
+    }
+
+    /// A dangling inject must stop `deploy render`, not ride along: the missing file would only
+    /// show up inside the sandbox, mid-turn, as content the agent was told to read but cannot.
+    #[test]
+    fn ensure_injects_resolve_rejects_a_dangling_src() {
+        let dir = tempdir("inject-dangling");
+        std::fs::write(dir.join("present.txt"), "x").expect("write");
+        let manifest_path = dir.join("crucible.toml");
+        std::fs::write(
+            &manifest_path,
+            r#"
+[repo]
+path = "."
+[judge]
+measure_cmd = "./measure.nu"
+direction = "higher"
+objective = "value"
+[agent]
+backend = "command"
+agent_cmd = "./bump.nu"
+goal = "raise it"
+[[workspace.inject]]
+src = "present.txt"
+dst = "present.txt"
+[[workspace.inject]]
+src = "traces/median_block.txt"
+dst = "traces/median_block.txt"
+"#,
+        )
+        .expect("write manifest");
+        let m = Manifest::load(&manifest_path).expect("manifest parses");
+
+        let err = ensure_injects_resolve(&m, &dir).expect_err("a missing src must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("traces/median_block.txt"),
+            "the error must name the missing file: {msg}"
+        );
+        assert!(
+            !msg.contains("present.txt"),
+            "a resolvable src must not be reported: {msg}"
+        );
+
+        std::fs::create_dir_all(dir.join("traces")).expect("mkdir");
+        std::fs::write(dir.join("traces/median_block.txt"), "y").expect("write");
+        ensure_injects_resolve(&m, &dir).expect("all srcs present now");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn tempdir(name: &str) -> PathBuf {

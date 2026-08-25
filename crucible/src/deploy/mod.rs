@@ -45,7 +45,7 @@ pub fn render_yaml(manifest_path: &Path, profile_path: &Path, opts: &RenderOpts)
                  publishes every completed turn unscored"
             );
         }
-        crate::check::ensure_injects_resolve(&manifest, manifest_dir)?;
+        manifest::ensure_injects_resolve(&manifest, manifest_dir)?;
         let name = manifest_dir
             .file_name()
             .and_then(|n| n.to_str())
