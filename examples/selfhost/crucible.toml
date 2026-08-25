@@ -1,0 +1,60 @@
+# selfhost — crucible optimizing crucible. The candidate is this repo's own agent-stream decoder
+# (crucible-harness/src/stream_json.rs), the score is the decoder's ns/line over a fixed synthetic
+# corpus (crucible-harness/benches/stream_json.rs), and the bench refuses to score a candidate
+# whose emitted event stream differs from the baseline's, so "faster by dropping events" cannot
+# KEEP. Both the bench and measure.sh are frozen injects: re-copied before every measure, so the
+# agent's edits to them never reach the gate.
+#
+# Laptop (a real claude turn on this machine, measure here too):
+#   crucible --manifest examples/selfhost/crucible.toml --agent-backend local --iterations 8
+# Controller: adopt a scenario whose authoritative brief names this pack (README).
+
+[repo]
+# A real clone, never a worktree of the running checkout: the candidate's git memory must not
+# touch the repo the loop is running from, and a pod has no checkout beside the pack anyway.
+url     = "https://github.com/neuralmagic/crucible.git"
+ref     = "rfc-scheduled-parameterized-loops"
+
+[workspace]
+dir = "workspace"
+
+[[workspace.inject]]
+src = "../../crucible-harness/benches/stream_json.rs"
+dst = "crucible-harness/benches/stream_json.rs"
+frozen = true
+
+[[workspace.inject]]
+src = "measure.sh"
+dst = "measure.sh"
+frozen = true
+
+[agent]
+backend       = "openshell"
+harness       = "claude"
+model         = "claude-opus-4-6"
+sandbox_image = "quay.io/wseaton/crucible-sandbox-rust@sha256:031c9dc4f513b5ac6517ec617825d39ca7ff4d79e0f8bc60f9211edd4d529b95"
+method_prompt = "method.md"
+goal          = "Cut the ns/line of StreamJsonParser over the bench corpus. Target: under 450 (half the baseline)."
+
+[agent.openshell]
+# crates.io for a dep the agent adds (criterion, divan); the deps in Cargo.lock are pre-fetched
+# into the image so a rebuild does not need these.
+endpoints = ["index.crates.io:443:read-only", "static.crates.io:443:read-only"]
+binaries  = ["/usr/local/cargo/bin/cargo"]
+
+[judge]
+measure_cmd = "./measure.sh"
+direction   = "lower"
+objective   = "ns_per_line"
+
+[judge.selftest]
+# good = pristine; bad = decode every line twice, which keeps the event stream identical and
+# roughly doubles the score, so the gate must read it as worse without calling it invalid.
+good_cmd = "true"
+bad_cmd  = "sed -i.bak 's|let Ok(msg) = serde_json::from_str::<Value>(line) else {|let _ = serde_json::from_str::<Value>(line); let Ok(msg) = serde_json::from_str::<Value>(line) else {|' crucible-harness/src/stream_json.rs && rm crucible-harness/src/stream_json.rs.bak"
+
+# No [world] block -> GitWorld: each kept improvement is a commit, regressions reset --hard.
+
+[workflow]
+type = "autoresearch"
+file = "workflow.star"
