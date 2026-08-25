@@ -156,8 +156,11 @@ pub const GROUNDED_RANK_WORK_KIND: &str = "grounded-rank";
 /// The `crucible.io/work-kind` label value a scope turn pod carries.
 pub const SCOPE_WORK_KIND: &str = "scope";
 
-/// Render one grounded-rank turn `Pod` (WorkPod primitive). The same
-/// security/auth scaffolding as the loop pod, privileged only under the podman driver
+/// Render one turn `Pod` (WorkPod primitive): the library form of `crucible deploy render-turn`,
+/// which reads `--goal-file` into [`TurnOpts::goal_text`]. Image pinning happens through
+/// [`TurnOpts::digests`] or not at all.
+///
+/// The same security/auth scaffolding as the loop pod, privileged only under the podman driver
 /// ([`crate::deploy::render::kube::agent_security_context`]), the pull secret, the run-as service
 /// account, the istio-inject-off annotation, `restartPolicy: Never`, and the `REGISTRY_AUTH_FILE`
 /// env, but no broker/deploy env, no kube RBAC mounts, and no NetworkPolicy: the turn only clones

@@ -13,18 +13,21 @@ mod controller;
 pub mod profile;
 mod render;
 
+pub use profile::DeployProfile;
 pub use render::{
     DigestResolver, MANAGED_BY_LABEL, PackDelivery, PlaybookLaunch, ProposeTier, RegistryDigests,
-    RenderOpts, TurnKind, TurnOpts,
+    RenderOpts, TurnKind, TurnOpts, render_turn,
 };
 
 use crate::manifest::{self, CompositeManifest, Manifest};
 use anyhow::{Context, Result};
-use profile::DeployProfile;
 use render::RenderInput;
 use std::path::Path;
 
-/// Render the deployment YAML for a manifest (composite or single-domain) + a deploy profile.
+/// Render the deployment YAML for a manifest (composite or single-domain) + a deploy profile:
+/// the library form of `crucible deploy render` (`deploy apply` server-side applies the same
+/// YAML). Reads only the manifest, its pack dir, the profile, and its fleet file; image pinning
+/// happens through [`RenderOpts::digests`] or not at all.
 pub fn render_yaml(manifest_path: &Path, profile_path: &Path, opts: &RenderOpts) -> Result<String> {
     let manifest_dir = manifest_path
         .parent()
@@ -97,7 +100,7 @@ pub fn render_controller_cmd(profile_path: &Path, opts: &RenderOpts) -> Result<(
 /// then stamps the work-pod labels + its ownerReference before creating the pod.
 pub fn render_turn_cmd(profile_path: &Path, opts: &render::TurnOpts) -> Result<()> {
     let profile = DeployProfile::load(profile_path)?;
-    let yaml = render::render_turn(&profile, opts)?;
+    let yaml = render_turn(&profile, opts)?;
     print!("{yaml}");
     Ok(())
 }

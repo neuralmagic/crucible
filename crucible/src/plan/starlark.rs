@@ -1753,7 +1753,8 @@ pub fn compile_file(path: &Path, pack_dir: &Path) -> Result<CompiledWorkflow> {
     compile_file_with(path, pack_dir, &BTreeMap::new())
 }
 
-/// Compile a file with the values a launcher supplied.
+/// Compile a file with the values a launcher supplied: the library form of
+/// `crucible plan compile-workflow`, which prints [`CompiledWorkflow::canonical_json`].
 pub fn compile_file_with(
     path: &Path,
     pack_dir: &Path,
@@ -1898,7 +1899,8 @@ pub fn materialize_sibling_manifest(
         .transpose()
 }
 
-/// The parameters a source declares, read without evaluating it.
+/// The parameters a source declares, read without evaluating it: the library form of
+/// `crucible plan params`, which prints the schema as pretty JSON.
 ///
 /// A launcher, a form, or an orchestrator validating an ask all need to know what a pack accepts
 /// before running a line of it, which is why the block is a literal and why this never reaches
