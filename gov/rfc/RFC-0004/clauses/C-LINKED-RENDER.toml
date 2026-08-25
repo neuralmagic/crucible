@@ -8,10 +8,14 @@ status = "active"
 
 [content]
 text = """
-A render or compilation the controller needs (a turn pod, a run pod and its pack ConfigMap, a compiled workflow, a workflow's parameter schema, a flow document) MUST be produced in the controller's own process by the engine's render library at the engine revision the controller build pins. The controller MUST NOT obtain any of these by spawning an engine executable.
+A render or compilation the controller needs (a turn pod, a run pod and its pack ConfigMap, a compiled workflow, a workflow's parameter schema, a flow document) MUST be produced in the controller's own process from the linked engine revision. The controller MUST NOT obtain any of these by spawning an engine executable.
 
-The options a render takes MUST be a typed value defined by the render library, so that a controller build that names an option the pinned engine does not have fails to compile rather than to dispatch. The same value MUST be what the engine's own command line parses into, so a render produced by the controller and one produced by hand from the CLI cannot differ for the same inputs.
+A controller build that requests a render option the linked engine revision does not define MUST fail to build; it MUST NOT be possible for such a controller to reach dispatch.
 
-A render MUST NOT depend on the filesystem beyond the inputs it is handed (the profile, the pack, the workflow source). A render MUST NOT resolve image tags to digests, contact a cluster, or read environment, unless the caller passes that capability in explicitly; the controller decides when a render is allowed to reach the network.
+For the same inputs, a render produced in-process by the controller and one produced by the engine's own command line MUST be byte-identical. The existing rendered fixtures are the acceptance test.
 
-Rationale: a render is a function of its inputs. Putting a process boundary and an argument parser between the caller and that function adds a contract nobody checks and removes the compiler, which was the only tool able to check it."""
+A render MUST NOT depend on anything beyond the inputs it is handed (the profile, the pack, the workflow source, its options). A render MUST NOT resolve image tags to digests, contact a cluster, or read the process environment unless the caller passes that capability in explicitly; the controller decides when a render may reach the network.
+
+This clause changes how a render is delivered, not what it contains: the parameter schema stays as [[RFC-0002:C-PLAYBOOK-PARAMS]] defines it and the compiled workflow stays as [[RFC-0001:C-WORKFLOW]] defines it.
+
+Rationale: a render is a function of its inputs. A process boundary and an argument parser between the caller and that function add a contract nobody checks and remove build-time checking, which was the only tool able to check it."""

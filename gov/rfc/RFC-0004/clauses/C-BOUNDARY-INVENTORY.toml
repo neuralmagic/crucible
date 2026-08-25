@@ -10,8 +10,16 @@ status = "active"
 text = """
 The controller reaches the engine in two ways today, and this RFC treats them differently.
 
-**Renders and compilations** are pure: given a profile, a manifest or workflow source, and a set of options, they produce a document (pod YAML, a pack ConfigMap, a workflow graph, a params schema, a flow document). Today the controller spawns the engine binary for each of these and parses its stdout: turn-pod render, run-pod render, workflow compile, params schema, and flow.
+**Renders and compilations** are pure: given a profile, a manifest or workflow source, and a set of options, they produce a document (pod objects, a pack ConfigMap, a workflow graph, a parameter schema, a flow document). Today the controller spawns the engine executable for each of these and parses its stdout: turn-pod render, run-pod render, workflow compile, parameter schema, and flow.
 
 **Process launches** are not pure: an agent turn or a plan run holds a checkout, spends money, streams a session, and must be killable. Today the controller spawns the engine for these too: scope, grounded rank, a local playbook run, and artifact fetch.
 
-Both paths share one contract surface, the engine's command line, and one enforcement point, the engine's argument parser at dispatch time. This RFC replaces the first path with a linked library and constrains the second to a typed request whose version is checked before any work happens."""
+Both paths share one contract surface, the engine's command line, and one enforcement point, the engine's argument parser at dispatch time.
+
+Three version-bearing things take part, and the clauses below name them consistently:
+
+- the **contract definition**: the single shared description of every document that crosses the boundary, compiled into both sides, carrying the **contract version**;
+- the **linked engine revision**: the engine source revision a controller build compiles its renders from;
+- a **dispatch image**: an engine image the running controller launches pods or processes from. A controller may be configured with more than one (loop images, sandbox images, per-pack images), and a dispatch image can differ from the linked engine revision because images are pinned in deployment configuration, not at build time.
+
+This RFC replaces the render path with in-process renders checked at build time, and constrains launches to a typed request whose contract version is checked before any work happens."""
