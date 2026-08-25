@@ -126,12 +126,12 @@ pub(crate) trait HarnessRuntime {
     fn local_env_defaults(self) -> &'static [(&'static str, &'static str)];
 
     /// The sandbox exec argv (program name first, no prompt, it arrives over stdin).
-    /// `mcp_seeded` says whether [`Harness::seed_files`] delivered an MCP config this turn, so
+    /// `mcp_seeded` says whether [`HarnessRuntime::seed_files`] delivered an MCP config this turn, so
     /// the argv can point the agent at it; the flag-ordering contract lives entirely in the
     /// harness arm (openshell/run.rs no longer knows the argv grammar).
     fn sandbox_argv(self, args: &Args, mcp_seeded: bool) -> Vec<String>;
 
-    /// Sandbox counterpart of [`Harness::local_session_argv`].
+    /// Sandbox counterpart of [`HarnessRuntime::local_session_argv`].
     fn sandbox_session_argv(
         self,
         args: &Args,
@@ -179,7 +179,7 @@ pub(crate) trait HarnessRuntime {
     /// Parse the downloaded transcript's in-memory bytes into [`TurnArtifacts`]. The caller reads
     /// the file ONCE (async, see the fetch path) and hands the bytes here; this method is pure and
     /// infallible: undecodable or unparseable bytes yield empty artifacts (the fetch layer decides
-    /// whether that is loud, see [`Harness::backfill_required`]). Bytes, not `&str`, because a
+    /// whether that is loud, see [`HarnessRuntime::backfill_required`]). Bytes, not `&str`, because a
     /// backfill harness's transcript is binary (hermes's SQLite `state.db`), while claude's is
     /// UTF-8 jsonl, each arm decodes its own format.
     fn parse_transcript(self, content: &[u8]) -> TurnArtifacts;
@@ -220,7 +220,6 @@ pub(crate) trait HarnessRuntime {
 }
 
 impl HarnessRuntime for Harness {
-    /// The full local-spawn argv (program name first): flags + the prompt as an argument.
     fn local_argv(self, args: &Args, prompt: &str) -> Vec<String> {
         match self {
             Harness::Claude => claude::local_argv(args, prompt),
@@ -244,8 +243,6 @@ impl HarnessRuntime for Harness {
         }
     }
 
-    /// Harness env defaults for a local spawn, applied before the manifest `[agent].env`
-    /// (so a manifest override wins).
     fn local_env_defaults(self) -> &'static [(&'static str, &'static str)] {
         match self {
             Harness::Claude => claude::LOCAL_ENV_DEFAULTS,
@@ -254,10 +251,6 @@ impl HarnessRuntime for Harness {
         }
     }
 
-    /// The sandbox exec argv (program name first, no prompt, it arrives over stdin).
-    /// `mcp_seeded` says whether [`Harness::seed_files`] delivered an MCP config this turn, so
-    /// the argv can point the agent at it; the flag-ordering contract lives entirely in the
-    /// harness arm (openshell/run.rs no longer knows the argv grammar).
     fn sandbox_argv(self, args: &Args, mcp_seeded: bool) -> Vec<String> {
         match self {
             Harness::Claude => claude::sandbox_argv(args, mcp_seeded),
@@ -266,7 +259,6 @@ impl HarnessRuntime for Harness {
         }
     }
 
-    /// Sandbox counterpart of [`Harness::local_session_argv`].
     fn sandbox_session_argv(
         self,
         args: &Args,
@@ -282,8 +274,6 @@ impl HarnessRuntime for Harness {
         }
     }
 
-    /// The agent's env script (sourced before the agent runs in the sandbox): harness defaults
-    /// plus the manifest's `[agent].env`.
     fn env_script(self, env: &[(String, String)]) -> String {
         match self {
             Harness::Claude => claude::env_script(env),
@@ -292,10 +282,6 @@ impl HarnessRuntime for Harness {
         }
     }
 
-    /// Which credential the sandbox turn attaches (token mint + provider create/attach + the
-    /// pod-env relay). Claude and hermes both resolve Vertex ADC through the gateway's metadata
-    /// emulator (hermes via its config.yaml `provider: vertex-anthropic`), key-free; codex
-    /// authenticates against the ChatGPT backend instead.
     fn auth_provider(self) -> AuthProvider {
         match self {
             Harness::Claude => AuthProvider::Vertex,
@@ -304,9 +290,6 @@ impl HarnessRuntime for Harness {
         }
     }
 
-    /// Whether the harness exports the `claude_code.*` OTEL metrics the in-process collector
-    /// captures. False means the collector never starts (no `otel_summary`; the pricing-table
-    /// estimate stays the cost fallback).
     fn otel_capable(self) -> bool {
         match self {
             Harness::Claude => true,
@@ -315,11 +298,6 @@ impl HarnessRuntime for Harness {
         }
     }
 
-    /// Files uploaded into the sandbox before the agent execs (claude: `.mcp.json` when the
-    /// broker is on). `broker_token` is what the seeded MCP config sends as its bearer: the raw
-    /// per-run token, or the provider placeholder when the openshell egress proxy resolves it.
-    /// `auth` is this turn's minted ChatGPT token, which only the codex arm seeds (as its
-    /// `auth.json`); the Vertex harnesses resolve their credential through the gateway instead.
     fn seed_files(
         self,
         args: &Args,
@@ -334,10 +312,6 @@ impl HarnessRuntime for Harness {
         }
     }
 
-    /// The stream decoder for this harness's stdout. `meters`, when present, are the in-process
-    /// OTLP collector's live readings (60 s-window token rate and running cost) stamped onto each
-    /// `tokens` sample; `tool_io` opts tool events into carrying bounded inputs and result excerpts
-    /// (see [`crate::agent::tool_io_full`]).
     fn decoder(self, args: &Args, meters: Option<&LiveMeters>, tool_io: bool) -> StreamDecoder {
         match self {
             Harness::Claude => StreamDecoder::StreamJson(Box::new(
@@ -356,7 +330,6 @@ impl HarnessRuntime for Harness {
         }
     }
 
-    /// Where this harness's session transcript lives inside the sandbox.
     fn transcript_locator(self) -> TranscriptLocator {
         match self {
             Harness::Claude => TranscriptLocator::NewestJsonl {
@@ -373,12 +346,6 @@ impl HarnessRuntime for Harness {
         }
     }
 
-    /// Parse the downloaded transcript's in-memory bytes into [`TurnArtifacts`]. The caller reads
-    /// the file ONCE (async, see the fetch path) and hands the bytes here; this method is pure and
-    /// infallible: undecodable or unparseable bytes yield empty artifacts (the fetch layer decides
-    /// whether that is loud, see [`Harness::backfill_required`]). Bytes, not `&str`, because a
-    /// backfill harness's transcript is binary (hermes's SQLite `state.db`), while claude's is
-    /// UTF-8 jsonl, each arm decodes its own format.
     fn parse_transcript(self, content: &[u8]) -> TurnArtifacts {
         match self {
             Harness::Claude => claude::parse_transcript(content),
@@ -387,9 +354,6 @@ impl HarnessRuntime for Harness {
         }
     }
 
-    /// The turn's conversation as GenAI records for content-log export, parsed from the same
-    /// in-memory transcript bytes (no re-read). Claude maps its jsonl messages; a harness whose
-    /// content arrives via its own reader (hermes: Phase B) returns empty.
     fn content_records(self, content: &[u8]) -> Vec<GenAiRecord> {
         match self {
             Harness::Claude => claude::content_records(content),
@@ -398,9 +362,6 @@ impl HarnessRuntime for Harness {
         }
     }
 
-    /// Whether the transcript is the turn's ONLY source of result events + cost. When true the
-    /// post-turn fetch runs unconditionally (not export-gated) and a fetch failure surfaces as
-    /// an [`AgentEvent::Error`], never a silent $0 success (keep/discard integrity).
     fn backfill_required(self) -> bool {
         match self {
             Harness::Claude => false,
@@ -409,9 +370,6 @@ impl HarnessRuntime for Harness {
         }
     }
 
-    /// The local-backend counterpart of the sandbox transcript fetch: recover
-    /// [`TurnArtifacts`] from this machine after a local turn. `None` when the harness has
-    /// nothing to backfill (claude's live stream already carried everything).
     fn local_backfill(self, paths: &crate::Paths) -> Option<TurnArtifacts> {
         match self {
             Harness::Claude => None,
@@ -420,9 +378,6 @@ impl HarnessRuntime for Harness {
         }
     }
 
-    /// Hard bound on the whole transcript fetch (find + download). For claude the fetch is pure
-    /// telemetry and must never wedge the turn; for a backfill harness the transcript carries
-    /// the turn's result, so it gets more headroom.
     fn transcript_fetch_timeout(self) -> Duration {
         match self {
             Harness::Claude => claude::TRANSCRIPT_FETCH_TIMEOUT,
@@ -431,10 +386,6 @@ impl HarnessRuntime for Harness {
         }
     }
 
-    /// Binaries always allowed to open egress for this harness (the agent CLIs). OpenShell
-    /// denies network to any binary not listed, but descendants inherit a parent's egress, so a
-    /// tool the agent shells out to (e.g. `kubectl`) does not need its own entry, only the
-    /// root agent does.
     fn default_binaries(self) -> &'static [&'static str] {
         match self {
             Harness::Claude => claude::DEFAULT_BINARIES,
@@ -443,7 +394,6 @@ impl HarnessRuntime for Harness {
         }
     }
 
-    /// The workspace-relative dir the toolbox skills install into.
     fn skills_dir(self) -> &'static str {
         match self {
             Harness::Claude => claude::SKILLS_DIR,
@@ -452,9 +402,6 @@ impl HarnessRuntime for Harness {
         }
     }
 
-    /// The egress allowlist built-ins for this harness: the shared defaults, plus the model
-    /// backend's own hosts for a harness that does not talk to Vertex. Per-harness so a claude
-    /// turn's allowlist never grows the OpenAI hosts a codex turn needs.
     fn default_endpoints(self) -> Vec<&'static str> {
         let mut out = crate::openshell::policy::DEFAULT_ENDPOINTS.to_vec();
         if self == Harness::Codex {
