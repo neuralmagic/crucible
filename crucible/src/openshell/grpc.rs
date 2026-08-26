@@ -402,6 +402,9 @@ pub struct Gateway {
 pub struct ExecResult {
     pub stderr_lines: Vec<String>,
     pub exit_code: Option<i32>,
+    /// Set when the exec stream broke rather than ended. The turn never reached an exit, so it
+    /// cannot be read as one.
+    pub transport_error: Option<String>,
 }
 
 impl Gateway {
@@ -1011,6 +1014,7 @@ impl Gateway {
         let mut stderr = LineSplitter::default();
         let mut stderr_lines: Vec<String> = Vec::new();
         let mut exit_code: Option<i32> = None;
+        let mut transport_error: Option<String> = None;
         loop {
             tokio::select! {
                 // `biased`: poll the stream arm first so a final output line that is already
@@ -1028,8 +1032,13 @@ impl Gateway {
                         Some(ExecPayload::Exit(e)) => exit_code = Some(e.exit_code),
                         None => {}
                     },
-                    Ok(None) => break,     // stream ended cleanly
-                    Err(_status) => break, // transport/RPC error, end the pump
+                    Ok(None) => break, // stream ended cleanly
+                    Err(status) => {
+                        // The stream broke mid-exec. Carried out rather than dropped: without it
+                        // the caller sees no exit code and reads the turn as complete.
+                        transport_error = Some(status.to_string());
+                        break;
+                    }
                 },
                 // Ctrl-C (via the run-module bridge): drop the stream, which cancels the RPC
                 // server-side. Trailing partials are still flushed below.
@@ -1042,6 +1051,7 @@ impl Gateway {
         Ok(ExecResult {
             stderr_lines,
             exit_code,
+            transport_error,
         })
     }
 }
