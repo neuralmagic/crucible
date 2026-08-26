@@ -135,6 +135,71 @@ pub struct TurnOpts {
     /// The model the in-pod turn runs, rendered as `--model <m>` into both wrapper commands.
     /// `None` emits no flag, the in-pod engine derives the model from the resolved harness.
     pub model: Option<String>,
+    /// A pack the checkout already carries, relative to its root. Set, a scope turn validates and
+    /// freezes that pack (`crucible scope --pack`) instead of drafting one, which spends no agent
+    /// turn and needs no sandbox. Ignored by a rank turn.
+    pub pack_path: Option<PackPath>,
+}
+
+/// A pack directory inside the cloned checkout, validated on construction because it is
+/// concatenated into the wrapper script's `--pack "$CHECKOUT/<path>"`.
+///
+/// Relative, no traversal, no shell metacharacters: the wrapper interpolates it into a
+/// double-quoted word, so a `"` or `$` would break out of it and anything absolute or climbing
+/// would leave the checkout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackPath(String);
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum PackPathError {
+    #[error("pack path must be non-empty")]
+    Empty,
+    #[error("pack path must be relative to the checkout, got {got:?}")]
+    Absolute { got: String },
+    #[error("pack path must not contain '..', got {got:?}")]
+    Traversal { got: String },
+    #[error(
+        "pack path may only contain ASCII letters, digits, '.', '_', '-', and '/', got {got:?}"
+    )]
+    Charset { got: String },
+}
+
+impl PackPath {
+    pub fn parse(raw: &str) -> Result<Self, PackPathError> {
+        let path = raw.trim().trim_end_matches('/');
+        if path.is_empty() {
+            return Err(PackPathError::Empty);
+        }
+        if path.starts_with('/') {
+            return Err(PackPathError::Absolute {
+                got: raw.to_owned(),
+            });
+        }
+        if path.split('/').any(|segment| segment == "..") {
+            return Err(PackPathError::Traversal {
+                got: raw.to_owned(),
+            });
+        }
+        if !path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+        {
+            return Err(PackPathError::Charset {
+                got: raw.to_owned(),
+            });
+        }
+        Ok(PackPath(path.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for PackPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 impl TurnOpts {
@@ -161,6 +226,7 @@ impl TurnOpts {
             authoritative: false,
             harness: None,
             model: None,
+            pack_path: None,
         }
     }
 }
@@ -309,6 +375,7 @@ pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
         authoritative,
         harness,
         model,
+        pack_path,
         ..
     } = opts;
     let harness_flag = harness_flag(*harness, ' ');
@@ -335,6 +402,20 @@ crucible rank-grounded --issue {issue} --workspace "$CHECKOUT" --max-cost {max_c
   --json --marker --agent-backend openshell --sandbox-image {sandbox_image}{compute_driver_flag}
 "#
         ),
+        // A pack the repo already carries needs validating and freezing, not drafting: no agent,
+        // no sandbox, no goal, and none of the propose turn's tier/gaming/authoritative knobs,
+        // which all describe how a pack gets written.
+        TurnKind::Scope if pack_path.is_some() => {
+            let pack = pack_path.as_ref().map(PackPath::as_str).unwrap_or_default();
+            format!(
+                r#"set -e
+CHECKOUT=/tmp/crucible-turn-checkout
+rm -rf "$CHECKOUT"
+git clone --depth 50{clone_ref} {repo_url} "$CHECKOUT"
+crucible scope --pack "$CHECKOUT/{pack}" --json --force --marker
+"#
+            )
+        }
         TurnKind::Scope => {
             let tier_flag = tier
                 .map(|t| format!(" --tier {}", t.cli_value()))
@@ -556,6 +637,7 @@ mod tests {
                 authoritative: false,
                 harness: None,
                 model: None,
+                pack_path: None,
             },
         )
         .expect("render turn");
@@ -653,6 +735,7 @@ mod tests {
                 authoritative: false,
                 harness: None,
                 model: None,
+                pack_path: None,
             },
         )
         .expect("render turn");
@@ -733,6 +816,7 @@ mod tests {
                 authoritative: false,
                 harness: None,
                 model: None,
+                pack_path: None,
             },
         )
         .expect("render turn");
@@ -799,6 +883,7 @@ mod tests {
                 authoritative: false,
                 harness: None,
                 model: None,
+                pack_path: None,
             },
         )
         .expect("render scope turn");
@@ -890,6 +975,7 @@ mod tests {
                 authoritative: false,
                 harness: None,
                 model: None,
+                pack_path: None,
             },
         )
         .expect("render scope turn");
@@ -946,6 +1032,7 @@ mod tests {
                 authoritative: false,
                 harness: None,
                 model: None,
+                pack_path: None,
             },
         )
         .expect("render scope turn");
@@ -992,6 +1079,7 @@ mod tests {
                 authoritative: true,
                 harness: None,
                 model: None,
+                pack_path: None,
             },
         )
         .expect("render scope turn");
@@ -1046,6 +1134,7 @@ mod tests {
             authoritative: false,
             harness,
             model: model.map(str::to_string),
+            pack_path: None,
         }
     }
 
@@ -1119,6 +1208,85 @@ mod tests {
         let yaml = render_turn(&minimal_profile(), &opts).expect("render turn");
         assert!(yaml.contains("git clone --depth 50 https://github.com/owner/repo.git"));
         assert!(!yaml.contains("--branch"));
+    }
+
+    /// A pack the repo already carries is validated, not drafted: the wrapper runs
+    /// `scope --pack` over the checkout and none of the propose turn's agent machinery.
+    #[test]
+    fn a_pack_path_turn_validates_instead_of_proposing() {
+        let mut opts = opts_with_run_config(TurnKind::Scope, None, None);
+        opts.pack_path = Some(PackPath::parse("examples/selfhost").expect("valid"));
+        opts.tier = Some(ProposeTier::T1);
+        opts.gaming_refine_rounds = 3;
+        opts.authoritative = true;
+        opts.goal_text = Some("a goal the pack does not need".to_string());
+        let yaml = render_turn(&minimal_profile(), &opts).expect("render");
+
+        assert!(
+            yaml.contains(
+                r#"crucible scope --pack "$CHECKOUT/examples/selfhost" --json --force --marker"#
+            ),
+            "{yaml}"
+        );
+        assert!(yaml.contains("git clone"), "still clones the repo");
+        // It is still a scope turn to the pod watcher, so the existing dispatch arm picks it up.
+        assert!(yaml.contains("crucible.io/work-kind: scope"));
+        // No agent runs, so nothing that only describes how a pack gets drafted may appear.
+        for absent in [
+            "--propose",
+            "--tier",
+            "--gaming-refine-rounds",
+            "--authoritative",
+            "--agent-backend",
+            "--sandbox-image",
+            "--goal-file",
+            "--max-cost",
+        ] {
+            assert!(
+                !yaml.contains(absent),
+                "{absent} has no place here:\n{yaml}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pack_path_leaving_the_checkout_is_refused() {
+        for bad in [
+            "/etc",
+            "../secrets",
+            "packs/../../etc",
+            "",
+            "   ",
+            "pack\"; rm -rf /",
+            "$(id)",
+            "pack dir",
+        ] {
+            assert!(PackPath::parse(bad).is_err(), "{bad:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn a_pack_path_keeps_the_relative_path_it_was_given() {
+        for (raw, want) in [
+            ("examples/selfhost", "examples/selfhost"),
+            ("examples/selfhost/", "examples/selfhost"),
+            ("  domains/deepgemm  ", "domains/deepgemm"),
+            ("pack", "pack"),
+            ("a_b-c.d/e", "a_b-c.d/e"),
+        ] {
+            assert_eq!(PackPath::parse(raw).expect(raw).as_str(), want);
+        }
+    }
+
+    /// A rank turn has no pack to validate; setting one must not change its command.
+    #[test]
+    fn a_rank_turn_ignores_a_pack_path() {
+        let mut opts = opts_with_run_config(TurnKind::Rank, None, None);
+        let plain = render_turn(&minimal_profile(), &opts).expect("render");
+        opts.pack_path = Some(PackPath::parse("examples/selfhost").expect("valid"));
+        let with_pack = render_turn(&minimal_profile(), &opts).expect("render");
+        assert_eq!(plain, with_pack);
+        assert!(with_pack.contains("crucible rank-grounded"));
     }
 
     #[test]

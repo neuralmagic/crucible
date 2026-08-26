@@ -474,6 +474,11 @@ pub(crate) struct RenderTurnArgs {
     /// Branch or tag to clone `--repo-url` at. Omitted: the repo's default branch.
     #[arg(long)]
     pub repo_ref: Option<String>,
+    /// A pack the checkout already carries, relative to its root. `scope` turn kind only; when set,
+    /// the in-pod invocation validates and freezes that pack (`crucible scope --pack`) instead of
+    /// drafting one, so the turn spends no agent and needs no sandbox.
+    #[arg(long)]
+    pub pack_path: Option<String>,
     /// The agent sandbox image carrying the claude CLI (the openshell backend pulls it).
     #[arg(long)]
     pub sandbox_image: String,

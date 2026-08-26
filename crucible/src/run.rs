@@ -265,6 +265,11 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                     authoritative: a.authoritative,
                     harness: a.harness,
                     model: a.model,
+                    pack_path: a
+                        .pack_path
+                        .as_deref()
+                        .map(deploy::PackPath::parse)
+                        .transpose()?,
                 },
             );
         }
