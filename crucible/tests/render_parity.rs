@@ -239,7 +239,7 @@ fn deploy_render_turn_matches_render_turn() {
         },
     )
     .expect("library render");
-    assert!(from_lib.contains("--tier t1"));
+    assert!(from_lib.contains("- --tier\n    - t1\n"), "{from_lib}");
     assert_eq!(from_cli, from_lib);
 }
 
@@ -289,7 +289,10 @@ fn pack_path_renders_the_same_through_cli_and_library() {
         },
     )
     .expect("library render");
-    assert!(from_lib.contains(r#"scope --pack "$CHECKOUT/examples/selfhost""#));
+    assert!(
+        from_lib.contains("- --pack\n    - /checkout/examples/selfhost\n"),
+        "{from_lib}"
+    );
     assert!(!from_lib.contains("--propose"));
     assert_eq!(from_cli, from_lib);
 }

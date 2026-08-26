@@ -13,7 +13,7 @@ use crucible_contract::scope::{ScopeReport, StageResult};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, thiserror::Error)]
-#[error("--propose requires a goal source: --issue or --goal-file")]
+#[error("--propose requires a goal source: --issue, --goal-file, or --goal")]
 struct ProposeNeedsGoal;
 
 /// The prefix of the single-line scope-report marker `--marker` emits as the command's last output.
@@ -27,6 +27,7 @@ pub fn execute(
     pack: &Path,
     issue: Option<&str>,
     goal_file: Option<&Path>,
+    goal_text: Option<&str>,
     force: bool,
     propose: Option<ProposeOpts>,
 ) -> ScopeReport {
@@ -50,6 +51,7 @@ pub fn execute(
     let mut stages: Vec<Box<dyn Stage>> = vec![Box::new(Ingest {
         issue: issue.map(str::to_string),
         goal_file: goal_file.map(Path::to_path_buf),
+        goal_text: goal_text.map(str::to_string),
     })];
     if let Some(opts) = propose {
         stages.push(Box::new(Propose { opts }));
@@ -100,6 +102,10 @@ pub struct ScopeArgs {
     /// Resolve the goal from a file, instead of the pack manifest's own goal.
     #[arg(long)]
     pub goal_file: Option<PathBuf>,
+    /// Resolve the goal from this literal text. What a caller with the goal in hand and no file to
+    /// put it in passes (a rendered turn pod hands it over as one argv element).
+    #[arg(long, conflicts_with_all = ["issue", "goal_file"])]
+    pub goal: Option<String>,
     /// Overwrite existing `SCOPE.md`, or propose into a non-empty `--out`.
     #[arg(long)]
     pub force: bool,
@@ -164,7 +170,7 @@ pub fn run(a: ScopeArgs) -> Result<()> {
         let repo = a
             .repo
             .context("--propose requires --repo <url|path> (the code under test)")?;
-        if a.issue.is_none() && a.goal_file.is_none() {
+        if a.issue.is_none() && a.goal_file.is_none() && a.goal.is_none() {
             return Err(ProposeNeedsGoal.into());
         }
         (
@@ -206,6 +212,7 @@ pub fn run(a: ScopeArgs) -> Result<()> {
             &pack,
             a.issue.as_deref(),
             a.goal_file.as_deref(),
+            a.goal.as_deref(),
             a.force,
             propose_opts,
         )
