@@ -37,8 +37,14 @@ pub enum GroundedVerdict {
     Ruled {
         tier: Disposition,
         rationale: String,
-        confidence: String,
+        /// Absent on a line an older engine wrote; it says how sure the ruling is, not whether one
+        /// was made.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confidence: Option<String>,
+        /// Required on purpose: a turn that spent money must say so, and a document without this
+        /// fails to decode rather than reading as free.
         cost_usd: f64,
+        #[serde(default)]
         over_budget: bool,
     },
     Failed {
@@ -46,8 +52,11 @@ pub enum GroundedVerdict {
         error_kind: GroundedErrorKind,
         /// The tail of whatever the agent printed on its way down. A turn that dies during startup
         /// prints its diagnostic and nothing else.
+        #[serde(default)]
         output_tail: Option<String>,
+        /// Required for the same reason as a ruling's: a turn that broke after billing is not free.
         cost_usd: f64,
+        #[serde(default)]
         over_budget: bool,
     },
 }
@@ -87,7 +96,7 @@ mod tests {
         GroundedVerdict::Ruled {
             tier: Disposition::Tier(Tier::T1),
             rationale: "needs a live cluster".to_string(),
-            confidence: "high".to_string(),
+            confidence: Some("high".to_string()),
             cost_usd: 0.42,
             over_budget: false,
         }
@@ -127,6 +136,22 @@ mod tests {
             let decoded: GroundedVerdict = crate::json::from_str(&encoded).expect("deserialize");
             assert_eq!(decoded, verdict);
         }
+    }
+
+    /// A line an older engine wrote carries no `confidence` and no `over_budget`. Those say how
+    /// sure a ruling is and whether it overran, not whether a ruling happened, so their absence
+    /// decodes rather than refusing the whole document.
+    #[test]
+    fn the_fields_that_are_not_the_cost_may_be_absent() {
+        let sparse = r#"{"tier":"stale","rationale":"already implemented","cost_usd":0.2}"#;
+        let decoded: GroundedVerdict = crate::json::from_str(sparse).expect("deserialize");
+        assert_eq!(decoded.disposition(), Some(Disposition::Stale));
+        assert_eq!(decoded.cost_usd(), 0.2);
+        assert!(!decoded.over_budget());
+
+        let failed = r#"{"error":"boom","error_kind":"no_verdict","cost_usd":0.0}"#;
+        let decoded: GroundedVerdict = crate::json::from_str(failed).expect("deserialize");
+        assert!(decoded.disposition().is_none());
     }
 
     /// The bug this closes: a cost that goes missing must not read as zero.
