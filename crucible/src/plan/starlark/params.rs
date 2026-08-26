@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
 use starlark_syntax::syntax::AstModule;
 use starlark_syntax::syntax::ast::{AstLiteral, Expr, Stmt};
 
@@ -19,12 +20,15 @@ type Result<T> = std::result::Result<T, CompileError>;
 
 /// The types a parameter may take. Deliberately small: every one has an unambiguous spelling on
 /// a command line and in JSON, which is what lets one declaration serve both.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ParamType {
     String,
     Int,
     Number,
     Bool,
+    /// Spelled as the declaration spells it, so the stored form and [`ParamType::parse`] agree.
+    #[serde(rename = "list<string>")]
     StringList,
 }
 
@@ -56,6 +60,9 @@ impl ParamType {
 }
 
 /// A bound parameter value.
+///
+/// Stores and reloads as the JSON the value already is (`42`, `true`, `["a"]`), not as a tagged
+/// wrapper: see the hand-written codec below.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParamValue {
     String(String),
@@ -63,6 +70,52 @@ pub enum ParamValue {
     Number(f64),
     Bool(bool),
     StringList(Vec<String>),
+}
+
+impl Serialize for ParamValue {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        self.json().serialize(serializer)
+    }
+}
+
+/// Decoded by inspecting the value rather than by trying variants in order: `serde(untagged)`
+/// cannot read a float back into an `f64` variant, and an integer must stay an integer instead of
+/// widening to `42.0`.
+impl<'de> Deserialize<'de> for ParamValue {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        use serde::de::Error as _;
+        match serde_json::Value::deserialize(deserializer)? {
+            serde_json::Value::String(s) => Ok(ParamValue::String(s)),
+            serde_json::Value::Bool(b) => Ok(ParamValue::Bool(b)),
+            serde_json::Value::Number(n) => match n.as_i64() {
+                Some(i) => i32::try_from(i)
+                    .map(ParamValue::Int)
+                    .map_err(|_| D::Error::custom(format!("{i} does not fit in 32 bits"))),
+                None => n
+                    .as_f64()
+                    .map(ParamValue::Number)
+                    .ok_or_else(|| D::Error::custom("a parameter number must be finite")),
+            },
+            serde_json::Value::Array(items) => items
+                .into_iter()
+                .map(|i| match i {
+                    serde_json::Value::String(s) => Ok(s),
+                    other => Err(D::Error::custom(format!(
+                        "a list parameter holds strings, got {other}"
+                    ))),
+                })
+                .collect::<std::result::Result<Vec<String>, _>>()
+                .map(ParamValue::StringList),
+            other => Err(D::Error::custom(format!(
+                "a parameter value is a string, int, number, bool, or list of strings, got {other}"
+            ))),
+        }
+    }
 }
 
 impl ParamValue {
@@ -78,7 +131,7 @@ impl ParamValue {
 }
 
 /// One declared parameter.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ParamSpec {
     pub name: String,
     pub ty: ParamType,
@@ -96,7 +149,10 @@ const FIELDS: &[&str] = &[
     "type", "required", "default", "doc", "pattern", "min", "max", "choices",
 ];
 
-#[derive(Debug, Clone, Default)]
+/// Every parameter a source declares, in source order. Serializes as the bare list, so a launcher
+/// can store the declarations it read and bind against them later without the engine in the loop.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct Params(Vec<ParamSpec>);
 
 impl Params {

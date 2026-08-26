@@ -167,6 +167,77 @@ fn the_schema_is_the_same_declaration() {
     assert_eq!(schema["required"], serde_json::json!(["repo"]));
 }
 
+/// A launcher stores what it read and binds against it later, with no engine in between. This is
+/// what lets a registration keep the declarations instead of a JSON Schema it would have to
+/// re-interpret.
+#[test]
+fn declarations_survive_being_stored_and_reloaded() {
+    let stored = serde_json::to_string(&params()).expect("serialize");
+    let reloaded: Params = serde_json::from_str(&stored).expect("deserialize");
+    assert_eq!(reloaded, params());
+
+    let bound = reloaded
+        .bind(&supplied(&[
+            ("repo", "neuralmagic/crucible"),
+            ("limit", "7"),
+            ("dry_run", "true"),
+        ]))
+        .expect("bind through the reloaded declarations");
+    assert_eq!(bound["limit"], ParamValue::Int(7));
+    assert_eq!(bound["dry_run"], ParamValue::Bool(true));
+    assert_eq!(bound["threshold"], ParamValue::Number(0.5));
+    assert_eq!(
+        reloaded
+            .bind(&supplied(&[
+                ("repo", "neuralmagic/crucible"),
+                ("limit", "0")
+            ]))
+            .expect_err("constraints survive too")
+            .to_string(),
+        params()
+            .bind(&supplied(&[
+                ("repo", "neuralmagic/crucible"),
+                ("limit", "0")
+            ]))
+            .expect_err("constraints")
+            .to_string()
+    );
+}
+
+/// The stored spelling of a kind is the one the declaration uses, so nothing has to translate
+/// between a serde name and `list<string>`.
+#[test]
+fn a_stored_kind_spells_itself_the_way_the_declaration_does() {
+    for ty in [
+        ParamType::String,
+        ParamType::Int,
+        ParamType::Number,
+        ParamType::Bool,
+        ParamType::StringList,
+    ] {
+        let stored = serde_json::to_value(ty).expect("serialize");
+        assert_eq!(stored, serde_json::Value::String(ty.as_str().to_owned()));
+        assert_eq!(ParamType::parse(ty.as_str()), Some(ty));
+    }
+}
+
+/// An integer default must not come back as a float: the untagged decode order is load-bearing.
+#[test]
+fn a_stored_value_keeps_its_kind() {
+    for value in [
+        ParamValue::String("s".into()),
+        ParamValue::Int(42),
+        ParamValue::Number(0.5),
+        ParamValue::Bool(true),
+        ParamValue::StringList(vec!["a".into()]),
+    ] {
+        let stored = serde_json::to_string(&value).expect("serialize");
+        let back: ParamValue = serde_json::from_str(&stored).expect("deserialize");
+        assert_eq!(back, value, "{stored}");
+        assert_eq!(stored, value.json().to_string());
+    }
+}
+
 #[test]
 fn a_source_declaring_nothing_binds_nothing() {
     let params = read_params("workflow(name = \"x\")\n", Path::new("workflow.star"))
