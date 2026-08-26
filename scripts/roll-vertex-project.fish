@@ -100,8 +100,8 @@ switch "$argv[1]"
         test -n "$T"; or begin; echo "no API token"; exit 1; end
         curl -s -m 5 -o /dev/null -H "authorization: Bearer $T" -H "x-auth-request-user: weaton" http://127.0.0.1:8899/api/config
         or begin; echo "port-forward on 8899 is down (the pod restarted); rerun: oc --context mpp-crucible-deployer -n crucible--runtime-ext port-forward svc/crucible-crucible-controller 8899:8080 &"; exit 1; end
-        step "adopt examples/selfhost/scenario.json (default branch: git_ref stripped, the pinned engine cannot clone at a ref)"
-        jq 'del(.git_ref)' /Users/weaton/git/crucible/examples/selfhost/scenario.json \
+        step "adopt examples/selfhost/scenario.json (pack_path: the pack is validated, not drafted)"
+        cat /Users/weaton/git/crucible/examples/selfhost/scenario.json \
             | curl -sS -X POST http://127.0.0.1:8899/api/scenarios \
                 -H "authorization: Bearer $T" -H "x-auth-request-user: weaton" \
                 -H "content-type: application/json" -d @-
