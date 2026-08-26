@@ -616,16 +616,18 @@ async fn try_turn(
     }
     .await;
 
-    // 10. Per-turn-fresh: delete the sandbox unless retrieval failed and it is the recovery copy.
-    //     Clear the
-    //     turn-token too: an empty token means uncapped, so the engine's own post-turn broker
+    // 10. Per-turn-fresh: delete the sandbox unless it is the only workspace recovery copy.
+    //     Clear the turn-token too: an empty token means uncapped, so the engine's own post-turn broker
     //     calls (the gate's rungs) never inherit a turn budget the agent already spent.
-    if !matches!(&result, Err(e) if e.downcast_ref::<OpenshellCliError>().is_some_and(|e| matches!(e, OpenshellCliError::WorkspaceRecovery { .. })))
-    {
+    if !workspace_recovery_pending(&result) {
         let _ = gw.delete_sandbox(&name).await;
     }
     let _ = fs::write(forge::storage_root().join("turn-token"), "").await;
     result
+}
+
+fn workspace_recovery_pending(result: &Result<f64>) -> bool {
+    matches!(result, Err(e) if matches!(e.downcast_ref::<OpenshellCliError>(), Some(OpenshellCliError::WorkspaceRecovery { .. })))
 }
 
 /// Fetch the sandbox's recent supervisor log lines and replay every policy-denial through the
