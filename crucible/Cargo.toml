@@ -97,6 +97,7 @@ serde_norway = "0.9"
 # share the vendored sqlite (no system-lib probe). Verify with `cargo tree -i libsqlite3-sys`.
 rusqlite = { version = "0.32", features = ["bundled"] }
 forge = { path = "../forge" }
+crucible-broker = { path = "../crucible-broker" }
 # The shared turn-result wire contract: the AgentEvent NDJSON types, the marker literals, the
 # managed-by label, and the kubelet-captured envelope, one source, no cross-crate drift.
 crucible-contract = { path = "../crucible-contract" }

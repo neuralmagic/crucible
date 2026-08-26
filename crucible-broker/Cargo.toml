@@ -9,6 +9,8 @@ edition.workspace = true
 # concrete trace-resolve backend is a trait the domain binary injects, so this crate carries NO
 # domain dependency: the resolver, admission, and approval are all boxed boundaries.
 [dependencies]
+crucible-contract = { path = "../crucible-contract" }
+minijinja = "2"
 anyhow.workspace = true
 # The bin's `spoke-smoke` subcommand (the default no-subcommand path stays the serve loop).
 clap.workspace = true

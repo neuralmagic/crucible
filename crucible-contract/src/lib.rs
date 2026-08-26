@@ -14,6 +14,7 @@ pub mod identity;
 pub mod json;
 pub mod markers;
 pub mod refine;
+pub mod report;
 pub mod scope;
 pub mod session;
 pub mod tier;
@@ -50,6 +51,7 @@ pub use refine::{
     Attack, AttackKind, ControlEvidence, FailureEvidence, ReadingEvidence, RoundKind, RoundOutcome,
     RoundRecord, SelftestEvidence, parse_rounds, render_rounds_json,
 };
+pub use report::{REPORT_FILE, RunReport, TaskReport};
 pub use scope::{ScopeReport, StageName, StageResult};
 pub use session::{PrLinkWire, RowWire, SessionEvent, WIRE_VERSION, decode, encode};
 pub use tier::{Disposition, Tier, TierParseError};

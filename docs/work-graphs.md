@@ -300,6 +300,13 @@ Epilogue results are advisory: they cannot un-keep the candidate. Rows land in t
 and RESULTS.md (`epilogue` / `epilogue-skip` / `epilogue-fail`), and the PR body gets an
 "Epilogue checks (advisory)" section with failures marked **FAILED**.
 
+`report(name = "publish-report", destination = {"kind": "slack"}, template = "reports/slack.md.j2",
+required = True)` is the engine-owned publication epilogue. Destinations are engine-known keys,
+not URLs or secret names; `slack` is the only destination in the first version.
+It accepts no message, channel, prompt, or task output: the engine invokes it once with the bounded
+run snapshot. A required report makes delivery failure fail the workflow; it does not rely on an
+agent remembering to call a tool.
+
 ## Worked example
 
 `examples/adversarial-review` puts a review task between a code node and the gate below it, in

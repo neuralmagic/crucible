@@ -704,9 +704,10 @@ impl<R: Reporter> LoopTaskRunner<'_, R> {
 impl<R: Reporter> TaskRunner for LoopTaskRunner<'_, R> {
     fn run(&mut self, task: &Task, attempt: u32, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
         match &task.task {
-            TaskKind::Agent { .. } | TaskKind::Command { .. } | TaskKind::Evaluate { .. } => {
-                self.workflow_runner.run(task, attempt, inputs)
-            }
+            TaskKind::Agent { .. }
+            | TaskKind::Command { .. }
+            | TaskKind::Evaluate { .. }
+            | TaskKind::Report { .. } => self.workflow_runner.run(task, attempt, inputs),
             TaskKind::Engine {
                 op: EngineOp::Propose,
                 ..
