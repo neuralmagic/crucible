@@ -572,6 +572,24 @@ pub struct CodexCfg {
     /// Model override for codex turns; unset = the resolved `[agent].model`.
     #[serde(default)]
     pub model: Option<String>,
+    /// Authentication selection. `auto` uses the named API-key env when non-empty and otherwise
+    /// falls back to ChatGPT OAuth; the explicit modes never switch implicitly.
+    #[serde(default)]
+    pub auth: CodexAuthMode,
+    /// Environment variable holding the selected API key; unset = `OPENAI_API_KEY`.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+}
+
+/// Which of Codex's two OpenAI login methods a turn uses. `Auto` preserves the historical
+/// environment-sensitive behavior for existing manifests.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CodexAuthMode {
+    #[default]
+    Auto,
+    Api,
+    Chatgpt,
 }
 
 /// Cross-field checks shared by [`Manifest::validate`] and [`CompositeManifest::validate`]: the

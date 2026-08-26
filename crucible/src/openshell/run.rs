@@ -158,6 +158,38 @@ fn stage(sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>), msg: &str)
     sink(msg, RawStream::Stderr, Some(&ev));
 }
 
+const DEFAULT_CODEX_API_KEY_ENV: &str = "OPENAI_API_KEY";
+
+/// Resolve the API-key half of Codex's dual auth. `None` means the caller should use the ChatGPT
+/// OAuth mint. The explicit modes never silently cross over; only `auto` falls back.
+fn selected_codex_api_key(cfg: &crate::manifest::CodexCfg) -> Result<Option<String>> {
+    use crate::manifest::CodexAuthMode;
+
+    if cfg.auth == CodexAuthMode::Chatgpt {
+        return Ok(None);
+    }
+    let env_name = cfg
+        .api_key_env
+        .as_deref()
+        .unwrap_or(DEFAULT_CODEX_API_KEY_ENV);
+    anyhow::ensure!(
+        !env_name.is_empty() && !env_name.contains(['=', '\0']),
+        "[agent.codex].api_key_env is not a valid environment variable name"
+    );
+    let key = std::env::var(env_name)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    match cfg.auth {
+        CodexAuthMode::Auto => Ok(key),
+        CodexAuthMode::Api => key.map(Some).with_context(|| {
+            format!(
+                "{env_name} unset or empty; [agent.codex].auth = \"api\" requires its selected API key"
+            )
+        }),
+        CodexAuthMode::Chatgpt => unreachable!("returned before reading the API-key environment"),
+    }
+}
+
 #[tracing::instrument(
     name = "openshell_turn",
     skip_all,
@@ -212,9 +244,10 @@ async fn try_turn(
 
     // 2. Resolve this harness's model credential: Vertex's static credential becomes a gateway
     //    provider the metadata emulator serves to claude/hermes (see `provider` docs); codex gets
-    //    an API key when `OPENAI_API_KEY` is configured, otherwise a host-refreshed ChatGPT OAuth
-    //    token. Either is seeded as auth.json (step 7b), since Codex reads the real bytes off disk
-    //    and its L4 WebSocket never crosses a placeholder-resolving proxy hop.
+    //    the auth mode selected by `[agent.codex]`: an API key from the named env or a
+    //    host-refreshed ChatGPT OAuth token. Either is seeded as auth.json (step 7b), since Codex
+    //    reads the real bytes off disk and its L4 WebSocket never crosses a placeholder-resolving
+    //    proxy hop.
     let codex_auth = match harness.auth_provider() {
         AuthProvider::Vertex => {
             let token = provider::mint_vertex_token()
@@ -224,9 +257,9 @@ async fn try_turn(
             ensure_provider(&gw, &token, &project, &region).await?;
             None
         }
-        AuthProvider::Codex => match std::env::var("OPENAI_API_KEY") {
-            Ok(key) if !key.trim().is_empty() => Some(provider::CodexAuth::ApiKey(key)),
-            _ => Some(provider::CodexAuth::ChatGpt(
+        AuthProvider::Codex => match selected_codex_api_key(&args.codex)? {
+            Some(key) => Some(provider::CodexAuth::ApiKey(key)),
+            None => Some(provider::CodexAuth::ChatGpt(
                 provider::mint_codex_token()
                     .await
                     .context("minting the codex ChatGPT access token")?,
@@ -1361,6 +1394,50 @@ pub fn relay_vertex_env(env: &mut Vec<(String, String)>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_auth_selection_can_switch_between_named_keys_and_chatgpt() {
+        let _guard = crate::test_env_lock();
+        const KEY_ENV: &str = "CRUCIBLE_TEST_OPENAI_KEY_WORK";
+        unsafe { std::env::set_var(KEY_ENV, "sk-work") };
+
+        let mut cfg = crate::manifest::CodexCfg {
+            auth: crate::manifest::CodexAuthMode::Api,
+            api_key_env: Some(KEY_ENV.to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            selected_codex_api_key(&cfg).unwrap().as_deref(),
+            Some("sk-work")
+        );
+
+        cfg.auth = crate::manifest::CodexAuthMode::Auto;
+        assert_eq!(
+            selected_codex_api_key(&cfg).unwrap().as_deref(),
+            Some("sk-work")
+        );
+
+        cfg.auth = crate::manifest::CodexAuthMode::Chatgpt;
+        assert_eq!(selected_codex_api_key(&cfg).unwrap(), None);
+        unsafe { std::env::remove_var(KEY_ENV) };
+
+        cfg.auth = crate::manifest::CodexAuthMode::Auto;
+        assert_eq!(selected_codex_api_key(&cfg).unwrap(), None);
+    }
+
+    #[test]
+    fn explicit_api_auth_never_silently_falls_back_to_chatgpt() {
+        let _guard = crate::test_env_lock();
+        const KEY_ENV: &str = "CRUCIBLE_TEST_OPENAI_KEY_MISSING";
+        unsafe { std::env::remove_var(KEY_ENV) };
+        let cfg = crate::manifest::CodexCfg {
+            auth: crate::manifest::CodexAuthMode::Api,
+            api_key_env: Some(KEY_ENV.to_string()),
+            ..Default::default()
+        };
+        let err = selected_codex_api_key(&cfg).expect_err("explicit API mode needs its key");
+        assert!(err.to_string().contains(KEY_ENV));
+    }
 
     /// A non-zero agent exit names the code and says the wrapper may have failed before the agent
     /// ran, rather than being reported as a turn that produced no verdict.
