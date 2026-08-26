@@ -19,7 +19,9 @@ ref     = "rfc-scheduled-parameterized-loops"
 dir = "workspace"
 
 [[workspace.inject]]
-src = "../../crucible-harness/benches/stream_json.rs"
+# Keep frozen injects inside the pack root. Hosted direct launch snapshots exactly
+# `examples/selfhost`; reaching into a parent checkout would make the snapshot incomplete.
+src = "workspace/crucible-harness/benches/stream_json.rs"
 dst = "crucible-harness/benches/stream_json.rs"
 frozen = true
 
