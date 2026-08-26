@@ -108,14 +108,20 @@ fn ensure_adc() -> Result<()> {
 /// host for a rotation. No gateway provider is involved (provider env resolves to a placeholder
 /// at the L7 proxy and codex's transport is an L4 WebSocket, so codex needs the real bytes).
 ///
-/// This whole OAuth path exists only for the personal-ChatGPT-subscription trial; once an
-/// `OPENAI_API_KEY` is available, codex takes the key directly and this module's codex half is
-/// deleted, not migrated.
+/// This is the ChatGPT-subscription auth path. API-key turns bypass it, while deployments that
+/// provide `CODEX_CREDENTIALS` retain refresh and rotation behavior.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexToken {
     pub access_token: String,
     pub account_id: String,
     pub id_token: String,
+}
+
+/// The two authentication modes Crucible can seed into a Codex sandbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodexAuth {
+    ApiKey(String),
+    ChatGpt(CodexToken),
 }
 
 /// The `~/.codex/auth.json` shape, as far as crucible cares: the OAuth material under `tokens`.

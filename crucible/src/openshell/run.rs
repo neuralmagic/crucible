@@ -210,12 +210,12 @@ async fn try_turn(
     // file transfer stays on the CLI). Constructed in this runtime context (`connect_lazy`).
     let gw = Gateway::connect().context("connecting to the openshell gateway over gRPC")?;
 
-    // 2. Mint this harness's model credential: Vertex's static credential becomes a gateway
+    // 2. Resolve this harness's model credential: Vertex's static credential becomes a gateway
     //    provider the metadata emulator serves to claude/hermes (see `provider` docs); codex gets
-    //    a ChatGPT OAuth access token minted from the host's refresh material and seeded into the
-    //    sandbox as auth.json (step 5's seed files), no gateway provider, since codex reads the
-    //    real bytes off disk and its L4 WebSocket never crosses a placeholder-resolving proxy hop.
-    let codex_token = match harness.auth_provider() {
+    //    an API key when `OPENAI_API_KEY` is configured, otherwise a host-refreshed ChatGPT OAuth
+    //    token. Either is seeded as auth.json (step 7b), since Codex reads the real bytes off disk
+    //    and its L4 WebSocket never crosses a placeholder-resolving proxy hop.
+    let codex_auth = match harness.auth_provider() {
         AuthProvider::Vertex => {
             let token = provider::mint_vertex_token()
                 .await
@@ -224,11 +224,14 @@ async fn try_turn(
             ensure_provider(&gw, &token, &project, &region).await?;
             None
         }
-        AuthProvider::Codex => Some(
-            provider::mint_codex_token()
-                .await
-                .context("minting the codex access token")?,
-        ),
+        AuthProvider::Codex => match std::env::var("OPENAI_API_KEY") {
+            Ok(key) if !key.trim().is_empty() => Some(provider::CodexAuth::ApiKey(key)),
+            _ => Some(provider::CodexAuth::ChatGpt(
+                provider::mint_codex_token()
+                    .await
+                    .context("minting the codex ChatGPT access token")?,
+            )),
+        },
     };
 
     // 2b. Sandbox S3 reads (the read half of the S3 role split): a gateway-minted `aws-s3`
@@ -495,7 +498,7 @@ async fn try_turn(
             args,
             broker_url.as_deref(),
             seed_token.as_deref(),
-            codex_token.as_ref(),
+            codex_auth.as_ref(),
         );
         for seed in &seeds {
             let seed_tmp = write_temp("seed", &seed.content).await?;
@@ -533,9 +536,8 @@ async fn try_turn(
         // A deep self-check turn outlives the ~1h Vertex token (the agent waits on many
         // multi-minute GPU jobs), so re-mint into the provider slot while claude runs, its
         // google-auth re-queries the metadata emulator as the cached token nears expiry. Codex has
-        // no mid-turn refresh: the sandbox read its seeded auth.json at exec and nothing re-reads
-        // it, so a re-mint could not land anywhere (it would only burn a rotated refresh token)
-        // and a turn that outlives the access token fails loudly.
+        // no mid-turn refresher: API keys do not expire during a turn, and the OAuth access token
+        // is fixed in the seeded auth file; refreshing it here could not update the sandbox.
         let refresher = match harness.auth_provider() {
             AuthProvider::Vertex => Some(tokio::spawn({
                 let gw = gw.clone();

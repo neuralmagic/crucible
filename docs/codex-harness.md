@@ -23,7 +23,25 @@ What differs from a claude turn:
   `ab.chatgpt.com` to the sandbox allowlist. Those hosts are per-harness: a claude turn's
   allowlist is byte-identical to what it was before codex existed.
 
-## Auth: `CODEX_CREDENTIALS` and the single-refresher rule
+## Auth selection
+
+Crucible supports both Codex login methods. A non-empty `OPENAI_API_KEY` takes precedence and is
+seeded into `$CODEX_HOME/auth.json` in API-key mode. Otherwise Crucible falls back to the existing
+`CODEX_CREDENTIALS` ChatGPT OAuth flow described below. A Kubernetes deploy profile can select
+API-key mode with:
+
+```toml
+[[secret_env]]
+name = "OPENAI_API_KEY"
+secret = "crucible-openai"
+key = "OPENAI_API_KEY"
+```
+
+Use a dedicated project-scoped key and rotate the Kubernetes Secret to rotate the credential.
+The key is not exported into the sandbox environment, but Codex can read it from its seeded auth
+file.
+
+## ChatGPT OAuth: `CODEX_CREDENTIALS` and the single-refresher rule
 
 Codex authenticates against the ChatGPT backend with a personal subscription, not Vertex. The
 credential is an OAuth pair produced by `codex login` on a host with a browser, stored at
@@ -68,6 +86,5 @@ Independently, an unused refresh token goes stale after roughly a week. When min
 with `refresh_token_expired`, re-run `codex login` on the host, replace the secret, and delete
 the state file if the process persists a home directory.
 
-All of this OAuth machinery exists only for the personal-subscription trial. The default once an
-`OPENAI_API_KEY` exists is the key: codex reads it directly, the mint/rotation/seeding path gets
-deleted, and auth collapses to one `[[secret_env]]` entry like any other credential.
+When `OPENAI_API_KEY` is absent or empty, this OAuth machinery remains the fallback for ChatGPT
+subscription access.
