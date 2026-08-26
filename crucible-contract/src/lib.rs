@@ -17,6 +17,7 @@ pub mod refine;
 pub mod scope;
 pub mod session;
 pub mod tier;
+pub mod verdict;
 
 /// The controller/engine contract version, as semver. Bump it on any change to a typed document
 /// that crosses the controller/engine boundary: the termination envelope, the ingest bodies, the
@@ -52,3 +53,4 @@ pub use refine::{
 pub use scope::{ScopeReport, StageName, StageResult};
 pub use session::{PrLinkWire, RowWire, SessionEvent, WIRE_VERSION, decode, encode};
 pub use tier::{Disposition, Tier, TierParseError};
+pub use verdict::{GroundedErrorKind, GroundedVerdict};
