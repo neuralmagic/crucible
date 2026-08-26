@@ -1,0 +1,3 @@
+*Crucible playbook complete* — {{ passed }} passed, {{ failed }} non-passing · ${{ "%.4f"|format(spent_usd) }}
+{% for task in tasks %}• `{{ task.name }}` — {{ task.status }}
+{% endfor %}{% if run_url %}<{{ run_url }}|Open run artifacts in Crucible>{% endif %}
