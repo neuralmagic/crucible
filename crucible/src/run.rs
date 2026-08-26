@@ -10,8 +10,7 @@ use crate::loop_driver::{LoopRuntime, run_loop};
 use crate::recovery::{RecoveryPlan, ResumeRecovery, classify_session, plan_recovery};
 use crate::{Args, Cli, Cmd, FlowArgs, Paths, Prepared, STOP, Ui};
 use crate::{
-    agent, broker, check, console, control, deploy, flow, init, manifest, publish, reporter, scope,
-    stream,
+    broker, check, console, control, deploy, flow, init, manifest, publish, reporter, scope, stream,
 };
 use anyhow::{Context, Result};
 use crucible::crucible::{Judge, World};
@@ -33,8 +32,6 @@ pub(crate) enum RunError {
         "a playbook needs a positive --max-cost; its source may not declare a limit its operator set"
     )]
     PlaybookNeedsBudget,
-    #[error("[agent].backend must be local|openshell|command, got {got:?}")]
-    UnknownAgentBackend { got: String },
     #[error("running setup_cmd: {cmd}")]
     SpawnSetupCmd {
         cmd: String,
@@ -268,6 +265,11 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                     authoritative: a.authoritative,
                     harness: a.harness,
                     model: a.model,
+                    pack_path: a
+                        .pack_path
+                        .as_deref()
+                        .map(deploy::PackPath::parse)
+                        .transpose()?,
                 },
             );
         }
@@ -384,17 +386,6 @@ fn playbook_launch(args: &crate::DeployArgs) -> Result<Option<deploy::PlaybookLa
         max_cost: args.max_cost,
         params: crate::plan::cli::parse_params(&args.params)?,
     }))
-}
-
-fn parse_backend(s: &str) -> Result<agent::AgentBackend, RunError> {
-    match s {
-        "local" => Ok(agent::AgentBackend::Local),
-        "openshell" => Ok(agent::AgentBackend::Openshell),
-        "command" => Ok(agent::AgentBackend::Command),
-        other => Err(RunError::UnknownAgentBackend {
-            got: other.to_owned(),
-        }),
-    }
 }
 
 /// Prepare the manifest's workspace: run `setup_cmd` (cwd = manifest dir, the one command that
@@ -767,8 +758,8 @@ fn apply_agent_cfg(args: &mut Args, agent: &manifest::AgentCfg, workspace: &Path
     // Backend: the manifest decides by default, but a CLI `--agent-backend openshell` overrides it
     // (the same manifest runs `local` on a laptop and `openshell` in the pod). Default
     // (Local) means "unset" → take the manifest's.
-    if args.agent_backend == agent::AgentBackend::Local {
-        args.agent_backend = parse_backend(&agent.backend)?;
+    if args.agent_backend == manifest::AgentBackend::Local {
+        args.agent_backend = agent.backend;
     }
     // CLI `--sandbox-image` wins; else the manifest's.
     if args.sandbox_image.is_none() {
@@ -786,7 +777,7 @@ fn apply_agent_cfg(args: &mut Args, agent: &manifest::AgentCfg, workspace: &Path
     // turns=1, $0, a silent no-op run. Relay the standard Vertex keys from the pod env (the
     // deploy profile's `[env]`), exactly like the scope/rank turn paths; manifest values win.
     // Only for a Vertex-authenticated harness; codex authenticates against the ChatGPT backend.
-    if args.agent_backend == agent::AgentBackend::Openshell
+    if args.agent_backend == manifest::AgentBackend::Openshell
         && args.harness().auth_provider() == crate::harness::AuthProvider::Vertex
     {
         crate::openshell::run::relay_vertex_env(&mut args.env);
@@ -798,7 +789,7 @@ fn apply_agent_cfg(args: &mut Args, agent: &manifest::AgentCfg, workspace: &Path
     // The provisioning broker: a run-lifetime child crucible spawns for the openshell
     // backend, reached by the sandboxed agent over streamable-http. Only that backend can reach it,
     // so don't spawn it for local/command.
-    if args.broker.enabled && args.agent_backend == agent::AgentBackend::Openshell {
+    if args.broker.enabled && args.agent_backend == manifest::AgentBackend::Openshell {
         // Hand the broker the deep loop's per-workspace sandbox name, its build sync must download
         // from the same sandbox the turns run in.
         let sandbox_name = crate::openshell::sandbox::name_for(workspace);

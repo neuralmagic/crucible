@@ -474,6 +474,11 @@ pub(crate) struct RenderTurnArgs {
     /// Branch or tag to clone `--repo-url` at. Omitted: the repo's default branch.
     #[arg(long)]
     pub repo_ref: Option<String>,
+    /// A pack the checkout already carries, relative to its root. `scope` turn kind only; when set,
+    /// the in-pod invocation validates and freezes that pack (`crucible scope --pack`) instead of
+    /// drafting one, so the turn spends no agent and needs no sandbox.
+    #[arg(long)]
+    pub pack_path: Option<String>,
     /// The agent sandbox image carrying the claude CLI (the openshell backend pulls it).
     #[arg(long)]
     pub sandbox_image: String,
@@ -672,8 +677,8 @@ pub(crate) struct Args {
     pub reasoning_effort: Option<crate::manifest::ReasoningEffort>,
     /// Backend for the agent turn: `local` (default) runs it here; `openshell` runs
     /// it in an OpenShell sandbox (what an in-pod loop uses). Needs `--sandbox-image`.
-    #[arg(long, value_enum, default_value_t = agent::AgentBackend::Local)]
-    pub agent_backend: agent::AgentBackend,
+    #[arg(long, value_enum, default_value_t = manifest::AgentBackend::Local)]
+    pub agent_backend: manifest::AgentBackend,
     /// Sandbox image for `--agent-backend openshell` (the domain's agent toolbox baked in).
     #[arg(long)]
     pub sandbox_image: Option<String>,
@@ -765,11 +770,11 @@ impl Args {
     /// Resolve where this run's agent events come from. `local` spawns `claude` directly
     /// (parsed as `stream-json`); `openshell` uses the in-Rust OpenShell driver.
     pub(crate) fn agent_source(&self) -> agent::AgentSource {
-        if self.agent_backend == agent::AgentBackend::Command {
+        if self.agent_backend == manifest::AgentBackend::Command {
             return agent::AgentSource::Command(self.agent_cmd.clone().unwrap_or_default());
         }
         match self.agent_backend {
-            agent::AgentBackend::Openshell => agent::AgentSource::OpenshellDriver,
+            manifest::AgentBackend::Openshell => agent::AgentSource::OpenshellDriver,
             // Local (and the Command case handled above) spawn claude directly.
             _ => agent::AgentSource::LocalClaude,
         }

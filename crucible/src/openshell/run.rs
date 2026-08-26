@@ -37,6 +37,11 @@ pub enum OpenshellCliError {
          exit can mean any of those failed before the agent ran)"
     )]
     AgentExit { code: i32 },
+    #[error(
+        "the sandbox exec stream broke before the agent reported an exit ({code:?}: {message}); \
+         whatever the turn had already done is neither complete nor reportable"
+    )]
+    ExecStreamBroke { code: tonic::Code, message: String },
     #[error("private session locator is outside Claude's pinned config directory")]
     LocatorOutsideConfigDir,
     #[error("Claude transcript path does not match the admitted session id")]
@@ -554,9 +559,16 @@ async fn try_turn(
             AuthProvider::Codex => None,
         };
         let decoder = harness.decoder(args, meters.as_ref(), crate::agent::tool_io_full(args));
-        let exec_result = exec_and_stream(&gw, &name, &wrapper, decoder, &exec_opts, sink).await;
+        let exec_result =
+            exec_and_stream(&gw, &name, &wrapper, decoder, &exec_opts, spent, sink).await;
         if let Some(refresher) = &refresher {
             refresher.abort();
+        }
+        // An exec that failed is exactly when the sandbox's own account of itself matters, and it
+        // is about to be deleted. Replay it before unwinding: a turn that exits non-zero having
+        // written nothing to stderr is otherwise indistinguishable from one that never started.
+        if exec_result.is_err() {
+            replay_sandbox_log(&gw, &name, LogReplay::Tail, sink).await;
         }
         let mut cost = exec_result?;
         spent.raise(cost);
@@ -576,7 +588,7 @@ async fn try_turn(
         // 8b. Sweep the sandbox log for egress denials before teardown. An agent probing
         //     blocked endpoints mid-turn is signal (reward-hacking telemetry), so denials
         //     land in the run log. Best-effort: a logs failure never fails the turn.
-        sweep_denials(&gw, &name, sink).await;
+        replay_sandbox_log(&gw, &name, LogReplay::DenialsOnly, sink).await;
 
         // 9. Download the workspace back (the agent's edits round-trip to the host).
         stage(sink, "agent turn done — downloading the workspace");
@@ -617,20 +629,49 @@ async fn try_turn(
 /// sink (the network proxy logs blocked connections / SSRF / L7 rejections). Best-effort by
 /// design: denial telemetry must never fail or block the turn, a logs RPC failure yields an
 /// empty set. Classification is structured ([`grpc::is_denial`]).
-async fn sweep_denials(
+/// How many trailing sandbox log lines a failed exec replays. Enough to carry a stack trace or an
+/// OOM notice, bounded so a chatty sandbox cannot flood the turn's own log.
+const SANDBOX_LOG_TAIL: usize = 40;
+
+/// What the sandbox's own log is being read for.
+enum LogReplay {
+    /// A healthy turn: only the blocked-egress lines, which are turn telemetry (an agent probing
+    /// what it cannot reach is signal).
+    DenialsOnly,
+    /// A failed turn: the tail, whatever it says. The agent's stderr is empty in the cases that
+    /// matter most — a process killed outright, a wrapper that died before exec — and this is the
+    /// only other place its last words exist.
+    Tail,
+}
+
+/// Replay the sandbox's own log into the turn's stream as typed events, carrying each line's
+/// level, target, fields, and whether the engine read it as a denial. Best-effort: a logs failure
+/// never fails the turn.
+async fn replay_sandbox_log(
     gw: &Gateway,
     name: &str,
+    what: LogReplay,
     sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
 ) {
-    for line in gw.sandbox_logs(name).await {
-        if grpc::is_denial(&line) {
-            let text = format!("[egress-deny] {}", line.message.trim());
-            let ev = AgentEvent::Raw {
-                text: text.clone(),
-                stream: RawStream::Stderr,
-            };
-            sink(&text, RawStream::Stderr, Some(&ev));
+    let lines = gw.sandbox_logs(name).await;
+    let skip = match what {
+        LogReplay::DenialsOnly => 0,
+        LogReplay::Tail => lines.len().saturating_sub(SANDBOX_LOG_TAIL),
+    };
+    for line in lines.iter().skip(skip) {
+        let denial = grpc::is_denial(line);
+        if matches!(what, LogReplay::DenialsOnly) && !denial {
+            continue;
         }
+        let ev = AgentEvent::SandboxLog {
+            ts_ms: line.timestamp_ms,
+            level: line.level.clone(),
+            target: line.target.clone(),
+            message: line.message.trim_end().to_string(),
+            denial,
+            fields: line.fields.clone().into_iter().collect(),
+        };
+        sink(line.message.trim_end(), RawStream::Stderr, Some(&ev));
     }
 }
 
@@ -741,6 +782,7 @@ async fn exec_and_stream(
     command: &[String],
     decoder: crate::harness::StreamDecoder,
     opts: &ExecOpts<'_>,
+    spent: &CostMeter,
     sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
 ) -> Result<f64> {
     let mut pump = agent::StreamPump::new(decoder);
@@ -750,13 +792,16 @@ async fn exec_and_stream(
         })
         .await?;
     let (mut cost, best_tokens) = pump.finish();
-    let exit_code = exec.exit_code;
+    let (exit_code, transport_error) = (exec.exit_code, exec.transport_error);
 
     if cost == 0.0
         && let Some(t) = &best_tokens
     {
         cost = estimate_cost(opts.model, t);
     }
+    // Bank it here, not at the caller's `?`: the agent can bill real tokens and still exit
+    // non-zero below, and a turn that spent money is never reported free.
+    spent.raise(cost);
 
     // Replay the agent's stderr (provisioning notes / errors) through the sink as raw lines.
     for line in exec.stderr_lines {
@@ -776,6 +821,9 @@ async fn exec_and_stream(
         && code != 0
     {
         return Err(OpenshellCliError::AgentExit { code }.into());
+    }
+    if let Some((code, message)) = transport_error {
+        return Err(OpenshellCliError::ExecStreamBroke { code, message }.into());
     }
     Ok(cost)
 }
@@ -1259,6 +1307,53 @@ mod tests {
             msg.contains("without producing a verdict"),
             "must distinguish itself from a parse failure: {msg}"
         );
+    }
+
+    /// The meter reports what a turn spent even when the step that would have returned the cost
+    /// unwinds instead. This is the shape of the live failure: the agent billed real tokens and
+    /// exited non-zero, and the turn reported $0.
+    #[test]
+    fn a_turn_that_billed_before_it_failed_is_not_reported_free() {
+        let spent = CostMeter::default();
+        // What `exec_and_stream` does once the pump has finished, before it inspects the exit code.
+        spent.raise(0.20629125);
+        let outcome = TurnOutcome::failed(
+            spent.get(),
+            TurnFailure::Orchestration(OpenshellCliError::AgentExit { code: 1 }.to_string()),
+        );
+        assert_eq!(outcome.cost_usd, 0.20629125);
+        assert!(outcome.failure.is_some());
+    }
+
+    /// `raise` is a high-water mark, so banking the cost early and again at the end cannot
+    /// double-count it, and a later smaller sample cannot lower it.
+    #[test]
+    fn the_meter_only_ever_rises() {
+        let spent = CostMeter::default();
+        spent.raise(0.25);
+        spent.raise(0.25);
+        assert_eq!(spent.get(), 0.25);
+        spent.raise(0.10);
+        assert_eq!(spent.get(), 0.25, "a smaller later sample never lowers it");
+        spent.raise(0.40);
+        assert_eq!(spent.get(), 0.40, "the OTEL rollup can only raise it");
+    }
+
+    /// A broken exec stream is not a finished turn. Before this it reported no exit code, and
+    /// "no exit code" read as a clean one.
+    #[test]
+    fn a_broken_exec_stream_is_its_own_error() {
+        let e = OpenshellCliError::ExecStreamBroke {
+            code: tonic::Code::Unavailable,
+            message: "broken pipe".to_string(),
+        };
+        let msg = e.to_string();
+        assert!(
+            msg.contains("Unavailable"),
+            "the code is the classifiable part: {msg}"
+        );
+        assert!(msg.contains("broken pipe"), "{msg}");
+        assert!(msg.contains("before the agent reported an exit"), "{msg}");
     }
 
     /// The locator's glob reaches each harness's transcript at its real depth: claude one segment

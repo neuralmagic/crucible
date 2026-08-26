@@ -142,7 +142,7 @@ impl Resolver<'_, '_> {
         }
         dsl::reject_deep_nesting(&source, &canonical).map_err(&located)?;
         let ast = AstModule::parse(&canonical.display().to_string(), source, &dsl::dialect())
-            .map_err(|error| located(dsl::CompileError::Parse(error.to_string())))?;
+            .map_err(|error| located(dsl::parse_error(error)))?;
         self.active.push(canonical.clone());
         let frozen = self.evaluate(ast);
         self.active.pop();

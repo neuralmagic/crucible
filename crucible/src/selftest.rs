@@ -352,7 +352,7 @@ mod tests {
         assert_eq!(report.bad.mean_score, 100.0);
         assert!(report.good.all_valid && report.bad.all_valid);
 
-        let ev: crate::refine::SelftestEvidence = (&report).into();
+        let ev: crucible_contract::refine::SelftestEvidence = (&report).into();
         assert_eq!(ev.direction, "higher");
         assert_eq!(ev.runs, 3);
         assert_eq!(ev.good.readings.len(), 3);

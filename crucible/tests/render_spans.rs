@@ -54,6 +54,7 @@ fn turn_opts() -> TurnOpts {
         authoritative: false,
         harness: None,
         model: None,
+        pack_path: None,
     }
 }
 
