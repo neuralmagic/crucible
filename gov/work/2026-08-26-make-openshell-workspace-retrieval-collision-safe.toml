@@ -1,0 +1,43 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-08-26-001"
+title = "Make OpenShell workspace retrieval collision-safe"
+status = "done"
+created = "2026-08-26"
+started = "2026-08-26"
+completed = "2026-08-26"
+refs = [
+    "RFC-0001:C-TRANSPORT",
+    "ADR-0015",
+]
+
+[content]
+description = "Make OpenShell's post-turn workspace retrieval reliably return an agent's candidate to the engine when the workspace contains hardlinks or the destination already contains build outputs. A transfer failure must not erase the only copy of completed, paid agent work before recovery has been attempted."
+
+[[content.acceptance_criteria]]
+text = "OpenShell workspace retrieval succeeds when the sandbox archive contains hardlinks whose destination paths already exist, including the observed Cargo target build-script hardlink layout"
+status = "done"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "A failed workspace retrieval leaves the sandbox candidate available for bounded retry or explicit operator recovery and is not reported as an agent-authored turn failure while recovery remains possible"
+status = "done"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "Failed or interrupted retrieval cannot leave a partially synchronized workspace that is subsequently measured as a valid candidate"
+status = "done"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "Automated coverage reproduces the existing-file hardlink collision and proves the edited workspace is recovered without losing candidate files"
+status = "done"
+category = "chore"
+
+[verification]
+required_guards = [
+    "GUARD-CARGO-FMT",
+    "GUARD-CARGO-TEST",
+    "GUARD-GOVCTL-CHECK",
+]
