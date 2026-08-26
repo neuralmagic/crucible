@@ -1327,7 +1327,7 @@ fn render_wide_prompt(template: &str, goal: &str, approach: &str) -> String {
 mod tests {
     use super::*;
     use crate::loop_driver::{LoopRuntime, run_loop};
-    use crate::{Prepared, agent, manifest, reporter, run, stream};
+    use crate::{Prepared, manifest, reporter, run, stream};
     use clap::Parser;
     use std::path::Path;
 

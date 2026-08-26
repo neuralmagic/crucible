@@ -13,6 +13,8 @@ pub mod event;
 pub mod identity;
 pub mod json;
 pub mod markers;
+pub mod refine;
+pub mod scope;
 pub mod session;
 pub mod tier;
 
@@ -43,5 +45,10 @@ pub use markers::{
     RANK_ACTIVITY_MARKER, RUN_SESSION_DELIMITER, SCOPE_ACTIVITY_MARKER, SCOPE_PACK_MARKER,
     SCOPE_PROGRESS_MARKER, SCOPE_REPORT_MARKER, SCOPE_TRANSCRIPT_MARKER, VERDICT_MARKER,
 };
+pub use refine::{
+    Attack, AttackKind, ControlEvidence, FailureEvidence, ReadingEvidence, RoundKind, RoundOutcome,
+    RoundRecord, SelftestEvidence, parse_rounds, render_rounds_json,
+};
+pub use scope::{ScopeReport, StageName, StageResult};
 pub use session::{PrLinkWire, RowWire, SessionEvent, WIRE_VERSION, decode, encode};
 pub use tier::{Disposition, Tier, TierParseError};
