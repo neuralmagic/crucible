@@ -3,9 +3,10 @@
 [govctl]
 id = "WI-2026-08-25-003"
 title = "Serve controller renders from a linked engine library"
-status = "active"
+status = "done"
 created = "2026-08-25"
 started = "2026-08-25"
+completed = "2026-08-25"
 refs = [
     "RFC-0004:C-LINKED-RENDER",
     "RFC-0004:C-CONTRACT-VERSION",
@@ -17,25 +18,25 @@ description = "Engine side of RFC-0004. The crucible crate becomes a library wit
 
 [[content.acceptance_criteria]]
 text = "the crucible crate exposes a library target; every render the controller performs today is a public function taking a typed options value, and the CLI subcommands are thin wrappers that parse into the same value"
-status = "pending"
+status = "done"
 category = "added"
 
 [[content.acceptance_criteria]]
 text = "for the existing render fixtures, the library call and the CLI produce byte-identical documents (a test drives both paths over the same inputs)"
-status = "pending"
+status = "done"
 category = "added"
 
 [[content.acceptance_criteria]]
 text = "renders take no ambient input: digest pinning and cluster access are capabilities the caller passes, and a test proves a render with pinning off performs no network access"
-status = "pending"
+status = "done"
 category = "changed"
 
 [[content.acceptance_criteria]]
 text = "crucible-contract exposes one contract version; `crucible --contract-version` prints it; Containerfile.runtime stamps it as an image label"
-status = "pending"
+status = "done"
 category = "added"
 
 [[content.acceptance_criteria]]
 text = "cargo fmt, cargo clippy --all-targets -D warnings, and the workspace tests pass; no new unwrap/expect/anyhow-macro sites outside tests"
-status = "pending"
+status = "done"
 category = "chore"
