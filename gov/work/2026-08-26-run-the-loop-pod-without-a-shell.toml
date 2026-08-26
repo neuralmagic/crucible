@@ -1,0 +1,28 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-08-26-003"
+title = "Run the loop pod without a shell"
+status = "queue"
+created = "2026-08-26"
+refs = [
+    "RFC-0002:C-PLAYBOOK-LANE",
+]
+
+[content]
+description = "The turn pods stopped running `/bin/sh -c` over an interpolated string on 2026-08-26: they clone in an init container and take exec-form argv. The loop pod's wrapper (`deploy::render::kube`, via `harness_flag`/`model_flag` with their `sep` argument) is the last one still building a shell script by formatting values into it. It is the larger of the two — state directories, resume, the results bucket, the control port — which is why it was left out of that change rather than tangled into it. The same argument applies: a value that reaches a shell word needs escaping analysis forever, and argv needs none."
+
+[[content.acceptance_criteria]]
+text = "the loop pod's container takes exec-form argv, and any step needing sequencing before it (the clone, the state directory) is its own init container rather than a line in a script"
+status = "pending"
+category = "changed"
+
+[[content.acceptance_criteria]]
+text = "`harness_flag` and `model_flag` and their `sep` argument are gone, since the two spellings existed only to serve a shell string and an argv element from one function"
+status = "pending"
+category = "removed"
+
+[[content.acceptance_criteria]]
+text = "the rendered loop pod is asserted against parsed argv, not against a substring of a script, and a resumed run renders the same way"
+status = "pending"
+category = "chore"
