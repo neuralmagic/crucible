@@ -1,0 +1,28 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-08-26-002"
+title = "Diagnose the silent sandboxed-turn death on prod"
+status = "queue"
+created = "2026-08-26"
+refs = [
+    "RFC-0002:C-PLAYBOOK-LANE",
+]
+
+[content]
+description = "On prod, a sandboxed agent turn exits 1 having written nothing to stderr. It reproduces on both the scope-propose and grounded-rank paths, intermittently: one round dies before the agent speaks at all ($0), the next runs real tool calls, bills ~$0.21, and then dies mid-turn. It is not model availability — `claude-opus-4-6` answers 200 on `us-east5` for this project, and the turn's own tool calls prove the model responded. It is not the credential binding, which `7a97f2b` fixed and which the billed round proves working. The engine changes of 2026-08-26 make the failure legible rather than explaining it: a failed exec now replays the sandbox's own log, a broken exec stream is no longer read as a clean exit, and a turn that billed before dying reports what it spent. This item is the diagnosis those were meant to enable. Until it closes, any lane that runs a sandboxed turn — including the loop pod, not just scope — is on unproven ground."
+
+[[content.acceptance_criteria]]
+text = "a failing turn is reproduced with the sandbox log replay in place, and the cause is named from evidence rather than inferred: what the process was, what killed it, and why it wrote nothing"
+status = "pending"
+category = "chore"
+
+[[content.acceptance_criteria]]
+text = "the cause is fixed, or refused with a typed error naming it, so the same failure never again reaches an operator as an unexplained exit code"
+status = "pending"
+category = "changed"
+
+[[content.acceptance_criteria]]
+text = "a sandboxed turn completes end to end on prod on both the scope and grounded paths"
+status = "pending"
+category = "chore"

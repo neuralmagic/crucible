@@ -1,0 +1,49 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-08-25-005"
+title = "Expose the types the controller must not mirror"
+status = "queue"
+created = "2026-08-25"
+refs = [
+    "RFC-0004:C-LINKED-RENDER",
+    "RFC-0004:C-TYPED-INVOCATION",
+]
+
+[content]
+description = "An audit of the controller after it began linking the engine found 21 sites that rebuild engine meaning from text: private serde mirrors of engine structs, re-parsing of the engine's own rendered output, and typed errors flattened to strings and later matched by substring. Most can be deleted the moment the engine exposes what it already models, but seven are blocked on the engine because the types live in the binary, are private, or serialize in a shape nothing can decode. This is the engine half; the controller half is tracked in the controller repository and is gated on a single coordinated rev bump."
+
+[[content.acceptance_criteria]]
+text = "the workflow parameter types (the parameter kind, its spec, its declared constraints, and the binder that applies supplied values) are public, so a launcher validates a parameter through the engine's own binder instead of a second constraint engine that treats every value as a string"
+status = "pending"
+category = "changed"
+
+[[content.acceptance_criteria]]
+text = "the refine trail's records are library types with a public parser for the fenced block the frozen scope document carries, and nothing outside the engine needs to redeclare them to read a trail"
+status = "pending"
+category = "changed"
+
+[[content.acceptance_criteria]]
+text = "the scope report and its per-stage results are decodable by a consumer: they deserialize as well as serialize, no field is typed so that only the engine can construct it, and the rounds a report carries survive the decode"
+status = "pending"
+category = "changed"
+
+[[content.acceptance_criteria]]
+text = "the agent backend is a manifest type with one parser, and no consumer needs a copy of its spellings or its default"
+status = "pending"
+category = "changed"
+
+[[content.acceptance_criteria]]
+text = "a compile error exposes its source anchor and its inner message as data rather than only inside a rendered string, and a parse failure keeps the span it was found at, so an editor can place a marker without re-parsing the rendered text"
+status = "pending"
+category = "changed"
+
+[[content.acceptance_criteria]]
+text = "the grounded ranking verdict is a shared contract type carrying the tier, rationale, confidence, cost, budget verdict, and error kind, emitted and parsed through that type, so a cost cannot silently read as zero"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "the library builds with default features off and gains no dependency it did not already have; fmt, clippy with warnings denied, and the workspace tests pass"
+status = "pending"
+category = "chore"

@@ -1,0 +1,29 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-08-25-002"
+title = "Add --repo-ref to deploy render-turn so scenario git_ref works"
+status = "active"
+created = "2026-08-25"
+started = "2026-08-25"
+refs = [
+    "RFC-0002:C-PLAYBOOK-LANE",
+]
+
+[content]
+description = "The controller passes `--repo-ref <ref>` to `crucible deploy render-turn` for a scenario adopted with git_ref (crucible-domains 01c39c9, 2026-08-02), but the engine's render-turn never took the flag, so every such scenario fails its scope turn at argument parsing (`unexpected argument '--repo-ref'`, prod 2026-08-25, scenario:01a03a0f-d4b4-7162-bf99-96b38d3389f2). Add the flag, clone at the ref in both turn wrappers, and bump the controller's engine pin once it lands."
+
+[[content.acceptance_criteria]]
+text = "`crucible deploy render-turn --repo-ref <ref>` renders `git clone --depth 50 --branch <ref>` in both the rank and scope wrappers; without the flag the clone is unchanged"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "a ref outside the plain branch/tag character set (whitespace, quotes, `$`, glob characters, leading `-`) is refused with a typed error before it reaches the wrapper script"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "the controller pin carries the flag and prod runs a loop image built from it; a scenario adopted with a git_ref reaches a scope pod instead of failing at argument parsing"
+status = "pending"
+category = "chore"
