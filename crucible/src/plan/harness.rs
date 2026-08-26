@@ -497,7 +497,7 @@ fn run_in(
             model,
             effort,
         } => (prompt, harness, model, effort),
-        TaskKind::Command { .. } | TaskKind::Evaluate { .. } => {
+        TaskKind::Command { .. } | TaskKind::Evaluate { .. } | TaskKind::Report { .. } => {
             let mut shell = ShellRunner {
                 workdir: paths.workspace.clone(),
                 agent_cmd: None,

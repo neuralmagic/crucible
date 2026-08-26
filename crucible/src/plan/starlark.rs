@@ -23,8 +23,8 @@ use crate::errors::FileError;
 use crate::manifest::{WorkflowCfg, WorkflowError, WorkflowType};
 use crate::plan::diag;
 use crate::plan::ir::{
-    Direction, EngineOp, Isolation, Join, MAX_FANOUT_CEILING, OutputField, OutputRef, Stage, Task,
-    TaskKind, TaskName,
+    Direction, EngineOp, Isolation, Join, MAX_FANOUT_CEILING, OutputField, OutputRef,
+    ReportDestination, SlackDestination, Stage, Task, TaskKind, TaskName,
 };
 use crate::plan::starlark::values::WorkflowValue;
 
@@ -674,6 +674,12 @@ pub enum CompileError {
     TopKZero,
     #[error("top_k direction must be `lower` or `higher`, got {got:?}")]
     UnknownTopKDirection { got: String },
+    #[error("report destination kind must be `slack`, got {got:?}")]
+    UnknownReportDestination { got: String },
+    #[error("report destination must be an object such as {{\"kind\": \"slack\"}}")]
+    ReportDestinationNotObject,
+    #[error("slack report destination has unknown parameter {parameter:?}")]
+    UnknownSlackDestinationParameter { parameter: String },
     #[error("top_k requires a non-empty depends_on")]
     TopKWithoutDependencies,
     #[error("stage must be `iteration` or `epilogue`, got {got:?}")]
@@ -847,6 +853,7 @@ const COMMON_FUNCTIONS: &[&str] = &[
     "evaluate",
     "param",
     "prompt_file",
+    "report",
     "session",
     "workflow",
 ];
@@ -946,6 +953,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "emits_files",
         ],
         "top_k" => &["name", "k", "direction", "depends_on", "required"],
+        "report" => &["name", "destination", "template", "required"],
         "propose" => &["name", "session", "depends_on"],
         "apply" | "measure" => &["name", "depends_on"],
         "grade" => &["name", "score", "evidence", "join"],
@@ -1082,6 +1090,27 @@ fn constructor(
             };
             dsl_task(&mut named, name, kind, None)?
         }
+        "report" => Task {
+            name: take_declared_name(&mut named, "name")?,
+            task: TaskKind::Report {
+                destination: take_report_destination(&mut named)?,
+                template: {
+                    let path = take_string(&mut named, "template")?;
+                    state.context_mut().prompt_file(&path)?
+                },
+            },
+            depends_on: Vec::new(),
+            session: None,
+            needs: "any".to_owned(),
+            required: take_bool_default(&mut named, "required", true)?,
+            isolation: None,
+            join: Join::All,
+            stage: Stage::Epilogue,
+            emits: Vec::new(),
+            emits_files: Vec::new(),
+            over: None,
+            max_fanout: None,
+        },
         "top_k" => {
             let k = take_int(&mut named, "k")?;
             if k <= 0 {
@@ -1521,6 +1550,35 @@ fn take_string(named: &mut BTreeMap<String, Value>, name: &str) -> Result<String
             argument: name.to_owned(),
         }),
         _ => Err(wrong_type(name, "a string")),
+    }
+}
+
+fn take_report_destination(named: &mut BTreeMap<String, Value>) -> Result<ReportDestination> {
+    let mut object = match take_value(named, "destination")? {
+        Value::Map(object) => object,
+        _ => return Err(CompileError::ReportDestinationNotObject),
+    };
+    let kind = match object.remove("kind") {
+        Some(Value::String(kind)) => kind,
+        Some(_) => return Err(wrong_type("destination.kind", "a string")),
+        None => {
+            return Err(CompileError::MissingArgument {
+                argument: "destination.kind".to_owned(),
+            });
+        }
+    };
+    match kind.as_str() {
+        "slack" => {
+            if let Some(parameter) = object.keys().next() {
+                return Err(CompileError::UnknownSlackDestinationParameter {
+                    parameter: parameter.clone(),
+                });
+            }
+            Ok(ReportDestination::Slack(SlackDestination::default()))
+        }
+        other => Err(CompileError::UnknownReportDestination {
+            got: other.to_owned(),
+        }),
     }
 }
 
@@ -2485,6 +2543,25 @@ default_autoresearch([racecheck])
             crate::errors::report(&compile_source(bad, &pack.join("bad.star"), &pack).unwrap_err());
         assert!(error.contains("`iteration` or `epilogue`"), "{error}");
         let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn report_is_an_engine_owned_required_epilogue() {
+        let pack = temp_pack("report");
+        std::fs::create_dir_all(pack.join("reports")).unwrap();
+        std::fs::write(pack.join("reports/slack.md.j2"), "{{ passed }} passed").unwrap();
+        let source = r#"
+work = command(name = "work", run = "true")
+publish = report(name = "publish-report", destination = {"kind": "slack"}, template = "reports/slack.md.j2", required = True)
+workflow(type = "playbook", tasks = [work, publish])
+"#;
+        let compiled = compile_source(source, &pack.join("workflow.star"), &pack).unwrap();
+        let publish = &compiled.workflow.tasks[1];
+        assert!(matches!(publish.task, TaskKind::Report { .. }));
+        assert_eq!(publish.stage, Stage::Epilogue);
+        assert!(publish.required);
+        assert!(publish.depends_on.is_empty());
+        let _ = std::fs::remove_dir_all(pack);
     }
 
     #[test]

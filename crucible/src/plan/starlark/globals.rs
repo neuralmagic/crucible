@@ -68,6 +68,14 @@ pub(crate) fn common(builder: &mut GlobalsBuilder) {
         dispatch("prompt_file", args, kwargs, eval)
     }
 
+    fn report<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("report", args, kwargs, eval)
+    }
+
     fn skill<'v>(
         #[starlark(args)] args: UnpackTuple<Value<'v>>,
         #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,

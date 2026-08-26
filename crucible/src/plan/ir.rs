@@ -47,6 +47,19 @@ pub enum Direction {
     Higher,
 }
 
+/// A controller-configured publication sink. The workflow selects a key, never an endpoint or
+/// credential; adding a destination is an engine change with an explicit transport policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportDestination {
+    Slack(SlackDestination),
+}
+
+/// Slack destination parameters. Empty in v1; the object shape allows additive options without
+/// changing `report()` or admitting caller-supplied webhook URLs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlackDestination {}
+
 /// Authorable operations that require orchestrator capabilities to execute.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -158,6 +171,12 @@ pub enum TaskKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         direction: Option<Direction>,
     },
+    /// Engine-owned publication of the bounded run report. The template is pack-authored at
+    /// compile time; its context remains the fixed typed report contract.
+    Report {
+        destination: ReportDestination,
+        template: String,
+    },
     /// Engine-builtin deterministic fold: keep the k best upstream outputs by `score`.
     TopK { k: u32, direction: Direction },
     /// A capability-owned engine operation.
@@ -180,6 +199,7 @@ impl TaskKind {
             TaskKind::Agent { .. } => "agent",
             TaskKind::Command { .. } => "command",
             TaskKind::Evaluate { .. } => "evaluate",
+            TaskKind::Report { .. } => "report",
             TaskKind::TopK { .. } => "top_k",
             TaskKind::Engine { op, .. } => match op {
                 EngineOp::Propose => "engine_propose",

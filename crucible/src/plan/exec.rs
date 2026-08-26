@@ -611,6 +611,7 @@ pub fn execute(
                 TaskKind::Agent { .. }
                 | TaskKind::Command { .. }
                 | TaskKind::Evaluate { .. }
+                | TaskKind::Report { .. }
                 | TaskKind::Engine { .. } => {
                     run_with_retries(t, &inputs, cfg, runner, &mut spent, budget)
                 }
