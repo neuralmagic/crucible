@@ -20,7 +20,7 @@ type Result<T> = std::result::Result<T, CompileError>;
 /// The types a parameter may take. Deliberately small: every one has an unambiguous spelling on
 /// a command line and in JSON, which is what lets one declaration serve both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ParamType {
+pub enum ParamType {
     String,
     Int,
     Number,
@@ -29,7 +29,7 @@ pub(crate) enum ParamType {
 }
 
 impl ParamType {
-    fn parse(name: &str) -> Option<Self> {
+    pub fn parse(name: &str) -> Option<Self> {
         match name {
             "string" => Some(ParamType::String),
             "int" => Some(ParamType::Int),
@@ -40,7 +40,7 @@ impl ParamType {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             ParamType::String => "string",
             ParamType::Int => "int",
@@ -57,7 +57,7 @@ impl ParamType {
 
 /// A bound parameter value.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum ParamValue {
+pub enum ParamValue {
     String(String),
     Int(i32),
     Number(f64),
@@ -66,7 +66,7 @@ pub(crate) enum ParamValue {
 }
 
 impl ParamValue {
-    pub(crate) fn json(&self) -> serde_json::Value {
+    pub fn json(&self) -> serde_json::Value {
         match self {
             ParamValue::String(s) => serde_json::Value::String(s.clone()),
             ParamValue::Int(n) => serde_json::json!(n),
@@ -79,16 +79,16 @@ impl ParamValue {
 
 /// One declared parameter.
 #[derive(Debug, Clone)]
-pub(crate) struct ParamSpec {
-    pub(crate) name: String,
-    pub(crate) ty: ParamType,
-    pub(crate) required: bool,
-    pub(crate) default: Option<ParamValue>,
-    pub(crate) doc: String,
-    pub(crate) pattern: Option<String>,
-    pub(crate) min: Option<f64>,
-    pub(crate) max: Option<f64>,
-    pub(crate) choices: Vec<String>,
+pub struct ParamSpec {
+    pub name: String,
+    pub ty: ParamType,
+    pub required: bool,
+    pub default: Option<ParamValue>,
+    pub doc: String,
+    pub pattern: Option<String>,
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+    pub choices: Vec<String>,
 }
 
 /// Every field a declaration may carry, for the did-you-mean on a typo.
@@ -97,7 +97,7 @@ const FIELDS: &[&str] = &[
 ];
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct Params(Vec<ParamSpec>);
+pub struct Params(Vec<ParamSpec>);
 
 impl Params {
     /// Read the block without evaluating the source.
@@ -146,7 +146,7 @@ impl Params {
     /// Everything a launcher supplies arrives as text, because a command line and a JSON form
     /// and an ask all hand over text. Parsing is the declaration's job, which is what keeps
     /// `max_steps = "many"` from reaching the graph.
-    pub(crate) fn bind(
+    pub fn bind(
         &self,
         supplied: &BTreeMap<String, String>,
     ) -> Result<BTreeMap<String, ParamValue>> {
@@ -180,15 +180,20 @@ impl Params {
         Ok(bound)
     }
 
+    /// The declarations, in the order the source wrote them.
+    pub fn specs(&self) -> &[ParamSpec] {
+        &self.0
+    }
+
     /// Whether the source declares no parameters at all. A graph that is not a function of its
     /// launch arguments can be frozen; one that is must be compiled per run.
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
     /// The declaration as a JSON Schema document, so one source serves command-line validation,
     /// ask validation, and a generated launch form.
-    pub(crate) fn json_schema(&self) -> serde_json::Value {
+    pub fn json_schema(&self) -> serde_json::Value {
         let mut properties = serde_json::Map::new();
         let mut required = Vec::new();
         for spec in &self.0 {

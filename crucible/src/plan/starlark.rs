@@ -6,7 +6,7 @@
 mod globals;
 mod idents;
 mod loader;
-pub(crate) mod params;
+pub mod params;
 mod values;
 
 use std::cell::{RefCell, RefMut};
@@ -1908,6 +1908,14 @@ pub fn materialize_sibling_manifest(
 /// the evaluator.
 #[tracing::instrument(skip_all, fields(source = %filename.display()), err)]
 pub fn declared_params(source: &str, filename: &Path) -> Result<serde_json::Value> {
+    Ok(read_params(source, filename)?.json_schema())
+}
+
+/// The declarations themselves, typed, for a launcher that has values to bind rather than a form
+/// to draw: [`params::Params::bind`] parses and constrains supplied text through the same code the
+/// compiler runs, so a launcher cannot disagree with the compiler about what a pack accepts.
+#[tracing::instrument(skip_all, fields(source = %filename.display()), err)]
+pub fn read_params(source: &str, filename: &Path) -> Result<params::Params> {
     on_compile_stack(|| {
         if source.len() > MAX_SOURCE_BYTES {
             return Err(CompileError::SourceTooLarge {
@@ -1921,7 +1929,7 @@ pub fn declared_params(source: &str, filename: &Path) -> Result<serde_json::Valu
             &dialect(),
         )
         .map_err(|error| CompileError::Parse(error.to_string()))?;
-        Ok(params::Params::read(&ast)?.json_schema())
+        params::Params::read(&ast)
     })
 }
 
