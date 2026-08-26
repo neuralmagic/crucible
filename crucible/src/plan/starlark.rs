@@ -416,6 +416,38 @@ impl SessionDecl {
 ///
 /// Causes are real `source()` links, so the message a user reads comes from
 /// [`crate::errors::report`] (or anyhow's `{:#}`), not from `Display` alone.
+/// Where a compile error was found, in lines and columns rather than in prose. Both ends are
+/// 1-based, matching what an editor shows and what the rendered message prints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceSpan {
+    pub begin_line: u32,
+    pub begin_column: u32,
+    pub end_line: u32,
+    pub end_column: u32,
+}
+
+/// A file and the span within it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceAnchor {
+    pub file: String,
+    pub span: SourceSpan,
+}
+
+impl From<&FileSpan> for SourceAnchor {
+    fn from(at: &FileSpan) -> Self {
+        let resolved = at.resolve();
+        SourceAnchor {
+            file: resolved.file,
+            span: SourceSpan {
+                begin_line: resolved.span.begin.line as u32 + 1,
+                begin_column: resolved.span.begin.column as u32 + 1,
+                end_line: resolved.span.end.line as u32 + 1,
+                end_column: resolved.span.end.column as u32 + 1,
+            },
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CompileError {
     /// An error located at its authoring site. The innermost site wins.
@@ -429,8 +461,13 @@ pub enum CompileError {
     File(#[from] FileError),
     #[error("prompt files must be UTF-8")]
     PromptNotUtf8(#[from] std::string::FromUtf8Error),
-    #[error("parsing workflow Starlark: {0}")]
-    Parse(String),
+    #[error("parsing workflow Starlark: {message}")]
+    Parse {
+        message: String,
+        /// Where the parser gave up, when it said. Kept as data so a marker can be placed without
+        /// re-parsing the rendered message.
+        at: Option<SourceAnchor>,
+    },
     #[error(transparent)]
     Workflow(#[from] WorkflowError),
     #[error("serializing the compiled workflow")]
@@ -738,6 +775,38 @@ pub enum CompileError {
         .sites.join(", ")
     )]
     UnboundSessions { sites: Vec<String> },
+}
+
+/// Keep the parser's own span alongside its message: it knows where it gave up, and a rendered
+/// string is the one form nothing downstream can use.
+pub(crate) fn parse_error(error: starlark_syntax::Error) -> CompileError {
+    CompileError::Parse {
+        at: error.span().map(SourceAnchor::from),
+        message: error.to_string(),
+    }
+}
+
+impl CompileError {
+    /// Where the error was found, if it was located. A consumer places a marker from this rather
+    /// than parsing the `file:line:col` out of the rendered message.
+    pub fn anchor(&self) -> Option<SourceAnchor> {
+        match self {
+            CompileError::At { at, inner } => {
+                Some(inner.anchor().unwrap_or_else(|| SourceAnchor::from(at)))
+            }
+            CompileError::Parse { at, .. } => at.clone(),
+            _ => None,
+        }
+    }
+
+    /// What went wrong, without the location. [`CompileError::At`] displays only its site, so the
+    /// message a consumer wants is the innermost one it wraps.
+    pub fn message(&self) -> String {
+        match self {
+            CompileError::At { inner, .. } => inner.message(),
+            other => other.to_string(),
+        }
+    }
 }
 
 /// Compiling `workflow.star` into the manifest's generated `[workflow]` block: the compile
@@ -1928,7 +1997,7 @@ pub fn read_params(source: &str, filename: &Path) -> Result<params::Params> {
             source.to_owned(),
             &dialect(),
         )
-        .map_err(|error| CompileError::Parse(error.to_string()))?;
+        .map_err(parse_error)?;
         params::Params::read(&ast)
     })
 }
@@ -1999,7 +2068,7 @@ fn compile_source_here(
         source.to_owned(),
         &dialect(),
     )
-    .map_err(|error| CompileError::Parse(error.to_string()))?;
+    .map_err(parse_error)?;
     let lane = idents::declared_lane(&ast);
     let idents = idents::scan(&ast, lane);
     let globals = lane_globals(lane);
