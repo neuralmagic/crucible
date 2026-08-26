@@ -1755,6 +1755,7 @@ pub fn compile_file(path: &Path, pack_dir: &Path) -> Result<CompiledWorkflow> {
 
 /// Compile a file with the values a launcher supplied: the library form of
 /// `crucible plan compile-workflow`, which prints [`CompiledWorkflow::canonical_json`].
+#[tracing::instrument(skip_all, fields(source = %path.display(), params = supplied.len()), err)]
 pub fn compile_file_with(
     path: &Path,
     pack_dir: &Path,
@@ -1905,6 +1906,7 @@ pub fn materialize_sibling_manifest(
 /// A launcher, a form, or an orchestrator validating an ask all need to know what a pack accepts
 /// before running a line of it, which is why the block is a literal and why this never reaches
 /// the evaluator.
+#[tracing::instrument(skip_all, fields(source = %filename.display()), err)]
 pub fn declared_params(source: &str, filename: &Path) -> Result<serde_json::Value> {
     on_compile_stack(|| {
         if source.len() > MAX_SOURCE_BYTES {
