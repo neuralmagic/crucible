@@ -3,31 +3,30 @@
 [govctl]
 id = "WI-2026-08-25-001"
 title = "Launch an existing loop pack through the controller without a scope turn"
-status = "queue"
+status = "active"
 created = "2026-08-25"
-refs = [
-    "RFC-0002:C-PLAYBOOK-LANE",
-]
+started = "2026-08-26"
+refs = ["RFC-0002:C-PLAYBOOK-LANE"]
 
 [content]
-description = "The controller has no launch path for a scored loop pack that already exists in a repository. The playbook registry refuses [workflow] type = \"autoresearch\" packs, and a scenario adoption always renders `crucible scope --propose`, so an agent turn is spent re-authoring (or copying) a pack the repo already carries (examples/selfhost is the first case). The engine already exposes `crucible scope --pack <dir>`, which validates a pack without proposing. Give the controller a way to point a scenario, or a registration, at an in-repo pack and dispatch the loop from it."
+description = "Provide a hosted launch path for a scored autoresearch pack that already exists in a repository, without spending a scope turn to re-author it. The controller freezes and validates the named pack, records it as an approved scope, and reuses the existing build and run lifecycle; examples/selfhost is the end-to-end case."
 
 [[content.acceptance_criteria]]
-text = "a scenario adoption body accepts a pack_path inside the checkout; the scope turn renders `scope --pack <checkout>/<pack_path>` and never `--propose` for it"
+text = "an admin can launch an autoresearch pack by repository, optional ref, and path without a scope turn"
 status = "pending"
 category = "added"
 
 [[content.acceptance_criteria]]
-text = "a pack_path that does not hold a crucible.toml at the adopted ref is refused at adoption with a field-level 422, not discovered in the pod"
+text = "invalid or non-autoresearch pack paths are refused before durable launch state is created"
 status = "pending"
 category = "added"
 
 [[content.acceptance_criteria]]
-text = "the validated pack dispatches a run pod with the controller's run_iterations and run_max_cost knobs, and the run shows on /runs/{id} like any dispatched run"
+text = "the frozen pack enters as an approved scope and dispatches with the controller run knobs through the ordinary lifecycle"
 status = "pending"
 category = "added"
 
 [[content.acceptance_criteria]]
-text = "controller tests cover the argv render for pack_path and the refusal path; an e2e against examples/selfhost on the dev controller records the run"
+text = "focused tests and a live examples/selfhost run verify direct launch, queue wake-up, and run tracking"
 status = "pending"
 category = "chore"
