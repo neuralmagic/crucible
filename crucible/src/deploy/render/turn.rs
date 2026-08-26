@@ -133,7 +133,7 @@ pub struct TurnOpts {
     pub goal_text: Option<String>,
     /// The clone URL of the repo under test (the init container clones it fresh into the pod).
     pub repo_url: String,
-    /// Branch or tag the init container clones at. `None` is the repo's default branch.
+    /// Branch, tag, or commit the init containers check out. `None` is the repo's default branch.
     pub repo_ref: Option<String>,
     /// The agent sandbox image carrying the claude CLI the loop/crucible image does not (the
     /// `openshell` backend pulls it via `REGISTRY_AUTH_FILE` pointing at the mounted authfile).
@@ -562,18 +562,32 @@ pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
     // The clone is its own step, so neither it nor the turn needs a shell to sequence them: an
     // init container that fails keeps the turn container from starting at all, which is what
     // `set -e` was standing in for.
-    let mut clone_args = strs(["clone", "--depth", "50"]);
-    if let Some(r) = repo_ref.as_deref() {
-        clone_args.extend(strs(["--branch", checked_git_ref(r)?]));
-    }
-    clone_args.push(repo_url.clone());
-    clone_args.push(CHECKOUT_DIR.to_string());
-    let clone = core::Container {
-        name: "clone".to_string(),
+    //
+    // Unpinned, a shallow clone of the default branch is all a turn needs. Pinned, the ref is
+    // checked out rather than cloned by name, because `--branch` takes a branch or a tag and not a
+    // commit: a blobless clone carries every commit at a fraction of the bytes, and the checkout
+    // fetches only the blobs it needs. One path serves branches, tags, and commits alike.
+    let checkout_step = repo_ref.as_deref().map(checked_git_ref).transpose()?;
+    let clone_args = match checkout_step {
+        Some(_) => {
+            let mut a = strs(["clone", "--filter=blob:none", "--no-checkout"]);
+            a.push(repo_url.clone());
+            a.push(CHECKOUT_DIR.to_string());
+            a
+        }
+        None => {
+            let mut a = strs(["clone", "--depth", "50"]);
+            a.push(repo_url.clone());
+            a.push(CHECKOUT_DIR.to_string());
+            a
+        }
+    };
+    let git_container = |name: &str, args: Vec<String>| core::Container {
+        name: name.to_string(),
         image: Some(image.clone()),
         image_pull_policy: Some("IfNotPresent".to_string()),
         command: Some(vec!["git".to_string()]),
-        args: Some(clone_args),
+        args: Some(args),
         volume_mounts: Some(vec![core::VolumeMount {
             name: CHECKOUT_VOLUME.to_string(),
             mount_path: CHECKOUT_DIR.to_string(),
@@ -582,6 +596,13 @@ pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
         resources: Some(resources(profile)),
         ..Default::default()
     };
+    let mut init = vec![git_container("clone", clone_args)];
+    if let Some(r) = checkout_step {
+        init.push(git_container(
+            "checkout",
+            strs(["-C", CHECKOUT_DIR, "checkout", "--detach", r]),
+        ));
+    }
 
     let container = core::Container {
         name: "turn".to_string(),
@@ -631,7 +652,7 @@ pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
             ),
             restart_policy: Some("Never".to_string()),
             affinity: node_avoid_affinity(profile),
-            init_containers: Some(vec![clone]),
+            init_containers: Some(init),
             containers: vec![container],
             volumes: Some(volumes),
             ..Default::default()
@@ -664,6 +685,21 @@ mod tests {
         let mut parts = c.command.unwrap_or_default();
         parts.extend(c.args.unwrap_or_default());
         parts.join(" ")
+    }
+
+    /// The checkout init container's command and argv, when the ref is pinned.
+    fn checkout_cmd(yaml: &str) -> Option<String> {
+        let pod = pod_of(yaml);
+        let c = pod
+            .spec
+            .expect("spec")
+            .init_containers
+            .unwrap_or_default()
+            .into_iter()
+            .find(|c| c.name == "checkout")?;
+        let mut parts = c.command.unwrap_or_default();
+        parts.extend(c.args.unwrap_or_default());
+        Some(parts.join(" "))
     }
 
     /// The clone init container's command and argv, same shape.
@@ -1311,9 +1347,14 @@ mod tests {
             let yaml = render_turn(&minimal_profile(), &opts).expect("render turn");
             assert_eq!(
                 clone_cmd(&yaml),
-                "git clone --depth 50 --branch feature/x-1.2 \
+                "git clone --filter=blob:none --no-checkout \
                  https://github.com/owner/repo.git /checkout",
-                "{kind:?} clones at the ref"
+                "{kind:?} clones every commit, no blobs"
+            );
+            assert_eq!(
+                checkout_cmd(&yaml).as_deref(),
+                Some("git -C /checkout checkout --detach feature/x-1.2"),
+                "{kind:?} checks the ref out, so a commit works as well as a name"
             );
         }
     }
@@ -1408,6 +1449,36 @@ mod tests {
         let with_pack = render_turn(&minimal_profile(), &opts).expect("render");
         assert_eq!(plain, with_pack);
         assert!(turn_cmd(&with_pack).contains("crucible rank-grounded"));
+    }
+
+    /// Pinning a pack to a commit is the point of the ref, and `git clone --branch` takes only a
+    /// branch or a tag. The checkout step is what makes a commit work.
+    #[test]
+    fn a_commit_sha_is_a_usable_pin() {
+        let mut opts = opts_with_run_config(TurnKind::Scope, None, None);
+        opts.pack_path = Some(PackPath::parse("examples/selfhost").expect("valid"));
+        opts.repo_ref = Some("308097caa4b55975e27d58465b1d441bc0bb6c63".to_string());
+        let yaml = render_turn(&minimal_profile(), &opts).expect("render");
+        assert!(
+            !clone_cmd(&yaml).contains("--branch"),
+            "a commit is no branch"
+        );
+        assert_eq!(
+            checkout_cmd(&yaml).as_deref(),
+            Some("git -C /checkout checkout --detach 308097caa4b55975e27d58465b1d441bc0bb6c63")
+        );
+    }
+
+    /// Unpinned stays the cheap shallow clone, and grows no second step.
+    #[test]
+    fn an_unpinned_turn_keeps_the_shallow_clone() {
+        let opts = opts_with_run_config(TurnKind::Rank, None, None);
+        let yaml = render_turn(&minimal_profile(), &opts).expect("render");
+        assert_eq!(
+            clone_cmd(&yaml),
+            "git clone --depth 50 https://github.com/owner/repo.git /checkout"
+        );
+        assert_eq!(checkout_cmd(&yaml), None, "nothing to check out");
     }
 
     #[test]
