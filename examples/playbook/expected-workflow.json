@@ -113,6 +113,20 @@
       "required": true,
       "isolation": null,
       "join": "passed"
+    },
+    {
+      "name": "publish-report",
+      "kind": "report",
+      "destination": {
+        "slack": {}
+      },
+      "template": "*Crucible playbook complete* — {{ passed }} passed, {{ failed }} non-passing · ${{ \"%.4f\"|format(spent_usd) }}\n{% for task in tasks %}• `{{ task.name }}` — {{ task.status }}\n{% endfor %}{% if run_url %}<{{ run_url }}|Open run artifacts in Crucible>{% endif %}\n",
+      "depends_on": [],
+      "needs": "any",
+      "required": true,
+      "isolation": null,
+      "join": "all",
+      "stage": "epilogue"
     }
   ]
 }

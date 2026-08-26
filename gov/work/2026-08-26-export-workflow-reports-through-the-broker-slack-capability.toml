@@ -1,0 +1,52 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-08-26-003"
+title = "Export workflow reports through the broker Slack capability"
+status = "active"
+created = "2026-08-26"
+started = "2026-08-26"
+refs = [
+    "RFC-0002:C-PLAYBOOK-LANE",
+    "RFC-0002:C-PLAYBOOK-CAPS",
+]
+
+[content]
+description = "Export workflow results to the existing broker-owned Slack webhook without exposing the credential or creating an agent-controlled exfiltration channel. The engine writes a bounded structured report snapshot from settled task metadata; a zero-argument broker tool posts that snapshot to the webhook-configured channel."
+
+[[content.acceptance_criteria]]
+text = "Playbook execution maintains an engine-authored report snapshot containing run identity, verdict, spend, and bounded task statuses without task output or secret values"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "The broker exposes a zero-argument report tool that posts the current engine-authored snapshot through SLACK_WEBHOOK_URL and cannot select a channel or supply message text"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "Task-facing instructions explain that report exports routine final results and distress is reserved for operator intervention"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "Tests prove task-controlled strings, prompts, outputs, and credential values cannot enter the Slack payload"
+status = "pending"
+category = "security"
+
+[[content.acceptance_criteria]]
+text = "A local webhook integration test observes one bounded report payload with no credential in the task environment"
+status = "pending"
+category = "chore"
+
+[[content.acceptance_criteria]]
+text = "The report includes a controller-generated hyperlink to the Crucible run artifact page; the URL is derived from trusted run identity and deployment configuration, never from task output"
+status = "pending"
+category = "added"
+
+[verification]
+required_guards = [
+    "GUARD-CARGO-FMT",
+    "GUARD-CARGO-TEST",
+    "GUARD-GOVCTL-CHECK",
+]

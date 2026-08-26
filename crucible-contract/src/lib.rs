@@ -13,6 +13,7 @@ pub mod event;
 pub mod identity;
 pub mod json;
 pub mod markers;
+pub mod report;
 pub mod session;
 pub mod tier;
 
@@ -33,5 +34,6 @@ pub use markers::{
     RANK_ACTIVITY_MARKER, RUN_SESSION_DELIMITER, SCOPE_ACTIVITY_MARKER, SCOPE_PACK_MARKER,
     SCOPE_PROGRESS_MARKER, SCOPE_REPORT_MARKER, SCOPE_TRANSCRIPT_MARKER, VERDICT_MARKER,
 };
+pub use report::{REPORT_FILE, RunReport, TaskReport};
 pub use session::{PrLinkWire, RowWire, SessionEvent, WIRE_VERSION, decode, encode};
 pub use tier::{Disposition, Tier, TierParseError};
