@@ -2,6 +2,7 @@
 //! `docs/crucible-contract.md`) and builds the engine's World + Judge from it, so onboarding a
 //! repo is config, not Rust. Unknown keys are rejected (typo protection).
 
+mod backend;
 mod broker;
 mod deploy;
 mod judge;
@@ -15,6 +16,7 @@ mod wiring;
 mod workflow;
 mod world;
 
+pub use backend::{AgentBackend, UnknownBackend};
 pub use broker::{BrokerCfg, broker_endpoint_from_url, broker_port, resolve_broker_url};
 pub use deploy::DeployCfg;
 pub use judge::JudgeCfg;
@@ -526,8 +528,8 @@ pub struct AgentCfg {
     /// doesn't exist under `toolbox_dir` (a stale exclusion is a config bug, not a no-op).
     #[serde(default)]
     pub toolbox_exclude: Vec<String>,
-    #[serde(default = "default_backend")]
-    pub backend: String,
+    #[serde(default)]
+    pub backend: AgentBackend,
     #[serde(default)]
     pub sandbox_image: Option<String>,
     #[serde(default)]
@@ -550,9 +552,6 @@ pub struct AgentCfg {
 
 fn default_model() -> String {
     Harness::default().default_model().to_string()
-}
-fn default_backend() -> String {
-    "local".to_string()
 }
 
 /// `[agent.hermes]`: hermes-harness tuning. Phase B grows this (auth, config.yaml knobs); for

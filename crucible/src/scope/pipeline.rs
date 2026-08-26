@@ -1,15 +1,14 @@
 use crate::Paths;
 use crate::activity::ActivityFeed;
-use crate::agent::{self, AgentBackend, TurnOutcome};
+use crate::agent::{self, TurnOutcome};
 use crate::check::{self, CheckOutcome};
 use crate::deploy::ProposeTier;
 use crate::event::{AgentEvent, RawStream};
 use crate::identity::{self, RunIdentity};
 use crate::init::MANIFEST_FILE;
 use crate::manifest;
-use crate::refine::{
-    self, Attack, FailureEvidence, MIN_PROPOSED_SELFTEST_RUNS, RoundKind, RoundOutcome, RoundRecord,
-};
+use crate::manifest::AgentBackend;
+use crate::refine::{self, MIN_PROPOSED_SELFTEST_RUNS};
 use crate::scope::pack::{
     PACK_WORK_DIR, drop_repo_checkouts, ensure_out_dir, frozen_workspace_dir,
     normalize_frozen_manifest, scratch_dir, strip_controls_and_selftest, sync_pack_from_workspace,
@@ -17,8 +16,11 @@ use crate::scope::pack::{
 use crate::scope::progress::emit_progress;
 use crate::scope::transcript::{transcript_event, transcript_note, write_seed_context};
 use anyhow::{Context, Result};
-use clap::{Parser, ValueEnum};
-use serde::Serialize;
+use clap::Parser;
+use crucible_contract::refine::{
+    Attack, FailureEvidence, RoundKind, RoundOutcome, RoundRecord, render_rounds_json,
+};
+use crucible_contract::scope::StageName;
 use std::path::{Path, PathBuf};
 
 const SCOPE_PROPOSE_PROMPT: &str = include_str!("../prompts/scope-propose.md");
@@ -117,20 +119,11 @@ pub(super) enum ScopeError {
     NoGoalResolved,
 }
 
-/// One stage's result, independent of how the pipeline renders it (console lines or one JSON
-/// object).
-#[derive(Debug, Clone, Serialize)]
-pub struct StageResult {
-    pub name: &'static str,
-    pub passed: bool,
-    pub detail: String,
-}
-
 /// A stage in the pipeline: given the running context, either advance it and report success, or
 /// fail with the reason. S2 (propose) / S3 (preflight) / S4 (approval) each add one more impl
 /// here, the runner in [`run`] doesn't otherwise change shape.
 pub(super) trait Stage {
-    fn name(&self) -> &'static str;
+    fn name(&self) -> StageName;
     fn run(&self, ctx: &mut ScopeCtx) -> Result<String>;
 }
 
@@ -163,8 +156,8 @@ pub(super) struct Ingest {
 }
 
 impl Stage for Ingest {
-    fn name(&self) -> &'static str {
-        "ingest"
+    fn name(&self) -> StageName {
+        StageName::Ingest
     }
 
     fn run(&self, ctx: &mut ScopeCtx) -> Result<String> {
@@ -234,8 +227,8 @@ pub(super) struct Propose {
 }
 
 impl Stage for Propose {
-    fn name(&self) -> &'static str {
-        "propose"
+    fn name(&self) -> StageName {
+        StageName::Propose
     }
 
     fn run(&self, ctx: &mut ScopeCtx) -> Result<String> {
@@ -767,7 +760,7 @@ fn write_rejection_note(ctx: &ScopeCtx, round: u32, note: &str) {
          `crucible scope --propose` stopped at round {round}: {note}\n\n\
          ## Refine trail\n\n{trail}\n",
         pack = ctx.pack.display(),
-        trail = refine::render_rounds_json(&ctx.refine_rounds),
+        trail = render_rounds_json(&ctx.refine_rounds),
     );
     body.push_str("\nThis pack was NOT frozen; no SCOPE.md was written.\n");
     let _ = std::fs::write(ctx.pack.join("REJECTED.md"), body);
@@ -872,7 +865,7 @@ fn write_rejection(ctx: &ScopeCtx, rounds: u32, last: Option<&FailureEvidence>) 
         last = last
             .map(FailureEvidence::describe)
             .unwrap_or_else(|| "no evidence captured".to_string()),
-        trail = refine::render_rounds_json(&ctx.refine_rounds),
+        trail = render_rounds_json(&ctx.refine_rounds),
     );
     body.push_str("\nThis pack was NOT frozen; no SCOPE.md was written.\n");
     let _ = std::fs::write(ctx.pack.join("REJECTED.md"), body);
@@ -991,8 +984,8 @@ fn propose_paths(scratch: &Path) -> Paths {
 pub(super) struct Validate;
 
 impl Stage for Validate {
-    fn name(&self) -> &'static str {
-        "validate"
+    fn name(&self) -> StageName {
+        StageName::Validate
     }
 
     fn run(&self, ctx: &mut ScopeCtx) -> Result<String> {
@@ -1047,12 +1040,7 @@ fn render_workflow_preview(manifest_path: &Path, pack: &Path) -> Result<(u32, u3
             .map(|workflow| workflow.workflow_type)
             .unwrap_or_default(),
     );
-    if AgentBackend::from_str(&manifest.agent.backend, true)
-        .ok()
-        .is_some_and(|backend| {
-            agent::backend_supports_persistent_sessions(backend, manifest.agent.harness)
-        })
-    {
+    if agent::backend_supports_persistent_sessions(manifest.agent.backend, manifest.agent.harness) {
         workflow_caps = workflow_caps.with_persistent_sessions();
     }
     let plan = match manifest.workflow.as_ref() {
@@ -1084,8 +1072,8 @@ pub(super) struct Freeze {
 }
 
 impl Stage for Freeze {
-    fn name(&self) -> &'static str {
-        "freeze"
+    fn name(&self) -> StageName {
+        StageName::Freeze
     }
 
     fn run(&self, ctx: &mut ScopeCtx) -> Result<String> {
@@ -1284,7 +1272,7 @@ fn render_refine_section(rounds: &[RoundRecord]) -> String {
          {lines}\
          **Round trail:**\n\n{trail}\n\n",
         n = rounds.len(),
-        trail = refine::render_rounds_json(rounds),
+        trail = render_rounds_json(rounds),
     )
 }
 
@@ -1292,10 +1280,9 @@ fn render_refine_section(rounds: &[RoundRecord]) -> String {
 mod tests {
     use super::*;
     use crate::activity::{ACTIVITY_MIN_INTERVAL, ACTIVITY_TEXT_CAP, ACTIVITY_TOOL_CAP};
-    use crate::agent::AgentBackend;
     use crate::event::Tokens;
-    use crate::refine::{FailureEvidence, RoundKind, RoundOutcome, RoundRecord, parse_rounds};
-    use crate::scope::cli::{SCOPE_REPORT_MARKER, ScopeReport, execute};
+    use crate::manifest::AgentBackend;
+    use crate::scope::cli::{SCOPE_REPORT_MARKER, execute};
     use crate::scope::pack::{
         CONTROLS_DIR, PACK_PAYLOAD_CAP_BYTES, PACK_TAR_CAP_BYTES, SCOPE_PACK_MARKER,
         pack_marker_line, pack_marker_payload, repo_pin, tar_pack_dir,
@@ -1306,6 +1293,10 @@ mod tests {
     use crate::scope::transcript::{cap_transcript, gzip_transcript};
     use base64::Engine as _;
     use crucible_contract::SCOPE_ACTIVITY_MARKER;
+    use crucible_contract::refine::{
+        FailureEvidence, RoundKind, RoundOutcome, RoundRecord, parse_rounds,
+    };
+    use crucible_contract::scope::{ScopeReport, StageName, StageResult};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
@@ -1726,7 +1717,7 @@ mod tests {
             report.stages
         );
         assert_eq!(report.stages.len(), 4, "ingest, propose, validate, freeze");
-        assert_eq!(report.stages[1].name, "propose");
+        assert_eq!(report.stages[1].name, StageName::Propose);
         assert!(report.cost.is_some_and(|c| c >= 0.0));
         assert!(
             report
@@ -1809,7 +1800,7 @@ mod tests {
             !report.stages[1].passed,
             "propose must reject a missing selftest"
         );
-        assert_eq!(report.stages[1].name, "propose");
+        assert_eq!(report.stages[1].name, StageName::Propose);
         assert!(report.stages[1].detail.contains("judge.selftest"));
         assert!(report.digest.is_none());
 
@@ -2075,7 +2066,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         let validate = report
             .stages
             .iter()
-            .find(|stage| stage.name == "validate")
+            .find(|stage| stage.name == StageName::Validate)
             .expect("validate stage");
         assert!(!validate.passed, "Hermes cannot resume Claude sessions");
         assert!(
@@ -2099,7 +2090,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         );
         assert!(report.stages[0].passed, "ingest still resolves the goal");
         assert!(!report.stages[1].passed, "validate must fail");
-        assert_eq!(report.stages[1].name, "validate");
+        assert_eq!(report.stages[1].name, StageName::Validate);
         assert!(report.stages[1].detail.contains("crucible check"));
         assert!(report.digest.is_none());
         assert!(
@@ -2501,7 +2492,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
     fn scope_report_marker_emits_the_exact_prefix() {
         let report = ScopeReport {
             stages: vec![StageResult {
-                name: "ingest",
+                name: StageName::Ingest,
                 passed: true,
                 detail: "ok".to_string(),
             }],
@@ -2944,7 +2935,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         let _ = fs::remove_dir_all(&pack);
     }
 
-    fn stage(name: &'static str, passed: bool) -> StageResult {
+    fn stage(name: StageName, passed: bool) -> StageResult {
         StageResult {
             name,
             passed,
@@ -2960,7 +2951,10 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         fs::write(pack.join("crucible.toml"), "[repo]\nurl = \"x\"\n").unwrap();
 
         let survived = ScopeReport {
-            stages: vec![stage("validate", true), stage("freeze", true)],
+            stages: vec![
+                stage(StageName::Validate, true),
+                stage(StageName::Freeze, true),
+            ],
             digest: Some("v1:beef".into()),
             cost: Some(0.1),
             rounds: Vec::new(),
@@ -2979,7 +2973,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         );
 
         let dead = ScopeReport {
-            stages: vec![stage("validate", false)],
+            stages: vec![stage(StageName::Validate, false)],
             digest: None,
             cost: Some(0.1),
             rounds: Vec::new(),
@@ -3605,7 +3599,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         );
         assert!(t1.contains("Confirmed tier: T1"), "{t1}");
 
-        let evidence = crate::refine::FailureEvidence::Structure {
+        let evidence = crucible_contract::refine::FailureEvidence::Structure {
             detail: "no [judge.selftest] table".to_string(),
         };
         let refine_t1 =
@@ -4019,7 +4013,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             propose.contains("De-prescribe the upstream issue"),
             "propose prompt tells the agent to strip the issue's own fix"
         );
-        let evidence = crate::refine::FailureEvidence::Structure {
+        let evidence = crucible_contract::refine::FailureEvidence::Structure {
             detail: "no [judge.selftest] table".to_string(),
         };
         let refine =
@@ -4057,7 +4051,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             "the controls-privacy rule survives the swap"
         );
 
-        let evidence = crate::refine::FailureEvidence::Structure {
+        let evidence = crucible_contract::refine::FailureEvidence::Structure {
             detail: "no [judge.selftest] table".to_string(),
         };
         let refine = refine::render_refine_prompt(goal, &out, &evidence, 2, ProposeTier::T1, true);

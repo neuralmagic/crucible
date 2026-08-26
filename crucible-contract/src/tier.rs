@@ -132,6 +132,19 @@ impl Disposition {
     }
 }
 
+impl serde::Serialize for Disposition {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Disposition {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let spelling = String::deserialize(deserializer)?;
+        Disposition::parse(&spelling).map_err(serde::de::Error::custom)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::tier::Tier;

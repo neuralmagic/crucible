@@ -1327,7 +1327,7 @@ fn render_wide_prompt(template: &str, goal: &str, approach: &str) -> String {
 mod tests {
     use super::*;
     use crate::loop_driver::{LoopRuntime, run_loop};
-    use crate::{Prepared, agent, manifest, reporter, run, stream};
+    use crate::{Prepared, manifest, reporter, run, stream};
     use clap::Parser;
     use std::path::Path;
 
@@ -1848,7 +1848,7 @@ mod tests {
 
         let mut args = crate::Cli::parse_from(["crucible"]).run;
         args.manifest = Some(manifest_path);
-        args.agent_backend = agent::AgentBackend::Command;
+        args.agent_backend = manifest::AgentBackend::Command;
         args.agent_cmd = m.agent.agent_cmd.clone();
         args.iterations = iterations;
         args.graph_loop = graph_loop;

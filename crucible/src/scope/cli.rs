@@ -1,18 +1,15 @@
 use crate::activity::ActivityFeed;
-use crate::agent::AgentBackend;
 use crate::deploy::ProposeTier;
 use crate::init::MANIFEST_FILE;
-use crate::refine::RoundRecord;
+use crate::manifest::AgentBackend;
 use crate::scope::pack::{SCOPE_PACK_MARKER, pack_gz, pack_marker_line};
-use crate::scope::pipeline::{
-    Freeze, Ingest, Propose, ProposeOpts, ScopeCtx, Stage, StageResult, Validate,
-};
+use crate::scope::pipeline::{Freeze, Ingest, Propose, ProposeOpts, ScopeCtx, Stage, Validate};
 use crate::scope::transcript::{
     SCOPE_TRANSCRIPT_MARKER, TRANSCRIPT_CAP_BYTES, cap_transcript, gzip_transcript,
 };
 use anyhow::{Context, Result};
 use base64::Engine as _;
-use serde::Serialize;
+use crucible_contract::scope::{ScopeReport, StageResult};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, thiserror::Error)]
@@ -22,22 +19,6 @@ struct ProposeNeedsGoal;
 /// The prefix of the single-line scope-report marker `--marker` emits as the command's last output.
 /// The controller's WorkPod log scraper matches the same shared literal from `crucible-contract`.
 pub use crucible_contract::SCOPE_REPORT_MARKER;
-
-/// The whole pipeline's result as one JSON object, for `--json`.
-#[derive(Serialize)]
-pub struct ScopeReport {
-    pub stages: Vec<StageResult>,
-    pub digest: Option<String>,
-    /// The `--propose` turn's cost (USD), summed across refine rounds; `None` outside `--propose`.
-    pub cost: Option<f64>,
-    /// The refine loop's per-round trail; empty outside `--propose`.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub rounds: Vec<RoundRecord>,
-    /// The turns' preserved session NDJSON. Never serialized into the report JSON (it can be MBs);
-    /// it rides its own delivery path, the `--marker` transcript line or `--transcript-out`.
-    #[serde(skip)]
-    pub transcript: String,
-}
 
 /// Drive `ingest [-> propose] -> validate -> freeze` over `pack`, stopping at the first failing
 /// stage. Pure: no printing, no process exit, [`run`] (the CLI entry point) owns rendering the
@@ -159,7 +140,7 @@ pub struct ScopeArgs {
     #[arg(long, value_enum)]
     pub tier: Option<ProposeTier>,
     /// Real agent backend for the propose/adversary turns.
-    #[arg(long, value_enum, default_value_t = crate::agent::AgentBackend::Local)]
+    #[arg(long, value_enum, default_value_t = crate::manifest::AgentBackend::Local)]
     pub agent_backend: AgentBackend,
     /// Sandbox image for `--agent-backend openshell`.
     #[arg(long)]

@@ -19,26 +19,12 @@
 
 use crate::event::{AgentEvent, RawStream, Tokens, cost_of, estimate_cost};
 use crate::harness::{HarnessRuntime, StreamDecoder};
+use crate::manifest::AgentBackend;
 use crate::{Args, Paths};
 use crucible_harness::OtelCollector;
 use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, Command, Stdio};
 use std::thread;
-
-/// Which backend a locally-spawned agent turn runs against.
-///
-/// `Local` runs the agent on this machine (the original behavior). `Openshell`
-/// runs it in an OpenShell sandbox (Landlock + egress policy), what an in-pod
-/// loop uses so its turns are isolated; it needs a `--sandbox-image` carrying
-/// the domain's toolbox binaries.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-pub enum AgentBackend {
-    Local,
-    Openshell,
-    /// Run a fixed shell command as the "agent turn" (no LLM). A deterministic, free proposer
-    /// for testing the engine end to end, see `examples/counter`.
-    Command,
-}
 
 /// Where a turn's events come from. Resolved once from [`Args`] (see
 /// [`Args::agent_source`]); each variant knows how to launch its transport and expose

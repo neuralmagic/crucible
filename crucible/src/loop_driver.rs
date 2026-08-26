@@ -3460,7 +3460,7 @@ mod tests {
             codex: Default::default(),
             disallowed_tools: Vec::new(),
             reasoning_effort: None,
-            agent_backend: crate::agent::AgentBackend::Command,
+            agent_backend: crate::manifest::AgentBackend::Command,
             sandbox_image: None,
             compute_driver: crate::openshell::gateway::ComputeDriver::Podman,
             namespace: String::new(),

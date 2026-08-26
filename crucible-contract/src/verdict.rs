@@ -1,0 +1,170 @@
+//! What one grounded ranking turn decided, as the `--json` document and the `VERDICT_MARKER` line
+//! carry it.
+//!
+//! A turn either ruled or it did not, and both shapes carry what the turn spent. Spending is not
+//! optional in either: a document missing `cost_usd` fails to decode rather than reading as free.
+
+use serde::{Deserialize, Serialize};
+
+use crate::tier::Disposition;
+
+/// Why a grounded turn yielded no verdict. The two cases are not interchangeable: a turn that
+/// never started tells the caller to look at the pod, a completed turn without a verdict tells it
+/// to look at the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroundedErrorKind {
+    /// The turn itself never completed (spawn, gateway, sandbox, transfer).
+    TurnFailed,
+    /// The turn ran and its last line was not a verdict.
+    NoVerdict,
+}
+
+impl GroundedErrorKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            GroundedErrorKind::TurnFailed => "turn_failed",
+            GroundedErrorKind::NoVerdict => "no_verdict",
+        }
+    }
+}
+
+/// One grounded ranking turn's result. Untagged because the two shapes are told apart by their own
+/// fields: a ruling carries `tier`, a failure carries `error`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum GroundedVerdict {
+    Ruled {
+        tier: Disposition,
+        rationale: String,
+        confidence: String,
+        cost_usd: f64,
+        over_budget: bool,
+    },
+    Failed {
+        error: String,
+        error_kind: GroundedErrorKind,
+        /// The tail of whatever the agent printed on its way down. A turn that dies during startup
+        /// prints its diagnostic and nothing else.
+        output_tail: Option<String>,
+        cost_usd: f64,
+        over_budget: bool,
+    },
+}
+
+impl GroundedVerdict {
+    /// What the turn spent, whichever way it ended. A partial turn is never free.
+    pub fn cost_usd(&self) -> f64 {
+        match self {
+            GroundedVerdict::Ruled { cost_usd, .. } | GroundedVerdict::Failed { cost_usd, .. } => {
+                *cost_usd
+            }
+        }
+    }
+
+    pub fn over_budget(&self) -> bool {
+        match self {
+            GroundedVerdict::Ruled { over_budget, .. }
+            | GroundedVerdict::Failed { over_budget, .. } => *over_budget,
+        }
+    }
+
+    /// The ruling, if the turn produced one.
+    pub fn disposition(&self) -> Option<Disposition> {
+        match self {
+            GroundedVerdict::Ruled { tier, .. } => Some(*tier),
+            GroundedVerdict::Failed { .. } => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tier::Tier;
+
+    fn ruled() -> GroundedVerdict {
+        GroundedVerdict::Ruled {
+            tier: Disposition::Tier(Tier::T1),
+            rationale: "needs a live cluster".to_string(),
+            confidence: "high".to_string(),
+            cost_usd: 0.42,
+            over_budget: false,
+        }
+    }
+
+    fn failed() -> GroundedVerdict {
+        GroundedVerdict::Failed {
+            error: "the turn never completed: agent spawn failed: boom".to_string(),
+            error_kind: GroundedErrorKind::TurnFailed,
+            output_tail: Some("could not resolve host".to_string()),
+            cost_usd: 0.01,
+            over_budget: false,
+        }
+    }
+
+    /// The bytes a deployed engine already emits, field for field.
+    #[test]
+    fn both_shapes_are_unchanged() {
+        assert_eq!(
+            serde_json::to_string(&ruled()).expect("serialize"),
+            r#"{"tier":"T1","rationale":"needs a live cluster","confidence":"high","cost_usd":0.42,"over_budget":false}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&failed()).expect("serialize"),
+            r#"{"error":"the turn never completed: agent spawn failed: boom","error_kind":"turn_failed","output_tail":"could not resolve host","cost_usd":0.01,"over_budget":false}"#
+        );
+        assert_eq!(
+            serde_json::to_value(Disposition::Stale).expect("serialize"),
+            "stale"
+        );
+    }
+
+    #[test]
+    fn each_shape_decodes_back_to_itself() {
+        for verdict in [ruled(), failed()] {
+            let encoded = serde_json::to_string(&verdict).expect("serialize");
+            let decoded: GroundedVerdict = crate::json::from_str(&encoded).expect("deserialize");
+            assert_eq!(decoded, verdict);
+        }
+    }
+
+    /// The bug this closes: a cost that goes missing must not read as zero.
+    #[test]
+    fn a_document_without_a_cost_is_refused() {
+        let no_cost = r#"{"tier":"T1","rationale":"r","confidence":"high","over_budget":false}"#;
+        assert!(crate::json::from_str::<GroundedVerdict>(no_cost).is_err());
+
+        let with_cost = r#"{"tier":"T1","rationale":"r","confidence":"high","cost_usd":2.5,"over_budget":false}"#;
+        let decoded: GroundedVerdict = crate::json::from_str(with_cost).expect("deserialize");
+        assert_eq!(decoded.cost_usd(), 2.5);
+    }
+
+    #[test]
+    fn a_failure_is_never_read_as_a_ruling() {
+        let decoded: GroundedVerdict =
+            crate::json::from_str(&serde_json::to_string(&failed()).expect("serialize"))
+                .expect("deserialize");
+        assert!(decoded.disposition().is_none());
+        assert_eq!(decoded.cost_usd(), 0.01);
+        assert_eq!(ruled().disposition(), Some(Disposition::Tier(Tier::T1)));
+    }
+
+    /// A stale ruling with a null tail still tells the two shapes apart.
+    #[test]
+    fn a_null_output_tail_still_decodes_as_a_failure() {
+        let doc = r#"{"error":"no verdict","error_kind":"no_verdict","output_tail":null,"cost_usd":0.0,"over_budget":true}"#;
+        let decoded: GroundedVerdict = crate::json::from_str(doc).expect("deserialize");
+        assert_eq!(
+            decoded,
+            GroundedVerdict::Failed {
+                error: "no verdict".to_string(),
+                error_kind: GroundedErrorKind::NoVerdict,
+                output_tail: None,
+                cost_usd: 0.0,
+                over_budget: true,
+            }
+        );
+        assert!(decoded.over_budget());
+    }
+}
