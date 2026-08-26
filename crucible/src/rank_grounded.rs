@@ -129,7 +129,7 @@ impl GroundedReport {
             Some(v) => GroundedVerdict::Ruled {
                 tier: v.disposition,
                 rationale: v.rationale.clone(),
-                confidence: v.confidence.clone(),
+                confidence: Some(v.confidence.clone()),
                 cost_usd: self.cost_usd,
                 over_budget: self.over_budget,
             },
