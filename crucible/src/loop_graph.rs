@@ -1848,7 +1848,7 @@ mod tests {
 
         let mut args = crate::Cli::parse_from(["crucible"]).run;
         args.manifest = Some(manifest_path);
-        args.agent_backend = agent::AgentBackend::Command;
+        args.agent_backend = manifest::AgentBackend::Command;
         args.agent_cmd = m.agent.agent_cmd.clone();
         args.iterations = iterations;
         args.graph_loop = graph_loop;

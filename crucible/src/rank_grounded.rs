@@ -16,9 +16,10 @@
 
 use crate::Paths;
 use crate::activity::ActivityFeed;
-use crate::agent::{self, AgentBackend, TurnFailure, TurnOutcome};
+use crate::agent::{self, TurnFailure, TurnOutcome};
 use crate::event::{AgentEvent, RawStream};
 use crate::harness::HarnessRuntime;
+use crate::manifest::AgentBackend;
 use anyhow::{Context, Result};
 use clap::Parser;
 use crucible_contract::Disposition;
@@ -51,7 +52,7 @@ pub struct RankGroundedArgs {
     #[arg(long)]
     pub marker: bool,
     /// Real agent backend for the turn; ignored when `--agent-cmd` is set.
-    #[arg(long, value_enum, default_value_t = crate::agent::AgentBackend::Local)]
+    #[arg(long, value_enum, default_value_t = crate::manifest::AgentBackend::Local)]
     pub agent_backend: AgentBackend,
     /// Sandbox image for `--agent-backend openshell`.
     #[arg(long)]

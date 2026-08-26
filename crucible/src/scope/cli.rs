@@ -1,7 +1,7 @@
 use crate::activity::ActivityFeed;
-use crate::agent::AgentBackend;
 use crate::deploy::ProposeTier;
 use crate::init::MANIFEST_FILE;
+use crate::manifest::AgentBackend;
 use crate::refine::RoundRecord;
 use crate::scope::pack::{SCOPE_PACK_MARKER, pack_gz, pack_marker_line};
 use crate::scope::pipeline::{
@@ -159,7 +159,7 @@ pub struct ScopeArgs {
     #[arg(long, value_enum)]
     pub tier: Option<ProposeTier>,
     /// Real agent backend for the propose/adversary turns.
-    #[arg(long, value_enum, default_value_t = crate::agent::AgentBackend::Local)]
+    #[arg(long, value_enum, default_value_t = crate::manifest::AgentBackend::Local)]
     pub agent_backend: AgentBackend,
     /// Sandbox image for `--agent-backend openshell`.
     #[arg(long)]

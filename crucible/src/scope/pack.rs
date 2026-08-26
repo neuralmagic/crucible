@@ -1,5 +1,5 @@
-use crate::agent::AgentBackend;
 use crate::manifest;
+use crate::manifest::AgentBackend;
 use crate::scope::cli::ScopeReport;
 use anyhow::{Context, Result};
 use base64::Engine as _;

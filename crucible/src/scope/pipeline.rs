@@ -1,12 +1,13 @@
 use crate::Paths;
 use crate::activity::ActivityFeed;
-use crate::agent::{self, AgentBackend, TurnOutcome};
+use crate::agent::{self, TurnOutcome};
 use crate::check::{self, CheckOutcome};
 use crate::deploy::ProposeTier;
 use crate::event::{AgentEvent, RawStream};
 use crate::identity::{self, RunIdentity};
 use crate::init::MANIFEST_FILE;
 use crate::manifest;
+use crate::manifest::AgentBackend;
 use crate::refine::{
     self, Attack, FailureEvidence, MIN_PROPOSED_SELFTEST_RUNS, RoundKind, RoundOutcome, RoundRecord,
 };
@@ -17,7 +18,7 @@ use crate::scope::pack::{
 use crate::scope::progress::emit_progress;
 use crate::scope::transcript::{transcript_event, transcript_note, write_seed_context};
 use anyhow::{Context, Result};
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
@@ -1047,12 +1048,7 @@ fn render_workflow_preview(manifest_path: &Path, pack: &Path) -> Result<(u32, u3
             .map(|workflow| workflow.workflow_type)
             .unwrap_or_default(),
     );
-    if AgentBackend::from_str(&manifest.agent.backend, true)
-        .ok()
-        .is_some_and(|backend| {
-            agent::backend_supports_persistent_sessions(backend, manifest.agent.harness)
-        })
-    {
+    if agent::backend_supports_persistent_sessions(manifest.agent.backend, manifest.agent.harness) {
         workflow_caps = workflow_caps.with_persistent_sessions();
     }
     let plan = match manifest.workflow.as_ref() {
@@ -1292,8 +1288,8 @@ fn render_refine_section(rounds: &[RoundRecord]) -> String {
 mod tests {
     use super::*;
     use crate::activity::{ACTIVITY_MIN_INTERVAL, ACTIVITY_TEXT_CAP, ACTIVITY_TOOL_CAP};
-    use crate::agent::AgentBackend;
     use crate::event::Tokens;
+    use crate::manifest::AgentBackend;
     use crate::refine::{FailureEvidence, RoundKind, RoundOutcome, RoundRecord, parse_rounds};
     use crate::scope::cli::{SCOPE_REPORT_MARKER, ScopeReport, execute};
     use crate::scope::pack::{
