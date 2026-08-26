@@ -153,6 +153,7 @@ pub(super) struct ScopeCtx {
 pub(super) struct Ingest {
     pub(super) issue: Option<String>,
     pub(super) goal_file: Option<PathBuf>,
+    pub(super) goal_text: Option<String>,
 }
 
 impl Stage for Ingest {
@@ -168,6 +169,8 @@ impl Stage for Ingest {
             let goal = std::fs::read_to_string(f)
                 .with_context(|| format!("reading --goal-file {}", f.display()))?;
             (goal, format!("--goal-file {}", f.display()))
+        } else if let Some(text) = &self.goal_text {
+            (text.clone(), "--goal".to_string())
         } else {
             manifest_goal(&ctx.manifest_path)?
         };
@@ -1708,6 +1711,7 @@ mod tests {
             &out,
             None,
             Some(&goal_file),
+            None,
             false,
             Some(propose_opts(&repo, &script)),
         );
@@ -1755,6 +1759,7 @@ mod tests {
             &rel,
             None,
             Some(&goal_file),
+            None,
             false,
             Some(propose_opts(&repo, &script)),
         );
@@ -1786,6 +1791,7 @@ mod tests {
             &out,
             None,
             Some(&goal_file),
+            None,
             false,
             Some(propose_opts(&repo, &script)),
         );
@@ -1827,6 +1833,7 @@ mod tests {
             &out,
             None,
             Some(&goal_file),
+            None,
             false,
             Some(propose_opts(&repo, &script)),
         );
@@ -1857,7 +1864,7 @@ mod tests {
 
         let mut opts = propose_opts(&repo, &script);
         opts.force = false;
-        let report = execute(&out, None, Some(&goal_file), false, Some(opts));
+        let report = execute(&out, None, Some(&goal_file), None, false, Some(opts));
         assert_eq!(report.stages.len(), 2);
         assert!(!report.stages[1].passed);
         assert!(report.stages[1].detail.contains("--force"));
@@ -1868,7 +1875,7 @@ mod tests {
 
         let mut opts = propose_opts(&repo, &script);
         opts.force = true;
-        let forced = execute(&out, None, Some(&goal_file), false, Some(opts));
+        let forced = execute(&out, None, Some(&goal_file), None, false, Some(opts));
         assert!(
             forced.stages.iter().all(|s| s.passed),
             "--force permits proposing into a nonempty --out: {:?}",
@@ -1895,6 +1902,7 @@ mod tests {
             &out,
             None,
             Some(&goal_file),
+            None,
             false,
             Some(propose_opts(&repo, &script)),
         );
@@ -1927,7 +1935,7 @@ mod tests {
         let dir = tempdir("valid");
         scaffold_pack(&dir);
 
-        let report = execute(&dir, None, None, false, None);
+        let report = execute(&dir, None, None, None, false, None);
         assert!(
             report.stages.iter().all(|s| s.passed),
             "all stages must pass: {:?}",
@@ -1963,7 +1971,7 @@ mod tests {
         )
         .unwrap();
 
-        let report = execute(&dir, None, None, false, None);
+        let report = execute(&dir, None, None, None, false, None);
         assert!(
             report.stages.iter().all(|stage| stage.passed),
             "{:?}",
@@ -1993,7 +2001,7 @@ workflow([agent(name = "review", prompt = prompt_file("prompts/review.md") + par
         )
         .unwrap();
 
-        let report = execute(&dir, None, None, false, None);
+        let report = execute(&dir, None, None, None, false, None);
         assert!(
             report.stages.iter().all(|stage| stage.passed),
             "{:?}",
@@ -2025,7 +2033,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, score, trace, measurem
         )
         .unwrap();
 
-        let report = execute(&dir, None, None, false, None);
+        let report = execute(&dir, None, None, None, false, None);
         assert!(
             report.stages.iter().all(|stage| stage.passed),
             "{:?}",
@@ -2062,7 +2070,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         )
         .unwrap();
 
-        let report = execute(&dir, None, None, false, None);
+        let report = execute(&dir, None, None, None, false, None);
         let validate = report
             .stages
             .iter()
@@ -2082,7 +2090,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         let dir = tempdir("broken");
         broken_pack(&dir);
 
-        let report = execute(&dir, None, None, false, None);
+        let report = execute(&dir, None, None, None, false, None);
         assert_eq!(
             report.stages.len(),
             2,
@@ -2128,7 +2136,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         let goal_file = dir.join("goal.md");
         fs::write(&goal_file, "the goal-file goal").expect("write goal file");
 
-        let report = execute(&dir, None, Some(&goal_file), false, None);
+        let report = execute(&dir, None, Some(&goal_file), None, false, None);
         assert!(
             report.stages.iter().all(|s| s.passed),
             "{:?}",
@@ -2179,7 +2187,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         unsafe {
             std::env::set_var("GITHUB_API_URL", format!("http://{addr}"));
         }
-        let report = execute(&dir, Some("owner/repo#42"), None, false, None);
+        let report = execute(&dir, Some("owner/repo#42"), None, None, false, None);
         unsafe {
             std::env::remove_var("GITHUB_API_URL");
         }
@@ -2206,11 +2214,11 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
     fn scope_md_overwrite_is_refused_without_force() {
         let dir = tempdir("overwrite");
         scaffold_pack(&dir);
-        let first_report = execute(&dir, None, None, false, None);
+        let first_report = execute(&dir, None, None, None, false, None);
         assert!(first_report.stages.iter().all(|s| s.passed));
         let first = fs::read_to_string(dir.join("SCOPE.md")).unwrap();
 
-        let refused = execute(&dir, None, None, false, None);
+        let refused = execute(&dir, None, None, None, false, None);
         assert!(
             !refused.stages.last().unwrap().passed,
             "refuses without --force"
@@ -2219,7 +2227,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         let unchanged = fs::read_to_string(dir.join("SCOPE.md")).unwrap();
         assert_eq!(first, unchanged, "SCOPE.md untouched without --force");
 
-        let forced = execute(&dir, None, None, true, None);
+        let forced = execute(&dir, None, None, None, true, None);
         assert!(forced.stages.iter().all(|s| s.passed), "--force overwrites");
 
         let _ = fs::remove_dir_all(&dir);
@@ -2241,6 +2249,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             &out,
             None,
             Some(&goal_file),
+            None,
             false,
             Some(propose_opts(&repo, &script)),
         );
@@ -2294,7 +2303,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
 
         let mut opts = propose_opts(&repo, &script);
         opts.refine_rounds = 2;
-        let report = execute(&out, None, Some(&goal_file), false, Some(opts));
+        let report = execute(&out, None, Some(&goal_file), None, false, Some(opts));
         assert!(
             !report.stages.last().expect("a last stage").passed,
             "exhaustion fails the propose stage: {:?}",
@@ -2352,7 +2361,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
 
         let mut opts = propose_opts(&repo, &script);
         opts.refine_rounds = 1;
-        let report = execute(&out, None, Some(&goal_file), false, Some(opts));
+        let report = execute(&out, None, Some(&goal_file), None, false, Some(opts));
         assert!(
             !report.stages[1].passed,
             "a pack outside the workspace must not validate: {:?}",
@@ -2396,7 +2405,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         let mut opts = propose_opts(&repo, &script);
         opts.max_cost = 5.0;
         opts.refine_rounds = 5;
-        let report = execute(&out, None, Some(&goal_file), false, Some(opts));
+        let report = execute(&out, None, Some(&goal_file), None, false, Some(opts));
         assert!(
             !report.stages.last().expect("a last stage").passed,
             "budget exhaustion fails the propose stage: {:?}",
@@ -2440,7 +2449,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
 
         let mut opts = propose_opts(&repo, &script);
         opts.refine_rounds = 2;
-        let report = execute(&out, None, Some(&goal_file), false, Some(opts));
+        let report = execute(&out, None, Some(&goal_file), None, false, Some(opts));
         assert!(
             !report.stages.last().expect("a last stage").passed,
             "runs<3 must reject: {:?}",
@@ -2474,7 +2483,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         let dir = tempdir("json");
         scaffold_pack(&dir);
 
-        let report = execute(&dir, None, None, false, None);
+        let report = execute(&dir, None, None, None, false, None);
         let json = serde_json::to_value(&report).expect("serializes");
         assert!(json["stages"].is_array());
         assert_eq!(json["stages"].as_array().unwrap().len(), 3);
@@ -3016,6 +3025,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             &out,
             None,
             Some(&goal_file),
+            None,
             false,
             Some(propose_opts(&repo, &script)),
         );
@@ -3070,6 +3080,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             &out,
             None,
             Some(&goal_file),
+            None,
             false,
             Some(propose_opts_review(&repo, &script)),
         );
@@ -3119,6 +3130,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             &out,
             None,
             Some(&goal_file),
+            None,
             false,
             Some(propose_opts_review(&repo, &script)),
         );
@@ -3171,6 +3183,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             &out,
             None,
             Some(&goal_file),
+            None,
             false,
             Some(propose_opts_review(&repo, &script)),
         );
@@ -3222,6 +3235,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             &out,
             None,
             Some(&goal_file),
+            None,
             false,
             Some(propose_opts_review(&repo, &script)),
         );
@@ -3266,7 +3280,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
 
         let mut opts = propose_opts(&repo, &script);
         opts.skip_gaming_review = true;
-        let report = execute(&out, None, Some(&goal_file), false, Some(opts));
+        let report = execute(&out, None, Some(&goal_file), None, false, Some(opts));
         assert!(
             report.stages.iter().all(|s| s.passed),
             "{:?}",
@@ -3318,7 +3332,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
 
         let mut opts = propose_opts_review(&repo, &script);
         opts.gaming_refine_rounds = 0;
-        let report = execute(&out, None, Some(&goal_file), false, Some(opts));
+        let report = execute(&out, None, Some(&goal_file), None, false, Some(opts));
         let kinds: Vec<RoundKind> = report.rounds.iter().map(|r| r.kind).collect();
         assert_eq!(
             kinds,
@@ -3358,7 +3372,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
 
         let mut opts = propose_opts_review(&repo, &script);
         opts.gaming_refine_rounds = 2;
-        let report = execute(&out, None, Some(&goal_file), false, Some(opts));
+        let report = execute(&out, None, Some(&goal_file), None, false, Some(opts));
         assert!(
             report.stages.iter().all(|s| s.passed),
             "two concern cycles then a pass must freeze: {:?}",
@@ -3408,7 +3422,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
 
         let mut opts = propose_opts_review(&repo, &script);
         opts.gaming_refine_rounds = 2;
-        let report = execute(&out, None, Some(&goal_file), false, Some(opts));
+        let report = execute(&out, None, Some(&goal_file), None, false, Some(opts));
         assert!(
             !report.stages.last().expect("a last stage").passed,
             "still-concerns at the final look must reject: {:?}",
@@ -3467,7 +3481,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         let mut opts = propose_opts_review(&repo, &script);
         opts.gaming_refine_rounds = 2;
         opts.max_cost = 10.0;
-        let report = execute(&out, None, Some(&goal_file), false, Some(opts));
+        let report = execute(&out, None, Some(&goal_file), None, false, Some(opts));
         assert!(
             !report.stages.last().expect("a last stage").passed,
             "budget exhaustion fails the stage: {:?}",
@@ -3561,7 +3575,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
 
         let mut opts = propose_opts(&repo, &script);
         opts.tier = ProposeTier::T1;
-        let report = execute(&out, None, Some(&goal_file), false, Some(opts));
+        let report = execute(&out, None, Some(&goal_file), None, false, Some(opts));
         assert!(
             report.stages.iter().all(|s| s.passed),
             "a T1 tools/ harness must validate + freeze like any other pack: {:?}",
@@ -3670,6 +3684,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             &out,
             None,
             Some(&goal_file),
+            None,
             false,
             Some(propose_opts(&repo, &script)),
         );
@@ -3719,6 +3734,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             &out,
             None,
             Some(&goal_file),
+            None,
             false,
             Some(propose_opts(&repo, &script)),
         );
@@ -3763,7 +3779,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         let mut opts = propose_opts(&repo, &script);
         opts.agent_backend = AgentBackend::Openshell;
         opts.sandbox_image = Some("ghcr.io/neuralmagic/crucible-sandbox:latest".to_string());
-        let report = execute(&out, None, Some(&goal_file), false, Some(opts));
+        let report = execute(&out, None, Some(&goal_file), None, false, Some(opts));
         assert!(
             report.stages.iter().all(|s| s.passed),
             "{:?}",
@@ -3803,6 +3819,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             &out,
             None,
             Some(&goal_file),
+            None,
             false,
             Some(propose_opts(&repo, &script)),
         );
@@ -3846,6 +3863,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             &out,
             None,
             Some(&goal_file),
+            None,
             false,
             Some(propose_opts(&repo, &script)),
         );
@@ -3886,6 +3904,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             &out,
             None,
             Some(&goal_file),
+            None,
             false,
             Some(propose_opts(&repo, &script)),
         );
@@ -3970,6 +3989,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             &out,
             None,
             Some(&goal_file),
+            None,
             false,
             Some(propose_opts(&repo, &script)),
         );

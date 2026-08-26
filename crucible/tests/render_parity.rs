@@ -2,8 +2,8 @@
 //! exactly the bytes the `crucible` command line prints. Each test drives both paths.
 
 use crucible::deploy::{
-    DeployProfile, PackDelivery, PlaybookLaunch, ProposeTier, RenderOpts, TurnKind, TurnOpts,
-    render_turn, render_yaml,
+    DeployProfile, PackDelivery, PackPath, PlaybookLaunch, ProposeTier, RenderOpts, TurnKind,
+    TurnOpts, render_turn, render_yaml,
 };
 use crucible::flow::{FlowFormat, FlowInput, render};
 use crucible::manifest::Harness;
@@ -235,10 +235,65 @@ fn deploy_render_turn_matches_render_turn() {
             authoritative: true,
             harness: Some(Harness::Codex),
             model: Some("gpt-5.6-sol".to_string()),
+            pack_path: None,
         },
     )
     .expect("library render");
-    assert!(from_lib.contains("--tier t1"));
+    assert!(from_lib.contains("- --tier\n    - t1\n"), "{from_lib}");
+    assert_eq!(from_cli, from_lib);
+}
+
+/// `--pack-path` renders the same pack turn through the CLI as through the library, so a caller
+/// that still shells the binary and one that links it dispatch the same pod.
+#[test]
+fn pack_path_renders_the_same_through_cli_and_library() {
+    let profile = delta_profile();
+    let from_cli = cli(&[
+        "deploy",
+        "render-turn",
+        "--profile",
+        profile.to_str().unwrap(),
+        "--name",
+        "crucible-scope-8",
+        "--issue",
+        "example/router#8",
+        "--repo-url",
+        "https://github.com/example/router.git",
+        "--sandbox-image",
+        "registry.example.com/router-sandbox:latest",
+        "--no-pin",
+        "--turn-kind",
+        "scope",
+        "--pack-path",
+        "examples/selfhost",
+    ]);
+    let from_lib = render_turn(
+        &DeployProfile::load(&profile).expect("profile parses"),
+        &TurnOpts {
+            kind: TurnKind::Scope,
+            name: "crucible-scope-8".to_string(),
+            issue: "example/router#8".to_string(),
+            goal_text: None,
+            repo_url: "https://github.com/example/router.git".to_string(),
+            repo_ref: None,
+            sandbox_image: "registry.example.com/router-sandbox:latest".to_string(),
+            max_cost: 5.0,
+            digests: None,
+            tier: None,
+            gaming_refine_rounds: 0,
+            skip_gaming_review: false,
+            authoritative: false,
+            harness: None,
+            model: None,
+            pack_path: Some(PackPath::parse("examples/selfhost").expect("valid")),
+        },
+    )
+    .expect("library render");
+    assert!(
+        from_lib.contains("- --pack\n    - /checkout/examples/selfhost\n"),
+        "{from_lib}"
+    );
+    assert!(!from_lib.contains("--propose"));
     assert_eq!(from_cli, from_lib);
 }
 

@@ -53,4 +53,4 @@ pub(in crate::deploy) fn pin_image(
 
 pub use kube::{MANAGED_BY_LABEL, PackDelivery, PlaybookLaunch, RenderInput, RenderOpts, render};
 pub(in crate::deploy) use kube::{node_avoid_affinity, role_binding};
-pub use turn::{ProposeTier, TurnKind, TurnOpts, render_turn};
+pub use turn::{PackPath, PackPathError, ProposeTier, TurnKind, TurnOpts, render_turn};

@@ -2732,6 +2732,7 @@ mod tests {
                 authoritative: false,
                 harness: None,
                 model: None,
+                pack_path: None,
             },
         )
         .expect("render turn");

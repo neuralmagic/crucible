@@ -554,7 +554,8 @@ async fn try_turn(
             AuthProvider::Codex => None,
         };
         let decoder = harness.decoder(args, meters.as_ref(), crate::agent::tool_io_full(args));
-        let exec_result = exec_and_stream(&gw, &name, &wrapper, decoder, &exec_opts, sink).await;
+        let exec_result =
+            exec_and_stream(&gw, &name, &wrapper, decoder, &exec_opts, spent, sink).await;
         if let Some(refresher) = &refresher {
             refresher.abort();
         }
@@ -741,6 +742,7 @@ async fn exec_and_stream(
     command: &[String],
     decoder: crate::harness::StreamDecoder,
     opts: &ExecOpts<'_>,
+    spent: &CostMeter,
     sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
 ) -> Result<f64> {
     let mut pump = agent::StreamPump::new(decoder);
@@ -757,6 +759,9 @@ async fn exec_and_stream(
     {
         cost = estimate_cost(opts.model, t);
     }
+    // Bank it here, not at the caller's `?`: the agent can bill real tokens and still exit
+    // non-zero below, and a turn that spent money is never reported free.
+    spent.raise(cost);
 
     // Replay the agent's stderr (provisioning notes / errors) through the sink as raw lines.
     for line in exec.stderr_lines {
@@ -1259,6 +1264,36 @@ mod tests {
             msg.contains("without producing a verdict"),
             "must distinguish itself from a parse failure: {msg}"
         );
+    }
+
+    /// The meter reports what a turn spent even when the step that would have returned the cost
+    /// unwinds instead. This is the shape of the live failure: the agent billed real tokens and
+    /// exited non-zero, and the turn reported $0.
+    #[test]
+    fn a_turn_that_billed_before_it_failed_is_not_reported_free() {
+        let spent = CostMeter::default();
+        // What `exec_and_stream` does once the pump has finished, before it inspects the exit code.
+        spent.raise(0.20629125);
+        let outcome = TurnOutcome::failed(
+            spent.get(),
+            TurnFailure::Orchestration(OpenshellCliError::AgentExit { code: 1 }.to_string()),
+        );
+        assert_eq!(outcome.cost_usd, 0.20629125);
+        assert!(outcome.failure.is_some());
+    }
+
+    /// `raise` is a high-water mark, so banking the cost early and again at the end cannot
+    /// double-count it, and a later smaller sample cannot lower it.
+    #[test]
+    fn the_meter_only_ever_rises() {
+        let spent = CostMeter::default();
+        spent.raise(0.25);
+        spent.raise(0.25);
+        assert_eq!(spent.get(), 0.25);
+        spent.raise(0.10);
+        assert_eq!(spent.get(), 0.25, "a smaller later sample never lowers it");
+        spent.raise(0.40);
+        assert_eq!(spent.get(), 0.40, "the OTEL rollup can only raise it");
     }
 
     /// The locator's glob reaches each harness's transcript at its real depth: claude one segment
