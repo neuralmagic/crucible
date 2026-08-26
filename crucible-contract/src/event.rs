@@ -3,6 +3,7 @@
 //! only; the cost/pricing helpers that consume them live in `crucible`.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// A telemetry sample the agent emits roughly every few thousand tokens.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -162,6 +163,26 @@ pub enum AgentEvent {
         #[serde(default)]
         code: i32,
     },
+    /// One line from the sandbox's own log, replayed into the turn's stream. The engine decides
+    /// whether a line reports a policy denial while it holds the structured line, so it says so
+    /// here instead of leaving a consumer to re-derive it from the message text.
+    SandboxLog {
+        #[serde(default)]
+        ts_ms: i64,
+        #[serde(default)]
+        level: String,
+        /// The subsystem that emitted it (`proxy`, `supervisor`, …).
+        #[serde(default)]
+        target: String,
+        #[serde(default)]
+        message: String,
+        /// The line reports a blocked egress attempt.
+        #[serde(default)]
+        denial: bool,
+        /// The line's own structured fields, verbatim.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        fields: BTreeMap<String, String>,
+    },
     /// A line we could not classify, passed through verbatim so nothing is lost.
     Raw { text: String, stream: RawStream },
 }
@@ -191,6 +212,58 @@ impl AgentEvent {
 
 #[cfg(test)]
 mod tests {
+    /// A sandbox line reaches a consumer as data: its level, its subsystem, its own fields, and
+    /// the engine's verdict on whether it reports a denial — none of which survive a message
+    /// string with a prefix on it.
+    #[test]
+    fn a_sandbox_log_line_carries_its_structure() {
+        let ev = AgentEvent::SandboxLog {
+            ts_ms: 1_787_759_206_035,
+            level: "WARN".to_string(),
+            target: "proxy".to_string(),
+            message: "CONNECT denied api.example.com:443".to_string(),
+            denial: true,
+            fields: BTreeMap::from([("denial_stage".to_string(), "connect".to_string())]),
+        };
+        let json = serde_json::to_value(&ev).expect("serialize");
+        assert_eq!(json["kind"], "sandbox_log");
+        assert_eq!(json["denial"], true);
+        assert_eq!(json["target"], "proxy");
+        assert_eq!(json["fields"]["denial_stage"], "connect");
+
+        let back: AgentEvent = crate::json::from_str(&json.to_string()).expect("deserialize");
+        let AgentEvent::SandboxLog {
+            denial,
+            target,
+            fields,
+            ts_ms,
+            ..
+        } = back
+        else {
+            panic!("decodes as itself");
+        };
+        assert!(denial);
+        assert_eq!(target, "proxy");
+        assert_eq!(ts_ms, 1_787_759_206_035);
+        assert_eq!(fields["denial_stage"], "connect");
+    }
+
+    /// An ordinary line carries no fields, and says so by omission rather than by an empty map.
+    #[test]
+    fn a_plain_sandbox_line_omits_empty_fields() {
+        let ev = AgentEvent::SandboxLog {
+            ts_ms: 0,
+            level: "INFO".to_string(),
+            target: "supervisor".to_string(),
+            message: "starting".to_string(),
+            denial: false,
+            fields: BTreeMap::new(),
+        };
+        let json = serde_json::to_value(&ev).expect("serialize");
+        assert!(json.get("fields").is_none(), "{json}");
+        assert_eq!(json["denial"], false);
+    }
+
     use super::*;
 
     type Case = (&'static str, fn(&AgentEvent) -> bool);

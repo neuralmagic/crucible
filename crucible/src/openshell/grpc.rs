@@ -403,8 +403,9 @@ pub struct ExecResult {
     pub stderr_lines: Vec<String>,
     pub exit_code: Option<i32>,
     /// Set when the exec stream broke rather than ended. The turn never reached an exit, so it
-    /// cannot be read as one.
-    pub transport_error: Option<String>,
+    /// cannot be read as one. The gRPC code rides along: the gateway is our own service, so a
+    /// caller classifies the break by code rather than by matching the message.
+    pub transport_error: Option<(tonic::Code, String)>,
 }
 
 impl Gateway {
@@ -1014,7 +1015,7 @@ impl Gateway {
         let mut stderr = LineSplitter::default();
         let mut stderr_lines: Vec<String> = Vec::new();
         let mut exit_code: Option<i32> = None;
-        let mut transport_error: Option<String> = None;
+        let mut transport_error: Option<(tonic::Code, String)> = None;
         loop {
             tokio::select! {
                 // `biased`: poll the stream arm first so a final output line that is already
@@ -1036,7 +1037,7 @@ impl Gateway {
                     Err(status) => {
                         // The stream broke mid-exec. Carried out rather than dropped: without it
                         // the caller sees no exit code and reads the turn as complete.
-                        transport_error = Some(status.to_string());
+                        transport_error = Some((status.code(), status.message().to_string()));
                         break;
                     }
                 },
