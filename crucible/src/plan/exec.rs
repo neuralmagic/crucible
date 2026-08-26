@@ -12,7 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::plan::ir::{Direction, Join, Task, TaskKind, TaskName, ValidPlan};
@@ -104,8 +104,17 @@ impl Default for ExecCfg {
     }
 }
 
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[error("task status must be pass|fail|transport|skipped|blocked|truncated, got {got:?}")]
+pub struct UnknownTaskStatus {
+    pub got: String,
+}
+
 /// Terminal task states.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+///
+/// A `task_result` line carries one of these, and a consumer reading a session log decodes it back
+/// through this type rather than matching the token itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     Pass,
@@ -127,6 +136,36 @@ impl TaskStatus {
             TaskStatus::Blocked => "blocked",
             TaskStatus::Truncated => "truncated",
         }
+    }
+
+    /// Whether this status is the task having done what it was asked. Everything else is a
+    /// failure of some kind, and none of them may read as a pass.
+    pub fn passed(self) -> bool {
+        self == TaskStatus::Pass
+    }
+}
+
+impl std::str::FromStr for TaskStatus {
+    type Err = UnknownTaskStatus;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pass" => Ok(TaskStatus::Pass),
+            "fail" => Ok(TaskStatus::Fail),
+            "transport" => Ok(TaskStatus::Transport),
+            "skipped" => Ok(TaskStatus::Skipped),
+            "blocked" => Ok(TaskStatus::Blocked),
+            "truncated" => Ok(TaskStatus::Truncated),
+            other => Err(UnknownTaskStatus {
+                got: other.to_owned(),
+            }),
+        }
+    }
+}
+
+impl std::fmt::Display for TaskStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
