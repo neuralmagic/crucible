@@ -51,7 +51,16 @@ roundup = command(
     join = "passed",
 )
 
+# Engine-owned: publishes only the bounded run snapshot. Required means a delivery failure is a
+# workflow failure; no agent can skip the call or choose its Slack payload.
+publish_report = report(
+    name = "publish-report",
+    destination = {"kind": "slack"},
+    template = "reports/slack.md.j2",
+    required = True,
+)
+
 workflow(
     type = "playbook",
-    tasks = [draft, shape, polish] + auditors + [roundup],
+    tasks = [draft, shape, polish] + auditors + [roundup, publish_report],
 )

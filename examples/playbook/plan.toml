@@ -108,3 +108,13 @@ kind = "command"
 command = "./roundup.sh"
 depends_on = ["audit-headings", "audit-bullets", "audit-freshness"]
 join = "passed"
+
+[[task]]
+name = "publish-report"
+kind = "report"
+destination = { slack = {} }
+template = '''*Crucible playbook complete* — {{ passed }} passed, {{ failed }} non-passing · ${{ "%.4f"|format(spent_usd) }}
+{% for task in tasks %}• `{{ task.name }}` — {{ task.status }}
+{% endfor %}{% if run_url %}<{{ run_url }}|Open run artifacts in Crucible>{% endif %}
+'''
+stage = "epilogue"
