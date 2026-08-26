@@ -19,6 +19,38 @@
 mod kube;
 mod turn;
 
+use anyhow::{Context, Result};
+
+/// Resolves an image tag to its `@sha256:…` digest. A render never reaches a registry on its own:
+/// a caller that wants pinned images passes a resolver in, and `None` emits every tag verbatim.
+pub trait DigestResolver: Send + Sync {
+    fn pin(&self, image: &str) -> Result<String>;
+}
+
+/// forge's in-process registry client: HEADs the manifest, with credentials from
+/// `REGISTRY_AUTH_FILE` or the docker config. What `crucible deploy` uses unless `--no-pin`.
+pub struct RegistryDigests;
+
+impl DigestResolver for RegistryDigests {
+    fn pin(&self, image: &str) -> Result<String> {
+        forge::oci::pin_digest(image, None)
+    }
+}
+
+/// `image`, pinned through `digests` when one is given.
+pub(in crate::deploy) fn pin_image(
+    digests: Option<&dyn DigestResolver>,
+    what: &str,
+    image: &str,
+) -> Result<String> {
+    match digests {
+        Some(d) => d
+            .pin(image)
+            .with_context(|| format!("pinning {what} {image}")),
+        None => Ok(image.to_string()),
+    }
+}
+
 pub use kube::{MANAGED_BY_LABEL, PackDelivery, PlaybookLaunch, RenderInput, RenderOpts, render};
 pub(in crate::deploy) use kube::{node_avoid_affinity, role_binding};
-pub use turn::{TurnKind, TurnOpts, render_turn};
+pub use turn::{ProposeTier, TurnKind, TurnOpts, render_turn};

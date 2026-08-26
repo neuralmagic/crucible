@@ -220,10 +220,7 @@ fn ancestors<'a>(plan: &'a ValidPlan, task: &Task) -> Vec<&'a Task> {
     found
 }
 
-pub(crate) fn runnable_set<'a>(
-    plan: &'a ValidPlan,
-    substrate: &Substrate,
-) -> BTreeSet<&'a TaskName> {
+pub fn runnable_set<'a>(plan: &'a ValidPlan, substrate: &Substrate) -> BTreeSet<&'a TaskName> {
     let mut runnable: BTreeSet<&TaskName> = BTreeSet::new();
     for t in plan.tasks_topo() {
         let deps_runnable = match t.join {

@@ -1,10 +1,10 @@
 //! The typed gRPC boundary to the local OpenShell gateway: Health / sandbox / provider / policy /
 //! exec / logs RPCs over a lazily-connected mTLS [`Channel`], all natively `async` and awaited
-//! from [`crate::openshell::run::turn`]'s one `block_on` on the shared engine runtime.
+//! from `openshell::run::turn`'s one `block_on` on the shared engine runtime.
 //! [`Gateway::exec`] consumes the tonic server stream directly, handing stdout lines to a caller
 //! callback and `select!`ing a [`CancellationToken`] so Ctrl-C drops the stream and cancels the
 //! RPC server-side (there is no local child to signal). Boot and file upload/download stay on the
-//! CLI, see [`crate::openshell::gateway`] and [`crate::openshell::run`].
+//! CLI, see [`crate::openshell::gateway`] and `openshell::run`.
 
 use crate::openshell::gateway::{GATEWAY_NAME, GATEWAY_PORT};
 use anyhow::{Context, Result};
@@ -152,7 +152,7 @@ fn provision_timeout() -> Duration {
 /// roll pulls a multi-GB agent image, which routinely outlasts [`provision_timeout`]: counting the
 /// short deadline from create killed the sandbox mid-pull and burned another full pull on the
 /// retry. Overridable via `OPENSHELL_PULL_TIMEOUT`.
-pub(crate) fn pull_timeout() -> Duration {
+pub fn pull_timeout() -> Duration {
     let secs = std::env::var("OPENSHELL_PULL_TIMEOUT")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -976,7 +976,7 @@ impl Gateway {
     /// Stream `ExecSandbox` output. Consumes the tonic server stream directly: each stdout
     /// [`ExecSandboxEvent`](openshell_core::proto::ExecSandboxEvent) chunk is split into complete
     /// lines and handed to `on_stdout_line` (the caller feeds them to a
-    /// [`crate::agent::StreamPump`]); stderr is collected and returned in the [`ExecResult`]. The
+    /// `agent::StreamPump`); stderr is collected and returned in the [`ExecResult`]. The
     /// exit code is not surfaced (the old CLI-child path ignored it too).
     ///
     /// Cancellation: `select!`s `cancel` against `stream.message()`. On trip the stream is dropped,
@@ -1323,7 +1323,7 @@ fn dedup(values: &[String]) -> Vec<String> {
 }
 
 /// Split a stream of byte-chunks into complete lines, invoking a callback per line. Used for both
-/// exec output streams: stdout lines flow to the [`crate::agent::StreamPump`], stderr lines into a
+/// exec output streams: stdout lines flow to the `agent::StreamPump`, stderr lines into a
 /// collected `Vec`. The async exec has no `impl Read` path, so it splits bytes into lines itself,
 /// in order. The trailing partial (unterminated) line is flushed by
 /// [`LineSplitter::finish`].

@@ -75,7 +75,7 @@ const AGENT_H: f64 = 32.0;
 const LANE_H: f64 = 20.0;
 const LANE_STEP: f64 = 27.0;
 
-pub(crate) fn emit_html(m: &FlowModel) -> String {
+pub fn emit_html(m: &FlowModel) -> String {
     let mut out = String::with_capacity(64 * 1024);
     head(&mut out, m);
     header_strip(&mut out, m);

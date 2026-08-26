@@ -3,7 +3,7 @@
 //! Hermes has no machine-readable event stream, so its result verdict, cost, tool spans, and
 //! conversation records are recovered post-hoc from the session db (`sessions` holds the per-turn
 //! rollup, `messages` the conversation). This is the ONLY source of a hermes turn's result + cost,
-//! so it is the load-bearing backfill (see `Harness::backfill_required`), but it is still pure
+//! so it is the load-bearing backfill (see `HarnessRuntime::backfill_required`), but it is still pure
 //! telemetry code: every failure degrades to `None`, never a panic or a wrong number. A `None`
 //! surfaces upstream as a loud transcript error, never a silent $0 success.
 //!

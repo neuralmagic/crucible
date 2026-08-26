@@ -18,6 +18,7 @@ use crate::Paths;
 use crate::activity::ActivityFeed;
 use crate::agent::{self, AgentBackend, TurnFailure, TurnOutcome};
 use crate::event::{AgentEvent, RawStream};
+use crate::harness::HarnessRuntime;
 use anyhow::{Context, Result};
 use clap::Parser;
 use crucible_contract::Disposition;
@@ -365,7 +366,7 @@ fn run_grounded_turn(
     // Manifest-less turn: the Vertex agent env normally supplied by `[agent].env` comes from the
     // turn pod's own env instead. Only for a Vertex-authenticated harness.
     if args.harness().auth_provider() == crate::harness::AuthProvider::Vertex {
-        crate::openshell::relay_vertex_env(&mut args.env);
+        crate::openshell::run::relay_vertex_env(&mut args.env);
     }
     // Flag wins; CRUCIBLE_RANK_MODEL lets a parent (rank-compare, the controller's escalation
     // arm) pin the model without threading a parameter through every layer.

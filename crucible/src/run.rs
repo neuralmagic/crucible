@@ -4,18 +4,20 @@
 //! run path: a `crucible.toml` builds the [`World`] + [`Judge`], anchors every path, picks a
 //! front-end, and calls [`crate::loop_driver::run_loop`].
 
-use crate::crucible::{Judge, World};
 use crate::errors::FileError;
+use crate::harness::HarnessRuntime;
 use crate::loop_driver::{LoopRuntime, run_loop};
 use crate::recovery::{RecoveryPlan, ResumeRecovery, classify_session, plan_recovery};
-use crate::{Args, Cli, Cmd, Paths, Prepared, STOP, Ui};
+use crate::{Args, Cli, Cmd, FlowArgs, Paths, Prepared, STOP, Ui};
 use crate::{
-    agent, broker, check, console, control, deploy, init, manifest, publish, reporter, scope,
+    agent, broker, check, console, control, deploy, flow, init, manifest, publish, reporter, scope,
     stream,
 };
 use anyhow::{Context, Result};
+use crucible::crucible::{Judge, World};
 use crucible_vcs::vcs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 /// The run layer's own failures: CLI-flag combinations the parser can't express, workspace
@@ -73,6 +75,11 @@ pub(crate) enum RunError {
 
 /// Route the parsed CLI: subcommands run standalone; everything else is a manifest run.
 pub(crate) fn dispatch(cli: Cli) -> Result<()> {
+    if cli.contract_version {
+        println!("{}", crucible_contract::CONTRACT_VERSION);
+        return Ok(());
+    }
+
     if let Some(Cmd::Init { dir }) = &cli.command {
         let dir = dir.clone().unwrap_or_else(|| PathBuf::from("."));
         return init::run(&dir);
@@ -157,7 +164,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
     }
     // Pure file-to-file fold: no engine runtime, no workspace.
     if let Some(Cmd::Flow(args)) = &cli.command {
-        return crate::flow::run(args);
+        return flow_cmd(args);
     }
     if let Some(Cmd::Fetch { uri, out }) = &cli.command {
         // The engine runtime the S3 GetObject block_ons on (published for `publish::fetch_object`).
@@ -217,7 +224,9 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                     manifest.as_deref(),
                     crate::plan::cli::Ceilings {
                         usd: *max_cost,
-                        wall_clock: max_time.as_deref().and_then(crate::parse_duration),
+                        wall_clock: max_time
+                            .as_deref()
+                            .and_then(crate::duration::parse_duration),
                         wall_clock_raw: max_time.clone(),
                     },
                     *compute_driver,
@@ -247,9 +256,12 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                     issue: a.issue,
                     goal_text,
                     repo_url: a.repo_url,
+                    repo_ref: a.repo_ref,
                     sandbox_image: a.sandbox_image,
                     max_cost: a.max_cost,
-                    pin_digests: !a.no_pin,
+                    digests: (!a.no_pin).then(|| {
+                        Arc::new(deploy::RegistryDigests) as Arc<dyn deploy::DigestResolver>
+                    }),
                     tier: a.tier,
                     gaming_refine_rounds: a.gaming_refine_rounds,
                     skip_gaming_review: a.skip_gaming_review,
@@ -282,7 +294,8 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
         let opts = deploy::RenderOpts {
             iterations: args.iterations,
             max_cost: args.max_cost,
-            pin_digests: !args.no_pin,
+            digests: (!args.no_pin)
+                .then(|| Arc::new(deploy::RegistryDigests) as Arc<dyn deploy::DigestResolver>),
             pr_repo: args.pr_repo.clone(),
             pack,
             clusters_file: args.clusters.clone(),
@@ -319,6 +332,41 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
     // exits via `process::exit`), so the runtime stays alive under the loop.
     let _engine = crate::engine::EngineCtx::new()?;
     run_from_manifest(cli.run)
+}
+
+/// `crucible flow`: gather the inputs (the session log, the span export from a file or Datadog),
+/// render, and write `--out`.
+fn flow_cmd(args: &FlowArgs) -> Result<()> {
+    let session_log = std::fs::read_to_string(&args.session)
+        .with_context(|| format!("reading {}", args.session.display()))?;
+    // clap rejects --spans + --dd-trace together, so at most one arm produces spans.
+    let spans_json = match (&args.spans, &args.dd_trace) {
+        (Some(p), _) => {
+            Some(std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?)
+        }
+        (None, Some(trace_id)) => Some(crate::flow_dd::fetch_trace_spans(
+            trace_id,
+            &args.dd_window,
+        )?),
+        (None, None) => None,
+    };
+    let ext = args
+        .out
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default();
+    let format = flow::FlowFormat::from_extension(ext)?;
+    let rendered = flow::render(
+        &flow::FlowInput {
+            session_log,
+            spans_json,
+        },
+        format,
+    )?;
+    std::fs::write(&args.out, rendered)
+        .with_context(|| format!("writing {}", args.out.display()))?;
+    println!("[crucible flow] wrote {}", args.out.display());
+    Ok(())
 }
 
 /// Fold `--playbook`'s flags into the renderer's launch knobs. clap enforces the flag
@@ -714,7 +762,7 @@ fn apply_agent_cfg(args: &mut Args, agent: &manifest::AgentCfg, workspace: &Path
         args.reasoning_effort = agent.reasoning_effort;
     }
     if args.reasoning_effort.is_none() {
-        args.reasoning_effort = Some(agent::ReasoningEffort::Medium);
+        args.reasoning_effort = Some(crate::manifest::ReasoningEffort::Medium);
     }
     // Backend: the manifest decides by default, but a CLI `--agent-backend openshell` overrides it
     // (the same manifest runs `local` on a laptop and `openshell` in the pod). Default
@@ -741,7 +789,7 @@ fn apply_agent_cfg(args: &mut Args, agent: &manifest::AgentCfg, workspace: &Path
     if args.agent_backend == agent::AgentBackend::Openshell
         && args.harness().auth_provider() == crate::harness::AuthProvider::Vertex
     {
-        crate::openshell::relay_vertex_env(&mut args.env);
+        crate::openshell::run::relay_vertex_env(&mut args.env);
     }
     args.relay = agent.relay.clone();
     args.openshell = agent.openshell.clone();
@@ -1043,7 +1091,7 @@ fn open_admission_ledger(
 }
 
 /// Copy every non-excluded skill under `p.skills` into the workspace's `skills_dir` (the
-/// harness's discovery path, see [`crate::harness::Harness::skills_dir`]).
+/// harness's discovery path, see [`crate::manifest::Harness::skills_dir`]).
 /// `exclude` names setup-only skills (deployment config, workload capture) that the loop agent must
 /// never see, see [`manifest::AgentCfg::toolbox_exclude`]. A name in `exclude` that doesn't
 /// exist under the toolbox dir is a manifest bug (the exclusion is silently doing nothing), so
@@ -1133,7 +1181,10 @@ mod tests {
         let m: manifest::Manifest = toml::from_str(&manifest_toml("")).unwrap();
         let mut a = args_from(&["crucible"]);
         apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
-        assert_eq!(a.reasoning_effort, Some(agent::ReasoningEffort::Medium));
+        assert_eq!(
+            a.reasoning_effort,
+            Some(crate::manifest::ReasoningEffort::Medium)
+        );
     }
 
     #[test]
@@ -1142,7 +1193,10 @@ mod tests {
             toml::from_str(&manifest_toml("reasoning_effort = \"max\"")).unwrap();
         let mut a = args_from(&["crucible"]);
         apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
-        assert_eq!(a.reasoning_effort, Some(agent::ReasoningEffort::Max));
+        assert_eq!(
+            a.reasoning_effort,
+            Some(crate::manifest::ReasoningEffort::Max)
+        );
     }
 
     #[test]
@@ -1150,12 +1204,12 @@ mod tests {
         let m: manifest::Manifest = toml::from_str(&manifest_toml("")).unwrap();
         let mut a = args_from(&["crucible"]);
         apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
-        assert_eq!(a.harness(), crate::harness::Harness::Claude);
+        assert_eq!(a.harness(), crate::manifest::Harness::Claude);
 
         let m: manifest::Manifest = toml::from_str(&manifest_toml("harness = \"hermes\"")).unwrap();
         let mut a = args_from(&["crucible"]);
         apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
-        assert_eq!(a.harness(), crate::harness::Harness::Hermes);
+        assert_eq!(a.harness(), crate::manifest::Harness::Hermes);
     }
 
     #[test]
@@ -1163,7 +1217,7 @@ mod tests {
         let m: manifest::Manifest = toml::from_str(&manifest_toml("harness = \"hermes\"")).unwrap();
         let mut a = args_from(&["crucible", "--harness", "claude"]);
         apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
-        assert_eq!(a.harness(), crate::harness::Harness::Claude);
+        assert_eq!(a.harness(), crate::manifest::Harness::Claude);
     }
 
     /// `[agent.hermes]` parses (and rides onto Args), and an unknown key inside it is a manifest
@@ -1200,7 +1254,7 @@ mod tests {
         .unwrap();
         let mut a = args_from(&["crucible"]);
         apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
-        assert_eq!(a.harness(), crate::harness::Harness::Codex);
+        assert_eq!(a.harness(), crate::manifest::Harness::Codex);
         assert_eq!(a.codex.model.as_deref(), Some("gpt-5.6-sol"));
 
         let err = toml::from_str::<manifest::Manifest>(&format!(
@@ -1216,7 +1270,10 @@ mod tests {
             toml::from_str(&manifest_toml("reasoning_effort = \"high\"")).unwrap();
         let mut a = args_from(&["crucible", "--effort", "low"]);
         apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
-        assert_eq!(a.reasoning_effort, Some(agent::ReasoningEffort::Low));
+        assert_eq!(
+            a.reasoning_effort,
+            Some(crate::manifest::ReasoningEffort::Low)
+        );
     }
 
     /// A manifest without `[agent.env]` (a controller-drafted pack) still gets the pod's Vertex

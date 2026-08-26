@@ -15,7 +15,6 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use crate::crucible::{Judge, MeasureCtx, Reading, World};
 use crate::loop_driver::{self, Decided, IterStep, Measured, TurnVerdict};
 use crate::manifest::{WorkflowCaps, WorkflowCfg, WorkflowType};
 use crate::plan::exec::{
@@ -28,6 +27,7 @@ use crate::plan::ir::{
 use crate::reporter::{Reporter, Row, TurnBudget};
 use crate::session::{EvidenceDisposition, EvidenceEntry};
 use crate::{Args, Paths, Prepared, STOP, agent, control};
+use crucible::crucible::{Judge, MeasureCtx, Reading, World};
 
 #[derive(Debug, thiserror::Error)]
 #[error("graph iteration ended with neither a decision nor a control signal (exit: {exit})")]

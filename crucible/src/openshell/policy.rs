@@ -56,7 +56,7 @@ pub const DEFAULT_ENDPOINTS: &[&str] = &[
 ];
 
 /// The harness's built-in endpoints (`defaults`, see
-/// [`crate::harness::Harness::default_endpoints`]) plus the domain's extras, de-duplicated, order
+/// `HarnessRuntime::default_endpoints`) plus the domain's extras, de-duplicated, order
 /// preserved, then with `deny_endpoints` subtracted. With `inherit_defaults = false` the built-ins
 /// are dropped and only the domain's are allowed.
 ///
@@ -80,7 +80,7 @@ pub fn resolve_endpoints(
     out
 }
 
-/// The harness's agent-CLI binaries (`defaults`, see [`crate::harness::Harness::default_binaries`])
+/// The harness's agent-CLI binaries (`defaults`, see `HarnessRuntime::default_binaries`)
 /// plus the domain's extras, de-duplicated, order preserved, then with `deny_binaries`
 /// subtracted. With `inherit_defaults = false` an unlisted agent CLI gets no network at all.
 pub fn resolve_binaries(cfg: &OpenshellCfg, defaults: &[&str]) -> Vec<String> {
@@ -121,7 +121,7 @@ mod tests {
 
     /// The claude harness's binary defaults, what every pre-harness-boundary test resolved
     /// against.
-    const DEFAULT_BINARIES: &[&str] = crate::harness::claude::DEFAULT_BINARIES;
+    const DEFAULT_BINARIES: &[&str] = &["/usr/local/bin/claude", "/usr/local/bin/opencode"];
 
     fn cfg(endpoints: &[&str], binaries: &[&str]) -> OpenshellCfg {
         OpenshellCfg {

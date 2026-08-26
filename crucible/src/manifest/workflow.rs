@@ -8,7 +8,7 @@ use crate::plan::ir::{
     EngineOp, Join, Plan, PlanBudget, PlanError, Stage, Task, TaskKind, TaskName,
 };
 
-/// Reserved epilogue input key: [`crate::loop_graph`] injects the kept candidate's
+/// Reserved epilogue input key: `loop_graph` injects the kept candidate's
 /// context into every epilogue task's inputs under this name.
 pub const KEPT_INPUT: &str = "kept";
 
