@@ -29,9 +29,15 @@ impl GroundedErrorKind {
     }
 }
 
-/// One grounded ranking turn's result. Untagged because the two shapes are told apart by their own
-/// fields: a ruling carries `tier`, a failure carries `error`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// One grounded ranking turn's result. The two shapes are told apart by their own fields: a ruling
+/// carries `tier`, a failure carries `error`.
+///
+/// Serializes untagged; decoded by dispatching on `error` rather than by `#[serde(untagged)]`,
+/// which cannot read a float when `serde_json/arbitrary_precision` is on — and `starlark` turns it
+/// on for any binary that links the engine (see [`crate::json`]). An untagged decode of this type
+/// therefore passes in this crate's own tests and fails in the controller, which is the worst way
+/// for a wire type to break.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum GroundedVerdict {
     Ruled {
@@ -59,6 +65,59 @@ pub enum GroundedVerdict {
         #[serde(default)]
         over_budget: bool,
     },
+}
+
+/// The ruling shape, derived so the fields stay declarative; fed a `Value` so nothing goes through
+/// serde's `Content` buffer.
+#[derive(Deserialize)]
+struct RuledWire {
+    tier: Disposition,
+    rationale: String,
+    #[serde(default)]
+    confidence: Option<String>,
+    cost_usd: f64,
+    #[serde(default)]
+    over_budget: bool,
+}
+
+/// The failure shape, same treatment.
+#[derive(Deserialize)]
+struct FailedWire {
+    error: String,
+    error_kind: GroundedErrorKind,
+    #[serde(default)]
+    output_tail: Option<String>,
+    cost_usd: f64,
+    #[serde(default)]
+    over_budget: bool,
+}
+
+impl<'de> Deserialize<'de> for GroundedVerdict {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if value.get("error").is_some() {
+            let w: FailedWire = serde_json::from_value(value).map_err(D::Error::custom)?;
+            Ok(GroundedVerdict::Failed {
+                error: w.error,
+                error_kind: w.error_kind,
+                output_tail: w.output_tail,
+                cost_usd: w.cost_usd,
+                over_budget: w.over_budget,
+            })
+        } else {
+            let w: RuledWire = serde_json::from_value(value).map_err(D::Error::custom)?;
+            Ok(GroundedVerdict::Ruled {
+                tier: w.tier,
+                rationale: w.rationale,
+                confidence: w.confidence,
+                cost_usd: w.cost_usd,
+                over_budget: w.over_budget,
+            })
+        }
+    }
 }
 
 impl GroundedVerdict {
