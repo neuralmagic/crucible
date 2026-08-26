@@ -201,6 +201,7 @@ impl FlowFormat {
 /// Render the flow document: the library form of `crucible flow`, which reads `--session` and
 /// `--spans` (or fetches `--dd-trace`) into a [`FlowInput`] and writes the result to `--out`.
 /// Pure: nothing beyond `input` is read.
+#[tracing::instrument(skip_all, fields(format = ?format), err)]
 pub fn render(input: &FlowInput, format: FlowFormat) -> Result<String> {
     let model = build_model(&input.session_log, input.spans_json.as_deref())?;
     Ok(match format {

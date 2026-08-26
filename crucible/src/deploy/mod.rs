@@ -28,6 +28,7 @@ use std::path::Path;
 /// the library form of `crucible deploy render` (`deploy apply` server-side applies the same
 /// YAML). Reads only the manifest, its pack dir, the profile, and its fleet file; image pinning
 /// happens through [`RenderOpts::digests`] or not at all.
+#[tracing::instrument(skip_all, fields(manifest = %manifest_path.display(), pinned = opts.digests.is_some()), err)]
 pub fn render_yaml(manifest_path: &Path, profile_path: &Path, opts: &RenderOpts) -> Result<String> {
     let manifest_dir = manifest_path
         .parent()

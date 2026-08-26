@@ -220,6 +220,7 @@ fn checked_git_ref(r: &str) -> Result<&str, BadRepoRef> {
     Ok(r)
 }
 
+#[tracing::instrument(skip_all, fields(turn_kind = ?opts.kind, issue = %opts.issue, pinned = opts.digests.is_some()), err)]
 pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
     let image = pin_image(
         opts.digests.as_deref(),
