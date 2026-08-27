@@ -8,7 +8,7 @@ use crate::plan::ir::{
     EngineOp, Join, Plan, PlanBudget, PlanError, Stage, Task, TaskKind, TaskName,
 };
 
-/// Reserved epilogue input key: [`crate::loop_graph`] injects the kept candidate's
+/// Reserved epilogue input key: `loop_graph` injects the kept candidate's
 /// context into every epilogue task's inputs under this name.
 pub const KEPT_INPUT: &str = "kept";
 
@@ -165,6 +165,8 @@ pub enum WorkflowError {
     PlaybookEngineTask { task: String, op: EngineOp },
     #[error("engine task {task:?} cannot run in the epilogue (the loop is over)")]
     EngineTaskInEpilogue { task: String },
+    #[error("report task {task:?} must run in the epilogue")]
+    ReportOutsideEpilogue { task: String },
     #[error("epilogue task name {KEPT_INPUT:?} is reserved for the kept-candidate input")]
     ReservedEpilogueName,
     #[error(
@@ -276,6 +278,11 @@ impl WorkflowCfg {
         // A measurement source may feed only one decision.
         let mut decided_sources: BTreeMap<&TaskName, &TaskName> = BTreeMap::new();
         for task in &self.tasks {
+            if matches!(task.task, TaskKind::Report { .. }) && task.stage != Stage::Epilogue {
+                return Err(WorkflowError::ReportOutsideEpilogue {
+                    task: task.name.0.clone(),
+                });
+            }
             if let TaskKind::Engine {
                 op,
                 source,

@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
 use starlark_syntax::syntax::AstModule;
 use starlark_syntax::syntax::ast::{AstLiteral, Expr, Stmt};
 
@@ -19,17 +20,20 @@ type Result<T> = std::result::Result<T, CompileError>;
 
 /// The types a parameter may take. Deliberately small: every one has an unambiguous spelling on
 /// a command line and in JSON, which is what lets one declaration serve both.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ParamType {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParamType {
     String,
     Int,
     Number,
     Bool,
+    /// Spelled as the declaration spells it, so the stored form and [`ParamType::parse`] agree.
+    #[serde(rename = "list<string>")]
     StringList,
 }
 
 impl ParamType {
-    fn parse(name: &str) -> Option<Self> {
+    pub fn parse(name: &str) -> Option<Self> {
         match name {
             "string" => Some(ParamType::String),
             "int" => Some(ParamType::Int),
@@ -40,7 +44,7 @@ impl ParamType {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             ParamType::String => "string",
             ParamType::Int => "int",
@@ -56,8 +60,11 @@ impl ParamType {
 }
 
 /// A bound parameter value.
+///
+/// Stores and reloads as the JSON the value already is (`42`, `true`, `["a"]`), not as a tagged
+/// wrapper: see the hand-written codec below.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum ParamValue {
+pub enum ParamValue {
     String(String),
     Int(i32),
     Number(f64),
@@ -65,8 +72,54 @@ pub(crate) enum ParamValue {
     StringList(Vec<String>),
 }
 
+impl Serialize for ParamValue {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        self.json().serialize(serializer)
+    }
+}
+
+/// Decoded by inspecting the value rather than by trying variants in order: `serde(untagged)`
+/// cannot read a float back into an `f64` variant, and an integer must stay an integer instead of
+/// widening to `42.0`.
+impl<'de> Deserialize<'de> for ParamValue {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        use serde::de::Error as _;
+        match serde_json::Value::deserialize(deserializer)? {
+            serde_json::Value::String(s) => Ok(ParamValue::String(s)),
+            serde_json::Value::Bool(b) => Ok(ParamValue::Bool(b)),
+            serde_json::Value::Number(n) => match n.as_i64() {
+                Some(i) => i32::try_from(i)
+                    .map(ParamValue::Int)
+                    .map_err(|_| D::Error::custom(format!("{i} does not fit in 32 bits"))),
+                None => n
+                    .as_f64()
+                    .map(ParamValue::Number)
+                    .ok_or_else(|| D::Error::custom("a parameter number must be finite")),
+            },
+            serde_json::Value::Array(items) => items
+                .into_iter()
+                .map(|i| match i {
+                    serde_json::Value::String(s) => Ok(s),
+                    other => Err(D::Error::custom(format!(
+                        "a list parameter holds strings, got {other}"
+                    ))),
+                })
+                .collect::<std::result::Result<Vec<String>, _>>()
+                .map(ParamValue::StringList),
+            other => Err(D::Error::custom(format!(
+                "a parameter value is a string, int, number, bool, or list of strings, got {other}"
+            ))),
+        }
+    }
+}
+
 impl ParamValue {
-    pub(crate) fn json(&self) -> serde_json::Value {
+    pub fn json(&self) -> serde_json::Value {
         match self {
             ParamValue::String(s) => serde_json::Value::String(s.clone()),
             ParamValue::Int(n) => serde_json::json!(n),
@@ -78,17 +131,17 @@ impl ParamValue {
 }
 
 /// One declared parameter.
-#[derive(Debug, Clone)]
-pub(crate) struct ParamSpec {
-    pub(crate) name: String,
-    pub(crate) ty: ParamType,
-    pub(crate) required: bool,
-    pub(crate) default: Option<ParamValue>,
-    pub(crate) doc: String,
-    pub(crate) pattern: Option<String>,
-    pub(crate) min: Option<f64>,
-    pub(crate) max: Option<f64>,
-    pub(crate) choices: Vec<String>,
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ParamSpec {
+    pub name: String,
+    pub ty: ParamType,
+    pub required: bool,
+    pub default: Option<ParamValue>,
+    pub doc: String,
+    pub pattern: Option<String>,
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+    pub choices: Vec<String>,
 }
 
 /// Every field a declaration may carry, for the did-you-mean on a typo.
@@ -96,8 +149,11 @@ const FIELDS: &[&str] = &[
     "type", "required", "default", "doc", "pattern", "min", "max", "choices",
 ];
 
-#[derive(Debug, Clone, Default)]
-pub(crate) struct Params(Vec<ParamSpec>);
+/// Every parameter a source declares, in source order. Serializes as the bare list, so a launcher
+/// can store the declarations it read and bind against them later without the engine in the loop.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Params(Vec<ParamSpec>);
 
 impl Params {
     /// Read the block without evaluating the source.
@@ -146,7 +202,7 @@ impl Params {
     /// Everything a launcher supplies arrives as text, because a command line and a JSON form
     /// and an ask all hand over text. Parsing is the declaration's job, which is what keeps
     /// `max_steps = "many"` from reaching the graph.
-    pub(crate) fn bind(
+    pub fn bind(
         &self,
         supplied: &BTreeMap<String, String>,
     ) -> Result<BTreeMap<String, ParamValue>> {
@@ -180,15 +236,20 @@ impl Params {
         Ok(bound)
     }
 
+    /// The declarations, in the order the source wrote them.
+    pub fn specs(&self) -> &[ParamSpec] {
+        &self.0
+    }
+
     /// Whether the source declares no parameters at all. A graph that is not a function of its
     /// launch arguments can be frozen; one that is must be compiled per run.
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
     /// The declaration as a JSON Schema document, so one source serves command-line validation,
     /// ask validation, and a generated launch form.
-    pub(crate) fn json_schema(&self) -> serde_json::Value {
+    pub fn json_schema(&self) -> serde_json::Value {
         let mut properties = serde_json::Map::new();
         let mut required = Vec::new();
         for spec in &self.0 {

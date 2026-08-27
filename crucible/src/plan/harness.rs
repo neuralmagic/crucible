@@ -14,6 +14,7 @@ use clap::ValueEnum;
 use serde_json::Value;
 
 use crate::event::{AgentEvent, RawStream};
+use crate::harness::HarnessRuntime;
 use crate::plan::exec::{Attempt, AttemptOutcome, BatchItem, TaskRunner};
 use crate::plan::ir::{Isolation, Task, TaskKind, TaskName};
 use crate::plan::runner::ShellRunner;
@@ -496,7 +497,7 @@ fn run_in(
             model,
             effort,
         } => (prompt, harness, model, effort),
-        TaskKind::Command { .. } | TaskKind::Evaluate { .. } => {
+        TaskKind::Command { .. } | TaskKind::Evaluate { .. } | TaskKind::Report { .. } => {
             let mut shell = ShellRunner {
                 workdir: paths.workspace.clone(),
                 agent_cmd: None,
@@ -524,7 +525,7 @@ fn run_in(
     args.env
         .push(("CRUCIBLE_TASK".to_string(), task.name.0.clone()));
     if let Some(h) = harness {
-        match crate::harness::Harness::from_str(h, true) {
+        match crate::manifest::Harness::from_str(h, true) {
             Ok(h) => args.harness = Some(h),
             Err(e) => return fail(0.0, format!("task names unknown harness {h:?}: {e}")),
         }
@@ -533,7 +534,7 @@ fn run_in(
         args.model = m.clone();
     }
     if let Some(e) = effort {
-        match crate::agent::ReasoningEffort::from_str(e, true) {
+        match crate::manifest::ReasoningEffort::from_str(e, true) {
             Ok(e) => args.reasoning_effort = Some(e),
             Err(err) => return fail(0.0, format!("task names unknown effort {e:?}: {err}")),
         }
@@ -1787,6 +1788,7 @@ workflow(type = "playbook", tasks = [good, bad, after])
                 None,
                 Some(&manifest),
                 ceilings,
+                crate::openshell::gateway::ComputeDriver::Podman,
             )
             .expect_err("a playbook without ceilings must not dispatch");
             assert!(format!("{error:#}").contains(expected), "{error:#}");
@@ -1807,6 +1809,7 @@ workflow(type = "playbook", tasks = [good, bad, after])
                 wall_clock: Some(std::time::Duration::from_secs(600)),
                 wall_clock_raw: Some("10m".into()),
             },
+            crate::openshell::gateway::ComputeDriver::Podman,
         )
         .expect("a playbook with both ceilings runs");
         assert!(dir.join("workspace/out.txt").exists(), "the task never ran");

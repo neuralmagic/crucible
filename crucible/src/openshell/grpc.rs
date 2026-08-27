@@ -1,10 +1,10 @@
 //! The typed gRPC boundary to the local OpenShell gateway: Health / sandbox / provider / policy /
 //! exec / logs RPCs over a lazily-connected mTLS [`Channel`], all natively `async` and awaited
-//! from [`crate::openshell::run::turn`]'s one `block_on` on the shared engine runtime.
+//! from `openshell::run::turn`'s one `block_on` on the shared engine runtime.
 //! [`Gateway::exec`] consumes the tonic server stream directly, handing stdout lines to a caller
 //! callback and `select!`ing a [`CancellationToken`] so Ctrl-C drops the stream and cancels the
 //! RPC server-side (there is no local child to signal). Boot and file upload/download stay on the
-//! CLI, see [`crate::openshell::gateway`] and [`crate::openshell::run`].
+//! CLI, see [`crate::openshell::gateway`] and `openshell::run`.
 
 use crate::openshell::gateway::{GATEWAY_NAME, GATEWAY_PORT};
 use anyhow::{Context, Result};
@@ -152,7 +152,7 @@ fn provision_timeout() -> Duration {
 /// roll pulls a multi-GB agent image, which routinely outlasts [`provision_timeout`]: counting the
 /// short deadline from create killed the sandbox mid-pull and burned another full pull on the
 /// retry. Overridable via `OPENSHELL_PULL_TIMEOUT`.
-pub(crate) fn pull_timeout() -> Duration {
+pub fn pull_timeout() -> Duration {
     let secs = std::env::var("OPENSHELL_PULL_TIMEOUT")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -402,6 +402,10 @@ pub struct Gateway {
 pub struct ExecResult {
     pub stderr_lines: Vec<String>,
     pub exit_code: Option<i32>,
+    /// Set when the exec stream broke rather than ended. The turn never reached an exit, so it
+    /// cannot be read as one. The gRPC code rides along: the gateway is our own service, so a
+    /// caller classifies the break by code rather than by matching the message.
+    pub transport_error: Option<(tonic::Code, String)>,
 }
 
 impl Gateway {
@@ -976,7 +980,7 @@ impl Gateway {
     /// Stream `ExecSandbox` output. Consumes the tonic server stream directly: each stdout
     /// [`ExecSandboxEvent`](openshell_core::proto::ExecSandboxEvent) chunk is split into complete
     /// lines and handed to `on_stdout_line` (the caller feeds them to a
-    /// [`crate::agent::StreamPump`]); stderr is collected and returned in the [`ExecResult`]. The
+    /// `agent::StreamPump`); stderr is collected and returned in the [`ExecResult`]. The
     /// exit code is not surfaced (the old CLI-child path ignored it too).
     ///
     /// Cancellation: `select!`s `cancel` against `stream.message()`. On trip the stream is dropped,
@@ -1011,6 +1015,7 @@ impl Gateway {
         let mut stderr = LineSplitter::default();
         let mut stderr_lines: Vec<String> = Vec::new();
         let mut exit_code: Option<i32> = None;
+        let mut transport_error: Option<(tonic::Code, String)> = None;
         loop {
             tokio::select! {
                 // `biased`: poll the stream arm first so a final output line that is already
@@ -1028,8 +1033,13 @@ impl Gateway {
                         Some(ExecPayload::Exit(e)) => exit_code = Some(e.exit_code),
                         None => {}
                     },
-                    Ok(None) => break,     // stream ended cleanly
-                    Err(_status) => break, // transport/RPC error, end the pump
+                    Ok(None) => break, // stream ended cleanly
+                    Err(status) => {
+                        // The stream broke mid-exec. Carried out rather than dropped: without it
+                        // the caller sees no exit code and reads the turn as complete.
+                        transport_error = Some((status.code(), status.message().to_string()));
+                        break;
+                    }
                 },
                 // Ctrl-C (via the run-module bridge): drop the stream, which cancels the RPC
                 // server-side. Trailing partials are still flushed below.
@@ -1042,6 +1052,7 @@ impl Gateway {
         Ok(ExecResult {
             stderr_lines,
             exit_code,
+            transport_error,
         })
     }
 }
@@ -1323,7 +1334,7 @@ fn dedup(values: &[String]) -> Vec<String> {
 }
 
 /// Split a stream of byte-chunks into complete lines, invoking a callback per line. Used for both
-/// exec output streams: stdout lines flow to the [`crate::agent::StreamPump`], stderr lines into a
+/// exec output streams: stdout lines flow to the `agent::StreamPump`, stderr lines into a
 /// collected `Vec`. The async exec has no `impl Read` path, so it splits bytes into lines itself,
 /// in order. The trailing partial (unterminated) line is flushed by
 /// [`LineSplitter::finish`].
@@ -1630,13 +1641,20 @@ pYBZ
     }
 
     /// The outage shape: the `google-cloud` provider profile declares no endpoints, so its
-    /// credential reaches a sandbox only through a policy endpoint naming the provider. Both
-    /// Vertex hosts must bind, or a turn whose region resolves to the wildcard form gets no
-    /// token and its agent retries until it gives up. The expected hosts are spelled out here
-    /// on purpose: deriving them from the constant under test would assert nothing.
+    /// credential reaches a sandbox only through a policy endpoint naming the provider. Every
+    /// Vertex host must bind, global and regional alike, or a turn whose region resolves to one
+    /// of the others gets no token and its agent exits before its first tool call. The expected
+    /// hosts are spelled out here on purpose: deriving them from the constant under test would
+    /// assert nothing.
     #[test]
     fn every_vertex_host_binds_the_gcp_provider() {
-        const EXPECTED: [&str; 2] = ["aiplatform.googleapis.com", "*.aiplatform.googleapis.com"];
+        const EXPECTED: [&str; 5] = [
+            "aiplatform.googleapis.com",
+            "*.aiplatform.googleapis.com",
+            "*-aiplatform.googleapis.com",
+            "aiplatform.us.rep.googleapis.com",
+            "aiplatform.eu.rep.googleapis.com",
+        ];
 
         let bindings: Vec<EndpointCredentialBinding> =
             crate::openshell::policy::VERTEX_CREDENTIAL_HOSTS

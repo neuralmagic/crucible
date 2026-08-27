@@ -16,11 +16,13 @@
 
 use crate::Paths;
 use crate::activity::ActivityFeed;
-use crate::agent::{self, AgentBackend, TurnFailure, TurnOutcome};
+use crate::agent::{self, TurnFailure, TurnOutcome};
 use crate::event::{AgentEvent, RawStream};
+use crate::harness::HarnessRuntime;
+use crate::manifest::AgentBackend;
 use anyhow::{Context, Result};
 use clap::Parser;
-use crucible_contract::Disposition;
+use crucible_contract::{Disposition, GroundedErrorKind, GroundedVerdict};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -50,7 +52,7 @@ pub struct RankGroundedArgs {
     #[arg(long)]
     pub marker: bool,
     /// Real agent backend for the turn; ignored when `--agent-cmd` is set.
-    #[arg(long, value_enum, default_value_t = crate::agent::AgentBackend::Local)]
+    #[arg(long, value_enum, default_value_t = crate::manifest::AgentBackend::Local)]
     pub agent_backend: AgentBackend,
     /// Sandbox image for `--agent-backend openshell`.
     #[arg(long)]
@@ -96,10 +98,10 @@ pub enum GroundedError {
 impl GroundedError {
     /// The machine-readable discriminant on the verdict marker, so the controller records which
     /// failure it was instead of re-deriving it from prose.
-    fn kind(&self) -> &'static str {
+    fn kind(&self) -> GroundedErrorKind {
         match self {
-            GroundedError::Turn(_) => "turn_failed",
-            GroundedError::NoVerdict => "no_verdict",
+            GroundedError::Turn(_) => GroundedErrorKind::TurnFailed,
+            GroundedError::NoVerdict => GroundedErrorKind::NoVerdict,
         }
     }
 }
@@ -120,29 +122,46 @@ pub struct GroundedReport {
 }
 
 impl GroundedReport {
-    /// The one-line JSON the caller (the controller's grounded arm) parses off stdout: the verdict
-    /// fields plus the turn's cost, or an `error` object when the agent emitted no parseable verdict.
-    fn to_json(&self) -> serde_json::Value {
+    /// The shared document the caller (the controller's grounded arm) decodes: the verdict fields
+    /// plus the turn's cost, or the error shape when the agent emitted no parseable verdict.
+    fn wire(&self) -> GroundedVerdict {
         match &self.verdict {
-            Some(v) => serde_json::json!({
-                "tier": v.disposition.as_str(),
-                "rationale": v.rationale,
-                "confidence": v.confidence,
-                "cost_usd": self.cost_usd,
-                "over_budget": self.over_budget,
-            }),
-            None => serde_json::json!({
-                "error": self
+            Some(v) => GroundedVerdict::Ruled {
+                tier: v.disposition,
+                rationale: v.rationale.clone(),
+                confidence: Some(v.confidence.clone()),
+                cost_usd: self.cost_usd,
+                over_budget: self.over_budget,
+            },
+            None => GroundedVerdict::Failed {
+                error: self
                     .error
                     .as_ref()
                     .map(GroundedError::to_string)
                     .unwrap_or_else(|| "no verdict".to_string()),
-                "error_kind": self.error.as_ref().map(GroundedError::kind).unwrap_or("no_verdict"),
-                "output_tail": self.output_tail,
+                error_kind: self
+                    .error
+                    .as_ref()
+                    .map(GroundedError::kind)
+                    .unwrap_or(GroundedErrorKind::NoVerdict),
+                output_tail: self.output_tail.clone(),
+                cost_usd: self.cost_usd,
+                over_budget: self.over_budget,
+            },
+        }
+    }
+
+    /// The one line printed on stdout and on the marker.
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::to_value(self.wire()).unwrap_or_else(|e| {
+            serde_json::json!({
+                "error": format!("the verdict failed to serialize: {e}"),
+                "error_kind": GroundedErrorKind::NoVerdict,
+                "output_tail": serde_json::Value::Null,
                 "cost_usd": self.cost_usd,
                 "over_budget": self.over_budget,
-            }),
-        }
+            })
+        })
     }
 }
 
@@ -365,7 +384,7 @@ fn run_grounded_turn(
     // Manifest-less turn: the Vertex agent env normally supplied by `[agent].env` comes from the
     // turn pod's own env instead. Only for a Vertex-authenticated harness.
     if args.harness().auth_provider() == crate::harness::AuthProvider::Vertex {
-        crate::openshell::relay_vertex_env(&mut args.env);
+        crate::openshell::run::relay_vertex_env(&mut args.env);
     }
     // Flag wins; CRUCIBLE_RANK_MODEL lets a parent (rank-compare, the controller's escalation
     // arm) pin the model without threading a parameter through every layer.
@@ -685,6 +704,39 @@ mod tests {
             Some(Disposition::Tier(Tier::T1))
         );
         assert!(report.to_json().get("error_kind").is_none());
+    }
+
+    /// What the command prints is what a caller decodes, through one type: a ruling keeps its
+    /// disposition and the turn's cost, and a failed turn's cost is never lost on the way out.
+    #[test]
+    fn the_printed_verdict_decodes_back_through_the_contract_type() {
+        let ruled = report_from_turn(
+            TurnOutcome::completed(0.3),
+            "{\"tier\":\"stale\",\"rationale\":\"already implemented\",\"confidence\":\"low\"}",
+            0.0,
+        );
+        let decoded: GroundedVerdict =
+            crucible_contract::json::from_str(&ruled.to_json().to_string()).expect("decodes");
+        assert_eq!(decoded.disposition(), Some(Disposition::Stale));
+        assert_eq!(decoded.cost_usd(), 0.3);
+        assert!(!decoded.over_budget());
+
+        let failed = report_from_turn(
+            TurnOutcome::failed(0.12, TurnFailure::Spawn("the agent exited 1".to_string())),
+            "",
+            0.0,
+        );
+        let decoded: GroundedVerdict =
+            crucible_contract::json::from_str(&failed.to_json().to_string()).expect("decodes");
+        assert_eq!(decoded.disposition(), None);
+        assert_eq!(decoded.cost_usd(), 0.12);
+        assert!(matches!(
+            decoded,
+            GroundedVerdict::Failed {
+                error_kind: GroundedErrorKind::TurnFailed,
+                ..
+            }
+        ));
     }
 
     /// The outage shape: the turn fails and the agent's only output is the diagnostic it

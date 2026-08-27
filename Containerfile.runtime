@@ -28,13 +28,18 @@ ARG GH_VERSION=2.94.0
 ARG GH_SHA256=a757f1ba6db18f4de8cbadb244843a5f89bc75b5e7c6fc127d2bd77fbd12ed62
 ARG VERSION=dev
 ARG REVISION=unknown
+# The controller/engine contract version. INJECTED like OPENSHELL_REV: docker.yml reads it from
+# the staged crucible binary (`crucible --contract-version`) and the RUN after the bin COPY
+# below re-checks it against the binary actually shipped, so the label cannot drift.
+ARG CONTRACT_VERSION=unset--pass-build-arg-CONTRACT_VERSION-from-crucible-binary
 
 LABEL org.opencontainers.image.title="crucible" \
       org.opencontainers.image.description="Domain-neutral crucible runtime: engine + broker + forge on a self-contained OpenShell/podman base" \
       org.opencontainers.image.source="https://github.com/neuralmagic/crucible" \
       org.opencontainers.image.licenses="MIT OR Apache-2.0" \
       org.opencontainers.image.version="${VERSION}" \
-      org.opencontainers.image.revision="${REVISION}"
+      org.opencontainers.image.revision="${REVISION}" \
+      io.crucible.contract-version="${CONTRACT_VERSION}"
 
 USER root
 
@@ -97,6 +102,8 @@ RUN curl -fsSL "https://github.com/nushell/nushell/releases/download/${NU_VERSIO
 
 # crucible (engine) + crucible-broker + forge bins on PATH (staged by docker.yml).
 COPY prebuilt/bin/ /usr/local/bin/
+RUN test "$(crucible --contract-version)" = "${CONTRACT_VERSION}" \
+    || { echo "io.crucible.contract-version=${CONTRACT_VERSION} does not match the shipped binary ($(crucible --contract-version))" >&2; exit 1; }
 
 # Override the Copr gateway AND CLI with the rev-pinned fork build (the openshell-dist stage,
 # tag derived from Cargo.lock's openshell-core rev, see the OPENSHELL_REV arg at the top).

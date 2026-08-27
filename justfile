@@ -36,6 +36,10 @@ install-tools:
 build-loop:
     cargo build --release
 
+# Score the agent-stream decoder (examples/selfhost's gate): ns/line over the synthetic corpus.
+bench-stream:
+    cargo bench -p crucible-harness --bench stream_json -q
+
 # Lint + test the Rust workspace.
 lint:
     cargo fmt --check && cargo clippy --workspace --all-targets && cargo test --workspace

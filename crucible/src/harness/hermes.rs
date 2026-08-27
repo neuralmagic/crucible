@@ -16,11 +16,6 @@ use crate::harness::{SeedFile, TurnArtifacts, append_manifest_env};
 use crate::turn_trace::GenAiRecord;
 use std::time::Duration;
 
-/// The default model when neither the CLI nor the manifest names one. A claude model (the harness
-/// A/B holds the model fixed and swaps only the harness); a manifest carries the provider-prefixed
-/// form its provider expects (e.g. `vertex_ai/claude-opus-4-6`).
-pub(crate) const DEFAULT_MODEL: &str = "claude-opus-4-6";
-
 /// The provider named in hermes's `config.yaml`: the `vertex-anthropic` provider from the
 /// hermes-agent fork (github.com/wseaton/hermes-agent, branch `anthropic-vertex`). It speaks the
 /// Anthropic API surface over Vertex, keeping the harness A/B model-identical with claude. Auth is

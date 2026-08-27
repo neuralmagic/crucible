@@ -1,4 +1,5 @@
 use crate::deploy::profile::DeployProfile;
+use crate::deploy::render::{DigestResolver, pin_image};
 use crate::manifest::{AgentCfg, CompositeManifest, DeployCfg, Manifest, MeasureCfg};
 use crate::openshell::gateway::{
     CLIENT_TLS_SECRET, ComputeDriver, GATEWAY_PORT, OTEL_COLLECTOR_PORT,
@@ -15,6 +16,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 
 #[derive(Debug, thiserror::Error)]
 #[error(
@@ -90,7 +92,9 @@ const SANDBOX_NAME_HASH_LABEL: &str = "agents.x-k8s.io/sandbox-name-hash";
 /// the right `hostAliases` on sandbox pods.
 pub(super) const POD_IP_ENV: &str = "CRUCIBLE_POD_IP";
 
-/// Options that vary per render invocation (not per cluster).
+/// Options that vary per render invocation (not per cluster). `Default` is a manual
+/// `crucible deploy render`: one iteration, no budget, no pin, baked domain, the loop.
+#[derive(Clone)]
 pub struct RenderOpts {
     /// Agent iterations the wrapper runs. The controller passes its `run_iterations` knob; a manual
     /// `crucible deploy render` defaults to 1.
@@ -99,9 +103,9 @@ pub struct RenderOpts {
     /// controller passes its `run_max_cost` knob so a dispatched run has a real budget; a manual
     /// render defaults to 0.
     pub max_cost: f64,
-    /// Resolve image tags to `@sha256:…` via the in-process registry client (the footgun fix). Off
-    /// emits the tag verbatim, for an air-gapped render where the registry isn't reachable.
-    pub pin_digests: bool,
+    /// Resolve image tags to `@sha256:…` through this resolver (the footgun fix). `None` emits the
+    /// tag verbatim, for an air-gapped render where the registry isn't reachable.
+    pub digests: Option<Arc<dyn DigestResolver>>,
     /// Publish-on-keep single-repo fork (`owner/repo`): the loop opens its kept-commits draft PR here.
     /// The controller passes its per-repo default so a dispatched run publishes; a manual render leaves
     /// it `None` (no `--pr-repo`, so `crucible run` opens no PR unless the manifest's `[publish] pr_repo`
@@ -121,7 +125,7 @@ pub struct RenderOpts {
     pub clusters_file: Option<std::path::PathBuf>,
     /// The agent harness the loop runs, rendered as `--harness=<h>` into the wrapper's `crucible`
     /// invocation. `None` emits no flag, the loop keeps the manifest's `[agent].harness`.
-    pub harness: Option<crate::harness::Harness>,
+    pub harness: Option<crate::manifest::Harness>,
     /// The model the loop runs, rendered as `--model=<m>` into the wrapper's `crucible` invocation.
     /// `None` emits no flag, the loop derives the model from the resolved harness.
     pub model: Option<String>,
@@ -130,7 +134,24 @@ pub struct RenderOpts {
     pub playbook: Option<PlaybookLaunch>,
 }
 
+impl Default for RenderOpts {
+    fn default() -> Self {
+        Self {
+            iterations: 1,
+            max_cost: 0.0,
+            digests: None,
+            pr_repo: None,
+            pack: None,
+            clusters_file: None,
+            harness: None,
+            model: None,
+            playbook: None,
+        }
+    }
+}
+
 /// The knobs the controller supplies for a pack render (see [`RenderOpts::pack`]).
+#[derive(Debug, Clone)]
 pub struct PackDelivery {
     /// The ConfigMap object name, the controller owns it (run-unique, derived from the pod name), and
     /// it is used for BOTH the emitted ConfigMap's `metadata.name` AND the pod volume that references
@@ -140,9 +161,9 @@ pub struct PackDelivery {
 }
 
 /// The knobs a playbook launch supplies (see [`RenderOpts::playbook`]).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PlaybookLaunch {
-    pub max_time: crate::MaxTime,
+    pub max_time: crate::duration::MaxTime,
     pub max_cost: f64,
     pub params: BTreeMap<String, String>,
 }
@@ -264,12 +285,11 @@ pub fn render(
     profile: &DeployProfile,
     opts: &RenderOpts,
 ) -> Result<String> {
-    let image = if opts.pin_digests {
-        forge::oci::pin_digest(&profile.image.loop_image, None)
-            .with_context(|| format!("pinning loop image {}", profile.image.loop_image))?
-    } else {
-        profile.image.loop_image.clone()
-    };
+    let image = pin_image(
+        opts.digests.as_deref(),
+        "loop image",
+        &profile.image.loop_image,
+    )?;
     // The loop image bakes the domain pack at its DIRECTORY name, which is
     // not the composite's `[composite].name` (an issue overlay may rename it). The wrapper resolves
     // `<domains_root>/<domain-dir>`.
@@ -981,9 +1001,13 @@ impl Renderer<'_> {
                 .iter()
                 .map(|(name, value)| format!(" --param {}", sh_quote(&format!("{name}={value}"))))
                 .collect();
+            let driver_flag = match self.driver {
+                ComputeDriver::Kubernetes => " --compute-driver=kubernetes",
+                ComputeDriver::Podman => "",
+            };
             return Ok(format!(
                 r#"D={domain_dir}
-crucible plan run --manifest "$D/{manifest_file}" --max-cost {max_cost} --max-time {max_time}{param_flags}
+crucible plan run --manifest "$D/{manifest_file}" --max-cost {max_cost} --max-time {max_time}{driver_flag}{param_flags}
 rc=$?
 if [ -z "${{CRUCIBLE_INGEST_URL:-}}" ]; then
   echo "=================== {session_delimiter}$rc) ==================="
@@ -1785,7 +1809,7 @@ mod tests {
             &RenderOpts {
                 iterations: 1,
                 max_cost: 0.0,
-                pin_digests: false,
+                digests: None,
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
@@ -1944,7 +1968,7 @@ mod tests {
                 &RenderOpts {
                     iterations: 1,
                     max_cost: 0.0,
-                    pin_digests: false,
+                    digests: None,
                     pr_repo: pr_repo.map(str::to_string),
                     pack: None,
                     clusters_file: None,
@@ -1978,7 +2002,7 @@ mod tests {
         let manifest = dir.join("crucible.delta.toml");
         let profile = DeployProfile::load(&fixture_profile("delta")).expect("profile parses");
 
-        let render_with = |harness: Option<crate::harness::Harness>, model: Option<&str>| {
+        let render_with = |harness: Option<crate::manifest::Harness>, model: Option<&str>| {
             let composite = CompositeManifest::load(&manifest).expect("composite parses");
             let input = RenderInput::from_composite(&composite, &dir).expect("render input");
             render(
@@ -1989,7 +2013,7 @@ mod tests {
                 &RenderOpts {
                     iterations: 1,
                     max_cost: 0.0,
-                    pin_digests: false,
+                    digests: None,
                     pr_repo: None,
                     pack: None,
                     clusters_file: None,
@@ -2001,7 +2025,7 @@ mod tests {
             .expect("render")
         };
 
-        let set = render_with(Some(crate::harness::Harness::Hermes), Some("hermes-4-70b"));
+        let set = render_with(Some(crate::manifest::Harness::Hermes), Some("hermes-4-70b"));
         assert!(set.contains("--harness=hermes"), "{set}");
         assert!(set.contains("--model=hermes-4-70b"), "{set}");
 
@@ -2030,7 +2054,7 @@ mod tests {
             &RenderOpts {
                 iterations: 1,
                 max_cost: 0.0,
-                pin_digests: false,
+                digests: None,
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
@@ -2145,7 +2169,7 @@ mod tests {
             &RenderOpts {
                 iterations: 1,
                 max_cost: 0.0,
-                pin_digests: false,
+                digests: None,
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
@@ -2263,7 +2287,7 @@ mod tests {
             &RenderOpts {
                 iterations: 1,
                 max_cost: 0.0,
-                pin_digests: false,
+                digests: None,
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
@@ -2320,7 +2344,7 @@ mod tests {
             &RenderOpts {
                 iterations: 1,
                 max_cost: 0.0,
-                pin_digests: false,
+                digests: None,
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
@@ -2510,7 +2534,7 @@ mod tests {
             &RenderOpts {
                 iterations: 7,
                 max_cost: 25.0,
-                pin_digests: false,
+                digests: None,
                 pr_repo: None,
                 pack: Some(PackDelivery {
                     configmap_name: "crucible-run-llm-d-1650-pack".to_string(),
@@ -2587,7 +2611,7 @@ mod tests {
             &RenderOpts {
                 iterations: 1,
                 max_cost: 0.0,
-                pin_digests: false,
+                digests: None,
                 pr_repo: None,
                 pack: Some(PackDelivery {
                     configmap_name: "pack-cm-name".to_string(),
@@ -2675,7 +2699,7 @@ mod tests {
             &RenderOpts {
                 iterations: 1,
                 max_cost: 0.0,
-                pin_digests: false,
+                digests: None,
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
@@ -2698,15 +2722,17 @@ mod tests {
                 issue: "owner/repo#42".to_string(),
                 goal_text: None,
                 repo_url: "https://github.com/owner/repo.git".to_string(),
+                repo_ref: None,
                 sandbox_image: "registry.example.com/alpha-sandbox:latest".to_string(),
                 max_cost: 5.0,
-                pin_digests: false,
+                digests: None,
                 tier: None,
                 gaming_refine_rounds: 1,
                 skip_gaming_review: false,
                 authoritative: false,
                 harness: None,
                 model: None,
+                pack_path: None,
             },
         )
         .expect("render turn");
@@ -2768,7 +2794,7 @@ mod tests {
             &RenderOpts {
                 iterations: 1,
                 max_cost: 0.0,
-                pin_digests: false,
+                digests: None,
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
@@ -2878,7 +2904,7 @@ mod tests {
             &RenderOpts {
                 iterations: 1,
                 max_cost: 0.0,
-                pin_digests: false,
+                digests: None,
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
@@ -2993,7 +3019,7 @@ mod tests {
             &RenderOpts {
                 iterations: 1,
                 max_cost: 0.0,
-                pin_digests: false,
+                digests: None,
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
@@ -3044,7 +3070,7 @@ mod tests {
             &RenderOpts {
                 iterations: 1,
                 max_cost: 0.0,
-                pin_digests: false,
+                digests: None,
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
@@ -3149,7 +3175,7 @@ mod tests {
             &RenderOpts {
                 iterations: 1,
                 max_cost: 0.0,
-                pin_digests: false,
+                digests: None,
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
@@ -3335,7 +3361,7 @@ mod tests {
             &RenderOpts {
                 iterations: 1,
                 max_cost: 0.0,
-                pin_digests: false,
+                digests: None,
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
@@ -3966,7 +3992,7 @@ mod tests {
             &RenderOpts {
                 iterations: 1,
                 max_cost: 0.0,
-                pin_digests: false,
+                digests: None,
                 pr_repo: None,
                 pack: None,
                 clusters_file: None,
@@ -3976,6 +4002,19 @@ mod tests {
             },
         )
         .expect("render")
+    }
+
+    /// The compute driver is a substrate fact the pod cannot infer. Without it the plan runner
+    /// takes clap's podman default, hunts for a socket no work pod has, and the first agent task
+    /// dies on transport retries.
+    #[test]
+    fn playbook_wrapper_passes_the_compute_driver() {
+        let yaml = render_playbook(&k8s_profile(""), playbook_launch());
+        assert!(
+            yaml.contains("crucible plan run --manifest")
+                && yaml.contains("--compute-driver=kubernetes"),
+            "a kubernetes render must tell the plan runner which driver to use: {yaml}"
+        );
     }
 
     /// The whole point: a playbook pod runs the plan runner, not the agent loop. Every loop-only
@@ -4040,7 +4079,6 @@ mod tests {
         for loop_only in [
             "--results-bucket",
             "--pr-repo",
-            "--compute-driver",
             "--harness",
             "--model",
             "--resume",
@@ -4160,7 +4198,7 @@ mod tests {
             &RenderOpts {
                 iterations: 1,
                 max_cost: 0.0,
-                pin_digests: false,
+                digests: None,
                 pr_repo: None,
                 pack: Some(PackDelivery {
                     configmap_name: "alpha-pack".to_string(),

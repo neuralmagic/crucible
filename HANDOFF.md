@@ -1,153 +1,145 @@
-# Playbook lane + launcher: handoff
+# Linked boundary, the Vertex move, and the self-host demo: handoff
 
-Date: 2026-08-24. Two repos, one arc: the engine's playbook lane (here, branch
-`playbook-lane`) is finished and up as **PR neuralmagic/crucible#63**; the controller
-(`~/git/agentic-epp-autoresearch`, branch `playbook-launcher`, ~30 commits, unpushed) grew the
-entire launch surface on top of it; UI is pencils-down.
-Everything below was adversarially verified by a paired skeptic agent unless marked otherwise.
+Date: 2026-08-25. Three arcs ran together and are entangled, so read the demo section last: it
+is blocked on the other two.
 
-## Engine (this repo)
+## What this was
 
-All five defect WIs from the previous handoff are closed: lambda counts in the nesting scanner
-and `declared_params` is bounded (`26e6609`), markers strip to a fixpoint (`51e431a`), params
-bind on one path for every graph spelling (`386d2c1`), declared files publish atomically and
-only on pass (`7b69c37` + `44c8799`), and a mapped node's instances run serialized with
-per-instance capture (`9991c21`) — suite 986 green. `examples/triage` is the first
-real-sandbox example pack (fan-out keyed by issue number, curl-first, no token needed) and is
-proven by a fake-agent dry run; its real-model sandbox run is the one open criterion on
-WI-2026-08-23-001. Also filed here: WI-2026-08-22-010 (dep-sweep pack, targets wseaton/vllm-vcr,
-merge gate default off), WI-2026-08-23-002 (captured-bytes bound must be operator-configurable —
-audit Critical vs C-TASK-FILES), WI-2026-08-23-003 (`str(param(...))` launders external text
-past the markers; live-reproduced injection, fix = refuse Display-reachable conversions).
+A self-hosted demo loop (crucible optimizing its own agent-stream decoder) turned into two
+deeper things. Adopting it on prod failed on a flag the controller had been sending to an engine
+that never accepted it, which is the argv boundary failing exactly as designed, so RFC-0004 now
+governs that boundary and the engine half has shipped. Separately, the move to the
+`crucible-729940` Vertex project collided with a live Google outage and then with a credential
+binding bug that only a sandboxed turn could reveal.
 
-**The pin gate:** `core-pin.toml` in the controller points at `7c2c1a5`, which predates the
-lane. Registration/preview/dispatch there run against a locally built binary
-(`target/release/crucible` here). Production needs: merge #63 → runtime image builds → bump the
-controller's core-pin + Cargo revs + lockfile → first boot re-derives stored schemas
-(`rederive_stale` was built for exactly this).
+## The demo pack
 
-## Controller (`~/git/agentic-epp-autoresearch`, branch `playbook-launcher`)
+`examples/selfhost` is on main. It scores `StreamJsonParser` in ns per input line over a
+deterministic synthetic corpus. The bench hashes every emitted event, so a candidate that drops
+or reshapes events reports invalid rather than fast; the bench and `measure.sh` are frozen
+injects, the gate also runs the crate's tests and clippy with warnings denied, and the self-test
+proves discrimination by decoding every line twice.
 
-ADR-0027 (accepted) is the design: schema-driven launch surface, one launch path, frozen-at-rev
-imports, controller-side dedupe, drafts as the shared human/agent editing surface. Landed, in
-rough order:
+Proven locally on 2026-08-25 with the `local` backend: three iterations, three keeps,
+891 to 176.6 ns per line, $7.89, run ended `finished`. It has never completed on prod.
 
-| what | commits |
+`examples/selfhost/scenario.json` is the adoption body. It carries no `git_ref` on purpose: see
+the traps below.
+
+## Engine (this repo), all merged to main
+
+| What | Commit |
 | --- | --- |
-| Registry (`plan params` at registration, JSONB schema + digest, rederive on pin bump) | `ecb5bab`, hardening `46bf7da` |
-| Launch path (`InputKind::Playbook`, adopt-time rows, argv render, field-level 422s, digest-drift 409) | `52fce8d` |
-| One-shots (`fire_at`, park-not-poison sweep), cron schedules (SKIP LOCKED claim), cursor dedupe v1 | `9df158c` `eddc25c` `27aa9c2` `7d05cfa` `353a4af` |
-| Launch form + schedule toggle + relaunch prefill | `74f2455` `409ed49` |
-| Durable imports (`pack_imports` frozen at rev, sharable `/playbooks/import/{id}`, approvals rail) | `aede7f6` |
-| Two-way drafts (identity-stamped versions, `base_version` 409-as-merge-prompt) | `27ae90d` |
-| MCP front door (21 tools: import/create/files/save; break-glass dev auth) | `23b508e` `4c1b33d` |
-| Graph: typed document from `plan compile-workflow` → React Flow, gutter-routed skip-edges, file edge labels | `999add7` `fc384b4` `a2fcf8a` `d2a4ee4` |
-| Studio (drafts, compile-on-save, graduation-as-PR), placeholder-bound required params | `4c6840a` `d405444` |
-| Local dispatch (`CONTROLLER_PLAYBOOK_EXECUTOR=local`, supervised engine subprocess, launch-time backend refusal) | `63845e0` `3c3c9e6` |
-| Playbook run page (journey ladder banished, dispatch first-class), run graph on the shared surface | `5a51583` `b59e0c3` |
-| Task evidence on nodes (`/tasks/{task}/evidence`, path-confined incl. bracketed names; `/log`) | `38d7bc4` |
-| Monaco everywhere + server-side per-identity editor prefs (`user_prefs`, GET/PUT `/api/prefs/editor`) | `b46ab57` |
-| Draft I/O: from-git create (provenance kept), origin + rebase diff (two-way, honestly scoped), tarball, CLI `draft pull/push` | `44f06b3` |
-| Native theming (palette drift-tested against global.css) + `@headless-tree` file tree | `be16bc6` |
-| Resizable panes (`react-resizable-panels`), editor fills pane, collapsible icon rail | `4b9dcb8` |
-| Molten masthead logo (WebGPU port of `just demo-logo`, 30px, transparent ground, static fallback) | `133ee7b` |
-| Fixes: upstream-filter `$8/$9` bind collision (mine, verifier-caught), operator authoring gates | `02720fc` `3639c89` |
+| The self-host pack, the bench, the Rust images, `docs/domain-images.md` | `ab48d5e` (#70) |
+| Bind the regional Vertex hosts | `7a97f2b` (#73) |
+| Split crucible into a library and a thin binary; contract version; `--repo-ref` | `7b59a44` (#72) |
+| Keep the AWS SDK out of the linked library; trace the renders | `71a2918` (#74) |
 
-**Nothing in flight.** The polish wave closed complete: WI-011 landed as `61908df` (one
-`CoDraft` renderer feeds both the served SKILL.md and the hint commands, so human and agent
-can never see different URLs; break-glass lines render only on a local deployment) and the
-invisible DOWNLOAD SKILL label it exposed was a pre-existing unlayered `a{color:inherit}`
-beating Tailwind utilities — fixed by layering the rule (`global.css`, own commit). UI is
-pencils-down by decree.
+The runtime image built from `71a2918` is
+`ghcr.io/neuralmagic/crucible@sha256:cff37efd7abdbfb7431d1fe526b2acb37bef1c2591b52282efb3639e64300216`
+and carries `io.crucible.contract-version=1.0.0`. Its build fails if that label disagrees with
+the binary it ships.
 
-**Proven live on this laptop:** the whole loop. An opus agent authored "fences" (a Chesterton's
-Fence archaeology pack, draft v7) through the MCP tools; a human edit landed mid-loop and the
-agent surfaced the stale-base refusal instead of clobbering; the pack ran locally
-($0.67, `pallets/itsdangerous`, verdict `keep` — correct); `triage-local` (templated from the
-registered pack, backend flipped to local in the studio) proved 4-instance fan-out against real
-speculators issues. Runs live under `state/local-runs/`. The agent e2e is committed:
-`MCP_AGENT_E2E=1 just mcp-agent-e2e`.
+RFC-0004 is on main in `spec`. It has not been advanced; whether the engine half shipping is
+enough to seal the candidate is a call for whoever picks this up.
 
-## Open work, ranked
+Open here: **#75** (this handoff and the work items), #65 and #51 from earlier arcs.
 
-1. **Merge train**: push + PR the controller branch; merge crucible #63; pin bump; deploy.
-   The demo rides after: roll the UI on prod, then record there with
-   `demo-auth.mjs`/`demo-record.mjs` (`DEMO_BASE=https://<host>`).
-2. Queued WIs: controller — secrets (WI-2026-08-23-006, ADR-gated; **another session** is
-   drafting ADR-0028/0029/0030 as untracked files in gov/adr — leave them alone),
-   ADR-0026 phase 5, design baselines for the playbook surfaces (WI-2026-08-24-003);
-   crucible — dep-sweep pack, captured-bytes knob, laundering fix,
-   WI-2026-08-22-006 v2 seen-set (cursor write-back hole noted on the WI).
+## Controller (`~/git/agentic-epp-autoresearch`)
 
-**Demo kit shipped** (WI-2026-08-24-002): `just demo` boots a fresh seeded stack on its own
-ports (API 8898, SPA 5183; refuses to start over a squatter, `KUBECONFIG=/dev/null` dodges
-the 30s kube stall) and seeds through the public API — demo-sweep (a cheap runnable pack:
-one haiku scan, free 5-way isolated command fan-out with a designed billing failure, free
-roundup), triage (the undispatchable notice), a pending import, a co-edited draft, a
-disabled schedule. `just demo-run` mints the finished run (~$0.04). `demo-record.mjs`
-walks the nine scenes (registry → approvals → import review → studio → stale-base merge →
-launch form → run graph → evidence → schedule) into walkthrough.webm + screenshots;
-against a hosted instance, `demo-auth.mjs` captures the oauth2-proxy session once and
-`DEMO_BASE` points the recorder at it. Walkthrough artifact published (Playbook Launcher
-Walkthrough). Playbook local runs settle as `incomplete` in `runs` — pre-existing ingest
-wording, the run page still reads DONE. Seeding earlier hit the stale dev daemon once:
-the dev DB gained a demo-sweep row and triage was re-pinned to the branch tip (benign).
+**#459 is the gate.** Branch `linked-boundary`, pinned to engine `71a2918`. It replaces every
+render subprocess with a linked call, records the contract version, compares it against every
+configured dispatch image, and refuses a launch against a mismatched image with a ledger entry
+naming both versions and a `ContractRejected` park. 1210 tests plus 16 e2e green against a live
+database, clippy clean, both guardrails green. It has been rebased twice, and main is moving
+under it roughly hourly, so expect a third.
 
-**Small reds closed** (WI-2026-08-24-001, `ab8f437`): the substrate notice quotes
-`[agent] backend = …` so both PackDispatchNotice specs pass; the merge/rebase captions no
-longer say left/right (Monaco goes inline under narrow panes); `register()` refuses a live
-draft's id with a 409 on both API paths (graduation-target exempt, the registration
-retires the draft) with a test proving both halves; the engine.log mirror is covered.
-design.spec.ts is green (18/18) but covers no playbook route — that gap is
-WI-2026-08-24-003.
+Also open: **#462** (work items), #461, #426, #408, #372.
 
-## Decisions made, do not relitigate
+Merged today: #451 (Vertex project flip), #456 (us-east5 pin), #457 (the revert of #456).
 
-- The pack declares (`params`, secrets-by-name someday); the controller renders and enforces,
-  never authors a registered pack. One registration path, one launch path, one ledger.
-- Imports and launches are **frozen at rev**; the link shows what was proposed even after the
-  branch moves.
-- Agents **propose** (operator), humans **register/launch/delete/graduate** (admin); draft
-  authoring is operator-level (`3639c89`).
-- Dedupe is the launcher's: cursor first, seen-set later; one-shots never advance it unless
-  opted in. One-shots are not degenerate cron.
-- Playbook rows stay off the autoresearch surfaces (issues board, inbox, runs leaderboard via
-  `kind=`/`exclude_kind=`); they have their own rail and run page; the journey ladder never
-  renders for them.
-- Editor prefs are **server-side per identity**; pane sizes and rail state are **per-device
-  localStorage** (a laptop and an ultrawide must not fight).
-- Editor is **Monaco** (CodeMirror was reversed before a line landed), tree is
-  `@headless-tree`, splitters are `react-resizable-panels` — all exact-pinned after
-  verify-current checks.
-- Drafts have no git remote of their own: git enters via import, leaves via graduation.
+## Prod state right now
 
-## Dev-stack runbook (the traps are real)
+MPP `crucible--runtime-ext`, Argo `Application/crucible-controller`, sync is manual.
 
-- Postgres: existing container `crucible-test-pg`, `postgres://postgres:ci@localhost:55432/crucible`;
-  `.env` at workspace root (git-excluded locally) feeds sqlx macros; `justfile.local` exports
-  DATABASE_URL for recipes. After migrations: `sqlx migrate run --source crucible-controller/migrations`.
-- Daemon: `DATABASE_URL=... CRUCIBLE_BIN=~/git/crucible/target/release/crucible
-  CONTROLLER_ADMINS=dev,wseaton CONTROLLER_API_ADDR=127.0.0.1:8899
-  CONTROLLER_PLAYBOOK_EXECUTOR=local ./target/release/crucible-controller autopilot`.
-  **The docs' `CONTROLLER_ADMINS=$USER` is a trap**: the browser identity is `dev` (vite proxy
-  injects it); omit it and every admin surface reads viewer/read-only.
-- SPA: `bun run dev` in `crucible-controller/ui` → localhost:5173.
-- MCP against the dev daemon: break-glass needs `CONTROLLER_BREAK_GLASS=true` (clap rejects
-  `1`) **and** `CONTROLLER_API_TOKEN` set to anything. Headless `claude -p` needs
-  `--permission-mode bypassPermissions` and `< /dev/null`.
-- A draft save is the **full tree** — a file missing from the map is deleted.
-- WebGPU renders black in headless screenshots (capture, not code); prove visuals in a real
-  browser. `moltenSim.ts`/`MoltenLogo.tsx` are named to dodge APFS case-collision.
-- Flakes: "unexpected response from SSLRequest" under full-suite load (re-run);
-  `bun test` ≠ `bun run test` (use the latter);
-  `otel::forwarding_mirrors_reparented_traces...` (crucible repo, not ours).
+- Vertex project `crucible-729940`, service account `crucible-agent@crucible-729940`, secret
+  `crucible-vertex-adc` rolled on both MPP and waldorf.
+- `CLOUD_ML_REGION` is back to `global` after the revert. This is a stopgap.
+- Loop image `ghcr.io/neuralmagic/crucible-loop:main@sha256:5aca6eed...`, which predates every
+  engine change above.
+- `run_iterations=10`, `run_max_cost=40` in the overrides ConfigMap. **Every Argo sync resets
+  these to null.** Re-run `scripts/roll-vertex-project.fish knobs` after each sync.
+- Four adopted scenarios are parked, all at $0: `01a03a0f` and `01a03ac3` on the `--repo-ref`
+  failure, `01a03ad1` and `01a03b22` on the credential binding.
 
-## How this was built
+## Three traps, each of which cost an hour
 
-Serial one-implementer workflows (opus) with a paired adversarial verifier per task and up to
-two repair rounds, redirected mid-flight at task boundaries via stop → edit script → resume
-(cache replays finished legs). The verifiers earned their keep repeatedly: the batched-staging
-bug, the register/discard race, the fan-out cost double-count, the `$8` bind collision, the
-missing `crucible_draft_create` (found by the agent-in-the-loop e2e's opus leg, which refused
-to hand over a 404 link and filed a gap report instead). Trust reports that say *observed*,
-not *reasoned*.
+**A region other than `global` breaks every sandboxed turn** until a loop image carries `7a97f2b`.
+The gateway resolves a region to its own apex domain (`us-east5-aiplatform.googleapis.com`), the
+engine bound the credential only to `aiplatform.googleapis.com` and its dot-subdomains, and a
+hyphen-prefixed apex domain is not a dot-subdomain. The credential goes unbound, the metadata
+emulator answers 503, and the agent exits 1 with nothing on stderr. A direct `rawPredict` probe
+proves nothing about this: it bypasses the gateway. Probe with a real turn in a pod.
+
+**The `global` endpoint is degraded.** It returned NOT_FOUND for enabled models on 30 to 70
+percent of calls through the evening. Claude Code probes availability before a turn and falls
+back to `claude-sonnet-4-5`, which this project is not entitled to, so a blip is fatal to the
+turn. Enabled: `claude-opus-4-6`, `claude-opus-4-6[1m]`, `claude-sonnet-5`,
+`claude-haiku-4-5@20251001`. Not enabled: `claude-sonnet-4-5` (worth asking for, it makes the
+fallback survivable) and `claude-opus-4-5@20251101` (the undated id is the one that exists).
+
+**A scenario adopted with a `git_ref` fails at argument parsing** on any loop image older than
+`7b59a44`. The controller has sent `--repo-ref` since 2026-08-02 and no engine accepted it.
+Adopt without one until prod carries the new image.
+
+## Live bugs found by the audit, not yet fixed
+
+An audit of the controller after linking found 21 sites rebuilding engine meaning from text.
+Two are wrong today:
+
+- `validate_params` builds every jsonschema instance as a string, so a pack declaring an
+  integer, number, boolean, or array parameter cannot be launched through the controller, even
+  though the engine's binder accepts the same text.
+- `task_evidence::session_result` never reads a `task_result`'s status and serves whichever line
+  came last, so a failing attempt after a passing one reports as passing.
+
+Tracked as WI-2026-08-25-002 in the controller repo, gated on WI-2026-08-25-005 here.
+
+## Work items
+
+Here: 001 launch an existing pack without a scope turn (queue), 002 `--repo-ref` (active, one
+criterion left: prod on a loop image built from the pin), 003 linked renders (done), 004
+reachable-model catalog (queue), 005 expose the types the controller must not mirror (queue),
+006 carry a brokered measure through the turn render (queue).
+
+Controller: 001 link the renders and check the contract version (active, #459), 002 decode
+engine outcomes from the linked types (queue), 003 re-pin the Vertex region (queue).
+
+006 is worth understanding: the controller has also been sending `--broker-measure`, which no
+engine ever accepted, so brokered scope turns have been failing silently. Linking turned that
+into a typed refusal at dispatch. The engine needs the field before the refusal can go away.
+
+## To finish the demo, in order
+
+1. Merge #459 once `build-and-test` clears, rebasing again if main moved.
+2. Wait for the `crucible-loop` image built from that merge; take its digest.
+3. One controller values PR: bump the turn profile's `loop` pin to that digest **and** re-pin
+   `CLOUD_ML_REGION` and `vertex.region` to `us-east5` (both, or the region change is half
+   applied). That closes WI-003 there and the last criterion of 002 here.
+4. `scripts/roll-vertex-project.fish sync`, then `restart`, then `knobs`.
+5. Port-forward 8899, then `scripts/roll-vertex-project.fish adopt`. It strips `git_ref` for
+   you. Watch the scope turn through `/api/issues/{key}/scope-transcript`, which is the only
+   place the sandbox's own stderr surfaces.
+
+`scripts/roll-vertex-project.fish` takes `sa`, `secrets`, `sync`, `restart`, `knobs`,
+`park <key>`, and `adopt`.
+
+## Smaller things
+
+- Local `#[sqlx::test]` runs need `DATABASE_URL=postgres://postgres:ci@localhost:55432/crucible`.
+  Without it they fail in a way that reads exactly like a session-ingest regression. It cost an
+  hour before the tests turned out to be fine.
+- Linker errors saying nothing useful were a full disk. Each worktree carries its own `target`,
+  and they run 8 to 83 GB. `.claude/worktrees` under this repo held another 25 GB.
+- Prod's vault-sync CronJob was crash-looping on a rustls provider panic. Fixed on controller
+  main by `1410728`, unrelated to this work.

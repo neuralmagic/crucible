@@ -14,7 +14,10 @@
 
 use crate::agent::{self, TurnFailure, TurnOutcome};
 use crate::event::{AgentEvent, RawStream, cost_of, estimate_cost};
-use crate::harness::{AuthProvider, Harness, SandboxLayout, TranscriptLocator, TurnArtifacts};
+use crate::harness::{
+    AuthProvider, HarnessRuntime, SandboxLayout, TranscriptLocator, TurnArtifacts,
+};
+use crate::manifest::Harness;
 use crate::openshell::grpc::Gateway;
 use crate::openshell::{gateway, grpc, policy, provider, sandbox};
 use crate::{Args, Paths, relay};
@@ -34,6 +37,11 @@ pub enum OpenshellCliError {
          exit can mean any of those failed before the agent ran)"
     )]
     AgentExit { code: i32 },
+    #[error(
+        "the sandbox exec stream broke before the agent reported an exit ({code:?}: {message}); \
+         whatever the turn had already done is neither complete nor reportable"
+    )]
+    ExecStreamBroke { code: tonic::Code, message: String },
     #[error("private session locator is outside Claude's pinned config directory")]
     LocatorOutsideConfigDir,
     #[error("Claude transcript path does not match the admitted session id")]
@@ -266,7 +274,7 @@ async fn try_turn(
     );
     let labels = [
         ("crucible-pid".to_string(), std::process::id().to_string()),
-        ("crucible-workspace".to_string(), basename.clone()),
+        ("crucible-workspace".to_string(), label_value(&basename)),
     ];
     let mut providers = match harness.auth_provider() {
         AuthProvider::Vertex => vec![provider::PROVIDER_NAME.to_string()],
@@ -551,9 +559,16 @@ async fn try_turn(
             AuthProvider::Codex => None,
         };
         let decoder = harness.decoder(args, meters.as_ref(), crate::agent::tool_io_full(args));
-        let exec_result = exec_and_stream(&gw, &name, &wrapper, decoder, &exec_opts, sink).await;
+        let exec_result =
+            exec_and_stream(&gw, &name, &wrapper, decoder, &exec_opts, spent, sink).await;
         if let Some(refresher) = &refresher {
             refresher.abort();
+        }
+        // An exec that failed is exactly when the sandbox's own account of itself matters, and it
+        // is about to be deleted. Replay it before unwinding: a turn that exits non-zero having
+        // written nothing to stderr is otherwise indistinguishable from one that never started.
+        if exec_result.is_err() {
+            replay_sandbox_log(&gw, &name, LogReplay::Tail, sink).await;
         }
         let mut cost = exec_result?;
         spent.raise(cost);
@@ -573,7 +588,7 @@ async fn try_turn(
         // 8b. Sweep the sandbox log for egress denials before teardown. An agent probing
         //     blocked endpoints mid-turn is signal (reward-hacking telemetry), so denials
         //     land in the run log. Best-effort: a logs failure never fails the turn.
-        sweep_denials(&gw, &name, sink).await;
+        replay_sandbox_log(&gw, &name, LogReplay::DenialsOnly, sink).await;
 
         // 9. Download the workspace back (the agent's edits round-trip to the host).
         stage(sink, "agent turn done — downloading the workspace");
@@ -614,20 +629,49 @@ async fn try_turn(
 /// sink (the network proxy logs blocked connections / SSRF / L7 rejections). Best-effort by
 /// design: denial telemetry must never fail or block the turn, a logs RPC failure yields an
 /// empty set. Classification is structured ([`grpc::is_denial`]).
-async fn sweep_denials(
+/// How many trailing sandbox log lines a failed exec replays. Enough to carry a stack trace or an
+/// OOM notice, bounded so a chatty sandbox cannot flood the turn's own log.
+const SANDBOX_LOG_TAIL: usize = 40;
+
+/// What the sandbox's own log is being read for.
+enum LogReplay {
+    /// A healthy turn: only the blocked-egress lines, which are turn telemetry (an agent probing
+    /// what it cannot reach is signal).
+    DenialsOnly,
+    /// A failed turn: the tail, whatever it says. The agent's stderr is empty in the cases that
+    /// matter most — a process killed outright, a wrapper that died before exec — and this is the
+    /// only other place its last words exist.
+    Tail,
+}
+
+/// Replay the sandbox's own log into the turn's stream as typed events, carrying each line's
+/// level, target, fields, and whether the engine read it as a denial. Best-effort: a logs failure
+/// never fails the turn.
+async fn replay_sandbox_log(
     gw: &Gateway,
     name: &str,
+    what: LogReplay,
     sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
 ) {
-    for line in gw.sandbox_logs(name).await {
-        if grpc::is_denial(&line) {
-            let text = format!("[egress-deny] {}", line.message.trim());
-            let ev = AgentEvent::Raw {
-                text: text.clone(),
-                stream: RawStream::Stderr,
-            };
-            sink(&text, RawStream::Stderr, Some(&ev));
+    let lines = gw.sandbox_logs(name).await;
+    let skip = match what {
+        LogReplay::DenialsOnly => 0,
+        LogReplay::Tail => lines.len().saturating_sub(SANDBOX_LOG_TAIL),
+    };
+    for line in lines.iter().skip(skip) {
+        let denial = grpc::is_denial(line);
+        if matches!(what, LogReplay::DenialsOnly) && !denial {
+            continue;
         }
+        let ev = AgentEvent::SandboxLog {
+            ts_ms: line.timestamp_ms,
+            level: line.level.clone(),
+            target: line.target.clone(),
+            message: line.message.trim_end().to_string(),
+            denial,
+            fields: line.fields.clone().into_iter().collect(),
+        };
+        sink(line.message.trim_end(), RawStream::Stderr, Some(&ev));
     }
 }
 
@@ -738,6 +782,7 @@ async fn exec_and_stream(
     command: &[String],
     decoder: crate::harness::StreamDecoder,
     opts: &ExecOpts<'_>,
+    spent: &CostMeter,
     sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
 ) -> Result<f64> {
     let mut pump = agent::StreamPump::new(decoder);
@@ -747,13 +792,16 @@ async fn exec_and_stream(
         })
         .await?;
     let (mut cost, best_tokens) = pump.finish();
-    let exit_code = exec.exit_code;
+    let (exit_code, transport_error) = (exec.exit_code, exec.transport_error);
 
     if cost == 0.0
         && let Some(t) = &best_tokens
     {
         cost = estimate_cost(opts.model, t);
     }
+    // Bank it here, not at the caller's `?`: the agent can bill real tokens and still exit
+    // non-zero below, and a turn that spent money is never reported free.
+    spent.raise(cost);
 
     // Replay the agent's stderr (provisioning notes / errors) through the sink as raw lines.
     for line in exec.stderr_lines {
@@ -773,6 +821,9 @@ async fn exec_and_stream(
         && code != 0
     {
         return Err(OpenshellCliError::AgentExit { code }.into());
+    }
+    if let Some((code, message)) = transport_error {
+        return Err(OpenshellCliError::ExecStreamBroke { code, message }.into());
     }
     Ok(cost)
 }
@@ -1169,6 +1220,26 @@ fn workdir_basename(p: &Paths) -> Result<String> {
         .context("workspace path has no final component")
 }
 
+/// A Kubernetes label value for `raw`: the label charset only, at most 63 characters, and an
+/// alphanumeric at both ends. An isolated task's workspace basename is `task-` plus a full
+/// sha256, which the gateway rejects verbatim.
+fn label_value(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(63)
+        .collect();
+    cleaned
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric())
+        .to_string()
+}
+
 /// Write `content` to a `tempfile` guard (unique name, 0600 on unix, unlinked on drop), the
 /// rendered cred / env / prompt / mcp-config staged for upload. `tempfile` is a blocking crate, so
 /// the create+write runs on a blocking thread rather than stalling the runtime.
@@ -1189,6 +1260,35 @@ async fn write_temp(tag: &str, content: &str) -> Result<tempfile::NamedTempFile>
     .context("temp-file task panicked")?
 }
 
+/// The Vertex keys a manifest-less turn (`rank-grounded`, scope-propose) relays from its own
+/// process env into the agent env: the claude switches plus every alias `run::vertex_config`
+/// honors. A domain loop gets these from `[agent].env` (the manifest validates them); a bare
+/// `git clone` turn has no manifest, so the turn pod's plain env (the deploy profile's `[env]`)
+/// carries them and this relay is the explicit bridge. `vertex_config`/`env_script` stay
+/// manifest-only, they never read the process env themselves.
+const VERTEX_RELAY_KEYS: &[&str] = &[
+    "CLAUDE_CODE_USE_VERTEX",
+    "ANTHROPIC_VERTEX_PROJECT_ID",
+    "CLOUD_ML_REGION",
+    "GCP_PROJECT_ID",
+    "VERTEX_LOCATION",
+];
+
+/// Seed `env` with the process values of [`VERTEX_RELAY_KEYS`]: only keys that are set and
+/// non-empty relay, and an existing entry (a manifest-provided value) always wins.
+pub fn relay_vertex_env(env: &mut Vec<(String, String)>) {
+    for key in VERTEX_RELAY_KEYS {
+        if env.iter().any(|(k, _)| k == key) {
+            continue;
+        }
+        if let Ok(v) = std::env::var(key)
+            && !v.is_empty()
+        {
+            env.push((key.to_string(), v));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1207,6 +1307,53 @@ mod tests {
             msg.contains("without producing a verdict"),
             "must distinguish itself from a parse failure: {msg}"
         );
+    }
+
+    /// The meter reports what a turn spent even when the step that would have returned the cost
+    /// unwinds instead. This is the shape of the live failure: the agent billed real tokens and
+    /// exited non-zero, and the turn reported $0.
+    #[test]
+    fn a_turn_that_billed_before_it_failed_is_not_reported_free() {
+        let spent = CostMeter::default();
+        // What `exec_and_stream` does once the pump has finished, before it inspects the exit code.
+        spent.raise(0.20629125);
+        let outcome = TurnOutcome::failed(
+            spent.get(),
+            TurnFailure::Orchestration(OpenshellCliError::AgentExit { code: 1 }.to_string()),
+        );
+        assert_eq!(outcome.cost_usd, 0.20629125);
+        assert!(outcome.failure.is_some());
+    }
+
+    /// `raise` is a high-water mark, so banking the cost early and again at the end cannot
+    /// double-count it, and a later smaller sample cannot lower it.
+    #[test]
+    fn the_meter_only_ever_rises() {
+        let spent = CostMeter::default();
+        spent.raise(0.25);
+        spent.raise(0.25);
+        assert_eq!(spent.get(), 0.25);
+        spent.raise(0.10);
+        assert_eq!(spent.get(), 0.25, "a smaller later sample never lowers it");
+        spent.raise(0.40);
+        assert_eq!(spent.get(), 0.40, "the OTEL rollup can only raise it");
+    }
+
+    /// A broken exec stream is not a finished turn. Before this it reported no exit code, and
+    /// "no exit code" read as a clean one.
+    #[test]
+    fn a_broken_exec_stream_is_its_own_error() {
+        let e = OpenshellCliError::ExecStreamBroke {
+            code: tonic::Code::Unavailable,
+            message: "broken pipe".to_string(),
+        };
+        let msg = e.to_string();
+        assert!(
+            msg.contains("Unavailable"),
+            "the code is the classifiable part: {msg}"
+        );
+        assert!(msg.contains("broken pipe"), "{msg}");
+        assert!(msg.contains("before the agent reported an exit"), "{msg}");
     }
 
     /// The locator's glob reaches each harness's transcript at its real depth: claude one segment
@@ -1316,5 +1463,84 @@ mod tests {
         assert!(!tp.exists(), "stale traceparent cleared");
         assert!(!ts.exists());
         let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    #[test]
+    fn label_values_fit_the_kubernetes_limit_and_charset() {
+        let digest = "4c2b536afd886a46bac8276a9c5e03370c3d715adc8332ffbfc3b575cc5bc6ab";
+        let long = label_value(&format!("task-{digest}"));
+        assert_eq!(long.len(), 63);
+        assert!(long.starts_with("task-4c2b536a"));
+        assert_eq!(label_value("my workspace/v2"), "my-workspace-v2");
+        assert_eq!(label_value("-.trimmed.-"), "trimmed");
+        assert_eq!(label_value("vllm"), "vllm");
+    }
+
+    fn clear_relay_keys() {
+        for k in VERTEX_RELAY_KEYS {
+            unsafe {
+                std::env::remove_var(k);
+            }
+        }
+    }
+
+    #[test]
+    fn relay_copies_set_nonempty_keys_and_skips_empty_and_unset() {
+        let _guard = crate::test_env_lock();
+        clear_relay_keys();
+        unsafe {
+            std::env::set_var("CLAUDE_CODE_USE_VERTEX", "1");
+        }
+        unsafe {
+            std::env::set_var("ANTHROPIC_VERTEX_PROJECT_ID", "proj-x");
+        }
+        unsafe {
+            std::env::set_var("CLOUD_ML_REGION", "");
+        }
+
+        let mut env = Vec::new();
+        relay_vertex_env(&mut env);
+        clear_relay_keys();
+
+        assert_eq!(
+            env,
+            vec![
+                ("CLAUDE_CODE_USE_VERTEX".to_string(), "1".to_string()),
+                (
+                    "ANTHROPIC_VERTEX_PROJECT_ID".to_string(),
+                    "proj-x".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn manifest_provided_values_win_over_the_process_env() {
+        let _guard = crate::test_env_lock();
+        clear_relay_keys();
+        unsafe {
+            std::env::set_var("ANTHROPIC_VERTEX_PROJECT_ID", "from-process");
+        }
+        unsafe {
+            std::env::set_var("VERTEX_LOCATION", "us-east5");
+        }
+
+        let mut env = vec![(
+            "ANTHROPIC_VERTEX_PROJECT_ID".to_string(),
+            "from-manifest".to_string(),
+        )];
+        relay_vertex_env(&mut env);
+        clear_relay_keys();
+
+        assert_eq!(
+            env,
+            vec![
+                (
+                    "ANTHROPIC_VERTEX_PROJECT_ID".to_string(),
+                    "from-manifest".to_string()
+                ),
+                ("VERTEX_LOCATION".to_string(), "us-east5".to_string()),
+            ]
+        );
     }
 }

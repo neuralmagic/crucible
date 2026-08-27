@@ -39,7 +39,7 @@ impl TaskRunner for ShellRunner {
 
 impl ShellRunner {
     /// Run in a worktree prepared by the outer runner without clearing its isolation marker.
-    pub(crate) fn run_in_prepared_worktree(
+    pub fn run_in_prepared_worktree(
         &mut self,
         task: &Task,
         inputs: &BTreeMap<TaskName, Value>,
@@ -92,6 +92,21 @@ impl ShellRunner {
                 if let Some(e) = effort {
                     cmd.env("CRUCIBLE_EFFORT", e);
                 }
+            }
+            TaskKind::Report { template, .. } => {
+                return match crucible_broker::report::deliver(Some(template)) {
+                    Ok(output) => Attempt {
+                        outcome: AttemptOutcome::Pass(
+                            serde_json::from_str(&output).unwrap_or_else(|_| {
+                                serde_json::json!({
+                                    "status": "delivered"
+                                })
+                            }),
+                        ),
+                        cost_usd: 0.0,
+                    },
+                    Err(error) => fail(error),
+                };
             }
             TaskKind::TopK { .. } => {
                 // The executor owns reducers; reaching the runner is an executor bug.

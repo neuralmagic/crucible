@@ -15,7 +15,6 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use crate::crucible::{Judge, MeasureCtx, Reading, World};
 use crate::loop_driver::{self, Decided, IterStep, Measured, TurnVerdict};
 use crate::manifest::{WorkflowCaps, WorkflowCfg, WorkflowType};
 use crate::plan::exec::{
@@ -28,6 +27,7 @@ use crate::plan::ir::{
 use crate::reporter::{Reporter, Row, TurnBudget};
 use crate::session::{EvidenceDisposition, EvidenceEntry};
 use crate::{Args, Paths, Prepared, STOP, agent, control};
+use crucible::crucible::{Judge, MeasureCtx, Reading, World};
 
 #[derive(Debug, thiserror::Error)]
 #[error("graph iteration ended with neither a decision nor a control signal (exit: {exit})")]
@@ -704,9 +704,10 @@ impl<R: Reporter> LoopTaskRunner<'_, R> {
 impl<R: Reporter> TaskRunner for LoopTaskRunner<'_, R> {
     fn run(&mut self, task: &Task, attempt: u32, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
         match &task.task {
-            TaskKind::Agent { .. } | TaskKind::Command { .. } | TaskKind::Evaluate { .. } => {
-                self.workflow_runner.run(task, attempt, inputs)
-            }
+            TaskKind::Agent { .. }
+            | TaskKind::Command { .. }
+            | TaskKind::Evaluate { .. }
+            | TaskKind::Report { .. } => self.workflow_runner.run(task, attempt, inputs),
             TaskKind::Engine {
                 op: EngineOp::Propose,
                 ..
@@ -1327,7 +1328,7 @@ fn render_wide_prompt(template: &str, goal: &str, approach: &str) -> String {
 mod tests {
     use super::*;
     use crate::loop_driver::{LoopRuntime, run_loop};
-    use crate::{Prepared, agent, manifest, reporter, run, stream};
+    use crate::{Prepared, manifest, reporter, run, stream};
     use clap::Parser;
     use std::path::Path;
 
@@ -1848,7 +1849,7 @@ mod tests {
 
         let mut args = crate::Cli::parse_from(["crucible"]).run;
         args.manifest = Some(manifest_path);
-        args.agent_backend = agent::AgentBackend::Command;
+        args.agent_backend = manifest::AgentBackend::Command;
         args.agent_cmd = m.agent.agent_cmd.clone();
         args.iterations = iterations;
         args.graph_loop = graph_loop;

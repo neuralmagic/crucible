@@ -1,4 +1,4 @@
-use crate::refine::RoundKind;
+use crucible_contract::refine::RoundKind;
 use serde::Serialize;
 
 /// The prefix of the interim progress marker `--marker` emits at each refine-round boundary, so a

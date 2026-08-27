@@ -38,24 +38,29 @@ env:
 
 jobs:
   build-push:
-    # Pinned, not ubuntu-latest: the runner's glibc must not exceed the runtime base's
-    # (UBI10 = 2.39; ubuntu-24.04 = 2.39). When -latest moves to a newer glibc, binaries built
-    # there would fail to load on the base, the smoke step below catches that before a push.
-    runs-on: ubuntu-24.04
+    # The org's image-pool runners (AL2023, glibc 2.34): the runner's glibc must not exceed the
+    # runtime base's (UBI10 = 2.39), and the smoke step below catches it before a push if the
+    # AMI ever moves past it. Main-branch pushes only, so no fork ever lands here.
+    runs-on: [self-hosted, linux, x64, beefy, image]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
-      # The hosted runner ships ~14GB of preinstalled toolchains this job never touches; the
-      # release target/ plus the docker build's base-image extraction want the headroom.
-      - name: Free runner disk
-        run: |
-          df -h /
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
-          df -h /
-
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          # The GH cache API round-trips from EC2 are slower than sccache's in-region S3.
+          cache: false
+
+      - name: Enable sccache + mold
+        run: |
+          {
+            echo "SCCACHE_BUCKET=llm-d-sccache-783952637884"
+            echo "SCCACHE_REGION=us-east-1"
+            echo "SCCACHE_S3_KEY_PREFIX=crucible"
+            echo "RUSTC_WRAPPER=sccache"
+            echo "RUSTFLAGS=-C link-arg=-B/usr/local/libexec/mold"
+          } >> "$GITHUB_ENV"
 
       # The crates the image ships, staged the same way release.yml packages its assets:
       # every top-level target/release executable into prebuilt/bin/, where the Containerfile
@@ -73,6 +78,10 @@ jobs:
       # Prove the runner-built binaries actually load on the runtime base BEFORE baking the
       # image: every dynamic dep must resolve (the glibc/zlib compatibility gate) and the
       # engine must run.
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
+
       - name: Smoke binaries on the runtime base
         run: |
           docker run --rm -v "$PWD/prebuilt/bin:/art/bin:ro" \
@@ -86,6 +95,10 @@ jobs:
               /art/bin/crucible --help >/dev/null
               echo "smoke ok"
             '
+
+      - name: Read the contract version from the staged binary
+        id: contract
+        run: echo "version=$(prebuilt/bin/crucible --contract-version)" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
 
@@ -136,7 +149,8 @@ jobs:
             OPENSHELL_REV=${{ steps.openshell.outputs.rev }}
             VERSION=${{ steps.meta.outputs.version }}
             REVISION=${{ github.sha }}
+            CONTRACT_VERSION=${{ steps.contract.outputs.version }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache,mode=max

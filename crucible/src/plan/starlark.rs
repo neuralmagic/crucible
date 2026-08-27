@@ -6,7 +6,7 @@
 mod globals;
 mod idents;
 mod loader;
-pub(crate) mod params;
+pub mod params;
 mod values;
 
 use std::cell::{RefCell, RefMut};
@@ -23,8 +23,8 @@ use crate::errors::FileError;
 use crate::manifest::{WorkflowCfg, WorkflowError, WorkflowType};
 use crate::plan::diag;
 use crate::plan::ir::{
-    Direction, EngineOp, Isolation, Join, MAX_FANOUT_CEILING, OutputField, OutputRef, Stage, Task,
-    TaskKind, TaskName,
+    Direction, EngineOp, Isolation, Join, MAX_FANOUT_CEILING, OutputField, OutputRef,
+    ReportDestination, SlackDestination, Stage, Task, TaskKind, TaskName,
 };
 use crate::plan::starlark::values::WorkflowValue;
 
@@ -416,6 +416,38 @@ impl SessionDecl {
 ///
 /// Causes are real `source()` links, so the message a user reads comes from
 /// [`crate::errors::report`] (or anyhow's `{:#}`), not from `Display` alone.
+/// Where a compile error was found, in lines and columns rather than in prose. Both ends are
+/// 1-based, matching what an editor shows and what the rendered message prints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceSpan {
+    pub begin_line: u32,
+    pub begin_column: u32,
+    pub end_line: u32,
+    pub end_column: u32,
+}
+
+/// A file and the span within it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceAnchor {
+    pub file: String,
+    pub span: SourceSpan,
+}
+
+impl From<&FileSpan> for SourceAnchor {
+    fn from(at: &FileSpan) -> Self {
+        let resolved = at.resolve();
+        SourceAnchor {
+            file: resolved.file,
+            span: SourceSpan {
+                begin_line: resolved.span.begin.line as u32 + 1,
+                begin_column: resolved.span.begin.column as u32 + 1,
+                end_line: resolved.span.end.line as u32 + 1,
+                end_column: resolved.span.end.column as u32 + 1,
+            },
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CompileError {
     /// An error located at its authoring site. The innermost site wins.
@@ -429,8 +461,13 @@ pub enum CompileError {
     File(#[from] FileError),
     #[error("prompt files must be UTF-8")]
     PromptNotUtf8(#[from] std::string::FromUtf8Error),
-    #[error("parsing workflow Starlark: {0}")]
-    Parse(String),
+    #[error("parsing workflow Starlark: {message}")]
+    Parse {
+        message: String,
+        /// Where the parser gave up, when it said. Kept as data so a marker can be placed without
+        /// re-parsing the rendered message.
+        at: Option<SourceAnchor>,
+    },
     #[error(transparent)]
     Workflow(#[from] WorkflowError),
     #[error("serializing the compiled workflow")]
@@ -637,6 +674,12 @@ pub enum CompileError {
     TopKZero,
     #[error("top_k direction must be `lower` or `higher`, got {got:?}")]
     UnknownTopKDirection { got: String },
+    #[error("report destination kind must be `slack`, got {got:?}")]
+    UnknownReportDestination { got: String },
+    #[error("report destination must be an object such as {{\"kind\": \"slack\"}}")]
+    ReportDestinationNotObject,
+    #[error("slack report destination has unknown parameter {parameter:?}")]
+    UnknownSlackDestinationParameter { parameter: String },
     #[error("top_k requires a non-empty depends_on")]
     TopKWithoutDependencies,
     #[error("stage must be `iteration` or `epilogue`, got {got:?}")]
@@ -740,6 +783,38 @@ pub enum CompileError {
     UnboundSessions { sites: Vec<String> },
 }
 
+/// Keep the parser's own span alongside its message: it knows where it gave up, and a rendered
+/// string is the one form nothing downstream can use.
+pub(crate) fn parse_error(error: starlark_syntax::Error) -> CompileError {
+    CompileError::Parse {
+        at: error.span().map(SourceAnchor::from),
+        message: error.to_string(),
+    }
+}
+
+impl CompileError {
+    /// Where the error was found, if it was located. A consumer places a marker from this rather
+    /// than parsing the `file:line:col` out of the rendered message.
+    pub fn anchor(&self) -> Option<SourceAnchor> {
+        match self {
+            CompileError::At { at, inner } => {
+                Some(inner.anchor().unwrap_or_else(|| SourceAnchor::from(at)))
+            }
+            CompileError::Parse { at, .. } => at.clone(),
+            _ => None,
+        }
+    }
+
+    /// What went wrong, without the location. [`CompileError::At`] displays only its site, so the
+    /// message a consumer wants is the innermost one it wraps.
+    pub fn message(&self) -> String {
+        match self {
+            CompileError::At { inner, .. } => inner.message(),
+            other => other.to_string(),
+        }
+    }
+}
+
 /// Compiling `workflow.star` into the manifest's generated `[workflow]` block: the compile
 /// itself, plus the TOML surgery that installs the result.
 #[derive(Debug, thiserror::Error)]
@@ -778,6 +853,7 @@ const COMMON_FUNCTIONS: &[&str] = &[
     "evaluate",
     "param",
     "prompt_file",
+    "report",
     "session",
     "workflow",
 ];
@@ -877,6 +953,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "emits_files",
         ],
         "top_k" => &["name", "k", "direction", "depends_on", "required"],
+        "report" => &["name", "destination", "template", "required"],
         "propose" => &["name", "session", "depends_on"],
         "apply" | "measure" => &["name", "depends_on"],
         "grade" => &["name", "score", "evidence", "join"],
@@ -1013,6 +1090,27 @@ fn constructor(
             };
             dsl_task(&mut named, name, kind, None)?
         }
+        "report" => Task {
+            name: take_declared_name(&mut named, "name")?,
+            task: TaskKind::Report {
+                destination: take_report_destination(&mut named)?,
+                template: {
+                    let path = take_string(&mut named, "template")?;
+                    state.context_mut().prompt_file(&path)?
+                },
+            },
+            depends_on: Vec::new(),
+            session: None,
+            needs: "any".to_owned(),
+            required: take_bool_default(&mut named, "required", true)?,
+            isolation: None,
+            join: Join::All,
+            stage: Stage::Epilogue,
+            emits: Vec::new(),
+            emits_files: Vec::new(),
+            over: None,
+            max_fanout: None,
+        },
         "top_k" => {
             let k = take_int(&mut named, "k")?;
             if k <= 0 {
@@ -1455,6 +1553,35 @@ fn take_string(named: &mut BTreeMap<String, Value>, name: &str) -> Result<String
     }
 }
 
+fn take_report_destination(named: &mut BTreeMap<String, Value>) -> Result<ReportDestination> {
+    let mut object = match take_value(named, "destination")? {
+        Value::Map(object) => object,
+        _ => return Err(CompileError::ReportDestinationNotObject),
+    };
+    let kind = match object.remove("kind") {
+        Some(Value::String(kind)) => kind,
+        Some(_) => return Err(wrong_type("destination.kind", "a string")),
+        None => {
+            return Err(CompileError::MissingArgument {
+                argument: "destination.kind".to_owned(),
+            });
+        }
+    };
+    match kind.as_str() {
+        "slack" => {
+            if let Some(parameter) = object.keys().next() {
+                return Err(CompileError::UnknownSlackDestinationParameter {
+                    parameter: parameter.clone(),
+                });
+            }
+            Ok(ReportDestination::Slack(SlackDestination::default()))
+        }
+        other => Err(CompileError::UnknownReportDestination {
+            got: other.to_owned(),
+        }),
+    }
+}
+
 /// The markers around a span that did not originate inside the pack.
 ///
 /// An agent reading a prompt cannot otherwise tell the pack's instruction from whatever the
@@ -1753,7 +1880,9 @@ pub fn compile_file(path: &Path, pack_dir: &Path) -> Result<CompiledWorkflow> {
     compile_file_with(path, pack_dir, &BTreeMap::new())
 }
 
-/// Compile a file with the values a launcher supplied.
+/// Compile a file with the values a launcher supplied: the library form of
+/// `crucible plan compile-workflow`, which prints [`CompiledWorkflow::canonical_json`].
+#[tracing::instrument(skip_all, fields(source = %path.display(), params = supplied.len()), err)]
 pub fn compile_file_with(
     path: &Path,
     pack_dir: &Path,
@@ -1881,7 +2010,7 @@ fn write_atomically(path: &Path, body: &str) -> std::result::Result<(), FileErro
 }
 
 /// A bare filename has an empty parent; tempfiles and prompt resolution need a real directory.
-pub(crate) fn parent_or_cwd(path: &Path) -> &Path {
+pub fn parent_or_cwd(path: &Path) -> &Path {
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))
@@ -1898,12 +2027,22 @@ pub fn materialize_sibling_manifest(
         .transpose()
 }
 
-/// The parameters a source declares, read without evaluating it.
+/// The parameters a source declares, read without evaluating it: the library form of
+/// `crucible plan params`, which prints the schema as pretty JSON.
 ///
 /// A launcher, a form, or an orchestrator validating an ask all need to know what a pack accepts
 /// before running a line of it, which is why the block is a literal and why this never reaches
 /// the evaluator.
+#[tracing::instrument(skip_all, fields(source = %filename.display()), err)]
 pub fn declared_params(source: &str, filename: &Path) -> Result<serde_json::Value> {
+    Ok(read_params(source, filename)?.json_schema())
+}
+
+/// The declarations themselves, typed, for a launcher that has values to bind rather than a form
+/// to draw: [`params::Params::bind`] parses and constrains supplied text through the same code the
+/// compiler runs, so a launcher cannot disagree with the compiler about what a pack accepts.
+#[tracing::instrument(skip_all, fields(source = %filename.display()), err)]
+pub fn read_params(source: &str, filename: &Path) -> Result<params::Params> {
     on_compile_stack(|| {
         if source.len() > MAX_SOURCE_BYTES {
             return Err(CompileError::SourceTooLarge {
@@ -1916,8 +2055,8 @@ pub fn declared_params(source: &str, filename: &Path) -> Result<serde_json::Valu
             source.to_owned(),
             &dialect(),
         )
-        .map_err(|error| CompileError::Parse(error.to_string()))?;
-        Ok(params::Params::read(&ast)?.json_schema())
+        .map_err(parse_error)?;
+        params::Params::read(&ast)
     })
 }
 
@@ -1987,7 +2126,7 @@ fn compile_source_here(
         source.to_owned(),
         &dialect(),
     )
-    .map_err(|error| CompileError::Parse(error.to_string()))?;
+    .map_err(parse_error)?;
     let lane = idents::declared_lane(&ast);
     let idents = idents::scan(&ast, lane);
     let globals = lane_globals(lane);
@@ -2404,6 +2543,25 @@ default_autoresearch([racecheck])
             crate::errors::report(&compile_source(bad, &pack.join("bad.star"), &pack).unwrap_err());
         assert!(error.contains("`iteration` or `epilogue`"), "{error}");
         let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn report_is_an_engine_owned_required_epilogue() {
+        let pack = temp_pack("report");
+        std::fs::create_dir_all(pack.join("reports")).unwrap();
+        std::fs::write(pack.join("reports/slack.md.j2"), "{{ passed }} passed").unwrap();
+        let source = r#"
+work = command(name = "work", run = "true")
+publish = report(name = "publish-report", destination = {"kind": "slack"}, template = "reports/slack.md.j2", required = True)
+workflow(type = "playbook", tasks = [work, publish])
+"#;
+        let compiled = compile_source(source, &pack.join("workflow.star"), &pack).unwrap();
+        let publish = &compiled.workflow.tasks[1];
+        assert!(matches!(publish.task, TaskKind::Report { .. }));
+        assert_eq!(publish.stage, Stage::Epilogue);
+        assert!(publish.required);
+        assert!(publish.depends_on.is_empty());
+        let _ = std::fs::remove_dir_all(pack);
     }
 
     #[test]

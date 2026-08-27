@@ -1,8 +1,8 @@
-use crate::agent::AgentBackend;
 use crate::manifest;
-use crate::scope::cli::ScopeReport;
+use crate::manifest::AgentBackend;
 use anyhow::{Context, Result};
 use base64::Engine as _;
+use crucible_contract::scope::ScopeReport;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 

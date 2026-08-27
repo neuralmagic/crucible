@@ -1,14 +1,14 @@
 use crate::Paths;
 use crate::activity::ActivityFeed;
-use crate::agent::{self, AgentBackend, TurnOutcome};
+use crate::agent::{self, TurnOutcome};
 use crate::check::{self, CheckOutcome};
+use crate::deploy::ProposeTier;
 use crate::event::{AgentEvent, RawStream};
 use crate::identity::{self, RunIdentity};
 use crate::init::MANIFEST_FILE;
 use crate::manifest;
-use crate::refine::{
-    self, Attack, FailureEvidence, MIN_PROPOSED_SELFTEST_RUNS, RoundKind, RoundOutcome, RoundRecord,
-};
+use crate::manifest::AgentBackend;
+use crate::refine::{self, MIN_PROPOSED_SELFTEST_RUNS};
 use crate::scope::pack::{
     PACK_WORK_DIR, drop_repo_checkouts, ensure_out_dir, frozen_workspace_dir,
     normalize_frozen_manifest, scratch_dir, strip_controls_and_selftest, sync_pack_from_workspace,
@@ -16,8 +16,11 @@ use crate::scope::pack::{
 use crate::scope::progress::emit_progress;
 use crate::scope::transcript::{transcript_event, transcript_note, write_seed_context};
 use anyhow::{Context, Result};
-use clap::{Parser, ValueEnum};
-use serde::Serialize;
+use clap::Parser;
+use crucible_contract::refine::{
+    Attack, FailureEvidence, RoundKind, RoundOutcome, RoundRecord, render_rounds_json,
+};
+use crucible_contract::scope::StageName;
 use std::path::{Path, PathBuf};
 
 const SCOPE_PROPOSE_PROMPT: &str = include_str!("../prompts/scope-propose.md");
@@ -27,42 +30,6 @@ const SCOPE_PROPOSE_PROMPT: &str = include_str!("../prompts/scope-propose.md");
 const GOAL_CONTRACT: &str = include_str!("../prompts/scope-goal-contract.md");
 const GOAL_CONTRACT_AUTHORITATIVE: &str =
     include_str!("../prompts/scope-goal-contract-authoritative.md");
-
-/// The confirmed tier a propose turn drafts against: threaded from the controller's ranker verdict
-/// (`--tier t0|t1`) into the prompt's `{{TIER}}` slot, so the agent follows the right section of
-/// `scope-propose.md` instead of guessing.
-/// `T0` is the engine default when the flag is absent, every call site predating this flag never set
-/// it, and a bare `crucible scope --propose` (no controller in front of it) should keep behaving exactly
-/// as before.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
-pub enum ProposeTier {
-    #[default]
-    #[value(name = "t0")]
-    T0,
-    #[value(name = "t1")]
-    T1,
-}
-
-impl ProposeTier {
-    /// The `{{TIER}}` spelling the prompt substitutes, matches the ranker/DB vocabulary
-    /// (`Tier::as_str` in the controller crate) so a human reading the rendered prompt recognizes
-    /// it as the same tier the ledger shows.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ProposeTier::T0 => "T0",
-            ProposeTier::T1 => "T1",
-        }
-    }
-
-    /// The `--tier` CLI spelling (the clap `#[value(name)]`s above), what the turn-pod wrapper
-    /// renders into its `crucible scope --propose --tier …` invocation.
-    pub fn cli_value(self) -> &'static str {
-        match self {
-            ProposeTier::T0 => "t0",
-            ProposeTier::T1 => "t1",
-        }
-    }
-}
 
 /// Why a scope stage refused. The [`Stage`] trait stays `anyhow`-typed (stages are
 /// heterogeneous and each carries its own plumbing errors); these are the pipeline's own
@@ -152,20 +119,11 @@ pub(super) enum ScopeError {
     NoGoalResolved,
 }
 
-/// One stage's result, independent of how the pipeline renders it (console lines or one JSON
-/// object).
-#[derive(Debug, Clone, Serialize)]
-pub struct StageResult {
-    pub name: &'static str,
-    pub passed: bool,
-    pub detail: String,
-}
-
 /// A stage in the pipeline: given the running context, either advance it and report success, or
 /// fail with the reason. S2 (propose) / S3 (preflight) / S4 (approval) each add one more impl
 /// here, the runner in [`run`] doesn't otherwise change shape.
 pub(super) trait Stage {
-    fn name(&self) -> &'static str;
+    fn name(&self) -> StageName;
     fn run(&self, ctx: &mut ScopeCtx) -> Result<String>;
 }
 
@@ -195,11 +153,12 @@ pub(super) struct ScopeCtx {
 pub(super) struct Ingest {
     pub(super) issue: Option<String>,
     pub(super) goal_file: Option<PathBuf>,
+    pub(super) goal_text: Option<String>,
 }
 
 impl Stage for Ingest {
-    fn name(&self) -> &'static str {
-        "ingest"
+    fn name(&self) -> StageName {
+        StageName::Ingest
     }
 
     fn run(&self, ctx: &mut ScopeCtx) -> Result<String> {
@@ -210,6 +169,8 @@ impl Stage for Ingest {
             let goal = std::fs::read_to_string(f)
                 .with_context(|| format!("reading --goal-file {}", f.display()))?;
             (goal, format!("--goal-file {}", f.display()))
+        } else if let Some(text) = &self.goal_text {
+            (text.clone(), "--goal".to_string())
         } else {
             manifest_goal(&ctx.manifest_path)?
         };
@@ -269,8 +230,8 @@ pub(super) struct Propose {
 }
 
 impl Stage for Propose {
-    fn name(&self) -> &'static str {
-        "propose"
+    fn name(&self) -> StageName {
+        StageName::Propose
     }
 
     fn run(&self, ctx: &mut ScopeCtx) -> Result<String> {
@@ -802,7 +763,7 @@ fn write_rejection_note(ctx: &ScopeCtx, round: u32, note: &str) {
          `crucible scope --propose` stopped at round {round}: {note}\n\n\
          ## Refine trail\n\n{trail}\n",
         pack = ctx.pack.display(),
-        trail = refine::render_rounds_json(&ctx.refine_rounds),
+        trail = render_rounds_json(&ctx.refine_rounds),
     );
     body.push_str("\nThis pack was NOT frozen; no SCOPE.md was written.\n");
     let _ = std::fs::write(ctx.pack.join("REJECTED.md"), body);
@@ -907,7 +868,7 @@ fn write_rejection(ctx: &ScopeCtx, rounds: u32, last: Option<&FailureEvidence>) 
         last = last
             .map(FailureEvidence::describe)
             .unwrap_or_else(|| "no evidence captured".to_string()),
-        trail = refine::render_rounds_json(&ctx.refine_rounds),
+        trail = render_rounds_json(&ctx.refine_rounds),
     );
     body.push_str("\nThis pack was NOT frozen; no SCOPE.md was written.\n");
     let _ = std::fs::write(ctx.pack.join("REJECTED.md"), body);
@@ -958,7 +919,7 @@ fn turn_args(opts: &ProposeOpts) -> crate::Args {
     args.compute_driver = opts.compute_driver;
     // Manifest-less turn: the Vertex agent env normally supplied by `[agent].env` comes from the
     // turn pod's own env instead.
-    crate::openshell::relay_vertex_env(&mut args.env);
+    crate::openshell::run::relay_vertex_env(&mut args.env);
     args
 }
 
@@ -1026,8 +987,8 @@ fn propose_paths(scratch: &Path) -> Paths {
 pub(super) struct Validate;
 
 impl Stage for Validate {
-    fn name(&self) -> &'static str {
-        "validate"
+    fn name(&self) -> StageName {
+        StageName::Validate
     }
 
     fn run(&self, ctx: &mut ScopeCtx) -> Result<String> {
@@ -1082,12 +1043,7 @@ fn render_workflow_preview(manifest_path: &Path, pack: &Path) -> Result<(u32, u3
             .map(|workflow| workflow.workflow_type)
             .unwrap_or_default(),
     );
-    if AgentBackend::from_str(&manifest.agent.backend, true)
-        .ok()
-        .is_some_and(|backend| {
-            agent::backend_supports_persistent_sessions(backend, manifest.agent.harness)
-        })
-    {
+    if agent::backend_supports_persistent_sessions(manifest.agent.backend, manifest.agent.harness) {
         workflow_caps = workflow_caps.with_persistent_sessions();
     }
     let plan = match manifest.workflow.as_ref() {
@@ -1119,8 +1075,8 @@ pub(super) struct Freeze {
 }
 
 impl Stage for Freeze {
-    fn name(&self) -> &'static str {
-        "freeze"
+    fn name(&self) -> StageName {
+        StageName::Freeze
     }
 
     fn run(&self, ctx: &mut ScopeCtx) -> Result<String> {
@@ -1319,7 +1275,7 @@ fn render_refine_section(rounds: &[RoundRecord]) -> String {
          {lines}\
          **Round trail:**\n\n{trail}\n\n",
         n = rounds.len(),
-        trail = refine::render_rounds_json(rounds),
+        trail = render_rounds_json(rounds),
     )
 }
 
@@ -1327,10 +1283,9 @@ fn render_refine_section(rounds: &[RoundRecord]) -> String {
 mod tests {
     use super::*;
     use crate::activity::{ACTIVITY_MIN_INTERVAL, ACTIVITY_TEXT_CAP, ACTIVITY_TOOL_CAP};
-    use crate::agent::AgentBackend;
     use crate::event::Tokens;
-    use crate::refine::{FailureEvidence, RoundKind, RoundOutcome, RoundRecord, parse_rounds};
-    use crate::scope::cli::{SCOPE_REPORT_MARKER, ScopeReport, execute};
+    use crate::manifest::AgentBackend;
+    use crate::scope::cli::{SCOPE_REPORT_MARKER, execute};
     use crate::scope::pack::{
         CONTROLS_DIR, PACK_PAYLOAD_CAP_BYTES, PACK_TAR_CAP_BYTES, SCOPE_PACK_MARKER,
         pack_marker_line, pack_marker_payload, repo_pin, tar_pack_dir,
@@ -1341,6 +1296,10 @@ mod tests {
     use crate::scope::transcript::{cap_transcript, gzip_transcript};
     use base64::Engine as _;
     use crucible_contract::SCOPE_ACTIVITY_MARKER;
+    use crucible_contract::refine::{
+        FailureEvidence, RoundKind, RoundOutcome, RoundRecord, parse_rounds,
+    };
+    use crucible_contract::scope::{ScopeReport, StageName, StageResult};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
@@ -1752,6 +1711,7 @@ mod tests {
             &out,
             None,
             Some(&goal_file),
+            None,
             false,
             Some(propose_opts(&repo, &script)),
         );
@@ -1761,7 +1721,7 @@ mod tests {
             report.stages
         );
         assert_eq!(report.stages.len(), 4, "ingest, propose, validate, freeze");
-        assert_eq!(report.stages[1].name, "propose");
+        assert_eq!(report.stages[1].name, StageName::Propose);
         assert!(report.cost.is_some_and(|c| c >= 0.0));
         assert!(
             report
@@ -1799,6 +1759,7 @@ mod tests {
             &rel,
             None,
             Some(&goal_file),
+            None,
             false,
             Some(propose_opts(&repo, &script)),
         );
@@ -1830,6 +1791,7 @@ mod tests {
             &out,
             None,
             Some(&goal_file),
+            None,
             false,
             Some(propose_opts(&repo, &script)),
         );
@@ -1844,7 +1806,7 @@ mod tests {
             !report.stages[1].passed,
             "propose must reject a missing selftest"
         );
-        assert_eq!(report.stages[1].name, "propose");
+        assert_eq!(report.stages[1].name, StageName::Propose);
         assert!(report.stages[1].detail.contains("judge.selftest"));
         assert!(report.digest.is_none());
 
@@ -1871,6 +1833,7 @@ mod tests {
             &out,
             None,
             Some(&goal_file),
+            None,
             false,
             Some(propose_opts(&repo, &script)),
         );
@@ -1901,7 +1864,7 @@ mod tests {
 
         let mut opts = propose_opts(&repo, &script);
         opts.force = false;
-        let report = execute(&out, None, Some(&goal_file), false, Some(opts));
+        let report = execute(&out, None, Some(&goal_file), None, false, Some(opts));
         assert_eq!(report.stages.len(), 2);
         assert!(!report.stages[1].passed);
         assert!(report.stages[1].detail.contains("--force"));
@@ -1912,7 +1875,7 @@ mod tests {
 
         let mut opts = propose_opts(&repo, &script);
         opts.force = true;
-        let forced = execute(&out, None, Some(&goal_file), false, Some(opts));
+        let forced = execute(&out, None, Some(&goal_file), None, false, Some(opts));
         assert!(
             forced.stages.iter().all(|s| s.passed),
             "--force permits proposing into a nonempty --out: {:?}",
@@ -1939,6 +1902,7 @@ mod tests {
             &out,
             None,
             Some(&goal_file),
+            None,
             false,
             Some(propose_opts(&repo, &script)),
         );
@@ -1971,7 +1935,7 @@ mod tests {
         let dir = tempdir("valid");
         scaffold_pack(&dir);
 
-        let report = execute(&dir, None, None, false, None);
+        let report = execute(&dir, None, None, None, false, None);
         assert!(
             report.stages.iter().all(|s| s.passed),
             "all stages must pass: {:?}",
@@ -2007,7 +1971,7 @@ mod tests {
         )
         .unwrap();
 
-        let report = execute(&dir, None, None, false, None);
+        let report = execute(&dir, None, None, None, false, None);
         assert!(
             report.stages.iter().all(|stage| stage.passed),
             "{:?}",
@@ -2037,7 +2001,7 @@ workflow([agent(name = "review", prompt = prompt_file("prompts/review.md") + par
         )
         .unwrap();
 
-        let report = execute(&dir, None, None, false, None);
+        let report = execute(&dir, None, None, None, false, None);
         assert!(
             report.stages.iter().all(|stage| stage.passed),
             "{:?}",
@@ -2069,7 +2033,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, score, trace, measurem
         )
         .unwrap();
 
-        let report = execute(&dir, None, None, false, None);
+        let report = execute(&dir, None, None, None, false, None);
         assert!(
             report.stages.iter().all(|stage| stage.passed),
             "{:?}",
@@ -2106,11 +2070,11 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         )
         .unwrap();
 
-        let report = execute(&dir, None, None, false, None);
+        let report = execute(&dir, None, None, None, false, None);
         let validate = report
             .stages
             .iter()
-            .find(|stage| stage.name == "validate")
+            .find(|stage| stage.name == StageName::Validate)
             .expect("validate stage");
         assert!(!validate.passed, "Hermes cannot resume Claude sessions");
         assert!(
@@ -2126,7 +2090,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         let dir = tempdir("broken");
         broken_pack(&dir);
 
-        let report = execute(&dir, None, None, false, None);
+        let report = execute(&dir, None, None, None, false, None);
         assert_eq!(
             report.stages.len(),
             2,
@@ -2134,7 +2098,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         );
         assert!(report.stages[0].passed, "ingest still resolves the goal");
         assert!(!report.stages[1].passed, "validate must fail");
-        assert_eq!(report.stages[1].name, "validate");
+        assert_eq!(report.stages[1].name, StageName::Validate);
         assert!(report.stages[1].detail.contains("crucible check"));
         assert!(report.digest.is_none());
         assert!(
@@ -2172,7 +2136,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         let goal_file = dir.join("goal.md");
         fs::write(&goal_file, "the goal-file goal").expect("write goal file");
 
-        let report = execute(&dir, None, Some(&goal_file), false, None);
+        let report = execute(&dir, None, Some(&goal_file), None, false, None);
         assert!(
             report.stages.iter().all(|s| s.passed),
             "{:?}",
@@ -2223,7 +2187,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         unsafe {
             std::env::set_var("GITHUB_API_URL", format!("http://{addr}"));
         }
-        let report = execute(&dir, Some("owner/repo#42"), None, false, None);
+        let report = execute(&dir, Some("owner/repo#42"), None, None, false, None);
         unsafe {
             std::env::remove_var("GITHUB_API_URL");
         }
@@ -2250,11 +2214,11 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
     fn scope_md_overwrite_is_refused_without_force() {
         let dir = tempdir("overwrite");
         scaffold_pack(&dir);
-        let first_report = execute(&dir, None, None, false, None);
+        let first_report = execute(&dir, None, None, None, false, None);
         assert!(first_report.stages.iter().all(|s| s.passed));
         let first = fs::read_to_string(dir.join("SCOPE.md")).unwrap();
 
-        let refused = execute(&dir, None, None, false, None);
+        let refused = execute(&dir, None, None, None, false, None);
         assert!(
             !refused.stages.last().unwrap().passed,
             "refuses without --force"
@@ -2263,7 +2227,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         let unchanged = fs::read_to_string(dir.join("SCOPE.md")).unwrap();
         assert_eq!(first, unchanged, "SCOPE.md untouched without --force");
 
-        let forced = execute(&dir, None, None, true, None);
+        let forced = execute(&dir, None, None, None, true, None);
         assert!(forced.stages.iter().all(|s| s.passed), "--force overwrites");
 
         let _ = fs::remove_dir_all(&dir);
@@ -2285,6 +2249,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             &out,
             None,
             Some(&goal_file),
+            None,
             false,
             Some(propose_opts(&repo, &script)),
         );
@@ -2338,7 +2303,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
 
         let mut opts = propose_opts(&repo, &script);
         opts.refine_rounds = 2;
-        let report = execute(&out, None, Some(&goal_file), false, Some(opts));
+        let report = execute(&out, None, Some(&goal_file), None, false, Some(opts));
         assert!(
             !report.stages.last().expect("a last stage").passed,
             "exhaustion fails the propose stage: {:?}",
@@ -2396,7 +2361,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
 
         let mut opts = propose_opts(&repo, &script);
         opts.refine_rounds = 1;
-        let report = execute(&out, None, Some(&goal_file), false, Some(opts));
+        let report = execute(&out, None, Some(&goal_file), None, false, Some(opts));
         assert!(
             !report.stages[1].passed,
             "a pack outside the workspace must not validate: {:?}",
@@ -2440,7 +2405,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         let mut opts = propose_opts(&repo, &script);
         opts.max_cost = 5.0;
         opts.refine_rounds = 5;
-        let report = execute(&out, None, Some(&goal_file), false, Some(opts));
+        let report = execute(&out, None, Some(&goal_file), None, false, Some(opts));
         assert!(
             !report.stages.last().expect("a last stage").passed,
             "budget exhaustion fails the propose stage: {:?}",
@@ -2484,7 +2449,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
 
         let mut opts = propose_opts(&repo, &script);
         opts.refine_rounds = 2;
-        let report = execute(&out, None, Some(&goal_file), false, Some(opts));
+        let report = execute(&out, None, Some(&goal_file), None, false, Some(opts));
         assert!(
             !report.stages.last().expect("a last stage").passed,
             "runs<3 must reject: {:?}",
@@ -2518,7 +2483,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         let dir = tempdir("json");
         scaffold_pack(&dir);
 
-        let report = execute(&dir, None, None, false, None);
+        let report = execute(&dir, None, None, None, false, None);
         let json = serde_json::to_value(&report).expect("serializes");
         assert!(json["stages"].is_array());
         assert_eq!(json["stages"].as_array().unwrap().len(), 3);
@@ -2536,7 +2501,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
     fn scope_report_marker_emits_the_exact_prefix() {
         let report = ScopeReport {
             stages: vec![StageResult {
-                name: "ingest",
+                name: StageName::Ingest,
                 passed: true,
                 detail: "ok".to_string(),
             }],
@@ -2979,7 +2944,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         let _ = fs::remove_dir_all(&pack);
     }
 
-    fn stage(name: &'static str, passed: bool) -> StageResult {
+    fn stage(name: StageName, passed: bool) -> StageResult {
         StageResult {
             name,
             passed,
@@ -2995,7 +2960,10 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         fs::write(pack.join("crucible.toml"), "[repo]\nurl = \"x\"\n").unwrap();
 
         let survived = ScopeReport {
-            stages: vec![stage("validate", true), stage("freeze", true)],
+            stages: vec![
+                stage(StageName::Validate, true),
+                stage(StageName::Freeze, true),
+            ],
             digest: Some("v1:beef".into()),
             cost: Some(0.1),
             rounds: Vec::new(),
@@ -3014,7 +2982,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         );
 
         let dead = ScopeReport {
-            stages: vec![stage("validate", false)],
+            stages: vec![stage(StageName::Validate, false)],
             digest: None,
             cost: Some(0.1),
             rounds: Vec::new(),
@@ -3057,6 +3025,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             &out,
             None,
             Some(&goal_file),
+            None,
             false,
             Some(propose_opts(&repo, &script)),
         );
@@ -3111,6 +3080,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             &out,
             None,
             Some(&goal_file),
+            None,
             false,
             Some(propose_opts_review(&repo, &script)),
         );
@@ -3160,6 +3130,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             &out,
             None,
             Some(&goal_file),
+            None,
             false,
             Some(propose_opts_review(&repo, &script)),
         );
@@ -3212,6 +3183,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             &out,
             None,
             Some(&goal_file),
+            None,
             false,
             Some(propose_opts_review(&repo, &script)),
         );
@@ -3263,6 +3235,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             &out,
             None,
             Some(&goal_file),
+            None,
             false,
             Some(propose_opts_review(&repo, &script)),
         );
@@ -3307,7 +3280,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
 
         let mut opts = propose_opts(&repo, &script);
         opts.skip_gaming_review = true;
-        let report = execute(&out, None, Some(&goal_file), false, Some(opts));
+        let report = execute(&out, None, Some(&goal_file), None, false, Some(opts));
         assert!(
             report.stages.iter().all(|s| s.passed),
             "{:?}",
@@ -3359,7 +3332,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
 
         let mut opts = propose_opts_review(&repo, &script);
         opts.gaming_refine_rounds = 0;
-        let report = execute(&out, None, Some(&goal_file), false, Some(opts));
+        let report = execute(&out, None, Some(&goal_file), None, false, Some(opts));
         let kinds: Vec<RoundKind> = report.rounds.iter().map(|r| r.kind).collect();
         assert_eq!(
             kinds,
@@ -3399,7 +3372,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
 
         let mut opts = propose_opts_review(&repo, &script);
         opts.gaming_refine_rounds = 2;
-        let report = execute(&out, None, Some(&goal_file), false, Some(opts));
+        let report = execute(&out, None, Some(&goal_file), None, false, Some(opts));
         assert!(
             report.stages.iter().all(|s| s.passed),
             "two concern cycles then a pass must freeze: {:?}",
@@ -3449,7 +3422,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
 
         let mut opts = propose_opts_review(&repo, &script);
         opts.gaming_refine_rounds = 2;
-        let report = execute(&out, None, Some(&goal_file), false, Some(opts));
+        let report = execute(&out, None, Some(&goal_file), None, false, Some(opts));
         assert!(
             !report.stages.last().expect("a last stage").passed,
             "still-concerns at the final look must reject: {:?}",
@@ -3508,7 +3481,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         let mut opts = propose_opts_review(&repo, &script);
         opts.gaming_refine_rounds = 2;
         opts.max_cost = 10.0;
-        let report = execute(&out, None, Some(&goal_file), false, Some(opts));
+        let report = execute(&out, None, Some(&goal_file), None, false, Some(opts));
         assert!(
             !report.stages.last().expect("a last stage").passed,
             "budget exhaustion fails the stage: {:?}",
@@ -3602,7 +3575,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
 
         let mut opts = propose_opts(&repo, &script);
         opts.tier = ProposeTier::T1;
-        let report = execute(&out, None, Some(&goal_file), false, Some(opts));
+        let report = execute(&out, None, Some(&goal_file), None, false, Some(opts));
         assert!(
             report.stages.iter().all(|s| s.passed),
             "a T1 tools/ harness must validate + freeze like any other pack: {:?}",
@@ -3640,7 +3613,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         );
         assert!(t1.contains("Confirmed tier: T1"), "{t1}");
 
-        let evidence = crate::refine::FailureEvidence::Structure {
+        let evidence = crucible_contract::refine::FailureEvidence::Structure {
             detail: "no [judge.selftest] table".to_string(),
         };
         let refine_t1 =
@@ -3711,6 +3684,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             &out,
             None,
             Some(&goal_file),
+            None,
             false,
             Some(propose_opts(&repo, &script)),
         );
@@ -3760,6 +3734,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             &out,
             None,
             Some(&goal_file),
+            None,
             false,
             Some(propose_opts(&repo, &script)),
         );
@@ -3804,7 +3779,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         let mut opts = propose_opts(&repo, &script);
         opts.agent_backend = AgentBackend::Openshell;
         opts.sandbox_image = Some("ghcr.io/neuralmagic/crucible-sandbox:latest".to_string());
-        let report = execute(&out, None, Some(&goal_file), false, Some(opts));
+        let report = execute(&out, None, Some(&goal_file), None, false, Some(opts));
         assert!(
             report.stages.iter().all(|s| s.passed),
             "{:?}",
@@ -3844,6 +3819,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             &out,
             None,
             Some(&goal_file),
+            None,
             false,
             Some(propose_opts(&repo, &script)),
         );
@@ -3887,6 +3863,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             &out,
             None,
             Some(&goal_file),
+            None,
             false,
             Some(propose_opts(&repo, &script)),
         );
@@ -3927,6 +3904,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             &out,
             None,
             Some(&goal_file),
+            None,
             false,
             Some(propose_opts(&repo, &script)),
         );
@@ -4011,6 +3989,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             &out,
             None,
             Some(&goal_file),
+            None,
             false,
             Some(propose_opts(&repo, &script)),
         );
@@ -4054,7 +4033,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             propose.contains("De-prescribe the upstream issue"),
             "propose prompt tells the agent to strip the issue's own fix"
         );
-        let evidence = crate::refine::FailureEvidence::Structure {
+        let evidence = crucible_contract::refine::FailureEvidence::Structure {
             detail: "no [judge.selftest] table".to_string(),
         };
         let refine =
@@ -4092,7 +4071,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             "the controls-privacy rule survives the swap"
         );
 
-        let evidence = crate::refine::FailureEvidence::Structure {
+        let evidence = crucible_contract::refine::FailureEvidence::Structure {
             detail: "no [judge.selftest] table".to_string(),
         };
         let refine = refine::render_refine_prompt(goal, &out, &evidence, 2, ProposeTier::T1, true);

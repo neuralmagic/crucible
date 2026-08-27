@@ -1,0 +1,19 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-CONTRACT-VERSION"
+title = "One contract version, checked before dispatch"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+The contract definition MUST carry exactly one contract version. Two contract versions match if and only if they are equal; there is no compatibility range. A controller build MUST record the contract version of the contract definition it was compiled against, and an engine build MUST record the one it was compiled against; both MUST be readable from the running executable and, for an image, from the image's labels.
+
+A controller build whose linked engine revision was compiled against a different contract version than the controller MUST fail its build, so the mismatch is found in CI and not in production.
+
+Because a dispatch image is pinned in deployment configuration and may differ from the linked engine revision, the running controller MUST, at startup and whenever a dispatch image pin changes, read the contract version from every dispatch image it is configured with and compare each against its own. It MUST expose the result per dispatch image (the image reference, both versions, and whether they match) on the same read endpoint that reports its effective configuration, so an operator can see a mismatch without reading logs.
+
+A mismatch MUST NOT stop the controller from serving. The controller MUST refuse to launch a pod or a process from a mismatched dispatch image, and each refusal MUST be ledgered per [[RFC-0004:C-BOUNDARY-FAILURE]]. Pods already running when a pin changes are out of scope; they carry the request they were launched with.
+
+Rationale: build-time checking removes drift for renders and for the linked revision; the runtime comparison covers the one place a link cannot reach, an image chosen by configuration, and turns a runtime surprise into a visible, explainable refusal."""

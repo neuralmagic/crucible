@@ -29,20 +29,13 @@ mod agent_session;
 mod broker;
 mod build;
 mod check;
-mod command_judge;
-mod command_world;
 mod console;
 pub(crate) mod control;
-mod crucible;
-mod deploy;
 mod distress;
 mod engine;
-mod errors;
 mod escalation;
 mod event;
-mod flow;
 mod flow_dd;
-mod flow_html;
 mod harness;
 mod heartbeat;
 mod hermes_trace;
@@ -52,9 +45,6 @@ mod init;
 mod issue;
 mod loop_driver;
 mod loop_graph;
-mod manifest;
-mod openshell;
-mod plan;
 mod pr_watch;
 mod preflight;
 mod provisioning;
@@ -71,10 +61,31 @@ mod scope;
 mod selftest;
 mod session;
 mod stream;
-mod task_judge;
-mod turn_trace;
 pub(crate) use crucible_harness::stream_json;
 
+use crucible::{command_judge, deploy, duration, errors, flow, manifest, turn_trace};
+
+/// The OpenShell turn runtime. The gateway client and the egress policy are library code (the
+/// deploy renderer needs their constants); the per-turn flow, provider, and sandbox helpers run
+/// only here.
+mod openshell {
+    pub use crucible::openshell::{gateway, grpc, policy};
+
+    pub mod provider;
+    pub mod run;
+    pub mod sandbox;
+}
+
+/// The plan runtime: the CLI and the agent-harness task runner over the library's plan IR,
+/// compiler, and executor.
+mod plan {
+    pub use crucible::plan::{exec, ir, runner, starlark, term_img, worktree};
+
+    pub mod cli;
+    pub mod harness;
+}
+
+use crate::duration::parse_duration;
 use anyhow::Result;
 use clap::Parser;
 use std::path::{Path, PathBuf};
@@ -178,6 +189,9 @@ pub(crate) enum Ui {
 )]
 #[command(args_conflicts_with_subcommands = true)]
 pub(crate) struct Cli {
+    /// Print the controller/engine contract version and exit.
+    #[arg(long, exclusive = true)]
+    contract_version: bool,
     #[command(subcommand)]
     command: Option<Cmd>,
     #[command(flatten)]
@@ -308,7 +322,32 @@ pub(crate) enum Cmd {
     /// export) into a small flow-model IR and emit it as `.json` (the IR itself), `.dot`
     /// (Graphviz run overview), `.mmd` (mermaid flowchart), or `.html` (self-contained
     /// explainer page) — picked by the `--out` extension.
-    Flow(flow::FlowArgs),
+    Flow(FlowArgs),
+}
+
+/// `crucible flow`: post-hoc run explainability, a file-to-file fold over the session log (see
+/// [`flow::render`]).
+#[derive(clap::Args)]
+pub(crate) struct FlowArgs {
+    /// The run's session log (`state/session.jsonl`).
+    #[arg(long)]
+    pub session: PathBuf,
+    /// Datadog span export for the same run (spans API v2 objects, a JSON array or
+    /// `{"data": [...]}`). Optional: adds real timings and the per-tool-call timeline.
+    #[arg(long, conflicts_with = "dd_trace")]
+    pub spans: Option<PathBuf>,
+    /// Fetch the span export straight from the Datadog API for this trace id instead
+    /// of a `--spans` file. Needs `DD_API_KEY` + `DD_APP_KEY` in the environment
+    /// (`DD_SITE` for a non-US1 org).
+    #[arg(long)]
+    pub dd_trace: Option<String>,
+    /// How far back the `--dd-trace` search looks (a Datadog duration: `48h`, `7d`).
+    #[arg(long, default_value = "48h")]
+    pub dd_window: String,
+    /// Output path; the extension picks the format: `.json` (the IR), `.dot`, `.mmd`,
+    /// `.html` (self-contained explainer page).
+    #[arg(long)]
+    pub out: PathBuf,
 }
 
 /// `crucible plan <show|run>`: compile and inspect a plan, or execute one.
@@ -387,6 +426,11 @@ pub(crate) enum PlanAction {
         /// workspace.
         #[arg(long)]
         manifest: Option<PathBuf>,
+        /// OpenShell compute driver for an agent task's sandbox: `podman` (default, nests it
+        /// beside the runner) or `kubernetes` (schedules it as a sibling pod in-cluster). Fixed
+        /// per deployment, so a rendered wrapper passes it; the manifest cannot declare it.
+        #[arg(long, value_enum, default_value_t = openshell::gateway::ComputeDriver::Podman)]
+        compute_driver: openshell::gateway::ComputeDriver,
     },
 }
 
@@ -427,6 +471,14 @@ pub(crate) struct RenderTurnArgs {
     /// The clone URL of the repo under test (cloned fresh into the turn pod).
     #[arg(long)]
     pub repo_url: String,
+    /// Branch or tag to clone `--repo-url` at. Omitted: the repo's default branch.
+    #[arg(long)]
+    pub repo_ref: Option<String>,
+    /// A pack the checkout already carries, relative to its root. `scope` turn kind only; when set,
+    /// the in-pod invocation validates and freezes that pack (`crucible scope --pack`) instead of
+    /// drafting one, so the turn spends no agent and needs no sandbox.
+    #[arg(long)]
+    pub pack_path: Option<String>,
     /// The agent sandbox image carrying the claude CLI (the openshell backend pulls it).
     #[arg(long)]
     pub sandbox_image: String,
@@ -442,7 +494,7 @@ pub(crate) struct RenderTurnArgs {
     /// The issue's confirmed tier, forwarded to the in-pod `crucible scope --propose --tier …`.
     /// `scope` turn kind only; absent = the engine's t0 default.
     #[arg(long, value_enum)]
-    pub tier: Option<crate::scope::ProposeTier>,
+    pub tier: Option<crate::deploy::ProposeTier>,
     /// Max gaming-review concern→refine→re-review cycles, forwarded to the in-pod
     /// `crucible scope --propose --gaming-refine-rounds …`. `scope` turn kind only.
     #[arg(long, default_value_t = 1)]
@@ -459,7 +511,7 @@ pub(crate) struct RenderTurnArgs {
     /// The agent harness the in-pod turn runs, forwarded as `--harness …`. Absent = the in-pod
     /// engine's own default.
     #[arg(long, value_enum)]
-    pub harness: Option<crate::harness::Harness>,
+    pub harness: Option<crate::manifest::Harness>,
     /// The model the in-pod turn runs, forwarded as `--model …`. Absent = the model the in-pod
     /// engine derives from its harness.
     #[arg(long)]
@@ -509,8 +561,8 @@ pub(crate) struct DeployArgs {
     pub playbook: bool,
     /// Wall-clock ceiling the launched playbook runs under (`90s`, `30m`, `2h`), emitted as the
     /// in-pod `plan run --max-time`. Required with `--playbook`.
-    #[arg(long, requires = "playbook", value_parser = clap::value_parser!(crate::MaxTime))]
-    pub max_time: Option<crate::MaxTime>,
+    #[arg(long, requires = "playbook", value_parser = clap::value_parser!(crate::duration::MaxTime))]
+    pub max_time: Option<crate::duration::MaxTime>,
     /// A playbook parameter value, `name=value`, repeatable. What the pack's `params` block declares
     /// is what it accepts.
     #[arg(long = "param", value_name = "NAME=VALUE", requires = "playbook")]
@@ -528,7 +580,7 @@ pub(crate) struct DeployArgs {
     /// The agent harness the rendered loop runs, emitted as the wrapper's `--harness=…`. Absent =
     /// the manifest's `[agent].harness`.
     #[arg(long, value_enum)]
-    pub harness: Option<crate::harness::Harness>,
+    pub harness: Option<crate::manifest::Harness>,
     /// The model the rendered loop runs, emitted as the wrapper's `--model=…`. Absent = the model
     /// the loop derives from its harness.
     #[arg(long)]
@@ -602,13 +654,13 @@ pub(crate) struct Args {
     #[arg(skip)]
     pub broker_token: Option<String>,
     /// Vertex Claude model for the agent (set from `[agent].model`).
-    #[arg(long, default_value = harness::claude::DEFAULT_MODEL)]
+    #[arg(long, default_value = crate::manifest::Harness::Claude.default_model())]
     pub model: String,
     /// The agent harness that runs each turn: `claude` (default), `hermes`, or `codex`. Overrides
     /// the manifest's `[agent].harness`; when neither is set the engine defaults to claude (see
     /// `apply_agent_cfg`).
     #[arg(long, value_enum)]
-    pub harness: Option<harness::Harness>,
+    pub harness: Option<crate::manifest::Harness>,
     /// Hermes-harness tuning (from `[agent.hermes]`). No CLI flag.
     #[arg(skip)]
     pub hermes: manifest::HermesCfg,
@@ -622,11 +674,11 @@ pub(crate) struct Args {
     /// `[agent].reasoning_effort`; when neither is set the engine defaults to `medium` (see
     /// `apply_agent_cfg`).
     #[arg(long = "effort", value_enum)]
-    pub reasoning_effort: Option<agent::ReasoningEffort>,
+    pub reasoning_effort: Option<crate::manifest::ReasoningEffort>,
     /// Backend for the agent turn: `local` (default) runs it here; `openshell` runs
     /// it in an OpenShell sandbox (what an in-pod loop uses). Needs `--sandbox-image`.
-    #[arg(long, value_enum, default_value_t = agent::AgentBackend::Local)]
-    pub agent_backend: agent::AgentBackend,
+    #[arg(long, value_enum, default_value_t = manifest::AgentBackend::Local)]
+    pub agent_backend: manifest::AgentBackend,
     /// Sandbox image for `--agent-backend openshell` (the domain's agent toolbox baked in).
     #[arg(long)]
     pub sandbox_image: Option<String>,
@@ -711,70 +763,21 @@ impl Args {
     /// The resolved agent harness: CLI `--harness` > manifest `[agent].harness` (folded on by
     /// `apply_agent_cfg`) > claude. Paths that never see a manifest (rank-grounded, scope) get
     /// the claude default.
-    pub(crate) fn harness(&self) -> harness::Harness {
+    pub(crate) fn harness(&self) -> crate::manifest::Harness {
         self.harness.unwrap_or_default()
     }
 
     /// Resolve where this run's agent events come from. `local` spawns `claude` directly
     /// (parsed as `stream-json`); `openshell` uses the in-Rust OpenShell driver.
     pub(crate) fn agent_source(&self) -> agent::AgentSource {
-        if self.agent_backend == agent::AgentBackend::Command {
+        if self.agent_backend == manifest::AgentBackend::Command {
             return agent::AgentSource::Command(self.agent_cmd.clone().unwrap_or_default());
         }
         match self.agent_backend {
-            agent::AgentBackend::Openshell => agent::AgentSource::OpenshellDriver,
+            manifest::AgentBackend::Openshell => agent::AgentSource::OpenshellDriver,
             // Local (and the Command case handled above) spawn claude directly.
             _ => agent::AgentSource::LocalClaude,
         }
-    }
-}
-
-/// Parse a short duration like `90s`, `30m`, `1h`. Empty, garbage, negative, and anything
-/// `Duration` cannot hold all yield `None`. `Duration::from_secs_f64` panics on a negative or
-/// non-finite argument, so both are refused before it is reached.
-pub(crate) fn parse_duration(s: &str) -> Option<Duration> {
-    let s = s.trim();
-    if s.is_empty() {
-        return None;
-    }
-    let (num, unit) = s.split_at(s.find(|c: char| c.is_alphabetic()).unwrap_or(s.len()));
-    let n: f64 = num.trim().parse().ok()?;
-    let secs = match unit.trim() {
-        "" | "s" | "sec" => n,
-        "m" | "min" => n * 60.0,
-        "h" | "hr" => n * 3600.0,
-        _ => return None,
-    };
-    Duration::try_from_secs_f64(secs).ok()
-}
-
-/// A positive wall-clock ceiling, parsed at the CLI boundary.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct MaxTime(Duration);
-
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum BadMaxTime {
-    #[error("--max-time {raw:?} is not a duration (try `90s`, `30m`, `2h`)")]
-    NotADuration { raw: String },
-    #[error("--max-time must be positive, got {raw:?}")]
-    NotPositive { raw: String },
-}
-
-impl std::str::FromStr for MaxTime {
-    type Err = BadMaxTime;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let d = parse_duration(s).ok_or_else(|| BadMaxTime::NotADuration { raw: s.to_string() })?;
-        if d.is_zero() {
-            return Err(BadMaxTime::NotPositive { raw: s.to_string() });
-        }
-        Ok(MaxTime(d))
-    }
-}
-
-impl std::fmt::Display for MaxTime {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}s", self.0.as_secs_f64())
     }
 }
 
@@ -895,36 +898,6 @@ pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn parse_duration_handles_suffixes() {
-        assert_eq!(parse_duration("90s"), Some(Duration::from_secs(90)));
-        assert_eq!(parse_duration("30m"), Some(Duration::from_secs(1800)));
-        assert_eq!(parse_duration("1h"), Some(Duration::from_secs(3600)));
-        assert_eq!(parse_duration("45"), Some(Duration::from_secs(45)));
-        assert_eq!(parse_duration(""), None);
-        assert_eq!(parse_duration("garbage"), None);
-        assert_eq!(parse_duration("10x"), None);
-    }
-
-    /// Every input reaches `Duration::try_from_secs_f64`, which refuses what
-    /// `Duration::from_secs_f64` would have panicked on.
-    #[test]
-    fn parse_duration_refuses_what_a_duration_cannot_hold() {
-        for hostile in [
-            "-5",
-            "-5s",
-            "-0.001h",
-            "99999999999999999999h",
-            "1e400",
-            "nan",
-            "inf",
-            "-inf",
-        ] {
-            assert_eq!(parse_duration(hostile), None, "{hostile}");
-        }
-        assert_eq!(parse_duration("0"), Some(Duration::ZERO));
-    }
-
     fn deploy_render(extra: &[&str]) -> Result<Cli, clap::Error> {
         let mut argv = vec![
             "crucible",
@@ -1026,21 +999,50 @@ mod tests {
     }
 
     #[test]
-    fn max_time_parses_and_round_trips() {
-        let t: MaxTime = "30m".parse().expect("30m parses");
-        assert_eq!(t.to_string(), "1800s");
-        assert_eq!(parse_duration(&t.to_string()), parse_duration("30m"));
-        for bad in ["garbage", "", "-5m"] {
-            assert!(
-                matches!(bad.parse::<MaxTime>(), Err(BadMaxTime::NotADuration { .. })),
-                "{bad}"
-            );
-        }
-        for zero in ["0", "0s", "0m"] {
-            assert!(
-                matches!(zero.parse::<MaxTime>(), Err(BadMaxTime::NotPositive { .. })),
-                "{zero}"
-            );
-        }
+    fn spans_and_dd_trace_are_mutually_exclusive() {
+        let err = Cli::try_parse_from([
+            "crucible",
+            "flow",
+            "--session",
+            "s.jsonl",
+            "--spans",
+            "x.json",
+            "--dd-trace",
+            "abc123",
+            "--out",
+            "f.html",
+        ])
+        .err()
+        .expect("--spans + --dd-trace must be rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        let cli = Cli::try_parse_from([
+            "crucible",
+            "flow",
+            "--session",
+            "s.jsonl",
+            "--dd-trace",
+            "abc123",
+            "--out",
+            "f.html",
+        ])
+        .unwrap();
+        let Some(Cmd::Flow(args)) = cli.command else {
+            panic!("flow parses as its subcommand");
+        };
+        assert_eq!(args.dd_trace.as_deref(), Some("abc123"));
+        assert_eq!(args.dd_window, "48h");
+        assert!(
+            Cli::try_parse_from([
+                "crucible",
+                "flow",
+                "--session",
+                "s.jsonl",
+                "--spans",
+                "x.json",
+                "--out",
+                "f.html",
+            ])
+            .is_ok()
+        );
     }
 }

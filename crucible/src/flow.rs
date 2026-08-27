@@ -11,38 +11,14 @@
 //! durations). Wide-round and infra rows are out of scope: this is the deep-loop
 //! overview a human is walked through.
 
-use crate::session::{EvidenceDisposition, RowWire, SessionEvent, decode};
-use anyhow::{Context, Result};
+use anyhow::Result;
+use crucible_contract::session::{EvidenceDisposition, RowWire, SessionEvent, decode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
-
-#[derive(clap::Args)]
-pub(crate) struct FlowArgs {
-    /// The run's session log (`state/session.jsonl`).
-    #[arg(long)]
-    pub session: PathBuf,
-    /// Datadog span export for the same run (spans API v2 objects, a JSON array or
-    /// `{"data": [...]}`). Optional: adds real timings and the per-tool-call timeline.
-    #[arg(long, conflicts_with = "dd_trace")]
-    pub spans: Option<PathBuf>,
-    /// Fetch the span export straight from the Datadog API for this trace id instead
-    /// of a `--spans` file. Needs `DD_API_KEY` + `DD_APP_KEY` in the environment
-    /// (`DD_SITE` for a non-US1 org).
-    #[arg(long)]
-    pub dd_trace: Option<String>,
-    /// How far back the `--dd-trace` search looks (a Datadog duration: `48h`, `7d`).
-    #[arg(long, default_value = "48h")]
-    pub dd_window: String,
-    /// Output path; the extension picks the format: `.json` (the IR), `.dot`, `.mmd`,
-    /// `.html` (self-contained explainer page).
-    #[arg(long)]
-    pub out: PathBuf,
-}
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum FlowError {
+pub enum FlowError {
     #[error("--out needs a .json/.dot/.mmd/.html extension, got `{ext}`")]
     UnknownFormat { ext: String },
     #[error("parsing span export")]
@@ -58,7 +34,7 @@ pub(crate) enum FlowError {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Default, Serialize, Deserialize)]
-pub(crate) struct FlowModel {
+pub struct FlowModel {
     pub run: RunHeader,
     pub preflight: Vec<PreflightStep>,
     pub iterations: Vec<Iteration>,
@@ -68,7 +44,7 @@ pub(crate) struct FlowModel {
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
-pub(crate) struct RunHeader {
+pub struct RunHeader {
     /// The publish run-record id (`<stamp>-<goal-slug>`); absent when the run never published.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -95,7 +71,7 @@ pub(crate) struct RunHeader {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct PreflightStep {
+pub struct PreflightStep {
     pub cmd_short: String,
     /// `ok` or `failed`.
     pub outcome: String,
@@ -103,7 +79,7 @@ pub(crate) struct PreflightStep {
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
-pub(crate) struct Iteration {
+pub struct Iteration {
     pub n: u32,
     /// Normalized: `keep`, `discard`, or `rejected` (discarded by a rung before any score).
     pub decision: String,
@@ -124,7 +100,7 @@ pub(crate) struct Iteration {
 
 /// File list + counts parsed from the row's unified diff — never the hunks themselves.
 #[derive(Debug, Default, Serialize, Deserialize)]
-pub(crate) struct Edits {
+pub struct Edits {
     pub files_changed: usize,
     pub insertions: usize,
     pub deletions: usize,
@@ -132,7 +108,7 @@ pub(crate) struct Edits {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct Rung {
+pub struct Rung {
     pub name: String,
     pub pass: bool,
     /// The check never ran (skipped disposition on the wire, or a gate that reports a
@@ -145,7 +121,7 @@ pub(crate) struct Rung {
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
-pub(crate) struct Turn {
+pub struct Turn {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_s: Option<f64>,
     /// The agent's in-turn actions from the span export, sorted by `at_s` (seconds
@@ -155,81 +131,95 @@ pub(crate) struct Turn {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct ToolCall {
+pub struct ToolCall {
     pub tool: String,
     pub at_s: f64,
     pub duration_s: f64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct BudgetPoint {
+pub struct BudgetPoint {
     pub at_s: u64,
     pub spent: f64,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
-pub(crate) struct Publish {
+pub struct Publish {
     pub prs: Vec<Pr>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct Pr {
+pub struct Pr {
     pub url: String,
     pub repo: String,
     pub branch: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct EpilogueCheck {
+pub struct EpilogueCheck {
     pub note: String,
     pub pass: bool,
 }
 
 // ---------------------------------------------------------------------------
-// CLI entry
+// Entry
 // ---------------------------------------------------------------------------
 
-pub(crate) fn run(args: &FlowArgs) -> Result<()> {
-    let log = std::fs::read_to_string(&args.session)
-        .with_context(|| format!("reading {}", args.session.display()))?;
-    // clap rejects --spans + --dd-trace together, so at most one arm produces spans.
-    let spans = match (&args.spans, &args.dd_trace) {
-        (Some(p), _) => {
-            Some(std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?)
+/// The inputs of one flow render: the run's session log and, when the caller has one, the
+/// Datadog span export for the same run (spans API v2 objects, a JSON array or `{"data": [...]}`).
+pub struct FlowInput {
+    pub session_log: String,
+    pub spans_json: Option<String>,
+}
+
+/// The output document format. The CLI picks it from the `--out` extension.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlowFormat {
+    /// The IR (`flow.json`).
+    Json,
+    /// Graphviz dot.
+    Dot,
+    /// Mermaid.
+    Mermaid,
+    /// The self-contained explainer page.
+    Html,
+}
+
+impl FlowFormat {
+    /// The format an output path's extension selects.
+    pub fn from_extension(ext: &str) -> Result<Self, FlowError> {
+        match ext {
+            "json" => Ok(FlowFormat::Json),
+            "dot" => Ok(FlowFormat::Dot),
+            "mmd" => Ok(FlowFormat::Mermaid),
+            "html" => Ok(FlowFormat::Html),
+            other => Err(FlowError::UnknownFormat { ext: other.into() }),
         }
-        (None, Some(trace_id)) => Some(crate::flow_dd::fetch_trace_spans(
-            trace_id,
-            &args.dd_window,
-        )?),
-        (None, None) => None,
-    };
-    let model = build_model(&log, spans.as_deref())?;
-    let ext = args
-        .out
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or_default();
-    let rendered = match ext {
-        "json" => {
+    }
+}
+
+/// Render the flow document: the library form of `crucible flow`, which reads `--session` and
+/// `--spans` (or fetches `--dd-trace`) into a [`FlowInput`] and writes the result to `--out`.
+/// Pure: nothing beyond `input` is read.
+#[tracing::instrument(skip_all, fields(format = ?format), err)]
+pub fn render(input: &FlowInput, format: FlowFormat) -> Result<String> {
+    let model = build_model(&input.session_log, input.spans_json.as_deref())?;
+    Ok(match format {
+        FlowFormat::Json => {
             let mut s = serde_json::to_string_pretty(&model).map_err(FlowError::Model)?;
             s.push('\n');
             s
         }
-        "dot" => emit_dot(&model),
-        "mmd" => emit_mermaid(&model),
-        "html" => crate::flow_html::emit_html(&model),
-        other => return Err(FlowError::UnknownFormat { ext: other.into() }.into()),
-    };
-    std::fs::write(&args.out, rendered)
-        .with_context(|| format!("writing {}", args.out.display()))?;
-    println!("[crucible flow] wrote {}", args.out.display());
-    Ok(())
+        FlowFormat::Dot => emit_dot(&model),
+        FlowFormat::Mermaid => emit_mermaid(&model),
+        FlowFormat::Html => crate::flow_html::emit_html(&model),
+    })
 }
 
 /// Fold a session log into the rendered report pair (`flow.json`, `flow.html`) with no span
 /// export — publish runs on the loop pod, which has no Datadog creds, so the page uses its
 /// no-spans fallback.
-pub(crate) fn render_report(session_log: &str) -> Result<(String, String)> {
+pub fn render_report(session_log: &str) -> Result<(String, String)> {
     let model = build_model(session_log, None)?;
     let mut json = serde_json::to_string_pretty(&model).map_err(FlowError::Model)?;
     json.push('\n');
@@ -237,12 +227,30 @@ pub(crate) fn render_report(session_log: &str) -> Result<(String, String)> {
 }
 
 /// Fold the session log (and, when given, the span export) into the flow model.
-pub(crate) fn build_model(session_log: &str, spans_json: Option<&str>) -> Result<FlowModel> {
+pub fn build_model(session_log: &str, spans_json: Option<&str>) -> Result<FlowModel> {
     let (mut model, aux) = extract(session_log);
     if let Some(raw) = spans_json {
         join_spans(&mut model, &aux, raw)?;
     }
     Ok(model)
+}
+
+/// Scores can be `INFINITY` (no measurement); `serde_json` refuses non-finite
+/// floats, so drop those to `null` rather than blow up the whole record.
+pub fn finite(x: f64) -> Option<f64> {
+    x.is_finite().then_some(x)
+}
+
+/// First non-empty goal line, de-hashed and length-capped, for leaderboard display.
+pub fn goal_line(goal: &str) -> String {
+    let line = goal
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .trim_start_matches('#')
+        .trim();
+    line.chars().take(120).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -265,7 +273,7 @@ fn extract(log: &str) -> (FlowModel, Aux) {
             SessionEvent::Start {
                 goal, gate, model, ..
             } => {
-                m.run.goal_line = crate::publish::goal_line(&goal);
+                m.run.goal_line = goal_line(&goal);
                 m.run.gate = gate;
                 m.run.model = model;
             }
@@ -284,7 +292,7 @@ fn extract(log: &str) -> (FlowModel, Aux) {
                 spent,
             }),
             SessionEvent::Summary { best_score, .. } => {
-                m.run.best_score = best_score.and_then(crate::publish::finite);
+                m.run.best_score = best_score.and_then(finite);
             }
             SessionEvent::PrLinks { links } => {
                 m.publish.prs = links
@@ -370,7 +378,7 @@ fn fold_iteration(aux: &mut Aux, row: &RowWire) -> Iteration {
     Iteration {
         n: row.iter,
         decision: classify(&row.decision, row.score),
-        score: row.score.and_then(crate::publish::finite),
+        score: row.score.and_then(finite),
         delta_pct_vs_baseline: None,
         note_short: fold_short(&row.note, 120),
         edits: parse_diff(&row.diff),
@@ -1268,81 +1276,30 @@ mod tests {
     }
 
     #[test]
-    fn run_writes_all_four_formats_and_json_round_trips() {
-        let dir = tempfile::tempdir().unwrap();
-        let session =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/flow/run7-session.jsonl");
-        for ext in ["json", "dot", "mmd", "html"] {
-            let out = dir.path().join(format!("flow.{ext}"));
-            run(&FlowArgs {
-                session: session.clone(),
-                spans: None,
-                dd_trace: None,
-                dd_window: "48h".into(),
-                out: out.clone(),
-            })
-            .unwrap();
-            assert!(out.exists());
+    fn render_emits_all_four_formats_and_json_round_trips() {
+        let input = FlowInput {
+            session_log: fixture("run7-session.jsonl"),
+            spans_json: None,
+        };
+        for format in [
+            FlowFormat::Json,
+            FlowFormat::Dot,
+            FlowFormat::Mermaid,
+            FlowFormat::Html,
+        ] {
+            assert!(!render(&input, format).unwrap().is_empty(), "{format:?}");
         }
-        let ir = std::fs::read_to_string(dir.path().join("flow.json")).unwrap();
+        let ir = render(&input, FlowFormat::Json).unwrap();
         let m: FlowModel = serde_json::from_str(&ir).unwrap();
         assert_eq!(m.iterations.len(), 6);
-        let err = run(&FlowArgs {
-            session: session.clone(),
-            spans: None,
-            dd_trace: None,
-            dd_window: "48h".into(),
-            out: dir.path().join("flow.txt"),
-        })
-        .unwrap_err();
+        let err = FlowFormat::from_extension("txt").unwrap_err();
         assert!(err.to_string().contains(".json/.dot/.mmd/.html"), "{err}");
     }
 
     #[test]
-    fn spans_and_dd_trace_are_mutually_exclusive() {
-        #[derive(clap::Parser)]
-        struct Cli {
-            #[command(flatten)]
-            args: FlowArgs,
-        }
-        use clap::Parser;
-        let err = Cli::try_parse_from([
-            "flow",
-            "--session",
-            "s.jsonl",
-            "--spans",
-            "x.json",
-            "--dd-trace",
-            "abc123",
-            "--out",
-            "f.html",
-        ])
-        .err()
-        .expect("--spans + --dd-trace must be rejected");
-        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
-        let cli = Cli::try_parse_from([
-            "flow",
-            "--session",
-            "s.jsonl",
-            "--dd-trace",
-            "abc123",
-            "--out",
-            "f.html",
-        ])
-        .unwrap();
-        assert_eq!(cli.args.dd_trace.as_deref(), Some("abc123"));
-        assert_eq!(cli.args.dd_window, "48h");
-        assert!(
-            Cli::try_parse_from([
-                "flow",
-                "--session",
-                "s.jsonl",
-                "--spans",
-                "x.json",
-                "--out",
-                "f.html",
-            ])
-            .is_ok()
-        );
+    fn finite_drops_non_finite() {
+        assert_eq!(finite(1.5), Some(1.5));
+        assert_eq!(finite(f64::INFINITY), None);
+        assert_eq!(finite(f64::NAN), None);
     }
 }

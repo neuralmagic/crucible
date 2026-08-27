@@ -6,7 +6,7 @@
 //!   span.
 //! - [`parse_messages`]: the FULL conversation (prompts, assistant text + reasoning, tool calls
 //!   with full args, tool results) as [`GenAiRecord`]s for the opt-in OpenTelemetry GenAI content
-//!   log records ([`crate::engine::emit_conversation_logs`]). This carries the real message bodies,
+//!   log records (`engine::emit_conversation_logs`). This carries the real message bodies,
 //!   so it is gated off by default and its bodies are run through the same [`redact`] machinery.
 
 use jiff::Timestamp;
@@ -23,12 +23,12 @@ const SUMMARY_CAP: usize = 200;
 /// result whose own timestamp is unparseable still closes the call (zero duration at `start`).
 /// `summary` is the sanitized one-line input hint (possibly empty); `error` is the tool's verdict.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ToolInvocation {
-    pub(crate) name: String,
-    pub(crate) start: SystemTime,
-    pub(crate) end: Option<SystemTime>,
-    pub(crate) summary: String,
-    pub(crate) error: bool,
+pub struct ToolInvocation {
+    pub name: String,
+    pub start: SystemTime,
+    pub end: Option<SystemTime>,
+    pub summary: String,
+    pub error: bool,
 }
 
 /// The parse accumulator: invocations in first-seen order, plus the `tool_use_id` → slot map that
@@ -43,8 +43,8 @@ struct Calls {
 /// Whether to scrub credential-shaped fragments from span hints. Defaults ON; set
 /// `CRUCIBLE_TURN_TRACE_REDACT` to `0`/`false`/`off` to disable it (e.g. when the harness already
 /// sanitizes tool inputs and the extra scrub just muddies the trace).
-/// `pub(crate)` so the hermes reader defaults to the same toggle.
-pub(crate) fn redact_enabled() -> bool {
+/// `pub` so the hermes reader defaults to the same toggle.
+pub fn redact_enabled() -> bool {
     !matches!(
         std::env::var("CRUCIBLE_TURN_TRACE_REDACT").ok().as_deref(),
         Some("0") | Some("false") | Some("FALSE") | Some("off")
@@ -54,7 +54,7 @@ pub(crate) fn redact_enabled() -> bool {
 /// Parse a native session transcript into its tool invocations, in call order. Robust to a torn
 /// tail and interleaved noise: any line that isn't valid JSON, or carries no `message.content`
 /// array, is skipped; a `tool_result` with no known id is ignored.
-pub(crate) fn parse_transcript(jsonl: &str) -> Vec<ToolInvocation> {
+pub fn parse_transcript(jsonl: &str) -> Vec<ToolInvocation> {
     parse_transcript_with(jsonl, redact_enabled())
 }
 
@@ -76,17 +76,17 @@ fn parse_transcript_with(jsonl: &str, redact: bool) -> Vec<ToolInvocation> {
 /// JSON-encoded (redacted when the toggle is on), unlike the span path's whitelisted one-line
 /// hint, this carries every argument. `id` pairs the call with its later `gen_ai.tool.message`.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ToolCall {
-    pub(crate) id: String,
-    pub(crate) name: String,
-    pub(crate) arguments: String,
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
 }
 
 /// One conversation record from the transcript, already mapped to an OpenTelemetry GenAI record
 /// kind. Bodies are the FULL message content (redacted when the toggle is on); the engine's logs
 /// exporter turns each into a `gen_ai.*` log record correlated to the turn span.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum GenAiRecord {
+pub enum GenAiRecord {
     /// A system prompt → `gen_ai.system.message`.
     System { content: String },
     /// A user prompt → `gen_ai.user.message`.
@@ -111,7 +111,7 @@ pub(crate) enum GenAiRecord {
 /// with message bodies redacted per [`redact_enabled`]. Robust to a torn tail and interleaved
 /// noise exactly like [`parse_transcript`]: a non-JSON line, or one with no usable message, is
 /// skipped.
-pub(crate) fn parse_messages(jsonl: &str) -> Vec<GenAiRecord> {
+pub fn parse_messages(jsonl: &str) -> Vec<GenAiRecord> {
     parse_messages_with(jsonl, redact_enabled())
 }
 
@@ -421,8 +421,8 @@ impl HintField {
 
 /// The sanitized one-line input hint for a tool: the [`HintField`] value, redacted (when `redact`)
 /// then truncated (see [`redact`]). Empty when the tool has no hint field or the field is absent.
-/// `pub(crate)` so the hermes reader synthesizes span hints through the same whitelist.
-pub(crate) fn summarize_input(name: &str, input: Option<&Value>, redact: bool) -> String {
+/// `pub` so the hermes reader synthesizes span hints through the same whitelist.
+pub fn summarize_input(name: &str, input: Option<&Value>, redact: bool) -> String {
     let Some(field) = HintField::for_tool(name) else {
         return String::new();
     };
@@ -452,8 +452,8 @@ const SECRET_MARKERS: [&str; 5] = ["TOKEN", "KEY", "SECRET", "PASSWORD", "PASSWD
 /// - URL userinfo `scheme://user:pass@host` → `scheme://***@host`
 ///
 /// Whitespace runs collapse to single spaces, this is a display hint, not a replayable command.
-/// `pub(crate)` so the hermes reader scrubs its tool-result bodies through the same gate.
-pub(crate) fn redact(s: &str) -> String {
+/// `pub` so the hermes reader scrubs its tool-result bodies through the same gate.
+pub fn redact(s: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut mask_next = 0u8; // pending Authorization-value tokens to mask
     for token in s.split_whitespace() {
@@ -536,8 +536,8 @@ fn redact_url_userinfo(token: &str) -> String {
 
 /// Truncate to at most `cap` chars, appending an ellipsis when clipped. `char_indices` keeps the
 /// cut on a char boundary (std's `String::truncate` is byte-indexed and panics off-boundary).
-/// `pub(crate)` so the hermes reader caps its span hints identically.
-pub(crate) fn truncate(s: &str, cap: usize) -> String {
+/// `pub` so the hermes reader caps its span hints identically.
+pub fn truncate(s: &str, cap: usize) -> String {
     match s.char_indices().nth(cap) {
         Some((i, _)) => format!("{}…", &s[..i]),
         None => s.to_string(),
@@ -545,8 +545,8 @@ pub(crate) fn truncate(s: &str, cap: usize) -> String {
 }
 
 /// Parse an RFC3339 transcript timestamp into a `SystemTime` via jiff, `None` when unparseable.
-/// `pub(crate)` so the codex rollout reader dates its spans the same way.
-pub(crate) fn parse_ts(s: &str) -> Option<SystemTime> {
+/// `pub` so the codex rollout reader dates its spans the same way.
+pub fn parse_ts(s: &str) -> Option<SystemTime> {
     s.parse::<Timestamp>().ok().map(SystemTime::from)
 }
 

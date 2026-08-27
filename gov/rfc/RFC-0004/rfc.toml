@@ -1,0 +1,35 @@
+#:schema ../../schema/rfc.schema.json
+
+[govctl]
+id = "RFC-0004"
+title = "Linked controller/engine boundary"
+version = "0.1.0"
+status = "draft"
+phase = "spec"
+owners = ["@Will Eaton"]
+created = "2026-08-25"
+
+[[sections]]
+title = "Summary"
+clauses = [
+    "clauses/C-SCOPE.toml",
+    "clauses/C-BOUNDARY-INVENTORY.toml",
+]
+
+[[sections]]
+title = "Specification"
+clauses = [
+    "clauses/C-LINKED-RENDER.toml",
+    "clauses/C-TYPED-INVOCATION.toml",
+    "clauses/C-CONTRACT-VERSION.toml",
+    "clauses/C-BOUNDARY-FAILURE.toml",
+]
+
+[[sections]]
+title = "Compatibility"
+clauses = ["clauses/C-MIGRATION.toml"]
+
+[[changelog]]
+version = "0.1.0"
+date = "2026-08-25"
+notes = "Initial draft"

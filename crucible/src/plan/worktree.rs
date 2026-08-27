@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 /// so the operation name is a field rather than five near-identical messages.
 #[derive(Debug, thiserror::Error)]
 #[error("{operation} failed: {stderr}")]
-pub(crate) struct GitFailed {
+pub struct GitFailed {
     operation: &'static str,
     stderr: String,
 }
@@ -34,7 +34,7 @@ impl GitFailed {
 /// `pending` is the source workspace's uncommitted state as a patch, from [`capture_diff`].
 /// The caller captures it because a fan-out shares one source workspace: N threads running
 /// `git add -A` in it race on `.git/index.lock`.
-pub(crate) fn setup(workspace: &Path, dest: &Path, pending: &str) -> Result<()> {
+pub fn setup(workspace: &Path, dest: &Path, pending: &str) -> Result<()> {
     if dest.exists() {
         std::fs::remove_dir_all(dest)?;
     }
@@ -76,7 +76,7 @@ pub(crate) fn setup(workspace: &Path, dest: &Path, pending: &str) -> Result<()> 
 /// Capture what a task changed in its worktree (staged + unstaged). `--binary` so the text
 /// survives a later [`apply`] losslessly. Stages the tree (`git add -A`) as a side effect,
 /// which is what every snapshot does a moment later anyway.
-pub(crate) fn capture_diff(worktree: &Path) -> Result<String> {
+pub fn capture_diff(worktree: &Path) -> Result<String> {
     let add = std::process::Command::new("git")
         .args(["-C", &worktree.to_string_lossy(), "add", "-A"])
         .output()
@@ -101,7 +101,7 @@ pub(crate) fn capture_diff(worktree: &Path) -> Result<String> {
 }
 
 /// Apply a captured diff to a workspace via `git apply` on stdin. An empty diff is a no-op.
-pub(crate) fn apply(main_ws: &Path, diff: &str) -> Result<()> {
+pub fn apply(main_ws: &Path, diff: &str) -> Result<()> {
     if diff.trim().is_empty() {
         return Ok(());
     }

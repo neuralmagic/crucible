@@ -18,55 +18,13 @@
 //!   examples/tests; native `AgentEvent` JSON lines are decoded, everything else is raw.
 
 use crate::event::{AgentEvent, RawStream, Tokens, cost_of, estimate_cost};
-use crate::harness::StreamDecoder;
+use crate::harness::{HarnessRuntime, StreamDecoder};
+use crate::manifest::AgentBackend;
 use crate::{Args, Paths};
 use crucible_harness::OtelCollector;
 use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, Command, Stdio};
 use std::thread;
-
-/// Which backend a locally-spawned agent turn runs against.
-///
-/// `Local` runs the agent on this machine (the original behavior). `Openshell`
-/// runs it in an OpenShell sandbox (Landlock + egress policy), what an in-pod
-/// loop uses so its turns are isolated; it needs a `--sandbox-image` carrying
-/// the domain's toolbox binaries.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-pub enum AgentBackend {
-    Local,
-    Openshell,
-    /// Run a fixed shell command as the "agent turn" (no LLM). A deterministic, free proposer
-    /// for testing the engine end to end, see `examples/counter`.
-    Command,
-}
-
-/// The agent's reasoning-effort tier, passed to Claude Code as `--effort <level>`. A closed set
-/// (Claude Code 2.1: low|medium|high|xhigh|max); unset means we don't pass the flag and Claude
-/// Code picks its own default. Per-domain because the right tier is task-dependent (mechanical
-/// remove-deprecated fixes need ~none; algorithmic issues want real reasoning), and it's a harness
-/// hyperparameter worth ablating: does more thinking find better fixes, or just better reward hacks?
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ReasoningEffort {
-    Low,
-    Medium,
-    High,
-    Xhigh,
-    Max,
-}
-
-impl ReasoningEffort {
-    /// The exact token Claude Code's `--effort` flag expects.
-    pub(crate) fn as_flag(self) -> &'static str {
-        match self {
-            ReasoningEffort::Low => "low",
-            ReasoningEffort::Medium => "medium",
-            ReasoningEffort::High => "high",
-            ReasoningEffort::Xhigh => "xhigh",
-            ReasoningEffort::Max => "max",
-        }
-    }
-}
 
 /// Where a turn's events come from. Resolved once from [`Args`] (see
 /// [`Args::agent_source`]); each variant knows how to launch its transport and expose
@@ -137,9 +95,9 @@ pub(crate) fn supports_persistent_sessions(args: &Args) -> bool {
 /// Capability predicate used by runtime admission and scope preview.
 pub(crate) fn backend_supports_persistent_sessions(
     backend: AgentBackend,
-    harness: crate::harness::Harness,
+    harness: crate::manifest::Harness,
 ) -> bool {
-    backend == AgentBackend::Command || harness == crate::harness::Harness::Claude
+    backend == AgentBackend::Command || harness == crate::manifest::Harness::Claude
 }
 
 /// A spawned transport: a child process plus the streams a turn reads from it.
@@ -550,7 +508,7 @@ pub(crate) struct StreamPump {
 }
 
 impl StreamPump {
-    /// A fresh pump over the harness's `decoder` (see [`crate::harness::Harness::decoder`]).
+    /// A fresh pump over the harness's `decoder` (see [`crate::manifest::Harness::decoder`]).
     pub(crate) fn new(decoder: StreamDecoder) -> Self {
         Self {
             decoder,

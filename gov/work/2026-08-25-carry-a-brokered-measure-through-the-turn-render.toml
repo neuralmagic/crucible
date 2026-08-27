@@ -1,0 +1,28 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-08-25-006"
+title = "Carry a brokered measure through the turn render"
+status = "queue"
+created = "2026-08-25"
+refs = [
+    "RFC-0004:C-LINKED-RENDER",
+]
+
+[content]
+description = "The controller has been appending a brokered-measure flag to the turn render for any scenario carrying a codegen contract, and no engine has ever accepted that flag, so those scope turns have been failing at argument parsing with nothing on the ledger to say why. Linking made it visible: the turn options have no such field, so the controller now refuses the launch with a typed error instead of rendering a command the engine will reject. The engine side is the missing field, after which the controller maps the contract onto it and the refusal goes away."
+
+[[content.acceptance_criteria]]
+text = "the turn options carry the brokered-measure choice, the scope wrapper the render emits asks for a brokered measure only when it is set, and a turn without it renders exactly as it does today"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "a rendered fixture covers both shapes, and the command line and the library produce the same bytes for each"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "after the controller pin moves, a scenario adopted with a codegen contract reaches a scope pod rather than a dispatch refusal, and the controller's typed refusal for this option is removed"
+status = "pending"
+category = "chore"

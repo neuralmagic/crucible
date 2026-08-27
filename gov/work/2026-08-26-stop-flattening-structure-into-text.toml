@@ -1,0 +1,34 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-08-26-001"
+title = "Stop flattening structure into text, then re-deriving it"
+status = "queue"
+created = "2026-08-26"
+refs = [
+    "RFC-0004:C-TYPED-INVOCATION",
+    "RFC-0004:C-LINKED-RENDER",
+]
+
+[content]
+description = "One pattern keeps producing the same class of bug: a producer holds a structured value, renders it into a string (often with a marker prefix), and a consumer matches text to get it back. Each instance is small; together they are why a cost read as zero, a failing task read as a pass, a broken stream read as a clean exit, and a sandbox's own log reached nobody. The controller audit of 2026-08-25 counted 21 such sites on its side; four more were found in the engine on 2026-08-26 while fixing the ones that had already caused outages. This is the sweep for the rest, engine-side. Known shapes: an `AgentEvent::Raw` carrying a `[prefix] message` where a typed variant belongs; an error whose only structure is its `Display`; a status or kind matched by substring; a value serialized for a consumer that must then re-parse it. Not in scope: human-facing prose (PR titles, console lines), where a rendered string is the product."
+
+[[content.acceptance_criteria]]
+text = "the engine's emitters of `AgentEvent::Raw` are inventoried, and each one either carries a typed variant or is recorded as genuinely unclassifiable output (the variant's stated purpose)"
+status = "pending"
+category = "changed"
+
+[[content.acceptance_criteria]]
+text = "no engine code recovers a value from a string its own process rendered; where a producer already computed a fact (a denial verdict, a status, an exit reason), the fact travels rather than the text"
+status = "pending"
+category = "changed"
+
+[[content.acceptance_criteria]]
+text = "an error that crosses a module boundary carries its discriminant as data, not only inside its `Display`, so a caller classifies it by matching rather than by substring"
+status = "pending"
+category = "changed"
+
+[[content.acceptance_criteria]]
+text = "each wire-visible change is either shape-preserving or lands with a CONTRACT_VERSION bump, and a golden test pins the emitted bytes either way"
+status = "pending"
+category = "chore"

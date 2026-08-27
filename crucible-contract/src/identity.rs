@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bump when the digest's input list changes shape, so an old digest can never silently collide
 /// with a new one over a different set of inputs. v2 added `seed_hash`.
-const FORMAT_VERSION: &str = "v2";
+pub const FORMAT_VERSION: &str = "v2";
 
 /// One component's contribution to the identity: where its source came from and the pristine
 /// commit the workspace started from. A single-domain run has exactly one (unnamed) entry; a

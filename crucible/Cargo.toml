@@ -5,9 +5,20 @@ version.workspace = true
 license.workspace = true
 edition.workspace = true
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "crucible"
 path = "src/main.rs"
+required-features = ["publish"]
+
+[features]
+default = ["publish"]
+# S3 run publishing, and with it the AWS SDK. The library surface a controller links (renders,
+# manifests, plans, flow) needs none of it, and the SDK carries its own hyper/rustls generation,
+# so a linked consumer turns this off.
+publish = ["dep:aws-config", "dep:aws-sdk-s3"]
 
 [dependencies]
 anyhow.workspace = true
@@ -41,8 +52,8 @@ nix = { version = "0.31.3", features = ["fs", "signal"] }
 # Publish-on-keep: S3 run records via IRSA web-identity (creds auto-discovered from
 # AWS_ROLE_ARN + the projected token). The loop is sync, so `publish` owns a small
 # block_on runtime; the rest of the loop never touches tokio.
-aws-config = "1"
-aws-sdk-s3 = "1"
+aws-config = { version = "1", optional = true }
+aws-sdk-s3 = { version = "1", optional = true }
 # `sync` (Notify) backs the autopilot daemon's graceful-shutdown signal. `process` runs the
 # surviving openshell CLI upload/download as cancellable async children inside the turn.
 tokio = { version = "1", features = [
@@ -86,6 +97,7 @@ serde_norway = "0.9"
 # share the vendored sqlite (no system-lib probe). Verify with `cargo tree -i libsqlite3-sys`.
 rusqlite = { version = "0.32", features = ["bundled"] }
 forge = { path = "../forge" }
+crucible-broker = { path = "../crucible-broker" }
 # The shared turn-result wire contract: the AgentEvent NDJSON types, the marker literals, the
 # managed-by label, and the kubelet-captured envelope, one source, no cross-crate drift.
 crucible-contract = { path = "../crucible-contract" }

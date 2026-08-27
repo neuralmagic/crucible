@@ -48,6 +48,9 @@ pub struct DistressArgs {
     evidence: Vec<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReportArgs {}
+
 /// Args for `check_capture`: poll an opened approval by its handle (the PR url).
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CheckCaptureArgs {
@@ -367,6 +370,17 @@ impl McpServer {
             Ok(Ok(reply)) => reply,
             Ok(Err(e)) => json_err(&e),
             Err(e) => json_err(&format!("distress task failed: {e}")),
+        }
+    }
+
+    #[tool(
+        description = "Post the engine-authored workflow status to the configured Crucible Slack channel. Call once from a final reporting or epilogue task. This tool takes no message content: task names, statuses, spend, and the Crucible artifact link come from trusted engine state. It does not suspend the run; use distress when operator action is required."
+    )]
+    async fn report(&self, Parameters(_args): Parameters<ReportArgs>) -> String {
+        match crate::telemetry::spawn_blocking(|| crate::report::deliver(None)).await {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(e)) => json_err(&e),
+            Err(e) => json_err(&format!("report task failed: {e}")),
         }
     }
 
@@ -1182,6 +1196,30 @@ mod tests {
             !required.contains(&"evidence".to_string()),
             "evidence is optional: {schema}"
         );
+    }
+
+    #[test]
+    fn report_is_zero_argument_and_explains_when_to_use_it() {
+        use crate::broker::NullResolver;
+        let server = McpServer::new(
+            Box::new(NullResolver),
+            frozen(),
+            false,
+            None,
+            Arc::new(DeployRegistry::new()),
+            Arc::new(CodegenState::new()),
+        );
+        let tool = server.get_tool("report").expect("report must be listed");
+        let schema = serde_json::to_value(&tool.input_schema).unwrap();
+        assert!(
+            schema["properties"]
+                .as_object()
+                .is_none_or(|p| p.is_empty()),
+            "{schema}"
+        );
+        let desc = tool.description.clone().unwrap_or_default();
+        assert!(desc.contains("final reporting or epilogue task"), "{desc}");
+        assert!(desc.contains("use distress"), "{desc}");
     }
 
     /// Regression guard for the stateless-mode bug: the http service builds a FRESH `McpServer` per

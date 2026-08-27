@@ -3,11 +3,13 @@ use crate::deploy::render::kube::{
     FORGE_STORAGE_ROOT, INGEST_TOKEN_DIR, INGEST_TOKEN_TTL_SECS, INGEST_TOKEN_VOLUME,
     PULL_AUTHFILE_PATH, kubernetes_sandbox_env, node_avoid_affinity, resources, secret_env_vars,
 };
+use crate::deploy::render::{DigestResolver, pin_image};
 use crate::openshell::gateway::ComputeDriver;
 use anyhow::{Context, Result};
 use k8s_openapi::api::core::v1 as core;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 #[derive(Debug, thiserror::Error)]
 #[error("unknown --turn-kind `{got}` (expected `rank` or `scope`)")]
@@ -15,9 +17,36 @@ pub struct UnknownTurnKind {
     got: String,
 }
 
-/// What kind of one-shot turn a rendered turn pod runs. End-to-end strong type: the CLI parses it,
-/// the renderer switches the wrapper command + label on it, and `WorkPodSpec::render_argv` round-trips
-/// it back to the CLI flag the subprocess sees.
+/// Where the init container clones the repo and where the turn container reads it.
+const CHECKOUT_DIR: &str = "/checkout";
+/// The `emptyDir` both containers share, carrying the checkout between them.
+const CHECKOUT_VOLUME: &str = "checkout";
+/// Where a propose turn drafts its pack.
+const SCOPE_OUT_DIR: &str = "/tmp/crucible-scope-out";
+
+fn strs<'a>(args: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    args.into_iter().map(str::to_string).collect()
+}
+
+/// `--harness <h>` as argv. The value is clap's own `ValueEnum` name, so the string the pod passes
+/// is by construction the one the in-pod CLI parses back.
+fn harness_arg(harness: Option<crate::manifest::Harness>) -> Vec<String> {
+    use clap::ValueEnum as _;
+    harness
+        .and_then(|h| h.to_possible_value())
+        .map(|v| strs(["--harness", v.get_name()]))
+        .unwrap_or_default()
+}
+
+/// `--model <m>` as argv.
+fn model_arg(model: Option<&String>) -> Vec<String> {
+    model
+        .map(|m| vec!["--model".to_string(), m.clone()])
+        .unwrap_or_default()
+}
+
+/// What kind of one-shot turn a rendered turn pod runs. End-to-end strong type: the CLI parses it
+/// and the renderer switches the turn container's argv + the work-kind label on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnKind {
     /// A code-grounded triage-ranking turn (`crucible rank-grounded`).
@@ -48,56 +77,187 @@ impl TurnKind {
     }
 }
 
+/// The confirmed tier a propose turn drafts against: threaded from the controller's ranker verdict
+/// (`--tier t0|t1`) into the prompt's `{{TIER}}` slot, so the agent follows the right section of
+/// `scope-propose.md` instead of guessing.
+/// `T0` is the engine default when the flag is absent, every call site predating this flag never set
+/// it, and a bare `crucible scope --propose` (no controller in front of it) should keep behaving exactly
+/// as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum ProposeTier {
+    #[default]
+    #[value(name = "t0")]
+    T0,
+    #[value(name = "t1")]
+    T1,
+}
+
+impl ProposeTier {
+    /// The `{{TIER}}` spelling the prompt substitutes, matches the ranker/DB vocabulary
+    /// (`Tier::as_str` in the controller crate) so a human reading the rendered prompt recognizes
+    /// it as the same tier the ledger shows.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProposeTier::T0 => "T0",
+            ProposeTier::T1 => "T1",
+        }
+    }
+
+    /// The `--tier` CLI spelling (the clap `#[value(name)]`s above), what the turn pod
+    /// passes as `crucible scope --propose --tier …`.
+    pub fn cli_value(self) -> &'static str {
+        match self {
+            ProposeTier::T0 => "t0",
+            ProposeTier::T1 => "t1",
+        }
+    }
+}
+
 /// Options for [`render_turn`]: a single one-shot agent-turn pod (WorkPod
-/// primitive). Unlike the loop pod it runs no manifest, the wrapper clones `repo_url`, then runs
-/// the kind-specific command over that checkout and prints the marker its logs are scraped for.
+/// primitive). Unlike the loop pod it runs no manifest: an init container clones `repo_url`, then
+/// the turn container runs the kind-specific command over that checkout and prints the marker its
+/// logs are scraped for.
+/// [`TurnOpts::new`] takes the fields every turn needs; the rest default to "no flag".
+#[derive(Clone)]
 pub struct TurnOpts {
-    /// What the turn pod does (rank vs scope), governing the wrapper command + the work-kind label.
+    /// What the turn pod does (rank vs scope), governing the turn container's argv + the work-kind label.
     pub kind: TurnKind,
     /// The pod's k8s object name (the controller supplies it so its `work_pods` row + ownerRef
     /// stamping key on a name it chose).
     pub name: String,
     /// The issue to rank/scope, `owner/repo#N`. Ignored by a scope turn when `goal_text` is set.
     pub issue: String,
-    /// A non-upstream scenario's ledgered free-text goal (no GitHub item to fetch): rendered into
-    /// the scope wrapper as a base64-decoded `goal.md` + `--goal-file`, instead of `--issue`. `None`
-    /// (and every rank turn, which is always upstream) keeps the `--issue` spelling.
+    /// A non-upstream scenario's ledgered free-text goal (no GitHub item to fetch): handed to the
+    /// scope turn as one `--goal <text>` argv element instead of `--issue`. `None` (and every rank
+    /// turn, which is always upstream) keeps the `--issue` spelling.
     pub goal_text: Option<String>,
-    /// The clone URL of the repo under test (the wrapper clones it fresh into the pod).
+    /// The clone URL of the repo under test (the init container clones it fresh into the pod).
     pub repo_url: String,
+    /// Branch, tag, or commit the init containers check out. `None` is the repo's default branch.
+    pub repo_ref: Option<String>,
     /// The agent sandbox image carrying the claude CLI the loop/crucible image does not (the
     /// `openshell` backend pulls it via `REGISTRY_AUTH_FILE` pointing at the mounted authfile).
     pub sandbox_image: String,
     /// Cap on the turn's cost in USD.
     pub max_cost: f64,
-    /// Resolve image tags to `@sha256:…` at render time (off for an air-gapped render).
-    pub pin_digests: bool,
-    /// The issue's confirmed tier (The confirmed tier), rendered into the scope wrapper's
+    /// Resolve image tags to `@sha256:…` through this resolver; `None` for an air-gapped render.
+    pub digests: Option<Arc<dyn DigestResolver>>,
+    /// The issue's confirmed tier (The confirmed tier), passed to the scope turn as
     /// `crucible scope --propose --tier …`. `None` (or a rank turn) emits no flag, the engine
     /// defaults to t0.
-    pub tier: Option<crate::scope::ProposeTier>,
-    /// Max gaming-review concern→refine→re-review cycles, rendered into the scope wrapper's
+    pub tier: Option<ProposeTier>,
+    /// Max gaming-review concern→refine→re-review cycles, passed to the scope turn as
     /// `crucible scope --propose --gaming-refine-rounds …`. Ignored by a rank turn.
     pub gaming_refine_rounds: u32,
-    /// Skip the adversarial gaming review entirely, rendered into the scope wrapper as
+    /// Skip the adversarial gaming review entirely, passed to the scope turn as
     /// `crucible scope --propose --skip-gaming-review` instead of `--gaming-refine-rounds`, an
     /// operator escape hatch for demo/bring-up postures where the review's fail-closed loop blocks
     /// the first e2e run through a new deployment. Ignored by a rank turn.
     pub skip_gaming_review: bool,
-    /// The goal is an authoritative brief, rendered into the scope wrapper as
+    /// The goal is an authoritative brief, passed to the scope turn as
     /// `crucible scope --propose --authoritative`. Ignored by a rank turn.
     pub authoritative: bool,
-    /// The agent harness the in-pod turn runs, rendered as `--harness <h>` into both wrapper
-    /// commands. `None` emits no flag, the in-pod engine keeps its manifest/default harness.
-    pub harness: Option<crate::harness::Harness>,
-    /// The model the in-pod turn runs, rendered as `--model <m>` into both wrapper commands.
+    /// The agent harness the in-pod turn runs, passed as `--harness <h>` to both turn kinds. `None` emits no flag, the in-pod engine keeps its manifest/default harness.
+    pub harness: Option<crate::manifest::Harness>,
+    /// The model the in-pod turn runs, passed as `--model <m>` to both turn kinds.
     /// `None` emits no flag, the in-pod engine derives the model from the resolved harness.
     pub model: Option<String>,
+    /// A pack the checkout already carries, relative to its root. Set, a scope turn validates and
+    /// freezes that pack (`crucible scope --pack`) instead of drafting one, which spends no agent
+    /// turn and needs no sandbox. Ignored by a rank turn.
+    pub pack_path: Option<PackPath>,
+}
+
+/// A pack directory inside the cloned checkout, validated on construction: relative, no traversal,
+/// and no character outside `[A-Za-z0-9._/-]`. It reaches the pod as one argv element, so nothing
+/// here is escaping a shell; the point is that the path stays inside the checkout and stays a path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackPath(String);
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum PackPathError {
+    #[error("pack path must be non-empty")]
+    Empty,
+    #[error("pack path must be relative to the checkout, got {got:?}")]
+    Absolute { got: String },
+    #[error("pack path must not contain '..', got {got:?}")]
+    Traversal { got: String },
+    #[error(
+        "pack path may only contain ASCII letters, digits, '.', '_', '-', and '/', got {got:?}"
+    )]
+    Charset { got: String },
+}
+
+impl PackPath {
+    pub fn parse(raw: &str) -> Result<Self, PackPathError> {
+        let path = raw.trim().trim_end_matches('/');
+        if path.is_empty() {
+            return Err(PackPathError::Empty);
+        }
+        if path.starts_with('/') {
+            return Err(PackPathError::Absolute {
+                got: raw.to_owned(),
+            });
+        }
+        if path.split('/').any(|segment| segment == "..") {
+            return Err(PackPathError::Traversal {
+                got: raw.to_owned(),
+            });
+        }
+        if !path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+        {
+            return Err(PackPathError::Charset {
+                got: raw.to_owned(),
+            });
+        }
+        Ok(PackPath(path.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for PackPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl TurnOpts {
+    pub fn new(
+        kind: TurnKind,
+        name: impl Into<String>,
+        issue: impl Into<String>,
+        repo_url: impl Into<String>,
+        sandbox_image: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind,
+            name: name.into(),
+            issue: issue.into(),
+            goal_text: None,
+            repo_url: repo_url.into(),
+            repo_ref: None,
+            sandbox_image: sandbox_image.into(),
+            max_cost: 0.0,
+            digests: None,
+            tier: None,
+            gaming_refine_rounds: 0,
+            skip_gaming_review: false,
+            authoritative: false,
+            harness: None,
+            model: None,
+            pack_path: None,
+        }
+    }
 }
 
 /// Render an optional `--harness <h>` wrapper flag. The value is clap's own `ValueEnum` name, so
 /// the string the wrapper emits is by construction the one the in-pod CLI parses back.
-pub(super) fn harness_flag(harness: Option<crate::harness::Harness>, sep: char) -> String {
+pub(super) fn harness_flag(harness: Option<crate::manifest::Harness>, sep: char) -> String {
     use clap::ValueEnum as _;
     harness
         .and_then(|h| h.to_possible_value())
@@ -119,27 +279,49 @@ pub const GROUNDED_RANK_WORK_KIND: &str = "grounded-rank";
 /// The `crucible.io/work-kind` label value a scope turn pod carries.
 pub const SCOPE_WORK_KIND: &str = "scope";
 
-/// Render one grounded-rank turn `Pod` (WorkPod primitive). The same
-/// security/auth scaffolding as the loop pod, privileged only under the podman driver
+/// Render one turn `Pod` (WorkPod primitive): the library form of `crucible deploy render-turn`,
+/// which reads `--goal-file` into [`TurnOpts::goal_text`]. Image pinning happens through
+/// [`TurnOpts::digests`] or not at all.
+///
+/// The same security/auth scaffolding as the loop pod, privileged only under the podman driver
 /// ([`crate::deploy::render::kube::agent_security_context`]), the pull secret, the run-as service
 /// account, the istio-inject-off annotation, `restartPolicy: Never`, and the `REGISTRY_AUTH_FILE`
 /// env, but no broker/deploy env, no kube RBAC mounts, and no NetworkPolicy: the turn only clones
 /// a repo and runs one read-only ranking turn. `automountServiceAccountToken` follows the sandbox
 /// driver: `false` under podman (no API calls), `true` under kubernetes (the in-pod gateway needs
 /// the token to reach the API server for Sandbox CRs).
+#[derive(Debug, thiserror::Error)]
+#[error("--repo-ref {got:?} is not a plain branch or tag name")]
+pub struct BadRepoRef {
+    got: String,
+}
+
+/// A ref narrowed to git's own ref grammar, and never a leading `-`, so `git clone --branch <ref>`
+/// cannot read it as another flag. The value is one argv element, so this is about what git will
+/// accept, not about what a shell would do to it.
+fn checked_git_ref(r: &str) -> Result<&str, BadRepoRef> {
+    let ok = !r.is_empty()
+        && !r.starts_with('-')
+        && r.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-' | '@' | '+'));
+    if !ok {
+        return Err(BadRepoRef { got: r.to_string() });
+    }
+    Ok(r)
+}
+
+#[tracing::instrument(skip_all, fields(turn_kind = ?opts.kind, issue = %opts.issue, pinned = opts.digests.is_some()), err)]
 pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
-    let image = if opts.pin_digests {
-        forge::oci::pin_digest(&profile.image.loop_image, None)
-            .with_context(|| format!("pinning loop image {}", profile.image.loop_image))?
-    } else {
-        profile.image.loop_image.clone()
-    };
-    let sandbox_image = if opts.pin_digests {
-        forge::oci::pin_digest(&opts.sandbox_image, None)
-            .with_context(|| format!("pinning turn sandbox image {}", opts.sandbox_image))?
-    } else {
-        opts.sandbox_image.clone()
-    };
+    let image = pin_image(
+        opts.digests.as_deref(),
+        "loop image",
+        &profile.image.loop_image,
+    )?;
+    let sandbox_image = pin_image(
+        opts.digests.as_deref(),
+        "turn sandbox image",
+        &opts.sandbox_image,
+    )?;
 
     let mut env = secret_env_vars(profile);
     let plain = |name: &str, value: String| core::EnvVar {
@@ -209,6 +391,7 @@ pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
         issue,
         goal_text,
         repo_url,
+        repo_ref,
         max_cost,
         tier,
         gaming_refine_rounds,
@@ -216,80 +399,94 @@ pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
         authoritative,
         harness,
         model,
+        pack_path,
         ..
     } = opts;
-    let harness_flag = harness_flag(*harness, ' ');
-    let model_flag = model_flag(model.as_ref(), ' ');
     // Same flag the loop wrapper passes (`Renderer::wrapper_script`): without it the turn's
     // subcommand synthesizes a fresh `Args` (`Cli::parse_from(["crucible"])`) that always defaults
     // to the podman compute driver, so the gateway resolves `sandbox_image` through the nested
     // podman/authfile path instead of the kubelet's `imagePullSecrets` and never creates a Sandbox.
-    let compute_driver_flag = match profile.cluster.sandbox_driver {
-        ComputeDriver::Kubernetes => " --compute-driver=kubernetes",
-        ComputeDriver::Podman => "",
+    let sandboxed = match profile.cluster.sandbox_driver {
+        ComputeDriver::Kubernetes => vec!["--compute-driver=kubernetes".to_string()],
+        ComputeDriver::Podman => Vec::new(),
     };
-    let wrapper = match kind {
-        TurnKind::Rank => format!(
-            r#"set -e
-CHECKOUT=/tmp/crucible-turn-checkout
-rm -rf "$CHECKOUT"
-git clone --depth 50 {repo_url} "$CHECKOUT"
-crucible rank-grounded --issue {issue} --workspace "$CHECKOUT" --max-cost {max_cost}{harness_flag}{model_flag} \
-  --json --marker --agent-backend openshell --sandbox-image {sandbox_image}{compute_driver_flag}
-"#
-        ),
+    let argv: Vec<String> = match kind {
+        TurnKind::Rank => {
+            let mut a = strs([
+                "rank-grounded",
+                "--issue",
+                issue,
+                "--workspace",
+                CHECKOUT_DIR,
+                "--max-cost",
+                &max_cost.to_string(),
+                "--json",
+                "--marker",
+                "--agent-backend",
+                "openshell",
+                "--sandbox-image",
+                sandbox_image.as_str(),
+            ]);
+            a.extend(harness_arg(*harness));
+            a.extend(model_arg(model.as_ref()));
+            a.extend(sandboxed);
+            a
+        }
+        // A pack the repo already carries needs validating and freezing, not drafting: no agent,
+        // no sandbox, no goal, and none of the propose turn's tier/gaming/authoritative knobs,
+        // which all describe how a pack gets written.
+        TurnKind::Scope if pack_path.is_some() => {
+            let pack = pack_path.as_ref().map(PackPath::as_str).unwrap_or_default();
+            strs([
+                "scope",
+                "--pack",
+                &format!("{CHECKOUT_DIR}/{pack}"),
+                "--json",
+                "--force",
+                "--marker",
+            ])
+        }
         TurnKind::Scope => {
-            let tier_flag = tier
-                .map(|t| format!(" --tier {}", t.cli_value()))
-                .unwrap_or_default();
-            let gaming_flag = if *skip_gaming_review {
-                " --skip-gaming-review".to_string()
-            } else {
-                format!(" --gaming-refine-rounds {gaming_refine_rounds}")
-            };
-            let authoritative_flag = if *authoritative {
-                " --authoritative"
-            } else {
-                ""
-            };
+            let mut a = strs(["scope", "--propose", "--json", "--force", "--marker"]);
             // A non-upstream scenario has no GitHub item to fetch: its goal is the free text
-            // ledgered at adoption. Base64-decode it into a file inside the pod and pass
-            // `--goal-file` (which `--issue` conflicts with at the CLI), the same local-file
-            // `Ingest` arm the non-pod executor uses (`engine::scope_propose`), just with the write
-            // happening in-pod since the goal text can't ride a local path into a remote pod.
-            let goal_source = match goal_text {
-                Some(text) => {
-                    use base64::Engine as _;
-                    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
-                    format!(
-                        "GOAL_FILE=/tmp/crucible-scope-goal.md\n\
-                         echo {encoded} | base64 -d > \"$GOAL_FILE\"\n"
-                    )
-                }
-                None => String::new(),
-            };
-            let goal_flag = if goal_text.is_some() {
-                "--goal-file \"$GOAL_FILE\""
+            // ledgered at adoption, handed over as one argv element (`--goal`), the same
+            // local-text `Ingest` arm the non-pod executor uses (`engine::scope_propose`).
+            match goal_text {
+                Some(text) => a.extend(strs(["--goal", text])),
+                None => a.extend(strs(["--issue", issue])),
+            }
+            a.extend(strs([
+                "--repo",
+                CHECKOUT_DIR,
+                "--out",
+                SCOPE_OUT_DIR,
+                "--max-cost",
+                &max_cost.to_string(),
+            ]));
+            if let Some(t) = tier {
+                a.extend(strs(["--tier", t.cli_value()]));
+            }
+            if *skip_gaming_review {
+                a.push("--skip-gaming-review".to_string());
             } else {
-                "--issue"
-            };
-            let goal_arg = if goal_text.is_some() {
-                String::new()
-            } else {
-                format!(" {issue}")
-            };
-            format!(
-                r#"set -e
-CHECKOUT=/tmp/crucible-turn-checkout
-rm -rf "$CHECKOUT"
-git clone --depth 50 {repo_url} "$CHECKOUT"
-SCOPE_OUT=/tmp/crucible-scope-out
-rm -rf "$SCOPE_OUT"
-{goal_source}crucible scope --propose --json --force --marker {goal_flag}{goal_arg} \
-  --repo "$CHECKOUT" --out "$SCOPE_OUT" --max-cost {max_cost}{tier_flag}{gaming_flag}{authoritative_flag}{harness_flag}{model_flag} \
-  --agent-backend openshell --sandbox-image {sandbox_image}{compute_driver_flag}
-"#
-            )
+                a.extend(strs([
+                    "--gaming-refine-rounds",
+                    &gaming_refine_rounds.to_string(),
+                ]));
+            }
+            if *authoritative {
+                a.push("--authoritative".to_string());
+            }
+            a.extend(harness_arg(*harness));
+            a.extend(model_arg(model.as_ref()));
+            a.extend(strs([
+                "--agent-backend",
+                "openshell",
+                "--sandbox-image",
+                sandbox_image.as_str(),
+            ]));
+            a.extend(sandboxed);
+            a
         }
     };
 
@@ -351,12 +548,68 @@ rm -rf "$SCOPE_OUT"
         });
     }
 
+    mounts.push(core::VolumeMount {
+        name: CHECKOUT_VOLUME.to_string(),
+        mount_path: CHECKOUT_DIR.to_string(),
+        ..Default::default()
+    });
+    volumes.push(core::Volume {
+        name: CHECKOUT_VOLUME.to_string(),
+        empty_dir: Some(core::EmptyDirVolumeSource::default()),
+        ..Default::default()
+    });
+
+    // The clone is its own step, so neither it nor the turn needs a shell to sequence them: an
+    // init container that fails keeps the turn container from starting at all, which is what
+    // `set -e` was standing in for.
+    //
+    // Unpinned, a shallow clone of the default branch is all a turn needs. Pinned, the ref is
+    // checked out rather than cloned by name, because `--branch` takes a branch or a tag and not a
+    // commit: a blobless clone carries every commit at a fraction of the bytes, and the checkout
+    // fetches only the blobs it needs. One path serves branches, tags, and commits alike.
+    let checkout_step = repo_ref.as_deref().map(checked_git_ref).transpose()?;
+    let clone_args = match checkout_step {
+        Some(_) => {
+            let mut a = strs(["clone", "--filter=blob:none", "--no-checkout"]);
+            a.push(repo_url.clone());
+            a.push(CHECKOUT_DIR.to_string());
+            a
+        }
+        None => {
+            let mut a = strs(["clone", "--depth", "50"]);
+            a.push(repo_url.clone());
+            a.push(CHECKOUT_DIR.to_string());
+            a
+        }
+    };
+    let git_container = |name: &str, args: Vec<String>| core::Container {
+        name: name.to_string(),
+        image: Some(image.clone()),
+        image_pull_policy: Some("IfNotPresent".to_string()),
+        command: Some(vec!["git".to_string()]),
+        args: Some(args),
+        volume_mounts: Some(vec![core::VolumeMount {
+            name: CHECKOUT_VOLUME.to_string(),
+            mount_path: CHECKOUT_DIR.to_string(),
+            ..Default::default()
+        }]),
+        resources: Some(resources(profile)),
+        ..Default::default()
+    };
+    let mut init = vec![git_container("clone", clone_args)];
+    if let Some(r) = checkout_step {
+        init.push(git_container(
+            "checkout",
+            strs(["-C", CHECKOUT_DIR, "checkout", "--detach", r]),
+        ));
+    }
+
     let container = core::Container {
         name: "turn".to_string(),
         image: Some(image),
         image_pull_policy: Some("IfNotPresent".to_string()),
-        command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
-        args: Some(vec![wrapper]),
+        command: Some(vec!["crucible".to_string()]),
+        args: Some(argv),
         security_context: crate::deploy::render::kube::agent_security_context(
             profile.cluster.sandbox_driver,
         ),
@@ -399,6 +652,7 @@ rm -rf "$SCOPE_OUT"
             ),
             restart_policy: Some("Never".to_string()),
             affinity: node_avoid_affinity(profile),
+            init_containers: Some(init),
             containers: vec![container],
             volumes: Some(volumes),
             ..Default::default()
@@ -412,6 +666,57 @@ rm -rf "$SCOPE_OUT"
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pod_of(yaml: &str) -> core::Pod {
+        serde_norway::from_str(yaml).expect("the render is a Pod")
+    }
+
+    /// The turn container's command and argv as one string. Nothing is shell-quoted here: this is
+    /// exec-form argv, joined only so an assertion can read like the command it stands for.
+    fn turn_cmd(yaml: &str) -> String {
+        let pod = pod_of(yaml);
+        let c = pod
+            .spec
+            .expect("spec")
+            .containers
+            .into_iter()
+            .find(|c| c.name == "turn")
+            .expect("turn container");
+        let mut parts = c.command.unwrap_or_default();
+        parts.extend(c.args.unwrap_or_default());
+        parts.join(" ")
+    }
+
+    /// The checkout init container's command and argv, when the ref is pinned.
+    fn checkout_cmd(yaml: &str) -> Option<String> {
+        let pod = pod_of(yaml);
+        let c = pod
+            .spec
+            .expect("spec")
+            .init_containers
+            .unwrap_or_default()
+            .into_iter()
+            .find(|c| c.name == "checkout")?;
+        let mut parts = c.command.unwrap_or_default();
+        parts.extend(c.args.unwrap_or_default());
+        Some(parts.join(" "))
+    }
+
+    /// The clone init container's command and argv, same shape.
+    fn clone_cmd(yaml: &str) -> String {
+        let pod = pod_of(yaml);
+        let c = pod
+            .spec
+            .expect("spec")
+            .init_containers
+            .unwrap_or_default()
+            .into_iter()
+            .find(|c| c.name == "clone")
+            .expect("clone init container");
+        let mut parts = c.command.unwrap_or_default();
+        parts.extend(c.args.unwrap_or_default());
+        parts.join(" ")
+    }
 
     /// A grounded-rank turn pod renders the reduced agent-turn shape: same security/auth scaffolding
     /// as the loop pod (privileged under the default podman driver, pull secret, run-as SA with token automount off, istio off,
@@ -449,15 +754,17 @@ mod tests {
                 issue: "owner/repo#42".to_string(),
                 goal_text: None,
                 repo_url: "https://github.com/owner/repo.git".to_string(),
+                repo_ref: None,
                 sandbox_image: "registry.example.com/epp-sandbox:latest".to_string(),
                 max_cost: 5.0,
-                pin_digests: false,
+                digests: None,
                 tier: None,
                 gaming_refine_rounds: 1,
                 skip_gaming_review: false,
                 authoritative: false,
                 harness: None,
                 model: None,
+                pack_path: None,
             },
         )
         .expect("render turn");
@@ -479,16 +786,24 @@ mod tests {
         assert!(yaml.contains("crucible.io/work-kind: grounded-rank"));
         assert!(yaml.contains("app.kubernetes.io/managed-by: crucible"));
         // The one-shot command: clone then rank-grounded with the marker + openshell backend.
-        assert!(yaml.contains("git clone"));
-        assert!(yaml.contains("rank-grounded --issue owner/repo#42"));
-        assert!(yaml.contains("--marker"));
-        assert!(yaml.contains("--agent-backend openshell"));
-        assert!(!yaml.contains("--tier"), "a rank turn carries no --tier");
-        assert!(yaml.contains("--sandbox-image registry.example.com/epp-sandbox:latest"));
+        assert!(clone_cmd(&yaml).starts_with("git clone"));
+        assert!(turn_cmd(&yaml).contains("rank-grounded --issue owner/repo#42"));
+        assert!(turn_cmd(&yaml).contains("--marker"));
+        assert!(turn_cmd(&yaml).contains("--agent-backend openshell"));
+        assert!(
+            !turn_cmd(&yaml).contains("--tier"),
+            "a rank turn carries no --tier"
+        );
+        assert!(
+            turn_cmd(&yaml).contains("--sandbox-image registry.example.com/epp-sandbox:latest")
+        );
         assert!(yaml.contains("name: REGISTRY_AUTH_FILE"));
         assert!(!yaml.contains("podman login"));
         // Default `sandbox_driver` (podman): no `--compute-driver` flag, no kubernetes driver env.
-        assert!(!yaml.contains("--compute-driver"), "podman needs no flag");
+        assert!(
+            !turn_cmd(&yaml).contains("--compute-driver"),
+            "podman needs no flag"
+        );
         assert!(
             !yaml.contains("CRUCIBLE_SANDBOX_"),
             "podman driver env leak"
@@ -545,26 +860,28 @@ mod tests {
                 issue: "owner/repo#42".to_string(),
                 goal_text: None,
                 repo_url: "https://github.com/owner/repo.git".to_string(),
+                repo_ref: None,
                 sandbox_image: "registry.example.com/epp-sandbox:latest".to_string(),
                 max_cost: 5.0,
-                pin_digests: false,
+                digests: None,
                 tier: None,
                 gaming_refine_rounds: 1,
                 skip_gaming_review: false,
                 authoritative: false,
                 harness: None,
                 model: None,
+                pack_path: None,
             },
         )
         .expect("render turn");
 
-        // The wrapper passes the driver through explicitly.
+        // The turn passes the driver through explicitly.
         assert!(
-            yaml.contains("rank-grounded --issue owner/repo#42"),
+            turn_cmd(&yaml).contains("rank-grounded --issue owner/repo#42"),
             "{yaml}"
         );
         assert!(
-            yaml.contains("--compute-driver=kubernetes"),
+            turn_cmd(&yaml).contains("--compute-driver=kubernetes"),
             "the compute driver must reach the turn's subcommand: {yaml}"
         );
         // The gateway needs the API server to reach Sandbox CRs, no mounted kubeconfig like the
@@ -624,15 +941,17 @@ mod tests {
                 issue: "owner/repo#42".to_string(),
                 goal_text: None,
                 repo_url: "https://github.com/owner/repo.git".to_string(),
+                repo_ref: None,
                 sandbox_image: "registry.example.com/epp-sandbox:latest".to_string(),
                 max_cost: 5.0,
-                pin_digests: false,
+                digests: None,
                 tier: None,
                 gaming_refine_rounds: 1,
                 skip_gaming_review: false,
                 authoritative: false,
                 harness: None,
                 model: None,
+                pack_path: None,
             },
         )
         .expect("render turn");
@@ -655,10 +974,10 @@ mod tests {
         assert!(yaml.contains("automountServiceAccountToken: false"));
     }
 
-    /// A scope turn pod renders the same agent-turn shape as a rank turn, but with the scope wrapper
+    /// A scope turn pod renders the same agent-turn shape as a rank turn, but with the scope
     /// command (`crucible scope --propose --json --force --marker`) and the `scope` work-kind label.
     #[test]
-    fn scope_turn_pod_renders_the_scope_wrapper_and_label() {
+    fn scope_turn_pod_renders_the_scope_command_and_label() {
         let profile: DeployProfile = toml::from_str(
             r#"
             [cluster]
@@ -689,15 +1008,17 @@ mod tests {
                 issue: "owner/repo#42".to_string(),
                 goal_text: None,
                 repo_url: "https://github.com/owner/repo.git".to_string(),
+                repo_ref: None,
                 sandbox_image: "registry.example.com/epp-sandbox:latest".to_string(),
                 max_cost: 8.0,
-                pin_digests: false,
-                tier: Some(crate::scope::ProposeTier::T1),
+                digests: None,
+                tier: Some(ProposeTier::T1),
                 gaming_refine_rounds: 3,
                 skip_gaming_review: false,
                 authoritative: false,
                 harness: None,
                 model: None,
+                pack_path: None,
             },
         )
         .expect("render scope turn");
@@ -714,29 +1035,32 @@ mod tests {
         );
         assert!(!yaml.contains("crucible.io/work-kind: grounded-rank"));
         assert!(yaml.contains("app.kubernetes.io/managed-by: crucible"));
-        // The scope wrapper command: clone then scope --propose with the marker.
-        assert!(yaml.contains("git clone"));
+        // The scope command: clone in the init container, then scope --propose with the marker.
+        assert!(clone_cmd(&yaml).starts_with("git clone"));
         assert!(
-            yaml.contains("crucible scope --propose --json --force --marker --issue owner/repo#42"),
-            "scope command in wrapper"
+            turn_cmd(&yaml)
+                .contains("crucible scope --propose --json --force --marker --issue owner/repo#42"),
+            "the scope command"
         );
-        assert!(yaml.contains("--max-cost 8"));
-        assert!(yaml.contains("--repo \"$CHECKOUT\""));
-        assert!(yaml.contains("--out \"$SCOPE_OUT\""));
+        assert!(turn_cmd(&yaml).contains("--max-cost 8"));
+        assert!(turn_cmd(&yaml).contains("--repo /checkout"));
+        assert!(turn_cmd(&yaml).contains("--out /tmp/crucible-scope-out"));
         // The in-pod turn runs on the openshell backend, the loop image has no claude CLI.
-        assert!(yaml.contains("--agent-backend openshell"));
-        assert!(yaml.contains("--sandbox-image registry.example.com/epp-sandbox:latest"));
-        // The confirmed tier: the confirmed tier lands in the wrapper's scope invocation.
+        assert!(turn_cmd(&yaml).contains("--agent-backend openshell"));
         assert!(
-            yaml.contains("--max-cost 8 --tier t1"),
+            turn_cmd(&yaml).contains("--sandbox-image registry.example.com/epp-sandbox:latest")
+        );
+        // The confirmed tier lands in the scope invocation.
+        assert!(
+            turn_cmd(&yaml).contains("--max-cost 8 --tier t1"),
             "the confirmed tier is forwarded: {yaml}"
         );
         // The gaming-review refine bound rides the same invocation.
         assert!(
-            yaml.contains("--gaming-refine-rounds 3"),
+            turn_cmd(&yaml).contains("--gaming-refine-rounds 3"),
             "the gaming refine bound is forwarded: {yaml}"
         );
-        // No rank-grounded command in this wrapper.
+        // No rank-grounded command here.
         assert!(
             !yaml.contains("rank-grounded"),
             "scope turn must not run rank-grounded"
@@ -754,7 +1078,7 @@ mod tests {
     /// non-pod executor's local-file `Ingest` arm, so a non-upstream scenario never routes into the
     /// engine's GitHub fetch.
     #[test]
-    fn scope_turn_pod_with_goal_text_uses_goal_file_not_issue() {
+    fn scope_turn_pod_with_goal_text_passes_the_goal_not_the_issue() {
         let profile: DeployProfile = toml::from_str(
             r#"
             [cluster]
@@ -779,31 +1103,32 @@ mod tests {
                 issue: "scenario:deadbeef".to_string(),
                 goal_text: Some("fix the reticulator".to_string()),
                 repo_url: "https://github.com/owner/repo.git".to_string(),
+                repo_ref: None,
                 sandbox_image: "registry.example.com/epp-sandbox:latest".to_string(),
                 max_cost: 8.0,
-                pin_digests: false,
+                digests: None,
                 tier: None,
                 gaming_refine_rounds: 1,
                 skip_gaming_review: false,
                 authoritative: false,
                 harness: None,
                 model: None,
+                pack_path: None,
             },
         )
         .expect("render scope turn");
 
         assert!(
-            yaml.contains("--goal-file \"$GOAL_FILE\""),
-            "goal_text set: the scope wrapper uses --goal-file: {yaml}"
+            turn_cmd(&yaml).contains("--goal fix the reticulator"),
+            "goal_text set: the goal rides as one argv element: {yaml}"
         );
         assert!(
-            !yaml.contains("--issue scenario:deadbeef"),
+            !turn_cmd(&yaml).contains("--issue scenario:deadbeef"),
             "goal_text set: --issue never carries the synthetic scenario key: {yaml}"
         );
-        assert!(
-            yaml.contains("base64 -d"),
-            "the ledgered goal text is base64-decoded into the in-pod scratch file: {yaml}"
-        );
+        // The goal is argv, so it needs no encoding and no scratch file to survive the trip.
+        assert!(!yaml.contains("base64"), "{yaml}");
+        assert!(!yaml.contains("GOAL_FILE"), "{yaml}");
     }
 
     /// A scope turn with no confirmed tier renders no `--tier` flag at all, the in-pod engine
@@ -834,20 +1159,25 @@ mod tests {
                 issue: "owner/repo#43".to_string(),
                 goal_text: None,
                 repo_url: "https://github.com/owner/repo.git".to_string(),
+                repo_ref: None,
                 sandbox_image: "registry.example.com/epp-sandbox:latest".to_string(),
                 max_cost: 8.0,
-                pin_digests: false,
+                digests: None,
                 tier: None,
                 gaming_refine_rounds: 1,
                 skip_gaming_review: false,
                 authoritative: false,
                 harness: None,
                 model: None,
+                pack_path: None,
             },
         )
         .expect("render scope turn");
-        assert!(yaml.contains("crucible scope --propose"));
-        assert!(!yaml.contains("--tier"), "no tier, no flag: {yaml}");
+        assert!(turn_cmd(&yaml).contains("crucible scope --propose"));
+        assert!(
+            !turn_cmd(&yaml).contains("--tier"),
+            "no tier, no flag: {yaml}"
+        );
     }
 
     /// `skip_gaming_review` renders `--skip-gaming-review` and OMITS `--gaming-refine-rounds`,
@@ -879,28 +1209,30 @@ mod tests {
                 issue: "owner/repo#44".to_string(),
                 goal_text: None,
                 repo_url: "https://github.com/owner/repo.git".to_string(),
+                repo_ref: None,
                 sandbox_image: "registry.example.com/epp-sandbox:latest".to_string(),
                 max_cost: 8.0,
-                pin_digests: false,
+                digests: None,
                 tier: None,
                 gaming_refine_rounds: 2,
                 skip_gaming_review: true,
                 authoritative: true,
                 harness: None,
                 model: None,
+                pack_path: None,
             },
         )
         .expect("render scope turn");
         assert!(
-            yaml.contains("--skip-gaming-review"),
+            turn_cmd(&yaml).contains("--skip-gaming-review"),
             "the skip flag is forwarded: {yaml}"
         );
         assert!(
-            !yaml.contains("--gaming-refine-rounds"),
+            !turn_cmd(&yaml).contains("--gaming-refine-rounds"),
             "the rounds flag is omitted once the review is skipped: {yaml}"
         );
         assert!(
-            yaml.contains("--authoritative"),
+            turn_cmd(&yaml).contains("--authoritative"),
             "the authoritative flag is forwarded: {yaml}"
         );
     }
@@ -923,7 +1255,7 @@ mod tests {
 
     fn opts_with_run_config(
         kind: TurnKind,
-        harness: Option<crate::harness::Harness>,
+        harness: Option<crate::manifest::Harness>,
         model: Option<&str>,
     ) -> TurnOpts {
         TurnOpts {
@@ -932,15 +1264,17 @@ mod tests {
             issue: "owner/repo#45".to_string(),
             goal_text: None,
             repo_url: "https://github.com/owner/repo.git".to_string(),
+            repo_ref: None,
             sandbox_image: "registry.example.com/epp-sandbox:latest".to_string(),
             max_cost: 5.0,
-            pin_digests: false,
+            digests: None,
             tier: None,
             gaming_refine_rounds: 1,
             skip_gaming_review: false,
             authoritative: false,
             harness,
             model: model.map(str::to_string),
+            pack_path: None,
         }
     }
 
@@ -954,17 +1288,17 @@ mod tests {
                 &profile,
                 &opts_with_run_config(
                     kind,
-                    Some(crate::harness::Harness::Hermes),
+                    Some(crate::manifest::Harness::Hermes),
                     Some("hermes-4-70b"),
                 ),
             )
             .expect("render turn");
             assert!(
-                yaml.contains("--harness hermes"),
+                turn_cmd(&yaml).contains("--harness hermes"),
                 "the run harness is forwarded: {yaml}"
             );
             assert!(
-                yaml.contains("--model hermes-4-70b"),
+                turn_cmd(&yaml).contains("--model hermes-4-70b"),
                 "the run model is forwarded: {yaml}"
             );
         }
@@ -978,8 +1312,14 @@ mod tests {
             &opts_with_run_config(TurnKind::Scope, None, Some("claude-opus-4-6")),
         )
         .expect("render turn");
-        assert!(yaml.contains("--model claude-opus-4-6"), "{yaml}");
-        assert!(!yaml.contains("--harness"), "no harness, no flag: {yaml}");
+        assert!(
+            turn_cmd(&yaml).contains("--model claude-opus-4-6"),
+            "{yaml}"
+        );
+        assert!(
+            !turn_cmd(&yaml).contains("--harness"),
+            "no harness, no flag: {yaml}"
+        );
     }
 
     /// Unset run config emits neither flag, so a pre-existing render stays byte-identical.
@@ -989,8 +1329,165 @@ mod tests {
         for kind in [TurnKind::Rank, TurnKind::Scope] {
             let yaml = render_turn(&profile, &opts_with_run_config(kind, None, None))
                 .expect("render turn");
-            assert!(!yaml.contains("--harness"), "no harness, no flag: {yaml}");
-            assert!(!yaml.contains("--model"), "no model, no flag: {yaml}");
+            assert!(
+                !turn_cmd(&yaml).contains("--harness"),
+                "no harness, no flag: {yaml}"
+            );
+            assert!(
+                !turn_cmd(&yaml).contains("--model"),
+                "no model, no flag: {yaml}"
+            );
+        }
+    }
+    #[test]
+    fn repo_ref_clones_at_the_branch_for_both_kinds() {
+        for kind in [TurnKind::Rank, TurnKind::Scope] {
+            let mut opts = opts_with_run_config(kind, None, None);
+            opts.repo_ref = Some("feature/x-1.2".to_string());
+            let yaml = render_turn(&minimal_profile(), &opts).expect("render turn");
+            assert_eq!(
+                clone_cmd(&yaml),
+                "git clone --filter=blob:none --no-checkout \
+                 https://github.com/owner/repo.git /checkout",
+                "{kind:?} clones every commit, no blobs"
+            );
+            assert_eq!(
+                checkout_cmd(&yaml).as_deref(),
+                Some("git -C /checkout checkout --detach feature/x-1.2"),
+                "{kind:?} checks the ref out, so a commit works as well as a name"
+            );
+        }
+    }
+
+    #[test]
+    fn no_repo_ref_clones_the_default_branch() {
+        let opts = opts_with_run_config(TurnKind::Scope, None, None);
+        let yaml = render_turn(&minimal_profile(), &opts).expect("render turn");
+        assert!(
+            clone_cmd(&yaml).starts_with("git clone --depth 50 https://github.com/owner/repo.git")
+        );
+        assert!(!clone_cmd(&yaml).contains("--branch"));
+    }
+
+    /// A pack the repo already carries is validated, not drafted: the turn runs
+    /// `scope --pack` over the checkout and none of the propose turn's agent machinery.
+    #[test]
+    fn a_pack_path_turn_validates_instead_of_proposing() {
+        let mut opts = opts_with_run_config(TurnKind::Scope, None, None);
+        opts.pack_path = Some(PackPath::parse("examples/selfhost").expect("valid"));
+        opts.tier = Some(ProposeTier::T1);
+        opts.gaming_refine_rounds = 3;
+        opts.authoritative = true;
+        opts.goal_text = Some("a goal the pack does not need".to_string());
+        let yaml = render_turn(&minimal_profile(), &opts).expect("render");
+
+        assert!(
+            turn_cmd(&yaml).contains(
+                "crucible scope --pack /checkout/examples/selfhost --json --force --marker"
+            ),
+            "{yaml}"
+        );
+        assert!(
+            clone_cmd(&yaml).starts_with("git clone"),
+            "still clones the repo"
+        );
+        // It is still a scope turn to the pod watcher, so the existing dispatch arm picks it up.
+        assert!(yaml.contains("crucible.io/work-kind: scope"));
+        // No agent runs, so nothing that only describes how a pack gets drafted may appear.
+        for absent in [
+            "--propose",
+            "--tier",
+            "--gaming-refine-rounds",
+            "--authoritative",
+            "--agent-backend",
+            "--sandbox-image",
+            "--goal-file",
+            "--max-cost",
+        ] {
+            assert!(
+                !yaml.contains(absent),
+                "{absent} has no place here:\n{yaml}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pack_path_leaving_the_checkout_is_refused() {
+        for bad in [
+            "/etc",
+            "../secrets",
+            "packs/../../etc",
+            "",
+            "   ",
+            "pack\"; rm -rf /",
+            "$(id)",
+            "pack dir",
+        ] {
+            assert!(PackPath::parse(bad).is_err(), "{bad:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn a_pack_path_keeps_the_relative_path_it_was_given() {
+        for (raw, want) in [
+            ("examples/selfhost", "examples/selfhost"),
+            ("examples/selfhost/", "examples/selfhost"),
+            ("  domains/deepgemm  ", "domains/deepgemm"),
+            ("pack", "pack"),
+            ("a_b-c.d/e", "a_b-c.d/e"),
+        ] {
+            assert_eq!(PackPath::parse(raw).expect(raw).as_str(), want);
+        }
+    }
+
+    /// A rank turn has no pack to validate; setting one must not change its command.
+    #[test]
+    fn a_rank_turn_ignores_a_pack_path() {
+        let mut opts = opts_with_run_config(TurnKind::Rank, None, None);
+        let plain = render_turn(&minimal_profile(), &opts).expect("render");
+        opts.pack_path = Some(PackPath::parse("examples/selfhost").expect("valid"));
+        let with_pack = render_turn(&minimal_profile(), &opts).expect("render");
+        assert_eq!(plain, with_pack);
+        assert!(turn_cmd(&with_pack).contains("crucible rank-grounded"));
+    }
+
+    /// Pinning a pack to a commit is the point of the ref, and `git clone --branch` takes only a
+    /// branch or a tag. The checkout step is what makes a commit work.
+    #[test]
+    fn a_commit_sha_is_a_usable_pin() {
+        let mut opts = opts_with_run_config(TurnKind::Scope, None, None);
+        opts.pack_path = Some(PackPath::parse("examples/selfhost").expect("valid"));
+        opts.repo_ref = Some("308097caa4b55975e27d58465b1d441bc0bb6c63".to_string());
+        let yaml = render_turn(&minimal_profile(), &opts).expect("render");
+        assert!(
+            !clone_cmd(&yaml).contains("--branch"),
+            "a commit is no branch"
+        );
+        assert_eq!(
+            checkout_cmd(&yaml).as_deref(),
+            Some("git -C /checkout checkout --detach 308097caa4b55975e27d58465b1d441bc0bb6c63")
+        );
+    }
+
+    /// Unpinned stays the cheap shallow clone, and grows no second step.
+    #[test]
+    fn an_unpinned_turn_keeps_the_shallow_clone() {
+        let opts = opts_with_run_config(TurnKind::Rank, None, None);
+        let yaml = render_turn(&minimal_profile(), &opts).expect("render");
+        assert_eq!(
+            clone_cmd(&yaml),
+            "git clone --depth 50 https://github.com/owner/repo.git /checkout"
+        );
+        assert_eq!(checkout_cmd(&yaml), None, "nothing to check out");
+    }
+
+    #[test]
+    fn a_shell_hostile_repo_ref_is_refused() {
+        for bad in ["", "-x", "main; rm -rf /", "a b", "$(id)", "v1*", "it's"] {
+            let mut opts = opts_with_run_config(TurnKind::Rank, None, None);
+            opts.repo_ref = Some(bad.to_string());
+            let err = render_turn(&minimal_profile(), &opts).expect_err(bad);
+            assert!(err.to_string().contains("--repo-ref"), "{bad:?}: {err}");
         }
     }
 }

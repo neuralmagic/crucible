@@ -1,0 +1,42 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-08-25-003"
+title = "Serve controller renders from a linked engine library"
+status = "done"
+created = "2026-08-25"
+started = "2026-08-25"
+completed = "2026-08-25"
+refs = [
+    "RFC-0004:C-LINKED-RENDER",
+    "RFC-0004:C-CONTRACT-VERSION",
+    "RFC-0004:C-BOUNDARY-FAILURE",
+]
+
+[content]
+description = "Engine side of RFC-0004. The crucible crate becomes a library with a thin binary, so the controller can link the render functions (turn pod, run pod + pack ConfigMap, workflow compile, params schema, flow) at its pinned engine revision instead of spawning the binary and parsing stdout. The shared contract crate gains a contract version the engine reports from the binary and the runtime image carries as a label. Controller-side adoption (linking, the startup version comparison, the ledgered refusal) is a follow-up work item in the controller repo."
+
+[[content.acceptance_criteria]]
+text = "the crucible crate exposes a library target; every render the controller performs today is a public function taking a typed options value, and the CLI subcommands are thin wrappers that parse into the same value"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "for the existing render fixtures, the library call and the CLI produce byte-identical documents (a test drives both paths over the same inputs)"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "renders take no ambient input: digest pinning and cluster access are capabilities the caller passes, and a test proves a render with pinning off performs no network access"
+status = "done"
+category = "changed"
+
+[[content.acceptance_criteria]]
+text = "crucible-contract exposes one contract version; `crucible --contract-version` prints it; Containerfile.runtime stamps it as an image label"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "cargo fmt, cargo clippy --all-targets -D warnings, and the workspace tests pass; no new unwrap/expect/anyhow-macro sites outside tests"
+status = "done"
+category = "chore"

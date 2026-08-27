@@ -16,4 +16,3 @@ mod progress;
 mod transcript;
 
 pub use cli::{ScopeArgs, run};
-pub use pipeline::ProposeTier;
