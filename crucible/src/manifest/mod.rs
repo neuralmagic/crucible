@@ -75,6 +75,10 @@ pub enum ManifestError {
     #[error("[workspace].carry_forward is not supported in a composite manifest")]
     CompositeCarryForward,
     #[error(
+        "[agent.codex].api_key_env `{name}` is not an environment variable name (letters, digits, and underscore, not starting with a digit)"
+    )]
+    BadCodexApiKeyEnv { name: String },
+    #[error(
         "[[workspace.artifact]] embed/upload `{embed}` must be a bare file name (no path separators)"
     )]
     BadArtifactEmbed { embed: String },
@@ -612,6 +616,7 @@ fn validate_common(c: CommonCfg<'_>) -> Result<()> {
     }
     validate_carry_forward(&c.workspace.carry_forward)?;
     validate_artifacts(&c.workspace.artifact)?;
+    validate_codex_api_key_env(c.agent.codex.api_key_env.as_deref())?;
     search::validate_search(c.search)?;
     if let Some(w) = c.workflow {
         w.validate()?;
@@ -669,6 +674,25 @@ fn validate_carry_forward(entries: &[String]) -> Result<()> {
             }
             .into());
         }
+    }
+    Ok(())
+}
+
+/// `[agent.codex].api_key_env` names an environment variable of the loop process, and a name
+/// outside the portable character set can never be read back, so the turn would fall through to
+/// ChatGPT OAuth (or fail the explicit `api` mode) with nothing naming the typo.
+fn validate_codex_api_key_env(name: Option<&str>) -> Result<()> {
+    let Some(name) = name else {
+        return Ok(());
+    };
+    let portable = !name.is_empty()
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !portable {
+        return Err(ManifestError::BadCodexApiKeyEnv {
+            name: name.to_string(),
+        }
+        .into());
     }
     Ok(())
 }
@@ -1098,6 +1122,24 @@ mod tests {
         assert_eq!(m.agent.harness, Harness::Codex);
         assert_eq!(m.agent.model, Harness::Claude.default_model());
         assert!(m.agent.codex.model.is_none());
+    }
+
+    #[test]
+    fn a_codex_api_key_env_that_is_not_an_env_name_is_rejected() {
+        assert!(validate_codex_api_key_env(None).is_ok());
+        assert!(validate_codex_api_key_env(Some("OPENAI_API_KEY_WORK")).is_ok());
+        assert!(validate_codex_api_key_env(Some("_key0")).is_ok());
+        for bad in [
+            "",
+            "0KEY",
+            "OPENAI-API-KEY",
+            "OPENAI_API_KEY=x",
+            "OPENAI API KEY",
+        ] {
+            let err = validate_codex_api_key_env(Some(bad))
+                .expect_err("an unreadable env name must be rejected");
+            assert!(err.to_string().contains(bad), "{err}");
+        }
     }
 
     #[test]

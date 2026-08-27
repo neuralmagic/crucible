@@ -161,32 +161,28 @@ fn stage(sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>), msg: &str)
 const DEFAULT_CODEX_API_KEY_ENV: &str = "OPENAI_API_KEY";
 
 /// Resolve the API-key half of Codex's dual auth. `None` means the caller should use the ChatGPT
-/// OAuth mint. The explicit modes never silently cross over; only `auto` falls back.
+/// OAuth mint. The explicit modes never silently cross over; only `auto` falls back. The env name
+/// is a manifest-validated shape ([`crate::manifest::Manifest::load`]).
 fn selected_codex_api_key(cfg: &crate::manifest::CodexCfg) -> Result<Option<String>> {
     use crate::manifest::CodexAuthMode;
 
-    if cfg.auth == CodexAuthMode::Chatgpt {
-        return Ok(None);
-    }
     let env_name = cfg
         .api_key_env
         .as_deref()
         .unwrap_or(DEFAULT_CODEX_API_KEY_ENV);
-    anyhow::ensure!(
-        !env_name.is_empty() && !env_name.contains(['=', '\0']),
-        "[agent.codex].api_key_env is not a valid environment variable name"
-    );
-    let key = std::env::var(env_name)
-        .ok()
-        .filter(|value| !value.trim().is_empty());
+    let key = || {
+        std::env::var(env_name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    };
     match cfg.auth {
-        CodexAuthMode::Auto => Ok(key),
-        CodexAuthMode::Api => key.map(Some).with_context(|| {
+        CodexAuthMode::Chatgpt => Ok(None),
+        CodexAuthMode::Auto => Ok(key()),
+        CodexAuthMode::Api => key().map(Some).with_context(|| {
             format!(
                 "{env_name} unset or empty; [agent.codex].auth = \"api\" requires its selected API key"
             )
         }),
-        CodexAuthMode::Chatgpt => unreachable!("returned before reading the API-key environment"),
     }
 }
 
