@@ -27,6 +27,7 @@ clauses = [
     "clauses/C-ASKS.toml",
     "clauses/C-PLAYBOOK-BUDGET.toml",
     "clauses/C-PLAYBOOK-RESUME.toml",
+    "clauses/C-REPORTS.toml",
 ]
 
 [[changelog]]
