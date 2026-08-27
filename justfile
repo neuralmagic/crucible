@@ -44,6 +44,15 @@ bench-stream:
 lint:
     cargo fmt --check && cargo clippy --workspace --all-targets && cargo test --workspace
 
+# Regenerate docs/dsl-reference.md from the compiler's DSL tables (the pre-commit hook's job,
+# for when you want it without a commit).
+dsl-docs:
+    ./scripts/dsl-docs.sh
+
+# Render the published RFCs from gov/ (the pre-commit hook's job, without a commit).
+gov-docs:
+    govctl render rfc
+
 # Run the pre-commit hooks over the whole tree (prek: https://github.com/j178/prek).
 hooks:
     prek run --all-files

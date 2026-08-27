@@ -7,6 +7,7 @@ mod globals;
 mod idents;
 mod loader;
 pub mod params;
+pub mod reference;
 mod values;
 
 use std::cell::{RefCell, RefMut};
@@ -956,7 +957,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
         "report" => &["name", "destination", "template", "result", "required"],
         "propose" => &["name", "session", "depends_on"],
         "apply" | "measure" => &["name", "depends_on"],
-        "grade" => &["name", "score", "evidence", "join"],
+        "grade" => &["name", "score", "tiebreak", "evidence", "join"],
         "decide" => &["name", "measurement", "depends_on"],
         "session" => &["name", "harness", "model", "effort"],
         "workflow" => &["type", "tasks", "result"],
@@ -1024,7 +1025,7 @@ fn constructor(
             .insert(decl.name.clone(), (decl.clone(), at.clone()));
         return Ok(Value::Session(decl));
     }
-    if matches!(function, "prompt_file" | "deps" | "default_autoresearch") {
+    if matches!(function, "prompt_file" | "param" | "default_autoresearch") {
         return Err(CompileError::NotOnePositional {
             function: function.to_owned(),
         });
@@ -3137,7 +3138,7 @@ workflow(type = "custom", tasks = [e], result = e)
             ),
             (
                 "grade",
-                "s = evaluate(name = \"s\", run = \"true\")\ng = grade(name = \"g\", score = s, evidence = [s], join = \"passed\"{extra})\nworkflow(type = \"custom\", tasks = [s, g], result = g)\n",
+                "s = evaluate(name = \"s\", run = \"true\")\nt = evaluate(name = \"t\", run = \"true\")\ng = grade(name = \"g\", score = s, tiebreak = t, evidence = [s, t], join = \"passed\"{extra})\nworkflow(type = \"custom\", tasks = [s, t, g], result = g)\n",
             ),
             (
                 "decide",

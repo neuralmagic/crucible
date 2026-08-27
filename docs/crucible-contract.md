@@ -312,11 +312,10 @@ workflow values are opaque and immutable, so they can be referenced directly in 
 `measurement`, and `result` without repeating names, and a library cannot mutate one after
 handing it back.
 
-The declared lane decides which constructors exist. Every lane has `agent`, `command`,
-`evaluate`, `session`, `prompt_file`, and `workflow`. `type = "autoresearch"` and
-`type = "custom"` add the scored loop's own: `propose`, `apply`, `measure`, `grade`, `decide`,
-`top_k`, and `default_autoresearch`. A playbook has none of those in scope at all, so naming one
-is an unknown-name error where it was written, and a did-you-mean never offers one.
+The declared lane decides which constructors exist. Which lane each belongs to, and what
+arguments each takes, is the [DSL reference](./dsl-reference.md), generated from the compiler's
+own tables. A playbook does not have the scored lane's constructors in scope at all, so naming
+one is an unknown-name error where it was written, and a did-you-mean never offers one.
 
 - `propose(...)`, `apply(...)`, `measure(...)`, `grade(...)`, and `decide(...)` create
   capability-owned engine tasks. `decide(measurement = score)` selects its measurement.

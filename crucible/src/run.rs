@@ -195,6 +195,18 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                 mermaid,
                 render,
             } => crate::plan::cli::show(file, &caps.iter().cloned().collect(), *mermaid, *render),
+            crate::PlanAction::DslReference { format } => {
+                match format {
+                    crate::DslFormat::Markdown => {
+                        print!("{}", crate::plan::starlark::reference::markdown())
+                    }
+                    crate::DslFormat::Json => println!(
+                        "{}",
+                        serde_json::to_string_pretty(&crate::plan::starlark::reference::json())?
+                    ),
+                }
+                Ok(())
+            }
             crate::PlanAction::Params { file } => {
                 let source = std::fs::read_to_string(file)
                     .with_context(|| format!("reading {}", file.display()))?;

@@ -8,6 +8,20 @@ repos:
         language: system
         types: [rust]
 
+      - id: dsl-docs
+        name: regenerate the workflow DSL reference
+        entry: scripts/dsl-docs.sh
+        language: system
+        pass_filenames: false
+        files: ^(crucible/src/plan/starlark|docs/dsl-reference\.md)
+
+      - id: gov-render
+        name: render RFCs from the governance SSOT
+        entry: govctl render rfc
+        language: system
+        pass_filenames: false
+        files: ^(gov/rfc/|docs/rfc/)
+
       - id: typed-error-ratchet
         name: no new stringly-error modules
         entry: scripts/typed-error-ratchet.sh
