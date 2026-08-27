@@ -384,6 +384,14 @@ pub(crate) enum PlanAction {
         #[arg(long)]
         render: bool,
     },
+    /// Print the workflow DSL's own surface: every constructor, its lane, and its keyword
+    /// arguments. Generated from the compiler's tables, so it describes the binary in hand
+    /// rather than a document someone remembered to update.
+    DslReference {
+        /// `markdown` (the published reference page) or `json` (for tooling).
+        #[arg(long, default_value = "markdown")]
+        format: DslFormat,
+    },
     /// Print a workflow source's `params` block as a JSON Schema document, without evaluating
     /// the source. One declaration serves command-line validation, ask validation, and a
     /// generated launch form.
@@ -432,6 +440,13 @@ pub(crate) enum PlanAction {
         #[arg(long, value_enum, default_value_t = openshell::gateway::ComputeDriver::Podman)]
         compute_driver: openshell::gateway::ComputeDriver,
     },
+}
+
+/// How `crucible plan dsl-reference` renders the DSL surface.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub(crate) enum DslFormat {
+    Markdown,
+    Json,
 }
 
 /// `crucible deploy <render|apply>`: emit the deployment YAML, or render-and-`kubectl apply`.

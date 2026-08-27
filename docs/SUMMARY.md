@@ -17,10 +17,17 @@
 
 - [Implementation contract](./crucible-contract.md)
 - [Work graphs](./work-graphs.md)
+- [Workflow DSL reference](./dsl-reference.md)
 - [Hand-rolled codegen pipelines](./hand-rolled-pipelines.md)
 - [The codex harness](./codex-harness.md)
 - [The OpenShell fork](./openshell-fork.md)
 - [JIRA tools (mediated)](./jira-proxy.md)
+
+# Specifications
+
+- [RFC-0001: Implementation contract](./rfc/RFC-0001.md)
+- [RFC-0002: Playbook workflows](./rfc/RFC-0002.md)
+- [RFC-0004: Linked controller/engine boundary](./rfc/RFC-0004.md)
 
 # Architecture decisions
 

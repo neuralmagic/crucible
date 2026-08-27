@@ -27,6 +27,34 @@ The manifest, judge, and frozen injected evaluation files form the evaluation bo
 the [implementation contract](docs/crucible-contract.md) for the normative behavior and
 [ADR-0001](docs/adr/0001-adaptive-harness.md) for the trust model.
 
+## Why not a general workflow engine
+
+Crucible executes its own graph rather than delegating to Argo Workflows, Tekton, or a
+similar system. The reason is not the graph, which is ordinary, but the loop around it and
+the state under it.
+
+The compiled plan is deliberately loop-free. Starlark control flow unrolls at compile time
+and the resulting plan is static; the only loop is the engine's iteration over that plan,
+which carries the accepted state, the best score so far, and the remaining budget across
+rounds. A workflow engine would have to host that loop, and neither hosts it well: Tekton
+has no loop construct at all, since a pipeline cannot reference itself and `matrix` covers
+fan-out only, and Argo expresses iteration as template recursion, which accumulates every
+round's nodes in a single workflow object.
+
+Four properties of the executor have no equivalent in either system:
+
+- **One workspace.** Tasks share a Git checkout, stage dependency files into it, and return
+  results through a workspace file. Both alternatives pass parameters and archived artifacts
+  between pods.
+- **Validity is not scheduling.** Capability truncation is computed before anything is
+  dispatched, transport failures retry while measured failures never do, and an advisory
+  failure blocks dependents without invalidating the run.
+- **Cost is an input.** `budget.usd` bounds a plan and `--max-cost` bounds a run; spend
+  accumulates per attempt and exhausting it is a terminal state.
+- **An agent turn is not a pod.** A turn runs against a sandbox owned by the agent backend
+  ([ADR-0019](docs/adr/0019-openshell-kubernetes-driver.md)), not a container the graph
+  runner creates.
+
 ## Requirements
 
 Building Crucible requires:
@@ -201,42 +229,18 @@ workflow(
 )
 ```
 
-Available constructors and helpers:
+Every constructor, the lane it belongs to, and its keyword arguments are in
+[docs/dsl-reference.md](docs/dsl-reference.md), which is generated from the compiler's own
+tables. Print the same thing for the binary in hand:
 
-| Function | Purpose |
-| --- | --- |
-| `propose()` | Runs the loop's candidate-producing agent turn. |
-| `apply()` | Applies the candidate through the configured world. |
-| `measure()` | Runs the manifest's frozen judge as one opaque measurement task. |
-| `evaluate()` | Runs an explicit measurement command with optional `threshold` and `direction`. |
-| `grade()` | Combines evaluation evidence and selects the task that supplies the decision score. |
-| `decide()` | Applies the engine's keep or discard rule to a measurement. |
-| `agent()` | Adds an agent task with a required prompt and optional model, harness, effort, and session settings. |
-| `command()` | Adds a deterministic shell task in the candidate workspace. |
-| `top_k()` | Selects the best `k` dependency outputs by numeric score. |
-| `deps()` | Converts a list of task values into dependency names. |
-| `prompt_file()` | Embeds a UTF-8 prompt file located below the domain directory. |
-| `workflow()` | Declares the workflow type, task list, and result task. |
-| `default_autoresearch()` | Expands the built-in workflow with additional tasks. |
+```bash
+crucible plan dsl-reference           # markdown
+crucible plan dsl-reference --format json
+```
 
-The DSL accepts assignments, scalar values, lists, list concatenation, and direct calls to
-these functions. It does not provide `load()`, control flow, user-defined functions,
-filesystem access other than `prompt_file()`, processes, network access, time, or randomness.
-
-Execution rules that affect authoring:
-
-- `depends_on` defines readiness. Task declarations do not control execution order.
-- Ready tasks marked `isolated = True` run concurrently in disposable worktrees; their file
-  changes are discarded and only their JSON outputs continue through the graph.
-- Tasks are required by default. `required = False` makes a task advisory, and
-  `join = "passed"` forwards the non-empty set of successful dependencies.
-- `session = "name"` preserves one logical agent conversation across dependency-ordered
-  tasks and loop iterations. Tasks sharing a session cannot be isolated.
-- `evaluate()` parses a JSON object from its last non-empty stdout line. `pass = false`
-  vetoes the result; numeric `score` is available to `grade()` and `top_k()`.
-- `type = "autoresearch"` must end in `decide()` with valid propose, apply, and measurement
-  ancestry. `type = "custom"` requires an orchestrator that explicitly admits custom
-  workflows.
+Two rules the reference does not carry: `type = "autoresearch"` must end in `decide()` with
+valid propose, apply, and measurement ancestry, and `type = "custom"` requires an orchestrator
+that explicitly admits custom workflows.
 
 Compile a workflow for review without changing the manifest:
 
