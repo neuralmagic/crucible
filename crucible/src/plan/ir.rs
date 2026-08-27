@@ -176,6 +176,8 @@ pub enum TaskKind {
     Report {
         destination: ReportDestination,
         template: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<TaskName>,
     },
     /// Engine-builtin deterministic fold: keep the k best upstream outputs by `score`.
     TopK { k: u32, direction: Direction },
@@ -340,6 +342,12 @@ pub enum PlanError {
     SelfDependency { task: String },
     #[error("task {task:?} depends on unknown task {dependency:?}")]
     UnknownDependency { task: String, dependency: String },
+    #[error("report task {task:?} selects unknown result task {result:?}")]
+    UnknownReportResult { task: String, result: String },
+    #[error(
+        "report task {task:?} selects epilogue task {result:?}; report results must come from the main graph"
+    )]
+    EpilogueReportResult { task: String, result: String },
     #[error("task {task:?} lists dependency {dependency:?} twice")]
     RepeatedDependency { task: String, dependency: String },
     #[error("task {task:?}: join = \"passed\" needs at least one dependency")]
@@ -526,6 +534,24 @@ impl Plan {
                 }
                 if threshold.is_some_and(|value| !value.is_finite()) {
                     return Err(PlanError::NonFiniteThreshold { task: task() });
+                }
+            }
+            if let TaskKind::Report {
+                result: Some(result),
+                ..
+            } = &t.task
+            {
+                let Some(&result_index) = index.get(result) else {
+                    return Err(PlanError::UnknownReportResult {
+                        task: task(),
+                        result: result.0.clone(),
+                    });
+                };
+                if self.tasks[result_index].stage == Stage::Epilogue {
+                    return Err(PlanError::EpilogueReportResult {
+                        task: task(),
+                        result: result.0.clone(),
+                    });
                 }
             }
             if !t.emits.is_empty() {

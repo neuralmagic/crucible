@@ -953,7 +953,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "emits_files",
         ],
         "top_k" => &["name", "k", "direction", "depends_on", "required"],
-        "report" => &["name", "destination", "template", "required"],
+        "report" => &["name", "destination", "template", "result", "required"],
         "propose" => &["name", "session", "depends_on"],
         "apply" | "measure" => &["name", "depends_on"],
         "grade" => &["name", "score", "evidence", "join"],
@@ -1098,6 +1098,7 @@ fn constructor(
                     let path = take_string(&mut named, "template")?;
                     state.context_mut().prompt_file(&path)?
                 },
+                result: take_optional_task_name(&mut named, "result")?,
             },
             depends_on: Vec::new(),
             session: None,
@@ -2552,12 +2553,18 @@ default_autoresearch([racecheck])
         std::fs::write(pack.join("reports/slack.md.j2"), "{{ passed }} passed").unwrap();
         let source = r#"
 work = command(name = "work", run = "true")
-publish = report(name = "publish-report", destination = {"kind": "slack"}, template = "reports/slack.md.j2", required = True)
+publish = report(name = "publish-report", destination = {"kind": "slack"}, template = "reports/slack.md.j2", result = work, required = True)
 workflow(type = "playbook", tasks = [work, publish])
 "#;
         let compiled = compile_source(source, &pack.join("workflow.star"), &pack).unwrap();
         let publish = &compiled.workflow.tasks[1];
-        assert!(matches!(publish.task, TaskKind::Report { .. }));
+        assert!(matches!(
+            &publish.task,
+            TaskKind::Report {
+                result: Some(result),
+                ..
+            } if result.0 == "work"
+        ));
         assert_eq!(publish.stage, Stage::Epilogue);
         assert!(publish.required);
         assert!(publish.depends_on.is_empty());

@@ -377,7 +377,7 @@ impl McpServer {
         description = "Post the engine-authored workflow status to the configured Crucible Slack channel. Call once from a final reporting or epilogue task. This tool takes no message content: task names, statuses, spend, and the Crucible artifact link come from trusted engine state. It does not suspend the run; use distress when operator action is required."
     )]
     async fn report(&self, Parameters(_args): Parameters<ReportArgs>) -> String {
-        match crate::telemetry::spawn_blocking(|| crate::report::deliver(None)).await {
+        match crate::telemetry::spawn_blocking(|| crate::report::deliver(None, None)).await {
             Ok(Ok(reply)) => reply,
             Ok(Err(e)) => json_err(&e),
             Err(e) => json_err(&format!("report task failed: {e}")),

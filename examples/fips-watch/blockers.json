@@ -1,0 +1,8 @@
+{
+  "ring": "vendors BoringSSL-derived assembly; cannot be a certified module",
+  "aws-lc-rs": "vendors AWS-LC; its FIPS mode is still not the system module",
+  "aws-lc-sys": "vendors AWS-LC",
+  "rustls": "not a blocker itself, but only reaches a certified module through a provider this project does not use",
+  "boring": "vendors BoringSSL",
+  "boring-sys": "vendors BoringSSL"
+}

@@ -1,0 +1,18 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-REPORTS"
+title = "Typed workflow reports"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = """
+A playbook MAY declare an engine-owned report task with a destination kind and an optional result task selector. The selected task MUST be a task in the same graph. Selection MUST NOT create a dependency from the report epilogue to the main graph. After the main graph settles, the report task MUST receive only the selected task's declared JSON output when that task passed, never its prompt, stdout, workspace, undeclared files, or credentials. When the selected task did not pass, the report MUST retain the selected task's terminal status without projecting partial output.
+
+A selected report result MUST be bounded before delivery. The operator MUST configure a maximum encoded size, and exceeding it MUST fail the report task without truncation. Values MUST retain their JSON types through the report snapshot. A report renderer MUST escape text for its destination and MUST NOT interpret result values as destination-native payload fragments.
+
+The Slack destination MUST support a structured card projection containing an engine-authored header, run verdict and cost, the selected result fields, bounded task status context, and a controller-owned run link. The engine MUST construct the destination-native payload; a pack MUST NOT supply raw Slack blocks, attachments, webhook URLs, channels, actions, or identifiers. Delivery failure MUST settle a required report task as failing.
+
+The persisted session result for a report task MUST record whether delivery succeeded but MUST NOT persist the webhook credential. An observer MUST be able to distinguish a delivered report, a rendering failure, an oversized result, and a destination failure."""
