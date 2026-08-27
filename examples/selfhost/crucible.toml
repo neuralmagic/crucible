@@ -33,7 +33,7 @@ harness       = "claude"
 model         = "claude-opus-4-6"
 sandbox_image = "quay.io/wseaton/crucible-sandbox-rust:v1"
 method_prompt = "method.md"
-goal          = "Cut the ns/line of StreamJsonParser over the bench corpus. Target: under 450 (half the baseline)."
+goal          = "Cut the ns/line of StreamJsonParser over the bench corpus. Target: under 450 (half the baseline). Evaluate whether a mature parser-combinator library can replace custom scanning cleanly and improve performance; benchmark it rather than assuming it will win."
 
 [agent.openshell]
 # crates.io for a dep the agent adds (criterion, divan); the deps in Cargo.lock are pre-fetched
