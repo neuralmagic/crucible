@@ -1251,7 +1251,7 @@ mod tests {
     #[test]
     fn codex_subtable_parses_and_denies_unknown_fields() {
         let m: manifest::Manifest = toml::from_str(&format!(
-            "{}\n[agent.codex]\nmodel = \"gpt-5.6-sol\"\n",
+            "{}\n[agent.codex]\nmodel = \"gpt-5.6-sol\"\nauth = \"api\"\napi_key = \"WORK\"\n",
             manifest_toml("harness = \"codex\"")
         ))
         .unwrap();
@@ -1259,12 +1259,24 @@ mod tests {
         apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
         assert_eq!(a.harness(), crate::manifest::Harness::Codex);
         assert_eq!(a.codex.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(a.codex.auth, manifest::CodexAuthMode::Api);
+        assert_eq!(a.codex.api_key.as_deref(), Some("WORK"));
+
+        let default: manifest::Manifest =
+            toml::from_str(&manifest_toml("harness = \"codex\"")).unwrap();
+        assert_eq!(default.agent.codex.auth, manifest::CodexAuthMode::Auto);
 
         let err = toml::from_str::<manifest::Manifest>(&format!(
             "{}\n[agent.codex]\nmodle = \"typo\"\n",
             manifest_toml("")
         ));
         assert!(err.is_err(), "unknown [agent.codex] key must be rejected");
+
+        let err = toml::from_str::<manifest::Manifest>(&format!(
+            "{}\n[agent.codex]\nauth = \"oauth\"\n",
+            manifest_toml("")
+        ));
+        assert!(err.is_err(), "unknown codex auth mode must be rejected");
     }
 
     #[test]

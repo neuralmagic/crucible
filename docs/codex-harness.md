@@ -11,6 +11,10 @@ harness = "codex"
 [agent.codex]
 # The shared `[agent].model` names a Claude model, so a codex domain overrides it here.
 model = "gpt-5.6-sol"
+# auto (default), api, or chatgpt
+auth = "api"
+# Which of the deployment's OpenAI keys to use; unset = the unnamed default key.
+api_key = "WORK"
 ```
 
 What differs from a claude turn:
@@ -25,21 +29,36 @@ What differs from a claude turn:
 
 ## Auth selection
 
-Crucible supports both Codex login methods. A non-empty `OPENAI_API_KEY` takes precedence and is
-seeded into `$CODEX_HOME/auth.json` in API-key mode. Otherwise Crucible falls back to the existing
-`CODEX_CREDENTIALS` ChatGPT OAuth flow described below. A Kubernetes deploy profile can select
-API-key mode with:
+Crucible supports both Codex login methods. `[agent.codex].auth` controls selection:
+
+- `auto` (default) uses the selected non-empty API key and otherwise falls back to ChatGPT OAuth.
+- `api` requires the selected API key and never silently falls back.
+- `chatgpt` uses the OAuth flow even when API keys are present.
+
+`[agent.codex].api_key` names one of the deployment's OpenAI keys (uppercase letters, digits, and
+underscore); unset selects the unnamed default. The manifest names a key, never the variable
+carrying it: the host resolves `api_key = "WORK"` to `OPENAI_API_KEY_WORK` and an unset `api_key`
+to `OPENAI_API_KEY`, so a manifest cannot reach any other host credential, and an openshell
+provider that can deliver the key later replaces the resolution without a manifest change.
+
+A Kubernetes deploy profile injects independently rotatable keys under those names:
 
 ```toml
 [[secret_env]]
-name = "OPENAI_API_KEY"
-secret = "crucible-openai"
+name = "OPENAI_API_KEY_WORK"
+secret = "crucible-openai-work"
+key = "OPENAI_API_KEY"
+
+[[secret_env]]
+name = "OPENAI_API_KEY_PERSONAL"
+secret = "crucible-openai-personal"
 key = "OPENAI_API_KEY"
 ```
 
-Use a dedicated project-scoped key and rotate the Kubernetes Secret to rotate the credential.
-The key is not exported into the sandbox environment, but Codex can read it from its seeded auth
-file.
+Switch `api_key` in the manifest (or select a deployment profile carrying that manifest) to
+choose a key for newly created turns. Use dedicated project-scoped keys and rotate their
+Kubernetes Secrets independently. The selected key is not exported into the sandbox environment,
+but Codex can read it from its seeded auth file.
 
 ## ChatGPT OAuth: `CODEX_CREDENTIALS` and the single-refresher rule
 
@@ -86,5 +105,5 @@ Independently, an unused refresh token goes stale after roughly a week. When min
 with `refresh_token_expired`, re-run `codex login` on the host, replace the secret, and delete
 the state file if the process persists a home directory.
 
-When `OPENAI_API_KEY` is absent or empty, this OAuth machinery remains the fallback for ChatGPT
-subscription access.
+In `auto` mode this OAuth machinery remains the fallback when the selected API key is absent or
+empty; `chatgpt` selects it explicitly.
