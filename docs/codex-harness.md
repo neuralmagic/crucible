@@ -13,8 +13,8 @@ harness = "codex"
 model = "gpt-5.6-sol"
 # auto (default), api, or chatgpt
 auth = "api"
-# Select among separately injected Kubernetes secrets without renaming them.
-api_key_env = "OPENAI_API_KEY_WORK"
+# Which of the deployment's OpenAI keys to use; unset = the unnamed default key.
+api_key = "WORK"
 ```
 
 What differs from a claude turn:
@@ -35,8 +35,13 @@ Crucible supports both Codex login methods. `[agent.codex].auth` controls select
 - `api` requires the selected API key and never silently falls back.
 - `chatgpt` uses the OAuth flow even when API keys are present.
 
-`[agent.codex].api_key_env` selects the key by environment-variable name and defaults to
-`OPENAI_API_KEY`. A Kubernetes deploy profile can inject independently rotatable keys:
+`[agent.codex].api_key` names one of the deployment's OpenAI keys (uppercase letters, digits, and
+underscore); unset selects the unnamed default. The manifest names a key, never the variable
+carrying it: the host resolves `api_key = "WORK"` to `OPENAI_API_KEY_WORK` and an unset `api_key`
+to `OPENAI_API_KEY`, so a manifest cannot reach any other host credential, and an openshell
+provider that can deliver the key later replaces the resolution without a manifest change.
+
+A Kubernetes deploy profile injects independently rotatable keys under those names:
 
 ```toml
 [[secret_env]]
@@ -50,7 +55,7 @@ secret = "crucible-openai-personal"
 key = "OPENAI_API_KEY"
 ```
 
-Switch `api_key_env` in the manifest (or select a deployment profile carrying that manifest) to
+Switch `api_key` in the manifest (or select a deployment profile carrying that manifest) to
 choose a key for newly created turns. Use dedicated project-scoped keys and rotate their
 Kubernetes Secrets independently. The selected key is not exported into the sandbox environment,
 but Codex can read it from its seeded auth file.

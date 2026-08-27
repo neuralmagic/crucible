@@ -1251,7 +1251,7 @@ mod tests {
     #[test]
     fn codex_subtable_parses_and_denies_unknown_fields() {
         let m: manifest::Manifest = toml::from_str(&format!(
-            "{}\n[agent.codex]\nmodel = \"gpt-5.6-sol\"\nauth = \"api\"\napi_key_env = \"OPENAI_API_KEY_WORK\"\n",
+            "{}\n[agent.codex]\nmodel = \"gpt-5.6-sol\"\nauth = \"api\"\napi_key = \"WORK\"\n",
             manifest_toml("harness = \"codex\"")
         ))
         .unwrap();
@@ -1260,7 +1260,7 @@ mod tests {
         assert_eq!(a.harness(), crate::manifest::Harness::Codex);
         assert_eq!(a.codex.model.as_deref(), Some("gpt-5.6-sol"));
         assert_eq!(a.codex.auth, manifest::CodexAuthMode::Api);
-        assert_eq!(a.codex.api_key_env.as_deref(), Some("OPENAI_API_KEY_WORK"));
+        assert_eq!(a.codex.api_key.as_deref(), Some("WORK"));
 
         let default: manifest::Manifest =
             toml::from_str(&manifest_toml("harness = \"codex\"")).unwrap();

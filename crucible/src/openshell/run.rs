@@ -160,18 +160,28 @@ fn stage(sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>), msg: &str)
 
 const DEFAULT_CODEX_API_KEY_ENV: &str = "OPENAI_API_KEY";
 
+/// Where a named `[agent.codex].api_key` is carried today: the deployment injects it as
+/// `OPENAI_API_KEY_<name>` ([[secret_env]] in the deploy profile), and the unnamed default is
+/// `OPENAI_API_KEY`. This is the one place a manifest's key name becomes a carrier, so an
+/// openshell provider that can deliver the credential replaces this function rather than the
+/// manifest schema.
+fn codex_api_key_env(selected: Option<&str>) -> String {
+    match selected {
+        Some(name) => format!("{DEFAULT_CODEX_API_KEY_ENV}_{name}"),
+        None => DEFAULT_CODEX_API_KEY_ENV.to_string(),
+    }
+}
+
 /// Resolve the API-key half of Codex's dual auth. `None` means the caller should use the ChatGPT
-/// OAuth mint. The explicit modes never silently cross over; only `auto` falls back. The env name
-/// is a manifest-validated shape ([`crate::manifest::Manifest::load`]).
+/// OAuth mint. The explicit modes never silently cross over; only `auto` falls back. The key name
+/// is manifest-validated ([`crate::manifest::Manifest::load`]) and resolved by
+/// [`codex_api_key_env`].
 fn selected_codex_api_key(cfg: &crate::manifest::CodexCfg) -> Result<Option<String>> {
     use crate::manifest::CodexAuthMode;
 
-    let env_name = cfg
-        .api_key_env
-        .as_deref()
-        .unwrap_or(DEFAULT_CODEX_API_KEY_ENV);
+    let env_name = codex_api_key_env(cfg.api_key.as_deref());
     let key = || {
-        std::env::var(env_name)
+        std::env::var(&env_name)
             .ok()
             .filter(|value| !value.trim().is_empty())
     };
@@ -1394,12 +1404,15 @@ mod tests {
     #[test]
     fn codex_auth_selection_can_switch_between_named_keys_and_chatgpt() {
         let _guard = crate::test_env_lock();
-        const KEY_ENV: &str = "CRUCIBLE_TEST_OPENAI_KEY_WORK";
-        unsafe { std::env::set_var(KEY_ENV, "sk-work") };
+        const KEY: &str = "CRUCIBLE_TEST_WORK";
+        let key_env = codex_api_key_env(Some(KEY));
+        assert_eq!(key_env, "OPENAI_API_KEY_CRUCIBLE_TEST_WORK");
+        assert_eq!(codex_api_key_env(None), DEFAULT_CODEX_API_KEY_ENV);
+        unsafe { std::env::set_var(&key_env, "sk-work") };
 
         let mut cfg = crate::manifest::CodexCfg {
             auth: crate::manifest::CodexAuthMode::Api,
-            api_key_env: Some(KEY_ENV.to_string()),
+            api_key: Some(KEY.to_string()),
             ..Default::default()
         };
         assert_eq!(
@@ -1415,7 +1428,7 @@ mod tests {
 
         cfg.auth = crate::manifest::CodexAuthMode::Chatgpt;
         assert_eq!(selected_codex_api_key(&cfg).unwrap(), None);
-        unsafe { std::env::remove_var(KEY_ENV) };
+        unsafe { std::env::remove_var(&key_env) };
 
         cfg.auth = crate::manifest::CodexAuthMode::Auto;
         assert_eq!(selected_codex_api_key(&cfg).unwrap(), None);
@@ -1424,15 +1437,16 @@ mod tests {
     #[test]
     fn explicit_api_auth_never_silently_falls_back_to_chatgpt() {
         let _guard = crate::test_env_lock();
-        const KEY_ENV: &str = "CRUCIBLE_TEST_OPENAI_KEY_MISSING";
-        unsafe { std::env::remove_var(KEY_ENV) };
+        const KEY: &str = "CRUCIBLE_TEST_MISSING";
+        let key_env = codex_api_key_env(Some(KEY));
+        unsafe { std::env::remove_var(&key_env) };
         let cfg = crate::manifest::CodexCfg {
             auth: crate::manifest::CodexAuthMode::Api,
-            api_key_env: Some(KEY_ENV.to_string()),
+            api_key: Some(KEY.to_string()),
             ..Default::default()
         };
         let err = selected_codex_api_key(&cfg).expect_err("explicit API mode needs its key");
-        assert!(err.to_string().contains(KEY_ENV));
+        assert!(err.to_string().contains(&key_env), "{err}");
     }
 
     /// A non-zero agent exit names the code and says the wrapper may have failed before the agent

@@ -75,9 +75,9 @@ pub enum ManifestError {
     #[error("[workspace].carry_forward is not supported in a composite manifest")]
     CompositeCarryForward,
     #[error(
-        "[agent.codex].api_key_env `{name}` is not an environment variable name (letters, digits, and underscore, not starting with a digit)"
+        "[agent.codex].api_key `{name}` must be uppercase letters, digits, and underscore: it names one of the deployment's OpenAI keys, not an arbitrary host credential"
     )]
-    BadCodexApiKeyEnv { name: String },
+    BadCodexApiKey { name: String },
     #[error(
         "[[workspace.artifact]] embed/upload `{embed}` must be a bare file name (no path separators)"
     )]
@@ -576,13 +576,13 @@ pub struct CodexCfg {
     /// Model override for codex turns; unset = the resolved `[agent].model`.
     #[serde(default)]
     pub model: Option<String>,
-    /// Authentication selection. `auto` uses the named API-key env when non-empty and otherwise
+    /// Authentication selection. `auto` uses the selected API key when non-empty and otherwise
     /// falls back to ChatGPT OAuth; the explicit modes never switch implicitly.
     #[serde(default)]
     pub auth: CodexAuthMode,
-    /// Environment variable holding the selected API key; unset = `OPENAI_API_KEY`.
+    /// Which of the deployment's OpenAI keys to use, by name; unset = the unnamed default key.
     #[serde(default)]
-    pub api_key_env: Option<String>,
+    pub api_key: Option<String>,
 }
 
 /// Which of Codex's two OpenAI login methods a turn uses. `Auto` preserves the historical
@@ -616,7 +616,7 @@ fn validate_common(c: CommonCfg<'_>) -> Result<()> {
     }
     validate_carry_forward(&c.workspace.carry_forward)?;
     validate_artifacts(&c.workspace.artifact)?;
-    validate_codex_api_key_env(c.agent.codex.api_key_env.as_deref())?;
+    validate_codex_api_key(c.agent.codex.api_key.as_deref())?;
     search::validate_search(c.search)?;
     if let Some(w) = c.workflow {
         w.validate()?;
@@ -678,18 +678,19 @@ fn validate_carry_forward(entries: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `[agent.codex].api_key_env` names an environment variable of the loop process, and a name
-/// outside the portable character set can never be read back, so the turn would fall through to
-/// ChatGPT OAuth (or fail the explicit `api` mode) with nothing naming the typo.
-fn validate_codex_api_key_env(name: Option<&str>) -> Result<()> {
+/// `[agent.codex].api_key` is a name the host resolves against the deployment's OpenAI keys
+/// ([`crate::openshell::run`]); the manifest never names the credential's carrier, so the check is
+/// on the name's character set rather than on an environment variable.
+fn validate_codex_api_key(name: Option<&str>) -> Result<()> {
     let Some(name) = name else {
         return Ok(());
     };
-    let portable = !name.is_empty()
-        && !name.starts_with(|c: char| c.is_ascii_digit())
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-    if !portable {
-        return Err(ManifestError::BadCodexApiKeyEnv {
+    let ok = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+    if !ok {
+        return Err(ManifestError::BadCodexApiKey {
             name: name.to_string(),
         }
         .into());
@@ -1125,19 +1126,13 @@ mod tests {
     }
 
     #[test]
-    fn a_codex_api_key_env_that_is_not_an_env_name_is_rejected() {
-        assert!(validate_codex_api_key_env(None).is_ok());
-        assert!(validate_codex_api_key_env(Some("OPENAI_API_KEY_WORK")).is_ok());
-        assert!(validate_codex_api_key_env(Some("_key0")).is_ok());
-        for bad in [
-            "",
-            "0KEY",
-            "OPENAI-API-KEY",
-            "OPENAI_API_KEY=x",
-            "OPENAI API KEY",
-        ] {
-            let err = validate_codex_api_key_env(Some(bad))
-                .expect_err("an unreadable env name must be rejected");
+    fn a_codex_api_key_naming_anything_but_a_key_is_rejected() {
+        assert!(validate_codex_api_key(None).is_ok());
+        assert!(validate_codex_api_key(Some("WORK")).is_ok());
+        assert!(validate_codex_api_key(Some("TEAM_2")).is_ok());
+        for bad in ["", "work", "WORK-2", "CODEX_CREDENTIALS=x", "AWS SECRET"] {
+            let err =
+                validate_codex_api_key(Some(bad)).expect_err("only a key name may be selected");
             assert!(err.to_string().contains(bad), "{err}");
         }
     }
