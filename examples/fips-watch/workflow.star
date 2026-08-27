@@ -52,7 +52,7 @@ roundup = command(
     run = "python3 roundup.py",
     depends_on = [scan, probe, select, triage],
     join = "passed",
-    emits = ["clean", "dirty"],
+    emits = ["revision", "clean", "dirty", "blockers"],
     emits_files = ["REPORT.md", "ISSUES.json"],
 )
 
@@ -66,8 +66,32 @@ file_issues = command(
     emits_files = ["FILED.md"],
 )
 
+card = command(
+    name = "card",
+    run = "python3 card.py",
+    depends_on = [roundup, file_issues],
+    join = "passed",
+    emits = [
+        "verdict",
+        "revision",
+        "clean_variants",
+        "dirty_variants",
+        "crypto_blockers",
+        "issues_filed",
+        "issues_skipped",
+    ],
+)
+
+publish_report = report(
+    name = "publish-report",
+    destination = {"kind": "slack"},
+    template = "reports/slack.md.j2",
+    result = card,
+    required = True,
+)
+
 workflow(
     type = "playbook",
-    tasks = [scan, probe, select, triage, roundup, file_issues],
+    tasks = [scan, probe, select, triage, roundup, file_issues, card, publish_report],
     result = roundup,
 )

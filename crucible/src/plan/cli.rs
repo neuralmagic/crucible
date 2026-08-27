@@ -5,8 +5,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::plan::exec::{Substrate, runnable_set};
-use crate::plan::ir::{Direction, Plan, TaskKind, ValidPlan};
+use crate::plan::exec::{Substrate, TaskResult, TaskStatus, runnable_set};
+use crate::plan::ir::{Direction, Plan, Task, TaskKind, ValidPlan};
 use xai_grok_mermaid::{MermaidTheme, RenderLimits, RenderParams, default_engine, render_checked};
 
 #[derive(Debug, thiserror::Error)]
@@ -22,6 +22,24 @@ struct NoValidVerdict {
 }
 
 const MERMAID_COMMAND_PREVIEW_CHARS: usize = 72;
+
+fn declared_report_output(task: &Task, result: &TaskResult) -> Option<serde_json::Value> {
+    if result.status != TaskStatus::Pass {
+        return None;
+    }
+    let object = result.output.as_ref()?.as_object()?;
+    Some(serde_json::Value::Object(
+        task.emits
+            .iter()
+            .filter_map(|field| {
+                object
+                    .get(&field.0)
+                    .cloned()
+                    .map(|value| (field.0.clone(), value))
+            })
+            .collect(),
+    ))
+}
 
 /// Compile scope-time workflow authoring syntax. JSON on stdout is stable enough for a
 /// checked-in golden; `--manifest` additionally materializes the runtime TOML authority. A
@@ -664,6 +682,16 @@ pub fn run(
     if let Some(f) = &events {
         append(f, &plan_admitted_event(&plan));
     }
+    let selected_results: std::collections::BTreeSet<_> = plan
+        .tasks_topo()
+        .filter_map(|task| match &task.task {
+            TaskKind::Report {
+                result: Some(result),
+                ..
+            } => Some(result.0.clone()),
+            _ => None,
+        })
+        .collect();
     let mut report = crucible_contract::RunReport {
         run: std::env::var("CRUCIBLE_RUN_NAME").unwrap_or_else(|_| "local".to_string()),
         run_url: match (
@@ -674,6 +702,18 @@ pub fn run(
             _ => None,
         },
         tasks: Vec::new(),
+        results: selected_results
+            .iter()
+            .map(|name| {
+                (
+                    name.clone(),
+                    crucible_contract::ReportResult {
+                        status: "pending".to_string(),
+                        output: None,
+                    },
+                )
+            })
+            .collect(),
     };
     let report_path = forge::storage_root().join(crucible_contract::REPORT_FILE);
     let write_report = |report: &crucible_contract::RunReport| {
@@ -699,6 +739,10 @@ pub fn run(
                 status: result.status.as_str().to_string(),
                 cost_usd: result.cost_usd,
             });
+            if let Some(selected) = report.results.get_mut(&task.name.0) {
+                selected.status = result.status.as_str().to_string();
+                selected.output = declared_report_output(task, result);
+            }
             write_report(&report);
             if let Some(f) = &events {
                 append(f, &task_result_event(plan.plan().version, 0, task, result));
@@ -1117,6 +1161,48 @@ mod tests {
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn report_projection_keeps_only_declared_fields_from_a_passing_task() {
+        let plan = Plan::from_toml_str(
+            r#"
+version = 1
+[budget]
+usd = 1
+[[task]]
+name = "card"
+kind = "command"
+command = "true"
+emits = ["verdict", "dirty"]
+"#,
+        )
+        .unwrap()
+        .validate()
+        .unwrap();
+        let task = plan.get(&"card".into()).unwrap();
+        let result = TaskResult {
+            status: TaskStatus::Pass,
+            attempts: 1,
+            cost_usd: 0.0,
+            output: Some(serde_json::json!({
+                "verdict": "ACTION REQUIRED",
+                "dirty": 3,
+                "undeclared_secret": "must not cross"
+            })),
+            note: None,
+            fanout: None,
+        };
+
+        assert_eq!(
+            declared_report_output(task, &result),
+            Some(serde_json::json!({"verdict": "ACTION REQUIRED", "dirty": 3}))
+        );
+        let failed = TaskResult {
+            status: TaskStatus::Fail,
+            ..result
+        };
+        assert_eq!(declared_report_output(task, &failed), None);
     }
 
     #[test]

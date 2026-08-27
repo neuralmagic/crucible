@@ -301,11 +301,14 @@ and RESULTS.md (`epilogue` / `epilogue-skip` / `epilogue-fail`), and the PR body
 "Epilogue checks (advisory)" section with failures marked **FAILED**.
 
 `report(name = "publish-report", destination = {"kind": "slack"}, template = "reports/slack.md.j2",
-required = True)` is the engine-owned publication epilogue. Destinations are engine-known keys,
-not URLs or secret names; `slack` is the only destination in the first version.
-It accepts no message, channel, prompt, or task output: the engine invokes it once with the bounded
-run snapshot. A required report makes delivery failure fail the workflow; it does not rely on an
-agent remembering to call a tool.
+result = roundup, required = True)` is the engine-owned publication epilogue. Destinations are
+engine-known keys, not URLs or secret names; `slack` is the only destination in the first version.
+The optional `result` selector projects only that main-graph task's declared JSON fields into an
+engine-built Block Kit card. It does not expose prompts, stdout, workspaces, undeclared fields, raw
+Slack blocks, channels, or credentials. Selected output defaults to a 16 KiB encoded limit; an
+operator may lower or raise it up to 64 KiB with `CRUCIBLE_REPORT_RESULT_MAX_BYTES`. Oversize data
+fails without truncation. A required report makes rendering or delivery failure fail the workflow;
+it does not rely on an agent remembering to call a tool.
 
 ## Worked example
 

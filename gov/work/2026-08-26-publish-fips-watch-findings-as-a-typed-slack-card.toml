@@ -11,21 +11,21 @@ started = "2026-08-26"
 description = "Extend the engine-owned report task with a bounded typed projection of the FIPS roundup result, render that projection as Slack Block Kit, and make the existing fips-watch playbook deliver an actionable compliance card without exposing arbitrary Slack payloads or credentials."
 
 [[content.acceptance_criteria]]
-text = "report(result = task) admits only a same-graph task, orders delivery after it settles, and snapshots only its declared bounded JSON output"
-status = "pending"
+text = "report(result = task) admits only a same-graph task and snapshots only its declared bounded JSON output after the main graph settles"
+status = "done"
 category = "added"
 
 [[content.acceptance_criteria]]
 text = "the Slack destination renders engine-owned Block Kit with verdict, cost, selected result fields, task context, and a working run link"
-status = "pending"
+status = "done"
 category = "added"
 
 [[content.acceptance_criteria]]
 text = "fips-watch reports its revision, clean and dirty variant counts, blockers, and filing outcome through the typed card"
-status = "pending"
+status = "done"
 category = "changed"
 
 [[content.acceptance_criteria]]
 text = "focused contract, broker, DSL, and FIPS workflow tests pass and govctl check is green"
-status = "pending"
+status = "done"
 category = "chore"

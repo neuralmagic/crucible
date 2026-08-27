@@ -20,6 +20,9 @@ decides clean or dirty from `cargo tree -e normal` — free, no model. `select` 
 ones, so a clean sweep spends nothing. `triage` is the single agent, and only for a dirty variant:
 it names the dependency edge that carries the blocker, proposes the smallest fix, and drafts a
 tracking issue. `roundup` assembles the report from captured evidence. `file` files the issues.
+Finally, `card` folds the declared verdict and filing fields into a bounded result, and the
+engine-owned `report` epilogue renders that result as Slack Block Kit with a link to the run. The
+pack never supplies Slack blocks, a channel, or a webhook URL.
 
 ## Why the verdict is a build graph, not a lockfile
 

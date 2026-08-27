@@ -93,8 +93,13 @@ impl ShellRunner {
                     cmd.env("CRUCIBLE_EFFORT", e);
                 }
             }
-            TaskKind::Report { template, .. } => {
-                return match crucible_broker::report::deliver(Some(template)) {
+            TaskKind::Report {
+                template, result, ..
+            } => {
+                return match crucible_broker::report::deliver(
+                    Some(template),
+                    result.as_ref().map(|name| name.0.as_str()),
+                ) {
                     Ok(output) => Attempt {
                         outcome: AttemptOutcome::Pass(
                             serde_json::from_str(&output).unwrap_or_else(|_| {

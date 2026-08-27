@@ -1,6 +1,8 @@
 //! Posts only the engine-authored report snapshot; tool callers supply no content.
 
 const DEFAULT_TEMPLATE: &str = "{{ passed }} passed, {{ failed }} non-passing · ${{ '%.4f'|format(spent_usd) }}\n{%- for task in tasks %}\n• `{{ task.name }}` — {{ task.status }}{% endfor %}\n{%- if run_url %}\n<{{ run_url }}|Open run artifacts in Crucible>{% endif %}";
+const DEFAULT_RESULT_MAX_BYTES: usize = 16 * 1024;
+const MAX_RESULT_MAX_BYTES: usize = 64 * 1024;
 
 #[derive(serde::Serialize)]
 struct TemplateTask {
@@ -60,25 +62,122 @@ fn render(report: &crucible_contract::RunReport, template: Option<&str>) -> Resu
 fn payload(
     report: &crucible_contract::RunReport,
     template: Option<&str>,
+    result: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     let failed = report.tasks.iter().filter(|t| t.status != "pass").count();
     let text = render(report, template)?;
-    Ok(serde_json::json!({"attachments": [{
-        "color": if failed == 0 { "good" } else { "warning" },
-        "title": format!("Crucible workflow: {}", slack_escape(&report.run)),
-        "text": text,
-        "mrkdwn_in": ["text"]
-    }]}))
+    let mut blocks = vec![
+        serde_json::json!({
+            "type": "header",
+            "text": {"type": "plain_text", "text": "Crucible workflow report"}
+        }),
+        serde_json::json!({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": format!(
+                "*{}*\n{}",
+                slack_escape(&report.run),
+                text
+            )}
+        }),
+    ];
+
+    if let Some(name) = result {
+        let selected = report
+            .results
+            .get(name)
+            .ok_or_else(|| format!("selected report result {name:?} is absent"))?;
+        blocks.push(serde_json::json!({"type": "divider"}));
+        blocks.push(serde_json::json!({
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": format!("*Result*\n{}", slack_escape(name))},
+                {"type": "mrkdwn", "text": format!("*Status*\n{}", slack_escape(&selected.status))}
+            ]
+        }));
+        if let Some(output) = &selected.output {
+            let encoded = serde_json::to_vec(output)
+                .map_err(|e| format!("encoding selected report result: {e}"))?;
+            let limit = result_max_bytes()?;
+            if encoded.len() > limit {
+                return Err(format!(
+                    "selected report result is {} bytes, exceeding the configured {limit}-byte limit",
+                    encoded.len()
+                ));
+            }
+            let object = output.as_object().ok_or_else(|| {
+                "selected report result must be a JSON object for Slack cards".to_string()
+            })?;
+            for fields in object.iter().collect::<Vec<_>>().chunks(10) {
+                let fields: Result<Vec<_>, String> = fields
+                    .iter()
+                    .map(|(key, value)| {
+                        let value = card_value(value)?;
+                        Ok(serde_json::json!({
+                            "type": "mrkdwn",
+                            "text": format!(
+                                "*{}*\n{}",
+                                slack_escape(&key.replace('_', " ")),
+                                value
+                            )
+                        }))
+                    })
+                    .collect();
+                blocks.push(serde_json::json!({"type": "section", "fields": fields?}));
+            }
+        }
+    }
+
+    if let Some(url) = &report.run_url {
+        blocks.push(serde_json::json!({
+            "type": "actions",
+            "elements": [{
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Open run in Crucible"},
+                "url": url,
+                "style": if failed == 0 { "primary" } else { "danger" }
+            }]
+        }));
+    }
+    Ok(serde_json::json!({"text": format!("Crucible workflow: {}", report.run), "blocks": blocks}))
+}
+
+fn result_max_bytes() -> Result<usize, String> {
+    let Some(raw) = std::env::var("CRUCIBLE_REPORT_RESULT_MAX_BYTES").ok() else {
+        return Ok(DEFAULT_RESULT_MAX_BYTES);
+    };
+    let value = raw
+        .parse::<usize>()
+        .map_err(|_| "CRUCIBLE_REPORT_RESULT_MAX_BYTES must be a positive integer".to_string())?;
+    if value == 0 || value > MAX_RESULT_MAX_BYTES {
+        return Err(format!(
+            "CRUCIBLE_REPORT_RESULT_MAX_BYTES must be between 1 and {MAX_RESULT_MAX_BYTES}"
+        ));
+    }
+    Ok(value)
+}
+
+fn card_value(value: &serde_json::Value) -> Result<String, String> {
+    let raw = match value {
+        serde_json::Value::String(value) => value.clone(),
+        other => {
+            serde_json::to_string(other).map_err(|e| format!("encoding Slack card field: {e}"))?
+        }
+    };
+    let escaped = slack_escape(&raw);
+    if escaped.len() > 2_000 {
+        return Err("a selected report field exceeds Slack's 2000-character field limit".into());
+    }
+    Ok(escaped)
 }
 
 /// Deliver the engine-authored snapshot. Public so the workflow executor can enforce a
 /// first-class `report()` task without routing it through an agent-controlled MCP call.
-pub fn deliver(template: Option<&str>) -> Result<String, String> {
+pub fn deliver(template: Option<&str>, result: Option<&str>) -> Result<String, String> {
     let path = forge::storage_root().join(crucible_contract::REPORT_FILE);
     let bytes = std::fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
     let report: crucible_contract::RunReport =
         serde_json::from_slice(&bytes).map_err(|e| format!("decoding engine report: {e}"))?;
-    let body = payload(&report, template)?;
+    let body = payload(&report, template, result)?;
     let url =
         std::env::var("SLACK_WEBHOOK_URL").map_err(|_| "SLACK_WEBHOOK_URL is unset".to_string())?;
     crate::slack::post(&url, &body)?;
@@ -88,6 +187,7 @@ pub fn deliver(template: Option<&str>) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::io::{Read, Write};
     use std::sync::Mutex;
 
@@ -103,8 +203,9 @@ mod tests {
                 status: "pass".into(),
                 cost_usd: 0.25,
             }],
+            results: Default::default(),
         };
-        let encoded = payload(&report, None).unwrap().to_string();
+        let encoded = payload(&report, None, None).unwrap().to_string();
         assert!(encoded.contains("run-7"));
         assert!(encoded.contains("roundup"));
         assert!(encoded.contains("https://crucible.example/runs/run-7"));
@@ -123,12 +224,45 @@ mod tests {
                 status: "pass".into(),
                 cost_usd: 0.0,
             }],
+            results: Default::default(),
         };
         let text = render(&report, Some("{{ run }} {{ tasks[0].name }} {{ run_url }}")).unwrap();
         assert_eq!(
             text,
             "run&lt;&amp; task&lt;@everyone&gt; https://example.test/runs/7?a=1&amp;b=2"
         );
+    }
+
+    #[test]
+    fn selected_result_becomes_engine_owned_slack_blocks() {
+        let report = crucible_contract::RunReport {
+            run: "fips-watch".into(),
+            run_url: Some("https://crucible.example/runs/fips-watch".into()),
+            tasks: vec![crucible_contract::TaskReport {
+                name: "card".into(),
+                status: "pass".into(),
+                cost_usd: 0.0,
+            }],
+            results: BTreeMap::from([(
+                "card".into(),
+                crucible_contract::ReportResult {
+                    status: "pass".into(),
+                    output: Some(serde_json::json!({
+                        "verdict": "ACTION REQUIRED",
+                        "dirty_variants": 3,
+                        "crypto_blockers": ["ring"]
+                    })),
+                },
+            )]),
+        };
+
+        let body = payload(&report, Some("*FIPS dependency watch*"), Some("card")).unwrap();
+        let encoded = body.to_string();
+        assert!(encoded.contains("\"blocks\""));
+        assert!(encoded.contains("ACTION REQUIRED"));
+        assert!(encoded.contains("dirty variants"));
+        assert!(encoded.contains("Open run in Crucible"));
+        assert!(!encoded.contains("webhook"));
     }
 
     #[test]
@@ -147,6 +281,7 @@ mod tests {
                     status: "pass".into(),
                     cost_usd: 0.0,
                 }],
+                results: Default::default(),
             })
             .unwrap(),
         )
@@ -167,7 +302,7 @@ mod tests {
             std::env::set_var("FORGE_STORAGE_ROOT", &root);
             std::env::set_var("SLACK_WEBHOOK_URL", format!("http://{addr}/hook"));
         }
-        assert!(deliver(None).unwrap().contains("delivered"));
+        assert!(deliver(None, None).unwrap().contains("delivered"));
         unsafe {
             std::env::remove_var("FORGE_STORAGE_ROOT");
             std::env::remove_var("SLACK_WEBHOOK_URL");

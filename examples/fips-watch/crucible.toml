@@ -5,7 +5,7 @@ path = "."
 
 [workspace]
 dir = "workspace"
-setup_cmd = "mkdir -p workspace && cp variants.json blockers.json required.json scan.py probe.py pick_dirty.py roundup.py file_issues.py workspace/ && git clone -q --depth 1 --branch \"${FIPS_WATCH_REF:-main}\" \"https://github.com/${FIPS_WATCH_REPO:-ai-dynamo/modelexpress}.git\" workspace/checkout && git -C workspace/checkout rev-parse HEAD > workspace/WATCHED_REV && rm -rf workspace/checkout/.git && git -C workspace init -q && git -C workspace add -A && git -C workspace -c user.email=crucible@local -c user.name=crucible commit -qm baseline"
+setup_cmd = "mkdir -p workspace && cp variants.json blockers.json required.json scan.py probe.py pick_dirty.py roundup.py file_issues.py card.py workspace/ && git clone -q --depth 1 --branch \"${FIPS_WATCH_REF:-main}\" \"https://github.com/${FIPS_WATCH_REPO:-ai-dynamo/modelexpress}.git\" workspace/checkout && git -C workspace/checkout rev-parse HEAD > workspace/WATCHED_REV && rm -rf workspace/checkout/.git && git -C workspace init -q && git -C workspace add -A && git -C workspace -c user.email=crucible@local -c user.name=crucible commit -qm baseline"
 
 [[workspace.inject]]
 src = "variants.json"

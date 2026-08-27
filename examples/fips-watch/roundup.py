@@ -88,7 +88,24 @@ def main() -> None:
     payloads = issue_payloads(dirty, triaged)
     Path("ISSUES.json").write_text(json.dumps(payloads, indent=2) + "\n")
 
-    print(json.dumps({"clean": len(clean), "dirty": len(dirty)}))
+    blockers = sorted(
+        {
+            blocker.strip()
+            for value in probes.values()
+            for blocker in value.get("blockers", "").split(",")
+            if blocker.strip()
+        }
+    )
+    print(
+        json.dumps(
+            {
+                "revision": rev.read_text().strip() if rev.exists() else "unknown",
+                "clean": len(clean),
+                "dirty": len(dirty),
+                "blockers": blockers,
+            }
+        )
+    )
 
 
 if __name__ == "__main__":
