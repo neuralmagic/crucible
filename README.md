@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/img/crucible-molten.gif" alt="The crucible mark: a vessel of molten metal, sloshing." width="180">
+</p>
+
 # crucible
 
 Crucible is an engine for running goal-directed optimization loops against a codebase or

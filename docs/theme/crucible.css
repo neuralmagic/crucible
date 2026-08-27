@@ -227,3 +227,26 @@ blockquote {
     padding: 1.1rem 1.2rem;
   }
 }
+
+/* The molten mark on the introduction hero: the still image holds the box until (and unless)
+   WebGPU takes over, so the layout never jumps. */
+.cru-mark {
+  position: relative;
+  display: block;
+  width: 120px;
+  height: 120px;
+  margin: 0 auto 18px;
+}
+.cru-mark img,
+.cru-mark canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  image-rendering: pixelated;
+}
+.cru-mark canvas {
+  opacity: 0;
+  cursor: crosshair;
+  transition: opacity 240ms ease;
+}

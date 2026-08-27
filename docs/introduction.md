@@ -1,6 +1,10 @@
 # crucible
 
 <div class="cru-hero">
+  <span class="cru-mark">
+    <img src="./img/crucible-mark.png" alt="The crucible mark: a vessel of molten metal." data-molten-fallback>
+    <canvas data-molten width="480" height="480" aria-label="The crucible mark, molten: lava sloshing in the vessel. Click to slosh."></canvas>
+  </span>
   <p class="eyebrow">Agentic autoresearch loop</p>
   <p class="lead">An agent forms a hypothesis, changes the code or config, measures once, and is gated keep-or-discard against a frozen objective. Git is the memory.</p>
 </div>
