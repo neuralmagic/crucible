@@ -22,9 +22,8 @@ use crucible_harness::{CodexJsonParser, LiveMeters};
 use std::time::Duration;
 
 /// How a sandbox turn gets its model credential. Vertex mints a `cloud-platform` access token from
-/// ADC and serves it through the gateway's metadata emulator; Codex mints a ChatGPT OAuth access
-/// token from the host's refresh material and seeds it as the sandbox's `auth.json`. Both mint at
-/// turn start through the same provider machinery; only the mint and the delivery differ.
+/// ADC and serves it through the gateway's metadata emulator; Codex seeds either an API key or a
+/// host-refreshed ChatGPT OAuth access token into the sandbox's `auth.json`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AuthProvider {
     Vertex,
@@ -157,14 +156,14 @@ pub(crate) trait HarnessRuntime {
     /// Files uploaded into the sandbox before the agent execs (claude: `.mcp.json` when the
     /// broker is on). `broker_token` is what the seeded MCP config sends as its bearer: the raw
     /// per-run token, or the provider placeholder when the openshell egress proxy resolves it.
-    /// `auth` is this turn's minted ChatGPT token, which only the codex arm seeds (as its
-    /// `auth.json`); the Vertex harnesses resolve their credential through the gateway instead.
+    /// `auth` is the API-key or ChatGPT credential only the codex arm seeds as `auth.json`;
+    /// the Vertex harnesses resolve their credential through the gateway instead.
     fn seed_files(
         self,
         args: &Args,
         broker_url: Option<&str>,
         broker_token: Option<&str>,
-        auth: Option<&crate::openshell::provider::CodexToken>,
+        auth: Option<&crate::openshell::provider::CodexAuth>,
     ) -> Vec<SeedFile>;
 
     /// The stream decoder for this harness's stdout. `meters`, when present, are the in-process
@@ -303,7 +302,7 @@ impl HarnessRuntime for Harness {
         args: &Args,
         broker_url: Option<&str>,
         broker_token: Option<&str>,
-        auth: Option<&crate::openshell::provider::CodexToken>,
+        auth: Option<&crate::openshell::provider::CodexAuth>,
     ) -> Vec<SeedFile> {
         match self {
             Harness::Claude => claude::seed_files(args, broker_url, broker_token),
@@ -523,7 +522,12 @@ mod tests {
             crate::openshell::policy::DEFAULT_ENDPOINTS,
             "the shared defaults come first, unchanged"
         );
-        for host in ["chatgpt.com", "auth.openai.com", "api.openai.com"] {
+        for host in [
+            "chatgpt.com",
+            "auth.openai.com",
+            "api.openai.com",
+            "ab.chatgpt.com",
+        ] {
             assert!(
                 codex.iter().any(|e| e.starts_with(&format!("{host}:443:"))),
                 "codex needs {host}: {codex:?}"
