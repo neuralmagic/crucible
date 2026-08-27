@@ -465,6 +465,19 @@ pub fn execute(
                     producers.push(p.clone());
                 }
             }
+            if let TaskKind::Report {
+                result: Some(result),
+                file: Some(_),
+                ..
+            } = &t.task
+                && results
+                    .get(result)
+                    .is_some_and(|r| r.status == TaskStatus::Pass)
+                && let Some(producer) = plan.get(result)
+                && !producers.iter().any(|p| p.name == producer.name)
+            {
+                producers.push(producer.clone());
+            }
             producers
         };
 
@@ -2382,5 +2395,34 @@ mod tests {
             vec!["audit[alpha]".to_string(), "audit[gamma]".to_string()],
             "the failed instance's files reached a descendant"
         );
+    }
+
+    #[test]
+    fn a_sheet_report_stages_its_selected_declared_file_without_a_graph_dependency() {
+        let mut producer = task("roundup", &[], "any", true);
+        producer.emits_files = vec!["report.csv".to_string()];
+        let mut report = task("publish", &[], "any", true);
+        report.stage = crate::plan::ir::Stage::Epilogue;
+        report.task = TaskKind::Report {
+            destination: crate::plan::ir::ReportDestination::GoogleSheets(
+                crate::plan::ir::GoogleSheetsDestination::default(),
+            ),
+            template: String::new(),
+            result: Some("roundup".into()),
+            file: Some("report.csv".to_string()),
+            markdown_from: None,
+            variables: Default::default(),
+        };
+        let plan = valid(vec![producer, report], 5.0);
+        let mut runner = FanoutRunner::new(&[]);
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut runner,
+            |_, _| {},
+        );
+        assert!(out.valid, "{:?}", out.results);
+        assert_eq!(runner.staged["publish"], vec!["roundup".to_string()]);
     }
 }

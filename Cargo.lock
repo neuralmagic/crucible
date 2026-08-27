@@ -1466,7 +1466,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "regex-lite",
- "reqwest",
+ "reqwest 0.13.4",
  "rusqlite",
  "rustix",
  "semver",
@@ -1500,14 +1500,17 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "crucible-contract",
+ "csv",
  "forge",
+ "gcp_auth",
+ "google-workspace",
  "jira-mcp",
  "minijinja",
  "openshell-core",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
- "reqwest",
+ "reqwest 0.13.4",
  "rmcp 3.1.2",
  "serde",
  "serde_json",
@@ -1536,7 +1539,7 @@ dependencies = [
  "axum",
  "crucible-contract",
  "jiff",
- "reqwest",
+ "reqwest 0.13.4",
  "serde_json",
  "tokio",
 ]
@@ -1578,6 +1581,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
 dependencies = [
  "hybrid-array",
+]
+
+[[package]]
+name = "csv"
+version = "1.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52cd9d68cf7efc6ddfaaee42e7288d3a99d613d4b50f76ce9827ae0c6e14f938"
+dependencies = [
+ "csv-core",
+ "itoa",
+ "ryu",
+ "serde_core",
+]
+
+[[package]]
+name = "csv-core"
+version = "0.1.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "704a3c26996a80471189265814dbc2c257598b96b8a7feae2d31ace646bb9782"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
@@ -2342,7 +2366,7 @@ dependencies = [
  "kube",
  "libc",
  "oci-client",
- "reqwest",
+ "reqwest 0.13.4",
  "rustls 0.23.41",
  "serde",
  "serde_json",
@@ -2606,6 +2630,22 @@ dependencies = [
  "log",
  "regex-automata",
  "regex-syntax",
+]
+
+[[package]]
+name = "google-workspace"
+version = "0.22.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "20d1026ff3ca7c7af6a893e3f10a76e6f7f0749a8f2a50b0617454dc73f0e2a7"
+dependencies = [
+ "anyhow",
+ "percent-encoding",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -3253,7 +3293,7 @@ dependencies = [
  "anyhow",
  "clap",
  "keyring",
- "reqwest",
+ "reqwest 0.13.4",
  "rmcp 1.8.0",
  "schemars 0.8.22",
  "serde",
@@ -4009,7 +4049,7 @@ dependencies = [
  "oci-spec",
  "olpc-cjson",
  "regex",
- "reqwest",
+ "reqwest 0.13.4",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -4141,7 +4181,7 @@ dependencies = [
  "bytes",
  "http 1.4.2",
  "opentelemetry",
- "reqwest",
+ "reqwest 0.13.4",
 ]
 
 [[package]]
@@ -4156,7 +4196,7 @@ dependencies = [
  "opentelemetry-proto",
  "opentelemetry_sdk",
  "prost",
- "reqwest",
+ "reqwest 0.13.4",
  "thiserror",
  "tokio",
  "tonic",
@@ -4983,6 +5023,44 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "reqwest"
+version = "0.12.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "futures-core",
+ "http 1.4.2",
+ "http-body 1.0.1",
+ "http-body-util",
+ "hyper 1.10.1",
+ "hyper-rustls 0.27.9",
+ "hyper-util",
+ "js-sys",
+ "log",
+ "percent-encoding",
+ "pin-project-lite",
+ "quinn",
+ "rustls 0.23.41",
+ "rustls-native-certs",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "sync_wrapper",
+ "tokio",
+ "tokio-rustls 0.26.4",
+ "tower",
+ "tower-http",
+ "tower-service",
+ "url",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
 
 [[package]]
 name = "reqwest"

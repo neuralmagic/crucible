@@ -56,6 +56,15 @@ impl ShellRunner {
     fn run_in_workdir(&mut self, task: &Task, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").current_dir(&self.workdir);
+        for name in [
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "CRUCIBLE_GOOGLE_DOC_ID",
+            "CRUCIBLE_GOOGLE_SHEET_ID",
+            "CRUCIBLE_GOOGLE_SHEET_RANGE",
+            "SLACK_WEBHOOK_URL",
+        ] {
+            cmd.env_remove(name);
+        }
         cmd.env("CRUCIBLE_TASK", &task.name.0);
         match serde_json::to_string(inputs) {
             Ok(json) => {
@@ -94,12 +103,50 @@ impl ShellRunner {
                 }
             }
             TaskKind::Report {
-                template, result, ..
+                destination,
+                template,
+                result,
+                file,
+                markdown_from,
+                variables,
             } => {
-                return match crucible_broker::report::deliver(
-                    Some(template),
-                    result.as_ref().map(|name| name.0.as_str()),
-                ) {
+                let result = result.as_ref().map(|name| name.0.as_str());
+                let variable_refs = variables
+                    .iter()
+                    .map(|(name, reference)| {
+                        (
+                            name.clone(),
+                            (reference.task.0.clone(), reference.field.0.clone()),
+                        )
+                    })
+                    .collect();
+                let delivered = match destination {
+                    crate::plan::ir::ReportDestination::Slack(_) => {
+                        crucible_broker::report::deliver_slack(
+                            Some(template),
+                            result,
+                            markdown_from.as_ref().map(|reference| {
+                                (reference.task.0.as_str(), reference.field.0.as_str())
+                            }),
+                            &variable_refs,
+                        )
+                    }
+                    crate::plan::ir::ReportDestination::GoogleDocs(_) => {
+                        crucible_broker::report::deliver_google_docs(Some(template), result)
+                    }
+                    crate::plan::ir::ReportDestination::GoogleSheets(_) => {
+                        let producer = result.expect("validated Google Sheets result");
+                        let file = file.as_deref().expect("validated Google Sheets file");
+                        let staged = self.workdir.join("inputs").join(producer).join(file);
+                        let path = if staged.is_file() {
+                            staged
+                        } else {
+                            self.workdir.join(file)
+                        };
+                        crucible_broker::report::deliver_google_sheets(&path)
+                    }
+                };
+                return match delivered {
                     Ok(output) => Attempt {
                         outcome: AttemptOutcome::Pass(
                             serde_json::from_str(&output).unwrap_or_else(|_| {

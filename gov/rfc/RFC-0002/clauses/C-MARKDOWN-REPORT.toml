@@ -1,0 +1,11 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-MARKDOWN-REPORT"
+title = "Author-opted Slack Markdown reports"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = "A Slack report MUST default to the engine-owned snapshot or structured result projection. A pack author MAY instead select exactly one task-authored content mode: markdown_from = producer.field supplies the complete Markdown body, while variables = {name: producer.field, ...} supplies only named values to the pack-owned template. result, markdown_from, and variables MUST be mutually exclusive. Every selected producer MUST name a same-graph main-stage task and every selected field MUST be declared in emits. Selected values MUST be strings, MUST have less-than, greater-than, and ampersand escaped before rendering, and template expansion MUST be strict and single-pass. The engine MUST emit a Slack markdown block and top-level fallback text and MUST reject empty output or output over 12000 characters before network I/O. These content modes MUST NOT apply to other destinations and MUST NOT add message or destination arguments to the MCP report tool."

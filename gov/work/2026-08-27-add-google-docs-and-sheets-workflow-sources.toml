@@ -1,0 +1,38 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-08-27-002"
+title = "Add Google Docs and Sheets workflow sources"
+status = "queue"
+created = "2026-08-27"
+refs = ["RFC-0002:C-EXTERNAL-SOURCES"]
+
+[content]
+description = "Add read-only engine-owned Google Docs and Google Sheets source tasks that resolve operator-defined logical keys into bounded typed workflow inputs without exposing Workspace routing or credentials to packs."
+
+[[content.acceptance_criteria]]
+text = "source tasks accept a Google Workspace source kind and logical operator-defined key, require no dependencies, and reject resource identifiers, ranges, credentials, and identities in workflow source"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "Google Docs sources return bounded document text and Google Sheets sources return bounded typed unformatted rows"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "retrieved content remains visibly external data in agent prompts and source credentials and resolved identifiers never enter task environments or persisted results"
+status = "pending"
+category = "security"
+
+[[content.acceptance_criteria]]
+text = "compiler, size-bound, taint-rendering, and Workspace transport behavior have focused tests and author/operator documentation"
+status = "pending"
+category = "chore"
+
+[verification]
+required_guards = [
+    "GUARD-CARGO-FMT",
+    "GUARD-CARGO-TEST",
+    "GUARD-GOVCTL-CHECK",
+]

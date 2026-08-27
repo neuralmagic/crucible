@@ -1,0 +1,18 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-EXTERNAL-SOURCES"
+title = "Engine-owned external source nodes"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = """
+A playbook MAY declare an engine-owned source task with no dependencies. A source task MUST name a source kind and an operator-defined logical source key. The engine MUST resolve that key from operator configuration; a pack MUST NOT supply a network location, Google Workspace resource identifier, range, credential, or delegated identity.
+
+A Google Docs source MUST read the textual content of the configured document and expose it as a declared string output. A Google Sheets source MUST read the configured range with unformatted values and expose the result as a declared array of rows whose cells retain null, boolean, number, or string JSON types. A source read MUST NOT expose formulas, formatting directives, comments, credentials, or resource metadata unless a later normative clause explicitly admits them.
+
+Every source result MUST be encoded and checked against an operator-configured maximum before it enters the graph. Exceeding the maximum MUST fail the source task without truncation. A source read failure MUST settle under the ordinary required or advisory task rules.
+
+Content retrieved from an external source MUST remain marked as external data when rendered into an agent prompt and MUST NOT be presented as pack-authored instruction. Source credentials MUST remain unavailable to workflow tasks and MUST NOT be persisted in the session result. The persisted source result MAY contain the bounded retrieved values but MUST NOT contain the resolved resource identifier or credential."""

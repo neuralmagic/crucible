@@ -1,0 +1,49 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-08-27-001"
+title = "Add Google Docs and Sheets report destinations"
+status = "active"
+created = "2026-08-27"
+started = "2026-08-27"
+refs = ["RFC-0002:C-REPORTS"]
+
+[content]
+description = "Add engine-owned Google Docs and Google Sheets report delivery alongside Slack, using operator-controlled service-account credentials and existing destination targets while preserving the typed report boundary and preventing workflow-authored routing or formulas."
+
+[[content.acceptance_criteria]]
+text = "report destinations google_docs and google_sheets compile to distinct engine-owned destination types without accepting workflow-supplied target or credential parameters"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "Google Docs delivery appends a rendered plain-text section to the operator-configured existing document using application default credentials"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "Google Sheets delivery parses a selected task's declared CSV or TSV file and appends its complete rectangular matrix to the operator-configured spreadsheet range using literal values"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "tests prove workflow data cannot select Google targets or credentials and spreadsheet values cannot execute as formulas"
+status = "pending"
+category = "security"
+
+[[content.acceptance_criteria]]
+text = "destination configuration and service-account setup are documented with focused compiler, payload, and transport tests"
+status = "pending"
+category = "chore"
+
+[[content.acceptance_criteria]]
+text = "workflow graph nodes carry accessible type chips for agents, commands, checks, engine operations, Slack, Google Docs, and Google Sheets"
+status = "pending"
+category = "changed"
+
+[verification]
+required_guards = [
+    "GUARD-CARGO-FMT",
+    "GUARD-CARGO-TEST",
+    "GUARD-GOVCTL-CHECK",
+]

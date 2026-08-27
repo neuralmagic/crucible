@@ -16,6 +16,9 @@ anyhow.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+gcp_auth = "0.12"
+google-workspace = "0.22.5"
+csv = "1.4"
 # Generic engine-side workspace build+deploy (brokered to the agent over MCP): the broker pulls the
 # agent's mid-turn edits out of the sandbox and runs forge's buildah-build + kubectl-deploy on the loop pod.
 forge = { path = "../forge" }

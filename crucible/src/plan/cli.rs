@@ -682,16 +682,20 @@ pub fn run(
     if let Some(f) = &events {
         append(f, &plan_admitted_event(&plan));
     }
-    let selected_results: std::collections::BTreeSet<_> = plan
-        .tasks_topo()
-        .filter_map(|task| match &task.task {
-            TaskKind::Report {
-                result: Some(result),
-                ..
-            } => Some(result.0.clone()),
-            _ => None,
-        })
-        .collect();
+    let mut selected_results = std::collections::BTreeSet::new();
+    for task in plan.tasks_topo() {
+        if let TaskKind::Report {
+            result,
+            markdown_from,
+            variables,
+            ..
+        } = &task.task
+        {
+            selected_results.extend(result.iter().map(|name| name.0.clone()));
+            selected_results.extend(markdown_from.iter().map(|r| r.task.0.clone()));
+            selected_results.extend(variables.values().map(|r| r.task.0.clone()));
+        }
+    }
     let mut report = crucible_contract::RunReport {
         run: std::env::var("CRUCIBLE_RUN_NAME").unwrap_or_else(|_| "local".to_string()),
         run_url: match (
