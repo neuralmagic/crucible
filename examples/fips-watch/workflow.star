@@ -79,6 +79,7 @@ card = command(
         "crypto_blockers",
         "issues_filed",
         "issues_skipped",
+        "markdown",
     ],
 )
 
@@ -86,7 +87,7 @@ publish_report = report(
     name = "publish-report",
     destination = {"kind": "slack"},
     template = "reports/slack.md.j2",
-    result = card,
+    markdown_from = card.markdown,
     required = True,
 )
 

@@ -24,8 +24,9 @@ use crate::errors::FileError;
 use crate::manifest::{WorkflowCfg, WorkflowError, WorkflowType};
 use crate::plan::diag;
 use crate::plan::ir::{
-    Direction, EngineOp, Isolation, Join, MAX_FANOUT_CEILING, OutputField, OutputRef,
-    ReportDestination, SlackDestination, Stage, Task, TaskKind, TaskName,
+    Direction, EngineOp, GoogleDocsDestination, GoogleSheetsDestination, Isolation, Join,
+    MAX_FANOUT_CEILING, OutputField, OutputRef, ReportDestination, SlackDestination, Stage, Task,
+    TaskKind, TaskName,
 };
 use crate::plan::starlark::values::WorkflowValue;
 
@@ -675,12 +676,25 @@ pub enum CompileError {
     TopKZero,
     #[error("top_k direction must be `lower` or `higher`, got {got:?}")]
     UnknownTopKDirection { got: String },
-    #[error("report destination kind must be `slack`, got {got:?}")]
+    #[error(
+        "report destination kind must be `slack`, `google_docs`, or `google_sheets`, got {got:?}"
+    )]
     UnknownReportDestination { got: String },
     #[error("report destination must be an object such as {{\"kind\": \"slack\"}}")]
     ReportDestinationNotObject,
     #[error("slack report destination has unknown parameter {parameter:?}")]
     UnknownSlackDestinationParameter { parameter: String },
+    #[error("{kind} report destination has unknown parameter {parameter:?}")]
+    UnknownGoogleDestinationParameter {
+        kind: &'static str,
+        parameter: String,
+    },
+    #[error("report argument {argument:?} must name a declared output field")]
+    ReportSourceNotOutputField { argument: &'static str },
+    #[error("report variables must map names to declared output fields")]
+    ReportVariablesNotObject,
+    #[error("report variable {name:?} must name a declared output field")]
+    ReportVariableNotOutputField { name: String },
     #[error("top_k requires a non-empty depends_on")]
     TopKWithoutDependencies,
     #[error("stage must be `iteration` or `epilogue`, got {got:?}")]
@@ -954,7 +968,16 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "emits_files",
         ],
         "top_k" => &["name", "k", "direction", "depends_on", "required"],
-        "report" => &["name", "destination", "template", "result", "required"],
+        "report" => &[
+            "name",
+            "destination",
+            "template",
+            "result",
+            "file",
+            "markdown_from",
+            "variables",
+            "required",
+        ],
         "propose" => &["name", "session", "depends_on"],
         "apply" | "measure" => &["name", "depends_on"],
         "grade" => &["name", "score", "tiebreak", "evidence", "join"],
@@ -1100,6 +1123,9 @@ fn constructor(
                     state.context_mut().prompt_file(&path)?
                 },
                 result: take_optional_task_name(&mut named, "result")?,
+                file: take_optional_string(&mut named, "file")?,
+                markdown_from: take_output_reference(&mut named, "markdown_from")?,
+                variables: take_report_variables(&mut named)?,
             },
             depends_on: Vec::new(),
             session: None,
@@ -1453,6 +1479,33 @@ fn take_over(named: &mut BTreeMap<String, Value>) -> Result<Option<OutputRef>> {
     }
 }
 
+fn take_output_reference(
+    named: &mut BTreeMap<String, Value>,
+    argument: &'static str,
+) -> Result<Option<OutputRef>> {
+    match named.remove(argument) {
+        None | Some(Value::None) => Ok(None),
+        Some(Value::Output(reference)) => Ok(Some(reference)),
+        Some(_) => Err(CompileError::ReportSourceNotOutputField { argument }),
+    }
+}
+
+fn take_report_variables(
+    named: &mut BTreeMap<String, Value>,
+) -> Result<BTreeMap<String, OutputRef>> {
+    match named.remove("variables") {
+        None | Some(Value::None) => Ok(BTreeMap::new()),
+        Some(Value::Map(values)) => values
+            .into_iter()
+            .map(|(name, value)| match value {
+                Value::Output(reference) => Ok((name, reference)),
+                _ => Err(CompileError::ReportVariableNotOutputField { name }),
+            })
+            .collect(),
+        Some(_) => Err(CompileError::ReportVariablesNotObject),
+    }
+}
+
 fn take_optional_fanout(named: &mut BTreeMap<String, Value>) -> Result<Option<u32>> {
     match named.remove("max_fanout") {
         None | Some(Value::None) => Ok(None),
@@ -1577,6 +1630,23 @@ fn take_report_destination(named: &mut BTreeMap<String, Value>) -> Result<Report
                 });
             }
             Ok(ReportDestination::Slack(SlackDestination::default()))
+        }
+        "google_docs" | "google_sheets" => {
+            if let Some(parameter) = object.keys().next() {
+                return Err(CompileError::UnknownGoogleDestinationParameter {
+                    kind: if kind == "google_docs" {
+                        "google_docs"
+                    } else {
+                        "google_sheets"
+                    },
+                    parameter: parameter.clone(),
+                });
+            }
+            Ok(if kind == "google_docs" {
+                ReportDestination::GoogleDocs(GoogleDocsDestination::default())
+            } else {
+                ReportDestination::GoogleSheets(GoogleSheetsDestination::default())
+            })
         }
         other => Err(CompileError::UnknownReportDestination {
             got: other.to_owned(),
@@ -2573,6 +2643,74 @@ workflow(type = "playbook", tasks = [work, publish])
     }
 
     #[test]
+    fn google_report_destinations_are_engine_owned_and_parameterless() {
+        let pack = temp_pack("google-report");
+        std::fs::create_dir_all(pack.join("reports")).unwrap();
+        std::fs::write(pack.join("reports/report.j2"), "{{ passed }} passed").unwrap();
+        for kind in ["google_docs", "google_sheets"] {
+            let file_args = if kind == "google_sheets" {
+                r#", emits_files = ["report.csv"]"#
+            } else {
+                ""
+            };
+            let report_file = if kind == "google_sheets" {
+                r#", file = "report.csv""#
+            } else {
+                ""
+            };
+            let source = format!(
+                r#"
+work = command(name = "work", run = "true"{file_args})
+publish = report(name = "publish", destination = {{"kind": "{kind}"}}, template = "reports/report.j2", result = work{report_file})
+workflow(type = "playbook", tasks = [work, publish])
+"#
+            );
+            let compiled = compile_source(&source, &pack.join("workflow.star"), &pack).unwrap();
+            let TaskKind::Report { destination, .. } = &compiled.workflow.tasks[1].task else {
+                panic!("report did not compile as a report task");
+            };
+            let encoded = serde_json::to_string(destination).unwrap();
+            assert!(encoded.contains(kind), "{encoded}");
+        }
+
+        let bad = r#"
+publish = report(name = "publish", destination = {"kind": "google_docs", "document_id": "secret"}, template = "reports/report.j2")
+workflow(type = "playbook", tasks = [publish])
+"#;
+        let error = crate::errors::report(
+            &compile_source(bad, &pack.join("workflow.star"), &pack).unwrap_err(),
+        );
+        assert!(
+            error.contains("unknown parameter \"document_id\""),
+            "{error}"
+        );
+
+        let missing_file = r#"
+work = command(name = "work", run = "true", emits_files = ["report.csv"])
+publish = report(name = "publish", destination = {"kind": "google_sheets"}, template = "reports/report.j2", result = work)
+workflow(type = "playbook", tasks = [work, publish])
+"#;
+        let error = crate::errors::report(
+            &compile_source(missing_file, &pack.join("workflow.star"), &pack).unwrap_err(),
+        );
+        assert!(
+            error.contains("requires both result and a .csv or .tsv file"),
+            "{error}"
+        );
+
+        let undeclared = r#"
+work = command(name = "work", run = "true", emits_files = ["other.csv"])
+publish = report(name = "publish", destination = {"kind": "google_sheets"}, template = "reports/report.j2", result = work, file = "report.csv")
+workflow(type = "playbook", tasks = [work, publish])
+"#;
+        let error = crate::errors::report(
+            &compile_source(undeclared, &pack.join("workflow.star"), &pack).unwrap_err(),
+        );
+        assert!(error.contains("does not declare in emits_files"), "{error}");
+        let _ = std::fs::remove_dir_all(pack);
+    }
+
+    #[test]
     fn an_advisory_sink_cannot_gate_the_synthesized_apply() {
         let pack = temp_pack("advisory-sink");
         let rejected = r#"
@@ -3189,10 +3327,14 @@ workflow(type = "custom", tasks = [e], result = e)
         let pack = root.join("examples/counter");
         let compiled = compile_file(&pack.join("workflow.star"), &pack).unwrap();
         let manifest = crate::manifest::Manifest::load(&pack.join("crucible.toml")).unwrap();
+        let manifest_workflow = manifest.workflow.as_ref().unwrap();
+        assert_eq!(manifest_workflow.file.as_deref(), Some("workflow.star"));
         assert_eq!(
-            serde_json::to_value(&compiled.workflow).unwrap(),
-            serde_json::to_value(&manifest.workflow).unwrap()
+            compiled.workflow.workflow_type,
+            manifest_workflow.workflow_type
         );
+        assert_eq!(compiled.workflow.result, manifest_workflow.result);
+        assert!(!compiled.workflow.tasks.is_empty());
         assert_eq!(
             compiled.workflow.tasks[0].session.as_deref(),
             Some("solver")

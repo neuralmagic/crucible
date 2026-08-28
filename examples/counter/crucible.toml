@@ -19,6 +19,7 @@ setup_cmd = "mkdir -p workspace && cp value.txt measure.nu bump.nu workspace/ &&
 
 [agent]
 backend       = "command"
+sandbox_image = "quay.io/wseaton/crucible-sandbox-rust:031c9dc4f513b5ac6517ec617825d39ca7ff4d79e0f8bc60f9211edd4d529b95"
 agent_cmd     = "./bump.nu"     # deterministic proposer: value.txt += 1
 method_prompt = "method.md"     # only used if you switch backend = "local"
 goal          = "Raise the integer in value.txt as high as you can (target: 5)."
@@ -28,67 +29,11 @@ measure_cmd = "./measure.nu"
 direction   = "higher"
 objective   = "value"
 
-# Generated from workflow.star. Edit the Starlark source; scope recompiles it.
+# Hosted single-domain renders require a typed deploy target even though Counter has no external deployment.
+[deploy]
+deploy_name = "crucible-counter"
+
 [workflow]
 type = "autoresearch"
+file = "workflow.star"
 result = "decide"
-
-[[workflow.task]]
-name = "propose"
-kind = "engine"
-op = "propose"
-depends_on = []
-session = "solver"
-needs = "any"
-required = true
-join = "all"
-
-[[workflow.task]]
-name = "apply"
-kind = "engine"
-op = "apply"
-depends_on = ["propose"]
-needs = "any"
-required = true
-join = "all"
-
-[[workflow.task]]
-name = "shape"
-kind = "evaluate"
-command = """test -s value.txt && echo '{"pass": true, "score": 1}'"""
-depends_on = ["apply"]
-needs = "any"
-required = true
-isolation = "worktree"
-join = "all"
-
-[[workflow.task]]
-name = "score"
-kind = "evaluate"
-command = "./measure.nu"
-depends_on = ["apply"]
-needs = "any"
-required = true
-isolation = "worktree"
-join = "all"
-emits = ["score", "pass"]
-
-[[workflow.task]]
-name = "grade"
-kind = "engine"
-op = "grade"
-source = "score"
-depends_on = ["shape", "score"]
-needs = "any"
-required = true
-join = "passed"
-
-[[workflow.task]]
-name = "decide"
-kind = "engine"
-op = "decide"
-source = "grade"
-depends_on = ["grade"]
-needs = "any"
-required = true
-join = "all"

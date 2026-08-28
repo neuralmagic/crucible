@@ -53,12 +53,20 @@ pub enum Direction {
 #[serde(rename_all = "snake_case")]
 pub enum ReportDestination {
     Slack(SlackDestination),
+    GoogleDocs(GoogleDocsDestination),
+    GoogleSheets(GoogleSheetsDestination),
 }
 
 /// Slack destination parameters. Empty in v1; the object shape allows additive options without
 /// changing `report()` or admitting caller-supplied webhook URLs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlackDestination {}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoogleDocsDestination {}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoogleSheetsDestination {}
 
 /// Authorable operations that require orchestrator capabilities to execute.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -178,6 +186,12 @@ pub enum TaskKind {
         template: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         result: Option<TaskName>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        markdown_from: Option<OutputRef>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        variables: BTreeMap<String, OutputRef>,
     },
     /// Engine-builtin deterministic fold: keep the k best upstream outputs by `score`.
     TopK { k: u32, direction: Direction },
@@ -348,6 +362,30 @@ pub enum PlanError {
         "report task {task:?} selects epilogue task {result:?}; report results must come from the main graph"
     )]
     EpilogueReportResult { task: String, result: String },
+    #[error("report task {task:?} selects more than one content mode")]
+    ReportContentModesConflict { task: String },
+    #[error("report task {task:?} reads unknown task output {reference}")]
+    UnknownReportSource { task: String, reference: String },
+    #[error("report task {task:?} reads undeclared output {reference}")]
+    UndeclaredReportSource { task: String, reference: String },
+    #[error("report task {task:?}: markdown_from and variables are supported only by Slack")]
+    MarkdownReportUnsupportedDestination { task: String },
+    #[error("Google Sheets report task {task:?} requires both result and a .csv or .tsv file")]
+    GoogleSheetsReportFileRequired { task: String },
+    #[error("report task {task:?} selects file {file:?} without selecting a result task")]
+    ReportFileWithoutResult { task: String, file: String },
+    #[error("report task {task:?} selects file {file:?}, but only google_sheets accepts files")]
+    ReportFileUnsupportedDestination { task: String, file: String },
+    #[error("Google Sheets report task {task:?} file {file:?} must end in .csv or .tsv")]
+    InvalidReportFileExtension { task: String, file: String },
+    #[error(
+        "report task {task:?} selects {file:?}, which result task {result:?} does not declare in emits_files"
+    )]
+    UndeclaredReportFile {
+        task: String,
+        result: String,
+        file: String,
+    },
     #[error("task {task:?} lists dependency {dependency:?} twice")]
     RepeatedDependency { task: String, dependency: String },
     #[error("task {task:?}: join = \"passed\" needs at least one dependency")]
@@ -552,6 +590,85 @@ impl Plan {
                         task: task(),
                         result: result.0.clone(),
                     });
+                }
+            }
+            if let TaskKind::Report {
+                destination,
+                result,
+                file,
+                markdown_from,
+                variables,
+                ..
+            } = &t.task
+            {
+                let content_modes = usize::from(result.is_some())
+                    + usize::from(markdown_from.is_some())
+                    + usize::from(!variables.is_empty());
+                if content_modes > 1 {
+                    return Err(PlanError::ReportContentModesConflict { task: task() });
+                }
+                if (markdown_from.is_some() || !variables.is_empty())
+                    && !matches!(destination, ReportDestination::Slack(_))
+                {
+                    return Err(PlanError::MarkdownReportUnsupportedDestination { task: task() });
+                }
+                for reference in markdown_from.iter().chain(variables.values()) {
+                    let Some(&source_index) = index.get(&reference.task) else {
+                        return Err(PlanError::UnknownReportSource {
+                            task: task(),
+                            reference: reference.to_string(),
+                        });
+                    };
+                    let source = &self.tasks[source_index];
+                    if !source.emits.is_empty()
+                        && !source.emits.iter().any(|field| field == &reference.field)
+                    {
+                        return Err(PlanError::UndeclaredReportSource {
+                            task: task(),
+                            reference: reference.to_string(),
+                        });
+                    }
+                    if source.stage == Stage::Epilogue {
+                        return Err(PlanError::EpilogueReportResult {
+                            task: task(),
+                            result: reference.task.0.clone(),
+                        });
+                    }
+                }
+                match (destination, result, file) {
+                    (ReportDestination::GoogleSheets(_), Some(result), Some(file)) => {
+                        if !file.ends_with(".csv") && !file.ends_with(".tsv") {
+                            return Err(PlanError::InvalidReportFileExtension {
+                                task: task(),
+                                file: file.clone(),
+                            });
+                        }
+                        if let Some(&result_index) = index.get(result)
+                            && !self.tasks[result_index].emits_files.contains(file)
+                        {
+                            return Err(PlanError::UndeclaredReportFile {
+                                task: task(),
+                                result: result.0.clone(),
+                                file: file.clone(),
+                            });
+                        }
+                    }
+                    (ReportDestination::GoogleSheets(_), _, _) => {
+                        return Err(PlanError::GoogleSheetsReportFileRequired { task: task() });
+                    }
+                    (_, None, Some(file)) => {
+                        return Err(PlanError::ReportFileWithoutResult {
+                            task: task(),
+                            file: file.clone(),
+                        });
+                    }
+                    (_, Some(_), Some(file)) => {
+                        return Err(PlanError::ReportFileUnsupportedDestination {
+                            task: task(),
+                            file: file.clone(),
+                        });
+                    }
+                    (_, _, None) => {}
                 }
             }
             if !t.emits.is_empty() {

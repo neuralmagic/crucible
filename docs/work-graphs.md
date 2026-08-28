@@ -301,14 +301,35 @@ and RESULTS.md (`epilogue` / `epilogue-skip` / `epilogue-fail`), and the PR body
 "Epilogue checks (advisory)" section with failures marked **FAILED**.
 
 `report(name = "publish-report", destination = {"kind": "slack"}, template = "reports/slack.md.j2",
-result = roundup, required = True)` is the engine-owned publication epilogue. Destinations are
-engine-known keys, not URLs or secret names; `slack` is the only destination in the first version.
+result = roundup, required = True)` is the engine-owned publication epilogue. Destination kinds are
+`slack`, `google_docs`, and `google_sheets`; they never carry URLs, resource IDs, ranges, credential
+paths, or secret names. Google Docs appends a plain-text section to the document selected by
+`CRUCIBLE_GOOGLE_DOC_ID`. Google Sheets accepts `result = roundup, file = "report.csv"` when the
+selected task declares that path in `emits_files`. It parses `.csv` and `.tsv` files, requires a
+non-empty rectangular matrix, and appends the whole matrix to `CRUCIBLE_GOOGLE_SHEET_ID` at
+`CRUCIBLE_GOOGLE_SHEET_RANGE`. Sheets uses the API's `RAW` input mode so strings are not evaluated
+as formulas. Other extensions, undeclared files, malformed records, and ragged rows are rejected
+before the API write.
 The optional `result` selector projects only that main-graph task's declared JSON fields into an
 engine-built Block Kit card. It does not expose prompts, stdout, workspaces, undeclared fields, raw
 Slack blocks, channels, or credentials. Selected output defaults to a 16 KiB encoded limit; an
 operator may lower or raise it up to 64 KiB with `CRUCIBLE_REPORT_RESULT_MAX_BYTES`. Oversize data
 fails without truncation. A required report makes rendering or delivery failure fail the workflow;
 it does not rely on an agent remembering to call a tool.
+
+Slack reports may instead explicitly select one declared string field as free-form Markdown with
+`markdown_from = roundup.markdown`, or expose selected string fields to the pack-owned template
+with `variables = {"summary": roundup.summary}`. These modes and `result` are mutually exclusive.
+Crucible escapes `<`, `>`, and `&` in selected values, emits a Slack `markdown` block with fallback
+text, and rejects empty or greater-than-12,000-character output before delivery. The MCP report
+tool remains zero-argument.
+
+Google delivery resolves Application Default Credentials from `GOOGLE_APPLICATION_CREDENTIALS`.
+For local service-account testing, point it at a private JSON key file and share the existing target
+document or spreadsheet with that service account. The Docs, Sheets, and Drive APIs must be enabled.
+The credential and target variables belong only to the engine/broker environment; task subprocesses
+have them removed. A later operator configuration may use domain-wide delegation without changing
+the workflow source.
 
 ## Worked example
 

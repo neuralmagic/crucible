@@ -18,7 +18,7 @@ url = "https://github.com/neuralmagic/crucible.git"
 dir = "workspace"
 
 [[workspace.inject]]
-src = "../../crucible-harness/benches/stream_json.rs"
+src = "frozen/stream_json.rs"
 dst = "crucible-harness/benches/stream_json.rs"
 frozen = true
 
@@ -31,9 +31,9 @@ frozen = true
 backend       = "openshell"
 harness       = "claude"
 model         = "claude-opus-4-6"
-sandbox_image = "quay.io/wseaton/crucible-sandbox-rust@sha256:031c9dc4f513b5ac6517ec617825d39ca7ff4d79e0f8bc60f9211edd4d529b95"
+sandbox_image = "quay.io/wseaton/crucible-sandbox-rust:v1"
 method_prompt = "method.md"
-goal          = "Cut the ns/line of StreamJsonParser over the bench corpus. Target: under 450 (half the baseline)."
+goal          = "Cut the ns/line of StreamJsonParser over the bench corpus. Target: under 450 (half the baseline). Evaluate whether a mature parser-combinator library can replace custom scanning cleanly and improve performance; benchmark it rather than assuming it will win."
 
 [agent.openshell]
 # crates.io for a dep the agent adds (criterion, divan); the deps in Cargo.lock are pre-fetched
@@ -53,6 +53,9 @@ good_cmd = "true"
 bad_cmd  = "sed -i.bak 's|let Ok(msg) = serde_json::from_str::<Value>(line) else {|let _ = serde_json::from_str::<Value>(line); let Ok(msg) = serde_json::from_str::<Value>(line) else {|' crucible-harness/src/stream_json.rs && rm crucible-harness/src/stream_json.rs.bak"
 
 # No [world] block -> GitWorld: each kept improvement is a commit, regressions reset --hard.
+
+[deploy]
+deploy_name = "crucible-selfhost"
 
 [workflow]
 type = "autoresearch"

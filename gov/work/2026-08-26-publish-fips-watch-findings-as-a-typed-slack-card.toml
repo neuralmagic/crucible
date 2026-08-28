@@ -3,12 +3,14 @@
 [govctl]
 id = "WI-2026-08-26-001"
 title = "Publish FIPS watch findings as a typed Slack card"
-status = "active"
+status = "done"
 created = "2026-08-26"
 started = "2026-08-26"
+completed = "2026-08-27"
+refs = ["RFC-0002:C-MARKDOWN-REPORT"]
 
 [content]
-description = "Extend the engine-owned report task with a bounded typed projection of the FIPS roundup result, render that projection as Slack Block Kit, and make the existing fips-watch playbook deliver an actionable compliance card without exposing arbitrary Slack payloads or credentials."
+description = "Extend the engine-owned report task with bounded, author-opted Slack rendering and make the existing fips-watch playbook deliver an actionable compliance report without exposing arbitrary Slack payloads or credentials. Structured result cards remain the default; a workflow may instead select an escaped Markdown output or explicitly bind selected outputs as template variables."
 
 [[content.acceptance_criteria]]
 text = "report(result = task) admits only a same-graph task and snapshots only its declared bounded JSON output after the main graph settles"
@@ -29,3 +31,8 @@ category = "changed"
 text = "focused contract, broker, DSL, and FIPS workflow tests pass and govctl check is green"
 status = "done"
 category = "chore"
+
+[[content.acceptance_criteria]]
+text = "fips-watch explicitly selects card.markdown and Slack delivers it as escaped Markdown with a fallback while result-based cards remain compatible"
+status = "done"
+category = "changed"

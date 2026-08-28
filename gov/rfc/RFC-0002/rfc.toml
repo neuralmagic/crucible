@@ -28,6 +28,8 @@ clauses = [
     "clauses/C-PLAYBOOK-BUDGET.toml",
     "clauses/C-PLAYBOOK-RESUME.toml",
     "clauses/C-REPORTS.toml",
+    "clauses/C-EXTERNAL-SOURCES.toml",
+    "clauses/C-MARKDOWN-REPORT.toml",
 ]
 
 [[changelog]]

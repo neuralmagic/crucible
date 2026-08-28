@@ -13,6 +13,22 @@ def main() -> None:
     verdict = output("roundup")
     filing = output("file")
     dirty = int(verdict.get("dirty", 0))
+    blockers = verdict.get("blockers", [])
+    blocker_lines = (
+        "\n".join(f"- `{blocker}`" for blocker in blockers) if blockers else "- None"
+    )
+    status = "ACTION REQUIRED" if dirty else "FIPS CLEAN"
+    markdown = f"""## FIPS dependency watch: {status}
+
+- Watched revision: `{verdict.get('revision', 'unknown')}`
+- Clean variants: **{int(verdict.get('clean', 0))}**
+- Dirty variants: **{dirty}**
+- Issues filed: **{int(filing.get('filed', 0))}**
+- Issues skipped: **{int(filing.get('skipped', 0))}**
+
+### Crypto blockers
+{blocker_lines}
+"""
     print(
         json.dumps(
             {
@@ -23,6 +39,7 @@ def main() -> None:
                 "crypto_blockers": verdict.get("blockers", []),
                 "issues_filed": int(filing.get("filed", 0)),
                 "issues_skipped": int(filing.get("skipped", 0)),
+                "markdown": markdown,
             }
         )
     )
