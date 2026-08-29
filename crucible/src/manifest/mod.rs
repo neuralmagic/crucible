@@ -11,6 +11,7 @@ mod openshell;
 mod preflight;
 mod relay;
 mod search;
+mod secret;
 mod selftest;
 mod wiring;
 mod workflow;
@@ -25,6 +26,7 @@ pub use openshell::OpenshellCfg;
 pub use preflight::{MODE_PLACEHOLDER, PreflightCfg};
 pub use relay::RelayFile;
 pub use search::SearchCfg;
+pub use secret::{SecretDecl, SecretError, SecretKind};
 pub use selftest::SelftestCfg;
 pub use workflow::{KEPT_INPUT, WorkflowCaps, WorkflowCfg, WorkflowError, WorkflowType};
 pub use world::WorldCfg;
@@ -261,6 +263,10 @@ pub struct Manifest {
     /// Absent = no preflight (the run starts straight at the baseline).
     #[serde(default)]
     pub preflight: Option<PreflightCfg>,
+    /// The secrets this pack needs, by name. Declaring one does not grant it: the registry binds
+    /// the name per scope, and a launch it cannot bind is refused before a pod exists.
+    #[serde(default, rename = "secret")]
+    pub secrets: Vec<SecretDecl>,
 }
 
 /// A single-repo run's publish-on-keep config: the fork the kept commits are pushed to as a draft PR.
@@ -608,6 +614,7 @@ struct CommonCfg<'a> {
     build: &'a BTreeMap<String, forge::spec::BuildSpec>,
     preflight: &'a Option<PreflightCfg>,
     measure: &'a Option<MeasureCfg>,
+    secrets: &'a [SecretDecl],
 }
 
 fn validate_common(c: CommonCfg<'_>) -> Result<()> {
@@ -652,6 +659,7 @@ fn validate_common(c: CommonCfg<'_>) -> Result<()> {
     }
     forge::spec::validate_builds(c.build)?;
     preflight::validate_preflight(c.preflight, c.measure)?;
+    secret::validate_secrets(c.secrets)?;
     Ok(())
 }
 
@@ -766,6 +774,7 @@ impl Manifest {
             build: &self.build,
             preflight: &self.preflight,
             measure: &self.measure,
+            secrets: &self.secrets,
         })
     }
 
@@ -907,6 +916,10 @@ pub struct CompositeManifest {
     /// Absent = no preflight (the run starts straight at the baseline).
     #[serde(default)]
     pub preflight: Option<PreflightCfg>,
+    /// The secrets this pack needs, by name. Declaring one does not grant it: the registry binds
+    /// the name per scope, and a launch it cannot bind is refused before a pod exists.
+    #[serde(default, rename = "secret")]
+    pub secrets: Vec<SecretDecl>,
 }
 
 #[derive(Deserialize)]
@@ -1013,6 +1026,7 @@ impl CompositeManifest {
             build: &self.build,
             preflight: &self.preflight,
             measure: &self.measure,
+            secrets: &self.secrets,
         })
     }
 
@@ -2176,6 +2190,69 @@ mod tests {
         assert!(
             m.validate().is_err(),
             "undeclared need must fail validation"
+        );
+    }
+
+    /// The controller's registry reads `[[secret]]` out of the same file this parses. When only
+    /// one of the two readers knows the key, a pack compiles, previews clean, and dies at
+    /// dispatch on `deny_unknown_fields`.
+    #[test]
+    fn parses_a_declared_secret() {
+        let m = toml::from_str::<Manifest>(
+            r#"
+            [repo]
+            path = "."
+            [agent]
+            goal = "g"
+            [[secret]]
+            name = "pr_token"
+            kind = "opaque"
+            env = "GH_TOKEN"
+            [[secret]]
+            name = "registry"
+            kind = "registry_authfile"
+            path = "/etc/quay/push.json"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(m.secrets.len(), 2);
+        assert_eq!(m.secrets[0].env.as_deref(), Some("GH_TOKEN"));
+        assert_eq!(m.secrets[1].kind, SecretKind::RegistryAuthfile);
+        assert!(m.validate().is_ok());
+    }
+
+    #[test]
+    fn a_manifest_with_no_secret_block_declares_none() {
+        let m = toml::from_str::<Manifest>(
+            r#"
+            [repo]
+            path = "."
+            [agent]
+            goal = "g"
+        "#,
+        )
+        .unwrap();
+        assert!(m.secrets.is_empty());
+    }
+
+    #[test]
+    fn an_unbindable_declaration_fails_validation() {
+        let m = toml::from_str::<Manifest>(
+            r#"
+            [repo]
+            path = "."
+            [agent]
+            goal = "g"
+            [[secret]]
+            name = "kubeconfig"
+            kind = "kubeconfig"
+            env = "KUBECONFIG"
+        "#,
+        )
+        .unwrap();
+        assert!(
+            m.validate().is_err(),
+            "a file kind cannot take an env projection"
         );
     }
 
