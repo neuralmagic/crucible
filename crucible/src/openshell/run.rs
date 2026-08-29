@@ -1382,6 +1382,45 @@ const VERTEX_RELAY_KEYS: &[&str] = &[
     "VERTEX_LOCATION",
 ];
 
+/// The env var naming the projections a run's agent may receive, comma-separated. The controller
+/// sets it from the registry, which is the only place visibility is known.
+pub const AGENT_VISIBLE_ENV: &str = "CRUCIBLE_AGENT_VISIBLE_ENV";
+
+/// Seed `env` with the declared secrets the agent may hold: those the manifest declares an `env`
+/// projection for AND [`AGENT_VISIBLE_ENV`] names. An unset or empty list relays nothing. A
+/// manifest-provided value wins, as with the Vertex keys.
+pub fn relay_agent_visible_secrets(
+    secrets: &[crate::manifest::SecretDecl],
+    env: &mut Vec<(String, String)>,
+) {
+    let Ok(allowed) = std::env::var(AGENT_VISIBLE_ENV) else {
+        return;
+    };
+    let allowed: Vec<&str> = allowed
+        .split(',')
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .collect();
+    for secret in secrets {
+        let Some(key) = secret
+            .env
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+        else {
+            continue;
+        };
+        if !allowed.contains(&key) || env.iter().any(|(k, _)| k == key) {
+            continue;
+        }
+        if let Ok(v) = std::env::var(key)
+            && !v.is_empty()
+        {
+            env.push((key.to_string(), v));
+        }
+    }
+}
+
 /// Seed `env` with the process values of [`VERTEX_RELAY_KEYS`]: only keys that are set and
 /// non-empty relay, and an existing entry (a manifest-provided value) always wins.
 pub fn relay_vertex_env(env: &mut Vec<(String, String)>) {
@@ -1630,6 +1669,74 @@ mod tests {
         assert_eq!(label_value("my workspace/v2"), "my-workspace-v2");
         assert_eq!(label_value("-.trimmed.-"), "trimmed");
         assert_eq!(label_value("vllm"), "vllm");
+    }
+
+    fn decl(name: &str, env: Option<&str>) -> crate::manifest::SecretDecl {
+        let toml = match env {
+            Some(e) => format!("name = \"{name}\"\nenv = \"{e}\"\n"),
+            None => format!("name = \"{name}\"\npath = \"/tmp/{name}\"\n"),
+        };
+        toml::from_str(&toml).expect("a secret declaration")
+    }
+
+    /// The whole point of the allowlist: what the registry did not name does not cross, and a
+    /// controller that sends no list withholds everything rather than leaking each secret.
+    #[test]
+    fn only_the_named_projections_reach_the_agent() {
+        let _guard = crate::test_env_lock();
+        let secrets = [
+            decl("pr", Some("GH_TOKEN")),
+            decl("push", Some("REG_TOKEN")),
+        ];
+        unsafe {
+            std::env::set_var("GH_TOKEN", "t-gh");
+            std::env::set_var("REG_TOKEN", "t-reg");
+        }
+
+        // No list at all: nothing crosses.
+        unsafe { std::env::remove_var(AGENT_VISIBLE_ENV) };
+        let mut env = Vec::new();
+        relay_agent_visible_secrets(&secrets, &mut env);
+        assert!(env.is_empty(), "an absent allowlist must relay nothing");
+
+        // An empty list: still nothing.
+        unsafe { std::env::set_var(AGENT_VISIBLE_ENV, "") };
+        let mut env = Vec::new();
+        relay_agent_visible_secrets(&secrets, &mut env);
+        assert!(env.is_empty(), "an empty allowlist must relay nothing");
+
+        // One named: only that one, and the broker-only sibling stays behind.
+        unsafe { std::env::set_var(AGENT_VISIBLE_ENV, "GH_TOKEN") };
+        let mut env = Vec::new();
+        relay_agent_visible_secrets(&secrets, &mut env);
+        assert_eq!(env, vec![("GH_TOKEN".to_string(), "t-gh".to_string())]);
+
+        unsafe {
+            std::env::remove_var("GH_TOKEN");
+            std::env::remove_var("REG_TOKEN");
+            std::env::remove_var(AGENT_VISIBLE_ENV);
+        }
+    }
+
+    /// A file projection has no env name to relay, and a manifest value is not overwritten.
+    #[test]
+    fn a_file_projection_relays_nothing_and_a_manifest_value_wins() {
+        let _guard = crate::test_env_lock();
+        let secrets = [decl("kube", None), decl("pr", Some("GH_TOKEN"))];
+        unsafe {
+            std::env::set_var(AGENT_VISIBLE_ENV, "GH_TOKEN");
+            std::env::set_var("GH_TOKEN", "from-pod");
+        }
+        let mut env = vec![("GH_TOKEN".to_string(), "from-manifest".to_string())];
+        relay_agent_visible_secrets(&secrets, &mut env);
+        assert_eq!(
+            env,
+            vec![("GH_TOKEN".to_string(), "from-manifest".to_string())]
+        );
+        unsafe {
+            std::env::remove_var("GH_TOKEN");
+            std::env::remove_var(AGENT_VISIBLE_ENV);
+        }
     }
 
     fn clear_relay_keys() {
