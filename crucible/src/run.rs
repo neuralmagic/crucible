@@ -516,7 +516,7 @@ pub(crate) fn prep_plan_runner_with_params(
         .run;
     args.manifest = Some(manifest_path.to_path_buf());
     args.compute_driver = compute_driver;
-    apply_agent_cfg(&mut args, &m.agent, &p.workspace)?;
+    apply_agent_cfg(&mut args, &m.agent, &m.secrets, &p.workspace)?;
     args.workflow_frozen_injects = m.frozen_inject_pairs(&manifest_dir);
     args.workflow_toolbox_exclude = m.agent.toolbox_exclude.clone();
     // A playbook's git memory is per task; the scored loop owns the same repository for
@@ -586,7 +586,7 @@ fn run_from_manifest(args: Args) -> Result<()> {
 
     // Fold the manifest's [agent] config onto Args (+ spawn the broker for openshell).
     let mut args = args;
-    apply_agent_cfg(&mut args, &m.agent, &p.workspace)?;
+    apply_agent_cfg(&mut args, &m.agent, &m.secrets, &p.workspace)?;
     // Single-repo publish target: a `[publish] pr_repo` in the manifest wins over any `--pr-repo` the
     // caller passed (the controller passes its per-repo default via the flag; a pack that names its
     // own fork overrides it). Absent → keep the flag value (empty by default, so no PR opens).
@@ -716,7 +716,7 @@ fn run_composite(args: Args, manifest_path: PathBuf) -> Result<()> {
     install_toolbox(&p, &m.agent.toolbox_exclude, harness.skills_dir())?;
 
     let mut args = args;
-    apply_agent_cfg(&mut args, &m.agent, &p.workspace)?;
+    apply_agent_cfg(&mut args, &m.agent, &m.secrets, &p.workspace)?;
     // The per-component fork map for publish-on-keep, manifest-owned via [[component]].pr_repo.
     args.component_pr_repos = m.component_pr_repos();
     let (goal, template) = resolve_goal_template(&args, &m.agent, &manifest_dir)?;
@@ -748,7 +748,12 @@ fn run_composite(args: Args, manifest_path: PathBuf) -> Result<()> {
 
 /// Fold a manifest's `[agent]` config onto `Args` and, for the openshell backend, spawn the
 /// provisioning broker. Shared by the single-domain and composite run paths.
-fn apply_agent_cfg(args: &mut Args, agent: &manifest::AgentCfg, workspace: &Path) -> Result<()> {
+fn apply_agent_cfg(
+    args: &mut Args,
+    agent: &manifest::AgentCfg,
+    secrets: &[manifest::SecretDecl],
+    workspace: &Path,
+) -> Result<()> {
     args.model = agent.model.clone();
     args.agent_cmd = agent.agent_cmd.clone();
     // Harness: CLI `--harness` wins, else the manifest's `[agent].harness` (default claude).
@@ -794,6 +799,9 @@ fn apply_agent_cfg(args: &mut Args, agent: &manifest::AgentCfg, workspace: &Path
     {
         crate::openshell::run::relay_vertex_env(&mut args.env);
     }
+    // The pack's declared secrets, for the ones the registry says this agent may hold. The kubelet
+    // put them in this process's environment; without this the sandbox never sees them.
+    crate::openshell::run::relay_agent_visible_secrets(secrets, &mut args.env);
     args.relay = agent.relay.clone();
     args.openshell = agent.openshell.clone();
     args.broker = agent.broker.clone();
@@ -1277,7 +1285,7 @@ mod tests {
     fn effort_defaults_to_medium_when_unset() {
         let m: manifest::Manifest = toml::from_str(&manifest_toml("")).unwrap();
         let mut a = args_from(&["crucible"]);
-        apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
+        apply_agent_cfg(&mut a, &m.agent, &m.secrets, Path::new("ws")).unwrap();
         assert_eq!(
             a.reasoning_effort,
             Some(crate::manifest::ReasoningEffort::Medium)
@@ -1289,7 +1297,7 @@ mod tests {
         let m: manifest::Manifest =
             toml::from_str(&manifest_toml("reasoning_effort = \"max\"")).unwrap();
         let mut a = args_from(&["crucible"]);
-        apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
+        apply_agent_cfg(&mut a, &m.agent, &m.secrets, Path::new("ws")).unwrap();
         assert_eq!(
             a.reasoning_effort,
             Some(crate::manifest::ReasoningEffort::Max)
@@ -1300,12 +1308,12 @@ mod tests {
     fn harness_defaults_to_claude_and_manifest_sets_it() {
         let m: manifest::Manifest = toml::from_str(&manifest_toml("")).unwrap();
         let mut a = args_from(&["crucible"]);
-        apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
+        apply_agent_cfg(&mut a, &m.agent, &m.secrets, Path::new("ws")).unwrap();
         assert_eq!(a.harness(), crate::manifest::Harness::Claude);
 
         let m: manifest::Manifest = toml::from_str(&manifest_toml("harness = \"hermes\"")).unwrap();
         let mut a = args_from(&["crucible"]);
-        apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
+        apply_agent_cfg(&mut a, &m.agent, &m.secrets, Path::new("ws")).unwrap();
         assert_eq!(a.harness(), crate::manifest::Harness::Hermes);
     }
 
@@ -1313,7 +1321,7 @@ mod tests {
     fn cli_harness_beats_the_manifest() {
         let m: manifest::Manifest = toml::from_str(&manifest_toml("harness = \"hermes\"")).unwrap();
         let mut a = args_from(&["crucible", "--harness", "claude"]);
-        apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
+        apply_agent_cfg(&mut a, &m.agent, &m.secrets, Path::new("ws")).unwrap();
         assert_eq!(a.harness(), crate::manifest::Harness::Claude);
     }
 
@@ -1327,7 +1335,7 @@ mod tests {
         ))
         .unwrap();
         let mut a = args_from(&["crucible"]);
-        apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
+        apply_agent_cfg(&mut a, &m.agent, &m.secrets, Path::new("ws")).unwrap();
         assert_eq!(
             a.hermes.model.as_deref(),
             Some("anthropic/claude-haiku-4-5")
@@ -1350,7 +1358,7 @@ mod tests {
         ))
         .unwrap();
         let mut a = args_from(&["crucible"]);
-        apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
+        apply_agent_cfg(&mut a, &m.agent, &m.secrets, Path::new("ws")).unwrap();
         assert_eq!(a.harness(), crate::manifest::Harness::Codex);
         assert_eq!(a.codex.model.as_deref(), Some("gpt-5.6-sol"));
         assert_eq!(a.codex.auth, manifest::CodexAuthMode::Api);
@@ -1378,7 +1386,7 @@ mod tests {
         let m: manifest::Manifest =
             toml::from_str(&manifest_toml("reasoning_effort = \"high\"")).unwrap();
         let mut a = args_from(&["crucible", "--effort", "low"]);
-        apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
+        apply_agent_cfg(&mut a, &m.agent, &m.secrets, Path::new("ws")).unwrap();
         assert_eq!(
             a.reasoning_effort,
             Some(crate::manifest::ReasoningEffort::Low)
@@ -1413,7 +1421,7 @@ mod tests {
         )
         .unwrap();
         let mut a = args_from(&["crucible"]);
-        let result = apply_agent_cfg(&mut a, &m.agent, Path::new("ws"));
+        let result = apply_agent_cfg(&mut a, &m.agent, &m.secrets, Path::new("ws"));
         unsafe {
             std::env::remove_var("CLAUDE_CODE_USE_VERTEX");
         }
@@ -1455,7 +1463,7 @@ mod tests {
         )
         .unwrap();
         let mut a = args_from(&["crucible"]);
-        let result = apply_agent_cfg(&mut a, &m.agent, Path::new("ws"));
+        let result = apply_agent_cfg(&mut a, &m.agent, &m.secrets, Path::new("ws"));
         unsafe {
             std::env::remove_var("ANTHROPIC_VERTEX_PROJECT_ID");
         }
@@ -1481,7 +1489,7 @@ mod tests {
 
         let m: manifest::Manifest = toml::from_str(&manifest_toml("")).unwrap();
         let mut a = args_from(&["crucible"]);
-        let result = apply_agent_cfg(&mut a, &m.agent, Path::new("ws"));
+        let result = apply_agent_cfg(&mut a, &m.agent, &m.secrets, Path::new("ws"));
         unsafe {
             std::env::remove_var("CLAUDE_CODE_USE_VERTEX");
         }
