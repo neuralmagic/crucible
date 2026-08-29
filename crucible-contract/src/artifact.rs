@@ -28,7 +28,7 @@ pub fn content_digest(bytes: &[u8]) -> String {
 }
 
 /// The Tier 2 artifact kinds. The serde spelling is the `{kind}` path segment of the ingest route
-/// (`scope-pack`, `scope-transcript`, `run-session`, `otel-log`).
+/// (`scope-pack`, `scope-transcript`, `run-session`, `run-files`, `otel-log`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ArtifactKind {
@@ -38,6 +38,8 @@ pub enum ArtifactKind {
     ScopeTranscript,
     /// The gzipped `state/session.jsonl` of a loop run.
     RunSession,
+    /// The gzipped tar of a loop run's `state/files`, one directory per task that captured.
+    RunFiles,
     /// The raw OTLP jsonl the in-process collector captured next to the agent.
     OtelLog,
 }
@@ -49,6 +51,7 @@ impl ArtifactKind {
             ArtifactKind::ScopePack => "scope-pack",
             ArtifactKind::ScopeTranscript => "scope-transcript",
             ArtifactKind::RunSession => "run-session",
+            ArtifactKind::RunFiles => "run-files",
             ArtifactKind::OtelLog => "otel-log",
         }
     }
@@ -59,15 +62,17 @@ impl ArtifactKind {
             ArtifactKind::ScopePack => 16 * MIB,
             ArtifactKind::ScopeTranscript => 32 * MIB,
             ArtifactKind::RunSession => 128 * MIB,
+            ArtifactKind::RunFiles => 256 * MIB,
             ArtifactKind::OtelLog => 32 * MIB,
         }
     }
 
     /// Every kind, for exhaustive iteration in tests and route registration.
-    const ALL: [ArtifactKind; 4] = [
+    const ALL: [ArtifactKind; 5] = [
         ArtifactKind::ScopePack,
         ArtifactKind::ScopeTranscript,
         ArtifactKind::RunSession,
+        ArtifactKind::RunFiles,
         ArtifactKind::OtelLog,
     ];
 }
