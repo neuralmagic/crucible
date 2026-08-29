@@ -1001,7 +1001,8 @@ fn drive_loop(
 /// fatal: a missing drop-box (a local run, or an old controller that injected nothing) is a silent
 /// no-op and the wrapper's `SESSION` delimiter is the controller's fallback; a failed POST is already
 /// logged loudly inside [`crate::ingest_client::post_artifact`]. The run-session is the loop's
-/// authoritative record; the otel log rides along only when the collector produced one.
+/// authoritative record; the captured files and the otel log ride along only when the run produced
+/// them.
 pub(crate) fn deliver_run_evidence(p: &Paths) {
     let Some(cfg) = crate::ingest_client::IngestConfig::from_env() else {
         return;
@@ -1011,12 +1012,79 @@ pub(crate) fn deliver_run_evidence(p: &Paths) {
         crucible_contract::ArtifactKind::RunSession,
         &p.session_log,
     );
+    deliver_captured_files(&cfg, p);
     // R5's in-process OTLP collector captures `otel.jsonl` in the run (state) dir; deliver it when it
     // exists. Absent until R5 lands, so this is inert plumbing today.
     let otel = p.state.join("otel.jsonl");
     if otel.exists() {
         deliver_artifact(&cfg, crucible_contract::ArtifactKind::OtelLog, &otel);
     }
+}
+
+/// POST the run's captured files to the drop-box as one gzipped tar of `state/files`. The tree is
+/// `<task>/<declared path>`, and `capture_declared` publishes a task's directory by rename only
+/// once every file it declared is there, so what is tarred is exactly what the run captured.
+///
+/// A run whose tasks declared nothing has no `state/files` and delivers nothing: the absent artifact
+/// is the honest answer, not an empty tar.
+fn deliver_captured_files(cfg: &crate::ingest_client::IngestConfig, p: &Paths) {
+    let files = p.state.join("files");
+    if !files.is_dir() {
+        return;
+    }
+    let kind = crucible_contract::ArtifactKind::RunFiles;
+    let tar = match tar_dir(&files) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!(
+                "[crucible] Tier 2: tarring {} for {kind} delivery failed: {e}",
+                files.display()
+            );
+            return;
+        }
+    };
+    let gz = match gzip(&tar) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!(
+                "[crucible] Tier 2: gzipping the captured files for {kind} delivery failed: {e}"
+            );
+            return;
+        }
+    };
+    let art = crate::ingest_client::post_artifact(cfg, kind, &gz);
+    if art.delivered {
+        eprintln!(
+            "[crucible] Tier 2: delivered {kind} ({} gzipped bytes) to the drop-box",
+            art.bytes
+        );
+    }
+}
+
+/// Tar `dir`'s files under paths relative to it. Captured files are regular files by construction
+/// (`capture_declared` copies with `std::fs::copy`), so there is nothing to filter and no symlink
+/// to resolve.
+fn tar_dir(dir: &Path) -> std::io::Result<Vec<u8>> {
+    fn append(
+        builder: &mut tar::Builder<Vec<u8>>,
+        dir: &Path,
+        prefix: &Path,
+    ) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let rel = prefix.join(entry.file_name());
+            if path.is_dir() {
+                append(builder, &path, &rel)?;
+            } else {
+                builder.append_path_with_name(&path, &rel)?;
+            }
+        }
+        Ok(())
+    }
+    let mut builder = tar::Builder::new(Vec::new());
+    append(&mut builder, dir, Path::new(""))?;
+    builder.into_inner()
 }
 
 /// Read `path`, gzip it, and POST it to the drop-box as `kind`. A read/gzip failure is logged and
@@ -1154,6 +1222,32 @@ mod tests {
     use super::*;
     use clap::Parser;
     use std::fs;
+
+    #[test]
+    fn the_captured_files_tar_carries_every_task_directory_by_relative_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let files = dir.path().join("files");
+        fs::create_dir_all(files.join("roundup")).expect("mkdir");
+        fs::create_dir_all(files.join("propose/nested")).expect("mkdir");
+        fs::write(files.join("roundup/FINDINGS.json"), b"{}").expect("write");
+        fs::write(files.join("propose/nested/fix.patch"), b"diff").expect("write");
+
+        let tar = tar_dir(&files).expect("tar");
+        let mut archive = tar::Archive::new(std::io::Cursor::new(tar));
+        let mut names: Vec<String> = archive
+            .entries()
+            .expect("entries")
+            .map(|e| {
+                e.expect("entry")
+                    .path()
+                    .expect("path")
+                    .display()
+                    .to_string()
+            })
+            .collect();
+        names.sort();
+        assert_eq!(names, ["propose/nested/fix.patch", "roundup/FINDINGS.json"]);
+    }
 
     // A minimal `command`-backend manifest (no broker, no Vertex) so `apply_agent_cfg` is
     // side-effect-free; `effort_line` optionally sets `[agent].reasoning_effort`.
