@@ -1,0 +1,39 @@
+# Pin GitHub Actions workflow references to immutable commit SHAs, report every finding,
+# and optionally propose the grounded changes as a pull request.
+[repo]
+path = "."
+
+[workspace]
+dir = "workspace"
+setup_cmd = "mkdir -p workspace && cp check_workflow.py roundup.py workspace/ && git -C workspace init -q && git -C workspace add -A && git -C workspace -c user.email=crucible@local -c user.name=crucible -c commit.gpgsign=false commit -qm baseline"
+
+[[workspace.inject]]
+src = "check_workflow.py"
+dst = "check_workflow.py"
+frozen = true
+
+[[workspace.inject]]
+src = "roundup.py"
+dst = "roundup.py"
+frozen = true
+
+[agent]
+backend = "openshell"
+harness = "claude"
+model = "claude-opus-4-6"
+sandbox_image = "quay.io/aipcc/agentic-ci/claude-sandbox:0.3.11"
+goal = "Find GitHub Actions workflow uses references that are not pinned to full commit SHAs, then propose grounded pinning changes."
+
+[agent.openshell]
+binaries = ["/usr/bin/git", "/usr/bin/curl", "/usr/bin/gh", "/usr/local/bin/gh"]
+
+# The proposal turn uses this registry-bound credential only when it is authorized to push
+# and open a PR. Without it, the useful patch is still produced.
+[[secret]]
+name = "action-pins-pr-token"
+kind = "opaque"
+env = "GH_TOKEN"
+
+[workflow]
+type = "playbook"
+file = "workflow.star"
