@@ -1382,6 +1382,17 @@ const VERTEX_RELAY_KEYS: &[&str] = &[
     "VERTEX_LOCATION",
 ];
 
+/// The identity a run's commits are attributed to, set on the pod by the controller when the run
+/// pushes as its GitHub App. Not a credential: it names an author, and the agent is the one that
+/// commits. The env spelling is what makes it win — it outranks `user.name`/`user.email` from a
+/// config file and from the `-c` overrides a pack's `setup_cmd` passes.
+const IDENTITY_RELAY_KEYS: &[&str] = &[
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+];
+
 /// The env var naming the projections a run's agent may receive, comma-separated. The controller
 /// sets it from the registry, which is the only place visibility is known.
 pub const AGENT_VISIBLE_ENV: &str = "CRUCIBLE_AGENT_VISIBLE_ENV";
@@ -1424,7 +1435,20 @@ pub fn relay_agent_visible_secrets(
 /// Seed `env` with the process values of [`VERTEX_RELAY_KEYS`]: only keys that are set and
 /// non-empty relay, and an existing entry (a manifest-provided value) always wins.
 pub fn relay_vertex_env(env: &mut Vec<(String, String)>) {
-    for key in VERTEX_RELAY_KEYS {
+    relay_keys(VERTEX_RELAY_KEYS, env);
+}
+
+/// Seed `env` with the process values of [`IDENTITY_RELAY_KEYS`], on the same terms. Without this
+/// the agent commits under whatever the pack's `setup_cmd` hardcoded, and the pull request that
+/// carries the commit is attributed to nobody.
+pub fn relay_identity_env(env: &mut Vec<(String, String)>) {
+    relay_keys(IDENTITY_RELAY_KEYS, env);
+}
+
+/// The shared relay: only keys that are set and non-empty cross, and an existing entry (a
+/// manifest-provided value) always wins.
+fn relay_keys(keys: &[&str], env: &mut Vec<(String, String)>) {
+    for key in keys {
         if env.iter().any(|(k, _)| k == key) {
             continue;
         }
@@ -1715,6 +1739,50 @@ mod tests {
             std::env::remove_var("GH_TOKEN");
             std::env::remove_var("REG_TOKEN");
             std::env::remove_var(AGENT_VISIBLE_ENV);
+        }
+    }
+
+    /// The identity the controller named for the run reaches the agent that does the committing.
+    /// Unset relays nothing, so a deploy that names no identity is unchanged.
+    #[test]
+    fn the_run_identity_reaches_the_agent_and_a_manifest_value_wins() {
+        let _guard = crate::test_env_lock();
+        for key in IDENTITY_RELAY_KEYS {
+            unsafe { std::env::remove_var(key) };
+        }
+        let mut env = Vec::new();
+        relay_identity_env(&mut env);
+        assert!(env.is_empty(), "no identity named, nothing relayed");
+
+        unsafe {
+            std::env::set_var("GIT_AUTHOR_NAME", "crucible-bot[bot]");
+            std::env::set_var(
+                "GIT_AUTHOR_EMAIL",
+                "299632118+crucible-bot[bot]@users.noreply.github.com",
+            );
+            std::env::set_var("GIT_COMMITTER_NAME", "crucible-bot[bot]");
+            std::env::set_var("GIT_COMMITTER_EMAIL", "");
+        }
+        // A manifest that named its own author keeps it; the empty committer email does not cross.
+        let mut env = vec![("GIT_AUTHOR_NAME".to_string(), "from-manifest".to_string())];
+        relay_identity_env(&mut env);
+        assert_eq!(
+            env,
+            vec![
+                ("GIT_AUTHOR_NAME".to_string(), "from-manifest".to_string()),
+                (
+                    "GIT_AUTHOR_EMAIL".to_string(),
+                    "299632118+crucible-bot[bot]@users.noreply.github.com".to_string()
+                ),
+                (
+                    "GIT_COMMITTER_NAME".to_string(),
+                    "crucible-bot[bot]".to_string()
+                ),
+            ]
+        );
+
+        for key in IDENTITY_RELAY_KEYS {
+            unsafe { std::env::remove_var(key) };
         }
     }
 

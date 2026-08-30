@@ -802,6 +802,9 @@ fn apply_agent_cfg(
     // The pack's declared secrets, for the ones the registry says this agent may hold. The kubelet
     // put them in this process's environment; without this the sandbox never sees them.
     crate::openshell::run::relay_agent_visible_secrets(secrets, &mut args.env);
+    // Who the agent's commits are attributed to. Same reason: the sandbox never sees the pod's env,
+    // so the identity the controller named for this run has to be relayed like everything else.
+    crate::openshell::run::relay_identity_env(&mut args.env);
     args.relay = agent.relay.clone();
     args.openshell = agent.openshell.clone();
     args.broker = agent.broker.clone();
