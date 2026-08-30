@@ -756,7 +756,7 @@ noted here tersely so this doc stays the map of what's authoritative:
   freeze applies identically regardless of which arm sourced the goal.
 - **`crucible ps [--namespace <ns>] [--json]`**: lists loop pods across the cluster, selecting on
   the `app.kubernetes.io/managed-by=crucible` label every rendered loop pod carries. `ITER` ships
-  as `-` (reserved, see `ps.rs`'s module doc for why it isn't wired up yet).
+  as `-` (reserved, see `crucible/src/ps.rs`'s module doc for why it isn't wired up yet).
 - **`crucible deploy render|apply --manifest <path> --profile <path> [--iterations N]
   [--max-cost USD] [--no-pin] [--pack [--pack-configmap-name <name>]] [--pr-repo <owner/repo>]
   [--clusters <path>] [--harness <h>] [--model <m>] [--playbook --max-time <dur> [--param
