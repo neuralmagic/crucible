@@ -16,6 +16,11 @@
 # gRPC client compiled against (crucible re-checks at runtime). The sentinel default makes a
 # bare build fail at the FROM below with the missing build-arg in the error.
 ARG OPENSHELL_REV=unset--pass-build-arg-OPENSHELL_REV-from-Cargo.lock
+# Declared globally (pre-FROM) and re-imported bare in the final stage: kaniko applies
+# --build-arg reliably only to pre-FROM ARGs, and cluster builds run under kaniko.
+ARG VERSION
+ARG REVISION
+ARG CONTRACT_VERSION=unset--pass-build-arg-CONTRACT_VERSION-from-crucible-binary
 
 # The sha-tagged OpenShell distribution image (built from the same rev): carries
 # /usr/local/bin/{openshell-gateway,openshell}, both from ONE rev.
@@ -31,11 +36,19 @@ FROM registry.access.redhat.com/ubi10/ubi:10.2 AS bins
 # Build toolchain: gcc/gcc-c++/make/cmake for cc-driven native crates (libgit2-sys, libssh2-sys,
 # libsqlite3-sys build bundled C); openssl-devel + pkgconfig + zlib-devel for git2's https/ssh;
 # git for cargo's checkout paths; protobuf for the gateway's gRPC client.
+# protobuf-compiler is not in the plain (unsubscribed) UBI10 repos, so a bare cluster build
+# dies at this install; fetch the official protoc release binary instead — same protoc, no
+# entitlement dependency.
 RUN dnf install -y --nodocs \
         gcc gcc-c++ make cmake \
         openssl-devel pkgconfig zlib-devel \
-        git curl tar gzip findutils protobuf-compiler \
-    && dnf clean all
+        git curl tar gzip findutils unzip \
+    && dnf clean all \
+    && curl -fsSL -o /tmp/protoc.zip \
+        https://github.com/protocolbuffers/protobuf/releases/download/v28.3/protoc-28.3-linux-x86_64.zip \
+    && unzip -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*' \
+    && rm /tmp/protoc.zip \
+    && protoc --version
 ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/cargo/bin:$PATH
 RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path \
     && cargo --version
@@ -54,12 +67,12 @@ FROM registry.access.redhat.com/ubi10/ubi:10.2
 ARG NU_VERSION=0.113.0
 ARG GH_VERSION=2.94.0
 ARG GH_SHA256=a757f1ba6db18f4de8cbadb244843a5f89bc75b5e7c6fc127d2bd77fbd12ed62
-ARG VERSION=dev
-ARG REVISION=unknown
+ARG VERSION
+ARG REVISION
 # The controller/engine contract version. INJECTED like OPENSHELL_REV: docker.yml reads it from
 # the staged crucible binary (`crucible --contract-version`) and the RUN after the bin COPY
 # below re-checks it against the binary actually shipped, so the label cannot drift.
-ARG CONTRACT_VERSION=unset--pass-build-arg-CONTRACT_VERSION-from-crucible-binary
+ARG CONTRACT_VERSION
 
 LABEL org.opencontainers.image.title="crucible" \
       org.opencontainers.image.description="Domain-neutral crucible runtime: engine + broker + forge on a self-contained OpenShell/podman base" \
