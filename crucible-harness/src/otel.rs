@@ -1177,19 +1177,28 @@ mod tests {
             serde_json::to_vec(&metrics_record("claude-opus-4-6", "input", 7, None)).unwrap();
         assert!(post_bytes(collector.port(), "/v1/metrics", &metrics).contains("partialSuccess"));
 
-        // The forward is detached, so poll rather than assuming it landed by the time POST returns.
+        // The forward is detached, so poll rather than assuming it landed by the time POST
+        // returns, and wait for a line that parses: a non-empty file can be a half-written one.
         let deadline = Instant::now() + Duration::from_secs(5);
-        let received = loop {
+        let (received, records) = loop {
             let got = std::fs::read_to_string(&upstream_log).unwrap_or_default();
-            if !got.trim().is_empty() || Instant::now() >= deadline {
-                break got;
+            let records: Vec<Value> = got
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .filter_map(|l| serde_json::from_str(l).ok())
+                .collect();
+            if !records.is_empty() || Instant::now() >= deadline {
+                break (got, records);
             }
             std::thread::sleep(Duration::from_millis(25));
         };
 
-        let lines: Vec<&str> = received.lines().filter(|l| !l.trim().is_empty()).collect();
-        assert_eq!(lines.len(), 1, "only the trace export forwards: {received}");
-        let record: Value = serde_json::from_str(lines[0]).expect("upstream record is json");
+        assert_eq!(
+            records.len(),
+            1,
+            "only the trace export forwards: {received}"
+        );
+        let record = &records[0];
         assert_eq!(record["path"], json!("/v1/traces"));
         let span = &record["payload"]["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
         assert_eq!(span["traceId"], json!(TID));

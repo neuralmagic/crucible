@@ -516,7 +516,7 @@ pub(crate) fn prep_plan_runner_with_params(
         .run;
     args.manifest = Some(manifest_path.to_path_buf());
     args.compute_driver = compute_driver;
-    apply_agent_cfg(&mut args, &m.agent, &p.workspace)?;
+    apply_agent_cfg(&mut args, &m.agent, &m.secrets, &p.workspace)?;
     args.workflow_frozen_injects = m.frozen_inject_pairs(&manifest_dir);
     args.workflow_toolbox_exclude = m.agent.toolbox_exclude.clone();
     // A playbook's git memory is per task; the scored loop owns the same repository for
@@ -586,7 +586,7 @@ fn run_from_manifest(args: Args) -> Result<()> {
 
     // Fold the manifest's [agent] config onto Args (+ spawn the broker for openshell).
     let mut args = args;
-    apply_agent_cfg(&mut args, &m.agent, &p.workspace)?;
+    apply_agent_cfg(&mut args, &m.agent, &m.secrets, &p.workspace)?;
     // Single-repo publish target: a `[publish] pr_repo` in the manifest wins over any `--pr-repo` the
     // caller passed (the controller passes its per-repo default via the flag; a pack that names its
     // own fork overrides it). Absent → keep the flag value (empty by default, so no PR opens).
@@ -716,7 +716,7 @@ fn run_composite(args: Args, manifest_path: PathBuf) -> Result<()> {
     install_toolbox(&p, &m.agent.toolbox_exclude, harness.skills_dir())?;
 
     let mut args = args;
-    apply_agent_cfg(&mut args, &m.agent, &p.workspace)?;
+    apply_agent_cfg(&mut args, &m.agent, &m.secrets, &p.workspace)?;
     // The per-component fork map for publish-on-keep, manifest-owned via [[component]].pr_repo.
     args.component_pr_repos = m.component_pr_repos();
     let (goal, template) = resolve_goal_template(&args, &m.agent, &manifest_dir)?;
@@ -748,7 +748,12 @@ fn run_composite(args: Args, manifest_path: PathBuf) -> Result<()> {
 
 /// Fold a manifest's `[agent]` config onto `Args` and, for the openshell backend, spawn the
 /// provisioning broker. Shared by the single-domain and composite run paths.
-fn apply_agent_cfg(args: &mut Args, agent: &manifest::AgentCfg, workspace: &Path) -> Result<()> {
+fn apply_agent_cfg(
+    args: &mut Args,
+    agent: &manifest::AgentCfg,
+    secrets: &[manifest::SecretDecl],
+    workspace: &Path,
+) -> Result<()> {
     args.model = agent.model.clone();
     args.agent_cmd = agent.agent_cmd.clone();
     // Harness: CLI `--harness` wins, else the manifest's `[agent].harness` (default claude).
@@ -794,6 +799,12 @@ fn apply_agent_cfg(args: &mut Args, agent: &manifest::AgentCfg, workspace: &Path
     {
         crate::openshell::run::relay_vertex_env(&mut args.env);
     }
+    // The pack's declared secrets, for the ones the registry says this agent may hold. The kubelet
+    // put them in this process's environment; without this the sandbox never sees them.
+    crate::openshell::run::relay_agent_visible_secrets(secrets, &mut args.env);
+    // Who the agent's commits are attributed to. Same reason: the sandbox never sees the pod's env,
+    // so the identity the controller named for this run has to be relayed like everything else.
+    crate::openshell::run::relay_identity_env(&mut args.env);
     args.relay = agent.relay.clone();
     args.openshell = agent.openshell.clone();
     args.broker = agent.broker.clone();
@@ -1001,7 +1012,8 @@ fn drive_loop(
 /// fatal: a missing drop-box (a local run, or an old controller that injected nothing) is a silent
 /// no-op and the wrapper's `SESSION` delimiter is the controller's fallback; a failed POST is already
 /// logged loudly inside [`crate::ingest_client::post_artifact`]. The run-session is the loop's
-/// authoritative record; the otel log rides along only when the collector produced one.
+/// authoritative record; the captured files and the otel log ride along only when the run produced
+/// them.
 pub(crate) fn deliver_run_evidence(p: &Paths) {
     let Some(cfg) = crate::ingest_client::IngestConfig::from_env() else {
         return;
@@ -1011,12 +1023,79 @@ pub(crate) fn deliver_run_evidence(p: &Paths) {
         crucible_contract::ArtifactKind::RunSession,
         &p.session_log,
     );
+    deliver_captured_files(&cfg, p);
     // R5's in-process OTLP collector captures `otel.jsonl` in the run (state) dir; deliver it when it
     // exists. Absent until R5 lands, so this is inert plumbing today.
     let otel = p.state.join("otel.jsonl");
     if otel.exists() {
         deliver_artifact(&cfg, crucible_contract::ArtifactKind::OtelLog, &otel);
     }
+}
+
+/// POST the run's captured files to the drop-box as one gzipped tar of `state/files`. The tree is
+/// `<task>/<declared path>`, and `capture_declared` publishes a task's directory by rename only
+/// once every file it declared is there, so what is tarred is exactly what the run captured.
+///
+/// A run whose tasks declared nothing has no `state/files` and delivers nothing: the absent artifact
+/// is the honest answer, not an empty tar.
+fn deliver_captured_files(cfg: &crate::ingest_client::IngestConfig, p: &Paths) {
+    let files = p.state.join("files");
+    if !files.is_dir() {
+        return;
+    }
+    let kind = crucible_contract::ArtifactKind::RunFiles;
+    let tar = match tar_dir(&files) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!(
+                "[crucible] Tier 2: tarring {} for {kind} delivery failed: {e}",
+                files.display()
+            );
+            return;
+        }
+    };
+    let gz = match gzip(&tar) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!(
+                "[crucible] Tier 2: gzipping the captured files for {kind} delivery failed: {e}"
+            );
+            return;
+        }
+    };
+    let art = crate::ingest_client::post_artifact(cfg, kind, &gz);
+    if art.delivered {
+        eprintln!(
+            "[crucible] Tier 2: delivered {kind} ({} gzipped bytes) to the drop-box",
+            art.bytes
+        );
+    }
+}
+
+/// Tar `dir`'s files under paths relative to it. Captured files are regular files by construction
+/// (`capture_declared` copies with `std::fs::copy`), so there is nothing to filter and no symlink
+/// to resolve.
+fn tar_dir(dir: &Path) -> std::io::Result<Vec<u8>> {
+    fn append(
+        builder: &mut tar::Builder<Vec<u8>>,
+        dir: &Path,
+        prefix: &Path,
+    ) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let rel = prefix.join(entry.file_name());
+            if path.is_dir() {
+                append(builder, &path, &rel)?;
+            } else {
+                builder.append_path_with_name(&path, &rel)?;
+            }
+        }
+        Ok(())
+    }
+    let mut builder = tar::Builder::new(Vec::new());
+    append(&mut builder, dir, Path::new(""))?;
+    builder.into_inner()
 }
 
 /// Read `path`, gzip it, and POST it to the drop-box as `kind`. A read/gzip failure is logged and
@@ -1155,6 +1234,32 @@ mod tests {
     use clap::Parser;
     use std::fs;
 
+    #[test]
+    fn the_captured_files_tar_carries_every_task_directory_by_relative_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let files = dir.path().join("files");
+        fs::create_dir_all(files.join("roundup")).expect("mkdir");
+        fs::create_dir_all(files.join("propose/nested")).expect("mkdir");
+        fs::write(files.join("roundup/FINDINGS.json"), b"{}").expect("write");
+        fs::write(files.join("propose/nested/fix.patch"), b"diff").expect("write");
+
+        let tar = tar_dir(&files).expect("tar");
+        let mut archive = tar::Archive::new(std::io::Cursor::new(tar));
+        let mut names: Vec<String> = archive
+            .entries()
+            .expect("entries")
+            .map(|e| {
+                e.expect("entry")
+                    .path()
+                    .expect("path")
+                    .display()
+                    .to_string()
+            })
+            .collect();
+        names.sort();
+        assert_eq!(names, ["propose/nested/fix.patch", "roundup/FINDINGS.json"]);
+    }
+
     // A minimal `command`-backend manifest (no broker, no Vertex) so `apply_agent_cfg` is
     // side-effect-free; `effort_line` optionally sets `[agent].reasoning_effort`.
     fn manifest_toml(effort_line: &str) -> String {
@@ -1183,7 +1288,7 @@ mod tests {
     fn effort_defaults_to_medium_when_unset() {
         let m: manifest::Manifest = toml::from_str(&manifest_toml("")).unwrap();
         let mut a = args_from(&["crucible"]);
-        apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
+        apply_agent_cfg(&mut a, &m.agent, &m.secrets, Path::new("ws")).unwrap();
         assert_eq!(
             a.reasoning_effort,
             Some(crate::manifest::ReasoningEffort::Medium)
@@ -1195,7 +1300,7 @@ mod tests {
         let m: manifest::Manifest =
             toml::from_str(&manifest_toml("reasoning_effort = \"max\"")).unwrap();
         let mut a = args_from(&["crucible"]);
-        apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
+        apply_agent_cfg(&mut a, &m.agent, &m.secrets, Path::new("ws")).unwrap();
         assert_eq!(
             a.reasoning_effort,
             Some(crate::manifest::ReasoningEffort::Max)
@@ -1206,12 +1311,12 @@ mod tests {
     fn harness_defaults_to_claude_and_manifest_sets_it() {
         let m: manifest::Manifest = toml::from_str(&manifest_toml("")).unwrap();
         let mut a = args_from(&["crucible"]);
-        apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
+        apply_agent_cfg(&mut a, &m.agent, &m.secrets, Path::new("ws")).unwrap();
         assert_eq!(a.harness(), crate::manifest::Harness::Claude);
 
         let m: manifest::Manifest = toml::from_str(&manifest_toml("harness = \"hermes\"")).unwrap();
         let mut a = args_from(&["crucible"]);
-        apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
+        apply_agent_cfg(&mut a, &m.agent, &m.secrets, Path::new("ws")).unwrap();
         assert_eq!(a.harness(), crate::manifest::Harness::Hermes);
     }
 
@@ -1219,7 +1324,7 @@ mod tests {
     fn cli_harness_beats_the_manifest() {
         let m: manifest::Manifest = toml::from_str(&manifest_toml("harness = \"hermes\"")).unwrap();
         let mut a = args_from(&["crucible", "--harness", "claude"]);
-        apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
+        apply_agent_cfg(&mut a, &m.agent, &m.secrets, Path::new("ws")).unwrap();
         assert_eq!(a.harness(), crate::manifest::Harness::Claude);
     }
 
@@ -1233,7 +1338,7 @@ mod tests {
         ))
         .unwrap();
         let mut a = args_from(&["crucible"]);
-        apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
+        apply_agent_cfg(&mut a, &m.agent, &m.secrets, Path::new("ws")).unwrap();
         assert_eq!(
             a.hermes.model.as_deref(),
             Some("anthropic/claude-haiku-4-5")
@@ -1251,20 +1356,32 @@ mod tests {
     #[test]
     fn codex_subtable_parses_and_denies_unknown_fields() {
         let m: manifest::Manifest = toml::from_str(&format!(
-            "{}\n[agent.codex]\nmodel = \"gpt-5.6-sol\"\n",
+            "{}\n[agent.codex]\nmodel = \"gpt-5.6-sol\"\nauth = \"api\"\napi_key = \"WORK\"\n",
             manifest_toml("harness = \"codex\"")
         ))
         .unwrap();
         let mut a = args_from(&["crucible"]);
-        apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
+        apply_agent_cfg(&mut a, &m.agent, &m.secrets, Path::new("ws")).unwrap();
         assert_eq!(a.harness(), crate::manifest::Harness::Codex);
         assert_eq!(a.codex.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(a.codex.auth, manifest::CodexAuthMode::Api);
+        assert_eq!(a.codex.api_key.as_deref(), Some("WORK"));
+
+        let default: manifest::Manifest =
+            toml::from_str(&manifest_toml("harness = \"codex\"")).unwrap();
+        assert_eq!(default.agent.codex.auth, manifest::CodexAuthMode::Auto);
 
         let err = toml::from_str::<manifest::Manifest>(&format!(
             "{}\n[agent.codex]\nmodle = \"typo\"\n",
             manifest_toml("")
         ));
         assert!(err.is_err(), "unknown [agent.codex] key must be rejected");
+
+        let err = toml::from_str::<manifest::Manifest>(&format!(
+            "{}\n[agent.codex]\nauth = \"oauth\"\n",
+            manifest_toml("")
+        ));
+        assert!(err.is_err(), "unknown codex auth mode must be rejected");
     }
 
     #[test]
@@ -1272,7 +1389,7 @@ mod tests {
         let m: manifest::Manifest =
             toml::from_str(&manifest_toml("reasoning_effort = \"high\"")).unwrap();
         let mut a = args_from(&["crucible", "--effort", "low"]);
-        apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
+        apply_agent_cfg(&mut a, &m.agent, &m.secrets, Path::new("ws")).unwrap();
         assert_eq!(
             a.reasoning_effort,
             Some(crate::manifest::ReasoningEffort::Low)
@@ -1307,7 +1424,7 @@ mod tests {
         )
         .unwrap();
         let mut a = args_from(&["crucible"]);
-        let result = apply_agent_cfg(&mut a, &m.agent, Path::new("ws"));
+        let result = apply_agent_cfg(&mut a, &m.agent, &m.secrets, Path::new("ws"));
         unsafe {
             std::env::remove_var("CLAUDE_CODE_USE_VERTEX");
         }
@@ -1349,7 +1466,7 @@ mod tests {
         )
         .unwrap();
         let mut a = args_from(&["crucible"]);
-        let result = apply_agent_cfg(&mut a, &m.agent, Path::new("ws"));
+        let result = apply_agent_cfg(&mut a, &m.agent, &m.secrets, Path::new("ws"));
         unsafe {
             std::env::remove_var("ANTHROPIC_VERTEX_PROJECT_ID");
         }
@@ -1375,7 +1492,7 @@ mod tests {
 
         let m: manifest::Manifest = toml::from_str(&manifest_toml("")).unwrap();
         let mut a = args_from(&["crucible"]);
-        let result = apply_agent_cfg(&mut a, &m.agent, Path::new("ws"));
+        let result = apply_agent_cfg(&mut a, &m.agent, &m.secrets, Path::new("ws"));
         unsafe {
             std::env::remove_var("CLAUDE_CODE_USE_VERTEX");
         }

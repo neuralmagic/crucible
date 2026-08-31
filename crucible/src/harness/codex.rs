@@ -4,18 +4,16 @@
 //! turn's result and token usage and `backfill_required` stays false; the rollout file under
 //! `$CODEX_HOME/sessions` is trace garnish, same posture as claude.
 //!
-//! Auth is not Vertex: codex talks to the ChatGPT backend with an OAuth access token the loop
-//! process mints host-side ([`crate::openshell::provider::mint_codex_token`]) and seeds as
-//! `$CODEX_HOME/auth.json`. Provider-delivered env reaches the sandbox as an
-//! `openshell:resolve:env:` placeholder that only the L7 egress proxy resolves, and codex talks to
-//! `wss://api.openai.com/v1/responses` over an L4 tunnel, so the token has to be in the file. The
-//! sandbox holds a short-lived access token and never a refresh token, so exactly one process ever
-//! performs the refresh grant.
+//! Codex authenticates with either the loop process's `OPENAI_API_KEY` or a short-lived ChatGPT
+//! OAuth token minted host-side from `CODEX_CREDENTIALS`. Both are seeded into
+//! `$CODEX_HOME/auth.json`. A gateway provider cannot deliver either credential: the sandbox sees
+//! only an `openshell:resolve:env:` placeholder that the L7 egress proxy resolves, while Codex
+//! uses an L4 WebSocket tunnel. The real credential therefore has to be in the auth file.
 
 use crate::Args;
 use crate::harness::{SeedFile, TurnArtifacts, append_manifest_env};
 use crate::manifest::{Harness, ReasoningEffort};
-use crate::openshell::provider::CodexToken;
+use crate::openshell::provider::CodexAuth;
 use crate::turn_trace::{self, GenAiRecord, ToolCall, ToolInvocation};
 use jiff::Timestamp;
 use serde_json::Value;
@@ -127,8 +125,8 @@ pub(crate) fn sandbox_argv(args: &Args, _mcp_seeded: bool) -> Vec<String> {
 }
 
 /// The agent's env script (sourced before codex runs in the sandbox): `AGENT_TOOL`, `CODEX_HOME`,
-/// then the manifest's `[agent].env`. No credential is ever exported: the access token reaches the
-/// sandbox as the seeded `auth.json` ([`auth_json`]).
+/// then the manifest's `[agent].env`. The credential is not exported; it reaches Codex only
+/// through the seeded `auth.json` ([`auth_json`]).
 pub(crate) fn env_script(env: &[(String, String)]) -> String {
     let lines = vec![
         "export AGENT_TOOL=codex".to_string(),
@@ -137,48 +135,49 @@ pub(crate) fn env_script(env: &[(String, String)]) -> String {
     append_manifest_env(lines, env)
 }
 
-/// Stands in for the refresh token codex requires as a field but must never hold: the loop process
-/// is the single refresher, so any refresh the sandbox attempts has to fail, and it fails naming
-/// this instead of an empty string.
-pub(crate) const WITHHELD_REFRESH_TOKEN: &str = "withheld-crucible-refreshes-host-side";
-
-/// `$CODEX_HOME/auth.json` as codex's `AuthDotJson` parses it. All four `tokens` fields must be
-/// present and `id_token` must be a real JWT: a missing or unparseable field makes serde drop
-/// `tokens` wholesale and codex then runs unauthenticated into a 401 reconnect loop rather than
-/// erroring. `last_refresh` is the mint time, or codex's 8-day staleness rule triggers a refresh
-/// the sandbox cannot perform.
-fn auth_json(token: &CodexToken, last_refresh: &str) -> String {
-    serde_json::json!({
-        "OPENAI_API_KEY": serde_json::Value::Null,
-        "auth_mode": "chatgpt",
-        "tokens": {
-            "access_token": token.access_token,
-            "account_id": token.account_id,
-            "id_token": token.id_token,
-            "refresh_token": WITHHELD_REFRESH_TOKEN,
-        },
-        "last_refresh": last_refresh,
-    })
+/// `$CODEX_HOME/auth.json` in the shape Codex expects for the selected auth mode.
+fn auth_json(auth: &CodexAuth, last_refresh: &str) -> String {
+    match auth {
+        CodexAuth::ApiKey(api_key) => serde_json::json!({
+            "auth_mode": "apikey",
+            "OPENAI_API_KEY": api_key,
+        }),
+        CodexAuth::ChatGpt(token) => serde_json::json!({
+            "OPENAI_API_KEY": serde_json::Value::Null,
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "access_token": token.access_token,
+                "account_id": token.account_id,
+                "id_token": token.id_token,
+                "refresh_token": WITHHELD_REFRESH_TOKEN,
+            },
+            "last_refresh": last_refresh,
+        }),
+    }
     .to_string()
 }
 
+/// Stands in for the refresh token Codex requires in its ChatGPT auth-file shape. The real refresh
+/// token remains in the loop process, which is the single refresher.
+pub(crate) const WITHHELD_REFRESH_TOKEN: &str = "withheld-crucible-refreshes-host-side";
+
 /// Files seeded into the sandbox before exec: codex's `config.toml`, ALWAYS (it carries the model
-/// and the approval/sandbox posture), plus `auth.json` whenever the turn minted a token. When the
+/// and the approval/sandbox posture), plus `auth.json` whenever Codex auth was resolved. When the
 /// broker is on, its streamable-HTTP MCP server is merged into the config with a bearer token,
 /// since the broker binds `0.0.0.0` and the token is what makes the sandbox its only caller.
 pub(crate) fn seed_files(
     args: &Args,
     broker_url: Option<&str>,
     broker_token: Option<&str>,
-    auth: Option<&CodexToken>,
+    auth: Option<&CodexAuth>,
 ) -> Vec<SeedFile> {
     let mut seeds = vec![SeedFile {
         content: config_toml(model(args), &args.broker.name, broker_url, broker_token),
         dest: CONFIG,
     }];
-    if let Some(token) = auth {
+    if let Some(auth) = auth {
         seeds.push(SeedFile {
-            content: auth_json(token, &Timestamp::now().to_string()),
+            content: auth_json(auth, &Timestamp::now().to_string()),
             dest: AUTH,
         });
     }
@@ -687,39 +686,42 @@ mod tests {
         );
     }
 
-    fn token() -> CodexToken {
-        CodexToken {
+    #[test]
+    fn the_seeded_auth_json_matches_codex_api_key_login() {
+        let auth = CodexAuth::ApiKey("sk-test".to_string());
+        let v: serde_json::Value =
+            serde_json::from_str(&auth_json(&auth, "unused")).expect("valid json");
+        assert_eq!(v["auth_mode"], "apikey");
+        assert_eq!(v["OPENAI_API_KEY"], "sk-test");
+        assert_eq!(v.as_object().map(|o| o.len()), Some(2));
+    }
+
+    #[test]
+    fn the_seeded_auth_json_carries_chatgpt_token_fields() {
+        let auth = CodexAuth::ChatGpt(crate::openshell::provider::CodexToken {
             access_token: "access-jwt".to_string(),
             account_id: "acct-1".to_string(),
             id_token: "id-jwt".to_string(),
-        }
-    }
-
-    /// Codex drops the whole `tokens` object when a field is missing, then runs unauthenticated
-    /// into a 401 loop, so every field has to be there and the withheld refresh token has to be
-    /// non-empty (an empty one 400s at the auth service instead of naming the withholding).
-    #[test]
-    fn the_seeded_auth_json_carries_all_four_token_fields() {
+        });
         let v: serde_json::Value =
-            serde_json::from_str(&auth_json(&token(), "2026-08-19T20:00:00Z")).expect("valid json");
+            serde_json::from_str(&auth_json(&auth, "2026-08-19T20:00:00Z")).expect("valid json");
         assert_eq!(v["auth_mode"], "chatgpt");
         assert!(v["OPENAI_API_KEY"].is_null());
         assert_eq!(v["tokens"]["access_token"], "access-jwt");
         assert_eq!(v["tokens"]["account_id"], "acct-1");
         assert_eq!(v["tokens"]["id_token"], "id-jwt");
         assert_eq!(v["tokens"]["refresh_token"], WITHHELD_REFRESH_TOKEN);
-        assert!(!WITHHELD_REFRESH_TOKEN.is_empty());
         assert_eq!(v["last_refresh"], "2026-08-19T20:00:00Z");
     }
 
     #[test]
-    fn auth_json_is_seeded_only_when_the_turn_minted_a_token() {
+    fn auth_json_is_seeded_only_when_the_turn_has_codex_auth() {
         let a = args();
-        let minted = token();
-        let seeds = seed_files(&a, None, None, Some(&minted));
+        let auth = CodexAuth::ApiKey("sk-test".to_string());
+        let seeds = seed_files(&a, None, None, Some(&auth));
         assert_eq!(seeds.len(), 2);
         assert_eq!(seeds[1].dest, AUTH);
-        assert!(seeds[1].content.contains("access-jwt"));
+        assert!(seeds[1].content.contains("sk-test"));
         assert!(
             seed_files(&a, None, None, None)
                 .iter()
