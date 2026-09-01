@@ -75,7 +75,7 @@ whether the code works.
 
 ## Vocabulary
 
-- The human gate on a scope is an **approval**, not a "door".
+- A scope's human sign-off is an **approval**; never introduce "door" naming.
 
 ## PRs, commits, comments
 
