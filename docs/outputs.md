@@ -99,8 +99,9 @@ Read this list before trusting the machinery with something it does not cover.
     approval PR spends the broker's tally, publish-on-keep spends the
     engine's, and a pack declaring one PR can therefore see one from each.
   - the `tracker-comment` engine default reads `$CRUCIBLE_ITEM`, which the
-    controller does not export yet; until wired, that default refuses writes
-    rather than scoping them.
+    controller exports for issue-driven runs and turns; a launch with no
+    upstream item (a playbook one-shot) exports nothing and that default
+    refuses writes rather than scoping them.
   - a composite's disclosure names its own credentials and relays but does
     not fold in its components' egress or broker reach.
   - an `[agent].env` name with no matching capability declaration is a
