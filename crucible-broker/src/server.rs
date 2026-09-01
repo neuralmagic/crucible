@@ -3,6 +3,7 @@
 //! backends are injected behind the trait boundaries (mediated provisioning).
 
 use crate::approval::{ApprovalBackend, ApprovalChannel};
+use crate::bounds::Bounds;
 use crate::broker::{Broker, TraceResolver};
 use crate::codegen::CodegenState;
 use crate::control_approval::ControlApproval;
@@ -10,6 +11,7 @@ use crate::deploy::DeployRegistry;
 use crate::draft_pr::DraftPrApproval;
 use crate::gpu_check::GpuCheck;
 use crate::types::{Resolution, TraceParams};
+use crucible_contract::outputs::OutputKind;
 use jira_mcp::{JiraClient, render};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -146,8 +148,11 @@ pub struct JiraGetIssueArgs {
 /// Args for `jira_add_comment`: post a comment to an issue.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct JiraAddCommentArgs {
-    /// The issue key, e.g. `PROJ-1234`.
-    issue_key: String,
+    /// The issue key, e.g. `PROJ-1234`. Omit it to comment on the item that parameterized this
+    /// run; a different item is accepted only where the pack declared an open target whose scope
+    /// admits it.
+    #[serde(default)]
+    issue_key: Option<String>,
     /// The comment body (Markdown / JIRA wiki markup).
     comment: String,
 }
@@ -266,6 +271,10 @@ pub struct McpServer {
     /// stateless mode a fresh `McpServer` is built per request, so a per-instance memo would never
     /// hit; main() owns the one shared Arc.
     codegen: Arc<CodegenState>,
+    /// The run's declared output bounds, which every mutating tool routes its write through.
+    /// INJECTED like `deploys`: the per-run counts must survive the fresh `McpServer` the http
+    /// service builds per request in stateless mode.
+    bounds: Arc<Bounds>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -281,6 +290,7 @@ impl McpServer {
         jira: Option<Arc<JiraClient>>,
         deploys: Arc<DeployRegistry>,
         codegen: Arc<CodegenState>,
+        bounds: Arc<Bounds>,
     ) -> Self {
         // Approval channel is a runtime choice (async approval). `BROKER_APPROVAL=control` selects the
         // attended, token-free control-bridge surface; otherwise the headless draft-PR default.
@@ -314,6 +324,7 @@ impl McpServer {
             jira,
             deploys,
             codegen,
+            bounds,
             tool_router,
         }
     }
@@ -324,6 +335,12 @@ impl McpServer {
         pending_approval | escalate. The server admits or denies; you never provision directly."
     )]
     async fn request_trace(&self, Parameters(args): Parameters<RequestTraceArgs>) -> String {
+        if let Err(detail) = self
+            .bounds
+            .admit("request_trace", OutputKind::GpuCapture, None)
+        {
+            return refused(&detail);
+        }
         let params: TraceParams = args.into();
         match self.broker.request_trace(&params) {
             Ok(res) => {
@@ -360,6 +377,9 @@ impl McpServer {
         if args.reason.trim().is_empty() {
             return json_err("reason must be non-empty: say what the operator has to fix");
         }
+        if let Err(detail) = self.bounds.admit("distress", OutputKind::ChatMessage, None) {
+            return refused(&detail);
+        }
         // Writes the handoff file and posts the webhook (blocking IO); keep it off the reactor,
         // and off `tokio::task::spawn_blocking` so the events land on the tool span.
         match crate::telemetry::spawn_blocking(move || {
@@ -377,6 +397,9 @@ impl McpServer {
         description = "Post the engine-authored workflow status to the configured Crucible Slack channel. Call once from a final reporting or epilogue task. This tool takes no message content: task names, statuses, spend, and the Crucible artifact link come from trusted engine state. It does not suspend the run; use distress when operator action is required."
     )]
     async fn report(&self, Parameters(_args): Parameters<ReportArgs>) -> String {
+        if let Err(detail) = self.bounds.admit("report", OutputKind::ChatMessage, None) {
+            return refused(&detail);
+        }
         match crate::telemetry::spawn_blocking(|| crate::report::deliver(None)).await {
             Ok(Ok(reply)) => reply,
             Ok(Err(e)) => json_err(&e),
@@ -406,8 +429,12 @@ impl McpServer {
         Edit, build, fix, repeat until it builds, then deploy_candidate."
     )]
     async fn build_epp(&self, Parameters(_): Parameters<BuildEppArgs>) -> String {
+        let registry = match self.bounds.admit("build_epp", OutputKind::ImagePush, None) {
+            Ok(target) => target,
+            Err(detail) => return refused(&detail),
+        };
         // The build shells buildah/openshell for minutes; keep it off the async reactor.
-        crate::telemetry::spawn_blocking(crate::build::build_epp)
+        crate::telemetry::spawn_blocking(move || crate::build::build_epp(registry.as_deref()))
             .await
             .unwrap_or_else(|e| format!(r#"{{"status":"error","error":"build task failed: {e}"}}"#))
     }
@@ -418,6 +445,19 @@ impl McpServer {
         Returns a JSON status: deployed{image_ref} | disabled | error."
     )]
     async fn deploy_candidate(&self, Parameters(args): Parameters<DeployCandidateArgs>) -> String {
+        if let Err(detail) = self.bounds.permit_target(
+            "deploy_candidate",
+            OutputKind::ImagePush,
+            args.image_ref.as_deref().filter(|r| !r.is_empty()),
+        ) {
+            return refused(&detail);
+        }
+        if let Err(detail) = self
+            .bounds
+            .admit("deploy_candidate", OutputKind::Deploy, None)
+        {
+            return refused(&detail);
+        }
         crate::telemetry::spawn_blocking(move || crate::build::deploy_candidate(args.image_ref))
             .await
             .unwrap_or_else(|e| {
@@ -437,6 +477,12 @@ impl McpServer {
         time — calling again while one is in flight just returns its deploy_id."
     )]
     async fn deploy_composite(&self, Parameters(_): Parameters<DeployCompositeArgs>) -> String {
+        if let Err(detail) = self
+            .bounds
+            .admit("deploy_composite", OutputKind::Deploy, None)
+        {
+            return refused(&detail);
+        }
         // Pulls the sandbox tree (openshell download, blocking IO) before kicking the hook on a
         // background thread; keep that off the async reactor.
         let reg = self.deploys.clone();
@@ -540,6 +586,12 @@ impl McpServer {
         handle AS THE BUILD RUNS, so a concurrent session can fetch_log it to watch progress."
     )]
     async fn codegen_build(&self, Parameters(args): Parameters<CodegenBuildArgs>) -> String {
+        if let Err(detail) = self
+            .bounds
+            .admit("codegen_build", OutputKind::ImagePush, None)
+        {
+            return refused(&detail);
+        }
         let state = self.codegen.clone();
         crate::telemetry::spawn_blocking(move || crate::codegen::build(&state, &args.mode))
             .await
@@ -566,6 +618,12 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<CodegenBenchmarkArgs>,
     ) -> String {
+        if let Err(detail) = self
+            .bounds
+            .admit("codegen_benchmark", OutputKind::GpuCapture, None)
+        {
+            return refused(&detail);
+        }
         let state = self.codegen.clone();
         let toggles: Vec<(String, String)> = args.toggles.into_iter().collect();
         crate::telemetry::spawn_blocking(move || {
@@ -587,6 +645,12 @@ impl McpServer {
         progress, poll codegen_jobs + fetch_log from a concurrent session."
     )]
     async fn codegen_lm_eval(&self, Parameters(args): Parameters<CodegenLmEvalArgs>) -> String {
+        if let Err(detail) = self
+            .bounds
+            .admit("codegen_lm_eval", OutputKind::GpuCapture, None)
+        {
+            return refused(&detail);
+        }
         let state = self.codegen.clone();
         crate::telemetry::spawn_blocking(move || {
             crate::codegen::lm_eval(&state, &args.digest, args.limit)
@@ -610,6 +674,12 @@ impl McpServer {
         codegen_jobs + fetch_log from a concurrent session."
     )]
     async fn codegen_profile(&self, Parameters(args): Parameters<CodegenProfileArgs>) -> String {
+        if let Err(detail) = self
+            .bounds
+            .admit("codegen_profile", OutputKind::GpuCapture, None)
+        {
+            return refused(&detail);
+        }
         let state = self.codegen.clone();
         crate::telemetry::spawn_blocking(move || crate::codegen::profile(&state, &args.digest))
             .await
@@ -725,18 +795,29 @@ impl McpServer {
 
     #[tool(
         description = "Post a comment to a JIRA issue (read+comment is the ONLY write — no create/ \
-        transition/edit exist). Pass `issue_key` and the `comment` body (plain text / JIRA wiki). \
-        Returns {id, url} on success, or {\"status\":\"disabled\"} when JIRA isn't configured."
+        transition/edit exist). Pass the `comment` body (plain text / JIRA wiki); OMIT `issue_key` \
+        to comment on the item that parameterized this run, which is the usual call. A different \
+        `issue_key` lands only where the pack declared an open target whose scope admits it, and \
+        comments are budgeted per run. Returns {id, url} on success, \
+        {\"status\":\"refused\",\"error\":...} naming the bound when the write is out of bounds, or \
+        {\"status\":\"disabled\"} when JIRA isn't configured."
     )]
     async fn jira_add_comment(&self, Parameters(args): Parameters<JiraAddCommentArgs>) -> String {
         let Some(jira) = &self.jira else {
             return jira_disabled();
         };
-        match jira.add_comment(&args.issue_key, &args.comment).await {
-            Ok(id) => format!(
-                r#"{{"id":"{id}","url":"{}"}}"#,
-                jira.browse_url(&args.issue_key)
-            ),
+        let issue_key = match self.bounds.admit(
+            "jira_add_comment",
+            OutputKind::TrackerComment,
+            args.issue_key.as_deref().filter(|k| !k.trim().is_empty()),
+        ) {
+            Ok(Some(target)) => target,
+            // TrackerComment addresses a target, so admission never yields None.
+            Ok(None) => return json_err("no tracker item resolved for this comment"),
+            Err(detail) => return refused(&detail),
+        };
+        match jira.add_comment(&issue_key, &args.comment).await {
+            Ok(id) => format!(r#"{{"id":"{id}","url":"{}"}}"#, jira.browse_url(&issue_key)),
             Err(e) => json_err(&format!("{e:#}")),
         }
     }
@@ -750,6 +831,11 @@ const MAX_ISSUE_CHARS: usize = 12_000;
 fn jira_disabled() -> String {
     r#"{"status":"disabled","reason":"JIRA is not configured (set JIRA_URL + JIRA_USERNAME + JIRA_API_TOKEN on the loop pod)"}"#
         .to_string()
+}
+
+/// A bounds refusal, tagged distinctly from a transport error.
+fn refused(detail: &str) -> String {
+    serde_json::json!({ "status": "refused", "error": detail }).to_string()
 }
 
 /// A safely-escaped `{"status":"error","error":"…"}` line (serde handles the quoting, so an upstream
@@ -1154,6 +1240,7 @@ mod tests {
             None,
             Arc::new(DeployRegistry::new()),
             Arc::new(CodegenState::new()),
+            Arc::new(Bounds::from_env()),
         )
         .get_info();
         assert!(
@@ -1176,6 +1263,7 @@ mod tests {
             None,
             Arc::new(DeployRegistry::new()),
             Arc::new(CodegenState::new()),
+            Arc::new(Bounds::from_env()),
         );
         let tool = server
             .get_tool("distress")
@@ -1208,6 +1296,7 @@ mod tests {
             None,
             Arc::new(DeployRegistry::new()),
             Arc::new(CodegenState::new()),
+            Arc::new(Bounds::from_env()),
         );
         let tool = server.get_tool("report").expect("report must be listed");
         let schema = serde_json::to_value(&tool.input_schema).unwrap();
@@ -1239,6 +1328,7 @@ mod tests {
                 None,
                 deploys.clone(),
                 Arc::new(CodegenState::new()),
+                Arc::new(Bounds::from_env()),
             )
         };
         let server_a = factory();

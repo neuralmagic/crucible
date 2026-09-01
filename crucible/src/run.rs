@@ -92,6 +92,9 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
             outcome.findings.extend(p.findings);
             outcome.warnings.extend(p.warnings);
         }
+        for line in &outcome.exposure {
+            println!("[crucible check] {line}");
+        }
         for w in &outcome.warnings {
             eprintln!("[crucible check] WARNING: {w}");
         }
@@ -187,6 +190,12 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                 mermaid,
                 render,
             } => crate::plan::cli::show(file, &caps.iter().cloned().collect(), *mermaid, *render),
+            crate::PlanAction::Exposure { manifest, pr_repo } => {
+                let m = manifest::Manifest::load_frozen(manifest)?;
+                let exposure = crate::exposure::compute(&m, pr_repo.as_deref());
+                println!("{}", serde_json::to_string_pretty(&exposure)?);
+                Ok(())
+            }
             crate::PlanAction::Params { file } => {
                 let source = std::fs::read_to_string(file)
                     .with_context(|| format!("reading {}", file.display()))?;
@@ -432,7 +441,13 @@ pub(crate) fn prep_plan_runner_with_params(
         .context("constructing default args")?
         .run;
     args.manifest = Some(manifest_path.to_path_buf());
-    apply_agent_cfg(&mut args, &m.agent, &p.workspace)?;
+    let frozen = frozen_projection(
+        &m,
+        m.publish.as_ref().and_then(|p| p.pr_repo.as_deref()),
+        params,
+        &p.session_log,
+    )?;
+    apply_agent_cfg(&mut args, &m.agent, &p.workspace, &frozen)?;
     args.workflow_frozen_injects = m.frozen_inject_pairs(&manifest_dir);
     args.workflow_toolbox_exclude = m.agent.toolbox_exclude.clone();
     // A playbook's git memory is per task; the scored loop owns the same repository for
@@ -502,7 +517,16 @@ fn run_from_manifest(args: Args) -> Result<()> {
 
     // Fold the manifest's [agent] config onto Args (+ spawn the broker for openshell).
     let mut args = args;
-    apply_agent_cfg(&mut args, &m.agent, &p.workspace)?;
+    let frozen = frozen_projection(
+        &m,
+        m.publish
+            .as_ref()
+            .and_then(|p| p.pr_repo.as_deref())
+            .or(Some(args.pr_repo.as_str())),
+        &std::collections::BTreeMap::new(),
+        &p.session_log,
+    )?;
+    apply_agent_cfg(&mut args, &m.agent, &p.workspace, &frozen)?;
     // Single-repo publish target: a `[publish] pr_repo` in the manifest wins over any `--pr-repo` the
     // caller passed (the controller passes its per-repo default via the flag; a pack that names its
     // own fork overrides it). Absent → keep the flag value (empty by default, so no PR opens).
@@ -632,7 +656,21 @@ fn run_composite(args: Args, manifest_path: PathBuf) -> Result<()> {
     install_toolbox(&p, &m.agent.toolbox_exclude, harness.skills_dir())?;
 
     let mut args = args;
-    apply_agent_cfg(&mut args, &m.agent, &p.workspace)?;
+    // A composite has no single-repo [publish]; its forks are per component.
+    let bounds = run_bounds(
+        &m.outputs,
+        &m.build,
+        Some(args.pr_repo.as_str()),
+        &std::collections::BTreeMap::new(),
+    );
+    let frozen = FrozenProjection {
+        broker_env: broker_bounds_env(&bounds, &p.session_log)?,
+        disclosure: Some(crate::exposure::covered_from(
+            crate::exposure::composite_capabilities(&m.agent, &m.capabilities),
+        )),
+        bounds: Some(bounds),
+    };
+    apply_agent_cfg(&mut args, &m.agent, &p.workspace, &frozen)?;
     // The per-component fork map for publish-on-keep, manifest-owned via [[component]].pr_repo.
     args.component_pr_repos = m.component_pr_repos();
     let (goal, template) = resolve_goal_template(&args, &m.agent, &manifest_dir)?;
@@ -662,9 +700,78 @@ fn run_composite(args: Args, manifest_path: PathBuf) -> Result<()> {
     drive_loop(args, p, prep, world, judge)
 }
 
+/// What the frozen manifest projects onto a run: the bounds the broker enforces, and the grants
+/// the capability disclosure covers.
+#[derive(Default)]
+pub(crate) struct FrozenProjection {
+    /// `BROKER_OUTPUTS` and friends, handed to the broker child only. The agent never sees them,
+    /// so nothing inside the sandbox can alter a bound.
+    broker_env: Vec<(String, String)>,
+    disclosure: Option<crate::exposure::Covered>,
+    /// The same resolved bounds the broker is handed, for the two kinds the engine writes itself.
+    bounds: Option<crate::outputs::RunBounds>,
+}
+
+/// Resolve the frozen manifest's output bounds and capability disclosure for a run.
+fn frozen_projection(
+    m: &manifest::Manifest,
+    pr_repo: Option<&str>,
+    params: &std::collections::BTreeMap<String, String>,
+    session_log: &Path,
+) -> Result<FrozenProjection> {
+    let bounds = run_bounds(&m.outputs, &m.build, pr_repo, params);
+    Ok(FrozenProjection {
+        broker_env: broker_bounds_env(&bounds, session_log)?,
+        disclosure: Some(crate::exposure::covered(m)),
+        bounds: Some(bounds),
+    })
+}
+
+/// Fold the pack's `[outputs]` onto the engine default table.
+fn run_bounds(
+    outputs: &manifest::OutputsCfg,
+    builds: &std::collections::BTreeMap<String, forge::spec::BuildSpec>,
+    pr_repo: Option<&str>,
+    params: &std::collections::BTreeMap<String, String>,
+) -> crate::outputs::RunBounds {
+    let defaults = manifest::outputs::default_targets(pr_repo, builds);
+    crate::outputs::RunBounds::new(
+        manifest::outputs::resolve(outputs, &defaults),
+        params.clone(),
+    )
+}
+
+/// Project the run's resolved output bounds into the environment the broker child reads.
+fn broker_bounds_env(
+    bounds: &crate::outputs::RunBounds,
+    session_log: &Path,
+) -> Result<Vec<(String, String)>> {
+    Ok(vec![
+        (
+            crucible_contract::outputs::ENV_OUTPUTS.to_string(),
+            serde_json::to_string(bounds.resolved())
+                .context("serializing the resolved output bounds")?,
+        ),
+        (
+            crucible_contract::outputs::ENV_OUTPUT_PARAMS.to_string(),
+            serde_json::to_string(bounds.params())
+                .context("serializing the run's bound parameters")?,
+        ),
+        (
+            crucible_contract::outputs::ENV_SESSION_LOG.to_string(),
+            session_log.display().to_string(),
+        ),
+    ])
+}
+
 /// Fold a manifest's `[agent]` config onto `Args` and, for the openshell backend, spawn the
 /// provisioning broker. Shared by the single-domain and composite run paths.
-fn apply_agent_cfg(args: &mut Args, agent: &manifest::AgentCfg, workspace: &Path) -> Result<()> {
+fn apply_agent_cfg(
+    args: &mut Args,
+    agent: &manifest::AgentCfg,
+    workspace: &Path,
+    frozen: &FrozenProjection,
+) -> Result<()> {
     args.model = agent.model.clone();
     args.agent_cmd = agent.agent_cmd.clone();
     // Harness: CLI `--harness` wins, else the manifest's `[agent].harness` (default claude).
@@ -711,6 +818,8 @@ fn apply_agent_cfg(args: &mut Args, agent: &manifest::AgentCfg, workspace: &Path
         crate::openshell::relay_vertex_env(&mut args.env);
     }
     args.relay = agent.relay.clone();
+    args.disclosure = frozen.disclosure.clone();
+    args.output_bounds = frozen.bounds.clone();
     args.openshell = agent.openshell.clone();
     args.broker = agent.broker.clone();
 
@@ -721,9 +830,14 @@ fn apply_agent_cfg(args: &mut Args, agent: &manifest::AgentCfg, workspace: &Path
         // Hand the broker the deep loop's per-workspace sandbox name, its build sync must download
         // from the same sandbox the turns run in.
         let sandbox_name = crate::openshell::sandbox::name_for(workspace);
-        args.broker_token =
-            broker::ensure_running(&args.broker, &args.env, args.control_port, &sandbox_name)
-                .context("starting the provisioning broker")?;
+        args.broker_token = broker::ensure_running(
+            &args.broker,
+            &args.env,
+            &frozen.broker_env,
+            args.control_port,
+            &sandbox_name,
+        )
+        .context("starting the provisioning broker")?;
     }
     Ok(())
 }
@@ -1099,7 +1213,13 @@ mod tests {
     fn effort_defaults_to_medium_when_unset() {
         let m: manifest::Manifest = toml::from_str(&manifest_toml("")).unwrap();
         let mut a = args_from(&["crucible"]);
-        apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
+        apply_agent_cfg(
+            &mut a,
+            &m.agent,
+            Path::new("ws"),
+            &FrozenProjection::default(),
+        )
+        .unwrap();
         assert_eq!(a.reasoning_effort, Some(agent::ReasoningEffort::Medium));
     }
 
@@ -1108,7 +1228,13 @@ mod tests {
         let m: manifest::Manifest =
             toml::from_str(&manifest_toml("reasoning_effort = \"max\"")).unwrap();
         let mut a = args_from(&["crucible"]);
-        apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
+        apply_agent_cfg(
+            &mut a,
+            &m.agent,
+            Path::new("ws"),
+            &FrozenProjection::default(),
+        )
+        .unwrap();
         assert_eq!(a.reasoning_effort, Some(agent::ReasoningEffort::Max));
     }
 
@@ -1116,12 +1242,24 @@ mod tests {
     fn harness_defaults_to_claude_and_manifest_sets_it() {
         let m: manifest::Manifest = toml::from_str(&manifest_toml("")).unwrap();
         let mut a = args_from(&["crucible"]);
-        apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
+        apply_agent_cfg(
+            &mut a,
+            &m.agent,
+            Path::new("ws"),
+            &FrozenProjection::default(),
+        )
+        .unwrap();
         assert_eq!(a.harness(), crate::harness::Harness::Claude);
 
         let m: manifest::Manifest = toml::from_str(&manifest_toml("harness = \"hermes\"")).unwrap();
         let mut a = args_from(&["crucible"]);
-        apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
+        apply_agent_cfg(
+            &mut a,
+            &m.agent,
+            Path::new("ws"),
+            &FrozenProjection::default(),
+        )
+        .unwrap();
         assert_eq!(a.harness(), crate::harness::Harness::Hermes);
     }
 
@@ -1129,7 +1267,13 @@ mod tests {
     fn cli_harness_beats_the_manifest() {
         let m: manifest::Manifest = toml::from_str(&manifest_toml("harness = \"hermes\"")).unwrap();
         let mut a = args_from(&["crucible", "--harness", "claude"]);
-        apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
+        apply_agent_cfg(
+            &mut a,
+            &m.agent,
+            Path::new("ws"),
+            &FrozenProjection::default(),
+        )
+        .unwrap();
         assert_eq!(a.harness(), crate::harness::Harness::Claude);
     }
 
@@ -1143,7 +1287,13 @@ mod tests {
         ))
         .unwrap();
         let mut a = args_from(&["crucible"]);
-        apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
+        apply_agent_cfg(
+            &mut a,
+            &m.agent,
+            Path::new("ws"),
+            &FrozenProjection::default(),
+        )
+        .unwrap();
         assert_eq!(
             a.hermes.model.as_deref(),
             Some("anthropic/claude-haiku-4-5")
@@ -1166,7 +1316,13 @@ mod tests {
         ))
         .unwrap();
         let mut a = args_from(&["crucible"]);
-        apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
+        apply_agent_cfg(
+            &mut a,
+            &m.agent,
+            Path::new("ws"),
+            &FrozenProjection::default(),
+        )
+        .unwrap();
         assert_eq!(a.harness(), crate::harness::Harness::Codex);
         assert_eq!(a.codex.model.as_deref(), Some("gpt-5.6-sol"));
 
@@ -1182,7 +1338,13 @@ mod tests {
         let m: manifest::Manifest =
             toml::from_str(&manifest_toml("reasoning_effort = \"high\"")).unwrap();
         let mut a = args_from(&["crucible", "--effort", "low"]);
-        apply_agent_cfg(&mut a, &m.agent, Path::new("ws")).unwrap();
+        apply_agent_cfg(
+            &mut a,
+            &m.agent,
+            Path::new("ws"),
+            &FrozenProjection::default(),
+        )
+        .unwrap();
         assert_eq!(a.reasoning_effort, Some(agent::ReasoningEffort::Low));
     }
 
@@ -1214,7 +1376,12 @@ mod tests {
         )
         .unwrap();
         let mut a = args_from(&["crucible"]);
-        let result = apply_agent_cfg(&mut a, &m.agent, Path::new("ws"));
+        let result = apply_agent_cfg(
+            &mut a,
+            &m.agent,
+            Path::new("ws"),
+            &FrozenProjection::default(),
+        );
         unsafe {
             std::env::remove_var("CLAUDE_CODE_USE_VERTEX");
         }
@@ -1256,7 +1423,12 @@ mod tests {
         )
         .unwrap();
         let mut a = args_from(&["crucible"]);
-        let result = apply_agent_cfg(&mut a, &m.agent, Path::new("ws"));
+        let result = apply_agent_cfg(
+            &mut a,
+            &m.agent,
+            Path::new("ws"),
+            &FrozenProjection::default(),
+        );
         unsafe {
             std::env::remove_var("ANTHROPIC_VERTEX_PROJECT_ID");
         }
@@ -1282,7 +1454,12 @@ mod tests {
 
         let m: manifest::Manifest = toml::from_str(&manifest_toml("")).unwrap();
         let mut a = args_from(&["crucible"]);
-        let result = apply_agent_cfg(&mut a, &m.agent, Path::new("ws"));
+        let result = apply_agent_cfg(
+            &mut a,
+            &m.agent,
+            Path::new("ws"),
+            &FrozenProjection::default(),
+        );
         unsafe {
             std::env::remove_var("CLAUDE_CODE_USE_VERTEX");
         }
@@ -1421,6 +1598,57 @@ mod tests {
         "#,
         ));
         assert!(!workflow_implies_graph_loop(&a));
+    }
+
+    #[test]
+    fn the_broker_projection_carries_the_declared_bounds_and_the_runs_params() {
+        let m: manifest::Manifest = toml::from_str(
+            r#"
+            [repo]
+            path = "."
+            [agent]
+            backend = "openshell"
+            goal = "g"
+            [judge]
+            measure_cmd = "m"
+            direction = "higher"
+            [outputs.tracker-comment]
+            count = 3
+            target = { open = { scope = "PROJ-*", param = "issue_key" } }
+        "#,
+        )
+        .expect("manifest parses");
+        let params =
+            std::collections::BTreeMap::from([("issue_key".to_string(), "PROJ-9".to_string())]);
+        let bounds = run_bounds(&m.outputs, &m.build, None, &params);
+        let env =
+            broker_bounds_env(&bounds, Path::new("/run/state/session.jsonl")).expect("projects");
+        let get = |k: &str| {
+            env.iter()
+                .find(|(name, _)| name == k)
+                .map(|(_, v)| v.as_str())
+                .unwrap_or_else(|| panic!("{k} missing from the projection"))
+        };
+        let resolved: crucible_contract::outputs::ResolvedOutputs =
+            serde_json::from_str(get(crucible_contract::outputs::ENV_OUTPUTS))
+                .expect("the broker deserializes what the engine wrote");
+        let tracker = resolved
+            .get(crucible_contract::outputs::OutputKind::TrackerComment)
+            .expect("declared kind");
+        assert_eq!(tracker.count, 3);
+        assert!(
+            resolved
+                .get(crucible_contract::outputs::OutputKind::GpuCapture)
+                .is_some_and(|b| b.count > 0)
+        );
+        let bound: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(get(crucible_contract::outputs::ENV_OUTPUT_PARAMS))
+                .expect("params json");
+        assert_eq!(bound.get("issue_key").map(String::as_str), Some("PROJ-9"));
+        assert_eq!(
+            get(crucible_contract::outputs::ENV_SESSION_LOG),
+            "/run/state/session.jsonl"
+        );
     }
 
     #[test]

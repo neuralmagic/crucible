@@ -522,7 +522,7 @@ fn run_in(
     // Name the task to the turn. A deterministic stand-in needs to know which task it is
     // without matching prompt prose, and a real harness gets it for free in its transcript.
     args.env
-        .push(("CRUCIBLE_TASK".to_string(), task.name.0.clone()));
+        .push((crate::plan::TASK_NAME_ENV.to_string(), task.name.0.clone()));
     if let Some(h) = harness {
         match crate::harness::Harness::from_str(h, true) {
             Ok(h) => args.harness = Some(h),

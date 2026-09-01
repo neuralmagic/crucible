@@ -24,7 +24,7 @@ pub mod sandbox;
 /// `git clone` turn has no manifest, so the turn pod's plain env (the deploy profile's `[env]`)
 /// carries them and this relay is the explicit bridge. `vertex_config`/`env_script` stay
 /// manifest-only, they never read the process env themselves.
-const VERTEX_RELAY_KEYS: &[&str] = &[
+pub(crate) const VERTEX_RELAY_KEYS: &[&str] = &[
     "CLAUDE_CODE_USE_VERTEX",
     "ANTHROPIC_VERTEX_PROJECT_ID",
     "CLOUD_ML_REGION",

@@ -15,9 +15,11 @@
 //! `run_id` (`<YYYYMMDDTHHMMSSZ>-<goal-slug>`) is the join key for the S3 prefix and the
 //! PR↔S3 cross-reference. Time-first so keys sort chronologically.
 
+use crate::outputs::OutputTally;
 use crate::reporter::{Reporter, Row};
 use crate::{Args, Paths};
 use anyhow::{Context, Result};
+use crucible_contract::outputs::{BoundViolation, OutputKind};
 use serde::Serialize;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -149,11 +151,11 @@ pub struct Record<'a> {
 /// Returns whatever draft PRs opened (empty when nothing was kept, no PR repo is
 /// configured, or the open failed), the caller uses these to auto-spawn a feedback
 /// watcher (`--watch-feedback`).
-pub fn publish<R: Reporter>(r: &mut R, rec: &Record<'_>) -> Vec<PrLink> {
+pub fn publish<R: Reporter>(r: &mut R, rec: &Record<'_>, tally: &mut OutputTally) -> Vec<PrLink> {
     // PRs open BEFORE the S3 record so their URLs land in `summary.json` (the report deep-links to
     // them). S3 still runs unconditionally afterwards, so the "the run happened" record ships even
     // when the PR step is skipped or fails, only now it's enriched with whatever PRs opened.
-    let prs = open_prs(r, rec);
+    let prs = open_prs(r, rec, tally);
 
     if !rec.args.results_bucket.is_empty() {
         match record(rec, &prs) {
@@ -169,7 +171,7 @@ pub fn publish<R: Reporter>(r: &mut R, rec: &Record<'_>) -> Vec<PrLink> {
 /// Open the draft PR(s) for a kept run and return their links (for the record). Best-effort: a push/
 /// open failure logs through `r` and yields no link, never aborting the publish. Empty when nothing
 /// was kept or no PR repo is configured.
-fn open_prs<R: Reporter>(r: &mut R, rec: &Record<'_>) -> Vec<PrLink> {
+fn open_prs<R: Reporter>(r: &mut R, rec: &Record<'_>, tally: &mut OutputTally) -> Vec<PrLink> {
     // Gate on any kept row (not on this session's `kept_shas`), so a resumed run whose keeps happened
     // earlier still ships the deliverable.
     let kept_any = rec.rows.iter().any(|row| row.decision == "keep");
@@ -179,7 +181,7 @@ fn open_prs<R: Reporter>(r: &mut R, rec: &Record<'_>) -> Vec<PrLink> {
     // Composite multi-fork (one draft PR per touched component) vs single-repo (one PR). A composite
     // run carries per-component targets; a single-repo run carries `pr_repo` + the single base/head.
     if !rec.components.is_empty() {
-        match open_composite_prs(r, rec) {
+        match open_composite_prs(r, rec, tally) {
             Ok(prs) => {
                 r.note(&format!(
                     "opened {} linked draft PR(s) across forks",
@@ -195,7 +197,7 @@ fn open_prs<R: Reporter>(r: &mut R, rec: &Record<'_>) -> Vec<PrLink> {
             }
         }
     } else if !rec.args.pr_repo.is_empty() {
-        match open_single_repo_prs(r, rec) {
+        match open_single_repo_prs(r, rec, tally) {
             Ok(prs) => {
                 r.note(&format!("opened {} draft PR(s)", prs.len()));
                 prs
@@ -823,6 +825,39 @@ fn parse_s3_uri(uri: &str) -> Result<(String, String), PublishError> {
 
 // --- git PR channel --------------------------------------------------------
 
+/// The mediation point a refused draft PR is recorded against on the session log.
+const TOOL: &str = "publish";
+
+/// What publishing does with one kept candidate before pushing anything.
+#[derive(Debug)]
+enum CandidateAction {
+    Open,
+    /// An earlier segment already opened this branch's PR; republishing it is a no-op, and it
+    /// spends no `draft-pr` budget.
+    Duplicate,
+    /// The run's declared bounds refuse it. Publishing stops here and the run completes.
+    Refused(BoundViolation),
+}
+
+/// The publish-side mediation point (RFC-0001:C-OUTPUTS): decide one kept candidate's fate against
+/// the run's `draft-pr` bound. A refusal is on the session log by the time this returns.
+fn candidate_action(
+    tally: &mut OutputTally,
+    repo: &str,
+    head: &str,
+    published: &[String],
+) -> CandidateAction {
+    // The dedupe runs before the bound: a replay must not spend budget the original write
+    // already spent.
+    if published.iter().any(|b| b == head) {
+        return CandidateAction::Duplicate;
+    }
+    match tally.admit(TOOL, OutputKind::DraftPr, Some(repo)) {
+        Ok(_) => CandidateAction::Open,
+        Err(violation) => CandidateAction::Refused(violation),
+    }
+}
+
 /// The head branch for one kept candidate: `autoresearch/<namespace>/<candidate_id>`. The
 /// `<candidate_id>` discriminant makes a multi-candidate run (an ablation/portfolio) push each
 /// candidate to its OWN branch instead of every candidate clobbering one shared ref.
@@ -924,7 +959,11 @@ pub(crate) fn head_branch_for_test(goal: &str, run_id: &str, kept_shas: &[String
 /// branch-to-branch, not SHA-to-SHA, so git reconstructs the delta, no hand-rolled base+delta. On
 /// resume the base SHA is absent (it lived in the original run), so that PR opens against the repo's
 /// default branch.
-fn open_single_repo_prs<R: Reporter>(r: &mut R, rec: &Record<'_>) -> Result<Vec<PrLink>> {
+fn open_single_repo_prs<R: Reporter>(
+    r: &mut R,
+    rec: &Record<'_>,
+    tally: &mut OutputTally,
+) -> Result<Vec<PrLink>> {
     let token = pr_token()?;
     // PAT in the URL (x-access-token is GitHub's conventional username for a token-as-password). The
     // URL is kept out of every error message (see push_ref) so the token never lands in a log.
@@ -932,13 +971,20 @@ fn open_single_repo_prs<R: Reporter>(r: &mut R, rec: &Record<'_>) -> Result<Vec<
     let mut links = Vec::new();
     for cand in single_repo_candidates(rec.goal, rec.run_id, rec.kept_shas, rec.base_sha) {
         let head = cand.head_branch();
-        // Sha-keyed branches make a republished kept commit recognizable: a prior segment
-        // already opened this branch's PR, so this replay is a no-op, not a duplicate.
-        if rec.published_branches.contains(&head) {
-            r.note(&format!(
-                "publish: kept commit already published as {head}; skipping duplicate PR"
-            ));
-            continue;
+        match candidate_action(tally, &rec.args.pr_repo, &head, rec.published_branches) {
+            CandidateAction::Open => {}
+            CandidateAction::Duplicate => {
+                r.note(&format!(
+                    "publish: kept commit already published as {head}; skipping duplicate PR"
+                ));
+                continue;
+            }
+            CandidateAction::Refused(violation) => {
+                r.note(&format!(
+                    "publish: {violation}; skipping the remaining kept candidate(s)"
+                ));
+                break;
+            }
         }
         push_ref(&rec.paths.workspace, &url, &cand.head_ref, &head).with_context(|| {
             format!("pushing kept commits to {} branch {head}", rec.args.pr_repo)
@@ -988,7 +1034,11 @@ fn push_url(repo: &str, token: &str) -> String {
 /// parsing. Returns the opened PR links (for the
 /// run record). A per-component push/open failure aborts (the caller logs it best-effort); the kept
 /// work stays in git memory + S3, recoverable.
-fn open_composite_prs<R: Reporter>(r: &mut R, rec: &Record<'_>) -> Result<Vec<PrLink>> {
+fn open_composite_prs<R: Reporter>(
+    r: &mut R,
+    rec: &Record<'_>,
+    tally: &mut OutputTally,
+) -> Result<Vec<PrLink>> {
     let token = pr_token()?;
     let ns = slug(rec.goal);
 
@@ -998,12 +1048,22 @@ fn open_composite_prs<R: Reporter>(r: &mut R, rec: &Record<'_>) -> Result<Vec<Pr
     let mut opened: Vec<(String, String, String, String)> = Vec::new();
     for c in rec.components {
         let head = head_branch_name(&ns, short_sha(&c.head_sha));
-        if rec.published_branches.contains(&head) {
-            r.note(&format!(
-                "publish: {} kept tip already published as {head}; skipping duplicate PR",
-                c.name
-            ));
-            continue;
+        match candidate_action(tally, &c.repo, &head, rec.published_branches) {
+            CandidateAction::Open => {}
+            CandidateAction::Duplicate => {
+                r.note(&format!(
+                    "publish: {} kept tip already published as {head}; skipping duplicate PR",
+                    c.name
+                ));
+                continue;
+            }
+            CandidateAction::Refused(violation) => {
+                r.note(&format!(
+                    "publish: {} refused: {violation}; skipping the remaining component(s)",
+                    c.name
+                ));
+                break;
+            }
         }
         let base_branch = base_branch_name(&ns, short_sha(&c.head_sha));
         let url = push_url(&c.repo, &token);
@@ -2539,5 +2599,104 @@ mod tests {
         assert_eq!(finite(1.5), Some(1.5));
         assert_eq!(finite(f64::INFINITY), None);
         assert_eq!(finite(f64::NAN), None);
+    }
+
+    /// A run bounded to `count` draft PRs against `repo`, and nothing else.
+    fn draft_pr_bounds(count: u32, repo: &str) -> crate::outputs::RunBounds {
+        use crucible_contract::outputs::{
+            BoundSource, OUTPUTS_WIRE_VERSION, ResolvedOutput, ResolvedOutputs, ResolvedTarget,
+        };
+        crate::outputs::RunBounds::new(
+            ResolvedOutputs {
+                version: OUTPUTS_WIRE_VERSION,
+                outputs: vec![ResolvedOutput {
+                    kind: OutputKind::DraftPr,
+                    count,
+                    target: Some(ResolvedTarget::Fixed { fixed: repo.into() }),
+                    source: BoundSource::Manifest,
+                }],
+            },
+            Default::default(),
+        )
+    }
+
+    #[test]
+    fn a_kept_candidate_beyond_the_draft_pr_count_is_refused() {
+        let mut tally = OutputTally::new(draft_pr_bounds(1, "owner/repo"), None);
+        assert!(matches!(
+            candidate_action(&mut tally, "owner/repo", "autoresearch/g/aaa", &[]),
+            CandidateAction::Open
+        ));
+        match candidate_action(&mut tally, "owner/repo", "autoresearch/g/bbb", &[]) {
+            CandidateAction::Refused(v) => {
+                assert_eq!(v.bound(), "[outputs.draft-pr].count = 1");
+            }
+            other => panic!("the second candidate must be refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_fork_outside_the_resolved_target_is_refused_naming_both() {
+        let mut tally = OutputTally::new(draft_pr_bounds(2, "owner/repo"), None);
+        match candidate_action(&mut tally, "attacker/repo", "autoresearch/g/aaa", &[]) {
+            CandidateAction::Refused(v) => {
+                let detail = v.to_string();
+                assert!(detail.contains("attacker/repo"), "{detail}");
+                assert!(detail.contains("owner/repo"), "{detail}");
+            }
+            other => panic!("an out-of-scope fork must be refused, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                candidate_action(&mut tally, "owner/repo", "autoresearch/g/aaa", &[]),
+                CandidateAction::Open
+            ),
+            "the refused candidate spent no budget"
+        );
+    }
+
+    #[test]
+    fn an_already_published_branch_is_a_duplicate_and_spends_no_budget() {
+        let mut tally = OutputTally::new(draft_pr_bounds(1, "owner/repo"), None);
+        let published = vec!["autoresearch/g/aaa".to_string()];
+        assert!(matches!(
+            candidate_action(&mut tally, "owner/repo", "autoresearch/g/aaa", &published),
+            CandidateAction::Duplicate
+        ));
+        assert!(
+            matches!(
+                candidate_action(&mut tally, "owner/repo", "autoresearch/g/bbb", &published),
+                CandidateAction::Open
+            ),
+            "the replayed candidate left the single allowed PR unspent"
+        );
+    }
+
+    #[test]
+    fn a_refusal_is_recorded_on_the_session_log_and_is_not_an_error() {
+        let dir = std::env::temp_dir().join(format!("pub-bounds-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let log = dir.join("session.jsonl");
+        let _ = std::fs::remove_file(&log);
+        let mut tally = OutputTally::new(draft_pr_bounds(0, "owner/repo"), Some(log.clone()));
+        match candidate_action(&mut tally, "owner/repo", "autoresearch/g/aaa", &[]) {
+            CandidateAction::Refused(_) => {}
+            other => panic!("a spent budget must refuse, got {other:?}"),
+        }
+        let text = std::fs::read_to_string(&log).expect("the row landed");
+        match crate::session::decode(text.trim()).expect("decodes") {
+            crate::session::SessionEvent::OutputRefused {
+                output_kind,
+                bound,
+                tool,
+                ..
+            } => {
+                assert_eq!(output_kind, "draft-pr");
+                assert_eq!(tool, TOOL);
+                assert_eq!(bound, "[outputs.draft-pr].count = 0");
+            }
+            other => panic!("wrong event: {other:?}"),
+        }
+        let _ = std::fs::remove_file(&log);
     }
 }

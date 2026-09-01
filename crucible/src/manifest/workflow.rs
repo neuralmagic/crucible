@@ -246,6 +246,17 @@ impl WorkflowCfg {
         self.resolved_from.is_some()
     }
 
+    /// True when the graph carries a task that runs outside the sandbox. An unresolved graph
+    /// counts as carrying one: what a source compiles to is not known until it compiles, and
+    /// under-disclosing reach is the worse error.
+    pub fn runs_host_commands(&self) -> bool {
+        self.is_unresolved()
+            || self
+                .tasks
+                .iter()
+                .any(|t| matches!(t.task, TaskKind::Command { .. } | TaskKind::Evaluate { .. }))
+    }
+
     /// Validate structure and type-specific invariants, without granting authority.
     pub fn validate(&self) -> Result<(), WorkflowError> {
         if let Some(file) = &self.file {

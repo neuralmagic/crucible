@@ -112,6 +112,7 @@ impl Reporter for ConsoleReporter {
                     // skips per-sample budget lines to keep the echo readable.
                     let spent =
                         budget.spent_before + crate::event::provisional_cost(&args.model, t);
+                    budget.record_provisional(it, spent);
                     if budget.over_cap(spent) && !over_cap_stopped {
                         over_cap_stopped = true;
                         println!(

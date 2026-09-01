@@ -40,6 +40,7 @@ mod engine;
 mod errors;
 mod escalation;
 mod event;
+mod exposure;
 mod flow;
 mod flow_dd;
 mod flow_html;
@@ -54,6 +55,7 @@ mod loop_driver;
 mod loop_graph;
 mod manifest;
 mod openshell;
+mod outputs;
 mod plan;
 mod pr_watch;
 mod preflight;
@@ -353,6 +355,18 @@ pub(crate) enum PlanAction {
         #[arg(long)]
         file: PathBuf,
     },
+    /// Print a frozen pack's resolved output bounds and capability disclosure as JSON, computed
+    /// without executing any pack content. The controller extracts this to show an approver what
+    /// a pack may write and what it can reach.
+    Exposure {
+        /// The domain manifest to read.
+        #[arg(long)]
+        manifest: PathBuf,
+        /// The publish target a launcher would pass, for the `draft-pr` engine default. The
+        /// manifest's own `[publish].pr_repo` wins over it, exactly as at run time.
+        #[arg(long)]
+        pr_repo: Option<String>,
+    },
     /// Execute a plan with the shell runner: `command` tasks run as real subprocesses,
     /// `agent` tasks run `--agent-cmd` (the command-backend stand-in). Exits nonzero when
     /// the plan does not reach a valid verdict.
@@ -580,6 +594,18 @@ pub(crate) struct Args {
     /// Credential files relayed into the sandbox before each turn (from `[[agent.relay]]`).
     #[arg(skip)]
     pub relay: Vec<manifest::RelayFile>,
+    /// What the frozen pack's capability disclosure covers. The provisioning path refuses any
+    /// grant outside it (RFC-0001:C-CAPABILITY-DISCLOSURE). `None` on a path with no frozen
+    /// manifest to disclose from (a scope or rank turn), which is not the same as disclosing
+    /// nothing. No CLI flag.
+    #[arg(skip)]
+    pub disclosure: Option<crate::exposure::Covered>,
+    /// The frozen pack's resolved output bounds, for the two kinds the engine writes itself (the
+    /// draft PRs publish-on-keep opens, the `workflow_dispatch` a github-actions build fires).
+    /// Same value the broker is projected (RFC-0001:C-OUTPUTS). `None` on a path with no frozen
+    /// manifest to bound from. No CLI flag.
+    #[arg(skip)]
+    pub output_bounds: Option<crate::outputs::RunBounds>,
     /// OpenShell egress policy (endpoints/binaries) for the `openshell` backend (from
     /// `[agent.openshell]`). No CLI flag.
     #[arg(skip)]

@@ -357,6 +357,20 @@ pub enum SessionEvent {
         #[serde(default)]
         reason: String,
     },
+    /// A mediated write refused by the run's declared output bounds. The refusal fails the
+    /// requesting tool call; it never terminates the run.
+    OutputRefused {
+        /// The output kind as its `OutputKind` wire token; named to dodge the envelope's `kind` tag.
+        output_kind: String,
+        /// The violated bound, e.g. `[outputs.tracker-comment].count = 2`.
+        bound: String,
+        /// The broker tool the refused call came in on.
+        #[serde(default)]
+        tool: String,
+        /// The refusal text handed back to the agent.
+        #[serde(default)]
+        detail: String,
+    },
     /// How this resume classified the previous shutdown. Purely a record: the loop's
     /// behavior is driven by the in-process recovery plan, not by re-reading this.
     Recovery {

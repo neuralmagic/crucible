@@ -3,10 +3,12 @@
 //! repo is config, not Rust. Unknown keys are rejected (typo protection).
 
 mod broker;
+mod capability;
 mod deploy;
 mod judge;
 mod measure;
 mod openshell;
+pub mod outputs;
 mod preflight;
 mod relay;
 mod search;
@@ -16,10 +18,12 @@ mod workflow;
 mod world;
 
 pub use broker::{BrokerCfg, broker_endpoint_from_url, broker_port, resolve_broker_url};
+pub use capability::{CapabilitiesCfg, CredentialContext};
 pub use deploy::DeployCfg;
 pub use judge::JudgeCfg;
 pub use measure::MeasureCfg;
 pub use openshell::OpenshellCfg;
+pub use outputs::OutputsCfg;
 pub use preflight::{MODE_PLACEHOLDER, PreflightCfg};
 pub use relay::RelayFile;
 pub use search::SearchCfg;
@@ -255,6 +259,13 @@ pub struct Manifest {
     /// Absent = no preflight (the run starts straight at the baseline).
     #[serde(default)]
     pub preflight: Option<PreflightCfg>,
+    /// Declared bounds on the run's mediated writes. Every vocabulary kind the table leaves out
+    /// resolves to the engine default (see [`outputs`]).
+    #[serde(default)]
+    pub outputs: OutputsCfg,
+    /// Declared credentials, the half of the capability disclosure a name alone cannot state.
+    #[serde(default)]
+    pub capabilities: CapabilitiesCfg,
 }
 
 /// A single-repo run's publish-on-keep config: the fork the kept commits are pushed to as a draft PR.
@@ -538,6 +549,8 @@ struct CommonCfg<'a> {
     build: &'a BTreeMap<String, forge::spec::BuildSpec>,
     preflight: &'a Option<PreflightCfg>,
     measure: &'a Option<MeasureCfg>,
+    outputs: &'a OutputsCfg,
+    capabilities: &'a CapabilitiesCfg,
 }
 
 fn validate_common(c: CommonCfg<'_>) -> Result<()> {
@@ -581,6 +594,8 @@ fn validate_common(c: CommonCfg<'_>) -> Result<()> {
     }
     forge::spec::validate_builds(c.build)?;
     preflight::validate_preflight(c.preflight, c.measure)?;
+    outputs::validate_outputs(c.outputs)?;
+    capability::validate_capabilities(c.capabilities)?;
     Ok(())
 }
 
@@ -675,6 +690,8 @@ impl Manifest {
             build: &self.build,
             preflight: &self.preflight,
             measure: &self.measure,
+            outputs: &self.outputs,
+            capabilities: &self.capabilities,
         })
     }
 
@@ -816,6 +833,13 @@ pub struct CompositeManifest {
     /// Absent = no preflight (the run starts straight at the baseline).
     #[serde(default)]
     pub preflight: Option<PreflightCfg>,
+    /// Declared bounds on the run's mediated writes. Every vocabulary kind the table leaves out
+    /// resolves to the engine default (see [`outputs`]).
+    #[serde(default)]
+    pub outputs: OutputsCfg,
+    /// Declared credentials, the half of the capability disclosure a name alone cannot state.
+    #[serde(default)]
+    pub capabilities: CapabilitiesCfg,
 }
 
 #[derive(Deserialize)]
@@ -922,6 +946,8 @@ impl CompositeManifest {
             build: &self.build,
             preflight: &self.preflight,
             measure: &self.measure,
+            outputs: &self.outputs,
+            capabilities: &self.capabilities,
         })
     }
 

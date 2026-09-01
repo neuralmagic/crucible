@@ -179,6 +179,12 @@ async fn try_turn(
     let cancel = CancellationToken::new();
     let _bridge = spawn_stop_bridge(cancel.clone());
 
+    // Env values and relay files are provisioned below, so the disclosure gate runs here, before
+    // the sandbox exists (RFC-0001:C-CAPABILITY-DISCLOSURE).
+    if let Some(covered) = &args.disclosure {
+        crate::exposure::refuse_uncovered(covered, &args.env, &args.relay)?;
+    }
+
     // The agent harness for this turn (claude default): argv grammar, env script, seed files,
     // stream decoder, and the post-turn transcript contract all come from here.
     let harness = args.harness();

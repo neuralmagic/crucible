@@ -5,8 +5,10 @@
 //! github workflow-input introspection only, then exits. This is the exact code path the
 //! controller dispatches, one implementation, two callers.
 
-use crate::manifest::{CompositeManifest, Manifest, is_composite};
+use crate::manifest::{CompositeManifest, Manifest, OutputsCfg, is_composite};
+use crate::outputs::{OutputTally, RunBounds};
 use anyhow::{Context, Result};
+use crucible_contract::outputs::{ENV_SESSION_LOG, OutputKind};
 
 /// What the `crucible build` CLI refuses on its own terms: a missing dependency digest, a
 /// malformed `--dep`, and the two credential lookups. Everything else is plumbing and stays
@@ -67,13 +69,13 @@ pub struct BuildArgs {
 
 /// Resolve the named build, enforce dependency-digest availability, and dispatch its backend.
 pub fn run(args: BuildArgs) -> Result<()> {
-    let (builds, default_repo) = load_builds(&args.manifest)?;
-    let spec: &BuildSpec = builds.get(&args.name).with_context(|| {
+    let loaded = load_builds(&args.manifest)?;
+    let spec: &BuildSpec = loaded.builds.get(&args.name).with_context(|| {
         format!(
             "no [build.{}] in {} (declared builds: {})",
             args.name,
             args.manifest.display(),
-            builds.keys().cloned().collect::<Vec<_>>().join(", ")
+            loaded.builds.keys().cloned().collect::<Vec<_>>().join(", ")
         )
     })?;
 
@@ -83,7 +85,8 @@ pub fn run(args: BuildArgs) -> Result<()> {
         let gh = spec.github.as_ref().context(
             "github-actions build has no [github] table (should have failed manifest validation)",
         )?;
-        return run_github(&args, spec, gh, &provided);
+        let mut tally = dispatch_tally(&loaded);
+        return run_github(&args, spec, gh, &provided, &mut tally);
     }
 
     if args.check {
@@ -111,7 +114,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
         .as_ref()
         .context("cluster build has no [cluster] table (should have failed manifest validation)")?;
 
-    let (git_url, git_ref) = resolve_context(&args.context_ref, &default_repo)?;
+    let (git_url, git_ref) = resolve_context(&args.context_ref, &loaded.default_repo)?;
     let correlation_id = correlation_id();
     let tag = args
         .tag
@@ -187,7 +190,14 @@ fn run_github(
     spec: &BuildSpec,
     gh: &GithubBuild,
     provided: &BTreeMap<String, String>,
+    tally: &mut OutputTally,
 ) -> Result<()> {
+    let target = forge::github::OrgAllowlist::from_env()?.authorize(&gh.repo)?;
+    // RFC-0001:C-OUTPUTS mediation point; `--check` only introspects, so it dispatches nothing.
+    if !args.check {
+        let repo = target.to_string();
+        tally.admit(TOOL, OutputKind::WorkflowDispatch, Some(&repo))?;
+    }
     let token = resolve_github_token()?;
 
     // Introspection validates the human-declared wiring against the workflow at the dispatched ref, and
@@ -198,7 +208,7 @@ fn run_github(
         .map(|o| o.digest.clone())
         .unwrap_or_default();
     forge::github::preflight_workflow(
-        &gh.repo,
+        &target,
         &gh.workflow,
         &gh.git_ref,
         &gh.inputs,
@@ -246,7 +256,7 @@ fn run_github(
 
     let req = forge::github::GithubBuildRequest {
         name: args.name.clone(),
-        repo: gh.repo.clone(),
+        repo: target,
         workflow: gh.workflow.clone(),
         git_ref: gh.git_ref.clone(),
         inputs,
@@ -312,22 +322,60 @@ fn default_authfile() -> Option<PathBuf> {
 /// The manifest's clonable default repo: `(url, ref)` when `[repo]` names a url, else `None`.
 type DefaultRepo = Option<(String, String)>;
 
-/// The `[build]` map plus the manifest's clonable default repo, when it has one. A composite has no
-/// single `[repo]`, so `--context-ref` is required there.
-fn load_builds(path: &Path) -> Result<(BTreeMap<String, BuildSpec>, DefaultRepo)> {
+/// What a dispatch reads out of the manifest: the declared builds, the clonable default repo (a
+/// composite has no single `[repo]`, so `--context-ref` is required there), and the pack's
+/// `[outputs]` declaration.
+struct LoadedBuilds {
+    builds: BTreeMap<String, BuildSpec>,
+    default_repo: DefaultRepo,
+    outputs: OutputsCfg,
+}
+
+fn load_builds(path: &Path) -> Result<LoadedBuilds> {
     if is_composite(path) {
         let m = CompositeManifest::load(path)?;
-        Ok((m.build, None))
+        Ok(LoadedBuilds {
+            builds: m.build,
+            default_repo: None,
+            outputs: m.outputs,
+        })
     } else {
         let m = Manifest::load(path)?;
-        let repo = m.repo.url.clone().map(|url| {
+        let default_repo = m.repo.url.clone().map(|url| {
             (
                 url,
                 m.repo.git_ref.clone().unwrap_or_else(|| "main".to_string()),
             )
         });
-        Ok((m.build, repo))
+        Ok(LoadedBuilds {
+            builds: m.build,
+            default_repo,
+            outputs: m.outputs,
+        })
     }
+}
+
+/// The mediation point a refused dispatch is recorded against on the session log.
+const TOOL: &str = "crucible build";
+
+/// The pack's `[outputs]` folded onto the engine default table.
+fn dispatch_bounds(loaded: &LoadedBuilds) -> RunBounds {
+    let defaults = crate::manifest::outputs::default_targets(None, &loaded.builds);
+    RunBounds::new(
+        crate::manifest::outputs::resolve(&loaded.outputs, &defaults),
+        BTreeMap::new(),
+    )
+}
+
+/// This dispatch's tally, recording onto the session log the run projected
+/// (`BROKER_SESSION_LOG`); a dispatch outside a run has none.
+fn dispatch_tally(loaded: &LoadedBuilds) -> OutputTally {
+    let session_log = std::env::var(ENV_SESSION_LOG)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    OutputTally::new(dispatch_bounds(loaded), session_log)
 }
 
 /// `--dep name=digest_ref` pairs into a map; errors on a malformed entry.
@@ -501,5 +549,100 @@ mod tests {
         let c = correlation_id();
         assert_eq!(c.len(), 8);
         assert!(c.chars().all(|ch| ch.is_ascii_hexdigit()));
+    }
+
+    /// A manifest whose single github build points at `o/r`, plus whatever `[outputs]` the case
+    /// declares.
+    fn loaded(outputs: &str) -> LoadedBuilds {
+        let text = format!(
+            r#"
+            [repo]
+            path = "."
+            [agent]
+            goal = "g"
+            [judge]
+            measure_cmd = "m"
+            direction = "higher"
+            [build.epp]
+            backend = "github-actions"
+            image = "ghcr.io/o/epp"
+            [build.epp.github]
+            repo = "o/r"
+            workflow = "build.yml"
+            {outputs}
+        "#
+        );
+        let m: Manifest = toml::from_str(&text).expect("manifest parses");
+        LoadedBuilds {
+            builds: m.build,
+            default_repo: None,
+            outputs: m.outputs,
+        }
+    }
+
+    #[test]
+    fn a_dispatch_beyond_the_declared_count_is_refused() {
+        let loaded =
+            loaded("[outputs.workflow-dispatch]\ncount = 1\ntarget = { fixed = \"o/r\" }\n");
+        let mut tally = OutputTally::new(dispatch_bounds(&loaded), None);
+        assert!(
+            tally
+                .admit(TOOL, OutputKind::WorkflowDispatch, Some("o/r"))
+                .is_ok()
+        );
+        let err = tally
+            .admit(TOOL, OutputKind::WorkflowDispatch, Some("o/r"))
+            .expect_err("the second dispatch is over the count");
+        assert_eq!(err.bound(), "[outputs.workflow-dispatch].count = 1");
+    }
+
+    #[test]
+    fn a_dispatch_outside_the_resolved_target_is_refused_naming_both() {
+        let loaded = loaded("");
+        let mut tally = OutputTally::new(dispatch_bounds(&loaded), None);
+        let err = tally
+            .admit(TOOL, OutputKind::WorkflowDispatch, Some("evil/r"))
+            .expect_err("a repo outside the resolved target");
+        let detail = err.to_string();
+        assert!(detail.contains("evil/r"), "{detail}");
+        assert!(detail.contains("o/r"), "{detail}");
+        assert!(
+            tally
+                .admit(TOOL, OutputKind::WorkflowDispatch, Some("o/r"))
+                .is_ok(),
+            "the refused dispatch spent no budget"
+        );
+    }
+
+    #[test]
+    fn a_refused_dispatch_lands_on_the_session_log() {
+        let dir =
+            std::env::temp_dir().join(format!("crucible-build-bounds-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let log = dir.join("session.jsonl");
+        let _ = std::fs::remove_file(&log);
+        let loaded =
+            loaded("[outputs.workflow-dispatch]\ncount = 0\ntarget = { fixed = \"o/r\" }\n");
+        let mut tally = OutputTally::new(dispatch_bounds(&loaded), Some(log.clone()));
+        assert!(
+            tally
+                .admit(TOOL, OutputKind::WorkflowDispatch, Some("o/r"))
+                .is_err()
+        );
+        let text = std::fs::read_to_string(&log).expect("the row landed");
+        match crucible_contract::session::decode(text.trim()).expect("decodes") {
+            crucible_contract::session::SessionEvent::OutputRefused {
+                output_kind,
+                bound,
+                tool,
+                ..
+            } => {
+                assert_eq!(output_kind, "workflow-dispatch");
+                assert_eq!(tool, TOOL);
+                assert_eq!(bound, "[outputs.workflow-dispatch].count = 0");
+            }
+            other => panic!("wrong event: {other:?}"),
+        }
+        let _ = std::fs::remove_file(&log);
     }
 }
