@@ -21,11 +21,16 @@ default table: every default carries a count, none carries an open target.
 **Enforcement.** Bounds load from the frozen manifest and are enforced at two
 mediation points the agent cannot reach:
 
-- the broker, for the five tool-written kinds (`tracker-comment`,
-  `chat-message`, `image-push`, `deploy`, `gpu-capture`), through one
-  admission check every mutating tool consults;
+- the broker, for the tool-written kinds (`tracker-comment`, `chat-message`,
+  `image-push`, `deploy`, `gpu-capture`, and the `draft-pr` a `request_trace`
+  approval opens), through one admission check every mutating tool consults;
 - the engine, for `draft-pr` (publish-on-keep) and `workflow-dispatch`
   (`run_github`), through a run-scoped tally.
+
+A count is enforced per mediation point: the broker and the engine each keep
+their own tally against the declared count, so the bound caps each path rather
+than their sum. A `draft-pr: 2` pack allows two publish-on-keep PRs from the
+engine and two approval PRs from the broker.
 
 A write that would exceed its count or address a target outside its scope
 fails the requesting call naming the violated bound, appends an
@@ -34,11 +39,12 @@ the remaining candidates and completes.
 
 **Adjacent hardening shipped with it.** `jira_add_comment` defaults its target
 to the item that parameterized the run. `deploy_candidate` validates
-`image_ref` against the declared registry prefix. `workflow_dispatch` targets
-must clear a fail-closed operator org allowlist (`FORGE_GITHUB_ALLOWED_ORGS`;
-unset refuses everything). `deny_endpoints` denies a host even when a wildcard
-allow entry would readmit it, and `crucible check` warns on denies a surviving
-entry still shadows.
+`image_ref` against the declared registry prefix, and `codegen_build` validates
+the loop pod's push destination against it the same way. `workflow_dispatch`
+targets must clear a fail-closed operator org allowlist
+(`FORGE_GITHUB_ALLOWED_ORGS`; unset refuses everything). `deny_endpoints`
+denies a host even when a wildcard allow entry would readmit it, and
+`crucible check` warns on denies a surviving entry still shadows.
 
 **Disclosure.** Channels that cannot be effect-typed are disclosed instead:
 resolved egress (built-ins marked as such), credentials with whether their
@@ -89,11 +95,9 @@ Read this list before trusting the machinery with something it does not cover.
     dispatch.
   - a standalone `crucible build` outside a run has no session log, so its
     refusal row is dropped (best-effort, like the broker's).
-  - `request_trace`'s draft-PR side effect is opened by the broker outside the
-    `draft-pr` tally.
-  - `codegen_build` spends the `image-push` count, but the GPU job's push
-    destination comes from `BROKER_CODEGEN_*` env rather than being
-    re-validated against the declared target.
+  - the `draft-pr` count is enforced per mediation point: `request_trace`'s
+    approval PR spends the broker's tally, publish-on-keep spends the
+    engine's, and a pack declaring one PR can therefore see one from each.
   - the `tracker-comment` engine default reads `$CRUCIBLE_ITEM`, which the
     controller does not export yet; until wired, that default refuses writes
     rather than scoping them.
