@@ -8,9 +8,13 @@ the contract an orchestrator integrates against.
 
 ## The mental model
 
-An agent never touches the outside world directly. Every side effect leaves a
-run through one of two doors: a broker tool the agent asks for, or an action
-the engine itself performs (publishing a kept candidate, dispatching a build).
+Ideally, an agent never touches the outside world directly: every side effect
+leaves a run through one of two doors — a broker tool the agent asks for, or
+an action the engine itself performs (publishing a kept candidate, dispatching
+a build). It is not a perfect world, and the escape hatches are deliberate: an
+agent-visible credential, added egress, a relayed kubeconfig all exist for
+packs that really need them. The deal is that a hatch can be taken but never
+taken silently — that is what the disclosure half is for.
 `[outputs]` is the pack declaring, before anything runs, how many writes of
 each kind its runs may make and where they may land. Both doors check that
 ledger before acting; a write over its count or off its target fails with the
