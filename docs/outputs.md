@@ -3,25 +3,23 @@
 What the `[outputs]` and capability-disclosure machinery does today, what it
 deliberately does not do, and how it compares to GitHub Agentic Workflows'
 safe outputs. The normative spec is RFC-0001 `C-OUTPUTS` and
-`C-CAPABILITY-DISCLOSURE`; this page is the honest operational summary, plus
-the contract an orchestrator integrates against.
+`C-CAPABILITY-DISCLOSURE`; this page summarizes current behavior and the
+integration contract.
 
 ## The mental model
 
 Ideally, an agent never touches the outside world directly: every side effect
 leaves a run as either a broker tool call the agent asks for, or an action the
-engine itself performs (publishing a kept candidate, dispatching a build). It is not a perfect world, and the escape hatches are deliberate: an
-agent-visible credential, added egress, a relayed kubeconfig all exist for
-packs that really need them. The deal is that a hatch can be taken but never
-taken silently — that is what the disclosure half is for.
+engine itself performs (publishing a kept candidate, dispatching a build). Deliberate exceptions exist —
+an agent-visible credential, added egress, a relayed kubeconfig — for packs
+that need them; every exception must appear in the disclosure.
 `[outputs]` is the pack declaring, before anything runs, how many writes of
 each kind its runs may make and where they may land. The broker and the engine
 both check that ledger before acting; a write over its count or off its target fails with the
 reason named and the run continues. What cannot be counted that way — a raw
 credential, network reach — cannot be bounded, so it must be declared instead:
 that declaration is the exposure, the approving human reads it, and a grant
-that is not on it refuses at launch. Firewall rules for agent side effects,
-plus a customs declaration checked at the border.
+that is not on it refuses at launch.
 
 ```
         frozen [outputs] ────────────┬──────────────┐
@@ -114,8 +112,6 @@ image and dispatch targets).
 
 ## What it does not do
 
-Read this list before trusting the machinery with something it does not cover.
-
 - **Payloads are unbounded.** Bounds govern where mediated writes land and how
   many, never what they say. There is no content sanitization: no domain
   allowlist inside a comment body, no mention caps, no dedupe-by-title, no
@@ -160,10 +156,6 @@ Read this list before trusting the machinery with something it does not cover.
   guarantees apply there.
 
 ## Comparison with GitHub Agentic Workflows safe outputs
-
-Walters' argument (Agentic AI and software forges, 2026) is that GH-AW is the
-minimum quality bar and anything similar should publish a comparison. This is
-ours.
 
 Same core: a closed vocabulary of typed output kinds, per-kind max and target
 constraints declared next to the workflow, conservative auto-defaults,
