@@ -26,6 +26,21 @@ pub struct Bounds {
 }
 
 impl Bounds {
+    /// Build over an explicit projection, with nothing spent yet. [`Bounds::from_env`] is the
+    /// production path; this one serves callers that already hold the resolved table.
+    pub fn new(
+        resolved: ResolvedOutputs,
+        params: BTreeMap<String, String>,
+        session_log: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            resolved,
+            params,
+            session_log,
+            spent: Mutex::new(BTreeMap::new()),
+        }
+    }
+
     /// Load from the engine's projection. Without `BROKER_OUTPUTS` (an operator-started broker, or
     /// an engine that predates the projection) the engine default table applies, computed from
     /// this process's own environment: the conservative posture, never an unbounded one.
@@ -173,15 +188,14 @@ mod tests {
     };
 
     fn bounds(outputs: Vec<ResolvedOutput>, log: Option<PathBuf>) -> Bounds {
-        Bounds {
-            resolved: ResolvedOutputs {
+        Bounds::new(
+            ResolvedOutputs {
                 version: OUTPUTS_WIRE_VERSION,
                 outputs,
             },
-            params: BTreeMap::new(),
-            session_log: log,
-            spent: Mutex::new(BTreeMap::new()),
-        }
+            BTreeMap::new(),
+            log,
+        )
     }
 
     fn fixed(kind: OutputKind, count: u32, target: &str) -> ResolvedOutput {
@@ -226,6 +240,34 @@ mod tests {
             ),
             Ok(Some("quay.io/aipcc/x:1".to_string())),
             "the refused call did not consume the single allowed push"
+        );
+    }
+
+    /// `codegen_build`'s push destination is read from the pod's forge config, so it is validated
+    /// (never spent) against the declared registry before the build's own count is admitted.
+    #[test]
+    fn a_push_destination_outside_the_declared_registry_is_refused_without_spending() {
+        let b = bounds(vec![fixed(OutputKind::ImagePush, 1, "quay.io/aipcc")], None);
+        let err = b
+            .permit_target(
+                "codegen_build",
+                OutputKind::ImagePush,
+                Some("quay.io/rogue/deepgemm"),
+            )
+            .expect_err("a destination outside the declared registry");
+        assert!(err.contains("quay.io/aipcc"), "{err}");
+        assert_eq!(
+            b.permit_target(
+                "codegen_build",
+                OutputKind::ImagePush,
+                Some("quay.io/aipcc/deepgemm")
+            ),
+            Ok(Some("quay.io/aipcc/deepgemm".to_string()))
+        );
+        assert_eq!(
+            b.admit("codegen_build", OutputKind::ImagePush, None),
+            Ok(Some("quay.io/aipcc".to_string())),
+            "validating the destination spends no push budget"
         );
     }
 

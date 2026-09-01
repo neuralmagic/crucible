@@ -4,7 +4,7 @@
 
 use crate::approval::{ApprovalBackend, ApprovalChannel};
 use crate::bounds::Bounds;
-use crate::broker::{Broker, TraceResolver};
+use crate::broker::{Broker, TraceOutcome, TraceResolver};
 use crate::codegen::CodegenState;
 use crate::control_approval::ControlApproval;
 use crate::deploy::DeployRegistry;
@@ -320,6 +320,7 @@ impl McpServer {
                 approval_channel,
                 frozen,
                 degraded_headless,
+                bounds: bounds.clone(),
             }),
             jira,
             deploys,
@@ -343,7 +344,8 @@ impl McpServer {
         }
         let params: TraceParams = args.into();
         match self.broker.request_trace(&params) {
-            Ok(res) => {
+            Ok(TraceOutcome::Refused(detail)) => refused(&detail),
+            Ok(TraceOutcome::Decided(res)) => {
                 // A judge-changing grant opened an approval. For the draft-PR channel the broker watches
                 // it out-of-band and fires a re-scope to the loop's control bridge on the human yes.
                 // For the control channel the operator approves over that bridge directly (the loop
@@ -586,6 +588,17 @@ impl McpServer {
         handle AS THE BUILD RUNS, so a concurrent session can fetch_log it to watch progress."
     )]
     async fn codegen_build(&self, Parameters(args): Parameters<CodegenBuildArgs>) -> String {
+        // The GPU job's push destination comes from the pod's forge config, not from the call, so
+        // it is checked against the declared target here the way deploy_candidate checks its ref.
+        if let Some(destination) = crate::codegen::push_destination()
+            && let Err(detail) = self.bounds.permit_target(
+                "codegen_build",
+                OutputKind::ImagePush,
+                Some(&destination),
+            )
+        {
+            return refused(&detail);
+        }
         if let Err(detail) = self
             .bounds
             .admit("codegen_build", OutputKind::ImagePush, None)
