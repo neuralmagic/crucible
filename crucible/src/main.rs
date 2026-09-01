@@ -180,6 +180,9 @@ pub(crate) enum Ui {
 )]
 #[command(args_conflicts_with_subcommands = true)]
 pub(crate) struct Cli {
+    /// Print the controller/engine contract version and exit.
+    #[arg(long, exclusive = true)]
+    contract_version: bool,
     #[command(subcommand)]
     command: Option<Cmd>,
     #[command(flatten)]
