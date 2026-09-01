@@ -3,8 +3,8 @@
 What the `[outputs]` and capability-disclosure machinery does today, what it
 deliberately does not do, and how it compares to GitHub Agentic Workflows'
 safe outputs. The normative spec is RFC-0001 `C-OUTPUTS` and
-`C-CAPABILITY-DISCLOSURE` (engine) and RFC-0001 `C-EXPOSURE` (controller);
-this page is the honest operational summary.
+`C-CAPABILITY-DISCLOSURE`; this page is the honest operational summary, plus
+the contract an orchestrator integrates against.
 
 ## The mental model
 
@@ -32,8 +32,8 @@ engine ─ publish/dispatch ──────> tally ──ok──> draft PR /
                      refuse, name the bound, log it, run continues
 
 uncountable reach (credentials, egress, relays)
-        └──> declared as exposure ──> stored + digested at registration
-                  └──> shown at approval ──> undisclosed grant refuses at launch
+        └──> declared as exposure ──> `crucible plan exposure` emits it as JSON
+                  └──> an orchestrator stores, diffs, and shows it at approval
 ```
 
 ## What it does
@@ -85,13 +85,29 @@ without executing pack content; `crucible check` prints them. A grant from
 outside the pack (an agent-visible secret binding) whose kind and reach the
 disclosure does not cover is refused at run start.
 
-**Controller side.** Registration and pin bumps extract the exposure with the
-pinned engine and store it digest-tracked; a bump that changes it is reported
-before acceptance; approval surfaces present it and approvals bind to the
-digest presented; launches refuse uncovered grants; mutable-draft one-shots
-recompute from the exact content launched; the task graph renders declared
-outputs as terminal nodes, with an explicit undeclared marker for revisions
-stored before exposure existed.
+**Integrating an orchestrator.** The engine's whole integration surface is
+three invocations, all offline and side-effect free:
+
+- `crucible --contract-version` — refuse a dispatch target whose version is
+  not yours before any spend.
+- `crucible plan exposure --manifest <pack>` — the resolved bounds plus
+  capability disclosure as versioned JSON, computed without executing pack
+  content. Extract it with the same pinned engine you dispatch, store the
+  document and a digest with the registered revision, diff the digest on every
+  pin bump before accepting it, and present it wherever a human approves a
+  run, binding the approval to the digest presented. A mutable pack must be
+  re-extracted from the exact content launched.
+- `crucible check --manifest <pack>` — the same resolution printed for humans,
+  plus validation findings.
+
+Two obligations run the other way: a grant the orchestrator supplies from
+outside the pack (an agent-visible secret, a mounted credential) must be
+covered by the disclosure or refused before dispatch — the engine
+independently enforces the same refusal at run start, so a stale stored
+exposure can fail a launch but never widen a run — and the environment the
+orchestrator projects is what the engine defaults resolve from
+(`CRUCIBLE_ITEM` for the tracker-comment default, the forge variables for
+image and dispatch targets).
 
 ## What it does not do
 
@@ -128,10 +144,10 @@ Read this list before trusting the machinery with something it does not cover.
   - the `draft-pr` count is enforced per mediation point: `request_trace`'s
     approval PR spends the broker's tally, publish-on-keep spends the
     engine's, and a pack declaring one PR can therefore see one from each.
-  - the `tracker-comment` engine default reads `$CRUCIBLE_ITEM`, which the
-    controller exports for issue-driven runs and turns; a launch with no
-    upstream item (a playbook one-shot) exports nothing and that default
-    refuses writes rather than scoping them.
+  - the `tracker-comment` engine default reads `$CRUCIBLE_ITEM`; an
+    orchestrator exports it for runs parameterized by a tracker item, and a
+    run launched without one gets a default that refuses writes rather than
+    scoping them.
   - a composite's disclosure names its own credentials and relays but does
     not fold in its components' egress or broker reach.
   - an `[agent].env` name with no matching capability declaration is a
