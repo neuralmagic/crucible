@@ -1,0 +1,22 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-OUTPUTS"
+title = "Declared output kinds"
+kind = "normative"
+status = "active"
+since = "0.2.0"
+
+[content]
+text = """
+A run's effects on systems outside its workspace divide into mediated writes, performed by the engine or a broker on the agent's request, and open-ended capabilities the agent exercises directly ([[RFC-0001:C-CAPABILITY-DISCLOSURE]]). This clause governs the mediated writes.
+
+Every mediated write MUST belong to an output kind drawn from a closed, engine-defined vocabulary. The vocabulary is part of the engine's versioned contract: a kind name, once retired, MUST NOT be reused with a different meaning. A write requesting a kind outside the vocabulary MUST be refused. A vocabulary kind the pack does not declare MUST resolve to a documented engine default, and an engine default MUST carry a count and MUST NOT contain an open target: a pack that ships no [outputs] section gets the conservative posture, not the permissive one. The resolved bounds for a frozen pack MUST be computable without executing pack content, and crucible check MUST print them.
+
+A pack MAY declare bounds for a kind in an [outputs] manifest section. A declaration, once present, MUST carry a per-run count, and, for a kind that addresses a target (a repository, a tracker item, a chat destination, an image registry, a deployment), the target itself. Bounds MUST load from the frozen manifest and MUST be enforced at the mediation point; the agent MUST NOT be able to alter a bound from inside the sandbox.
+
+Where a kind addresses a target, the target MUST come from the resolved declaration, never from an agent-supplied value, unless the declaration explicitly marks the target open. An open-target declaration MUST name a scope narrower than the kind's whole address space; a declaration whose scope admits any target MUST be rejected at manifest validation. A scope MAY bind to a named workflow parameter, and when it does, the target MUST equal that parameter's value for the run; this is how a run fanned out per tracker item confines its writes to the item that parameterized it.
+
+A write that would exceed a count or address a target outside its scope MUST be refused at the mediation point. Every refusal under this clause MUST fail the requesting call naming the violated bound, MUST be recorded on the session log, and MUST NOT by itself terminate the run.
+
+Bounding governs where mediated writes land and how many, not what they say. Payloads remain agent-authored; the reader on the addressed target is the payload's review."""
