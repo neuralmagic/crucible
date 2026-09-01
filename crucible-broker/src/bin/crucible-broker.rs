@@ -166,6 +166,8 @@ async fn main() -> anyhow::Result<()> {
     let deploys = std::sync::Arc::new(crucible_broker::deploy::DeployRegistry::new());
     // Same shared-across-per-request-instances rationale as `deploys`: the code-gen build/measure memo.
     let codegen = std::sync::Arc::new(crucible_broker::codegen::CodegenState::new());
+    // Same rationale: a per-request instance would reset every per-run output count.
+    let bounds = std::sync::Arc::new(crucible_broker::Bounds::from_env());
 
     let service: StreamableHttpService<McpServer, LocalSessionManager> = StreamableHttpService::new(
         move || {
@@ -176,6 +178,7 @@ async fn main() -> anyhow::Result<()> {
                 jira.clone(),
                 deploys.clone(),
                 codegen.clone(),
+                bounds.clone(),
             ))
         },
         Default::default(),

@@ -64,7 +64,9 @@ mod session;
 mod stream;
 pub(crate) use crucible_harness::stream_json;
 
-use crucible::{command_judge, deploy, duration, errors, flow, manifest, turn_trace};
+use crucible::{
+    command_judge, deploy, duration, errors, exposure, flow, manifest, outputs, turn_trace,
+};
 
 /// The OpenShell turn runtime. The gateway client and the egress policy are library code (the
 /// deploy renderer needs their constants); the per-turn flow, provider, and sandbox helpers run
@@ -80,7 +82,7 @@ mod openshell {
 /// The plan runtime: the CLI and the agent-harness task runner over the library's plan IR,
 /// compiler, and executor.
 mod plan {
-    pub use crucible::plan::{exec, ir, runner, starlark, term_img, worktree};
+    pub use crucible::plan::{TASK_NAME_ENV, exec, ir, runner, starlark, term_img, worktree};
 
     pub mod cli;
     pub mod harness;
@@ -401,6 +403,18 @@ pub(crate) enum PlanAction {
         #[arg(long)]
         file: PathBuf,
     },
+    /// Print a frozen pack's resolved output bounds and capability disclosure as JSON, computed
+    /// without executing any pack content. The controller extracts this to show an approver what
+    /// a pack may write and what it can reach.
+    Exposure {
+        /// The domain manifest to read.
+        #[arg(long)]
+        manifest: PathBuf,
+        /// The publish target a launcher would pass, for the `draft-pr` engine default. The
+        /// manifest's own `[publish].pr_repo` wins over it, exactly as at run time.
+        #[arg(long)]
+        pr_repo: Option<String>,
+    },
     /// Execute a plan with the shell runner: `command` tasks run as real subprocesses,
     /// `agent` tasks run `--agent-cmd` (the command-backend stand-in). Exits nonzero when
     /// the plan does not reach a valid verdict.
@@ -665,6 +679,18 @@ pub(crate) struct Args {
     /// Credential files relayed into the sandbox before each turn (from `[[agent.relay]]`).
     #[arg(skip)]
     pub relay: Vec<manifest::RelayFile>,
+    /// What the frozen pack's capability disclosure covers. The provisioning path refuses any
+    /// grant outside it (RFC-0001:C-CAPABILITY-DISCLOSURE). `None` on a path with no frozen
+    /// manifest to disclose from (a scope or rank turn), which is not the same as disclosing
+    /// nothing. No CLI flag.
+    #[arg(skip)]
+    pub disclosure: Option<crate::exposure::Covered>,
+    /// The frozen pack's resolved output bounds, for the two kinds the engine writes itself (the
+    /// draft PRs publish-on-keep opens, the `workflow_dispatch` a github-actions build fires).
+    /// Same value the broker is projected (RFC-0001:C-OUTPUTS). `None` on a path with no frozen
+    /// manifest to bound from. No CLI flag.
+    #[arg(skip)]
+    pub output_bounds: Option<crate::outputs::RunBounds>,
     /// OpenShell egress policy (endpoints/binaries) for the `openshell` backend (from
     /// `[agent.openshell]`). No CLI flag.
     #[arg(skip)]

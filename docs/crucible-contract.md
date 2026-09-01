@@ -383,6 +383,74 @@ Scope validation renders the admitted graph to `WORKFLOW.png` for the scope PR, 
 
 ---
 
+### 1.9 `[outputs]` and `[capabilities]` — declared writes and disclosed reach
+
+`[outputs]` bounds the run's mediated writes (RFC-0001:C-OUTPUTS). The kind vocabulary is closed
+and engine-defined; a kind outside it is a manifest error.
+
+```toml
+# A declaration carries a per-run count, and a target for a kind that addresses one.
+[outputs.image-push]
+count = 20
+target = { fixed = "quay.io/aipcc" }
+
+# An OPEN target names a scope narrower than the kind's whole address space, and may bind that
+# scope to a workflow parameter. The target must then equal that parameter's run value, which is
+# how a run fanned out per tracker item confines its writes to the item that parameterized it.
+[outputs.tracker-comment]
+count = 3
+target = { open = { scope = "PROJ-*", param = "issue_key" } }
+```
+
+A scope that admits any target (`"*"`, `"**"`, `""`) is rejected at validation. `gpu-capture`
+addresses nothing, so it takes a count and no target; every other kind requires one.
+
+A kind the pack does not declare resolves to the engine default table. Every default carries a
+count and none carries an open target, so a pack shipping no `[outputs]` gets the conservative
+posture. A default whose target does not resolve refuses every write of that kind.
+
+| kind | default count | default target |
+| --- | --- | --- |
+| `draft-pr` | 2 | `[publish].pr_repo`, else `$AUTORESEARCH_PR_REPO` |
+| `tracker-comment` | 2 | the run's parameterizing item (`$CRUCIBLE_ITEM`) |
+| `chat-message` | 8 | the engine's operator channel |
+| `image-push` | 100 | `$FORGE_REGISTRY` |
+| `deploy` | 100 | `$FORGE_DEPLOY_NAMESPACE/$FORGE_DEPLOY_NAME` |
+| `workflow-dispatch` | 20 | the single `[build.*.github].repo`, when unambiguous |
+| `gpu-capture` | 100 | addresses nothing |
+
+Bounds are enforced in the broker, at one chokepoint every mutating tool routes through. They are
+projected there from the frozen manifest as `BROKER_OUTPUTS` (with `BROKER_OUTPUT_PARAMS` and
+`BROKER_SESSION_LOG`), handed to the broker child only, so nothing inside the sandbox can alter
+one. The two kinds the engine writes itself rather than through a broker tool — the draft PRs
+publish-on-keep opens and the `workflow_dispatch` a `github-actions` build fires — are mediated in
+the engine against the same resolved value. A write over a count or outside a scope fails that
+write naming the bound, writes an `output_refused` row on the session log, and does not terminate
+the run: publishing skips the remaining candidates and the run completes.
+
+`[[capabilities.secret]]` states what a credential authorizes; a name alone does not.
+
+```toml
+[[capabilities.secret]]
+name    = "JIRA_API_TOKEN"
+context = "broker"            # or "agent": whether the value enters the sandbox
+system  = "jira"
+scope   = "read + comment on PROJ"
+```
+
+The rest of the disclosure is read from what the manifest already declares: the resolved egress
+allowlist (each entry labelled `builtin` or `manifest`), every `[agent].env` name, every
+`[[agent.relay]]` destination, a substituted `[agent.broker].bin`, and whether the pack runs
+commands outside the sandbox (workflow `command`/`evaluate` tasks, world and judge hooks). At run
+start, an agent-visible env value or a relay file the disclosure does not cover is refused, naming
+the grant and what is missing.
+
+`crucible check` prints the resolved bounds and the disclosure; `crucible plan exposure --manifest
+crucible.toml` emits the same as JSON (`{version, outputs, capabilities}`) for the controller to
+extract. Both compute it without executing pack content.
+
+---
+
 ## 2. Path resolution (portable, never `CARGO_MANIFEST_DIR`)
 
 | Thing | Resolves to |

@@ -84,7 +84,10 @@ pub enum BuildReply {
 }
 
 /// `build_epp`: pull the agent's current edits from the sandbox and build+push a candidate.
-pub(crate) fn build_epp() -> String {
+///
+/// `registry` is the push destination the run's `image-push` bound resolved; it overrides the
+/// pod's `FORGE_REGISTRY`, and `None` leaves the env value in place.
+pub(crate) fn build_epp(registry: Option<&str>) -> String {
     if !enabled() {
         return json(&BuildReply::Disabled {
             reason: "build tools not enabled for this run (BROKER_BUILD unset)".into(),
@@ -94,7 +97,7 @@ pub(crate) fn build_epp() -> String {
     if let crate::turn::Budget::Spent { reason } = crate::turn::check(false) {
         return json(&BuildReply::WrapUp { reason });
     }
-    json(&do_build().unwrap_or_else(|e| BuildReply::Error {
+    json(&do_build(registry).unwrap_or_else(|e| BuildReply::Error {
         error: format!("{e:#}"),
     }))
 }
@@ -115,9 +118,12 @@ pub(crate) fn deploy_candidate(image_ref: Option<String>) -> String {
     }))
 }
 
-fn do_build() -> Result<BuildReply> {
-    let build_cfg = BuildConfig::from_env()
+fn do_build(registry: Option<&str>) -> Result<BuildReply> {
+    let mut build_cfg = BuildConfig::from_env()
         .context("build config (set FORGE_REGISTRY / FORGE_AUTHFILE on the loop pod)")?;
+    if let Some(registry) = registry.filter(|r| !r.is_empty()) {
+        build_cfg.registry = registry.to_string();
+    }
     let ctx = ctx_dir(&build_cfg);
     let workdir = sandbox_workdir()?;
     let outcome = build_step(
@@ -435,7 +441,11 @@ pub(crate) fn log_tail(stdout: &[u8], stderr: &[u8]) -> String {
 
 pub(crate) fn json(reply: &BuildReply) -> String {
     serde_json::to_string(reply)
-        .unwrap_or_else(|e| format!(r#"{{"status":"error","error":"{e}"}}"#))
+        // Static: interpolating the Display text would itself emit malformed JSON when that text
+        // contains quotes or control characters.
+        .unwrap_or_else(|_| {
+            r#"{"status":"error","error":"failed to serialize build reply"}"#.into()
+        })
 }
 
 // The injected-IO stubs below fail on purpose; a fake failure carries no error contract worth
@@ -477,7 +487,7 @@ mod tests {
     fn tools_are_disabled_without_the_gate() {
         // The test process doesn't set BROKER_BUILD, so the gate is off.
         assert!(!enabled());
-        assert!(build_epp().contains(r#""status":"disabled""#));
+        assert!(build_epp(None).contains(r#""status":"disabled""#));
         assert!(deploy_candidate(None).contains(r#""status":"disabled""#));
     }
 

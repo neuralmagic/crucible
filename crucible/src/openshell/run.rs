@@ -225,6 +225,12 @@ async fn try_turn(
     let cancel = CancellationToken::new();
     let _bridge = spawn_stop_bridge(cancel.clone());
 
+    // Env values and relay files are provisioned below, so the disclosure gate runs here, before
+    // the sandbox exists (RFC-0001:C-CAPABILITY-DISCLOSURE).
+    if let Some(covered) = &args.disclosure {
+        crate::exposure::refuse_uncovered(covered, &args.env, &args.relay)?;
+    }
+
     // The agent harness for this turn (claude default): argv grammar, env script, seed files,
     // stream decoder, and the post-turn transcript contract all come from here.
     let harness = args.harness();
@@ -1424,20 +1430,6 @@ async fn write_temp(tag: &str, content: &str) -> Result<tempfile::NamedTempFile>
     .context("temp-file task panicked")?
 }
 
-/// The Vertex keys a manifest-less turn (`rank-grounded`, scope-propose) relays from its own
-/// process env into the agent env: the claude switches plus every alias `run::vertex_config`
-/// honors. A domain loop gets these from `[agent].env` (the manifest validates them); a bare
-/// `git clone` turn has no manifest, so the turn pod's plain env (the deploy profile's `[env]`)
-/// carries them and this relay is the explicit bridge. `vertex_config`/`env_script` stay
-/// manifest-only, they never read the process env themselves.
-const VERTEX_RELAY_KEYS: &[&str] = &[
-    "CLAUDE_CODE_USE_VERTEX",
-    "ANTHROPIC_VERTEX_PROJECT_ID",
-    "CLOUD_ML_REGION",
-    "GCP_PROJECT_ID",
-    "VERTEX_LOCATION",
-];
-
 /// The identity a run's commits are attributed to, set on the pod by the controller when the run
 /// pushes as its GitHub App. Not a credential: it names an author, and the agent is the one that
 /// commits. The env spelling is what makes it win — it outranks `user.name`/`user.email` from a
@@ -1488,10 +1480,10 @@ pub fn relay_agent_visible_secrets(
     }
 }
 
-/// Seed `env` with the process values of [`VERTEX_RELAY_KEYS`]: only keys that are set and
+/// Seed `env` with the process values of [`crate::openshell::policy::VERTEX_RELAY_KEYS`]: only keys that are set and
 /// non-empty relay, and an existing entry (a manifest-provided value) always wins.
 pub fn relay_vertex_env(env: &mut Vec<(String, String)>) {
-    relay_keys(VERTEX_RELAY_KEYS, env);
+    relay_keys(crate::openshell::policy::VERTEX_RELAY_KEYS, env);
 }
 
 /// Seed `env` with the process values of [`IDENTITY_RELAY_KEYS`], on the same terms. Without this
@@ -1932,7 +1924,7 @@ mod tests {
     }
 
     fn clear_relay_keys() {
-        for k in VERTEX_RELAY_KEYS {
+        for k in crate::openshell::policy::VERTEX_RELAY_KEYS {
             unsafe {
                 std::env::remove_var(k);
             }

@@ -9,3 +9,8 @@ pub mod runner;
 pub mod starlark;
 pub mod term_img;
 pub mod worktree;
+
+/// The environment variable naming the task a turn runs, set by both the command runner and the
+/// agent harness. Engine-provisioned, so [`crate::exposure`] carries it as standing disclosed
+/// reach.
+pub const TASK_NAME_ENV: &str = "CRUCIBLE_TASK";

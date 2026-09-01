@@ -195,6 +195,7 @@ impl Reporter for SessionReporter {
                         // budget call reconciles it with the authoritative cost.
                         let spent =
                             budget.spent_before + crate::event::provisional_cost(args.model(), t);
+                        budget.record_provisional(it, spent);
                         sink.write_event(&SessionEvent::Budget {
                             spent,
                             elapsed_secs: budget.started.elapsed().as_secs(),

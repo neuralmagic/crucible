@@ -155,7 +155,21 @@ struct Run {
     /// Head branches prior segments already opened PRs from (restored from the log's `pr_links`
     /// events; empty on a fresh run). Publish skips candidates whose branch is in here.
     published_branches: Vec<String>,
+    /// The run's spend against its declared output bounds, for the writes the engine performs
+    /// itself (RFC-0001:C-OUTPUTS). The broker tallies its own tools separately.
+    outputs: crate::outputs::OutputTally,
     segment: Segment,
+}
+
+/// The run's spend against its declared output bounds: the frozen pack's when one was projected,
+/// else the engine default table.
+fn output_tally(args: &Args, p: &Paths) -> crate::outputs::OutputTally {
+    crate::outputs::OutputTally::new(
+        args.output_bounds
+            .clone()
+            .unwrap_or_else(crate::outputs::RunBounds::engine_defaults),
+        Some(p.session_log.clone()),
+    )
 }
 
 /// Consecutive never-started turns (transport/sandbox death before the agent produced
@@ -557,7 +571,8 @@ fn run_loop_body<R: Reporter>(
 ) -> Result<Outcome> {
     let control = runtime.control;
     let ledger = runtime.ledger.as_deref();
-    let heartbeat = runtime.heartbeat.as_deref();
+    let heartbeat_handle = runtime.heartbeat.as_ref();
+    let heartbeat = heartbeat_handle.map(std::sync::Arc::as_ref);
     let started = Instant::now();
     let start_iter: u32;
     let is_resume = runtime.resume.is_some();
@@ -602,6 +617,7 @@ fn run_loop_body<R: Reporter>(
             parked_total: Duration::ZERO,
             pending_block: None,
             published_branches: rs.published_branches,
+            outputs: output_tally(args, p),
             segment,
         };
         update_control_status(
@@ -774,6 +790,7 @@ fn run_loop_body<R: Reporter>(
             parked_total: Duration::ZERO,
             pending_block: None,
             published_branches: Vec::new(),
+            outputs: output_tally(args, p),
             segment,
         };
         r.row(&base_row, false);
@@ -1085,6 +1102,7 @@ fn run_loop_body<R: Reporter>(
                     best_tiebreak: run.segment.best_tiebreak,
                     spent_before: run.spent,
                     started,
+                    heartbeat: heartbeat_handle.cloned(),
                     workflow: args.workflow.as_ref(),
                 },
                 r,
@@ -1104,6 +1122,7 @@ fn run_loop_body<R: Reporter>(
                     spent_before: run.spent,
                     started,
                     max_cost: live_max_cost(args, control),
+                    heartbeat: heartbeat_handle.cloned(),
                 },
             );
             run.spent += turn.cost;
@@ -1409,6 +1428,7 @@ fn run_loop_body<R: Reporter>(
             identity_digest: &prep.identity.digest,
             seed_hash: &prep.identity.seed_hash,
         },
+        &mut run.outputs,
     );
     // Record the opened PR(s) on the session log so the controller's pull-ingest can fold them onto
     // the kept candidates' `pr_url` (the P1 fix). Best-effort by construction, a single-repo run
@@ -3441,6 +3461,8 @@ mod tests {
             state_dir: None,
             agent_cmd: None,
             artifacts: Vec::new(),
+            disclosure: None,
+            output_bounds: None,
             iterations,
             wide: 0,
             wide_keep: 1,

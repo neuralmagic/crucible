@@ -49,16 +49,6 @@ pub(crate) const TRANSCRIPT_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// is deliberately absent: a local spawn uses the operator's own `~/.codex`.
 pub(crate) const LOCAL_ENV_DEFAULTS: &[(&str, &str)] = &[("AGENT_TOOL", "codex")];
 
-/// Egress hosts a codex turn needs on top of the shared defaults. `full` (raw L4 tunnel, like
-/// github's default) rather than `read-write`: the proxy applies protocol handling to read-write
-/// endpoints, and codex's streaming connection to the ChatGPT backend dies mid-stream through it.
-pub(crate) const EXTRA_ENDPOINTS: &[&str] = &[
-    "chatgpt.com:443:full",
-    "auth.openai.com:443:full",
-    "api.openai.com:443:full",
-    "ab.chatgpt.com:443:full",
-];
-
 /// The model for this turn: `[agent.codex].model` overrides the shared `[agent].model`, and a
 /// Claude name in the shared slot falls back to the codex default model. Both `--model` and the
 /// manifest's `[agent].model` default to a Claude model (the default harness owns that default),

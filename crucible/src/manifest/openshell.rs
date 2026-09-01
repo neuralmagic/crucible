@@ -30,17 +30,17 @@ pub struct OpenshellCfg {
     #[serde(default = "default_true")]
     pub inherit_defaults: bool,
     /// Endpoints to subtract, applied last so deny overrides both an inherited default and an
-    /// appended extra. Exact-string match against the resolved
-    /// `host:port:access[:proto[:enforcement]]` entry, no glob semantics, so denying
-    /// `"github.com:443:full"` does not touch `"*.github.com:443:full"`; the defaults ship both
-    /// entries, and the wildcard alone still lets an agent reach `api.github.com`. This is how a
-    /// domain seals the contamination hole (an agent scored on an upstream issue reading the fix
-    /// off GitHub) without losing the rest of the built-in allowlist the way
-    /// `inherit_defaults = false` would, but sealing GitHub means listing both
-    /// `"github.com:443:full"` and `"*.github.com:443:full"`.
+    /// appended extra. Written in the same `host:port:access[:proto[:enforcement]]` form, matched
+    /// on `host:port` alone: the deny removes every entry admitting that host:port at any access
+    /// level, and takes the domain with it, so `"github.com:443:full"` also removes
+    /// `"*.github.com:443:full"` and `"api.github.com:443:full"`. The port is exact, denying `:443`
+    /// leaves `:8443`. This is how a domain seals the contamination hole (an agent scored on an
+    /// upstream issue reading the fix off GitHub) without losing the rest of the built-in
+    /// allowlist the way `inherit_defaults = false` would. See
+    /// [`crate::openshell::policy::resolve_endpoints`] for the full rule.
     #[serde(default)]
     pub deny_endpoints: Vec<String>,
-    /// Binaries to subtract, applied last, same exact-string semantics as `deny_endpoints`.
+    /// Binaries to subtract, applied last. Exact-string match against the resolved path.
     #[serde(default)]
     pub deny_binaries: Vec<String>,
     /// Absolute image paths the sandboxed agent may READ and EXECUTE, on top of its workspace.
