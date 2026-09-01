@@ -6,6 +6,36 @@ safe outputs. The normative spec is RFC-0001 `C-OUTPUTS` and
 `C-CAPABILITY-DISCLOSURE` (engine) and RFC-0001 `C-EXPOSURE` (controller);
 this page is the honest operational summary.
 
+## The mental model
+
+An agent never touches the outside world directly. Every side effect leaves a
+run through one of two doors: a broker tool the agent asks for, or an action
+the engine itself performs (publishing a kept candidate, dispatching a build).
+`[outputs]` is the pack declaring, before anything runs, how many writes of
+each kind its runs may make and where they may land. Both doors check that
+ledger before acting; a write over its count or off its target fails with the
+reason named and the run continues. What cannot be counted that way — a raw
+credential, network reach — cannot be bounded, so it must be declared instead:
+that declaration is the exposure, the approving human reads it, and a grant
+that is not on it refuses at launch. Firewall rules for agent side effects,
+plus a customs declaration checked at the border.
+
+```
+        frozen [outputs] ────────────┬──────────────┐
+                                     v              v
+agent ── asks tool ──> broker ──> tally ──ok──> jira/slack/registry/rig
+                                     │
+engine ─ publish/dispatch ──────> tally ──ok──> draft PR / workflow run
+                                     │
+                            over / off-target
+                                     v
+                     refuse, name the bound, log it, run continues
+
+uncountable reach (credentials, egress, relays)
+        └──> declared as exposure ──> stored + digested at registration
+                  └──> shown at approval ──> undisclosed grant refuses at launch
+```
+
 ## What it does
 
 **Declaration.** A pack may declare, per output kind, a per-run count and a
