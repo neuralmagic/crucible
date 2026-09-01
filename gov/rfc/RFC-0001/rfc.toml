@@ -31,6 +31,8 @@ clauses = [
     "clauses/C-WIRE.toml",
     "clauses/C-LEDGER.toml",
     "clauses/C-SURFACE.toml",
+    "clauses/C-OUTPUTS.toml",
+    "clauses/C-CAPABILITY-DISCLOSURE.toml",
 ]
 
 [[changelog]]

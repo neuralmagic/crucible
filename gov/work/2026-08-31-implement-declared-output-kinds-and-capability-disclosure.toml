@@ -1,0 +1,62 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-08-31-003"
+title = "Implement declared output kinds and capability disclosure"
+status = "queue"
+created = "2026-08-31"
+refs = [
+    "RFC-0001:C-OUTPUTS",
+    "RFC-0001:C-CAPABILITY-DISCLOSURE",
+]
+
+[content]
+description = "Implements [[RFC-0001:C-OUTPUTS]] and [[RFC-0001:C-CAPABILITY-DISCLOSURE]]. Today the broker's mutating tools carry bounds only where each tool hard-codes them: report() is fully engine-owned, the codegen family checks scenario-declared toggles, but jira_add_comment accepts any issue key with free text, deploy_candidate accepts an unvalidated image_ref, and nothing limits per-run counts. There is no [outputs] manifest section, no engine-default bounds for undeclared kinds, and no single place that can print what a frozen pack may write or reach. Disclosure has the same shape: egress additions, relay entries, agent-visible values, and broker binary substitution are all manifest-scattered, so an approver cannot read a pack's reach without reading its sources."
+
+[[content.acceptance_criteria]]
+text = "an [outputs] manifest section parses, validates, and freezes with the manifest; unknown kinds and malformed bounds are manifest errors"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "every mutating broker tool routes through one bounds check that loads from the frozen manifest; exceeding a count or an undeclared target fails the call naming the bound and logs a session row, without terminating the run"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "jira_add_comment defaults its target to the item that parameterized the run; another target requires an explicit open-target declaration with a scope"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "deploy_candidate validates image_ref against the pack's declared registry prefix"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "crucible check prints the resolved output bounds and capability disclosure for a frozen pack without executing pack content, and plan tooling exposes the same as structured output for the controller to extract"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "a secret binding or grant whose kind and reach the disclosure does not cover is refused at run start, naming the grant and the missing disclosure"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "the disclosure states when a pack runs commands outside the sandbox (workflow command/evaluate tasks, world and judge hooks)"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "existing example packs pass crucible check under the engine defaults with no manifest change"
+status = "pending"
+category = "chore"
+
+[verification]
+required_guards = [
+    "GUARD-CARGO-FMT",
+    "GUARD-CARGO-CLIPPY",
+    "GUARD-CARGO-TEST",
+    "GUARD-GOVCTL-CHECK",
+]

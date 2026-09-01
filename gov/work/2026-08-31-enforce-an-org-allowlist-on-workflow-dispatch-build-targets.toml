@@ -1,0 +1,32 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-08-31-001"
+title = "Enforce an org allowlist on workflow_dispatch build targets"
+status = "queue"
+created = "2026-08-31"
+refs = ["RFC-0001:C-CAPABILITY-DISCLOSURE"]
+
+[content]
+description = "[build.<name>.github].repo is an arbitrary owner/name taken from the pack manifest and dispatched with an actions:write token. forge/src/spec.rs:203-212 carries the comment that an allowed-orgs whitelist is not yet enforced. Dispatch inputs are template-expanded from a closed vocabulary, so the payload is bounded; the target repository is not, and a pack can aim a dispatch at any repository the token reaches. Under [[RFC-0001:C-CAPABILITY-DISCLOSURE]] a workflow dispatch is reach the pack must disclose, and reach an operator, not a pack, must bound."
+
+[[content.acceptance_criteria]]
+text = "a dispatch whose target repository is outside the operator-configured org allowlist is refused before any GitHub call, and the refusal names the repository and the allowlist"
+status = "pending"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "the allowlist is operator configuration; nothing in a pack manifest can widen it"
+status = "pending"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "a test dispatches to an out-of-allowlist repo and asserts the refusal, and an in-allowlist target still dispatches"
+status = "pending"
+category = "chore"
+
+[verification]
+required_guards = [
+    "GUARD-CARGO-CLIPPY",
+    "GUARD-CARGO-TEST",
+]
