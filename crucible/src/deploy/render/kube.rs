@@ -1005,9 +1005,11 @@ impl Renderer<'_> {
                 ComputeDriver::Kubernetes => " --compute-driver=kubernetes",
                 ComputeDriver::Podman => "",
             };
+            let harness_flag = crate::deploy::render::turn::harness_flag(self.opts.harness, '=');
+            let model_flag = crate::deploy::render::turn::model_flag(self.opts.model.as_ref(), '=');
             return Ok(format!(
                 r#"D={domain_dir}
-crucible plan run --manifest "$D/{manifest_file}" --max-cost {max_cost} --max-time {max_time}{driver_flag}{param_flags}
+crucible plan run --manifest "$D/{manifest_file}" --max-cost {max_cost} --max-time {max_time}{driver_flag}{harness_flag}{model_flag}{param_flags}
 rc=$?
 if [ -z "${{CRUCIBLE_INGEST_URL:-}}" ]; then
   echo "=================== {session_delimiter}$rc) ==================="
@@ -4015,6 +4017,44 @@ mod tests {
                 && yaml.contains("--compute-driver=kubernetes"),
             "a kubernetes render must tell the plan runner which driver to use: {yaml}"
         );
+    }
+
+    /// A run-level harness/model reaches the playbook wrapper the same way it reaches the loop's:
+    /// as `plan run` flags, ahead of the params so a param value can never read as one.
+    #[test]
+    fn playbook_wrapper_emits_harness_and_model_flags_when_set() {
+        let manifest = playbook_manifest();
+        let render_with = |harness: Option<crate::manifest::Harness>, model: Option<&str>| {
+            let input = RenderInput::from_playbook_manifest(&manifest, "alpha");
+            render(
+                input,
+                std::path::Path::new("/opt/crucible/domains/alpha"),
+                "crucible.toml",
+                &k8s_profile(""),
+                &RenderOpts {
+                    iterations: 1,
+                    max_cost: 0.0,
+                    digests: None,
+                    pr_repo: None,
+                    pack: None,
+                    clusters_file: None,
+                    harness,
+                    model: model.map(str::to_string),
+                    playbook: Some(playbook_launch()),
+                },
+            )
+            .expect("render")
+        };
+        let set = render_with(Some(crate::manifest::Harness::Codex), Some("gpt-5.6-luna"));
+        assert!(
+            set.contains(
+                "--compute-driver=kubernetes --harness=codex --model=gpt-5.6-luna --param"
+            ),
+            "{set}"
+        );
+        let unset = render_with(None, None);
+        assert!(!unset.contains("--harness"), "no harness, no flag: {unset}");
+        assert!(!unset.contains("--model"), "no model, no flag: {unset}");
     }
 
     /// The whole point: a playbook pod runs the plan runner, not the agent loop. Every loop-only

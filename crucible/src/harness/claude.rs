@@ -54,7 +54,7 @@ pub(crate) fn claude_base_args(args: &Args) -> Vec<String> {
         "--permission-mode".to_string(),
         "bypassPermissions".to_string(),
         "--model".to_string(),
-        args.model.clone(),
+        args.model().to_string(),
         "--output-format".to_string(),
         "stream-json".to_string(),
         "--include-partial-messages".to_string(),

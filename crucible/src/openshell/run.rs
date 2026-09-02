@@ -202,7 +202,7 @@ fn selected_codex_api_key(cfg: &crate::manifest::CodexCfg) -> Result<Option<Stri
     fields(
         backend = "openshell",
         workspace = %p.workspace.display(),
-        model = %args.model,
+        model = %args.model(),
         sandbox = tracing::field::Empty,
         // Queryable without waiting for the run/iteration ancestors to export (long spans only
         // reach the backend when they END): which logical session and turn this is.
@@ -568,7 +568,7 @@ async fn try_turn(
         };
         let wrapper = crate::harness::exec_wrapper(&basename, &argv);
         let exec_opts = ExecOpts {
-            model: &args.model,
+            model: args.model(),
             json,
             cancel: &cancel,
         };

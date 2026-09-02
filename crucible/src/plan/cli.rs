@@ -538,6 +538,23 @@ pub struct Ceilings {
     pub wall_clock_raw: Option<String>,
 }
 
+/// What a launch supplies beyond the graph and its parameters.
+#[derive(Debug, Clone, Default)]
+pub struct RunOpts {
+    pub ceilings: Ceilings,
+    pub compute_driver: crate::openshell::gateway::ComputeDriver,
+    pub agent: AgentOverride,
+}
+
+/// The agent a launch names in place of the manifest's `[agent]` defaults. A task that pins its
+/// own harness or model keeps it; the override replaces only what the manifest would have
+/// supplied.
+#[derive(Debug, Clone, Default)]
+pub struct AgentOverride {
+    pub harness: Option<crate::manifest::Harness>,
+    pub model: Option<String>,
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error(
     "a playbook needs {missing} from whoever launches it. Its source may not declare a limit its \
@@ -582,11 +599,15 @@ pub fn run(
     caps: &BTreeSet<String>,
     agent_cmd: Option<String>,
     manifest: Option<&Path>,
-    ceilings: Ceilings,
-    compute_driver: crate::openshell::gateway::ComputeDriver,
+    opts: RunOpts,
 ) -> Result<()> {
     use crate::plan::exec::{ExecCfg, PlanExit, TaskRunner, execute};
     use crate::plan::runner::ShellRunner;
+    let RunOpts {
+        ceilings,
+        compute_driver,
+        agent,
+    } = opts;
 
     if let (None, Some(raw)) = (ceilings.wall_clock, ceilings.wall_clock_raw.as_ref()) {
         return Err(BadDuration { raw: raw.clone() }.into());
@@ -598,7 +619,7 @@ pub fn run(
         match (path, manifest) {
             (_, Some(m)) => {
                 let (prepared, loaded) =
-                    crate::run::prep_plan_runner_with_params(m, params, compute_driver)?;
+                    crate::run::prep_plan_runner_with_params(m, params, compute_driver, agent)?;
                 let session_log = prepared.paths.session_log.clone();
                 evidence = Some(prepared.paths.clone());
                 let playbook = loaded
@@ -845,12 +866,14 @@ mod tests {
                 &BTreeSet::new(),
                 None,
                 Some(manifest),
-                Ceilings {
-                    usd: Some(1.0),
-                    wall_clock: Some(std::time::Duration::from_secs(60)),
-                    wall_clock_raw: Some("60s".to_string()),
+                RunOpts {
+                    ceilings: Ceilings {
+                        usd: Some(1.0),
+                        wall_clock: Some(std::time::Duration::from_secs(60)),
+                        wall_clock_raw: Some("60s".to_string()),
+                    },
+                    ..Default::default()
                 },
-                crate::openshell::gateway::ComputeDriver::Podman,
             )
             .expect_err("an undeclared parameter is a mistake either way")
         };
@@ -1353,8 +1376,10 @@ emits = ["verdict", "dirty"]
             &BTreeSet::new(),
             None,
             Some(&passing),
-            ceilings(),
-            crate::openshell::gateway::ComputeDriver::Podman,
+            RunOpts {
+                ceilings: ceilings(),
+                ..Default::default()
+            },
         )
         .expect("the passing playbook reaches a verdict");
         run(
@@ -1363,8 +1388,10 @@ emits = ["verdict", "dirty"]
             &BTreeSet::new(),
             None,
             Some(&failing),
-            ceilings(),
-            crate::openshell::gateway::ComputeDriver::Podman,
+            RunOpts {
+                ceilings: ceilings(),
+                ..Default::default()
+            },
         )
         .expect_err("the failing playbook has no valid verdict");
 

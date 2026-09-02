@@ -422,7 +422,7 @@ fn run_turn_with(
     if cost == 0.0
         && let Some(t) = &best_tokens
     {
-        cost = estimate_cost(&args.model, t);
+        cost = estimate_cost(args.model(), t);
     }
     TurnOutcome::completed(cost)
 }

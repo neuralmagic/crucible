@@ -717,7 +717,7 @@ fn run_adversary_turn(
     activity: &mut ActivityFeed,
 ) -> (TurnOutcome, String) {
     let args = turn_args(opts);
-    let model = args.model.clone();
+    let model = args.model().to_string();
     let meta = scratch_dir("scope-adversary-meta");
     let paths = Paths {
         workspace: pack.to_path_buf(),
@@ -956,7 +956,7 @@ fn run_propose_turn(
     activity: &mut ActivityFeed,
 ) -> TurnOutcome {
     let args = turn_args(opts);
-    let model = args.model.clone();
+    let model = args.model().to_string();
     let paths = propose_paths(scratch);
     let _ = std::fs::create_dir_all(&paths.state);
     agent::run_turn(&args, &paths, prompt, false, |_line, _stream, ev| {
