@@ -40,6 +40,7 @@ mod harness;
 mod heartbeat;
 mod hermes_trace;
 mod identity;
+mod inference;
 mod ingest_client;
 mod init;
 mod issue;

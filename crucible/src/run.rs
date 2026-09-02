@@ -810,7 +810,10 @@ fn apply_agent_cfg(
     // deploy profile's `[env]`), exactly like the scope/rank turn paths; manifest values win.
     // Only for a Vertex-authenticated harness; codex authenticates against the ChatGPT backend.
     if args.agent_backend == manifest::AgentBackend::Openshell
-        && args.harness().auth_provider() == crate::harness::AuthProvider::Vertex
+        && crate::harness::resolve_auth(
+            args.harness(),
+            &crate::inference::InferenceEnv::from_process_env()?,
+        ) == crate::harness::AuthProvider::Vertex
     {
         crate::openshell::run::relay_vertex_env(&mut args.env);
     }

@@ -170,9 +170,25 @@ pub(crate) fn seed_files(
     broker_url: Option<&str>,
     broker_token: Option<&str>,
     auth: Option<&CodexAuth>,
+    inference: &crate::inference::InferenceEnv,
 ) -> Vec<SeedFile> {
+    let endpoint = inference
+        .openai_base_url
+        .as_deref()
+        .map(|base_url| CustomEndpoint {
+            base_url,
+            wire_api: inference
+                .wire_api
+                .unwrap_or(crate::inference::WireApi::Chat),
+        });
     let mut seeds = vec![SeedFile {
-        content: config_toml(model(args), &args.broker.name, broker_url, broker_token),
+        content: config_toml(
+            model(args),
+            &args.broker.name,
+            broker_url,
+            broker_token,
+            endpoint.as_ref(),
+        ),
         dest: CONFIG,
     }];
     if let Some(auth) = auth {
@@ -184,6 +200,17 @@ pub(crate) fn seed_files(
     seeds
 }
 
+/// The custom OpenAI-speaking endpoint a turn runs against, as codex's `model_providers` entry.
+/// Codex reads the key for a non-built-in provider from `env_key`, so the sandbox env carries
+/// `OPENAI_API_KEY` for this case where the built-in provider reads `auth.json`.
+pub(crate) struct CustomEndpoint<'a> {
+    pub base_url: &'a str,
+    pub wire_api: crate::inference::WireApi,
+}
+
+/// The `model_providers` id a custom endpoint registers under.
+pub(crate) const CUSTOM_PROVIDER_ID: &str = "crucible";
+
 /// Render codex's `config.toml`. Serialized through the `toml` crate rather than formatted, so a
 /// token or server name carrying a quote cannot break out of its value.
 fn config_toml(
@@ -191,11 +218,26 @@ fn config_toml(
     broker_name: &str,
     broker_url: Option<&str>,
     token: Option<&str>,
+    endpoint: Option<&CustomEndpoint<'_>>,
 ) -> String {
     let mut cfg = toml::Table::new();
     cfg.insert("model".into(), model.into());
     cfg.insert("approval_policy".into(), "never".into());
     cfg.insert("sandbox_mode".into(), "danger-full-access".into());
+    if let Some(endpoint) = endpoint {
+        cfg.insert("model_provider".into(), CUSTOM_PROVIDER_ID.into());
+        let mut provider = toml::Table::new();
+        provider.insert("name".into(), "Crucible inference endpoint".into());
+        provider.insert("base_url".into(), endpoint.base_url.into());
+        provider.insert("wire_api".into(), endpoint.wire_api.as_str().into());
+        provider.insert(
+            "env_key".into(),
+            crate::inference::OPENAI_API_KEY_ENV.into(),
+        );
+        let mut providers = toml::Table::new();
+        providers.insert(CUSTOM_PROVIDER_ID.into(), provider.into());
+        cfg.insert("model_providers".into(), providers.into());
+    }
     if let Some(url) = broker_url {
         let mut server = toml::Table::new();
         server.insert("url".into(), url.into());
@@ -631,7 +673,7 @@ mod tests {
     fn config_toml_always_seeds_model_and_approval_posture() {
         let mut a = args();
         a.codex.model = Some("gpt-5.6-sol".to_string());
-        let seeds = seed_files(&a, None, None, None);
+        let seeds = seed_files(&a, None, None, None, &Default::default());
         assert_eq!(seeds.len(), 1, "config.toml is always seeded");
         assert_eq!(seeds[0].dest, CONFIG);
         let v: toml::Table = toml::from_str(&seeds[0].content).expect("valid toml");
@@ -651,6 +693,7 @@ mod tests {
             Some("http://host.containers.internal:8849/mcp"),
             a.broker_token.as_deref(),
             None,
+            &Default::default(),
         );
         let v: toml::Table = toml::from_str(&seeds[0].content).expect("valid toml");
         let server = &v["mcp_servers"]["epp-broker"];
@@ -668,7 +711,7 @@ mod tests {
     fn config_toml_omits_the_bearer_token_when_there_is_none() {
         let mut a = args();
         a.broker.name = "b".into();
-        let seeds = seed_files(&a, Some("http://x/mcp"), None, None);
+        let seeds = seed_files(&a, Some("http://x/mcp"), None, None, &Default::default());
         let v: toml::Table = toml::from_str(&seeds[0].content).expect("valid toml");
         assert_eq!(v["mcp_servers"]["b"]["url"].as_str(), Some("http://x/mcp"));
         assert!(v["mcp_servers"]["b"].get("http_headers").is_none());
@@ -678,7 +721,13 @@ mod tests {
     fn a_quote_in_a_broker_token_cannot_break_the_config() {
         let mut a = args();
         a.broker.name = "b".into();
-        let seeds = seed_files(&a, Some("http://x/mcp"), Some("a\"b\nc"), None);
+        let seeds = seed_files(
+            &a,
+            Some("http://x/mcp"),
+            Some("a\"b\nc"),
+            None,
+            &Default::default(),
+        );
         let v: toml::Table = toml::from_str(&seeds[0].content).expect("valid toml");
         assert_eq!(
             v["mcp_servers"]["b"]["http_headers"]["Authorization"].as_str(),
@@ -718,15 +767,43 @@ mod tests {
     fn auth_json_is_seeded_only_when_the_turn_has_codex_auth() {
         let a = args();
         let auth = CodexAuth::ApiKey("sk-test".to_string());
-        let seeds = seed_files(&a, None, None, Some(&auth));
+        let seeds = seed_files(&a, None, None, Some(&auth), &Default::default());
         assert_eq!(seeds.len(), 2);
         assert_eq!(seeds[1].dest, AUTH);
         assert!(seeds[1].content.contains("sk-test"));
         assert!(
-            seed_files(&a, None, None, None)
+            seed_files(&a, None, None, None, &Default::default())
                 .iter()
                 .all(|s| s.dest != AUTH)
         );
+    }
+
+    /// A custom OpenAI-speaking endpoint is codex's own `model_providers` entry: the base URL, the
+    /// wire API the endpoint speaks, and the env key it reads the credential from, selected as the
+    /// active provider. Without one the config names no provider and codex uses its built-in.
+    #[test]
+    fn config_toml_registers_a_custom_endpoint_as_the_active_provider() {
+        let a = args();
+        let inference = crate::inference::InferenceEnv {
+            openai_base_url: Some("http://vllm.internal:8000/v1".into()),
+            wire_api: Some(crate::inference::WireApi::Responses),
+            ..Default::default()
+        };
+        let seeds = seed_files(&a, None, None, None, &inference);
+        let v: toml::Table = toml::from_str(&seeds[0].content).expect("valid toml");
+        assert_eq!(v["model_provider"].as_str(), Some(CUSTOM_PROVIDER_ID));
+        let provider = &v["model_providers"][CUSTOM_PROVIDER_ID];
+        assert_eq!(
+            provider["base_url"].as_str(),
+            Some("http://vllm.internal:8000/v1")
+        );
+        assert_eq!(provider["wire_api"].as_str(), Some("responses"));
+        assert_eq!(provider["env_key"].as_str(), Some("OPENAI_API_KEY"));
+
+        let plain = seed_files(&a, None, None, None, &Default::default());
+        let v: toml::Table = toml::from_str(&plain[0].content).expect("valid toml");
+        assert!(v.get("model_provider").is_none());
+        assert!(v.get("model_providers").is_none());
     }
 
     const ROLLOUT: &[u8] = include_bytes!("../testdata/codex_rollout_fixture.jsonl");

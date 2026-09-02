@@ -18,7 +18,6 @@ use crate::Paths;
 use crate::activity::ActivityFeed;
 use crate::agent::{self, TurnFailure, TurnOutcome};
 use crate::event::{AgentEvent, RawStream};
-use crate::harness::HarnessRuntime;
 use crate::manifest::AgentBackend;
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -383,7 +382,11 @@ fn run_grounded_turn(
     args.compute_driver = a.compute_driver;
     // Manifest-less turn: the Vertex agent env normally supplied by `[agent].env` comes from the
     // turn pod's own env instead. Only for a Vertex-authenticated harness.
-    if args.harness().auth_provider() == crate::harness::AuthProvider::Vertex {
+    if crate::harness::resolve_auth(
+        args.harness(),
+        &crate::inference::InferenceEnv::from_process_env()?,
+    ) == crate::harness::AuthProvider::Vertex
+    {
         crate::openshell::run::relay_vertex_env(&mut args.env);
     }
     // Flag wins; CRUCIBLE_RANK_MODEL lets a parent (rank-compare, the controller's escalation
