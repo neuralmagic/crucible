@@ -28,6 +28,21 @@ use std::time::Duration;
 pub(crate) enum AuthProvider {
     Vertex,
     Codex,
+    /// A direct Anthropic API key from the environment ([`crate::inference::ANTHROPIC_API_KEY`]),
+    /// relayed into the sandbox; no gateway provider, no metadata emulator.
+    AnthropicKey,
+}
+
+/// Which credential this turn runs on: the harness's default, unless the environment carries a
+/// direct Anthropic key for a Claude-speaking harness.
+pub(crate) fn resolve_auth(
+    harness: Harness,
+    inference: &crate::inference::InferenceEnv,
+) -> AuthProvider {
+    match (harness.auth_provider(), inference.anthropic_key.as_deref()) {
+        (AuthProvider::Vertex, Some(_)) => AuthProvider::AnthropicKey,
+        (auth, _) => auth,
+    }
 }
 
 /// The filesystem contract between crucible and the agent harness inside the sandbox: where
@@ -164,6 +179,7 @@ pub(crate) trait HarnessRuntime {
         broker_url: Option<&str>,
         broker_token: Option<&str>,
         auth: Option<&crate::openshell::provider::CodexAuth>,
+        inference: &crate::inference::InferenceEnv,
     ) -> Vec<SeedFile>;
 
     /// The stream decoder for this harness's stdout. `meters`, when present, are the in-process
@@ -303,11 +319,12 @@ impl HarnessRuntime for Harness {
         broker_url: Option<&str>,
         broker_token: Option<&str>,
         auth: Option<&crate::openshell::provider::CodexAuth>,
+        inference: &crate::inference::InferenceEnv,
     ) -> Vec<SeedFile> {
         match self {
             Harness::Claude => claude::seed_files(args, broker_url, broker_token),
             Harness::Hermes => hermes::seed_files(args, broker_url, broker_token),
-            Harness::Codex => codex::seed_files(args, broker_url, broker_token, auth),
+            Harness::Codex => codex::seed_files(args, broker_url, broker_token, auth, inference),
         }
     }
 
@@ -639,6 +656,29 @@ mod tests {
             }
             other => panic!("expected Raw, got {other:?}"),
         }
+    }
+
+    /// A direct Anthropic key in the environment moves a Claude-speaking harness off Vertex; Codex
+    /// never reads it.
+    #[test]
+    fn a_direct_anthropic_key_selects_key_auth_for_claude_only() {
+        let keyed = crate::inference::InferenceEnv {
+            anthropic_key: Some("sk-ant".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_auth(Harness::Claude, &keyed),
+            AuthProvider::AnthropicKey
+        );
+        assert_eq!(
+            resolve_auth(Harness::Hermes, &keyed),
+            AuthProvider::AnthropicKey
+        );
+        assert_eq!(resolve_auth(Harness::Codex, &keyed), AuthProvider::Codex);
+        assert_eq!(
+            resolve_auth(Harness::Claude, &Default::default()),
+            AuthProvider::Vertex
+        );
     }
 
     #[test]

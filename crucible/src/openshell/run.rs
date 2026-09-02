@@ -254,7 +254,9 @@ async fn try_turn(
     //    host-refreshed ChatGPT OAuth token. Either is seeded as auth.json (step 7b), since Codex
     //    reads the real bytes off disk and its L4 WebSocket never crosses a placeholder-resolving
     //    proxy hop.
-    let codex_auth = match harness.auth_provider() {
+    let inference = crate::inference::InferenceEnv::from_process_env()?;
+    let auth = crate::harness::resolve_auth(harness, &inference);
+    let codex_auth = match auth {
         AuthProvider::Vertex => {
             let token = provider::mint_vertex_token()
                 .await
@@ -263,6 +265,7 @@ async fn try_turn(
             ensure_provider(&gw, &token, &project, &region).await?;
             None
         }
+        AuthProvider::AnthropicKey => None,
         AuthProvider::Codex => match selected_codex_api_key(&args.codex)? {
             Some(key) => Some(provider::CodexAuth::ApiKey(key)),
             None => Some(provider::CodexAuth::ChatGpt(
@@ -322,9 +325,9 @@ async fn try_turn(
         ("crucible-pid".to_string(), std::process::id().to_string()),
         ("crucible-workspace".to_string(), label_value(&basename)),
     ];
-    let mut providers = match harness.auth_provider() {
+    let mut providers = match auth {
         AuthProvider::Vertex => vec![provider::PROVIDER_NAME.to_string()],
-        AuthProvider::Codex => Vec::new(),
+        AuthProvider::Codex | AuthProvider::AnthropicKey => Vec::new(),
     };
     if aws_provider {
         providers.push(provider::AWS_PROVIDER_NAME.to_string());
@@ -437,6 +440,12 @@ async fn try_turn(
         if let Some(c) = &collector {
             endpoints.push(c.sandbox_egress(driver.broker_host()));
         }
+        // A custom base URL is a host the harness's built-in allowlist never named.
+        if let Some(ep) = inference.egress_endpoint_for(harness)?
+            && !endpoints.contains(&ep)
+        {
+            endpoints.push(ep);
+        }
         let mut credential_bindings: Vec<grpc::EndpointCredentialBinding> = broker_ep
             .as_deref()
             .filter(|_| broker_provider)
@@ -452,7 +461,7 @@ async fn try_turn(
             })
             .into_iter()
             .collect();
-        if harness.auth_provider() == AuthProvider::Vertex {
+        if auth == AuthProvider::Vertex {
             credential_bindings.extend(policy::VERTEX_CREDENTIAL_HOSTS.iter().map(|host| {
                 grpc::EndpointCredentialBinding {
                     host: (*host).to_string(),
@@ -502,6 +511,13 @@ async fn try_turn(
                 &c.sandbox_endpoint(driver.broker_host()),
             ));
         }
+        inference_env(
+            &mut turn_env,
+            harness,
+            auth,
+            &inference,
+            codex_auth.as_ref(),
+        );
         let env_tmp = write_temp("env", &harness.env_script(&turn_env)).await?;
         run_os(
             &sandbox::file_upload_args(
@@ -538,6 +554,7 @@ async fn try_turn(
             broker_url.as_deref(),
             seed_token.as_deref(),
             codex_auth.as_ref(),
+            &inference,
         );
         for seed in &seeds {
             let seed_tmp = write_temp("seed", &seed.content).await?;
@@ -577,7 +594,7 @@ async fn try_turn(
         // google-auth re-queries the metadata emulator as the cached token nears expiry. Codex has
         // no mid-turn refresher: API keys do not expire during a turn, and the OAuth access token
         // is fixed in the seeded auth file; refreshing it here could not update the sandbox.
-        let refresher = match harness.auth_provider() {
+        let refresher = match auth {
             AuthProvider::Vertex => Some(tokio::spawn({
                 let gw = gw.clone();
                 async move {
@@ -601,7 +618,7 @@ async fn try_turn(
                     }
                 }
             })),
-            AuthProvider::Codex => None,
+            AuthProvider::Codex | AuthProvider::AnthropicKey => None,
         };
         let decoder = harness.decoder(args, meters.as_ref(), crate::agent::tool_io_full(args));
         let exec_result =
@@ -962,6 +979,45 @@ async fn publish_workspace(staged: &std::path::Path, workspace: &std::path::Path
 
 /// The Vertex project + region for the provider config, read from the manifest env,
 /// with sane fallbacks.
+/// The model-reach variables this turn's sandbox carries. A direct Anthropic key replaces the
+/// Vertex selectors the manifest set (Claude Code prefers Vertex whenever they are present), and
+/// a custom base URL rides under the name its harness reads. Codex reads a custom endpoint's key
+/// from the environment where the built-in provider reads `auth.json`, so the key is exported only
+/// in that case.
+pub(crate) fn inference_env(
+    env: &mut Vec<(String, String)>,
+    harness: Harness,
+    auth: AuthProvider,
+    inference: &crate::inference::InferenceEnv,
+    codex_auth: Option<&provider::CodexAuth>,
+) {
+    let set = |env: &mut Vec<(String, String)>, key: &str, value: &str| {
+        env.retain(|(k, _)| k != key);
+        env.push((key.to_string(), value.to_string()));
+    };
+    if auth == AuthProvider::AnthropicKey {
+        env.retain(|(k, _)| !crate::inference::VERTEX_SELECTORS.contains(&k.as_str()));
+        if let Some(key) = inference.anthropic_key.as_deref() {
+            set(env, crate::inference::ANTHROPIC_API_KEY, key);
+        }
+    }
+    match harness {
+        Harness::Claude | Harness::Hermes => {
+            if let Some(url) = inference.anthropic_base_url.as_deref() {
+                set(env, crate::inference::ANTHROPIC_BASE_URL, url);
+            }
+        }
+        Harness::Codex => {
+            if let Some(url) = inference.openai_base_url.as_deref() {
+                set(env, crate::inference::OPENAI_BASE_URL, url);
+                if let Some(provider::CodexAuth::ApiKey(key)) = codex_auth {
+                    set(env, crate::inference::OPENAI_API_KEY_ENV, key);
+                }
+            }
+        }
+    }
+}
+
 fn vertex_config(env: &[(String, String)]) -> (String, String) {
     let get = |keys: &[&str]| {
         keys.iter()
@@ -1607,6 +1663,74 @@ mod tests {
             ),
             "ls -1t /sandbox/.codex/sessions/*/*/*/rollout-*.jsonl 2>/dev/null | head -n 1"
         );
+    }
+
+    #[test]
+    fn a_direct_key_turn_drops_the_vertex_selectors_and_carries_the_key() {
+        let mut env = vec![
+            ("CLAUDE_CODE_USE_VERTEX".to_string(), "1".to_string()),
+            (
+                "ANTHROPIC_VERTEX_PROJECT_ID".to_string(),
+                "proj".to_string(),
+            ),
+            ("KEEP_ME".to_string(), "yes".to_string()),
+        ];
+        let inference = crate::inference::InferenceEnv {
+            anthropic_key: Some("sk-ant".into()),
+            anthropic_base_url: Some("https://claude.corp/v1".into()),
+            ..Default::default()
+        };
+        inference_env(
+            &mut env,
+            Harness::Claude,
+            AuthProvider::AnthropicKey,
+            &inference,
+            None,
+        );
+        let get = |k: &str| {
+            env.iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("CLAUDE_CODE_USE_VERTEX"), None);
+        assert_eq!(get("ANTHROPIC_VERTEX_PROJECT_ID"), None);
+        assert_eq!(get("KEEP_ME"), Some("yes"));
+        assert_eq!(get("ANTHROPIC_API_KEY"), Some("sk-ant"));
+        assert_eq!(get("ANTHROPIC_BASE_URL"), Some("https://claude.corp/v1"));
+    }
+
+    /// Codex reads a custom endpoint's key from the environment, so the key is exported only when
+    /// a base URL is set; against the built-in provider it stays in `auth.json`.
+    #[test]
+    fn codex_exports_its_key_only_for_a_custom_endpoint() {
+        let auth = provider::CodexAuth::ApiKey("sk-oa".to_string());
+        let mut plain = Vec::new();
+        inference_env(
+            &mut plain,
+            Harness::Codex,
+            AuthProvider::Codex,
+            &Default::default(),
+            Some(&auth),
+        );
+        assert!(plain.is_empty(), "{plain:?}");
+
+        let mut custom = Vec::new();
+        let inference = crate::inference::InferenceEnv {
+            openai_base_url: Some("http://vllm.internal:8000/v1".into()),
+            ..Default::default()
+        };
+        inference_env(
+            &mut custom,
+            Harness::Codex,
+            AuthProvider::Codex,
+            &inference,
+            Some(&auth),
+        );
+        assert!(custom.contains(&(
+            "OPENAI_BASE_URL".to_string(),
+            "http://vllm.internal:8000/v1".to_string()
+        )));
+        assert!(custom.contains(&("OPENAI_API_KEY".to_string(), "sk-oa".to_string())));
     }
 
     #[test]
