@@ -48,7 +48,7 @@ pub(crate) const LOCAL_ENV_DEFAULTS: &[(&str, &str)] = &[("AGENT_TOOL", "hermes"
 /// by the caller. `--yolo` bypasses approval prompts (headless); `[agent.hermes].model` overrides
 /// the shared `[agent].model`.
 fn base_args(args: &Args) -> Vec<String> {
-    let model = args.hermes.model.as_deref().unwrap_or(&args.model);
+    let model = args.hermes.model.as_deref().unwrap_or_else(|| args.model());
     vec![
         "hermes".to_string(),
         "chat".to_string(),
@@ -97,7 +97,7 @@ pub(crate) fn seed_files(
     broker_url: Option<&str>,
     broker_token: Option<&str>,
 ) -> Vec<SeedFile> {
-    let model = args.hermes.model.as_deref().unwrap_or(&args.model);
+    let model = args.hermes.model.as_deref().unwrap_or_else(|| args.model());
     vec![SeedFile {
         content: config_yaml(model, &args.broker.name, broker_url, broker_token),
         dest: CONFIG,
@@ -226,7 +226,7 @@ mod tests {
         assert_eq!(seeds.len(), 1, "config.yaml is always seeded");
         assert_eq!(seeds[0].dest, CONFIG);
         let v: serde_json::Value = serde_norway::from_str(&seeds[0].content).expect("valid yaml");
-        assert_eq!(v["model"], a.model.as_str());
+        assert_eq!(v["model"], a.model());
         assert_eq!(v["provider"], PROVIDER);
         assert_eq!(v["display"]["tool_progress"], "all");
         assert!(v.get("mcp_servers").is_none(), "no broker ⇒ no mcp_servers");

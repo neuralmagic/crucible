@@ -62,7 +62,7 @@ impl Reporter for ConsoleReporter {
         session: Option<&str>,
         budget: TurnBudget,
     ) -> AgentTurn {
-        println!("  -> running agent (iteration {it}, {}) …", args.model);
+        println!("  -> running agent (iteration {it}, {}) …", args.model());
         // Pretty stream (json=false): echo each line so the human sees the same
         // output as before, while the helper scrapes cost for budgeting and we
         // watch the result event for a failed (is_error) no-op turn.
@@ -111,7 +111,7 @@ impl Reporter for ConsoleReporter {
                     // Same mid-turn cap check as the session reporter; the console
                     // skips per-sample budget lines to keep the echo readable.
                     let spent =
-                        budget.spent_before + crate::event::provisional_cost(&args.model, t);
+                        budget.spent_before + crate::event::provisional_cost(args.model(), t);
                     if budget.over_cap(spent) && !over_cap_stopped {
                         over_cap_stopped = true;
                         println!(

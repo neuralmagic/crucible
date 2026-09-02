@@ -194,7 +194,7 @@ impl Reporter for SessionReporter {
                         // Provisional mid-turn budget line; the loop's turn-end
                         // budget call reconciles it with the authoritative cost.
                         let spent =
-                            budget.spent_before + crate::event::provisional_cost(&args.model, t);
+                            budget.spent_before + crate::event::provisional_cost(args.model(), t);
                         sink.write_event(&SessionEvent::Budget {
                             spent,
                             elapsed_secs: budget.started.elapsed().as_secs(),

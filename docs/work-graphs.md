@@ -22,6 +22,9 @@ crucible plan run --file plan.toml --manifest crucible.toml
 
 # execute without a manifest: agent tasks run a stand-in command instead
 crucible plan run --file plan.toml --agent-cmd ./role.sh
+
+# replace the manifest's [agent] harness and model for this run; a task that pins its own keeps it
+crucible plan run --manifest crucible.toml --harness codex --model gpt-5.6-luna
 ```
 
 `--cap <name>` (repeatable) declares what the substrate can do; see *needs* below.

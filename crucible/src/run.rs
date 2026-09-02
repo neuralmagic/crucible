@@ -223,6 +223,8 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                 agent_cmd,
                 manifest,
                 compute_driver,
+                harness,
+                model,
             } => {
                 let _engine = crate::engine::EngineCtx::new()?;
                 crate::plan::cli::run(
@@ -231,14 +233,20 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                     &caps.iter().cloned().collect(),
                     agent_cmd.clone(),
                     manifest.as_deref(),
-                    crate::plan::cli::Ceilings {
-                        usd: *max_cost,
-                        wall_clock: max_time
-                            .as_deref()
-                            .and_then(crate::duration::parse_duration),
-                        wall_clock_raw: max_time.clone(),
+                    crate::plan::cli::RunOpts {
+                        ceilings: crate::plan::cli::Ceilings {
+                            usd: *max_cost,
+                            wall_clock: max_time
+                                .as_deref()
+                                .and_then(crate::duration::parse_duration),
+                            wall_clock_raw: max_time.clone(),
+                        },
+                        compute_driver: *compute_driver,
+                        agent: crate::plan::cli::AgentOverride {
+                            harness: *harness,
+                            model: model.clone(),
+                        },
                     },
-                    *compute_driver,
                 )
             }
         };
@@ -472,6 +480,7 @@ pub(crate) fn prep_plan_runner(
         manifest_path,
         &std::collections::BTreeMap::new(),
         crate::openshell::gateway::ComputeDriver::Podman,
+        crate::plan::cli::AgentOverride::default(),
     )
 }
 
@@ -479,6 +488,7 @@ pub(crate) fn prep_plan_runner_with_params(
     manifest_path: &Path,
     params: &std::collections::BTreeMap<String, String>,
     compute_driver: crate::openshell::gateway::ComputeDriver,
+    agent: crate::plan::cli::AgentOverride,
 ) -> Result<(crate::plan::harness::HarnessRunner, manifest::Manifest)> {
     let mut m = manifest::Manifest::load_frozen(manifest_path)?;
     let manifest_dir = manifest_path
@@ -508,14 +518,17 @@ pub(crate) fn prep_plan_runner_with_params(
     );
     std::fs::create_dir_all(&p.state)
         .with_context(|| format!("creating state dir {}", p.state.display()))?;
-    install_toolbox(&p, &m.agent.toolbox_exclude, m.agent.harness.skills_dir())?;
-    // Default Args (as if `crucible` ran flagless), then the manifest's [agent] folded on top —
-    // the same resolution a loop run does.
+    let harness = agent.harness.unwrap_or(m.agent.harness);
+    install_toolbox(&p, &m.agent.toolbox_exclude, harness.skills_dir())?;
+    // Default Args (as if `crucible` ran flagless) carrying the launch's own agent flags, then
+    // the manifest's [agent] folded on top — the same resolution a loop run does.
     let mut args = <Cli as clap::Parser>::try_parse_from(["crucible"])
         .context("constructing default args")?
         .run;
     args.manifest = Some(manifest_path.to_path_buf());
     args.compute_driver = compute_driver;
+    args.harness = agent.harness;
+    args.model = agent.model;
     apply_agent_cfg(&mut args, &m.agent, &m.secrets, &p.workspace)?;
     args.workflow_frozen_injects = m.frozen_inject_pairs(&manifest_dir);
     args.workflow_toolbox_exclude = m.agent.toolbox_exclude.clone();
@@ -754,9 +767,11 @@ fn apply_agent_cfg(
     secrets: &[manifest::SecretDecl],
     workspace: &Path,
 ) -> Result<()> {
-    args.model = agent.model.clone();
+    // Model and harness: the CLI flag wins, else the manifest's `[agent]` value.
+    if args.model.is_none() {
+        args.model = Some(agent.model.clone());
+    }
     args.agent_cmd = agent.agent_cmd.clone();
-    // Harness: CLI `--harness` wins, else the manifest's `[agent].harness` (default claude).
     if args.harness.is_none() {
         args.harness = Some(agent.harness);
     }
@@ -1326,6 +1341,69 @@ mod tests {
         let mut a = args_from(&["crucible", "--harness", "claude"]);
         apply_agent_cfg(&mut a, &m.agent, &m.secrets, Path::new("ws")).unwrap();
         assert_eq!(a.harness(), crate::manifest::Harness::Claude);
+    }
+
+    #[test]
+    fn the_manifest_model_applies_when_the_cli_names_none() {
+        let m: manifest::Manifest =
+            toml::from_str(&manifest_toml("model = \"claude-haiku-4-5\"")).unwrap();
+        let mut a = args_from(&["crucible"]);
+        assert_eq!(a.model(), crate::manifest::Harness::Claude.default_model());
+        apply_agent_cfg(&mut a, &m.agent, &m.secrets, Path::new("ws")).unwrap();
+        assert_eq!(a.model(), "claude-haiku-4-5");
+    }
+
+    /// The loop wrapper renders `--model=<m>` from the controller's provider resolution, so the
+    /// manifest's `[agent].model` must not overwrite it.
+    #[test]
+    fn cli_model_beats_the_manifest() {
+        let m: manifest::Manifest =
+            toml::from_str(&manifest_toml("model = \"claude-haiku-4-5\"")).unwrap();
+        let mut a = args_from(&["crucible", "--model", "gpt-5.6-luna"]);
+        apply_agent_cfg(&mut a, &m.agent, &m.secrets, Path::new("ws")).unwrap();
+        assert_eq!(a.model(), "gpt-5.6-luna");
+    }
+
+    #[test]
+    fn a_model_less_run_takes_the_resolved_harness_default() {
+        let a = args_from(&["crucible", "--harness", "codex"]);
+        assert_eq!(a.model(), crate::manifest::Harness::Codex.default_model());
+    }
+
+    /// Without a manifest there is no `[agent]` table to replace, so the flags are refused rather
+    /// than accepted and ignored.
+    #[test]
+    fn plan_run_agent_flags_need_a_manifest() {
+        for flags in [["--harness", "codex"], ["--model", "gpt-5.6-luna"]] {
+            let argv = [
+                "crucible",
+                "plan",
+                "run",
+                "--file",
+                "plan.toml",
+                flags[0],
+                flags[1],
+            ];
+            let Err(err) = <crate::Cli as clap::Parser>::try_parse_from(argv) else {
+                panic!("an agent flag without --manifest is refused: {argv:?}");
+            };
+            assert!(err.to_string().contains("--manifest"), "{err}");
+        }
+        let argv = [
+            "crucible",
+            "plan",
+            "run",
+            "--manifest",
+            "crucible.toml",
+            "--harness",
+            "codex",
+            "--model",
+            "gpt-5.6-luna",
+        ];
+        assert!(
+            <crate::Cli as clap::Parser>::try_parse_from(argv).is_ok(),
+            "both flags parse with a manifest"
+        );
     }
 
     /// `[agent.hermes]` parses (and rides onto Args), and an unknown key inside it is a manifest

@@ -66,8 +66,8 @@ pub(crate) const EXTRA_ENDPOINTS: &[&str] = &[
 pub(crate) fn model(args: &Args) -> &str {
     match args.codex.model.as_deref() {
         Some(m) => m,
-        None if args.model.starts_with("claude") => Harness::Codex.default_model(),
-        None => &args.model,
+        None if args.model().starts_with("claude") => Harness::Codex.default_model(),
+        None => args.model(),
     }
 }
 
@@ -541,14 +541,14 @@ mod tests {
     fn a_claude_model_never_reaches_the_chatgpt_backend() {
         assert_eq!(Harness::Codex.default_model(), "gpt-5.6-sol");
         let mut a = args();
-        a.model = "claude-opus-4-6".to_string();
+        a.model = Some("claude-opus-4-6".to_string());
         let v = sandbox_argv(&a, false);
         assert!(
             v.windows(2)
                 .any(|w| w == ["-m", Harness::Codex.default_model()]),
             "{v:?}"
         );
-        a.model = "gpt-5.6-terra".to_string();
+        a.model = Some("gpt-5.6-terra".to_string());
         assert!(
             sandbox_argv(&a, false)
                 .windows(2)
@@ -560,7 +560,7 @@ mod tests {
     #[test]
     fn codex_model_override_beats_the_shared_agent_model() {
         let mut a = args();
-        a.model = "claude-opus-4-6".to_string();
+        a.model = Some("claude-opus-4-6".to_string());
         a.codex.model = Some("gpt-5.6-terra".to_string());
         let v = sandbox_argv(&a, false);
         assert!(v.windows(2).any(|w| w == ["-m", "gpt-5.6-terra"]));

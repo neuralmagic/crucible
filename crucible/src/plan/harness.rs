@@ -531,7 +531,7 @@ fn run_in(
         }
     }
     if let Some(m) = model {
-        args.model = m.clone();
+        args.model = Some(m.clone());
     }
     if let Some(e) = effort {
         match crate::manifest::ReasoningEffort::from_str(e, true) {
@@ -842,6 +842,74 @@ mod tests {
             &mut runner,
             |_, _| {},
         )
+    }
+
+    /// A launch's `--harness`/`--model` replace the manifest's `[agent]` pair on the runner every
+    /// agent task inherits from, and the toolbox lands where that harness discovers skills.
+    #[test]
+    fn a_launch_agent_override_replaces_the_manifest_pair() {
+        let dir = std::env::temp_dir().join(format!(
+            "crucible-plan-agent-override-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("skills/demo")).unwrap();
+        std::fs::write(dir.join("skills/demo/SKILL.md"), "# demo\n").unwrap();
+        std::fs::write(
+            dir.join("crucible.toml"),
+            r#"
+            [repo]
+            path = "."
+            [workspace]
+            dir = "workspace"
+            setup_cmd = "mkdir -p workspace && git -C workspace init -q && git -C workspace -c user.email=c@l -c user.name=c -c commit.gpgsign=false commit -q --allow-empty -m baseline"
+            [agent]
+            backend = "command"
+            agent_cmd = "true"
+            goal = "g"
+            toolbox_dir = "skills"
+            [workflow]
+            type = "playbook"
+            file = "workflow.star"
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("workflow.star"),
+            "go = agent(name = \"go\", prompt = \"go\")\nworkflow(type = \"playbook\", tasks = [go])\n",
+        )
+        .unwrap();
+        let manifest = dir.join("crucible.toml");
+
+        let (plain, _) = crate::run::prep_plan_runner(&manifest).unwrap();
+        assert_eq!(plain.args.harness(), crate::manifest::Harness::Claude);
+        assert_eq!(
+            plain.args.model(),
+            crate::manifest::Harness::Claude.default_model()
+        );
+
+        let (overridden, _) = crate::run::prep_plan_runner_with_params(
+            &manifest,
+            &BTreeMap::new(),
+            crate::openshell::gateway::ComputeDriver::Podman,
+            crate::plan::cli::AgentOverride {
+                harness: Some(crate::manifest::Harness::Codex),
+                model: Some("gpt-5.6-luna".to_string()),
+            },
+        )
+        .unwrap();
+        assert_eq!(overridden.args.harness(), crate::manifest::Harness::Codex);
+        assert_eq!(overridden.args.model(), "gpt-5.6-luna");
+        assert!(
+            overridden
+                .paths
+                .workspace
+                .join(crate::manifest::Harness::Codex.skills_dir())
+                .join("demo")
+                .is_dir(),
+            "the toolbox lands in the override harness's skills dir"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A serial producer's declared file has to reach an isolated consumer, whose worktree is a
@@ -1787,8 +1855,10 @@ workflow(type = "playbook", tasks = [good, bad, after])
                 &caps,
                 None,
                 Some(&manifest),
-                ceilings,
-                crate::openshell::gateway::ComputeDriver::Podman,
+                crate::plan::cli::RunOpts {
+                    ceilings,
+                    ..Default::default()
+                },
             )
             .expect_err("a playbook without ceilings must not dispatch");
             assert!(format!("{error:#}").contains(expected), "{error:#}");
@@ -1804,12 +1874,14 @@ workflow(type = "playbook", tasks = [good, bad, after])
             &caps,
             None,
             Some(&manifest),
-            crate::plan::cli::Ceilings {
-                usd: Some(1.0),
-                wall_clock: Some(std::time::Duration::from_secs(600)),
-                wall_clock_raw: Some("10m".into()),
+            crate::plan::cli::RunOpts {
+                ceilings: crate::plan::cli::Ceilings {
+                    usd: Some(1.0),
+                    wall_clock: Some(std::time::Duration::from_secs(600)),
+                    wall_clock_raw: Some("10m".into()),
+                },
+                ..Default::default()
             },
-            crate::openshell::gateway::ComputeDriver::Podman,
         )
         .expect("a playbook with both ceilings runs");
         assert!(dir.join("workspace/out.txt").exists(), "the task never ran");

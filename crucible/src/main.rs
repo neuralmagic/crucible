@@ -439,6 +439,14 @@ pub(crate) enum PlanAction {
         /// per deployment, so a rendered wrapper passes it; the manifest cannot declare it.
         #[arg(long, value_enum, default_value_t = openshell::gateway::ComputeDriver::Podman)]
         compute_driver: openshell::gateway::ComputeDriver,
+        /// The harness every agent task runs, replacing the manifest's `[agent].harness`. A task
+        /// that pins its own harness keeps it. Only a `--manifest` run has an agent to replace.
+        #[arg(long, value_enum, requires = "manifest")]
+        harness: Option<crate::manifest::Harness>,
+        /// The model every agent task asks for, replacing the manifest's `[agent].model`. A task
+        /// that pins its own model keeps it.
+        #[arg(long, requires = "manifest")]
+        model: Option<String>,
     },
 }
 
@@ -668,9 +676,10 @@ pub(crate) struct Args {
     /// the sandbox's `.mcp.json` headers. Runtime state rather than config, so there is no CLI flag.
     #[arg(skip)]
     pub broker_token: Option<String>,
-    /// Vertex Claude model for the agent (set from `[agent].model`).
-    #[arg(long, default_value = crate::manifest::Harness::Claude.default_model())]
-    pub model: String,
+    /// The model the agent runs. Overrides the manifest's `[agent].model`; when neither is set the
+    /// resolved harness's own default applies (see `Args::model`).
+    #[arg(long)]
+    pub model: Option<String>,
     /// The agent harness that runs each turn: `claude` (default), `hermes`, or `codex`. Overrides
     /// the manifest's `[agent].harness`; when neither is set the engine defaults to claude (see
     /// `apply_agent_cfg`).
@@ -780,6 +789,14 @@ impl Args {
     /// the claude default.
     pub(crate) fn harness(&self) -> crate::manifest::Harness {
         self.harness.unwrap_or_default()
+    }
+
+    /// The resolved model: CLI `--model` > manifest `[agent].model` (folded on by
+    /// `apply_agent_cfg`) > the resolved harness's default.
+    pub(crate) fn model(&self) -> &str {
+        self.model
+            .as_deref()
+            .unwrap_or_else(|| self.harness().default_model())
     }
 
     /// Resolve where this run's agent events come from. `local` spawns `claude` directly

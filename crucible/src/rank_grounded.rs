@@ -394,7 +394,7 @@ fn run_grounded_turn(
             .filter(|s| !s.is_empty())
     });
     if let Some(model) = model {
-        args.model = model;
+        args.model = Some(model);
     }
     let paths = grounded_paths(&scratch);
     let _ = std::fs::create_dir_all(&paths.state);
@@ -403,7 +403,7 @@ fn run_grounded_turn(
     // The turn's own narration on stdout: stage banners, tool calls and the agent's stderr, so a
     // turn that dies mid-orchestration leaves more than a 7-line pod log. Bounded by the feed's
     // caps and byte budget, and always before the verdict marker `run` prints last.
-    let model = args.model.clone();
+    let model = args.model().to_string();
     let mut activity = ActivityFeed::new(crucible_contract::RANK_ACTIVITY_MARKER, a.marker);
     let outcome = agent::run_turn(&args, &paths, prompt, false, |_line, _stream, ev| {
         if let Some(ev) = ev {

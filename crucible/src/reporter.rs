@@ -95,7 +95,7 @@ impl RunMeta {
     pub fn from_args(args: &Args) -> Self {
         Self {
             namespace: args.namespace.clone(),
-            model: args.model.clone(),
+            model: args.model().to_string(),
             iters_total: args.iterations,
             max_cost: args.max_cost,
             max_secs: args.max_time().map(|d| d.as_secs()).unwrap_or(0),
