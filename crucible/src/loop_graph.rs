@@ -63,6 +63,7 @@ pub(crate) struct IterCtx<'a> {
     /// the typestate path would after the turn.
     pub spent_before: f64,
     pub started: Instant,
+    pub heartbeat: Option<std::sync::Arc<crate::heartbeat::Heartbeat>>,
     pub workflow: Option<&'a WorkflowCfg>,
 }
 
@@ -105,6 +106,7 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
         best_tiebreak: cx.best_tiebreak,
         spent_before: cx.spent_before,
         started: cx.started,
+        heartbeat: cx.heartbeat,
         signal: None,
         measured: BTreeMap::new(),
         decided: BTreeMap::new(),
@@ -490,6 +492,7 @@ struct LoopTaskRunner<'a, R: Reporter> {
     best_tiebreak: Option<f64>,
     spent_before: f64,
     started: Instant,
+    heartbeat: Option<std::sync::Arc<crate::heartbeat::Heartbeat>>,
     signal: Option<Signal>,
     measured: BTreeMap<TaskName, Measured>,
     decided: BTreeMap<TaskName, Decided>,
@@ -513,6 +516,7 @@ impl<R: Reporter> LoopTaskRunner<'_, R> {
                 spent_before: self.spent_before,
                 started: self.started,
                 max_cost: loop_driver::live_max_cost(self.args, self.control),
+                heartbeat: self.heartbeat.clone(),
             },
         );
         let cost = turn.cost;
@@ -704,9 +708,10 @@ impl<R: Reporter> LoopTaskRunner<'_, R> {
 impl<R: Reporter> TaskRunner for LoopTaskRunner<'_, R> {
     fn run(&mut self, task: &Task, attempt: u32, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
         match &task.task {
-            TaskKind::Agent { .. } | TaskKind::Command { .. } | TaskKind::Evaluate { .. } => {
-                self.workflow_runner.run(task, attempt, inputs)
-            }
+            TaskKind::Agent { .. }
+            | TaskKind::Command { .. }
+            | TaskKind::Evaluate { .. }
+            | TaskKind::Report { .. } => self.workflow_runner.run(task, attempt, inputs),
             TaskKind::Engine {
                 op: EngineOp::Propose,
                 ..

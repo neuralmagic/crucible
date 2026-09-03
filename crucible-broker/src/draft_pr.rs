@@ -127,6 +127,10 @@ impl ApprovalBackend for DraftPrApproval {
         Ok(url.trim().trim_matches('"').to_string())
     }
 
+    fn draft_pr_repo(&self) -> Option<&str> {
+        Some(&self.repo)
+    }
+
     fn poll(&self, handle: &str) -> Result<ApprovalState> {
         let number = pr_number(handle).context("parsing PR number from handle")?;
 

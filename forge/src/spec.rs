@@ -207,9 +207,9 @@ impl ClusterBuild {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GithubBuild {
-    /// `owner/repo` holding the build workflow. NOTE: an allowed-orgs whitelist is NOT YET ENFORCED
-    /// anywhere in this branch; enforcing it is a prerequisite before the M1 controller dispatches
-    /// this path autonomously (tracked as M1 integration-hardening follow-up work).
+    /// `owner/repo` holding the build workflow. Its owner must be in the operator's org allowlist
+    /// ([`crate::github::OrgAllowlist`], `$FORGE_GITHUB_ALLOWED_ORGS`), checked before any GitHub
+    /// call; no manifest field widens it.
     pub repo: String,
     /// The workflow file to dispatch (must exist on `ref`; crucible never generates it).
     pub workflow: String,

@@ -18,7 +18,6 @@
 use rmcp::schemars;
 use serde::Deserialize;
 use std::path::PathBuf;
-use std::time::Duration;
 
 /// How loud the signal is. A closed set on the wire (the agent picks one of three) and the only
 /// thing that decides whether the run suspends.
@@ -245,22 +244,8 @@ pub(crate) fn payload(page: &Page) -> serde_json::Value {
 /// POST the page. Blocking (the caller is already on a blocking thread) and fire-and-forget: a
 /// dead webhook must not fail the tool, because the suspend itself is the load-bearing half.
 pub(crate) fn post(webhook_url: &str, payload: &serde_json::Value) {
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(error = %e, "building the slack http client failed");
-            return;
-        }
-    };
-    match client.post(webhook_url).json(payload).send() {
-        Ok(resp) if resp.status().is_success() => {}
-        Ok(resp) => {
-            tracing::warn!(status = %resp.status(), "slack webhook rejected the distress page")
-        }
-        Err(e) => tracing::warn!(error = %e, "posting the distress page to slack failed"),
+    if let Err(error) = crate::slack::post(webhook_url, payload) {
+        tracing::warn!(%error, "posting the distress page to slack failed");
     }
 }
 

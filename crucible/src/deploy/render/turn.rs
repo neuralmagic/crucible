@@ -65,6 +65,8 @@ pub struct TurnOpts {
     pub goal_text: Option<String>,
     /// The clone URL of the repo under test (the wrapper clones it fresh into the pod).
     pub repo_url: String,
+    /// Branch or tag the wrapper clones at. `None` is the repo's default branch.
+    pub repo_ref: Option<String>,
     /// The agent sandbox image carrying the claude CLI the loop/crucible image does not (the
     /// `openshell` backend pulls it via `REGISTRY_AUTH_FILE` pointing at the mounted authfile).
     pub sandbox_image: String,
@@ -127,6 +129,26 @@ pub const SCOPE_WORK_KIND: &str = "scope";
 /// a repo and runs one read-only ranking turn. `automountServiceAccountToken` follows the sandbox
 /// driver: `false` under podman (no API calls), `true` under kubernetes (the in-pod gateway needs
 /// the token to reach the API server for Sandbox CRs).
+#[derive(Debug, thiserror::Error)]
+#[error("--repo-ref {got:?} is not a plain branch or tag name")]
+pub struct BadRepoRef {
+    got: String,
+}
+
+/// A ref that is safe to interpolate unquoted into the wrapper script: git's own ref grammar minus
+/// anything the shell would read (whitespace, quotes, `$`, glob characters), and never a leading
+/// `-`, so it cannot be mistaken for another `git clone` flag.
+fn checked_git_ref(r: &str) -> Result<&str, BadRepoRef> {
+    let ok = !r.is_empty()
+        && !r.starts_with('-')
+        && r.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-' | '@' | '+'));
+    if !ok {
+        return Err(BadRepoRef { got: r.to_string() });
+    }
+    Ok(r)
+}
+
 pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
     let image = if opts.pin_digests {
         forge::oci::pin_digest(&profile.image.loop_image, None)
@@ -209,6 +231,7 @@ pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
         issue,
         goal_text,
         repo_url,
+        repo_ref,
         max_cost,
         tier,
         gaming_refine_rounds,
@@ -228,12 +251,16 @@ pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
         ComputeDriver::Kubernetes => " --compute-driver=kubernetes",
         ComputeDriver::Podman => "",
     };
+    let clone_ref = match repo_ref.as_deref() {
+        Some(r) => format!(" --branch {}", checked_git_ref(r)?),
+        None => String::new(),
+    };
     let wrapper = match kind {
         TurnKind::Rank => format!(
             r#"set -e
 CHECKOUT=/tmp/crucible-turn-checkout
 rm -rf "$CHECKOUT"
-git clone --depth 50 {repo_url} "$CHECKOUT"
+git clone --depth 50{clone_ref} {repo_url} "$CHECKOUT"
 crucible rank-grounded --issue {issue} --workspace "$CHECKOUT" --max-cost {max_cost}{harness_flag}{model_flag} \
   --json --marker --agent-backend openshell --sandbox-image {sandbox_image}{compute_driver_flag}
 "#
@@ -282,7 +309,7 @@ crucible rank-grounded --issue {issue} --workspace "$CHECKOUT" --max-cost {max_c
                 r#"set -e
 CHECKOUT=/tmp/crucible-turn-checkout
 rm -rf "$CHECKOUT"
-git clone --depth 50 {repo_url} "$CHECKOUT"
+git clone --depth 50{clone_ref} {repo_url} "$CHECKOUT"
 SCOPE_OUT=/tmp/crucible-scope-out
 rm -rf "$SCOPE_OUT"
 {goal_source}crucible scope --propose --json --force --marker {goal_flag}{goal_arg} \
@@ -449,6 +476,7 @@ mod tests {
                 issue: "owner/repo#42".to_string(),
                 goal_text: None,
                 repo_url: "https://github.com/owner/repo.git".to_string(),
+                repo_ref: None,
                 sandbox_image: "registry.example.com/epp-sandbox:latest".to_string(),
                 max_cost: 5.0,
                 pin_digests: false,
@@ -545,6 +573,7 @@ mod tests {
                 issue: "owner/repo#42".to_string(),
                 goal_text: None,
                 repo_url: "https://github.com/owner/repo.git".to_string(),
+                repo_ref: None,
                 sandbox_image: "registry.example.com/epp-sandbox:latest".to_string(),
                 max_cost: 5.0,
                 pin_digests: false,
@@ -624,6 +653,7 @@ mod tests {
                 issue: "owner/repo#42".to_string(),
                 goal_text: None,
                 repo_url: "https://github.com/owner/repo.git".to_string(),
+                repo_ref: None,
                 sandbox_image: "registry.example.com/epp-sandbox:latest".to_string(),
                 max_cost: 5.0,
                 pin_digests: false,
@@ -689,6 +719,7 @@ mod tests {
                 issue: "owner/repo#42".to_string(),
                 goal_text: None,
                 repo_url: "https://github.com/owner/repo.git".to_string(),
+                repo_ref: None,
                 sandbox_image: "registry.example.com/epp-sandbox:latest".to_string(),
                 max_cost: 8.0,
                 pin_digests: false,
@@ -779,6 +810,7 @@ mod tests {
                 issue: "scenario:deadbeef".to_string(),
                 goal_text: Some("fix the reticulator".to_string()),
                 repo_url: "https://github.com/owner/repo.git".to_string(),
+                repo_ref: None,
                 sandbox_image: "registry.example.com/epp-sandbox:latest".to_string(),
                 max_cost: 8.0,
                 pin_digests: false,
@@ -834,6 +866,7 @@ mod tests {
                 issue: "owner/repo#43".to_string(),
                 goal_text: None,
                 repo_url: "https://github.com/owner/repo.git".to_string(),
+                repo_ref: None,
                 sandbox_image: "registry.example.com/epp-sandbox:latest".to_string(),
                 max_cost: 8.0,
                 pin_digests: false,
@@ -879,6 +912,7 @@ mod tests {
                 issue: "owner/repo#44".to_string(),
                 goal_text: None,
                 repo_url: "https://github.com/owner/repo.git".to_string(),
+                repo_ref: None,
                 sandbox_image: "registry.example.com/epp-sandbox:latest".to_string(),
                 max_cost: 8.0,
                 pin_digests: false,
@@ -932,6 +966,7 @@ mod tests {
             issue: "owner/repo#45".to_string(),
             goal_text: None,
             repo_url: "https://github.com/owner/repo.git".to_string(),
+            repo_ref: None,
             sandbox_image: "registry.example.com/epp-sandbox:latest".to_string(),
             max_cost: 5.0,
             pin_digests: false,
@@ -991,6 +1026,38 @@ mod tests {
                 .expect("render turn");
             assert!(!yaml.contains("--harness"), "no harness, no flag: {yaml}");
             assert!(!yaml.contains("--model"), "no model, no flag: {yaml}");
+        }
+    }
+    #[test]
+    fn repo_ref_clones_at_the_branch_in_both_wrappers() {
+        for kind in [TurnKind::Rank, TurnKind::Scope] {
+            let mut opts = opts_with_run_config(kind, None, None);
+            opts.repo_ref = Some("feature/x-1.2".to_string());
+            let yaml = render_turn(&minimal_profile(), &opts).expect("render turn");
+            assert!(
+                yaml.contains(
+                    "git clone --depth 50 --branch feature/x-1.2 https://github.com/owner/repo.git"
+                ),
+                "{kind:?} wrapper clones at the ref:\n{yaml}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_repo_ref_clones_the_default_branch() {
+        let opts = opts_with_run_config(TurnKind::Scope, None, None);
+        let yaml = render_turn(&minimal_profile(), &opts).expect("render turn");
+        assert!(yaml.contains("git clone --depth 50 https://github.com/owner/repo.git"));
+        assert!(!yaml.contains("--branch"));
+    }
+
+    #[test]
+    fn a_shell_hostile_repo_ref_is_refused() {
+        for bad in ["", "-x", "main; rm -rf /", "a b", "$(id)", "v1*", "it's"] {
+            let mut opts = opts_with_run_config(TurnKind::Rank, None, None);
+            opts.repo_ref = Some(bad.to_string());
+            let err = render_turn(&minimal_profile(), &opts).expect_err(bad);
+            assert!(err.to_string().contains("--repo-ref"), "{bad:?}: {err}");
         }
     }
 }

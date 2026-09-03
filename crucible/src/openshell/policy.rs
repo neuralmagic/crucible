@@ -12,10 +12,10 @@
 //! path. To *subtract* specific defaults (notably GitHub, which an agent being scored on an
 //! upstream issue can otherwise read the fix from) without losing the rest of the built-ins, use
 //! `deny_endpoints`/`deny_binaries`, applied last so deny beats both an inherited default and an
-//! appended extra. `subtract` is exact-string, not glob-aware: the defaults ship both
-//! `github.com:443:full` and `*.github.com:443:full` (the latter covers `api.github.com`), so
-//! sealing GitHub requires denying both entries, denying only the apex leaves the wildcard,
-//! and `api.github.com`, reachable.
+//! appended extra. `deny_endpoints` is host-scoped, not exact-string: denying
+//! `github.com:443:full` also removes `*.github.com:443:full`, so one entry seals the domain.
+//! See [`resolve_endpoints`] for the full rule. `deny_binaries` stays exact-string, a binary path
+//! has no domain structure.
 
 use crate::manifest::OpenshellCfg;
 
@@ -48,6 +48,23 @@ pub const DEFAULT_ENDPOINTS: &[&str] = &[
 /// preserved, then with `deny_endpoints` subtracted. With `inherit_defaults = false` the built-ins
 /// are dropped and only the domain's are allowed.
 ///
+/// # Deny semantics
+///
+/// A deny wins over any allow that would admit the denied `host:port`. Both sides are parsed as
+/// `host:port:...`; the port must match exactly (denying `:443` leaves `:8443` alone) and the
+/// access/protocol/enforcement tail is ignored, so a deny removes an entry at any access level.
+/// Hosts are compared as domain scopes with openshell's own DNS-label matcher (`*` inside one
+/// label, `**` across several, case-insensitive):
+///
+/// - deny `github.com` removes `github.com`, `*.github.com`, and `api.github.com`,
+/// - deny `*.github.com` removes `*.github.com` and `api.github.com` but leaves the apex
+///   `github.com`,
+/// - deny `api.github.com` removes only `api.github.com`, and leaves `*.github.com`, which still
+///   admits the denied host. Nothing narrower can be subtracted from a broader wildcard, so that
+///   residue is reported by `crucible check` rather than silently honored here.
+///
+/// A deny entry with no parseable `host:port` prefix falls back to exact-string equality.
+///
 /// `broker_endpoint`, when `Some`, is the engine-resolved broker `host:port:access` entry. It is
 /// appended **after** the deny subtraction and regardless of `inherit_defaults`, because the
 /// broker is engine plumbing the domain opted into by enabling `[agent.broker]`, not a built-in
@@ -59,7 +76,7 @@ pub fn resolve_endpoints(
     broker_endpoint: Option<&str>,
 ) -> Vec<String> {
     let merged = merge(inherited(cfg, defaults), &cfg.endpoints);
-    let mut out = subtract(merged, &cfg.deny_endpoints);
+    let mut out = subtract_endpoints(merged, &cfg.deny_endpoints);
     if let Some(ep) = broker_endpoint
         && !out.iter().any(|seen| seen == ep)
     {
@@ -94,13 +111,114 @@ fn merge(defaults: &[&str], extra: &[String]) -> Vec<String> {
     out
 }
 
-/// Drop any entry in `list` that exact-string-matches one in `deny`. No glob semantics: denying
-/// `"github.com:443:full"` does not touch `"*.github.com:443:full"`. A deny of an entry that
+/// Drop any entry in `list` that exact-string-matches one in `deny`. A deny of an entry that
 /// isn't present is a no-op.
 fn subtract(list: Vec<String>, deny: &[String]) -> Vec<String> {
     list.into_iter()
         .filter(|item| !deny.iter().any(|d| d == item))
         .collect()
+}
+
+/// Drop any endpoint in `list` that a `deny` entry covers, per the rule documented on
+/// [`resolve_endpoints`].
+fn subtract_endpoints(list: Vec<String>, deny: &[String]) -> Vec<String> {
+    list.into_iter()
+        .filter(|item| !deny.iter().any(|d| denies(d, item)))
+        .collect()
+}
+
+/// Whether the deny entry `deny` removes the allowlist entry `allow`.
+fn denies(deny: &str, allow: &str) -> bool {
+    match (Endpoint::parse(deny), Endpoint::parse(allow)) {
+        (Some(d), Some(a)) => d.port == a.port && d.covers_host_of(&a),
+        _ => deny == allow,
+    }
+}
+
+/// A deny entry that survived subtraction only because a broader allowlist entry still admits the
+/// host:port it names.
+pub struct ShadowedDeny {
+    pub deny: String,
+    pub allow: String,
+}
+
+/// Deny entries whose `host:port` a surviving `resolved` entry still admits, each paired with the
+/// entry that admits it. Non-empty only when the deny names something strictly narrower than a
+/// surviving wildcard (deny `api.github.com:443:full` against an allowed `*.github.com:443:full`),
+/// which subtraction cannot carve a hole in.
+pub fn shadowed_denies(resolved: &[String], deny: &[String]) -> Vec<ShadowedDeny> {
+    let mut out = Vec::new();
+    for d in deny {
+        let Some(dep) = Endpoint::parse(d) else {
+            continue;
+        };
+        for a in resolved {
+            let Some(aep) = Endpoint::parse(a) else {
+                continue;
+            };
+            if dep.port == aep.port && !dep.covers_host_of(&aep) && dep.overlaps_host_of(&aep) {
+                out.push(ShadowedDeny {
+                    deny: d.clone(),
+                    allow: a.clone(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The `host:port` prefix of an openshell `host:port:access[:proto[:enforcement]]` entry. The tail
+/// is dropped: a deny is about reachability of a host:port, at whatever access level.
+///
+/// Host comparisons go through openshell's own DNS-label matcher
+/// ([`openshell_core::host_pattern`]): `*` stays inside a label, `**` spans several.
+struct Endpoint<'a> {
+    host: &'a str,
+    port: &'a str,
+}
+
+impl<'a> Endpoint<'a> {
+    fn parse(entry: &'a str) -> Option<Self> {
+        let mut parts = entry.split(':');
+        let host = parts.next().filter(|h| !h.is_empty())?;
+        let port = parts.next().filter(|p| !p.is_empty())?;
+        Some(Self { host, port })
+    }
+
+    /// The host patterns a deny naming this endpoint denies: the host itself plus everything under
+    /// it, unless the host is already a wildcard, which names only what it matches.
+    fn denied_patterns(&self) -> Vec<String> {
+        if self.host.contains('*') {
+            vec![self.host.to_string()]
+        } else {
+            vec![self.host.to_string(), format!("**.{}", self.host)]
+        }
+    }
+
+    /// Whether every host `allow` admits is one this deny names, so the entry can be dropped whole.
+    /// A literal deny subsumes any pattern whose every match ends in `.<host>`, wildcard shapes
+    /// included; a wildcard deny drops a literal entry but never a wildcard one it does not spell
+    /// identically.
+    fn covers_host_of(&self, allow: &Endpoint<'_>) -> bool {
+        if self.host.eq_ignore_ascii_case(allow.host) {
+            return true;
+        }
+        if self.host.contains('*') {
+            return !allow.host.contains('*')
+                && openshell_core::host_pattern::host_matches(self.host, allow.host)
+                    .unwrap_or(false);
+        }
+        let suffix = format!(".{}", self.host.to_ascii_lowercase());
+        allow.host.len() > suffix.len() && allow.host.to_ascii_lowercase().ends_with(&suffix)
+    }
+
+    /// Whether `allow` admits any host this deny names, whether or not it can be dropped whole.
+    fn overlaps_host_of(&self, allow: &Endpoint<'_>) -> bool {
+        self.denied_patterns().iter().any(|pattern| {
+            openshell_core::host_pattern::host_patterns_overlap(pattern, allow.host)
+                .unwrap_or(false)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -290,24 +408,24 @@ mod tests {
 
     #[test]
     fn deny_beats_an_inherited_default() {
-        // Denying the apex only removes that one entry; the wildcard sibling is a separate
-        // default and survives (see `deny_is_exact_string_not_glob` and
-        // `deny_both_github_entries_seals_the_wildcard_too` for the actual GitHub seal).
+        // The contamination guard: denying the apex seals the domain, wildcard sibling included,
+        // so an in-loop agent cannot read the upstream fix off `api.github.com`.
         let c = OpenshellCfg {
             deny_endpoints: vec!["github.com:443:full".to_string()],
             ..OpenshellCfg::default()
         };
         let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, None);
-        assert!(!eps.contains(&"github.com:443:full".to_string()));
-        assert_eq!(eps.len(), DEFAULT_ENDPOINTS.len() - 1);
+        assert!(
+            !eps.iter().any(|e| e.contains("github.com")),
+            "apex deny must take the wildcard too: {eps:?}"
+        );
+        assert_eq!(eps.len(), DEFAULT_ENDPOINTS.len() - 2);
     }
 
     #[test]
-    fn deny_both_github_entries_seals_the_wildcard_too() {
-        // The contamination guard, done correctly: sealing GitHub without opting out of the
-        // rest of the built-in allowlist requires denying BOTH the apex and the wildcard, since
-        // `*.github.com:443:full` (a separate default) covers `api.github.com`, the host an
-        // in-loop agent would otherwise use to read the upstream fix off the REST API.
+    fn deny_both_github_entries_is_idempotent() {
+        // Listing both the apex and the wildcard must resolve to the same sealed allowlist
+        // rather than over-subtracting.
         let c = OpenshellCfg {
             deny_endpoints: vec![
                 "github.com:443:full".to_string(),
@@ -318,6 +436,118 @@ mod tests {
         let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, None);
         assert!(!eps.iter().any(|e| e.contains("github.com")));
         assert_eq!(eps.len(), DEFAULT_ENDPOINTS.len() - 2);
+    }
+
+    #[test]
+    fn deny_of_a_wildcard_leaves_the_apex() {
+        let c = OpenshellCfg {
+            deny_endpoints: vec!["*.github.com:443:full".to_string()],
+            ..OpenshellCfg::default()
+        };
+        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, None);
+        assert!(eps.contains(&"github.com:443:full".to_string()));
+        assert!(!eps.contains(&"*.github.com:443:full".to_string()));
+        assert!(
+            shadowed_denies(&eps, &c.deny_endpoints).is_empty(),
+            "the surviving apex does not admit any host `*.github.com` names: {eps:?}"
+        );
+    }
+
+    #[test]
+    fn deny_matches_at_any_access_level() {
+        let c = OpenshellCfg {
+            endpoints: vec!["registry.internal:443:read-write:rest".to_string()],
+            deny_endpoints: vec!["registry.internal:443:read-only".to_string()],
+            ..OpenshellCfg::default()
+        };
+        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, None);
+        assert!(!eps.iter().any(|e| e.starts_with("registry.internal:")));
+    }
+
+    #[test]
+    fn deny_is_port_exact() {
+        let c = OpenshellCfg {
+            endpoints: vec![
+                "registry.internal:8443:full".to_string(),
+                "*.registry.internal:8443:full".to_string(),
+                "registry.internal:443:full".to_string(),
+            ],
+            deny_endpoints: vec!["registry.internal:443:full".to_string()],
+            ..OpenshellCfg::default()
+        };
+        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, None);
+        assert!(eps.contains(&"registry.internal:8443:full".to_string()));
+        assert!(eps.contains(&"*.registry.internal:8443:full".to_string()));
+        assert!(!eps.contains(&"registry.internal:443:full".to_string()));
+    }
+
+    #[test]
+    fn deny_takes_a_deeper_host_but_not_a_sibling() {
+        let c = OpenshellCfg {
+            endpoints: vec![
+                "api.github.com:443:full".to_string(),
+                "raw.githubusercontent.com:443:full".to_string(),
+            ],
+            deny_endpoints: vec!["github.com:443:full".to_string()],
+            ..OpenshellCfg::default()
+        };
+        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, None);
+        assert!(!eps.contains(&"api.github.com:443:full".to_string()));
+        assert!(
+            eps.contains(&"raw.githubusercontent.com:443:full".to_string()),
+            "a host that merely shares a suffix substring is a different domain: {eps:?}"
+        );
+    }
+
+    #[test]
+    fn deny_host_matching_is_case_insensitive() {
+        let c = OpenshellCfg {
+            deny_endpoints: vec!["GitHub.COM:443:full".to_string()],
+            ..OpenshellCfg::default()
+        };
+        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, None);
+        assert!(!eps.iter().any(|e| e.to_lowercase().contains("github.com")));
+    }
+
+    #[test]
+    fn a_narrow_deny_is_reported_as_shadowed_not_honored() {
+        let c = OpenshellCfg {
+            deny_endpoints: vec!["api.github.com:443:full".to_string()],
+            ..OpenshellCfg::default()
+        };
+        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, None);
+        assert!(eps.contains(&"*.github.com:443:full".to_string()));
+        let shadowed = shadowed_denies(&eps, &c.deny_endpoints);
+        assert_eq!(shadowed.len(), 1);
+        assert_eq!(shadowed[0].deny, "api.github.com:443:full");
+        assert_eq!(shadowed[0].allow, "*.github.com:443:full");
+    }
+
+    #[test]
+    fn an_effective_deny_is_not_reported_as_shadowed() {
+        let c = OpenshellCfg {
+            deny_endpoints: vec!["github.com:443:full".to_string()],
+            ..OpenshellCfg::default()
+        };
+        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, None);
+        assert!(shadowed_denies(&eps, &c.deny_endpoints).is_empty());
+    }
+
+    #[test]
+    fn a_deny_shadowed_only_on_another_port_is_not_reported() {
+        let c = OpenshellCfg {
+            endpoints: vec!["*.registry.internal:8443:full".to_string()],
+            ..OpenshellCfg::default()
+        };
+        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, None);
+        assert!(
+            shadowed_denies(&eps, &["one.registry.internal:443:full".to_string()]).is_empty(),
+            "a :443 deny is not shadowed by an :8443 allow"
+        );
+        assert_eq!(
+            shadowed_denies(&eps, &["one.registry.internal:8443:full".to_string()]).len(),
+            1
+        );
     }
 
     #[test]
@@ -351,18 +581,6 @@ mod tests {
     }
 
     #[test]
-    fn deny_is_exact_string_not_glob() {
-        // Denying the apex entry must not touch the wildcard sibling, and vice versa.
-        let c = OpenshellCfg {
-            deny_endpoints: vec!["github.com:443:full".to_string()],
-            ..OpenshellCfg::default()
-        };
-        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, None);
-        assert!(!eps.contains(&"github.com:443:full".to_string()));
-        assert!(eps.contains(&"*.github.com:443:full".to_string()));
-    }
-
-    #[test]
     fn deny_beats_default_but_broker_endpoint_still_appended() {
         // deny_endpoints only subtracts from defaults/extras; the broker entry is appended
         // after, same as the existing opt-out behavior.
@@ -372,9 +590,9 @@ mod tests {
         };
         let ep = "host.containers.internal:8849:full";
         let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, Some(ep));
-        assert!(!eps.contains(&"github.com:443:full".to_string()));
+        assert!(!eps.iter().any(|e| e.contains("github.com")));
         assert_eq!(eps.last().unwrap(), ep);
-        assert_eq!(eps.len(), DEFAULT_ENDPOINTS.len());
+        assert_eq!(eps.len(), DEFAULT_ENDPOINTS.len() - 1);
     }
 
     #[test]

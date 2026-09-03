@@ -38,6 +38,10 @@ pub enum OpenshellCliError {
     LocatorOutsideConfigDir,
     #[error("Claude transcript path does not match the admitted session id")]
     TranscriptSessionMismatch,
+    #[error(
+        "workspace retrieval failed after bounded retry; sandbox '{sandbox}' was preserved for operator recovery: {detail}"
+    )]
+    WorkspaceRecovery { sandbox: String, detail: String },
 }
 use crucible_harness::OtelCollector;
 use std::sync::atomic::Ordering;
@@ -174,6 +178,12 @@ async fn try_turn(
     // end (including any `?` bail below).
     let cancel = CancellationToken::new();
     let _bridge = spawn_stop_bridge(cancel.clone());
+
+    // Env values and relay files are provisioned below, so the disclosure gate runs here, before
+    // the sandbox exists (RFC-0001:C-CAPABILITY-DISCLOSURE).
+    if let Some(covered) = &args.disclosure {
+        crate::exposure::refuse_uncovered(covered, &args.env, &args.relay)?;
+    }
 
     // The agent harness for this turn (claude default): argv grammar, env script, seed files,
     // stream decoder, and the post-turn transcript contract all come from here.
@@ -355,7 +365,7 @@ async fn try_turn(
     let meters = collector.as_ref().map(OtelCollector::meters);
 
     // Best-effort sandbox teardown from here on, so a mid-turn failure still cleans up.
-    let result = async {
+    let result: Result<f64> = async {
         // 4. Egress policy (deny-by-default; merge domain extras over the built-ins). The
         //    broker endpoint is auto-appended when the broker is enabled, and
         //    the collector's egress rule is appended when on.
@@ -578,12 +588,7 @@ async fn try_turn(
         // 9. Download the workspace back (the agent's edits round-trip to the host).
         stage(sink, "agent turn done — downloading the workspace");
         let sandbox_workdir = format!("{}/{basename}", SandboxLayout::HOME);
-        run_os(
-            &sandbox::download_args(&name, &sandbox_workdir, &ws),
-            "workdir download",
-            &cancel,
-        )
-        .await?;
+        retrieve_workspace(&name, &sandbox_workdir, p.workspace.as_path(), &cancel).await?;
 
         // Save the updated native transcript before telemetry parsing and teardown. It is private
         // 0600 runtime state, never appended to session.jsonl or published with the run record.
@@ -602,12 +607,18 @@ async fn try_turn(
     }
     .await;
 
-    // 10. Per-turn-fresh: delete the sandbox regardless of the turn's outcome. Clear the
-    //     turn-token too: an empty token means uncapped, so the engine's own post-turn broker
+    // 10. Per-turn-fresh: delete the sandbox unless it is the only workspace recovery copy.
+    //     Clear the turn-token too: an empty token means uncapped, so the engine's own post-turn broker
     //     calls (the gate's rungs) never inherit a turn budget the agent already spent.
-    let _ = gw.delete_sandbox(&name).await;
+    if !workspace_recovery_pending(&result) {
+        let _ = gw.delete_sandbox(&name).await;
+    }
     let _ = fs::write(forge::storage_root().join("turn-token"), "").await;
     result
+}
+
+fn workspace_recovery_pending(result: &Result<f64>) -> bool {
+    matches!(result, Err(e) if matches!(e.downcast_ref::<OpenshellCliError>(), Some(OpenshellCliError::WorkspaceRecovery { .. })))
 }
 
 /// Fetch the sandbox's recent supervisor log lines and replay every policy-denial through the
@@ -799,6 +810,70 @@ async fn run_os(args: &[String], label: &str, cancel: &CancellationToken) -> Res
             Ok(())
         }
     }
+}
+
+/// Download into an empty sibling directory, then atomically publish the complete candidate.
+/// This avoids tar hardlink collisions with pre-existing Cargo outputs and prevents a failed or
+/// interrupted transfer from exposing a half-synchronized workspace to the judge.
+async fn retrieve_workspace(
+    sandbox_name: &str,
+    remote: &str,
+    workspace: &std::path::Path,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    let parent = workspace.parent().context("workspace has no parent")?;
+    let mut last_error = None;
+    for attempt in 1..=2 {
+        let staged = tempfile::Builder::new()
+            .prefix(".crucible-retrieval-")
+            .tempdir_in(parent)
+            .context("creating workspace retrieval staging directory")?;
+        match run_os(
+            &sandbox::download_args(sandbox_name, remote, &staged.path().to_string_lossy()),
+            "workdir download",
+            cancel,
+        )
+        .await
+        {
+            Ok(()) => {
+                return publish_workspace(staged.path(), workspace)
+                    .await
+                    .map_err(|e| OpenshellCliError::WorkspaceRecovery {
+                        sandbox: sandbox_name.to_string(),
+                        detail: format!("atomic publication: {e:#}"),
+                    })
+                    .map_err(Into::into);
+            }
+            Err(e) => last_error = Some(format!("attempt {attempt}: {e:#}")),
+        }
+    }
+    Err(OpenshellCliError::WorkspaceRecovery {
+        sandbox: sandbox_name.to_string(),
+        detail: last_error.unwrap_or_else(|| "download did not run".to_string()),
+    }
+    .into())
+}
+
+async fn publish_workspace(staged: &std::path::Path, workspace: &std::path::Path) -> Result<()> {
+    let parent = workspace.parent().context("workspace has no parent")?;
+    let backup = parent.join(format!(
+        ".crucible-replaced-{}",
+        uuid::Uuid::now_v7().simple()
+    ));
+    fs::rename(workspace, &backup)
+        .await
+        .context("moving the previous workspace aside")?;
+    if let Err(e) = fs::rename(staged, workspace).await {
+        let rollback = fs::rename(&backup, workspace).await;
+        return Err(e).context(match rollback {
+            Ok(()) => "publishing retrieved workspace (previous workspace restored)".to_string(),
+            Err(r) => format!("publishing retrieved workspace; rollback also failed: {r}"),
+        });
+    }
+    if let Err(e) = fs::remove_dir_all(&backup).await {
+        tracing::warn!(path = %backup.display(), error = %e, "retrieved workspace published; old workspace cleanup deferred");
+    }
+    Ok(())
 }
 
 /// The Vertex project + region for the provider config, read from the manifest env,
@@ -1316,5 +1391,44 @@ mod tests {
         assert!(!tp.exists(), "stale traceparent cleared");
         assert!(!ts.exists());
         let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn staged_publication_replaces_a_colliding_cargo_hardlink_tree_atomically() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("candidate");
+        let staged = root.path().join("staged");
+        fs::create_dir_all(workspace.join("target/debug/build/pkg/out"))
+            .await
+            .unwrap();
+        fs::create_dir_all(staged.join("target/debug/build/pkg/out"))
+            .await
+            .unwrap();
+        let collision = "target/debug/build/pkg/out/build-script-build";
+        fs::write(workspace.join(collision), b"stale host output")
+            .await
+            .unwrap();
+        let staged_source = staged.join("target/debug/build/pkg/out/build-script-source");
+        fs::write(&staged_source, b"paid candidate output")
+            .await
+            .unwrap();
+        fs::hard_link(&staged_source, staged.join(collision))
+            .await
+            .unwrap();
+        fs::write(staged.join("agent-edit.rs"), b"complete edit")
+            .await
+            .unwrap();
+
+        publish_workspace(&staged, &workspace).await.unwrap();
+
+        assert_eq!(
+            fs::read(workspace.join(collision)).await.unwrap(),
+            b"paid candidate output"
+        );
+        assert_eq!(
+            fs::read(workspace.join("agent-edit.rs")).await.unwrap(),
+            b"complete edit"
+        );
+        assert!(!staged.exists());
     }
 }

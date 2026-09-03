@@ -56,7 +56,7 @@ impl ShellRunner {
     fn run_in_workdir(&mut self, task: &Task, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").current_dir(&self.workdir);
-        cmd.env("CRUCIBLE_TASK", &task.name.0);
+        cmd.env(crate::plan::TASK_NAME_ENV, &task.name.0);
         match serde_json::to_string(inputs) {
             Ok(json) => {
                 cmd.env("CRUCIBLE_INPUTS", json);
@@ -92,6 +92,21 @@ impl ShellRunner {
                 if let Some(e) = effort {
                     cmd.env("CRUCIBLE_EFFORT", e);
                 }
+            }
+            TaskKind::Report { template, .. } => {
+                return match crucible_broker::report::deliver(Some(template)) {
+                    Ok(output) => Attempt {
+                        outcome: AttemptOutcome::Pass(
+                            serde_json::from_str(&output).unwrap_or_else(|_| {
+                                serde_json::json!({
+                                    "status": "delivered"
+                                })
+                            }),
+                        ),
+                        cost_usd: 0.0,
+                    },
+                    Err(error) => fail(error),
+                };
             }
             TaskKind::TopK { .. } => {
                 // The executor owns reducers; reaching the runner is an executor bug.

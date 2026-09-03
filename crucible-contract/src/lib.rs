@@ -13,8 +13,18 @@ pub mod event;
 pub mod identity;
 pub mod json;
 pub mod markers;
+pub mod outputs;
+pub mod report;
 pub mod session;
 pub mod tier;
+
+/// The controller/engine contract version, as semver. Bump it on any change to a typed document
+/// that crosses the controller/engine boundary: the termination envelope, the ingest bodies, the
+/// admission and session wire types, the identity digests. The engine prints it via
+/// `crucible --contract-version` and the runtime image carries it as the
+/// `io.crucible.contract-version` OCI label, so a deployed image can be matched against the
+/// controller it talks to without a probe.
+pub const CONTRACT_VERSION: &str = "1.2.0";
 
 pub use admission::{
     ADMISSION_WIRE_VERSION, AdmissionEvent, AdmissionKey, AdmissionOutcome, AdmittedInput,
@@ -33,5 +43,10 @@ pub use markers::{
     RANK_ACTIVITY_MARKER, RUN_SESSION_DELIMITER, SCOPE_ACTIVITY_MARKER, SCOPE_PACK_MARKER,
     SCOPE_PROGRESS_MARKER, SCOPE_REPORT_MARKER, SCOPE_TRANSCRIPT_MARKER, VERDICT_MARKER,
 };
+pub use outputs::{
+    BoundSource, BoundViolation, ENV_OUTPUT_PARAMS, ENV_OUTPUTS, ENV_SESSION_LOG,
+    OUTPUTS_WIRE_VERSION, OpenScope, OutputKind, ResolvedOutput, ResolvedOutputs, ResolvedTarget,
+};
+pub use report::{REPORT_FILE, RunReport, TaskReport};
 pub use session::{PrLinkWire, RowWire, SessionEvent, WIRE_VERSION, decode, encode};
 pub use tier::{Disposition, Tier, TierParseError};

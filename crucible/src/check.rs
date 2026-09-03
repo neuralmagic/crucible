@@ -6,6 +6,7 @@
 
 use crate::command_judge::Direction;
 use crate::manifest::{self, AgentCfg, CompositeManifest, Manifest, WorldCfg};
+use crate::openshell;
 use crate::selftest::{self, SelftestReport};
 use anyhow::Result;
 use std::path::{Path, PathBuf};
@@ -25,6 +26,9 @@ pub struct CheckOutcome {
     /// The tail of `measure_cmd`'s stderr from the contract probe (bounded), so a `Contract`
     /// failure can quote why the gate blew up.
     pub measure_stderr_tail: Vec<String>,
+    /// The resolved output bounds and capability disclosure, rendered for a human. Present on the
+    /// parse-only path too, since computing it executes no pack content.
+    pub exposure: Vec<String>,
 }
 
 /// How many trailing stderr lines the contract probe keeps for evidence.
@@ -60,15 +64,18 @@ pub fn run(manifest_path: &Path) -> Result<CheckOutcome> {
 pub fn run_parse_only(manifest_path: &Path) -> Result<CheckOutcome> {
     let result = if manifest::is_composite(manifest_path) {
         CompositeManifest::load(manifest_path)
-            .map(|_| ())
+            .map(|m| crate::exposure::render(&crate::exposure::compute_composite(&m)))
             .map_err(|e| format!("composite manifest parse failed: {e:#}"))
     } else {
         Manifest::load(manifest_path)
-            .map(|_| ())
+            .map(|m| crate::exposure::render(&crate::exposure::compute(&m, None)))
             .map_err(|e| format!("manifest parse failed: {e:#}"))
     };
     Ok(match result {
-        Ok(()) => CheckOutcome::default(),
+        Ok(exposure) => CheckOutcome {
+            exposure,
+            ..CheckOutcome::default()
+        },
         Err(msg) => CheckOutcome::fail(msg),
     })
 }
@@ -138,6 +145,27 @@ fn manifest_dir_of(manifest_path: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// One warning naming every `[agent].env` credential with no `[[capabilities.secret]]` entry
+/// stating its reach (RFC-0001:C-CAPABILITY-DISCLOSURE). A warning, not a finding.
+fn undeclared_credential_warnings(m: &Manifest) -> Vec<String> {
+    let undeclared: Vec<&str> = m
+        .agent
+        .env
+        .keys()
+        .filter(|name| m.capabilities.secret_named(name).is_none())
+        .map(String::as_str)
+        .collect();
+    if undeclared.is_empty() {
+        return Vec::new();
+    }
+    vec![format!(
+        "[agent].env delivers {} into the sandbox with no [[capabilities.secret]] stating what \
+         they authorize: {}",
+        undeclared.len(),
+        undeclared.join(", ")
+    )]
+}
+
 fn check_single(manifest_path: &Path) -> Result<CheckOutcome> {
     let m = match Manifest::load_frozen(manifest_path) {
         Ok(m) => m,
@@ -146,7 +174,12 @@ fn check_single(manifest_path: &Path) -> Result<CheckOutcome> {
     let manifest_dir = manifest_dir_of(manifest_path);
     let workspace = manifest_dir.join(&m.workspace.dir);
 
-    let mut out = CheckOutcome::default();
+    let mut out = CheckOutcome {
+        exposure: crate::exposure::render(&crate::exposure::compute(&m, None)),
+        ..CheckOutcome::default()
+    };
+    out.warnings.extend(undeclared_credential_warnings(&m));
+    out.warnings.extend(shadowed_deny_warnings(&m.agent));
     check_referenced_files(&m, &manifest_dir, &mut out);
     if !out.ok() {
         // Missing goal/prompt/inject files means the run would fail before ever measuring,
@@ -229,6 +262,25 @@ fn check_single(manifest_path: &Path) -> Result<CheckOutcome> {
     Ok(out)
 }
 
+/// One warning per `[agent.openshell].deny_endpoints` entry the resolved allowlist still admits:
+/// a deny narrower than a surviving wildcard cannot be subtracted from it, so the host stays
+/// reachable.
+fn shadowed_deny_warnings(agent: &AgentCfg) -> Vec<String> {
+    let cfg = &agent.openshell;
+    let defaults = agent.harness.default_endpoints();
+    let resolved = openshell::policy::resolve_endpoints(cfg, &defaults, None);
+    openshell::policy::shadowed_denies(&resolved, &cfg.deny_endpoints)
+        .into_iter()
+        .map(|s| {
+            format!(
+                "[agent.openshell] deny_endpoints \"{}\" has no effect: the allowlist entry \"{}\" \
+                 still admits it — deny that entry instead, or drop it from endpoints",
+                s.deny, s.allow
+            )
+        })
+        .collect()
+}
+
 /// `[[workspace.inject]]` entries with `frozen = true`, resolved to absolute `(src, dst)`, the
 /// same set [`crate::command_judge::CommandJudge`] re-establishes before every scored measure.
 fn frozen_injects(m: &Manifest, manifest_dir: &Path, workspace: &Path) -> Vec<(PathBuf, PathBuf)> {
@@ -288,7 +340,11 @@ fn check_composite(manifest_path: &Path) -> Result<CheckOutcome> {
     };
     let manifest_dir = manifest_dir_of(manifest_path);
 
-    let mut out = CheckOutcome::default();
+    let mut out = CheckOutcome {
+        exposure: crate::exposure::render(&crate::exposure::compute_composite(&m)),
+        ..CheckOutcome::default()
+    };
+    out.warnings.extend(shadowed_deny_warnings(&m.agent));
     if let Some(f) = &m.agent.goal_file {
         check_file_exists("[agent].goal_file", &manifest_dir, f, &mut out);
     }
@@ -1061,5 +1117,91 @@ dst = "traces/median_block.txt"
             outcome.findings
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_only_prints_the_exposure_for_a_single_and_a_composite_manifest() {
+        let dir = tempdir("parse-only-exposure");
+        scaffold_domain(&dir, "#!/bin/sh\nexit 1\n");
+        let outcome = run_parse_only(&dir.join(MANIFEST)).expect("check runs");
+        let text = outcome.exposure.join("\n");
+        assert!(text.contains("output bounds:"), "{text}");
+        assert!(text.contains("capability disclosure:"), "{text}");
+
+        let composite = dir.join("composite.toml");
+        fs::write(
+            &composite,
+            r#"
+            [composite]
+            name = "pair"
+            [agent]
+            backend = "openshell"
+            goal = "g"
+            [judge]
+            measure_cmd = "m"
+            direction = "higher"
+            [[component]]
+            domain = "alpha"
+            [[component]]
+            domain = "beta"
+            [outputs.image-push]
+            count = 5
+            target = { fixed = "quay.io/aipcc" }
+            "#,
+        )
+        .unwrap();
+        let outcome = run_parse_only(&composite).expect("check runs");
+        assert!(outcome.ok(), "findings: {:?}", outcome.findings);
+        let text = outcome.exposure.join("\n");
+        assert!(
+            text.contains("image-push") && text.contains("quay.io/aipcc"),
+            "a composite's declared bounds are printed too: {text}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn manifest_with_denies(deny_endpoints: &str) -> Manifest {
+        let src = format!(
+            r#"
+            [repo]
+            path = "."
+            [judge]
+            measure_cmd = "m"
+            direction = "higher"
+            [agent]
+            backend = "openshell"
+            goal = "g"
+            [agent.openshell]
+            deny_endpoints = [{deny_endpoints}]
+            "#
+        );
+        toml::from_str(&src).expect("manifest parses")
+    }
+
+    #[test]
+    fn a_deny_shadowed_by_a_wildcard_warns() {
+        let m = manifest_with_denies(r#""api.github.com:443:full""#);
+        let warnings = shadowed_deny_warnings(&m.agent);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("api.github.com:443:full")
+                && warnings[0].contains("*.github.com:443:full"),
+            "the warning names both entries: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn an_effective_deny_does_not_warn() {
+        let m = manifest_with_denies(r#""github.com:443:full""#);
+        assert!(shadowed_deny_warnings(&m.agent).is_empty());
+    }
+
+    #[test]
+    fn a_deny_on_another_port_does_not_warn() {
+        let m = manifest_with_denies(r#""api.github.com:8443:full""#);
+        assert!(
+            shadowed_deny_warnings(&m.agent).is_empty(),
+            "the :443 wildcard does not admit an :8443 deny"
+        );
     }
 }

@@ -165,6 +165,8 @@ pub enum WorkflowError {
     PlaybookEngineTask { task: String, op: EngineOp },
     #[error("engine task {task:?} cannot run in the epilogue (the loop is over)")]
     EngineTaskInEpilogue { task: String },
+    #[error("report task {task:?} must run in the epilogue")]
+    ReportOutsideEpilogue { task: String },
     #[error("epilogue task name {KEPT_INPUT:?} is reserved for the kept-candidate input")]
     ReservedEpilogueName,
     #[error(
@@ -244,6 +246,17 @@ impl WorkflowCfg {
         self.resolved_from.is_some()
     }
 
+    /// True when the graph carries a task that runs outside the sandbox. An unresolved graph
+    /// counts as carrying one: what a source compiles to is not known until it compiles, and
+    /// under-disclosing reach is the worse error.
+    pub fn runs_host_commands(&self) -> bool {
+        self.is_unresolved()
+            || self
+                .tasks
+                .iter()
+                .any(|t| matches!(t.task, TaskKind::Command { .. } | TaskKind::Evaluate { .. }))
+    }
+
     /// Validate structure and type-specific invariants, without granting authority.
     pub fn validate(&self) -> Result<(), WorkflowError> {
         if let Some(file) = &self.file {
@@ -276,6 +289,11 @@ impl WorkflowCfg {
         // A measurement source may feed only one decision.
         let mut decided_sources: BTreeMap<&TaskName, &TaskName> = BTreeMap::new();
         for task in &self.tasks {
+            if matches!(task.task, TaskKind::Report { .. }) && task.stage != Stage::Epilogue {
+                return Err(WorkflowError::ReportOutsideEpilogue {
+                    task: task.name.0.clone(),
+                });
+            }
             if let TaskKind::Engine {
                 op,
                 source,
