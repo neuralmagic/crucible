@@ -1,0 +1,29 @@
+# The smallest ticket-driven pack: one Jira key in, one brief out. What a tracker watch
+# fires per matching ticket, and what a one-shot or a manual launch fires for one key. Nothing
+# reaches the network; the ticket key is the whole input, so the run is cheap and deterministic
+# enough to fire on every ticket that matches a query.
+[repo]
+path = "."
+
+[workspace]
+dir = "workspace"
+setup_cmd = "mkdir -p workspace && cp report.py workspace/ && git -C workspace init -q && git -C workspace add -A && git -C workspace -c user.email=crucible@local -c user.name=crucible -c commit.gpgsign=false commit -qm baseline"
+
+[[workspace.inject]]
+src = "report.py"
+dst = "report.py"
+frozen = true
+
+[agent]
+backend = "openshell"
+harness = "claude"
+model = "claude-opus-4-6"
+# sandbox-triage-cc (images/matrix.toml in crucible-domains): claude-code on the base substrate;
+# the turn needs no network, so no egress is named.
+sandbox_image = "ghcr.io/neuralmagic/sandbox-triage-cc:latest"
+goal = "Write a one-page brief for the ticket you were handed."
+
+# Compiled per run from workflow.star, which declares params.
+[workflow]
+type = "playbook"
+file = "workflow.star"
