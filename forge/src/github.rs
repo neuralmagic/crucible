@@ -29,7 +29,8 @@ use crate::build::BuildSuccess;
 use crate::oci::{self, RETRY_DELAYS, with_retry};
 use crate::spec::{CorrelationSource, DigestKind, DigestSource};
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -41,6 +42,26 @@ type Result<T> = std::result::Result<T, GithubError>;
 pub enum GithubError {
     #[error("github repo {repo:?} must be \"owner/repo\"")]
     MalformedRepo { repo: String },
+    #[error(
+        "${ALLOWED_ORGS_ENV} entry {entry:?} is not a github owner \
+         ([A-Za-z0-9-], no \"/\")"
+    )]
+    MalformedAllowedOrg { entry: String },
+    #[error(
+        "github dispatch target {repo:?} refused: the operator org allowlist \
+         ${ALLOWED_ORGS_ENV} is unset or empty, so no dispatch target is permitted — set it to \
+         the comma-separated owners this engine may dispatch to"
+    )]
+    EmptyOrgAllowlist { repo: String },
+    #[error(
+        "github dispatch target {repo:?} refused: owner {owner:?} is outside the operator org \
+         allowlist ${ALLOWED_ORGS_ENV} = [{allowed}]"
+    )]
+    OrgNotAllowed {
+        repo: String,
+        owner: String,
+        allowed: String,
+    },
     #[error(
         "github workflow {workflow:?} must be a workflow filename like \"crucible-build.yml\" \
          ([A-Za-z0-9._-]+.ya?ml, no path separators or \"..\")"
@@ -180,6 +201,10 @@ impl GithubError {
     }
 }
 
+/// Operator configuration naming the github owners this engine may dispatch a `workflow_dispatch`
+/// build to, comma- or whitespace-separated.
+pub const ALLOWED_ORGS_ENV: &str = "FORGE_GITHUB_ALLOWED_ORGS";
+
 const GITHUB_API: &str = "https://api.github.com";
 /// The pinned REST API version header GitHub asks every request to send.
 const API_VERSION: &str = "2022-11-28";
@@ -209,8 +234,8 @@ const ERR_BODY_CHARS: usize = 500;
 pub struct GithubBuildRequest {
     /// The `[build.<name>]` name, for messages only.
     pub name: String,
-    /// `owner/repo` holding the build workflow.
-    pub repo: String,
+    /// The allowlist-cleared `owner/repo` holding the build workflow.
+    pub repo: RepoTarget,
     /// The workflow file to dispatch (e.g. `crucible-build.yml`), resolved under `.github/workflows/`.
     pub workflow: String,
     /// The git ref to dispatch against (branch, tag, or SHA).
@@ -249,7 +274,6 @@ pub fn dispatch_github(
     token: &str,
     authfile: Option<&Path>,
 ) -> Result<BuildSuccess> {
-    ensure_repo(&req.repo)?;
     ensure_workflow_filename(&req.workflow)?;
     // Reject an unsupported digest source BEFORE dispatching, so we never waste a whole build only to
     // bail at digest resolution (and never wedge an M1 deployment slot on it).
@@ -383,17 +407,16 @@ async fn poll_run(
 /// manifest's declared `mapped` input mapping against them. This is validation of a human-declared
 /// mapping; it never invents mappings. The `crucible build --check` path runs exactly this.
 fn validate_workflow(
-    repo: &str,
+    repo: &RepoTarget,
     workflow: &str,
     git_ref: &str,
     mapped: &BTreeMap<String, String>,
     token: &str,
 ) -> Result<MappingReport> {
-    ensure_repo(repo)?;
     ensure_workflow_filename(workflow)?;
     let yaml = fetch_workflow_content(repo, workflow, git_ref, token)?;
     let inputs = parse_workflow_inputs(&yaml).map_err(|source| GithubError::Introspecting {
-        repo: repo.to_owned(),
+        repo: repo.to_string(),
         workflow: workflow.to_owned(),
         git_ref: git_ref.to_owned(),
         source: Box::new(source),
@@ -404,7 +427,7 @@ fn validate_workflow(
 /// Run [`validate_workflow`], print any warnings to stderr, and fail on any error. Both the `--check`
 /// path and the pre-dispatch preflight call this so a mis-wired manifest never reaches a dispatch.
 pub fn preflight_workflow(
-    repo: &str,
+    repo: &RepoTarget,
     workflow: &str,
     git_ref: &str,
     mapped: &BTreeMap<String, String>,
@@ -421,7 +444,7 @@ pub fn preflight_workflow(
     }
     if !report.errors.is_empty() {
         return Err(GithubError::InputValidation {
-            repo: repo.to_owned(),
+            repo: repo.to_string(),
             workflow: workflow.to_owned(),
             git_ref: git_ref.to_owned(),
             errors: report.errors,
@@ -610,16 +633,98 @@ enum RunOutcome {
     Failure(String),
 }
 
-/// `owner/repo` sanity check: exactly one slash, both halves non-empty. A malformed repo would
-/// silently build a wrong URL otherwise.
-fn ensure_repo(repo: &str) -> Result<()> {
-    match repo.split_once('/') {
-        Some((owner, name)) if !owner.is_empty() && !name.is_empty() && !name.contains('/') => {
-            Ok(())
+/// A dispatch target that has cleared the operator org allowlist. [`OrgAllowlist::authorize`] is the
+/// only constructor, so a repository string taken from a pack manifest cannot reach a GitHub call
+/// without having been checked against operator configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoTarget {
+    owner: String,
+    name: String,
+}
+
+impl RepoTarget {
+    /// `owner/repo` sanity check: exactly one slash, both halves non-empty. A malformed repo would
+    /// silently build a wrong URL otherwise.
+    fn parse(repo: &str) -> Result<Self> {
+        match repo.split_once('/') {
+            Some((owner, name)) if !owner.is_empty() && !name.is_empty() && !name.contains('/') => {
+                Ok(RepoTarget {
+                    owner: owner.to_owned(),
+                    name: name.to_owned(),
+                })
+            }
+            _ => Err(GithubError::MalformedRepo {
+                repo: repo.to_owned(),
+            }),
         }
-        _ => Err(GithubError::MalformedRepo {
-            repo: repo.to_owned(),
-        }),
+    }
+}
+
+impl fmt::Display for RepoTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.owner, self.name)
+    }
+}
+
+/// The operator-configured set of github owners a `workflow_dispatch` build may target. Read from
+/// `$FORGE_GITHUB_ALLOWED_ORGS`; no manifest field feeds it, so a pack cannot widen its own reach.
+/// An empty set permits nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OrgAllowlist {
+    owners: BTreeSet<String>,
+}
+
+impl OrgAllowlist {
+    /// Read the allowlist from operator configuration. An unset or empty variable yields the empty
+    /// allowlist, which [`OrgAllowlist::authorize`] refuses every target against.
+    pub fn from_env() -> Result<Self> {
+        match std::env::var(ALLOWED_ORGS_ENV) {
+            Ok(raw) => Self::parse(&raw),
+            Err(_) => Ok(Self::default()),
+        }
+    }
+
+    /// Parse a comma- or whitespace-separated owner list. Owners are matched case-insensitively, as
+    /// github logins are.
+    pub fn parse(raw: &str) -> Result<Self> {
+        let mut owners = BTreeSet::new();
+        for entry in raw.split([',', ' ', '\t', '\n', '\r']) {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            if !entry.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+                return Err(GithubError::MalformedAllowedOrg {
+                    entry: entry.to_owned(),
+                });
+            }
+            owners.insert(entry.to_ascii_lowercase());
+        }
+        Ok(OrgAllowlist { owners })
+    }
+
+    /// The configured owners, comma-separated, for messages.
+    fn rendered(&self) -> String {
+        self.owners.iter().cloned().collect::<Vec<_>>().join(", ")
+    }
+
+    /// Parse `repo` and check its owner against the allowlist. The refusal names the repository and
+    /// the allowlist it failed.
+    pub fn authorize(&self, repo: &str) -> Result<RepoTarget> {
+        let target = RepoTarget::parse(repo)?;
+        if self.owners.is_empty() {
+            return Err(GithubError::EmptyOrgAllowlist {
+                repo: target.to_string(),
+            });
+        }
+        if !self.owners.contains(&target.owner.to_ascii_lowercase()) {
+            return Err(GithubError::OrgNotAllowed {
+                repo: target.to_string(),
+                owner: target.owner.clone(),
+                allowed: self.rendered(),
+            });
+        }
+        Ok(target)
     }
 }
 
@@ -668,16 +773,16 @@ fn ensure_digest_supported(name: &str, digest: &DigestSource) -> Result<()> {
     }
 }
 
-fn dispatch_url(repo: &str, workflow: &str) -> String {
+fn dispatch_url(repo: &RepoTarget, workflow: &str) -> String {
     format!("{GITHUB_API}/repos/{repo}/actions/workflows/{workflow}/dispatches")
 }
-fn workflow_runs_url(repo: &str, workflow: &str) -> String {
+fn workflow_runs_url(repo: &RepoTarget, workflow: &str) -> String {
     format!("{GITHUB_API}/repos/{repo}/actions/workflows/{workflow}/runs")
 }
-fn run_url(repo: &str, run_id: u64) -> String {
+fn run_url(repo: &RepoTarget, run_id: u64) -> String {
     format!("{GITHUB_API}/repos/{repo}/actions/runs/{run_id}")
 }
-fn contents_url(repo: &str, workflow: &str) -> String {
+fn contents_url(repo: &RepoTarget, workflow: &str) -> String {
     format!("{GITHUB_API}/repos/{repo}/contents/.github/workflows/{workflow}")
 }
 
@@ -755,7 +860,7 @@ async fn post_dispatch(
 
 async fn list_workflow_runs(
     client: &reqwest::Client,
-    repo: &str,
+    repo: &RepoTarget,
     workflow: &str,
     token: &str,
 ) -> Result<Vec<WorkflowRun>> {
@@ -775,7 +880,7 @@ async fn list_workflow_runs(
 
 async fn get_run(
     client: &reqwest::Client,
-    repo: &str,
+    repo: &RepoTarget,
     run_id: u64,
     token: &str,
 ) -> Result<WorkflowRun> {
@@ -793,7 +898,7 @@ async fn get_run(
 /// Blocking fetch of a workflow file's raw text via the contents API (its own runtime; called only
 /// from the sync `--check`/preflight path, never inside the dispatch runtime).
 fn fetch_workflow_content(
-    repo: &str,
+    repo: &RepoTarget,
     workflow: &str,
     git_ref: &str,
     token: &str,
@@ -818,7 +923,7 @@ fn fetch_workflow_content(
             .map_err(GithubError::http("fetching the workflow file"))?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(GithubError::WorkflowNotFound {
-                repo: repo.to_owned(),
+                repo: repo.to_string(),
                 workflow: workflow.to_owned(),
                 git_ref: git_ref.to_owned(),
             });
@@ -832,7 +937,7 @@ fn fetch_workflow_content(
             && len > MAX_WORKFLOW_BYTES
         {
             return Err(GithubError::WorkflowTooLarge {
-                repo: repo.to_owned(),
+                repo: repo.to_string(),
                 workflow: workflow.to_owned(),
                 len,
             });
@@ -845,7 +950,7 @@ fn fetch_workflow_content(
         {
             if buf.len() as u64 + chunk.len() as u64 > MAX_WORKFLOW_BYTES {
                 return Err(GithubError::WorkflowBodyOverCap {
-                    repo: repo.to_owned(),
+                    repo: repo.to_string(),
                     workflow: workflow.to_owned(),
                 });
             }
@@ -875,7 +980,7 @@ fn truncate(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::github::*;
 
     /// The real contract-v1 workflow. Introspection tests parse THIS file so the contract can't drift
     /// out from under the backend.
@@ -1094,30 +1199,99 @@ on:
     }
 
     #[test]
-    fn ensure_repo_requires_owner_and_name() {
-        assert!(ensure_repo("neuralmagic/crucible").is_ok());
-        assert!(ensure_repo("crucible").is_err());
-        assert!(ensure_repo("/crucible").is_err());
-        assert!(ensure_repo("neuralmagic/").is_err());
-        assert!(ensure_repo("a/b/c").is_err());
+    fn repo_target_requires_owner_and_name() {
+        let t = RepoTarget::parse("neuralmagic/crucible").unwrap();
+        assert_eq!(
+            (t.owner.as_str(), t.name.as_str()),
+            ("neuralmagic", "crucible")
+        );
+        assert_eq!(t.to_string(), "neuralmagic/crucible");
+        for bad in ["crucible", "/crucible", "neuralmagic/", "a/b/c", ""] {
+            assert!(RepoTarget::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn allowlist_refuses_an_out_of_allowlist_target() {
+        let allowlist = OrgAllowlist::parse("neuralmagic, vllm-project").unwrap();
+        let err = allowlist.authorize("attacker/exfil").unwrap_err();
+        assert!(
+            matches!(&err, GithubError::OrgNotAllowed { repo, owner, .. }
+                if repo == "attacker/exfil" && owner == "attacker"),
+            "{err:?}"
+        );
+        let rendered = err.to_string();
+        assert!(rendered.contains("attacker/exfil"), "{rendered}");
+        assert!(rendered.contains("neuralmagic, vllm-project"), "{rendered}");
+        assert!(rendered.contains(ALLOWED_ORGS_ENV), "{rendered}");
+    }
+
+    #[test]
+    fn allowlist_admits_a_configured_owner_case_insensitively() {
+        let allowlist = OrgAllowlist::parse("neuralmagic\nvllm-project").unwrap();
+        assert_eq!(
+            allowlist.authorize("NeuralMagic/crucible").unwrap(),
+            RepoTarget {
+                owner: "NeuralMagic".into(),
+                name: "crucible".into(),
+            }
+        );
+        let cleared = allowlist.authorize("vllm-project/vllm").unwrap();
+        assert_eq!(
+            dispatch_url(&cleared, "crucible-build.yml"),
+            "https://api.github.com/repos/vllm-project/vllm/actions/workflows/crucible-build.yml/dispatches"
+        );
+    }
+
+    #[test]
+    fn an_unset_or_empty_allowlist_permits_nothing() {
+        for raw in ["", "   ", ",,"] {
+            let allowlist = OrgAllowlist::parse(raw).unwrap();
+            assert!(allowlist.owners.is_empty(), "{raw:?}");
+            let err = allowlist.authorize("neuralmagic/crucible").unwrap_err();
+            assert!(
+                matches!(&err, GithubError::EmptyOrgAllowlist { repo } if repo == "neuralmagic/crucible"),
+                "{err:?}"
+            );
+            let rendered = err.to_string();
+            assert!(rendered.contains("neuralmagic/crucible"), "{rendered}");
+            assert!(rendered.contains(ALLOWED_ORGS_ENV), "{rendered}");
+        }
+        assert!(
+            OrgAllowlist::default()
+                .authorize("neuralmagic/crucible")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn allowlist_rejects_entries_that_are_not_owners() {
+        for bad in ["neuralmagic/crucible", "org*", "https://github.com/org"] {
+            let err = OrgAllowlist::parse(bad).unwrap_err();
+            assert!(
+                matches!(&err, GithubError::MalformedAllowedOrg { entry } if entry == bad),
+                "{err:?}"
+            );
+        }
     }
 
     #[test]
     fn urls_are_constructed_per_the_rest_api() {
+        let repo = RepoTarget::parse("neuralmagic/crucible").unwrap();
         assert_eq!(
-            dispatch_url("neuralmagic/crucible", "crucible-build.yml"),
+            dispatch_url(&repo, "crucible-build.yml"),
             "https://api.github.com/repos/neuralmagic/crucible/actions/workflows/crucible-build.yml/dispatches"
         );
         assert_eq!(
-            workflow_runs_url("neuralmagic/crucible", "crucible-build.yml"),
+            workflow_runs_url(&repo, "crucible-build.yml"),
             "https://api.github.com/repos/neuralmagic/crucible/actions/workflows/crucible-build.yml/runs"
         );
         assert_eq!(
-            run_url("neuralmagic/crucible", 42),
+            run_url(&repo, 42),
             "https://api.github.com/repos/neuralmagic/crucible/actions/runs/42"
         );
         assert_eq!(
-            contents_url("neuralmagic/crucible", "crucible-build.yml"),
+            contents_url(&repo, "crucible-build.yml"),
             "https://api.github.com/repos/neuralmagic/crucible/contents/.github/workflows/crucible-build.yml"
         );
     }

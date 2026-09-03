@@ -4,10 +4,12 @@
 
 mod backend;
 mod broker;
+mod capability;
 mod deploy;
 mod judge;
 mod measure;
 mod openshell;
+pub mod outputs;
 mod preflight;
 mod relay;
 mod search;
@@ -19,10 +21,12 @@ mod world;
 
 pub use backend::{AgentBackend, UnknownBackend};
 pub use broker::{BrokerCfg, broker_endpoint_from_url, broker_port, resolve_broker_url};
+pub use capability::{CapabilitiesCfg, CredentialContext};
 pub use deploy::DeployCfg;
 pub use judge::JudgeCfg;
 pub use measure::MeasureCfg;
 pub use openshell::OpenshellCfg;
+pub use outputs::OutputsCfg;
 pub use preflight::{MODE_PLACEHOLDER, PreflightCfg};
 pub use relay::RelayFile;
 pub use search::SearchCfg;
@@ -267,6 +271,13 @@ pub struct Manifest {
     /// the name per scope, and a launch it cannot bind is refused before a pod exists.
     #[serde(default, rename = "secret")]
     pub secrets: Vec<SecretDecl>,
+    /// Declared bounds on the run's mediated writes. Every vocabulary kind the table leaves out
+    /// resolves to the engine default (see [`outputs`]).
+    #[serde(default)]
+    pub outputs: OutputsCfg,
+    /// Declared credentials, the half of the capability disclosure a name alone cannot state.
+    #[serde(default)]
+    pub capabilities: CapabilitiesCfg,
 }
 
 /// A single-repo run's publish-on-keep config: the fork the kept commits are pushed to as a draft PR.
@@ -615,6 +626,8 @@ struct CommonCfg<'a> {
     preflight: &'a Option<PreflightCfg>,
     measure: &'a Option<MeasureCfg>,
     secrets: &'a [SecretDecl],
+    outputs: &'a OutputsCfg,
+    capabilities: &'a CapabilitiesCfg,
 }
 
 fn validate_common(c: CommonCfg<'_>) -> Result<()> {
@@ -660,6 +673,8 @@ fn validate_common(c: CommonCfg<'_>) -> Result<()> {
     forge::spec::validate_builds(c.build)?;
     preflight::validate_preflight(c.preflight, c.measure)?;
     secret::validate_secrets(c.secrets)?;
+    outputs::validate_outputs(c.outputs)?;
+    capability::validate_capabilities(c.capabilities)?;
     Ok(())
 }
 
@@ -775,6 +790,8 @@ impl Manifest {
             preflight: &self.preflight,
             measure: &self.measure,
             secrets: &self.secrets,
+            outputs: &self.outputs,
+            capabilities: &self.capabilities,
         })
     }
 
@@ -920,6 +937,13 @@ pub struct CompositeManifest {
     /// the name per scope, and a launch it cannot bind is refused before a pod exists.
     #[serde(default, rename = "secret")]
     pub secrets: Vec<SecretDecl>,
+    /// Declared bounds on the run's mediated writes. Every vocabulary kind the table leaves out
+    /// resolves to the engine default (see [`outputs`]).
+    #[serde(default)]
+    pub outputs: OutputsCfg,
+    /// Declared credentials, the half of the capability disclosure a name alone cannot state.
+    #[serde(default)]
+    pub capabilities: CapabilitiesCfg,
 }
 
 #[derive(Deserialize)]
@@ -1027,6 +1051,8 @@ impl CompositeManifest {
             preflight: &self.preflight,
             measure: &self.measure,
             secrets: &self.secrets,
+            outputs: &self.outputs,
+            capabilities: &self.capabilities,
         })
     }
 

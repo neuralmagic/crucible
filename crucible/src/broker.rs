@@ -33,6 +33,7 @@ const BOOT_TIMEOUT: Duration = Duration::from_secs(5);
 /// the agent does; crucible's own environment (KUBECONFIG, the PR token, ...) is inherited too,
 /// including `TRACEPARENT`, deliberately: broker spans grafting onto the run trace is telemetry,
 /// not a leak (unlike the agent child, which strips it).
+/// `bounds_env` is the frozen manifest's resolved output bounds (`BROKER_OUTPUTS` and friends).
 /// `control_port`, when set, is handed to the broker as `BROKER_CONTROL_ADDR` so its approval
 /// watcher can send a re-scope back to the loop's control bridge on a granted approval.
 ///
@@ -46,6 +47,7 @@ const BOOT_TIMEOUT: Duration = Duration::from_secs(5);
 pub fn ensure_running(
     cfg: &BrokerCfg,
     env: &[(String, String)],
+    bounds_env: &[(String, String)],
     control_port: Option<u16>,
     sandbox_name: &str,
 ) -> Result<Option<String>> {
@@ -81,6 +83,11 @@ pub fn ensure_running(
         cmd.env("BROKER_BUILD", "1");
     }
     for (k, v) in env {
+        cmd.env(k, v);
+    }
+    // The frozen manifest's output bounds, applied after `[agent].env` so a manifest key can
+    // never shadow the bounds it is bounded by.
+    for (k, v) in bounds_env {
         cmd.env(k, v);
     }
     cmd.spawn()

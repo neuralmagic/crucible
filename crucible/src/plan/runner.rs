@@ -56,7 +56,7 @@ impl ShellRunner {
     fn run_in_workdir(&mut self, task: &Task, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").current_dir(&self.workdir);
-        cmd.env("CRUCIBLE_TASK", &task.name.0);
+        cmd.env(crate::plan::TASK_NAME_ENV, &task.name.0);
         match serde_json::to_string(inputs) {
             Ok(json) => {
                 cmd.env("CRUCIBLE_INPUTS", json);

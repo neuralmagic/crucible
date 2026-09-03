@@ -13,6 +13,7 @@ pub mod event;
 pub mod identity;
 pub mod json;
 pub mod markers;
+pub mod outputs;
 pub mod refine;
 pub mod report;
 pub mod scope;
@@ -46,6 +47,10 @@ pub use markers::{
     INGEST_TOKEN_AUDIENCE, MANAGED_BY_KEY, MANAGED_BY_SELECTOR, MANAGED_BY_VALUE,
     RANK_ACTIVITY_MARKER, RUN_SESSION_DELIMITER, SCOPE_ACTIVITY_MARKER, SCOPE_PACK_MARKER,
     SCOPE_PROGRESS_MARKER, SCOPE_REPORT_MARKER, SCOPE_TRANSCRIPT_MARKER, VERDICT_MARKER,
+};
+pub use outputs::{
+    BoundSource, BoundViolation, ENV_OUTPUT_PARAMS, ENV_OUTPUTS, ENV_SESSION_LOG,
+    OUTPUTS_WIRE_VERSION, OpenScope, OutputKind, ResolvedOutput, ResolvedOutputs, ResolvedTarget,
 };
 pub use refine::{
     Attack, AttackKind, ControlEvidence, FailureEvidence, ReadingEvidence, RoundKind, RoundOutcome,

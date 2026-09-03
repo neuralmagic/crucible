@@ -1,0 +1,32 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-08-31-002"
+title = "Deny an egress host even when a wildcard entry matches it"
+status = "queue"
+created = "2026-08-31"
+refs = ["RFC-0001:C-EGRESS"]
+
+[content]
+description = "deny_endpoints subtraction is exact-string. Denying github.com:443:full leaves *.github.com:443:full in the resolved allowlist, so api.github.com stays reachable and the deny reads as if it worked; the footgun is noted in crucible/src/manifest/openshell.rs and the merge in the openshell policy crate. [[RFC-0001:C-EGRESS]] makes the resolved allowlist the contract; a deny that a wildcard silently overrides means the resolved list is not what the manifest author can read off their own file."
+
+[[content.acceptance_criteria]]
+text = "a host:port named by deny_endpoints is unreachable in the resolved policy even when a wildcard or broader entry would otherwise admit it"
+status = "pending"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "crucible check reports any deny entry that a surviving allowlist entry still shadows, naming both"
+status = "pending"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "tests cover exact, wildcard-shadowed, and port-differing denies against the resolved allowlist"
+status = "pending"
+category = "chore"
+
+[verification]
+required_guards = [
+    "GUARD-CARGO-CLIPPY",
+    "GUARD-CARGO-TEST",
+]

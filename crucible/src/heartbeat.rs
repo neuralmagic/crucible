@@ -65,7 +65,7 @@ impl Heartbeat {
         self.iter.load(Ordering::Relaxed)
     }
 
-    fn spent_usd(&self) -> f64 {
+    pub(crate) fn spent_usd(&self) -> f64 {
         self.spent_milli_usd.load(Ordering::Relaxed) as f64 / 1000.0
     }
 

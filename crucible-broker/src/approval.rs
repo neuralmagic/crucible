@@ -39,4 +39,10 @@ pub enum ApprovalState {
 pub trait ApprovalBackend {
     fn open(&self, req: &ApprovalRequest) -> anyhow::Result<String>;
     fn poll(&self, handle: &str) -> anyhow::Result<ApprovalState>;
+
+    /// The repo `open` writes a draft PR to, for the `draft-pr` bound the broker admits the write
+    /// against. `None` for a backend whose `open` performs no forge write.
+    fn draft_pr_repo(&self) -> Option<&str> {
+        None
+    }
 }

@@ -21,6 +21,7 @@
 pub mod admission;
 pub mod approval;
 pub mod auth;
+pub mod bounds;
 pub mod broker;
 pub mod build;
 pub mod codegen;
@@ -45,5 +46,6 @@ pub(crate) mod watch;
 
 pub use admission::{Admission, AdmissionDecision, GpuNeed};
 pub use approval::{ApprovalBackend, ApprovalChannel, ApprovalRequest, ApprovalState};
+pub use bounds::Bounds;
 pub use broker::{Broker, NullResolver, TraceResolver};
 pub use types::{JudgeImpact, Resolution, TraceId, TraceParams, judge_impact, trace_id};

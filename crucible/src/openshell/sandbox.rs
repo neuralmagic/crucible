@@ -7,16 +7,26 @@
 //! The per-turn targeted upload (`upload <name> <local> <dest>`) places a rendered cluster cred
 //! straight at its sandbox path, never through the workspace/repo.
 
-/// The per-workspace sandbox name: `ci-<pid>-<workspace-hash>`. Stable across turns within one
-/// loop instance (its workspace is fixed), unique across parallel wide-round candidates
-/// (distinct worktrees) and across
-/// crucible processes sharing a gateway. The broker gets this exact string at spawn
-/// (`BROKER_SANDBOX_NAME`) rather than re-deriving it, the hash isn't stable across builds.
+/// One random identity for this engine process. Kubernetes containers commonly reuse the same
+/// small PID, so a PID cannot distinguish a relaunched run from the sandbox it left behind.
+fn run_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| uuid::Uuid::now_v7().simple().to_string())
+}
+
+/// The per-workspace sandbox name: `ci-<run-id>-<workspace-hash>`. Stable across turns within one
+/// loop instance (the process identity and workspace are fixed), unique across parallel
+/// candidates and relaunched processes sharing a gateway. The broker gets this exact string at
+/// spawn (`BROKER_SANDBOX_NAME`) rather than re-deriving it; neither component is a durable ID.
 pub fn name_for(workspace: &std::path::Path) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     workspace.hash(&mut h);
-    format!("ci-{}-{:08x}", std::process::id(), h.finish() as u32)
+    format!(
+        "ci-{}-{:08x}",
+        &run_id()[..12],
+        h.finish() & u64::from(u32::MAX)
+    )
 }
 
 /// `sandbox upload --no-git-ignore <name> <local>`: push the whole workspace to `~`, dotfiles
@@ -62,7 +72,7 @@ mod tests {
     use crate::openshell::sandbox::*;
 
     #[test]
-    fn name_for_is_per_workspace_and_process() {
+    fn name_for_is_per_workspace_and_run() {
         use std::path::Path;
         let a = name_for(Path::new("/state/worktrees/lane-a"));
         let b = name_for(Path::new("/state/worktrees/lane-b"));
@@ -72,8 +82,8 @@ mod tests {
             name_for(Path::new("/state/worktrees/lane-a")),
             "stable across turns within a lane"
         );
-        let pid = std::process::id().to_string();
-        assert!(a.starts_with(&format!("ci-{pid}-")));
+        assert!(a.starts_with("ci-"));
+        assert_eq!(a.split('-').nth(1).map(str::len), Some(12));
         assert!(
             a.len() <= 63 && a.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
             "container-name safe: {a}"

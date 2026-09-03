@@ -7,6 +7,7 @@
 //! mode, not a degraded fallback.
 
 use crate::{Args, Paths};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Cumulative-budget context for one agent turn. Cost is only authoritative at turn
@@ -14,7 +15,7 @@ use std::time::{Duration, Instant};
 /// [`crate::event::provisional_cost`]) and emit provisional budget updates; the
 /// loop's turn-end budget call reconciles them. Without this a run could spend its
 /// whole cap inside one turn before any guard fires.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct TurnBudget {
     /// Run spend before this turn started (authoritative).
     pub spent_before: f64,
@@ -23,6 +24,9 @@ pub struct TurnBudget {
     /// Effective cost cap resolved by the loop (live control override or the CLI
     /// arg); 0 means uncapped.
     pub max_cost: f64,
+    /// Live liveness telemetry for provisional, mid-turn spend. The authoritative
+    /// total still comes from the completed turn and overwrites this estimate.
+    pub(crate) heartbeat: Option<Arc<crate::heartbeat::Heartbeat>>,
 }
 
 impl TurnBudget {
@@ -30,6 +34,13 @@ impl TurnBudget {
     /// between-iteration guard).
     pub fn over_cap(&self, spent: f64) -> bool {
         self.max_cost > 0.0 && spent >= self.max_cost
+    }
+
+    /// Publish a provisional cumulative total while the agent is still running.
+    pub fn record_provisional(&self, iter: u32, spent: f64) {
+        if let Some(heartbeat) = &self.heartbeat {
+            heartbeat.record(iter, spent);
+        }
     }
 }
 
@@ -272,10 +283,26 @@ mod tests {
             spent_before: 0.0,
             started: Instant::now(),
             max_cost: 0.0,
+            heartbeat: None,
         };
         assert!(!b.over_cap(1e9), "0 means uncapped");
         let b = TurnBudget { max_cost: 5.0, ..b };
         assert!(!b.over_cap(4.99));
         assert!(b.over_cap(5.0), ">= like over_budget");
+    }
+
+    #[test]
+    fn provisional_spend_reaches_the_heartbeat() {
+        let heartbeat = Arc::new(crate::heartbeat::Heartbeat::new());
+        let budget = TurnBudget {
+            spent_before: 1.0,
+            started: Instant::now(),
+            max_cost: 5.0,
+            heartbeat: Some(Arc::clone(&heartbeat)),
+        };
+
+        budget.record_provisional(2, 1.2345);
+
+        assert!((heartbeat.spent_usd() - 1.235).abs() < 1e-9);
     }
 }

@@ -529,6 +529,16 @@ pub(crate) fn build(state: &CodegenState, mode: &str) -> String {
     guard(|cfg| do_build(state, cfg, mode))
 }
 
+/// The registry [`build`] pushes the candidate to, for the caller to validate against the run's
+/// `image-push` bound. `None` when the loop pod's forge config resolves no destination: the build
+/// then pushes nothing and reports the config failure itself.
+pub(crate) fn push_destination() -> Option<String> {
+    forge::BuildConfig::from_env()
+        .ok()
+        .map(|cfg| cfg.registry)
+        .filter(|r| !r.is_empty())
+}
+
 pub(crate) fn benchmark(
     state: &Arc<CodegenState>,
     digest: &str,

@@ -1097,19 +1097,35 @@ fn sandbox_filesystem_policy(read_only_paths: &[String]) -> Option<SandboxPolicy
     Some(policy)
 }
 
-/// Whether a supervisor log line reports a policy denial. The precise signals are the OCSF
+/// How a supervisor log line was identified as a policy denial. Callers that only need a yes/no
+/// answer can use [`is_denial`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenialClassification {
+    StructuredAction,
+    StructuredStage,
+    MessageFallback,
+}
+
+/// Classify a supervisor log line that reports a policy denial. The precise signals are the OCSF
 /// network/HTTP `DENIED` action token (the proxy emits `CONNECT denied …` as an OCSF event,
 /// which carries no structured fields, so its message is the marker) and any structured
 /// `action`/`denial_stage` field a non-OCSF denial line might carry. A conservative message
 /// substring stays as the backstop across denial stages (connect/forward/ssrf/l7/bypass).
-pub fn is_denial(line: &SandboxLogLine) -> bool {
-    if line.fields.get("action").is_some_and(|a| is_deny_action(a))
-        || line.fields.contains_key("denial_stage")
-    {
-        return true;
+pub fn classify_denial(line: &SandboxLogLine) -> Option<DenialClassification> {
+    if line.fields.get("action").is_some_and(|a| is_deny_action(a)) {
+        return Some(DenialClassification::StructuredAction);
+    }
+    if line.fields.contains_key("denial_stage") {
+        return Some(DenialClassification::StructuredStage);
     }
     let m = line.message.to_ascii_lowercase();
-    m.contains("denied") || m.contains("denial") || m.contains("deny")
+    (m.contains("denied") || m.contains("denial") || m.contains("deny"))
+        .then_some(DenialClassification::MessageFallback)
+}
+
+/// Whether a supervisor log line reports a policy denial.
+pub fn is_denial(line: &SandboxLogLine) -> bool {
+    classify_denial(line).is_some()
 }
 
 /// Whether a structured `action` field value names a denial.
@@ -1755,21 +1771,26 @@ pYBZ
 
     #[test]
     fn is_denial_matches_structured_fields() {
-        assert!(is_denial(&log_line(
-            "WARN",
-            "connection blocked",
-            &[("action", "deny")]
-        )));
-        assert!(is_denial(&log_line(
-            "WARN",
-            "blocked",
-            &[("denial_stage", "bypass")]
-        )));
+        assert_eq!(
+            classify_denial(&log_line(
+                "WARN",
+                "connection blocked",
+                &[("action", "deny")]
+            )),
+            Some(DenialClassification::StructuredAction)
+        );
+        assert_eq!(
+            classify_denial(&log_line("WARN", "blocked", &[("denial_stage", "bypass")])),
+            Some(DenialClassification::StructuredStage)
+        );
     }
 
     #[test]
     fn is_denial_matches_message_substring_fallback() {
-        assert!(is_denial(&log_line("WARN", "CONNECT denied host:443", &[])));
+        assert_eq!(
+            classify_denial(&log_line("WARN", "CONNECT denied host:443", &[])),
+            Some(DenialClassification::MessageFallback)
+        );
         assert!(is_denial(&log_line(
             "INFO",
             "ssrf_denied: internal address",

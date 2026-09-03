@@ -419,11 +419,7 @@ impl HarnessRuntime for Harness {
     }
 
     fn default_endpoints(self) -> Vec<&'static str> {
-        let mut out = crate::openshell::policy::DEFAULT_ENDPOINTS.to_vec();
-        if self == Harness::Codex {
-            out.extend_from_slice(codex::EXTRA_ENDPOINTS);
-        }
-        out
+        crate::openshell::policy::default_endpoints(self)
     }
 }
 

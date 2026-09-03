@@ -1,0 +1,20 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-CAPABILITY-DISCLOSURE"
+title = "Opaque capability disclosure"
+kind = "normative"
+status = "active"
+since = "0.2.0"
+
+[content]
+text = """
+Some channels cannot be typed as output kinds because they hand the run open-ended reach: a credential whose value enters the sandbox, egress beyond what the engine's built-ins grant ([[RFC-0001:C-EGRESS]]), a relay that materializes host-side secrets into sandbox files, a substitute broker binary, or a mounted credential authorizing writes to an external system such as a cluster namespace. These are capabilities, not outputs, and bounding them by effect is not possible; the contract is disclosure.
+
+A frozen pack MUST disclose every such capability, and the resolved disclosure MUST be computable from the pack without executing pack content. For each capability the disclosure MUST state its reach: for egress, the host, port, and access class in C-EGRESS's terms; for a credential, whether its value enters agent context or remains broker-held, which external system it authorizes, and at what scope; for a relay or a broker substitution, what it draws from and what it exposes. The agent's own credentials, [agent].env included, are credentials under this clause and MUST appear in the disclosure. The built-in egress allowlist is standing disclosed reach: it need not be re-declared, but the resolved disclosure MUST include it, and with inherit_defaults = false every entry the manifest names is disclosed manifest reach, built-in lookalikes included.
+
+The engine MUST derive what it provisions and what it discloses from the same resolved declaration, so the two cannot diverge, and crucible check MUST print the resolved disclosure.
+
+A capability granted from outside the pack, such as a secret binding supplied at launch, is covered when a disclosed capability of the same kind has reach equal to or broader than the grant's. A grant that is not covered MUST be refused at run start, and the refusal MUST name the grant and the missing disclosure.
+
+Sandbox-resident pack content, skills included, holds no reach of its own: what it can touch is the union of the resolved disclosure and the declared output kinds. Pack-authored commands that execute outside the sandbox (workflow command and evaluate tasks, world and judge hooks) hold their executor's reach instead, and the disclosure MUST state that the pack runs commands outside the sandbox whenever it does. Narrowing that executor's reach is outside this clause; disclosing that it exists is not."""
