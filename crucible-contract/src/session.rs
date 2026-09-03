@@ -127,6 +127,9 @@ pub struct PlanTaskWire {
     pub needs: String,
     #[serde(default)]
     pub required: bool,
+    /// The task preserves only its declared files after a measured failure.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub capture_on_failure: bool,
     /// What the task needs of its dependencies: `all` or `passed`.
     #[serde(default)]
     pub join: String,
@@ -703,12 +706,25 @@ mod tests {
                 session: "solver".into(),
                 needs: "any".into(),
                 required: true,
+                capture_on_failure: true,
                 join: "all".into(),
                 stage: "iteration".into(),
                 over: "discover.targets".into(),
                 max_fanout: 8,
             }],
         });
+    }
+
+    #[test]
+    fn old_plan_admitted_tasks_default_failure_capture_to_false() {
+        let event = decode(
+            r#"{"v":1,"kind":"plan_admitted","plan_version":1,"budget_usd":1.0,"tasks":[{"name":"probe","kind":"evaluate"}]}"#,
+        )
+        .expect("old plan_admitted event decodes");
+        let SessionEvent::PlanAdmitted { tasks, .. } = event else {
+            panic!("wrong event kind")
+        };
+        assert!(!tasks[0].capture_on_failure);
     }
 
     /// Asks reach the log as their emitting task settles, so an auditor can compare what a run

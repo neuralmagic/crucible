@@ -346,6 +346,7 @@ pub(crate) fn plan_admitted_event(plan: &ValidPlan) -> crate::session::SessionEv
                 session: t.session.clone().unwrap_or_default(),
                 needs: t.needs.clone(),
                 required: t.required,
+                capture_on_failure: t.capture_on_failure,
                 join: t.join.as_str().to_string(),
                 stage: t.stage.as_str().to_string(),
                 over: t
@@ -1184,6 +1185,33 @@ mod tests {
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn admitted_plan_projects_failure_capture_to_the_wire() {
+        let plan = Plan::from_toml_str(
+            r#"
+                version = 1
+                [budget]
+                usd = 1.0
+                [[task]]
+                name = "probe"
+                kind = "evaluate"
+                command = "./probe.sh"
+                isolation = "worktree"
+                emits_files = ["evidence.json"]
+                capture_on_failure = true
+            "#,
+        )
+        .unwrap()
+        .validate()
+        .unwrap();
+        let event = plan_admitted_event(&plan);
+        let back = crate::session::decode(&crate::session::encode(&event)).unwrap();
+        let crate::session::SessionEvent::PlanAdmitted { tasks, .. } = back else {
+            panic!("wrong event variant")
+        };
+        assert!(tasks[0].capture_on_failure);
     }
 
     #[test]

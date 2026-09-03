@@ -67,6 +67,7 @@ A deterministic shell task in the candidate workspace.
 | --- | --- | --- |
 | `name` | `str` | Task identity, unique within the workflow. |
 | `run` | `str` | The command, run through `sh -c`. |
+| `capture_on_failure` | `bool` | On an isolated, non-mapped task, capture the complete declared file set after a measured failure for epilogue reporting. |
 | `depends_on` | `list[task]` | Dependencies. Readiness decides execution order; declaration order does not. |
 | `needs` | `"any" \| "all"` | How many dependencies must be admitted before the task is ready. |
 | `join` | `"all" \| "passed"` | Which dependencies must have passed. `passed` forwards the non-empty successful set. |
@@ -88,6 +89,7 @@ A measurement command. Its last non-empty stdout line is a JSON object; `pass = 
 | `run` | `str` | The command, run through `sh -c`. |
 | `threshold` | `number` | Grade the emitted score against this bound. An explicit `pass` wins. |
 | `direction` | `"lower" \| "higher"` | Which side of the threshold passes. |
+| `capture_on_failure` | `bool` | On an isolated, non-mapped task, capture the complete declared file set after a measured failure for epilogue reporting. |
 | `depends_on` | `list[task]` | Dependencies. Readiness decides execution order; declaration order does not. |
 | `needs` | `"any" \| "all"` | How many dependencies must be admitted before the task is ready. |
 | `join` | `"all" \| "passed"` | Which dependencies must have passed. `passed` forwards the non-empty successful set. |

@@ -127,6 +127,14 @@ fn name_kwarg() -> Kwarg {
     Kwarg::new("name", "str", "Task identity, unique within the workflow.")
 }
 
+fn failure_capture_kwarg() -> Kwarg {
+    Kwarg::new(
+        "capture_on_failure",
+        "bool",
+        "On an isolated, non-mapped task, capture the complete declared file set after a measured failure for epilogue reporting.",
+    )
+}
+
 fn with(head: Vec<Kwarg>, tail: Vec<Kwarg>) -> Vec<Kwarg> {
     let mut all = head;
     all.extend(tail);
@@ -182,6 +190,7 @@ pub fn functions() -> Vec<Function> {
                 vec![
                     name_kwarg(),
                     Kwarg::new("run", "str", "The command, run through `sh -c`."),
+                    failure_capture_kwarg(),
                 ],
                 task_knobs(),
             ),
@@ -207,6 +216,7 @@ pub fn functions() -> Vec<Function> {
                         "\"lower\" | \"higher\"",
                         "Which side of the threshold passes.",
                     ),
+                    failure_capture_kwarg(),
                 ],
                 task_knobs(),
             ),

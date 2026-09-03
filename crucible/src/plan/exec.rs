@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::plan::ir::{Direction, Join, Task, TaskKind, TaskName, ValidPlan};
+use crate::plan::ir::{Direction, Join, Stage, Task, TaskKind, TaskName, ValidPlan};
 
 /// What the substrate can measure. Missing caps truncate the plan fail-closed.
 #[derive(Clone, Debug, Default)]
@@ -329,7 +329,7 @@ pub fn execute(
         let failed = r.status != TaskStatus::Pass;
         on_result(t, &r);
         results.insert(t.name.clone(), r);
-        if gates && failed && t.required && halted.is_none() {
+        if gates && failed && t.required && t.stage == Stage::Iteration && halted.is_none() {
             *halted = Some(PlanExit::ShortCircuit {
                 task: t.name.clone(),
             });
@@ -341,7 +341,20 @@ pub fn execute(
             if results.contains_key(&t.name) {
                 continue;
             }
-            if let Some(exit) = &halted {
+            // An epilogue observes the settled main graph. Declaration order is not an ordering
+            // primitive, so do not let an independent epilogue task race ahead of main work.
+            if t.stage == Stage::Epilogue
+                && plan
+                    .tasks_topo()
+                    .any(|main| main.stage == Stage::Iteration && !results.contains_key(&main.name))
+            {
+                continue;
+            }
+            let report_after_failure =
+                t.stage == Stage::Epilogue && matches!(halted, Some(PlanExit::ShortCircuit { .. }));
+            if let Some(exit) = &halted
+                && !report_after_failure
+            {
                 let why = match exit {
                     PlanExit::ShortCircuit { task } => format!("required task {task} failed"),
                     PlanExit::BudgetExceeded => "budget ceiling reached".to_string(),
@@ -432,15 +445,22 @@ pub fn execute(
                 .collect::<BTreeMap<TaskName, Value>>()
         };
 
-        // Only an ancestor that settled passing contributes. The file channel says what the
-        // JSON channel says: a failed task's output does not reach a descendant, and whatever a
-        // previous run left in `state/files` is not this run's evidence.
+        // Passing ancestors contribute to an ordinary task. An epilogue additionally receives
+        // the explicitly captured evidence of failed main-graph tasks; that file channel does
+        // not turn the failed task into a contributing JSON dependency.
         //
         // A mapped ancestor is expanded into one stand-in per passing instance, so a consumer is
         // handed `inputs/node[key]/<declared>` and the runner never has to know what `over` is.
-        let passing_producers = |t: &Task, results: &BTreeMap<TaskName, TaskResult>| {
+        let file_producers = |t: &Task, results: &BTreeMap<TaskName, TaskResult>| {
             let mut producers: Vec<Task> = Vec::new();
-            for p in ancestors(plan, t) {
+            let candidates: Vec<&Task> = if t.stage == Stage::Epilogue {
+                plan.tasks_topo()
+                    .filter(|p| p.stage == Stage::Iteration)
+                    .collect()
+            } else {
+                ancestors(plan, t)
+            };
+            for p in candidates {
                 if p.emits_files.is_empty() {
                     continue;
                 }
@@ -449,20 +469,34 @@ pub fn execute(
                         results
                             .iter()
                             .filter(|(name, r)| {
-                                r.status == TaskStatus::Pass && is_instance_of(&p.name, name)
+                                (r.status == TaskStatus::Pass
+                                    || (t.stage == Stage::Epilogue
+                                        && r.status == TaskStatus::Fail
+                                        && p.capture_on_failure))
+                                    && is_instance_of(&p.name, name)
                             })
-                            .map(|(name, _)| Task {
-                                name: name.clone(),
-                                over: None,
-                                max_fanout: None,
-                                ..p.clone()
+                            .map(|(name, result)| {
+                                let mut producer = Task {
+                                    name: name.clone(),
+                                    over: None,
+                                    max_fanout: None,
+                                    ..p.clone()
+                                };
+                                producer.capture_on_failure =
+                                    result.status == TaskStatus::Fail && p.capture_on_failure;
+                                producer
                             }),
                     );
-                } else if results
-                    .get(&p.name)
-                    .is_some_and(|r| r.status == TaskStatus::Pass)
+                } else if let Some(result) = results.get(&p.name)
+                    && (result.status == TaskStatus::Pass
+                        || (t.stage == Stage::Epilogue
+                            && result.status == TaskStatus::Fail
+                            && p.capture_on_failure))
                 {
-                    producers.push(p.clone());
+                    let mut producer = p.clone();
+                    producer.capture_on_failure =
+                        result.status == TaskStatus::Fail && p.capture_on_failure;
+                    producers.push(producer);
                 }
             }
             producers
@@ -473,7 +507,7 @@ pub fn execute(
         // say so, or the previous dispatch's inputs are still lying there when it runs.
         let mut refused = None;
         for t in &dispatch {
-            let producers = passing_producers(t, &results);
+            let producers = file_producers(t, &results);
             let producers: Vec<&Task> = producers.iter().collect();
             if let Err(why) = runner.stage(t, &producers) {
                 refused = Some((*t, why));
@@ -514,7 +548,7 @@ pub fn execute(
                         .collect();
                     // An instance is staged under its own name: it runs in its own root, and
                     // the node itself never runs.
-                    let producers = passing_producers(node, &results);
+                    let producers = file_producers(node, &results);
                     let producers: Vec<&Task> = producers.iter().collect();
                     let refused = instances
                         .iter()
@@ -649,7 +683,7 @@ pub fn execute(
     let valid = exit == PlanExit::Completed
         && plan
             .tasks_topo()
-            .filter(|t| t.required)
+            .filter(|t| t.required && t.stage == Stage::Iteration)
             .all(|t| results.get(&t.name).map(|r| r.status) == Some(TaskStatus::Pass));
     PlanOutcome {
         valid,
@@ -1140,6 +1174,7 @@ mod tests {
             session: None,
             needs: needs.into(),
             required,
+            capture_on_failure: false,
             isolation: None,
             join: Join::default(),
             stage: Stage::Iteration,
@@ -1570,6 +1605,7 @@ mod tests {
             session: None,
             needs: "any".into(),
             required: true,
+            capture_on_failure: false,
             isolation: None,
             join: Join::default(),
             stage: Stage::Iteration,
@@ -1628,6 +1664,7 @@ mod tests {
             session: None,
             needs: "any".into(),
             required: false,
+            capture_on_failure: false,
             isolation: None,
             join: Join::default(),
             stage: Stage::Iteration,
@@ -1819,6 +1856,7 @@ mod tests {
             session: None,
             needs: "any".into(),
             required: false,
+            capture_on_failure: false,
             isolation: None,
             join: Join::Passed,
             stage: Stage::Iteration,

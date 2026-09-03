@@ -160,6 +160,13 @@ impl TaskRunner for HarnessRunner {
     fn stage(&mut self, task: &Task, producers: &[&Task]) -> Result<(), String> {
         let files = producers
             .iter()
+            // The executor marks a failed producer by leaving this bit set on its staging clone.
+            // An absent directory means its promised set was incomplete and atomically withheld;
+            // the epilogue still runs, it simply receives no partial or stale files from it.
+            .filter(|producer| {
+                !producer.capture_on_failure
+                    || captured_dir(&self.paths.state, &producer.name.0).is_dir()
+            })
             .flat_map(|producer| {
                 producer.emits_files.iter().map(|declared| StagedInput {
                     producer: producer.name.0.clone(),
@@ -342,7 +349,8 @@ fn run_task(
     attempt_out
 }
 
-/// Take a passing attempt's declared files, or turn it into a measured failure.
+/// Take a passing attempt's declared files, and the declared files of a measured failure when
+/// the task explicitly requests that evidence channel.
 ///
 /// A declared file that is absent after an otherwise-passing attempt is output drift, and it
 /// fails at the task that promised it rather than as a mystery in whatever depended on it. It is
@@ -358,7 +366,25 @@ fn capture_declared(
     attempt: Attempt,
     captured: &AtomicU64,
 ) -> Attempt {
-    if task.emits_files.is_empty() || !matches!(attempt.outcome, AttemptOutcome::Pass(_)) {
+    let measured_failure =
+        task.capture_on_failure && matches!(attempt.outcome, AttemptOutcome::Fail(_));
+    let declared_skip = matches!(
+        &attempt.outcome,
+        AttemptOutcome::Pass(value)
+            if value.get("status").and_then(Value::as_str) == Some("skipped")
+    );
+    if task.capture_on_failure
+        && (declared_skip || matches!(attempt.outcome, AttemptOutcome::Transport(_)))
+    {
+        // This task did settle for the current run, so an older set is stale rather than
+        // evidence for this outcome. In particular, exhausted transport retries are surfaced
+        // as a failed task result and must not make a prior run's evidence look current.
+        let _ = std::fs::remove_dir_all(captured_dir(&paths.state, &task.name.0));
+    }
+    if task.emits_files.is_empty()
+        || declared_skip
+        || !(matches!(attempt.outcome, AttemptOutcome::Pass(_)) || measured_failure)
+    {
         return attempt;
     }
     let staging = paths.state.join("files.tmp").join(&task.name.0);
@@ -400,8 +426,17 @@ fn capture_declared(
     })();
     if let Err(why) = taken {
         let _ = std::fs::remove_dir_all(&staging);
+        // This task did run, so an older complete set is stale rather than resumable evidence
+        // for the current result. In particular, an epilogue must not stage it for this failure.
+        let _ = std::fs::remove_dir_all(captured_dir(&paths.state, &task.name.0));
         captured.fetch_sub(charged, Ordering::Relaxed);
-        return fail(attempt.cost_usd, why);
+        return match attempt.outcome {
+            AttemptOutcome::Fail(note) if measured_failure => fail(
+                attempt.cost_usd,
+                format!("{note}; capturing declared failure evidence: {why}"),
+            ),
+            _ => fail(attempt.cost_usd, why),
+        };
     }
     let published = captured_dir(&paths.state, &task.name.0);
     if let Some(parent) = published.parent()
@@ -445,7 +480,10 @@ fn materialize_inputs(
     for file in staged {
         let from = captured_path(state, &file.producer, &file.declared);
         if !from.exists() {
-            continue;
+            return Err(format!(
+                "staging {} from {}: captured file is absent",
+                file.declared, file.producer
+            ));
         }
         let to = inputs.join(&file.producer).join(&file.declared);
         if let Some(parent) = to.parent()
@@ -684,6 +722,7 @@ mod tests {
             session: None,
             needs: "any".into(),
             required: true,
+            capture_on_failure: false,
             isolation: None,
             join: Join::default(),
             stage: Stage::Iteration,
@@ -728,6 +767,89 @@ mod tests {
             !paths.state.join("files.tmp/draft").exists(),
             "the staging directory outlived the failure"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_partial_failure_capture_publishes_nothing_and_keeps_the_original_failure() {
+        let (dir, paths) = scratch("capture-failure-partial");
+        std::fs::write(paths.workspace.join("A.md"), "present\n").unwrap();
+        std::fs::create_dir_all(paths.state.join("files/probe")).unwrap();
+        std::fs::write(paths.state.join("files/probe/A.md"), "stale\n").unwrap();
+        let mut task = emitting("probe", &["A.md", "B.md"]);
+        task.capture_on_failure = true;
+        let counter = AtomicU64::new(0);
+        let out = capture_declared(
+            &paths,
+            &paths.workspace,
+            &task,
+            fail(0.0, "probe vetoed".to_string()),
+            &counter,
+        );
+        let note = note(&out);
+        assert!(
+            note.contains("probe vetoed") && note.contains("B.md"),
+            "{note}"
+        );
+        assert!(!paths.state.join("files/probe").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transport_failure_never_captures_declared_files() {
+        let (dir, paths) = scratch("capture-failure-transport");
+        std::fs::write(paths.workspace.join("A.md"), "attempt debris\n").unwrap();
+        std::fs::create_dir_all(paths.state.join("files/probe")).unwrap();
+        std::fs::write(paths.state.join("files/probe/A.md"), "stale\n").unwrap();
+        let mut task = emitting("probe", &["A.md"]);
+        task.capture_on_failure = true;
+        let counter = AtomicU64::new(0);
+        let out = capture_declared(
+            &paths,
+            &paths.workspace,
+            &task,
+            transport("broker unavailable".to_string()),
+            &counter,
+        );
+        assert!(matches!(out.outcome, AttemptOutcome::Transport(_)));
+        assert!(!paths.state.join("files/probe").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn declared_skip_never_captures_declared_files() {
+        let (dir, paths) = scratch("capture-failure-skip");
+        std::fs::write(paths.workspace.join("A.md"), "not evidence\n").unwrap();
+        std::fs::create_dir_all(paths.state.join("files/probe")).unwrap();
+        std::fs::write(paths.state.join("files/probe/A.md"), "stale\n").unwrap();
+        let mut task = emitting("probe", &["A.md"]);
+        task.capture_on_failure = true;
+        let counter = AtomicU64::new(0);
+        let out = capture_declared(
+            &paths,
+            &paths.workspace,
+            &task,
+            Attempt {
+                outcome: AttemptOutcome::Pass(serde_json::json!({"status": "skipped"})),
+                cost_usd: 0.0,
+            },
+            &counter,
+        );
+        assert!(matches!(out.outcome, AttemptOutcome::Pass(_)));
+        assert!(!paths.state.join("files/probe").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn staging_refuses_an_incomplete_published_set() {
+        let (dir, paths) = scratch("stage-incomplete-set");
+        std::fs::create_dir_all(paths.state.join("files/probe")).unwrap();
+        let staged = [StagedInput {
+            producer: "probe".to_string(),
+            declared: "missing.json".to_string(),
+        }];
+        let error = materialize_inputs(&paths.state, &paths.workspace, Some(&staged)).unwrap_err();
+        assert!(error.contains("captured file is absent"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1767,6 +1889,137 @@ workflow(type = "playbook", tasks = [good, bad, after])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A measured veto may retain only the files it declared for the run's epilogue. The veto
+    /// still blocks the main graph, its stray workspace edits are discarded, and no failed-task
+    /// commit can reach publication.
+    #[test]
+    fn measured_failure_evidence_reaches_the_epilogue_without_entering_git_memory() {
+        let dir =
+            std::env::temp_dir().join(format!("crucible-failure-evidence-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("workflow.star"),
+            r#"
+probe = evaluate(
+    name = "probe",
+    run = "mkdir -p evidence; echo why > evidence/probe.txt; echo junk > partial.txt; echo '{\"pass\": false}'",
+    emits_files = ["evidence/probe.txt"],
+    capture_on_failure = True,
+    isolated = True,
+)
+report = command(
+    name = "report",
+    run = "test \"$(cat inputs/probe/evidence/probe.txt)\" = why; echo '{} '",
+    stage = "epilogue",
+)
+workflow(type = "playbook", tasks = [probe, report])
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("crucible.toml"),
+            r#"
+                [repo]
+                path = "."
+                [workspace]
+                dir = "workspace"
+                setup_cmd = "mkdir -p workspace && git -C workspace init -q && git -C workspace -c user.email=c@l -c user.name=c -c commit.gpgsign=false commit -q --allow-empty -m baseline"
+                [agent]
+                backend = "command"
+                agent_cmd = "true"
+                goal = "retain bounded failure evidence"
+                [workflow]
+                type = "playbook"
+                file = "workflow.star"
+                "#,
+        )
+        .unwrap();
+
+        let mut manifest = crate::manifest::Manifest::load(&dir.join("crucible.toml")).unwrap();
+        manifest.resolve_workflow(&dir).unwrap();
+        let tasks = manifest.workflow.as_ref().unwrap().tasks.clone();
+        let plan = Plan {
+            version: 1,
+            reason: None,
+            budget: crate::plan::ir::PlanBudget { usd: 5.0 },
+            tasks,
+        }
+        .validate()
+        .unwrap();
+        let mut runner = crate::run::prep_plan_runner(&dir.join("crucible.toml"))
+            .unwrap()
+            .0;
+        let out = execute(
+            &plan,
+            &Substrate::default(),
+            ExecCfg::default(),
+            &mut runner,
+            |_, _| {},
+        );
+
+        assert_eq!(out.results[&"probe".into()].status, TaskStatus::Fail);
+        assert_eq!(out.results[&"report".into()].status, TaskStatus::Pass);
+        assert!(!out.valid, "failure evidence must not launder the veto");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("state/files/probe/evidence/probe.txt")).unwrap(),
+            "why\n"
+        );
+        assert!(!dir.join("workspace/evidence/probe.txt").exists());
+        assert!(!dir.join("workspace/partial.txt").exists());
+
+        let log = std::process::Command::new("git")
+            .args([
+                "-C",
+                &dir.join("workspace").display().to_string(),
+                "log",
+                "--oneline",
+            ])
+            .output()
+            .expect("git log");
+        let log = String::from_utf8_lossy(&log.stdout);
+        assert!(
+            !log.contains("task probe"),
+            "failed evidence was committed: {log}"
+        );
+
+        // The captured set belongs to engine state, not to the runner object or workspace.
+        // Reconstructing a runner over that state can still stage it for an unsettled epilogue.
+        let probe = plan
+            .tasks_topo()
+            .find(|task| task.name.0 == "probe")
+            .unwrap()
+            .clone();
+        let report = plan
+            .tasks_topo()
+            .find(|task| task.name.0 == "report")
+            .unwrap()
+            .clone();
+        let HarnessRunner {
+            args,
+            paths,
+            commit_per_task,
+            captured_bytes,
+            ..
+        } = runner;
+        let _ = std::fs::remove_dir_all(paths.workspace.join(STAGED_INPUTS));
+        let mut resumed = HarnessRunner {
+            args,
+            paths,
+            commit_per_task,
+            captured_bytes,
+            staged: BTreeMap::new(),
+        };
+        resumed.stage(&report, &[&probe]).unwrap();
+        let resumed_report = resumed.run(&report, 2, &BTreeMap::new());
+        assert!(
+            matches!(resumed_report.outcome, AttemptOutcome::Pass(_)),
+            "reconstructed runner lost failure evidence: {:?}",
+            resumed_report.outcome
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A playbook runs from its manifest: the pack names its graph, the engine compiles it, and
     /// the ceilings come from whoever launched it. There is no plan file anywhere.
     #[test]
@@ -2305,6 +2558,7 @@ workflow(type = "playbook", tasks = [analyze, implement, report])
             session: None,
             needs: "any".into(),
             required: true,
+            capture_on_failure: false,
             isolation: None,
             join: Join::default(),
             stage: Stage::Iteration,

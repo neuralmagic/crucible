@@ -239,6 +239,10 @@ pub struct Task {
     /// Required tasks gate plan validity; advisory failures block dependents only.
     #[serde(default = "default_required")]
     pub required: bool,
+    /// Capture the declared file set when a command/evaluate task settles with a measured
+    /// failure. The failed workspace itself is still discarded.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub capture_on_failure: bool,
     /// Isolated execution (see [`Isolation`]); absent = run in the shared workspace.
     #[serde(default)]
     pub isolation: Option<Isolation>,
@@ -384,6 +388,14 @@ pub enum PlanError {
     GradeSourceOmitsScore { task: String, from: String },
     #[error("task {task:?}: a thresholded evaluate grades `score`, but its emits omits it")]
     ThresholdedEvaluateOmitsScore { task: String },
+    #[error("task {task:?}: capture_on_failure is accepted only on command and evaluate tasks")]
+    FailureCaptureOnUnsupportedTask { task: String },
+    #[error("task {task:?}: capture_on_failure requires at least one emits_files path")]
+    FailureCaptureWithoutFiles { task: String },
+    #[error("task {task:?}: capture_on_failure requires isolated execution")]
+    FailureCaptureRequiresIsolation { task: String },
+    #[error("task {task:?}: capture_on_failure is not supported on mapped tasks")]
+    FailureCaptureOnMappedTask { task: String },
     #[error(
         "task {task:?} has invalid session {session:?}; use 1-64 ASCII letters, digits, `.`, `_`, or `-`"
     )]
@@ -484,6 +496,20 @@ impl Plan {
         }
         for t in &self.tasks {
             let task = || t.name.0.clone();
+            if t.capture_on_failure {
+                if !matches!(t.task, TaskKind::Command { .. } | TaskKind::Evaluate { .. }) {
+                    return Err(PlanError::FailureCaptureOnUnsupportedTask { task: task() });
+                }
+                if t.emits_files.is_empty() {
+                    return Err(PlanError::FailureCaptureWithoutFiles { task: task() });
+                }
+                if t.isolation.is_none() {
+                    return Err(PlanError::FailureCaptureRequiresIsolation { task: task() });
+                }
+                if t.over.is_some() {
+                    return Err(PlanError::FailureCaptureOnMappedTask { task: task() });
+                }
+            }
             let mut seen = BTreeSet::new();
             for d in &t.depends_on {
                 if d == &t.name {
@@ -775,6 +801,7 @@ mod tests {
             session: None,
             needs: "any".into(),
             required: true,
+            capture_on_failure: false,
             isolation: None,
             join: Join::default(),
             stage: Stage::Iteration,
@@ -806,6 +833,65 @@ mod tests {
         let pos = |n: &str| order.iter().position(|x| *x == n).unwrap();
         assert!(pos("a") < pos("b"));
         assert!(pos("b") < pos("c"));
+    }
+
+    #[test]
+    fn failure_capture_requires_a_command_or_evaluate_with_declared_files() {
+        let mut unsupported = agent("review", &[]);
+        unsupported.capture_on_failure = true;
+        unsupported.emits_files = vec!["review.json".to_string()];
+        assert_eq!(
+            plan(vec![unsupported]).validate().unwrap_err(),
+            PlanError::FailureCaptureOnUnsupportedTask {
+                task: "review".to_string()
+            }
+        );
+
+        let mut no_files = agent("probe", &[]);
+        no_files.task = TaskKind::Command {
+            command: "probe".to_string(),
+        };
+        no_files.capture_on_failure = true;
+        assert_eq!(
+            plan(vec![no_files]).validate().unwrap_err(),
+            PlanError::FailureCaptureWithoutFiles {
+                task: "probe".to_string()
+            }
+        );
+
+        let mut shared = agent("shared", &[]);
+        shared.task = TaskKind::Command {
+            command: "probe".to_string(),
+        };
+        shared.capture_on_failure = true;
+        shared.emits_files = vec!["probe.json".to_string()];
+        assert_eq!(
+            plan(vec![shared]).validate().unwrap_err(),
+            PlanError::FailureCaptureRequiresIsolation {
+                task: "shared".to_string()
+            }
+        );
+
+        let mut source = agent("source", &[]);
+        source.emits = vec![OutputField("items".to_string())];
+        let mut mapped = agent("mapped", &["source"]);
+        mapped.task = TaskKind::Command {
+            command: "probe".to_string(),
+        };
+        mapped.capture_on_failure = true;
+        mapped.emits_files = vec!["probe.json".to_string()];
+        mapped.isolation = Some(Isolation::Worktree);
+        mapped.over = Some(OutputRef {
+            task: "source".into(),
+            field: OutputField("items".to_string()),
+        });
+        mapped.max_fanout = Some(2);
+        assert_eq!(
+            plan(vec![source, mapped]).validate().unwrap_err(),
+            PlanError::FailureCaptureOnMappedTask {
+                task: "mapped".to_string()
+            }
+        );
     }
 
     #[test]
@@ -926,6 +1012,7 @@ mod tests {
             session: None,
             needs: "any".into(),
             required: true,
+            capture_on_failure: false,
             isolation: None,
             join: Join::default(),
             stage: Stage::Iteration,
@@ -1053,6 +1140,7 @@ mod tests {
             session: None,
             needs: "any".into(),
             required: true,
+            capture_on_failure: false,
             isolation: None,
             join: Join::default(),
             stage: Stage::Iteration,
