@@ -90,6 +90,17 @@ pub const VERTEX_RELAY_KEYS: &[&str] = &[
     "VERTEX_LOCATION",
 ];
 
+/// The identity a run's commits are attributed to, set on the pod by the controller when the run
+/// pushes as its GitHub App. Not a credential: it names an author, and the agent is the one that
+/// commits. The env spelling is what makes it win — it outranks `user.name`/`user.email` from a
+/// config file and from the `-c` overrides a pack's `setup_cmd` passes.
+pub const IDENTITY_RELAY_KEYS: &[&str] = &[
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+];
+
 /// The harness's built-in endpoints (`defaults`, see
 /// `HarnessRuntime::default_endpoints`) plus the domain's extras, de-duplicated, order
 /// preserved, then with `deny_endpoints` subtracted. With `inherit_defaults = false` the built-ins
