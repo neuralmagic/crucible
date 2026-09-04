@@ -132,15 +132,21 @@ impl ShellRunner {
                 };
             }
         };
+        let stdout = String::from_utf8_lossy(&out.stdout);
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            return fail(format!(
-                "exit {}: {}",
-                out.status.code().unwrap_or(-1),
-                stderr_tail(&stderr)
-            ));
+            return Attempt {
+                outcome: AttemptOutcome::Fail {
+                    note: format!(
+                        "exit {}: {}",
+                        out.status.code().unwrap_or(-1),
+                        stderr_tail(&stderr)
+                    ),
+                    output: last_json_line(&stdout).filter(Value::is_object),
+                },
+                cost_usd: 0.0,
+            };
         }
-        let stdout = String::from_utf8_lossy(&out.stdout);
         let Some(last) = stdout.lines().rev().find(|l| !l.trim().is_empty()) else {
             return fail("no output: expected a JSON result on the last stdout line".to_string());
         };
@@ -152,6 +158,15 @@ impl ShellRunner {
             )),
         }
     }
+}
+
+/// The task's JSON result, where the last non-empty stdout line carries one.
+fn last_json_line(stdout: &str) -> Option<Value> {
+    stdout
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .and_then(|line| serde_json::from_str::<Value>(line.trim()).ok())
 }
 
 /// Lines kept from the end of stderr. A build/pytest verdict plus its immediate
@@ -258,7 +273,7 @@ fn evaluation_attempt(task: &Task, mut value: Value) -> Attempt {
             cost_usd: 0.0,
         }
     } else {
-        fail(format!(
+        let note = format!(
             "evaluation {} did not pass{}{}",
             task.name,
             threshold
@@ -269,13 +284,20 @@ fn evaluation_attempt(task: &Task, mut value: Value) -> Attempt {
             } else {
                 format!(" logs: {}", handles.join(","))
             }
-        ))
+        );
+        Attempt {
+            outcome: AttemptOutcome::Fail {
+                note,
+                output: Some(value),
+            },
+            cost_usd: 0.0,
+        }
     }
 }
 
 fn fail(note: String) -> Attempt {
     Attempt {
-        outcome: AttemptOutcome::Fail(note),
+        outcome: AttemptOutcome::fail(note),
         cost_usd: 0.0,
     }
 }
@@ -387,6 +409,89 @@ mod tests {
         assert_eq!(r.attempts, 1, "measured failures never retry");
         assert!(r.note.as_ref().unwrap().contains("exit 3"));
         assert!(r.note.as_ref().unwrap().contains("doomed"));
+    }
+
+    /// The reading that says why the task failed is the reading a settled consumer came for, so
+    /// a nonzero exit that still printed its result keeps it.
+    #[test]
+    fn a_nonzero_exit_that_printed_json_keeps_the_object() {
+        let out = run_plan(
+            vec![command(
+                "boom",
+                r#"echo '{"pass": false, "detail": "rung did not separate"}'; echo doomed >&2; exit 1"#,
+                &[],
+            )],
+            None,
+        );
+        let r = &out.results[&"boom".into()];
+        assert_eq!(r.status, TaskStatus::Fail);
+        assert_eq!(
+            r.output.as_ref().unwrap()["detail"],
+            "rung did not separate"
+        );
+        assert!(r.note.as_ref().unwrap().contains("exit 1"));
+        assert!(r.note.as_ref().unwrap().contains("doomed"));
+    }
+
+    /// A payload is a bonus, never a second failure mode: unparsable or non-object output leaves
+    /// the failure exactly as it was.
+    #[test]
+    fn a_nonzero_exit_that_printed_no_object_keeps_no_output() {
+        for command_line in [
+            "echo not json at all; exit 4",
+            "echo '[1, 2, 3]'; exit 4",
+            "exit 4",
+        ] {
+            let out = run_plan(vec![command("boom", command_line, &[])], None);
+            let r = &out.results[&"boom".into()];
+            assert_eq!(r.status, TaskStatus::Fail, "{command_line}");
+            assert_eq!(r.attempts, 1, "{command_line}");
+            assert!(r.output.is_none(), "{command_line}: {:?}", r.output);
+            assert!(
+                r.note.as_ref().unwrap().contains("exit 4"),
+                "{command_line}: {:?}",
+                r.note
+            );
+        }
+    }
+
+    /// `evaluation_attempt` normalizes `pass` and then throws the record away today. The graded
+    /// object is the whole point of an evaluate task, so a failing grade keeps it.
+    #[test]
+    fn a_failing_evaluation_keeps_its_graded_object() {
+        let out = run_plan(
+            vec![evaluate(
+                "latency",
+                r#"echo '{"score": 42.0, "detail": "p99 regressed"}'"#,
+                Some(10.0),
+            )],
+            None,
+        );
+        let r = &out.results[&"latency".into()];
+        assert_eq!(r.status, TaskStatus::Fail);
+        let output = r.output.as_ref().unwrap();
+        assert_eq!(
+            output["pass"], false,
+            "`pass` is normalized before it rides"
+        );
+        assert_eq!(output["score"], 42.0);
+        assert_eq!(output["detail"], "p99 regressed");
+    }
+
+    /// The self-graded shape the playbook producers use: exit 0, `pass = false`, no threshold.
+    #[test]
+    fn a_self_graded_evaluation_that_declared_failure_keeps_its_object() {
+        let out = run_plan(
+            vec![evaluate(
+                "probe",
+                r#"echo '{"pass": false, "bug_present": false}'"#,
+                None,
+            )],
+            None,
+        );
+        let r = &out.results[&"probe".into()];
+        assert_eq!(r.status, TaskStatus::Fail);
+        assert_eq!(r.output.as_ref().unwrap()["bug_present"], false);
     }
 
     #[test]

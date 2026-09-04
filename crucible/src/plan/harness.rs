@@ -621,7 +621,7 @@ fn run_in(
 
 fn fail(cost_usd: f64, note: String) -> Attempt {
     Attempt {
-        outcome: AttemptOutcome::Fail(note),
+        outcome: AttemptOutcome::fail(note),
         cost_usd,
     }
 }
@@ -703,7 +703,7 @@ mod tests {
 
     fn note(attempt: &Attempt) -> String {
         match &attempt.outcome {
-            AttemptOutcome::Fail(note) => note.clone(),
+            AttemptOutcome::Fail { note, .. } => note.clone(),
             other => panic!("expected a measured failure, got {other:?}"),
         }
     }
@@ -2329,7 +2329,7 @@ workflow(type = "playbook", tasks = [analyze, implement, report])
         };
         let a = runner.run(&t, 1, &BTreeMap::new());
         match a.outcome {
-            AttemptOutcome::Fail(note) => assert!(note.contains("unknown harness")),
+            AttemptOutcome::Fail { note, .. } => assert!(note.contains("unknown harness")),
             _ => panic!("expected a measured failure"),
         }
     }

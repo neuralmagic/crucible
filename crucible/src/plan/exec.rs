@@ -34,14 +34,26 @@ impl Substrate {
 pub enum AttemptOutcome {
     /// Measured success with the task's structured output (the edge payload).
     Pass(Value),
-    /// Measured failure. Never retried: a task that failed, failed.
-    Fail(String),
+    /// Measured failure. Never retried: a task that failed, failed. `output` is the object this
+    /// attempt itself produced (a graded evaluation record, a nonzero exit's JSON line), and
+    /// `None` when it produced nothing readable.
+    Fail { note: String, output: Option<Value> },
     /// The task ran and found its check inapplicable: no evidence either way, and nobody accused.
     /// Declared by the task itself via `"status": "skipped"` in its output — distinct from the
     /// walker's own skip (a task filtered out by substrate caps, which never ran at all).
     Skipped(Value, String),
     /// Transport failure (infra, not the work). Retried, bounded, every attempt visible.
     Transport(String),
+}
+
+impl AttemptOutcome {
+    /// A measured failure that produced no readable output.
+    pub fn fail(note: impl Into<String>) -> Self {
+        AttemptOutcome::Fail {
+            note: note.into(),
+            output: None,
+        }
+    }
 }
 
 pub struct Attempt {
@@ -435,12 +447,18 @@ pub fn execute(
             break;
         };
 
+        // A failure keeps its output, so the selection is by status. A mapped node is exempt: a
+        // fold that settled `Fail` is what `join = "passed"` reduces over.
         let inputs_for = |t: &Task, results: &BTreeMap<TaskName, TaskResult>| {
             t.depends_on
                 .iter()
                 .filter_map(|d| {
                     results
                         .get(d)
+                        .filter(|r| {
+                            r.fanout.is_some()
+                                || matches!(r.status, TaskStatus::Pass | TaskStatus::Skipped)
+                        })
                         .and_then(|r| r.output.clone())
                         .map(|v| (d.clone(), v))
                 })
@@ -704,8 +722,10 @@ fn fanout_items(
         return Err("not a mapped task".to_string());
     };
     let bound = node.max_fanout.unwrap_or(0) as usize;
+    // A failure keeps its output, and a list read off a failed discovery is not a list.
     let produced = results
         .get(&reference.task)
+        .filter(|r| r.status == TaskStatus::Pass)
         .and_then(|r| r.output.as_ref())
         .ok_or_else(|| format!("{} produced no output to map over", reference.task))?;
     let list = produced
@@ -807,20 +827,18 @@ fn declared_status(value: &Value) -> Option<&str> {
 }
 
 fn enforce_emits(task: &Task, outcome: AttemptOutcome) -> AttemptOutcome {
-    let AttemptOutcome::Pass(value) = &outcome else {
-        return outcome;
+    let value = match outcome {
+        AttemptOutcome::Pass(value) => value,
+        other => return other,
     };
     // A skipped task produces no evidence, so its declared emits are not owed. Checking them would
     // turn an honest skip into a spurious failure.
-    if declared_status(value) == Some("skipped") {
+    if declared_status(&value) == Some("skipped") {
         let note = value
             .get("note")
             .and_then(Value::as_str)
             .unwrap_or("task declared status=skipped")
             .to_string();
-        let AttemptOutcome::Pass(value) = outcome else {
-            unreachable!("guarded by the let-else above")
-        };
         return AttemptOutcome::Skipped(value, note);
     }
     match task
@@ -828,10 +846,11 @@ fn enforce_emits(task: &Task, outcome: AttemptOutcome) -> AttemptOutcome {
         .iter()
         .find(|field| value.get(&field.0).is_none())
     {
-        None => outcome,
-        Some(missing) => {
-            AttemptOutcome::Fail(format!("output missing declared field {:?}", missing.0))
-        }
+        None => AttemptOutcome::Pass(value),
+        Some(missing) => AttemptOutcome::Fail {
+            note: format!("output missing declared field {:?}", missing.0),
+            output: Some(value),
+        },
     }
 }
 
@@ -879,13 +898,13 @@ fn run_with_retries(
                     *spent > budget,
                 );
             }
-            AttemptOutcome::Fail(note) => {
+            AttemptOutcome::Fail { note, output } => {
                 return (
                     TaskResult {
                         status: TaskStatus::Fail,
                         attempts,
                         cost_usd: cost,
-                        output: None,
+                        output,
                         note: Some(note),
                         fanout: None,
                     },
@@ -994,14 +1013,14 @@ fn run_batch_with_retries<'a>(
                         },
                     );
                 }
-                AttemptOutcome::Fail(note) => {
+                AttemptOutcome::Fail { note, output } => {
                     done.insert(
                         idx,
                         TaskResult {
                             status: TaskStatus::Fail,
                             attempts: item.attempt,
                             cost_usd: cost_so_far[idx],
-                            output: None,
+                            output,
                             note: Some(note),
                             fanout: None,
                         },
@@ -1371,8 +1390,8 @@ mod tests {
         tasks.push(grade);
         let plan = valid(tasks, 10.0);
         let mut runner = ScriptRunner::new();
-        runner.on("trace", 1, || AttemptOutcome::Fail("no trace".into()), 0.0);
-        runner.on("racecheck", 1, || AttemptOutcome::Fail("race".into()), 0.0);
+        runner.on("trace", 1, || AttemptOutcome::fail("no trace"), 0.0);
+        runner.on("racecheck", 1, || AttemptOutcome::fail("race"), 0.0);
         let out = execute(
             &plan,
             &any_substrate(),
@@ -1400,7 +1419,7 @@ mod tests {
             10.0,
         );
         let mut r = ScriptRunner::new();
-        r.on("adv", 1, || AttemptOutcome::Fail("nope".into()), 0.1);
+        r.on("adv", 1, || AttemptOutcome::fail("nope"), 0.1);
         let out = execute(
             &plan,
             &any_substrate(),
@@ -1425,12 +1444,7 @@ mod tests {
             10.0,
         );
         let mut r = ScriptRunner::new();
-        r.on(
-            "b",
-            1,
-            || AttemptOutcome::Fail("measured failure".into()),
-            0.1,
-        );
+        r.on("b", 1, || AttemptOutcome::fail("measured failure"), 0.1);
         let out = execute(
             &plan,
             &any_substrate(),
@@ -1454,7 +1468,7 @@ mod tests {
         r.on("t", 1, || AttemptOutcome::Transport("blip".into()), 0.1);
         r.on("t", 2, || AttemptOutcome::Transport("blip".into()), 0.1);
         r.on("t", 3, || AttemptOutcome::Transport("blip".into()), 0.1);
-        r.on("f", 1, || AttemptOutcome::Fail("wrong answer".into()), 0.1);
+        r.on("f", 1, || AttemptOutcome::fail("wrong answer"), 0.1);
         let out = execute(
             &plan,
             &any_substrate(),
@@ -1682,7 +1696,7 @@ mod tests {
             10.0,
         );
         let mut r = ScriptRunner::new();
-        r.on("b", 1, || AttemptOutcome::Fail("nope".into()), 0.1);
+        r.on("b", 1, || AttemptOutcome::fail("nope"), 0.1);
         let mut seen: Vec<(String, TaskStatus)> = Vec::new();
         let out = execute(
             &plan,
@@ -1851,7 +1865,7 @@ mod tests {
             || AttemptOutcome::Pass(serde_json::json!({"score": 5.0})),
             0.1,
         );
-        r.on("m-bad", 1, || AttemptOutcome::Fail("broke".into()), 0.1);
+        r.on("m-bad", 1, || AttemptOutcome::fail("broke"), 0.1);
         let out = execute(
             &plan,
             &any_substrate(),
@@ -1871,6 +1885,89 @@ mod tests {
         assert_eq!(kept[0]["task"], "m-ok");
     }
 
+    /// A retained failure output must not become an input under a lossy join: a consumer that
+    /// sees a key for every dependency cannot tell a reading apart from a verdict, and reads a
+    /// failed run as green.
+    #[test]
+    fn a_passed_join_receives_no_entry_for_a_failed_plain_dependency() {
+        let mut grade = task("grade", &["ok", "bad"], "any", true);
+        grade.join = Join::Passed;
+        let plan = valid(
+            vec![
+                task("ok", &[], "any", false),
+                task("bad", &[], "any", false),
+                grade,
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.on(
+            "bad",
+            1,
+            || AttemptOutcome::Fail {
+                note: "measured a regression".to_string(),
+                output: Some(serde_json::json!({"pass": false, "score": 12.0})),
+            },
+            0.1,
+        );
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        let bad = &out.results[&"bad".into()];
+        assert_eq!(bad.status, TaskStatus::Fail);
+        assert_eq!(bad.output.as_ref().unwrap()["score"], 12.0);
+        assert_eq!(out.results[&"grade".into()].status, TaskStatus::Pass);
+        assert_eq!(r.seen_inputs["grade"], vec!["ok".to_string()]);
+    }
+
+    /// The other side of the status filter: a self-declared skip is a reading the task stands
+    /// behind, so a lossy join still receives it alongside a passing sibling.
+    #[test]
+    fn a_passed_join_receives_the_output_of_a_dependency_that_declared_a_skip() {
+        let mut grade = task("grade", &["ok", "unmeasured"], "any", true);
+        grade.join = Join::Passed;
+        let plan = valid(
+            vec![
+                task("ok", &[], "any", false),
+                task("unmeasured", &[], "any", false),
+                grade,
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.on(
+            "unmeasured",
+            1,
+            || {
+                AttemptOutcome::Pass(serde_json::json!({
+                    "status": "skipped",
+                    "note": "broker rejected toggle 'VLLM_GLM_TOGGLE'"
+                }))
+            },
+            0.1,
+        );
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        assert_eq!(
+            out.results[&"unmeasured".into()].status,
+            TaskStatus::Skipped
+        );
+        assert_eq!(out.results[&"grade".into()].status, TaskStatus::Pass);
+        assert_eq!(
+            r.seen_inputs["grade"],
+            vec!["ok".to_string(), "unmeasured".to_string()]
+        );
+    }
+
     #[test]
     fn all_join_still_blocks_on_a_failed_dependency() {
         // The default join is unchanged by the Passed addition.
@@ -1880,7 +1977,7 @@ mod tests {
         ];
         let plan = valid(tasks, 10.0);
         let mut r = ScriptRunner::new();
-        r.on("m", 1, || AttemptOutcome::Fail("broke".into()), 0.1);
+        r.on("m", 1, || AttemptOutcome::fail("broke"), 0.1);
         let out = execute(
             &plan,
             &any_substrate(),
@@ -2001,6 +2098,32 @@ mod tests {
             drifted.note
         );
         assert_eq!(out.results[&"child".into()].status, TaskStatus::Blocked);
+    }
+
+    /// Output drift is measured, so the object it drifted from is the evidence of what drifted.
+    #[test]
+    fn a_task_that_missed_a_declared_field_keeps_the_object_it_did_emit() {
+        let plan = valid(
+            vec![emitting("drifted", &[], false, &["score", "pass"])],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.on(
+            "drifted",
+            1,
+            || AttemptOutcome::Pass(serde_json::json!({"score": 1.0})),
+            0.1,
+        );
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        let drifted = &out.results[&"drifted".into()];
+        assert_eq!(drifted.status, TaskStatus::Fail);
+        assert_eq!(drifted.output.as_ref().unwrap()["score"], 1.0);
     }
 
     #[test]
@@ -2185,6 +2308,7 @@ mod tests {
         cost: f64,
         log: Vec<String>,
         staged: BTreeMap<String, Vec<String>>,
+        seen_inputs: BTreeMap<String, BTreeMap<TaskName, Value>>,
     }
 
     impl FanoutRunner {
@@ -2195,6 +2319,7 @@ mod tests {
                 cost: 0.0,
                 log: Vec::new(),
                 staged: BTreeMap::new(),
+                seen_inputs: BTreeMap::new(),
             }
         }
     }
@@ -2207,6 +2332,7 @@ mod tests {
             inputs: &BTreeMap<TaskName, Value>,
         ) -> Attempt {
             self.log.push(format!("run {}", task.name));
+            self.seen_inputs.insert(task.name.0.clone(), inputs.clone());
             if task.name.0 == "discover" {
                 return Attempt {
                     outcome: AttemptOutcome::Pass(serde_json::json!({"targets": self.items})),
@@ -2218,7 +2344,10 @@ mod tests {
                 .cloned()
                 .unwrap_or(Value::Null);
             let outcome = if self.fail.contains(&task.name.0) {
-                AttemptOutcome::Fail(format!("{} was programmed to fail", task.name))
+                AttemptOutcome::Fail {
+                    note: format!("{} was programmed to fail", task.name),
+                    output: Some(serde_json::json!({"item": item, "status": "fail"})),
+                }
             } else {
                 AttemptOutcome::Pass(serde_json::json!({"item": item, "ran": task.name.0}))
             };
@@ -2325,6 +2454,44 @@ mod tests {
         );
     }
 
+    /// The batch path keeps a failing instance's object on its own row, and the fold still
+    /// reduces over the passing set alone.
+    #[test]
+    fn a_failing_instance_keeps_its_output_but_stays_out_of_the_fold() {
+        let mut node = mapped_node("audit", "discover", "targets", false);
+        node.isolation = Some(crate::plan::ir::Isolation::Worktree);
+        let plan = valid(vec![task("discover", &[], "any", true), node], 5.0);
+        let mut runner = FanoutRunner::new(&["alpha", "beta"]);
+        runner.fail.insert("audit[beta]".to_string());
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut runner,
+            |_, _| {},
+        );
+        assert!(
+            runner.log.contains(&"batch of 2".to_string()),
+            "{:?}",
+            runner.log
+        );
+        let beta = &out.results[&"audit[beta]".into()];
+        assert_eq!(beta.status, TaskStatus::Fail);
+        assert_eq!(
+            beta.output.as_ref().expect("the failing instance's object"),
+            &serde_json::json!({"item": "beta", "status": "fail"})
+        );
+        let fold = out.results[&"audit".into()]
+            .output
+            .clone()
+            .expect("a mapped node folds an output");
+        assert_eq!(fold["outputs"]["alpha"]["ran"], "audit[alpha]");
+        assert!(
+            fold["outputs"].get("beta").is_none(),
+            "the failed instance reached the fold: {fold}"
+        );
+    }
+
     /// The budget is checked before every instance, exactly as it is before every serial task:
     /// the ones that never ran are Blocked rows the fold counts as failures.
     #[test]
@@ -2399,6 +2566,112 @@ mod tests {
         );
     }
 
+    /// The JSON mirror of the staging test above: a fold that settled `Fail` because one instance
+    /// failed is still what `join = "passed"` exists to reduce over, so it must reach the reducer
+    /// even though a plain task's failure output does not.
+    #[test]
+    fn a_passed_join_over_a_fail_folded_mapped_node_still_receives_the_fold() {
+        let node = mapped_node("audit", "discover", "targets", false);
+        let mut consumer = task("roundup", &["audit"], "any", true);
+        consumer.join = Join::Passed;
+        let plan = valid(
+            vec![task("discover", &[], "any", true), node, consumer],
+            5.0,
+        );
+        let mut runner = FanoutRunner::new(&["alpha", "beta"]);
+        runner.fail.insert("audit[beta]".to_string());
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut runner,
+            |_, _| {},
+        );
+        assert_eq!(out.results[&"audit".into()].status, TaskStatus::Fail);
+        assert_eq!(out.results[&"roundup".into()].status, TaskStatus::Pass);
+        let fold = &runner.seen_inputs["roundup"][&TaskName("audit".to_string())];
+        assert_eq!(fold["instances"], 2);
+        assert_eq!(fold["passed"], 1);
+        assert_eq!(fold["outputs"]["alpha"]["ran"], "audit[alpha]");
+    }
+
+    /// A retained failure output is a reading, not a work list. The `over` source has to have
+    /// passed, or a mapped node spends on a list read off a discovery that failed.
+    #[test]
+    fn a_mapped_node_whose_over_source_failed_refuses_to_fan_out() {
+        let mut node = mapped_node("audit", "discover", "targets", false);
+        node.depends_on = vec!["discover".into(), "sibling".into()];
+        node.join = Join::Passed;
+        let plan = valid(
+            vec![
+                task("discover", &[], "any", false),
+                task("sibling", &[], "any", false),
+                node,
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.on(
+            "discover",
+            1,
+            || AttemptOutcome::Fail {
+                note: "discovery did not pass".to_string(),
+                output: Some(serde_json::json!({"targets": ["alpha", "beta"]})),
+            },
+            0.1,
+        );
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        let audit = &out.results[&"audit".into()];
+        assert_eq!(audit.status, TaskStatus::Fail);
+        assert_eq!(
+            audit.note.as_deref(),
+            Some("discover produced no output to map over")
+        );
+        assert!(
+            !r.dispatched.iter().any(|(n, _)| n.starts_with("audit[")),
+            "an instance ran over a failed discovery: {:?}",
+            r.dispatched
+        );
+    }
+
+    /// The same guard read at the source, so it holds for every join that can dispatch a mapped
+    /// node: only the status separates a usable list from a retained failure reading.
+    #[test]
+    fn fanout_items_reads_a_list_only_from_a_source_that_passed() {
+        let node = mapped_node("audit", "discover", "targets", false);
+        let source = |status| TaskResult {
+            status,
+            attempts: 1,
+            cost_usd: 0.0,
+            output: Some(serde_json::json!({"targets": ["alpha"]})),
+            note: None,
+            fanout: None,
+        };
+        for status in [
+            TaskStatus::Fail,
+            TaskStatus::Skipped,
+            TaskStatus::Transport,
+            TaskStatus::Blocked,
+            TaskStatus::Truncated,
+        ] {
+            let results = BTreeMap::from([(TaskName("discover".to_string()), source(status))]);
+            assert_eq!(
+                fanout_items(&node, &results),
+                Err("discover produced no output to map over".to_string()),
+                "{status} was read as a work list"
+            );
+        }
+        let results =
+            BTreeMap::from([(TaskName("discover".to_string()), source(TaskStatus::Pass))]);
+        assert_eq!(fanout_items(&node, &results), Ok(vec!["alpha".to_string()]));
+    }
+
     fn epilogue(name: &str, deps: &[&str], required: bool) -> Task {
         let mut t = task(name, deps, "any", required);
         t.stage = Stage::Epilogue;
@@ -2443,7 +2716,7 @@ mod tests {
             10.0,
         );
         let mut r = ScriptRunner::new();
-        r.on("probe", 1, || AttemptOutcome::Fail("vetoed".into()), 0.1);
+        r.on("probe", 1, || AttemptOutcome::fail("vetoed"), 0.1);
         let out = run_plan(&plan, &mut r);
         assert_eq!(out.results[&"report".into()].status, TaskStatus::Pass);
         assert_eq!(out.results[&"after".into()].status, TaskStatus::Blocked);
@@ -2463,7 +2736,7 @@ mod tests {
             10.0,
         );
         let mut r = ScriptRunner::new();
-        r.on("report", 1, || AttemptOutcome::Fail("no sink".into()), 0.1);
+        r.on("report", 1, || AttemptOutcome::fail("no sink"), 0.1);
         let out = run_plan(&plan, &mut r);
         assert_eq!(out.results[&"report".into()].status, TaskStatus::Fail);
         assert_eq!(out.exit, PlanExit::Completed);
@@ -2483,7 +2756,7 @@ mod tests {
             10.0,
         );
         let mut r = ScriptRunner::new();
-        r.on("first", 1, || AttemptOutcome::Fail("no sink".into()), 0.1);
+        r.on("first", 1, || AttemptOutcome::fail("no sink"), 0.1);
         let out = run_plan(&plan, &mut r);
         assert_eq!(out.results[&"second".into()].status, TaskStatus::Pass);
         assert_eq!(out.exit, PlanExit::Completed);
@@ -2532,7 +2805,7 @@ mod tests {
             0.15,
         );
         let mut r = ScriptRunner::new();
-        r.on("probe", 1, || AttemptOutcome::Fail("vetoed".into()), 0.1);
+        r.on("probe", 1, || AttemptOutcome::fail("vetoed"), 0.1);
         let out = run_plan(&plan, &mut r);
         assert_eq!(out.results[&"report".into()].status, TaskStatus::Pass);
         assert!(out.spent_usd > 0.15);
@@ -2556,7 +2829,7 @@ mod tests {
             0.1,
         );
         let mut r = ScriptRunner::new();
-        r.on("probe", 1, || AttemptOutcome::Fail("vetoed".into()), 0.1);
+        r.on("probe", 1, || AttemptOutcome::fail("vetoed"), 0.1);
         let out = run_plan(&plan, &mut r);
         let report = &out.results[&"report".into()];
         assert_eq!(report.status, TaskStatus::Blocked);
@@ -2587,7 +2860,7 @@ mod tests {
             1,
             || {
                 std::thread::sleep(Duration::from_millis(50));
-                AttemptOutcome::Fail("vetoed".into())
+                AttemptOutcome::fail("vetoed")
             },
             0.1,
         );
@@ -2616,7 +2889,7 @@ mod tests {
         second.isolation = Some(crate::plan::ir::Isolation::Worktree);
         let plan = valid(vec![task("probe", &[], "any", true), first, second], 0.15);
         let mut r = ScriptRunner::new();
-        r.on("probe", 1, || AttemptOutcome::Fail("vetoed".into()), 0.1);
+        r.on("probe", 1, || AttemptOutcome::fail("vetoed"), 0.1);
         let out = run_plan(&plan, &mut r);
         for name in ["first", "second"] {
             assert_eq!(out.results[&name.into()].status, TaskStatus::Pass);
