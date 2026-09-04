@@ -113,6 +113,60 @@ fn read_only(path: &Path) {
     }
 }
 
+/// What a declared path held at one moment, as its size and the digest of its content.
+#[derive(Debug, PartialEq, Eq)]
+enum Fingerprint {
+    Absent,
+    /// Something is there that could not be read as a file, so authorship is undecidable and
+    /// the comparison must refuse rather than guess.
+    Unreadable,
+    Content {
+        bytes: u64,
+        content: git2::Oid,
+    },
+}
+
+fn fingerprint(path: &Path) -> Fingerprint {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return Fingerprint::Absent;
+    };
+    match git2::Oid::hash_file(git2::ObjectType::Blob, path) {
+        Ok(content) => Fingerprint::Content {
+            bytes: metadata.len(),
+            content,
+        },
+        Err(_) => Fingerprint::Unreadable,
+    }
+}
+
+/// Each declared path's content in the root the attempt is about to run in, taken before it
+/// runs. A failing attempt owns a declared path only where this changed: a file an earlier task
+/// left in the workspace is that task's evidence, and publishing it would report a sibling's
+/// reading as the failure's.
+struct PriorContents(BTreeMap<String, Fingerprint>);
+
+impl PriorContents {
+    fn of(workspace: &Path, declared: &[String]) -> Self {
+        PriorContents(
+            declared
+                .iter()
+                .map(|path| {
+                    let held = confined(workspace, path)
+                        .map_or(Fingerprint::Unreadable, |resolved| fingerprint(&resolved));
+                    (path.clone(), held)
+                })
+                .collect(),
+        )
+    }
+
+    /// Whether the attempt wrote `declared`, now resolved at `path`.
+    fn wrote(&self, declared: &str, path: &Path) -> bool {
+        let now = fingerprint(path);
+        matches!(now, Fingerprint::Content { .. })
+            && self.0.get(declared).is_some_and(|before| *before != now)
+    }
+}
+
 /// One file an ancestor declared, as the producer's name and the path it declared.
 pub struct StagedInput {
     pub producer: String,
@@ -304,8 +358,16 @@ fn run_task(
         if let Err(e) = materialize_inputs(&paths.state, &paths.workspace, staged) {
             return transport(e);
         }
+        let before = PriorContents::of(&paths.workspace, &task.emits_files);
         let attempt_out = prepare_and_run(args, paths, task, attempt, inputs);
-        return capture_declared(paths, &paths.workspace, task, attempt_out, captured_bytes);
+        return capture_declared(
+            paths,
+            &paths.workspace,
+            task,
+            attempt_out,
+            captured_bytes,
+            &before,
+        );
     };
     // A private clone of the workspace. Its edits are discarded on cleanup: what leaves an
     // isolated task is its declared output, so this is for review/analysis work, not for
@@ -342,10 +404,18 @@ fn run_task(
     }
     let iso = Paths::for_worktree(worktree.clone(), paths.skills.clone());
     let _ = std::fs::create_dir_all(&iso.state);
+    let before = PriorContents::of(&iso.workspace, &task.emits_files);
     let attempt_out = prepare_and_run(args, &iso, task, attempt, inputs);
     // Before the worktree goes: a declared file is part of the task's output, not part of the
     // workspace state isolation discards, so it has to be taken while the tree is still there.
-    let attempt_out = capture_declared(paths, &iso.workspace, task, attempt_out, captured_bytes);
+    let attempt_out = capture_declared(
+        paths,
+        &iso.workspace,
+        task,
+        attempt_out,
+        captured_bytes,
+        &before,
+    );
     let _ = std::fs::remove_dir_all(&worktree);
     attempt_out
 }
@@ -358,8 +428,8 @@ fn run_task(
 ///
 /// A failing attempt's set is captured too, for a consumer joining `settled`, and it is captured
 /// before [`TaskRunner::settled`] discards the workspace. On that path a declared path counts
-/// only when this attempt wrote it: a file an earlier task committed is that task's evidence,
-/// not this one's, and publishing it would report a sibling's reading as the failure's.
+/// only when this attempt wrote it, which `before` (taken in the same root, before the attempt
+/// ran) decides.
 ///
 /// Capture goes to a temporary directory and is published with a rename, so `state/files/<task>`
 /// exists only for a task that delivered everything it declared: a partial capture cannot reach
@@ -370,6 +440,7 @@ fn capture_declared(
     task: &Task,
     attempt: Attempt,
     captured: &AtomicU64,
+    before: &PriorContents,
 ) -> Attempt {
     let failing = match &attempt.outcome {
         AttemptOutcome::Pass(_) => false,
@@ -397,13 +468,10 @@ fn capture_declared(
                     ));
                 }
             };
-            if failing
-                && !crucible_vcs::vcs::differs_from_committed(workspace, declared)
-                    .map_err(|error| format!("dating declared file {declared:?}: {error:#}"))?
-            {
+            if failing && !before.wrote(declared, &from) {
                 return Err(format!(
-                    "declared file {declared:?} is unchanged from the run's git memory, so this \
-                     attempt did not write it"
+                    "declared file {declared:?} holds what it held before the attempt started, so \
+                     this attempt did not write it"
                 ));
             }
             let total = captured
@@ -446,18 +514,23 @@ fn capture_declared(
 }
 
 /// A capture that published nothing. A passing attempt becomes the measured failure, since it
-/// promised the set; an attempt that had already failed keeps its status and its output, and the
-/// capture problem joins its note.
+/// promised the set; an attempt that had already failed keeps its status. Either way the
+/// attempt's own reading is retained and the capture problem joins the note.
 fn withheld(attempt: Attempt, why: String) -> Attempt {
-    match attempt.outcome {
-        AttemptOutcome::Fail { note, output } => Attempt {
-            outcome: AttemptOutcome::Fail {
-                note: format!("{note}; {why}"),
-                output,
-            },
-            cost_usd: attempt.cost_usd,
+    let outcome = match attempt.outcome {
+        AttemptOutcome::Fail { note, output } => AttemptOutcome::Fail {
+            note: format!("{note}; {why}"),
+            output,
         },
-        _ => fail(attempt.cost_usd, why),
+        AttemptOutcome::Pass(output) => AttemptOutcome::Fail {
+            note: why,
+            output: Some(output),
+        },
+        _ => AttemptOutcome::fail(why),
+    };
+    Attempt {
+        outcome,
+        cost_usd: attempt.cost_usd,
     }
 }
 
@@ -740,6 +813,12 @@ mod tests {
         }
     }
 
+    /// The declared paths as they stood before a dispatch. The passing path never consults
+    /// them, so a test driving that path can take them at any point.
+    fn prior(paths: &Paths, task: &crate::plan::ir::Task) -> PriorContents {
+        PriorContents::of(&paths.workspace, &task.emits_files)
+    }
+
     fn note(attempt: &Attempt) -> String {
         match &attempt.outcome {
             AttemptOutcome::Fail { note, .. } => note.clone(),
@@ -756,7 +835,15 @@ mod tests {
         std::fs::write(paths.workspace.join("A.md"), "present\n").unwrap();
         let task = emitting("draft", &["A.md", "B.md"]);
         let counter = AtomicU64::new(0);
-        let out = capture_declared(&paths, &paths.workspace, &task, passing(), &counter);
+        let before = prior(&paths, &task);
+        let out = capture_declared(
+            &paths,
+            &paths.workspace,
+            &task,
+            passing(),
+            &counter,
+            &before,
+        );
         let note = note(&out);
         assert!(note.contains("B.md") && note.contains("absent"), "{note}");
         assert!(
@@ -781,8 +868,16 @@ mod tests {
         read_only(&source);
         let task = emitting("draft", &["A.md"]);
         let counter = AtomicU64::new(0);
+        let before = prior(&paths, &task);
         for round in 1..=3 {
-            let out = capture_declared(&paths, &paths.workspace, &task, passing(), &counter);
+            let out = capture_declared(
+                &paths,
+                &paths.workspace,
+                &task,
+                passing(),
+                &counter,
+                &before,
+            );
             assert!(
                 matches!(out.outcome, AttemptOutcome::Pass(_)),
                 "round {round}: {:?}",
@@ -808,14 +903,30 @@ mod tests {
         std::fs::write(paths.workspace.join("A.md"), vec![b'x'; 4096]).unwrap();
         let task = emitting("draft", &["A.md"]);
         let counter = AtomicU64::new(0);
-        let out = capture_declared(&paths, &paths.workspace, &task, passing(), &counter);
+        let before = prior(&paths, &task);
+        let out = capture_declared(
+            &paths,
+            &paths.workspace,
+            &task,
+            passing(),
+            &counter,
+            &before,
+        );
         assert!(matches!(out.outcome, AttemptOutcome::Pass(_)));
         assert_eq!(counter.load(Ordering::Relaxed), 4096);
 
         // A second task, itself far under the bound, lands on a run that is already there.
         let later = emitting("polish", &["A.md"]);
         counter.store(MAX_CAPTURED_BYTES - 1, Ordering::Relaxed);
-        let out = capture_declared(&paths, &paths.workspace, &later, passing(), &counter);
+        let before = prior(&paths, &later);
+        let out = capture_declared(
+            &paths,
+            &paths.workspace,
+            &later,
+            passing(),
+            &counter,
+            &before,
+        );
         let note = note(&out);
         assert!(note.contains("this run's declared files exceed"), "{note}");
         assert!(
@@ -3139,6 +3250,7 @@ workflow(type = "playbook", tasks = [producer, report])
         std::fs::write(paths.workspace.join("A.md"), "present\n").unwrap();
         let task = emitting("draft", &["A.md"]);
         let counter = AtomicU64::new(0);
+        let before = prior(&paths, &task);
         for outcome in [
             AttemptOutcome::Transport("the broker hung up".to_string()),
             AttemptOutcome::Skipped(Value::Null, "not applicable here".to_string()),
@@ -3152,6 +3264,7 @@ workflow(type = "playbook", tasks = [producer, report])
                     cost_usd: 0.0,
                 },
                 &counter,
+                &before,
             );
             assert!(
                 !matches!(out.outcome, AttemptOutcome::Fail { .. }),
@@ -3255,6 +3368,142 @@ workflow(type = "playbook", tasks = [probe, deliver, report])
         assert_eq!(seen["deliver"]["status"], "blocked");
         assert_eq!(seen["deliver"]["output"], serde_json::Value::Null);
         assert_eq!(seen["deliver"]["files"], false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// Provenance cannot rest on git's opinion of the workspace: a declared path an earlier
+    /// passing task wrote is still there when a later task fails without writing it, and a
+    /// `.gitignore` covering that path makes it invisible to every cleanliness test.
+    #[test]
+    fn an_ignored_path_an_earlier_task_wrote_is_not_the_failing_tasks_evidence() {
+        let dir = playbook_pack(
+            "settled-ignored-provenance",
+            r#"
+first = command(
+    name = "first",
+    run = "printf 'evidence/\n' > .gitignore && mkdir -p evidence && printf 'from first\n' > evidence/x.json && printf '{\"ok\": true}\n'",
+    required = False,
+    emits_files = ["evidence/x.json"],
+)
+second = command(
+    name = "second",
+    run = "printf 'second wrote nothing\n' >&2 && exit 1",
+    depends_on = [first],
+    required = False,
+    emits_files = ["evidence/x.json"],
+)
+report = command(
+    name = "report",
+    run = "test ! -e inputs/second && test -e inputs/first/evidence/x.json && printf '{\"ok\": true}\n'",
+    depends_on = [first, second],
+    join = "settled",
+)
+workflow(type = "playbook", tasks = [first, second, report])
+"#,
+        );
+        let out = run_playbook(&dir);
+
+        assert_eq!(out.results[&"first".into()].status, TaskStatus::Pass);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("workspace/evidence/x.json")).unwrap_or_default(),
+            "from first\n",
+            "the ignored file has to survive into the next task for this to prove anything"
+        );
+        let second = &out.results[&"second".into()];
+        assert_eq!(second.status, TaskStatus::Fail);
+        let note = second.note.clone().unwrap_or_default();
+        assert!(note.contains("did not write it"), "{note}");
+        assert!(
+            !dir.join("state/files/second").exists(),
+            "a failing task published an ignored file it inherited"
+        );
+        let report = &out.results[&"report".into()];
+        assert_eq!(report.status, TaskStatus::Pass, "{:?}", report.note);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half of the same rule: a failing task that did rewrite the path owns what it
+    /// wrote, and the settled consumer reads this attempt's content and not its predecessor's.
+    #[test]
+    fn a_failing_task_that_rewrote_a_declared_path_publishes_its_own_content() {
+        let dir = playbook_pack(
+            "settled-rewrote-provenance",
+            r#"
+first = command(
+    name = "first",
+    run = "printf 'evidence/\n' > .gitignore && mkdir -p evidence && printf 'from first\n' > evidence/x.json && printf '{\"ok\": true}\n'",
+    required = False,
+    emits_files = ["evidence/x.json"],
+)
+second = command(
+    name = "second",
+    run = "mkdir -p evidence && printf 'from second\n' > evidence/x.json && exit 1",
+    depends_on = [first],
+    required = False,
+    emits_files = ["evidence/x.json"],
+)
+report = command(
+    name = "report",
+    run = "grep -q 'from second' inputs/second/evidence/x.json && printf '{\"ok\": true}\n'",
+    depends_on = [first, second],
+    join = "settled",
+)
+workflow(type = "playbook", tasks = [first, second, report])
+"#,
+        );
+        let out = run_playbook(&dir);
+
+        assert_eq!(out.results[&"second".into()].status, TaskStatus::Fail);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("state/files/second/evidence/x.json"))
+                .unwrap_or_default(),
+            "from second\n",
+            "the failing task's own write was withheld"
+        );
+        let report = &out.results[&"report".into()];
+        assert_eq!(report.status, TaskStatus::Pass, "{:?}", report.note);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Output drift converts a passing attempt into a measured failure, and a measured failure
+    /// keeps its reading: the reporter that joins settled needs the number the probe printed,
+    /// not a null where the missing file used to be.
+    #[test]
+    fn a_pass_converted_by_an_absent_declared_file_keeps_its_reading() {
+        let dir = playbook_pack(
+            "settled-withheld-output",
+            r#"
+probe = command(
+    name = "probe",
+    run = "printf '{\"pass\": true, \"margin\": 0.42}\n'",
+    required = False,
+    emits_files = ["evidence/probe.json"],
+)
+report = command(
+    name = "report",
+    run = "python3 -c 'import json, os; e = json.loads(os.environ[\"CRUCIBLE_INPUTS\"])[\"probe\"]; print(json.dumps({\"seen\": e[\"status\"], \"margin\": e[\"output\"][\"margin\"], \"files\": e[\"files\"]}))'",
+    depends_on = [probe],
+    join = "settled",
+)
+workflow(type = "playbook", tasks = [probe, report])
+"#,
+        );
+        let out = run_playbook(&dir);
+
+        let probe = &out.results[&"probe".into()];
+        assert_eq!(probe.status, TaskStatus::Fail);
+        let note = probe.note.clone().unwrap_or_default();
+        assert!(note.contains("absent"), "{note}");
+        assert_eq!(
+            probe.output.as_ref().and_then(|o| o.get("margin")),
+            Some(&serde_json::json!(0.42)),
+            "the converted attempt dropped its own reading"
+        );
+        let report = &out.results[&"report".into()];
+        assert_eq!(report.status, TaskStatus::Pass, "{:?}", report.note);
+        let seen = report.output.as_ref().expect("the echoed entry");
+        assert_eq!(seen["seen"], "fail");
+        assert_eq!(seen["margin"], 0.42);
+        assert_eq!(seen["files"], false);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
