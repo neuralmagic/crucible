@@ -229,8 +229,24 @@ impl TaskRunner for HarnessRunner {
         captured_dir(&self.paths.state, &task.name.0).is_dir()
     }
 
+    /// Discards the set published under this task's name, and for a mapped node the sets
+    /// published under its instances' names too: a node that did not expand this run has no
+    /// instance rows, so nothing else in the run ever reaches them.
     fn drop_captured(&mut self, task: &Task) {
         let _ = std::fs::remove_dir_all(captured_dir(&self.paths.state, &task.name.0));
+        if task.over.is_none() {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(self.paths.state.join("files")) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if crate::plan::exec::is_instance_of(&task.name, &TaskName(name.to_string())) {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
     }
 
     /// Commit what a passing task did, and discard what a failing one did.
@@ -3504,6 +3520,49 @@ workflow(type = "playbook", tasks = [probe, report])
         assert_eq!(seen["seen"], "fail");
         assert_eq!(seen["margin"], 0.42);
         assert_eq!(seen["files"], false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// A mapped node that settles blocked publishes no instance rows, so its own drop is the
+    /// only thing that can reach the instance sets an earlier run left behind.
+    #[test]
+    fn a_mapped_node_that_never_expands_drops_the_instance_sets_an_earlier_run_published() {
+        let dir = playbook_pack(
+            "settled-stale-instances",
+            r#"
+discover = command(
+    name = "discover",
+    run = "test ! -f ../fail-gate && printf '{\"targets\": [\"alpha\"]}\n'",
+    required = False,
+    emits = ["targets"],
+)
+audit = command(
+    name = "audit",
+    run = "mkdir -p evidence && printf 'a\n' > evidence/a.json && printf '{\"ok\": true}\n'",
+    depends_on = [discover],
+    over = discover.targets,
+    max_fanout = 2,
+    required = False,
+    emits_files = ["evidence/a.json"],
+)
+workflow(type = "playbook", tasks = [discover, audit])
+"#,
+        );
+        let out = run_playbook(&dir);
+        assert_eq!(out.results[&"audit[alpha]".into()].status, TaskStatus::Pass);
+        assert!(
+            dir.join("state/files/audit[alpha]/evidence/a.json")
+                .exists(),
+            "the instance never published a set to go stale"
+        );
+
+        std::fs::write(dir.join("fail-gate"), "").unwrap();
+        let out = run_playbook(&dir);
+        assert_eq!(out.results[&"discover".into()].status, TaskStatus::Fail);
+        assert_eq!(out.results[&"audit".into()].status, TaskStatus::Blocked);
+        assert!(
+            !dir.join("state/files/audit[alpha]").exists(),
+            "a node that never expanded kept an earlier run's instance set"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

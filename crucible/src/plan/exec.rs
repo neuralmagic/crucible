@@ -726,8 +726,9 @@ fn instance_key<'a>(node: &TaskName, name: &'a TaskName) -> Option<&'a str> {
         .and_then(|rest| rest.strip_suffix(']'))
 }
 
-/// Whether `name` is an instance of the mapped node `node`.
-fn is_instance_of(node: &TaskName, name: &TaskName) -> bool {
+/// Whether `name` is an instance of the mapped node `node`, by the `node[item]` naming a
+/// declared name cannot collide with.
+pub fn is_instance_of(node: &TaskName, name: &TaskName) -> bool {
     instance_key(node, name).is_some()
 }
 
