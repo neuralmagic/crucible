@@ -16,7 +16,8 @@ use serde_json::Value;
 use crate::loop_driver::{self, Decided, IterStep, Measured, TurnVerdict};
 use crate::manifest::{WorkflowCaps, WorkflowCfg, WorkflowType};
 use crate::plan::exec::{
-    Attempt, AttemptOutcome, BatchItem, ExecCfg, Substrate, TaskRunner, TaskStatus, execute,
+    Attempt, AttemptOutcome, BatchItem, ExecCfg, Substrate, TaskResult, TaskRunner, TaskStatus,
+    execute, execute_from,
 };
 use crate::plan::ir::{
     EngineOp, Join, Plan, PlanBudget, Stage, Task, TaskKind, TaskName, ValidPlan,
@@ -62,6 +63,54 @@ pub(crate) struct IterCtx<'a> {
     pub started: Instant,
     pub heartbeat: Option<std::sync::Arc<crate::heartbeat::Heartbeat>>,
     pub workflow: Option<&'a WorkflowCfg>,
+    /// Results a previous process settled in this same iteration, from the session log.
+    pub prior: Option<PriorPlan>,
+}
+
+/// The plan tasks a dead process settled in the iteration it died in, as the contract fold
+/// restored them. A resumed iteration whose freshly built plan declares the same tasks under
+/// the same version starts from these instead of re-dispatching them.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PriorPlan {
+    pub iter: u32,
+    pub plan_version: u32,
+    pub declared: Vec<String>,
+    pub results: BTreeMap<String, crucible_contract::TaskResultWire>,
+}
+
+impl PriorPlan {
+    /// The results to seed `plan` with: only when the plan is the one the log admitted (same
+    /// version, same declared tasks), and only the tasks that passed. Engine operations are
+    /// never seeded: the world a passing `propose` or `apply` produced did not survive the
+    /// process, so they run again.
+    fn seed(&self, plan: &ValidPlan) -> BTreeMap<TaskName, TaskResult> {
+        let declared: Vec<String> = plan.plan().tasks.iter().map(|t| t.name.0.clone()).collect();
+        if plan.plan().version != self.plan_version || declared != self.declared {
+            return BTreeMap::new();
+        }
+        plan.plan()
+            .tasks
+            .iter()
+            .filter(|t| !matches!(t.task, TaskKind::Engine { .. }))
+            .filter_map(|t| {
+                let prior = self.results.get(&t.name.0)?;
+                let status = TaskStatus::parse(&prior.status)?;
+                (status == TaskStatus::Pass).then(|| {
+                    (
+                        t.name.clone(),
+                        TaskResult {
+                            status,
+                            attempts: prior.attempts,
+                            cost_usd: prior.cost_usd,
+                            output: prior.output.clone(),
+                            note: (!prior.note.is_empty()).then(|| prior.note.clone()),
+                            fanout: None,
+                        },
+                    )
+                })
+            })
+            .collect()
+    }
 }
 
 /// Run one admitted autoresearch iteration and return its step and cost.
@@ -75,6 +124,17 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
         caps = caps.with_persistent_sessions();
     }
     let plan = iteration_template(cx.workflow, &caps)?;
+    let prior = cx
+        .prior
+        .as_ref()
+        .map(|prior| prior.seed(&plan))
+        .unwrap_or_default();
+    if !prior.is_empty() {
+        r.note(&format!(
+            "resume: {} task(s) settled before the run died carry over; the rest run",
+            prior.len()
+        ));
+    }
     let result_task = cx
         .workflow
         .filter(|workflow| !workflow.is_legacy_splice())
@@ -120,11 +180,12 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
     // The runner and the on_result hook both need the reporter; collect the wire lines
     // here and append them after the executor returns (they're additive either way).
     let mut task_events = Vec::new();
-    let outcome = execute(
+    let outcome = execute_from(
         &plan,
         &Substrate::default(),
         ExecCfg::default(),
         &mut runner,
+        prior,
         |task, result| {
             task_states
                 .borrow_mut()
@@ -819,6 +880,62 @@ mod tests {
         );
         assert_eq!(dep("measure"), ["apply"]);
         assert_eq!(dep("decide"), ["measure"]);
+    }
+
+    /// A resumed iteration re-uses what the dead process settled only when the plan is the
+    /// one it admitted, and only the passing pack tasks: engine operations run again because
+    /// the world they produced did not survive the process.
+    #[test]
+    fn a_prior_plan_seeds_only_passing_pack_tasks_of_the_same_plan() {
+        let w: WorkflowCfg = toml::from_str(
+            "[[task]]\nname = \"review\"\nkind = \"command\"\ncommand = \"true\"\n             [[task]]\nname = \"lint\"\nkind = \"command\"\ncommand = \"true\"\ndepends_on = [\"review\"]\n",
+        )
+        .unwrap();
+        w.validate().unwrap();
+        let plan = iteration_template(Some(&w), &WorkflowCaps::autoresearch_engine()).unwrap();
+        let declared: Vec<String> = plan.plan().tasks.iter().map(|t| t.name.0.clone()).collect();
+        let wire = |status: &str| crucible_contract::TaskResultWire {
+            status: status.into(),
+            task_kind: "command".into(),
+            iter: 2,
+            attempts: 1,
+            cost_usd: 0.1,
+            secs: 0.2,
+            note: String::new(),
+            output: Some(serde_json::json!({"ok": true})),
+        };
+        let prior = PriorPlan {
+            iter: 2,
+            plan_version: 1,
+            declared: declared.clone(),
+            results: BTreeMap::from([
+                ("propose".to_string(), wire("pass")),
+                ("review".to_string(), wire("pass")),
+                ("lint".to_string(), wire("fail")),
+            ]),
+        };
+        let seeded = prior.seed(&plan);
+        let names: Vec<&str> = seeded.keys().map(|n| n.0.as_str()).collect();
+        assert_eq!(names, ["review"], "passing pack task only: {names:?}");
+        assert_eq!(seeded[&TaskName::from("review")].status, TaskStatus::Pass);
+        assert_eq!(seeded[&TaskName::from("review")].cost_usd, 0.1);
+
+        let other_version = PriorPlan {
+            plan_version: 2,
+            ..prior.clone()
+        };
+        assert!(
+            other_version.seed(&plan).is_empty(),
+            "a different plan version seeds nothing"
+        );
+        let other_shape = PriorPlan {
+            declared: vec!["review".into()],
+            ..prior
+        };
+        assert!(
+            other_shape.seed(&plan).is_empty(),
+            "a different task set seeds nothing"
+        );
     }
 
     /// Epilogue tasks stay out of the per-iteration plan entirely (legacy splice and

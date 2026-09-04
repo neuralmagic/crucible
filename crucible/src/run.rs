@@ -1067,6 +1067,7 @@ fn drive_loop(
                             recovery: Some(recovery),
                             ledger: Some(ledger),
                             heartbeat: beat.clone(),
+                            prior_plan: recovered.prior_plan,
                         },
                     )?
                 }

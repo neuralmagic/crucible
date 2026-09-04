@@ -1,14 +1,14 @@
-//! Recovery classification: one pass over a dead run's session log names how it died.
-//! Reads only the durable log (marker files are consume-on-read and gone by park time).
-//! Facts only; policy lives in [`plan_recovery`].
+//! Recovery classification: the session log, folded once by the contract, names how a dead run
+//! ended. Reads only the durable log (marker files are consume-on-read and gone by park time).
+//! Facts come from [`crucible_contract::LoopState`]; policy lives in [`plan_recovery`].
 
-use crate::event::AgentEvent;
-use crate::loop_driver::{ResumeFold, ResumeState};
+use crate::loop_driver::ResumeState;
 use crate::provisioning::{self, WaitMode};
-use crate::session::{self, RecoveryClass, SessionEvent};
+use crate::session::RecoveryClass;
 use anyhow::{Context, Result};
+use crucible_contract::LoopState;
 use crucible_contract::admission::AdmissionKey;
-use std::io::BufRead;
+pub(crate) use crucible_contract::{Classification, OpenApproval, ShutdownOutcome};
 use std::path::Path;
 
 #[derive(Debug, thiserror::Error)]
@@ -18,374 +18,51 @@ struct EmptySessionLog {
     class: String,
 }
 
-/// Evidence scraped from a dangling turn's Agent events; retry policy lives elsewhere.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct TurnEvidence {
-    /// Events inside the dangling AgentStart bracket.
-    pub agent_events: u32,
-    /// Last per-turn cost seen (`Tokens.cost_usd` or `OtelSummary.cost_usd`).
-    pub last_cost_usd: Option<f64>,
-    /// Last error text (`Error.message` or an is_error `Result.error`), verbatim.
-    pub last_error: Option<String>,
-    /// From the preceding AgentSession line.
-    pub session: Option<DanglingSession>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct DanglingSession {
-    pub name: String,
-    /// 1-based, from the AgentSession line.
-    pub turn: u32,
-}
-
-/// An approval the dead run was still waiting on (dangling ApprovalWait).
-#[derive(Debug, Clone)]
-pub(crate) struct PendingApproval {
-    pub handle: String,
-    pub trace_id: String,
-    pub mode: WaitMode,
-}
-
-/// PlanAdmitted with its iteration's Row absent. The graph runner batches TaskResult
-/// emission until the executor returns, so a mid-plan death leaves `resulted` empty.
-#[derive(Debug, Clone)]
-pub(crate) struct OpenPlan {
-    pub plan_version: u32,
-    /// PlanTaskWire names, in order.
-    pub declared: Vec<String>,
-    /// TaskResult names seen after this PlanAdmitted.
-    pub resulted: Vec<String>,
-}
-
-/// What the tail of the log says happened.
-#[derive(Debug, Clone)]
-pub(crate) enum Classification {
-    /// Shutdown line present: the previous process exited on purpose.
-    CleanExit {
-        outcome: ShutdownOutcome,
-        reason: String,
-    },
-    /// Start (maybe Phase baseline) but no decided rows: nothing to resume from.
-    DiedInBaseline,
-    /// AgentStart with no AgentDone: the turn was in flight.
-    DiedMidTurn {
-        iter: u32,
-        evidence: TurnEvidence,
-        approval: Option<PendingApproval>,
-    },
-    /// Turn finished (AgentDone) but no Row for that iter: died in measure/decide/keep.
-    DiedDeciding { iter: u32, evidence: TurnEvidence },
-    /// Graph loop: PlanAdmitted for an iteration with no Row and no dangling turn.
-    DiedInPlanTask { iter: u32, plan: OpenPlan },
-    /// Parked on a block-mode approval (dangling ApprovalWait, no turn in flight).
-    DiedAwaitingApproval { approval: PendingApproval },
-    /// No dangling turn/plan/approval; died between a Row and the next AgentStart.
-    DiedBetweenIterations { last_iter: u32 },
-}
-
-pub(crate) use crucible_contract::ShutdownOutcome;
-
-fn trunc(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let cut: String = s.chars().take(max).collect();
-    format!("{cut}…")
-}
-
-impl Classification {
-    pub(crate) fn class(&self) -> RecoveryClass {
-        match self {
-            Classification::CleanExit { .. } => RecoveryClass::CleanExit,
-            Classification::DiedInBaseline => RecoveryClass::DiedInBaseline,
-            Classification::DiedMidTurn { .. } => RecoveryClass::DiedMidTurn,
-            Classification::DiedDeciding { .. } => RecoveryClass::DiedDeciding,
-            Classification::DiedInPlanTask { .. } => RecoveryClass::DiedInPlanTask,
-            Classification::DiedAwaitingApproval { .. } => RecoveryClass::DiedAwaitingApproval,
-            Classification::DiedBetweenIterations { .. } => RecoveryClass::DiedBetweenIterations,
-        }
-    }
-
-    /// The iteration the interruption touched (0 if none).
-    pub(crate) fn iter(&self) -> u32 {
-        match self {
-            Classification::DiedMidTurn { iter, .. }
-            | Classification::DiedDeciding { iter, .. }
-            | Classification::DiedInPlanTask { iter, .. } => *iter,
-            Classification::DiedBetweenIterations { last_iter } => *last_iter,
-            _ => 0,
-        }
-    }
-
-    /// One-line evidence summary for the Recovery event and the resume note.
-    pub(crate) fn detail(&self) -> String {
-        match self {
-            Classification::CleanExit { outcome, reason } => {
-                format!("previous run exited {}: {reason}", outcome.as_str())
-            }
-            Classification::DiedInBaseline => "no decided rows in the log".to_string(),
-            Classification::DiedMidTurn {
-                iter,
-                evidence,
-                approval,
-            } => {
-                let mut s = format!(
-                    "turn in flight at iter {iter}, {} agent events",
-                    evidence.agent_events
-                );
-                if let Some(c) = evidence.last_cost_usd {
-                    s.push_str(&format!(", last cost ${c:.2}"));
-                }
-                if let Some(sess) = &evidence.session {
-                    s.push_str(&format!(", session {} turn {}", sess.name, sess.turn));
-                }
-                if let Some(e) = &evidence.last_error {
-                    s.push_str(&format!(", last error: {}", trunc(e, 200)));
-                }
-                if let Some(a) = approval {
-                    s.push_str(&format!(", approval {} outstanding", a.handle));
-                }
-                s
-            }
-            Classification::DiedDeciding { iter, evidence } => {
-                let mut s = format!("turn at iter {iter} completed but was never decided");
-                if let Some(sess) = &evidence.session {
-                    s.push_str(&format!(
-                        " (session {} turn {} cursor advanced ungraded)",
-                        sess.name, sess.turn
-                    ));
-                }
-                s
-            }
-            Classification::DiedInPlanTask { iter, plan } => format!(
-                "plan v{} at iter {iter} never accounted ({}/{} tasks resulted)",
-                plan.plan_version,
-                plan.resulted.len(),
-                plan.declared.len()
-            ),
-            Classification::DiedAwaitingApproval { approval } => {
-                format!(
-                    "parked on approval {} ({})",
-                    approval.handle, approval.trace_id
-                )
-            }
-            Classification::DiedBetweenIterations { last_iter } => {
-                format!("died between iterations, last decided iter {last_iter}")
-            }
-        }
-    }
-}
-
-#[derive(Default)]
-struct TailScan {
-    /// Only a TRAILING Shutdown counts: a resumed process appends past its
-    /// predecessor's Shutdown, so any later event clears it.
-    shutdown: Option<(String, String)>,
-    /// Any decided (non-infra) row.
-    saw_any_row: bool,
-    last_row_iter: u32,
-    last_phase_iter: u32,
-    /// AgentSession seen; the next AgentStart claims it.
-    pending_session: Option<DanglingSession>,
-    /// AgentStart .. missing AgentDone.
-    open_turn: Option<(u32, TurnEvidence)>,
-    /// AgentDone landed, the Row for that iter has not.
-    done_unrowed: Option<(u32, TurnEvidence)>,
-    /// PlanAdmitted .. missing its Row.
-    open_plan: Option<OpenPlan>,
-    /// ApprovalWait .. missing ApprovalResolved.
-    open_approval: Option<PendingApproval>,
-}
-
-impl TailScan {
-    fn feed(&mut self, ev: &SessionEvent) {
-        if self.shutdown.is_some() && !matches!(ev, SessionEvent::Shutdown { .. }) {
-            self.shutdown = None;
-        }
-        match ev {
-            SessionEvent::Shutdown { outcome, reason } => {
-                self.shutdown = Some((outcome.clone(), reason.clone()));
-            }
-            SessionEvent::Phase { phase, iter } => {
-                if phase == "iteration" {
-                    self.last_phase_iter = *iter;
-                    // Safety net for paths that account an iteration without a Row.
-                    self.done_unrowed = None;
-                }
-            }
-            SessionEvent::AgentSession { session, turn, .. } => {
-                self.pending_session = Some(DanglingSession {
-                    name: session.clone(),
-                    turn: *turn,
-                });
-            }
-            SessionEvent::AgentStart { iter } => {
-                self.open_turn = Some((
-                    *iter,
-                    TurnEvidence {
-                        session: self.pending_session.take(),
-                        ..TurnEvidence::default()
-                    },
-                ));
-            }
-            SessionEvent::Agent { event } => {
-                if let Some((_, evidence)) = &mut self.open_turn {
-                    evidence.agent_events += 1;
-                    match event {
-                        AgentEvent::Tokens(t) => {
-                            if let Some(c) = t.cost_usd {
-                                evidence.last_cost_usd = Some(c);
-                            }
-                        }
-                        AgentEvent::OtelSummary { cost_usd, .. } => {
-                            evidence.last_cost_usd = Some(*cost_usd);
-                        }
-                        AgentEvent::Error { message, .. } => {
-                            evidence.last_error = Some(message.clone());
-                        }
-                        AgentEvent::Result {
-                            is_error: true,
-                            error: Some(e),
-                            ..
-                        } => {
-                            evidence.last_error = Some(e.clone());
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            SessionEvent::AgentDone => {
-                self.done_unrowed = self.open_turn.take();
-            }
-            SessionEvent::Row { row, .. } => {
-                if !matches!(row.phase.as_deref(), Some("wide") | Some("infra")) {
-                    self.saw_any_row = true;
-                    self.last_row_iter = row.iter;
-                }
-                if self
-                    .done_unrowed
-                    .as_ref()
-                    .is_some_and(|(iter, _)| *iter == row.iter)
-                {
-                    self.done_unrowed = None;
-                }
-                // Any row after an admission accounts the plan's iteration.
-                self.open_plan = None;
-            }
-            SessionEvent::PlanAdmitted {
-                plan_version,
-                tasks,
-                ..
-            } => {
-                self.open_plan = Some(OpenPlan {
-                    plan_version: *plan_version,
-                    declared: tasks.iter().map(|t| t.name.clone()).collect(),
-                    resulted: Vec::new(),
-                });
-            }
-            SessionEvent::TaskResult { task, .. } => {
-                if let Some(plan) = &mut self.open_plan {
-                    plan.resulted.push(task.clone());
-                }
-            }
-            SessionEvent::ApprovalWait {
-                handle,
-                trace_id,
-                mode,
-                ..
-            } => {
-                self.open_approval = Some(PendingApproval {
-                    handle: handle.clone(),
-                    trace_id: trace_id.clone(),
-                    // Unknown tokens degrade to Continue: never re-park on a mode
-                    // this binary can't honor.
-                    mode: if mode == "block" {
-                        WaitMode::Block
-                    } else {
-                        WaitMode::Continue
-                    },
-                });
-            }
-            SessionEvent::ApprovalResolved { .. } => self.open_approval = None,
-            _ => {}
-        }
-    }
-
-    /// Precedence: each earlier case subsumes the later ones.
-    fn finish(mut self) -> (Classification, Option<PendingApproval>) {
-        let pending = self.open_approval.clone();
-        let classification = if let Some((outcome, reason)) = self.shutdown {
-            Classification::CleanExit {
-                outcome: ShutdownOutcome::parse(&outcome),
-                reason,
-            }
-        } else if !self.saw_any_row {
-            Classification::DiedInBaseline
-        } else if let Some((iter, evidence)) = self.open_turn {
-            Classification::DiedMidTurn {
-                iter,
-                evidence,
-                approval: self.open_approval.take(),
-            }
-        } else if let Some(plan) = self.open_plan {
-            Classification::DiedInPlanTask {
-                iter: self.last_phase_iter,
-                plan,
-            }
-        } else if let Some(approval) = self.open_approval.take_if(|a| a.mode == WaitMode::Block) {
-            Classification::DiedAwaitingApproval { approval }
-        } else if let Some((iter, evidence)) = self.done_unrowed {
-            Classification::DiedDeciding { iter, evidence }
-        } else {
-            Classification::DiedBetweenIterations {
-                last_iter: self.last_row_iter,
-            }
-        };
-        (classification, pending)
-    }
-}
-
-/// Everything `--resume` needs from the log, produced in one pass.
+/// Everything `--resume` needs from the log, produced in one fold.
 #[derive(Debug)]
 pub(crate) struct SessionRecovery {
     pub resume: ResumeState,
     pub classification: Classification,
     /// Dangling approval regardless of class, for re-registration.
-    pub pending_approval: Option<PendingApproval>,
+    pub pending_approval: Option<OpenApproval>,
+    /// The plan tasks settled in the iteration the run died in, when it died inside a plan.
+    pub prior_plan: Option<crate::loop_graph::PriorPlan>,
 }
 
 /// Replay the session log into resume counters and a tail classification. Torn final
 /// lines are skipped; a rowless log is a refusal (`--resume` means continue, not restart).
 pub(crate) fn classify_session(session_log: &Path) -> Result<SessionRecovery> {
-    let file = std::fs::File::open(session_log).with_context(|| {
+    let body = std::fs::read_to_string(session_log).with_context(|| {
         format!(
             "reading session log {} to resume (run with --ui stream first?)",
             session_log.display()
         )
     })?;
-    let mut fold = ResumeFold::default();
-    let mut scan = TailScan::default();
-    for line in std::io::BufReader::new(file).lines() {
-        let line =
-            line.with_context(|| format!("reading session log {}", session_log.display()))?;
-        let Some(ev) = session::decode(&line) else {
-            continue;
-        };
-        fold.feed(&ev);
-        scan.feed(&ev);
-    }
-    let (classification, pending_approval) = scan.finish();
-    if !fold.has_rows() {
+    let state = LoopState::from_lines(body.lines());
+    let classification = state.classify();
+    if !state.has_rows() {
         return Err(EmptySessionLog {
             path: session_log.to_path_buf(),
             class: classification.class().to_string(),
         }
         .into());
     }
+    let prior_plan = match (&classification, &state.plan) {
+        (Classification::DiedInPlanTask { iter, .. }, Some(plan)) => {
+            Some(crate::loop_graph::PriorPlan {
+                iter: *iter,
+                plan_version: plan.plan_version,
+                declared: plan.tasks.iter().map(|t| t.name.clone()).collect(),
+                results: state.plan_results.clone(),
+            })
+        }
+        _ => None,
+    };
     Ok(SessionRecovery {
-        resume: fold.finish(),
+        resume: ResumeState::from_view(state.resume_view()),
+        pending_approval: state.open_approval().cloned(),
         classification,
-        pending_approval,
+        prior_plan,
     })
 }
 
@@ -456,7 +133,7 @@ pub(crate) fn plan_recovery(s: &SessionRecovery, iterations: u32, max_cost: f64)
         repark: s
             .pending_approval
             .as_ref()
-            .filter(|a| a.mode == WaitMode::Block)
+            .filter(|a| a.mode == crucible_contract::WaitMode::Block)
             .map(|a| provisioning::PendingProvisioning {
                 mode: WaitMode::Block,
                 trace_id: a.trace_id.clone(),
@@ -525,90 +202,12 @@ pub(crate) fn resume_approval(
     }
 }
 
-/// The old folds against the contract's [`crucible_contract::LoopState`]: every test that
-/// classifies a log runs both and proves they agree, so the contract fold can replace the
-/// scanners here without a behavior change.
-#[cfg(test)]
-pub(crate) mod parity {
-    use super::{Classification, SessionRecovery};
-    use crate::provisioning::WaitMode;
-    use crucible_contract::{LoopState, WaitMode as WireWaitMode};
-    use std::path::Path;
-
-    pub(crate) fn fold(session_log: &Path) -> LoopState {
-        let body = std::fs::read_to_string(session_log).expect("session log readable");
-        LoopState::from_lines(body.lines())
-    }
-
-    /// Both folds over the same file agree on the classification, the resume counters, and the
-    /// open approval.
-    pub(crate) fn assert_matches(session_log: &Path, got: &SessionRecovery) {
-        let state = fold(session_log);
-        let theirs = state.classify();
-        assert_eq!(theirs.class(), got.classification.class(), "class");
-        assert_eq!(theirs.iter(), got.classification.iter(), "iter");
-        assert_eq!(theirs.detail(), got.classification.detail(), "detail");
-        if let Classification::CleanExit { outcome, reason } = &got.classification {
-            match &theirs {
-                crucible_contract::Classification::CleanExit {
-                    outcome: o,
-                    reason: r,
-                } => {
-                    assert_eq!(o.as_str(), outcome.as_str(), "outcome token");
-                    assert_eq!(r, reason, "reason");
-                }
-                other => panic!("contract fold classified {other:?}"),
-            }
-        }
-        assert_eq!(
-            state.has_rows(),
-            got.resume.has_rows_for_parity(),
-            "has_rows"
-        );
-        let view = state.resume_view();
-        let rs = &got.resume;
-        assert_eq!(view.rows.len(), rs.rows.len(), "row count");
-        for (w, r) in view.rows.iter().zip(rs.rows.iter()) {
-            assert_eq!(w.iter, r.iter, "row iter");
-            assert_eq!(w.decision, r.decision, "row decision");
-            assert_eq!(w.score, r.score, "row score");
-            assert_eq!(w.tiebreak, r.tiebreak, "row tiebreak");
-            assert_eq!(w.total, r.total, "row total");
-            assert_eq!(w.phase, r.phase, "row phase");
-            assert_eq!(w.kept_snap, r.kept_snap, "row kept_snap");
-        }
-        assert_eq!(view.best_score, rs.best_score, "best_score");
-        assert_eq!(view.best_tiebreak, rs.best_tiebreak, "best_tiebreak");
-        assert_eq!(view.baseline_score, rs.baseline_score, "baseline_score");
-        assert_eq!(view.baseline_total, rs.baseline_total, "baseline_total");
-        assert_eq!(view.spent, rs.spent, "spent");
-        assert_eq!(view.next_iter, rs.next_iter, "next_iter");
-        assert_eq!(view.solved_any, rs.solved_any, "solved_any");
-        assert_eq!(view.identity, rs.identity, "identity");
-        assert_eq!(
-            view.published_branches, rs.published_branches,
-            "published_branches"
-        );
-        match (state.open_approval(), &got.pending_approval) {
-            (None, None) => {}
-            (Some(a), Some(b)) => {
-                assert_eq!(a.handle, b.handle, "approval handle");
-                assert_eq!(a.trace_id, b.trace_id, "approval trace");
-                let mode = match b.mode {
-                    WaitMode::Block => WireWaitMode::Block,
-                    WaitMode::Continue => WireWaitMode::Continue,
-                };
-                assert_eq!(a.mode, mode, "approval mode");
-            }
-            (a, b) => panic!("open approval disagrees: contract {a:?}, scanner {b:?}"),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{PlanTaskWire, RowWire, encode};
+    use crate::event::AgentEvent;
+    use crate::session::{PlanTaskWire, RowWire, SessionEvent, encode};
+    use crucible_contract::WaitMode as WireMode;
 
     fn write_log(name: &str, events: &[SessionEvent]) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -656,19 +255,8 @@ mod tests {
     fn classify(name: &str, events: &[SessionEvent]) -> SessionRecovery {
         let path = write_log(name, events);
         let got = classify_session(&path).unwrap();
-        super::parity::assert_matches(&path, &got);
         let _ = std::fs::remove_file(&path);
         got
-    }
-
-    /// A rowless log is refused by the scanner and folds to `has_rows() == false` in the
-    /// contract, the same verdict.
-    #[test]
-    fn rowless_log_folds_without_rows_in_the_contract_too() {
-        let path = write_log("rowless-parity", &[iteration_phase(1)]);
-        assert!(classify_session(&path).is_err());
-        assert!(!super::parity::fold(&path).has_rows());
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -851,6 +439,71 @@ mod tests {
         }
     }
 
+    /// A death inside a plan hands the resume the tasks that settled under it, so the resumed
+    /// iteration can start from them.
+    #[test]
+    fn a_death_inside_a_plan_carries_the_settled_tasks_for_the_resume() {
+        let mut events = prefix();
+        events.push(SessionEvent::PlanAdmitted {
+            plan_version: 1,
+            reason: String::new(),
+            budget_usd: 1.0,
+            tasks: ["review", "lint"]
+                .iter()
+                .map(|n| PlanTaskWire {
+                    name: (*n).into(),
+                    kind: "command".into(),
+                    depends_on: vec![],
+                    session: String::new(),
+                    needs: "any".into(),
+                    required: true,
+                    join: "all".into(),
+                    stage: "iteration".into(),
+                    over: String::new(),
+                    max_fanout: 0,
+                })
+                .collect(),
+        });
+        events.push(SessionEvent::TaskResult {
+            task: "review".into(),
+            status: "pass".into(),
+            plan_version: 1,
+            task_kind: "command".into(),
+            iter: 1,
+            digest: String::new(),
+            job: String::new(),
+            attempts: 1,
+            cost_usd: 0.3,
+            metric: None,
+            output: Some(serde_json::json!({"n": 1})),
+            note: String::new(),
+            secs: 1.0,
+            trace_id: String::new(),
+            span_id: String::new(),
+        });
+        let got = classify("plan-prior", &events);
+        assert!(matches!(
+            got.classification,
+            Classification::DiedInPlanTask { iter: 1, .. }
+        ));
+        let prior = got
+            .prior_plan
+            .expect("a plan death carries its settled tasks");
+        assert_eq!(prior.iter, 1);
+        assert_eq!(prior.plan_version, 1);
+        assert_eq!(
+            prior.declared,
+            vec!["review".to_string(), "lint".to_string()]
+        );
+        assert_eq!(prior.results.len(), 1);
+        assert_eq!(prior.results["review"].status, "pass");
+
+        let mut events = prefix();
+        events.push(row(1, "keep", 210.0));
+        let got = classify("no-plan", &events);
+        assert!(got.prior_plan.is_none(), "no plan death, nothing to carry");
+    }
+
     #[test]
     fn a_row_closes_the_open_plan() {
         let mut events = prefix();
@@ -920,7 +573,7 @@ mod tests {
         match &got.classification {
             Classification::DiedAwaitingApproval { approval } => {
                 assert_eq!(approval.handle, "https://example.com/pr/7");
-                assert_eq!(approval.mode, WaitMode::Block);
+                assert_eq!(approval.mode, WireMode::Block);
             }
             other => panic!("expected DiedAwaitingApproval, got {other:?}"),
         }
@@ -992,7 +645,7 @@ mod tests {
             got.classification
         );
         let pending = got.pending_approval.as_ref().expect("wait still open");
-        assert_eq!(pending.mode, WaitMode::Continue);
+        assert_eq!(pending.mode, WireMode::Continue);
         match plan_recovery(&got, 5, 0.0) {
             RecoveryPlan::Continue {
                 repark,
@@ -1168,6 +821,7 @@ mod tests {
                 reason: "r".into(),
             },
             pending_approval: None,
+            prior_plan: None,
         }
     }
 
@@ -1243,6 +897,7 @@ mod tests {
             },
             classification: Classification::DiedBetweenIterations { last_iter: 5 },
             pending_approval: None,
+            prior_plan: None,
         };
         match plan_recovery(&s, 5, 10.0) {
             RecoveryPlan::NoOp { message } => {

@@ -360,7 +360,7 @@ real wall-clock: time-proportional columns, check durations, the agent's tool-ca
 
 ## Concept → code (where to look)
 
-- loop / budget / keep-discard: `crucible/src/run.rs` + `crucible/src/loop_driver.rs`
+- loop / budget / keep-discard: `crucible/src/run.rs` + `crucible/src/loop_driver.rs` (the host: every effect) + `crucible/src/machine.rs` (the decisions, no I/O)
 - the contract traits: `crucible/src/crucible.rs`
 - World/Judge batteries: `crucible/src/command_world.rs` (`GitWorld`/`CommandWorld`/`CompositeWorld`), `crucible/src/command_judge.rs` (`CommandJudge`)
 - composite domains: `crucible/src/manifest.rs` (`CompositeManifest`) + `crucible/src/run.rs` (`run_composite`)

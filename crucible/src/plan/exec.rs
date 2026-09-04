@@ -173,6 +173,20 @@ pub enum TaskStatus {
 }
 
 impl TaskStatus {
+    /// The status a wire token names; `None` for a token this reader does not know.
+    pub fn parse(token: &str) -> Option<Self> {
+        [
+            TaskStatus::Pass,
+            TaskStatus::Fail,
+            TaskStatus::Transport,
+            TaskStatus::Skipped,
+            TaskStatus::Blocked,
+            TaskStatus::Truncated,
+        ]
+        .into_iter()
+        .find(|s| s.as_str() == token)
+    }
+
     /// The stable wire token (`SessionEvent::TaskResult.status`).
     pub fn as_str(self) -> &'static str {
         match self {
@@ -343,6 +357,21 @@ pub fn execute(
     substrate: &Substrate,
     cfg: ExecCfg,
     runner: &mut dyn TaskRunner,
+    on_result: impl FnMut(&Task, &TaskResult),
+) -> PlanOutcome {
+    execute_from(plan, substrate, cfg, runner, BTreeMap::new(), on_result)
+}
+
+/// [`execute`] with results already settled by an earlier process. A task named in `prior` is
+/// never dispatched: its result stands, its output feeds its dependents, and it is reported
+/// through `on_result` like any other terminal result so the log accounts for it. This is how a
+/// resumed run continues a graph instead of re-running the tasks that already passed.
+pub fn execute_from(
+    plan: &ValidPlan,
+    substrate: &Substrate,
+    cfg: ExecCfg,
+    runner: &mut dyn TaskRunner,
+    prior: BTreeMap<TaskName, TaskResult>,
     mut on_result: impl FnMut(&Task, &TaskResult),
 ) -> PlanOutcome {
     let runnable = runnable_set(plan, substrate);
@@ -373,6 +402,12 @@ pub fn execute(
 
     let started = Instant::now();
     let mut results: BTreeMap<TaskName, TaskResult> = BTreeMap::new();
+    for task in plan.tasks_topo() {
+        if let Some(result) = prior.get(&task.name) {
+            on_result(task, result);
+            results.insert(task.name.clone(), result.clone());
+        }
+    }
     let mut spent = 0.0f64;
     let budget = plan.plan().budget.usd;
     let mut halted: Option<PlanExit> = None;
@@ -1485,6 +1520,62 @@ mod tests {
         assert_eq!(out.exit, PlanExit::Completed);
         assert_eq!(out.results[&"b".into()].status, TaskStatus::Pass);
         assert_eq!(r.seen_inputs["b"], vec!["a".to_string()]);
+    }
+
+    /// A resumed run hands the executor what its predecessor settled: those tasks are reported
+    /// and never dispatched, and their outputs reach their dependents like a fresh pass would.
+    #[test]
+    fn prior_results_are_reported_not_dispatched_and_feed_dependents() {
+        let plan = valid(
+            vec![task("a", &[], "any", true), task("b", &["a"], "any", true)],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        let prior = BTreeMap::from([(
+            TaskName::from("a"),
+            TaskResult {
+                status: TaskStatus::Pass,
+                attempts: 2,
+                cost_usd: 0.4,
+                output: Some(serde_json::json!({"from": "before"})),
+                note: None,
+                fanout: None,
+            },
+        )]);
+        let mut reported = Vec::new();
+        let out = execute_from(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            prior,
+            |task, result| reported.push((task.name.0.clone(), result.status)),
+        );
+        assert!(out.valid);
+        assert_eq!(out.exit, PlanExit::Completed);
+        assert_eq!(
+            reported,
+            vec![
+                ("a".to_string(), TaskStatus::Pass),
+                ("b".to_string(), TaskStatus::Pass)
+            ],
+            "the prior result is reported first, then the dispatched one"
+        );
+        assert!(
+            !r.seen_inputs.contains_key("a"),
+            "a settled task is never dispatched again"
+        );
+        assert_eq!(r.seen_inputs["b"], vec!["a".to_string()]);
+        assert_eq!(
+            out.results[&"a".into()].attempts,
+            2,
+            "the prior result stands"
+        );
+        assert!(
+            out.spent_usd < 0.4,
+            "the prior task's cost was booked by the run that spent it, not again: {}",
+            out.spent_usd
+        );
     }
 
     /// The wall-clock ceiling blocks every task not yet dispatched and invalidates the run.

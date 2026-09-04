@@ -46,6 +46,7 @@ mod init;
 mod issue;
 mod loop_driver;
 mod loop_graph;
+mod machine;
 mod pr_watch;
 mod preflight;
 mod provisioning;
