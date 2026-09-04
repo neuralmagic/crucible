@@ -274,6 +274,8 @@ pub struct ResumeView {
     pub spent: f64,
     /// First iteration to run (last logged iteration + 1).
     pub next_iter: u32,
+    /// Never-started turns already spent on `next_iter`, so the attempt bound survives a resume.
+    pub dead_turns: u32,
     pub solved_any: bool,
     pub identity: Option<RunIdentity>,
     /// Head branches of every draft PR prior segments already opened.
@@ -578,6 +580,18 @@ impl LoopState {
             .filter(|r| !matches!(r.phase.as_deref(), Some("wide") | Some("infra")))
     }
 
+    /// Never-started turns at the tail of the log: the streak an in-flight iteration has
+    /// already spent. Any row from a turn that started ends the streak; a `distressed` row
+    /// annotates the turn before it rather than reporting one, so it does not.
+    pub fn dead_turns(&self) -> u32 {
+        self.rows
+            .iter()
+            .rev()
+            .filter(|r| r.decision != "distressed")
+            .take_while(|r| r.phase.as_deref() == Some("infra"))
+            .count() as u32
+    }
+
     /// The counters a resume restores. Decided rows carry `score`/`total`, so baseline and
     /// best restore exactly; keeps are monotone within a segment, so the last kept row is the
     /// best and its tiebreak travels with the best score.
@@ -600,6 +614,7 @@ impl LoopState {
         let next_iter = rows.iter().map(|r| r.iter).max().unwrap_or(0) + 1;
         ResumeView {
             rows,
+            dead_turns: self.dead_turns(),
             best_score,
             best_tiebreak,
             baseline_score,
@@ -868,6 +883,44 @@ mod tests {
         assert_eq!(v.best_score, 220.0);
         assert_eq!(v.next_iter, 3);
         assert_eq!(v.spent, 2.5);
+        assert_eq!(
+            v.dead_turns, 0,
+            "a decided row after the dead turn ends the streak"
+        );
+    }
+
+    #[test]
+    fn the_resume_view_carries_the_dead_turn_streak_the_log_ends_on() {
+        // A pod that died mid-streak must not hand its successor a fresh attempt budget.
+        let s = fold(&[
+            row(0, "baseline", 240.0, None),
+            iteration(1),
+            row(1, "keep", 220.0, None),
+            iteration(2),
+            row(2, "infra-dead", 0.0, Some("infra")),
+            row(2, "infra-dead", 0.0, Some("infra")),
+        ]);
+        let v = s.resume_view();
+        assert_eq!(v.next_iter, 2, "the never-started iteration re-runs");
+        assert_eq!(v.dead_turns, 2);
+
+        // A distress row annotates the turn before it; it does not report one, so it neither
+        // ends the streak nor counts toward it.
+        let mut with_distress = vec![
+            row(0, "baseline", 240.0, None),
+            iteration(2),
+            row(2, "infra-dead", 0.0, Some("infra")),
+        ];
+        with_distress.push(row(1, "distressed", 0.0, None));
+        assert_eq!(fold(&with_distress).resume_view().dead_turns, 1);
+
+        // No dead turn at the tail, no streak.
+        assert_eq!(
+            fold(&[row(0, "baseline", 240.0, None)])
+                .resume_view()
+                .dead_turns,
+            0
+        );
     }
 
     #[test]

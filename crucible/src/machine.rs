@@ -58,8 +58,12 @@ pub(crate) struct RunState {
     /// The pristine baseline snapshot token; `None` on resume.
     pub base_snap: Option<String>,
     pub solved_any: bool,
-    /// Idle time spent parked on a human, excluded from the time cap.
+    /// Idle time spent parked on a human, excluded from the time cap. A resumed process
+    /// measures its own wall clock, so this starts at zero there.
     pub parked_total: Duration,
+    /// Never-started turns already spent on the current iteration. Restored on resume so the
+    /// attempt bound counts the iteration's attempts, not one process's.
+    pub dead_turns: u32,
     /// The block-mode approval the next head parks on.
     pub pending_block: Option<PendingProvisioning>,
     /// Branches prior publishes opened PRs from; publish skips them.
@@ -191,7 +195,6 @@ pub(crate) struct Machine {
     pub run: RunState,
     /// The iteration about to run. Advances only when a turn actually started.
     pub it: u32,
-    dead_turns: u32,
     /// The distress marker this run already parked on, by its `ts_ms`.
     parked_distress_ts: Option<u64>,
     exit: Option<LoopExit>,
@@ -203,7 +206,6 @@ impl Machine {
             cfg,
             run,
             it: start_iter,
-            dead_turns: 0,
             parked_distress_ts: None,
             exit: None,
         }
@@ -313,7 +315,7 @@ impl Machine {
     /// [`MAX_DEAD_TURN_ATTEMPTS`].
     pub(crate) fn settle(&mut self, step: IterStep) -> Settle {
         if !matches!(step, IterStep::NeverStarted { .. }) {
-            self.dead_turns = 0;
+            self.run.dead_turns = 0;
         }
         let it = self.it;
         match step {
@@ -328,7 +330,7 @@ impl Machine {
                 Settle::Discard { row }
             }
             IterStep::NeverStarted { reason } => {
-                self.dead_turns += 1;
+                self.run.dead_turns += 1;
                 let row = Row {
                     iter: it,
                     decision: "infra-dead".to_string(),
@@ -336,13 +338,13 @@ impl Machine {
                     phase: Some("infra".to_string()),
                     ..Default::default()
                 };
-                let stalled = self.dead_turns >= MAX_DEAD_TURN_ATTEMPTS;
+                let stalled = self.run.dead_turns >= MAX_DEAD_TURN_ATTEMPTS;
                 if stalled {
                     self.exit = Some(LoopExit::Stalled);
                 }
                 Settle::Rerun {
                     row,
-                    attempt: self.dead_turns,
+                    attempt: self.run.dead_turns,
                     stalled,
                 }
             }
@@ -458,6 +460,7 @@ mod tests {
                 ..Default::default()
             }],
             spent: 0.0,
+            dead_turns: 0,
             kept_shas: Vec::new(),
             base_sha: None,
             base_snap: None,
@@ -618,6 +621,26 @@ mod tests {
             panic!("rerun");
         };
         assert!(stalled);
+        assert_eq!(m.exit(), Some(LoopExit::Stalled));
+    }
+
+    #[test]
+    fn a_resumed_run_keeps_the_streak_the_log_already_spent() {
+        // The bound is per iteration, not per process: a pod that died after two dead turns
+        // gets one more attempt on resume, not three.
+        let mut resumed = run();
+        resumed.dead_turns = MAX_DEAD_TURN_ATTEMPTS - 1;
+        let mut m = Machine::new(cfg(), resumed, 2);
+        let Settle::Rerun {
+            attempt, stalled, ..
+        } = m.settle(IterStep::NeverStarted {
+            reason: "401".into(),
+        })
+        else {
+            panic!("rerun");
+        };
+        assert_eq!(attempt, MAX_DEAD_TURN_ATTEMPTS);
+        assert!(stalled, "the attempt the resume inherited is the last one");
         assert_eq!(m.exit(), Some(LoopExit::Stalled));
     }
 
