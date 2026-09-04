@@ -852,7 +852,7 @@ pub fn run(
         };
         let open = open.clone();
         if let Some(f) = &events {
-            append(f, &gate::wait_event(&open));
+            append(f, &host.wait_event(&open));
         }
         println!(
             "gate {} ({}): awaiting approval via {}",
@@ -863,7 +863,7 @@ pub fn run(
         match host.wait(&open, &gates, evidence.as_ref())? {
             gate::Waited::Resolved(resolution) => {
                 if let Some(f) = &events {
-                    append(f, &gate::resolved_event(&open, &resolution));
+                    append(f, &host.resolved_event(&open, &resolution));
                 }
                 println!(
                     "gate {}: {}{}",
@@ -883,7 +883,7 @@ pub fn run(
                 let Some(paths) = &evidence else {
                     return Err(SuspendNeedsManifest.into());
                 };
-                match gate::suspend(paths, &plan, &open) {
+                match host.suspend(paths, &open) {
                     Ok(()) => {
                         if let Some(f) = &events {
                             append(
@@ -918,7 +918,7 @@ pub fn run(
                         match host.park(&open, None, evidence.as_ref())? {
                             gate::Parked::Resolved(resolution) => {
                                 if let Some(f) = &events {
-                                    append(f, &gate::resolved_event(&open, &resolution));
+                                    append(f, &host.resolved_event(&open, &resolution));
                                 }
                                 runner.resolve_gate(&open.trace_id, resolution);
                                 spent_before = out.spent_usd;
@@ -942,7 +942,7 @@ pub fn run(
                             gate::Parked::TimedOut => {
                                 let resolution = crucible_contract::GateResolution::timeout();
                                 if let Some(f) = &events {
-                                    append(f, &gate::resolved_event(&open, &resolution));
+                                    append(f, &host.resolved_event(&open, &resolution));
                                 }
                                 runner.resolve_gate(&open.trace_id, resolution);
                                 spent_before = out.spent_usd;

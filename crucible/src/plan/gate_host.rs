@@ -77,7 +77,7 @@ impl Host {
                     )
                 })?;
                 let state = LoopState::from_lines(body.lines());
-                prior = prior_from(&state, plan);
+                prior = Self::prior_from(&state, plan);
                 if let Some(open) = state.open_approval()
                     && !resolutions.contains_key(&open.trace_id)
                     && let Some(recorded) = opened.gate_resolution(&open.trace_id)
@@ -115,6 +115,19 @@ impl Host {
     /// The results a previous process settled under this plan; empty on a fresh run.
     pub(crate) fn take_prior(&mut self) -> BTreeMap<TaskName, TaskResult> {
         std::mem::take(&mut self.prior)
+    }
+
+    fn prior_from(state: &LoopState, plan: &ValidPlan) -> BTreeMap<TaskName, TaskResult> {
+        let Some(admitted) = &state.plan else {
+            return BTreeMap::new();
+        };
+        crate::loop_graph::PriorPlan {
+            iter: 0,
+            plan_version: admitted.plan_version,
+            declared: admitted.tasks.iter().map(|t| t.name.clone()).collect(),
+            results: state.plan_results.clone(),
+        }
+        .seed(plan)
     }
 
     /// Wait at `open` under the run's park policy.
@@ -215,10 +228,17 @@ impl Host {
         let Ok(json) = serde_json::to_vec(&waits) else {
             return;
         };
-        let Ok(gz) = gzip(&json) else {
+        let Ok(gz) = Self::gzip(&json) else {
             return;
         };
         post_artifact(cfg, ArtifactKind::ApprovalWaits, &gz);
+    }
+
+    fn gzip(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
+        use std::io::Write as _;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(bytes)?;
+        enc.finish()
     }
 
     /// Record a resolution that arrived from outside the bridge, under the gate's key.
@@ -247,74 +267,54 @@ impl Host {
     }
 }
 
-/// Snapshot the run at `open` and deliver it, so a later `--resume` continues from here.
-pub(crate) fn suspend(paths: &Paths, _plan: &ValidPlan, open: &Gate) -> Result<()> {
-    let record = crate::suspend::ResumeRecord {
-        v: crate::suspend::ResumeRecord::VERSION,
-        run_id: crate::plan::gate::run_id_from_env(),
-        gate: open.trace_id.clone(),
-        head: crate::suspend::head_of(&paths.workspace),
-        suspended_at: crate::suspend::now_secs(),
-    };
-    let gz = crate::suspend::snapshot(&paths.state, &paths.workspace, &record)?;
-    let delivered = crate::suspend::deliver(&paths.session_log, &gz)?;
-    eprintln!(
-        "[crucible] suspended at gate {} ({}){}",
-        open.task,
-        open.trace_id,
-        if delivered {
-            ": snapshot delivered to the drop-box"
-        } else {
-            ": snapshot kept in the state dir"
+impl Host {
+    /// Snapshot the run at an open gate and deliver it for resumption.
+    pub(crate) fn suspend(&self, paths: &Paths, open: &Gate) -> Result<()> {
+        let record = crate::suspend::ResumeRecord {
+            v: crate::suspend::ResumeRecord::VERSION,
+            run_id: crate::plan::gate::run_id_from_env(),
+            gate: open.trace_id.clone(),
+            head: crate::suspend::head_of(&paths.workspace),
+            suspended_at: crate::suspend::now_secs(),
+        };
+        let gz = crate::suspend::snapshot(&paths.state, &paths.workspace, &record)?;
+        let delivered = crate::suspend::deliver(&paths.session_log, &gz)?;
+        eprintln!(
+            "[crucible] suspended at gate {} ({}){}",
+            open.task,
+            open.trace_id,
+            if delivered {
+                ": snapshot delivered to the drop-box"
+            } else {
+                ": snapshot kept in the state dir"
+            }
+        );
+        Ok(())
+    }
+}
+
+impl Host {
+    pub(crate) fn wait_event(&self, open: &Gate) -> SessionEvent {
+        SessionEvent::ApprovalWait {
+            handle: open.handle.clone(),
+            trace_id: open.trace_id.clone(),
+            mode: "block".to_string(),
+            task: Some(open.task.0.clone()),
+            source: serde_json::to_value(&open.source).ok(),
+            park: Some(ParkMode::Park.as_str().to_string()),
         }
-    );
-    Ok(())
-}
-
-/// The results a dead process settled under `plan`: only when the log admitted this same plan
-/// (version and task set), and only the passing pack tasks.
-fn prior_from(state: &LoopState, plan: &ValidPlan) -> BTreeMap<TaskName, TaskResult> {
-    let Some(admitted) = &state.plan else {
-        return BTreeMap::new();
-    };
-    crate::loop_graph::PriorPlan {
-        iter: 0,
-        plan_version: admitted.plan_version,
-        declared: admitted.tasks.iter().map(|t| t.name.clone()).collect(),
-        results: state.plan_results.clone(),
     }
-    .seed(plan)
-}
 
-/// The `approval_wait` line a gate opens with.
-pub(crate) fn wait_event(open: &Gate) -> SessionEvent {
-    SessionEvent::ApprovalWait {
-        handle: open.handle.clone(),
-        trace_id: open.trace_id.clone(),
-        mode: "block".to_string(),
-        task: Some(open.task.0.clone()),
-        source: serde_json::to_value(&open.source).ok(),
-        park: Some(ParkMode::Park.as_str().to_string()),
+    pub(crate) fn resolved_event(&self, open: &Gate, resolution: &GateResolution) -> SessionEvent {
+        SessionEvent::ApprovalResolved {
+            outcome: match resolution.source.as_deref() {
+                Some("timeout") => "timeout".to_string(),
+                _ => resolution.decision.as_str().to_string(),
+            },
+            reason: resolution.reason_text(),
+            trace_id: open.trace_id.clone(),
+            by: resolution.by.as_ref().map(|by| by.as_str().to_string()),
+            source: resolution.source.clone(),
+        }
     }
-}
-
-/// The `approval_resolved` line that closes a gate.
-pub(crate) fn resolved_event(open: &Gate, resolution: &GateResolution) -> SessionEvent {
-    SessionEvent::ApprovalResolved {
-        outcome: match resolution.source.as_deref() {
-            Some("timeout") => "timeout".to_string(),
-            _ => resolution.decision.as_str().to_string(),
-        },
-        reason: resolution.reason_text(),
-        trace_id: open.trace_id.clone(),
-        by: resolution.by.as_ref().map(|by| by.as_str().to_string()),
-        source: resolution.source.clone(),
-    }
-}
-
-fn gzip(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
-    use std::io::Write as _;
-    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    enc.write_all(bytes)?;
-    enc.finish()
 }
