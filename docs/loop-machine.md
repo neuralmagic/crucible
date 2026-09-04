@@ -11,6 +11,8 @@ stateDiagram-v2
     ApprovalPark --> Head: granted: the re-scope drain re-baselines
     ApprovalPark --> escalated: denied with no fallback
     ApprovalPark --> stopped: stop while parked
+    Head --> Head: an approved re-scope re-baselines a new segment
+    Head --> Head: a denial noted; the frozen regime stands
     Head --> DistressPark: the agent raised distress(error)
     DistressPark --> Head: the operator cleared the marker
     DistressPark --> stopped: stop, or the park timed out

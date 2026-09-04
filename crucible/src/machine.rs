@@ -437,6 +437,119 @@ impl Machine {
     }
 }
 
+/// One check the host performs at the head of an iteration, before any turn runs. The order is
+/// the machine's, not the host's reading order: [`HEAD`] is the single place it is written down,
+/// the host dispatches over it, and the published state chart is drawn from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeadCheck {
+    /// Block while an operator holds the run paused.
+    WaitIfPaused,
+    /// Park on a `block` approval the last turn raised, budget-paused, until it resolves.
+    ParkOnPendingBlock,
+    /// Drain an approved re-scope: re-baseline into the granted regime, opening a segment.
+    DrainRescope,
+    /// Drain a denial that arrived while the run continued; the frozen regime stands.
+    DrainDeny,
+    /// Park on a distress marker the agent wrote, until the operator clears it.
+    ParkOnDistress,
+    /// End the run if a stop or interrupt landed.
+    Interrupt,
+    /// End the run if a cost or wall-clock cap is reached.
+    Budget,
+}
+
+/// The head, in order. Every entry is dispatched by [`crate::loop_driver`]; nothing else may
+/// happen before a turn.
+pub(crate) const HEAD: &[HeadCheck] = &[
+    HeadCheck::WaitIfPaused,
+    HeadCheck::ParkOnPendingBlock,
+    HeadCheck::DrainRescope,
+    HeadCheck::DrainDeny,
+    HeadCheck::ParkOnDistress,
+    HeadCheck::Interrupt,
+    HeadCheck::Budget,
+];
+
+/// What a head check tells the host to do next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeadFlow {
+    /// Nothing happened; run the next check.
+    Continue,
+    /// Start the head over: state changed underneath the remaining checks.
+    Restart,
+    /// The run is over; [`Machine::exit`] carries why.
+    Exit,
+}
+
+impl HeadCheck {
+    /// The chart edges this check can take. Exhaustive: a new check names its edges before
+    /// this compiles, so the head of the chart is the head the host walks.
+    fn edges(self) -> &'static [Edge] {
+        match self {
+            HeadCheck::WaitIfPaused => &[],
+            HeadCheck::ParkOnPendingBlock => &[
+                Edge {
+                    from: "Head",
+                    to: "ApprovalPark",
+                    label: "a block approval is pending",
+                },
+                Edge {
+                    from: "ApprovalPark",
+                    to: "Head",
+                    label: "granted: the re-scope drain re-baselines",
+                },
+                Edge {
+                    from: "ApprovalPark",
+                    to: "escalated",
+                    label: "denied with no fallback",
+                },
+                Edge {
+                    from: "ApprovalPark",
+                    to: "stopped",
+                    label: "stop while parked",
+                },
+            ],
+            HeadCheck::DrainRescope => &[Edge {
+                from: "Head",
+                to: "Head",
+                label: "an approved re-scope re-baselines a new segment",
+            }],
+            HeadCheck::DrainDeny => &[Edge {
+                from: "Head",
+                to: "Head",
+                label: "a denial noted; the frozen regime stands",
+            }],
+            HeadCheck::ParkOnDistress => &[
+                Edge {
+                    from: "Head",
+                    to: "DistressPark",
+                    label: "the agent raised distress(error)",
+                },
+                Edge {
+                    from: "DistressPark",
+                    to: "Head",
+                    label: "the operator cleared the marker",
+                },
+                Edge {
+                    from: "DistressPark",
+                    to: "stopped",
+                    label: "stop, or the park timed out",
+                },
+            ],
+            HeadCheck::Interrupt => &[Edge {
+                from: "Head",
+                to: "stopped",
+                label: "interrupt at the head",
+            }],
+            HeadCheck::Budget => &[Edge {
+                from: "Head",
+                to: "budget",
+                label: "a cost or time cap was reached",
+            }],
+        }
+    }
+}
+
 /// One transition in the rendered state chart. `label` is the condition that takes the loop
 /// from `from` to `to`, in the order the host actually evaluates them.
 struct Edge {
@@ -445,55 +558,10 @@ struct Edge {
     label: &'static str,
 }
 
-/// The loop's transitions, in the order [`crate::loop_driver`] evaluates them. Hand-ordered
-/// because the order is the host's, not the machine's; the coverage tests below hold every
-/// variant of [`IterStep`] and [`LoopExit`] present, so a new one cannot land undrawn.
+/// What happens once the head lets an iteration run. The head's own transitions are not here:
+/// they come from [`HEAD`], which is the order the host dispatches, so that half of the chart
+/// cannot disagree with the code that walks it.
 const EDGES: &[Edge] = &[
-    Edge {
-        from: "Head",
-        to: "ApprovalPark",
-        label: "a block approval is pending",
-    },
-    Edge {
-        from: "ApprovalPark",
-        to: "Head",
-        label: "granted: the re-scope drain re-baselines",
-    },
-    Edge {
-        from: "ApprovalPark",
-        to: "escalated",
-        label: "denied with no fallback",
-    },
-    Edge {
-        from: "ApprovalPark",
-        to: "stopped",
-        label: "stop while parked",
-    },
-    Edge {
-        from: "Head",
-        to: "DistressPark",
-        label: "the agent raised distress(error)",
-    },
-    Edge {
-        from: "DistressPark",
-        to: "Head",
-        label: "the operator cleared the marker",
-    },
-    Edge {
-        from: "DistressPark",
-        to: "stopped",
-        label: "stop, or the park timed out",
-    },
-    Edge {
-        from: "Head",
-        to: "stopped",
-        label: "interrupt at the head",
-    },
-    Edge {
-        from: "Head",
-        to: "budget",
-        label: "a cost or time cap was reached",
-    },
     Edge {
         from: "Head",
         to: "finished",
@@ -555,7 +623,7 @@ const EDGES: &[Edge] = &[
 /// wire carries, so a reader can match a diagram node to a run's shutdown line.
 pub(crate) fn mermaid() -> String {
     let mut out = String::from("stateDiagram-v2\n    [*] --> Head\n");
-    for edge in EDGES {
+    for edge in HEAD.iter().flat_map(|c| c.edges()).chain(EDGES) {
         out.push_str(&format!(
             "    {} --> {}: {}\n",
             edge.from, edge.to, edge.label
@@ -1026,6 +1094,45 @@ mod tests {
         // asserted directly against the same exhaustive source.
         assert!(chart.contains("decided"), "{chart}");
         assert!(chart.contains("parked"), "{chart}");
+    }
+
+    /// The head is dispatched from `HEAD`, so a check that is not listed never runs. `edges`
+    /// is exhaustive, which makes a new variant compile only once it is described; this holds
+    /// it to also being dispatched, exactly once.
+    #[test]
+    fn head_dispatches_every_check_exactly_once() {
+        let all = [
+            HeadCheck::WaitIfPaused,
+            HeadCheck::ParkOnPendingBlock,
+            HeadCheck::DrainRescope,
+            HeadCheck::DrainDeny,
+            HeadCheck::ParkOnDistress,
+            HeadCheck::Interrupt,
+            HeadCheck::Budget,
+        ];
+        for check in all {
+            assert_eq!(
+                HEAD.iter().filter(|h| **h == check).count(),
+                1,
+                "{check:?} is not dispatched exactly once"
+            );
+        }
+        assert_eq!(
+            HEAD.len(),
+            all.len(),
+            "HEAD has a check this test does not know"
+        );
+    }
+
+    /// The order is the contract the chart is drawn from: a pending approval parks before a
+    /// re-scope drains it, and both settle before the run can be ended by a cap.
+    #[test]
+    fn the_head_parks_before_it_drains_and_ends() {
+        let at = |c: HeadCheck| HEAD.iter().position(|h| *h == c).expect("dispatched");
+        assert!(at(HeadCheck::ParkOnPendingBlock) < at(HeadCheck::DrainRescope));
+        assert!(at(HeadCheck::DrainRescope) < at(HeadCheck::DrainDeny));
+        assert!(at(HeadCheck::ParkOnDistress) < at(HeadCheck::Interrupt));
+        assert!(at(HeadCheck::Interrupt) < at(HeadCheck::Budget));
     }
 
     /// Every edge must start somewhere the chart can be entered from, so the diagram is one

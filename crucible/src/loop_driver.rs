@@ -6,10 +6,11 @@
 //! workspace prep, front-end choice) lives in [`crate::run`]; this module is just the loop and
 //! its helpers.
 
+use crate::machine;
 pub(crate) use crate::machine::IterStep;
 use crate::machine::{
-    BudgetHit, DistressOutcome, LoopCfg, LoopExit, MAX_DEAD_TURN_ATTEMPTS, Machine, ParkOutcome,
-    RunState, Segment, Settle,
+    BudgetHit, DistressOutcome, HeadCheck, HeadFlow, LoopCfg, LoopExit, MAX_DEAD_TURN_ATTEMPTS,
+    Machine, ParkOutcome, RunState, Segment, Settle,
 };
 use crate::reporter::{AgentTurn, Outcome, Phase, Reporter, Row, Stop, TurnBudget};
 use crate::{Args, Paths, Prepared, STOP};
@@ -426,6 +427,206 @@ pub(crate) fn run_loop<R: Reporter>(
     }
 }
 
+/// Everything a head check reads that is not the machine or the reporter. One struct so a
+/// check takes five arguments instead of thirteen.
+struct HeadCtx<'a> {
+    args: &'a Args,
+    p: &'a Paths,
+    prep: &'a Prepared,
+    world: &'a dyn World,
+    judge: &'a dyn Judge,
+    control: Option<&'a control::ControlState>,
+    ledger: Option<&'a crate::admission::AdmissionLedger>,
+    preflight: &'a Option<crate::preflight::PreflightBaseline>,
+    started: Instant,
+}
+
+/// Perform one head check. The machine owns which checks run and in what order
+/// ([`machine::HEAD`]); this owns what each one does. Returning [`HeadFlow`] instead of
+/// breaking a loop is what lets that order live in data rather than in this function's shape.
+fn head_check<R: Reporter>(
+    check: HeadCheck,
+    m: &mut Machine,
+    r: &mut R,
+    ctx: &HeadCtx<'_>,
+    bad_marker_seen: &mut Option<Option<std::time::SystemTime>>,
+) -> Result<HeadFlow> {
+    let it = m.it;
+    match check {
+        HeadCheck::WaitIfPaused => {
+            wait_if_paused(ctx.control, r);
+        }
+        HeadCheck::ParkOnPendingBlock => {
+            // The agent blocked on a pending approval last turn (it had no frozen-regime fallback).
+            // Park here (idle, budget-paused) until the approval lands as a re-scope (the broker
+            // fires it over the control bridge) or we're told to stop. The drain below then
+            // re-baselines into the granted regime.
+            if let Some(pp) = m.take_pending_block() {
+                let (outcome, parked) =
+                    park_for_approval(ctx.control, ctx.ledger, r, m.cfg.max_park);
+                match (m.on_park(parked, &outcome), &outcome) {
+                    (None, _) => {} // the re-scope drain below re-baselines
+                    (Some(LoopExit::Escalated), ParkOutcome::Denied(why)) => {
+                        // `block` means the agent had no frozen-regime fallback, a denial leaves
+                        // nothing to do, so escalate-halt for a human.
+                        r.note(&format!(
+                            "approval denied — escalating (no fallback): provisioning for '{}' was not granted: {why}",
+                            pp.trace_id
+                        ));
+                        update_control_status(
+                            ctx.control,
+                            "escalated",
+                            it,
+                            m.run.segment.best_score,
+                            m.run.spent,
+                        );
+                        ctx.world.restore(&m.run.segment.best_snap)?;
+                        return Ok(HeadFlow::Exit);
+                    }
+                    (Some(_), _) => return Ok(HeadFlow::Exit),
+                }
+            }
+        }
+        HeadCheck::DrainRescope => {
+            // An approved judge-changing grant arrived (via the control channel / MCP): re-baseline
+            // into the new regime and open a fresh segment before this iteration measures.
+            if let Some((rescope_key, new_regime)) = ctx.control.and_then(|c| c.take_rescope()) {
+                // Close any open approval bracket: a rescope IS the grant. Harmless when no
+                // wait was open (the classifier treats an unmatched resolve as a no-op).
+                r.approval_resolved("granted", &new_regime);
+                r.note(&format!(
+                    "control: re-scoping to '{new_regime}' — re-baselining a new comparable segment"
+                ));
+                // One atomic swap of the goalpost: the new regime, its fingerprint, the re-baselined
+                // scores, and the fresh rollback snapshot all land together. The admission
+                // settles only after the swap: a baseline error leaves it for the resume.
+                let (segment, _row) = baseline_segment(
+                    ctx.world,
+                    ctx.judge,
+                    &ctx.prep.goal,
+                    new_regime.clone(),
+                    baseline_source(ctx.prep.skip_baseline, ctx.preflight.as_ref()),
+                )?;
+                m.rescope(segment);
+                if let Some(ledger) = ctx.ledger {
+                    let _ = ledger.settle(
+                        &rescope_key,
+                        AdmissionOutcome::Applied,
+                        &format!("re-baselined into '{new_regime}' at iter {it}"),
+                    );
+                }
+                r.segment(
+                    &m.run.segment.fingerprint,
+                    m.run.segment.baseline_score,
+                    &m.run.segment.regime,
+                );
+                write_results(ctx.p, &ctx.prep.goal, &ctx.prep.prior, &m.run.rows)?;
+            }
+        }
+        HeadCheck::DrainDeny => {
+            // A denial that arrived while *continuing* (the agent had a fallback, so the loop never
+            // parked) just means the regime change won't happen; note it and stay in the frozen regime.
+            if let Some((deny_key, reason)) = ctx.control.and_then(|c| c.take_deny()) {
+                r.approval_resolved("denied", &reason);
+                r.note(&format!(
+                    "approval not granted ({reason}) — staying in the frozen regime"
+                ));
+                if let Some(ledger) = ctx.ledger {
+                    let _ = ledger.settle(
+                        &deny_key,
+                        AdmissionOutcome::Applied,
+                        &format!("drained at the head of iter {it}"),
+                    );
+                }
+            }
+        }
+        HeadCheck::ParkOnDistress => {
+            // The agent raised `distress(severity=error)` during the last turn: that turn finished and
+            // was decided above, so bookkeeping is complete and this is the safe point to suspend.
+            // Modeled as an approval wait (same bracket, same parked-time accounting); the operator's
+            // `rm` of the marker is the grant.
+            match crate::distress::read_marker() {
+                Some(Ok(marker)) => {
+                    if let Some(row) = m.on_distress(marker.ts_ms, &marker.reason) {
+                        // An in-place restart re-reads a marker the operator never cleared and
+                        // re-parks (correct: no grant was given), but the row for it is already in
+                        // the resumed log.
+                        if let Some(row) = row {
+                            r.row(&row, false);
+                            m.record(row);
+                            write_results(ctx.p, &ctx.prep.goal, &ctx.prep.prior, &m.run.rows)?;
+                        }
+                        r.note(&format!(
+                            "distress: {}, suspended awaiting the operator (clear {})",
+                            marker.reason,
+                            forge::storage_root().join("distress").display()
+                        ));
+                        for item in &marker.evidence {
+                            r.note(&format!("distress evidence: {item}"));
+                        }
+                        update_control_status(
+                            ctx.control,
+                            "distressed",
+                            it,
+                            m.run.segment.best_score,
+                            m.run.spent,
+                        );
+                        r.approval_wait(
+                            crate::distress::HANDLE,
+                            crate::distress::HANDLE,
+                            provisioning::WaitMode::Block,
+                        );
+                        let (outcome, parked) =
+                            park_for_distress(ctx.p, &m.run.rows, r, m.cfg.max_park);
+                        match m.on_distress_park(parked, outcome) {
+                            None => {
+                                r.approval_resolved("granted", "distress cleared by operator");
+                                r.note("distress cleared, resuming");
+                                // The head re-checks budget/interrupts before the next turn runs.
+                                return Ok(HeadFlow::Restart);
+                            }
+                            Some(_) => {
+                                if outcome == DistressOutcome::TimedOut {
+                                    r.note(
+                                        "distress park timed out, stopping with state preserved",
+                                    );
+                                }
+                                return Ok(HeadFlow::Exit);
+                            }
+                        }
+                    }
+                }
+                // A marker we cannot parse is a broken handoff, not a suspend order: note it once per
+                // rewrite and keep iterating. Wedging a paid run on a bad byte is the worse failure.
+                Some(Err(why)) => {
+                    let mtime = crate::distress::marker_mtime();
+                    if *bad_marker_seen != Some(mtime) {
+                        *bad_marker_seen = Some(mtime);
+                        r.note(&format!("distress marker unreadable ({why}), not parking"));
+                    }
+                }
+                None => {}
+            }
+        }
+        HeadCheck::Interrupt => {
+            if matches!(r.check_interrupt(ctx.p, &m.run.rows), Stop::Quit) {
+                m.end(LoopExit::Stopped);
+                return Ok(HeadFlow::Exit);
+            }
+        }
+        HeadCheck::Budget => {
+            if let Some(hit) =
+                m.over_budget(live_max_cost(ctx.args, ctx.control), ctx.started.elapsed())
+            {
+                note_budget_hit(r, ctx.args, hit);
+                m.end(LoopExit::Budget);
+                return Ok(HeadFlow::Exit);
+            }
+        }
+    }
+    Ok(HeadFlow::Continue)
+}
+
 /// The host: performs every effect the loop needs and hands the results to the
 /// [`crate::machine::Machine`], which owns the decisions. Effects happen in the order they
 /// always have, so the session log a run writes is unchanged.
@@ -700,155 +901,28 @@ fn run_loop_body<R: Reporter>(
     let mut bad_marker_seen: Option<Option<std::time::SystemTime>> = None;
     while m.exit().is_none() && m.has_iterations() {
         let it = m.it;
-        wait_if_paused(control, r);
-        // The agent blocked on a pending approval last turn (it had no frozen-regime fallback).
-        // Park here (idle, budget-paused) until the approval lands as a re-scope (the broker
-        // fires it over the control bridge) or we're told to stop. The drain below then
-        // re-baselines into the granted regime.
-        if let Some(pp) = m.take_pending_block() {
-            let (outcome, parked) = park_for_approval(control, ledger, r, m.cfg.max_park);
-            match (m.on_park(parked, &outcome), &outcome) {
-                (None, _) => {} // the re-scope drain below re-baselines
-                (Some(LoopExit::Escalated), ParkOutcome::Denied(why)) => {
-                    // `block` means the agent had no frozen-regime fallback, a denial leaves
-                    // nothing to do, so escalate-halt for a human.
-                    r.note(&format!(
-                        "approval denied — escalating (no fallback): provisioning for '{}' was not granted: {why}",
-                        pp.trace_id
-                    ));
-                    update_control_status(
-                        control,
-                        "escalated",
-                        it,
-                        m.run.segment.best_score,
-                        m.run.spent,
-                    );
-                    world.restore(&m.run.segment.best_snap)?;
-                    break;
-                }
-                (Some(_), _) => break,
+        let mut flow = HeadFlow::Continue;
+        let ctx = HeadCtx {
+            args,
+            p,
+            prep,
+            world,
+            judge,
+            control,
+            ledger,
+            preflight: &preflight_baseline,
+            started,
+        };
+        for check in machine::HEAD {
+            flow = head_check(*check, &mut m, r, &ctx, &mut bad_marker_seen)?;
+            if flow != HeadFlow::Continue {
+                break;
             }
         }
-        // An approved judge-changing grant arrived (via the control channel / MCP): re-baseline
-        // into the new regime and open a fresh segment before this iteration measures.
-        if let Some((rescope_key, new_regime)) = control.and_then(|c| c.take_rescope()) {
-            // Close any open approval bracket: a rescope IS the grant. Harmless when no
-            // wait was open (the classifier treats an unmatched resolve as a no-op).
-            r.approval_resolved("granted", &new_regime);
-            r.note(&format!(
-                "control: re-scoping to '{new_regime}' — re-baselining a new comparable segment"
-            ));
-            // One atomic swap of the goalpost: the new regime, its fingerprint, the re-baselined
-            // scores, and the fresh rollback snapshot all land together. The admission
-            // settles only after the swap: a baseline error leaves it for the resume.
-            let (segment, _row) = baseline_segment(
-                world,
-                judge,
-                &prep.goal,
-                new_regime.clone(),
-                baseline_source(prep.skip_baseline, preflight_baseline.as_ref()),
-            )?;
-            m.rescope(segment);
-            if let Some(ledger) = ledger {
-                let _ = ledger.settle(
-                    &rescope_key,
-                    AdmissionOutcome::Applied,
-                    &format!("re-baselined into '{new_regime}' at iter {it}"),
-                );
-            }
-            r.segment(
-                &m.run.segment.fingerprint,
-                m.run.segment.baseline_score,
-                &m.run.segment.regime,
-            );
-            write_results(p, &prep.goal, &prep.prior, &m.run.rows)?;
-        }
-        // A denial that arrived while *continuing* (the agent had a fallback, so the loop never
-        // parked) just means the regime change won't happen; note it and stay in the frozen regime.
-        if let Some((deny_key, reason)) = control.and_then(|c| c.take_deny()) {
-            r.approval_resolved("denied", &reason);
-            r.note(&format!(
-                "approval not granted ({reason}) — staying in the frozen regime"
-            ));
-            if let Some(ledger) = ledger {
-                let _ = ledger.settle(
-                    &deny_key,
-                    AdmissionOutcome::Applied,
-                    &format!("drained at the head of iter {it}"),
-                );
-            }
-        }
-        // The agent raised `distress(severity=error)` during the last turn: that turn finished and
-        // was decided above, so bookkeeping is complete and this is the safe point to suspend.
-        // Modeled as an approval wait (same bracket, same parked-time accounting); the operator's
-        // `rm` of the marker is the grant.
-        match crate::distress::read_marker() {
-            Some(Ok(marker)) => {
-                if let Some(row) = m.on_distress(marker.ts_ms, &marker.reason) {
-                    // An in-place restart re-reads a marker the operator never cleared and
-                    // re-parks (correct: no grant was given), but the row for it is already in
-                    // the resumed log.
-                    if let Some(row) = row {
-                        r.row(&row, false);
-                        m.record(row);
-                        write_results(p, &prep.goal, &prep.prior, &m.run.rows)?;
-                    }
-                    r.note(&format!(
-                        "distress: {}, suspended awaiting the operator (clear {})",
-                        marker.reason,
-                        forge::storage_root().join("distress").display()
-                    ));
-                    for item in &marker.evidence {
-                        r.note(&format!("distress evidence: {item}"));
-                    }
-                    update_control_status(
-                        control,
-                        "distressed",
-                        it,
-                        m.run.segment.best_score,
-                        m.run.spent,
-                    );
-                    r.approval_wait(
-                        crate::distress::HANDLE,
-                        crate::distress::HANDLE,
-                        provisioning::WaitMode::Block,
-                    );
-                    let (outcome, parked) = park_for_distress(p, &m.run.rows, r, m.cfg.max_park);
-                    match m.on_distress_park(parked, outcome) {
-                        None => {
-                            r.approval_resolved("granted", "distress cleared by operator");
-                            r.note("distress cleared, resuming");
-                            // The head re-checks budget/interrupts before the next turn runs.
-                            continue;
-                        }
-                        Some(_) => {
-                            if outcome == DistressOutcome::TimedOut {
-                                r.note("distress park timed out, stopping with state preserved");
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-            // A marker we cannot parse is a broken handoff, not a suspend order: note it once per
-            // rewrite and keep iterating. Wedging a paid run on a bad byte is the worse failure.
-            Some(Err(why)) => {
-                let mtime = crate::distress::marker_mtime();
-                if bad_marker_seen != Some(mtime) {
-                    bad_marker_seen = Some(mtime);
-                    r.note(&format!("distress marker unreadable ({why}), not parking"));
-                }
-            }
-            None => {}
-        }
-        if matches!(r.check_interrupt(p, &m.run.rows), Stop::Quit) {
-            m.end(LoopExit::Stopped);
-            break;
-        }
-        if let Some(hit) = m.over_budget(live_max_cost(args, control), started.elapsed()) {
-            note_budget_hit(r, args, hit);
-            m.end(LoopExit::Budget);
-            break;
+        match flow {
+            HeadFlow::Exit => break,
+            HeadFlow::Restart => continue,
+            HeadFlow::Continue => {}
         }
         r.phase(Phase::Iteration(it));
         // One span per loop round, entered for the iteration's whole body on this thread: the
