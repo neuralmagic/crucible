@@ -993,8 +993,8 @@ fn drive_loop(
     args: Args,
     p: Paths,
     prep: Prepared,
-    world: Box<dyn World + Send>,
-    judge: Box<dyn Judge + Send>,
+    world: Arc<dyn World>,
+    judge: Arc<dyn Judge>,
 ) -> Result<()> {
     let mut args = args;
     install_ctrlc()?;
@@ -1061,8 +1061,8 @@ fn drive_loop(
                         &p,
                         &prep,
                         &mut r,
-                        world.as_ref(),
-                        judge.as_ref(),
+                        &world,
+                        &judge,
                         LoopRuntime {
                             control: control.as_deref(),
                             resume: Some(recovered.resume),
@@ -1083,8 +1083,8 @@ fn drive_loop(
                         &p,
                         &prep,
                         &mut r,
-                        world.as_ref(),
-                        judge.as_ref(),
+                        &world,
+                        &judge,
                         LoopRuntime {
                             heartbeat: beat.clone(),
                             ..LoopRuntime::default()
@@ -1101,8 +1101,8 @@ fn drive_loop(
                         &p,
                         &prep,
                         &mut r,
-                        world.as_ref(),
-                        judge.as_ref(),
+                        &world,
+                        &judge,
                         LoopRuntime {
                             control: control.as_deref(),
                             ledger: Some(ledger),
@@ -1118,8 +1118,8 @@ fn drive_loop(
                         &p,
                         &prep,
                         &mut r,
-                        world.as_ref(),
-                        judge.as_ref(),
+                        &world,
+                        &judge,
                         LoopRuntime {
                             heartbeat: beat.clone(),
                             ..LoopRuntime::default()

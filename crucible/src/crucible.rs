@@ -78,7 +78,10 @@ pub struct PublishComponent {
 /// [`World::restore`] on discard, never inspecting it. (A git world returns a commit sha; a
 /// command world returns `"<git-sha>\t<domain-token>"`.) Object-safe on purpose, so the engine
 /// can hold `&dyn World` and pick the domain at runtime from a manifest.
-pub trait World {
+///
+/// `Send + Sync` so an executor can own the world behind an `Arc` rather than borrowing it from
+/// the driver's frame. Every method takes `&self`, so shared ownership costs nothing.
+pub trait World: Send + Sync {
     /// Make the agent's freshly-edited candidate live, after its turn and before the judge
     /// measures. The default is a no-op: for code/agent-edit worlds the edit *is* the candidate
     /// (git memory captures it on the next snapshot). A deploy domain overrides this to
@@ -124,7 +127,10 @@ pub trait World {
 
 /// The frozen objective. Outside the agent's reach by construction: the engine owns it,
 /// the agent only ever sees the [`World`].
-pub trait Judge {
+///
+/// `Send + Sync` for the same reason as [`World`]: shared ownership by an executor, and every
+/// method takes `&self`.
+pub trait Judge: Send + Sync {
     /// Measure the currently-applied candidate. `ctx` carries the run-so-far numbers a
     /// command judge exposes to its measure command as env; domains that don't need them
     /// ignore it.
