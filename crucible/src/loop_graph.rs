@@ -5,11 +5,10 @@
 //! The templates carry no budget of their own (`f64::MAX`): the driver owns the run budget
 //! and checks it between rounds, so a turn that blows the cap is still measured and decided.
 
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -39,15 +38,24 @@ struct NoDecisionOrSignal {
 /// callback and the grade runner (both live inside one serial `execute` call). Grade
 /// needs it because its `inputs` hold only the passing dependencies: the declared
 /// evidence tasks that failed or never ran are invisible there.
-type TaskStates = Rc<RefCell<BTreeMap<TaskName, (TaskStatus, Option<String>)>>>;
+type TaskStates = Arc<Mutex<BTreeMap<TaskName, (TaskStatus, Option<String>)>>>;
+
+/// Both holders run inside one serial `execute`, so the lock is never contended and a poisoned
+/// guard carries a map that is still structurally sound. Recover it rather than panicking in a
+/// runner that has a live workspace under it.
+fn states_of(
+    states: &TaskStates,
+) -> MutexGuard<'_, BTreeMap<TaskName, (TaskStatus, Option<String>)>> {
+    states.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Everything one graph iteration reads from the driver. Scalars are copies of the
 /// segment state; the driver folds the returned [`IterStep`] + cost back itself.
 pub(crate) struct IterCtx<'a> {
     pub args: &'a Args,
     pub p: &'a Paths,
-    pub world: &'a dyn World,
-    pub judge: &'a dyn Judge,
+    pub world: Arc<dyn World>,
+    pub judge: Arc<dyn Judge>,
     pub control: Option<&'a control::ControlState>,
     pub it: u32,
     pub prompt: &'a str,
@@ -111,7 +119,7 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
         measured: BTreeMap::new(),
         decided: BTreeMap::new(),
         fatal: None,
-        task_states: Rc::clone(&task_states),
+        task_states: Arc::clone(&task_states),
         workflow_runner: crate::plan::harness::HarnessRunner {
             args: cx.args.clone(),
             paths: cx.p.clone(),
@@ -129,9 +137,7 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
         ExecCfg::default(),
         &mut runner,
         |task, result| {
-            task_states
-                .borrow_mut()
-                .insert(task.name.clone(), (result.status, result.note.clone()));
+            states_of(&task_states).insert(task.name.clone(), (result.status, result.note.clone()));
             task_events.push(crate::plan::cli::task_result_event(
                 plan.plan().version,
                 cx.it,
@@ -495,8 +501,8 @@ enum Signal {
 struct LoopTaskRunner<'a, R: Reporter> {
     args: &'a Args,
     p: &'a Paths,
-    world: &'a dyn World,
-    judge: &'a dyn Judge,
+    world: Arc<dyn World>,
+    judge: Arc<dyn Judge>,
     control: Option<&'a control::ControlState>,
     r: &'a mut R,
     it: u32,
@@ -594,7 +600,7 @@ impl<R: Reporter> LoopTaskRunner<'_, R> {
     }
 
     fn measure(&mut self, task: &Task) -> Attempt {
-        match loop_driver::measure_candidate(self.judge, &self.ctx, self.p, self.world) {
+        match loop_driver::measure_candidate(&*self.judge, &self.ctx, self.p, &*self.world) {
             Ok(m) => {
                 let out = serde_json::json!({ "score": m.reading.score, "valid": m.reading.valid });
                 self.measured.insert(task.name.clone(), m);
@@ -658,7 +664,7 @@ impl<R: Reporter> LoopTaskRunner<'_, R> {
         // The folded inputs hold only the passing dependencies (`join = "passed"`), so
         // record every DECLARED evidence task with its disposition: a candidate that
         // passed two of three declared rungs must not read as fully graded.
-        let states = self.task_states.borrow();
+        let states = states_of(&self.task_states);
         let evidence: Vec<EvidenceEntry> = task
             .depends_on
             .iter()
@@ -682,7 +688,7 @@ impl<R: Reporter> LoopTaskRunner<'_, R> {
             })
             .collect();
         drop(states);
-        let mut measured = loop_driver::measured_from_reading(reading, self.p, self.world);
+        let mut measured = loop_driver::measured_from_reading(reading, self.p, &*self.world);
         measured.evidence = evidence.clone();
         let out = serde_json::json!({
             "score": measured.reading.score,
@@ -709,8 +715,13 @@ impl<R: Reporter> LoopTaskRunner<'_, R> {
                 format!("decide source {source} has no measured candidate"),
             );
         };
-        let d =
-            loop_driver::decide_row(self.judge, self.best_score, self.best_tiebreak, self.it, m);
+        let d = loop_driver::decide_row(
+            &*self.judge,
+            self.best_score,
+            self.best_tiebreak,
+            self.it,
+            m,
+        );
         let out = serde_json::json!({
             "keep": d.verdict.keep,
             "solved": d.verdict.solved,
@@ -873,8 +884,8 @@ pub(crate) fn run_wide_tournament<R: Reporter>(
     p: &Paths,
     prep: &Prepared,
     r: &mut R,
-    world: &dyn World,
-    judge: &dyn Judge,
+    world: &Arc<dyn World>,
+    judge: &Arc<dyn Judge>,
     baseline_score: f64,
 ) -> Result<WideOutcome> {
     r.note(&format!(
@@ -899,8 +910,8 @@ pub(crate) fn run_wide_tournament<R: Reporter>(
     let mut runner = WideRunner {
         args,
         p,
-        world,
-        judge,
+        world: Arc::clone(world),
+        judge: Arc::clone(judge),
         r,
         wide_dir,
         baseline_score,
@@ -1071,8 +1082,8 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
 struct WideRunner<'a, R: Reporter> {
     args: &'a Args,
     p: &'a Paths,
-    world: &'a dyn World,
-    judge: &'a dyn Judge,
+    world: Arc<dyn World>,
+    judge: Arc<dyn Judge>,
     r: &'a mut R,
     wide_dir: PathBuf,
     baseline_score: f64,
@@ -1976,8 +1987,8 @@ mod tests {
             &p,
             &prep,
             &mut r,
-            world.as_ref(),
-            judge.as_ref(),
+            &world,
+            &judge,
             LoopRuntime::default(),
         )
         .unwrap();

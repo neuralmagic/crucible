@@ -12,6 +12,7 @@ use crate::{control, escalation, provisioning, publish, session};
 use anyhow::{Context, Result};
 use crucible::crucible::{Judge, World};
 use crucible_contract::admission::AdmissionOutcome;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -547,8 +548,8 @@ pub(crate) fn run_loop<R: Reporter>(
     p: &Paths,
     prep: &Prepared,
     r: &mut R,
-    world: &dyn World,
-    judge: &dyn Judge,
+    world: &Arc<dyn World>,
+    judge: &Arc<dyn Judge>,
     runtime: LoopRuntime<'_>,
 ) -> Result<Outcome> {
     match run_loop_body(args, p, prep, r, world, judge, runtime) {
@@ -565,8 +566,8 @@ fn run_loop_body<R: Reporter>(
     p: &Paths,
     prep: &Prepared,
     r: &mut R,
-    world: &dyn World,
-    judge: &dyn Judge,
+    world: &Arc<dyn World>,
+    judge: &Arc<dyn Judge>,
     runtime: LoopRuntime<'_>,
 ) -> Result<Outcome> {
     let control = runtime.control;
@@ -591,7 +592,7 @@ fn run_loop_body<R: Reporter>(
         // the tree the logged best score measured).
         let resumed_identity = rs.identity.clone();
         let resumed_best = restore_kept_best(
-            world,
+            &**world,
             judge.direction(),
             &rs.rows,
             rs.best_score,
@@ -767,8 +768,8 @@ fn run_loop_body<R: Reporter>(
         r.phase(Phase::Baseline);
         update_control_status(control, "baseline", 0, f64::INFINITY, 0.0);
         let (segment, base_row) = Segment::baseline(
-            world,
-            judge,
+            &**world,
+            &**judge,
             &prep.goal,
             "default".to_string(),
             baseline_source(prep.skip_baseline, preflight_baseline.as_ref()),
@@ -926,8 +927,8 @@ fn run_loop_body<R: Reporter>(
             // scores, and the fresh rollback snapshot all land together. The admission
             // settles only after the swap: a baseline error leaves it for the resume.
             let (segment, _row) = Segment::baseline(
-                world,
-                judge,
+                &**world,
+                &**judge,
                 &prep.goal,
                 new_regime.clone(),
                 baseline_source(prep.skip_baseline, preflight_baseline.as_ref()),
@@ -1089,8 +1090,8 @@ fn run_loop_body<R: Reporter>(
                 crate::loop_graph::IterCtx {
                     args,
                     p,
-                    world,
-                    judge,
+                    world: Arc::clone(world),
+                    judge: Arc::clone(judge),
                     control,
                     it,
                     prompt: &prompt,
@@ -1137,7 +1138,7 @@ fn run_loop_body<R: Reporter>(
                     // Make the candidate live (deploy domains build+push+set-image); a no-op
                     // for the agent-edit/git worlds where the edit IS the candidate. A failed
                     // apply is an unscoreable candidate: roll back to best and move on.
-                    match Iteration::proposed(it).apply(world) {
+                    match Iteration::proposed(it).apply(&**world) {
                         Ok(applied) => {
                             let ctx = crucible::crucible::MeasureCtx {
                                 baseline_score: Some(run.segment.baseline_score),
@@ -1145,8 +1146,8 @@ fn run_loop_body<R: Reporter>(
                                 best_score: Some(run.segment.best_score),
                             };
                             IterStep::Decided(Box::new(
-                                applied.measure(judge, &ctx, p, world)?.decide(
-                                    judge,
+                                applied.measure(&**judge, &ctx, p, &**world)?.decide(
+                                    &**judge,
                                     run.segment.best_score,
                                     run.segment.best_tiebreak,
                                 ),
@@ -2182,6 +2183,14 @@ mod tests {
     use crate::reporter::{AgentTurn, Phase, Row, Stop, TurnBudget};
     use crucible_contract::admission::AdmissionKey;
 
+    fn world_of(w: impl World + 'static) -> Arc<dyn World> {
+        Arc::new(w)
+    }
+
+    fn judge_of(j: impl Judge + 'static) -> Arc<dyn Judge> {
+        Arc::new(j)
+    }
+
     /// The counter fold as `--resume` consumes it (through the classifier), so these
     /// replay tests exercise the same path `run.rs` takes.
     fn load_resume_state(session_log: &std::path::Path) -> Result<ResumeState> {
@@ -3088,12 +3097,12 @@ mod tests {
             &f.paths,
             &f.prepared,
             &mut r,
-            &FakeWorld,
-            &FakeJudge {
+            &world_of(FakeWorld),
+            &judge_of(FakeJudge {
                 keep: false,
                 solved: false,
                 fail_baseline: false,
-            },
+            }),
             LoopRuntime::default(),
         )
         .expect("a granted distress resumes, it does not error");
@@ -3154,12 +3163,12 @@ mod tests {
             &f.paths,
             &f.prepared,
             &mut r,
-            &FakeWorld,
-            &FakeJudge {
+            &world_of(FakeWorld),
+            &judge_of(FakeJudge {
                 keep: false,
                 solved: false,
                 fail_baseline: false,
-            },
+            }),
             LoopRuntime::default(),
         )
         .expect("a bad byte must never wedge a paid run");
@@ -3214,12 +3223,12 @@ mod tests {
             &f.paths,
             &f.prepared,
             &mut r,
-            &FakeWorld,
-            &FakeJudge {
+            &world_of(FakeWorld),
+            &judge_of(FakeJudge {
                 keep: false,
                 solved: false,
                 fail_baseline: false,
-            },
+            }),
             LoopRuntime {
                 resume: Some(prior_run),
                 ..Default::default()
@@ -3545,12 +3554,12 @@ mod tests {
         let mut f = fixture(3, 0.0, false);
         f.prepared.seed_diff = Some("--- a/x.py\n+++ b/x.py\n".into());
         f.prepared.identity.seed_hash = "deadbeefdeadbeef".into();
-        let world = FakeWorld;
-        let judge = FakeJudge {
+        let world = world_of(FakeWorld);
+        let judge = judge_of(FakeJudge {
             keep: false,
             solved: false,
             fail_baseline: false,
-        };
+        });
         let mut r = RecordingReporter::default();
         run_loop(
             &f.args,
@@ -3588,12 +3597,12 @@ mod tests {
     #[test]
     fn shutdown_emitted_once_on_a_clean_finish() {
         let f = fixture(1, 0.0, false);
-        let world = FakeWorld;
-        let judge = FakeJudge {
+        let world = world_of(FakeWorld);
+        let judge = judge_of(FakeJudge {
             keep: false,
             solved: false,
             fail_baseline: false,
-        };
+        });
         let mut r = RecordingReporter::default();
         let outcome = run_loop(
             &f.args,
@@ -3618,12 +3627,12 @@ mod tests {
     #[test]
     fn shutdown_emitted_once_on_solved() {
         let f = fixture(3, 0.0, false);
-        let world = FakeWorld;
-        let judge = FakeJudge {
+        let world = world_of(FakeWorld);
+        let judge = judge_of(FakeJudge {
             keep: true,
             solved: true,
             fail_baseline: false,
-        };
+        });
         let mut r = RecordingReporter::default();
         let outcome = run_loop(
             &f.args,
@@ -3648,12 +3657,12 @@ mod tests {
     #[test]
     fn shutdown_emitted_once_on_stop() {
         let f = fixture(3, 0.0, false);
-        let world = FakeWorld;
-        let judge = FakeJudge {
+        let world = world_of(FakeWorld);
+        let judge = judge_of(FakeJudge {
             keep: false,
             solved: false,
             fail_baseline: false,
-        };
+        });
         let mut r = RecordingReporter {
             stop_now: true,
             ..Default::default()
@@ -3697,12 +3706,12 @@ mod tests {
         f.args.workflow = Some(epilogue_workflow(
             r#"command = "case \"$CRUCIBLE_INPUTS\" in *kept*) echo '{\"score\": 7}';; *) exit 1;; esac""#,
         ));
-        let world = FakeWorld;
-        let judge = FakeJudge {
+        let world = world_of(FakeWorld);
+        let judge = judge_of(FakeJudge {
             keep: true,
             solved: false,
             fail_baseline: false,
-        };
+        });
         let mut r = RecordingReporter::default();
         run_loop(
             &f.args,
@@ -3733,12 +3742,12 @@ mod tests {
     fn epilogue_is_skipped_when_the_run_kept_nothing() {
         let mut f = fixture(2, 0.0, false);
         f.args.workflow = Some(epilogue_workflow(r#"command = "echo {}""#));
-        let world = FakeWorld;
-        let judge = FakeJudge {
+        let world = world_of(FakeWorld);
+        let judge = judge_of(FakeJudge {
             keep: false,
             solved: false,
             fail_baseline: false,
-        };
+        });
         let mut r = RecordingReporter::default();
         run_loop(
             &f.args,
@@ -3771,12 +3780,12 @@ mod tests {
     fn epilogue_failure_is_advisory_and_does_not_unkeep() {
         let mut f = fixture(1, 0.0, true);
         f.args.workflow = Some(epilogue_workflow(r#"command = "echo boom >&2; exit 3""#));
-        let world = FakeWorld;
-        let judge = FakeJudge {
+        let world = world_of(FakeWorld);
+        let judge = judge_of(FakeJudge {
             keep: true,
             solved: false,
             fail_baseline: false,
-        };
+        });
         let mut r = RecordingReporter::default();
         run_loop(
             &f.args,
@@ -3820,8 +3829,8 @@ mod tests {
     fn task_lane_keeps_every_turn_unscored_and_finishes() {
         let mut f = fixture(3, 0.0, true);
         f.prepared.skip_baseline = true;
-        let world = FakeWorld;
-        let judge = crucible::task_judge::TaskJudge;
+        let world = world_of(FakeWorld);
+        let judge = judge_of(crucible::task_judge::TaskJudge);
         let mut r = RecordingReporter::default();
         let outcome = run_loop(
             &f.args,
@@ -3854,12 +3863,12 @@ mod tests {
     #[test]
     fn shutdown_emitted_once_on_budget() {
         let f = fixture(3, 1.0, false);
-        let world = FakeWorld;
-        let judge = FakeJudge {
+        let world = world_of(FakeWorld);
+        let judge = judge_of(FakeJudge {
             keep: false,
             solved: false,
             fail_baseline: false,
-        };
+        });
         let mut r = RecordingReporter {
             agent_cost: 5.0, // over the 1.0 cap after the first iteration's turn
             ..Default::default()
@@ -3886,12 +3895,12 @@ mod tests {
     #[test]
     fn shutdown_emitted_once_on_escalation() {
         let f = fixture(3, 0.0, false);
-        let world = FakeWorld;
-        let judge = FakeJudge {
+        let world = world_of(FakeWorld);
+        let judge = judge_of(FakeJudge {
             keep: false,
             solved: false,
             fail_baseline: false,
-        };
+        });
         let mut r = RecordingReporter {
             escalation_path: Some(f.paths.escalation.clone()),
             ..Default::default()
@@ -3924,12 +3933,12 @@ mod tests {
         // clean finish. A measured turn would have exited "solved", so a "finished" exit
         // with no solve is proof the measure was skipped.
         let f = fixture(1, 0.0, false);
-        let world = FakeWorld;
-        let judge = FakeJudge {
+        let world = world_of(FakeWorld);
+        let judge = judge_of(FakeJudge {
             keep: true,
             solved: true,
             fail_baseline: false,
-        };
+        });
         let mut r = RecordingReporter {
             agent_is_error: true,
             agent_error: Some("Not logged in".into()),
@@ -3977,11 +3986,11 @@ mod tests {
         // run_agent calls), record the dead attempt as an infra-dead row, and still decide
         // the re-run as iter 1 — a "finished" exit with both rows present.
         let f = fixture(1, 0.0, false);
-        let judge = FakeJudge {
+        let judge = judge_of(FakeJudge {
             keep: false,
             solved: false,
             fail_baseline: false,
-        };
+        });
         let mut r = RecordingReporter {
             agent_turns: [dead_turn(), AgentTurn::default()].into(),
             ..Default::default()
@@ -3991,7 +4000,7 @@ mod tests {
             &f.paths,
             &f.prepared,
             &mut r,
-            &FakeWorld,
+            &world_of(FakeWorld),
             &judge,
             LoopRuntime::default(),
         )
@@ -4023,11 +4032,11 @@ mod tests {
         // MAX_DEAD_TURN_ATTEMPTS consecutive dead attempts, never burn to the iteration
         // cap and report "finished" (run 6 did exactly that, 7 dead iterations deep).
         let f = fixture(5, 0.0, false);
-        let judge = FakeJudge {
+        let judge = judge_of(FakeJudge {
             keep: false,
             solved: false,
             fail_baseline: false,
-        };
+        });
         let mut r = RecordingReporter {
             agent_is_error: true,
             agent_error: Some("connection refused".into()),
@@ -4038,7 +4047,7 @@ mod tests {
             &f.paths,
             &f.prepared,
             &mut r,
-            &FakeWorld,
+            &world_of(FakeWorld),
             &judge,
             LoopRuntime::default(),
         )
@@ -4061,11 +4070,11 @@ mod tests {
         // the streak resets on every started turn, so the run finishes instead of stalling
         // (an unreset counter would have stalled on the fourth dead turn).
         let f = fixture(2, 0.0, false);
-        let judge = FakeJudge {
+        let judge = judge_of(FakeJudge {
             keep: false,
             solved: false,
             fail_baseline: false,
-        };
+        });
         let mut r = RecordingReporter {
             agent_turns: [
                 dead_turn(),
@@ -4083,7 +4092,7 @@ mod tests {
             &f.paths,
             &f.prepared,
             &mut r,
-            &FakeWorld,
+            &world_of(FakeWorld),
             &judge,
             LoopRuntime::default(),
         )
@@ -4104,18 +4113,18 @@ mod tests {
     #[test]
     fn graph_loop_shutdown_once_on_a_clean_finish() {
         let f = graph_fixture(1, 0.0);
-        let judge = FakeJudge {
+        let judge = judge_of(FakeJudge {
             keep: false,
             solved: false,
             fail_baseline: false,
-        };
+        });
         let mut r = RecordingReporter::default();
         let outcome = run_loop(
             &f.args,
             &f.paths,
             &f.prepared,
             &mut r,
-            &FakeWorld,
+            &world_of(FakeWorld),
             &judge,
             LoopRuntime::default(),
         )
@@ -4130,18 +4139,18 @@ mod tests {
     #[test]
     fn graph_loop_stops_early_on_solved() {
         let f = graph_fixture(3, 0.0);
-        let judge = FakeJudge {
+        let judge = judge_of(FakeJudge {
             keep: true,
             solved: true,
             fail_baseline: false,
-        };
+        });
         let mut r = RecordingReporter::default();
         let outcome = run_loop(
             &f.args,
             &f.paths,
             &f.prepared,
             &mut r,
-            &FakeWorld,
+            &world_of(FakeWorld),
             &judge,
             LoopRuntime::default(),
         )
@@ -4154,11 +4163,11 @@ mod tests {
     #[test]
     fn graph_loop_discards_an_is_error_turn_before_measuring() {
         let f = graph_fixture(1, 0.0);
-        let judge = FakeJudge {
+        let judge = judge_of(FakeJudge {
             keep: true,
             solved: true,
             fail_baseline: false,
-        };
+        });
         let mut r = RecordingReporter {
             agent_is_error: true,
             agent_error: Some("Not logged in".into()),
@@ -4169,7 +4178,7 @@ mod tests {
             &f.paths,
             &f.prepared,
             &mut r,
-            &FakeWorld,
+            &world_of(FakeWorld),
             &judge,
             LoopRuntime::default(),
         )
@@ -4191,11 +4200,11 @@ mod tests {
         // driver owns the cap and checks it between rounds, so a turn that blows the cap
         // is still measured and decided (a keep!) before the run stops on budget.
         let f = graph_fixture(3, 1.0);
-        let judge = FakeJudge {
+        let judge = judge_of(FakeJudge {
             keep: true,
             solved: false,
             fail_baseline: false,
-        };
+        });
         let mut r = RecordingReporter {
             agent_cost: 5.0, // over the 1.0 cap after the first turn
             ..Default::default()
@@ -4205,7 +4214,7 @@ mod tests {
             &f.paths,
             &f.prepared,
             &mut r,
-            &FakeWorld,
+            &world_of(FakeWorld),
             &judge,
             LoopRuntime::default(),
         )
@@ -4217,11 +4226,11 @@ mod tests {
     #[test]
     fn graph_loop_escalation_halts_for_review() {
         let f = graph_fixture(3, 0.0);
-        let judge = FakeJudge {
+        let judge = judge_of(FakeJudge {
             keep: false,
             solved: false,
             fail_baseline: false,
-        };
+        });
         let mut r = RecordingReporter {
             escalation_path: Some(f.paths.escalation.clone()),
             ..Default::default()
@@ -4231,7 +4240,7 @@ mod tests {
             &f.paths,
             &f.prepared,
             &mut r,
-            &FakeWorld,
+            &world_of(FakeWorld),
             &judge,
             LoopRuntime::default(),
         )
@@ -4247,11 +4256,11 @@ mod tests {
         // (ExecCfg transport_retries); only an exhausted task counts as one dead attempt
         // toward the driver's stall bound.
         let f = graph_fixture(5, 0.0);
-        let judge = FakeJudge {
+        let judge = judge_of(FakeJudge {
             keep: false,
             solved: false,
             fail_baseline: false,
-        };
+        });
         let mut r = RecordingReporter {
             agent_is_error: true,
             agent_error: Some("request timed out".into()),
@@ -4262,7 +4271,7 @@ mod tests {
             &f.paths,
             &f.prepared,
             &mut r,
-            &FakeWorld,
+            &world_of(FakeWorld),
             &judge,
             LoopRuntime::default(),
         )
@@ -4285,12 +4294,12 @@ mod tests {
     #[test]
     fn shutdown_emitted_once_on_error() {
         let f = fixture(1, 0.0, false);
-        let world = FakeWorld;
-        let judge = FakeJudge {
+        let world = world_of(FakeWorld);
+        let judge = judge_of(FakeJudge {
             keep: false,
             solved: false,
             fail_baseline: true, // the baseline measurement itself fails
-        };
+        });
         let mut r = RecordingReporter::default();
         let err = run_loop(
             &f.args,
@@ -4346,11 +4355,11 @@ mod tests {
     #[test]
     fn resume_emits_recovery_and_reparks_a_block_approval() {
         let f = fixture(2, 0.0, false);
-        let judge = FakeJudge {
+        let judge = judge_of(FakeJudge {
             keep: false,
             solved: false,
             fail_baseline: false,
-        };
+        });
         let mut r = RecordingReporter::default();
         let recovery = crate::recovery::ResumeRecovery {
             class: crate::session::RecoveryClass::DiedAwaitingApproval,
@@ -4368,7 +4377,7 @@ mod tests {
             &f.paths,
             &f.prepared,
             &mut r,
-            &FakeWorld,
+            &world_of(FakeWorld),
             &judge,
             LoopRuntime {
                 control: None,
@@ -4400,11 +4409,11 @@ mod tests {
     #[test]
     fn resume_reregisters_the_pending_regime_on_the_control_bridge() {
         let f = fixture(2, 0.0, false);
-        let judge = FakeJudge {
+        let judge = judge_of(FakeJudge {
             keep: false,
             solved: false,
             fail_baseline: false,
-        };
+        });
         let control = control::ControlState::default();
         let mut r = RecordingReporter::default();
         let recovery = crate::recovery::ResumeRecovery {
@@ -4419,7 +4428,7 @@ mod tests {
             &f.paths,
             &f.prepared,
             &mut r,
-            &FakeWorld,
+            &world_of(FakeWorld),
             &judge,
             LoopRuntime {
                 control: Some(&control),
@@ -4464,18 +4473,18 @@ mod tests {
             )
             .expect("admit");
 
-        let judge = FakeJudge {
+        let judge = judge_of(FakeJudge {
             keep: false,
             solved: false,
             fail_baseline: false,
-        };
+        });
         let mut r = RecordingReporter::default();
         run_loop(
             &f.args,
             &f.paths,
             &f.prepared,
             &mut r,
-            &FakeWorld,
+            &world_of(FakeWorld),
             &judge,
             LoopRuntime {
                 ledger: Some(ledger.clone()),
@@ -4523,11 +4532,11 @@ mod tests {
             )
             .expect("admit");
 
-        let judge = FakeJudge {
+        let judge = judge_of(FakeJudge {
             keep: false,
             solved: false,
             fail_baseline: false,
-        };
+        });
         let mut r = RecordingReporter::default();
         // The first turn dies in transport (never started); the second runs.
         r.agent_turns.push_back(AgentTurn {
@@ -4540,7 +4549,7 @@ mod tests {
             &f.paths,
             &f.prepared,
             &mut r,
-            &FakeWorld,
+            &world_of(FakeWorld),
             &judge,
             LoopRuntime {
                 ledger: Some(ledger.clone()),
@@ -4636,13 +4645,13 @@ mod tests {
     fn skip_baseline_snapshots_without_measuring() {
         // fail_baseline would explode measure(); skip must never call it. FakeJudge is
         // direction=lower, so the seeded score is the worst (INFINITY) and any candidate beats it.
-        let judge = FakeJudge {
+        let judge = judge_of(FakeJudge {
             keep: false,
             solved: false,
             fail_baseline: true,
-        };
+        });
         let (score, total, snap, row) =
-            run_baseline(&FakeWorld, &judge, BaselineSource::Skip).expect("skip never measures");
+            run_baseline(&FakeWorld, &*judge, BaselineSource::Skip).expect("skip never measures");
         assert_eq!(score, f64::INFINITY);
         assert_eq!(total, 0);
         assert!(!snap.is_empty());
@@ -4666,12 +4675,12 @@ mod tests {
             &["echo 'libnvrtc.so not found' 1>&2; exit 1"],
             None,
         ));
-        let world = FakeWorld;
-        let judge = FakeJudge {
+        let world = world_of(FakeWorld);
+        let judge = judge_of(FakeJudge {
             keep: false,
             solved: false,
             fail_baseline: false,
-        };
+        });
         let mut r = RecordingReporter::default();
         let err = run_loop(
             &f.args,
@@ -4705,12 +4714,12 @@ mod tests {
             &[r#"echo '{"pass":true,"digest":"sha256:base","note":"built"}'"#],
             Some(r#"echo '{"score":140.0,"tiebreak":0.5,"note":"tpot=140 {digest}"}'"#),
         ));
-        let world = FakeWorld;
-        let judge = FakeJudge {
+        let world = world_of(FakeWorld);
+        let judge = judge_of(FakeJudge {
             keep: true,
             solved: false,
             fail_baseline: true, // proves the preseeded path never calls measure() for the baseline
-        };
+        });
         let mut r = RecordingReporter::default();
         run_loop(
             &f.args,
@@ -4750,12 +4759,12 @@ mod tests {
         ));
         let control = std::sync::Arc::new(control::ControlState::default());
         control.set_rescope(AdmissionKey::new("g1"), "concurrency=48".into());
-        let world = FakeWorld;
-        let judge = FakeJudge {
+        let world = world_of(FakeWorld);
+        let judge = judge_of(FakeJudge {
             keep: false,
             solved: false,
             fail_baseline: false,
-        };
+        });
         let mut r = RecordingReporter::default();
         let runtime = LoopRuntime {
             control: Some(&control),
@@ -4923,12 +4932,12 @@ mod tests {
             identity: None,
             published_branches: Vec::new(),
         };
-        let world = FakeWorld;
-        let judge = FakeJudge {
+        let world = world_of(FakeWorld);
+        let judge = judge_of(FakeJudge {
             keep: false,
             solved: false,
             fail_baseline: false,
-        };
+        });
         let mut r = RecordingReporter::default();
         run_loop(
             &f.args,
@@ -5018,12 +5027,12 @@ mod tests {
             identity: None,
             published_branches: Vec::new(),
         };
-        let world = FakeWorld;
-        let judge = FakeJudge {
+        let world = world_of(FakeWorld);
+        let judge = judge_of(FakeJudge {
             keep: false,
             solved: false,
             fail_baseline: false,
-        };
+        });
         let mut r = RecordingReporter::default();
         run_loop(
             &f.args,
@@ -5086,12 +5095,12 @@ mod tests {
             identity: None,
             published_branches: Vec::new(),
         };
-        let world = FakeWorld;
-        let judge = FakeJudge {
+        let world = world_of(FakeWorld);
+        let judge = judge_of(FakeJudge {
             keep: false,
             solved: false,
             fail_baseline: false,
-        };
+        });
         let mut r = RecordingReporter::default();
         run_loop(
             &f.args,
@@ -5163,12 +5172,12 @@ mod tests {
             identity: None,
             published_branches: Vec::new(),
         };
-        let world = FakeWorld;
-        let judge = FakeJudge {
+        let world = world_of(FakeWorld);
+        let judge = judge_of(FakeJudge {
             keep: false,
             solved: false,
             fail_baseline: false,
-        };
+        });
         let mut r = RecordingReporter::default();
         run_loop(
             &f.args,
