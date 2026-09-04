@@ -278,6 +278,19 @@ pub enum PlanExit {
     TimeExceeded,
 }
 
+impl PlanExit {
+    /// The shutdown-outcome token this exit reports, in the vocabulary the shutdown event
+    /// carries. A run whose graph completed without passing every required task is still an
+    /// error, which the caller decides from the verdict rather than from the exit.
+    pub fn shutdown_token(&self) -> &'static str {
+        match self {
+            PlanExit::Completed => "finished",
+            PlanExit::BudgetExceeded | PlanExit::TimeExceeded => "budget",
+            PlanExit::Truncated { .. } | PlanExit::ShortCircuit { .. } => "error",
+        }
+    }
+}
+
 pub struct PlanOutcome {
     pub valid: bool,
     pub exit: PlanExit,
@@ -507,7 +520,14 @@ pub fn execute(
             BTreeMap::new();
         for t in &dispatch {
             let producers = file_producers(plan, t, &results, &*runner);
-            inputs_for_dispatch.insert(t.name.clone(), inputs_for(plan, t, &results, &producers));
+            let mut inputs = inputs_for(plan, t, &results, &producers);
+            if t.stage == Stage::Epilogue {
+                inputs.insert(
+                    TaskName(OUTCOME_INPUT.to_string()),
+                    main_graph_outcome(plan, &results, halted.as_ref()),
+                );
+            }
+            inputs_for_dispatch.insert(t.name.clone(), inputs);
             let staged: Vec<&Task> = producers.iter().collect();
             if let Err(why) = runner.stage(t, &staged) {
                 refused = Some((*t, why));
@@ -708,9 +728,12 @@ pub fn execute(
 /// epilogue's kept-candidate input: a task may not declare a dependency by this name.
 pub const ITEM_INPUT: &str = "item";
 
+/// The reserved input every epilogue task receives the main graph's outcome under.
+pub const OUTCOME_INPUT: &str = "outcome";
+
 /// Every key the engine writes into a task's inputs itself. A dependency named after one of
 /// them would have its entry overwritten, so [`crate::plan::ir::Plan::validate`] refuses it.
-pub const RESERVED_INPUTS: [&str; 2] = [ITEM_INPUT, crate::manifest::KEPT_INPUT];
+pub const RESERVED_INPUTS: [&str; 3] = [ITEM_INPUT, crate::manifest::KEPT_INPUT, OUTCOME_INPUT];
 
 /// One instance's name, `node[key]`. The key is the item, never its position: a list that comes
 /// back reordered or shorter still names the same work the same way, which is what makes a
@@ -730,8 +753,8 @@ fn instance_key<'a>(node: &TaskName, name: &'a TaskName) -> Option<&'a str> {
         .and_then(|rest| rest.strip_suffix(']'))
 }
 
-/// Whether `name` is an instance of the mapped node `node`, by the `node[item]` naming a
-/// declared name cannot collide with.
+/// Whether `name` is an instance of the mapped node `node`. A declared task name may not
+/// contain a bracket, so an instance name can never be mistaken for a task of its own.
 pub fn is_instance_of(node: &TaskName, name: &TaskName) -> bool {
     instance_key(node, name).is_some()
 }
@@ -848,22 +871,51 @@ fn inputs_for(
         .collect()
 }
 
-/// One dependency's entry in a settled join's inputs. The entry carries the output rather than
-/// being it, so a consumer cannot read a failed dependency's reading without stepping past its
-/// status.
-fn settled_entry(r: &TaskResult, files: bool) -> serde_json::Map<String, Value> {
+/// What one settled task reports about itself: the settled entry with the output and the
+/// staged-file flag omitted, which is what an epilogue task receives per main-graph task.
+fn outcome_entry(r: &TaskResult) -> serde_json::Map<String, Value> {
     let mut entry = serde_json::Map::new();
     entry.insert("status".to_string(), Value::from(r.status.as_str()));
     entry.insert(
         "note".to_string(),
         r.note.clone().map_or(Value::Null, Value::String),
     );
+    entry
+}
+
+/// One dependency's entry in a settled join's inputs. The entry carries the output rather than
+/// being it, so a consumer cannot read a failed dependency's reading without stepping past its
+/// status.
+fn settled_entry(r: &TaskResult, files: bool) -> serde_json::Map<String, Value> {
+    let mut entry = outcome_entry(r);
     entry.insert(
         "output".to_string(),
         r.output.clone().unwrap_or(Value::Null),
     );
     entry.insert("files".to_string(), Value::Bool(files));
     entry
+}
+
+/// What an epilogue task is told about the run it reports on: how dispatch ended, and one entry
+/// per settled main-graph task. An epilogue task has no dependencies to read, so this is the
+/// only channel by which it learns what happened.
+fn main_graph_outcome(
+    plan: &ValidPlan,
+    results: &BTreeMap<TaskName, TaskResult>,
+    halted: Option<&PlanExit>,
+) -> Value {
+    let tasks: serde_json::Map<String, Value> = plan
+        .tasks_topo()
+        .filter(|t| t.stage == Stage::Iteration)
+        .filter_map(|t| {
+            let r = results.get(&t.name)?;
+            Some((t.name.0.clone(), Value::Object(outcome_entry(r))))
+        })
+        .collect();
+    serde_json::json!({
+        "exit": halted.unwrap_or(&PlanExit::Completed).shutdown_token(),
+        "tasks": Value::Object(tasks),
+    })
 }
 
 /// Read the items a mapped task fans out over, or say why it cannot.
@@ -3895,5 +3947,88 @@ mod tests {
         let entry = r.entry("roundup", "audit");
         assert_eq!(status_of(entry), "fail");
         assert_eq!(entry["per_instance"], serde_json::json!({}));
+    }
+
+    fn outcome_of(r: &ScriptRunner, task: &str) -> Value {
+        r.seen_values[task][&TaskName(OUTCOME_INPUT.to_string())].clone()
+    }
+
+    /// An epilogue task has no dependencies to read, so the run's outcome is the only channel
+    /// by which it learns what the main graph did. Every main-graph task settled, whatever it
+    /// settled as, and no epilogue task appears in the graph it reports on.
+    #[test]
+    fn an_epilogue_task_reads_the_completed_runs_outcome() {
+        let plan = valid(
+            vec![
+                task("build", &[], "any", true),
+                task("check", &["build"], "any", false),
+                epilogue("report", &[], true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.on(
+            "check",
+            1,
+            || AttemptOutcome::fail("measured a negative"),
+            0.1,
+        );
+        let out = run_plan(&plan, &mut r);
+
+        assert_eq!(out.exit, PlanExit::Completed);
+        assert!(out.valid, "an advisory failure does not change the verdict");
+        let outcome = outcome_of(&r, "report");
+        assert_eq!(outcome["exit"], "finished");
+        assert_eq!(outcome["tasks"]["build"]["status"], "pass");
+        assert_eq!(outcome["tasks"]["build"]["note"], Value::Null);
+        assert_eq!(outcome["tasks"]["check"]["status"], "fail");
+        assert_eq!(outcome["tasks"]["check"]["note"], "measured a negative");
+        assert_eq!(
+            outcome["tasks"].as_object().map(|t| t.len()),
+            Some(2),
+            "an epilogue task is not part of the main graph it reports on"
+        );
+        assert!(
+            outcome["tasks"]["build"].get("output").is_none()
+                && outcome["tasks"]["build"].get("files").is_none(),
+            "the epilogue entry is the settled entry minus output and files"
+        );
+        assert!(
+            !r.seen_inputs["check"].contains(&OUTCOME_INPUT.to_string()),
+            "a main-graph task was given the run's outcome"
+        );
+    }
+
+    /// The failure path is the one the epilogue exists for: it dispatches over a short-circuit,
+    /// and the outcome names how dispatch stopped and what every task it left behind settled as.
+    #[test]
+    fn an_epilogue_task_reads_the_short_circuit_that_ended_the_main_graph() {
+        let plan = valid(
+            vec![
+                task("probe", &[], "any", true),
+                task("after", &["probe"], "any", true),
+                epilogue("report", &[], true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.on("probe", 1, || AttemptOutcome::fail("vetoed"), 0.1);
+        let out = run_plan(&plan, &mut r);
+
+        assert_eq!(
+            out.exit,
+            PlanExit::ShortCircuit {
+                task: "probe".into()
+            }
+        );
+        let outcome = outcome_of(&r, "report");
+        assert_eq!(outcome["exit"], "error");
+        assert_eq!(outcome["tasks"]["probe"]["status"], "fail");
+        assert_eq!(outcome["tasks"]["probe"]["note"], "vetoed");
+        assert_eq!(outcome["tasks"]["after"]["status"], "blocked");
+        assert_eq!(
+            outcome["tasks"]["after"]["note"],
+            "required task probe failed"
+        );
     }
 }

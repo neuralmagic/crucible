@@ -8,7 +8,7 @@
 use crate::manifest::KEPT_INPUT;
 #[cfg(test)]
 use crate::manifest::WorkflowType;
-use crate::plan::exec::{DeclaredStatus, ITEM_INPUT};
+use crate::plan::exec::{DeclaredStatus, ITEM_INPUT, OUTCOME_INPUT};
 use crate::plan::ir::MAX_FANOUT_CEILING;
 
 /// Which lanes see a constructor.
@@ -428,8 +428,8 @@ pub fn reserved_result_fields() -> Vec<Reserved> {
     )]
 }
 
-/// Keys the engine writes into a task's inputs. Neither is ever wrapped in a settled join's
-/// per-dependency entry.
+/// Keys the engine writes into a task's inputs. None of them is ever wrapped in a settled
+/// join's per-dependency entry.
 pub fn reserved_inputs() -> Vec<Reserved> {
     vec![
         Reserved::new(
@@ -441,6 +441,13 @@ pub fn reserved_inputs() -> Vec<Reserved> {
             KEPT_INPUT,
             "object",
             "The kept candidate, in an epilogue task only.",
+        ),
+        Reserved::new(
+            OUTCOME_INPUT,
+            "object",
+            "How the main graph ended and what each of its tasks settled as, as \
+             `{\"exit\": str, \"tasks\": {name: {\"status\", \"note\"}}}`, in an epilogue \
+             task only.",
         ),
     ]
 }
@@ -610,8 +617,8 @@ fn reserved_rows(rows: Vec<Reserved>) -> serde_json::Value {
 mod tests {
     use std::collections::BTreeSet;
 
-    use crate::manifest::{KEPT_INPUT, WorkflowType};
-    use crate::plan::exec::{DeclaredStatus, ITEM_INPUT, TaskStatus};
+    use crate::manifest::WorkflowType;
+    use crate::plan::exec::{DeclaredStatus, TaskStatus};
     use crate::plan::starlark::reference::functions;
     use crate::plan::starlark::{dsl_functions, known_kwargs, lane_globals};
 
@@ -705,7 +712,8 @@ mod tests {
                 .iter()
                 .map(|row| row.name)
                 .collect::<Vec<_>>(),
-            [ITEM_INPUT, KEPT_INPUT]
+            crate::plan::exec::RESERVED_INPUTS,
+            "an input the engine writes is undocumented, or a documented one is invented"
         );
     }
 

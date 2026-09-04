@@ -167,8 +167,8 @@ pub enum WorkflowError {
     EngineTaskInEpilogue { task: String },
     #[error("report task {task:?} must run in the epilogue")]
     ReportOutsideEpilogue { task: String },
-    #[error("epilogue task name {KEPT_INPUT:?} is reserved for the kept-candidate input")]
-    ReservedEpilogueName,
+    #[error("epilogue task name {name:?} is reserved for an input the engine writes")]
+    ReservedEpilogueName { name: String },
     #[error(
         "task {task:?} (stage {stage:?}) depends on {dependency:?} (stage {dependency_stage:?}); \
          dependencies cannot cross stages"
@@ -453,8 +453,10 @@ impl WorkflowCfg {
                         task: task.name.0.clone(),
                     });
                 }
-                if task.name.0 == KEPT_INPUT {
-                    return Err(WorkflowError::ReservedEpilogueName);
+                if task.name.0 == KEPT_INPUT || task.name.0 == crate::plan::exec::OUTCOME_INPUT {
+                    return Err(WorkflowError::ReservedEpilogueName {
+                        name: task.name.0.clone(),
+                    });
                 }
             }
             for dependency in &task.depends_on {
@@ -1032,12 +1034,17 @@ mod tests {
 
     #[test]
     fn engine_tasks_cannot_be_epilogue() {
-        let mut workflow = full_autoresearch();
-        workflow.tasks[2].stage = Stage::Epilogue;
+        // A leaf: an engine task spliced into the epilogue with a dependency either way is a
+        // cross-stage edge, which the plan refuses before the stage rules are reached.
+        let workflow = parse(
+            "type = \"custom\"\nresult = \"check\"\n\
+             [[task]]\nname = \"check\"\nkind = \"evaluate\"\ncommand = \"true\"\n\
+             [[task]]\nname = \"grade\"\nkind = \"engine\"\nop = \"grade\"\nsource = \"check\"\nstage = \"epilogue\"\n",
+        );
         assert_eq!(
             workflow.validate().unwrap_err(),
             WorkflowError::EngineTaskInEpilogue {
-                task: "score".to_owned()
+                task: "grade".to_owned()
             }
         );
     }
@@ -1056,13 +1063,17 @@ mod tests {
             }
         );
 
-        let workflow = parse(
-            "[[task]]\nname = \"kept\"\nkind = \"command\"\ncommand = \"true\"\nstage = \"epilogue\"\n",
-        );
-        assert_eq!(
-            workflow.validate().unwrap_err(),
-            WorkflowError::ReservedEpilogueName
-        );
+        for reserved in [KEPT_INPUT, crate::plan::exec::OUTCOME_INPUT] {
+            let workflow = parse(&format!(
+                "[[task]]\nname = \"{reserved}\"\nkind = \"command\"\ncommand = \"true\"\nstage = \"epilogue\"\n"
+            ));
+            assert_eq!(
+                workflow.validate().unwrap_err(),
+                WorkflowError::ReservedEpilogueName {
+                    name: reserved.to_owned()
+                }
+            );
+        }
     }
 
     #[test]

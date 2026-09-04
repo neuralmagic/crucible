@@ -238,3 +238,4 @@ Present alongside the dependency entries, never wrapped in one.
 | --- | --- | --- |
 | `item` | `str` | This mapped instance's key, one per item of the list `over` names. |
 | `kept` | `object` | The kept candidate, in an epilogue task only. |
+| `outcome` | `object` | How the main graph ended and what each of its tasks settled as, as `{"exit": str, "tasks": {name: {"status", "note"}}}`, in an epilogue task only. |
