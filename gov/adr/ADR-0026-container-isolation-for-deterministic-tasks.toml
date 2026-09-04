@@ -1,0 +1,63 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0026"
+title = "Container isolation for deterministic tasks"
+status = "proposed"
+date = "2026-09-04"
+refs = [
+    "ADR-0010",
+    "ADR-0025",
+    "RFC-0001",
+    "RFC-0002",
+]
+
+[content]
+context = """
+A `command` task runs `sh -c` in the run's workspace, in the loop pod, as the loop's user, on the loop's network, with whatever toolchain the loop image baked. A pack that needs a different toolchain has two options today: get it into the shared loop image, or vendor it into the pack. The first makes the loop image the union of everything every domain has ever needed; the second makes every pack carry a build.
+
+The plan contract already says what a task is allowed to hand back: the fields it declares in `emits`, and the workspace files it declares in `emits_files`, staged for dependents under [[RFC-0002:C-TASK-FILES]]. Nothing else crosses. That is what makes where a task ran a substrate detail rather than a contract one.
+
+The engine also already knows how to run work in a container. `isolated = true` means "run somewhere disposable, keep only the declared output", and `Isolation` is a one-variant enum whose only member is a git worktree, on the same filesystem, image, user, and network as the loop. Separately, an agent turn already runs in a real container: `ComputeDriver` chooses podman nested in the loop pod or a sibling pod in-cluster, and the sandbox module already moves a workdir in and named files out.
+
+So the boundary exists, the transfer exists, and the output contract that makes substitution safe exists. What is missing is the ability for a deterministic task to ask for it.
+"""
+decision = """
+Proposed, not decided.
+
+Give `command` and `evaluate` an optional `image`. Supplied, the task runs in a container built from that image, receiving the staged workspace and returning its declared JSON and files. Omitted, nothing changes: the task runs on the loop pod exactly as today, and every existing pack renders byte-identically.
+
+Model it as a second variant of the existing isolation enum rather than as an independent flag, so "where does this task run" stays one question with one dispatch point. A separate flag alongside `isolated` would admit combinations that have to be defined and then defended.
+
+Placement reuses `ComputeDriver`: nested under podman when the loop runs on a laptop or a single host, a sibling pod in-cluster. A pack must not have to know which, for the same reason a pack does not name a cluster today. The image is pinned to a digest at render time like every other image the renderer emits.
+"""
+consequences = """
+Positive: a pack brings its own toolchain, so the loop image stops accreting one. A command that is slow, flaky, or hostile cannot corrupt the shared workspace or reach the loop pod's network. The task's declared output stops being a convention and becomes the enforced boundary it was always described as.
+
+Negative: a container start per task, an image pull as a new failure mode, and a workspace round-trip that makes a file-heavy task slower than a worktree. `emits_files` becomes load-bearing: a task that forgets to declare a file silently loses it, where today it would have left it in the shared workspace and a dependent would have found it anyway. That is a behavior change for anyone who was relying on the shared filesystem without saying so.
+
+The risk worth naming: two dispatchers for the same task kind. If this lands as a parallel path beside the shell runner rather than as a second variant behind one dispatch point, it repeats what [[ADR-0010]]'s wide tournament cost: a second runner over the same type, a second thing every later change has to be taught.
+
+Open questions this ADR does not answer: whether a task with an image may share the workspace rather than be isolated; which secrets and environment reach it, given that the loop pod's are not automatically the task's; and whether its changes join the run's git memory, which [[RFC-0002:C-PLAYBOOK-LANE]] commits only for a task that settles passing.
+
+Sequencing: this wants the pod-dispatch path that the approval-gate work in [[ADR-0025]] is about to change in the controller. It should be specified after that stack merges, not stacked on top of it.
+"""
+
+[[content.alternatives]]
+text = "An optional image on the existing deterministic task kinds, dispatched as a second isolation variant"
+status = "considered"
+
+[[content.alternatives]]
+text = "A distinct container task kind alongside command and evaluate"
+status = "rejected"
+rejection_reason = "Where a task runs is a substrate choice, not a different kind of work; a third kind would duplicate the whole command surface (run, emits, emits_files, over, join) to change one thing about it."
+
+[[content.alternatives]]
+text = "Keep one loop image and add what packs need to it"
+status = "rejected"
+rejection_reason = "It is the status quo, and it makes the image the union of every domain's dependencies while giving a deterministic task no isolation from the loop it runs beside."
+
+[[content.alternatives]]
+text = "Let a task shell out to podman itself"
+status = "rejected"
+rejection_reason = "Puts placement, image pinning, and cleanup in the pack, and requires handing every pack a container socket, which is a larger grant than the isolation it buys."

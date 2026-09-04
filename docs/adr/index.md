@@ -32,3 +32,4 @@ Expand this section in the sidebar to browse the full list.
 | [0027](./0027-measurement-sessions.md) | Measurement sessions, one warm engine and many observations | Proposed |
 | [0028](./0028-retire-the-wide-tournament.md) | Retire the wide tournament | Implemented |
 | [0029](./0029-approval-gates.md) | Plan-authored approval gates on an event-sourced loop | Implemented |
+| [0030](./0030-container-isolation-for-tasks.md) | Container isolation for deterministic tasks | Proposed |

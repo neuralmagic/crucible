@@ -55,3 +55,4 @@
   - [ADR 0026: The no-judge task lane](./adr/0026-no-judge-task-lane.md)
   - [ADR 0028: Retire the wide tournament](./adr/0028-retire-the-wide-tournament.md)
   - [ADR 0029: Plan-authored approval gates on an event-sourced loop](./adr/0029-approval-gates.md)
+  - [ADR 0030: Container isolation for deterministic tasks](./adr/0030-container-isolation-for-tasks.md)
