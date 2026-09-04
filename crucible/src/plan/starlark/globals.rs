@@ -385,7 +385,7 @@ fn convert_at(value: Value<'_>, depth: usize) -> dsl::Result<dsl::Value> {
         return Ok(dsl::Value::External(external.0.clone()));
     }
     if let Some(task) = TaskValue::from_value(value) {
-        return Ok(dsl::Value::Task(task.0.clone()));
+        return Ok(dsl::Value::Task(Box::new(task.0.clone())));
     }
     if let Some(output) = OutputRefValue::from_value(value) {
         return output.resolve().map(dsl::Value::Output);
@@ -432,7 +432,7 @@ fn alloc_at<'v>(heap: Heap<'v>, value: dsl::Value, depth: usize) -> Value<'v> {
         dsl::Value::External(segments) => heap.alloc(ExternalText(segments)),
         // A dictionary never travels back out: the constructors consume it.
         dsl::Value::Map(_) => Value::new_none(),
-        dsl::Value::Task(task) => heap.alloc(TaskValue(task)),
+        dsl::Value::Task(task) => heap.alloc(TaskValue(*task)),
         dsl::Value::Output(reference) => heap.alloc(OutputRefValue {
             declared: vec![reference.field.0.clone()],
             reference,

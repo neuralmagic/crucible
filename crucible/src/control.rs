@@ -304,6 +304,12 @@ impl ControlState {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("the control bridge at {addr} sent no reply")]
+pub(crate) struct NoBridgeReply {
+    pub addr: String,
+}
+
 /// Send one command line to a live run's control bridge and return its reply. The shape is
 /// exactly what [`parse_request`] accepts, so `crucible approve`, `crucible deny`, and the PR
 /// watcher all speak to the bridge the same way.
@@ -329,7 +335,10 @@ pub(crate) fn send_command(addr: &str, command: &Value) -> Result<Value> {
             return Ok(v);
         }
     }
-    anyhow::bail!("the control bridge at {addr} sent no reply")
+    Err(NoBridgeReply {
+        addr: addr.to_string(),
+    }
+    .into())
 }
 
 /// Start a detached TCP bridge thread. The listener binds to all interfaces so it works

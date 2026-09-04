@@ -385,7 +385,7 @@ enum Value {
     /// A dictionary, ordered by key so a rendered prompt is the same on every compile.
     Map(BTreeMap<String, Value>),
     List(Vec<Value>),
-    Task(Task),
+    Task(Box<Task>),
     /// `producer.field`, already checked against the producer's declared emits.
     Output(OutputRef),
     Session(SessionDecl),
@@ -1311,7 +1311,7 @@ fn constructor(
             count: constructed,
         });
     }
-    Ok(Value::Task(task))
+    Ok(Value::Task(Box::new(task)))
 }
 
 fn no_unknown_kwargs(function: &str, named: &BTreeMap<String, Value>) -> Result<()> {
@@ -1377,7 +1377,7 @@ fn task_list(function: &str, tasks: Vec<Value>) -> Result<Vec<Task>> {
     tasks
         .into_iter()
         .map(|task| match task {
-            Value::Task(task) => Ok(task),
+            Value::Task(task) => Ok(*task),
             _ => Err(CompileError::TaskListEntryNotTask {
                 function: function.to_owned(),
             }),

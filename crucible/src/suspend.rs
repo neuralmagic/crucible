@@ -64,6 +64,12 @@ pub enum SuspendError {
     },
     #[error("pod {of} left no {kind} artifact")]
     MissingArtifact { kind: ArtifactKind, of: String },
+    #[error("snapshot entry {} escapes the state dir", .path.display())]
+    EscapingEntry { path: PathBuf },
+    #[error("git bundle failed: {stderr}")]
+    Bundle { stderr: String },
+    #[error("git {args} failed: {stderr}")]
+    Git { args: String, stderr: String },
 }
 
 /// Attempts a drop-box fetch gets before the resume gives up; the controller may still be
@@ -148,7 +154,7 @@ pub fn restore(snapshot_gz: &[u8], state: &Path, workspace: &Path) -> Result<Opt
                 std::path::Component::ParentDir | std::path::Component::RootDir
             )
         }) {
-            anyhow::bail!("snapshot entry {} escapes the state dir", path.display());
+            return Err(SuspendError::EscapingEntry { path }.into());
         }
         if path == Path::new(WORKSPACE_BUNDLE) {
             let mut bytes = Vec::new();
@@ -246,7 +252,10 @@ fn bundle_workspace(workspace: &Path) -> Result<Option<Vec<u8>>> {
         if stderr.contains("Refusing to create empty bundle") {
             return Ok(None);
         }
-        anyhow::bail!("git bundle failed: {}", stderr.trim());
+        return Err(SuspendError::Bundle {
+            stderr: stderr.trim().to_string(),
+        }
+        .into());
     }
     Ok(Some(out.stdout))
 }
@@ -284,11 +293,11 @@ fn run_git(workspace: &Path, args: &[&str]) -> Result<()> {
         .output()
         .with_context(|| format!("running git {}", args.join(" ")))?;
     if !out.status.success() {
-        anyhow::bail!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+        return Err(SuspendError::Git {
+            args: args.join(" "),
+            stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        }
+        .into());
     }
     Ok(())
 }

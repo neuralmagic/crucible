@@ -16,6 +16,18 @@ struct MermaidRenderFailed {
     detail: String,
 }
 
+/// A gate asked to suspend from a run with no state dir to snapshot into.
+#[derive(Debug, thiserror::Error)]
+#[error("a gate can only suspend a --manifest run")]
+struct SuspendNeedsManifest;
+
+/// The run was stopped by an operator while parked on a gate; the gate is still open.
+#[derive(Debug, thiserror::Error)]
+#[error("stopped while parked on gate {task}")]
+struct StoppedWhileParked {
+    task: String,
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("plan did not reach a valid verdict ({exit})")]
 struct NoValidVerdict {
@@ -829,7 +841,7 @@ pub fn run(
         let mut out = execute_from(
             &plan,
             &substrate,
-            exec_cfg.clone(),
+            exec_cfg,
             runner.as_mut(),
             prior,
             &mut on_result,
@@ -869,7 +881,7 @@ pub fn run(
             }
             gate::Waited::Suspend => {
                 let Some(paths) = &evidence else {
-                    anyhow::bail!("a gate can only suspend a --manifest run");
+                    return Err(SuspendNeedsManifest.into());
                 };
                 match gate::suspend(paths, &plan, &open) {
                     Ok(()) => {
@@ -922,7 +934,10 @@ pub fn run(
                                         },
                                     );
                                 }
-                                anyhow::bail!("stopped while parked on gate {}", open.task);
+                                return Err(StoppedWhileParked {
+                                    task: open.task.0.clone(),
+                                }
+                                .into());
                             }
                             gate::Parked::TimedOut => {
                                 let resolution = crucible_contract::GateResolution::timeout();
@@ -947,7 +962,10 @@ pub fn run(
                         },
                     );
                 }
-                anyhow::bail!("stopped while parked on gate {}", open.task);
+                return Err(StoppedWhileParked {
+                    task: open.task.0.clone(),
+                }
+                .into());
             }
         }
     };
