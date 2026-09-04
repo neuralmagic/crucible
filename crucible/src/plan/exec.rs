@@ -3126,6 +3126,45 @@ mod tests {
         );
     }
 
+    /// The mapped-node batch is the second site a ceiling crossed after a required failure can
+    /// relabel the exit from. A fan-out over another epilogue task crosses no stage, so the
+    /// site is reachable: the instances run, spend past the ceiling, and the run still reports
+    /// the short-circuit that ended the main graph.
+    #[test]
+    fn a_mapped_epilogue_batch_crossing_the_budget_ceiling_does_not_relabel_a_short_circuit() {
+        let mut fan = mapped_node("fan", "src", "items", true);
+        fan.stage = Stage::Epilogue;
+        fan.isolation = Some(crate::plan::ir::Isolation::Worktree);
+        let plan = valid(
+            vec![
+                task("probe", &[], "any", true),
+                epilogue("src", &[], true),
+                fan,
+            ],
+            0.25,
+        );
+        let mut r = ScriptRunner::new();
+        r.on("probe", 1, || AttemptOutcome::fail("vetoed"), 0.1);
+        r.on(
+            "src",
+            1,
+            || AttemptOutcome::Pass(serde_json::json!({"items": ["x", "y"]})),
+            0.05,
+        );
+        let out = run_plan(&plan, &mut r);
+        for key in ["x", "y"] {
+            let instance: TaskName = format!("fan[{key}]").as_str().into();
+            assert_eq!(out.results[&instance].status, TaskStatus::Pass);
+        }
+        assert!(out.spent_usd > 0.25, "the batch never crossed the ceiling");
+        assert_eq!(
+            out.exit,
+            PlanExit::ShortCircuit {
+                task: "probe".into()
+            }
+        );
+    }
+
     #[test]
     fn a_required_epilogue_the_substrate_cannot_run_does_not_truncate_the_plan() {
         let mut report = epilogue("report", &[], true);
