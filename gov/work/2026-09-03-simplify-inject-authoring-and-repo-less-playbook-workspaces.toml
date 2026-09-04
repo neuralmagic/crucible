@@ -1,0 +1,47 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-09-03-001"
+title = "Simplify inject authoring and repo-less playbook workspaces"
+status = "done"
+created = "2026-09-03"
+started = "2026-09-03"
+completed = "2026-09-03"
+refs = [
+    "RFC-0001:C-MANIFEST",
+    "RFC-0001:C-COMMANDS",
+]
+
+[content]
+description = """Every [[workspace.inject]] in the shipped domains and the live draft packs is four lines that say src equals dst and frozen equals the default, and each script is declared again in setup_cmd's cp chain and again in the task's run string. A playbook with no upstream repository still has to write [repo] path = "." plus a setup_cmd that mkdirs, copies, git inits and commits, only to satisfy the clone default. A run string naming a script the pack carries but never injected previews green and dies at runtime with exit 127. Let [workspace].inject take plain strings and globs, let a playbook omit [repo] and setup_cmd so the engine seeds the workspace from injects alone, and have crucible check flag an uninjected script."""
+
+[[content.acceptance_criteria]]
+text = "a string entry in [workspace].inject means src equals dst and frozen; a glob or directory entry expands to the sorted files under the pack dir, never above it, and a pattern matching nothing is a manifest error naming the pattern"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "a playbook manifest may omit [repo] and setup_cmd; the engine creates the workspace dir, applies injects, and commits them as the baseline, while a scored manifest without [repo] is still refused"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "crucible check warns for a command or evaluate task whose run string names a file present in the pack dir but not covered by an inject, naming the task and the file"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "run identity hashes the expanded inject set, so a glob entry and its explicit expansion produce the same digest"
+status = "done"
+category = "chore"
+
+[[content.acceptance_criteria]]
+text = "the example packs and the manifest docs use the shorthand and the repo-less form"
+status = "done"
+category = "chore"
+
+[verification]
+required_guards = [
+    "GUARD-CARGO-CLIPPY",
+    "GUARD-CARGO-TEST",
+]

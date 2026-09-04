@@ -13,7 +13,9 @@ The engine must read exactly one manifest per run. Default path is ./crucible.to
 
 The manifest directory (dirname of the manifest file) must anchor all config-relative paths.
 
-Required fields: [repo] must contain exactly one of url or path. When [judge] is present, [judge].measure_cmd and [judge].direction are required. When [judge] is absent, the run is a task lane.
+Required fields: [repo], when present, must contain exactly one of url or path. [repo] may be omitted only by a manifest whose [workflow].type is playbook; every other manifest must carry it. When [judge] is present, [judge].measure_cmd and [judge].direction are required. When [judge] is absent, the run is a task lane.
+
+[workspace].inject entries take two forms. A table names src (manifest-relative), dst (workspace-relative), and frozen (default true). A string is shorthand for a table whose dst equals its src and whose frozen is true. A string that names a directory or contains a glob metacharacter must expand to every regular file it matches under the manifest directory, in sorted path order, each becoming its own frozen entry with dst equal to its manifest-relative path. Expansion must not escape the manifest directory, and a string that matches no file must be rejected as a manifest error naming the string.
 
 [world] with no commands must produce GitWorld. Any command given must produce CommandWorld, which layers domain commands on top of git memory.
 
