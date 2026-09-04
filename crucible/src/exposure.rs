@@ -59,6 +59,7 @@ pub struct Exposure {
 /// pack neither declares nor can subtract. Read from the constants the provisioning paths use.
 pub fn builtin_agent_credentials() -> Vec<&'static str> {
     let mut out = crate::openshell::policy::VERTEX_RELAY_KEYS.to_vec();
+    out.extend_from_slice(crate::openshell::policy::IDENTITY_RELAY_KEYS);
     out.push(crate::plan::TASK_NAME_ENV);
     out
 }
@@ -623,6 +624,16 @@ mod tests {
             .map(|k| (k.to_string(), "v".to_string()))
             .collect();
         assert!(refuse_uncovered(&covered(&m), &grants, &[]).is_ok());
+    }
+
+    #[test]
+    fn the_run_identity_the_controller_names_is_not_a_credential_grant() {
+        let m = manifest(OPENSHELL);
+        let grants: Vec<(String, String)> = crate::openshell::policy::IDENTITY_RELAY_KEYS
+            .iter()
+            .map(|k| (k.to_string(), "crucible-bot[bot]".to_string()))
+            .collect();
+        assert!(refuse_uncovered(&covered(&m), &grants, &m.agent.relay).is_ok());
     }
 
     #[test]

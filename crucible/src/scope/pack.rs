@@ -301,19 +301,26 @@ pub(super) fn strip_controls_and_selftest(manifest_path: &Path, pack: &Path) -> 
         judge.remove("selftest");
     }
 
-    // Drop any [[workspace.inject]] whose src pulls a control into the workspace.
-    if let Some(inject) = doc
+    // Drop any [workspace].inject entry whose src pulls a control into the workspace.
+    let mut emptied = false;
+    match doc
         .get_mut("workspace")
         .and_then(Item::as_table_mut)
         .and_then(|w| w.get_mut("inject"))
-        .and_then(Item::as_array_of_tables_mut)
     {
-        inject.retain(|t| !inject_src_is_control(t));
-        if inject.is_empty()
-            && let Some(ws) = doc.get_mut("workspace").and_then(Item::as_table_mut)
-        {
-            ws.remove("inject");
+        Some(Item::ArrayOfTables(inject)) => {
+            inject.retain(|t| !inject_src_is_control(t));
+            emptied = inject.is_empty();
         }
+        Some(Item::Value(toml_edit::Value::Array(inject))) => {
+            inject.retain(|v| !v.as_str().is_some_and(src_is_control));
+            inject.fmt();
+            emptied = inject.is_empty();
+        }
+        _ => {}
+    }
+    if emptied && let Some(ws) = doc.get_mut("workspace").and_then(Item::as_table_mut) {
+        ws.remove("inject");
     }
 
     std::fs::write(manifest_path, doc.to_string())
@@ -333,11 +340,12 @@ fn inject_src_is_control(inject: &toml_edit::Table) -> bool {
     inject
         .get("src")
         .and_then(|v| v.as_str())
-        .map(|s| {
-            let s = s.trim_start_matches("./");
-            s == CONTROLS_DIR || s.starts_with(&format!("{CONTROLS_DIR}/"))
-        })
-        .unwrap_or(false)
+        .is_some_and(src_is_control)
+}
+
+fn src_is_control(src: &str) -> bool {
+    let s = src.trim_start_matches("./");
+    s == CONTROLS_DIR || s.starts_with(&format!("{CONTROLS_DIR}/"))
 }
 
 /// Refuse a non-empty `--out` unless `force`; create it if it doesn't exist yet.
@@ -464,4 +472,57 @@ pub(super) fn pack_marker_line(report: &ScopeReport, pack: &Path) -> Option<Stri
         Err(e) => serde_json::json!({ "error": format!("{e:#}") }).to_string(),
     };
     Some(format!("{SCOPE_PACK_MARKER} {payload}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn de_prescribing_strips_control_injects_in_both_authoring_forms() {
+        let dir = std::env::temp_dir().join(format!(
+            "crucible-pack-strip-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(dir.join(CONTROLS_DIR)).unwrap();
+        let manifest = dir.join("crucible.toml");
+        std::fs::write(
+            &manifest,
+            r#"[workspace]
+inject = ["_controls/fix.go", "./_controls/gate_test.go", "roundup.py"]
+[judge]
+measure_cmd = "m"
+[judge.selftest]
+good_cmd = "cp _controls/fix.go ."
+bad_cmd = "true"
+"#,
+        )
+        .unwrap();
+        strip_controls_and_selftest(&manifest, &dir).unwrap();
+        let text = std::fs::read_to_string(&manifest).unwrap();
+        assert!(text.contains("inject = [\"roundup.py\"]"), "{text}");
+        assert!(
+            !text.contains("_controls") && !text.contains("selftest"),
+            "{text}"
+        );
+        assert!(!dir.join(CONTROLS_DIR).exists());
+
+        std::fs::write(
+            &manifest,
+            r#"[workspace]
+[[workspace.inject]]
+src = "_controls/fix.go"
+dst = "fix.go"
+"#,
+        )
+        .unwrap();
+        strip_controls_and_selftest(&manifest, &dir).unwrap();
+        let text = std::fs::read_to_string(&manifest).unwrap();
+        assert!(!text.contains("inject"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

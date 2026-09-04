@@ -1,7 +1,7 @@
 #:schema ../schema/work.schema.json
 
 [govctl]
-id = "WI-2026-09-03-001"
+id = "WI-2026-09-03-002"
 title = "Preserve declared evidence from measured task failures"
 status = "done"
 created = "2026-09-03"

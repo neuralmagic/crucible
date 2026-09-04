@@ -1430,17 +1430,6 @@ async fn write_temp(tag: &str, content: &str) -> Result<tempfile::NamedTempFile>
     .context("temp-file task panicked")?
 }
 
-/// The identity a run's commits are attributed to, set on the pod by the controller when the run
-/// pushes as its GitHub App. Not a credential: it names an author, and the agent is the one that
-/// commits. The env spelling is what makes it win — it outranks `user.name`/`user.email` from a
-/// config file and from the `-c` overrides a pack's `setup_cmd` passes.
-const IDENTITY_RELAY_KEYS: &[&str] = &[
-    "GIT_AUTHOR_NAME",
-    "GIT_AUTHOR_EMAIL",
-    "GIT_COMMITTER_NAME",
-    "GIT_COMMITTER_EMAIL",
-];
-
 /// The env var naming the projections a run's agent may receive, comma-separated. The controller
 /// sets it from the registry, which is the only place visibility is known.
 pub const AGENT_VISIBLE_ENV: &str = "CRUCIBLE_AGENT_VISIBLE_ENV";
@@ -1486,11 +1475,11 @@ pub fn relay_vertex_env(env: &mut Vec<(String, String)>) {
     relay_keys(crate::openshell::policy::VERTEX_RELAY_KEYS, env);
 }
 
-/// Seed `env` with the process values of [`IDENTITY_RELAY_KEYS`], on the same terms. Without this
+/// Seed `env` with the process values of [`crate::openshell::policy::IDENTITY_RELAY_KEYS`], on the same terms. Without this
 /// the agent commits under whatever the pack's `setup_cmd` hardcoded, and the pull request that
 /// carries the commit is attributed to nobody.
 pub fn relay_identity_env(env: &mut Vec<(String, String)>) {
-    relay_keys(IDENTITY_RELAY_KEYS, env);
+    relay_keys(crate::openshell::policy::IDENTITY_RELAY_KEYS, env);
 }
 
 /// The shared relay: only keys that are set and non-empty cross, and an existing entry (a
@@ -1863,7 +1852,7 @@ mod tests {
     #[test]
     fn the_run_identity_reaches_the_agent_and_a_manifest_value_wins() {
         let _guard = crate::test_env_lock();
-        for key in IDENTITY_RELAY_KEYS {
+        for key in crate::openshell::policy::IDENTITY_RELAY_KEYS {
             unsafe { std::env::remove_var(key) };
         }
         let mut env = Vec::new();
@@ -1897,7 +1886,7 @@ mod tests {
             ]
         );
 
-        for key in IDENTITY_RELAY_KEYS {
+        for key in crate::openshell::policy::IDENTITY_RELAY_KEYS {
             unsafe { std::env::remove_var(key) };
         }
     }

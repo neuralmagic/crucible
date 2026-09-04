@@ -29,6 +29,8 @@ serde_json.workspace = true
 clap.workspace = true
 # Manifest parsing: crucible.toml -> the domain config (the standard TOML crate).
 toml = "0.8"
+# `[workspace].inject` shorthand: a pattern or directory entry expands under the manifest dir.
+glob = "0.3"
 # Validating a `params` pattern constraint. regex-lite over regex because the pattern comes from
 # an agent-authored pack: both guarantee linear-time matching (a backtracking engine would be a
 # denial-of-service vector here), and the lite build has no dependencies and is already in the

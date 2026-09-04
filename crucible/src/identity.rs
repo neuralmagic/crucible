@@ -87,7 +87,7 @@ pub fn for_manifest(
     }];
     let manifest_text = manifest::frozen_manifest_text(manifest_path, workspace)?;
     let graph_text = workflow_graph_text(m)?;
-    let injects = m.resolved_injects(manifest_dir, workspace);
+    let injects = m.resolved_injects(manifest_dir, workspace)?;
     let inject_hash = hash_injects(&injects)?;
     let seed_hash = hash_seed(manifest_dir, m.agent.seed_diff.as_deref())?;
     Ok(RunIdentity::new(
@@ -465,6 +465,27 @@ mod tests {
             "an inline or absent graph appends nothing to the hash"
         );
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The comparability key sees the expanded set, so a pattern and its spelled-out expansion are
+    /// the same world.
+    #[test]
+    fn a_glob_inject_and_its_expansion_share_a_digest() {
+        let dir = tempdir();
+        fs::write(dir.join("a.py"), "a").unwrap();
+        fs::write(dir.join("b.py"), "b").unwrap();
+        let ws = dir.join("workspace");
+        let (_, globbed) = manifest_with(&dir, "[workspace]\ninject = [\"*.py\"]");
+        let (_, spelled) = manifest_with(
+            &dir,
+            "[workspace]\ninject = [{ src = \"a.py\", dst = \"a.py\" }, { src = \"b.py\", dst = \"b.py\" }]",
+        );
+        let digest =
+            |m: &manifest::Manifest| hash_injects(&m.resolved_injects(&dir, &ws).unwrap()).unwrap();
+        assert_eq!(digest(&globbed), digest(&spelled));
+        let (_, fewer) = manifest_with(&dir, "[workspace]\ninject = [\"a.py\"]");
+        assert_ne!(digest(&globbed), digest(&fewer));
         let _ = fs::remove_dir_all(&dir);
     }
 }

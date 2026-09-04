@@ -150,7 +150,7 @@ The main manifest sections are:
 
 | Section | Required | Purpose |
 | --- | --- | --- |
-| `[repo]` | yes | Selects one source repository by `url` or `path`, with an optional Git `ref`. |
+| `[repo]` | scored runs | Selects one source repository by `url` or `path`, with an optional Git `ref`. A playbook may omit it and work in a workspace seeded from `[workspace].inject` alone. |
 | `[workspace]` | no | Configures the workspace directory, setup command, and injected files. |
 | `[agent]` | yes | Configures the backend, harness, model, goal, prompt, environment, and sandbox. |
 | `[judge]` | no | Defines `measure_cmd`, score `direction`, and optional gate self-tests. Omitted entirely, the run is a task: every completed turn is kept, unscored (see [docs/task-lane.md](docs/task-lane.md)). |
@@ -185,7 +185,9 @@ objective = "latency_ms"
 ```
 
 With no `[workspace].setup_cmd`, Crucible clones the repository into `workspace/`. With no
-world commands, it uses Git for snapshots and restoration. With no `[judge]` at all, the run
+`[repo]` at all, a playbook's workspace starts empty and holds only what
+`[workspace].inject` lists, so a self-contained pack is `inject = ["*.py"]` and nothing
+else. With no world commands, it uses Git for snapshots and restoration. With no `[judge]` at all, the run
 is a task: unsupervised general-purpose work where every completed turn is kept
 ([docs/task-lane.md](docs/task-lane.md)).
 
