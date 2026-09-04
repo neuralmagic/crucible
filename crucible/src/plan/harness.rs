@@ -160,13 +160,6 @@ impl TaskRunner for HarnessRunner {
     fn stage(&mut self, task: &Task, producers: &[&Task]) -> Result<(), String> {
         let files = producers
             .iter()
-            // The executor marks a failed producer by leaving this bit set on its staging clone.
-            // An absent directory means its promised set was incomplete and atomically withheld;
-            // the epilogue still runs, it simply receives no partial or stale files from it.
-            .filter(|producer| {
-                !producer.capture_on_failure
-                    || captured_dir(&self.paths.state, &producer.name.0).is_dir()
-            })
             .flat_map(|producer| {
                 producer.emits_files.iter().map(|declared| StagedInput {
                     producer: producer.name.0.clone(),
@@ -176,6 +169,10 @@ impl TaskRunner for HarnessRunner {
             .collect();
         self.staged.insert(task.name.clone(), files);
         Ok(())
+    }
+
+    fn has_captured_files(&self, task: &Task) -> bool {
+        captured_dir(&self.paths.state, &task.name.0).is_dir()
     }
 
     /// Commit what a passing task did, and discard what a failing one did.

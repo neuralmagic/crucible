@@ -397,6 +397,10 @@ pub enum PlanError {
     #[error("task {task:?}: capture_on_failure is not supported on mapped tasks")]
     FailureCaptureOnMappedTask { task: String },
     #[error(
+        "task {task:?}: capture_on_failure is for main-graph tasks; an epilogue's files are never staged"
+    )]
+    FailureCaptureOnEpilogue { task: String },
+    #[error(
         "task {task:?} has invalid session {session:?}; use 1-64 ASCII letters, digits, `.`, `_`, or `-`"
     )]
     InvalidSessionName { task: String, session: String },
@@ -508,6 +512,9 @@ impl Plan {
                 }
                 if t.over.is_some() {
                     return Err(PlanError::FailureCaptureOnMappedTask { task: task() });
+                }
+                if t.stage == Stage::Epilogue {
+                    return Err(PlanError::FailureCaptureOnEpilogue { task: task() });
                 }
             }
             let mut seen = BTreeSet::new();
@@ -874,6 +881,21 @@ mod tests {
 
         let mut source = agent("source", &[]);
         source.emits = vec![OutputField("items".to_string())];
+        let mut late = agent("late", &[]);
+        late.task = TaskKind::Command {
+            command: "probe".to_string(),
+        };
+        late.capture_on_failure = true;
+        late.emits_files = vec!["probe.json".to_string()];
+        late.isolation = Some(Isolation::Worktree);
+        late.stage = Stage::Epilogue;
+        assert_eq!(
+            plan(vec![late]).validate().unwrap_err(),
+            PlanError::FailureCaptureOnEpilogue {
+                task: "late".to_string()
+            }
+        );
+
         let mut mapped = agent("mapped", &["source"]);
         mapped.task = TaskKind::Command {
             command: "probe".to_string(),
