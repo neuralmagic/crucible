@@ -445,6 +445,16 @@ pub enum PlanError {
          inputs itself and would overwrite the dependency's entry with; rename the dependency"
     )]
     ReservedDependencyName { task: String, dependency: String },
+    #[error(
+        "task {task:?} (stage {stage:?}) depends on {dependency:?} (stage {dependency_stage:?}); \
+         dependencies cannot cross stages, and each would wait for the other forever"
+    )]
+    CrossStageDependency {
+        task: String,
+        stage: Stage,
+        dependency: String,
+        dependency_stage: Stage,
+    },
     #[error("plan has a dependency cycle involving: {}", .tasks.join(", "))]
     DependencyCycle { tasks: Vec<String> },
     #[error(
@@ -522,6 +532,15 @@ impl Plan {
                     return Err(PlanError::ReservedDependencyName {
                         task: task(),
                         dependency: d.0.clone(),
+                    });
+                }
+                let dependency_stage = index.get(d).map_or(t.stage, |&i| self.tasks[i].stage);
+                if dependency_stage != t.stage {
+                    return Err(PlanError::CrossStageDependency {
+                        task: task(),
+                        stage: t.stage,
+                        dependency: d.0.clone(),
+                        dependency_stage,
                     });
                 }
             }
@@ -1490,6 +1509,48 @@ mod tests {
         let ok = plan(vec![agent("items", &[]), agent("consumer", &["items"])])
             .validate()
             .expect("a name that only looks like a reserved one");
+        assert_eq!(ok.plan().tasks.len(), 2);
+    }
+
+    /// The two stages are scheduled against each other: an epilogue task waits for every
+    /// main-graph task to settle, and a main-graph task waits for its dependencies. An edge
+    /// either way is a deadlock the executor cannot see, so it dispatches nothing and reports a
+    /// completed run with no rows at all.
+    #[test]
+    fn a_dependency_that_crosses_a_stage_is_refused() {
+        let mut wrap = agent("wrap", &[]);
+        wrap.stage = Stage::Epilogue;
+        assert_eq!(
+            plan(vec![wrap.clone(), agent("build", &["wrap"])])
+                .validate()
+                .unwrap_err(),
+            PlanError::CrossStageDependency {
+                task: "build".to_owned(),
+                stage: Stage::Iteration,
+                dependency: "wrap".to_owned(),
+                dependency_stage: Stage::Epilogue,
+            }
+        );
+
+        let mut wrap_on_build = agent("wrap", &["build"]);
+        wrap_on_build.stage = Stage::Epilogue;
+        assert_eq!(
+            plan(vec![agent("build", &[]), wrap_on_build])
+                .validate()
+                .unwrap_err(),
+            PlanError::CrossStageDependency {
+                task: "wrap".to_owned(),
+                stage: Stage::Epilogue,
+                dependency: "build".to_owned(),
+                dependency_stage: Stage::Iteration,
+            }
+        );
+
+        let mut publish = agent("publish", &["wrap"]);
+        publish.stage = Stage::Epilogue;
+        let ok = plan(vec![wrap, publish])
+            .validate()
+            .expect("one stage, one graph");
         assert_eq!(ok.plan().tasks.len(), 2);
     }
 }
