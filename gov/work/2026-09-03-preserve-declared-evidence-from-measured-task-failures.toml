@@ -1,0 +1,36 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-09-03-002"
+title = "Preserve declared evidence from measured task failures"
+status = "done"
+created = "2026-09-03"
+started = "2026-09-03"
+completed = "2026-09-03"
+refs = [
+    "RFC-0002:C-FAILURE-EVIDENCE",
+    "RFC-0001:C-WIRE",
+]
+
+[content]
+description = "Add an opt-in declared-file channel for measured command and evaluate failures so playbooks can report bounded failure evidence without retaining or publishing a failed workspace."
+
+[[content.acceptance_criteria]]
+text = "Isolated, non-mapped command and evaluate tasks can opt into atomic capture of their declared files after a measured failure."
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "Failure capture excludes skipped and transport outcomes, mapped namespaces, undeclared files, and publishable workspace state."
+status = "done"
+category = "security"
+
+[[content.acceptance_criteria]]
+text = "Epilogue execution and runner reconstruction make complete captured failure sets available under producer-namespaced inputs without unblocking ordinary dependencies."
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "The admitted-plan wire projection, generated DSL reference, RFC projection, and focused regression coverage describe the new option."
+status = "done"
+category = "chore"

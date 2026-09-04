@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::plan::ir::{Direction, Join, Task, TaskKind, TaskName, ValidPlan};
+use crate::plan::ir::{Direction, Join, Stage, Task, TaskKind, TaskName, ValidPlan};
 
 /// What the substrate can measure. Missing caps truncate the plan fail-closed.
 #[derive(Clone, Debug, Default)]
@@ -77,6 +77,12 @@ pub trait TaskRunner {
     /// durable state records what a passing task did and drops what a failing one did; the
     /// default keeps nothing, which is what a stateless runner wants.
     fn settled(&mut self, _task: &Task, _passed: bool) {}
+
+    /// Whether a complete declared file set from `task`'s latest settle is there to stage. A
+    /// runner with no durable state has nothing to withhold, so the default is `true`.
+    fn has_captured_files(&self, _task: &Task) -> bool {
+        true
+    }
 
     fn run_many(&mut self, batch: &[BatchItem<'_>]) -> Vec<Attempt> {
         batch
@@ -329,7 +335,7 @@ pub fn execute(
         let failed = r.status != TaskStatus::Pass;
         on_result(t, &r);
         results.insert(t.name.clone(), r);
-        if gates && failed && t.required && halted.is_none() {
+        if gates && failed && t.required && t.stage == Stage::Iteration && halted.is_none() {
             *halted = Some(PlanExit::ShortCircuit {
                 task: t.name.clone(),
             });
@@ -341,7 +347,20 @@ pub fn execute(
             if results.contains_key(&t.name) {
                 continue;
             }
-            if let Some(exit) = &halted {
+            // An epilogue observes the settled main graph. Declaration order is not an ordering
+            // primitive, so do not let an independent epilogue task race ahead of main work.
+            if t.stage == Stage::Epilogue
+                && plan
+                    .tasks_topo()
+                    .any(|main| main.stage == Stage::Iteration && !results.contains_key(&main.name))
+            {
+                continue;
+            }
+            let report_after_failure =
+                t.stage == Stage::Epilogue && matches!(halted, Some(PlanExit::ShortCircuit { .. }));
+            if let Some(exit) = &halted
+                && !report_after_failure
+            {
                 let why = match exit {
                     PlanExit::ShortCircuit { task } => format!("required task {task} failed"),
                     PlanExit::BudgetExceeded => "budget ceiling reached".to_string(),
@@ -381,7 +400,7 @@ pub fn execute(
                 continue;
             }
             if spent >= budget {
-                halted = Some(PlanExit::BudgetExceeded);
+                halted.get_or_insert(PlanExit::BudgetExceeded);
                 let r = TaskResult::undispatched(TaskStatus::Blocked, "budget ceiling reached");
                 record(t, r, &mut results, &mut halted, true);
                 continue;
@@ -392,7 +411,7 @@ pub fn execute(
                 .wall_clock
                 .is_some_and(|limit| started.elapsed() >= limit)
             {
-                halted = Some(PlanExit::TimeExceeded);
+                halted.get_or_insert(PlanExit::TimeExceeded);
                 let r = TaskResult::undispatched(TaskStatus::Blocked, "wall-clock ceiling reached");
                 record(t, r, &mut results, &mut halted, true);
                 continue;
@@ -432,15 +451,30 @@ pub fn execute(
                 .collect::<BTreeMap<TaskName, Value>>()
         };
 
-        // Only an ancestor that settled passing contributes. The file channel says what the
-        // JSON channel says: a failed task's output does not reach a descendant, and whatever a
-        // previous run left in `state/files` is not this run's evidence.
+        // Passing ancestors contribute to an ordinary task. An epilogue additionally receives
+        // every main-graph task's files, including the explicitly captured evidence of a failed
+        // one; that file channel does not turn the failed task into a contributing JSON
+        // dependency. A withheld set (the failure left its promised files incomplete) is the
+        // runner's to report, so the producer is dropped here rather than staged empty.
         //
         // A mapped ancestor is expanded into one stand-in per passing instance, so a consumer is
         // handed `inputs/node[key]/<declared>` and the runner never has to know what `over` is.
-        let passing_producers = |t: &Task, results: &BTreeMap<TaskName, TaskResult>| {
+        let file_producers = |t: &Task,
+                              results: &BTreeMap<TaskName, TaskResult>,
+                              runner: &dyn TaskRunner| {
             let mut producers: Vec<Task> = Vec::new();
-            for p in ancestors(plan, t) {
+            let mut candidates: Vec<&Task> = ancestors(plan, t);
+            if t.stage == Stage::Epilogue {
+                candidates.extend(plan.tasks_topo().filter(|p| p.stage == Stage::Iteration));
+            }
+            let contributes = |p: &Task, r: &TaskResult| {
+                r.status == TaskStatus::Pass
+                    || (t.stage == Stage::Epilogue
+                        && r.status == TaskStatus::Fail
+                        && p.capture_on_failure
+                        && runner.has_captured_files(p))
+            };
+            for p in candidates {
                 if p.emits_files.is_empty() {
                     continue;
                 }
@@ -448,9 +482,7 @@ pub fn execute(
                     producers.extend(
                         results
                             .iter()
-                            .filter(|(name, r)| {
-                                r.status == TaskStatus::Pass && is_instance_of(&p.name, name)
-                            })
+                            .filter(|(name, r)| contributes(p, r) && is_instance_of(&p.name, name))
                             .map(|(name, _)| Task {
                                 name: name.clone(),
                                 over: None,
@@ -458,10 +490,7 @@ pub fn execute(
                                 ..p.clone()
                             }),
                     );
-                } else if results
-                    .get(&p.name)
-                    .is_some_and(|r| r.status == TaskStatus::Pass)
-                {
+                } else if results.get(&p.name).is_some_and(|r| contributes(p, r)) {
                     producers.push(p.clone());
                 }
             }
@@ -473,7 +502,7 @@ pub fn execute(
         // say so, or the previous dispatch's inputs are still lying there when it runs.
         let mut refused = None;
         for t in &dispatch {
-            let producers = passing_producers(t, &results);
+            let producers = file_producers(t, &results, &*runner);
             let producers: Vec<&Task> = producers.iter().collect();
             if let Err(why) = runner.stage(t, &producers) {
                 refused = Some((*t, why));
@@ -514,7 +543,7 @@ pub fn execute(
                         .collect();
                     // An instance is staged under its own name: it runs in its own root, and
                     // the node itself never runs.
-                    let producers = passing_producers(node, &results);
+                    let producers = file_producers(node, &results, &*runner);
                     let producers: Vec<&Task> = producers.iter().collect();
                     let refused = instances
                         .iter()
@@ -545,7 +574,7 @@ pub fn execute(
                         let (batch_results, budget_exceeded) =
                             run_batch_with_retries(batch, cfg, runner, &mut spent, budget);
                         if budget_exceeded {
-                            halted = Some(PlanExit::BudgetExceeded);
+                            halted.get_or_insert(PlanExit::BudgetExceeded);
                         }
                         for ((task, result), key) in batch_results.into_iter().zip(&keys) {
                             runner.settled(task, result.status == TaskStatus::Pass);
@@ -587,7 +616,7 @@ pub fn execute(
                                 budget,
                             );
                             if budget_exceeded {
-                                halted = Some(PlanExit::BudgetExceeded);
+                                halted.get_or_insert(PlanExit::BudgetExceeded);
                             }
                             runner.settled(instance, result.status == TaskStatus::Pass);
                             settled.push((key.clone(), result.clone()));
@@ -617,7 +646,7 @@ pub fn execute(
                 }
             };
             if budget_exceeded {
-                halted = Some(PlanExit::BudgetExceeded);
+                halted.get_or_insert(PlanExit::BudgetExceeded);
             }
             runner.settled(t, result.status == TaskStatus::Pass);
             record(t, result, &mut results, &mut halted, true);
@@ -636,7 +665,7 @@ pub fn execute(
             let (batch_results, budget_exceeded) =
                 run_batch_with_retries(batch, cfg, runner, &mut spent, budget);
             if budget_exceeded {
-                halted = Some(PlanExit::BudgetExceeded);
+                halted.get_or_insert(PlanExit::BudgetExceeded);
             }
             for (t, result) in batch_results {
                 runner.settled(t, result.status == TaskStatus::Pass);
@@ -649,7 +678,7 @@ pub fn execute(
     let valid = exit == PlanExit::Completed
         && plan
             .tasks_topo()
-            .filter(|t| t.required)
+            .filter(|t| t.required && t.stage == Stage::Iteration)
             .all(|t| results.get(&t.name).map(|r| r.status) == Some(TaskStatus::Pass));
     PlanOutcome {
         valid,
@@ -1140,6 +1169,7 @@ mod tests {
             session: None,
             needs: needs.into(),
             required,
+            capture_on_failure: false,
             isolation: None,
             join: Join::default(),
             stage: Stage::Iteration,
@@ -1570,6 +1600,7 @@ mod tests {
             session: None,
             needs: "any".into(),
             required: true,
+            capture_on_failure: false,
             isolation: None,
             join: Join::default(),
             stage: Stage::Iteration,
@@ -1628,6 +1659,7 @@ mod tests {
             session: None,
             needs: "any".into(),
             required: false,
+            capture_on_failure: false,
             isolation: None,
             join: Join::default(),
             stage: Stage::Iteration,
@@ -1819,6 +1851,7 @@ mod tests {
             session: None,
             needs: "any".into(),
             required: false,
+            capture_on_failure: false,
             isolation: None,
             join: Join::Passed,
             stage: Stage::Iteration,
@@ -2382,5 +2415,206 @@ mod tests {
             vec!["audit[alpha]".to_string(), "audit[gamma]".to_string()],
             "the failed instance's files reached a descendant"
         );
+    }
+
+    /// The epilogue tests: a runner that remembers what it was asked to stage and answers for
+    /// whether a failed producer's captured set exists, the two things the executor asks of it.
+    struct StagingRunner {
+        inner: ScriptRunner,
+        captured: bool,
+        staged: BTreeMap<String, Vec<String>>,
+    }
+
+    impl StagingRunner {
+        fn new(captured: bool) -> Self {
+            StagingRunner {
+                inner: ScriptRunner::new(),
+                captured,
+                staged: BTreeMap::new(),
+            }
+        }
+    }
+
+    impl TaskRunner for StagingRunner {
+        fn run(
+            &mut self,
+            task: &Task,
+            attempt: u32,
+            inputs: &BTreeMap<TaskName, Value>,
+        ) -> Attempt {
+            self.inner.run(task, attempt, inputs)
+        }
+        fn stage(&mut self, task: &Task, producers: &[&Task]) -> Result<(), String> {
+            self.staged.insert(
+                task.name.0.clone(),
+                producers.iter().map(|p| p.name.0.clone()).collect(),
+            );
+            Ok(())
+        }
+        fn has_captured_files(&self, _task: &Task) -> bool {
+            self.captured
+        }
+    }
+
+    fn epilogue(name: &str, deps: &[&str], required: bool) -> Task {
+        let mut t = task(name, deps, "any", required);
+        t.stage = Stage::Epilogue;
+        t
+    }
+
+    fn run_plan(plan: &ValidPlan, runner: &mut dyn TaskRunner) -> PlanOutcome {
+        execute(
+            plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            runner,
+            |_, _| {},
+        )
+    }
+
+    #[test]
+    fn an_epilogue_waits_for_every_main_task_even_when_declared_first() {
+        let plan = valid(
+            vec![
+                epilogue("report", &[], true),
+                task("a", &[], "any", true),
+                task("b", &["a"], "any", true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        let out = run_plan(&plan, &mut r);
+        assert!(out.valid);
+        let order: Vec<&str> = r.dispatched.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(order, vec!["a", "b", "report"]);
+    }
+
+    #[test]
+    fn an_epilogue_runs_after_a_required_failure_and_the_exit_stays_a_short_circuit() {
+        let plan = valid(
+            vec![
+                task("probe", &[], "any", true),
+                task("after", &["probe"], "any", true),
+                epilogue("report", &[], true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.on("probe", 1, || AttemptOutcome::Fail("vetoed".into()), 0.1);
+        let out = run_plan(&plan, &mut r);
+        assert_eq!(out.results[&"report".into()].status, TaskStatus::Pass);
+        assert_eq!(out.results[&"after".into()].status, TaskStatus::Blocked);
+        assert_eq!(
+            out.exit,
+            PlanExit::ShortCircuit {
+                task: "probe".into()
+            }
+        );
+        assert!(!out.valid);
+    }
+
+    #[test]
+    fn a_required_epilogue_failure_never_changes_the_verdict() {
+        let plan = valid(
+            vec![task("a", &[], "any", true), epilogue("report", &[], true)],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.on("report", 1, || AttemptOutcome::Fail("no sink".into()), 0.1);
+        let out = run_plan(&plan, &mut r);
+        assert_eq!(out.results[&"report".into()].status, TaskStatus::Fail);
+        assert_eq!(out.exit, PlanExit::Completed);
+        assert!(out.valid, "an epilogue is advisory by contract");
+    }
+
+    #[test]
+    fn an_epilogue_is_blocked_once_a_ceiling_ended_the_main_graph() {
+        let plan = valid(
+            vec![task("a", &[], "any", true), epilogue("report", &[], true)],
+            0.05,
+        );
+        let mut r = ScriptRunner::new();
+        let out = run_plan(&plan, &mut r);
+        assert_eq!(out.results[&"a".into()].status, TaskStatus::Pass);
+        assert_eq!(out.results[&"report".into()].status, TaskStatus::Blocked);
+        assert_eq!(out.exit, PlanExit::BudgetExceeded);
+        assert!(!r.dispatched.iter().any(|(n, _)| n == "report"));
+    }
+
+    #[test]
+    fn an_epilogue_crossing_the_ceiling_does_not_relabel_a_short_circuit() {
+        let plan = valid(
+            vec![
+                task("probe", &[], "any", true),
+                epilogue("report", &[], true),
+            ],
+            0.15,
+        );
+        let mut r = ScriptRunner::new();
+        r.on("probe", 1, || AttemptOutcome::Fail("vetoed".into()), 0.1);
+        let out = run_plan(&plan, &mut r);
+        assert_eq!(out.results[&"report".into()].status, TaskStatus::Pass);
+        assert!(out.spent_usd > 0.15);
+        assert_eq!(
+            out.exit,
+            PlanExit::ShortCircuit {
+                task: "probe".into()
+            }
+        );
+    }
+
+    fn evidence_plan() -> ValidPlan {
+        let mut probe = task("probe", &[], "any", false);
+        probe.emits_files = vec!["evidence.json".into()];
+        probe.capture_on_failure = true;
+        probe.isolation = Some(crate::plan::ir::Isolation::Worktree);
+        let mut consumer = task("consumer", &["probe"], "any", false);
+        consumer.join = Join::Passed;
+        let mut first = epilogue("first", &[], false);
+        first.emits_files = vec!["summary.md".into()];
+        let second = epilogue("second", &["first"], false);
+        valid(vec![probe, consumer, first, second], 10.0)
+    }
+
+    /// The file channel of an epilogue is its own ancestors plus the main graph, and a failed
+    /// producer joins it only when its captured set exists. A main-graph consumer never sees a
+    /// failed producer's files.
+    #[test]
+    fn an_epilogue_stages_its_ancestors_and_the_captured_evidence_of_main_failures() {
+        let plan = evidence_plan();
+        let mut r = StagingRunner::new(true);
+        r.inner
+            .on("probe", 1, || AttemptOutcome::Fail("vetoed".into()), 0.1);
+        let out = run_plan(&plan, &mut r);
+        assert_eq!(out.results[&"probe".into()].status, TaskStatus::Fail);
+        assert_eq!(out.results[&"consumer".into()].status, TaskStatus::Blocked);
+        assert_eq!(out.results[&"second".into()].status, TaskStatus::Pass);
+        assert_eq!(r.staged["first"], vec!["probe".to_string()]);
+        assert_eq!(
+            r.staged["second"],
+            vec!["first".to_string(), "probe".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_withheld_failure_set_is_not_staged_but_the_epilogue_still_runs() {
+        let plan = evidence_plan();
+        let mut r = StagingRunner::new(false);
+        r.inner
+            .on("probe", 1, || AttemptOutcome::Fail("vetoed".into()), 0.1);
+        let out = run_plan(&plan, &mut r);
+        assert_eq!(out.results[&"second".into()].status, TaskStatus::Pass);
+        assert!(r.staged["first"].is_empty());
+        assert_eq!(r.staged["second"], vec!["first".to_string()]);
+    }
+
+    #[test]
+    fn a_passing_producer_reaches_the_epilogue_and_its_consumer_alike() {
+        let plan = evidence_plan();
+        let mut r = StagingRunner::new(false);
+        let out = run_plan(&plan, &mut r);
+        assert!(out.valid);
+        assert_eq!(r.staged["consumer"], vec!["probe".to_string()]);
+        assert_eq!(r.staged["first"], vec!["probe".to_string()]);
     }
 }
