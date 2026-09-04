@@ -229,8 +229,6 @@ Read out of the object the task returns.
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `status` | `"pass" \| "fail" \| "skipped"` | Settles the task, overriding an exit code or `pass`. Any other value is ignored. |
-| `complete` | `bool` | Ends the run quietly. MUST NOT be declared in `emits`. |
-| `reason` | `str` | Why, alongside `complete`. |
 
 ### Inputs the engine writes
 

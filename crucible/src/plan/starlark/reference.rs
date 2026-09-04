@@ -421,19 +421,11 @@ fn declared_status_type() -> String {
 
 /// Fields the engine reads out of a task's own JSON output.
 pub fn reserved_result_fields() -> Vec<Reserved> {
-    vec![
-        Reserved::new(
-            "status",
-            declared_status_type(),
-            "Settles the task, overriding an exit code or `pass`. Any other value is ignored.",
-        ),
-        Reserved::new(
-            "complete",
-            "bool",
-            "Ends the run quietly. MUST NOT be declared in `emits`.",
-        ),
-        Reserved::new("reason", "str", "Why, alongside `complete`."),
-    ]
+    vec![Reserved::new(
+        "status",
+        declared_status_type(),
+        "Settles the task, overriding an exit code or `pass`. Any other value is ignored.",
+    )]
 }
 
 /// Keys the engine writes into a task's inputs. Neither is ever wrapped in a settled join's
@@ -689,7 +681,8 @@ mod tests {
         let results = super::reserved_result_fields();
         assert_eq!(
             results.iter().map(|row| row.name).collect::<Vec<_>>(),
-            ["status", "complete", "reason"]
+            ["status"],
+            "the table documents a field no engine code reads"
         );
         for declared in DeclaredStatus::ALL {
             assert!(
