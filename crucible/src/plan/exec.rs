@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::plan::ir::{Direction, Join, Task, TaskKind, TaskName, ValidPlan};
+use crate::plan::ir::{Direction, Join, Stage, Task, TaskKind, TaskName, ValidPlan};
 
 /// What the substrate can measure. Missing caps truncate the plan fail-closed.
 #[derive(Clone, Debug, Default)]
@@ -285,7 +285,7 @@ pub fn execute(
     let runnable = runnable_set(plan, substrate);
     if let Some(t) = plan
         .tasks_topo()
-        .find(|t| t.required && !runnable.contains(&t.name))
+        .find(|t| t.required && t.stage == Stage::Iteration && !runnable.contains(&t.name))
     {
         // A truncated DAG can never produce an honest pass: fail fast, dispatch nothing.
         let mut results = BTreeMap::new();
@@ -329,7 +329,7 @@ pub fn execute(
         let failed = r.status != TaskStatus::Pass;
         on_result(t, &r);
         results.insert(t.name.clone(), r);
-        if gates && failed && t.required && halted.is_none() {
+        if gates && failed && t.required && t.stage == Stage::Iteration && halted.is_none() {
             *halted = Some(PlanExit::ShortCircuit {
                 task: t.name.clone(),
             });
@@ -341,7 +341,22 @@ pub fn execute(
             if results.contains_key(&t.name) {
                 continue;
             }
-            if let Some(exit) = &halted {
+            // An epilogue observes the settled main graph. Declaration order is not an
+            // ordering primitive, so an independent epilogue task must not race ahead of it.
+            if t.stage == Stage::Epilogue
+                && plan
+                    .tasks_topo()
+                    .any(|main| main.stage == Stage::Iteration && !results.contains_key(&main.name))
+            {
+                continue;
+            }
+            // The epilogue is what reports a required failure, so a short-circuit is the one
+            // halt it outlives. A ceiling still blocks it.
+            let reports_the_short_circuit =
+                t.stage == Stage::Epilogue && matches!(halted, Some(PlanExit::ShortCircuit { .. }));
+            if let Some(exit) = &halted
+                && !reports_the_short_circuit
+            {
                 let why = match exit {
                     PlanExit::ShortCircuit { task } => format!("required task {task} failed"),
                     PlanExit::BudgetExceeded => "budget ceiling reached".to_string(),
@@ -381,7 +396,7 @@ pub fn execute(
                 continue;
             }
             if spent >= budget {
-                halted = Some(PlanExit::BudgetExceeded);
+                halted.get_or_insert(PlanExit::BudgetExceeded);
                 let r = TaskResult::undispatched(TaskStatus::Blocked, "budget ceiling reached");
                 record(t, r, &mut results, &mut halted, true);
                 continue;
@@ -392,7 +407,7 @@ pub fn execute(
                 .wall_clock
                 .is_some_and(|limit| started.elapsed() >= limit)
             {
-                halted = Some(PlanExit::TimeExceeded);
+                halted.get_or_insert(PlanExit::TimeExceeded);
                 let r = TaskResult::undispatched(TaskStatus::Blocked, "wall-clock ceiling reached");
                 record(t, r, &mut results, &mut halted, true);
                 continue;
@@ -545,7 +560,7 @@ pub fn execute(
                         let (batch_results, budget_exceeded) =
                             run_batch_with_retries(batch, cfg, runner, &mut spent, budget);
                         if budget_exceeded {
-                            halted = Some(PlanExit::BudgetExceeded);
+                            halted.get_or_insert(PlanExit::BudgetExceeded);
                         }
                         for ((task, result), key) in batch_results.into_iter().zip(&keys) {
                             runner.settled(task, result.status == TaskStatus::Pass);
@@ -587,7 +602,7 @@ pub fn execute(
                                 budget,
                             );
                             if budget_exceeded {
-                                halted = Some(PlanExit::BudgetExceeded);
+                                halted.get_or_insert(PlanExit::BudgetExceeded);
                             }
                             runner.settled(instance, result.status == TaskStatus::Pass);
                             settled.push((key.clone(), result.clone()));
@@ -617,7 +632,7 @@ pub fn execute(
                 }
             };
             if budget_exceeded {
-                halted = Some(PlanExit::BudgetExceeded);
+                halted.get_or_insert(PlanExit::BudgetExceeded);
             }
             runner.settled(t, result.status == TaskStatus::Pass);
             record(t, result, &mut results, &mut halted, true);
@@ -636,7 +651,7 @@ pub fn execute(
             let (batch_results, budget_exceeded) =
                 run_batch_with_retries(batch, cfg, runner, &mut spent, budget);
             if budget_exceeded {
-                halted = Some(PlanExit::BudgetExceeded);
+                halted.get_or_insert(PlanExit::BudgetExceeded);
             }
             for (t, result) in batch_results {
                 runner.settled(t, result.status == TaskStatus::Pass);
@@ -649,7 +664,7 @@ pub fn execute(
     let valid = exit == PlanExit::Completed
         && plan
             .tasks_topo()
-            .filter(|t| t.required)
+            .filter(|t| t.required && t.stage == Stage::Iteration)
             .all(|t| results.get(&t.name).map(|r| r.status) == Some(TaskStatus::Pass));
     PlanOutcome {
         valid,
@@ -2382,5 +2397,268 @@ mod tests {
             vec!["audit[alpha]".to_string(), "audit[gamma]".to_string()],
             "the failed instance's files reached a descendant"
         );
+    }
+
+    fn epilogue(name: &str, deps: &[&str], required: bool) -> Task {
+        let mut t = task(name, deps, "any", required);
+        t.stage = Stage::Epilogue;
+        t
+    }
+
+    fn run_plan(plan: &ValidPlan, runner: &mut dyn TaskRunner) -> PlanOutcome {
+        execute(
+            plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            runner,
+            |_, _| {},
+        )
+    }
+
+    #[test]
+    fn an_epilogue_waits_for_every_main_task_even_when_declared_first() {
+        let plan = valid(
+            vec![
+                epilogue("report", &[], true),
+                task("a", &[], "any", true),
+                task("b", &["a"], "any", true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        let out = run_plan(&plan, &mut r);
+        assert!(out.valid);
+        let order: Vec<&str> = r.dispatched.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(order, vec!["a", "b", "report"]);
+    }
+
+    #[test]
+    fn an_epilogue_runs_after_a_required_failure_and_the_exit_stays_a_short_circuit() {
+        let plan = valid(
+            vec![
+                task("probe", &[], "any", true),
+                task("after", &["probe"], "any", true),
+                epilogue("report", &[], true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.on("probe", 1, || AttemptOutcome::Fail("vetoed".into()), 0.1);
+        let out = run_plan(&plan, &mut r);
+        assert_eq!(out.results[&"report".into()].status, TaskStatus::Pass);
+        assert_eq!(out.results[&"after".into()].status, TaskStatus::Blocked);
+        assert_eq!(
+            out.exit,
+            PlanExit::ShortCircuit {
+                task: "probe".into()
+            }
+        );
+        assert!(!out.valid);
+    }
+
+    #[test]
+    fn a_required_epilogue_failure_never_changes_the_verdict() {
+        let plan = valid(
+            vec![task("a", &[], "any", true), epilogue("report", &[], true)],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.on("report", 1, || AttemptOutcome::Fail("no sink".into()), 0.1);
+        let out = run_plan(&plan, &mut r);
+        assert_eq!(out.results[&"report".into()].status, TaskStatus::Fail);
+        assert_eq!(out.exit, PlanExit::Completed);
+        assert!(out.valid, "an epilogue is advisory by contract");
+    }
+
+    /// A failed epilogue task must not gate a second one either: the short-circuit is a
+    /// main-graph device, and the epilogue has no verdict to protect.
+    #[test]
+    fn a_failed_epilogue_task_does_not_short_circuit_a_later_one() {
+        let plan = valid(
+            vec![
+                task("a", &[], "any", true),
+                epilogue("first", &[], true),
+                epilogue("second", &[], true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.on("first", 1, || AttemptOutcome::Fail("no sink".into()), 0.1);
+        let out = run_plan(&plan, &mut r);
+        assert_eq!(out.results[&"second".into()].status, TaskStatus::Pass);
+        assert_eq!(out.exit, PlanExit::Completed);
+        assert!(out.valid);
+    }
+
+    #[test]
+    fn an_epilogue_is_blocked_once_a_budget_ceiling_ended_the_main_graph() {
+        let plan = valid(
+            vec![task("a", &[], "any", true), epilogue("report", &[], true)],
+            0.05,
+        );
+        let mut r = ScriptRunner::new();
+        let out = run_plan(&plan, &mut r);
+        assert_eq!(out.results[&"a".into()].status, TaskStatus::Pass);
+        assert_eq!(out.results[&"report".into()].status, TaskStatus::Blocked);
+        assert_eq!(out.exit, PlanExit::BudgetExceeded);
+        assert!(!out.valid);
+        assert!(!r.dispatched.iter().any(|(n, _)| n == "report"));
+    }
+
+    #[test]
+    fn an_epilogue_is_blocked_once_a_wall_clock_ceiling_ended_the_main_graph() {
+        let plan = valid(
+            vec![task("a", &[], "any", true), epilogue("report", &[], true)],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        let cfg = ExecCfg {
+            wall_clock: Some(Duration::ZERO),
+            ..ExecCfg::default()
+        };
+        let out = execute(&plan, &any_substrate(), cfg, &mut r, |_, _| {});
+        assert_eq!(out.results[&"report".into()].status, TaskStatus::Blocked);
+        assert_eq!(out.exit, PlanExit::TimeExceeded);
+        assert!(r.dispatched.is_empty());
+    }
+
+    #[test]
+    fn an_epilogue_crossing_the_budget_ceiling_does_not_relabel_a_short_circuit() {
+        let plan = valid(
+            vec![
+                task("probe", &[], "any", true),
+                epilogue("report", &[], true),
+            ],
+            0.15,
+        );
+        let mut r = ScriptRunner::new();
+        r.on("probe", 1, || AttemptOutcome::Fail("vetoed".into()), 0.1);
+        let out = run_plan(&plan, &mut r);
+        assert_eq!(out.results[&"report".into()].status, TaskStatus::Pass);
+        assert!(out.spent_usd > 0.15);
+        assert_eq!(
+            out.exit,
+            PlanExit::ShortCircuit {
+                task: "probe".into()
+            }
+        );
+    }
+
+    /// The readiness scan's own ceiling check is the second halt here, and the first one wins:
+    /// the epilogue is blocked naming the budget, and the run still reports the short-circuit.
+    #[test]
+    fn a_budget_reached_before_the_epilogue_blocks_it_without_relabelling_the_exit() {
+        let plan = valid(
+            vec![
+                task("probe", &[], "any", true),
+                epilogue("report", &[], true),
+            ],
+            0.1,
+        );
+        let mut r = ScriptRunner::new();
+        r.on("probe", 1, || AttemptOutcome::Fail("vetoed".into()), 0.1);
+        let out = run_plan(&plan, &mut r);
+        let report = &out.results[&"report".into()];
+        assert_eq!(report.status, TaskStatus::Blocked);
+        assert_eq!(report.note.as_deref(), Some("budget ceiling reached"));
+        assert_eq!(
+            out.exit,
+            PlanExit::ShortCircuit {
+                task: "probe".into()
+            }
+        );
+        assert!(!r.dispatched.iter().any(|(n, _)| n == "report"));
+    }
+
+    /// The ceiling is spent by the failing task's own attempt, so the epilogue meets it at the
+    /// readiness scan: blocked naming the clock, with the short-circuit still the run's exit.
+    #[test]
+    fn a_wall_clock_reached_before_the_epilogue_blocks_it_without_relabelling_the_exit() {
+        let plan = valid(
+            vec![
+                task("probe", &[], "any", true),
+                epilogue("report", &[], true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.on(
+            "probe",
+            1,
+            || {
+                std::thread::sleep(Duration::from_millis(50));
+                AttemptOutcome::Fail("vetoed".into())
+            },
+            0.1,
+        );
+        let cfg = ExecCfg {
+            wall_clock: Some(Duration::from_millis(25)),
+            ..ExecCfg::default()
+        };
+        let out = execute(&plan, &any_substrate(), cfg, &mut r, |_, _| {});
+        let report = &out.results[&"report".into()];
+        assert_eq!(report.status, TaskStatus::Blocked);
+        assert_eq!(report.note.as_deref(), Some("wall-clock ceiling reached"));
+        assert_eq!(
+            out.exit,
+            PlanExit::ShortCircuit {
+                task: "probe".into()
+            }
+        );
+        assert!(!r.dispatched.iter().any(|(n, _)| n == "report"));
+    }
+
+    #[test]
+    fn an_epilogue_batch_crossing_the_budget_ceiling_does_not_relabel_a_short_circuit() {
+        let mut first = epilogue("first", &[], true);
+        first.isolation = Some(crate::plan::ir::Isolation::Worktree);
+        let mut second = epilogue("second", &[], true);
+        second.isolation = Some(crate::plan::ir::Isolation::Worktree);
+        let plan = valid(vec![task("probe", &[], "any", true), first, second], 0.15);
+        let mut r = ScriptRunner::new();
+        r.on("probe", 1, || AttemptOutcome::Fail("vetoed".into()), 0.1);
+        let out = run_plan(&plan, &mut r);
+        for name in ["first", "second"] {
+            assert_eq!(out.results[&name.into()].status, TaskStatus::Pass);
+        }
+        assert!(out.spent_usd > 0.15);
+        assert_eq!(
+            out.exit,
+            PlanExit::ShortCircuit {
+                task: "probe".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_required_epilogue_the_substrate_cannot_run_does_not_truncate_the_plan() {
+        let mut report = epilogue("report", &[], true);
+        report.needs = "fp8-tc".into();
+        let plan = valid(vec![task("a", &[], "any", true), report], 10.0);
+        let mut r = ScriptRunner::new();
+        let out = run_plan(&plan, &mut r);
+        assert_eq!(out.results[&"a".into()].status, TaskStatus::Pass);
+        let report = &out.results[&"report".into()];
+        assert_eq!(report.status, TaskStatus::Skipped);
+        assert_eq!(report.note.as_deref(), Some("unrunnable on this substrate"));
+        assert_eq!(out.exit, PlanExit::Completed);
+        assert!(out.valid);
+    }
+
+    #[test]
+    fn a_required_main_task_the_substrate_cannot_run_truncates_the_epilogue_too() {
+        let plan = valid(
+            vec![
+                task("gpu", &[], "fp8-tc", true),
+                epilogue("report", &[], true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        let out = run_plan(&plan, &mut r);
+        assert_eq!(out.exit, PlanExit::Truncated { task: "gpu".into() });
+        assert_eq!(out.results[&"report".into()].status, TaskStatus::Truncated);
+        assert!(!out.valid);
+        assert!(r.dispatched.is_empty());
     }
 }
