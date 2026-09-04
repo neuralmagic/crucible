@@ -153,17 +153,17 @@ Any language works the same way, because the engine reads only the JSON verdict.
 | **Agent** | proposal policy + transport (local / remote pod) | `agent::AgentSource` |
 | **Reporters** | console / NDJSON / session-log frontends | `reporter::Reporter` + `console`/`stream` |
 | **Session log** | versioned NDJSON event stream (the source of truth) | `session.rs` |
-| **Memory** | git-as-memory (kept commits) + `RESULTS.md` | `vcs.rs` + `write_results` |
+| **Memory** | git-as-memory (kept commits) + `RESULTS.md` | `crucible-vcs/src/vcs.rs` + `write_results` |
 | **Control plane** | steer / stop-park / resume / escalate | `STEER.md` / `state/control.json` / `--resume` / `ESCALATION.json` |
 | **Distress** | the agent pages the operator; `severity=error` suspends the run with the pod alive | `crucible-broker::distress` + `crucible/src/distress.rs` |
 | **Durable run state** | `[cluster] state_pvc` mounts a claim over the domain's `state/` dir, so a replaced pod resumes instead of restarting the run. A named (shared) claim is keyed per run by a `state/<run>` subPath and needs RWX; a `[cluster.state_pvc]` table materializes a dedicated `<run>-state` claim mounted at its root | `deploy/profile.rs` + `deploy/render/kube.rs` |
 | **Provisioning** | mediated MCP broker: the agent asks, the host holds the keys (GPU capture, issue-tracker grounding, draft PRs) | `crucible-broker` (ADR-0002) |
 | **Profiler** | generic profile-over-MCP: pprof for a Go service, GPU traces for a model server | `crucible-broker::profile` (ADR-0006) |
 | **Build + deploy** | engine-side build, and `crucible deploy render` projects the loop/deployment manifests, digest-pinned | `forge` + `crucible/src/deploy/` (ADR-0005 / 0012) |
-| **Publish** | publish-on-keep to S3 + a draft PR per fork; authorized review comments re-steer the run | `publish.rs` / `crucible-broker::draft_pr` |
+| **Publish** | publish-on-keep to S3 + a draft PR per fork; authorized review comments re-steer the run | `crucible/src/publish.rs` / `crucible-broker::draft_pr` |
 | **Search (wide round)** | optional fan-out of N parallel propose turns, ranked by the same Judge, before the deep loop ([ADR 0010](./adr/0010-candidate-portfolios-and-search.md)) | `crucible/src/wide/` |
 | **Self-test** | `crucible check` proves the Judge can tell a known-good config from a known-bad one before a run trusts it | `[judge.selftest]` + `selftest.rs` |
-| **On-ramp** | `crucible init` scaffolds a manifest + measure stub onto an existing repo; `crucible check` validates it with no agent turn; `crucible scope` ingests a goal and freezes a `SCOPE.md` (ADR-0014 S0) | `init.rs` / `check.rs` / `scope.rs` |
+| **On-ramp** | `crucible init` scaffolds a manifest + measure stub onto an existing repo; `crucible check` validates it with no agent turn; `crucible scope` ingests a goal and freezes a `SCOPE.md` (ADR-0014 S0) | `crucible/src/init.rs` / `crucible/src/check.rs` / `crucible-contract/src/scope.rs` |
 | **Preflight** | runs the domain's rung ladder against the unmodified tree before iteration 1; a failure refuses the run, and the optional baseline rung seeds `segment.baseline_score` | `[preflight]` + `preflight.rs` |
 
 An optional private control plane can sit above all of this: a controller that discovers
