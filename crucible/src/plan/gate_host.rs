@@ -307,7 +307,7 @@ pub(crate) fn resolved_event(open: &Gate, resolution: &GateResolution) -> Sessio
         },
         reason: resolution.reason_text(),
         trace_id: open.trace_id.clone(),
-        by: resolution.by.clone(),
+        by: resolution.by.as_ref().map(|by| by.as_str().to_string()),
         source: resolution.source.clone(),
     }
 }

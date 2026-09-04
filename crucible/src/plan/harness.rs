@@ -660,7 +660,7 @@ fn run_in(
             return fail(0.0, "engine task reached a non-loop runner".to_string());
         }
         TaskKind::Approve { .. } => {
-            return crate::plan::gate::attempt(gate, task, inputs);
+            return gate.attempt(task, inputs);
         }
     };
 

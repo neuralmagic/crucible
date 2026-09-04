@@ -871,8 +871,8 @@ pub fn run(
                     resolution.decision.as_str(),
                     resolution
                         .by
-                        .as_deref()
-                        .map(|by| format!(" by {by}"))
+                        .as_ref()
+                        .map(|by| format!(" by {}", by.as_str()))
                         .unwrap_or_default()
                 );
                 runner.resolve_gate(&open.trace_id, resolution);
@@ -1727,7 +1727,10 @@ file = "workflow.star"
             GateOpts {
                 approvals: vec![(
                     gate_trace(),
-                    crucible_contract::GateResolution::granted(Some("wseaton".into()), "native"),
+                    crucible_contract::GateResolution::granted(
+                        Some("wseaton".parse().unwrap()),
+                        "native",
+                    ),
                 )],
                 ..Default::default()
             },
@@ -1759,7 +1762,7 @@ file = "workflow.star"
                     gate_trace(),
                     crucible_contract::GateResolution::denied(
                         "not this quarter",
-                        Some("wseaton".into()),
+                        Some("wseaton".parse().unwrap()),
                         "native",
                     ),
                 )],

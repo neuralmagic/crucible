@@ -7,6 +7,7 @@
 use crate::admission::{AdmissionLedger, Admitted};
 use crate::{Paths, STOP};
 use anyhow::{Context, Result};
+use crucible_contract::Approver;
 use crucible_contract::admission::{
     AdmissionKey, AdmissionOutcome, AdmittedInput, MAX_KEY_LEN, SteerSource,
 };
@@ -590,7 +591,7 @@ fn apply_command(req: ControlRequest, state: &ControlState, ledger: &AdmissionLe
                     let _ = ledger.settle(
                         key,
                         AdmissionOutcome::Applied,
-                        &format!("gate granted{}", by_suffix(by.as_deref())),
+                        &format!("gate granted{}", by_suffix(by.as_ref())),
                     );
                     json!({"ok": true, "cmd": "approve", "trace_id": trace, "by": by})
                 });
@@ -618,7 +619,7 @@ fn apply_command(req: ControlRequest, state: &ControlState, ledger: &AdmissionLe
                         let _ = ledger.settle(
                             key,
                             AdmissionOutcome::Applied,
-                            &format!("gate denied: {reason}{}", by_suffix(by.as_deref())),
+                            &format!("gate denied: {reason}{}", by_suffix(by.as_ref())),
                         );
                         json!({"ok": true, "cmd": "deny", "trace_id": trace, "reason": reason, "by": by})
                     },
@@ -761,7 +762,7 @@ fn stop_the_run(id: Option<AdmissionKey>, input: AdmittedInput, ledger: &Admissi
 }
 
 /// Settle the admission a newly-armed one displaced as superseded.
-fn by_suffix(by: Option<&str>) -> String {
+fn by_suffix(by: Option<&Approver>) -> String {
     by.map(|who| format!(" by {who}")).unwrap_or_default()
 }
 
@@ -813,11 +814,11 @@ enum ControlCommand {
         regime: String,
     },
     Approve {
-        by: Option<String>,
+        by: Option<Approver>,
     },
     Deny {
         reason: String,
-        by: Option<String>,
+        by: Option<Approver>,
     },
     Status,
     /// Subscribe to the live session broadcast, replaying retained lines with `seq > from_seq`
@@ -871,14 +872,16 @@ fn parse_id(raw: Option<&Value>) -> std::result::Result<Option<AdmissionKey>, St
     Ok(Some(AdmissionKey::new(id)))
 }
 
-/// Who sent an approve/deny, when the sender says. Free text, bounded like a key.
-fn parse_by(value: &Value) -> Option<String> {
-    value
-        .get("by")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|by| !by.is_empty())
-        .map(|by| by.chars().take(MAX_KEY_LEN).collect())
+fn parse_by(value: &Value) -> std::result::Result<Option<Approver>, String> {
+    let Some(raw) = value.get("by").filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let raw = raw
+        .as_str()
+        .ok_or_else(|| format!("by must be a string, got {raw:?}"))?;
+    Approver::try_from(raw)
+        .map(Some)
+        .map_err(|error| error.to_string())
 }
 
 fn command_from_name(cmd: &str, value: &Value) -> std::result::Result<ControlCommand, String> {
@@ -888,7 +891,7 @@ fn command_from_name(cmd: &str, value: &Value) -> std::result::Result<ControlCom
         "pause" => Ok(ControlCommand::Pause),
         "resume" => Ok(ControlCommand::Resume),
         "approve" => Ok(ControlCommand::Approve {
-            by: parse_by(value),
+            by: parse_by(value)?,
         }),
         "deny" => {
             // Reason is optional (an operator may just reject); default to a generic note.
@@ -900,7 +903,7 @@ fn command_from_name(cmd: &str, value: &Value) -> std::result::Result<ControlCom
                 .to_string();
             Ok(ControlCommand::Deny {
                 reason,
-                by: parse_by(value),
+                by: parse_by(value)?,
             })
         }
         "status" => Ok(ControlCommand::Status),
@@ -1302,6 +1305,20 @@ mod tests {
                 by: None,
             }
         );
+    }
+
+    #[test]
+    fn rejects_invalid_approver_values_at_the_control_boundary() {
+        let ControlCommand::Approve { by: Some(by) } =
+            parse_command(r#"{"cmd":"approve","by":" alice "}"#).unwrap()
+        else {
+            panic!("the approver should be present");
+        };
+        assert_eq!(by.as_str(), "alice");
+        assert!(parse_command(r#"{"cmd":"approve","by":42}"#).is_err());
+        let long = "a".repeat(crucible_contract::admission::MAX_KEY_LEN + 1);
+        let command = serde_json::json!({"cmd": "approve", "by": long});
+        assert!(parse_command(&command.to_string()).is_err());
     }
 
     #[test]

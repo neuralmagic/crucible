@@ -159,6 +159,14 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
         return crate::pr_watch::watch_and_steer(&pr, &sink, &opts);
     }
 
+    if let Some(Cmd::LoopReference { format }) = &cli.command {
+        match format {
+            crate::LoopFormat::Markdown => print!("{}", crate::machine::doc_page()),
+            crate::LoopFormat::Mermaid => print!("{}", crate::machine::mermaid()),
+        }
+        return Ok(());
+    }
+
     if let Some(Cmd::Approve { control_addr, by }) = &cli.command {
         let reply = control::send_command(
             control_addr,

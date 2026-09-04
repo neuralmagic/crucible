@@ -194,7 +194,7 @@ fn approval_arg(trace: &str, resolution: &crucible_contract::GateResolution) -> 
         arg.push(':');
         arg.push_str(&reason.replace('@', " "));
     }
-    if let Some(by) = resolution.by.as_deref().filter(|b| !b.is_empty()) {
+    if let Some(by) = resolution.by.as_ref().map(|by| by.as_str()) {
         arg.push('@');
         arg.push_str(by);
     }
@@ -4469,7 +4469,7 @@ mod tests {
                     crucible_contract::GateResolution {
                         decision: crucible_contract::GateDecision::Granted,
                         reason: None,
-                        by: Some("wseaton".to_string()),
+                        by: Some("wseaton".parse().unwrap()),
                         source: Some("github_pr".to_string()),
                     },
                 ),
@@ -4516,12 +4516,16 @@ mod tests {
             &crucible_contract::GateResolution {
                 decision: crucible_contract::GateDecision::Denied,
                 reason: Some("ask ops@example.com".to_string()),
-                by: Some("real-denier".to_string()),
+                by: Some("real-denier".parse().unwrap()),
                 source: None,
             },
         );
         let (_, back) = crucible_contract::parse_approval_arg(&arg).expect("parses");
-        assert_eq!(back.by.as_deref(), Some("real-denier"), "{arg}");
+        assert_eq!(
+            back.by.as_ref().map(|by| by.as_str()),
+            Some("real-denier"),
+            "{arg}"
+        );
         assert_eq!(back.reason.as_deref(), Some("ask ops example.com"), "{arg}");
     }
 

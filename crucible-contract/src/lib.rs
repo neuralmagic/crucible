@@ -41,8 +41,9 @@ pub use ask::{Ask, AskKey, AskKeyError};
 pub use envelope::{Envelope, EnvelopeKind, SCHEMA_VERSION, TERMINATION_MESSAGE_CAP, Usage};
 pub use event::{AgentEvent, ModelUsage, RawStream, Tokens};
 pub use gate::{
-    ApprovalWaits, BadApprovalArg, GateDecision, GateResolution, GateSource, GateWait, JiraUntil,
-    ParkMode, PodApproval, PrUntil, gate_trace_id, parse_approval_arg,
+    ApprovalWaits, Approver, ApproverError, BadApprovalArg, GateDecision, GateResolution,
+    GateSource, GateWait, JiraUntil, ParkMode, PodApproval, PrUntil, gate_trace_id,
+    parse_approval_arg,
 };
 pub use identity::{
     ComponentIdentity, FORMAT_VERSION as IDENTITY_FORMAT_VERSION, RigIdentity, RunIdentity,

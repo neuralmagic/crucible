@@ -1,8 +1,100 @@
 //! Approval gates: the wire shapes an `approve(...)` plan task, its resolution, and the
 //! artifacts around a parked run share between the engine and the controller.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::fmt;
+
+/// A non-empty approval actor name bounded to the admission-key size.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Approver(String);
+
+/// Why an approval actor name cannot cross the wire.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ApproverError {
+    #[error("approver {value:?} is empty")]
+    Empty { value: String },
+    #[error("approver {value:?} is {bytes} bytes, maximum is {max} bytes")]
+    TooLong {
+        value: String,
+        bytes: usize,
+        max: usize,
+    },
+}
+
+impl Approver {
+    /// Return the canonical actor name without its validation wrapper.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for Approver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl TryFrom<String> for Approver {
+    type Error = ApproverError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(ApproverError::Empty {
+                value: value.to_string(),
+            });
+        }
+        if value.len() > crate::admission::MAX_KEY_LEN {
+            return Err(ApproverError::TooLong {
+                value: value.to_string(),
+                bytes: value.len(),
+                max: crate::admission::MAX_KEY_LEN,
+            });
+        }
+        Ok(Approver(value.to_string()))
+    }
+}
+
+impl TryFrom<&str> for Approver {
+    type Error = ApproverError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::try_from(value.to_string())
+    }
+}
+
+impl std::str::FromStr for Approver {
+    type Err = ApproverError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::try_from(value)
+    }
+}
+
+impl From<Approver> for String {
+    fn from(value: Approver) -> Self {
+        value.0
+    }
+}
+
+impl Serialize for Approver {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Approver {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::try_from(value).map_err(de::Error::custom)
+    }
+}
 
 /// Where a gate's resolution comes from, as the engine resolved it when the gate was reached.
 /// Rides `ApprovalWait.source` on the session log and the `approval-waits` artifact.
@@ -103,14 +195,14 @@ pub struct GateResolution {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub by: Option<String>,
+    pub by: Option<Approver>,
     /// The source kind that resolved it (`native`, `github_pr`, `jira`, `timeout`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
 }
 
 impl GateResolution {
-    pub fn granted(by: Option<String>, source: &str) -> Self {
+    pub fn granted(by: Option<Approver>, source: &str) -> Self {
         GateResolution {
             decision: GateDecision::Granted,
             reason: None,
@@ -119,7 +211,7 @@ impl GateResolution {
         }
     }
 
-    pub fn denied(reason: impl Into<String>, by: Option<String>, source: &str) -> Self {
+    pub fn denied(reason: impl Into<String>, by: Option<Approver>, source: &str) -> Self {
         GateResolution {
             decision: GateDecision::Denied,
             reason: Some(reason.into()),
@@ -164,7 +256,10 @@ pub fn parse_approval_arg(raw: &str) -> Result<(String, GateResolution), BadAppr
         return Err(bad());
     }
     let (rest, by) = match rest.rsplit_once('@') {
-        Some((head, by)) if !by.trim().is_empty() => (head, Some(by.trim().to_string())),
+        Some((head, by)) if !by.trim().is_empty() => {
+            let by = Approver::try_from(by).map_err(|_| bad())?;
+            (head, Some(by))
+        }
         _ => (rest, None),
     };
     let (decision, reason) = match rest.split_once(':') {
@@ -290,15 +385,27 @@ mod tests {
         let (_, r) = parse_approval_arg("t=denied:changes requested@alice").expect("full deny");
         assert_eq!(r.decision, GateDecision::Denied);
         assert_eq!(r.reason.as_deref(), Some("changes requested"));
-        assert_eq!(r.by.as_deref(), Some("alice"));
+        assert_eq!(r.by.as_ref().map(Approver::as_str), Some("alice"));
         let (_, r) = parse_approval_arg("t=granted@bob").expect("grant with by");
-        assert_eq!(r.by.as_deref(), Some("bob"));
+        assert_eq!(r.by.as_ref().map(Approver::as_str), Some("bob"));
         assert_eq!(r.reason, None);
         let (_, r) = parse_approval_arg("t=approve").expect("approve alias");
         assert_eq!(r.decision, GateDecision::Granted);
         for bad in ["", "t", "=granted", "t=maybe", "t=", "t=:why"] {
             assert!(parse_approval_arg(bad).is_err(), "{bad:?} must not parse");
         }
+    }
+
+    #[test]
+    fn approvers_reject_empty_and_overlong_values_without_truncating() {
+        assert!(Approver::try_from("   ").is_err());
+        let value = "é".repeat(crate::admission::MAX_KEY_LEN);
+        assert!(Approver::try_from(value).is_err());
+        let value = "a".repeat(crate::admission::MAX_KEY_LEN);
+        assert!(Approver::try_from(value).is_ok());
+        let value = "a".repeat(crate::admission::MAX_KEY_LEN + 1);
+        assert!(Approver::try_from(value).is_err());
+        assert_eq!(Approver::try_from(" alice ").unwrap().as_str(), "alice");
     }
 
     #[test]

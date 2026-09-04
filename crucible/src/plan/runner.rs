@@ -61,7 +61,7 @@ impl ShellRunner {
 
     fn run_in_workdir(&mut self, task: &Task, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
         if matches!(task.task, TaskKind::Approve { .. }) {
-            return crate::plan::gate::attempt(&self.gate, task, inputs);
+            return self.gate.attempt(task, inputs);
         }
         let mut cmd = Command::new("sh");
         cmd.arg("-c").current_dir(&self.workdir);
@@ -132,7 +132,7 @@ impl ShellRunner {
                 return fail("engine task reached a non-loop runner".to_string());
             }
             TaskKind::Approve { .. } => {
-                return crate::plan::gate::attempt(&self.gate, task, inputs);
+                return self.gate.attempt(task, inputs);
             }
         }
         let out = match cmd.output() {

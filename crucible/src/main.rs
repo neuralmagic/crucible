@@ -302,6 +302,14 @@ pub(crate) enum Cmd {
         #[arg(long)]
         once: bool,
     },
+    /// Print the scored loop's state machine: every way an iteration ends and every way the
+    /// run does, as a mermaid state chart. Generated from the machine's own vocabulary, so it
+    /// describes the binary in hand rather than a diagram someone remembered to redraw.
+    LoopReference {
+        /// `markdown` (the published page) or `mermaid` (the bare chart).
+        #[arg(long, default_value = "markdown")]
+        format: LoopFormat,
+    },
     /// Grant the approval gate a live run is parked on, over its control bridge.
     Approve {
         /// The live run's control-bridge address (host:port, from its `--control-port`).
@@ -309,7 +317,7 @@ pub(crate) enum Cmd {
         control_addr: String,
         /// Who is approving, recorded with the grant.
         #[arg(long)]
-        by: Option<String>,
+        by: Option<crucible_contract::Approver>,
     },
     /// Deny the approval gate a live run is parked on, over its control bridge.
     Deny {
@@ -321,7 +329,7 @@ pub(crate) enum Cmd {
         reason: String,
         /// Who is denying, recorded with the denial.
         #[arg(long)]
-        by: Option<String>,
+        by: Option<crucible_contract::Approver>,
     },
     /// Restore a suspended run's snapshot from the controller before resuming it: pulls the
     /// `run-session` and `run-workspace` artifacts the pod named by `CRUCIBLE_RESUME_OF` left,
@@ -521,6 +529,13 @@ pub(crate) enum PlanAction {
         #[arg(long, requires = "manifest")]
         control_port: Option<u16>,
     },
+}
+
+/// How `crucible loop-reference` renders the loop's state machine.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub(crate) enum LoopFormat {
+    Markdown,
+    Mermaid,
 }
 
 /// How `crucible plan dsl-reference` renders the DSL surface.

@@ -15,6 +15,13 @@ repos:
         pass_filenames: false
         files: ^(crucible/src/plan/starlark|docs/dsl-reference\.md)
 
+      - id: loop-docs
+        name: regenerate the loop state machine page
+        entry: scripts/loop-docs.sh
+        language: system
+        pass_filenames: false
+        files: ^(crucible/src/machine\.rs|docs/loop-machine\.md)
+
       - id: gov-render
         name: render RFCs from the governance SSOT
         entry: govctl render rfc

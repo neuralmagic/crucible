@@ -28,6 +28,53 @@ impl GateCtx {
     pub fn resolve(&mut self, trace_id: impl Into<String>, resolution: GateResolution) {
         self.resolutions.insert(trace_id.into(), resolution);
     }
+
+    /// Apply the held resolution, or report that the task is waiting for one.
+    pub fn attempt(
+        &self,
+        task: &Task,
+        inputs: &BTreeMap<TaskName, Value>,
+    ) -> Attempt {
+        let TaskKind::Approve {
+            summary,
+            source,
+            timeout_secs,
+        } = &task.task
+        else {
+            return Attempt {
+                outcome: AttemptOutcome::fail(format!("task {} is not an approve task", task.name)),
+                cost_usd: 0.0,
+            };
+        };
+        let source = match source.resolve(inputs) {
+            Ok(source) => source,
+            Err(why) => {
+                return Attempt {
+                    outcome: AttemptOutcome::fail(why.to_string()),
+                    cost_usd: 0.0,
+                };
+            }
+        };
+        let trace_id = gate_trace_id(&self.run_id, &task.name.0);
+        let outcome = match self.resolutions.get(&trace_id) {
+            Some(resolution) => settle(resolution, &source),
+            None => AttemptOutcome::Await(Gate {
+                task: task.name.clone(),
+                trace_id,
+                handle: source
+                    .handle()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| task.name.0.clone()),
+                source,
+                summary: summary.clone(),
+                timeout_secs: *timeout_secs,
+            }),
+        };
+        Attempt {
+            outcome,
+            cost_usd: 0.0,
+        }
+    }
 }
 
 /// The env var the launcher sets to name the run a gate belongs to. It must be stable across a
@@ -57,92 +104,47 @@ pub enum SourceError {
     FieldMissing { task: String, field: String },
 }
 
-/// The wire source for a gate, with any upstream reference read from the task's inputs.
-pub fn resolve_source(
-    spec: &ApprovalSourceSpec,
-    inputs: &BTreeMap<TaskName, Value>,
-) -> Result<GateSource, SourceError> {
-    let read = |r: &RefOrLiteral| -> Result<String, SourceError> {
-        match r {
-            RefOrLiteral::Literal(s) => Ok(s.clone()),
-            RefOrLiteral::Output(reference) => {
-                let producer =
-                    inputs
-                        .get(&reference.task)
-                        .ok_or_else(|| SourceError::ProducerMissing {
+impl ApprovalSourceSpec {
+    /// Resolve upstream references in a gate source against settled task outputs.
+    pub fn resolve(
+        &self,
+        inputs: &BTreeMap<TaskName, Value>,
+    ) -> Result<GateSource, SourceError> {
+        let read = |r: &RefOrLiteral| -> Result<String, SourceError> {
+            match r {
+                RefOrLiteral::Literal(s) => Ok(s.clone()),
+                RefOrLiteral::Output(reference) => {
+                    let producer = inputs.get(&reference.task).ok_or_else(|| {
+                        SourceError::ProducerMissing {
                             task: reference.task.0.clone(),
                             field: reference.field.0.clone(),
-                        })?;
-                producer
-                    .get(&reference.field.0)
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .ok_or_else(|| SourceError::FieldMissing {
-                        task: reference.task.0.clone(),
-                        field: reference.field.0.clone(),
-                    })
+                        }
+                    })?;
+                    producer
+                        .get(&reference.field.0)
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .ok_or_else(|| SourceError::FieldMissing {
+                            task: reference.task.0.clone(),
+                            field: reference.field.0.clone(),
+                        })
+                }
             }
-        }
-    };
-    Ok(match spec {
-        ApprovalSourceSpec::Native => GateSource::Native,
-        ApprovalSourceSpec::GithubPr { url, until } => GateSource::GithubPr {
-            url: read(url)?,
-            until: *until,
-        },
-        ApprovalSourceSpec::Jira { key, until } => GateSource::Jira {
-            key: read(key)?,
-            until: until.clone(),
-        },
-    })
-}
-
-/// Run one `approve` task: a held resolution settles it, otherwise the gate is reported open.
-/// Never spends.
-pub fn attempt(ctx: &GateCtx, task: &Task, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
-    let TaskKind::Approve {
-        summary,
-        source,
-        timeout_secs,
-    } = &task.task
-    else {
-        return Attempt {
-            outcome: AttemptOutcome::fail(format!("task {} is not an approve task", task.name)),
-            cost_usd: 0.0,
         };
-    };
-    let source = match resolve_source(source, inputs) {
-        Ok(source) => source,
-        Err(why) => {
-            return Attempt {
-                outcome: AttemptOutcome::fail(why.to_string()),
-                cost_usd: 0.0,
-            };
-        }
-    };
-    let trace_id = gate_trace_id(&ctx.run_id, &task.name.0);
-    let outcome = match ctx.resolutions.get(&trace_id) {
-        Some(resolution) => settle(resolution, &source),
-        None => AttemptOutcome::Await(Gate {
-            task: task.name.clone(),
-            trace_id,
-            handle: source
-                .handle()
-                .map(str::to_string)
-                .unwrap_or_else(|| task.name.0.clone()),
-            source,
-            summary: summary.clone(),
-            timeout_secs: *timeout_secs,
-        }),
-    };
-    Attempt {
-        outcome,
-        cost_usd: 0.0,
+        Ok(match self {
+            ApprovalSourceSpec::Native => GateSource::Native,
+            ApprovalSourceSpec::GithubPr { url, until } => GateSource::GithubPr {
+                url: read(url)?,
+                until: *until,
+            },
+            ApprovalSourceSpec::Jira { key, until } => GateSource::Jira {
+                key: read(key)?,
+                until: until.clone(),
+            },
+        })
     }
 }
 
-/// A grant passes the gate with the resolution as its output; a denial or timeout fails it
-/// with the reason.
 fn settle(resolution: &GateResolution, source: &GateSource) -> AttemptOutcome {
     match resolution.decision {
         GateDecision::Granted => AttemptOutcome::Pass(serde_json::json!({
@@ -254,7 +256,7 @@ mod tests {
         let mut ctx = GateCtx::new("run-1");
         ctx.resolve(
             "approve:run-1:review",
-            GateResolution::granted(Some("alice".into()), "native"),
+            GateResolution::granted(Some("alice".parse().unwrap()), "native"),
         );
         let a = attempt(
             &ctx,
@@ -269,7 +271,11 @@ mod tests {
 
         ctx.resolve(
             "approve:run-1:review",
-            GateResolution::denied("changes requested", Some("bob".into()), "github_pr"),
+            GateResolution::denied(
+                "changes requested",
+                Some("bob".parse().unwrap()),
+                "github_pr",
+            ),
         );
         let a = attempt(
             &ctx,
