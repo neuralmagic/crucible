@@ -31,6 +31,6 @@ A task declared required = false MUST NOT affect the run's verdict, and its fail
 
 A task declared stage = "epilogue" MUST be excluded from the main graph, MUST run once after the main graph settles, and MUST NOT change the verdict. It MUST run when the main graph completed, when it failed, and when a task declared early completion. It MUST NOT run when the run was stopped by an operator or ended by an exhausted ceiling, evaluated at the moment the main graph settles: continuing to spend after either would defeat the control that ended the run.
 
-An epilogue task MUST NOT depend on a main-graph task. It MUST instead receive the main graph's outcome as a reserved input carrying the run's shutdown outcome, and one entry per settled task giving that task's name, terminal status, and note. This is what makes an epilogue task reachable on the failure path, where dependencies would not have passed.
+An epilogue task MUST NOT depend on a main-graph task. It MUST instead receive the main graph's outcome as the reserved input [[RFC-0002:C-SETTLED-JOIN]] defines, which carries the run's shutdown outcome and one entry per settled main-graph task. This is what makes an epilogue task reachable on the failure path, where dependencies would not have passed.
 
 A playbook MUST carry the task lane's gate label, written under the key [[RFC-0001:C-WIRE]] reserves for it. The engine MUST NOT introduce a third gate label; a consumer needing the graph MUST read the plan_admitted event [[RFC-0001:C-WIRE]] defines, which a playbook always emits."""

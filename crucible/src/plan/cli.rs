@@ -322,12 +322,9 @@ fn render_mermaid_styled(
 /// `finished`.
 fn shutdown_outcome(out: &crate::plan::exec::PlanOutcome) -> &'static str {
     use crate::plan::exec::PlanExit;
-    if out.valid {
-        return "finished";
-    }
     match out.exit {
-        PlanExit::BudgetExceeded | PlanExit::TimeExceeded => "budget",
-        PlanExit::Completed | PlanExit::Truncated { .. } | PlanExit::ShortCircuit { .. } => "error",
+        PlanExit::Completed if !out.valid => "error",
+        ref exit => exit.shutdown_token(),
     }
 }
 

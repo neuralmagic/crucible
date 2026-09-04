@@ -780,7 +780,7 @@ fn pass(v: Value) -> Attempt {
 
 fn fail(cost_usd: f64, note: String) -> Attempt {
     Attempt {
-        outcome: AttemptOutcome::Fail(note),
+        outcome: AttemptOutcome::fail(note),
         cost_usd,
     }
 }

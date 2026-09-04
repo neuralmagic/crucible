@@ -28,6 +28,7 @@ clauses = [
     "clauses/C-PLAYBOOK-BUDGET.toml",
     "clauses/C-PLAYBOOK-RESUME.toml",
     "clauses/C-REPORTS.toml",
+    "clauses/C-SETTLED-JOIN.toml",
 ]
 
 [[changelog]]

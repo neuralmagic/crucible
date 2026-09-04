@@ -113,6 +113,60 @@ fn read_only(path: &Path) {
     }
 }
 
+/// What a declared path held at one moment, as its size and the digest of its content.
+#[derive(Debug, PartialEq, Eq)]
+enum Fingerprint {
+    Absent,
+    /// Something is there that could not be read as a file, so authorship is undecidable and
+    /// the comparison must refuse rather than guess.
+    Unreadable,
+    Content {
+        bytes: u64,
+        content: git2::Oid,
+    },
+}
+
+fn fingerprint(path: &Path) -> Fingerprint {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return Fingerprint::Absent;
+    };
+    match git2::Oid::hash_file(git2::ObjectType::Blob, path) {
+        Ok(content) => Fingerprint::Content {
+            bytes: metadata.len(),
+            content,
+        },
+        Err(_) => Fingerprint::Unreadable,
+    }
+}
+
+/// Each declared path's content in the root the attempt is about to run in, taken before it
+/// runs. A failing attempt owns a declared path only where this changed: a file an earlier task
+/// left in the workspace is that task's evidence, and publishing it would report a sibling's
+/// reading as the failure's.
+struct PriorContents(BTreeMap<String, Fingerprint>);
+
+impl PriorContents {
+    fn of(workspace: &Path, declared: &[String]) -> Self {
+        PriorContents(
+            declared
+                .iter()
+                .map(|path| {
+                    let held = confined(workspace, path)
+                        .map_or(Fingerprint::Unreadable, |resolved| fingerprint(&resolved));
+                    (path.clone(), held)
+                })
+                .collect(),
+        )
+    }
+
+    /// Whether the attempt wrote `declared`, now resolved at `path`.
+    fn wrote(&self, declared: &str, path: &Path) -> bool {
+        let now = fingerprint(path);
+        matches!(now, Fingerprint::Content { .. })
+            && self.0.get(declared).is_some_and(|before| *before != now)
+    }
+}
+
 /// One file an ancestor declared, as the producer's name and the path it declared.
 pub struct StagedInput {
     pub producer: String,
@@ -169,6 +223,30 @@ impl TaskRunner for HarnessRunner {
             .collect();
         self.staged.insert(task.name.clone(), files);
         Ok(())
+    }
+
+    fn has_captured_files(&self, task: &Task) -> bool {
+        captured_dir(&self.paths.state, &task.name.0).is_dir()
+    }
+
+    /// Discards the set published under this task's name, and for a mapped node the sets
+    /// published under its instances' names too: a node that did not expand this run has no
+    /// instance rows, so nothing else in the run ever reaches them.
+    fn drop_captured(&mut self, task: &Task) {
+        let _ = std::fs::remove_dir_all(captured_dir(&self.paths.state, &task.name.0));
+        if task.over.is_none() {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(self.paths.state.join("files")) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if crate::plan::exec::is_instance_of(&task.name, &TaskName(name.to_string())) {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
     }
 
     /// Commit what a passing task did, and discard what a failing one did.
@@ -296,8 +374,16 @@ fn run_task(
         if let Err(e) = materialize_inputs(&paths.state, &paths.workspace, staged) {
             return transport(e);
         }
+        let before = PriorContents::of(&paths.workspace, &task.emits_files);
         let attempt_out = prepare_and_run(args, paths, task, attempt, inputs);
-        return capture_declared(paths, &paths.workspace, task, attempt_out, captured_bytes);
+        return capture_declared(
+            paths,
+            &paths.workspace,
+            task,
+            attempt_out,
+            captured_bytes,
+            &before,
+        );
     };
     // A private clone of the workspace. Its edits are discarded on cleanup: what leaves an
     // isolated task is its declared output, so this is for review/analysis work, not for
@@ -334,19 +420,32 @@ fn run_task(
     }
     let iso = Paths::for_worktree(worktree.clone(), paths.skills.clone());
     let _ = std::fs::create_dir_all(&iso.state);
+    let before = PriorContents::of(&iso.workspace, &task.emits_files);
     let attempt_out = prepare_and_run(args, &iso, task, attempt, inputs);
     // Before the worktree goes: a declared file is part of the task's output, not part of the
     // workspace state isolation discards, so it has to be taken while the tree is still there.
-    let attempt_out = capture_declared(paths, &iso.workspace, task, attempt_out, captured_bytes);
+    let attempt_out = capture_declared(
+        paths,
+        &iso.workspace,
+        task,
+        attempt_out,
+        captured_bytes,
+        &before,
+    );
     let _ = std::fs::remove_dir_all(&worktree);
     attempt_out
 }
 
-/// Take a passing attempt's declared files, or turn it into a measured failure.
+/// Take a settled attempt's declared files, or withhold the whole set.
 ///
 /// A declared file that is absent after an otherwise-passing attempt is output drift, and it
 /// fails at the task that promised it rather than as a mystery in whatever depended on it. It is
 /// not retried: a task that ran and did not produce what it promised will not produce it twice.
+///
+/// A failing attempt's set is captured too, for a consumer joining `settled`, and it is captured
+/// before [`TaskRunner::settled`] discards the workspace. On that path a declared path counts
+/// only when this attempt wrote it, which `before` (taken in the same root, before the attempt
+/// ran) decides.
 ///
 /// Capture goes to a temporary directory and is published with a rename, so `state/files/<task>`
 /// exists only for a task that delivered everything it declared: a partial capture cannot reach
@@ -357,8 +456,14 @@ fn capture_declared(
     task: &Task,
     attempt: Attempt,
     captured: &AtomicU64,
+    before: &PriorContents,
 ) -> Attempt {
-    if task.emits_files.is_empty() || !matches!(attempt.outcome, AttemptOutcome::Pass(_)) {
+    let failing = match &attempt.outcome {
+        AttemptOutcome::Pass(_) => false,
+        AttemptOutcome::Fail { .. } => true,
+        AttemptOutcome::Skipped(..) | AttemptOutcome::Transport(_) => return attempt,
+    };
+    if task.emits_files.is_empty() {
         return attempt;
     }
     let staging = paths.state.join("files.tmp").join(&task.name.0);
@@ -374,10 +479,17 @@ fn capture_declared(
                 }
                 Err(_) => {
                     return Err(format!(
-                        "declared file {declared:?} is absent after a passing attempt"
+                        "declared file {declared:?} is absent after a {} attempt",
+                        if failing { "failing" } else { "passing" }
                     ));
                 }
             };
+            if failing && !before.wrote(declared, &from) {
+                return Err(format!(
+                    "declared file {declared:?} holds what it held before the attempt started, so \
+                     this attempt did not write it"
+                ));
+            }
             let total = captured
                 .fetch_add(size, Ordering::Relaxed)
                 .saturating_add(size);
@@ -398,32 +510,44 @@ fn capture_declared(
         }
         Ok(())
     })();
-    if let Err(why) = taken {
-        let _ = std::fs::remove_dir_all(&staging);
-        captured.fetch_sub(charged, Ordering::Relaxed);
-        return fail(attempt.cost_usd, why);
-    }
     let published = captured_dir(&paths.state, &task.name.0);
-    if let Some(parent) = published.parent()
-        && let Err(error) = std::fs::create_dir_all(parent)
-    {
+    let outcome = taken.and_then(|()| {
+        if let Some(parent) = published.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("publishing the files {} declared: {error}", task.name))?;
+        }
+        let _ = std::fs::remove_dir_all(&published);
+        std::fs::rename(&staging, &published)
+            .map_err(|error| format!("publishing the files {} declared: {error}", task.name))
+    });
+    if let Err(why) = outcome {
         let _ = std::fs::remove_dir_all(&staging);
+        let _ = std::fs::remove_dir_all(&published);
         captured.fetch_sub(charged, Ordering::Relaxed);
-        return fail(
-            attempt.cost_usd,
-            format!("publishing the files {} declared: {error}", task.name),
-        );
-    }
-    let _ = std::fs::remove_dir_all(&published);
-    if let Err(error) = std::fs::rename(&staging, &published) {
-        let _ = std::fs::remove_dir_all(&staging);
-        captured.fetch_sub(charged, Ordering::Relaxed);
-        return fail(
-            attempt.cost_usd,
-            format!("publishing the files {} declared: {error}", task.name),
-        );
+        return withheld(attempt, why);
     }
     attempt
+}
+
+/// A capture that published nothing. A passing attempt becomes the measured failure, since it
+/// promised the set; an attempt that had already failed keeps its status. Either way the
+/// attempt's own reading is retained and the capture problem joins the note.
+fn withheld(attempt: Attempt, why: String) -> Attempt {
+    let outcome = match attempt.outcome {
+        AttemptOutcome::Fail { note, output } => AttemptOutcome::Fail {
+            note: format!("{note}; {why}"),
+            output,
+        },
+        AttemptOutcome::Pass(output) => AttemptOutcome::Fail {
+            note: why,
+            output: Some(output),
+        },
+        _ => AttemptOutcome::fail(why),
+    };
+    Attempt {
+        outcome,
+        cost_usd: attempt.cost_usd,
+    }
 }
 
 /// Lay a task's staged inputs down under `<root>/inputs/<producer>/`, replacing whatever a
@@ -478,7 +602,11 @@ fn prepare_and_run(
             ));
         }
     }
-    run_in(args, paths, task, attempt, inputs)
+    let out = run_in(args, paths, task, attempt, inputs);
+    Attempt {
+        outcome: out.outcome.settle_declared(),
+        cost_usd: out.cost_usd,
+    }
 }
 
 /// One task against a specific workspace. `Command` tasks go to the shell runner; `Agent`
@@ -621,7 +749,7 @@ fn run_in(
 
 fn fail(cost_usd: f64, note: String) -> Attempt {
     Attempt {
-        outcome: AttemptOutcome::Fail(note),
+        outcome: AttemptOutcome::fail(note),
         cost_usd,
     }
 }
@@ -701,9 +829,15 @@ mod tests {
         }
     }
 
+    /// The declared paths as they stood before a dispatch. The passing path never consults
+    /// them, so a test driving that path can take them at any point.
+    fn prior(paths: &Paths, task: &crate::plan::ir::Task) -> PriorContents {
+        PriorContents::of(&paths.workspace, &task.emits_files)
+    }
+
     fn note(attempt: &Attempt) -> String {
         match &attempt.outcome {
-            AttemptOutcome::Fail(note) => note.clone(),
+            AttemptOutcome::Fail { note, .. } => note.clone(),
             other => panic!("expected a measured failure, got {other:?}"),
         }
     }
@@ -717,7 +851,15 @@ mod tests {
         std::fs::write(paths.workspace.join("A.md"), "present\n").unwrap();
         let task = emitting("draft", &["A.md", "B.md"]);
         let counter = AtomicU64::new(0);
-        let out = capture_declared(&paths, &paths.workspace, &task, passing(), &counter);
+        let before = prior(&paths, &task);
+        let out = capture_declared(
+            &paths,
+            &paths.workspace,
+            &task,
+            passing(),
+            &counter,
+            &before,
+        );
         let note = note(&out);
         assert!(note.contains("B.md") && note.contains("absent"), "{note}");
         assert!(
@@ -742,8 +884,16 @@ mod tests {
         read_only(&source);
         let task = emitting("draft", &["A.md"]);
         let counter = AtomicU64::new(0);
+        let before = prior(&paths, &task);
         for round in 1..=3 {
-            let out = capture_declared(&paths, &paths.workspace, &task, passing(), &counter);
+            let out = capture_declared(
+                &paths,
+                &paths.workspace,
+                &task,
+                passing(),
+                &counter,
+                &before,
+            );
             assert!(
                 matches!(out.outcome, AttemptOutcome::Pass(_)),
                 "round {round}: {:?}",
@@ -769,14 +919,30 @@ mod tests {
         std::fs::write(paths.workspace.join("A.md"), vec![b'x'; 4096]).unwrap();
         let task = emitting("draft", &["A.md"]);
         let counter = AtomicU64::new(0);
-        let out = capture_declared(&paths, &paths.workspace, &task, passing(), &counter);
+        let before = prior(&paths, &task);
+        let out = capture_declared(
+            &paths,
+            &paths.workspace,
+            &task,
+            passing(),
+            &counter,
+            &before,
+        );
         assert!(matches!(out.outcome, AttemptOutcome::Pass(_)));
         assert_eq!(counter.load(Ordering::Relaxed), 4096);
 
         // A second task, itself far under the bound, lands on a run that is already there.
         let later = emitting("polish", &["A.md"]);
         counter.store(MAX_CAPTURED_BYTES - 1, Ordering::Relaxed);
-        let out = capture_declared(&paths, &paths.workspace, &later, passing(), &counter);
+        let before = prior(&paths, &later);
+        let out = capture_declared(
+            &paths,
+            &paths.workspace,
+            &later,
+            passing(),
+            &counter,
+            &before,
+        );
         let note = note(&out);
         assert!(note.contains("this run's declared files exceed"), "{note}");
         assert!(
@@ -824,6 +990,13 @@ mod tests {
     }
 
     fn run_playbook(dir: &std::path::Path) -> crate::plan::exec::PlanOutcome {
+        run_playbook_recording(dir).0
+    }
+
+    /// The same run, keeping the runner so a test can read the run-scoped state it owns.
+    fn run_playbook_recording(
+        dir: &std::path::Path,
+    ) -> (crate::plan::exec::PlanOutcome, HarnessRunner) {
         let mut manifest = crate::manifest::Manifest::load(&dir.join("crucible.toml")).unwrap();
         manifest.resolve_workflow(dir).unwrap();
         let workflow = manifest.workflow.as_ref().unwrap();
@@ -835,13 +1008,14 @@ mod tests {
         let mut runner = crate::run::prep_plan_runner(&dir.join("crucible.toml"))
             .unwrap()
             .0;
-        execute(
+        let out = execute(
             &plan,
             &Substrate::default(),
             ExecCfg::default(),
             &mut runner,
             |_, _| {},
-        )
+        );
+        (out, runner)
     }
 
     /// A launch's `--harness`/`--model` replace the manifest's `[agent]` pair on the runner every
@@ -973,13 +1147,17 @@ workflow(type = "playbook", tasks = [write, copy, review])
         let dir = std::env::temp_dir().join(format!("crucible-stale-files-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        // The failing round writes different bytes, so its own capture is published rather than
+        // withheld as a file it inherited: the staging assertion below is about the join, not
+        // about there being nothing on disk to stage.
         let script = |produce_fails: bool| {
             format!(
                 r#"{{
                   "seed": {{"result": {{"ok": true}}}},
-                  "produce": {{{}"writes": {{"A.md": "the source\n"}}, "result": {{"ok": true}}}}
+                  "produce": {{{}"writes": {{"A.md": "the source{}\n"}}, "result": {{"ok": true}}}}
                 }}"#,
-                if produce_fails { "\"exit\": 1, " } else { "" }
+                if produce_fails { "\"exit\": 1, " } else { "" },
+                if produce_fails { ", rewritten" } else { "" }
             )
         };
         std::fs::write(dir.join("agents.json"), script(false)).unwrap();
@@ -1025,7 +1203,7 @@ workflow(type = "playbook", tasks = [seed, produce, check])
         assert_eq!(out.results[&"produce".into()].status, TaskStatus::Fail);
         assert!(
             dir.join("state/files/produce/A.md").exists(),
-            "the previous run's capture was expected to still be on disk"
+            "the failed producer's own capture was expected to be on disk"
         );
         assert_eq!(
             out.results[&"check".into()].status,
@@ -2329,7 +2507,7 @@ workflow(type = "playbook", tasks = [analyze, implement, report])
         };
         let a = runner.run(&t, 1, &BTreeMap::new());
         match a.outcome {
-            AttemptOutcome::Fail(note) => assert!(note.contains("unknown harness")),
+            AttemptOutcome::Fail { note, .. } => assert!(note.contains("unknown harness")),
             _ => panic!("expected a measured failure"),
         }
     }
@@ -2523,9 +2701,10 @@ workflow(type = "playbook", tasks = [discover, audit, roundup])
                 "instance capture is not per instance"
             );
         }
-        assert!(
-            !files.join("audit[beta]").exists(),
-            "a failed instance published its declared file"
+        // The failed instance's own reading is captured, and reaches a settled edge or nothing.
+        assert_eq!(
+            std::fs::read_to_string(files.join("audit[beta]/OUT.md")).unwrap(),
+            "findings for beta\n"
         );
 
         // The consumer is handed the passing instances, and only those.
@@ -2575,5 +2754,815 @@ workflow(type = "playbook", tasks = [discover, audit, roundup])
             &crate::manifest::WorkflowCaps::for_lane(workflow.workflow_type),
         )
         .unwrap()
+    }
+
+    /// A scratch pack directory with `crucible.toml`, an empty fake-agent script, and the
+    /// workflow source, ready for [`run_playbook`].
+    fn playbook_pack(tag: &str, workflow: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("crucible-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agents.json"), "{}").unwrap();
+        std::fs::write(dir.join("workflow.star"), workflow).unwrap();
+        fake_agent_manifest(&dir);
+        dir
+    }
+
+    fn git_output(workspace: &std::path::Path, args: &[&str]) -> String {
+        let mut command = std::process::Command::new("git");
+        command.arg("-C").arg(workspace);
+        let out = command.args(args).output().expect("git");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// The whole failure path in one run: the declared file is captured before the workspace is
+    /// rolled back, the undeclared write goes with the rollback, nothing is committed, and the
+    /// evidence reaches the consumer that joined settled and nowhere else.
+    #[test]
+    fn a_failed_producers_declared_file_survives_the_rollback_and_reaches_a_settled_consumer() {
+        let dir = playbook_pack(
+            "settled-capture",
+            r#"
+probe = command(
+    name = "probe",
+    run = "mkdir -p evidence && printf '{\"pass\": false}\n' > evidence/probe.json && printf 'junk\n' > junk.txt && exit 1",
+    required = False,
+    emits_files = ["evidence/probe.json"],
+)
+report = command(
+    name = "report",
+    run = "cat inputs/probe/evidence/probe.json > SEEN.json && printf '{\"saw\": true}\n'",
+    depends_on = [probe],
+    join = "settled",
+)
+workflow(type = "playbook", tasks = [probe, report])
+"#,
+        );
+        let out = run_playbook(&dir);
+
+        assert_eq!(out.results[&"probe".into()].status, TaskStatus::Fail);
+        assert_eq!(
+            out.results[&"report".into()].status,
+            TaskStatus::Pass,
+            "{:?}",
+            out.results[&"report".into()].note
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("state/files/probe/evidence/probe.json")).unwrap(),
+            "{\"pass\": false}\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("workspace/SEEN.json")).unwrap(),
+            "{\"pass\": false}\n",
+            "the settled consumer did not read the failed producer's evidence"
+        );
+
+        let workspace = dir.join("workspace");
+        assert!(
+            !workspace.join("junk.txt").exists(),
+            "a failed task's undeclared write survived"
+        );
+        assert!(
+            !workspace.join("evidence/probe.json").exists(),
+            "a failed task's declared write stayed in the tree"
+        );
+        let log = git_output(&workspace, &["log", "--oneline"]);
+        assert!(
+            !log.contains("task probe"),
+            "a failed task committed: {log}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A staged set is complete or absent. A failing producer that delivered one of two declared
+    /// paths publishes neither, refunds what it charged, says why beside its own failure note,
+    /// and stays failed rather than becoming a different failure.
+    #[test]
+    fn a_failing_producers_partial_set_is_withheld_whole() {
+        let dir = playbook_pack(
+            "settled-partial",
+            r#"
+probe = command(
+    name = "probe",
+    run = "mkdir -p evidence && printf 'a\n' > evidence/a.json && printf 'the probe did not separate\n' >&2 && exit 1",
+    required = False,
+    emits_files = ["evidence/a.json", "evidence/b.json"],
+)
+report = command(
+    name = "report",
+    run = "test ! -e inputs/probe && printf '{\"saw_nothing\": true}\n'",
+    depends_on = [probe],
+    join = "settled",
+)
+workflow(type = "playbook", tasks = [probe, report])
+"#,
+        );
+        let (out, runner) = run_playbook_recording(&dir);
+
+        let probe = &out.results[&"probe".into()];
+        assert_eq!(probe.status, TaskStatus::Fail);
+        let note = probe.note.clone().unwrap_or_default();
+        assert!(note.contains("b.json") && note.contains("absent"), "{note}");
+        assert!(
+            !dir.join("state/files/probe").exists(),
+            "a partial set was published"
+        );
+        assert_eq!(
+            runner.captured_bytes.load(Ordering::Relaxed),
+            0,
+            "a set that was never published still spent the run's budget"
+        );
+        assert_eq!(
+            out.results[&"report".into()].status,
+            TaskStatus::Pass,
+            "{:?}",
+            out.results[&"report".into()].note
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ordering is not provenance. A file an earlier task committed is that task's evidence, so a
+    /// later task that failed without writing it publishes nothing and reports no files.
+    #[test]
+    fn a_failing_task_does_not_publish_the_file_an_earlier_task_committed() {
+        let dir = playbook_pack(
+            "settled-provenance",
+            r#"
+first = command(
+    name = "first",
+    run = "mkdir -p evidence && printf 'from first\n' > evidence/x.json && printf '{\"ok\": true}\n'",
+    required = False,
+    emits_files = ["evidence/x.json"],
+)
+second = command(
+    name = "second",
+    run = "printf 'second wrote nothing\n' >&2 && exit 1",
+    depends_on = [first],
+    required = False,
+    emits_files = ["evidence/x.json"],
+)
+report = command(
+    name = "report",
+    run = "test ! -e inputs/second && test -e inputs/first/evidence/x.json && printf '{\"ok\": true}\n'",
+    depends_on = [first, second],
+    join = "settled",
+)
+workflow(type = "playbook", tasks = [first, second, report])
+"#,
+        );
+        let out = run_playbook(&dir);
+
+        assert_eq!(out.results[&"first".into()].status, TaskStatus::Pass);
+        let second = &out.results[&"second".into()];
+        assert_eq!(second.status, TaskStatus::Fail);
+        let note = second.note.clone().unwrap_or_default();
+        assert!(note.contains("did not write it"), "{note}");
+        assert!(
+            !dir.join("state/files/second").exists(),
+            "a failing task published a file it inherited"
+        );
+        assert_eq!(
+            out.results[&"report".into()].status,
+            TaskStatus::Pass,
+            "{:?}",
+            out.results[&"report".into()].note
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same provenance rule across serial instances of one mapped node, which is where it
+    /// bites: they share a workspace and a declared path, so the instance that failed before
+    /// writing would otherwise publish its sibling's reading as its own.
+    #[test]
+    fn a_mapped_instance_that_failed_before_writing_publishes_nothing() {
+        let dir =
+            std::env::temp_dir().join(format!("crucible-settled-instance-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("agents.json"),
+            r#"{
+              "review[a]": {"writes": {"evidence/review.json": "a reviewed\n"},
+                            "result": {"status": "pass"}},
+              "review[b]": {"exit": 1, "stderr": "b objected before writing"}
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("workflow.star"),
+            r#"
+discover = command(
+    name = "discover",
+    run = "printf '{\"targets\": [\"a\", \"b\"]}\n'",
+    emits = ["targets"],
+)
+review = agent(
+    name = "review",
+    prompt = "review one target",
+    depends_on = [discover],
+    over = discover.targets,
+    max_fanout = 4,
+    required = False,
+    emits_files = ["evidence/review.json"],
+)
+report = command(
+    name = "report",
+    run = "test -e 'inputs/review[a]/evidence/review.json' && test ! -e 'inputs/review[b]' && printf '{\"ok\": true}\n'",
+    depends_on = [review],
+    join = "settled",
+)
+workflow(type = "playbook", tasks = [discover, review, report])
+"#,
+        )
+        .unwrap();
+        fake_agent_manifest(&dir);
+        let out = run_playbook(&dir);
+
+        assert_eq!(out.results[&"review[a]".into()].status, TaskStatus::Pass);
+        assert_eq!(out.results[&"review[b]".into()].status, TaskStatus::Fail);
+        assert!(
+            dir.join("state/files/review[a]/evidence/review.json")
+                .exists()
+        );
+        assert!(
+            !dir.join("state/files/review[b]").exists(),
+            "the failing instance published its sibling's file"
+        );
+        assert_eq!(
+            out.results[&"report".into()].status,
+            TaskStatus::Pass,
+            "{:?}",
+            out.results[&"report".into()].note
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same rule for the veto an agent turn actually has: an instance with no exit code
+    /// settles itself failing by returning "status": "fail", and that is its terminal state
+    /// before its files are taken, not after.
+    #[test]
+    fn a_mapped_instance_that_vetoes_itself_publishes_nothing() {
+        let dir =
+            std::env::temp_dir().join(format!("crucible-settled-veto-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("agents.json"),
+            r#"{
+              "review[a]": {"writes": {"evidence/review.json": "a reviewed\n"},
+                            "result": {"status": "pass", "agree": true}},
+              "review[b]": {"result": {"status": "fail", "note": "b objected", "agree": false}}
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("workflow.star"),
+            r#"
+discover = command(
+    name = "discover",
+    run = "printf '{\"targets\": [\"a\", \"b\"]}\n'",
+    emits = ["targets"],
+)
+review = agent(
+    name = "review",
+    prompt = "review one target",
+    depends_on = [discover],
+    over = discover.targets,
+    max_fanout = 4,
+    required = False,
+    emits = ["status", "agree"],
+    emits_files = ["evidence/review.json"],
+)
+report = command(
+    name = "report",
+    run = "test -e 'inputs/review[a]/evidence/review.json' && test ! -e 'inputs/review[b]' && printf '{\"ok\": true}\n'",
+    depends_on = [review],
+    join = "settled",
+)
+workflow(type = "playbook", tasks = [discover, review, report])
+"#,
+        )
+        .unwrap();
+        fake_agent_manifest(&dir);
+        let out = run_playbook(&dir);
+
+        assert_eq!(out.results[&"review[a]".into()].status, TaskStatus::Pass);
+        let vetoed = &out.results[&"review[b]".into()];
+        assert_eq!(vetoed.status, TaskStatus::Fail);
+        assert_eq!(
+            vetoed.output.as_ref().expect("the vetoing object")["agree"],
+            false
+        );
+        let note = vetoed.note.clone().unwrap_or_default();
+        assert!(note.starts_with("b objected"), "{note}");
+        assert!(note.contains("did not write it"), "{note}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("state/files/review[a]/evidence/review.json"))
+                .unwrap(),
+            "a reviewed\n"
+        );
+        assert!(
+            !dir.join("state/files/review[b]").exists(),
+            "the vetoing instance published its sibling's file"
+        );
+        assert_eq!(
+            out.results[&"report".into()].status,
+            TaskStatus::Pass,
+            "{:?}",
+            out.results[&"report".into()].note
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A task that vetoed itself has already failed, so an absent declared file cannot make it a
+    /// different failure: the capture problem joins its own note and the object it vetoed with
+    /// still reaches a settled consumer.
+    #[test]
+    fn a_self_declared_failure_keeps_its_object_when_its_declared_file_is_absent() {
+        let dir = playbook_pack(
+            "settled-veto-solo",
+            r#"
+solo = agent(
+    name = "solo",
+    prompt = "grade the stimulus",
+    required = False,
+    emits = ["status", "separates"],
+    emits_files = ["evidence/solo.json"],
+)
+workflow(type = "playbook", tasks = [solo])
+"#,
+        );
+        std::fs::write(
+            dir.join("agents.json"),
+            r#"{"solo": {"result": {"status": "fail", "note": "solo vetoed", "separates": false}}}"#,
+        )
+        .unwrap();
+        let (out, runner) = run_playbook_recording(&dir);
+
+        let solo = &out.results[&"solo".into()];
+        assert_eq!(solo.status, TaskStatus::Fail);
+        assert_eq!(
+            solo.output.as_ref().expect("the vetoing object")["separates"],
+            false
+        );
+        let note = solo.note.clone().unwrap_or_default();
+        assert!(note.starts_with("solo vetoed"), "{note}");
+        assert!(note.contains("absent after a failing attempt"), "{note}");
+        assert!(
+            !dir.join("state/files/solo").exists(),
+            "a task that published nothing left a set behind"
+        );
+        assert_eq!(runner.captured_bytes.load(Ordering::Relaxed), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A task that declared itself skipped measured nothing, so its declared files are not
+    /// evidence: an absent one is not drift, and one it happened to leave behind is neither
+    /// published nor charged to the run.
+    #[test]
+    fn a_self_declared_skip_captures_nothing() {
+        let dir = playbook_pack(
+            "settled-skip",
+            r#"
+wrote = command(
+    name = "wrote",
+    run = "mkdir -p evidence && printf 'no reading\n' > evidence/wrote.json && printf '{\"status\": \"skipped\", \"note\": \"no rig here\"}\n'",
+    required = False,
+    emits_files = ["evidence/wrote.json"],
+)
+silent = command(
+    name = "silent",
+    run = "printf '{\"status\": \"skipped\"}\n'",
+    required = False,
+    emits_files = ["evidence/silent.json"],
+)
+workflow(type = "playbook", tasks = [wrote, silent])
+"#,
+        );
+        let (out, runner) = run_playbook_recording(&dir);
+
+        for name in ["wrote", "silent"] {
+            let result = &out.results[&TaskName::from(name)];
+            assert_eq!(
+                result.status,
+                TaskStatus::Skipped,
+                "{name}: {:?}",
+                result.note
+            );
+            assert!(
+                !dir.join("state/files").join(name).exists(),
+                "{name} published a set"
+            );
+        }
+        assert_eq!(runner.captured_bytes.load(Ordering::Relaxed), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `state` outlives a run, so a set from an earlier one would otherwise stand for a task that
+    /// never ran this time. A task that settles without evidence takes its old set with it.
+    #[test]
+    fn a_blocked_task_removes_the_set_an_earlier_run_published() {
+        let dir = playbook_pack(
+            "settled-stale",
+            r#"
+gate = command(
+    name = "gate",
+    run = "test ! -f ../fail-gate && printf '{\"ok\": true}\n'",
+    required = False,
+)
+producer = command(
+    name = "producer",
+    run = "mkdir -p evidence && printf 'p\n' > evidence/p.json && printf '{\"ok\": true}\n'",
+    depends_on = [gate],
+    required = False,
+    emits_files = ["evidence/p.json"],
+)
+report = command(
+    name = "report",
+    run = "test ! -e inputs/producer && printf '{\"ok\": true}\n'",
+    depends_on = [producer],
+    join = "settled",
+    required = False,
+)
+workflow(type = "playbook", tasks = [gate, producer, report])
+"#,
+        );
+        let out = run_playbook(&dir);
+        assert_eq!(out.results[&"producer".into()].status, TaskStatus::Pass);
+        assert!(dir.join("state/files/producer/evidence/p.json").exists());
+
+        std::fs::write(dir.join("fail-gate"), "").unwrap();
+        let out = run_playbook(&dir);
+        assert_eq!(out.results[&"gate".into()].status, TaskStatus::Fail);
+        assert_eq!(out.results[&"producer".into()].status, TaskStatus::Blocked);
+        assert!(
+            !dir.join("state/files/producer").exists(),
+            "a blocked task kept the set an earlier run published"
+        );
+        assert_eq!(
+            out.results[&"report".into()].status,
+            TaskStatus::Pass,
+            "{:?}",
+            out.results[&"report".into()].note
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The withhold path clears the same stale set the blocked path does: a task that failed
+    /// without writing what it declared must not have the set it published while passing stand
+    /// for the attempt that captured nothing.
+    #[test]
+    fn a_withheld_capture_removes_the_set_an_earlier_run_published() {
+        let dir = playbook_pack(
+            "settled-withhold-stale",
+            r#"
+producer = command(
+    name = "producer",
+    run = "test ! -f ../fail-gate && mkdir -p evidence && printf 'p\n' > evidence/p.json && printf '{\"ok\": true}\n'",
+    required = False,
+    emits_files = ["evidence/p.json"],
+)
+report = command(
+    name = "report",
+    run = "python3 -c 'import json, os; v = json.loads(os.environ[\"CRUCIBLE_INPUTS\"]); print(json.dumps({\"files\": v[\"producer\"][\"files\"]}))'",
+    depends_on = [producer],
+    join = "settled",
+)
+workflow(type = "playbook", tasks = [producer, report])
+"#,
+        );
+        let out = run_playbook(&dir);
+        assert_eq!(out.results[&"producer".into()].status, TaskStatus::Pass);
+        assert!(dir.join("state/files/producer/evidence/p.json").exists());
+        assert_eq!(
+            out.results[&"report".into()].output.as_ref().unwrap()["files"],
+            true,
+            "a passing producer's set was not staged"
+        );
+
+        std::fs::write(dir.join("fail-gate"), "").unwrap();
+        let out = run_playbook(&dir);
+        let producer = &out.results[&"producer".into()];
+        assert_eq!(producer.status, TaskStatus::Fail, "{:?}", producer.note);
+        assert!(
+            !dir.join("state/files/producer").exists(),
+            "a withheld capture kept the set an earlier run published"
+        );
+        let report = &out.results[&"report".into()];
+        assert_eq!(report.status, TaskStatus::Pass, "{:?}", report.note);
+        assert_eq!(
+            report.output.as_ref().unwrap()["files"],
+            false,
+            "a withheld capture was reported as staged"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Bytes from an attempt that never reached the work are not a reading, so a transport
+    /// failure and a self-declared skip publish nothing and charge nothing.
+    #[test]
+    fn a_transport_failure_and_a_skip_capture_nothing() {
+        let (dir, paths) = scratch("capture-unmeasured");
+        std::fs::write(paths.workspace.join("A.md"), "present\n").unwrap();
+        let task = emitting("draft", &["A.md"]);
+        let counter = AtomicU64::new(0);
+        let before = prior(&paths, &task);
+        for outcome in [
+            AttemptOutcome::Transport("the broker hung up".to_string()),
+            AttemptOutcome::Skipped(Value::Null, "not applicable here".to_string()),
+        ] {
+            let out = capture_declared(
+                &paths,
+                &paths.workspace,
+                &task,
+                Attempt {
+                    outcome,
+                    cost_usd: 0.0,
+                },
+                &counter,
+                &before,
+            );
+            assert!(
+                !matches!(out.outcome, AttemptOutcome::Fail { .. }),
+                "an unmeasured attempt was turned into a failure: {:?}",
+                out.outcome
+            );
+            assert!(
+                !paths.state.join("files/draft").exists(),
+                "an unmeasured attempt published a set"
+            );
+            assert_eq!(counter.load(Ordering::Relaxed), 0);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The edge rule end to end: a failed producer's evidence is laid down for the consumer that
+    /// declared it and for nothing further along, so a descendant cannot read a failed
+    /// grandparent's file as if it had passed.
+    #[test]
+    fn a_failed_producers_evidence_stops_at_the_edge_that_declared_it() {
+        let dir = playbook_pack(
+            "settled-grandparent",
+            r#"
+probe = command(
+    name = "probe",
+    run = "mkdir -p evidence && printf '{\"pass\": false}\n' > evidence/probe.json && exit 1",
+    required = False,
+    emits_files = ["evidence/probe.json"],
+)
+mid = command(
+    name = "mid",
+    run = "test -f inputs/probe/evidence/probe.json && printf '{\"ok\": true}\n'",
+    depends_on = [probe],
+    join = "settled",
+    required = False,
+)
+tip = command(
+    name = "tip",
+    run = "test ! -e inputs/probe && printf '{\"ok\": true}\n'",
+    depends_on = [mid],
+    join = "settled",
+)
+workflow(type = "playbook", tasks = [probe, mid, tip])
+"#,
+        );
+        let out = run_playbook(&dir);
+
+        assert_eq!(out.results[&"probe".into()].status, TaskStatus::Fail);
+        for name in ["mid", "tip"] {
+            let result = &out.results[&TaskName::from(name)];
+            assert_eq!(result.status, TaskStatus::Pass, "{name}: {:?}", result.note);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The whole envelope as a task actually reads it: status, note, retained output and the
+    /// staged-file flag, for a dependency that failed and one that was blocked behind it.
+    #[test]
+    fn a_settled_consumer_reads_the_whole_envelope_out_of_its_inputs() {
+        let dir = playbook_pack(
+            "settled-envelope",
+            r#"
+probe = command(
+    name = "probe",
+    run = "mkdir -p evidence && printf 'e\n' > evidence/probe.json && printf '{\"pass\": false, \"margin\": 0.02}\n' && printf 'the rungs did not separate\n' >&2 && exit 3",
+    required = False,
+    emits_files = ["evidence/probe.json"],
+)
+deliver = command(
+    name = "deliver",
+    run = "printf '{\"ok\": true}\n'",
+    depends_on = [probe],
+    required = False,
+)
+report = command(
+    name = "report",
+    run = "python3 -c 'import json, os; print(json.dumps(json.loads(os.environ[\"CRUCIBLE_INPUTS\"])))'",
+    depends_on = [probe, deliver],
+    join = "settled",
+)
+workflow(type = "playbook", tasks = [probe, deliver, report])
+"#,
+        );
+        let out = run_playbook(&dir);
+
+        assert_eq!(out.results[&"deliver".into()].status, TaskStatus::Blocked);
+        let report = &out.results[&"report".into()];
+        assert_eq!(report.status, TaskStatus::Pass, "{:?}", report.note);
+        let seen = report.output.as_ref().expect("the echoed envelope");
+        assert_eq!(seen["probe"]["status"], "fail");
+        assert_eq!(seen["probe"]["output"]["margin"], 0.02);
+        assert_eq!(seen["probe"]["files"], true);
+        assert!(
+            seen["probe"]["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("exit 3"),
+            "{}",
+            seen["probe"]["note"]
+        );
+        assert_eq!(seen["deliver"]["status"], "blocked");
+        assert_eq!(seen["deliver"]["output"], serde_json::Value::Null);
+        assert_eq!(seen["deliver"]["files"], false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// Provenance cannot rest on git's opinion of the workspace: a declared path an earlier
+    /// passing task wrote is still there when a later task fails without writing it, and a
+    /// `.gitignore` covering that path makes it invisible to every cleanliness test.
+    #[test]
+    fn an_ignored_path_an_earlier_task_wrote_is_not_the_failing_tasks_evidence() {
+        let dir = playbook_pack(
+            "settled-ignored-provenance",
+            r#"
+first = command(
+    name = "first",
+    run = "printf 'evidence/\n' > .gitignore && mkdir -p evidence && printf 'from first\n' > evidence/x.json && printf '{\"ok\": true}\n'",
+    required = False,
+    emits_files = ["evidence/x.json"],
+)
+second = command(
+    name = "second",
+    run = "printf 'second wrote nothing\n' >&2 && exit 1",
+    depends_on = [first],
+    required = False,
+    emits_files = ["evidence/x.json"],
+)
+report = command(
+    name = "report",
+    run = "test ! -e inputs/second && test -e inputs/first/evidence/x.json && printf '{\"ok\": true}\n'",
+    depends_on = [first, second],
+    join = "settled",
+)
+workflow(type = "playbook", tasks = [first, second, report])
+"#,
+        );
+        let out = run_playbook(&dir);
+
+        assert_eq!(out.results[&"first".into()].status, TaskStatus::Pass);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("workspace/evidence/x.json")).unwrap_or_default(),
+            "from first\n",
+            "the ignored file has to survive into the next task for this to prove anything"
+        );
+        let second = &out.results[&"second".into()];
+        assert_eq!(second.status, TaskStatus::Fail);
+        let note = second.note.clone().unwrap_or_default();
+        assert!(note.contains("did not write it"), "{note}");
+        assert!(
+            !dir.join("state/files/second").exists(),
+            "a failing task published an ignored file it inherited"
+        );
+        let report = &out.results[&"report".into()];
+        assert_eq!(report.status, TaskStatus::Pass, "{:?}", report.note);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half of the same rule: a failing task that did rewrite the path owns what it
+    /// wrote, and the settled consumer reads this attempt's content and not its predecessor's.
+    #[test]
+    fn a_failing_task_that_rewrote_a_declared_path_publishes_its_own_content() {
+        let dir = playbook_pack(
+            "settled-rewrote-provenance",
+            r#"
+first = command(
+    name = "first",
+    run = "printf 'evidence/\n' > .gitignore && mkdir -p evidence && printf 'from first\n' > evidence/x.json && printf '{\"ok\": true}\n'",
+    required = False,
+    emits_files = ["evidence/x.json"],
+)
+second = command(
+    name = "second",
+    run = "mkdir -p evidence && printf 'from second\n' > evidence/x.json && exit 1",
+    depends_on = [first],
+    required = False,
+    emits_files = ["evidence/x.json"],
+)
+report = command(
+    name = "report",
+    run = "grep -q 'from second' inputs/second/evidence/x.json && printf '{\"ok\": true}\n'",
+    depends_on = [first, second],
+    join = "settled",
+)
+workflow(type = "playbook", tasks = [first, second, report])
+"#,
+        );
+        let out = run_playbook(&dir);
+
+        assert_eq!(out.results[&"second".into()].status, TaskStatus::Fail);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("state/files/second/evidence/x.json"))
+                .unwrap_or_default(),
+            "from second\n",
+            "the failing task's own write was withheld"
+        );
+        let report = &out.results[&"report".into()];
+        assert_eq!(report.status, TaskStatus::Pass, "{:?}", report.note);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Output drift converts a passing attempt into a measured failure, and a measured failure
+    /// keeps its reading: the reporter that joins settled needs the number the probe printed,
+    /// not a null where the missing file used to be.
+    #[test]
+    fn a_pass_converted_by_an_absent_declared_file_keeps_its_reading() {
+        let dir = playbook_pack(
+            "settled-withheld-output",
+            r#"
+probe = command(
+    name = "probe",
+    run = "printf '{\"pass\": true, \"margin\": 0.42}\n'",
+    required = False,
+    emits_files = ["evidence/probe.json"],
+)
+report = command(
+    name = "report",
+    run = "python3 -c 'import json, os; e = json.loads(os.environ[\"CRUCIBLE_INPUTS\"])[\"probe\"]; print(json.dumps({\"seen\": e[\"status\"], \"margin\": e[\"output\"][\"margin\"], \"files\": e[\"files\"]}))'",
+    depends_on = [probe],
+    join = "settled",
+)
+workflow(type = "playbook", tasks = [probe, report])
+"#,
+        );
+        let out = run_playbook(&dir);
+
+        let probe = &out.results[&"probe".into()];
+        assert_eq!(probe.status, TaskStatus::Fail);
+        let note = probe.note.clone().unwrap_or_default();
+        assert!(note.contains("absent"), "{note}");
+        assert_eq!(
+            probe.output.as_ref().and_then(|o| o.get("margin")),
+            Some(&serde_json::json!(0.42)),
+            "the converted attempt dropped its own reading"
+        );
+        let report = &out.results[&"report".into()];
+        assert_eq!(report.status, TaskStatus::Pass, "{:?}", report.note);
+        let seen = report.output.as_ref().expect("the echoed entry");
+        assert_eq!(seen["seen"], "fail");
+        assert_eq!(seen["margin"], 0.42);
+        assert_eq!(seen["files"], false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// A mapped node that settles blocked publishes no instance rows, so its own drop is the
+    /// only thing that can reach the instance sets an earlier run left behind.
+    #[test]
+    fn a_mapped_node_that_never_expands_drops_the_instance_sets_an_earlier_run_published() {
+        let dir = playbook_pack(
+            "settled-stale-instances",
+            r#"
+discover = command(
+    name = "discover",
+    run = "test ! -f ../fail-gate && printf '{\"targets\": [\"alpha\"]}\n'",
+    required = False,
+    emits = ["targets"],
+)
+audit = command(
+    name = "audit",
+    run = "mkdir -p evidence && printf 'a\n' > evidence/a.json && printf '{\"ok\": true}\n'",
+    depends_on = [discover],
+    over = discover.targets,
+    max_fanout = 2,
+    required = False,
+    emits_files = ["evidence/a.json"],
+)
+workflow(type = "playbook", tasks = [discover, audit])
+"#,
+        );
+        let out = run_playbook(&dir);
+        assert_eq!(out.results[&"audit[alpha]".into()].status, TaskStatus::Pass);
+        assert!(
+            dir.join("state/files/audit[alpha]/evidence/a.json")
+                .exists(),
+            "the instance never published a set to go stale"
+        );
+
+        std::fs::write(dir.join("fail-gate"), "").unwrap();
+        let out = run_playbook(&dir);
+        assert_eq!(out.results[&"discover".into()].status, TaskStatus::Fail);
+        assert_eq!(out.results[&"audit".into()].status, TaskStatus::Blocked);
+        assert!(
+            !dir.join("state/files/audit[alpha]").exists(),
+            "a node that never expanded kept an earlier run's instance set"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

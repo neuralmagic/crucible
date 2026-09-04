@@ -120,7 +120,7 @@ impl Stage {
     }
 }
 
-/// How dependency outputs join into a task's inputs (`join = "all" | "passed"`).
+/// How dependency outputs join into a task's inputs (`join = "all" | "passed" | "settled"`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Join {
@@ -132,6 +132,10 @@ pub enum Join {
     /// reducer over a lossy fan-out (the wide `top_k`: skipped/failed candidates just
     /// don't rank), or a join over reviewers where one being advisory must not stop the run.
     Passed,
+    /// Dispatch once every dependency is terminal whatever it settled as, unless the run has
+    /// halted, forwarding each one as an entry carrying its status, note, output, and whether
+    /// a file set was staged for this consumer.
+    Settled,
 }
 
 impl Join {
@@ -139,6 +143,7 @@ impl Join {
         match self {
             Join::All => "all",
             Join::Passed => "passed",
+            Join::Settled => "settled",
         }
     }
 }
@@ -314,7 +319,6 @@ impl ValidPlan {
         self.topo.iter().map(|&i| &self.plan.tasks[i])
     }
 
-    #[allow(dead_code)]
     pub fn get(&self, name: &TaskName) -> Option<&Task> {
         self.plan.tasks.iter().find(|t| &t.name == name)
     }
@@ -352,6 +356,14 @@ pub enum PlanError {
     RepeatedDependency { task: String, dependency: String },
     #[error("task {task:?}: join = \"passed\" needs at least one dependency")]
     JoinPassedWithoutDependencies { task: String },
+    #[error("task {task:?}: join = \"settled\" needs at least one dependency")]
+    JoinSettledWithoutDependencies { task: String },
+    #[error(
+        "task {task:?}: join = \"settled\" is not accepted on {kind} tasks, whose inputs are a \
+         fixed typed context rather than one entry per dependency. Use join = \"all\" or \
+         join = \"passed\""
+    )]
+    SettledJoinOnFixedContext { task: String, kind: &'static str },
     #[error(
         "task {task:?} is required and joins on {dependency:?} with join = \"all\", but \
          {dependency:?} is advisory and allowed to fail. Set join = \"passed\" on {task:?}, or \
@@ -428,6 +440,21 @@ pub enum PlanError {
         reference: String,
         session: String,
     },
+    #[error(
+        "task {task:?} depends on {dependency:?}, which is a key the engine writes into a task's \
+         inputs itself and would overwrite the dependency's entry with; rename the dependency"
+    )]
+    ReservedDependencyName { task: String, dependency: String },
+    #[error(
+        "task {task:?} (stage {stage:?}) depends on {dependency:?} (stage {dependency_stage:?}); \
+         dependencies cannot cross stages, and each would wait for the other forever"
+    )]
+    CrossStageDependency {
+        task: String,
+        stage: Stage,
+        dependency: String,
+        dependency_stage: Stage,
+    },
     #[error("plan has a dependency cycle involving: {}", .tasks.join(", "))]
     DependencyCycle { tasks: Vec<String> },
     #[error(
@@ -501,9 +528,38 @@ impl Plan {
                         dependency: d.0.clone(),
                     });
                 }
+                if crate::plan::exec::RESERVED_INPUTS.contains(&d.0.as_str()) {
+                    return Err(PlanError::ReservedDependencyName {
+                        task: task(),
+                        dependency: d.0.clone(),
+                    });
+                }
+                let dependency_stage = index.get(d).map_or(t.stage, |&i| self.tasks[i].stage);
+                if dependency_stage != t.stage {
+                    return Err(PlanError::CrossStageDependency {
+                        task: task(),
+                        stage: t.stage,
+                        dependency: d.0.clone(),
+                        dependency_stage,
+                    });
+                }
             }
             if t.join == Join::Passed && t.depends_on.is_empty() {
                 return Err(PlanError::JoinPassedWithoutDependencies { task: task() });
+            }
+            if t.join == Join::Settled {
+                if t.depends_on.is_empty() {
+                    return Err(PlanError::JoinSettledWithoutDependencies { task: task() });
+                }
+                if matches!(
+                    t.task,
+                    TaskKind::TopK { .. } | TaskKind::Report { .. } | TaskKind::Engine { .. }
+                ) {
+                    return Err(PlanError::SettledJoinOnFixedContext {
+                        task: task(),
+                        kind: t.task.label(),
+                    });
+                }
             }
             if t.required && t.join == Join::All {
                 for d in &t.depends_on {
@@ -1251,6 +1307,79 @@ mod tests {
         assert!(p.validate().is_ok());
     }
 
+    /// A settled join names the dependencies it reports on, so a task that names none has
+    /// nothing to wait for and nothing to read.
+    #[test]
+    fn a_settled_join_needs_at_least_one_dependency() {
+        let mut tip = agent("report", &[]);
+        tip.join = Join::Settled;
+        assert_eq!(
+            plan(vec![tip]).validate().unwrap_err(),
+            PlanError::JoinSettledWithoutDependencies {
+                task: "report".to_owned()
+            }
+        );
+    }
+
+    /// The reducer, the engine-owned report, and every engine operation read their inputs
+    /// against a fixed typed context, so a per-dependency envelope has nowhere to land. `top_k`
+    /// and `report` never accept `join` from the DSL at all, so this arm is the JSON route's.
+    #[test]
+    fn a_settled_join_is_refused_on_a_task_with_a_fixed_input_context() {
+        let settled = |kind: TaskKind| {
+            let mut t = agent("tip", &["source"]);
+            t.task = kind;
+            t.join = Join::Settled;
+            let json = serde_json::to_string(&plan(vec![agent("source", &[]), t])).unwrap();
+            Plan::from_json_str(&json)
+                .unwrap()
+                .validate()
+                .expect_err("the plan validated")
+        };
+        for (kind, label) in [
+            (
+                TaskKind::TopK {
+                    k: 1,
+                    direction: Direction::Higher,
+                },
+                "top_k",
+            ),
+            (
+                TaskKind::Report {
+                    destination: ReportDestination::Slack(SlackDestination {}),
+                    template: "t".into(),
+                    result: None,
+                },
+                "report",
+            ),
+            (
+                TaskKind::Engine {
+                    op: EngineOp::Grade,
+                    source: None,
+                    tiebreak: None,
+                },
+                "engine_grade",
+            ),
+        ] {
+            assert_eq!(
+                settled(kind),
+                PlanError::SettledJoinOnFixedContext {
+                    task: "tip".to_owned(),
+                    kind: label,
+                }
+            );
+        }
+    }
+
+    /// A required task joining settled declares that it runs on whatever settled, so the
+    /// advisory-gates-required rule does not reach it.
+    #[test]
+    fn a_required_settled_task_may_join_an_advisory_dependency() {
+        let mut tip = agent("report", &["copy"]);
+        tip.join = Join::Settled;
+        assert!(plan(vec![advisory("copy", &[]), tip]).validate().is_ok());
+    }
+
     #[test]
     fn advisory_work_may_gate_advisory_consumers() {
         let p = plan(vec![
@@ -1359,6 +1488,69 @@ mod tests {
         ]))
         .unwrap();
         let ok = Plan::from_json_str(&json).unwrap().validate().unwrap();
+        assert_eq!(ok.plan().tasks.len(), 2);
+    }
+
+    /// The engine writes its own keys into a task's inputs after the dependency envelope is
+    /// built, so a dependency named after one of them loses the entry the plan promised it.
+    #[test]
+    fn a_dependency_named_after_a_reserved_input_is_refused() {
+        for reserved in crate::plan::exec::RESERVED_INPUTS {
+            assert_eq!(
+                plan(vec![agent(reserved, &[]), agent("consumer", &[reserved])])
+                    .validate()
+                    .unwrap_err(),
+                PlanError::ReservedDependencyName {
+                    task: "consumer".to_owned(),
+                    dependency: reserved.to_owned(),
+                }
+            );
+        }
+        let ok = plan(vec![agent("items", &[]), agent("consumer", &["items"])])
+            .validate()
+            .expect("a name that only looks like a reserved one");
+        assert_eq!(ok.plan().tasks.len(), 2);
+    }
+
+    /// The two stages are scheduled against each other: an epilogue task waits for every
+    /// main-graph task to settle, and a main-graph task waits for its dependencies. An edge
+    /// either way is a deadlock the executor cannot see, so it dispatches nothing and reports a
+    /// completed run with no rows at all.
+    #[test]
+    fn a_dependency_that_crosses_a_stage_is_refused() {
+        let mut wrap = agent("wrap", &[]);
+        wrap.stage = Stage::Epilogue;
+        assert_eq!(
+            plan(vec![wrap.clone(), agent("build", &["wrap"])])
+                .validate()
+                .unwrap_err(),
+            PlanError::CrossStageDependency {
+                task: "build".to_owned(),
+                stage: Stage::Iteration,
+                dependency: "wrap".to_owned(),
+                dependency_stage: Stage::Epilogue,
+            }
+        );
+
+        let mut wrap_on_build = agent("wrap", &["build"]);
+        wrap_on_build.stage = Stage::Epilogue;
+        assert_eq!(
+            plan(vec![agent("build", &[]), wrap_on_build])
+                .validate()
+                .unwrap_err(),
+            PlanError::CrossStageDependency {
+                task: "wrap".to_owned(),
+                stage: Stage::Epilogue,
+                dependency: "build".to_owned(),
+                dependency_stage: Stage::Iteration,
+            }
+        );
+
+        let mut publish = agent("publish", &["wrap"]);
+        publish.stage = Stage::Epilogue;
+        let ok = plan(vec![wrap, publish])
+            .validate()
+            .expect("one stage, one graph");
         assert_eq!(ok.plan().tasks.len(), 2);
     }
 }

@@ -23,7 +23,7 @@ Tasks marked isolated = True must run concurrently in disposable worktrees; thei
 
 session = "name" must preserve one logical agent conversation across dependency-ordered tasks and loop iterations. Tasks sharing a session must not be isolated and must be dependency-ordered.
 
-A required task must not depend, through a path of "all"-join edges, on a task declared advisory. Such a graph asserts both that a failure is tolerable and that the work it gates must pass, and no execution of it can produce an honest verdict. Validation must reject it before dispatch, naming both tasks. A required task joining "passed" is exempt: it declares that it runs on whatever survived.
+A required task must not depend, through a path of "all"-join edges, on a task declared advisory. Such a graph asserts both that a failure is tolerable and that the work it gates must pass, and no execution of it can produce an honest verdict. Validation must reject it before dispatch, naming both tasks. A required task joining "passed" or "settled" is exempt: it declares that it runs on whatever settled.
 
 A list of tasks must be accepted wherever a list of task names is, so an author never wraps one to pass it. A task constructed in workflow.star but omitted from workflow(tasks = ...) must be a compile error.
 

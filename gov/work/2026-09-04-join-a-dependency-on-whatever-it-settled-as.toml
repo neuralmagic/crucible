@@ -1,0 +1,85 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-09-04-001"
+title = "Join a dependency on whatever it settled as"
+status = "done"
+created = "2026-09-04"
+started = "2026-09-04"
+completed = "2026-09-04"
+refs = [
+    "RFC-0002:C-SETTLED-JOIN",
+    "RFC-0002:C-TASK-FILES",
+    "RFC-0002:C-PLAYBOOK-LANE",
+    "RFC-0002:C-PLAYBOOK-RESUME",
+    "RFC-0001:C-WORKFLOW",
+]
+
+[content]
+description = """
+A reporting task could not be reached on the path it exists to report on. `join = "all"` blocks it behind the failure and `join = "passed"` forwards only what survived, so a pack that wants a verdict written after a negative reading had to route every producer through a paired gate task that re-emitted the reading as a pass. The backport pack carries twelve of them.
+
+`join = "settled"` is the edge that says it. The engine dispatches such a task once every declared dependency holds a terminal result, whatever it is, and forwards each one as `{status, note, output, files}` rather than as the output itself, so a script switched from `passed` to `settled` fails at its first read instead of consuming a negative reading as a positive one. A mapped dependency's entry additionally carries a `per_instance` map keyed by item.
+
+It is a statement about dependency status, not a scheduling exemption: a required failure, either ceiling, or a truncated graph still blocks it. Running after dispatch has stopped is the epilogue's job.
+
+Declared files follow the same edge. A failing attempt's set is captured before the workspace rollback, published whole or not at all, and staged only into a task that joins settled on it directly. On the failure path a declared path counts only when that attempt wrote it, tested against the workspace's committed state, so a file an earlier task committed is not published as this one's evidence. A task that settles skipped, transport-failed, or blocked drops any set an earlier run left under its name, so `files` in the envelope means what it says.
+
+`"status": "fail"` in a task's own output joins `"skipped"` as an engine-meaningful value, which is how an agent turn with no exit code and no `pass` grading vetoes itself. Both, plus `complete`/`reason`, `item`, and `kept`, are now documented in a reserved-fields table in the generated DSL reference; none of them was written down anywhere before.
+
+`grade()` refuses the join at its call site: it folds the evidence that passed. So do `top_k`, the engine-owned `report`, and every engine operation, which read a fixed typed context."""
+
+[[content.acceptance_criteria]]
+text = "a task joining settled dispatches once every dependency is terminal, over each of fail, self-declared skip, walker-declared skip, transport, and blocked"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "a settled join stays blocked by a required failure, a cost ceiling, and a wall-clock ceiling"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "a settled join imposes no runnability condition, so a required settled tip survives an unrunnable advisory branch"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "each dependency arrives as {status, note, output, files}, with per_instance for a mapped node, present and empty where it produced no instances"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "an all or passed join still receives only contributing outputs, and a Fail-folded mapped node still reaches a passed consumer"
+status = "done"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "a failing attempt's declared files are captured, published whole or not at all, and staged only into a settled dependent"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "on the failure path only paths the attempt itself wrote are captured, tested against the workspace's committed state"
+status = "done"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "a task settling skipped, transport-failed, blocked, or truncated drops the set an earlier run published under its name"
+status = "done"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = 'a task settles itself failing with "status": "fail", keeping its object and skipping the declared-field check'
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "settled is refused with no dependencies, and on top_k, report, and engine tasks; grade refuses it at its call site"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "the DSL reference documents the join's third value and the reserved result fields and inputs, with a drift test"
+status = "done"
+category = "chore"

@@ -26,7 +26,7 @@ An agent turn driven by a prompt.
 | `session` | `session \| str` | Join a durable conversation. A task in a session cannot be isolated. |
 | `depends_on` | `list[task]` | Dependencies. Readiness decides execution order; declaration order does not. |
 | `needs` | `"any" \| "all"` | How many dependencies must be admitted before the task is ready. |
-| `join` | `"all" \| "passed"` | Which dependencies must have passed. `passed` forwards the non-empty successful set. |
+| `join` | `"all" \| "passed" \| "settled"` | Which dependencies must have passed: `all` every one, `passed` at least one and only those are forwarded, `settled` none — it dispatches once every dependency is terminal, whatever it settled as, unless the run has already halted, and forwards each one as {status, note, output, files}. |
 | `required` | `bool` | False makes the task advisory: it blocks dependents but cannot invalidate the run. |
 | `isolated` | `bool` | Run in a disposable worktree. File changes are discarded; only JSON output continues. |
 | `emits` | `list[str]` | Result fields the task promises in its JSON output. |
@@ -50,7 +50,7 @@ An agent turn whose prompt is a skill's instructions plus its arguments.
 | `session` | `session \| str` | Join a durable conversation. A task in a session cannot be isolated. |
 | `depends_on` | `list[task]` | Dependencies. Readiness decides execution order; declaration order does not. |
 | `needs` | `"any" \| "all"` | How many dependencies must be admitted before the task is ready. |
-| `join` | `"all" \| "passed"` | Which dependencies must have passed. `passed` forwards the non-empty successful set. |
+| `join` | `"all" \| "passed" \| "settled"` | Which dependencies must have passed: `all` every one, `passed` at least one and only those are forwarded, `settled` none — it dispatches once every dependency is terminal, whatever it settled as, unless the run has already halted, and forwards each one as {status, note, output, files}. |
 | `required` | `bool` | False makes the task advisory: it blocks dependents but cannot invalidate the run. |
 | `isolated` | `bool` | Run in a disposable worktree. File changes are discarded; only JSON output continues. |
 | `emits` | `list[str]` | Result fields the task promises in its JSON output. |
@@ -69,7 +69,7 @@ A deterministic shell task in the candidate workspace.
 | `run` | `str` | The command, run through `sh -c`. |
 | `depends_on` | `list[task]` | Dependencies. Readiness decides execution order; declaration order does not. |
 | `needs` | `"any" \| "all"` | How many dependencies must be admitted before the task is ready. |
-| `join` | `"all" \| "passed"` | Which dependencies must have passed. `passed` forwards the non-empty successful set. |
+| `join` | `"all" \| "passed" \| "settled"` | Which dependencies must have passed: `all` every one, `passed` at least one and only those are forwarded, `settled` none — it dispatches once every dependency is terminal, whatever it settled as, unless the run has already halted, and forwards each one as {status, note, output, files}. |
 | `required` | `bool` | False makes the task advisory: it blocks dependents but cannot invalidate the run. |
 | `isolated` | `bool` | Run in a disposable worktree. File changes are discarded; only JSON output continues. |
 | `emits` | `list[str]` | Result fields the task promises in its JSON output. |
@@ -90,7 +90,7 @@ A measurement command. Its last non-empty stdout line is a JSON object; `pass = 
 | `direction` | `"lower" \| "higher"` | Which side of the threshold passes. |
 | `depends_on` | `list[task]` | Dependencies. Readiness decides execution order; declaration order does not. |
 | `needs` | `"any" \| "all"` | How many dependencies must be admitted before the task is ready. |
-| `join` | `"all" \| "passed"` | Which dependencies must have passed. `passed` forwards the non-empty successful set. |
+| `join` | `"all" \| "passed" \| "settled"` | Which dependencies must have passed: `all` every one, `passed` at least one and only those are forwarded, `settled` none — it dispatches once every dependency is terminal, whatever it settled as, unless the run has already halted, and forwards each one as {status, note, output, files}. |
 | `required` | `bool` | False makes the task advisory: it blocks dependents but cannot invalidate the run. |
 | `isolated` | `bool` | Run in a disposable worktree. File changes are discarded; only JSON output continues. |
 | `emits` | `list[str]` | Result fields the task promises in its JSON output. |
@@ -217,3 +217,25 @@ Engine-owned reducer: the best `k` dependency outputs by numeric score.
 Expand the built-in propose/apply/measure/decide loop into visible nodes, plus the tasks passed to it.
 
 Takes one positional argument, `extra_tasks`.
+
+## Reserved fields
+
+Names the engine reads and writes for itself. They are not constructor arguments; they appear in a task's own JSON output and in the inputs it receives.
+
+### A task's own JSON output
+
+Read out of the object the task returns.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `status` | `"pass" \| "fail" \| "skipped"` | Settles the task, overriding an exit code or `pass`. Any other value is ignored. |
+
+### Inputs the engine writes
+
+Present alongside the dependency entries, never wrapped in one.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `item` | `str` | This mapped instance's key, one per item of the list `over` names. |
+| `kept` | `object` | The kept candidate, in an epilogue task only. |
+| `outcome` | `object` | How the main graph ended and what each of its tasks settled as, as `{"exit": str, "tasks": {name: {"status", "note"}}}`, in an epilogue task only. |

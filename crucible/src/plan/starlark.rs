@@ -685,8 +685,24 @@ pub enum CompileError {
     TopKWithoutDependencies,
     #[error("stage must be `iteration` or `epilogue`, got {got:?}")]
     UnknownStage { got: String },
-    #[error("join must be `all` or `passed`, got {got:?}")]
+    #[error("join must be `all`, `passed`, or `settled`, got {got:?}")]
     UnknownJoin { got: String },
+    #[error(
+        "grade() folds the evidence that passed, so it does not accept join = \"settled\"; use \
+         join = \"passed\", or read the failed evidence from a command or evaluate task that \
+         joins settled"
+    )]
+    SettledJoinOnGrade,
+    #[error(
+        "join = \"settled\" names the dependencies it reports on, so it needs at least one; \
+         give {task:?} a depends_on, or drop the join"
+    )]
+    SettledJoinWithoutDependencies { task: String },
+    #[error(
+        "task {task:?} depends on {dependency:?}, which is a key the engine writes into a task's \
+         inputs itself and would overwrite the dependency's entry with; rename the dependency"
+    )]
+    ReservedDependencyName { task: String, dependency: String },
     #[error(
         "\"over\" must name a declared output field of a task this one depends on, as \
          `over = producer.field`"
@@ -1189,7 +1205,10 @@ fn constructor(
             if let TaskKind::Engine { tiebreak: slot, .. } = &mut task.task {
                 *slot = tiebreak;
             }
-            task.join = parse_join(&take_string_default(&mut named, "join", "passed")?)?;
+            task.join = match parse_join(&take_string_default(&mut named, "join", "passed")?)? {
+                Join::Settled => return Err(CompileError::SettledJoinOnGrade),
+                join => join,
+            };
             task
         }
         "decide" => {
@@ -1389,6 +1408,21 @@ fn dsl_task(
         max_fanout: take_optional_fanout(named)?,
     };
     check_fanout(&task)?;
+    if task.join == Join::Settled && task.depends_on.is_empty() {
+        return Err(CompileError::SettledJoinWithoutDependencies {
+            task: task.name.0.clone(),
+        });
+    }
+    if let Some(reserved) = task
+        .depends_on
+        .iter()
+        .find(|d| crate::plan::exec::RESERVED_INPUTS.contains(&d.0.as_str()))
+    {
+        return Err(CompileError::ReservedDependencyName {
+            task: task.name.0.clone(),
+            dependency: reserved.0.clone(),
+        });
+    }
     Ok(task)
 }
 
@@ -1871,6 +1905,7 @@ fn parse_join(join: &str) -> Result<Join> {
     match join {
         "all" => Ok(Join::All),
         "passed" => Ok(Join::Passed),
+        "settled" => Ok(Join::Settled),
         other => Err(CompileError::UnknownJoin {
             got: other.to_owned(),
         }),
@@ -4733,5 +4768,115 @@ workflow(reviews + [gate("gate", reviews)])
         let compiled = compile_source(source, &pack.join("workflow.star"), &pack).unwrap();
         assert_eq!(compiled.workflow.tasks[0].emits_files, ["A.md"]);
         let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// A settled join is a task knob, so every constructor that builds a graph task takes it,
+    /// mapped or not.
+    #[test]
+    fn every_task_constructor_accepts_a_settled_join() {
+        let pack = temp_pack("settled-join");
+        std::fs::create_dir_all(pack.join("skills/demo")).unwrap();
+        std::fs::write(pack.join("skills/demo/SKILL.md"), "# demo\n\nDo it.\n").unwrap();
+        let source = r#"
+seed = command(name = "seed", run = "./seed.sh", emits = ["targets"])
+turn = agent(name = "turn", prompt = "p", depends_on = [seed], join = "settled")
+helper = skill(
+    name = "helper",
+    skill = "skills/demo",
+    depends_on = [seed],
+    join = "settled",
+)
+sweep = command(name = "sweep", run = "./sweep.sh", depends_on = [seed], join = "settled")
+probe = evaluate(name = "probe", run = "./probe.sh", depends_on = [seed], join = "settled")
+mapped = command(
+    name = "mapped",
+    run = "./one.sh",
+    depends_on = [seed],
+    join = "settled",
+    over = seed.targets,
+    max_fanout = 4,
+)
+workflow(type = "playbook", tasks = [seed, turn, helper, sweep, probe, mapped])
+"#;
+        let compiled = compile_source(source, &pack.join("workflow.star"), &pack)
+            .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
+        for name in ["turn", "helper", "sweep", "probe", "mapped"] {
+            let task = compiled
+                .workflow
+                .tasks
+                .iter()
+                .find(|task| task.name.0 == name)
+                .unwrap_or_else(|| panic!("{name} is missing"));
+            assert_eq!(task.join, Join::Settled, "{name}");
+        }
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// `grade()` folds the evidence that passed, so a settled join has no meaning there. The
+    /// refusal carries the constructor's own site rather than the plan's.
+    #[test]
+    fn grade_refuses_a_settled_join_at_its_call_site() {
+        let pack = temp_pack("settled-grade");
+        let source = "s = evaluate(name = \"s\", run = \"true\")\n\
+                      g = grade(name = \"g\", score = s, evidence = [s], join = \"settled\")\n\
+                      workflow(type = \"custom\", tasks = [s, g], result = g)\n";
+        let error = compile_source(source, &pack.join("workflow.star"), &pack)
+            .expect_err("grade accepted a settled join");
+        assert!(error.message().contains("join = \"settled\""), "{error:?}");
+        let anchor = error.anchor().expect("a located refusal");
+        assert_eq!(anchor.span.begin_line, 2);
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// A settled join names the dependencies it reports on, so a task that names none is refused
+    /// where it was written rather than at plan validation.
+    #[test]
+    fn a_settled_join_without_dependencies_is_refused_at_its_call_site() {
+        let pack = temp_pack("settled-orphan");
+        let source = "a = command(name = \"a\", run = \"true\")\n\
+             tip = command(name = \"tip\", run = \"true\", join = \"settled\")\n\
+             workflow(type = \"playbook\", tasks = [a, tip])\n";
+        let error = compile_source(source, &pack.join("workflow.star"), &pack)
+            .expect_err("a settled join with no dependencies compiled");
+        assert!(error.message().contains("\"tip\""), "{error:?}");
+        let anchor = error.anchor().expect("a located refusal");
+        assert_eq!(anchor.span.begin_line, 2);
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// The vocabulary the DSL accepts for `join`, and what it says when it does not recognise a
+    /// value.
+    #[test]
+    fn join_accepts_three_values_and_names_them_when_it_refuses() {
+        for (raw, join) in [
+            ("all", Join::All),
+            ("passed", Join::Passed),
+            ("settled", Join::Settled),
+        ] {
+            assert_eq!(parse_join(raw).unwrap(), join);
+        }
+        let error = parse_join("always").expect_err("`always` is not a join");
+        let rendered = error.to_string();
+        assert!(rendered.contains("settled"), "{rendered}");
+        assert!(rendered.contains("\"always\""), "{rendered}");
+    }
+    /// The reserved keys are refused where the graph is written, so the author reads the line
+    /// that named the dependency rather than a plan-validation error with no source location.
+    #[test]
+    fn a_dependency_named_after_a_reserved_input_is_refused_at_its_call_site() {
+        for reserved in crate::plan::exec::RESERVED_INPUTS {
+            let pack = temp_pack(&format!("reserved-dep-{reserved}"));
+            let source = format!(
+                "a = command(name = \"{reserved}\", run = \"true\")\n\
+                 tip = command(name = \"tip\", run = \"true\", depends_on = [a])\n\
+                 workflow(type = \"playbook\", tasks = [a, tip])\n"
+            );
+            let error = compile_source(&source, &pack.join("workflow.star"), &pack)
+                .expect_err("a dependency on a reserved name compiled");
+            assert!(error.message().contains(reserved), "{error:?}");
+            let anchor = error.anchor().expect("a located refusal");
+            assert_eq!(anchor.span.begin_line, 2);
+            let _ = std::fs::remove_dir_all(&pack);
+        }
     }
 }
