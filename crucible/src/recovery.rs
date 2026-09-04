@@ -90,47 +90,7 @@ pub(crate) enum Classification {
     DiedBetweenIterations { last_iter: u32 },
 }
 
-/// `Shutdown.outcome` tokens. Unknown maps to `Other` so a newer writer never breaks an
-/// older resumer.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ShutdownOutcome {
-    Finished,
-    Solved,
-    Budget,
-    Stopped,
-    Escalated,
-    Stalled,
-    Error,
-    Other(String),
-}
-
-impl ShutdownOutcome {
-    pub(crate) fn parse(token: &str) -> Self {
-        match token {
-            "finished" => ShutdownOutcome::Finished,
-            "solved" => ShutdownOutcome::Solved,
-            "budget" => ShutdownOutcome::Budget,
-            "stopped" => ShutdownOutcome::Stopped,
-            "escalated" => ShutdownOutcome::Escalated,
-            "stalled" => ShutdownOutcome::Stalled,
-            "error" => ShutdownOutcome::Error,
-            other => ShutdownOutcome::Other(other.to_string()),
-        }
-    }
-
-    fn as_str(&self) -> &str {
-        match self {
-            ShutdownOutcome::Finished => "finished",
-            ShutdownOutcome::Solved => "solved",
-            ShutdownOutcome::Budget => "budget",
-            ShutdownOutcome::Stopped => "stopped",
-            ShutdownOutcome::Escalated => "escalated",
-            ShutdownOutcome::Stalled => "stalled",
-            ShutdownOutcome::Error => "error",
-            ShutdownOutcome::Other(t) => t,
-        }
-    }
-}
+pub(crate) use crucible_contract::ShutdownOutcome;
 
 fn trunc(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -359,6 +319,7 @@ impl TailScan {
                 handle,
                 trace_id,
                 mode,
+                ..
             } => {
                 self.open_approval = Some(PendingApproval {
                     handle: handle.clone(),
@@ -510,9 +471,11 @@ pub(crate) fn plan_recovery(s: &SessionRecovery, iterations: u32, max_cost: f64)
                     ),
                 };
             }
-            // Budget falls through: the operator may resume with a raised cap.
+            // Budget falls through: the operator may resume with a raised cap. Suspended
+            // falls through with its approval still open, so the wait re-arms below.
             ShutdownOutcome::Budget
             | ShutdownOutcome::Stopped
+            | ShutdownOutcome::Suspended
             | ShutdownOutcome::Stalled
             | ShutdownOutcome::Error
             | ShutdownOutcome::Other(_) => {}
@@ -594,6 +557,86 @@ pub(crate) fn resume_approval(
     }
 }
 
+/// The old folds against the contract's [`crucible_contract::LoopState`]: every test that
+/// classifies a log runs both and proves they agree, so the contract fold can replace the
+/// scanners here without a behavior change.
+#[cfg(test)]
+pub(crate) mod parity {
+    use super::{Classification, SessionRecovery};
+    use crate::provisioning::WaitMode;
+    use crucible_contract::{LoopState, WaitMode as WireWaitMode};
+    use std::path::Path;
+
+    pub(crate) fn fold(session_log: &Path) -> LoopState {
+        let body = std::fs::read_to_string(session_log).expect("session log readable");
+        LoopState::from_lines(body.lines())
+    }
+
+    /// Both folds over the same file agree on the classification, the resume counters, and the
+    /// open approval.
+    pub(crate) fn assert_matches(session_log: &Path, got: &SessionRecovery) {
+        let state = fold(session_log);
+        let theirs = state.classify();
+        assert_eq!(theirs.class(), got.classification.class(), "class");
+        assert_eq!(theirs.iter(), got.classification.iter(), "iter");
+        assert_eq!(theirs.detail(), got.classification.detail(), "detail");
+        if let Classification::CleanExit { outcome, reason } = &got.classification {
+            match &theirs {
+                crucible_contract::Classification::CleanExit {
+                    outcome: o,
+                    reason: r,
+                } => {
+                    assert_eq!(o.as_str(), outcome.as_str(), "outcome token");
+                    assert_eq!(r, reason, "reason");
+                }
+                other => panic!("contract fold classified {other:?}"),
+            }
+        }
+        assert_eq!(
+            state.has_rows(),
+            got.resume.has_rows_for_parity(),
+            "has_rows"
+        );
+        let view = state.resume_view();
+        let rs = &got.resume;
+        assert_eq!(view.rows.len(), rs.rows.len(), "row count");
+        for (w, r) in view.rows.iter().zip(rs.rows.iter()) {
+            assert_eq!(w.iter, r.iter, "row iter");
+            assert_eq!(w.decision, r.decision, "row decision");
+            assert_eq!(w.score, r.score, "row score");
+            assert_eq!(w.tiebreak, r.tiebreak, "row tiebreak");
+            assert_eq!(w.total, r.total, "row total");
+            assert_eq!(w.phase, r.phase, "row phase");
+            assert_eq!(w.kept_snap, r.kept_snap, "row kept_snap");
+        }
+        assert_eq!(view.best_score, rs.best_score, "best_score");
+        assert_eq!(view.best_tiebreak, rs.best_tiebreak, "best_tiebreak");
+        assert_eq!(view.baseline_score, rs.baseline_score, "baseline_score");
+        assert_eq!(view.baseline_total, rs.baseline_total, "baseline_total");
+        assert_eq!(view.spent, rs.spent, "spent");
+        assert_eq!(view.next_iter, rs.next_iter, "next_iter");
+        assert_eq!(view.solved_any, rs.solved_any, "solved_any");
+        assert_eq!(view.identity, rs.identity, "identity");
+        assert_eq!(
+            view.published_branches, rs.published_branches,
+            "published_branches"
+        );
+        match (state.open_approval(), &got.pending_approval) {
+            (None, None) => {}
+            (Some(a), Some(b)) => {
+                assert_eq!(a.handle, b.handle, "approval handle");
+                assert_eq!(a.trace_id, b.trace_id, "approval trace");
+                let mode = match b.mode {
+                    WaitMode::Block => WireWaitMode::Block,
+                    WaitMode::Continue => WireWaitMode::Continue,
+                };
+                assert_eq!(a.mode, mode, "approval mode");
+            }
+            (a, b) => panic!("open approval disagrees: contract {a:?}, scanner {b:?}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -645,8 +688,19 @@ mod tests {
     fn classify(name: &str, events: &[SessionEvent]) -> SessionRecovery {
         let path = write_log(name, events);
         let got = classify_session(&path).unwrap();
+        super::parity::assert_matches(&path, &got);
         let _ = std::fs::remove_file(&path);
         got
+    }
+
+    /// A rowless log is refused by the scanner and folds to `has_rows() == false` in the
+    /// contract, the same verdict.
+    #[test]
+    fn rowless_log_folds_without_rows_in_the_contract_too() {
+        let path = write_log("rowless-parity", &[iteration_phase(1)]);
+        assert!(classify_session(&path).is_err());
+        assert!(!super::parity::fold(&path).has_rows());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -881,6 +935,9 @@ mod tests {
             handle: "https://example.com/pr/7".into(),
             trace_id: "c=48".into(),
             mode: "block".into(),
+            task: None,
+            source: None,
+            park: None,
         });
         let got = classify("awaiting", &events);
         match &got.classification {
@@ -913,10 +970,16 @@ mod tests {
             handle: "h".into(),
             trace_id: "t".into(),
             mode: "block".into(),
+            task: None,
+            source: None,
+            park: None,
         });
         events.push(SessionEvent::ApprovalResolved {
             outcome: "denied".into(),
             reason: "policy".into(),
+            trace_id: String::new(),
+            by: None,
+            source: None,
         });
         let got = classify("resolved", &events);
         assert!(got.pending_approval.is_none());
@@ -937,6 +1000,9 @@ mod tests {
             handle: "h".into(),
             trace_id: "regime-x".into(),
             mode: "continue".into(),
+            task: None,
+            source: None,
+            park: None,
         });
         events.push(row(1, "discard", 250.0));
         let got = classify("continue-wait", &events);
@@ -971,6 +1037,9 @@ mod tests {
             handle: "h".into(),
             trace_id: "t".into(),
             mode: "block".into(),
+            task: None,
+            source: None,
+            park: None,
         });
         events.push(SessionEvent::Shutdown {
             outcome: "stopped".into(),
@@ -1011,6 +1080,9 @@ mod tests {
             handle: "h".into(),
             trace_id: "t".into(),
             mode: "continue".into(),
+            task: None,
+            source: None,
+            park: None,
         });
         events.push(SessionEvent::AgentStart { iter: 2 });
         let got = classify("precedence", &events);

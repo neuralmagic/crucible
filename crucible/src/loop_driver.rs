@@ -56,6 +56,13 @@ pub(crate) struct ResumeState {
     pub published_branches: Vec<String>,
 }
 
+#[cfg(test)]
+impl ResumeState {
+    pub(crate) fn has_rows_for_parity(&self) -> bool {
+        !self.rows.is_empty()
+    }
+}
+
 /// Optional runtime state for special loop starts (remote control and resume). Kept in
 /// one argument so the core loop boundary stays small as front-ends evolve.
 #[derive(Default)]
@@ -2185,7 +2192,9 @@ mod tests {
     /// The counter fold as `--resume` consumes it (through the classifier), so these
     /// replay tests exercise the same path `run.rs` takes.
     fn load_resume_state(session_log: &std::path::Path) -> Result<ResumeState> {
-        crate::recovery::classify_session(session_log).map(|s| s.resume)
+        let got = crate::recovery::classify_session(session_log)?;
+        crate::recovery::parity::assert_matches(session_log, &got);
+        Ok(got.resume)
     }
 
     /// The 401 that killed a 5h turn, plus the other transport signatures, classify as retryable;

@@ -300,6 +300,9 @@ impl Reporter for SessionReporter {
             handle: handle.to_string(),
             trace_id: trace_id.to_string(),
             mode: mode.as_str().to_string(),
+            task: None,
+            source: None,
+            park: None,
         });
     }
 
@@ -307,6 +310,9 @@ impl Reporter for SessionReporter {
         self.emit(&SessionEvent::ApprovalResolved {
             outcome: outcome.to_string(),
             reason: reason.to_string(),
+            trace_id: String::new(),
+            by: None,
+            source: None,
         });
     }
 
