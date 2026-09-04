@@ -30,11 +30,7 @@ impl GateCtx {
     }
 
     /// Apply the held resolution, or report that the task is waiting for one.
-    pub fn attempt(
-        &self,
-        task: &Task,
-        inputs: &BTreeMap<TaskName, Value>,
-    ) -> Attempt {
+    pub fn attempt(&self, task: &Task, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
         let TaskKind::Approve {
             summary,
             source,
@@ -106,10 +102,7 @@ pub enum SourceError {
 
 impl ApprovalSourceSpec {
     /// Resolve upstream references in a gate source against settled task outputs.
-    pub fn resolve(
-        &self,
-        inputs: &BTreeMap<TaskName, Value>,
-    ) -> Result<GateSource, SourceError> {
+    pub fn resolve(&self, inputs: &BTreeMap<TaskName, Value>) -> Result<GateSource, SourceError> {
         let read = |r: &RefOrLiteral| -> Result<String, SourceError> {
             match r {
                 RefOrLiteral::Literal(s) => Ok(s.clone()),
@@ -215,11 +208,7 @@ mod tests {
             TaskName("open_pr".into()),
             serde_json::json!({"pr_url": "https://github.com/o/r/pull/9"}),
         )]);
-        let a = attempt(
-            &ctx,
-            &gate(pr_from("open_pr", "pr_url"), &["open_pr"]),
-            &inputs,
-        );
+        let a = ctx.attempt(&gate(pr_from("open_pr", "pr_url"), &["open_pr"]), &inputs);
         assert_eq!(a.cost_usd, 0.0);
         let AttemptOutcome::Await(g) = a.outcome else {
             panic!("an unresolved gate awaits");
@@ -239,11 +228,7 @@ mod tests {
     #[test]
     fn a_native_gate_uses_the_task_name_as_its_handle() {
         let ctx = GateCtx::new("run-1");
-        let a = attempt(
-            &ctx,
-            &gate(ApprovalSourceSpec::Native, &[]),
-            &BTreeMap::new(),
-        );
+        let a = ctx.attempt(&gate(ApprovalSourceSpec::Native, &[]), &BTreeMap::new());
         let AttemptOutcome::Await(g) = a.outcome else {
             panic!("awaits");
         };
@@ -258,11 +243,7 @@ mod tests {
             "approve:run-1:review",
             GateResolution::granted(Some("alice".parse().unwrap()), "native"),
         );
-        let a = attempt(
-            &ctx,
-            &gate(ApprovalSourceSpec::Native, &[]),
-            &BTreeMap::new(),
-        );
+        let a = ctx.attempt(&gate(ApprovalSourceSpec::Native, &[]), &BTreeMap::new());
         let AttemptOutcome::Pass(out) = a.outcome else {
             panic!("a grant passes");
         };
@@ -277,11 +258,7 @@ mod tests {
                 "github_pr",
             ),
         );
-        let a = attempt(
-            &ctx,
-            &gate(ApprovalSourceSpec::Native, &[]),
-            &BTreeMap::new(),
-        );
+        let a = ctx.attempt(&gate(ApprovalSourceSpec::Native, &[]), &BTreeMap::new());
         let AttemptOutcome::Fail { note, output } = a.outcome else {
             panic!("a denial fails");
         };
@@ -289,19 +266,14 @@ mod tests {
         assert_eq!(output.expect("carries the denial")["denied_by"], "bob");
 
         ctx.resolve("approve:run-1:review", GateResolution::timeout());
-        let a = attempt(
-            &ctx,
-            &gate(ApprovalSourceSpec::Native, &[]),
-            &BTreeMap::new(),
-        );
+        let a = ctx.attempt(&gate(ApprovalSourceSpec::Native, &[]), &BTreeMap::new());
         assert!(matches!(a.outcome, AttemptOutcome::Fail { .. }));
     }
 
     #[test]
     fn a_source_read_from_a_missing_producer_or_field_fails_the_gate() {
         let ctx = GateCtx::new("run-1");
-        let a = attempt(
-            &ctx,
+        let a = ctx.attempt(
             &gate(pr_from("open_pr", "pr_url"), &["open_pr"]),
             &BTreeMap::new(),
         );
@@ -311,11 +283,7 @@ mod tests {
         assert!(note.contains("no passing output"), "{note}");
         let inputs =
             BTreeMap::from([(TaskName("open_pr".into()), serde_json::json!({"number": 9}))]);
-        let a = attempt(
-            &ctx,
-            &gate(pr_from("open_pr", "pr_url"), &["open_pr"]),
-            &inputs,
-        );
+        let a = ctx.attempt(&gate(pr_from("open_pr", "pr_url"), &["open_pr"]), &inputs);
         let AttemptOutcome::Fail { note, .. } = a.outcome else {
             panic!("fails");
         };
@@ -324,7 +292,7 @@ mod tests {
             key: RefOrLiteral::Literal("PROJ-1".into()),
             until: JiraUntil::Status("Ready".into()),
         };
-        let AttemptOutcome::Await(g) = attempt(&ctx, &gate(jira, &[]), &BTreeMap::new()).outcome
+        let AttemptOutcome::Await(g) = ctx.attempt(&gate(jira, &[]), &BTreeMap::new()).outcome
         else {
             panic!("awaits");
         };
