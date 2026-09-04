@@ -462,6 +462,22 @@ impl TaskRunner for EpilogueRunner {
             .collect();
         self.inner.run_many(&batch)
     }
+
+    fn stage(&mut self, task: &Task, producers: &[&Task]) -> Result<(), String> {
+        self.inner.stage(task, producers)
+    }
+
+    fn settled(&mut self, task: &Task, passed: bool) {
+        self.inner.settled(task, passed);
+    }
+
+    fn has_captured_files(&self, task: &Task) -> bool {
+        self.inner.has_captured_files(task)
+    }
+
+    fn drop_captured(&mut self, task: &Task) {
+        self.inner.drop_captured(task);
+    }
 }
 
 /// What the propose task's post-turn drains decided, parked here for the driver: the
@@ -750,6 +766,22 @@ impl<R: Reporter> TaskRunner for LoopTaskRunner<'_, R> {
 
     fn run_many(&mut self, batch: &[BatchItem<'_>]) -> Vec<Attempt> {
         self.workflow_runner.run_many(batch)
+    }
+
+    fn stage(&mut self, task: &Task, producers: &[&Task]) -> Result<(), String> {
+        self.workflow_runner.stage(task, producers)
+    }
+
+    fn settled(&mut self, task: &Task, passed: bool) {
+        self.workflow_runner.settled(task, passed);
+    }
+
+    fn has_captured_files(&self, task: &Task) -> bool {
+        self.workflow_runner.has_captured_files(task)
+    }
+
+    fn drop_captured(&mut self, task: &Task) {
+        self.workflow_runner.drop_captured(task);
     }
 }
 
@@ -1335,6 +1367,61 @@ mod tests {
     use crate::{Prepared, manifest, reporter, run, stream};
     use clap::Parser;
     use std::path::Path;
+
+    /// The one-task plan the forwarding tests pull a `Task` out of.
+    fn task_named(name: &str) -> Task {
+        let plan: crate::plan::ir::Plan = toml::from_str(&format!(
+            "version = 1\n[budget]\nusd = 1.0\n[[task]]\nname = \"{name}\"\nkind = \"command\"\ncommand = \"true\"\nemits_files = [\"out.txt\"]\n"
+        ))
+        .unwrap();
+        plan.validate()
+            .unwrap()
+            .tasks_topo()
+            .find(|t| t.name.0 == name)
+            .unwrap()
+            .clone()
+    }
+
+    fn harness_runner(state: &Path) -> crate::plan::harness::HarnessRunner {
+        crate::plan::harness::HarnessRunner {
+            args: <crate::Cli as Parser>::try_parse_from(["crucible"])
+                .unwrap()
+                .run,
+            paths: crate::Paths::for_manifest(
+                state.to_path_buf(),
+                state.to_path_buf(),
+                state,
+                None,
+            ),
+            commit_per_task: false,
+            captured_bytes: std::sync::atomic::AtomicU64::new(0),
+            staged: Default::default(),
+        }
+    }
+
+    /// An epilogue task consumes what the main graph declared, so the wrapper has to answer
+    /// from the runner that did the capturing. Inheriting the trait default reports `false`
+    /// for a set that is on disk, and the executor then stages nothing into `inputs/`.
+    #[test]
+    fn an_epilogue_runner_answers_captured_files_from_its_inner_runner() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = task_named("probe");
+        std::fs::create_dir_all(dir.path().join("files").join("probe")).unwrap();
+
+        let runner = EpilogueRunner {
+            inner: harness_runner(dir.path()),
+            kept: Value::Null,
+        };
+
+        assert!(
+            runner.has_captured_files(&task),
+            "the epilogue wrapper reported no captured set for a task whose files are on disk"
+        );
+        assert!(
+            !runner.has_captured_files(&task_named("never-ran")),
+            "the wrapper claimed a captured set for a task that captured nothing"
+        );
+    }
 
     #[test]
     fn pack_tasks_splice_between_the_turn_and_the_gate() {

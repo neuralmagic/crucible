@@ -16,7 +16,12 @@ impl Manifest {
     /// front-end can move the world onto a worker thread.
     pub fn build_world(&self, workspace: PathBuf) -> Box<dyn World + Send> {
         let carry_forward = self.workspace.carried_paths();
-        crucible_vcs::git_memory::install_harness_excludes(&workspace, &carry_forward);
+        let excludes: Vec<String> = carry_forward
+            .iter()
+            .cloned()
+            .chain(std::iter::once(format!("{}/", crate::plan::STAGED_INPUTS)))
+            .collect();
+        crucible_vcs::git_memory::install_harness_excludes(&workspace, &excludes);
         let w = &self.world;
         if w.apply_cmd.is_none() && w.snapshot_cmd.is_none() && w.restore_cmd.is_none() {
             Box::new(GitWorld {

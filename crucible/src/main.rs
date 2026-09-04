@@ -82,7 +82,9 @@ mod openshell {
 /// The plan runtime: the CLI and the agent-harness task runner over the library's plan IR,
 /// compiler, and executor.
 mod plan {
-    pub use crucible::plan::{TASK_NAME_ENV, exec, ir, runner, starlark, term_img, worktree};
+    pub use crucible::plan::{
+        STAGED_INPUTS, TASK_NAME_ENV, exec, ir, runner, starlark, term_img, worktree,
+    };
 
     pub mod cli;
     pub mod harness;
