@@ -19,4 +19,4 @@ apply_cmd, if present, must run after the agent turn and before measure. Nonzero
 
 snapshot_cmd must emit one opaque token on its last stdout line. restore_cmd must receive the token in CRUCIBLE_TOKEN env. snapshot_cmd and restore_cmd must come as a pair.
 
-setup_cmd default when omitted: the engine must git clone [repo] into [workspace].dir and git checkout [ref]. The workspace must end up a git repo."""
+setup_cmd default when omitted: with [repo] present the engine must git clone [repo] into [workspace].dir and git checkout [ref]; with [repo] absent the engine must create [workspace].dir empty. In every case the engine must then apply [workspace].inject, and the workspace must end up a git repo whose base commit holds the injected files."""

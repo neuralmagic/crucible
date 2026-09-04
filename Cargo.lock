@@ -1457,6 +1457,7 @@ dependencies = [
  "fs_extra",
  "gcp_auth",
  "git2",
+ "glob",
  "jiff",
  "k8s-openapi",
  "nix 0.31.3",

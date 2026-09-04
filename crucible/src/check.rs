@@ -7,9 +7,11 @@
 use crate::command_judge::Direction;
 use crate::manifest::{self, AgentCfg, CompositeManifest, Manifest, WorldCfg};
 use crate::openshell;
+use crate::plan::ir::TaskKind;
 use crate::selftest::{self, SelftestReport};
 use anyhow::Result;
-use std::path::{Path, PathBuf};
+use std::collections::BTreeSet;
+use std::path::{Component, Path, PathBuf};
 
 /// The result of a check: empty `findings` means the manifest is good to run. `warnings` never fail
 /// the check (exit 0) but are worth a human's attention (e.g. an editable gate).
@@ -167,7 +169,7 @@ fn undeclared_credential_warnings(m: &Manifest) -> Vec<String> {
 }
 
 fn check_single(manifest_path: &Path) -> Result<CheckOutcome> {
-    let m = match Manifest::load_frozen(manifest_path) {
+    let mut m = match Manifest::load_frozen(manifest_path) {
         Ok(m) => m,
         Err(e) => return Ok(CheckOutcome::fail(format!("manifest parse failed: {e:#}"))),
     };
@@ -186,13 +188,18 @@ fn check_single(manifest_path: &Path) -> Result<CheckOutcome> {
         // no point spending a workspace setup + measure_cmd exec on top.
         return Ok(out);
     }
+    // A parameterised graph has no values here; the lint then has no tasks to read.
+    if m.resolve_workflow(&manifest_dir).is_ok() {
+        out.warnings
+            .extend(uninjected_script_warnings(&m, &manifest_dir));
+    }
 
     if !workspace.exists() {
         if let Err(e) = crate::run::manifest_setup(&m, &manifest_dir, &workspace) {
             out.findings.push(format!("workspace setup failed: {e:#}"));
             return Ok(out);
         }
-        for (src, dst, _frozen) in m.resolved_injects(&manifest_dir, &workspace) {
+        for (src, dst, _frozen) in m.resolved_injects(&manifest_dir, &workspace)? {
             if let Err(e) = manifest::apply_inject(&src, &dst) {
                 out.findings
                     .push(format!("applying [workspace].inject failed: {e:#}"));
@@ -208,8 +215,9 @@ fn check_single(manifest_path: &Path) -> Result<CheckOutcome> {
 
     // The contract's frozen-inject rule: re-established before EVERY scored measurement, so the
     // probe must apply them too, a pre-existing workspace may predate an inject added since.
-    for (src, dst) in frozen_injects(&m, &manifest_dir, &workspace) {
-        if let Err(e) = manifest::apply_inject(&src, &dst) {
+    let frozen = frozen_injects(&m, &manifest_dir, &workspace)?;
+    for (src, dst) in &frozen {
+        if let Err(e) = manifest::apply_inject(src, dst) {
             out.findings
                 .push(format!("applying frozen [workspace].inject failed: {e:#}"));
             return Ok(out);
@@ -237,8 +245,7 @@ fn check_single(manifest_path: &Path) -> Result<CheckOutcome> {
         return Ok(out);
     };
     check_measure_once(&judge.measure_cmd, &workspace, &mut out);
-    if let Some(w) = agent_editable_gate_warning(&judge.measure_cmd, &m, &manifest_dir, &workspace)
-    {
+    if let Some(w) = agent_editable_gate_warning(&judge.measure_cmd, &frozen, &workspace) {
         out.warnings.push(w);
     }
     if let Some(f) = unfenced_rig_toolbox_finding(&m.world, &m.agent) {
@@ -248,9 +255,8 @@ fn check_single(manifest_path: &Path) -> Result<CheckOutcome> {
         match &judge.selftest {
             Some(cfg) => {
                 let result = (|| -> Result<SelftestReport> {
-                    let frozen = frozen_injects(&m, &manifest_dir, &workspace);
                     let world = m.build_world(workspace.clone());
-                    let judge = m.build_judge(workspace.clone(), frozen)?;
+                    let judge = m.build_judge(workspace.clone(), frozen.clone())?;
                     let direction = m.direction()?;
                     selftest::run(world.as_ref(), judge.as_ref(), &workspace, cfg, direction)
                 })();
@@ -283,12 +289,16 @@ fn shadowed_deny_warnings(agent: &AgentCfg) -> Vec<String> {
 
 /// `[[workspace.inject]]` entries with `frozen = true`, resolved to absolute `(src, dst)`, the
 /// same set [`crate::command_judge::CommandJudge`] re-establishes before every scored measure.
-fn frozen_injects(m: &Manifest, manifest_dir: &Path, workspace: &Path) -> Vec<(PathBuf, PathBuf)> {
-    m.resolved_injects(manifest_dir, workspace)
+fn frozen_injects(
+    m: &Manifest,
+    manifest_dir: &Path,
+    workspace: &Path,
+) -> Result<Vec<(PathBuf, PathBuf)>> {
+    Ok(m.resolved_injects(manifest_dir, workspace)?
         .into_iter()
         .filter(|(_, _, frozen)| *frozen)
         .map(|(src, dst, _)| (src, dst))
-        .collect()
+        .collect())
 }
 
 fn no_selftest_warning() -> String {
@@ -439,7 +449,14 @@ fn check_referenced_files(m: &Manifest, manifest_dir: &Path, out: &mut CheckOutc
             ));
         }
     }
-    for inject in &m.workspace.inject {
+    let injects = match m.workspace.injects(manifest_dir) {
+        Ok(injects) => injects,
+        Err(e) => {
+            out.findings.push(format!("{e:#}"));
+            return;
+        }
+    };
+    for inject in &injects {
         let p = manifest_dir.join(&inject.src);
         if !p.exists() {
             out.findings.push(format!(
@@ -526,27 +543,73 @@ fn check_measure_once(measure_cmd: &str, workspace: &Path, out: &mut CheckOutcom
     }
 }
 
+/// A `command`/`evaluate` task whose `run` names a file the pack carries but no inject delivers
+/// dies at dispatch in a fresh workspace, or runs a stale copy in one created before the file.
+pub fn uninjected_script_warnings(m: &Manifest, manifest_dir: &Path) -> Vec<String> {
+    let Some(workflow) = m.workflow.as_ref() else {
+        return Vec::new();
+    };
+    let Ok(injects) = m.workspace.injects(manifest_dir) else {
+        return Vec::new();
+    };
+    let delivered: BTreeSet<&str> = injects
+        .iter()
+        .map(|i| i.dst.trim_start_matches("./"))
+        .collect();
+    let mut warnings = Vec::new();
+    for task in &workflow.tasks {
+        let command = match &task.task {
+            TaskKind::Command { command } | TaskKind::Evaluate { command, .. } => command,
+            _ => continue,
+        };
+        for file in pack_files_named(command, manifest_dir) {
+            if !delivered.contains(file.as_str()) {
+                warnings.push(format!(
+                    "task `{}` runs `{file}`, which the pack carries but no [workspace].inject \
+                     delivers into the workspace",
+                    task.name.0
+                ));
+            }
+        }
+    }
+    warnings
+}
+
+/// The words of a `run` string that name a regular file under the pack dir.
+fn pack_files_named(command: &str, manifest_dir: &Path) -> Vec<String> {
+    command
+        .split_whitespace()
+        .map(|tok| tok.trim_matches(|c| matches!(c, '"' | '\'' | ';' | '(' | ')')))
+        .map(|tok| tok.trim_start_matches("./"))
+        .filter(|tok| {
+            !tok.is_empty()
+                && !tok.starts_with('-')
+                && !tok.starts_with('$')
+                && !tok.contains('=')
+                && !Path::new(tok).is_absolute()
+                && !Path::new(tok)
+                    .components()
+                    .any(|c| matches!(c, Component::ParentDir))
+        })
+        .filter(|tok| manifest_dir.join(tok).is_file())
+        .map(str::to_string)
+        .collect()
+}
+
 /// The frozen-judge lint: if `measure_cmd` names a file that lives inside the workspace and no
 /// `frozen = true` `[[workspace.inject]]` re-establishes it before every scored measure, the agent's
 /// own edits can reach and game the gate.
 fn agent_editable_gate_warning(
     measure_cmd: &str,
-    m: &Manifest,
-    manifest_dir: &Path,
+    frozen: &[(PathBuf, PathBuf)],
     workspace: &Path,
 ) -> Option<String> {
-    let frozen_dsts: Vec<PathBuf> = m
-        .resolved_injects(manifest_dir, workspace)
-        .into_iter()
-        .filter(|(_, _, frozen)| *frozen)
-        .map(|(_, dst, _)| dst)
-        .collect();
     for tok in measure_cmd.split_whitespace() {
         let candidate = workspace.join(tok);
         if !candidate.is_file() {
             continue;
         }
-        let covered = frozen_dsts.iter().any(|d| paths_match(d, &candidate));
+        let covered = frozen.iter().any(|(_, dst)| paths_match(dst, &candidate));
         if !covered {
             return Some(format!(
                 "[judge].measure_cmd references `{tok}`, a file inside the workspace with no \
@@ -1130,5 +1193,55 @@ mod tests {
             shadowed_deny_warnings(&m.agent).is_empty(),
             "the :443 wildcard does not admit an :8443 deny"
         );
+    }
+
+    /// A run string naming a pack file that no inject delivers is exit 127 waiting to happen; the
+    /// check says so by task and file, and stays quiet about the file an inject covers.
+    #[test]
+    fn check_warns_when_a_task_runs_a_pack_script_no_inject_delivers() {
+        let dir = tempdir("uninjected-script");
+        fs::write(dir.join("roundup.py"), "print('ok')\n").unwrap();
+        fs::write(dir.join("helper.py"), "print('ok')\n").unwrap();
+        fs::write(
+            dir.join("workflow.star"),
+            r#"
+r = command(name = "roundup", run = "python3 roundup.py")
+h = command(name = "helper", run = "python3 ./helper.py --fast")
+workflow(type = "playbook", tasks = [r, h])
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join(MANIFEST),
+            r#"
+            [workspace]
+            inject = ["roundup.py"]
+            [agent]
+            backend = "command"
+            agent_cmd = "true"
+            goal = "goal"
+            [workflow]
+            type = "playbook"
+            file = "workflow.star"
+            "#,
+        )
+        .unwrap();
+        let out = run(&dir.join(MANIFEST)).expect("check runs");
+        assert!(out.ok(), "findings: {:?}", out.findings);
+        let hits: Vec<&String> = out
+            .warnings
+            .iter()
+            .filter(|w| w.contains("no [workspace].inject delivers"))
+            .collect();
+        assert_eq!(hits.len(), 1, "{:?}", out.warnings);
+        assert!(
+            hits[0].contains("`helper`") && hits[0].contains("`helper.py`"),
+            "{}",
+            hits[0]
+        );
+        // The repo-less playbook got a workspace seeded from its injects alone.
+        assert!(dir.join("workspace/roundup.py").is_file());
+        assert!(!dir.join("workspace/helper.py").exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

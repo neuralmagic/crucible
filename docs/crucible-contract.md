@@ -20,7 +20,8 @@ config-relative paths below.
 
 ```toml
 [repo]
-# Exactly one of url|path. The upstream the agent edits a checkout of.
+# Exactly one of url|path. The upstream the agent edits a checkout of. A playbook may omit the
+# whole table: its workspace is then an empty dir the injects populate.
 url  = "https://github.com/owner/name.git"   # OR
 path = "."                                    # local path, relative to manifest dir
 ref  = "main"                                 # optional; default: clone default branch
@@ -29,16 +30,23 @@ ref  = "main"                                 # optional; default: clone default
 dir       = "workspace"                       # checkout dir, relative to manifest dir. default "workspace"
 setup_cmd = "git clone ... && git checkout"   # optional; default: engine git clone+checkout of [repo]
 
-# Frozen-judge / fixture injection (optional, repeatable). After setup, the engine copies each
-# `src` (relative to the manifest dir, a baked artifact outside the clone target, so the agent has
-# no pre-clone copy) to `dst` (relative to the workspace). A `frozen` inject (default true) is ALSO
-# re-copied before every scored measure, so a candidate can't edit the gate (a T1 scoring harness, a
-# seeded regression test) to game it; set `frozen = false` for a one-time fixture the agent may then
-# edit. This is the generic alternative to hand-chaining an `install` into `setup_cmd`.
-[[workspace.inject]]
-src    = "judges/1489/judge_harness_test.go"  # baked judge, manifest-relative
-dst    = "pkg/.../judge_harness_test.go"      # into the clone, workspace-relative
-frozen = true                                 # re-copied before each measure (default true)
+# Frozen-judge / fixture injection (optional). After setup, the engine copies each `src` (relative
+# to the manifest dir, a baked artifact outside the clone target, so the agent has no pre-clone
+# copy) to `dst` (relative to the workspace), then commits the result as the baseline. A `frozen`
+# inject (default true) is ALSO re-copied before every scored measure and before every plan task,
+# so a candidate can't edit the gate (a T1 scoring harness, a seeded regression test) to game it;
+# set `frozen = false` for a one-time fixture the agent may then edit. This is the generic
+# alternative to hand-chaining an `install` into `setup_cmd`.
+#
+# A string entry is a frozen copy to the same path. A directory or a glob (`*`, `?`, `[`) expands
+# to every regular file under it, sorted; it must stay under the manifest dir and must match
+# something. Use the table form to rename, to unfreeze, or to reach outside the manifest dir.
+inject = [
+  "measure.sh",                                                                    # -> measure.sh, frozen
+  "tools/*.py",                                                                    # every script, frozen
+  { src = "judges/1489/judge_harness_test.go", dst = "pkg/.../judge_harness_test.go" },
+  { src = "fixtures/seed.json", dst = "testdata/seed.json", frozen = false },
+]
 
 [agent]
 model         = "claude-opus-4-6"             # default engine constant
@@ -544,9 +552,11 @@ Rules that are easy to get wrong, and that `crucible check` should catch before 
 ### `setup_cmd` (prepare the workspace): optional
 - **The one cwd exception:** runs with **cwd = manifest dir** (the workspace does not exist
   yet, it's what setup creates). Every other command runs with cwd = workspace.
-- Default when omitted: engine does `git clone [repo] <workspace> && git checkout [ref]`. The
-  workspace must end up a git repo (GitWorld commits into it); for a non-git `[repo].path`,
-  give a `setup_cmd` that copies the tree in and `git init`s it (see `examples/counter/`).
+- Default when omitted: engine does `git clone [repo] <workspace> && git checkout [ref]`; with
+  no `[repo]` (a playbook), it creates `<workspace>` empty. Either way the injects land next
+  and the engine `git init`s the workspace and commits the result as the baseline when setup
+  left no repo behind, so a `setup_cmd` only has to produce the tree, never the commit. A
+  `setup_cmd` that commits before returning freezes a baseline without the injects.
 
 ---
 

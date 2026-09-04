@@ -43,8 +43,12 @@ pub(crate) enum RunError {
         cmd: String,
         status: std::process::ExitStatus,
     },
-    #[error("[repo] needs url or path (or give [workspace].setup_cmd)")]
-    NoRepoSource,
+    #[error("creating workspace {}", .dir.display())]
+    CreateWorkspace {
+        dir: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("git clone")]
     SpawnGitClone(#[source] std::io::Error),
     #[error("git clone {src} -> {} failed", .dest.display())]
@@ -418,7 +422,8 @@ fn playbook_launch(args: &crate::DeployArgs) -> Result<Option<deploy::PlaybookLa
 }
 
 /// Prepare the manifest's workspace: run `setup_cmd` (cwd = manifest dir, the one command that
-/// runs there since it *creates* the workspace), else default to `git clone` of `[repo]`.
+/// runs there since it *creates* the workspace), else `git clone` `[repo]`, else an empty dir
+/// for a repo-less playbook. Injects land after this, and `ensure_repo` commits the baseline.
 pub(crate) fn manifest_setup(
     m: &manifest::Manifest,
     manifest_dir: &Path,
@@ -442,13 +447,13 @@ pub(crate) fn manifest_setup(
         }
         return Ok(());
     }
-    let src = m
-        .repo
-        .url
-        .clone()
-        .or_else(|| m.repo.path.clone())
-        .ok_or(RunError::NoRepoSource)?;
-    clone_repo(&src, m.repo.git_ref.as_deref(), workspace)
+    let Some(src) = m.repo.source() else {
+        return std::fs::create_dir_all(workspace).map_err(|source| RunError::CreateWorkspace {
+            dir: workspace.to_path_buf(),
+            source,
+        });
+    };
+    clone_repo(src, m.repo.git_ref.as_deref(), workspace)
 }
 
 /// `git clone <src> <dest>` then optional `checkout <ref>`. The default-setup primitive, shared by the
@@ -512,7 +517,7 @@ pub(crate) fn prep_plan_runner_with_params(
     let p = crate::Paths::for_manifest(workspace.clone(), state, &manifest_dir, skills);
     if !workspace.exists() {
         manifest_setup(&m, &manifest_dir, &workspace)?;
-        for (src, dst, _frozen) in m.resolved_injects(&manifest_dir, &workspace) {
+        for (src, dst, _frozen) in m.resolved_injects(&manifest_dir, &workspace)? {
             manifest::apply_inject(&src, &dst)
                 .context("applying [workspace].inject after setup")?;
         }
@@ -545,7 +550,7 @@ pub(crate) fn prep_plan_runner_with_params(
         &p.session_log,
     )?;
     apply_agent_cfg(&mut args, &m.agent, &m.secrets, &p.workspace, &frozen)?;
-    args.workflow_frozen_injects = m.frozen_inject_pairs(&manifest_dir);
+    args.workflow_frozen_injects = m.frozen_inject_pairs(&manifest_dir)?;
     args.workflow_toolbox_exclude = m.agent.toolbox_exclude.clone();
     // A playbook's git memory is per task; the scored loop owns the same repository for
     // keep/discard of whole candidates and must not find per-task commits inside an iteration.
@@ -599,7 +604,7 @@ fn run_from_manifest(args: Args) -> Result<()> {
         // Inject baked judge/fixture files into the fresh clone (frozen judges + one-time fixtures).
         // Frozen ones are also re-copied before each measure; the initial copy gives the agent a
         // present, compilable harness from turn one.
-        for (src, dst, _frozen) in m.resolved_injects(&manifest_dir, &workspace) {
+        for (src, dst, _frozen) in m.resolved_injects(&manifest_dir, &workspace)? {
             manifest::apply_inject(&src, &dst)
                 .context("applying [workspace].inject after setup")?;
         }
@@ -668,14 +673,14 @@ fn run_from_manifest(args: Args) -> Result<()> {
     // scored measure, the agent can't edit the harness/test to game the gate. Resolve before the
     // workspace move.
     let frozen_injects: Vec<(PathBuf, PathBuf)> = m
-        .resolved_injects(&manifest_dir, &workspace)
+        .resolved_injects(&manifest_dir, &workspace)?
         .into_iter()
         .filter(|(_, _, frozen)| *frozen)
         .map(|(src, dst, _)| (src, dst))
         .collect();
     args.search = m.search.clone();
     args.workflow = m.workflow.clone();
-    args.workflow_frozen_injects = m.frozen_inject_pairs(&manifest_dir);
+    args.workflow_frozen_injects = m.frozen_inject_pairs(&manifest_dir)?;
     args.workflow_toolbox_exclude = m.agent.toolbox_exclude.clone();
     let world = m.build_world(workspace.clone());
     let judge = m.build_judge(workspace, frozen_injects)?;
@@ -2020,5 +2025,52 @@ mod tests {
             "topic",
         ]);
         assert!(playbook_launch(&args).is_err());
+    }
+
+    /// A playbook with no upstream repository: the engine creates the workspace, lands the injects,
+    /// and commits them as the baseline, so the task sees the script from its first dispatch.
+    #[test]
+    fn a_repo_less_playbook_gets_a_workspace_seeded_from_its_injects() {
+        let dir = tempdir("repo-less-playbook");
+        fs::write(dir.join("tool.py"), "print('ok')\n").unwrap();
+        fs::write(
+            dir.join("workflow.star"),
+            "t = command(name = \"t\", run = \"python3 tool.py\")\nworkflow(type = \"playbook\", tasks = [t])\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("crucible.toml"),
+            r#"
+            [workspace]
+            inject = ["tool.py"]
+            [agent]
+            backend = "command"
+            agent_cmd = "true"
+            goal = "g"
+            [workflow]
+            type = "playbook"
+            file = "workflow.star"
+            "#,
+        )
+        .unwrap();
+        prep_plan_runner(&dir.join("crucible.toml")).expect("prep");
+        let ws = dir.join("workspace");
+        assert!(ws.join("tool.py").is_file());
+        let tracked = std::process::Command::new("git")
+            .args([
+                "-C",
+                &ws.display().to_string(),
+                "ls-tree",
+                "--name-only",
+                "HEAD",
+            ])
+            .output()
+            .expect("git ls-tree");
+        let tracked = String::from_utf8_lossy(&tracked.stdout);
+        assert!(
+            tracked.lines().any(|l| l == "tool.py"),
+            "baseline commit lacks the inject: {tracked:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

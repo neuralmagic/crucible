@@ -52,6 +52,21 @@ pub enum ManifestError {
         missing: Vec<String>,
     },
     #[error(
+        "[workspace].inject entry {src:?} must stay under the manifest dir; inject from outside it with a table naming src and dst"
+    )]
+    InjectShorthandEscapes { src: String },
+    #[error("[workspace].inject entry {pattern:?} matches no file under {}", .manifest_dir.display())]
+    InjectPatternMatchesNothing {
+        pattern: String,
+        manifest_dir: PathBuf,
+    },
+    #[error("[workspace].inject entry {pattern:?} is not a valid glob: {reason}")]
+    InjectPatternInvalid { pattern: String, reason: String },
+    #[error("[repo] takes exactly one of url or path, not both")]
+    RepoNeedsOneSource,
+    #[error("[repo] needs url or path; only a playbook may omit it")]
+    RepoRequired,
+    #[error(
         "[agent.broker].bin is required when the broker is enabled (the domain's broker binary)"
     )]
     BrokerBinRequired,
@@ -228,6 +243,7 @@ fn git_show_head(repo_dir: &Path, rel: &Path) -> Result<(String, String)> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
+    #[serde(default)]
     pub repo: Repo,
     #[serde(default)]
     pub workspace: Workspace,
@@ -294,7 +310,7 @@ pub struct PublishCfg {
     pub pr_repo: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Repo {
     #[serde(default)]
@@ -305,6 +321,21 @@ pub struct Repo {
     pub git_ref: Option<String>,
 }
 
+impl Repo {
+    /// The clone source, `url` over `path`; `None` for a repo-less playbook.
+    pub fn source(&self) -> Option<&str> {
+        self.url.as_deref().or(self.path.as_deref())
+    }
+
+    fn validate(&self, playbook: bool) -> Result<(), ManifestError> {
+        match (&self.url, &self.path) {
+            (Some(_), Some(_)) => Err(ManifestError::RepoNeedsOneSource),
+            (None, None) if !playbook => Err(ManifestError::RepoRequired),
+            _ => Ok(()),
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Workspace {
@@ -313,9 +344,9 @@ pub struct Workspace {
     #[serde(default)]
     pub setup_cmd: Option<String>,
     /// Baked files copied into the workspace clone after setup, the generic frozen-judge primitive
-    /// (a T1 scoring harness, a seeded fixture). See [`Inject`].
+    /// (a T1 scoring harness, a seeded fixture). See [`InjectSpec`].
     #[serde(default)]
-    pub inject: Vec<Inject>,
+    pub inject: Vec<InjectSpec>,
     /// Workspace-relative paths holding derived pipeline output (code traces, a codegen tree) that a
     /// discard must NOT delete, so iteration N+1 doesn't re-derive what iteration N already paid
     /// for. Each entry is added to `.git/info/exclude` and spared by the discard's clean, so carried
@@ -388,7 +419,7 @@ pub struct Artifact {
 /// inject is re-copied before EVERY scored measurement, so the agent can't edit the judge to game
 /// the gate; a non-frozen inject is a one-time fixture the agent may then modify. This is the
 /// generic alternative to hand-chaining an `install` into `setup_cmd`.
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Inject {
     pub src: String,
@@ -397,8 +428,102 @@ pub struct Inject {
     pub frozen: bool,
 }
 
+/// One `[workspace].inject` entry as authored: a table, or a string that stands for a frozen
+/// table whose `dst` equals its `src`. A string naming a directory or carrying a glob
+/// metacharacter expands to every regular file it matches under the manifest dir.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(untagged)]
+pub enum InjectSpec {
+    Path(String),
+    Entry(Inject),
+}
+
 fn default_true() -> bool {
     true
+}
+
+impl Workspace {
+    /// Expand every `[workspace].inject` entry into concrete `(src, dst, frozen)` triples, in
+    /// declaration order with each pattern's matches sorted by path. Shorthand entries are confined
+    /// to the manifest dir; a table may point outside it.
+    pub fn injects(&self, manifest_dir: &Path) -> Result<Vec<Inject>, ManifestError> {
+        let mut out = Vec::new();
+        for spec in &self.inject {
+            match spec {
+                InjectSpec::Entry(inject) => out.push(inject.clone()),
+                InjectSpec::Path(src) => expand_shorthand(src, manifest_dir, &mut out)?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+fn expand_shorthand(
+    src: &str,
+    manifest_dir: &Path,
+    out: &mut Vec<Inject>,
+) -> Result<(), ManifestError> {
+    let escapes = Path::new(src).is_absolute()
+        || Path::new(src)
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)));
+    if escapes || src.is_empty() {
+        return Err(ManifestError::InjectShorthandEscapes {
+            src: src.to_string(),
+        });
+    }
+    let frozen = |rel: String| Inject {
+        src: rel.clone(),
+        dst: rel,
+        frozen: true,
+    };
+    let rel = src.trim_start_matches("./").trim_end_matches('/');
+    let is_glob = rel.contains(['*', '?', '[']);
+    if !is_glob && !manifest_dir.join(rel).is_dir() {
+        out.push(frozen(rel.to_string()));
+        return Ok(());
+    }
+    let pattern = if is_glob {
+        rel.to_string()
+    } else {
+        format!("{rel}/**/*")
+    };
+    let root =
+        std::path::absolute(manifest_dir).map_err(|e| ManifestError::InjectPatternInvalid {
+            pattern: src.to_string(),
+            reason: format!("resolving {}: {e}", manifest_dir.display()),
+        })?;
+    let full = format!(
+        "{}/{pattern}",
+        glob::Pattern::escape(&root.to_string_lossy())
+    );
+    let options = glob::MatchOptions {
+        require_literal_leading_dot: true,
+        ..glob::MatchOptions::default()
+    };
+    let paths =
+        glob::glob_with(&full, options).map_err(|e| ManifestError::InjectPatternInvalid {
+            pattern: src.to_string(),
+            reason: e.msg.to_string(),
+        })?;
+    let mut matched: Vec<String> = paths
+        .filter_map(Result::ok)
+        .filter(|p| p.is_file())
+        .filter_map(|p| {
+            p.strip_prefix(&root)
+                .ok()
+                .map(|r| r.to_string_lossy().into_owned())
+        })
+        .collect();
+    if matched.is_empty() {
+        return Err(ManifestError::InjectPatternMatchesNothing {
+            pattern: src.to_string(),
+            manifest_dir: manifest_dir.to_path_buf(),
+        });
+    }
+    matched.sort();
+    out.extend(matched.into_iter().map(frozen));
+    Ok(())
 }
 
 fn default_workspace_dir() -> String {
@@ -780,6 +905,7 @@ impl Manifest {
 
     /// Cross-field checks the type system + `deny_unknown_fields` can't express. Run at load.
     fn validate(&self) -> Result<()> {
+        self.repo.validate(self.is_playbook())?;
         validate_common(CommonCfg {
             workspace: &self.workspace,
             agent: &self.agent,
@@ -842,6 +968,12 @@ impl Manifest {
         self.judge.is_none()
     }
 
+    pub fn is_playbook(&self) -> bool {
+        self.workflow
+            .as_ref()
+            .is_some_and(|w| w.workflow_type == WorkflowType::Playbook)
+    }
+
     /// The `[judge]` table, for callers that only make sense on a scored run. Task-lane
     /// callers must branch on [`Manifest::is_task`] first.
     pub fn require_judge(&self) -> Result<&JudgeCfg> {
@@ -864,24 +996,29 @@ impl Manifest {
         &self,
         manifest_dir: &Path,
         workspace: &Path,
-    ) -> Vec<(PathBuf, PathBuf, bool)> {
-        self.workspace
-            .inject
-            .iter()
+    ) -> Result<Vec<(PathBuf, PathBuf, bool)>, ManifestError> {
+        Ok(self
+            .workspace
+            .injects(manifest_dir)?
+            .into_iter()
             .map(|i| (manifest_dir.join(&i.src), workspace.join(&i.dst), i.frozen))
-            .collect()
+            .collect())
     }
 
     /// Frozen injects as `(absolute src, workspace-relative dst)`. Unlike
     /// [`Manifest::resolved_injects`] the destination stays relative: a plan task may run in an
     /// isolated worktree, so the workspace root is only known at dispatch.
-    pub fn frozen_inject_pairs(&self, manifest_dir: &Path) -> Vec<(PathBuf, PathBuf)> {
-        self.workspace
-            .inject
-            .iter()
+    pub fn frozen_inject_pairs(
+        &self,
+        manifest_dir: &Path,
+    ) -> Result<Vec<(PathBuf, PathBuf)>, ManifestError> {
+        Ok(self
+            .workspace
+            .injects(manifest_dir)?
+            .into_iter()
             .filter(|i| i.frozen)
             .map(|i| (manifest_dir.join(&i.src), PathBuf::from(&i.dst)))
-            .collect()
+            .collect())
     }
 }
 
@@ -1120,7 +1257,7 @@ impl CompositeManifest {
 pub fn ensure_injects_resolve(m: &Manifest, manifest_dir: &Path) -> Result<(), ManifestError> {
     let missing: Vec<String> = m
         .workspace
-        .inject
+        .injects(manifest_dir)?
         .iter()
         .filter(|inject| !manifest_dir.join(&inject.src).exists())
         .map(|inject| format!("  {} -> {}", inject.src, inject.dst))
@@ -1815,13 +1952,13 @@ mod tests {
         "#,
         )
         .unwrap();
-        assert_eq!(m.workspace.inject.len(), 2);
-        assert!(m.workspace.inject[0].frozen, "frozen defaults to true");
-        assert!(!m.workspace.inject[1].frozen);
-
         let md = Path::new("/repo");
         let ws = Path::new("/repo/ws");
-        let resolved = m.resolved_injects(md, ws);
+        let injects = m.workspace.injects(md).unwrap();
+        assert_eq!(injects.len(), 2);
+        assert!(injects[0].frozen, "frozen defaults to true");
+        assert!(!injects[1].frozen);
+        let resolved = m.resolved_injects(md, ws).unwrap();
         assert_eq!(
             resolved[0],
             (
@@ -2130,7 +2267,7 @@ mod tests {
         let ws = alpha_dir.join(&m.workspace.dir);
         m.build_judge(ws.clone(), vec![]).expect("build_judge");
         // The frozen harness must be baked + resolve under the manifest dir.
-        let injects = m.resolved_injects(&alpha_dir, &ws);
+        let injects = m.resolved_injects(&alpha_dir, &ws).unwrap();
         assert_eq!(injects.len(), 1, "the overlay injects exactly the harness");
         let (src, _dst, frozen) = &injects[0];
         assert!(frozen, "the harness is frozen (re-copied each measure)");
@@ -2453,5 +2590,170 @@ dst = "traces/median_block.txt"
         assert_eq!(m.agent.goal.as_deref(), Some("committed goal"));
         assert_eq!(m.workspace.dir, "workspace");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn playbook_manifest(extra: &str) -> Manifest {
+        toml::from_str(&format!(
+            r#"
+            [agent]
+            backend = "command"
+            agent_cmd = "a"
+            goal = "g"
+            [workflow]
+            type = "playbook"
+            file = "workflow.star"
+            {extra}
+            "#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_string_inject_stands_for_a_frozen_copy_to_the_same_path() {
+        let m = playbook_manifest(
+            r#"
+            [workspace]
+            inject = ["roundup.py", "./tools/apply.py"]
+            "#,
+        );
+        let injects = m.workspace.injects(Path::new("/nowhere")).unwrap();
+        assert_eq!(
+            injects,
+            vec![
+                Inject {
+                    src: "roundup.py".into(),
+                    dst: "roundup.py".into(),
+                    frozen: true
+                },
+                Inject {
+                    src: "tools/apply.py".into(),
+                    dst: "tools/apply.py".into(),
+                    frozen: true
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_glob_or_directory_inject_expands_to_its_sorted_files() {
+        let dir = tempdir("inject-glob");
+        std::fs::write(dir.join("b.py"), "").unwrap();
+        std::fs::write(dir.join("a.py"), "").unwrap();
+        std::fs::write(dir.join("notes.md"), "").unwrap();
+        std::fs::create_dir_all(dir.join("inbox/deep")).unwrap();
+        std::fs::write(dir.join("inbox/deep/2.md"), "").unwrap();
+        std::fs::write(dir.join("inbox/1.md"), "").unwrap();
+        std::fs::write(dir.join("inbox/.hidden"), "").unwrap();
+        let m = playbook_manifest(
+            r#"
+            [workspace]
+            inject = ["*.py", "inbox/", { src = "notes.md", dst = "doc/notes.md", frozen = false }]
+            "#,
+        );
+        let injects = m.workspace.injects(&dir).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let ups = cwd.components().count() - cwd.components().count().min(1);
+        let mut relative = PathBuf::new();
+        for _ in 0..ups {
+            relative.push("..");
+        }
+        relative.push(dir.strip_prefix("/").unwrap_or(&dir));
+        assert_eq!(m.workspace.injects(&relative).unwrap(), injects);
+        let paths: Vec<(&str, &str, bool)> = injects
+            .iter()
+            .map(|i| (i.src.as_str(), i.dst.as_str(), i.frozen))
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                ("a.py", "a.py", true),
+                ("b.py", "b.py", true),
+                ("inbox/1.md", "inbox/1.md", true),
+                ("inbox/deep/2.md", "inbox/deep/2.md", true),
+                ("notes.md", "doc/notes.md", false),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pattern_inject_matching_nothing_is_rejected_by_name() {
+        let dir = tempdir("inject-glob-empty");
+        let m = playbook_manifest(
+            r#"
+            [workspace]
+            inject = ["*.rs"]
+            "#,
+        );
+        let err = m.workspace.injects(&dir).unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::InjectPatternMatchesNothing { pattern, .. } if pattern == "*.rs"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_shorthand_inject_may_not_leave_the_manifest_dir_but_a_table_may() {
+        for bad in ["../sibling.py", "/etc/hosts", "tools/../../x", ""] {
+            let m = playbook_manifest(&format!("[workspace]\ninject = [{bad:?}]"));
+            let err = m.workspace.injects(Path::new("/nowhere")).unwrap_err();
+            assert!(
+                matches!(&err, ManifestError::InjectShorthandEscapes { src } if src == bad),
+                "{bad}: {err}"
+            );
+        }
+        let m = playbook_manifest(
+            r#"
+            [workspace]
+            inject = [{ src = "../../shared/bench.rs", dst = "benches/bench.rs" }]
+            "#,
+        );
+        let injects = m.workspace.injects(Path::new("/nowhere")).unwrap();
+        assert_eq!(injects[0].src, "../../shared/bench.rs");
+    }
+
+    #[test]
+    fn a_playbook_may_omit_repo_but_a_scored_manifest_may_not() {
+        playbook_manifest("")
+            .validate()
+            .expect("repo-less playbook");
+
+        let scored: Manifest = toml::from_str(
+            r#"
+            [judge]
+            measure_cmd = "m"
+            direction = "higher"
+            [agent]
+            backend = "command"
+            agent_cmd = "a"
+            goal = "g"
+            "#,
+        )
+        .unwrap();
+        let err = scored.validate().unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<ManifestError>(),
+                Some(ManifestError::RepoRequired)
+            ),
+            "{err:#}"
+        );
+
+        let both = playbook_manifest(
+            r#"
+            [repo]
+            url = "https://example.invalid/x.git"
+            path = "."
+            "#,
+        );
+        let err = both.validate().unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<ManifestError>(),
+                Some(ManifestError::RepoNeedsOneSource)
+            ),
+            "{err:#}"
+        );
     }
 }
