@@ -699,6 +699,11 @@ pub enum CompileError {
     )]
     SettledJoinWithoutDependencies { task: String },
     #[error(
+        "task {task:?} depends on {dependency:?}, which is a key the engine writes into a task's \
+         inputs itself and would overwrite the dependency's entry with; rename the dependency"
+    )]
+    ReservedDependencyName { task: String, dependency: String },
+    #[error(
         "\"over\" must name a declared output field of a task this one depends on, as \
          `over = producer.field`"
     )]
@@ -1406,6 +1411,16 @@ fn dsl_task(
     if task.join == Join::Settled && task.depends_on.is_empty() {
         return Err(CompileError::SettledJoinWithoutDependencies {
             task: task.name.0.clone(),
+        });
+    }
+    if let Some(reserved) = task
+        .depends_on
+        .iter()
+        .find(|d| crate::plan::exec::RESERVED_INPUTS.contains(&d.0.as_str()))
+    {
+        return Err(CompileError::ReservedDependencyName {
+            task: task.name.0.clone(),
+            dependency: reserved.0.clone(),
         });
     }
     Ok(task)
@@ -4844,5 +4859,24 @@ workflow(type = "playbook", tasks = [seed, turn, helper, sweep, probe, mapped])
         let rendered = error.to_string();
         assert!(rendered.contains("settled"), "{rendered}");
         assert!(rendered.contains("\"always\""), "{rendered}");
+    }
+    /// The reserved keys are refused where the graph is written, so the author reads the line
+    /// that named the dependency rather than a plan-validation error with no source location.
+    #[test]
+    fn a_dependency_named_after_a_reserved_input_is_refused_at_its_call_site() {
+        for reserved in crate::plan::exec::RESERVED_INPUTS {
+            let pack = temp_pack(&format!("reserved-dep-{reserved}"));
+            let source = format!(
+                "a = command(name = \"{reserved}\", run = \"true\")\n\
+                 tip = command(name = \"tip\", run = \"true\", depends_on = [a])\n\
+                 workflow(type = \"playbook\", tasks = [a, tip])\n"
+            );
+            let error = compile_source(&source, &pack.join("workflow.star"), &pack)
+                .expect_err("a dependency on a reserved name compiled");
+            assert!(error.message().contains(reserved), "{error:?}");
+            let anchor = error.anchor().expect("a located refusal");
+            assert_eq!(anchor.span.begin_line, 2);
+            let _ = std::fs::remove_dir_all(&pack);
+        }
     }
 }

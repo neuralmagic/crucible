@@ -708,6 +708,10 @@ pub fn execute(
 /// epilogue's kept-candidate input: a task may not declare a dependency by this name.
 pub const ITEM_INPUT: &str = "item";
 
+/// Every key the engine writes into a task's inputs itself. A dependency named after one of
+/// them would have its entry overwritten, so [`crate::plan::ir::Plan::validate`] refuses it.
+pub const RESERVED_INPUTS: [&str; 2] = [ITEM_INPUT, crate::manifest::KEPT_INPUT];
+
 /// One instance's name, `node[key]`. The key is the item, never its position: a list that comes
 /// back reordered or shorter still names the same work the same way, which is what makes a
 /// folded result on resume safe to match. Airflow's mapped tasks key on the index, and clearing

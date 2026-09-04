@@ -440,6 +440,11 @@ pub enum PlanError {
         reference: String,
         session: String,
     },
+    #[error(
+        "task {task:?} depends on {dependency:?}, which is a key the engine writes into a task's \
+         inputs itself and would overwrite the dependency's entry with; rename the dependency"
+    )]
+    ReservedDependencyName { task: String, dependency: String },
     #[error("plan has a dependency cycle involving: {}", .tasks.join(", "))]
     DependencyCycle { tasks: Vec<String> },
     #[error(
@@ -509,6 +514,12 @@ impl Plan {
                 }
                 if !seen.insert(d) {
                     return Err(PlanError::RepeatedDependency {
+                        task: task(),
+                        dependency: d.0.clone(),
+                    });
+                }
+                if crate::plan::exec::RESERVED_INPUTS.contains(&d.0.as_str()) {
+                    return Err(PlanError::ReservedDependencyName {
                         task: task(),
                         dependency: d.0.clone(),
                     });
@@ -1458,6 +1469,27 @@ mod tests {
         ]))
         .unwrap();
         let ok = Plan::from_json_str(&json).unwrap().validate().unwrap();
+        assert_eq!(ok.plan().tasks.len(), 2);
+    }
+
+    /// The engine writes its own keys into a task's inputs after the dependency envelope is
+    /// built, so a dependency named after one of them loses the entry the plan promised it.
+    #[test]
+    fn a_dependency_named_after_a_reserved_input_is_refused() {
+        for reserved in crate::plan::exec::RESERVED_INPUTS {
+            assert_eq!(
+                plan(vec![agent(reserved, &[]), agent("consumer", &[reserved])])
+                    .validate()
+                    .unwrap_err(),
+                PlanError::ReservedDependencyName {
+                    task: "consumer".to_owned(),
+                    dependency: reserved.to_owned(),
+                }
+            );
+        }
+        let ok = plan(vec![agent("items", &[]), agent("consumer", &["items"])])
+            .validate()
+            .expect("a name that only looks like a reserved one");
         assert_eq!(ok.plan().tasks.len(), 2);
     }
 }
