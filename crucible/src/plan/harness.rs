@@ -26,9 +26,7 @@ use crate::{Args, Paths};
 
 const RESULT_FILE: &str = "PLAN_TASK_RESULT.json";
 
-/// Where a consumer finds what its ancestors declared. Under the workspace so a task reaches it
-/// with a relative path, and named so it is obviously not the task's own work.
-pub(crate) const STAGED_INPUTS: &str = "inputs";
+use crate::plan::STAGED_INPUTS;
 
 /// The most a single run may capture. Operator-owned, and the run's bound rather than any one
 /// task's: a pipeline that captures a little at every stage can still fill a disk.

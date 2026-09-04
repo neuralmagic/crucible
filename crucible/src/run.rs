@@ -528,7 +528,7 @@ pub(crate) fn prep_plan_runner_with_params(
     // handed this task, and each task's commit reads as though it produced all of them.
     crucible_vcs::git_memory::install_harness_excludes(
         &workspace,
-        &[format!("{}/", crate::plan::harness::STAGED_INPUTS)],
+        &[format!("{}/", crate::plan::STAGED_INPUTS)],
     );
     std::fs::create_dir_all(&p.state)
         .with_context(|| format!("creating state dir {}", p.state.display()))?;
