@@ -14,19 +14,22 @@ fn run_id() -> &'static str {
     ID.get_or_init(|| uuid::Uuid::now_v7().simple().to_string())
 }
 
-/// The per-workspace sandbox name: `ci-<run-id>-<workspace-hash>`. Stable across turns within one
-/// loop instance (the process identity and workspace are fixed), unique across parallel
-/// candidates and relaunched processes sharing a gateway. The broker gets this exact string at
-/// spawn (`BROKER_SANDBOX_NAME`) rather than re-deriving it; neither component is a durable ID.
+/// The gateway's cap on a sandbox name: three routable names and two `--` delimiters have to fit
+/// one 63-character DNS label.
+pub const MAX_NAME_LEN: usize = 19;
+const _: () = assert!("ci-".len() + 16 == MAX_NAME_LEN);
+
+/// The per-workspace sandbox name: `ci-` plus a 64-bit hash of the run id and the workspace,
+/// exactly [`MAX_NAME_LEN`] long. Stable across turns within one loop instance (the process
+/// identity and workspace are fixed), unique across parallel candidates and relaunched processes
+/// sharing a gateway. The broker gets this exact string at spawn (`BROKER_SANDBOX_NAME`) rather
+/// than re-deriving it; neither component is a durable ID.
 pub fn name_for(workspace: &std::path::Path) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
+    run_id().hash(&mut h);
     workspace.hash(&mut h);
-    format!(
-        "ci-{}-{:08x}",
-        &run_id()[..12],
-        h.finish() & u64::from(u32::MAX)
-    )
+    format!("ci-{:016x}", h.finish())
 }
 
 /// `sandbox upload --no-git-ignore <name> <local>`: push the whole workspace to `~`, dotfiles
@@ -83,9 +86,13 @@ mod tests {
             "stable across turns within a lane"
         );
         assert!(a.starts_with("ci-"));
-        assert_eq!(a.split('-').nth(1).map(str::len), Some(12));
+        assert_eq!(
+            a.len(),
+            MAX_NAME_LEN,
+            "fills the gateway's routable cap: {a}"
+        );
         assert!(
-            a.len() <= 63 && a.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+            a.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
             "container-name safe: {a}"
         );
     }
