@@ -678,7 +678,6 @@ fn run_from_manifest(args: Args) -> Result<()> {
         .filter(|(_, _, frozen)| *frozen)
         .map(|(src, dst, _)| (src, dst))
         .collect();
-    args.search = m.search.clone();
     args.workflow = m.workflow.clone();
     args.workflow_frozen_injects = m.frozen_inject_pairs(&manifest_dir)?;
     args.workflow_toolbox_exclude = m.agent.toolbox_exclude.clone();
@@ -793,7 +792,6 @@ fn run_composite(args: Args, manifest_path: PathBuf) -> Result<()> {
         seed_diff: read_seed_diff(&manifest_dir, m.agent.seed_diff.as_deref())?,
     };
 
-    args.search = m.search.clone();
     args.workflow = m.workflow.clone();
     args.workflow_frozen_injects = Vec::new();
     args.workflow_toolbox_exclude = m.agent.toolbox_exclude.clone();

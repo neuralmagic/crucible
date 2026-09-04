@@ -9,7 +9,7 @@
 //! (blocked-connection attempts are turn telemetry) → download the workspace and private session back → delete
 //! the sandbox (per-turn-fresh, so a discarded iteration leaves no residue).
 //!
-//! The sandbox name is derived per (process, workspace), so parallel wide-round candidates and parallel
+//! The sandbox name is derived per (process, workspace), so parallel isolated plan tasks and parallel
 //! crucible processes sharing one gateway never collide on a fixed name.
 
 use crate::agent::{self, TurnFailure, TurnOutcome};

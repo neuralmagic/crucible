@@ -21,8 +21,6 @@ Required fields: [repo], when present, must contain exactly one of url or path. 
 
 [judge.selftest], if present, must require both good_cmd and bad_cmd; runs must be >= 1.
 
-[search], if present with wide > 0, must require approaches.len() >= wide and policy_k in 1..=wide.
-
 Unknown manifest keys must be rejected as errors.
 
 Frozen loading: when the manifest lives inside the workspace it targets, the engine must parse it from the workspace's pristine base commit, not the current working tree. Before any base commit exists (the very first run), the engine must hard-warn and trust the working tree for that run only."""

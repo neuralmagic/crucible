@@ -1,6 +1,6 @@
 # ADR 0010: Candidate portfolios — explore/exploit search over reviewable candidates
 
-**Status:** Accepted; implemented (v1, 2026-07-02: parallel propose turns + serialized measurement + top-k ranking behind `--wide N` / `[search]`; since re-implemented as a [work-graph](../work-graphs.md) template compiled from `[search]`, with the same `[search]` surface; round-robin and successive-halving policies remain future impls)
+**Status:** Superseded by [ADR 0028](./0028-retire-the-wide-tournament.md) (2026-09-04). Was implemented (v1, 2026-07-02: parallel propose turns + serialized measurement + top-k ranking behind `--wide N` / `[search]`; later re-implemented as a [work-graph](../work-graphs.md) template compiled from `[search]`). The wide round, `[search]`, and `--wide` no longer exist; breadth is authored as a fan-out in the work graph.
 **Date:** 2026-06-28
 **Related:** [ADR-0004](./0004-core-loop-state-model.md) (the core loop is a *sequential* refinement of one
 line; this generalizes it to a population), [ADR-0009](./0009-composite-domains.md) (a composite candidate

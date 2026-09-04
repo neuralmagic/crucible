@@ -122,8 +122,6 @@ pub struct OpenPlan {
     pub declared: Vec<String>,
     /// TaskResult names seen after this PlanAdmitted.
     pub resulted: Vec<String>,
-    /// Admitted before the first iteration Phase.
-    pub wide: bool,
 }
 
 /// What the tail of the log says happened.
@@ -136,11 +134,6 @@ pub enum Classification {
     },
     /// No decided rows: nothing to resume from.
     DiedInBaseline,
-    /// Died before the first iteration Phase.
-    DiedInWideRound {
-        plan: Option<OpenPlan>,
-        turn: Option<(u32, TurnEvidence)>,
-    },
     /// AgentStart with no AgentDone: the turn was in flight.
     DiedMidTurn {
         iter: u32,
@@ -162,7 +155,6 @@ impl Classification {
         match self {
             Classification::CleanExit { .. } => RecoveryClass::CleanExit,
             Classification::DiedInBaseline => RecoveryClass::DiedInBaseline,
-            Classification::DiedInWideRound { .. } => RecoveryClass::DiedInWideRound,
             Classification::DiedMidTurn { .. } => RecoveryClass::DiedMidTurn,
             Classification::DiedDeciding { .. } => RecoveryClass::DiedDeciding,
             Classification::DiedInPlanTask { .. } => RecoveryClass::DiedInPlanTask,
@@ -189,21 +181,6 @@ impl Classification {
                 format!("previous run exited {}: {reason}", outcome.as_str())
             }
             Classification::DiedInBaseline => "no decided rows in the log".to_string(),
-            Classification::DiedInWideRound { plan, turn } => {
-                let mut s = "died in the wide tournament".to_string();
-                if let Some(p) = plan {
-                    s.push_str(&format!(
-                        ", plan v{} open ({}/{} tasks resulted)",
-                        p.plan_version,
-                        p.resulted.len(),
-                        p.declared.len()
-                    ));
-                }
-                if turn.is_some() {
-                    s.push_str(", a turn was in flight");
-                }
-                s
-            }
             Classification::DiedMidTurn {
                 iter,
                 evidence,
@@ -238,8 +215,7 @@ impl Classification {
                 s
             }
             Classification::DiedInPlanTask { iter, plan } => format!(
-                "{}plan v{} at iter {iter} never accounted ({}/{} tasks resulted)",
-                if plan.wide { "wide " } else { "" },
+                "plan v{} at iter {iter} never accounted ({}/{} tasks resulted)",
                 plan.plan_version,
                 plan.resulted.len(),
                 plan.declared.len()
@@ -331,7 +307,6 @@ pub struct LoopState {
     /// Lines whose `kind` this reader does not know.
     pub unknown: u32,
     // Open brackets, exactly the facts the tail classifier needs.
-    saw_iteration_phase: bool,
     saw_any_row: bool,
     last_row_iter: u32,
     last_phase_iter: u32,
@@ -365,7 +340,6 @@ impl LoopState {
             SessionEvent::Start { .. } => {}
             SessionEvent::Phase { phase, iter } => {
                 if phase == "iteration" {
-                    self.saw_iteration_phase = true;
                     self.last_phase_iter = *iter;
                     self.done_unrowed = None;
                 }
@@ -468,7 +442,6 @@ impl LoopState {
                     plan_version: *plan_version,
                     declared: tasks.iter().map(|t| t.name.clone()).collect(),
                     resulted: Vec::new(),
-                    wide: !self.saw_iteration_phase,
                 });
             }
             SessionEvent::AsksEmitted { .. } => {}
@@ -564,12 +537,6 @@ impl LoopState {
         if !self.saw_any_row {
             return Classification::DiedInBaseline;
         }
-        if !self.saw_iteration_phase {
-            return Classification::DiedInWideRound {
-                plan: self.open_plan.clone(),
-                turn: self.open_turn.clone(),
-            };
-        }
         if let Some((iter, evidence)) = &self.open_turn {
             return Classification::DiedMidTurn {
                 iter: *iter,
@@ -603,7 +570,8 @@ impl LoopState {
         }
     }
 
-    /// Decided deep-loop rows: neither a wide-round lane nor a never-started turn record.
+    /// Decided deep-loop rows: not a never-started turn record, and not a `wide` lane row from a
+    /// log written before the wide tournament was removed.
     pub fn deep_rows(&self) -> impl DoubleEndedIterator<Item = &RowWire> {
         self.rows
             .iter()

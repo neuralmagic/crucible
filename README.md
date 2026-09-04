@@ -155,7 +155,6 @@ The main manifest sections are:
 | `[agent]` | yes | Configures the backend, harness, model, goal, prompt, environment, and sandbox. |
 | `[judge]` | no | Defines `measure_cmd`, score `direction`, and optional gate self-tests. Omitted entirely, the run is a task: every completed turn is kept, unscored (see [docs/task-lane.md](docs/task-lane.md)). |
 | `[world]` | no | Adds apply, snapshot, and restore commands for state outside Git. |
-| `[search]` | no | Configures a parallel wide round before the iterative deep loop. |
 | `[workflow]` | no | Defines the task graph used by an iteration. |
 | `[deploy]` | no | Defines build and deployment values used by rendered cluster runs. |
 | `[build.<name>]` | no | Defines a named image build target. |
@@ -332,8 +331,8 @@ Running `crucible` without a subcommand starts an optimization loop and requires
 | `crucible rank-grounded` | Performs one read-only, code-grounded ranking turn over an existing checkout. |
 | `crucible build` | Executes a named build configuration and prints the resulting digest-pinned image reference. |
 
-Common loop controls include `--iterations`, `--wide`, `--wide-keep`, `--max-cost`,
-`--max-time`, `--ui`, `--resume`, and `--no-early-stop`.
+Common loop controls include `--iterations`, `--max-cost`, `--max-time`, `--ui`, `--resume`,
+and `--no-early-stop`.
 
 ## Repository layout
 

@@ -76,11 +76,6 @@ apply_cmd    = "..."                          # optional. §3.
 snapshot_cmd = "..."                          # optional. §3.
 restore_cmd  = "..."                          # optional. §3.
 
-[search]                                      # optional (ADR-0010). Absent or wide=0 → pure-deep, the default.
-wide       = 0                                # u32. N parallel propose turns before the deep loop. default 0
-approaches = ["...", "..."]                   # REQUIRED when wide > 0: one distinct approach string per candidate slot
-policy     = "top-k"                          # only v1 policy. default "top-k"
-policy_k   = 1                                # how many wide-round winners seed the deep loop. default 1, must be in 1..=wide
 ```
 
 Rules:
@@ -89,8 +84,6 @@ Rules:
   which still owns git memory and layers the given commands on top.
 - `[judge.selftest]`, if present, requires both `good_cmd` and `bad_cmd` (a self-test that only
   stages one side isn't a control); `runs` must be `>= 1`.
-- `[search]`, if present with `wide > 0`, requires `approaches.len() >= wide` (hard error,
-  diversity is engineered, not auto-generated) and `policy_k` in `1..=wide`.
 - Unknown keys are an error (typo protection), not silently ignored.
 - **Frozen loading (`load_frozen`).** When the manifest file lives *inside* the workspace it
   targets (the BYO on-ramp: `crucible init` scaffolds `[repo] path = "."`), the engine parses it
@@ -116,18 +109,7 @@ The workspace is restored to pristine on every exit path (pass, fail, or error).
 no `[judge.selftest]` isn't an error, `crucible check` warns instead, since the gate hasn't been
 proven to discriminate.
 
-### 1.2 Wide-round search (`[search]`, ADR-0010)
-
-`[search].wide > 0` (or `--wide N` on the CLI, which overrides the manifest) fans out `N`
-independent PROPOSE turns in per-candidate git worktrees under the state dir before the deep
-loop starts, one turn per `approaches` entry biased into its prompt. Each candidate's diff is
-applied (cherry-picked) into the shared main workspace and measured serially there (measurement
-never runs concurrently, only proposal does). The scored set is ranked by `[search].policy` (v1:
-`"top-k"`); the `policy_k` (or `--wide-keep K`) winner(s) seed the deep loop, which then runs as
-normal. Session rows from the wide round carry an additive `phase: "wide"` field (§7) so a
-consumer can tell a wide-round row from a deep-loop row without a wire-shape change.
-
-### 1.3 Scope-authored workflows (`workflow.star`)
+### 1.2 Scope-authored workflows (`workflow.star`)
 
 A scoped pack may include `workflow.star` beside `crucible.toml`. It is authoring syntax, not a
 runtime interpreter: scope compiles it to the existing `[[workflow.task]]` manifest IR before
@@ -701,9 +683,9 @@ free-text label like `"score"`/`"bench"`, not the deleted enum). This keeps `--r
 remote viewer, and already-published S3 runs loading. Do **not** rename the wire key.
 
 A `row` event's wire record (`RowWire`) carries an additive, optional `phase` field
-(`"wide"` for a wide-round candidate row, absent for a deep-loop row). It's `skip_serializing_if
-= "Option::is_none"`, so a deep-only run's wire bytes are unchanged from before wide rounds
-existed.
+(`"infra"` for a never-started turn record, absent for a deep-loop row). It's `skip_serializing_if
+= "Option::is_none"`. Logs written before the wide tournament was removed carry `"wide"` rows;
+readers keep them out of the deep loop's baseline and best.
 
 Additive event kinds beyond the compat set include:
 

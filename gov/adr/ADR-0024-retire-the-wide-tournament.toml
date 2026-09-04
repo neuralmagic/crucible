@@ -1,0 +1,47 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0024"
+title = "Retire the wide tournament"
+status = "accepted"
+date = "2026-09-04"
+refs = [
+    "ADR-0010",
+    "ADR-0004",
+    "RFC-0001",
+    "RFC-0002",
+]
+
+[content]
+context = """
+[[ADR-0010]] added a wide round before the deep loop: N parallel propose turns in per-candidate worktrees, serial diff scoring on the shared deployment, a top-k fold, and the winner's diff seeding the deep loop. It shipped as a work-graph template (`WideRunner`, `wide_template`, `MeasureDiff`) with its own manifest table (`[search]`), two CLI flags (`--wide`, `--wide-keep`), a row phase (`"wide"`), a crash class (`died_in_wide_round`), and a second row-accounting filter in the resume fold.
+
+No domain pack in crucible-domains sets `[search]`, and the loop is being refactored into one event-sourced state machine (a contract-level fold of the session log, a pure decision step, and a host that runs commands). Every piece the wide round adds is a second copy of something the deep loop already has: a second runner over `Row`, a second phase to classify, a second filter in every fold, and a third `TaskKind` dispatch site. Each would have to be carried through the refactor and taught to the approval-gate work that follows it.
+
+The breadth the wide round bought is available inside the work graph: an authored fan-out of isolated plan tasks and a `top_k` reducer express the same search without a separate pre-loop stage."""
+decision = """
+Delete the wide tournament. `WideConfig`, `WideOutcome`, `run_wide_tournament`, `wide_template`, `WideRunner`, `wide_propose`, `render_wide_prompt`, the `[search]` manifest table and its validation, the `--wide` and `--wide-keep` flags, and the `engine.measure_diff` operation are removed. The `died_in_wide_round` classification arm goes with them; a plan admitted before any iteration phase now classifies as an open plan like any other.
+
+The wire stays readable. `phase: "wide"` remains a legal row value and `died_in_wide_round` remains a decodable recovery-class token, because logs written before this decision carry them; readers keep such rows out of the deep loop's baseline and best, exactly as the resume fold did. [[RFC-0001:C-SEARCH]] is deprecated and the `[search]` rule leaves [[RFC-0001:C-MANIFEST]].
+
+This supersedes [[ADR-0010]]. The candidate-portfolio idea it recorded is not rejected; its home moves from a dedicated stage to the authored graph."""
+consequences = """
+Positive: the loop has one runner over `Row`, one phase vocabulary, and one row filter, so the event-sourced refactor and the approval gates have one fewer shape to carry. `loop_graph.rs` loses its second `TaskRunner`; `recovery.rs` and the contract fold lose a classification arm; the manifest loses a table.
+
+Negative: a run that wants breadth has to author it as a fan-out in `workflow.star`, and no shipped template does that yet. Old session logs with `"wide"` rows render those rows as legacy context rather than as a named stage.
+
+The removal lands as its own behavior-preserving change with the parity tests green, before the state-machine refactor touches the same files."""
+
+[[content.alternatives]]
+text = "Delete the wide tournament; breadth lives in the authored work graph"
+status = "accepted"
+
+[[content.alternatives]]
+text = "Keep the wide round and carry it through the state-machine refactor"
+status = "rejected"
+rejection_reason = "Doubles the shapes the reducer, the classifier, and the gate work must handle, for a stage no deployed pack uses."
+
+[[content.alternatives]]
+text = "Keep [search] as an authored-graph sugar that expands to a fan-out template"
+status = "rejected"
+rejection_reason = "A template no one runs is code no one tests; the DSL can express the same graph explicitly when a pack wants it."

@@ -8,8 +8,7 @@ privileged operations live host-side behind a mediated broker the agent can only
 ```mermaid
 flowchart TD
     issue["GitHub issue / Jira ticket"] -->|scope --issue| goal["Run goal<br/>(frozen objective)"]
-    goal --> wide["wide round (optional)<br/>N parallel propose → rank → winner seeds"]
-    wide --> propose
+    goal --> propose
 
     subgraph control["Control plane (operator, human-in-the-loop)"]
         direction LR
@@ -61,7 +60,6 @@ flowchart TD
 | Stage | What happens | Deeper |
 | --- | --- | --- |
 | **Goal** | A GitHub issue or Jira ticket becomes a frozen run objective. The objective never moves once the run starts. | [ADR 0001](./adr/0001-adaptive-harness.md) |
-| **wide round** | Optional: `--wide N` fans out N independent propose turns (one per `[search].approaches` entry) in parallel, ranks them by the gate, and the winner seeds the deep loop below. 0 (default) skips straight to propose. | [ADR 0010](./adr/0010-candidate-portfolios-and-search.md) |
 | **propose** | The agent reads the history and edits the world toward the goal. The proposal policy is a pluggable backend (`local` / `openshell` / `command`), not the engine. | [What crucible is](./crucible.md) |
 | **apply** | Make the candidate live. For a code repo the edits *are* the apply; for a deploy domain it builds + sets the image. | [ADR 0005](./adr/0005-engine-side-builds.md), [ADR 0012](./adr/0012-rendered-deployments.md) |
 | **measure** | The frozen judge scores the candidate once. The agent is handed a `World`, never the `Judge`, so it can't tune the test it's graded on. | [ADR 0001](./adr/0001-adaptive-harness.md) |

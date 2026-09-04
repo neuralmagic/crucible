@@ -2101,7 +2101,7 @@ mod tests {
 
     #[test]
     fn passed_join_folds_only_passing_dependencies() {
-        // Wide's reducer shape: one candidate fails, the reducer still ranks the rest.
+        // A lossy reducer: one candidate fails, the reducer still ranks the rest.
         let mut tasks = vec![
             task("m-ok", &[], "any", false),
             task("m-bad", &[], "any", false),

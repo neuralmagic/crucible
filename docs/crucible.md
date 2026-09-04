@@ -47,11 +47,9 @@ flowchart LR
 - **accept?**: keep if it's strictly better; otherwise restore the last good state.
 - **remember**: kept states are git commits; every step is an NDJSON event.
 
-This single-candidate line of descent is the default, and it's not the only shape: a
-**wide round** ([ADR 0010](./adr/0010-candidate-portfolios-and-search.md)) can fan `N`
-independent propose turns out in parallel first, biased to distinct `[search].approaches`,
-rank them by the same Judge, and seed the loop above with the winner. `--wide 0` (the
-default) skips it entirely, no engine change, just a pre-loop step.
+This single-candidate line of descent is the loop. Breadth, when a run wants it, is an
+authored fan-out inside the work graph (isolated plan tasks and a `top_k` reducer), not a
+separate pre-loop stage.
 
 ## The contract: framework owns it, the repo owns the implementations
 
@@ -93,8 +91,8 @@ Limits worth knowing before you use it:
 - A path that doesn't exist yet is fine; the exclude is prospective.
 - Nested paths (`target/codegen-out`) work: the clean descends into the parent instead of
   deleting it. Entries must be plain relative paths, so no `.`, `..`, or leading `/`.
-- Wide-tournament rounds run in fresh worktrees with no untracked carried dirs, so they don't
-  benefit.
+- Isolated plan-task worktrees are fresh checkouts with no untracked carried dirs, so they
+  don't benefit.
 - Composite manifests reject the key; per-component carry-forward is a non-goal.
 
 Omitting it is the default and keeps today's fresh-start behavior exactly, which is what a
@@ -161,7 +159,6 @@ Any language works the same way, because the engine reads only the JSON verdict.
 | **Profiler** | generic profile-over-MCP: pprof for a Go service, GPU traces for a model server | `crucible-broker::profile` (ADR-0006) |
 | **Build + deploy** | engine-side build, and `crucible deploy render` projects the loop/deployment manifests, digest-pinned | `forge` + `crucible/src/deploy/` (ADR-0005 / 0012) |
 | **Publish** | publish-on-keep to S3 + a draft PR per fork; authorized review comments re-steer the run | `publish.rs` / `crucible-broker::draft_pr` |
-| **Search (wide round)** | optional fan-out of N parallel propose turns, ranked by the same Judge, before the deep loop ([ADR 0010](./adr/0010-candidate-portfolios-and-search.md)) | `crucible/src/wide/` |
 | **Self-test** | `crucible check` proves the Judge can tell a known-good config from a known-bad one before a run trusts it | `[judge.selftest]` + `selftest.rs` |
 | **On-ramp** | `crucible init` scaffolds a manifest + measure stub onto an existing repo; `crucible check` validates it with no agent turn; `crucible scope` ingests a goal and freezes a `SCOPE.md` (ADR-0014 S0) | `init.rs` / `check.rs` / `scope.rs` |
 | **Preflight** | runs the domain's rung ladder against the unmodified tree before iteration 1; a failure refuses the run, and the optional baseline rung seeds `segment.baseline_score` | `[preflight]` + `preflight.rs` |
@@ -302,7 +299,7 @@ On the wire the run is the normal shape with `gate: "task"` as the discriminator
   no-op).
 - The trust boundary is unchanged: the agent still holds no credentials. Output lands as a
   draft PR; privileged write actions (merging, closing issues) stay broker-tool material.
-- Composites still require `[judge]`; so do `[search]`, `[workflow]`, and `[preflight]`,
+- Composites still require `[judge]`; so do `[workflow]` and `[preflight]`,
   which a task manifest rejects at load. The scope pipeline still rejects judge-less
   proposed packs, and a scored judge may not claim `objective = "task"`.
 

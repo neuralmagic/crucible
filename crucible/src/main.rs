@@ -104,8 +104,8 @@ pub(crate) fn kill_pid(pid: i32) {
     }
 }
 
-/// Registry of live agent-child PIDs so Ctrl+C can kill ALL concurrent children (wide-round
-/// parallel agents and the serial deep-loop agent alike).
+/// Registry of live agent-child PIDs so Ctrl+C can kill ALL concurrent children (parallel
+/// isolated plan tasks and the serial deep-loop agent alike).
 pub(crate) mod pid_registry {
     use std::sync::Mutex;
 
@@ -641,16 +641,6 @@ pub(crate) struct Args {
     /// Max agent iterations.
     #[arg(long, default_value_t = 3)]
     pub iterations: u32,
-    /// Wide-round breadth: fan out N independent candidates in parallel before the deep loop.
-    /// Each candidate gets one PROPOSE turn biased to a distinct `[search].approaches` entry,
-    /// measured serially, ranked by the gate. The winner seeds the deep loop. 0 = no wide round
-    /// (pure deep, the default). Overrides `[search].wide`.
-    #[arg(long, default_value_t = 0)]
-    pub wide: u32,
-    /// How many wide-round winners seed a deep loop (top-K by score). Default 1. Only
-    /// meaningful when `--wide > 0`. Overrides `[search].policy_k`.
-    #[arg(long, default_value_t = 1)]
-    pub wide_keep: u32,
     /// Run each iteration as a canonical work-graph plan (propose → apply → measure → decide)
     /// through the shared plan executor instead of the hand-sequenced stages. Same events,
     /// same decisions (parity-gated), plus additive plan lines on the session log.
@@ -780,9 +770,6 @@ pub(crate) struct Args {
     /// each `embed` match lands in the PR body and the S3 run record. No CLI flag.
     #[arg(skip)]
     pub artifacts: Vec<manifest::Artifact>,
-    /// Wide-round search config (from `[search]`). No CLI flag, set by `run_from_manifest`.
-    #[arg(skip)]
-    pub search: Option<manifest::SearchCfg>,
     /// Manifest-only authored workflow.
     #[arg(skip)]
     pub workflow: Option<manifest::WorkflowCfg>,

@@ -7,9 +7,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -21,12 +19,11 @@ use crate::plan::exec::{
     Attempt, AttemptOutcome, BatchItem, ExecCfg, Substrate, TaskRunner, TaskStatus, execute,
 };
 use crate::plan::ir::{
-    Direction, EngineOp, Isolation, Join, Plan, PlanBudget, Stage, Task, TaskKind, TaskName,
-    ValidPlan,
+    EngineOp, Join, Plan, PlanBudget, Stage, Task, TaskKind, TaskName, ValidPlan,
 };
 use crate::reporter::{Reporter, Row, TurnBudget};
 use crate::session::{EvidenceDisposition, EvidenceEntry};
-use crate::{Args, Paths, Prepared, STOP, agent, control};
+use crate::{Args, Paths, agent, control};
 use crucible::crucible::{Judge, MeasureCtx, Reading, World};
 
 #[derive(Debug, thiserror::Error)]
@@ -734,11 +731,7 @@ impl<R: Reporter> TaskRunner for LoopTaskRunner<'_, R> {
                 source,
                 ..
             } => self.decide(task, source.as_ref()),
-            TaskKind::Engine {
-                op: EngineOp::MeasureDiff,
-                ..
-            }
-            | TaskKind::TopK { .. } => fail(
+            TaskKind::TopK { .. } => fail(
                 0.0,
                 format!(
                     "unexpected task kind in the loop template: {}",
@@ -783,549 +776,6 @@ fn fail(cost_usd: f64, note: String) -> Attempt {
         outcome: AttemptOutcome::fail(note),
         cost_usd,
     }
-}
-
-// ---------------------------------------------------------------------------
-// The wide tournament as a template: N isolated propose tasks fan out in
-// parallel worktrees, their diffs are scored serially on the shared deployment
-// by MeasureDiff tasks, and an engine top_k with a lossy join ranks whatever
-// survived. The driver seeds the deep loop from the winner's diff text.
-// ---------------------------------------------------------------------------
-
-/// The resolved wide-round config, merged from CLI flags + manifest `[search]`. CLI wins.
-pub struct WideConfig {
-    pub n: u32,
-    pub k: u32,
-    pub approaches: Vec<String>,
-}
-
-impl WideConfig {
-    /// Merge CLI flags (`--wide`, `--wide-keep`) with the manifest's `[search]`. CLI wins.
-    pub fn resolve(args: &Args, search: Option<&crate::manifest::SearchCfg>) -> Option<Self> {
-        let n = if args.wide > 0 {
-            args.wide
-        } else {
-            search.map(|s| s.wide).unwrap_or(0)
-        };
-        if n == 0 {
-            return None;
-        }
-        let k = if args.wide_keep > 0 && args.wide > 0 {
-            args.wide_keep
-        } else {
-            search.map(|s| s.policy_k).unwrap_or(1)
-        };
-        let approaches = search.map(|s| s.approaches.clone()).unwrap_or_default();
-        if approaches.len() < n as usize {
-            return None;
-        }
-        Some(WideConfig { n, k, approaches })
-    }
-}
-
-/// What the wide tournament left behind for the driver.
-pub(crate) struct WideOutcome {
-    /// Winning candidate ids, best first.
-    pub winners: Vec<u32>,
-    /// Every candidate row (skip/fail/measured), for the session log.
-    pub rows: Vec<Row>,
-    /// Candidate id → captured diff text, for seeding the deep loop. Only winners are
-    /// resolved here.
-    pub diffs: BTreeMap<u32, String>,
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn run_wide_tournament<R: Reporter>(
-    cfg: &WideConfig,
-    args: &Args,
-    p: &Paths,
-    prep: &Prepared,
-    r: &mut R,
-    world: &dyn World,
-    judge: &dyn Judge,
-    baseline_score: f64,
-) -> Result<WideOutcome> {
-    r.note(&format!(
-        "wide round: fanning out {} candidates (top-{} advance)",
-        cfg.n, cfg.k
-    ));
-    let wide_dir = p.state.join("wide").join(&prep.run_id);
-    std::fs::create_dir_all(&wide_dir)
-        .with_context(|| format!("creating wide-round dir {}", wide_dir.display()))?;
-
-    let direction = match judge.direction() {
-        crate::command_judge::Direction::Lower => Direction::Lower,
-        crate::command_judge::Direction::Higher => Direction::Higher,
-    };
-    let plan = wide_template(cfg, prep, direction)?;
-    r.plan_event(&crate::plan::cli::plan_admitted_event(&plan));
-    r.note("wide: starting parallel PROPOSE turns");
-    let snap = world
-        .snapshot("wide-pre-measure")
-        .context("wide pre-measure snapshot")?;
-
-    let mut runner = WideRunner {
-        args,
-        p,
-        world,
-        judge,
-        r,
-        wide_dir,
-        baseline_score,
-        approaches: (0..cfg.n)
-            .map(|id| (id, cfg.approaches[id as usize].clone()))
-            .collect(),
-        snap,
-        measure_note_emitted: false,
-        rows: Vec::new(),
-        fatal: None,
-    };
-    let mut task_events = Vec::new();
-    let outcome = execute(
-        &plan,
-        &Substrate::default(),
-        ExecCfg::default(),
-        &mut runner,
-        |task, result| {
-            task_events.push(crate::plan::cli::task_result_event(
-                plan.plan().version,
-                0,
-                task,
-                result,
-            ));
-        },
-    );
-    for ev in &task_events {
-        runner.r.plan_event(ev);
-    }
-    if let Some(e) = runner.fatal.take() {
-        return Err(e);
-    }
-
-    let mut winners: Vec<u32> = Vec::new();
-    if let Some(kept) = outcome
-        .results
-        .get(&"pick".into())
-        .and_then(|r| r.output.as_ref())
-        .and_then(|o| o.get("kept"))
-        .and_then(Value::as_array)
-    {
-        for (rank, entry) in kept.iter().enumerate() {
-            let id = entry
-                .get("task")
-                .and_then(Value::as_str)
-                .and_then(|n| n.rsplit('-').next())
-                .and_then(|s| s.parse::<u32>().ok());
-            let score = entry.get("score").and_then(Value::as_f64);
-            if let (Some(id), Some(score)) = (id, score) {
-                runner.r.note(&format!(
-                    "wide round: rank {} = candidate {id} (score: {score:.2})",
-                    rank + 1
-                ));
-                winners.push(id);
-            }
-        }
-    }
-    if winners.is_empty() {
-        runner
-            .r
-            .note("wide round: no candidates scored, deep loop starts from baseline");
-    }
-
-    let diffs: BTreeMap<u32, String> = winners
-        .iter()
-        .filter_map(|id| {
-            outcome
-                .results
-                .get(&TaskName(format!("propose-{id}")))
-                .and_then(|r| r.output.as_ref())
-                .and_then(|o| o.get("diff"))
-                .and_then(Value::as_str)
-                .map(|d| (*id, d.to_string()))
-        })
-        .collect();
-    Ok(WideOutcome {
-        winners,
-        rows: runner.rows,
-        diffs,
-    })
-}
-
-/// The wide tournament template: `propose-{i} (isolated, advisory) → measure-{i}
-/// (advisory) → pick (top_k over whatever passed)`. Everything is advisory: a dead
-/// candidate never gates the tournament, matching the loop's skip/fail rows. The budget
-/// stays driver-owned, like the iteration template's.
-fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Result<ValidPlan> {
-    let mut tasks: Vec<Task> = Vec::new();
-    for id in 0..cfg.n {
-        tasks.push(Task {
-            name: TaskName(format!("propose-{id}")),
-            task: TaskKind::Agent {
-                prompt: render_wide_prompt(
-                    &prep.template,
-                    &prep.goal,
-                    &cfg.approaches[id as usize],
-                ),
-                harness: None,
-                model: None,
-                effort: None,
-            },
-            depends_on: vec![],
-            session: None,
-            needs: "any".to_string(),
-            required: false,
-            isolation: Some(Isolation::Worktree),
-            join: Join::All,
-            stage: Stage::Iteration,
-            emits: Vec::new(),
-            emits_files: Vec::new(),
-            over: None,
-            max_fanout: None,
-        });
-    }
-    for id in 0..cfg.n {
-        tasks.push(Task {
-            name: TaskName(format!("measure-{id}")),
-            task: TaskKind::Engine {
-                op: EngineOp::MeasureDiff,
-                source: None,
-                tiebreak: None,
-            },
-            depends_on: vec![TaskName(format!("propose-{id}"))],
-            session: None,
-            needs: "any".to_string(),
-            required: false,
-            isolation: None,
-            join: Join::All,
-            stage: Stage::Iteration,
-            emits: Vec::new(),
-            emits_files: Vec::new(),
-            over: None,
-            max_fanout: None,
-        });
-    }
-    tasks.push(Task {
-        name: "pick".into(),
-        task: TaskKind::TopK {
-            k: cfg.k,
-            direction,
-        },
-        depends_on: (0..cfg.n)
-            .map(|id| TaskName(format!("measure-{id}")))
-            .collect(),
-        session: None,
-        needs: "any".to_string(),
-        required: false,
-        isolation: None,
-        join: Join::Passed,
-        stage: Stage::Iteration,
-        emits: Vec::new(),
-        emits_files: Vec::new(),
-        over: None,
-        max_fanout: None,
-    });
-    Plan {
-        version: 1,
-        reason: None,
-        budget: PlanBudget { usd: f64::MAX },
-        tasks,
-    }
-    .validate()
-    .context("building the wide tournament template")
-}
-
-/// [`TaskRunner`] for the wide template. Propose batches run threaded (one worktree per
-/// candidate); MeasureDiff serializes on the main workspace.
-struct WideRunner<'a, R: Reporter> {
-    args: &'a Args,
-    p: &'a Paths,
-    world: &'a dyn World,
-    judge: &'a dyn Judge,
-    r: &'a mut R,
-    wide_dir: PathBuf,
-    baseline_score: f64,
-    approaches: BTreeMap<u32, String>,
-    /// The pre-measure rollback token every scoring pass restores to.
-    snap: String,
-    measure_note_emitted: bool,
-    rows: Vec<Row>,
-    /// A failed world restore leaves the workspace in an unknown state; abort the run.
-    fatal: Option<anyhow::Error>,
-}
-
-impl<R: Reporter> WideRunner<'_, R> {
-    fn restore_or_fatal(&mut self) -> bool {
-        match self.world.restore(&self.snap) {
-            Ok(()) => true,
-            Err(e) => {
-                self.fatal = Some(e.context("restoring after a wide candidate measure"));
-                false
-            }
-        }
-    }
-
-    fn measure_diff(&mut self, task: &Task, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
-        if !self.measure_note_emitted {
-            self.r.note("wide: measuring candidates serially");
-            self.measure_note_emitted = true;
-        }
-        if STOP.load(Ordering::SeqCst) {
-            return fail(0.0, "stop requested".to_string());
-        }
-        let Some(id) = candidate_id(&task.name) else {
-            return fail(0.0, format!("task {} has no candidate id", task.name));
-        };
-        let approach = self.approaches.get(&id).cloned().unwrap_or_default();
-        let diff = inputs
-            .values()
-            .next()
-            .and_then(|v| v.get("diff"))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        if diff.trim().is_empty() {
-            self.r
-                .note(&format!("wide candidate {id}: no diff produced, skipping"));
-            self.rows.push(Row {
-                iter: 0,
-                decision: "wide-skip".into(),
-                note: format!("candidate {id} ({approach}) produced no diff"),
-                phase: Some("wide".into()),
-                ..Default::default()
-            });
-            return fail(0.0, "no diff produced".to_string());
-        }
-        self.r.note(&format!(
-            "wide candidate {id}: measuring (approach: {approach})"
-        ));
-        if let Err(e) = crate::plan::worktree::apply(&self.p.workspace, &diff) {
-            self.r
-                .note(&format!("wide candidate {id}: apply failed: {e:#}"));
-            if !self.restore_or_fatal() {
-                return fail(0.0, "restore failed".to_string());
-            }
-            self.rows.push(Row {
-                iter: 0,
-                decision: "wide-fail".into(),
-                note: format!("candidate {id} apply failed: {e:#}"),
-                phase: Some("wide".into()),
-                ..Default::default()
-            });
-            return fail(0.0, format!("apply failed: {e:#}"));
-        }
-        if let Err(e) = self.world.apply() {
-            self.r
-                .note(&format!("wide candidate {id}: world apply failed: {e:#}"));
-            if !self.restore_or_fatal() {
-                return fail(0.0, "restore failed".to_string());
-            }
-            self.rows.push(Row {
-                iter: 0,
-                decision: "wide-fail".into(),
-                note: format!("candidate {id} world apply failed: {e:#}"),
-                phase: Some("wide".into()),
-                ..Default::default()
-            });
-            return fail(0.0, format!("world apply failed: {e:#}"));
-        }
-        let ctx = MeasureCtx {
-            baseline_score: Some(self.baseline_score),
-            baseline_total: None,
-            best_score: Some(self.baseline_score),
-        };
-        match self.judge.measure(&ctx) {
-            Ok(reading) => {
-                let (diff_text, diffstat) = self.world.staged_diff();
-                let decision = if self.judge.decide(&reading, self.baseline_score, None).keep {
-                    "wide-keep"
-                } else {
-                    "wide-discard"
-                };
-                let row = Row {
-                    iter: 0,
-                    decision: decision.into(),
-                    note: format!("[wide candidate {id}] {approach} — {}", reading.note),
-                    detail: self.judge.detail(&reading),
-                    diff: diff_text,
-                    diffstat,
-                    score: reading.score,
-                    tiebreak: reading.tiebreak,
-                    total: reading.detail.get("total").and_then(Value::as_u64),
-                    phase: Some("wide".into()),
-                    kept_snap: None,
-                    evidence: Vec::new(),
-                    candidate_md: String::new(),
-                };
-                self.r.row(&row, false);
-                self.rows.push(row);
-                if !self.restore_or_fatal() {
-                    return fail(0.0, "restore failed".to_string());
-                }
-                match reading.score {
-                    Some(s) if s.is_finite() => pass(serde_json::json!({ "score": s })),
-                    // The reducer needs a finite number, so a scoreless candidate
-                    // does not rank.
-                    _ => fail(0.0, "no finite score to rank".to_string()),
-                }
-            }
-            Err(e) => {
-                self.r
-                    .note(&format!("wide candidate {id}: measure failed: {e:#}"));
-                self.rows.push(Row {
-                    iter: 0,
-                    decision: "wide-fail".into(),
-                    note: format!("candidate {id} measure failed: {e:#}"),
-                    phase: Some("wide".into()),
-                    ..Default::default()
-                });
-                if !self.restore_or_fatal() {
-                    return fail(0.0, "restore failed".to_string());
-                }
-                fail(0.0, format!("measure failed: {e:#}"))
-            }
-        }
-    }
-}
-
-impl<R: Reporter> TaskRunner for WideRunner<'_, R> {
-    fn run(&mut self, task: &Task, _attempt: u32, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
-        match &task.task {
-            TaskKind::Agent { prompt, .. } => {
-                // A batch of one (wide n=1) lands here instead of run_many.
-                let Some(id) = candidate_id(&task.name) else {
-                    return fail(0.0, format!("task {} has no candidate id", task.name));
-                };
-                let pending = match crate::plan::worktree::capture_diff(&self.p.workspace) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        return fail(0.0, format!("capturing the workspace state failed: {e:#}"));
-                    }
-                };
-                wide_propose(
-                    self.args,
-                    &self.p.workspace,
-                    &self.wide_dir,
-                    self.p.skills.clone(),
-                    id,
-                    prompt,
-                    &pending,
-                )
-            }
-            TaskKind::Engine {
-                op: EngineOp::MeasureDiff,
-                ..
-            } => self.measure_diff(task, inputs),
-            other => fail(
-                0.0,
-                format!(
-                    "unexpected task kind in the wide template: {}",
-                    other.label()
-                ),
-            ),
-        }
-    }
-
-    fn run_many(&mut self, batch: &[BatchItem<'_>]) -> Vec<Attempt> {
-        let workspace = self.p.workspace.clone();
-        let wide_dir = self.wide_dir.clone();
-        let skills = self.p.skills.clone();
-        let args = self.args;
-        // Every candidate clones the same workspace, so its pending state is captured once
-        // here: concurrent `git add -A` in one repo races on `.git/index.lock`.
-        let pending = match crate::plan::worktree::capture_diff(&workspace) {
-            Ok(p) => p,
-            Err(e) => {
-                let note = format!("capturing the workspace state failed: {e:#}");
-                return batch.iter().map(|_| fail(0.0, note.clone())).collect();
-            }
-        };
-        std::thread::scope(|s| {
-            let handles: Vec<_> = batch
-                .iter()
-                .map(|b| {
-                    let workspace = workspace.clone();
-                    let wide_dir = wide_dir.clone();
-                    let skills = skills.clone();
-                    let args = args.clone();
-                    let pending = pending.as_str();
-                    let parsed = match (&b.task.task, candidate_id(&b.task.name)) {
-                        (TaskKind::Agent { prompt, .. }, Some(id)) => Some((id, prompt.clone())),
-                        _ => None,
-                    };
-                    s.spawn(move || match parsed {
-                        Some((id, prompt)) => {
-                            wide_propose(&args, &workspace, &wide_dir, skills, id, &prompt, pending)
-                        }
-                        None => fail(0.0, "non-agent task in a propose batch".to_string()),
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| {
-                    h.join()
-                        .unwrap_or_else(|_| fail(0.0, "propose thread panicked".to_string()))
-                })
-                .collect()
-        })
-    }
-}
-
-/// One candidate's PROPOSE turn in a private worktree: clone, run the turn, capture the
-/// staged diff as the task output, clean up. The diff text is the only thing that leaves
-/// the worktree. Wide turns are not streamed and their cost is not booked against the run
-/// budget.
-fn wide_propose(
-    args: &Args,
-    workspace: &Path,
-    wide_dir: &Path,
-    skills: Option<PathBuf>,
-    id: u32,
-    prompt: &str,
-    pending: &str,
-) -> Attempt {
-    if STOP.load(Ordering::SeqCst) {
-        return pass(serde_json::json!({ "diff": "" }));
-    }
-    let worktree = wide_dir.join(format!("candidate-{id}"));
-    if let Err(e) = crate::plan::worktree::setup(workspace, &worktree, pending) {
-        return fail(0.0, format!("worktree setup failed: {e:#}"));
-    }
-    let cand_paths = Paths::for_worktree(worktree.clone(), skills);
-    let _ = std::fs::create_dir_all(&cand_paths.state);
-    let turn = agent::run_turn(args, &cand_paths, prompt, false, |_line, _stream, _ev| {});
-    if let Some(failure) = turn.failure() {
-        let _ = std::fs::remove_dir_all(&worktree);
-        return fail(turn.cost_usd, failure.to_string());
-    }
-    let diff = crate::plan::worktree::capture_diff(&worktree);
-    let _ = std::fs::remove_dir_all(&worktree);
-    match diff {
-        Ok(diff) => pass(serde_json::json!({ "diff": diff })),
-        Err(e) => fail(0.0, format!("capturing the candidate diff failed: {e:#}")),
-    }
-}
-
-/// The numeric suffix of `propose-{id}` / `measure-{id}` task names.
-fn candidate_id(name: &TaskName) -> Option<u32> {
-    name.0.rsplit('-').next().and_then(|s| s.parse().ok())
-}
-
-/// Build the wide-round prompt. The approach biases the candidate; the template provides
-/// the domain's structure. The status is omitted (no prior score in the wide round).
-fn render_wide_prompt(template: &str, goal: &str, approach: &str) -> String {
-    let status = "no prior score (wide round, first attempt)";
-    let out = template
-        .replace("{{GOAL}}", goal.trim())
-        .replace("{{STATUS}}", status)
-        .replace("{{BEST_SCORE}}", status)
-        .replace("{{STEER}}", "");
-    format!(
-        "## Approach constraint (MANDATORY)\n\
-         You MUST use this specific approach: {approach}\n\
-         Implement a minimal, working version of this approach. Do not deviate.\n\n\
-         {out}"
-    )
 }
 
 #[cfg(test)]
@@ -1421,7 +871,6 @@ mod tests {
             true,
             2,
             BUMP,
-            false,
             Some(
                 "\n[[workflow.task]]\nname = \"review\"\nkind = \"command\"\ncommand = \"exit 1\"\n",
             ),
@@ -1548,7 +997,7 @@ mod tests {
             source = "grade"
             depends_on = ["grade"]
         "#;
-        let trace = run_counter_cfg(true, 2, BUMP, false, Some(workflow));
+        let trace = run_counter_cfg(true, 2, BUMP, Some(workflow));
         assert_eq!(trace.best, 3.0, "{}", describe(&trace));
         assert_eq!(
             trace
@@ -1623,7 +1072,7 @@ mod tests {
             source = "grade"
             depends_on = ["grade"]
         "#;
-        let trace = run_counter_cfg(true, 1, BUMP, false, Some(workflow));
+        let trace = run_counter_cfg(true, 1, BUMP, Some(workflow));
         assert_eq!(
             trace
                 .rows
@@ -1712,7 +1161,7 @@ mod tests {
             source = "grade"
             depends_on = ["grade"]
         "#;
-        let trace = run_counter_cfg(true, 1, BUMP, false, Some(workflow));
+        let trace = run_counter_cfg(true, 1, BUMP, Some(workflow));
         assert_eq!(
             trace
                 .rows
@@ -1774,14 +1223,13 @@ mod tests {
     /// path. sh stands in for nu so the fixture is self-contained. The measure declares
     /// solved at value >= 3, so a multi-iteration run exercises the early stop.
     fn run_counter(graph_loop: bool, iterations: u32, bump: &str) -> RunTrace {
-        run_counter_cfg(graph_loop, iterations, bump, false, None)
+        run_counter_cfg(graph_loop, iterations, bump, None)
     }
 
     fn run_counter_cfg(
         graph_loop: bool,
         iterations: u32,
         bump: &str,
-        wide: bool,
         workflow: Option<&str>,
     ) -> RunTrace {
         // A counter, not a timestamp: two tests starting in the same microsecond would get
@@ -1813,11 +1261,6 @@ mod tests {
         }
         let manifest_path = dir.join("crucible.toml");
         let workflow_block = workflow.unwrap_or("");
-        let search_block = if wide {
-            "\n[search]\nwide = 3\napproaches = [\"plus one\", \"add a unit\", \"increment\"]\npolicy_k = 1\n"
-        } else {
-            ""
-        };
         std::fs::write(
             &manifest_path,
             format!(
@@ -1835,7 +1278,7 @@ mod tests {
             measure_cmd = "./measure.sh"
             direction = "higher"
             objective = "value"
-            {search_block}{workflow_block}"#
+            {workflow_block}"#
             ),
         )
         .unwrap();
@@ -1857,7 +1300,6 @@ mod tests {
         args.agent_cmd = m.agent.agent_cmd.clone();
         args.iterations = iterations;
         args.graph_loop = graph_loop;
-        args.search = m.search.clone();
         args.workflow = m.workflow.clone();
 
         let prep = Prepared {
@@ -1997,8 +1439,8 @@ mod tests {
             legacy.shutdown, graph.shutdown,
             "shutdown outcome must match"
         );
-        // Both traces may carry additive plan lines (the wide tournament is graph-shaped
-        // on both loop paths); the parity claim is about everything else.
+        // Both traces may carry additive plan lines; the parity claim is about everything
+        // else.
         let strip = |t: &RunTrace| -> Vec<String> {
             t.kinds
                 .iter()
@@ -2032,65 +1474,6 @@ mod tests {
         );
     }
 
-    /// The wide tournament as a template: parallel isolated proposes, serial
-    /// diff scoring, top_k, winner seed: produces the same rows, notes order, seed
-    /// state, and event sequence under both paths, then the deep loop runs on
-    /// top of the seeded workspace under both paths.
-    #[test]
-    fn counter_parity_wide_tournament() {
-        let legacy = run_counter_cfg(false, 2, BUMP, true, None);
-        let graph = run_counter_cfg(true, 2, BUMP, true, None);
-
-        // Shape pinned on the legacy path first: 3 measured candidates at value 2 (each
-        // row appears twice on the wire: once at measure time, once in the driver's
-        // fold), then the seeded deep loop solves at 3 on its first iteration.
-        let decisions: Vec<&str> = legacy.rows.iter().map(|(_, d, _)| d.as_str()).collect();
-        assert_eq!(
-            decisions,
-            [
-                "baseline",
-                "wide-keep",
-                "wide-keep",
-                "wide-keep", // measure-time emissions
-                "wide-keep",
-                "wide-keep",
-                "wide-keep", // driver re-emissions
-                "keep",      // deep iteration on the seeded workspace
-            ]
-        );
-        let scores: Vec<Option<f64>> = legacy.rows.iter().map(|(_, _, s)| *s).collect();
-        assert_eq!(
-            scores,
-            [
-                Some(1.0),
-                Some(2.0),
-                Some(2.0),
-                Some(2.0),
-                Some(2.0),
-                Some(2.0),
-                Some(2.0),
-                Some(3.0)
-            ],
-            "the winner seed must actually land: the deep iteration starts from 2"
-        );
-        assert_eq!(legacy.shutdown, "solved");
-
-        assert_parity(&legacy, &graph);
-        assert_eq!(
-            graph.kinds.iter().filter(|k| *k == "plan_admitted").count(),
-            2,
-            "one admitted plan for the tournament, one for the deep round"
-        );
-        assert_eq!(
-            graph.kinds.iter().filter(|k| *k == "task_result").count(),
-            7 + 4,
-            "3 proposes + 3 measures + pick, then the 4 deep-round tasks"
-        );
-    }
-
-    /// The full round loop under the graph path: keep, a regression that
-    /// exercises discard/restore, then the solve that stops the run early (3 of 5
-    /// budgeted iterations): identical to the typestate path.
     #[test]
     fn counter_parity_multi_iteration_with_discard_restore_and_early_stop() {
         let legacy = run_counter(false, 5, ZIGZAG);
@@ -2124,97 +1507,5 @@ mod tests {
             [1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3],
             "task_result lines carry their loop round"
         );
-    }
-
-    fn default_args() -> crate::Args {
-        crate::Cli::parse_from(["crucible"]).run
-    }
-
-    fn search_cfg(wide: u32, approaches: &[&str], k: u32) -> crate::manifest::SearchCfg {
-        crate::manifest::SearchCfg {
-            wide,
-            approaches: approaches.iter().map(|s| s.to_string()).collect(),
-            policy: "top-k".into(),
-            policy_k: k,
-        }
-    }
-
-    #[test]
-    fn wide_config_resolve_none_when_no_wide() {
-        assert!(WideConfig::resolve(&default_args(), None).is_none());
-    }
-
-    #[test]
-    fn wide_config_resolve_from_cli() {
-        let search = search_cfg(3, &["a", "b", "c"], 1);
-        let args = crate::Args {
-            wide: 3,
-            wide_keep: 2,
-            ..default_args()
-        };
-        let cfg = WideConfig::resolve(&args, Some(&search)).unwrap();
-        assert_eq!(cfg.n, 3);
-        assert_eq!(cfg.k, 2);
-    }
-
-    #[test]
-    fn wide_config_resolve_from_manifest() {
-        let search = search_cfg(4, &["a", "b", "c", "d"], 2);
-        let cfg = WideConfig::resolve(&default_args(), Some(&search)).unwrap();
-        assert_eq!(cfg.n, 4);
-        assert_eq!(cfg.k, 2);
-    }
-
-    #[test]
-    fn wide_config_cli_wide_wins_over_manifest_wide() {
-        let search = search_cfg(5, &["a", "b", "c"], 1);
-        let args = crate::Args {
-            wide: 3,
-            wide_keep: 1,
-            ..default_args()
-        };
-        assert_eq!(WideConfig::resolve(&args, Some(&search)).unwrap().n, 3);
-    }
-
-    #[test]
-    fn wide_config_none_when_too_few_approaches() {
-        let search = search_cfg(3, &["a"], 1);
-        let args = crate::Args {
-            wide: 3,
-            wide_keep: 1,
-            ..default_args()
-        };
-        assert!(WideConfig::resolve(&args, Some(&search)).is_none());
-    }
-
-    #[test]
-    fn wide_prompt_includes_approach_constraint() {
-        let prompt = render_wide_prompt(
-            "goal={{GOAL}} status={{BEST_SCORE}}",
-            "lower p99",
-            "metrics-scrape approach",
-        );
-        assert!(prompt.contains("metrics-scrape approach"));
-        assert!(prompt.contains("MUST use this specific approach"));
-        assert!(prompt.contains("goal=lower p99"));
-    }
-
-    #[test]
-    fn wide_prompt_replaces_steer_placeholder() {
-        let prompt = render_wide_prompt(
-            "{{GOAL}} {{STATUS}} steer:{{STEER}}",
-            "improve throughput",
-            "batch-all",
-        );
-        assert!(prompt.contains("improve throughput"));
-        assert!(prompt.contains("steer:"));
-        assert!(!prompt.contains("{{STEER}}"));
-    }
-
-    #[test]
-    fn wide_prompt_without_steer_placeholder() {
-        let prompt = render_wide_prompt("goal={{GOAL}}", "my goal", "approach-x");
-        assert!(prompt.contains("goal=my goal"));
-        assert!(!prompt.contains("{{STEER}}"));
     }
 }

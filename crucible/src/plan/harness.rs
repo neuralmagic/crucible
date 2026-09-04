@@ -387,7 +387,7 @@ fn run_task(
     };
     // A private clone of the workspace. Its edits are discarded on cleanup: what leaves an
     // isolated task is its declared output, so this is for review/analysis work, not for
-    // coding tasks whose diff has to survive (the wide tournament carries those out itself).
+    // coding tasks whose diff has to survive.
     let root = paths.state.join("plan-iso");
     if let Err(e) = std::fs::create_dir_all(&root) {
         return transport(format!("creating the isolation root failed: {e}"));

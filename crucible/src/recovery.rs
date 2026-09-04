@@ -55,8 +55,6 @@ pub(crate) struct OpenPlan {
     pub declared: Vec<String>,
     /// TaskResult names seen after this PlanAdmitted.
     pub resulted: Vec<String>,
-    /// Admitted before the first iteration Phase (the wide tournament).
-    pub wide: bool,
 }
 
 /// What the tail of the log says happened.
@@ -69,11 +67,6 @@ pub(crate) enum Classification {
     },
     /// Start (maybe Phase baseline) but no decided rows: nothing to resume from.
     DiedInBaseline,
-    /// Died before the deep loop's first iteration, inside the wide tournament.
-    DiedInWideRound {
-        plan: Option<OpenPlan>,
-        turn: Option<(u32, TurnEvidence)>,
-    },
     /// AgentStart with no AgentDone: the turn was in flight.
     DiedMidTurn {
         iter: u32,
@@ -105,7 +98,6 @@ impl Classification {
         match self {
             Classification::CleanExit { .. } => RecoveryClass::CleanExit,
             Classification::DiedInBaseline => RecoveryClass::DiedInBaseline,
-            Classification::DiedInWideRound { .. } => RecoveryClass::DiedInWideRound,
             Classification::DiedMidTurn { .. } => RecoveryClass::DiedMidTurn,
             Classification::DiedDeciding { .. } => RecoveryClass::DiedDeciding,
             Classification::DiedInPlanTask { .. } => RecoveryClass::DiedInPlanTask,
@@ -132,21 +124,6 @@ impl Classification {
                 format!("previous run exited {}: {reason}", outcome.as_str())
             }
             Classification::DiedInBaseline => "no decided rows in the log".to_string(),
-            Classification::DiedInWideRound { plan, turn } => {
-                let mut s = "died in the wide tournament".to_string();
-                if let Some(p) = plan {
-                    s.push_str(&format!(
-                        ", plan v{} open ({}/{} tasks resulted)",
-                        p.plan_version,
-                        p.resulted.len(),
-                        p.declared.len()
-                    ));
-                }
-                if turn.is_some() {
-                    s.push_str(", a turn was in flight");
-                }
-                s
-            }
             Classification::DiedMidTurn {
                 iter,
                 evidence,
@@ -181,8 +158,7 @@ impl Classification {
                 s
             }
             Classification::DiedInPlanTask { iter, plan } => format!(
-                "{}plan v{} at iter {iter} never accounted ({}/{} tasks resulted)",
-                if plan.wide { "wide " } else { "" },
+                "plan v{} at iter {iter} never accounted ({}/{} tasks resulted)",
                 plan.plan_version,
                 plan.resulted.len(),
                 plan.declared.len()
@@ -205,8 +181,7 @@ struct TailScan {
     /// Only a TRAILING Shutdown counts: a resumed process appends past its
     /// predecessor's Shutdown, so any later event clears it.
     shutdown: Option<(String, String)>,
-    saw_iteration_phase: bool,
-    /// Any decided (non-wide, non-infra) row.
+    /// Any decided (non-infra) row.
     saw_any_row: bool,
     last_row_iter: u32,
     last_phase_iter: u32,
@@ -233,7 +208,6 @@ impl TailScan {
             }
             SessionEvent::Phase { phase, iter } => {
                 if phase == "iteration" {
-                    self.saw_iteration_phase = true;
                     self.last_phase_iter = *iter;
                     // Safety net for paths that account an iteration without a Row.
                     self.done_unrowed = None;
@@ -307,7 +281,6 @@ impl TailScan {
                     plan_version: *plan_version,
                     declared: tasks.iter().map(|t| t.name.clone()).collect(),
                     resulted: Vec::new(),
-                    wide: !self.saw_iteration_phase,
                 });
             }
             SessionEvent::TaskResult { task, .. } => {
@@ -348,11 +321,6 @@ impl TailScan {
             }
         } else if !self.saw_any_row {
             Classification::DiedInBaseline
-        } else if !self.saw_iteration_phase {
-            Classification::DiedInWideRound {
-                plan: self.open_plan,
-                turn: self.open_turn,
-            }
         } else if let Some((iter, evidence)) = self.open_turn {
             Classification::DiedMidTurn {
                 iter,
@@ -878,7 +846,6 @@ mod tests {
                 assert_eq!(plan.plan_version, 7);
                 assert_eq!(plan.declared, vec!["propose", "measure"]);
                 assert!(plan.resulted.is_empty());
-                assert!(!plan.wide);
             }
             other => panic!("expected DiedInPlanTask, got {other:?}"),
         }
@@ -905,25 +872,35 @@ mod tests {
         );
     }
 
+    /// A plan admitted before any iteration phase (a log from before the wide tournament was
+    /// removed) is an open plan like any other.
     #[test]
-    fn pre_iteration_plan_classifies_died_in_wide_round() {
-        // A wide tournament plan admitted before any iteration Phase.
-        let events = vec![
-            row(0, "baseline", 240.0),
-            SessionEvent::PlanAdmitted {
-                plan_version: 1,
-                reason: String::new(),
-                budget_usd: 5.0,
-                tasks: vec![],
-            },
-        ];
-        let got = classify("wide", &events);
+    fn pre_iteration_plan_classifies_died_in_plan_task() {
+        let mut events = vec![row(0, "baseline", 240.0)];
+        events.push(SessionEvent::PlanAdmitted {
+            plan_version: 1,
+            reason: String::new(),
+            budget_usd: 1.0,
+            tasks: vec![PlanTaskWire {
+                name: "propose-0".into(),
+                kind: "agent".into(),
+                depends_on: vec![],
+                session: String::new(),
+                needs: "any".into(),
+                required: true,
+                join: "all".into(),
+                stage: "iteration".into(),
+                over: String::new(),
+                max_fanout: 0,
+            }],
+        });
+        let got = classify("pre-iteration-plan", &events);
         match &got.classification {
-            Classification::DiedInWideRound { plan, turn } => {
-                assert!(plan.as_ref().is_some_and(|p| p.wide));
-                assert!(turn.is_none());
+            Classification::DiedInPlanTask { iter, plan } => {
+                assert_eq!(*iter, 0, "no iteration phase was seen");
+                assert_eq!(plan.declared, vec!["propose-0".to_string()]);
             }
-            other => panic!("expected DiedInWideRound, got {other:?}"),
+            other => panic!("expected DiedInPlanTask, got {other:?}"),
         }
     }
 

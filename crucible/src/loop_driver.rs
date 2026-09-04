@@ -16,10 +16,6 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, thiserror::Error)]
-#[error("winner produced no diff")]
-struct WinnerProducedNoDiff;
-
-#[derive(Debug, thiserror::Error)]
 #[error("baseline measurement invalid: {note}")]
 struct BaselineInvalid {
     note: String,
@@ -582,7 +578,6 @@ fn run_loop_body<R: Reporter>(
     let heartbeat = heartbeat_handle.map(std::sync::Arc::as_ref);
     let started = Instant::now();
     let start_iter: u32;
-    let is_resume = runtime.resume.is_some();
     // Held across the whole body: an approved re-scope re-baselines, and re-measuring a rescoped
     // baseline without an agent turn is impossible for a codegen domain, so it reuses this same
     // preflight measurement. A resumed run whose baseline was never measured re-runs preflight
@@ -814,65 +809,6 @@ fn run_loop_body<R: Reporter>(
         run.segment.baseline_score,
         &run.segment.regime,
     );
-
-    // Wide round: fan out N candidates before the deep loop, if configured. The winner's diff
-    // seeds the deep loop's workspace. Skipped on resume (the wide rows already live in the
-    // session log).
-    if !is_resume
-        && let Some(wide_cfg) = crate::loop_graph::WideConfig::resolve(args, args.search.as_ref())
-    {
-        // The tournament runs as a work-graph template (parallel isolated proposes,
-        // serial diff scoring, engine top_k) on both loop paths. The winner diff travels
-        // as text: the candidate worktrees are removed before seed time, so re-deriving a
-        // diff from one silently yields nothing.
-        let result = crate::loop_graph::run_wide_tournament(
-            &wide_cfg,
-            args,
-            p,
-            prep,
-            r,
-            world,
-            judge,
-            run.segment.baseline_score,
-        )?;
-        let winner = result.winners.first().copied();
-        let winner_diff = winner.and_then(|id| result.diffs.get(&id).cloned());
-        let rows = result.rows;
-
-        for row in &rows {
-            r.row(row, false);
-            run.rows.push(row.clone());
-        }
-        write_results(p, &prep.goal, &prep.prior, &run.rows)?;
-
-        if let Some(winner_id) = winner {
-            r.note(&format!(
-                "wide round complete: seeding deep loop with candidate {winner_id}"
-            ));
-            let applied = winner_diff
-                .filter(|d| !d.trim().is_empty())
-                .ok_or_else(|| WinnerProducedNoDiff.into())
-                .and_then(|d| crate::plan::worktree::apply(&p.workspace, &d));
-            if let Err(e) = applied {
-                r.note(&format!(
-                    "failed to apply winner diff: {e:#} — deep loop starts from baseline"
-                ));
-            } else {
-                // Snapshot the seeded state so the deep loop has a base to work from.
-                match world.snapshot("wide: winner applied") {
-                    Ok(snap) => {
-                        if let Some(sha) = world.commit_sha(&snap) {
-                            run.kept_shas.push(sha);
-                        }
-                        run.segment.best_snap = Snapshot(snap);
-                    }
-                    Err(e) => r.note(&format!("snapshot after wide winner failed: {e:#}")),
-                }
-            }
-        } else {
-            r.note("wide round produced no winners — deep loop starts from baseline");
-        }
-    }
 
     // How this run ends. Each early exit sets it before breaking; a loop that runs out of
     // iterations leaves it `Finished`. One match below folds it into the `Outcome`.
@@ -1593,10 +1529,10 @@ impl ResumeFold {
         use session::{IntoRow, SessionEvent};
         match ev {
             SessionEvent::Row { row, solved } => {
-                // Wide-round rows (phase:"wide") are historical context only on resume; they
-                // must not count toward next_iter or influence the deep loop's baseline/best.
                 // Infra-dead rows (phase:"infra") record turns that never started — their
                 // iteration was never consumed, so counting them would skip it on resume.
+                // Wide-round rows (phase:"wide") come from logs written before the wide
+                // tournament was removed; they never counted toward the deep loop.
                 if matches!(row.phase.as_deref(), Some("wide") | Some("infra")) {
                     return;
                 }
@@ -2445,7 +2381,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_filters_out_wide_phase_rows() {
+    fn resume_ignores_legacy_wide_phase_rows() {
         use session::{RowWire, SessionEvent, encode};
         let mk_deep = |iter, decision: &str, score: f64| SessionEvent::Row {
             row: RowWire {
@@ -3473,8 +3409,6 @@ mod tests {
             disclosure: None,
             output_bounds: None,
             iterations,
-            wide: 0,
-            wide_keep: 1,
             graph_loop: false,
             no_early_stop,
             ui: crate::Ui::Headless,
@@ -3503,7 +3437,6 @@ mod tests {
             results_bucket: String::new(),
             pr_repo: String::new(),
             component_pr_repos: Vec::new(),
-            search: None,
             workflow: None,
             workflow_frozen_injects: Vec::new(),
             workflow_toolbox_exclude: Vec::new(),

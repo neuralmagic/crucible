@@ -121,7 +121,6 @@ parser rejects unknown keys, so typos fail loudly):
 | `[judge]` | The frozen objective. | `measure_cmd`, `direction` (`lower`/`higher`), `[judge.selftest]` (`good_cmd`/`bad_cmd`) |
 | `[world]` | Reversibility beyond git. | `apply_cmd`, `snapshot_cmd`, `restore_cmd` (omit all three → pure `GitWorld`) |
 | `[deploy]` | Image rebuild targets (deploy domains). | `[deploy.buildah]` `registry`/`dockerfile`, `[deploy.env]` |
-| `[search]` | Wide-round fan-out before the deep loop. | `wide`, `approaches` (required when `wide > 0`), `policy_k` |
 | `[composite]` | Assemble N domains into one run. | `[composite].name`, `[[component]]` `domain`/`pr_repo` |
 
 The single most important rule: **omit `[world]` entirely and you get `GitWorld`** (git is the

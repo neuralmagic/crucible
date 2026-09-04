@@ -53,3 +53,4 @@
   - [ADR 0024: Admission ledger for external inputs](./adr/0024-admission-ledger.md)
   - [ADR 0025: Durable tool steps for broker builds and measures](./adr/0025-durable-tool-steps.md)
   - [ADR 0026: The no-judge task lane](./adr/0026-no-judge-task-lane.md)
+  - [ADR 0028: Retire the wide tournament](./adr/0028-retire-the-wide-tournament.md)

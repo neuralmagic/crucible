@@ -74,10 +74,6 @@ pub enum EngineOp {
     Grade,
     /// `Judge::decide`: rule keep/discard against the run's best.
     Decide,
-    /// The wide tournament's scoring stage: apply an upstream candidate diff to the main
-    /// workspace, `World::apply`, measure with the frozen judge, restore. Serialized by
-    /// construction (never isolation-marked), because candidates share one deployment.
-    MeasureDiff,
 }
 
 /// Where a task executes. Authorable (`isolation = "worktree"`); a runner that cannot
@@ -129,8 +125,8 @@ pub enum Join {
     #[default]
     All,
     /// Dispatch once every dependency is terminal, folding only the passing outputs: a
-    /// reducer over a lossy fan-out (the wide `top_k`: skipped/failed candidates just
-    /// don't rank), or a join over reviewers where one being advisory must not stop the run.
+    /// reducer over a lossy fan-out (a `top_k` where skipped/failed candidates just don't
+    /// rank), or a join over reviewers where one being advisory must not stop the run.
     Passed,
     /// Dispatch once every dependency is terminal whatever it settled as, unless the run has
     /// halted, forwarding each one as an entry carrying its status, note, output, and whether
@@ -214,7 +210,6 @@ impl TaskKind {
                 EngineOp::Measure => "engine_measure",
                 EngineOp::Grade => "engine_grade",
                 EngineOp::Decide => "engine_decide",
-                EngineOp::MeasureDiff => "engine_measure_diff",
             },
         }
     }
