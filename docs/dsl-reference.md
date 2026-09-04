@@ -218,6 +218,56 @@ Expand the built-in propose/apply/measure/decide loop into visible nodes, plus t
 
 Takes one positional argument, `extra_tasks`.
 
+## Playbooks only
+
+Available to `type = "playbook"`. An approval gate parks the run until a person or an external item resolves it; the scored lanes have no gate in scope.
+
+### `approve()`
+
+A human gate. The graph waits here until the source resolves it: a grant passes the task with the resolution as its output, a denial or a timeout fails it.
+
+| Argument | Type | Purpose |
+| --- | --- | --- |
+| `name` | `str` | Task identity, unique within the workflow. |
+| `summary` | `str` | What the approver is deciding, shown with the gate. |
+| `source` | `"native" \| github_pr(...) \| jira(...)` | Where the resolution comes from. `native` (the default) is a person acting through the controller or the control bridge. |
+| `timeout` | `str` | How long this gate may park before the run's park policy applies, e.g. `30m`. |
+| `depends_on` | `list[task]` | Dependencies. A source read from a task's field must name that task here. |
+| `needs` | `"any" \| "all"` | How many dependencies must be admitted before the gate is reached. |
+| `required` | `bool` | False makes the gate advisory: a denial fails it without invalidating the run. |
+| `join` | `"all" \| "passed" \| "settled"` | Which dependencies must have passed before the gate is reached. |
+| `stage` | `"iteration" \| "epilogue"` | `epilogue` gates the run's conclusion instead of its graph. |
+
+### `github_pr()`
+
+An approval source: a GitHub pull request reaching a state.
+
+| Argument | Type | Purpose |
+| --- | --- | --- |
+| `url` | `str \| task.field` | The pull request, written out or read from an upstream task's emitted field. |
+| `until` | `"approved" \| "merged"` | What resolves the gate: an authorized review approval or `/approve` comment (the default), or the merge. |
+
+### `jira()`
+
+An approval source: a Jira issue reaching a status or carrying a label.
+
+| Argument | Type | Purpose |
+| --- | --- | --- |
+| `key` | `str \| task.field` | The issue key, written out or read from an upstream task's emitted field. |
+| `until` | `status(...) \| label(...)` | What resolves the gate. |
+
+### `status()`
+
+A Jira predicate: the issue's status name equals the argument.
+
+Takes one positional argument, `name`.
+
+### `label()`
+
+A Jira predicate: the issue carries the label.
+
+Takes one positional argument, `name`.
+
 ## Reserved fields
 
 Names the engine reads and writes for itself. They are not constructor arguments; they appear in a task's own JSON output and in the inputs it receives.

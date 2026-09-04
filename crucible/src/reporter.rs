@@ -64,8 +64,8 @@ pub struct Row {
     pub tiebreak: Option<f64>,
     /// Total test count for this row (test gate), for the same reason.
     pub total: Option<u64>,
-    /// `Some("wide")` for wide-round rows, `Some("infra")` for never-started turn
-    /// records; `None` for the deep (default) loop.
+    /// `Some("infra")` for never-started turn records; `None` for the deep (default) loop.
+    /// Logs written before the wide tournament was removed carry `Some("wide")`.
     pub phase: Option<String>,
     /// The World snapshot token committed when this row was kept (a git world packs the
     /// commit sha). Carried on the wire so a resume can restore the kept-best tree instead

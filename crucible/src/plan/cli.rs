@@ -5,6 +5,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+use crate::plan::ParkPolicy;
 use crate::plan::exec::{Substrate, TaskResult, TaskStatus, runnable_set};
 use crate::plan::ir::{Direction, Plan, Task, TaskKind, ValidPlan};
 use xai_grok_mermaid::{MermaidTheme, RenderLimits, RenderParams, default_engine, render_checked};
@@ -13,6 +14,18 @@ use xai_grok_mermaid::{MermaidTheme, RenderLimits, RenderParams, default_engine,
 #[error("mermaid render failed: {detail}")]
 struct MermaidRenderFailed {
     detail: String,
+}
+
+/// A gate asked to suspend from a run with no state dir to snapshot into.
+#[derive(Debug, thiserror::Error)]
+#[error("a gate can only suspend a --manifest run")]
+struct SuspendNeedsManifest;
+
+/// The run was stopped by an operator while parked on a gate; the gate is still open.
+#[derive(Debug, thiserror::Error)]
+#[error("stopped while parked on gate {task}")]
+struct StoppedWhileParked {
+    task: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -123,6 +136,7 @@ pub fn render(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
                     .unwrap_or_default()
             ),
             TaskKind::TopK { k, .. } => format!("top_k[k={k}]"),
+            TaskKind::Approve { source, .. } => format!("approve[{}]", source_label(source)),
             TaskKind::Report { .. } => "report".to_string(),
             TaskKind::Engine { .. } => t.task.label().to_string(),
         };
@@ -224,6 +238,7 @@ fn render_mermaid_styled(
             TaskKind::TopK { .. } => ("{{", "}}", CLASS_STYLES[4]),
             TaskKind::Report { .. } => ("[[", "]]", CLASS_STYLES[3]),
             TaskKind::Engine { .. } => ("[[", "]]", CLASS_STYLES[5]),
+            TaskKind::Approve { .. } => ("{{", "}}", CLASS_STYLES[3]),
         };
         let mut detail = match &t.task {
             TaskKind::Agent { harness, model, .. } => format!(
@@ -254,6 +269,9 @@ fn render_mermaid_styled(
             | TaskKind::Report { .. }
             | TaskKind::Engine { .. } => String::new(),
             TaskKind::TopK { k, .. } => format!("<br/>k={k}"),
+            TaskKind::Approve { source, .. } => {
+                format!("<br/>{}", mermaid_label(&source_label(source)))
+            }
         };
         if let Some(session) = &t.session {
             detail.push_str(&format!("<br/>session: {}", mermaid_label(session)));
@@ -391,6 +409,28 @@ pub(crate) fn task_result_event(
         secs: 0.0,
         trace_id,
         span_id,
+    }
+}
+
+/// The gate's source for a label: `native`, or the kind plus what it waits for.
+fn source_label(source: &crate::plan::ir::ApprovalSourceSpec) -> String {
+    use crate::plan::ir::{ApprovalSourceSpec, RefOrLiteral};
+    let show = |r: &RefOrLiteral| match r {
+        RefOrLiteral::Literal(s) => s.clone(),
+        RefOrLiteral::Output(reference) => reference.to_string(),
+    };
+    match source {
+        ApprovalSourceSpec::Native => "native".to_string(),
+        ApprovalSourceSpec::GithubPr { url, until } => {
+            format!("github_pr {} until {}", show(url), until.as_str())
+        }
+        ApprovalSourceSpec::Jira { key, until } => {
+            let until = match until {
+                crucible_contract::JiraUntil::Status(s) => format!("status {s}"),
+                crucible_contract::JiraUntil::Label(l) => format!("label {l}"),
+            };
+            format!("jira {} until {until}", show(key))
+        }
     }
 }
 
@@ -541,6 +581,23 @@ pub struct RunOpts {
     pub ceilings: Ceilings,
     pub compute_driver: crate::openshell::gateway::ComputeDriver,
     pub agent: AgentOverride,
+    pub gates: GateOpts,
+}
+
+/// How a run behaves at an approval gate, and what it already knows about them.
+#[derive(Debug, Clone, Default)]
+pub struct GateOpts {
+    /// Continue the session log in `state/` instead of starting a run: settled tasks are not
+    /// re-dispatched, and an open gate is re-entered.
+    pub resume: bool,
+    /// Resolutions handed in on the command line, keyed by trace id.
+    pub approvals: Vec<(String, crucible_contract::GateResolution)>,
+    pub policy: ParkPolicy,
+    /// How long a gate may park before `policy` decides, `None` for as long as it takes.
+    pub max_park: Option<std::time::Duration>,
+    /// Serve the control bridge on this port while the run is up, so an operator `approve`
+    /// resolves a parked gate.
+    pub control_port: Option<u16>,
 }
 
 /// The agent a launch names in place of the manifest's `[agent]` defaults. A task that pins its
@@ -598,12 +655,14 @@ pub fn run(
     manifest: Option<&Path>,
     opts: RunOpts,
 ) -> Result<()> {
-    use crate::plan::exec::{ExecCfg, PlanExit, TaskRunner, execute};
+    use crate::plan::exec::{ExecCfg, PlanExit, TaskRunner, execute_from};
+    use crate::plan::gate_host as gate;
     use crate::plan::runner::ShellRunner;
     let RunOpts {
         ceilings,
         compute_driver,
         agent,
+        gates,
     } = opts;
 
     if let (None, Some(raw)) = (ceilings.wall_clock, ceilings.wall_clock_raw.as_ref()) {
@@ -683,6 +742,7 @@ pub fn run(
                         workdir: std::env::current_dir()
                             .context("resolving the working directory")?,
                         agent_cmd,
+                        gate: crate::plan::gate::GateCtx::new(crate::plan::gate::run_id_from_env()),
                     }),
                     None,
                 )
@@ -743,30 +803,172 @@ pub fn run(
         }
     };
     write_report(&report);
-    let out = execute(
-        &plan,
-        &substrate,
-        ExecCfg {
-            wall_clock: ceilings.wall_clock,
-            ..ExecCfg::default()
-        },
-        runner.as_mut(),
-        |task, result| {
-            report.tasks.push(crucible_contract::TaskReport {
+    let mut on_result = |task: &Task, result: &TaskResult| {
+        match report.tasks.iter_mut().find(|t| t.name == task.name.0) {
+            Some(existing) => {
+                existing.status = result.status.as_str().to_string();
+                existing.cost_usd = result.cost_usd;
+            }
+            None => report.tasks.push(crucible_contract::TaskReport {
                 name: task.name.0.clone(),
                 status: result.status.as_str().to_string(),
                 cost_usd: result.cost_usd,
-            });
-            if let Some(selected) = report.results.get_mut(&task.name.0) {
-                selected.status = result.status.as_str().to_string();
-                selected.output = declared_report_output(task, result);
+            }),
+        }
+        if let Some(selected) = report.results.get_mut(&task.name.0) {
+            selected.status = result.status.as_str().to_string();
+            selected.output = declared_report_output(task, result);
+        }
+        write_report(&report);
+        if let Some(f) = &events {
+            append(f, &task_result_event(plan.plan().version, 0, task, result));
+        }
+    };
+    let exec_cfg = ExecCfg {
+        wall_clock: ceilings.wall_clock,
+        ..ExecCfg::default()
+    };
+
+    // What the run already knows: the results a previous process settled under this same plan,
+    // the resolutions handed in, and the ones the admission ledger recorded before a death.
+    let mut host = gate::Host::open(evidence.as_ref(), &plan, &gates)?;
+    for (trace, resolution) in host.resolutions() {
+        runner.resolve_gate(&trace, resolution);
+    }
+    let mut prior = host.take_prior();
+    let mut spent_before = 0.0;
+    let out = loop {
+        let mut out = execute_from(
+            &plan,
+            &substrate,
+            exec_cfg,
+            runner.as_mut(),
+            prior,
+            &mut on_result,
+        );
+        out.spent_usd += spent_before;
+        let PlanExit::AwaitingApproval(open) = &out.exit else {
+            break out;
+        };
+        let open = open.clone();
+        if let Some(f) = &events {
+            append(f, &host.wait_event(&open));
+        }
+        println!(
+            "gate {} ({}): awaiting approval via {}",
+            open.task,
+            open.trace_id,
+            open.source.kind()
+        );
+        match host.wait(&open, &gates, evidence.as_ref())? {
+            gate::Waited::Resolved(resolution) => {
+                if let Some(f) = &events {
+                    append(f, &host.resolved_event(&open, &resolution));
+                }
+                println!(
+                    "gate {}: {}{}",
+                    open.task,
+                    resolution.decision.as_str(),
+                    resolution
+                        .by
+                        .as_ref()
+                        .map(|by| format!(" by {}", by.as_str()))
+                        .unwrap_or_default()
+                );
+                runner.resolve_gate(&open.trace_id, resolution);
+                spent_before = out.spent_usd;
+                prior = out.results;
             }
-            write_report(&report);
-            if let Some(f) = &events {
-                append(f, &task_result_event(plan.plan().version, 0, task, result));
+            gate::Waited::Suspend => {
+                let Some(paths) = &evidence else {
+                    return Err(SuspendNeedsManifest.into());
+                };
+                match host.suspend(paths, &open) {
+                    Ok(()) => {
+                        if let Some(f) = &events {
+                            append(
+                                f,
+                                &crate::session::SessionEvent::Shutdown {
+                                    outcome: "suspended".to_string(),
+                                    reason: open.trace_id.clone(),
+                                },
+                            );
+                        }
+                        println!(
+                            "plan v{}: suspended at gate {} — resume with --resume --approval {}=granted|denied",
+                            plan.plan().version,
+                            open.task,
+                            open.trace_id
+                        );
+                        return Ok(());
+                    }
+                    Err(why) => {
+                        // Never lose a run to a failed snapshot: park instead and say why.
+                        eprintln!(
+                            "[crucible] suspend failed ({why:#}); parking on the gate instead"
+                        );
+                        if let Some(f) = &events {
+                            append(
+                                f,
+                                &crate::session::SessionEvent::Note {
+                                    msg: format!("suspend failed, parking instead: {why:#}"),
+                                },
+                            );
+                        }
+                        match host.park(&open, None, evidence.as_ref())? {
+                            gate::Parked::Resolved(resolution) => {
+                                if let Some(f) = &events {
+                                    append(f, &host.resolved_event(&open, &resolution));
+                                }
+                                runner.resolve_gate(&open.trace_id, resolution);
+                                spent_before = out.spent_usd;
+                                prior = out.results;
+                            }
+                            gate::Parked::Stopped => {
+                                if let Some(f) = &events {
+                                    append(
+                                        f,
+                                        &crate::session::SessionEvent::Shutdown {
+                                            outcome: "stopped".to_string(),
+                                            reason: "stop signal received while parked".into(),
+                                        },
+                                    );
+                                }
+                                return Err(StoppedWhileParked {
+                                    task: open.task.0.clone(),
+                                }
+                                .into());
+                            }
+                            gate::Parked::TimedOut => {
+                                let resolution = crucible_contract::GateResolution::timeout();
+                                if let Some(f) = &events {
+                                    append(f, &host.resolved_event(&open, &resolution));
+                                }
+                                runner.resolve_gate(&open.trace_id, resolution);
+                                spent_before = out.spent_usd;
+                                prior = out.results;
+                            }
+                        }
+                    }
+                }
             }
-        },
-    );
+            gate::Waited::Stopped => {
+                if let Some(f) = &events {
+                    append(
+                        f,
+                        &crate::session::SessionEvent::Shutdown {
+                            outcome: "stopped".to_string(),
+                            reason: "stop signal received while parked".into(),
+                        },
+                    );
+                }
+                return Err(StoppedWhileParked {
+                    task: open.task.0.clone(),
+                }
+                .into());
+            }
+        }
+    };
     for t in plan.tasks_topo() {
         if let Some(r) = out.results.get(&t.name) {
             println!(
@@ -792,6 +994,7 @@ pub fn run(
         PlanExit::ShortCircuit { task } => format!("short-circuited at {task}"),
         PlanExit::BudgetExceeded => "budget exceeded".to_string(),
         PlanExit::TimeExceeded => "wall-clock ceiling reached".to_string(),
+        PlanExit::AwaitingApproval(gate) => format!("awaiting approval at {}", gate.task),
     };
     if let Some(f) = &events {
         append(
@@ -825,6 +1028,7 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     const SRC: &str = r#"
         version = 1
@@ -1415,6 +1619,254 @@ emits = ["verdict", "dirty"]
                 other => panic!("the session must end in a shutdown, got {other:?}: {text}"),
             }
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The three-node gate shape, end to end: a deterministic task opens a PR and emits its url,
+    /// a gate reads that url as what it is waiting on, and a third task runs only if the gate is
+    /// granted. Every task is a real shell command in a real workspace; the only thing the test
+    /// supplies is the decision a person would make.
+    const GATE_WORKFLOW: &str = r#"
+open_pr = command(
+    name = "open-pr",
+    run = "printf '%s\n' '{\"url\": \"https://github.com/o/r/pull/7\"}'",
+    emits = ["url"],
+)
+
+ship = approve(
+    name = "ship",
+    summary = "Ship the change",
+    source = github_pr(url = open_pr.url, until = "approved"),
+    depends_on = [open_pr],
+)
+
+deploy = command(
+    name = "deploy",
+    run = "echo shipped > deployed.txt && printf '%s\n' '{}'",
+    depends_on = [ship],
+)
+
+workflow(type = "playbook", tasks = [open_pr, ship, deploy])
+"#;
+
+    /// A manifest dir holding the three-node playbook. Returns the dir; the caller removes it.
+    /// Clears the drop-box env: a gate run publishes its session like any other, and inheriting
+    /// another test's ingest URL would send it to that test's listener.
+    fn gate_pack(tag: &str) -> std::path::PathBuf {
+        unsafe {
+            for key in [
+                crucible_contract::ENV_INGEST_URL,
+                crucible_contract::ENV_INGEST_TOKEN_PATH,
+                crucible_contract::ENV_POD_NAME,
+            ] {
+                std::env::remove_var(key);
+            }
+        }
+        let dir =
+            std::env::temp_dir().join(format!("crucible-gate-e2e-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("workflow.star"), GATE_WORKFLOW).unwrap();
+        std::fs::write(
+            dir.join("crucible.toml"),
+            r#"
+[repo]
+path = "."
+[workspace]
+dir = "workspace"
+setup_cmd = "mkdir -p workspace && git -C workspace init -q && git -C workspace -c user.email=c@l -c user.name=c -c commit.gpgsign=false commit -q --allow-empty -m baseline"
+[agent]
+backend = "command"
+agent_cmd = "true"
+goal = "open a PR, wait for approval, deploy"
+[workflow]
+type = "playbook"
+file = "workflow.star"
+"#,
+        )
+        .unwrap();
+        dir
+    }
+
+    /// The gate this pack opens. `run_id_from_env` falls back to "local" outside a pod.
+    fn gate_trace() -> String {
+        crucible_contract::gate_trace_id("local", "ship")
+    }
+
+    fn run_gate_pack(dir: &Path, gates: GateOpts) -> Result<()> {
+        run(
+            None,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            Some(&dir.join("crucible.toml")),
+            RunOpts {
+                ceilings: Ceilings {
+                    usd: Some(5.0),
+                    wall_clock: Some(Duration::from_secs(120)),
+                    wall_clock_raw: Some("2m".to_string()),
+                },
+                gates,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn session_log(dir: &Path) -> String {
+        std::fs::read_to_string(dir.join("state/session.jsonl")).unwrap_or_default()
+    }
+
+    /// A grant handed to the run before it starts is the resume path: the gate settles from the
+    /// recorded decision without reopening, and the task after it runs.
+    #[test]
+    fn a_granted_gate_lets_the_task_after_it_run() {
+        let _guard = crate::test_env_lock();
+        let dir = gate_pack("granted");
+        let out = run_gate_pack(
+            &dir,
+            GateOpts {
+                approvals: vec![(
+                    gate_trace(),
+                    crucible_contract::GateResolution::granted(
+                        Some("wseaton".parse().unwrap()),
+                        "native",
+                    ),
+                )],
+                ..Default::default()
+            },
+        );
+        assert!(out.is_ok(), "a granted run exits clean: {out:?}");
+        assert!(
+            dir.join("workspace/deployed.txt").exists(),
+            "the task after the gate ran: {}",
+            session_log(&dir)
+        );
+        let log = session_log(&dir);
+        assert!(
+            log.contains("\"url\":\"https://github.com/o/r/pull/7\"") || log.contains("pull/7"),
+            "the gate names the PR the first task opened: {log}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A denial blocks the gate's dependents exactly as any other failure does, and the run is
+    /// invalid: an approval nobody gave must not let the deploy through.
+    #[test]
+    fn a_denied_gate_blocks_the_task_after_it() {
+        let _guard = crate::test_env_lock();
+        let dir = gate_pack("denied");
+        let out = run_gate_pack(
+            &dir,
+            GateOpts {
+                approvals: vec![(
+                    gate_trace(),
+                    crucible_contract::GateResolution::denied(
+                        "not this quarter",
+                        Some("wseaton".parse().unwrap()),
+                        "native",
+                    ),
+                )],
+                ..Default::default()
+            },
+        );
+        let err = out.expect_err("a denied required gate invalidates the run");
+        assert!(
+            err.to_string().contains("did not reach a valid verdict"),
+            "the run fails on its verdict, not on a launch error: {err}"
+        );
+        assert!(
+            !dir.join("workspace/deployed.txt").exists(),
+            "nothing after the gate ran: {}",
+            session_log(&dir)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A gate nobody resolves parks until the run's `max_park`, then settles as a timeout under
+    /// park-then-deny. The bound is what keeps an unanswered gate from holding a pod forever.
+    #[test]
+    fn an_unanswered_gate_times_out_rather_than_waiting_forever() {
+        let _guard = crate::test_env_lock();
+        let dir = gate_pack("timeout");
+        let started = std::time::Instant::now();
+        let out = run_gate_pack(
+            &dir,
+            GateOpts {
+                max_park: Some(Duration::from_millis(300)),
+                policy: crate::plan::ParkPolicy::ParkThenDeny,
+                ..Default::default()
+            },
+        );
+        assert!(
+            out.is_err(),
+            "a timed-out required gate invalidates the run"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the park is bounded by max_park"
+        );
+        assert!(!dir.join("workspace/deployed.txt").exists());
+        let log = session_log(&dir);
+        assert!(
+            log.contains("timeout"),
+            "the gate settles as a timeout: {log}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The operator path, over a real socket: the run parks with its control bridge up, an
+    /// `approve` arrives the way `crucible approve` sends one, and the deploy runs. Nothing here
+    /// is stubbed, the bridge is the one the pod serves.
+    #[test]
+    fn an_approve_over_the_control_bridge_releases_a_parked_gate() {
+        let _guard = crate::test_env_lock();
+        let dir = gate_pack("bridge");
+        let port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let run_dir = dir.clone();
+        let runner = std::thread::spawn(move || {
+            run_gate_pack(
+                &run_dir,
+                GateOpts {
+                    control_port: Some(port),
+                    max_park: Some(Duration::from_secs(30)),
+                    ..Default::default()
+                },
+            )
+        });
+
+        // Retry until the bridge is up AND a gate is armed: an approve with no gate armed answers
+        // without a trace id, which is exactly the "not parked yet" signal to keep waiting on.
+        let addr = format!("127.0.0.1:{port}");
+        let trace = gate_trace();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut granted = false;
+        while std::time::Instant::now() < deadline {
+            if let Ok(reply) = crate::control::send_command(
+                &addr,
+                &serde_json::json!({"cmd": "approve", "by": "operator"}),
+            ) && reply.get("trace_id").and_then(serde_json::Value::as_str)
+                == Some(trace.as_str())
+            {
+                granted = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(granted, "the parked run accepted an approve for {trace}");
+
+        let out = runner.join().expect("the run thread did not panic");
+        assert!(out.is_ok(), "the released run finishes clean: {out:?}");
+        assert!(
+            dir.join("workspace/deployed.txt").exists(),
+            "the task after the gate ran: {}",
+            session_log(&dir)
+        );
+        let log = session_log(&dir);
+        assert!(log.contains("approval_wait"), "the gate opened: {log}");
+        assert!(log.contains("granted"), "and was granted: {log}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

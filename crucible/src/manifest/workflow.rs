@@ -56,7 +56,6 @@ impl EngineOp {
             EngineOp::Measure => "engine.measure",
             EngineOp::Grade => "engine.grade",
             EngineOp::Decide => "engine.decide",
-            EngineOp::MeasureDiff => "engine.measure_diff",
         }
     }
 }

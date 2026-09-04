@@ -11,7 +11,8 @@ use std::fmt;
 use std::fmt::Write as _;
 use std::str::FromStr;
 
-const MIB: u64 = 1024 * 1024;
+const KIB: u64 = 1024;
+const MIB: u64 = 1024 * KIB;
 
 /// The content digest of an artifact's (compressed) bytes, `sha256:<lowercase-hex>`. Both the
 /// engine and the controller drop-box call this, so the two digests are byte-for-byte comparable
@@ -28,7 +29,8 @@ pub fn content_digest(bytes: &[u8]) -> String {
 }
 
 /// The Tier 2 artifact kinds. The serde spelling is the `{kind}` path segment of the ingest route
-/// (`scope-pack`, `scope-transcript`, `run-session`, `run-files`, `otel-log`).
+/// (`scope-pack`, `scope-transcript`, `run-session`, `run-files`, `run-workspace`,
+/// `approval-waits`, `otel-log`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ArtifactKind {
@@ -40,6 +42,11 @@ pub enum ArtifactKind {
     RunSession,
     /// The gzipped tar of a loop run's `state/files`, one directory per task that captured.
     RunFiles,
+    /// The gzipped tar a suspended run leaves for its resume: `state/` minus the session log,
+    /// a bundle of the workspace repo, and `state/resume.json`.
+    RunWorkspace,
+    /// The JSON list of approval gates a parked run is waiting on, replaced on every change.
+    ApprovalWaits,
     /// The raw OTLP jsonl the in-process collector captured next to the agent.
     OtelLog,
 }
@@ -52,6 +59,8 @@ impl ArtifactKind {
             ArtifactKind::ScopeTranscript => "scope-transcript",
             ArtifactKind::RunSession => "run-session",
             ArtifactKind::RunFiles => "run-files",
+            ArtifactKind::RunWorkspace => "run-workspace",
+            ArtifactKind::ApprovalWaits => "approval-waits",
             ArtifactKind::OtelLog => "otel-log",
         }
     }
@@ -63,16 +72,20 @@ impl ArtifactKind {
             ArtifactKind::ScopeTranscript => 32 * MIB,
             ArtifactKind::RunSession => 128 * MIB,
             ArtifactKind::RunFiles => 256 * MIB,
+            ArtifactKind::RunWorkspace => 32 * MIB,
+            ArtifactKind::ApprovalWaits => 64 * KIB,
             ArtifactKind::OtelLog => 32 * MIB,
         }
     }
 
     /// Every kind, for exhaustive iteration in tests and route registration.
-    const ALL: [ArtifactKind; 5] = [
+    const ALL: [ArtifactKind; 7] = [
         ArtifactKind::ScopePack,
         ArtifactKind::ScopeTranscript,
         ArtifactKind::RunSession,
         ArtifactKind::RunFiles,
+        ArtifactKind::RunWorkspace,
+        ArtifactKind::ApprovalWaits,
         ArtifactKind::OtelLog,
     ];
 }
@@ -172,6 +185,8 @@ mod tests {
         assert_eq!(ArtifactKind::ScopePack.as_str(), "scope-pack");
         assert_eq!(ArtifactKind::ScopeTranscript.as_str(), "scope-transcript");
         assert_eq!(ArtifactKind::RunSession.as_str(), "run-session");
+        assert_eq!(ArtifactKind::RunWorkspace.as_str(), "run-workspace");
+        assert_eq!(ArtifactKind::ApprovalWaits.as_str(), "approval-waits");
         assert_eq!(ArtifactKind::OtelLog.as_str(), "otel-log");
     }
 
@@ -180,6 +195,8 @@ mod tests {
         assert_eq!(ArtifactKind::ScopePack.max_bytes(), 16 * MIB);
         assert_eq!(ArtifactKind::ScopeTranscript.max_bytes(), 32 * MIB);
         assert_eq!(ArtifactKind::RunSession.max_bytes(), 128 * MIB);
+        assert_eq!(ArtifactKind::RunWorkspace.max_bytes(), 32 * MIB);
+        assert_eq!(ArtifactKind::ApprovalWaits.max_bytes(), 64 * KIB);
         assert_eq!(ArtifactKind::OtelLog.max_bytes(), 32 * MIB);
     }
 

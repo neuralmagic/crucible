@@ -2,8 +2,7 @@
 //! carry work out of one. An isolated task's edits never touch the shared workspace: what
 //! leaves is its structured output (and, where the runner asks for it, a captured diff).
 //!
-//! Used by the wide tournament's parallel proposers and by any plan task marked
-//! `isolation = "worktree"`.
+//! Used by any plan task marked `isolation = "worktree"`.
 
 use std::path::Path;
 

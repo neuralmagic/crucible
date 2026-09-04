@@ -19,11 +19,19 @@ use starlark_syntax::codemap::FileSpan;
 use crate::manifest::{WorkflowCfg, WorkflowType};
 use crate::plan::starlark as dsl;
 use crate::plan::starlark::values::{
-    ExternalText, OutputRefValue, SessionValue, TaskValue, WorkflowValue,
+    ExternalText, GateSourceValue, OutputRefValue, SessionValue, TaskValue, UntilValue,
+    WorkflowValue,
 };
 
 /// Constructors that historically took one positional argument. Everything else is named-only.
-const POSITIONAL: &[&str] = &["prompt_file", "param", "workflow", "default_autoresearch"];
+const POSITIONAL: &[&str] = &[
+    "prompt_file",
+    "param",
+    "workflow",
+    "default_autoresearch",
+    "status",
+    "label",
+];
 
 /// The constructors every lane has.
 #[starlark_module]
@@ -98,6 +106,50 @@ pub(crate) fn common(builder: &mut GlobalsBuilder) {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Value<'v>> {
         dispatch("workflow", args, kwargs, eval)
+    }
+}
+
+/// The playbook lane's own constructors: the approval gate and the sources that resolve it.
+#[starlark_module]
+pub(crate) fn playbook(builder: &mut GlobalsBuilder) {
+    fn approve<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("approve", args, kwargs, eval)
+    }
+
+    fn github_pr<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("github_pr", args, kwargs, eval)
+    }
+
+    fn jira<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("jira", args, kwargs, eval)
+    }
+
+    fn status<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("status", args, kwargs, eval)
+    }
+
+    fn label<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("label", args, kwargs, eval)
     }
 }
 
@@ -211,6 +263,12 @@ fn call<'v>(
                 .prompt_file(&path)
                 .map(dsl::Value::String),
             ("param", dsl::Value::String(name)) => state.context_mut().param(&name),
+            ("status", dsl::Value::String(name)) => Ok(dsl::Value::Until(
+                crucible_contract::JiraUntil::Status(name),
+            )),
+            ("label", dsl::Value::String(name)) => {
+                Ok(dsl::Value::Until(crucible_contract::JiraUntil::Label(name)))
+            }
             ("workflow", dsl::Value::List(tasks)) => {
                 let tasks = dsl::task_list("workflow", tasks)?;
                 let workflow = WorkflowCfg {
@@ -327,7 +385,7 @@ fn convert_at(value: Value<'_>, depth: usize) -> dsl::Result<dsl::Value> {
         return Ok(dsl::Value::External(external.0.clone()));
     }
     if let Some(task) = TaskValue::from_value(value) {
-        return Ok(dsl::Value::Task(task.0.clone()));
+        return Ok(dsl::Value::Task(Box::new(task.0.clone())));
     }
     if let Some(output) = OutputRefValue::from_value(value) {
         return output.resolve().map(dsl::Value::Output);
@@ -337,6 +395,12 @@ fn convert_at(value: Value<'_>, depth: usize) -> dsl::Result<dsl::Value> {
     }
     if let Some(workflow) = WorkflowValue::from_value(value) {
         return Ok(dsl::Value::Workflow(workflow.0.clone()));
+    }
+    if let Some(source) = GateSourceValue::from_value(value) {
+        return Ok(dsl::Value::GateSource(source.0.clone()));
+    }
+    if let Some(until) = UntilValue::from_value(value) {
+        return Ok(dsl::Value::Until(until.0.clone()));
     }
     Ok(dsl::Value::Opaque)
 }
@@ -368,12 +432,14 @@ fn alloc_at<'v>(heap: Heap<'v>, value: dsl::Value, depth: usize) -> Value<'v> {
         dsl::Value::External(segments) => heap.alloc(ExternalText(segments)),
         // A dictionary never travels back out: the constructors consume it.
         dsl::Value::Map(_) => Value::new_none(),
-        dsl::Value::Task(task) => heap.alloc(TaskValue(task)),
+        dsl::Value::Task(task) => heap.alloc(TaskValue(*task)),
         dsl::Value::Output(reference) => heap.alloc(OutputRefValue {
             declared: vec![reference.field.0.clone()],
             reference,
         }),
         dsl::Value::Session(session) => heap.alloc(SessionValue(session)),
         dsl::Value::Workflow(workflow) => heap.alloc(WorkflowValue(workflow)),
+        dsl::Value::GateSource(source) => heap.alloc(GateSourceValue(source)),
+        dsl::Value::Until(until) => heap.alloc(UntilValue(until)),
     }
 }

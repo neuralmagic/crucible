@@ -79,7 +79,7 @@ mod tests {
         use std::path::Path;
         let a = name_for(Path::new("/state/worktrees/lane-a"));
         let b = name_for(Path::new("/state/worktrees/lane-b"));
-        assert_ne!(a, b, "wide-round lanes get distinct sandboxes");
+        assert_ne!(a, b, "isolated lanes get distinct sandboxes");
         assert_eq!(
             a,
             name_for(Path::new("/state/worktrees/lane-a")),

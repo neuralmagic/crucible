@@ -5,11 +5,15 @@
 //! This is the wire-only half of the format: plain-data types and the codec, with no dependency
 //! on the CLI's in-process `Row`/`Phase` state (that bridge lives in `crucible::session`).
 
+pub mod fold;
+
 use crate::event::AgentEvent;
 use crate::identity::RunIdentity;
 use serde::{Deserialize, Serialize};
 
-/// Bump only on a breaking change to the on-disk shape.
+/// Bump only on a breaking change to the on-disk shape. Adding a variant or a defaulted field is
+/// not one: [`SessionEvent::Unknown`] absorbs a kind this reader predates, and every field added
+/// since v1 defaults on decode.
 pub const WIRE_VERSION: u8 = 1;
 
 /// How one declared grade-evidence task ended up. A lossy grade (`join = "passed"`)
@@ -58,7 +62,7 @@ impl std::fmt::Display for EvidenceEntry {
 
 /// A plain-serde mirror of `Row`, so `Row`'s fields can churn without touching the
 /// on-disk contract.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RowWire {
     pub iter: u32,
     pub decision: String,
@@ -99,7 +103,7 @@ pub struct RowWire {
 /// onto the kept candidate rows' `pr_url`. A single-repo run emits one link with `name` empty; a
 /// composite run emits one per touched component. Mirrors `crucible::publish::PrLink` but adds
 /// `Deserialize`, for the same reason [`RowWire`] mirrors `Row`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PrLinkWire {
     pub url: String,
     pub repo: String,
@@ -113,7 +117,7 @@ pub struct PrLinkWire {
 }
 
 /// A validated plan task emitted for visualization.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlanTaskWire {
     pub name: String,
     /// Task kind label: `agent`, `command`, or a reducer name like `top_k`.
@@ -333,21 +337,35 @@ pub enum SessionEvent {
         span_id: String,
     },
     /// The loop is exiting, emitted exactly once as the LAST line of the session log. `outcome` is
-    /// one of `finished`/`solved`/`budget`/`stopped`/`escalated`/`stalled`/`error`. The viewer keys
-    /// its terminal state off this line: a dead stream with no `Shutdown` line means the pod died
-    /// mid-run rather than exiting cleanly.
+    /// one of `finished`/`solved`/`budget`/`stopped`/`escalated`/`stalled`/`error`/`suspended`.
+    /// The viewer keys its terminal state off this line: a dead stream with no `Shutdown` line
+    /// means the pod died mid-run rather than exiting cleanly. `suspended` is a clean exit that
+    /// left an approval open on purpose; a resume with the resolution continues past it.
     Shutdown {
         outcome: String,
         reason: String,
     },
-    /// The loop began waiting on a mediated-provisioning approval. A dangling ApprovalWait
-    /// means the run died or stopped with the approval outstanding; resume re-parks a
-    /// block-mode one.
+    /// The loop began waiting on an approval: a mediated-provisioning ask, a distress marker, or a
+    /// plan `approve` task. A dangling ApprovalWait means the run died, stopped, or suspended with
+    /// the approval outstanding; resume re-parks a block-mode one unless it is handed the
+    /// resolution.
     ApprovalWait {
         handle: String,
         #[serde(default)]
         trace_id: String,
         mode: String,
+        /// The plan task that opened the gate; absent for provisioning and distress waits.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task: Option<String>,
+        /// Where the resolution comes from, as the engine resolved it at the gate:
+        /// `{"kind":"native"}`, `{"kind":"github_pr","url":..,"until":..}`, or
+        /// `{"kind":"jira","key":..,"until":{..}}`. Absent on logs written before gates existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<serde_json::Value>,
+        /// `park` (the pod idles) or `suspend` (the pod snapshots and exits). Absent on older
+        /// logs, which always parked.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        park: Option<String>,
     },
     /// The wait above reached a terminal outcome: `granted`/`denied`/`timeout`. Deliberately
     /// NOT emitted on a stop-while-parked (a stop doesn't resolve the ask), so a resumed run
@@ -356,6 +374,16 @@ pub enum SessionEvent {
         outcome: String,
         #[serde(default)]
         reason: String,
+        /// The `trace_id` of the wait this resolves; empty on older logs, which resolved the one
+        /// open wait.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        trace_id: String,
+        /// Who resolved it, when the source knows.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<String>,
+        /// Which source resolved it (`native`, `github_pr`, `jira`, `timeout`, ...).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
     },
     /// A mediated write refused by the run's declared output bounds. The refusal fails the
     /// requesting tool call; it never terminates the run.
@@ -382,12 +410,19 @@ pub enum SessionEvent {
         #[serde(default)]
         detail: String,
     },
+    /// A `kind` this reader does not know: written by a newer engine. Folds count it and
+    /// classify from the events they do know; a resume refuses when one precedes no terminal.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Borrowing envelope so encoding doesn't clone the event.
 #[derive(Serialize)]
 struct EnvelopeRef<'a> {
     v: u8,
+    /// Unix seconds when the line was written. Absent on logs written before the field existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ts: Option<f64>,
     #[serde(flatten)]
     event: &'a SessionEvent,
 }
@@ -398,6 +433,8 @@ struct Envelope {
     #[serde(default = "default_version")]
     #[allow(dead_code)] // read for forward-compat; we accept any v for now
     v: u8,
+    #[serde(default)]
+    ts: Option<f64>,
     #[serde(flatten)]
     event: SessionEvent,
 }
@@ -406,12 +443,25 @@ fn default_version() -> u8 {
     WIRE_VERSION
 }
 
+/// One decoded line: the event and the moment it was written, when the writer stamped one.
+#[derive(Debug, Clone)]
+pub struct Line {
+    pub ts: Option<f64>,
+    pub event: SessionEvent,
+}
+
 /// Encode one event as a single NDJSON line (no trailing newline). Infallible for our
 /// own types; on the impossible serde error we emit a valid `note` line rather than
 /// corrupt the log.
 pub fn encode(ev: &SessionEvent) -> String {
+    encode_at(ev, None)
+}
+
+/// [`encode`] with a write timestamp (unix seconds) on the envelope.
+pub fn encode_at(ev: &SessionEvent, ts: Option<f64>) -> String {
     serde_json::to_string(&EnvelopeRef {
         v: WIRE_VERSION,
+        ts,
         event: ev,
     })
     .unwrap_or_else(|e| {
@@ -422,11 +472,19 @@ pub fn encode(ev: &SessionEvent) -> String {
 /// Decode one NDJSON line. Returns `None` for blank or torn/partial lines so a tailing
 /// reader can skip them.
 pub fn decode(line: &str) -> Option<SessionEvent> {
+    decode_line(line).map(|l| l.event)
+}
+
+/// [`decode`] keeping the envelope's timestamp.
+pub fn decode_line(line: &str) -> Option<Line> {
     let t = line.trim();
     if t.is_empty() {
         return None;
     }
-    crate::json::from_str::<Envelope>(t).ok().map(|e| e.event)
+    crate::json::from_str::<Envelope>(t).ok().map(|e| Line {
+        ts: e.ts,
+        event: e.event,
+    })
 }
 
 #[cfg(test)]
@@ -589,10 +647,35 @@ mod tests {
                 handle: "https://github.com/wseaton/llm-d-router/pull/7".into(),
                 trace_id: "model=Qwen/Qwen3-0.6B;c=48".into(),
                 mode: "block".into(),
+                task: None,
+                source: None,
+                park: None,
+            },
+            SessionEvent::ApprovalWait {
+                handle: "https://github.com/wseaton/llm-d-router/pull/7".into(),
+                trace_id: "approve:run-1:review".into(),
+                mode: "block".into(),
+                task: Some("review".into()),
+                source: Some(serde_json::json!({
+                    "kind": "github_pr",
+                    "url": "https://github.com/wseaton/llm-d-router/pull/7",
+                    "until": "approved"
+                })),
+                park: Some("suspend".into()),
             },
             SessionEvent::ApprovalResolved {
                 outcome: "granted".into(),
                 reason: "concurrency=48".into(),
+                trace_id: String::new(),
+                by: None,
+                source: None,
+            },
+            SessionEvent::ApprovalResolved {
+                outcome: "denied".into(),
+                reason: "changes requested".into(),
+                trace_id: "approve:run-1:review".into(),
+                by: Some("alice".into()),
+                source: Some("github_pr".into()),
             },
             SessionEvent::Recovery {
                 class: RecoveryClass::DiedMidTurn,
@@ -641,13 +724,42 @@ mod tests {
                 handle,
                 trace_id,
                 mode,
+                task,
+                source,
+                park,
             } => {
                 assert_eq!(handle, "h");
                 assert_eq!(trace_id, "");
                 assert_eq!(mode, "continue");
+                assert_eq!(task, None);
+                assert_eq!(source, None);
+                assert_eq!(park, None);
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    /// A kind this reader predates decodes as `Unknown` instead of failing the whole line, so
+    /// a rolling deploy never turns a newer log into "resume refused" or "ingest refused".
+    #[test]
+    fn unknown_kind_decodes_as_unknown_and_round_trips() {
+        let ev = decode(r#"{"v":1,"kind":"teleport","where":"elsewhere"}"#)
+            .expect("unknown kind decodes");
+        assert!(matches!(ev, SessionEvent::Unknown), "{ev:?}");
+        assert_round_trips(SessionEvent::Unknown);
+    }
+
+    #[test]
+    fn envelope_timestamp_is_optional_and_survives_the_trip() {
+        let bare = encode(&SessionEvent::Finished);
+        assert!(!bare.contains("\"ts\""), "{bare}");
+        let stamped = encode_at(&SessionEvent::Finished, Some(1_725_000_000.5));
+        assert!(stamped.contains(r#""ts":1725000000.5"#), "{stamped}");
+        let line = decode_line(&stamped).expect("stamped line decodes");
+        assert_eq!(line.ts, Some(1_725_000_000.5));
+        assert!(matches!(line.event, SessionEvent::Finished));
+        let old = decode_line(r#"{"v":1,"kind":"finished"}"#).expect("old line decodes");
+        assert_eq!(old.ts, None);
     }
 
     #[test]

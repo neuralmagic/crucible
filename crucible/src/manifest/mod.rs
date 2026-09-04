@@ -12,7 +12,6 @@ mod openshell;
 pub mod outputs;
 mod preflight;
 mod relay;
-mod search;
 mod secret;
 mod selftest;
 mod wiring;
@@ -29,7 +28,6 @@ pub use openshell::OpenshellCfg;
 pub use outputs::OutputsCfg;
 pub use preflight::{MODE_PLACEHOLDER, PreflightCfg};
 pub use relay::RelayFile;
-pub use search::SearchCfg;
 pub use secret::{SecretDecl, SecretError, SecretKind};
 pub use selftest::SelftestCfg;
 pub use workflow::{KEPT_INPUT, WorkflowCaps, WorkflowCfg, WorkflowError, WorkflowType};
@@ -258,9 +256,6 @@ pub struct Manifest {
     /// rebuilds an image leaves it unset.
     #[serde(default)]
     pub deploy: Option<DeployCfg>,
-    /// Wide-round search config. Optional, most domains run pure-deep.
-    #[serde(default)]
-    pub search: Option<SearchCfg>,
     /// Authored iteration graph; absent uses the default workflow.
     #[serde(default)]
     pub workflow: Option<WorkflowCfg>,
@@ -359,8 +354,8 @@ pub struct Workspace {
     ///   the discard's `reset --hard` reverts tracked content regardless. Carry pipeline output the
     ///   repo doesn't track.
     /// - A path that doesn't exist yet is fine; the exclude is prospective.
-    /// - Wide-tournament worktrees are fresh checkouts with no untracked carried dirs, so the wide
-    ///   round doesn't benefit.
+    /// - Isolated plan-task worktrees are fresh checkouts with no untracked carried dirs, so
+    ///   they don't benefit.
     /// - Composite manifests reject the key: per-component carry-forward is a non-goal.
     #[serde(default)]
     pub carry_forward: Vec<String>,
@@ -745,7 +740,6 @@ struct CommonCfg<'a> {
     workspace: &'a Workspace,
     agent: &'a AgentCfg,
     judge: Option<&'a JudgeCfg>,
-    search: &'a Option<SearchCfg>,
     workflow: &'a Option<WorkflowCfg>,
     build: &'a BTreeMap<String, forge::spec::BuildSpec>,
     preflight: &'a Option<PreflightCfg>,
@@ -762,7 +756,6 @@ fn validate_common(c: CommonCfg<'_>) -> Result<()> {
     validate_carry_forward(&c.workspace.carry_forward)?;
     validate_artifacts(&c.workspace.artifact)?;
     validate_codex_api_key(c.agent.codex.api_key.as_deref())?;
-    search::validate_search(c.search)?;
     if let Some(w) = c.workflow {
         w.validate()?;
     }
@@ -785,7 +778,6 @@ fn validate_common(c: CommonCfg<'_>) -> Result<()> {
                 .as_ref()
                 .is_some_and(|w| w.workflow_type == WorkflowType::Playbook);
             for (present, table) in [
-                (c.search.is_some(), "[search]"),
                 (c.workflow.is_some() && !playbook, "[workflow]"),
                 (c.preflight.is_some(), "[preflight]"),
             ] {
@@ -910,7 +902,6 @@ impl Manifest {
             workspace: &self.workspace,
             agent: &self.agent,
             judge: self.judge.as_ref(),
-            search: &self.search,
             workflow: &self.workflow,
             build: &self.build,
             preflight: &self.preflight,
@@ -1051,9 +1042,6 @@ pub struct CompositeManifest {
     /// without forking the base domain manifest.
     #[serde(default)]
     pub deploy: BTreeMap<String, DeployCfg>,
-    /// Wide-round search config. Optional.
-    #[serde(default)]
-    pub search: Option<SearchCfg>,
     /// Authored iteration graph; absent uses the default workflow.
     #[serde(default)]
     pub workflow: Option<WorkflowCfg>,
@@ -1182,7 +1170,6 @@ impl CompositeManifest {
             workspace: &self.workspace,
             agent: &self.agent,
             judge: Some(&self.judge),
-            search: &self.search,
             workflow: &self.workflow,
             build: &self.build,
             preflight: &self.preflight,
@@ -1363,9 +1350,8 @@ mod tests {
     }
 
     #[test]
-    fn task_lane_rejects_search_workflow_and_preflight() {
+    fn task_lane_rejects_workflow_and_preflight() {
         for table in [
-            "[search]\nwide = 2\napproaches = [\"a\", \"b\"]",
             "[workflow]\ntype = \"custom\"\nresult = \"t\"\n[[workflow.task]]\nname = \"t\"\nkind = \"evaluate\"\ncommand = \"true\"",
             "[preflight]\ncommands = [\"true\"]",
         ] {

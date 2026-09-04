@@ -187,9 +187,15 @@ pub struct HarnessRunner {
     /// and materialized into that task's own root when it runs. A task with no entry is one the
     /// executor never staged, and its `inputs/` is left alone.
     pub staged: BTreeMap<TaskName, Vec<StagedInput>>,
+    /// The run's gates: which resolutions it holds, under which run id.
+    pub gate: crate::plan::gate::GateCtx,
 }
 
 impl TaskRunner for HarnessRunner {
+    fn resolve_gate(&mut self, trace_id: &str, resolution: crucible_contract::GateResolution) {
+        self.gate.resolve(trace_id, resolution);
+    }
+
     fn run(&mut self, task: &Task, attempt: u32, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
         run_task(
             &Dispatch {
@@ -197,6 +203,7 @@ impl TaskRunner for HarnessRunner {
                 paths: &self.paths,
                 captured_bytes: &self.captured_bytes,
                 staged: self.staged.get(&task.name).map(Vec::as_slice),
+                gate: &self.gate,
             },
             task,
             attempt,
@@ -293,6 +300,7 @@ impl TaskRunner for HarnessRunner {
                     paths: &self.paths,
                     captured_bytes: &self.captured_bytes,
                     staged: self.staged.get(&b.task.name).map(Vec::as_slice),
+                    gate: &self.gate,
                 },
                 b.task,
                 b.attempt,
@@ -317,6 +325,7 @@ impl TaskRunner for HarnessRunner {
                 .map(|b| {
                     let args = self.args.clone();
                     let paths = self.paths.clone();
+                    let gate = self.gate.clone();
                     let pending = pending.as_str();
                     scope.spawn(move || {
                         run_task(
@@ -325,6 +334,7 @@ impl TaskRunner for HarnessRunner {
                                 paths: &paths,
                                 captured_bytes: captured,
                                 staged: staged.get(&b.task.name).map(Vec::as_slice),
+                                gate: &gate,
                             },
                             b.task,
                             b.attempt,
@@ -352,6 +362,7 @@ struct Dispatch<'a> {
     paths: &'a Paths,
     captured_bytes: &'a AtomicU64,
     staged: Option<&'a [StagedInput]>,
+    gate: &'a crate::plan::gate::GateCtx,
 }
 
 /// Dispatch one task, in the shared workspace or in a private worktree. `pending` is the
@@ -369,13 +380,14 @@ fn run_task(
         paths,
         captured_bytes,
         staged,
+        gate,
     } = *cx;
     let Some(Isolation::Worktree) = task.isolation else {
         if let Err(e) = materialize_inputs(&paths.state, &paths.workspace, staged) {
             return transport(e);
         }
         let before = PriorContents::of(&paths.workspace, &task.emits_files);
-        let attempt_out = prepare_and_run(args, paths, task, attempt, inputs);
+        let attempt_out = prepare_and_run(args, paths, gate, task, attempt, inputs);
         return capture_declared(
             paths,
             &paths.workspace,
@@ -387,7 +399,7 @@ fn run_task(
     };
     // A private clone of the workspace. Its edits are discarded on cleanup: what leaves an
     // isolated task is its declared output, so this is for review/analysis work, not for
-    // coding tasks whose diff has to survive (the wide tournament carries those out itself).
+    // coding tasks whose diff has to survive.
     let root = paths.state.join("plan-iso");
     if let Err(e) = std::fs::create_dir_all(&root) {
         return transport(format!("creating the isolation root failed: {e}"));
@@ -421,7 +433,7 @@ fn run_task(
     let iso = Paths::for_worktree(worktree.clone(), paths.skills.clone());
     let _ = std::fs::create_dir_all(&iso.state);
     let before = PriorContents::of(&iso.workspace, &task.emits_files);
-    let attempt_out = prepare_and_run(args, &iso, task, attempt, inputs);
+    let attempt_out = prepare_and_run(args, &iso, gate, task, attempt, inputs);
     // Before the worktree goes: a declared file is part of the task's output, not part of the
     // workspace state isolation discards, so it has to be taken while the tree is still there.
     let attempt_out = capture_declared(
@@ -461,7 +473,9 @@ fn capture_declared(
     let failing = match &attempt.outcome {
         AttemptOutcome::Pass(_) => false,
         AttemptOutcome::Fail { .. } => true,
-        AttemptOutcome::Skipped(..) | AttemptOutcome::Transport(_) => return attempt,
+        AttemptOutcome::Skipped(..) | AttemptOutcome::Transport(_) | AttemptOutcome::Await(_) => {
+            return attempt;
+        }
     };
     if task.emits_files.is_empty() {
         return attempt;
@@ -589,6 +603,7 @@ fn materialize_inputs(
 fn prepare_and_run(
     args: &Args,
     paths: &Paths,
+    gate: &crate::plan::gate::GateCtx,
     task: &Task,
     attempt: u32,
     inputs: &BTreeMap<TaskName, Value>,
@@ -602,7 +617,7 @@ fn prepare_and_run(
             ));
         }
     }
-    let out = run_in(args, paths, task, attempt, inputs);
+    let out = run_in(args, paths, gate, task, attempt, inputs);
     Attempt {
         outcome: out.outcome.settle_declared(),
         cost_usd: out.cost_usd,
@@ -614,6 +629,7 @@ fn prepare_and_run(
 fn run_in(
     args: &Args,
     paths: &Paths,
+    gate: &crate::plan::gate::GateCtx,
     task: &Task,
     attempt: u32,
     inputs: &BTreeMap<TaskName, Value>,
@@ -629,6 +645,7 @@ fn run_in(
             let mut shell = ShellRunner {
                 workdir: paths.workspace.clone(),
                 agent_cmd: None,
+                gate: crate::plan::gate::GateCtx::default(),
             };
             return if task.isolation == Some(Isolation::Worktree) {
                 shell.run_in_prepared_worktree(task, inputs)
@@ -641,6 +658,9 @@ fn run_in(
         }
         TaskKind::Engine { .. } => {
             return fail(0.0, "engine task reached a non-loop runner".to_string());
+        }
+        TaskKind::Approve { .. } => {
+            return gate.attempt(task, inputs);
         }
     };
 
@@ -2492,6 +2512,7 @@ workflow(type = "playbook", tasks = [analyze, implement, report])
             max_fanout: None,
         };
         let mut runner = HarnessRunner {
+            gate: crate::plan::gate::GateCtx::default(),
             args: <crate::Cli as clap::Parser>::try_parse_from(["crucible"])
                 .unwrap()
                 .run,

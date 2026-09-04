@@ -1,0 +1,67 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0025"
+title = "Plan-authored approval gates on an event-sourced loop"
+status = "accepted"
+date = "2026-09-04"
+refs = [
+    "ADR-0003",
+    "ADR-0004",
+    "ADR-0018",
+    "RFC-0001",
+    "RFC-0002",
+]
+
+[content]
+context = """
+A playbook can already ask a human for something: the provisioning ask parks the loop on a marker and waits for a re-scope over the control bridge. That path is the scored loop's, it is one global wait rather than a step in the graph, and the only thing that can end it is an operator at a socket.
+
+The work that needs gating is not shaped like that. A pack wants to say "run these tasks, then wait for someone to approve the change, then deploy", and the approval usually already exists somewhere else: a pull request got a review, a tracker issue moved to Ready. It is a node in the graph, with dependents, a verdict contribution, and a name.
+
+Waiting is also expensive in the shape the controller runs playbooks: a pod idling for a day on a human costs a scheduled slot and a node. A run that can leave and come back is worth more than a run that can only idle, but leaving requires state that outlives the process.
+
+Three folds of the session log had grown up independently by this point: the resume fold rebuilt counters, a tail scan classified crashes, and the controller's ingest had its own enum. A gate adds events all three would have to learn. [[ADR-0018]] made the session log the run's record; nothing had made it the run's state.
+"""
+decision = """
+Add an approval gate as a task kind a playbook author declares, and make the session log the single fold every consumer reads.
+
+The fold moves into the contract: one exhaustive apply over the event vocabulary, one classifier, one resume view. The engine and the controller read the same code, so a new event kind is taught to one place. The scored loop's decisions move out of the driver into a state machine with no I/O, which the driver hosts by performing effects and handing back results.
+
+A gate names what may resolve it. An operator acting on the run always can; a gate may additionally name a pull request or a tracker issue, and whichever arrives first wins. Resolution is keyed by a trace id derived from the run and the task, and is idempotent under that key, so a retrying resolver, a second source, and a resumed process replaying a decision all converge on one recorded outcome. Granted settles the gate passing; denied and timeout settle it failing, and the ordinary verdict rule in [[RFC-0002:C-PLAYBOOK-LANE]] does the rest. There is no fourth outcome and no new task status.
+
+A run at a gate either waits in place or suspends. Suspending writes the workspace and the state dir to the controller's existing artifact drop-box and exits zero under a distinct shutdown outcome; a later process restores them and is handed the decisions the controller settled meanwhile. Waiting time does not count against the wall-clock ceiling.
+
+The obligations are in [[RFC-0002:C-PLAYBOOK-APPROVAL]], with the wire additions in [[RFC-0001:C-WIRE]] and the resume rule in [[RFC-0002:C-PLAYBOOK-RESUME]]. This amends [[ADR-0004]], which assumed a run's dispatch ends with the process that started it.
+"""
+consequences = """
+Positive: a pack can express "a person decides here" as a node rather than as a task that polls something. The four folds become one, so the controller and the engine cannot disagree about what a log says. The scored loop's decisions became testable without a harness, and doing that turned up an attempt bound that had been counting per process rather than per iteration.
+
+Negative: the feature is only half usable until the controller carries it. The engine can suspend, but nothing resumes it without the controller's approval rows, its suspended status, and its artifact endpoints, so the pin bump and that work are one delivery rather than two. A gate also makes a run's wall-clock unbounded in practice: the ceiling stops counting, and the only backstop is the gate's own timeout.
+
+Neutral: the wire stays at one version. Every addition is an optional field or a new token, and readers are required to skip event kinds they do not know, which is what makes an older consumer safe against a newer writer.
+"""
+
+[[content.alternatives]]
+text = "A gate task in the graph, resolvable by an operator or by a named external source, with park and suspend"
+status = "accepted"
+
+[[content.alternatives]]
+text = "Extend the existing provisioning ask to cover approvals"
+status = "rejected"
+rejection_reason = "It is one global wait on the scored loop, not a node with dependents and a verdict contribution, and only an operator at a socket can end it."
+
+[[content.alternatives]]
+text = "Let a task poll the tracker or the forge itself and pass when it sees approval"
+status = "rejected"
+rejection_reason = "Puts the forge token and the wait policy in the pack, makes the wait indistinguishable from work in the log, and charges the wall-clock ceiling for time spent waiting on a person."
+
+[[content.alternatives]]
+text = "Host the durable wait on a workflow engine rather than building it"
+status = "rejected"
+rejection_reason = "The controller is already a durable workflow engine for this purpose, and the loop must keep running from a laptop with no server; revisited once the reducer is the thing a workflow would step."
+
+[[content.alternatives]]
+text = "Park only, never suspend"
+status = "rejected"
+rejection_reason = "An idle pod holds a scheduled slot and a node for as long as the human takes, which is the common case rather than the exception."

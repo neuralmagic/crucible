@@ -162,6 +162,67 @@ fn deliver(cfg: &IngestConfig, kind: ArtifactKind, bytes: &[u8]) -> bool {
     false
 }
 
+/// The resolutions the controller holds for this pod's open gates. A controller without the
+/// endpoint (404) or an unreachable one yields nothing; the park keeps waiting.
+pub fn fetch_pod_approvals(cfg: &IngestConfig) -> Vec<crucible_contract::PodApproval> {
+    let url = format!("{}/api/pods/{}/approvals", cfg.base_url, cfg.pod);
+    match get(cfg, &url) {
+        Ok(Some(bytes)) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        Ok(None) => Vec::new(),
+        Err(e) => {
+            eprintln!("[crucible] polling {url} for approvals failed: {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// Pull one artifact a previous pod of this run left in the drop-box. `None` when the
+/// controller holds none for it.
+pub fn fetch_artifact(
+    cfg: &IngestConfig,
+    of_pod: &str,
+    kind: ArtifactKind,
+) -> Result<Option<Vec<u8>>, String> {
+    let url = format!(
+        "{}/api/pods/{}/artifacts/{}?from={}",
+        cfg.base_url,
+        cfg.pod,
+        kind.as_str(),
+        of_pod
+    );
+    get(cfg, &url)
+}
+
+/// One authenticated GET with the pod's projected token. `Ok(None)` on 404.
+fn get(cfg: &IngestConfig, url: &str) -> Result<Option<Vec<u8>>, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .map_err(|e| format!("client build failed: {e}"))?;
+    let token = std::fs::read_to_string(&cfg.token_path)
+        .map(|t| t.trim().to_string())
+        .map_err(|e| format!("reading ingest token {}: {e}", cfg.token_path.display()))?;
+    let resp = client
+        .get(url)
+        .bearer_auth(&token)
+        .send()
+        .map_err(|e| format!("GET {url}: {e}"))?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !resp.status().is_success() {
+        return Err(format!("GET {url} → HTTP {}", resp.status()));
+    }
+    resp.bytes()
+        .map(|b| Some(b.to_vec()))
+        .map_err(|e| format!("reading {url}: {e}"))
+}
+
+/// The drop-box config for a run resuming another pod's artifacts, from the pod env.
+pub fn resume_of_from_env() -> Option<String> {
+    non_empty_env(crucible_contract::ENV_RESUME_OF)
+}
+
 fn non_empty_env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|s| !s.is_empty())
 }

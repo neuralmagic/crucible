@@ -20,9 +20,15 @@ pub struct ShellRunner {
     /// Stand-in command for `Agent` tasks (receives the prompt and knobs via env). `None`
     /// means agent tasks are refused: `plan run` without `--agent-cmd` is command-only.
     pub agent_cmd: Option<String>,
+    /// The run's gates: which resolutions it holds, under which run id.
+    pub gate: crate::plan::gate::GateCtx,
 }
 
 impl TaskRunner for ShellRunner {
+    fn resolve_gate(&mut self, trace_id: &str, resolution: crucible_contract::GateResolution) {
+        self.gate.resolve(trace_id, resolution);
+    }
+
     fn run(&mut self, task: &Task, _attempt: u32, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
         if task.isolation.is_some() {
             // Fail loud: a runner that quietly ran an isolation-marked task in the shared
@@ -54,6 +60,9 @@ impl ShellRunner {
     }
 
     fn run_in_workdir(&mut self, task: &Task, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
+        if matches!(task.task, TaskKind::Approve { .. }) {
+            return self.gate.attempt(task, inputs);
+        }
         let mut cmd = Command::new("sh");
         cmd.arg("-c").current_dir(&self.workdir);
         cmd.env(crate::plan::TASK_NAME_ENV, &task.name.0);
@@ -121,6 +130,9 @@ impl ShellRunner {
                 // Engine ops only exist in the loop's canonical template; its runner
                 // handles them, this one can't.
                 return fail("engine task reached a non-loop runner".to_string());
+            }
+            TaskKind::Approve { .. } => {
+                return self.gate.attempt(task, inputs);
             }
         }
         let out = match cmd.output() {
@@ -312,6 +324,7 @@ mod tests {
         ShellRunner {
             workdir: std::env::temp_dir(),
             agent_cmd: None,
+            gate: crate::plan::gate::GateCtx::default(),
         }
     }
 

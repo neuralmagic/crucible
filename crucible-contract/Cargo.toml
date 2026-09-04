@@ -8,6 +8,7 @@ edition.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 # Tier 2 content-addressing: engine and controller MUST compute the same `sha256:<hex>` digest,
 # so the one spelling lives here where both sides call it.
 sha2 = "0.10"

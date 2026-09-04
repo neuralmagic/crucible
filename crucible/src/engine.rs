@@ -242,7 +242,7 @@ fn dispatch_parent() -> Option<opentelemetry::Context> {
 /// standalone run (no controller, so no `TRACEPARENT`) gets the same span self-rooted. Returns
 /// `None` only when the engine's OTLP exporter is not installed. Enter the returned span for the
 /// life of the loop: the `openshell_turn` spans, created on the same thread, then nest under it
-/// (wide-round turns run on their own threads and root themselves, no thread-local to inherit).
+/// (isolated plan-task turns run on their own threads and root themselves, no thread-local to inherit).
 ///
 /// CONSUMER kind is recorded only in the dispatched case, where it pairs with the controller's
 /// PRODUCER span — the async producer/consumer edge a service-graph processor draws the

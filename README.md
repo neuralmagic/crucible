@@ -155,7 +155,6 @@ The main manifest sections are:
 | `[agent]` | yes | Configures the backend, harness, model, goal, prompt, environment, and sandbox. |
 | `[judge]` | no | Defines `measure_cmd`, score `direction`, and optional gate self-tests. Omitted entirely, the run is a task: every completed turn is kept, unscored (see [docs/task-lane.md](docs/task-lane.md)). |
 | `[world]` | no | Adds apply, snapshot, and restore commands for state outside Git. |
-| `[search]` | no | Configures a parallel wide round before the iterative deep loop. |
 | `[workflow]` | no | Defines the task graph used by an iteration. |
 | `[deploy]` | no | Defines build and deployment values used by rendered cluster runs. |
 | `[build.<name>]` | no | Defines a named image build target. |
@@ -328,12 +327,14 @@ Running `crucible` without a subcommand starts an optimization loop and requires
 | `crucible plan show` | Validates and displays a work-graph plan. |
 | `crucible plan run` | Executes a plan with the shell runner or a manifest-backed agent. |
 | `crucible watch-pr` | Converts authorized pull-request review comments into live steering or a reseed file. |
+| `crucible approve` / `crucible deny` | Resolves the approval gate a live run is parked on, over its control bridge. |
+| `crucible fetch-resume` | Restores a suspended run's session log and workspace from the controller before resuming it. |
 | `crucible fetch` | Downloads one exact S3 object URI to a local file. |
 | `crucible rank-grounded` | Performs one read-only, code-grounded ranking turn over an existing checkout. |
 | `crucible build` | Executes a named build configuration and prints the resulting digest-pinned image reference. |
 
-Common loop controls include `--iterations`, `--wide`, `--wide-keep`, `--max-cost`,
-`--max-time`, `--ui`, `--resume`, and `--no-early-stop`.
+Common loop controls include `--iterations`, `--max-cost`, `--max-time`, `--ui`, `--resume`,
+and `--no-early-stop`.
 
 ## Repository layout
 

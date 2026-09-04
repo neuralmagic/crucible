@@ -24,8 +24,8 @@ use crate::errors::FileError;
 use crate::manifest::{WorkflowCfg, WorkflowError, WorkflowType};
 use crate::plan::diag;
 use crate::plan::ir::{
-    Direction, EngineOp, Isolation, Join, MAX_FANOUT_CEILING, OutputField, OutputRef,
-    ReportDestination, SlackDestination, Stage, Task, TaskKind, TaskName,
+    ApprovalSourceSpec, Direction, EngineOp, Isolation, Join, MAX_FANOUT_CEILING, OutputField,
+    OutputRef, RefOrLiteral, ReportDestination, SlackDestination, Stage, Task, TaskKind, TaskName,
 };
 use crate::plan::starlark::values::WorkflowValue;
 
@@ -385,11 +385,15 @@ enum Value {
     /// A dictionary, ordered by key so a rendered prompt is the same on every compile.
     Map(BTreeMap<String, Value>),
     List(Vec<Value>),
-    Task(Task),
+    Task(Box<Task>),
     /// `producer.field`, already checked against the producer's declared emits.
     Output(OutputRef),
     Session(SessionDecl),
     Workflow(WorkflowCfg),
+    /// `github_pr(...)` / `jira(...)`: where an approval gate's resolution comes from.
+    GateSource(ApprovalSourceSpec),
+    /// `status("...")` / `label("...")`: what a Jira issue must reach.
+    Until(crucible_contract::JiraUntil),
     /// A starlark value outside the DSL's own space: a dict, a function, a struct. The `take_*`
     /// helpers report it with the same wrong-type sentence a wrong scalar gets.
     Opaque,
@@ -685,6 +689,10 @@ pub enum CompileError {
     TopKWithoutDependencies,
     #[error("stage must be `iteration` or `epilogue`, got {got:?}")]
     UnknownStage { got: String },
+    #[error("github_pr until must be \"approved\" or \"merged\", got {got:?}")]
+    UnknownPrUntil { got: String },
+    #[error("{argument} {got:?} is not a duration (try `90s`, `30m`, `2h`)")]
+    BadDuration { argument: String, got: String },
     #[error("join must be `all`, `passed`, or `settled`, got {got:?}")]
     UnknownJoin { got: String },
     #[error(
@@ -875,6 +883,9 @@ const COMMON_FUNCTIONS: &[&str] = &[
     "workflow",
 ];
 
+/// The playbook lane's own constructors: the approval gate and its sources.
+const PLAYBOOK_FUNCTIONS: &[&str] = &["approve", "github_pr", "jira", "status", "label"];
+
 /// The scored loop's own constructors, absent from a playbook.
 const SCORED_FUNCTIONS: &[&str] = &[
     "apply",
@@ -891,7 +902,9 @@ const SCORED_FUNCTIONS: &[&str] = &[
 /// constructor cannot be added to one and forgotten in the other.
 fn dsl_functions(lane: WorkflowType) -> Vec<&'static str> {
     let mut names = COMMON_FUNCTIONS.to_vec();
-    if lane != WorkflowType::Playbook {
+    if lane == WorkflowType::Playbook {
+        names.extend_from_slice(PLAYBOOK_FUNCTIONS);
+    } else {
         names.extend_from_slice(SCORED_FUNCTIONS);
     }
     names.sort_unstable();
@@ -977,6 +990,19 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
         "decide" => &["name", "measurement", "depends_on"],
         "session" => &["name", "harness", "model", "effort"],
         "workflow" => &["type", "tasks", "result"],
+        "approve" => &[
+            "name",
+            "summary",
+            "source",
+            "timeout",
+            "depends_on",
+            "needs",
+            "required",
+            "join",
+            "stage",
+        ],
+        "github_pr" => &["url", "until"],
+        "jira" => &["key", "until"],
         _ => &[],
     }
 }
@@ -1097,6 +1123,46 @@ fn constructor(
                 command: take_string(&mut named, "run")?,
             };
             dsl_task(&mut named, name, kind, None)?
+        }
+        "approve" => {
+            let name = take_declared_name(&mut named, "name")?;
+            let kind = TaskKind::Approve {
+                summary: take_optional_string(&mut named, "summary")?,
+                source: take_gate_source(&mut named)?,
+                timeout_secs: take_optional_duration_secs(&mut named, "timeout")?,
+            };
+            dsl_task(&mut named, name, kind, None)?
+        }
+        "github_pr" => {
+            let url = take_ref_or_literal(&mut named, "url")?;
+            let until = match take_string_default(&mut named, "until", "approved")?.as_str() {
+                "approved" => crucible_contract::PrUntil::Approved,
+                "merged" => crucible_contract::PrUntil::Merged,
+                other => {
+                    return Err(CompileError::UnknownPrUntil {
+                        got: other.to_owned(),
+                    });
+                }
+            };
+            no_unknown_kwargs(function, &named)?;
+            return Ok(Value::GateSource(ApprovalSourceSpec::GithubPr {
+                url,
+                until,
+            }));
+        }
+        "jira" => {
+            let key = take_ref_or_literal(&mut named, "key")?;
+            let until = match named.remove("until") {
+                Some(Value::Until(until)) => until,
+                Some(_) => return Err(wrong_type("until", "status(...) or label(...)")),
+                None => {
+                    return Err(CompileError::MissingArgument {
+                        argument: "until".to_owned(),
+                    });
+                }
+            };
+            no_unknown_kwargs(function, &named)?;
+            return Ok(Value::GateSource(ApprovalSourceSpec::Jira { key, until }));
         }
         "evaluate" => {
             let name = take_declared_name(&mut named, "name")?;
@@ -1245,7 +1311,7 @@ fn constructor(
             count: constructed,
         });
     }
-    Ok(Value::Task(task))
+    Ok(Value::Task(Box::new(task)))
 }
 
 fn no_unknown_kwargs(function: &str, named: &BTreeMap<String, Value>) -> Result<()> {
@@ -1311,7 +1377,7 @@ fn task_list(function: &str, tasks: Vec<Value>) -> Result<Vec<Task>> {
     tasks
         .into_iter()
         .map(|task| match task {
-            Value::Task(task) => Ok(task),
+            Value::Task(task) => Ok(*task),
             _ => Err(CompileError::TaskListEntryNotTask {
                 function: function.to_owned(),
             }),
@@ -1477,6 +1543,49 @@ fn take_emitted_files(named: &mut BTreeMap<String, Value>) -> Result<Vec<String>
         paths.push(relative.display().to_string());
     }
     Ok(paths)
+}
+
+/// `source =` on an `approve` task: `"native"` (the default), or a `github_pr(...)` /
+/// `jira(...)` value.
+fn take_gate_source(named: &mut BTreeMap<String, Value>) -> Result<ApprovalSourceSpec> {
+    match named.remove("source") {
+        None | Some(Value::None) => Ok(ApprovalSourceSpec::Native),
+        Some(Value::String(s)) if s == "native" => Ok(ApprovalSourceSpec::Native),
+        Some(Value::GateSource(source)) => Ok(source),
+        Some(_) => Err(wrong_type(
+            "source",
+            "\"native\", github_pr(...), or jira(...)",
+        )),
+    }
+}
+
+/// A gate source's target: a string, or an upstream task's emitted field.
+fn take_ref_or_literal(named: &mut BTreeMap<String, Value>, name: &str) -> Result<RefOrLiteral> {
+    match take_value(named, name)? {
+        Value::String(s) => Ok(RefOrLiteral::Literal(s)),
+        Value::Output(reference) => Ok(RefOrLiteral::Output(reference)),
+        Value::External(_) => Err(CompileError::ExternalOutsidePrompt {
+            argument: name.to_owned(),
+        }),
+        _ => Err(wrong_type(name, "a string or a task's emitted field")),
+    }
+}
+
+/// `timeout = "30m"`: a duration, in seconds.
+fn take_optional_duration_secs(
+    named: &mut BTreeMap<String, Value>,
+    name: &str,
+) -> Result<Option<u64>> {
+    match named.remove(name) {
+        None | Some(Value::None) => Ok(None),
+        Some(Value::String(raw)) => crate::duration::parse_duration(&raw)
+            .map(|d| Some(d.as_secs()))
+            .ok_or_else(|| CompileError::BadDuration {
+                argument: name.to_owned(),
+                got: raw,
+            }),
+        Some(_) => Err(wrong_type(name, "a duration string such as \"30m\"")),
+    }
 }
 
 fn take_over(named: &mut BTreeMap<String, Value>) -> Result<Option<OutputRef>> {
@@ -2400,7 +2509,7 @@ fn catching_panics<T>(evaluate: impl FnOnce() -> T) -> Result<T> {
 fn lane_globals(lane: WorkflowType) -> Globals {
     let builder = GlobalsBuilder::standard().with(globals::common);
     match lane {
-        WorkflowType::Playbook => builder.build(),
+        WorkflowType::Playbook => builder.with(globals::playbook).build(),
         _ => builder.with(globals::scored).build(),
     }
 }

@@ -6,6 +6,12 @@
 //! workspace prep, front-end choice) lives in [`crate::run`]; this module is just the loop and
 //! its helpers.
 
+use crate::machine;
+pub(crate) use crate::machine::IterStep;
+use crate::machine::{
+    BudgetHit, DistressOutcome, HeadCheck, HeadFlow, LoopCfg, LoopExit, MAX_DEAD_TURN_ATTEMPTS,
+    Machine, ParkOutcome, RunState, Segment, Settle,
+};
 use crate::reporter::{AgentTurn, Outcome, Phase, Reporter, Row, Stop, TurnBudget};
 use crate::{Args, Paths, Prepared, STOP};
 use crate::{control, escalation, provisioning, publish, session};
@@ -14,10 +20,6 @@ use crucible::crucible::{Judge, World};
 use crucible_contract::admission::AdmissionOutcome;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
-
-#[derive(Debug, thiserror::Error)]
-#[error("winner produced no diff")]
-struct WinnerProducedNoDiff;
 
 #[derive(Debug, thiserror::Error)]
 #[error("baseline measurement invalid: {note}")]
@@ -44,6 +46,8 @@ pub(crate) struct ResumeState {
     pub spent: f64,
     /// First iteration to run (last logged iter + 1).
     pub next_iter: u32,
+    /// Never-started turns the log already spent on `next_iter`.
+    pub dead_turns: u32,
     pub solved_any: bool,
     /// The last [`crate::identity::RunIdentity`] the original run recorded, if any (older logs
     /// predate this event). The resume path recomputes the identity fresh and hard-warns, never
@@ -70,95 +74,33 @@ pub(crate) struct LoopRuntime<'a> {
     /// The liveness beat's view of the loop, refreshed wherever the control status is. `None`
     /// when the beat is disabled (`CRUCIBLE_HEARTBEAT_SECS=0`).
     pub heartbeat: Option<std::sync::Arc<crate::heartbeat::Heartbeat>>,
+    /// The plan tasks the previous process settled in the iteration it died in, so a resumed
+    /// graph iteration does not re-dispatch them; present only with `resume`.
+    pub prior_plan: Option<crate::loop_graph::PriorPlan>,
 }
 
-/// An opaque rollback token from [`World::snapshot`]. The engine never inspects it (a git
-/// world packs a sha, a command world packs `"<sha>\t<token>"`); the newtype just keeps it
-/// from being confused with the run's other strings (regime, fingerprint, note).
-struct Snapshot(String);
-
-impl Snapshot {
-    fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// Everything an approved judge-changing re-scope replaces *atomically*: scores across a segment
-/// boundary are not comparable, so the regime, its fingerprint, the re-baselined scores, and the
-/// rollback snapshot move as one set. Swapping the whole `Segment` in a single assignment means
-/// a re-scope can't half-update the goalpost.
-struct Segment {
+/// Measure a fresh baseline and open a new comparable segment for `regime`. Used both for the
+/// initial segment 0 and for an approved re-scope; the returned [`Row`] is the baseline row
+/// (the initial path logs it, a re-scope discards it).
+fn baseline_segment(
+    world: &dyn World,
+    judge: &dyn Judge,
+    goal: &str,
     regime: String,
-    fingerprint: String,
-    baseline_score: f64,
-    /// Mutable within the segment: a kept improvement lowers it. A re-scope resets it to the new
-    /// baseline.
-    best_score: f64,
-    /// The kept best's secondary tiebreak scalar, tracked with `best_score` so a
-    /// primary-score tie can be ruled on the secondary axis. `None` when the kept best
-    /// (or the baseline) declared none.
-    best_tiebreak: Option<f64>,
-    baseline_total: u64,
-    best_snap: Snapshot,
-}
-
-impl Segment {
-    /// Measure a fresh baseline and open a new comparable segment for `regime`. Used both for the
-    /// initial segment 0 and for an approved re-scope; the returned [`Row`] is the baseline row
-    /// (the initial path logs it, a re-scope discards it).
-    fn baseline(
-        world: &dyn World,
-        judge: &dyn Judge,
-        goal: &str,
-        regime: String,
-        source: BaselineSource,
-    ) -> Result<(Self, Row)> {
-        let (baseline_score, baseline_total, snap, row) = run_baseline(world, judge, source)?;
-        let fingerprint = fingerprint(goal, &judge.objective(), &regime);
-        let segment = Segment {
-            regime,
-            fingerprint,
-            baseline_score,
-            best_score: baseline_score,
-            best_tiebreak: row.tiebreak,
-            baseline_total,
-            best_snap: Snapshot(snap),
-        };
-        Ok((segment, row))
-    }
-}
-
-/// The per-run state [`run_loop`] threads across iterations. Bundled so a new gate plugs into
-/// a named context instead of adding a 14th mutable binding, and so the segment-scoped fields
-/// can be swapped atomically (see [`Segment`]).
-struct Run {
-    rows: Vec<Row>,
-    spent: f64,
-    /// SHAs of commits this session kept, for the publish summary. A resumed run rebuilds the
-    /// pre-resume keeps from the log's kept rows (see [`restore_kept_best`]).
-    kept_shas: Vec<String>,
-    /// The pristine upstream SHA the workspace was checked out at, captured from segment 0's baseline
-    /// snapshot BEFORE any agent commit (a later re-baseline would see kept commits, so this is taken
-    /// once). It's the true PR base (the diff base for publish-on-keep) replacing the pod wrapper's
-    /// `/tmp/base-shas` hack. `None` on resume (the pristine base lived in the original run).
-    base_sha: Option<String>,
-    /// The pristine baseline snapshot TOKEN, captured once at segment 0 (same moment as `base_sha`).
-    /// A composite world reads its per-component base shas out of this (the multi-fork publish path);
-    /// a single-repo world ignores it. `None` on resume (the original run held it).
-    base_snap: Option<String>,
-    solved_any: bool,
-    /// Idle time spent parked on a human approval, excluded from the time cap.
-    parked_total: Duration,
-    /// Set when the agent blocked on a pending approval with no frozen-regime fallback; the loop
-    /// parks at the next iteration head until the re-scope lands.
-    pending_block: Option<provisioning::PendingProvisioning>,
-    /// Head branches prior segments already opened PRs from (restored from the log's `pr_links`
-    /// events; empty on a fresh run). Publish skips candidates whose branch is in here.
-    published_branches: Vec<String>,
-    /// The run's spend against its declared output bounds, for the writes the engine performs
-    /// itself (RFC-0001:C-OUTPUTS). The broker tallies its own tools separately.
-    outputs: crate::outputs::OutputTally,
-    segment: Segment,
+    source: BaselineSource,
+) -> Result<(Segment, Row)> {
+    let (baseline_score, baseline_total, snap, row) = run_baseline(world, judge, source)?;
+    let fingerprint = fingerprint(goal, &judge.objective(), &regime);
+    let segment = Segment {
+        regime,
+        fingerprint,
+        baseline_score,
+        best_score: baseline_score,
+        best_tiebreak: row.tiebreak,
+        baseline_total,
+        best_snap: snap,
+    };
+    Ok((segment, row))
 }
 
 /// The run's spend against its declared output bounds: the frozen pack's when one was projected,
@@ -170,55 +112,6 @@ fn output_tally(args: &Args, p: &Paths) -> crate::outputs::OutputTally {
             .unwrap_or_else(crate::outputs::RunBounds::engine_defaults),
         Some(p.session_log.clone()),
     )
-}
-
-/// Consecutive never-started turns (transport/sandbox death before the agent produced
-/// anything) after which the run halts as [`LoopExit::Stalled`]. Such a turn re-runs its
-/// iteration instead of consuming it, so without this bound one dead node could spin the
-/// run forever (run 6 burned 7 of 9 iterations on a single sandbox that never came up).
-const MAX_DEAD_TURN_ATTEMPTS: u32 = 3;
-
-/// How a run ended, the single enumeration of every way the loop exits, replacing the old
-/// `escalated: Option` flag plus the scattered `break`s. Mapped to an [`Outcome`] once
-/// at the end of [`run_loop`].
-enum LoopExit {
-    /// The `for` ran every iteration without an early exit.
-    Finished,
-    /// A kept candidate satisfied the win condition.
-    Solved,
-    /// A cost or time cap was reached.
-    Budget,
-    /// Ctrl+C / a stop signal (at an interrupt checkpoint or while parked).
-    Stopped,
-    /// The agent declared the harness inadequate, or a `block` approval was denied with no
-    /// fallback: halt for human review. The escalation itself is reported and the world rolled
-    /// back eagerly at the break site (differently per site) so the variant only needs to
-    /// mark the run as "needs human" for the exit code.
-    Escalated,
-    /// [`MAX_DEAD_TURN_ATTEMPTS`] consecutive turns died on transport before starting: the
-    /// run is stalled on infrastructure, not out of iterations.
-    Stalled,
-}
-
-impl LoopExit {
-    /// The wire token + human-readable reason for [`Reporter::shutdown`]. `error` (a bail from
-    /// inside the loop, never reaching this variant) is reported separately by [`run_loop`].
-    fn shutdown_reason(&self) -> (&'static str, &'static str) {
-        match self {
-            LoopExit::Finished => ("finished", "all iterations completed"),
-            LoopExit::Solved => ("solved", "a kept candidate satisfied the win condition"),
-            LoopExit::Budget => ("budget", "a cost or time cap was reached"),
-            LoopExit::Stopped => ("stopped", "stop signal received"),
-            LoopExit::Escalated => (
-                "escalated",
-                "the agent declared the harness inadequate — halted for human review",
-            ),
-            LoopExit::Stalled => (
-                "stalled",
-                "the run stalled on consecutive transport failures — no turn could start",
-            ),
-        }
-    }
 }
 
 /// One turn's linear protocol, typed so its illegal orderings stop compiling: the candidate
@@ -255,32 +148,6 @@ pub(crate) struct Decided {
     pub(crate) row: Row,
     pub(crate) verdict: crucible::crucible::Decision,
     pub(crate) reading: crucible::crucible::Reading,
-}
-
-/// One iteration's outcome in driver vocabulary, produced by either path (the typestate
-/// chain or the graph template) and folded by the shared keep/discard tail in
-/// [`run_loop_body`].
-pub(crate) enum IterStep {
-    Decided(Box<Decided>),
-    /// Discard and move on (failed turn, failed apply, gate rejection). The reason lands in the
-    /// iteration's Row, so the run summary counts every iteration honestly — a run that lost all
-    /// its iterations must not read as a clean "finished" with an empty scoreboard.
-    Discarded {
-        reason: String,
-    },
-    /// The turn never started: a transport-class death (sandbox setup, auth, connection)
-    /// before the agent produced anything. There is no candidate to discard, so the driver
-    /// re-runs the SAME iteration instead of consuming it, bounded by
-    /// [`MAX_DEAD_TURN_ATTEMPTS`] consecutive attempts.
-    NeverStarted {
-        reason: String,
-    },
-    /// Halt for human review (the escalation is already reported).
-    Escalated,
-    /// Park at the next iteration head on a blocking approval.
-    Parked(provisioning::PendingProvisioning),
-    /// Stop signal at the post-turn checkpoint.
-    Stopped,
 }
 
 /// What the post-turn sentinel drains decided, in the exact order the loop checks them.
@@ -560,6 +427,209 @@ pub(crate) fn run_loop<R: Reporter>(
     }
 }
 
+/// Everything a head check reads that is not the machine or the reporter. One struct so a
+/// check takes five arguments instead of thirteen.
+struct HeadCtx<'a> {
+    args: &'a Args,
+    p: &'a Paths,
+    prep: &'a Prepared,
+    world: &'a dyn World,
+    judge: &'a dyn Judge,
+    control: Option<&'a control::ControlState>,
+    ledger: Option<&'a crate::admission::AdmissionLedger>,
+    preflight: &'a Option<crate::preflight::PreflightBaseline>,
+    started: Instant,
+}
+
+/// Perform one head check. The machine owns which checks run and in what order
+/// ([`machine::HEAD`]); this owns what each one does. Returning [`HeadFlow`] instead of
+/// breaking a loop is what lets that order live in data rather than in this function's shape.
+fn head_check<R: Reporter>(
+    check: HeadCheck,
+    m: &mut Machine,
+    r: &mut R,
+    ctx: &HeadCtx<'_>,
+    bad_marker_seen: &mut Option<Option<std::time::SystemTime>>,
+) -> Result<HeadFlow> {
+    let it = m.it;
+    match check {
+        HeadCheck::WaitIfPaused => {
+            wait_if_paused(ctx.control, r);
+        }
+        HeadCheck::ParkOnPendingBlock => {
+            // The agent blocked on a pending approval last turn (it had no frozen-regime fallback).
+            // Park here (idle, budget-paused) until the approval lands as a re-scope (the broker
+            // fires it over the control bridge) or we're told to stop. The drain below then
+            // re-baselines into the granted regime.
+            if let Some(pp) = m.take_pending_block() {
+                let (outcome, parked) =
+                    park_for_approval(ctx.control, ctx.ledger, r, m.cfg.max_park);
+                match (m.on_park(parked, &outcome), &outcome) {
+                    (None, _) => {} // the re-scope drain below re-baselines
+                    (Some(LoopExit::Escalated), ParkOutcome::Denied(why)) => {
+                        // `block` means the agent had no frozen-regime fallback, a denial leaves
+                        // nothing to do, so escalate-halt for a human.
+                        r.note(&format!(
+                            "approval denied — escalating (no fallback): provisioning for '{}' was not granted: {why}",
+                            pp.trace_id
+                        ));
+                        update_control_status(
+                            ctx.control,
+                            "escalated",
+                            it,
+                            m.run.segment.best_score,
+                            m.run.spent,
+                        );
+                        ctx.world.restore(&m.run.segment.best_snap)?;
+                        return Ok(HeadFlow::Exit);
+                    }
+                    (Some(_), _) => return Ok(HeadFlow::Exit),
+                }
+            }
+        }
+        HeadCheck::DrainRescope => {
+            // An approved judge-changing grant arrived (via the control channel / MCP): re-baseline
+            // into the new regime and open a fresh segment before this iteration measures.
+            if let Some((rescope_key, new_regime)) = ctx.control.and_then(|c| c.take_rescope()) {
+                // Close any open approval bracket: a rescope IS the grant. Harmless when no
+                // wait was open (the classifier treats an unmatched resolve as a no-op).
+                r.approval_resolved("granted", &new_regime);
+                r.note(&format!(
+                    "control: re-scoping to '{new_regime}' — re-baselining a new comparable segment"
+                ));
+                // One atomic swap of the goalpost: the new regime, its fingerprint, the re-baselined
+                // scores, and the fresh rollback snapshot all land together. The admission
+                // settles only after the swap: a baseline error leaves it for the resume.
+                let (segment, _row) = baseline_segment(
+                    ctx.world,
+                    ctx.judge,
+                    &ctx.prep.goal,
+                    new_regime.clone(),
+                    baseline_source(ctx.prep.skip_baseline, ctx.preflight.as_ref()),
+                )?;
+                m.rescope(segment);
+                if let Some(ledger) = ctx.ledger {
+                    let _ = ledger.settle(
+                        &rescope_key,
+                        AdmissionOutcome::Applied,
+                        &format!("re-baselined into '{new_regime}' at iter {it}"),
+                    );
+                }
+                r.segment(
+                    &m.run.segment.fingerprint,
+                    m.run.segment.baseline_score,
+                    &m.run.segment.regime,
+                );
+                write_results(ctx.p, &ctx.prep.goal, &ctx.prep.prior, &m.run.rows)?;
+            }
+        }
+        HeadCheck::DrainDeny => {
+            // A denial that arrived while *continuing* (the agent had a fallback, so the loop never
+            // parked) just means the regime change won't happen; note it and stay in the frozen regime.
+            if let Some((deny_key, reason)) = ctx.control.and_then(|c| c.take_deny()) {
+                r.approval_resolved("denied", &reason);
+                r.note(&format!(
+                    "approval not granted ({reason}) — staying in the frozen regime"
+                ));
+                if let Some(ledger) = ctx.ledger {
+                    let _ = ledger.settle(
+                        &deny_key,
+                        AdmissionOutcome::Applied,
+                        &format!("drained at the head of iter {it}"),
+                    );
+                }
+            }
+        }
+        HeadCheck::ParkOnDistress => {
+            // The agent raised `distress(severity=error)` during the last turn: that turn finished and
+            // was decided above, so bookkeeping is complete and this is the safe point to suspend.
+            // Modeled as an approval wait (same bracket, same parked-time accounting); the operator's
+            // `rm` of the marker is the grant.
+            match crate::distress::read_marker() {
+                Some(Ok(marker)) => {
+                    if let Some(row) = m.on_distress(marker.ts_ms, &marker.reason) {
+                        // An in-place restart re-reads a marker the operator never cleared and
+                        // re-parks (correct: no grant was given), but the row for it is already in
+                        // the resumed log.
+                        if let Some(row) = row {
+                            r.row(&row, false);
+                            m.record(row);
+                            write_results(ctx.p, &ctx.prep.goal, &ctx.prep.prior, &m.run.rows)?;
+                        }
+                        r.note(&format!(
+                            "distress: {}, suspended awaiting the operator (clear {})",
+                            marker.reason,
+                            forge::storage_root().join("distress").display()
+                        ));
+                        for item in &marker.evidence {
+                            r.note(&format!("distress evidence: {item}"));
+                        }
+                        update_control_status(
+                            ctx.control,
+                            "distressed",
+                            it,
+                            m.run.segment.best_score,
+                            m.run.spent,
+                        );
+                        r.approval_wait(
+                            crate::distress::HANDLE,
+                            crate::distress::HANDLE,
+                            provisioning::WaitMode::Block,
+                        );
+                        let (outcome, parked) =
+                            park_for_distress(ctx.p, &m.run.rows, r, m.cfg.max_park);
+                        match m.on_distress_park(parked, outcome) {
+                            None => {
+                                r.approval_resolved("granted", "distress cleared by operator");
+                                r.note("distress cleared, resuming");
+                                // The head re-checks budget/interrupts before the next turn runs.
+                                return Ok(HeadFlow::Restart);
+                            }
+                            Some(_) => {
+                                if outcome == DistressOutcome::TimedOut {
+                                    r.note(
+                                        "distress park timed out, stopping with state preserved",
+                                    );
+                                }
+                                return Ok(HeadFlow::Exit);
+                            }
+                        }
+                    }
+                }
+                // A marker we cannot parse is a broken handoff, not a suspend order: note it once per
+                // rewrite and keep iterating. Wedging a paid run on a bad byte is the worse failure.
+                Some(Err(why)) => {
+                    let mtime = crate::distress::marker_mtime();
+                    if *bad_marker_seen != Some(mtime) {
+                        *bad_marker_seen = Some(mtime);
+                        r.note(&format!("distress marker unreadable ({why}), not parking"));
+                    }
+                }
+                None => {}
+            }
+        }
+        HeadCheck::Interrupt => {
+            if matches!(r.check_interrupt(ctx.p, &m.run.rows), Stop::Quit) {
+                m.end(LoopExit::Stopped);
+                return Ok(HeadFlow::Exit);
+            }
+        }
+        HeadCheck::Budget => {
+            if let Some(hit) =
+                m.over_budget(live_max_cost(ctx.args, ctx.control), ctx.started.elapsed())
+            {
+                note_budget_hit(r, ctx.args, hit);
+                m.end(LoopExit::Budget);
+                return Ok(HeadFlow::Exit);
+            }
+        }
+    }
+    Ok(HeadFlow::Continue)
+}
+
+/// The host: performs every effect the loop needs and hands the results to the
+/// [`crate::machine::Machine`], which owns the decisions. Effects happen in the order they
+/// always have, so the session log a run writes is unchanged.
 fn run_loop_body<R: Reporter>(
     args: &Args,
     p: &Paths,
@@ -569,20 +639,26 @@ fn run_loop_body<R: Reporter>(
     judge: &dyn Judge,
     runtime: LoopRuntime<'_>,
 ) -> Result<Outcome> {
+    let mut runtime = runtime;
     let control = runtime.control;
     let ledger = runtime.ledger.as_deref();
     let heartbeat_handle = runtime.heartbeat.as_ref();
     let heartbeat = heartbeat_handle.map(std::sync::Arc::as_ref);
     let started = Instant::now();
-    let start_iter: u32;
-    let is_resume = runtime.resume.is_some();
+    let cfg = LoopCfg {
+        iterations: args.iterations,
+        max_time: args.max_time(),
+        max_park: args.max_park(),
+        no_early_stop: args.no_early_stop,
+    };
+    let mut outputs = output_tally(args, p);
     // Held across the whole body: an approved re-scope re-baselines, and re-measuring a rescoped
     // baseline without an agent turn is impossible for a codegen domain, so it reuses this same
     // preflight measurement. A resumed run whose baseline was never measured re-runs preflight
     // and sets this; a resume with a finite baseline skips preflight entirely.
     let mut preflight_baseline: Option<crate::preflight::PreflightBaseline> = None;
 
-    let mut run = if let Some(rs) = runtime.resume {
+    let mut m = if let Some(rs) = runtime.resume.take() {
         // Resume restores state in-memory only: the log already holds the prior
         // `start` + rows, so re-emitting them would double-count on replay. We append
         // just the continuation (a resume note, then the new iterations). Segment 0 opens
@@ -606,30 +682,34 @@ fn run_loop_body<R: Reporter>(
             baseline_total: rs.baseline_total,
             best_snap: resumed_best.best_snap,
         };
-        start_iter = rs.next_iter;
-        let mut run = Run {
-            rows: rs.rows,
-            spent: rs.spent,
-            kept_shas: resumed_best.kept_shas,
-            base_sha: None,
-            base_snap: None,
-            solved_any: rs.solved_any,
-            parked_total: Duration::ZERO,
-            pending_block: None,
-            published_branches: rs.published_branches,
-            outputs: output_tally(args, p),
-            segment,
-        };
+        let start_iter = rs.next_iter;
+        let mut m = Machine::new(
+            cfg,
+            RunState {
+                rows: rs.rows,
+                spent: rs.spent,
+                kept_shas: resumed_best.kept_shas,
+                base_sha: None,
+                base_snap: None,
+                solved_any: rs.solved_any,
+                parked_total: Duration::ZERO,
+                dead_turns: rs.dead_turns,
+                pending_block: None,
+                published_branches: rs.published_branches,
+                segment,
+            },
+            start_iter,
+        );
         update_control_status(
             control,
             "resume",
             start_iter.saturating_sub(1),
-            run.segment.best_score,
-            run.spent,
+            m.run.segment.best_score,
+            m.run.spent,
         );
         r.note(&format!(
             "resumed: {} prior rows restored, continuing at iter {start_iter}",
-            run.rows.len()
+            m.run.rows.len()
         ));
         if let Some(why) = &resumed_best.degraded {
             r.note(&format!("resume: {why}"));
@@ -637,7 +717,7 @@ fn run_loop_body<R: Reporter>(
         // The ledger is read FIRST: a grant recorded before the death settles what the
         // dangling approval bracket means.
         let replay = ledger.map(crate::admission::AdmissionLedger::replay_for_resume);
-        if let Some(rec) = runtime.recovery {
+        if let Some(rec) = runtime.recovery.take() {
             r.recovery(rec.class, rec.iter, &rec.detail);
             let approval = crate::recovery::resume_approval(&rec, replay.as_ref());
             if let Some(why) = &approval.note {
@@ -646,7 +726,7 @@ fn run_loop_body<R: Reporter>(
             if let (Some(control), Some(regime)) = (control, approval.pending_regime) {
                 control.set_pending_regime(regime);
             }
-            run.pending_block = approval.repark;
+            m.run.pending_block = approval.repark;
         }
         if let (Some(ledger), Some(replay)) = (ledger, replay) {
             replay_admissions(ledger, control, replay, r);
@@ -670,15 +750,15 @@ fn run_loop_body<R: Reporter>(
         // baseline comes from the judge, not from preflight.
         if prep.skip_baseline
             && let Some(cfg) = &prep.preflight
-            && !run.segment.baseline_score.is_finite()
+            && !m.run.segment.baseline_score.is_finite()
         {
             r.phase(Phase::Preflight);
             update_control_status(
                 control,
                 "preflight",
                 start_iter.saturating_sub(1),
-                run.segment.best_score,
-                run.spent,
+                m.run.segment.best_score,
+                m.run.spent,
             );
             match crate::preflight::run(cfg, &prep.preflight_modes, &p.workspace, r) {
                 Ok(seeded) => preflight_baseline = seeded,
@@ -698,8 +778,8 @@ fn run_loop_body<R: Reporter>(
                         ..Default::default()
                     };
                     r.row(&row, false);
-                    run.rows.push(row);
-                    write_results(p, &prep.goal, &prep.prior, &run.rows)?;
+                    m.record(row);
+                    write_results(p, &prep.goal, &prep.prior, &m.run.rows)?;
                     return Err(e);
                 }
             }
@@ -708,12 +788,12 @@ fn run_loop_body<R: Reporter>(
             // (pre-preflight) can carry a finite kept best with a sentinel baseline, and
             // clobbering that best would discard real progress.
             if let Some(pb) = &preflight_baseline {
-                run.segment.baseline_score = pb.score;
-                if !run.segment.best_score.is_finite() {
+                m.run.segment.baseline_score = pb.score;
+                if !m.run.segment.best_score.is_finite() {
                     let snap = world.snapshot("preflight baseline")?;
-                    run.segment.best_score = pb.score;
-                    run.segment.best_tiebreak = pb.tiebreak;
-                    run.segment.best_snap = Snapshot(snap);
+                    m.run.segment.best_score = pb.score;
+                    m.run.segment.best_tiebreak = pb.tiebreak;
+                    m.run.segment.best_snap = snap;
                 }
                 let base_row = Row {
                     iter: 0,
@@ -724,16 +804,15 @@ fn run_loop_body<R: Reporter>(
                     ..Default::default()
                 };
                 r.row(&base_row, false);
-                run.rows.push(base_row);
+                m.record(base_row);
             }
         }
 
-        write_results(p, &prep.goal, &prep.prior, &run.rows)?;
-        run
+        write_results(p, &prep.goal, &prep.prior, &m.run.rows)?;
+        m
     } else {
         r.start(&prep.goal, &judge.objective());
         r.identity(&prep.identity);
-        start_iter = 1;
 
         if let Some(cfg) = &prep.preflight {
             r.phase(Phase::Preflight);
@@ -766,7 +845,7 @@ fn run_loop_body<R: Reporter>(
 
         r.phase(Phase::Baseline);
         update_control_status(control, "baseline", 0, f64::INFINITY, 0.0);
-        let (segment, base_row) = Segment::baseline(
+        let (segment, base_row) = baseline_segment(
             world,
             judge,
             &prep.goal,
@@ -776,282 +855,95 @@ fn run_loop_body<R: Reporter>(
         // The pristine base: segment 0's baseline snapshot is the upstream checkout, before any
         // agent commit. Captured here (not at publish time) because a kept iteration advances HEAD,
         // so by end-of-run `git rev-parse HEAD` is the candidate, not the base.
-        let base_sha = world.commit_sha(segment.best_snap.as_str());
+        let base_sha = world.commit_sha(&segment.best_snap);
         // The composite multi-fork publish path needs the full baseline token (per-component base
         // shas), not just the single `commit_sha`; capture it once here, same moment as `base_sha`.
-        let base_snap = Some(segment.best_snap.as_str().to_string());
-        let mut run = Run {
-            rows: Vec::new(),
-            spent: 0.0_f64,
-            kept_shas: Vec::new(),
-            base_sha,
-            base_snap,
-            solved_any: false,
-            parked_total: Duration::ZERO,
-            pending_block: None,
-            published_branches: Vec::new(),
-            outputs: output_tally(args, p),
-            segment,
-        };
+        let base_snap = Some(segment.best_snap.clone());
+        let mut m = Machine::new(
+            cfg,
+            RunState {
+                rows: Vec::new(),
+                spent: 0.0_f64,
+                kept_shas: Vec::new(),
+                base_sha,
+                base_snap,
+                solved_any: false,
+                parked_total: Duration::ZERO,
+                dead_turns: 0,
+                pending_block: None,
+                published_branches: Vec::new(),
+                segment,
+            },
+            1,
+        );
         r.row(&base_row, false);
-        run.rows.push(base_row);
-        write_results(p, &prep.goal, &prep.prior, &run.rows)?;
-        update_control_status(control, "baseline", 0, run.segment.best_score, run.spent);
-        run
+        m.record(base_row);
+        write_results(p, &prep.goal, &prep.prior, &m.run.rows)?;
+        update_control_status(
+            control,
+            "baseline",
+            0,
+            m.run.segment.best_score,
+            m.run.spent,
+        );
+        m
     };
 
-    // Announce segment 0. A re-scope (below) swaps `run.segment` for a fresh one, marking a new
+    // Announce segment 0. A re-scope (below) swaps the segment for a fresh one, marking a new
     // comparable segment: scores across a boundary are NOT comparable.
     r.segment(
-        &run.segment.fingerprint,
-        run.segment.baseline_score,
-        &run.segment.regime,
+        &m.run.segment.fingerprint,
+        m.run.segment.baseline_score,
+        &m.run.segment.regime,
     );
 
-    // Wide round: fan out N candidates before the deep loop, if configured. The winner's diff
-    // seeds the deep loop's workspace. Skipped on resume (the wide rows already live in the
-    // session log).
-    if !is_resume
-        && let Some(wide_cfg) = crate::loop_graph::WideConfig::resolve(args, args.search.as_ref())
-    {
-        // The tournament runs as a work-graph template (parallel isolated proposes,
-        // serial diff scoring, engine top_k) on both loop paths. The winner diff travels
-        // as text: the candidate worktrees are removed before seed time, so re-deriving a
-        // diff from one silently yields nothing.
-        let result = crate::loop_graph::run_wide_tournament(
-            &wide_cfg,
+    // The mtime of the malformed marker already complained about; a rewrite re-notes.
+    let mut bad_marker_seen: Option<Option<std::time::SystemTime>> = None;
+    while m.exit().is_none() && m.has_iterations() {
+        let it = m.it;
+        let mut flow = HeadFlow::Continue;
+        let ctx = HeadCtx {
             args,
             p,
             prep,
-            r,
             world,
             judge,
-            run.segment.baseline_score,
-        )?;
-        let winner = result.winners.first().copied();
-        let winner_diff = winner.and_then(|id| result.diffs.get(&id).cloned());
-        let rows = result.rows;
-
-        for row in &rows {
-            r.row(row, false);
-            run.rows.push(row.clone());
-        }
-        write_results(p, &prep.goal, &prep.prior, &run.rows)?;
-
-        if let Some(winner_id) = winner {
-            r.note(&format!(
-                "wide round complete: seeding deep loop with candidate {winner_id}"
-            ));
-            let applied = winner_diff
-                .filter(|d| !d.trim().is_empty())
-                .ok_or_else(|| WinnerProducedNoDiff.into())
-                .and_then(|d| crate::plan::worktree::apply(&p.workspace, &d));
-            if let Err(e) = applied {
-                r.note(&format!(
-                    "failed to apply winner diff: {e:#} — deep loop starts from baseline"
-                ));
-            } else {
-                // Snapshot the seeded state so the deep loop has a base to work from.
-                match world.snapshot("wide: winner applied") {
-                    Ok(snap) => {
-                        if let Some(sha) = world.commit_sha(&snap) {
-                            run.kept_shas.push(sha);
-                        }
-                        run.segment.best_snap = Snapshot(snap);
-                    }
-                    Err(e) => r.note(&format!("snapshot after wide winner failed: {e:#}")),
-                }
-            }
-        } else {
-            r.note("wide round produced no winners — deep loop starts from baseline");
-        }
-    }
-
-    // How this run ends. Each early exit sets it before breaking; a loop that runs out of
-    // iterations leaves it `Finished`. One match below folds it into the `Outcome`.
-    let mut exit = LoopExit::Finished;
-    // `it` advances only when a turn actually started: a never-started attempt re-runs the
-    // same iteration (hence a `while`, not a `for`), and `dead_turns` counts the consecutive
-    // never-started attempts that bound the re-runs.
-    let mut dead_turns: u32 = 0;
-    // The marker this run already parked on (by its `ts_ms`), so a marker the operator left in
-    // place can't re-park the loop, and a fresh distress still can.
-    let mut parked_distress_ts: Option<u64> = None;
-    // The mtime of the malformed marker already complained about; a rewrite re-notes.
-    let mut bad_marker_seen: Option<Option<std::time::SystemTime>> = None;
-    let mut it = start_iter;
-    while it <= args.iterations {
-        wait_if_paused(control, r);
-        // The agent blocked on a pending approval last turn (it had no frozen-regime fallback).
-        // Park here (idle, budget-paused) until the approval lands as a re-scope (the broker
-        // fires it over the control bridge) or we're told to stop. The drain below then
-        // re-baselines into the granted regime.
-        if let Some(pp) = run.pending_block.take() {
-            match park_for_approval(control, ledger, r, &mut run.parked_total, args.max_park()) {
-                ParkOutcome::Resumed => {} // the re-scope drain below re-baselines
-                ParkOutcome::Denied(why) => {
-                    // `block` means the agent had no frozen-regime fallback, a denial leaves
-                    // nothing to do, so escalate-halt for a human.
-                    r.note(&format!(
-                        "approval denied — escalating (no fallback): provisioning for '{}' was not granted: {why}",
-                        pp.trace_id
-                    ));
-                    update_control_status(
-                        control,
-                        "escalated",
-                        it,
-                        run.segment.best_score,
-                        run.spent,
-                    );
-                    world.restore(run.segment.best_snap.as_str())?;
-                    exit = LoopExit::Escalated;
-                    break;
-                }
-                ParkOutcome::Stopped => {
-                    exit = LoopExit::Stopped;
-                    break;
-                }
+            control,
+            ledger,
+            preflight: &preflight_baseline,
+            started,
+        };
+        for check in machine::HEAD {
+            flow = head_check(*check, &mut m, r, &ctx, &mut bad_marker_seen)?;
+            if flow != HeadFlow::Continue {
+                break;
             }
         }
-        // An approved judge-changing grant arrived (via the control channel / MCP): re-baseline
-        // into the new regime and open a fresh segment before this iteration measures.
-        if let Some((rescope_key, new_regime)) = control.and_then(|c| c.take_rescope()) {
-            // Close any open approval bracket: a rescope IS the grant. Harmless when no
-            // wait was open (the classifier treats an unmatched resolve as a no-op).
-            r.approval_resolved("granted", &new_regime);
-            r.note(&format!(
-                "control: re-scoping to '{new_regime}' — re-baselining a new comparable segment"
-            ));
-            // One atomic swap of the goalpost: the new regime, its fingerprint, the re-baselined
-            // scores, and the fresh rollback snapshot all land together. The admission
-            // settles only after the swap: a baseline error leaves it for the resume.
-            let (segment, _row) = Segment::baseline(
-                world,
-                judge,
-                &prep.goal,
-                new_regime.clone(),
-                baseline_source(prep.skip_baseline, preflight_baseline.as_ref()),
-            )?;
-            run.segment = segment;
-            if let Some(ledger) = ledger {
-                let _ = ledger.settle(
-                    &rescope_key,
-                    AdmissionOutcome::Applied,
-                    &format!("re-baselined into '{new_regime}' at iter {it}"),
-                );
-            }
-            r.segment(
-                &run.segment.fingerprint,
-                run.segment.baseline_score,
-                &run.segment.regime,
-            );
-            write_results(p, &prep.goal, &prep.prior, &run.rows)?;
-        }
-        // A denial that arrived while *continuing* (the agent had a fallback, so the loop never
-        // parked) just means the regime change won't happen; note it and stay in the frozen regime.
-        if let Some((deny_key, reason)) = control.and_then(|c| c.take_deny()) {
-            r.approval_resolved("denied", &reason);
-            r.note(&format!(
-                "approval not granted ({reason}) — staying in the frozen regime"
-            ));
-            if let Some(ledger) = ledger {
-                let _ = ledger.settle(
-                    &deny_key,
-                    AdmissionOutcome::Applied,
-                    &format!("drained at the head of iter {it}"),
-                );
-            }
-        }
-        // The agent raised `distress(severity=error)` during the last turn: that turn finished and
-        // was decided above, so bookkeeping is complete and this is the safe point to suspend.
-        // Modeled as an approval wait (same bracket, same parked-time accounting); the operator's
-        // `rm` of the marker is the grant.
-        match crate::distress::read_marker() {
-            Some(Ok(marker)) if parked_distress_ts != Some(marker.ts_ms) => {
-                parked_distress_ts = Some(marker.ts_ms);
-                // The turn that raised distress is already numbered; this row annotates it.
-                let row = Row {
-                    iter: it.saturating_sub(1),
-                    decision: "distressed".to_string(),
-                    note: marker.reason.clone(),
-                    ..Default::default()
-                };
-                // An in-place restart re-reads a marker the operator never cleared and re-parks
-                // (correct: no grant was given), but the row for it is already in the resumed log.
-                if !run.rows.iter().any(|prior| {
-                    prior.decision == row.decision
-                        && prior.iter == row.iter
-                        && prior.note == row.note
-                }) {
-                    r.row(&row, false);
-                    run.rows.push(row);
-                    write_results(p, &prep.goal, &prep.prior, &run.rows)?;
-                }
-                r.note(&format!(
-                    "distress: {}, suspended awaiting the operator (clear {})",
-                    marker.reason,
-                    forge::storage_root().join("distress").display()
-                ));
-                for item in &marker.evidence {
-                    r.note(&format!("distress evidence: {item}"));
-                }
-                update_control_status(control, "distressed", it, run.segment.best_score, run.spent);
-                r.approval_wait(
-                    crate::distress::HANDLE,
-                    crate::distress::HANDLE,
-                    provisioning::WaitMode::Block,
-                );
-                match park_for_distress(p, &run.rows, r, &mut run.parked_total, args.max_park()) {
-                    DistressOutcome::Cleared => {
-                        r.approval_resolved("granted", "distress cleared by operator");
-                        r.note("distress cleared, resuming");
-                        // The head re-checks budget/interrupts before the next turn runs.
-                        continue;
-                    }
-                    DistressOutcome::Stopped => {
-                        exit = LoopExit::Stopped;
-                        break;
-                    }
-                    DistressOutcome::TimedOut => {
-                        r.note("distress park timed out, stopping with state preserved");
-                        exit = LoopExit::Stopped;
-                        break;
-                    }
-                }
-            }
-            // A marker we cannot parse is a broken handoff, not a suspend order: note it once per
-            // rewrite and keep iterating. Wedging a paid run on a bad byte is the worse failure.
-            Some(Err(why)) => {
-                let mtime = crate::distress::marker_mtime();
-                if bad_marker_seen != Some(mtime) {
-                    bad_marker_seen = Some(mtime);
-                    r.note(&format!("distress marker unreadable ({why}), not parking"));
-                }
-            }
-            _ => {}
-        }
-        if matches!(r.check_interrupt(p, &run.rows), Stop::Quit) {
-            exit = LoopExit::Stopped;
-            break;
-        }
-        if over_budget(args, control, run.spent, started, run.parked_total, r) {
-            exit = LoopExit::Budget;
-            break;
+        match flow {
+            HeadFlow::Exit => break,
+            HeadFlow::Restart => continue,
+            HeadFlow::Continue => {}
         }
         r.phase(Phase::Iteration(it));
         // One span per loop round, entered for the iteration's whole body on this thread: the
         // turn span, gate evaluations, and broker traceparent files all nest under it, so a trace
         // groups by iteration and `iter` is queryable directly.
-        let iter_span = tracing::info_span!("iteration", iter = it, spent_usd = run.spent);
+        let iter_span = tracing::info_span!("iteration", iter = it, spent_usd = m.run.spent);
         let _iter_span = iter_span.enter();
         // The broker's distress page prints the iteration it fired on; best-effort by design, a
         // missing stamp only costs the page a "?".
-        write_turn_meta(it, run.spent);
-        update_control_status(control, "iteration", it, run.segment.best_score, run.spent);
-        beat_position(heartbeat, it, run.spent);
-        write_results(p, &prep.goal, &prep.prior, &run.rows)?;
+        write_turn_meta(it, m.run.spent);
+        update_control_status(
+            control,
+            "iteration",
+            it,
+            m.run.segment.best_score,
+            m.run.spent,
+        );
+        beat_position(heartbeat, it, m.run.spent);
+        write_results(p, &prep.goal, &prep.prior, &m.run.rows)?;
 
-        let status = judge.status(run.segment.best_score);
+        let status = judge.status(m.run.segment.best_score);
         // Un-carried steers, in admission order. The keys settle after the turn ran, so a
         // turn that never started re-delivers the same batch.
         let steer_batch = crate::admission::drain_steer(ledger, &p.steer);
@@ -1060,7 +952,7 @@ fn run_loop_body<R: Reporter>(
         }
         // The pack-declared seed diff goes to iteration 1 only: it's starting material, not
         // standing guidance, and later iterations already stand on whatever iter 1 kept.
-        let seed = if it == 1 {
+        let seed = if m.wants_seed() {
             prep.seed_diff.as_deref()
         } else {
             None
@@ -1072,7 +964,7 @@ fn run_loop_body<R: Reporter>(
             ));
         }
         let resume_prompt =
-            render_resume_prompt(&status, &run.segment.regime, steer_batch.text.as_deref());
+            render_resume_prompt(&status, &m.run.segment.regime, steer_batch.text.as_deref());
         let prompt = render_prompt(
             &prep.template,
             &prep.goal,
@@ -1095,20 +987,21 @@ fn run_loop_body<R: Reporter>(
                     it,
                     prompt: &prompt,
                     resume_prompt: &resume_prompt,
-                    rows: &run.rows,
-                    baseline_score: run.segment.baseline_score,
-                    baseline_total: run.segment.baseline_total,
-                    best_score: run.segment.best_score,
-                    best_tiebreak: run.segment.best_tiebreak,
-                    spent_before: run.spent,
+                    rows: &m.run.rows,
+                    baseline_score: m.run.segment.baseline_score,
+                    baseline_total: m.run.segment.baseline_total,
+                    best_score: m.run.segment.best_score,
+                    best_tiebreak: m.run.segment.best_tiebreak,
+                    spent_before: m.run.spent,
                     started,
                     heartbeat: heartbeat_handle.cloned(),
                     workflow: args.workflow.as_ref(),
+                    prior: runtime.prior_plan.take_if(|prior| prior.iter == it),
                 },
                 r,
             )?;
-            run.spent += cost;
-            beat_position(heartbeat, it, run.spent);
+            m.add_cost(cost);
+            beat_position(heartbeat, it, m.run.spent);
             step
         } else {
             let turn = r.run_agent(
@@ -1119,20 +1012,20 @@ fn run_loop_body<R: Reporter>(
                 None,
                 None,
                 TurnBudget {
-                    spent_before: run.spent,
+                    spent_before: m.run.spent,
                     started,
                     max_cost: live_max_cost(args, control),
                     heartbeat: heartbeat_handle.cloned(),
                 },
             );
-            run.spent += turn.cost;
+            m.add_cost(turn.cost);
             if let Some(control) = control {
-                control.set_spend(run.spent);
+                control.set_spend(m.run.spent);
             }
-            beat_position(heartbeat, it, run.spent);
-            r.budget(run.spent, started.elapsed());
+            beat_position(heartbeat, it, m.run.spent);
+            r.budget(m.run.spent, started.elapsed());
 
-            match drain_turn_markers(r, p, control, it, &turn, &run.rows) {
+            match drain_turn_markers(r, p, control, it, &turn, &m.run.rows) {
                 TurnVerdict::Proceed => {
                     // Make the candidate live (deploy domains build+push+set-image); a no-op
                     // for the agent-edit/git worlds where the edit IS the candidate. A failed
@@ -1140,15 +1033,15 @@ fn run_loop_body<R: Reporter>(
                     match Iteration::proposed(it).apply(world) {
                         Ok(applied) => {
                             let ctx = crucible::crucible::MeasureCtx {
-                                baseline_score: Some(run.segment.baseline_score),
-                                baseline_total: Some(run.segment.baseline_total),
-                                best_score: Some(run.segment.best_score),
+                                baseline_score: Some(m.run.segment.baseline_score),
+                                baseline_total: Some(m.run.segment.baseline_total),
+                                best_score: Some(m.run.segment.best_score),
                             };
                             IterStep::Decided(Box::new(
                                 applied.measure(judge, &ctx, p, world)?.decide(
                                     judge,
-                                    run.segment.best_score,
-                                    run.segment.best_tiebreak,
+                                    m.run.segment.best_score,
+                                    m.run.segment.best_tiebreak,
                                 ),
                             ))
                         }
@@ -1173,118 +1066,106 @@ fn run_loop_body<R: Reporter>(
             }
         };
 
-        // Any step other than NeverStarted proves a turn started: reset the stall streak.
         // A started turn carried the steer batch in its prompt, which settles an admitted
         // steer ("delivered", not "heeded"); a never-started turn leaves the batch owed.
-        if !matches!(&step, IterStep::NeverStarted { .. }) {
-            dead_turns = 0;
-            if let Some(ledger) = ledger {
-                ledger.settle_all(
-                    &steer_batch.keys,
-                    AdmissionOutcome::Applied,
-                    &format!("delivered in iter {it}"),
-                );
-            }
+        if !matches!(&step, IterStep::NeverStarted { .. })
+            && let Some(ledger) = ledger
+        {
+            ledger.settle_all(
+                &steer_batch.keys,
+                AdmissionOutcome::Applied,
+                &format!("delivered in iter {it}"),
+            );
         }
         let Decided {
             mut row,
             verdict,
             reading,
-        } = match step {
-            IterStep::Decided(d) => *d,
-            IterStep::Discarded { reason } => {
-                let mut row = Row {
-                    iter: it,
-                    decision: "discarded".to_string(),
-                    note: reason,
-                    ..Default::default()
-                };
+        } = match m.settle(step) {
+            Settle::Decide(d) => *d,
+            Settle::Discard { mut row } => {
                 fold_distress_notes(r, &mut row.note);
                 r.row(&row, false);
-                run.rows.push(row);
-                world.restore(run.segment.best_snap.as_str())?;
-                it += 1;
+                m.record(row);
+                world.restore(&m.run.segment.best_snap)?;
+                m.advance();
                 continue;
             }
             // A never-started turn produced no candidate, so there is nothing to charge the
             // iteration for: log the dead attempt faithfully (row + note), then re-run the
             // same `it`. Bounded so a dead node stalls the run instead of burning it to the
             // iteration cap as a fake "finished".
-            IterStep::NeverStarted { reason } => {
-                dead_turns += 1;
-                let row = Row {
-                    iter: it,
-                    decision: "infra-dead".to_string(),
-                    note: reason,
-                    phase: Some("infra".to_string()),
-                    ..Default::default()
-                };
+            Settle::Rerun {
+                row,
+                attempt,
+                stalled,
+            } => {
                 r.row(&row, false);
-                run.rows.push(row);
-                write_results(p, &prep.goal, &prep.prior, &run.rows)?;
-                world.restore(run.segment.best_snap.as_str())?;
-                if dead_turns >= MAX_DEAD_TURN_ATTEMPTS {
+                m.record(row);
+                write_results(p, &prep.goal, &prep.prior, &m.run.rows)?;
+                world.restore(&m.run.segment.best_snap)?;
+                if stalled {
                     r.note(&format!(
-                        "{dead_turns} consecutive turns died before starting — the run is stalled"
+                        "{attempt} consecutive turns died before starting — the run is stalled"
                     ));
-                    exit = LoopExit::Stalled;
                     break;
                 }
                 r.note(&format!(
-                    "turn never started (attempt {dead_turns}/{MAX_DEAD_TURN_ATTEMPTS}) — re-running iter {it} without consuming it"
+                    "turn never started (attempt {attempt}/{MAX_DEAD_TURN_ATTEMPTS}) — re-running iter {it} without consuming it"
                 ));
                 continue;
             }
-            IterStep::Escalated => {
-                update_control_status(control, "escalated", it, run.segment.best_score, run.spent);
-                world.restore(run.segment.best_snap.as_str())?;
-                exit = LoopExit::Escalated;
+            Settle::Escalate => {
+                update_control_status(
+                    control,
+                    "escalated",
+                    it,
+                    m.run.segment.best_score,
+                    m.run.spent,
+                );
+                world.restore(&m.run.segment.best_snap)?;
                 break;
             }
-            IterStep::Parked(pp) => {
-                update_control_status(control, "parked", it, run.segment.best_score, run.spent);
-                run.pending_block = Some(pp);
-                write_results(p, &prep.goal, &prep.prior, &run.rows)?;
-                it += 1;
+            Settle::Park => {
+                update_control_status(control, "parked", it, m.run.segment.best_score, m.run.spent);
+                write_results(p, &prep.goal, &prep.prior, &m.run.rows)?;
+                m.advance();
                 continue;
             }
-            IterStep::Stopped => {
-                exit = LoopExit::Stopped;
-                break;
-            }
+            Settle::Stop => break,
         };
         fold_distress_notes(r, &mut row.note);
 
         if verdict.keep {
-            if let Some(s) = reading.score {
-                run.segment.best_score = s;
-                // The kept candidate defines BOTH axes, even when its tiebreak is absent:
-                // carrying a stale tiebreak forward would compare the next tie against a
-                // scalar the current best never earned.
-                run.segment.best_tiebreak = reading.tiebreak;
-                update_control_status(control, "iteration", it, run.segment.best_score, run.spent);
-            }
             // The World owns reversibility now: snapshot commits the kept state (git memory)
             // and captures any external state; the engine never touches git directly.
-            match world.snapshot(&format!("iter {it}: keep ({})", reading.note)) {
-                Ok(snap) => {
-                    if let Some(sha) = world.commit_sha(&snap) {
-                        run.kept_shas.push(sha);
-                    }
-                    // The row carries the token so a resume can restore this kept tree.
-                    row.kept_snap = Some(snap.clone());
-                    run.segment.best_snap = Snapshot(snap);
-                }
-                Err(e) => r.note(&format!("snapshot failed (change still live): {e:#}")),
+            let snapshot = world
+                .snapshot(&format!("iter {it}: keep ({})", reading.note))
+                .map(|snap| {
+                    let sha = world.commit_sha(&snap);
+                    (snap, sha)
+                })
+                .map_err(|e| format!("{e:#}"));
+            m.keep(&mut row, &reading, verdict.solved, snapshot.clone());
+            if reading.score.is_some() {
+                update_control_status(
+                    control,
+                    "iteration",
+                    it,
+                    m.run.segment.best_score,
+                    m.run.spent,
+                );
             }
-            run.solved_any |= verdict.solved;
+            if let Err(why) = snapshot {
+                r.note(&format!("snapshot failed (change still live): {why}"));
+            }
         } else {
-            world.restore(run.segment.best_snap.as_str())?;
+            world.restore(&m.run.segment.best_snap)?;
         }
 
         r.row(&row, verdict.solved);
-        run.rows.push(row);
-        write_results(p, &prep.goal, &prep.prior, &run.rows)?;
+        m.record(row);
+        write_results(p, &prep.goal, &prep.prior, &m.run.rows)?;
 
         // Snapshot durable state per decided iteration so cross-run memory survives a killed pod
         // (the end-of-run publish below only fires on a clean exit). No branch push mid-run.
@@ -1297,80 +1178,61 @@ fn run_loop_body<R: Reporter>(
                 goal: &prep.goal,
                 model: args.model(),
                 gate: judge.objective(),
-                rows: &run.rows,
-                baseline_score: run.segment.baseline_score,
-                best_score: run.segment.best_score,
+                rows: &m.run.rows,
+                baseline_score: m.run.segment.baseline_score,
+                best_score: m.run.segment.best_score,
                 improved: judge.improved(
-                    run.segment.best_score,
-                    run.segment.baseline_score,
-                    run.solved_any,
+                    m.run.segment.best_score,
+                    m.run.segment.baseline_score,
+                    m.run.solved_any,
                 ),
-                kept_shas: &run.kept_shas,
-                base_sha: run.base_sha.as_deref(),
+                kept_shas: &m.run.kept_shas,
+                base_sha: m.run.base_sha.as_deref(),
                 // Progress publish never pushes branches (S3 only), so no composite targets here.
                 components: &[],
-                published_branches: &run.published_branches,
-                cost_usd: run.spent,
+                published_branches: &m.run.published_branches,
+                cost_usd: m.run.spent,
                 elapsed: started.elapsed(),
                 identity_digest: &prep.identity.digest,
                 seed_hash: &prep.identity.seed_hash,
             },
         );
 
-        if over_budget(args, control, run.spent, started, run.parked_total, r) {
-            exit = LoopExit::Budget;
-            break;
+        if let Some(hit) = m.after_decide(&verdict, live_max_cost(args, control), started.elapsed())
+        {
+            note_budget_hit(r, args, hit);
         }
-        if verdict.keep && verdict.solved && !args.no_early_stop {
-            exit = LoopExit::Solved;
-            break;
-        }
-        it += 1;
     }
+    let exit = m.exit().unwrap_or(LoopExit::Finished);
 
     // Run-scoped epilogue: expensive one-shot checks (a 90-minute racecheck, a slow perf
     // rung) that cannot ride the per-iteration graph run once here, against the final kept
     // candidate. Advisory by contract: rows land in the log, RESULTS.md, the summary, and
     // the PR body, but nothing here can un-keep the candidate, and a concluded run stays
     // concluded even if the epilogue itself cannot run.
-    if matches!(
-        exit,
-        LoopExit::Finished | LoopExit::Budget | LoopExit::Solved
-    ) && let Some(workflow) = args.workflow.as_ref().filter(|w| w.has_epilogue())
+    if exit.concluded()
+        && let Some(workflow) = args.workflow.as_ref().filter(|w| w.has_epilogue())
     {
-        let kept = run
-            .rows
-            .iter()
-            .rev()
-            .find(|row| row.decision == "keep")
-            .map(|row| crate::loop_graph::KeptContext {
-                iter: row.iter,
-                score: row.score,
-                tiebreak: row.tiebreak,
-                sha: run.kept_shas.last().cloned(),
-                snapshot: row.kept_snap.clone(),
-                note: row.note.clone(),
-            });
-        match kept {
+        match m.kept_context() {
             None => r.note("epilogue skipped: the run kept nothing"),
             Some(kept) => {
                 // The epilogue measures the kept tree, not whatever the last discard left
                 // behind; skip loudly rather than score the wrong tree.
-                if let Err(e) = world.restore(run.segment.best_snap.as_str()) {
+                if let Err(e) = world.restore(&m.run.segment.best_snap) {
                     r.note(&format!(
                         "epilogue skipped: restoring the kept best failed: {e:#}"
                     ));
                 } else {
                     match crate::loop_graph::run_epilogue(args, p, workflow, &kept, r) {
                         Ok((rows, cost)) => {
-                            run.spent += cost;
-                            beat_position(heartbeat, args.iterations, run.spent);
-                            r.budget(run.spent, started.elapsed());
+                            m.add_cost(cost);
+                            beat_position(heartbeat, args.iterations, m.run.spent);
+                            r.budget(m.run.spent, started.elapsed());
                             for row in rows {
                                 r.row(&row, false);
-                                run.rows.push(row);
+                                m.record(row);
                             }
-                            write_results(p, &prep.goal, &prep.prior, &run.rows)?;
+                            write_results(p, &prep.goal, &prep.prior, &m.run.rows)?;
                         }
                         Err(e) => r.note(&format!("epilogue failed to run (advisory): {e:#}")),
                     }
@@ -1379,31 +1241,32 @@ fn run_loop_body<R: Reporter>(
         }
     }
 
-    r.summary(&run.rows, &judge.objective(), run.segment.best_score);
+    r.summary(&m.run.rows, &judge.objective(), m.run.segment.best_score);
     update_control_status(
         control,
         "finished",
         args.iterations,
-        run.segment.best_score,
-        run.spent,
+        m.run.segment.best_score,
+        m.run.spent,
     );
-    beat_position(heartbeat, args.iterations, run.spent);
+    beat_position(heartbeat, args.iterations, m.run.spent);
 
     // Publish-on-keep: durable artifacts off the (possibly ephemeral) pod. Runs here
     // so it fires on every exit path (clean finish, Ctrl+C, or budget-stop) and is
     // best-effort: a publish failure logs but never masks the loop's real outcome.
     let improved = judge.improved(
-        run.segment.best_score,
-        run.segment.baseline_score,
-        run.solved_any,
+        m.run.segment.best_score,
+        m.run.segment.baseline_score,
+        m.run.solved_any,
     );
     // Composite multi-fork targets: a composite world resolves its touched components from the
     // baseline + best tokens; the per-component fork comes from the manifest map on `args`.
     // Empty for a single-repo world (it publishes via `base_sha`/`kept_shas` instead).
-    let components = run
+    let components = m
+        .run
         .base_snap
         .as_deref()
-        .and_then(|base| world.publish_components(base, run.segment.best_snap.as_str()))
+        .and_then(|base| world.publish_components(base, &m.run.segment.best_snap))
         .map(|pc| publish::composite_targets(pc, &args.component_pr_repos))
         .unwrap_or_default();
     let prs = publish::publish(
@@ -1415,20 +1278,20 @@ fn run_loop_body<R: Reporter>(
             goal: &prep.goal,
             model: args.model(),
             gate: judge.objective(),
-            rows: &run.rows,
-            baseline_score: run.segment.baseline_score,
-            best_score: run.segment.best_score,
+            rows: &m.run.rows,
+            baseline_score: m.run.segment.baseline_score,
+            best_score: m.run.segment.best_score,
             improved,
-            kept_shas: &run.kept_shas,
-            base_sha: run.base_sha.as_deref(),
+            kept_shas: &m.run.kept_shas,
+            base_sha: m.run.base_sha.as_deref(),
             components: &components,
-            published_branches: &run.published_branches,
-            cost_usd: run.spent,
+            published_branches: &m.run.published_branches,
+            cost_usd: m.run.spent,
             elapsed: started.elapsed(),
             identity_digest: &prep.identity.digest,
             seed_hash: &prep.identity.seed_hash,
         },
-        &mut run.outputs,
+        &mut outputs,
     );
     // Record the opened PR(s) on the session log so the controller's pull-ingest can fold them onto
     // the kept candidates' `pr_url` (the P1 fix). Best-effort by construction, a single-repo run
@@ -1452,8 +1315,8 @@ fn run_loop_body<R: Reporter>(
 
     Ok(Outcome {
         improved,
-        solved: run.solved_any,
-        escalated: matches!(exit, LoopExit::Escalated),
+        solved: m.run.solved_any,
+        escalated: exit == LoopExit::Escalated,
     })
 }
 
@@ -1500,7 +1363,7 @@ fn spawn_feedback_watcher<R: Reporter>(r: &mut R, prs: &[publish::PrLink], p: &P
 /// The resumed segment's best tree, score, and keeps, resolved together by
 /// [`restore_kept_best`] so the score can never be paired with a tree it did not measure.
 struct ResumedBest {
-    best_snap: Snapshot,
+    best_snap: String,
     best_score: f64,
     best_tiebreak: Option<f64>,
     kept_shas: Vec<String>,
@@ -1524,7 +1387,7 @@ fn restore_kept_best(
     let Some(last_kept) = rows.iter().rev().find(|row| row.decision == "keep") else {
         // No keeps: the re-prepared checkout IS the baseline the logged scores measured.
         return Ok(ResumedBest {
-            best_snap: Snapshot(world.snapshot("resume").context("resume snapshot")?),
+            best_snap: world.snapshot("resume").context("resume snapshot")?,
             best_score: logged_best,
             best_tiebreak: logged_tiebreak,
             kept_shas: Vec::new(),
@@ -1548,13 +1411,13 @@ fn restore_kept_best(
                 .filter_map(|row| row.kept_snap.as_deref())
                 .filter_map(|snap| world.commit_sha(snap))
                 .collect(),
-            best_snap: Snapshot(snap),
+            best_snap: snap,
             best_score: logged_best,
             best_tiebreak: logged_tiebreak,
             degraded: None,
         }),
         Err(why) => Ok(ResumedBest {
-            best_snap: Snapshot(world.snapshot("resume").context("resume snapshot")?),
+            best_snap: world.snapshot("resume").context("resume snapshot")?,
             best_score: worst_score(direction),
             // The score's artifact is gone, so its tiebreak goes with it.
             best_tiebreak: None,
@@ -1568,88 +1431,22 @@ fn restore_kept_best(
     }
 }
 
-/// The counter fold `--resume` replays from the session log. Fed one event at a time so
-/// [`crate::recovery::classify_session`] can drive it and the tail scanner in one pass.
-/// Decided rows carry `score`/`total`, so baseline + best restore exactly.
-#[derive(Default)]
-pub(crate) struct ResumeFold {
-    rows: Vec<Row>,
-    spent: f64,
-    summary_best: Option<f64>,
-    solved_any: bool,
-    identity: Option<crate::identity::RunIdentity>,
-    published_branches: Vec<String>,
-}
-
-impl ResumeFold {
-    pub(crate) fn feed(&mut self, ev: &session::SessionEvent) {
-        use session::{IntoRow, SessionEvent};
-        match ev {
-            SessionEvent::Row { row, solved } => {
-                // Wide-round rows (phase:"wide") are historical context only on resume; they
-                // must not count toward next_iter or influence the deep loop's baseline/best.
-                // Infra-dead rows (phase:"infra") record turns that never started — their
-                // iteration was never consumed, so counting them would skip it on resume.
-                if matches!(row.phase.as_deref(), Some("wide") | Some("infra")) {
-                    return;
-                }
-                self.solved_any |= *solved;
-                self.rows.push(row.clone().into_row());
-            }
-            SessionEvent::Budget { spent, .. } => self.spent = *spent,
-            SessionEvent::Summary { best_score, .. } => self.summary_best = *best_score,
-            // Last one wins: a run resumed more than once re-emits a fresh identity each time.
-            SessionEvent::Identity { identity } => self.identity = Some(identity.clone()),
-            // Accumulated across segments: every branch any prior publish opened a PR from,
-            // so a replayed finish can recognize an already-published kept commit.
-            SessionEvent::PrLinks { links } => {
-                self.published_branches
-                    .extend(links.iter().map(|l| l.branch.clone()));
-            }
-            _ => {}
-        }
-    }
-
-    /// A rowless log is unresumable; the caller refuses before [`finish`](Self::finish).
-    pub(crate) fn has_rows(&self) -> bool {
-        !self.rows.is_empty()
-    }
-
-    pub(crate) fn finish(self) -> ResumeState {
-        let baseline_score = self
-            .rows
-            .first()
-            .and_then(|r| r.score)
-            .unwrap_or(f64::INFINITY);
-        let baseline_total = self.rows.first().and_then(|r| r.total).unwrap_or(0);
-        let best_score = self.summary_best.unwrap_or_else(|| {
-            self.rows
-                .iter()
-                .filter(|r| r.decision == "keep")
-                .filter_map(|r| r.score)
-                .fold(baseline_score, f64::min)
-        });
-        // Keeps are monotone within a segment, so the last kept row IS the best; its tiebreak
-        // travels with the best score. No keeps = the baseline's (usually absent) tiebreak.
-        let best_tiebreak = self
-            .rows
-            .iter()
-            .rev()
-            .find(|r| r.decision == "keep")
-            .or_else(|| self.rows.first())
-            .and_then(|r| r.tiebreak);
-        let next_iter = self.rows.iter().map(|r| r.iter).max().unwrap_or(0) + 1;
+impl ResumeState {
+    /// The engine's typed view of what the contract fold restored.
+    pub(crate) fn from_view(view: crucible_contract::ResumeView) -> Self {
+        use session::IntoRow;
         ResumeState {
-            rows: self.rows,
-            best_score,
-            best_tiebreak,
-            baseline_score,
-            baseline_total,
-            spent: self.spent,
-            next_iter,
-            solved_any: self.solved_any,
-            identity: self.identity,
-            published_branches: self.published_branches,
+            rows: view.rows.into_iter().map(IntoRow::into_row).collect(),
+            best_score: view.best_score,
+            best_tiebreak: view.best_tiebreak,
+            baseline_score: view.baseline_score,
+            baseline_total: view.baseline_total,
+            spent: view.spent,
+            next_iter: view.next_iter,
+            dead_turns: view.dead_turns,
+            solved_any: view.solved_any,
+            identity: view.identity,
+            published_branches: view.published_branches,
         }
     }
 }
@@ -1703,8 +1500,6 @@ fn update_control_status(
     }
 }
 
-/// True when a cost/time cap is set and reached; notes it on `r`. `parked_total` is idle time
-/// spent waiting on a human approval, excluded from the wall-clock the time cap measures.
 /// The effective cost cap: a live control override wins over the CLI arg.
 pub(crate) fn live_max_cost(args: &Args, control: Option<&control::ControlState>) -> f64 {
     control
@@ -1712,46 +1507,16 @@ pub(crate) fn live_max_cost(args: &Args, control: Option<&control::ControlState>
         .unwrap_or(args.max_cost)
 }
 
-fn over_budget<R: Reporter>(
-    args: &Args,
-    control: Option<&control::ControlState>,
-    spent: f64,
-    started: Instant,
-    parked_total: Duration,
-    r: &mut R,
-) -> bool {
-    let max_cost = live_max_cost(args, control);
-    if max_cost > 0.0 && spent >= max_cost {
-        r.note(&format!(
-            "budget: cost ${spent:.4} reached cap ${:.2} — stopping",
-            max_cost
-        ));
-        return true;
+fn note_budget_hit<R: Reporter>(r: &mut R, args: &Args, hit: BudgetHit) {
+    match hit {
+        BudgetHit::Cost { spent, cap } => r.note(&format!(
+            "budget: cost ${spent:.4} reached cap ${cap:.2} — stopping"
+        )),
+        BudgetHit::Time => r.note(&format!(
+            "budget: time cap {} reached — stopping",
+            args.max_time
+        )),
     }
-    if let Some(cap) = args.max_time() {
-        // Subtract parked (approval-wait) time: idling on a human must not burn the time budget.
-        let active = started.elapsed().saturating_sub(parked_total);
-        if active >= cap {
-            r.note(&format!(
-                "budget: time cap {} reached — stopping",
-                args.max_time
-            ));
-            return true;
-        }
-    }
-    false
-}
-
-/// Why a [`park_for_approval`] ended, the terminal provisioning outcome the loop waited on.
-enum ParkOutcome {
-    /// A grant landed as a re-scope (the watcher sends this once provisioning is ready). The
-    /// iteration-head drain re-baselines into the new regime.
-    Resumed,
-    /// Not granted: a denial (operator / forge / policy) or a park timeout. The caller decides
-    /// whether to resume frozen or escalate, per the agent's mode.
-    Denied(String),
-    /// Ctrl+C / stop while parked.
-    Stopped,
 }
 
 /// Park the loop until a pending approval reaches a terminal outcome: a re-scope (the grant is
@@ -1763,12 +1528,11 @@ fn park_for_approval<R: Reporter>(
     control: Option<&control::ControlState>,
     ledger: Option<&crate::admission::AdmissionLedger>,
     r: &mut R,
-    parked_total: &mut Duration,
     timeout: Option<Duration>,
-) -> ParkOutcome {
+) -> (ParkOutcome, Duration) {
     let Some(control) = control else {
         r.note("block requested but no control bridge to receive an approval — continuing");
-        return ParkOutcome::Resumed;
+        return (ParkOutcome::Resumed, Duration::ZERO);
     };
     r.note("parked: idle, awaiting approval (budget paused)");
     let start = Instant::now();
@@ -1796,13 +1560,12 @@ fn park_for_approval<R: Reporter>(
         }
         std::thread::sleep(Duration::from_millis(250));
     };
-    *parked_total += start.elapsed();
     match &outcome {
         ParkOutcome::Resumed => r.note("approval received — resuming with a re-scope"),
         ParkOutcome::Denied(why) => r.note(&format!("approval not granted: {why}")),
         ParkOutcome::Stopped => {}
     }
-    outcome
+    (outcome, start.elapsed())
 }
 
 /// Fold the turn's info/warn distress notes onto the row being written: they are per-turn signals,
@@ -1815,17 +1578,6 @@ fn fold_distress_notes<R: Reporter>(r: &mut R, note: &mut String) {
     }
 }
 
-/// Why a [`park_for_distress`] ended.
-#[derive(Debug, PartialEq, Eq)]
-enum DistressOutcome {
-    /// The operator removed the marker: that IS the grant, resume at the next iteration head.
-    Cleared,
-    /// Ctrl+C / stop / a control interrupt while suspended.
-    Stopped,
-    /// `--max-park` elapsed with the marker still in place.
-    TimedOut,
-}
-
 /// Suspend the loop while the broker's distress marker exists. Idle and budget-paused: the caller
 /// folds the elapsed time into `parked_total`, so suspended wall-clock burns no time budget. The
 /// engine never deletes the marker: the operator's `rm` is the resume grant.
@@ -1833,9 +1585,8 @@ fn park_for_distress<R: Reporter>(
     p: &Paths,
     rows: &[Row],
     r: &mut R,
-    parked_total: &mut Duration,
     timeout: Option<Duration>,
-) -> DistressOutcome {
+) -> (DistressOutcome, Duration) {
     let start = Instant::now();
     let outcome = loop {
         if crate::distress::read_marker().is_none() {
@@ -1849,8 +1600,7 @@ fn park_for_distress<R: Reporter>(
         }
         std::thread::sleep(Duration::from_millis(250));
     };
-    *parked_total += start.elapsed();
-    outcome
+    (outcome, start.elapsed())
 }
 
 /// Stamp the current iteration where the broker's distress page reads it (`<storage>/turn-meta.json`,
@@ -2436,7 +2186,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_filters_out_wide_phase_rows() {
+    fn resume_ignores_legacy_wide_phase_rows() {
         use session::{RowWire, SessionEvent, encode};
         let mk_deep = |iter, decision: &str, score: f64| SessionEvent::Row {
             row: RowWire {
@@ -2771,8 +2521,7 @@ mod tests {
         });
 
         let mut r = NoteCapture::default();
-        let mut parked = Duration::ZERO;
-        let outcome = park_for_approval(Some(&control), None, &mut r, &mut parked, None);
+        let (outcome, parked) = park_for_approval(Some(&control), None, &mut r, None);
         h.join().unwrap();
 
         assert!(matches!(outcome, ParkOutcome::Resumed));
@@ -2812,8 +2561,7 @@ mod tests {
             deliver.set_deny(AdmissionKey::new("d1"), "over budget".into());
         });
         let mut r = NoteCapture::default();
-        let mut parked = Duration::ZERO;
-        let outcome = park_for_approval(Some(&control), None, &mut r, &mut parked, None);
+        let (outcome, _parked) = park_for_approval(Some(&control), None, &mut r, None);
         h.join().unwrap();
         match outcome {
             ParkOutcome::Denied(why) => {
@@ -2834,12 +2582,10 @@ mod tests {
         // No signal ever arrives; a short --max-park bounds the wait and resolves to Denied.
         let control = std::sync::Arc::new(control::ControlState::default());
         let mut r = NoteCapture::default();
-        let mut parked = Duration::ZERO;
-        let outcome = park_for_approval(
+        let (outcome, parked) = park_for_approval(
             Some(&control),
             None,
             &mut r,
-            &mut parked,
             Some(Duration::from_millis(120)),
         );
         match outcome {
@@ -2858,8 +2604,7 @@ mod tests {
     fn park_without_control_bridge_does_not_block() {
         // No bridge => nothing could deliver an approval; park notes and returns rather than hang.
         let mut r = NoteCapture::default();
-        let mut parked = Duration::ZERO;
-        let outcome = park_for_approval(None, None, &mut r, &mut parked, None);
+        let (outcome, parked) = park_for_approval(None, None, &mut r, None);
         assert!(matches!(outcome, ParkOutcome::Resumed));
         assert_eq!(parked, Duration::ZERO);
         assert!(r.notes.iter().any(|n| n.contains("no control bridge")));
@@ -2897,8 +2642,7 @@ mod tests {
         });
 
         let mut r = NoteCapture::default();
-        let mut parked = Duration::ZERO;
-        let outcome = park_for_distress(&f.paths, &[], &mut r, &mut parked, None);
+        let (outcome, parked) = park_for_distress(&f.paths, &[], &mut r, None);
         h.join().unwrap();
 
         assert_eq!(outcome, DistressOutcome::Cleared);
@@ -2916,9 +2660,8 @@ mod tests {
             quit_after: Some(1),
             ..Default::default()
         };
-        let mut parked = Duration::ZERO;
         assert_eq!(
-            park_for_distress(&f.paths, &[], &mut r, &mut parked, None),
+            park_for_distress(&f.paths, &[], &mut r, None).0,
             DistressOutcome::Stopped
         );
         assert!(
@@ -2932,17 +2675,9 @@ mod tests {
         let (f, root) = distress_fixture("loop-timeout", 1);
         write_marker(&root.dir, "nobody came", 1);
         let mut r = NoteCapture::default();
-        let mut parked = Duration::ZERO;
-        assert_eq!(
-            park_for_distress(
-                &f.paths,
-                &[],
-                &mut r,
-                &mut parked,
-                Some(Duration::from_millis(120))
-            ),
-            DistressOutcome::TimedOut
-        );
+        let (outcome, parked) =
+            park_for_distress(&f.paths, &[], &mut r, Some(Duration::from_millis(120)));
+        assert_eq!(outcome, DistressOutcome::TimedOut);
         assert!(parked >= Duration::from_millis(100), "{parked:?}");
         assert!(root.dir.join("distress").exists());
     }
@@ -2953,22 +2688,22 @@ mod tests {
         // longer than its time cap is not over budget, because suspended time buys nothing.
         let mut f = fixture(1, 0.0, false);
         f.args.max_time = "0.1s".into();
-        let started = Instant::now();
-        std::thread::sleep(Duration::from_millis(150));
-        let mut r = NoteCapture::default();
+        let cfg = LoopCfg {
+            iterations: f.args.iterations,
+            max_time: f.args.max_time(),
+            max_park: f.args.max_park(),
+            no_early_stop: f.args.no_early_stop,
+        };
+        let mut m = Machine::new(cfg, resume_run_state(resume_state_for_test(1)), 1);
+        m.run.parked_total = Duration::from_millis(150);
         assert!(
-            !over_budget(
-                &f.args,
-                None,
-                0.0,
-                started,
-                Duration::from_millis(150),
-                &mut r
-            ),
+            m.over_budget(0.0, Duration::from_millis(150)).is_none(),
             "suspended wall-clock must not burn the time cap"
         );
-        assert!(
-            over_budget(&f.args, None, 0.0, started, Duration::ZERO, &mut r),
+        m.run.parked_total = Duration::ZERO;
+        assert_eq!(
+            m.over_budget(0.0, Duration::from_millis(150)),
+            Some(BudgetHit::Time),
             "the same elapsed time WITHOUT a park is over budget"
         );
     }
@@ -3046,14 +2781,14 @@ mod tests {
     fn a_distressed_row_folds_as_inert_on_resume() {
         // The distressed row is an annotation, not a measurement: it carries no score and no
         // kept snapshot, so a resume must not treat it as the baseline or the best.
-        let mut fold = ResumeFold::default();
+        let mut fold = crucible_contract::LoopState::default();
         for ev in [
             logged_row(1, "keep", "", Some(10.0), Some("snap-1")),
             logged_row(1, "distressed", "torch skew", None, None),
         ] {
-            fold.feed(&ev);
+            fold.apply(&ev);
         }
-        let state = fold.finish();
+        let state = ResumeState::from_view(fold.resume_view());
         assert_eq!(state.best_score, 10.0, "the kept row still defines best");
         assert_eq!(
             state.next_iter, 2,
@@ -3194,14 +2929,14 @@ mod tests {
         let marker = root.dir.join("distress");
         write_marker(&root.dir, "torch skew", 42);
         // The pre-restart log: iteration 1 ran, then this same marker parked the head.
-        let mut fold = ResumeFold::default();
+        let mut fold = crucible_contract::LoopState::default();
         for ev in [
             logged_row(1, "discard", "", Some(100.0), None),
             logged_row(1, "distressed", "torch skew", None, None),
         ] {
-            fold.feed(&ev);
+            fold.apply(&ev);
         }
-        let prior_run = fold.finish();
+        let prior_run = ResumeState::from_view(fold.resume_view());
         let mut r = RecordingReporter::default();
         let clear = marker.clone();
         let operator = std::thread::spawn(move || {
@@ -3464,8 +3199,6 @@ mod tests {
             disclosure: None,
             output_bounds: None,
             iterations,
-            wide: 0,
-            wide_keep: 1,
             graph_loop: false,
             no_early_stop,
             ui: crate::Ui::Headless,
@@ -3494,7 +3227,6 @@ mod tests {
             results_bucket: String::new(),
             pr_repo: String::new(),
             component_pr_repos: Vec::new(),
-            search: None,
             workflow: None,
             workflow_frozen_injects: Vec::new(),
             workflow_toolbox_exclude: Vec::new(),
@@ -4315,6 +4047,31 @@ mod tests {
         assert_eq!(r.shutdowns[0].0, "error");
     }
 
+    /// The machine's state for a resumed run, as the host builds it minus the world calls.
+    fn resume_run_state(rs: ResumeState) -> RunState {
+        RunState {
+            rows: rs.rows,
+            spent: rs.spent,
+            kept_shas: Vec::new(),
+            base_sha: None,
+            base_snap: None,
+            solved_any: rs.solved_any,
+            parked_total: Duration::ZERO,
+            dead_turns: rs.dead_turns,
+            pending_block: None,
+            published_branches: rs.published_branches,
+            segment: Segment {
+                regime: "default".into(),
+                fingerprint: String::new(),
+                baseline_score: rs.baseline_score,
+                best_score: rs.best_score,
+                best_tiebreak: rs.best_tiebreak,
+                baseline_total: rs.baseline_total,
+                best_snap: String::new(),
+            },
+        }
+    }
+
     fn resume_state_for_test(next_iter: u32) -> ResumeState {
         ResumeState {
             rows: vec![
@@ -4336,6 +4093,7 @@ mod tests {
             baseline_total: 0,
             spent: 0.0,
             next_iter,
+            dead_turns: 0,
             solved_any: false,
             identity: None,
             best_tiebreak: None,
@@ -4376,6 +4134,7 @@ mod tests {
                 recovery: Some(recovery),
                 ledger: None,
                 heartbeat: None,
+                prior_plan: None,
             },
         )
         .expect("resumed run finishes");
@@ -4427,6 +4186,7 @@ mod tests {
                 recovery: Some(recovery),
                 ledger: None,
                 heartbeat: None,
+                prior_plan: None,
             },
         )
         .expect("resumed run finishes");
@@ -4904,8 +4664,8 @@ mod tests {
             &[&touch_cmd],
             Some(r#"echo '{"score":42.0,"tiebreak":0.1,"note":"seeded on resume"}'"#),
         ));
-        // The prior session: exactly one preflight-failed row, no score. This is what
-        // ResumeFold::finish produces when the only row is a preflight refusal.
+        // The prior session: exactly one preflight-failed row, no score. This is what the
+        // contract fold produces when the only row is a preflight refusal.
         let rs = ResumeState {
             rows: vec![Row {
                 iter: 0,
@@ -4919,6 +4679,7 @@ mod tests {
             baseline_total: 0,
             spent: 0.0,
             next_iter: 1,
+            dead_turns: 0,
             solved_any: false,
             identity: None,
             published_branches: Vec::new(),
@@ -5014,6 +4775,7 @@ mod tests {
             baseline_total: 0,
             spent: 0.0,
             next_iter: 2,
+            dead_turns: 0,
             solved_any: false,
             identity: None,
             published_branches: Vec::new(),
@@ -5082,6 +4844,7 @@ mod tests {
             baseline_total: 0,
             spent: 0.0,
             next_iter: 2,
+            dead_turns: 0,
             solved_any: false,
             identity: None,
             published_branches: Vec::new(),
@@ -5159,6 +4922,7 @@ mod tests {
             baseline_total: 0,
             spent: 0.0,
             next_iter: 1,
+            dead_turns: 0,
             solved_any: false,
             identity: None,
             published_branches: Vec::new(),

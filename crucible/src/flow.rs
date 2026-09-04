@@ -8,7 +8,7 @@
 //! `flow.json`, so extraction and emission never mix. The session log alone covers
 //! decisions, scores, edits, rungs, budget and publish; the span export adds wall-clock
 //! (iteration windows, turn durations, the agent's per-tool-call timeline, rung
-//! durations). Wide-round and infra rows are out of scope: this is the deep-loop
+//! durations). Infra rows are out of scope: this is the deep-loop
 //! overview a human is walked through.
 
 use anyhow::Result;

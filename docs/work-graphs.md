@@ -4,8 +4,8 @@ A **plan** is a versioned DAG of **tasks** that a deterministic executor runs. T
 turns, plan-authored commands, or engine-owned reducers. The executor owns advancement: a task never
 decides what runs next.
 
-Today, the engine supplies a default loop graph and a wide-tournament template, and a human or
-pack can supply TOML or JSON through the `plan` CLI. Workflow admission separates authorable
+Today, the engine supplies a default loop graph, and a human or pack can supply TOML or JSON
+through the `plan` CLI. Workflow admission separates authorable
 topology from authority: an orchestrator must advertise the workflow type and engine operations
 it can safely execute.
 
@@ -76,7 +76,7 @@ depends_on = ["measure"]
 | `command` | A plan-authored command returning JSON on its last stdout line. |
 | `evaluate` | A measurement command. `pass = false` vetoes; paired `threshold` + `direction` grade numeric `score`. |
 | `top_k` | Engine-owned reducer: keep the `k` best inputs by their `score` field. Needs at least one dependency. |
-| `engine` | Capability-owned operation (`propose`, `apply`, `measure`, `grade`, `decide`, or `measure_diff`). Only an admitting orchestrator can execute it. |
+| `engine` | Capability-owned operation (`propose`, `apply`, `measure`, `grade`, or `decide`). Only an admitting orchestrator can execute it. |
 
 Serialization is not authority. A workflow may author and sequence engine nodes, but admission
 requires matching capabilities such as `workflow.autoresearch`, `engine.apply`, and
@@ -224,8 +224,7 @@ task can run; workflow capabilities control what the orchestrator is authorized 
 
 Same decisions and same session events as the default path, plus additive `plan_admitted` and
 `task_result` lines. Cross-round state, keep/discard, and every between-round control (parking,
-steering, re-scoping, budget) stay with the driver. The wide round runs as a template compiled
-from `[search]` on both paths.
+steering, re-scoping, budget) stay with the driver.
 
 The templates carry no budget of their own: the run budget is the driver's, checked between
 rounds, so a turn that overruns the cap is still measured and decided.

@@ -4,7 +4,7 @@
 id = "C-SEARCH"
 title = "Wide-round search protocol"
 kind = "normative"
-status = "active"
+status = "deprecated"
 since = "0.1.0"
 
 [content]

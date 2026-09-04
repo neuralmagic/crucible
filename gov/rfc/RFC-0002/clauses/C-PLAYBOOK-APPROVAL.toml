@@ -1,0 +1,28 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-PLAYBOOK-APPROVAL"
+title = "Approval gates"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = """
+A playbook MAY declare a task that waits for a human decision before its dependents run. Such a gate task MUST NOT run a command, dispatch an agent, or change the workspace: its whole effect is the decision it carries, so a run that reaches one has nothing to undo if the decision never arrives.
+
+Every gate MUST carry a trace id that is unique within the run and stable across the run's resumptions, so that a decision recorded against it before an interruption is still the same decision afterwards. The trace id MUST be derivable from the run and the task alone, because a resolver that learned it from one process must be able to name it to another.
+
+A gate MUST settle in exactly one of three ways. Granted settles the gate task passing, and its dependents run. Denied settles it failing with the denier's reason, and its dependents are blocked exactly as any other failure blocks them. Timeout settles it failing when the gate has waited as long as it was permitted. The engine MUST NOT introduce a fourth outcome, and MUST NOT report a gate as settled without one of these three: a run whose dependents ran because nobody said no would make an approval meaningless.
+
+A denied or timed-out gate MUST invalidate the run's verdict when the gate task is required, under the ordinary rule in [[RFC-0002:C-PLAYBOOK-LANE]]. Approval is not a separate axis from success; a required step that was refused is a step that did not pass.
+
+Resolution MUST be idempotent by trace id. A decision delivered more than once, whether by a retrying resolver, by a second source, or by a resume replaying one already recorded, MUST converge on the first decision recorded rather than settling the gate twice or reversing it. This is what lets a resolver retry freely and a resumed run replay a decision it cannot tell it already applied.
+
+A gate MUST accept a decision from more than one source: an operator acting directly on the run, and an external system the gate names, such as a tracker issue reaching a state or a pull request being approved. Whichever arrives first resolves the gate, and the recorded resolution MUST name the source and, where the source supplies one, the deciding identity. A run MUST NOT require any particular source to be reachable: a gate whose named source cannot be consulted MUST still be resolvable by an operator, or a run becomes unfinishable whenever an external system is down.
+
+While a gate is open the run MUST NOT count the waiting against any wall-clock ceiling. A ceiling bounds the work a run may do, and a run waiting on a person is doing none; charging it would make a ceiling a function of how promptly a human answered.
+
+A run that reaches a gate MUST either wait in place or suspend. A run that waits MUST remain able to accept a decision for as long as it waits. A run that suspends MUST first record enough state for a later process to continue the same run, MUST report the shutdown outcome [[RFC-0001:C-WIRE]] reserves for a suspension, and MUST exit zero: a suspension is not a failure, and a consumer that treated it as one would retry a run that is merely waiting. A suspended run MUST NOT be reported as having produced a verdict; its verdict is determined only when a later process finishes the graph.
+
+The engine MUST accept, at the start of a run, decisions already reached for gates the run has not yet opened, and MUST apply each to its gate rather than reopening it. This is what makes a suspension resumable: the process that resumes learns the decision from its caller, not from the gate it never saw opened."""

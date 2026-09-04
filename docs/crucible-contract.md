@@ -76,11 +76,6 @@ apply_cmd    = "..."                          # optional. §3.
 snapshot_cmd = "..."                          # optional. §3.
 restore_cmd  = "..."                          # optional. §3.
 
-[search]                                      # optional (ADR-0010). Absent or wide=0 → pure-deep, the default.
-wide       = 0                                # u32. N parallel propose turns before the deep loop. default 0
-approaches = ["...", "..."]                   # REQUIRED when wide > 0: one distinct approach string per candidate slot
-policy     = "top-k"                          # only v1 policy. default "top-k"
-policy_k   = 1                                # how many wide-round winners seed the deep loop. default 1, must be in 1..=wide
 ```
 
 Rules:
@@ -89,8 +84,6 @@ Rules:
   which still owns git memory and layers the given commands on top.
 - `[judge.selftest]`, if present, requires both `good_cmd` and `bad_cmd` (a self-test that only
   stages one side isn't a control); `runs` must be `>= 1`.
-- `[search]`, if present with `wide > 0`, requires `approaches.len() >= wide` (hard error,
-  diversity is engineered, not auto-generated) and `policy_k` in `1..=wide`.
 - Unknown keys are an error (typo protection), not silently ignored.
 - **Frozen loading (`load_frozen`).** When the manifest file lives *inside* the workspace it
   targets (the BYO on-ramp: `crucible init` scaffolds `[repo] path = "."`), the engine parses it
@@ -116,18 +109,7 @@ The workspace is restored to pristine on every exit path (pass, fail, or error).
 no `[judge.selftest]` isn't an error, `crucible check` warns instead, since the gate hasn't been
 proven to discriminate.
 
-### 1.2 Wide-round search (`[search]`, ADR-0010)
-
-`[search].wide > 0` (or `--wide N` on the CLI, which overrides the manifest) fans out `N`
-independent PROPOSE turns in per-candidate git worktrees under the state dir before the deep
-loop starts, one turn per `approaches` entry biased into its prompt. Each candidate's diff is
-applied (cherry-picked) into the shared main workspace and measured serially there (measurement
-never runs concurrently, only proposal does). The scored set is ranked by `[search].policy` (v1:
-`"top-k"`); the `policy_k` (or `--wide-keep K`) winner(s) seed the deep loop, which then runs as
-normal. Session rows from the wide round carry an additive `phase: "wide"` field (§7) so a
-consumer can tell a wide-round row from a deep-loop row without a wire-shape change.
-
-### 1.3 Scope-authored workflows (`workflow.star`)
+### 1.2 Scope-authored workflows (`workflow.star`)
 
 A scoped pack may include `workflow.star` beside `crucible.toml`. It is authoring syntax, not a
 runtime interpreter: scope compiles it to the existing `[[workflow.task]]` manifest IR before
@@ -701,9 +683,9 @@ free-text label like `"score"`/`"bench"`, not the deleted enum). This keeps `--r
 remote viewer, and already-published S3 runs loading. Do **not** rename the wire key.
 
 A `row` event's wire record (`RowWire`) carries an additive, optional `phase` field
-(`"wide"` for a wide-round candidate row, absent for a deep-loop row). It's `skip_serializing_if
-= "Option::is_none"`, so a deep-only run's wire bytes are unchanged from before wide rounds
-existed.
+(`"infra"` for a never-started turn record, absent for a deep-loop row). It's `skip_serializing_if
+= "Option::is_none"`. Logs written before the wide tournament was removed carry `"wide"` rows;
+readers keep them out of the deep loop's baseline and best.
 
 Additive event kinds beyond the compat set include:
 
@@ -712,8 +694,10 @@ Additive event kinds beyond the compat set include:
   a hard-warning `note` event, never an abort.
 - **`shutdown`**: `{ outcome, reason }`, emitted **exactly once**, as the **last** line of every
   run (after `finished`/`summary`). `outcome` is one of `finished`/`solved`/`budget`/`stopped`/
-  `escalated`/`stalled`/`error`. Session-log consumers key a run's terminal state off this line; a
-  dead stream with **no** `shutdown` line means the pod likely died mid-run, not a clean exit.
+  `escalated`/`stalled`/`error`/`suspended`. Session-log consumers key a run's terminal state off
+  this line; a dead stream with **no** `shutdown` line means the pod likely died mid-run, not a
+  clean exit. `suspended` is a clean exit that left an `approval_wait` open on purpose: the run
+  snapshotted itself and expects a `--resume` carrying the resolution.
   `--resume` consumes this invariant, not just documents it: a resumed run classifies the log
   tail (see `recovery` below) and a trailing `shutdown` is the "exited on purpose" signal. In a
   resumed (appended) log, only the **trailing** `shutdown` counts; one followed by more events
@@ -721,14 +705,21 @@ Additive event kinds beyond the compat set include:
 - **`agent_session`**: `{ session, action, turn }`, emitted before a persistent agent turn so a
   viewer can draw continuation lanes and distinguish `started` from `resumed`. It deliberately
   contains neither the provider cursor nor native transcript content.
-- **`approval_wait`**: `{ handle, trace_id, mode }`, emitted when the loop reads the agent's
-  pending-provisioning marker. `mode` is `block` (the loop parks idle) or `continue` (it keeps
-  iterating in the frozen regime). Bracket invariant: every `approval_wait` is closed by an
-  `approval_resolved` **except** on stop-while-parked and process death, so a dangling wait in
-  the log tail means the run ended with the approval outstanding, and a resume re-parks a
-  block-mode one and re-registers the approval key so an operator `approve` still resolves it.
-- **`approval_resolved`**: `{ outcome, reason }` with `outcome` one of `granted`/`denied`/
-  `timeout`. A grant is emitted at the iteration-head rescope drain (the single re-baseline
+- **`approval_wait`**: `{ handle, trace_id, mode, task?, source?, park? }`, emitted when the
+  loop reads the agent's pending-provisioning marker or reaches a plan `approve` task. `mode` is
+  `block` (the loop parks idle) or `continue` (it keeps iterating in the frozen regime). `task`
+  names the plan task that opened the gate; `source` is the resolution source the engine
+  resolved at the gate (`{"kind":"native"}`, `{"kind":"github_pr","url","until"}`,
+  `{"kind":"jira","key","until"}`); `park` is `park` or `suspend`. All three are absent on
+  provisioning and distress waits and on older logs. Bracket invariant: every `approval_wait`
+  is closed by an `approval_resolved` **except** on stop-while-parked, suspend, and process
+  death, so a dangling wait in the log tail means the run ended with the approval outstanding,
+  and a resume re-parks a block-mode one (or continues past it when handed the resolution) and
+  re-registers the approval key so an operator `approve` still resolves it.
+- **`approval_resolved`**: `{ outcome, reason, trace_id?, by?, source? }` with `outcome` one of
+  `granted`/`denied`/`timeout`. `trace_id` names the wait it resolves (empty on older logs,
+  which resolved the one open wait); `by` and `source` record who and which source resolved it
+  when known. A grant is emitted at the iteration-head rescope drain (the single re-baseline
   site); a stop deliberately emits nothing (a stop doesn't resolve the ask).
 - **`recovery`**: `{ class, iter, detail }`, emitted once per `--resume` right after the resume
   note: how the resumed process classified its predecessor's end. `class` is one of
@@ -737,6 +728,21 @@ Additive event kinds beyond the compat set include:
   iteration the interruption touched (0 when not iteration-scoped); `detail` is a human-readable
   evidence summary. Purely a record: the loop acts on the in-process classification, never by
   re-reading this line.
+
+Two reader rules make the format additive rather than frozen:
+
+- **Unknown kinds.** A line whose `kind` this reader does not know decodes as `unknown` instead
+  of failing. Folds count it and classify from the events they do know; a `--resume` refuses
+  when an unknown line precedes no terminal `shutdown`, because it cannot know whether that
+  line opened a bracket.
+- **Envelope timestamp.** The envelope may carry `ts` (unix seconds, `{"v":1,"ts":…,"kind":…}`).
+  Readers never require it; a writer that stamps it lets a fold account wall-clock spans such
+  as parked time without a process-side clock.
+
+**One fold, every consumer.** `crucible-contract::LoopState` is the session log folded into
+one state: `apply` is exhaustive over every event kind, `classify` names how a dead run ended,
+and `resume_view` is what `--resume` restores. The engine's resume and crash classification and
+the controller's ingest read the same fold, so a new event kind is taught to one place.
 
 **`RunIdentity`** (`crucible/src/identity.rs`) is the comparability key: two runs' scores are
 comparable only if it matches. It's a hash-of-hashes (`v1:<hex>`) over, per component (one

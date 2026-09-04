@@ -70,6 +70,8 @@ pub(crate) enum RunError {
         #[source]
         source: fs_extra::error::Error,
     },
+    #[error("--max-park `{raw}` is not a duration (e.g. 30m, 4h, 7d)")]
+    BadMaxPark { raw: String },
     #[error(transparent)]
     File(#[from] FileError),
 }
@@ -139,12 +141,6 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
         once,
     }) = cli.command
     {
-        let sink = match (control_addr, reseed) {
-            (Some(addr), None) => crate::pr_watch::Sink::Steer(addr),
-            (None, Some(path)) => crate::pr_watch::Sink::Reseed(path),
-            (None, None) => return Err(RunError::WatchPrNoSink.into()),
-            (Some(_), Some(_)) => return Err(RunError::WatchPrTwoSinks.into()),
-        };
         let opts = crate::pr_watch::WatchOpts {
             poll: std::time::Duration::from_secs(poll_secs),
             bot_user,
@@ -154,7 +150,61 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
             },
             once,
         };
+        let sink = match (control_addr, reseed) {
+            (Some(addr), None) => crate::pr_watch::Sink::Steer(addr),
+            (None, Some(path)) => crate::pr_watch::Sink::Reseed(path),
+            (None, None) => return Err(RunError::WatchPrNoSink.into()),
+            (Some(_), Some(_)) => return Err(RunError::WatchPrTwoSinks.into()),
+        };
         return crate::pr_watch::watch_and_steer(&pr, &sink, &opts);
+    }
+
+    if let Some(Cmd::LoopReference { format }) = &cli.command {
+        match format {
+            crate::LoopFormat::Markdown => print!("{}", crate::machine::doc_page()),
+            crate::LoopFormat::Mermaid => print!("{}", crate::machine::mermaid()),
+        }
+        return Ok(());
+    }
+
+    if let Some(Cmd::Approve { control_addr, by }) = &cli.command {
+        let reply = control::send_command(
+            control_addr,
+            &serde_json::json!({"cmd": "approve", "by": by}),
+        )?;
+        println!("{reply}");
+        return Ok(());
+    }
+
+    if let Some(Cmd::Deny {
+        control_addr,
+        reason,
+        by,
+    }) = &cli.command
+    {
+        let reply = control::send_command(
+            control_addr,
+            &serde_json::json!({"cmd": "deny", "reason": reason, "by": by}),
+        )?;
+        println!("{reply}");
+        return Ok(());
+    }
+
+    if let Some(Cmd::FetchResume { into, workspace }) = &cli.command {
+        let record = crate::suspend::fetch_resume(into, workspace)?;
+        match record {
+            Some(r) => println!(
+                "[crucible fetch-resume] restored run {} at gate {} into {}",
+                r.run_id,
+                r.gate,
+                into.display()
+            ),
+            None => println!(
+                "[crucible fetch-resume] restored a snapshot with no resume record into {}",
+                into.display()
+            ),
+        }
+        return Ok(());
     }
 
     if let Some(Cmd::Ps { namespace, json }) = cli.command {
@@ -238,8 +288,25 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                 compute_driver,
                 harness,
                 model,
+                resume,
+                approvals,
+                park_policy,
+                max_park,
+                control_port,
             } => {
                 let _engine = crate::engine::EngineCtx::new()?;
+                install_ctrlc()?;
+                let approvals = approvals
+                    .iter()
+                    .map(|raw| crucible_contract::parse_approval_arg(raw))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let max_park = match max_park {
+                    Some(raw) => Some(
+                        crate::duration::parse_duration(raw)
+                            .ok_or_else(|| RunError::BadMaxPark { raw: raw.clone() })?,
+                    ),
+                    None => None,
+                };
                 crate::plan::cli::run(
                     file.as_deref(),
                     &crate::plan::cli::parse_params(params)?,
@@ -258,6 +325,13 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                         agent: crate::plan::cli::AgentOverride {
                             harness: *harness,
                             model: model.clone(),
+                        },
+                        gates: crate::plan::cli::GateOpts {
+                            resume: *resume,
+                            approvals,
+                            policy: *park_policy,
+                            max_park,
+                            control_port: *control_port,
                         },
                     },
                 )
@@ -337,6 +411,9 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
             harness: args.harness,
             model: args.model.clone(),
             playbook,
+            // The controller sets these when it dispatches; a hand render has no gate to resume.
+            park_policy: crate::plan::ParkPolicy::default(),
+            resume: None,
         };
         if args.controller {
             // Deprecated in favor of the `crucible-controller` Helm chart (the one packaging path).
@@ -565,6 +642,7 @@ pub(crate) fn prep_plan_runner_with_params(
             commit_per_task,
             captured_bytes: std::sync::atomic::AtomicU64::new(0),
             staged: Default::default(),
+            gate: crate::plan::gate::GateCtx::new(crate::plan::gate::run_id_from_env()),
         },
         m,
     ))
@@ -678,7 +756,6 @@ fn run_from_manifest(args: Args) -> Result<()> {
         .filter(|(_, _, frozen)| *frozen)
         .map(|(src, dst, _)| (src, dst))
         .collect();
-    args.search = m.search.clone();
     args.workflow = m.workflow.clone();
     args.workflow_frozen_injects = m.frozen_inject_pairs(&manifest_dir)?;
     args.workflow_toolbox_exclude = m.agent.toolbox_exclude.clone();
@@ -793,7 +870,6 @@ fn run_composite(args: Args, manifest_path: PathBuf) -> Result<()> {
         seed_diff: read_seed_diff(&manifest_dir, m.agent.seed_diff.as_deref())?,
     };
 
-    args.search = m.search.clone();
     args.workflow = m.workflow.clone();
     args.workflow_frozen_injects = Vec::new();
     args.workflow_toolbox_exclude = m.agent.toolbox_exclude.clone();
@@ -1069,6 +1145,7 @@ fn drive_loop(
                             recovery: Some(recovery),
                             ledger: Some(ledger),
                             heartbeat: beat.clone(),
+                            prior_plan: recovered.prior_plan,
                         },
                     )?
                 }

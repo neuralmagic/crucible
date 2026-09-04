@@ -8,7 +8,7 @@ status = "normative"
 phase = "spec"
 owners = ["@Will Eaton"]
 created = "2026-08-19"
-updated = "2026-08-22"
+updated = "2026-09-04"
 signature = "ff8072ad4fecc176564e2ffbbf52c069b261c784901d2028972e8a983ac8b969"
 
 [[sections]]
@@ -53,6 +53,8 @@ changed = [
     "the declared lane scopes the constructor namespace, so a playbook cannot name or be offered a scored constructor",
     "session log gains asks_emitted, so what a run proposed is auditable apart from what an orchestrator admitted",
     "skill joins the enumerated constructors: an agent task whose prompt is assembled from a shipped SKILL.md and the invocation's arguments",
+    "the wide tournament is retired (ADR-0024): C-SEARCH is deprecated, [search] leaves C-MANIFEST, and phase: \"wide\" is a legacy row value readers keep out of the deep loop",
+    "engine.measure_diff leaves the engine operations, since only the wide template produced it",
 ]
 
 [[changelog]]

@@ -203,6 +203,29 @@ impl AdmissionLedger {
         replay
     }
 
+    /// The resolution recorded for an approval gate, if an `approve`/`deny` keyed by the gate
+    /// landed in a previous process. What was written is the fact; whether it was settled is
+    /// not, since a crash between the admit and the settle still means an operator decided.
+    pub(crate) fn gate_resolution(
+        &self,
+        trace_id: &str,
+    ) -> Option<crucible_contract::GateResolution> {
+        let g = self.lock().ok()?;
+        let key = AdmissionKey::approve(trace_id);
+        let at = *g.index.get(&key)?;
+        match &g.log[at].input {
+            AdmittedInput::Approve => {
+                Some(crucible_contract::GateResolution::granted(None, "native"))
+            }
+            AdmittedInput::Deny { reason } => Some(crucible_contract::GateResolution::denied(
+                reason.clone(),
+                None,
+                "native",
+            )),
+            _ => None,
+        }
+    }
+
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Inner>> {
         // A poisoned lock means a prior holder panicked mid-fold; the ledger's in-memory view
         // can no longer be trusted, so every later call fails the same way.

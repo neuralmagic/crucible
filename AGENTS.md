@@ -55,6 +55,10 @@ whether the code works.
   values become newtypes whose only constructor is the check
   (`RepoTarget` via `OrgAllowlist::authorize` is the house style: a checked
   value is a type, so an unchecked one cannot reach the call).
+- Put behavior on the domain type that owns the state or specification it acts
+  on. Prefer `gate.attempt(...)`, `source.resolve(...)`, and `host.suspend(...)`
+  over free functions that take the owner as their first argument; keep a free
+  function only when no domain type owns the operation.
 - Groups of adjacent scalars in a signature become a struct; mode-dependent
   knobs become an enum keyed by mode. Repeated inline conversions become
   `From`/`TryFrom` impls next to the types.
@@ -80,7 +84,7 @@ whether the code works.
 ## PRs, commits, comments
 
 - Never put an AI session link in a PR body, PR description, or commit
-  message. Commits carry a plain `Assisted-by: Claude` trailer.
+  message.
 - Agents never post PR comments, review replies, or issue comments; those would
   appear under the operator's account. Report dispositions in the driving
   session instead.
