@@ -3166,4 +3166,95 @@ workflow(type = "playbook", tasks = [producer, report])
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// The edge rule end to end: a failed producer's evidence is laid down for the consumer that
+    /// declared it and for nothing further along, so a descendant cannot read a failed
+    /// grandparent's file as if it had passed.
+    #[test]
+    fn a_failed_producers_evidence_stops_at_the_edge_that_declared_it() {
+        let dir = playbook_pack(
+            "settled-grandparent",
+            r#"
+probe = command(
+    name = "probe",
+    run = "mkdir -p evidence && printf '{\"pass\": false}\n' > evidence/probe.json && exit 1",
+    required = False,
+    emits_files = ["evidence/probe.json"],
+)
+mid = command(
+    name = "mid",
+    run = "test -f inputs/probe/evidence/probe.json && printf '{\"ok\": true}\n'",
+    depends_on = [probe],
+    join = "settled",
+    required = False,
+)
+tip = command(
+    name = "tip",
+    run = "test ! -e inputs/probe && printf '{\"ok\": true}\n'",
+    depends_on = [mid],
+    join = "settled",
+)
+workflow(type = "playbook", tasks = [probe, mid, tip])
+"#,
+        );
+        let out = run_playbook(&dir);
+
+        assert_eq!(out.results[&"probe".into()].status, TaskStatus::Fail);
+        for name in ["mid", "tip"] {
+            let result = &out.results[&TaskName::from(name)];
+            assert_eq!(result.status, TaskStatus::Pass, "{name}: {:?}", result.note);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The whole envelope as a task actually reads it: status, note, retained output and the
+    /// staged-file flag, for a dependency that failed and one that was blocked behind it.
+    #[test]
+    fn a_settled_consumer_reads_the_whole_envelope_out_of_its_inputs() {
+        let dir = playbook_pack(
+            "settled-envelope",
+            r#"
+probe = command(
+    name = "probe",
+    run = "mkdir -p evidence && printf 'e\n' > evidence/probe.json && printf '{\"pass\": false, \"margin\": 0.02}\n' && printf 'the rungs did not separate\n' >&2 && exit 3",
+    required = False,
+    emits_files = ["evidence/probe.json"],
+)
+deliver = command(
+    name = "deliver",
+    run = "printf '{\"ok\": true}\n'",
+    depends_on = [probe],
+    required = False,
+)
+report = command(
+    name = "report",
+    run = "python3 -c 'import json, os; print(json.dumps(json.loads(os.environ[\"CRUCIBLE_INPUTS\"])))'",
+    depends_on = [probe, deliver],
+    join = "settled",
+)
+workflow(type = "playbook", tasks = [probe, deliver, report])
+"#,
+        );
+        let out = run_playbook(&dir);
+
+        assert_eq!(out.results[&"deliver".into()].status, TaskStatus::Blocked);
+        let report = &out.results[&"report".into()];
+        assert_eq!(report.status, TaskStatus::Pass, "{:?}", report.note);
+        let seen = report.output.as_ref().expect("the echoed envelope");
+        assert_eq!(seen["probe"]["status"], "fail");
+        assert_eq!(seen["probe"]["output"]["margin"], 0.02);
+        assert_eq!(seen["probe"]["files"], true);
+        assert!(
+            seen["probe"]["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("exit 3"),
+            "{}",
+            seen["probe"]["note"]
+        );
+        assert_eq!(seen["deliver"]["status"], "blocked");
+        assert_eq!(seen["deliver"]["output"], serde_json::Value::Null);
+        assert_eq!(seen["deliver"]["files"], false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

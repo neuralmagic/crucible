@@ -3687,4 +3687,169 @@ mod tests {
         assert_eq!(out.exit, PlanExit::Truncated { task: "gpu".into() });
         assert_eq!(r.dropped, vec!["gpu".to_string(), "report".to_string()]);
     }
+
+    /// A settled join is refused a halt exemption, and an epilogue task is granted one. Where a
+    /// task is both, the epilogue rule wins: it dispatches over the main graph's failure.
+    #[test]
+    fn a_settled_epilogue_dispatches_after_a_required_failure() {
+        let mut tip = epilogue("tip", &["wrap"], false);
+        tip.join = Join::Settled;
+        let plan = valid(
+            vec![
+                task("gate", &[], "any", true),
+                epilogue("wrap", &[], false),
+                tip,
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.on(
+            "gate",
+            1,
+            || AttemptOutcome::fail("measured a negative"),
+            0.0,
+        );
+        r.on("wrap", 1, || AttemptOutcome::fail("teardown refused"), 0.0);
+        let out = run_plan(&plan, &mut r);
+
+        assert_eq!(
+            out.exit,
+            PlanExit::ShortCircuit {
+                task: "gate".into()
+            }
+        );
+        assert_eq!(out.results[&"tip".into()].status, TaskStatus::Pass);
+        assert_eq!(status_of(r.entry("tip", "wrap")), "fail");
+    }
+
+    /// The edge rule holds for a mapped producer too: a failed instance's evidence is staged
+    /// into a consumer that declared the node, and into nothing further down.
+    #[test]
+    fn a_failed_mapped_grandparents_instances_reach_no_settled_descendant() {
+        let mut node = mapped_node("audit", "discover", "targets", false);
+        node.emits_files = vec!["OUT.md".to_string()];
+        let plan = valid(
+            vec![
+                task("discover", &[], "any", true),
+                node,
+                settled_task("mid", &["audit"], false),
+                settled_task("tip", &["mid"], true),
+            ],
+            5.0,
+        );
+        let mut runner = FanoutRunner::new(&["alpha"]);
+        runner.fail.insert("audit[alpha]".to_string());
+        runner.captured.insert("audit[alpha]".to_string());
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut runner,
+            |_, _| {},
+        );
+
+        assert_eq!(out.results[&"tip".into()].status, TaskStatus::Pass);
+        assert_eq!(runner.staged["mid"], vec!["audit[alpha]".to_string()]);
+        assert!(
+            runner.staged["tip"].is_empty(),
+            "a failed grandparent's instance reached a consumer with no entry for it: {:?}",
+            runner.staged["tip"]
+        );
+    }
+
+    /// Failure files ride settled edges only. A lossy join over the same failed dependency is
+    /// staged nothing, so a reducer cannot read evidence its inputs do not mention.
+    #[test]
+    fn a_passed_join_is_staged_nothing_from_a_failed_direct_dependency() {
+        let mut probe = task("probe", &[], "any", false);
+        probe.emits_files = vec!["evidence/probe.json".to_string()];
+        let mut roundup = task("roundup", &["probe", "other"], "any", true);
+        roundup.join = Join::Passed;
+        let plan = valid(vec![probe, task("other", &[], "any", false), roundup], 10.0);
+        let mut r = ScriptRunner::new();
+        r.captured.insert("probe".to_string());
+        r.on(
+            "probe",
+            1,
+            || AttemptOutcome::fail("measured a negative"),
+            0.0,
+        );
+        let out = run_plan(&plan, &mut r);
+
+        assert_eq!(out.results[&"roundup".into()].status, TaskStatus::Pass);
+        assert!(
+            r.staged["roundup"].is_empty(),
+            "a lossy join was staged a failed dependency's evidence: {:?}",
+            r.staged["roundup"]
+        );
+        assert_eq!(r.seen_inputs["roundup"], vec!["other".to_string()]);
+    }
+
+    /// "Nothing" has one spelling in the entry: a dependency the engine recorded no note for
+    /// carries a null note, not an empty string, and a dependency with no output carries a null
+    /// output.
+    #[test]
+    fn an_entry_the_engine_recorded_no_note_for_carries_null() {
+        let plan = valid(
+            vec![
+                task("quiet", &[], "any", false),
+                settled_task("report", &["quiet"], true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        let out = run_plan(&plan, &mut r);
+
+        assert_eq!(out.results[&"quiet".into()].note, None);
+        let entry = r.entry("report", "quiet");
+        assert_eq!(entry["note"], Value::Null);
+        assert_eq!(status_of(entry), "pass");
+        assert_eq!(entry["files"], false);
+    }
+
+    /// A mapped node whose `over` source failed reads nothing and fails naming the source, and
+    /// the settled consumer that reports on it sees a node that never expanded.
+    #[test]
+    fn a_settled_consumer_of_a_node_that_never_expanded_reads_the_refusal() {
+        let mut source = task("discover", &[], "any", false);
+        source.emits = vec![crate::plan::ir::OutputField("targets".to_string())];
+        let mut node = mapped_node("audit", "discover", "targets", false);
+        node.join = Join::Settled;
+        let plan = valid(
+            vec![source, node, settled_task("roundup", &["audit"], true)],
+            5.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.on(
+            "discover",
+            1,
+            || AttemptOutcome::Fail {
+                note: "discovery did not finish".to_string(),
+                output: Some(serde_json::json!({"targets": ["alpha", "beta"]})),
+            },
+            0.0,
+        );
+        let out = run_plan(&plan, &mut r);
+
+        let node = &out.results[&"audit".into()];
+        assert_eq!(node.status, TaskStatus::Fail);
+        assert!(
+            node.note
+                .as_deref()
+                .unwrap_or_default()
+                .contains("no output to map over"),
+            "{:?}",
+            node.note
+        );
+        assert!(
+            !r.dispatched
+                .iter()
+                .any(|(name, _)| name.starts_with("audit[")),
+            "a failed discovery's list was fanned out over: {:?}",
+            r.dispatched
+        );
+        let entry = r.entry("roundup", "audit");
+        assert_eq!(status_of(entry), "fail");
+        assert_eq!(entry["per_instance"], serde_json::json!({}));
+    }
 }
