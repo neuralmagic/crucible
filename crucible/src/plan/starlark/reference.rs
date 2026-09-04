@@ -5,8 +5,10 @@
 //! [`crate::plan::starlark::known_kwargs`], so a constructor cannot be added, renamed, or given a
 //! new argument without the reference following it.
 
+use crate::manifest::KEPT_INPUT;
 #[cfg(test)]
 use crate::manifest::WorkflowType;
+use crate::plan::exec::{DeclaredStatus, ITEM_INPUT};
 use crate::plan::ir::MAX_FANOUT_CEILING;
 
 /// Which lanes see a constructor.
@@ -65,8 +67,11 @@ fn task_knobs() -> Vec<Kwarg> {
         ),
         Kwarg::new(
             "join",
-            "\"all\" | \"passed\"",
-            "Which dependencies must have passed. `passed` forwards the non-empty successful set.",
+            "\"all\" | \"passed\" | \"settled\"",
+            "Which dependencies must have passed: `all` every one, `passed` at least one and \
+             only those are forwarded, `settled` none — it dispatches once every dependency is \
+             terminal, whatever it settled as, unless the run has already halted, and forwards \
+             each one as {status, note, output, files}.",
         ),
         Kwarg::new(
             "required",
@@ -388,6 +393,66 @@ pub fn functions() -> Vec<Function> {
     ]
 }
 
+/// A name the engine reads or writes for itself, and what it means there.
+pub struct Reserved {
+    pub name: &'static str,
+    pub ty: String,
+    pub purpose: &'static str,
+}
+
+impl Reserved {
+    fn new(name: &'static str, ty: impl Into<String>, purpose: &'static str) -> Self {
+        Reserved {
+            name,
+            ty: ty.into(),
+            purpose,
+        }
+    }
+}
+
+/// The tokens the engine acts on in a task's own `status` field, as a union type.
+fn declared_status_type() -> String {
+    DeclaredStatus::ALL
+        .iter()
+        .map(|s| format!("\"{}\"", s.as_str()))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+/// Fields the engine reads out of a task's own JSON output.
+pub fn reserved_result_fields() -> Vec<Reserved> {
+    vec![
+        Reserved::new(
+            "status",
+            declared_status_type(),
+            "Settles the task, overriding an exit code or `pass`. Any other value is ignored.",
+        ),
+        Reserved::new(
+            "complete",
+            "bool",
+            "Ends the run quietly. MUST NOT be declared in `emits`.",
+        ),
+        Reserved::new("reason", "str", "Why, alongside `complete`."),
+    ]
+}
+
+/// Keys the engine writes into a task's inputs. Neither is ever wrapped in a settled join's
+/// per-dependency entry.
+pub fn reserved_inputs() -> Vec<Reserved> {
+    vec![
+        Reserved::new(
+            ITEM_INPUT,
+            "str",
+            "This mapped instance's key, one per item of the list `over` names.",
+        ),
+        Reserved::new(
+            KEPT_INPUT,
+            "object",
+            "The kept candidate, in an epilogue task only.",
+        ),
+    ]
+}
+
 /// The dialect's authoring surface, read off the dialect the compiler actually installs.
 fn dialect_sentence() -> String {
     let dialect = crate::plan::starlark::dialect();
@@ -476,6 +541,36 @@ pub fn markdown() -> String {
             out.push('\n');
         }
     }
+
+    out.push_str(
+        "## Reserved fields\n\nNames the engine reads and writes for itself. They are not \
+         constructor arguments; they appear in a task's own JSON output and in the inputs it \
+         receives.\n\n",
+    );
+    for (heading, blurb, rows) in [
+        (
+            "A task's own JSON output",
+            "Read out of the object the task returns.",
+            reserved_result_fields(),
+        ),
+        (
+            "Inputs the engine writes",
+            "Present alongside the dependency entries, never wrapped in one.",
+            reserved_inputs(),
+        ),
+    ] {
+        out.push_str(&format!("### {heading}\n\n{blurb}\n\n"));
+        out.push_str("| Field | Type | Meaning |\n| --- | --- | --- |\n");
+        for row in rows {
+            out.push_str(&format!(
+                "| `{}` | `{}` | {} |\n",
+                cell(row.name),
+                cell(&row.ty),
+                cell(row.purpose)
+            ));
+        }
+        out.push('\n');
+    }
     out
 }
 
@@ -502,14 +597,29 @@ pub fn json() -> serde_json::Value {
                     .collect::<Vec<_>>(),
             }))
             .collect::<Vec<_>>(),
+        "reserved_result_fields": reserved_rows(reserved_result_fields()),
+        "reserved_inputs": reserved_rows(reserved_inputs()),
     })
+}
+
+fn reserved_rows(rows: Vec<Reserved>) -> serde_json::Value {
+    rows.iter()
+        .map(|row| {
+            serde_json::json!({
+                "name": row.name,
+                "type": row.ty,
+                "purpose": row.purpose,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
 
-    use crate::manifest::WorkflowType;
+    use crate::manifest::{KEPT_INPUT, WorkflowType};
+    use crate::plan::exec::{DeclaredStatus, ITEM_INPUT, TaskStatus};
     use crate::plan::starlark::reference::functions;
     use crate::plan::starlark::{dsl_functions, known_kwargs, lane_globals};
 
@@ -569,6 +679,56 @@ mod tests {
                 .filter(|(i, c)| *c == '|' && (*i == 0 || !line[..*i].ends_with('\\')))
                 .count();
             assert_eq!(separators, 4, "{line}");
+        }
+    }
+
+    /// The reserved-fields table is the engine's own vocabulary, not prose beside it: the status
+    /// tokens are the ones the engine acts on, and the input names are the constants it writes.
+    #[test]
+    fn the_reserved_fields_table_names_the_engines_own_constants() {
+        let results = super::reserved_result_fields();
+        assert_eq!(
+            results.iter().map(|row| row.name).collect::<Vec<_>>(),
+            ["status", "complete", "reason"]
+        );
+        for declared in DeclaredStatus::ALL {
+            assert!(
+                results[0]
+                    .ty
+                    .contains(&format!("\"{}\"", declared.as_str())),
+                "{} is acted on but undocumented: {}",
+                declared.as_str(),
+                results[0].ty
+            );
+            assert_eq!(
+                declared.as_str().parse::<TaskStatus>().map(|s| s.as_str()),
+                Ok(declared.as_str()),
+                "a declared status has no terminal status to settle as"
+            );
+        }
+
+        assert_eq!(
+            super::reserved_inputs()
+                .iter()
+                .map(|row| row.name)
+                .collect::<Vec<_>>(),
+            [ITEM_INPUT, KEPT_INPUT]
+        );
+    }
+
+    /// The page carries the tables, not just the tables' source.
+    #[test]
+    fn the_rendered_page_documents_every_reserved_name() {
+        let page = super::markdown();
+        for row in super::reserved_result_fields()
+            .iter()
+            .chain(super::reserved_inputs().iter())
+        {
+            assert!(
+                page.contains(&format!("| `{}` |", row.name)),
+                "{} is missing from the page",
+                row.name
+            );
         }
     }
 }

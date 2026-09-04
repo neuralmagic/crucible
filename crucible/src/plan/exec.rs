@@ -54,6 +54,31 @@ impl AttemptOutcome {
             output: None,
         }
     }
+
+    /// The terminal outcome a task's own reserved `status` field declares, or this outcome
+    /// unchanged. A runner that acts on an attempt before returning it — capturing declared
+    /// files, discarding a workspace — settles the declared status first, or it acts on a
+    /// veto as if it were a pass.
+    pub fn settle_declared(self) -> Self {
+        let value = match self {
+            AttemptOutcome::Pass(value) => value,
+            other => return other,
+        };
+        match DeclaredStatus::of(&value) {
+            Some(DeclaredStatus::Skipped) => {
+                let note = declared_note(&value, DeclaredStatus::Skipped);
+                AttemptOutcome::Skipped(value, note)
+            }
+            Some(DeclaredStatus::Fail) => {
+                let note = declared_note(&value, DeclaredStatus::Fail);
+                AttemptOutcome::Fail {
+                    note,
+                    output: Some(value),
+                }
+            }
+            Some(DeclaredStatus::Pass) | None => AttemptOutcome::Pass(value),
+        }
+    }
 }
 
 pub struct Attempt {
@@ -89,6 +114,16 @@ pub trait TaskRunner {
     /// durable state records what a passing task did and drops what a failing one did; the
     /// default keeps nothing, which is what a stateless runner wants.
     fn settled(&mut self, _task: &Task, _passed: bool) {}
+
+    /// Whether a complete declared file set captured in this run is there to stage for `task`.
+    /// A runner that keeps no durable state has captured nothing, so the default is `false`.
+    fn has_captured_files(&self, _task: &Task) -> bool {
+        false
+    }
+
+    /// Discard any file set published under `task`'s name. Called when a task settles without
+    /// producing evidence, so a set from an earlier run cannot outlive its producer's silence.
+    fn drop_captured(&mut self, _task: &Task) {}
 
     fn run_many(&mut self, batch: &[BatchItem<'_>]) -> Vec<Attempt> {
         batch
@@ -278,6 +313,9 @@ pub fn runnable_set<'a>(plan: &'a ValidPlan, substrate: &Substrate) -> BTreeSet<
             Join::All => t.depends_on.iter().all(|d| runnable.contains(d)),
             // A lossy join remains runnable if any dependency can run.
             Join::Passed => t.depends_on.iter().any(|d| runnable.contains(d)),
+            // A settled join imposes no runnability condition: a reporting tip stays reachable
+            // on a substrate that cannot run the half of the graph it reports on.
+            Join::Settled => true,
         };
         if substrate.supports(&t.needs) && deps_runnable {
             runnable.insert(&t.name);
@@ -306,6 +344,7 @@ pub fn execute(
                 TaskStatus::Truncated,
                 format!("required task {} unrunnable on this substrate", t.name),
             );
+            runner.drop_captured(task);
             on_result(task, &r);
             results.insert(task.name.clone(), r);
         }
@@ -333,12 +372,19 @@ pub fn execute(
     // `gates` is false for one mapped instance: an instance is not a node of the graph, so its
     // failure is folded into the node's result and it is the node that short-circuits or does
     // not. Reporting still happens, because a reader wants the row per item.
-    let mut record = |t: &Task,
+    let mut record = |runner: &mut dyn TaskRunner,
+                      t: &Task,
                       r: TaskResult,
                       results: &mut BTreeMap<TaskName, TaskResult>,
                       halted: &mut Option<PlanExit>,
                       gates: bool| {
         let failed = r.status != TaskStatus::Pass;
+        if matches!(
+            r.status,
+            TaskStatus::Skipped | TaskStatus::Transport | TaskStatus::Blocked
+        ) {
+            runner.drop_captured(t);
+        }
         on_result(t, &r);
         results.insert(t.name.clone(), r);
         if gates && failed && t.required && t.stage == Stage::Iteration && halted.is_none() {
@@ -376,13 +422,13 @@ pub fn execute(
                     _ => "halted".to_string(),
                 };
                 let r = TaskResult::undispatched(TaskStatus::Blocked, why);
-                record(t, r, &mut results, &mut halted, true);
+                record(&mut *runner, t, r, &mut results, &mut halted, true);
                 continue;
             }
             if !runnable.contains(&t.name) {
                 let r =
                     TaskResult::undispatched(TaskStatus::Skipped, "unrunnable on this substrate");
-                record(t, r, &mut results, &mut halted, true);
+                record(&mut *runner, t, r, &mut results, &mut halted, true);
                 continue;
             }
             if t.depends_on.iter().any(|d| !results.contains_key(d)) {
@@ -399,18 +445,21 @@ pub fn execute(
                     .depends_on
                     .iter()
                     .any(|d| results.get(d).is_some_and(TaskResult::contributed)),
+                // Every dependency already holds a result by the guard above, so terminality is
+                // established and no status blocks the dispatch.
+                Join::Settled => true,
             };
             if !deps_ok {
                 // Nothing runs on top of a failure (or a skip): advisory failures gate
                 // their dependents even though they never gate validity.
                 let r = TaskResult::undispatched(TaskStatus::Blocked, "dependency did not pass");
-                record(t, r, &mut results, &mut halted, true);
+                record(&mut *runner, t, r, &mut results, &mut halted, true);
                 continue;
             }
             if spent >= budget {
                 halted.get_or_insert(PlanExit::BudgetExceeded);
                 let r = TaskResult::undispatched(TaskStatus::Blocked, "budget ceiling reached");
-                record(t, r, &mut results, &mut halted, true);
+                record(&mut *runner, t, r, &mut results, &mut halted, true);
                 continue;
             }
             // Elapsed time is known continuously, unlike a cost total, so the ceiling is
@@ -421,7 +470,7 @@ pub fn execute(
             {
                 halted.get_or_insert(PlanExit::TimeExceeded);
                 let r = TaskResult::undispatched(TaskStatus::Blocked, "wall-clock ceiling reached");
-                record(t, r, &mut results, &mut halted, true);
+                record(&mut *runner, t, r, &mut results, &mut halted, true);
                 continue;
             }
             if dispatch.is_empty() {
@@ -447,81 +496,34 @@ pub fn execute(
             break;
         };
 
-        // A failure keeps its output, so the selection is by status. A mapped node is exempt: a
-        // fold that settled `Fail` is what `join = "passed"` reduces over.
-        let inputs_for = |t: &Task, results: &BTreeMap<TaskName, TaskResult>| {
-            t.depends_on
-                .iter()
-                .filter_map(|d| {
-                    results
-                        .get(d)
-                        .filter(|r| {
-                            r.fanout.is_some()
-                                || matches!(r.status, TaskStatus::Pass | TaskStatus::Skipped)
-                        })
-                        .and_then(|r| r.output.clone())
-                        .map(|v| (d.clone(), v))
-                })
-                .collect::<BTreeMap<TaskName, Value>>()
-        };
-
-        // Only an ancestor that settled passing contributes. The file channel says what the
-        // JSON channel says: a failed task's output does not reach a descendant, and whatever a
-        // previous run left in `state/files` is not this run's evidence.
-        //
-        // A mapped ancestor is expanded into one stand-in per passing instance, so a consumer is
-        // handed `inputs/node[key]/<declared>` and the runner never has to know what `over` is.
-        let passing_producers = |t: &Task, results: &BTreeMap<TaskName, TaskResult>| {
-            let mut producers: Vec<Task> = Vec::new();
-            for p in ancestors(plan, t) {
-                if p.emits_files.is_empty() {
-                    continue;
-                }
-                if p.over.is_some() {
-                    producers.extend(
-                        results
-                            .iter()
-                            .filter(|(name, r)| {
-                                r.status == TaskStatus::Pass && is_instance_of(&p.name, name)
-                            })
-                            .map(|(name, _)| Task {
-                                name: name.clone(),
-                                over: None,
-                                max_fanout: None,
-                                ..p.clone()
-                            }),
-                    );
-                } else if results
-                    .get(&p.name)
-                    .is_some_and(|r| r.status == TaskStatus::Pass)
-                {
-                    producers.push(p.clone());
-                }
-            }
-            producers
-        };
-
         // Every dispatched task is staged, in its own right and with its own ancestors: batched
         // isolated tasks do not share an ancestor set, and a task with no producers still has to
         // say so, or the previous dispatch's inputs are still lying there when it runs.
+        //
+        // A settled entry's `files` key is read off this list, so the list is built first.
         let mut refused = None;
+        let mut producers_for: BTreeMap<TaskName, Vec<Task>> = BTreeMap::new();
+        let mut inputs_for_dispatch: BTreeMap<TaskName, BTreeMap<TaskName, Value>> =
+            BTreeMap::new();
         for t in &dispatch {
-            let producers = passing_producers(t, &results);
-            let producers: Vec<&Task> = producers.iter().collect();
-            if let Err(why) = runner.stage(t, &producers) {
+            let producers = file_producers(plan, t, &results, &*runner);
+            inputs_for_dispatch.insert(t.name.clone(), inputs_for(plan, t, &results, &producers));
+            let staged: Vec<&Task> = producers.iter().collect();
+            if let Err(why) = runner.stage(t, &staged) {
                 refused = Some((*t, why));
                 break;
             }
+            producers_for.insert(t.name.clone(), producers);
         }
         if let Some((t, why)) = refused {
             let r = TaskResult::undispatched(TaskStatus::Blocked, why);
-            record(t, r, &mut results, &mut halted, true);
+            record(&mut *runner, t, r, &mut results, &mut halted, true);
             continue;
         }
 
         if let Some(node) = dispatch.first().filter(|t| t.over.is_some()) {
             let node = *node;
-            let base = inputs_for(node, &results);
+            let base = inputs_for_dispatch.remove(&node.name).unwrap_or_default();
             match fanout_items(node, &results) {
                 Err(why) => {
                     let r = TaskResult {
@@ -532,7 +534,7 @@ pub fn execute(
                         note: Some(why),
                         fanout: None,
                     };
-                    record(node, r, &mut results, &mut halted, true);
+                    record(&mut *runner, node, r, &mut results, &mut halted, true);
                 }
                 Ok(keys) => {
                     let instances: Vec<Task> = keys
@@ -547,14 +549,16 @@ pub fn execute(
                         .collect();
                     // An instance is staged under its own name: it runs in its own root, and
                     // the node itself never runs.
-                    let producers = passing_producers(node, &results);
-                    let producers: Vec<&Task> = producers.iter().collect();
+                    let producers: Vec<&Task> = producers_for
+                        .get(&node.name)
+                        .map(|producers| producers.iter().collect())
+                        .unwrap_or_default();
                     let refused = instances
                         .iter()
                         .find_map(|instance| runner.stage(instance, &producers).err());
                     if let Some(why) = refused {
                         let r = TaskResult::undispatched(TaskStatus::Blocked, why);
-                        record(node, r, &mut results, &mut halted, true);
+                        record(&mut *runner, node, r, &mut results, &mut halted, true);
                         continue;
                     }
                     let item_inputs = |key: &String| {
@@ -583,7 +587,7 @@ pub fn execute(
                         for ((task, result), key) in batch_results.into_iter().zip(&keys) {
                             runner.settled(task, result.status == TaskStatus::Pass);
                             settled.push((key.clone(), result.clone()));
-                            record(task, result, &mut results, &mut halted, false);
+                            record(&mut *runner, task, result, &mut results, &mut halted, false);
                         }
                     } else {
                         // Instances of a shared-workspace node are one serial task each: they
@@ -608,7 +612,7 @@ pub fn execute(
                                 };
                                 let r = TaskResult::undispatched(TaskStatus::Blocked, why);
                                 settled.push((key.clone(), r.clone()));
-                                record(instance, r, &mut results, &mut halted, false);
+                                record(&mut *runner, instance, r, &mut results, &mut halted, false);
                                 continue;
                             }
                             let (result, budget_exceeded) = run_with_retries(
@@ -624,10 +628,18 @@ pub fn execute(
                             }
                             runner.settled(instance, result.status == TaskStatus::Pass);
                             settled.push((key.clone(), result.clone()));
-                            record(instance, result, &mut results, &mut halted, false);
+                            record(
+                                &mut *runner,
+                                instance,
+                                result,
+                                &mut results,
+                                &mut halted,
+                                false,
+                            );
                         }
                     }
                     record(
+                        &mut *runner,
                         node,
                         fold_instances(settled),
                         &mut results,
@@ -638,7 +650,7 @@ pub fn execute(
             }
         } else if dispatch.len() == 1 {
             let t = first;
-            let inputs = inputs_for(t, &results);
+            let inputs = inputs_for_dispatch.remove(&t.name).unwrap_or_default();
             let (result, budget_exceeded) = match &t.task {
                 TaskKind::TopK { k, direction } => (reduce_top_k(&inputs, *k, *direction), false),
                 TaskKind::Agent { .. }
@@ -653,7 +665,7 @@ pub fn execute(
                 halted.get_or_insert(PlanExit::BudgetExceeded);
             }
             runner.settled(t, result.status == TaskStatus::Pass);
-            record(t, result, &mut results, &mut halted, true);
+            record(&mut *runner, t, result, &mut results, &mut halted, true);
         } else {
             // A concurrent batch of independent isolated tasks; results are recorded in
             // declaration order regardless of completion order, so the event stream
@@ -663,7 +675,7 @@ pub fn execute(
                 .map(|t| BatchItem {
                     task: t,
                     attempt: 1,
-                    inputs: inputs_for(t, &results),
+                    inputs: inputs_for_dispatch.remove(&t.name).unwrap_or_default(),
                 })
                 .collect();
             let (batch_results, budget_exceeded) =
@@ -673,7 +685,7 @@ pub fn execute(
             }
             for (t, result) in batch_results {
                 runner.settled(t, result.status == TaskStatus::Pass);
-                record(t, result, &mut results, &mut halted, true);
+                record(&mut *runner, t, result, &mut results, &mut halted, true);
             }
         }
     }
@@ -704,13 +716,149 @@ fn instance_name(node: &TaskName, key: &str) -> TaskName {
     TaskName(format!("{}[{}]", node.0, key))
 }
 
-/// Whether `name` is an instance of the mapped node `node`. Declared names may not contain a
-/// bracket ([`crate::plan::ir::PlanError::BracketInTaskName`]), so the match is exact.
-fn is_instance_of(node: &TaskName, name: &TaskName) -> bool {
+/// The item key `name` carries when it is an instance of the mapped node `node`. Declared names
+/// may not contain a bracket ([`crate::plan::ir::PlanError::BracketInTaskName`]), so the match is
+/// exact.
+fn instance_key<'a>(node: &TaskName, name: &'a TaskName) -> Option<&'a str> {
     name.0
         .strip_prefix(&node.0)
         .and_then(|rest| rest.strip_prefix('['))
-        .is_some_and(|rest| rest.ends_with(']'))
+        .and_then(|rest| rest.strip_suffix(']'))
+}
+
+/// Whether `name` is an instance of the mapped node `node`.
+fn is_instance_of(node: &TaskName, name: &TaskName) -> bool {
+    instance_key(node, name).is_some()
+}
+
+/// Which producers' declared files are staged into `t` for this dispatch.
+///
+/// A passing ancestor contributes, as it always has. A direct dependency that settled failing
+/// contributes to a consumer joining `settled`, and to no one else: staging a failed
+/// grandparent's evidence into a consumer that has no envelope entry for it would read as the
+/// grandparent having passed.
+///
+/// A mapped ancestor is expanded into one stand-in per contributing instance, so a consumer is
+/// handed `inputs/node[key]/<declared>` and the runner never has to know what `over` is.
+fn file_producers(
+    plan: &ValidPlan,
+    t: &Task,
+    results: &BTreeMap<TaskName, TaskResult>,
+    runner: &dyn TaskRunner,
+) -> Vec<Task> {
+    let contributes = |node: &Task, candidate: &Task, r: &TaskResult| match r.status {
+        TaskStatus::Pass => true,
+        TaskStatus::Fail => {
+            t.join == Join::Settled
+                && t.depends_on.contains(&node.name)
+                && runner.has_captured_files(candidate)
+        }
+        _ => false,
+    };
+    let mut producers: Vec<Task> = Vec::new();
+    for p in ancestors(plan, t) {
+        if p.emits_files.is_empty() {
+            continue;
+        }
+        if p.over.is_some() {
+            for (name, r) in results
+                .iter()
+                .filter(|(name, _)| is_instance_of(&p.name, name))
+            {
+                let instance = Task {
+                    name: name.clone(),
+                    over: None,
+                    max_fanout: None,
+                    ..p.clone()
+                };
+                if contributes(p, &instance, r) {
+                    producers.push(instance);
+                }
+            }
+        } else if let Some(r) = results.get(&p.name)
+            && contributes(p, p, r)
+        {
+            producers.push(p.clone());
+        }
+    }
+    producers
+}
+
+/// What a dispatched task reads from its dependencies, as JSON.
+///
+/// Under `all` and `passed` a dependency contributes its output directly, under its own name. A
+/// failure keeps its output, so the selection is by status; a mapped node is exempt, because a
+/// fold that settled `Fail` is what `join = "passed"` reduces over.
+///
+/// Under `settled` every declared dependency contributes one entry carrying its status, note,
+/// output and staged-file flag, whatever it settled as. `staged` is the producer list this
+/// dispatch is about to hand the runner, which is what makes the `files` flag mean "staged for
+/// this consumer, in this run".
+fn inputs_for(
+    plan: &ValidPlan,
+    t: &Task,
+    results: &BTreeMap<TaskName, TaskResult>,
+    staged: &[Task],
+) -> BTreeMap<TaskName, Value> {
+    if t.join != Join::Settled {
+        return t
+            .depends_on
+            .iter()
+            .filter_map(|d| {
+                results
+                    .get(d)
+                    .filter(|r| {
+                        r.fanout.is_some()
+                            || matches!(r.status, TaskStatus::Pass | TaskStatus::Skipped)
+                    })
+                    .and_then(|r| r.output.clone())
+                    .map(|v| (d.clone(), v))
+            })
+            .collect();
+    }
+    let was_staged = |name: &TaskName| staged.iter().any(|p| &p.name == name);
+    t.depends_on
+        .iter()
+        .filter_map(|d| {
+            let r = results.get(d)?;
+            // A mapped node is staged under its instances' names, so the node's own flag is true
+            // when any of them was.
+            let any_staged = was_staged(d) || staged.iter().any(|p| is_instance_of(d, &p.name));
+            let mut entry = settled_entry(r, any_staged);
+            if plan.get(d).is_some_and(|dep| dep.over.is_some()) {
+                let per_instance: serde_json::Map<String, Value> = results
+                    .iter()
+                    .filter_map(|(name, r)| {
+                        let key = instance_key(d, name)?;
+                        Some((
+                            key.to_owned(),
+                            Value::Object(settled_entry(r, was_staged(name))),
+                        ))
+                    })
+                    .collect();
+                entry.insert("per_instance".to_string(), Value::Object(per_instance));
+            }
+            Some((d.clone(), Value::Object(entry)))
+        })
+        .collect()
+}
+
+/// One dependency's entry in a settled join's inputs. The entry carries the output rather than
+/// being it, so a consumer cannot read a failed dependency's reading without stepping past its
+/// status.
+fn settled_entry(r: &TaskResult, files: bool) -> serde_json::Map<String, Value> {
+    let mut entry = serde_json::Map::new();
+    entry.insert("status".to_string(), Value::from(r.status.as_str()));
+    entry.insert(
+        "note".to_string(),
+        r.note.clone().map_or(Value::Null, Value::String),
+    );
+    entry.insert(
+        "output".to_string(),
+        r.output.clone().unwrap_or(Value::Null),
+    );
+    entry.insert("files".to_string(), Value::Bool(files));
+    entry
 }
 
 /// Read the items a mapped task fans out over, or say why it cannot.
@@ -821,26 +969,59 @@ fn fold_instances(settled: Vec<(String, TaskResult)>) -> TaskResult {
 /// Without this a task that RAN could only report pass or fail, so a rung whose check turned out to
 /// be inapplicable had to pick between claiming success and accusing the candidate. The GLM A/B rung
 /// picked success, and six hours of GPU reported a green attribution rung with no attribution behind
-/// it. `skipped` is the honest third answer: ran, measured nothing, blames nobody.
-fn declared_status(value: &Value) -> Option<&str> {
-    value.get("status").and_then(Value::as_str)
+/// it. `skipped` is the honest third answer: ran, measured nothing, blames nobody. `fail` is how a
+/// task with no exit code and no `pass` grading vetoes itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeclaredStatus {
+    Pass,
+    Fail,
+    Skipped,
+}
+
+impl DeclaredStatus {
+    /// Every value the engine acts on. Any other value of the field is ignored.
+    pub const ALL: [DeclaredStatus; 3] = [
+        DeclaredStatus::Pass,
+        DeclaredStatus::Fail,
+        DeclaredStatus::Skipped,
+    ];
+
+    /// The token a task writes into its output's reserved `status` field.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeclaredStatus::Pass => "pass",
+            DeclaredStatus::Fail => "fail",
+            DeclaredStatus::Skipped => "skipped",
+        }
+    }
+
+    fn of(value: &Value) -> Option<Self> {
+        match value.get("status").and_then(Value::as_str)? {
+            "pass" => Some(DeclaredStatus::Pass),
+            "fail" => Some(DeclaredStatus::Fail),
+            "skipped" => Some(DeclaredStatus::Skipped),
+            _ => None,
+        }
+    }
+}
+
+/// The note a self-declaring task gave, or a stand-in naming what it declared.
+fn declared_note(value: &Value, declared: DeclaredStatus) -> String {
+    value
+        .get("note")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("task declared status={}", declared.as_str()))
 }
 
 fn enforce_emits(task: &Task, outcome: AttemptOutcome) -> AttemptOutcome {
-    let value = match outcome {
+    // Declared fields are owed by a passing attempt only, so a task that settled itself skipped or
+    // failed is read before they are checked: checking them would turn an honest skip into a
+    // spurious failure and would replace a task's own verdict with a drift complaint.
+    let value = match outcome.settle_declared() {
         AttemptOutcome::Pass(value) => value,
         other => return other,
     };
-    // A skipped task produces no evidence, so its declared emits are not owed. Checking them would
-    // turn an honest skip into a spurious failure.
-    if declared_status(&value) == Some("skipped") {
-        let note = value
-            .get("note")
-            .and_then(Value::as_str)
-            .unwrap_or("task declared status=skipped")
-            .to_string();
-        return AttemptOutcome::Skipped(value, note);
-    }
     match task
         .emits
         .iter()
@@ -1123,6 +1304,11 @@ mod tests {
         default_cost: f64,
         dispatched: Vec<(String, u32)>,
         seen_inputs: BTreeMap<String, Vec<String>>,
+        seen_values: BTreeMap<String, BTreeMap<TaskName, Value>>,
+        staged: BTreeMap<String, Vec<String>>,
+        /// Producers this runner claims to hold a complete captured set for.
+        captured: BTreeSet<String>,
+        dropped: Vec<String>,
     }
 
     impl ScriptRunner {
@@ -1132,14 +1318,38 @@ mod tests {
                 default_cost: 0.1,
                 dispatched: Vec::new(),
                 seen_inputs: BTreeMap::new(),
+                seen_values: BTreeMap::new(),
+                staged: BTreeMap::new(),
+                captured: BTreeSet::new(),
+                dropped: Vec::new(),
             }
         }
         fn on(&mut self, task: &str, attempt: u32, f: fn() -> AttemptOutcome, cost: f64) {
             self.script.insert((task.to_string(), attempt), (f, cost));
         }
+        /// The entry a settled consumer received for one dependency.
+        fn entry(&self, consumer: &str, dependency: &str) -> &Value {
+            &self.seen_values[consumer][&TaskName(dependency.to_string())]
+        }
     }
 
     impl TaskRunner for ScriptRunner {
+        fn stage(&mut self, task: &Task, producers: &[&Task]) -> Result<(), String> {
+            self.staged.insert(
+                task.name.0.clone(),
+                producers.iter().map(|p| p.name.0.clone()).collect(),
+            );
+            Ok(())
+        }
+
+        fn has_captured_files(&self, task: &Task) -> bool {
+            self.captured.contains(&task.name.0)
+        }
+
+        fn drop_captured(&mut self, task: &Task) {
+            self.dropped.push(task.name.0.clone());
+        }
+
         fn run(
             &mut self,
             task: &Task,
@@ -1151,6 +1361,7 @@ mod tests {
                 task.name.0.clone(),
                 inputs.keys().map(|k| k.0.clone()).collect(),
             );
+            self.seen_values.insert(task.name.0.clone(), inputs.clone());
             match self.script.get(&(task.name.0.clone(), attempt)) {
                 Some((f, cost)) => Attempt {
                     outcome: f(),
@@ -2309,6 +2520,8 @@ mod tests {
         log: Vec<String>,
         staged: BTreeMap<String, Vec<String>>,
         seen_inputs: BTreeMap<String, BTreeMap<TaskName, Value>>,
+        /// Producers this runner claims to hold a complete captured set for.
+        captured: BTreeSet<String>,
     }
 
     impl FanoutRunner {
@@ -2320,6 +2533,7 @@ mod tests {
                 log: Vec::new(),
                 staged: BTreeMap::new(),
                 seen_inputs: BTreeMap::new(),
+                captured: BTreeSet::new(),
             }
         }
     }
@@ -2371,6 +2585,10 @@ mod tests {
                 producers.iter().map(|p| p.name.0.clone()).collect(),
             );
             Ok(())
+        }
+
+        fn has_captured_files(&self, task: &Task) -> bool {
+            self.captured.contains(&task.name.0)
         }
 
         fn settled(&mut self, task: &Task, passed: bool) {
@@ -2933,5 +3151,540 @@ mod tests {
         assert_eq!(out.results[&"report".into()].status, TaskStatus::Truncated);
         assert!(!out.valid);
         assert!(r.dispatched.is_empty());
+    }
+
+    fn settled_task(name: &str, deps: &[&str], required: bool) -> Task {
+        let mut t = task(name, deps, "any", required);
+        t.join = Join::Settled;
+        t
+    }
+
+    fn status_of(entry: &Value) -> &str {
+        entry["status"].as_str().unwrap_or("<not a status token>")
+    }
+
+    /// Every terminal status satisfies a settled join and none of them blocks it, including the
+    /// two spellings of a skip and a task that was never dispatched at all.
+    #[test]
+    fn a_settled_join_dispatches_over_a_dependency_in_every_terminal_state() {
+        let plan = valid(
+            vec![
+                task("boom", &[], "any", false),
+                task("self_skip", &[], "any", false),
+                task("walker_skip", &[], "fp8-tc", false),
+                task("flaky", &[], "any", false),
+                task("upstream", &[], "any", false),
+                task("blocked", &["upstream"], "any", false),
+                settled_task(
+                    "report",
+                    &[
+                        "boom",
+                        "self_skip",
+                        "walker_skip",
+                        "flaky",
+                        "upstream",
+                        "blocked",
+                    ],
+                    true,
+                ),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.on(
+            "boom",
+            1,
+            || AttemptOutcome::fail("measured a negative"),
+            0.0,
+        );
+        r.on(
+            "self_skip",
+            1,
+            || AttemptOutcome::Pass(serde_json::json!({"status": "skipped"})),
+            0.0,
+        );
+        r.on(
+            "upstream",
+            1,
+            || AttemptOutcome::fail("measured a negative"),
+            0.0,
+        );
+        for attempt in 1..=3 {
+            r.on(
+                "flaky",
+                attempt,
+                || AttemptOutcome::Transport("the broker hung up".to_string()),
+                0.0,
+            );
+        }
+        let out = run_plan(&plan, &mut r);
+
+        assert_eq!(out.exit, PlanExit::Completed);
+        assert!(out.valid, "{:?}", out.results);
+        assert_eq!(out.results[&"report".into()].status, TaskStatus::Pass);
+        for (dependency, status) in [
+            ("boom", "fail"),
+            ("self_skip", "skipped"),
+            ("walker_skip", "skipped"),
+            ("flaky", "transport"),
+            ("upstream", "fail"),
+            ("blocked", "blocked"),
+        ] {
+            assert_eq!(
+                status_of(r.entry("report", dependency)),
+                status,
+                "{dependency}"
+            );
+        }
+    }
+
+    /// A settled join governs dependency status and nothing else: a required failure stops
+    /// dispatch, and a settled tip is blocked by it like any other task.
+    #[test]
+    fn a_settled_join_does_not_outlive_a_required_failure() {
+        let plan = valid(
+            vec![
+                task("gate", &[], "any", true),
+                settled_task("report", &["gate"], false),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.on(
+            "gate",
+            1,
+            || AttemptOutcome::fail("measured a negative"),
+            0.0,
+        );
+        let out = run_plan(&plan, &mut r);
+
+        assert_eq!(
+            out.exit,
+            PlanExit::ShortCircuit {
+                task: "gate".into()
+            }
+        );
+        assert_eq!(out.results[&"report".into()].status, TaskStatus::Blocked);
+        assert!(!r.dispatched.iter().any(|(name, _)| name == "report"));
+    }
+
+    /// A pack that puts expensive work behind a settled join must not keep spending once the
+    /// cost ceiling is gone.
+    #[test]
+    fn a_settled_join_does_not_outlive_a_budget_halt() {
+        let plan = valid(
+            vec![
+                task("probe", &[], "any", false),
+                settled_task("report", &["probe"], false),
+            ],
+            0.15,
+        );
+        let mut r = ScriptRunner::new();
+        r.on(
+            "probe",
+            1,
+            || AttemptOutcome::Pass(serde_json::json!({"ok": true})),
+            0.2,
+        );
+        let out = run_plan(&plan, &mut r);
+
+        assert_eq!(out.exit, PlanExit::BudgetExceeded);
+        assert_eq!(out.results[&"report".into()].status, TaskStatus::Blocked);
+        assert!(!r.dispatched.iter().any(|(name, _)| name == "report"));
+    }
+
+    #[test]
+    fn a_settled_join_does_not_outlive_a_wall_clock_halt() {
+        let plan = valid(
+            vec![
+                task("probe", &[], "any", false),
+                settled_task("report", &["probe"], false),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        let cfg = ExecCfg {
+            wall_clock: Some(Duration::ZERO),
+            ..ExecCfg::default()
+        };
+        let out = execute(&plan, &any_substrate(), cfg, &mut r, |_, _| {});
+
+        assert_eq!(out.exit, PlanExit::TimeExceeded);
+        assert_eq!(out.results[&"report".into()].status, TaskStatus::Blocked);
+        assert!(r.dispatched.is_empty());
+    }
+
+    /// Runnability is the substrate's question, and a settled join does not inherit its
+    /// dependencies' answer: a reporting tip stays reachable on a machine that cannot run the
+    /// branch it reports on, so the plan is not truncated.
+    #[test]
+    fn a_required_settled_tip_survives_an_unrunnable_advisory_branch() {
+        let plan = valid(
+            vec![
+                task("gpu", &[], "fp8-tc", false),
+                settled_task("report", &["gpu"], true),
+            ],
+            10.0,
+        );
+        assert!(runnable_set(&plan, &any_substrate()).contains(&TaskName("report".into())));
+
+        let mut r = ScriptRunner::new();
+        let out = run_plan(&plan, &mut r);
+        assert_eq!(out.exit, PlanExit::Completed);
+        assert!(out.valid, "{:?}", out.results);
+        assert_eq!(out.results[&"gpu".into()].status, TaskStatus::Skipped);
+        assert_eq!(status_of(r.entry("report", "gpu")), "skipped");
+    }
+
+    /// The reading that says why a task failed reaches the task that reports on it, wrapped in
+    /// its status. An `all` consumer of the same failure is still blocked and still receives
+    /// nothing: the entry is a settled join's alone.
+    #[test]
+    fn a_failed_dependencys_reading_reaches_a_settled_consumer_and_no_one_else() {
+        let plan = valid(
+            vec![
+                task("probe", &[], "any", false),
+                settled_task("report", &["probe"], false),
+                task("deliver", &["probe"], "any", false),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.on(
+            "probe",
+            1,
+            || AttemptOutcome::Fail {
+                note: "the probe did not separate".to_string(),
+                output: Some(serde_json::json!({"pass": false, "margin": 0.02})),
+            },
+            0.0,
+        );
+        let out = run_plan(&plan, &mut r);
+
+        assert_eq!(out.results[&"deliver".into()].status, TaskStatus::Blocked);
+        assert!(!r.dispatched.iter().any(|(name, _)| name == "deliver"));
+        let entry = r.entry("report", "probe");
+        assert_eq!(status_of(entry), "fail");
+        assert_eq!(entry["note"], "the probe did not separate");
+        assert_eq!(entry["output"]["margin"], 0.02);
+        assert_eq!(entry["files"], false);
+    }
+
+    /// The guard a retained failure output needs: a lossy join over ordinary siblings forwards
+    /// the ones that passed and nothing else. Without it a reporter reads a failed sibling's
+    /// object under its own name and calls the run green.
+    #[test]
+    fn a_passed_join_over_one_failed_sibling_receives_only_the_passing_one() {
+        let mut roundup = task("roundup", &["good", "bad"], "any", true);
+        roundup.join = Join::Passed;
+        let plan = valid(
+            vec![
+                task("good", &[], "any", false),
+                task("bad", &[], "any", false),
+                roundup,
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.on(
+            "bad",
+            1,
+            || AttemptOutcome::Fail {
+                note: "measured a negative".to_string(),
+                output: Some(serde_json::json!({"pass": false})),
+            },
+            0.0,
+        );
+        let out = run_plan(&plan, &mut r);
+
+        assert_eq!(out.results[&"roundup".into()].status, TaskStatus::Pass);
+        assert_eq!(r.seen_inputs["roundup"], vec!["good".to_string()]);
+    }
+
+    /// A settled dependent of a mapped node waits for the fold and then reads each instance,
+    /// including when not one of them passed.
+    #[test]
+    fn a_settled_consumer_of_a_mapped_node_reads_every_failed_instance() {
+        let node = mapped_node("audit", "discover", "targets", false);
+        let plan = valid(
+            vec![
+                task("discover", &[], "any", true),
+                node,
+                settled_task("roundup", &["audit"], true),
+            ],
+            5.0,
+        );
+        let mut runner = FanoutRunner::new(&["alpha", "beta"]);
+        runner.fail.insert("audit[alpha]".to_string());
+        runner.fail.insert("audit[beta]".to_string());
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut runner,
+            |_, _| {},
+        );
+
+        assert_eq!(out.results[&"audit".into()].status, TaskStatus::Fail);
+        assert_eq!(out.results[&"roundup".into()].status, TaskStatus::Pass);
+        let entry = &runner.seen_inputs["roundup"][&TaskName("audit".to_string())];
+        assert_eq!(entry["status"], "fail");
+        assert_eq!(entry["output"]["passed"], 0);
+        assert_eq!(entry["per_instance"]["alpha"]["status"], "fail");
+        assert_eq!(entry["per_instance"]["beta"]["output"]["item"], "beta");
+    }
+
+    /// An empty fan-out passes with no instances, and a node that never expanded produces no
+    /// instance rows either. The entry's status, not the emptiness, is what tells them apart.
+    #[test]
+    fn an_empty_per_instance_mapping_is_read_by_the_nodes_own_status() {
+        let empty = valid(
+            vec![
+                task("discover", &[], "any", true),
+                mapped_node("audit", "discover", "targets", false),
+                settled_task("roundup", &["audit"], true),
+            ],
+            5.0,
+        );
+        let mut runner = FanoutRunner::new(&[]);
+        let out = execute(
+            &empty,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut runner,
+            |_, _| {},
+        );
+        let entry = &runner.seen_inputs["roundup"][&TaskName("audit".to_string())];
+        assert_eq!(out.results[&"audit".into()].status, TaskStatus::Pass);
+        assert_eq!(entry["status"], "pass");
+        assert_eq!(entry["output"]["instances"], 0);
+        assert_eq!(entry["per_instance"], serde_json::json!({}));
+
+        let mut node = mapped_node("audit", "discover", "targets", false);
+        node.depends_on.push("gate".into());
+        let never_expanded = valid(
+            vec![
+                task("discover", &[], "any", true),
+                task("gate", &[], "any", false),
+                node,
+                settled_task("roundup", &["audit"], true),
+            ],
+            5.0,
+        );
+        let mut runner = FanoutRunner::new(&["alpha"]);
+        runner.fail.insert("gate".to_string());
+        let out = execute(
+            &never_expanded,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut runner,
+            |_, _| {},
+        );
+        let entry = &runner.seen_inputs["roundup"][&TaskName("audit".to_string())];
+        assert_eq!(out.results[&"audit".into()].status, TaskStatus::Blocked);
+        assert_eq!(entry["status"], "blocked");
+        assert_eq!(entry["output"], Value::Null);
+        assert_eq!(entry["per_instance"], serde_json::json!({}));
+    }
+
+    /// A failed producer's evidence is staged along declared edges only. Staging a failed
+    /// grandparent's file into a consumer with no entry for it would read as the grandparent
+    /// having passed.
+    #[test]
+    fn a_failed_producers_files_reach_a_settled_dependent_and_not_a_settled_descendant() {
+        let mut probe = task("probe", &[], "any", false);
+        probe.emits_files = vec!["evidence/probe.json".to_string()];
+        let plan = valid(
+            vec![
+                probe,
+                settled_task("mid", &["probe"], false),
+                settled_task("tip", &["mid"], true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.captured.insert("probe".to_string());
+        r.on(
+            "probe",
+            1,
+            || AttemptOutcome::fail("measured a negative"),
+            0.0,
+        );
+        let out = run_plan(&plan, &mut r);
+
+        assert_eq!(out.results[&"tip".into()].status, TaskStatus::Pass);
+        assert_eq!(r.staged["mid"], vec!["probe".to_string()]);
+        assert!(
+            r.staged["tip"].is_empty(),
+            "a failed grandparent's evidence reached a consumer with no entry for it: {:?}",
+            r.staged["tip"]
+        );
+        assert_eq!(r.entry("mid", "probe")["files"], true);
+    }
+
+    /// The `files` flag says a set was staged for this consumer in this run, so it is false for
+    /// a producer that declares none and false for one whose set the runner does not hold.
+    #[test]
+    fn the_files_flag_is_false_without_a_set_staged_for_this_consumer() {
+        let mut hoard = task("hoard", &[], "any", false);
+        hoard.emits_files = vec!["evidence/hoard.json".to_string()];
+        let plan = valid(
+            vec![
+                task("quiet", &[], "any", false),
+                hoard,
+                settled_task("report", &["quiet", "hoard"], true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.on(
+            "quiet",
+            1,
+            || AttemptOutcome::fail("measured a negative"),
+            0.0,
+        );
+        r.on(
+            "hoard",
+            1,
+            || AttemptOutcome::fail("measured a negative"),
+            0.0,
+        );
+        let out = run_plan(&plan, &mut r);
+
+        assert_eq!(out.results[&"report".into()].status, TaskStatus::Pass);
+        assert_eq!(r.entry("report", "quiet")["files"], false);
+        assert_eq!(r.entry("report", "hoard")["files"], false);
+        assert!(r.staged["report"].is_empty());
+    }
+
+    /// One mapped producer is staged per instance whose set exists, and each instance's own flag
+    /// says which `inputs/node[key]/` directory is there to read.
+    #[test]
+    fn a_mapped_producers_files_flag_is_per_instance() {
+        let mut node = mapped_node("audit", "discover", "targets", false);
+        node.emits_files = vec!["OUT.md".to_string()];
+        let plan = valid(
+            vec![
+                task("discover", &[], "any", true),
+                node,
+                settled_task("roundup", &["audit"], true),
+            ],
+            5.0,
+        );
+        let mut runner = FanoutRunner::new(&["alpha", "beta", "gamma"]);
+        runner.fail.insert("audit[beta]".to_string());
+        runner.fail.insert("audit[gamma]".to_string());
+        runner.captured.insert("audit[beta]".to_string());
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut runner,
+            |_, _| {},
+        );
+
+        assert_eq!(out.results[&"roundup".into()].status, TaskStatus::Pass);
+        assert_eq!(
+            runner.staged["roundup"],
+            vec!["audit[alpha]".to_string(), "audit[beta]".to_string()],
+            "an instance whose set the runner does not hold was staged anyway"
+        );
+        let entry = &runner.seen_inputs["roundup"][&TaskName("audit".to_string())];
+        assert_eq!(entry["files"], true);
+        assert_eq!(entry["per_instance"]["alpha"]["files"], true);
+        assert_eq!(entry["per_instance"]["beta"]["files"], true);
+        assert_eq!(entry["per_instance"]["gamma"]["files"], false);
+    }
+
+    /// An agent turn has no exit code and no `pass` to grade, so `"status": "fail"` is how it
+    /// vetoes itself. It settles failing with its object intact, is not retried, and is not
+    /// checked against its declared fields: those are owed by a passing attempt only.
+    #[test]
+    fn a_task_declaring_status_fail_settles_failing_with_its_object_kept() {
+        let mut veto = task("veto", &[], "any", false);
+        veto.emits = vec![crate::plan::ir::OutputField("separates".to_string())];
+        let plan = valid(vec![veto, settled_task("report", &["veto"], true)], 10.0);
+        let mut r = ScriptRunner::new();
+        r.on(
+            "veto",
+            1,
+            || {
+                AttemptOutcome::Pass(
+                    serde_json::json!({"status": "fail", "note": "the stimulus does not separate"}),
+                )
+            },
+            0.0,
+        );
+        let out = run_plan(&plan, &mut r);
+
+        let result = &out.results[&"veto".into()];
+        assert_eq!(result.status, TaskStatus::Fail);
+        assert_eq!(result.attempts, 1);
+        assert_eq!(
+            result.note.as_deref(),
+            Some("the stimulus does not separate")
+        );
+        let entry = r.entry("report", "veto");
+        assert_eq!(status_of(entry), "fail");
+        assert_eq!(entry["output"]["status"], "fail");
+    }
+
+    /// A task that published nothing this run must not leave a set from an earlier one standing:
+    /// disk state and run state cannot be allowed to disagree about what it produced.
+    #[test]
+    fn a_task_that_settles_without_evidence_drops_the_set_an_earlier_run_left() {
+        let plan = valid(
+            vec![
+                task("gone", &[], "fp8-tc", false),
+                task("flaky", &[], "any", false),
+                task("upstream", &[], "any", false),
+                task("blocked", &["upstream"], "any", false),
+                task("kept", &[], "any", false),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        for attempt in 1..=3 {
+            r.on(
+                "flaky",
+                attempt,
+                || AttemptOutcome::Transport("the broker hung up".to_string()),
+                0.0,
+            );
+        }
+        r.on(
+            "upstream",
+            1,
+            || AttemptOutcome::fail("measured a negative"),
+            0.0,
+        );
+        run_plan(&plan, &mut r);
+
+        assert_eq!(
+            r.dropped,
+            vec![
+                "gone".to_string(),
+                "flaky".to_string(),
+                "blocked".to_string()
+            ]
+        );
+    }
+
+    /// A truncated graph dispatches nothing at all, so every task in it settles without evidence
+    /// and every set an earlier run published goes with them.
+    #[test]
+    fn a_truncated_graph_drops_the_sets_an_earlier_run_left() {
+        let plan = valid(
+            vec![
+                task("gpu", &[], "fp8-tc", true),
+                task("report", &["gpu"], "any", false),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        let out = run_plan(&plan, &mut r);
+
+        assert_eq!(out.exit, PlanExit::Truncated { task: "gpu".into() });
+        assert_eq!(r.dropped, vec!["gpu".to_string(), "report".to_string()]);
     }
 }

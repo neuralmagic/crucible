@@ -167,6 +167,17 @@ pub fn head_sha(ws: &Path) -> Result<String> {
     Ok(commit.id().to_string())
 }
 
+/// `git status --porcelain -- <path>`: whether the workspace-relative `path` differs from what
+/// the repository has committed. A path git has never tracked is not part of that state, so it
+/// counts as changed.
+pub fn differs_from_committed(ws: &Path, path: &str) -> Result<bool> {
+    let repo = Repository::open(ws).context("open workspace repo")?;
+    let status = repo
+        .status_file(Path::new(path))
+        .with_context(|| format!("status of {path}"))?;
+    Ok(status != Status::CURRENT)
+}
+
 /// `git clean -fd -e <keep> ...`: remove untracked (not ignored) files and fully-untracked
 /// directories, preserving the given workspace-relative paths (at any depth); leaves dirs that
 /// still hold tracked files.

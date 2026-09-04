@@ -120,7 +120,7 @@ impl Stage {
     }
 }
 
-/// How dependency outputs join into a task's inputs (`join = "all" | "passed"`).
+/// How dependency outputs join into a task's inputs (`join = "all" | "passed" | "settled"`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Join {
@@ -132,6 +132,10 @@ pub enum Join {
     /// reducer over a lossy fan-out (the wide `top_k`: skipped/failed candidates just
     /// don't rank), or a join over reviewers where one being advisory must not stop the run.
     Passed,
+    /// Dispatch once every dependency is terminal whatever it settled as, unless the run has
+    /// halted, forwarding each one as an entry carrying its status, note, output, and whether
+    /// a file set was staged for this consumer.
+    Settled,
 }
 
 impl Join {
@@ -139,6 +143,7 @@ impl Join {
         match self {
             Join::All => "all",
             Join::Passed => "passed",
+            Join::Settled => "settled",
         }
     }
 }
@@ -314,7 +319,6 @@ impl ValidPlan {
         self.topo.iter().map(|&i| &self.plan.tasks[i])
     }
 
-    #[allow(dead_code)]
     pub fn get(&self, name: &TaskName) -> Option<&Task> {
         self.plan.tasks.iter().find(|t| &t.name == name)
     }
@@ -352,6 +356,14 @@ pub enum PlanError {
     RepeatedDependency { task: String, dependency: String },
     #[error("task {task:?}: join = \"passed\" needs at least one dependency")]
     JoinPassedWithoutDependencies { task: String },
+    #[error("task {task:?}: join = \"settled\" needs at least one dependency")]
+    JoinSettledWithoutDependencies { task: String },
+    #[error(
+        "task {task:?}: join = \"settled\" is not accepted on {kind} tasks, whose inputs are a \
+         fixed typed context rather than one entry per dependency. Use join = \"all\" or \
+         join = \"passed\""
+    )]
+    SettledJoinOnFixedContext { task: String, kind: &'static str },
     #[error(
         "task {task:?} is required and joins on {dependency:?} with join = \"all\", but \
          {dependency:?} is advisory and allowed to fail. Set join = \"passed\" on {task:?}, or \
@@ -504,6 +516,20 @@ impl Plan {
             }
             if t.join == Join::Passed && t.depends_on.is_empty() {
                 return Err(PlanError::JoinPassedWithoutDependencies { task: task() });
+            }
+            if t.join == Join::Settled {
+                if t.depends_on.is_empty() {
+                    return Err(PlanError::JoinSettledWithoutDependencies { task: task() });
+                }
+                if matches!(
+                    t.task,
+                    TaskKind::TopK { .. } | TaskKind::Report { .. } | TaskKind::Engine { .. }
+                ) {
+                    return Err(PlanError::SettledJoinOnFixedContext {
+                        task: task(),
+                        kind: t.task.label(),
+                    });
+                }
             }
             if t.required && t.join == Join::All {
                 for d in &t.depends_on {
@@ -1249,6 +1275,79 @@ mod tests {
             agent("measure", &["apply"]),
         ]);
         assert!(p.validate().is_ok());
+    }
+
+    /// A settled join names the dependencies it reports on, so a task that names none has
+    /// nothing to wait for and nothing to read.
+    #[test]
+    fn a_settled_join_needs_at_least_one_dependency() {
+        let mut tip = agent("report", &[]);
+        tip.join = Join::Settled;
+        assert_eq!(
+            plan(vec![tip]).validate().unwrap_err(),
+            PlanError::JoinSettledWithoutDependencies {
+                task: "report".to_owned()
+            }
+        );
+    }
+
+    /// The reducer, the engine-owned report, and every engine operation read their inputs
+    /// against a fixed typed context, so a per-dependency envelope has nowhere to land. `top_k`
+    /// and `report` never accept `join` from the DSL at all, so this arm is the JSON route's.
+    #[test]
+    fn a_settled_join_is_refused_on_a_task_with_a_fixed_input_context() {
+        let settled = |kind: TaskKind| {
+            let mut t = agent("tip", &["source"]);
+            t.task = kind;
+            t.join = Join::Settled;
+            let json = serde_json::to_string(&plan(vec![agent("source", &[]), t])).unwrap();
+            Plan::from_json_str(&json)
+                .unwrap()
+                .validate()
+                .expect_err("the plan validated")
+        };
+        for (kind, label) in [
+            (
+                TaskKind::TopK {
+                    k: 1,
+                    direction: Direction::Higher,
+                },
+                "top_k",
+            ),
+            (
+                TaskKind::Report {
+                    destination: ReportDestination::Slack(SlackDestination {}),
+                    template: "t".into(),
+                    result: None,
+                },
+                "report",
+            ),
+            (
+                TaskKind::Engine {
+                    op: EngineOp::Grade,
+                    source: None,
+                    tiebreak: None,
+                },
+                "engine_grade",
+            ),
+        ] {
+            assert_eq!(
+                settled(kind),
+                PlanError::SettledJoinOnFixedContext {
+                    task: "tip".to_owned(),
+                    kind: label,
+                }
+            );
+        }
+    }
+
+    /// A required task joining settled declares that it runs on whatever settled, so the
+    /// advisory-gates-required rule does not reach it.
+    #[test]
+    fn a_required_settled_task_may_join_an_advisory_dependency() {
+        let mut tip = agent("report", &["copy"]);
+        tip.join = Join::Settled;
+        assert!(plan(vec![advisory("copy", &[]), tip]).validate().is_ok());
     }
 
     #[test]

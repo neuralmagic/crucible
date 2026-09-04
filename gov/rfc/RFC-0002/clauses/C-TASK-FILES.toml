@@ -11,7 +11,7 @@ since = "0.1.0"
 text = """
 A task MAY declare emits_files: the workspace-relative paths its output includes as files. Each declared path MUST be relative, MUST NOT traverse outside the workspace, and MUST NOT reach a file outside the workspace through a link of any kind. A symbolic link is refused per path component; a hard link is not distinguishable by resolving the path, so the engine MUST establish confinement by a means that does not rely on resolution alone.
 
-When a task passes, the engine MUST capture each declared file. A declared file absent after an otherwise-passing attempt MUST convert that attempt to a measured failure at the producing task, MUST NOT be retried, and MUST block its dependents. This mirrors the rule for declared JSON output fields: output drift fails where it happened.
+When a task passes, the engine MUST capture each declared file. A declared file absent after an otherwise-passing attempt MUST convert that attempt to a measured failure at the producing task, MUST NOT be retried, and MUST block its dependents. This mirrors the rule for declared JSON output fields: output drift fails where it happened. A task that settles failing is captured too, under the additional provenance and withholding rules of [[RFC-0002:C-SETTLED-JOIN]], and its set is staged only along the edges that clause names.
 
 Captured files MUST be staged into a task's workspace before it is dispatched, for every ancestor on its dependency paths and not only its direct dependencies. A pipeline whose later stages need an earlier stage's artifact is the ordinary case, and requiring each hop to re-emit what it received would reproduce by hand the state files this replaces. JSON outputs keep the narrower direct-dependency rule.
 
