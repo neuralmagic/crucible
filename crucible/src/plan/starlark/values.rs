@@ -17,8 +17,9 @@ use starlark::values::{
 
 use crate::manifest::WorkflowCfg;
 use crate::plan::diag;
-use crate::plan::ir::{OutputField, OutputRef, Task};
+use crate::plan::ir::{ApprovalSourceSpec, OutputField, OutputRef, Task};
 use crate::plan::starlark::{CompileError, SessionDecl};
+use crucible_contract::JiraUntil;
 
 #[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
 pub(crate) struct TaskValue(#[allocative(skip)] pub(crate) Task);
@@ -192,3 +193,40 @@ impl Display for WorkflowValue {
 
 #[starlark_value(type = "workflow")]
 impl<'v> StarlarkValue<'v> for WorkflowValue {}
+
+/// Where an `approve` task's resolution comes from: `github_pr(...)` or `jira(...)`.
+#[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
+pub(crate) struct GateSourceValue(#[allocative(skip)] pub(crate) ApprovalSourceSpec);
+
+starlark_simple_value!(GateSourceValue);
+
+impl Display for GateSourceValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            ApprovalSourceSpec::Native => write!(f, "native"),
+            ApprovalSourceSpec::GithubPr { .. } => write!(f, "github_pr(...)"),
+            ApprovalSourceSpec::Jira { .. } => write!(f, "jira(...)"),
+        }
+    }
+}
+
+#[starlark_value(type = "approval_source")]
+impl<'v> StarlarkValue<'v> for GateSourceValue {}
+
+/// What a Jira issue must reach: `status("...")` or `label("...")`.
+#[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
+pub(crate) struct UntilValue(#[allocative(skip)] pub(crate) JiraUntil);
+
+starlark_simple_value!(UntilValue);
+
+impl Display for UntilValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            JiraUntil::Status(s) => write!(f, "status({s})"),
+            JiraUntil::Label(l) => write!(f, "label({l})"),
+        }
+    }
+}
+
+#[starlark_value(type = "until")]
+impl<'v> StarlarkValue<'v> for UntilValue {}

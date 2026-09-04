@@ -83,7 +83,7 @@ impl PriorPlan {
     /// version, same declared tasks), and only the tasks that passed. Engine operations are
     /// never seeded: the world a passing `propose` or `apply` produced did not survive the
     /// process, so they run again.
-    fn seed(&self, plan: &ValidPlan) -> BTreeMap<TaskName, TaskResult> {
+    pub(crate) fn seed(&self, plan: &ValidPlan) -> BTreeMap<TaskName, TaskResult> {
         let declared: Vec<String> = plan.plan().tasks.iter().map(|t| t.name.0.clone()).collect();
         if plan.plan().version != self.plan_version || declared != self.declared {
             return BTreeMap::new();
@@ -175,6 +175,7 @@ pub(crate) fn run_iteration<R: Reporter>(cx: IterCtx<'_>, r: &mut R) -> Result<(
             commit_per_task: false,
             captured_bytes: std::sync::atomic::AtomicU64::new(0),
             staged: Default::default(),
+            gate: crate::plan::gate::GateCtx::default(),
         },
     };
     // The runner and the on_result hook both need the reporter; collect the wire lines
@@ -422,6 +423,7 @@ pub(crate) fn run_epilogue<R: Reporter>(
             commit_per_task: false,
             captured_bytes: std::sync::atomic::AtomicU64::new(0),
             staged: Default::default(),
+            gate: crate::plan::gate::GateCtx::default(),
         },
         kept: kept.to_value(),
     };
@@ -792,7 +794,7 @@ impl<R: Reporter> TaskRunner for LoopTaskRunner<'_, R> {
                 source,
                 ..
             } => self.decide(task, source.as_ref()),
-            TaskKind::TopK { .. } => fail(
+            TaskKind::TopK { .. } | TaskKind::Approve { .. } => fail(
                 0.0,
                 format!(
                     "unexpected task kind in the loop template: {}",

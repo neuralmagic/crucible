@@ -10,6 +10,7 @@ pub mod artifact;
 pub mod ask;
 pub mod envelope;
 pub mod event;
+pub mod gate;
 pub mod identity;
 pub mod json;
 pub mod markers;
@@ -39,11 +40,15 @@ pub use artifact::{
 pub use ask::{Ask, AskKey, AskKeyError};
 pub use envelope::{Envelope, EnvelopeKind, SCHEMA_VERSION, TERMINATION_MESSAGE_CAP, Usage};
 pub use event::{AgentEvent, ModelUsage, RawStream, Tokens};
+pub use gate::{
+    ApprovalWaits, BadApprovalArg, GateDecision, GateResolution, GateSource, GateWait, JiraUntil,
+    ParkMode, PodApproval, PrUntil, gate_trace_id, parse_approval_arg,
+};
 pub use identity::{
     ComponentIdentity, FORMAT_VERSION as IDENTITY_FORMAT_VERSION, RigIdentity, RunIdentity,
 };
 pub use markers::{
-    ENV_INGEST_TOKEN_PATH, ENV_INGEST_URL, ENV_POD_NAME, INGEST_POD_NAME_CLAIM,
+    ENV_INGEST_TOKEN_PATH, ENV_INGEST_URL, ENV_POD_NAME, ENV_RESUME_OF, INGEST_POD_NAME_CLAIM,
     INGEST_TOKEN_AUDIENCE, MANAGED_BY_KEY, MANAGED_BY_SELECTOR, MANAGED_BY_VALUE,
     RANK_ACTIVITY_MARKER, RUN_SESSION_DELIMITER, SCOPE_ACTIVITY_MARKER, SCOPE_PACK_MARKER,
     SCOPE_PROGRESS_MARKER, SCOPE_REPORT_MARKER, SCOPE_TRANSCRIPT_MARKER, VERDICT_MARKER,

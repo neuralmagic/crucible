@@ -63,6 +63,7 @@ mod scope;
 mod selftest;
 mod session;
 mod stream;
+mod suspend;
 pub(crate) use crucible_harness::stream_json;
 
 use crucible::{
@@ -83,9 +84,12 @@ mod openshell {
 /// The plan runtime: the CLI and the agent-harness task runner over the library's plan IR,
 /// compiler, and executor.
 mod plan {
-    pub use crucible::plan::{TASK_NAME_ENV, exec, ir, runner, starlark, term_img, worktree};
+    pub use crucible::plan::{
+        ParkPolicy, TASK_NAME_ENV, exec, gate, ir, runner, starlark, term_img, worktree,
+    };
 
     pub mod cli;
+    pub mod gate_host;
     pub mod harness;
 }
 
@@ -298,6 +302,38 @@ pub(crate) enum Cmd {
         #[arg(long)]
         once: bool,
     },
+    /// Grant the approval gate a live run is parked on, over its control bridge.
+    Approve {
+        /// The live run's control-bridge address (host:port, from its `--control-port`).
+        #[arg(long)]
+        control_addr: String,
+        /// Who is approving, recorded with the grant.
+        #[arg(long)]
+        by: Option<String>,
+    },
+    /// Deny the approval gate a live run is parked on, over its control bridge.
+    Deny {
+        /// The live run's control-bridge address (host:port, from its `--control-port`).
+        #[arg(long)]
+        control_addr: String,
+        /// Why, recorded with the denial and shown as the gate's failure.
+        #[arg(long, default_value = "rejected")]
+        reason: String,
+        /// Who is denying, recorded with the denial.
+        #[arg(long)]
+        by: Option<String>,
+    },
+    /// Restore a suspended run's snapshot from the controller before resuming it: pulls the
+    /// `run-session` and `run-workspace` artifacts the pod named by `CRUCIBLE_RESUME_OF` left,
+    /// into `<into>/state` and `<into>/<workspace>`.
+    FetchResume {
+        /// The manifest directory the run lives in.
+        #[arg(long)]
+        into: PathBuf,
+        /// The workspace directory below `--into` (the manifest's `[workspace].dir`).
+        #[arg(long, default_value = "workspace")]
+        workspace: String,
+    },
     /// Download one published object at an exact `s3://bucket/key` URI to a local file, the general
     /// GetObject the controller's artifact proxy shells so no S3 client leaks into
     /// `crucible-controller`. Nothing is appended to the URI; the caller passes the exact key.
@@ -463,6 +499,27 @@ pub(crate) enum PlanAction {
         /// that pins its own model keeps it.
         #[arg(long, requires = "manifest")]
         model: Option<String>,
+        /// Continue the session log in the manifest's `state/` instead of starting fresh: tasks
+        /// the previous process settled are not re-dispatched, and a gate it left open is
+        /// re-entered.
+        #[arg(long, requires = "manifest")]
+        resume: bool,
+        /// A gate's resolution, `<trace_id>=granted|denied[:reason][@by]` (repeatable). The
+        /// trace id is on the `approval_wait` line the gate wrote.
+        #[arg(long = "approval", value_name = "TRACE=DECISION")]
+        approvals: Vec<String>,
+        /// What a gate does once it has parked for `--max-park`: fail as timed out, snapshot and
+        /// exit for a later `--resume`, or (`suspend`) snapshot at once without idling.
+        #[arg(long, value_enum, default_value_t = plan::ParkPolicy::ParkThenDeny)]
+        park_policy: plan::ParkPolicy,
+        /// How long a gate may idle (`30m`, `2h`). Absent: as long as it takes. A gate's own
+        /// `timeout` clamps it further.
+        #[arg(long)]
+        max_park: Option<String>,
+        /// Serve the control bridge on this port while the run is up, so `crucible approve`
+        /// can resolve a parked gate.
+        #[arg(long, requires = "manifest")]
+        control_port: Option<u16>,
     },
 }
 

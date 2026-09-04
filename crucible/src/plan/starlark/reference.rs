@@ -18,12 +18,18 @@ pub enum Lane {
     Common,
     /// The scored types (`autoresearch` and `custom`) only.
     Scored,
+    /// Playbooks only.
+    Playbook,
 }
 
 impl Lane {
     #[cfg(test)]
     fn includes(self, workflow: WorkflowType) -> bool {
-        self == Lane::Common || workflow != WorkflowType::Playbook
+        match self {
+            Lane::Common => true,
+            Lane::Scored => workflow != WorkflowType::Playbook,
+            Lane::Playbook => workflow == WorkflowType::Playbook,
+        }
     }
 }
 
@@ -233,6 +239,109 @@ pub fn functions() -> Vec<Function> {
                 ),
                 Kwarg::new("required", "bool", "False makes the report advisory."),
             ],
+        },
+        Function {
+            name: "approve",
+            lane: Lane::Playbook,
+            purpose: "A human gate. The graph waits here until the source resolves it: a grant \
+                      passes the task with the resolution as its output, a denial or a timeout \
+                      fails it.",
+            positional: None,
+            kwargs: vec![
+                name_kwarg(),
+                Kwarg::new(
+                    "summary",
+                    "str",
+                    "What the approver is deciding, shown with the gate.",
+                ),
+                Kwarg::new(
+                    "source",
+                    "\"native\" | github_pr(...) | jira(...)",
+                    "Where the resolution comes from. `native` (the default) is a person acting \
+                     through the controller or the control bridge.",
+                ),
+                Kwarg::new(
+                    "timeout",
+                    "str",
+                    "How long this gate may park before the run's park policy applies, e.g. `30m`.",
+                ),
+                Kwarg::new(
+                    "depends_on",
+                    "list[task]",
+                    "Dependencies. A source read from a task's field must name that task here.",
+                ),
+                Kwarg::new(
+                    "needs",
+                    "\"any\" | \"all\"",
+                    "How many dependencies must be admitted before the gate is reached.",
+                ),
+                Kwarg::new(
+                    "required",
+                    "bool",
+                    "False makes the gate advisory: a denial fails it without invalidating the run.",
+                ),
+                Kwarg::new(
+                    "join",
+                    "\"all\" | \"passed\" | \"settled\"",
+                    "Which dependencies must have passed before the gate is reached.",
+                ),
+                Kwarg::new(
+                    "stage",
+                    "\"iteration\" | \"epilogue\"",
+                    "`epilogue` gates the run's conclusion instead of its graph.",
+                ),
+            ],
+        },
+        Function {
+            name: "github_pr",
+            lane: Lane::Playbook,
+            purpose: "An approval source: a GitHub pull request reaching a state.",
+            positional: None,
+            kwargs: vec![
+                Kwarg::new(
+                    "url",
+                    "str | task.field",
+                    "The pull request, written out or read from an upstream task's emitted field.",
+                ),
+                Kwarg::new(
+                    "until",
+                    "\"approved\" | \"merged\"",
+                    "What resolves the gate: an authorized review approval or `/approve` comment \
+                     (the default), or the merge.",
+                ),
+            ],
+        },
+        Function {
+            name: "jira",
+            lane: Lane::Playbook,
+            purpose: "An approval source: a Jira issue reaching a status or carrying a label.",
+            positional: None,
+            kwargs: vec![
+                Kwarg::new(
+                    "key",
+                    "str | task.field",
+                    "The issue key, written out or read from an upstream task's emitted field.",
+                ),
+                Kwarg::new(
+                    "until",
+                    "status(...) | label(...)",
+                    "What resolves the gate.",
+                ),
+            ],
+        },
+        Function {
+            name: "status",
+            lane: Lane::Playbook,
+            purpose: "A Jira predicate: the issue's status name equals the argument.",
+            positional: Some("name"),
+            kwargs: vec![],
+        },
+        Function {
+            name: "label",
+            lane: Lane::Playbook,
+            purpose: "A Jira predicate: the issue carries the label.",
+            positional: Some("name"),
+            kwargs: vec![],
         },
         Function {
             name: "session",
@@ -513,6 +622,12 @@ pub fn markdown() -> String {
              have these in scope at all, so naming one is an unknown-name error and a \
              did-you-mean never offers one.",
         ),
+        (
+            Lane::Playbook,
+            "Playbooks only",
+            "Available to `type = \"playbook\"`. An approval gate parks the run until a person or \
+             an external item resolves it; the scored lanes have no gate in scope.",
+        ),
     ] {
         out.push_str(&format!("## {heading}\n\n{blurb}\n\n"));
         for function in functions().iter().filter(|f| f.lane == lane) {
@@ -583,6 +698,7 @@ pub fn json() -> serde_json::Value {
                 "lane": match function.lane {
                     Lane::Common => "common",
                     Lane::Scored => "scored",
+                    Lane::Playbook => "playbook",
                 },
                 "purpose": function.purpose,
                 "positional": function.positional,

@@ -125,6 +125,16 @@ pub(crate) struct ControlState {
     /// A rejected pending approval, drained by the park as the terminal "not granted"
     /// outcome.
     deny: Mutex<Option<(AdmissionKey, String)>>,
+    /// The approval gate a parked playbook is waiting on, and its resolution once an operator
+    /// `approve`/`deny` lands. Armed by the park, drained by it.
+    gate: Mutex<Option<GateSlot>>,
+}
+
+/// An armed approval gate on the bridge.
+#[derive(Debug, Clone)]
+pub(crate) struct GateSlot {
+    pub trace_id: String,
+    pub resolution: Option<crucible_contract::GateResolution>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -243,6 +253,37 @@ impl ControlState {
         self.deny.lock().ok()?.take()
     }
 
+    /// Arm the gate a parked run waits on, so an operator `approve`/`deny` resolves it.
+    pub(crate) fn arm_gate(&self, trace_id: String) {
+        if let Ok(mut slot) = self.gate.lock() {
+            *slot = Some(GateSlot {
+                trace_id,
+                resolution: None,
+            });
+        }
+    }
+
+    /// The armed gate's trace id, if one is armed.
+    pub(crate) fn armed_gate(&self) -> Option<String> {
+        self.gate.lock().ok()?.as_ref().map(|g| g.trace_id.clone())
+    }
+
+    /// Take the gate's resolution once an operator has sent one, disarming the gate.
+    pub(crate) fn take_gate_resolution(&self) -> Option<crucible_contract::GateResolution> {
+        let mut slot = self.gate.lock().ok()?;
+        if slot.as_ref().is_some_and(|g| g.resolution.is_some()) {
+            return slot.take().and_then(|g| g.resolution);
+        }
+        None
+    }
+
+    fn resolve_gate(&self, resolution: crucible_contract::GateResolution) -> Option<String> {
+        let mut slot = self.gate.lock().ok()?;
+        let gate = slot.as_mut()?;
+        gate.resolution = Some(resolution);
+        Some(gate.trace_id.clone())
+    }
+
     fn snapshot(&self) -> StatusSnapshot {
         let mut status = self
             .status
@@ -261,6 +302,34 @@ impl ControlState {
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst) + 1;
         stamp_session_line(line, seq).map(|stamped| (seq, stamped))
     }
+}
+
+/// Send one command line to a live run's control bridge and return its reply. The shape is
+/// exactly what [`parse_request`] accepts, so `crucible approve`, `crucible deny`, and the PR
+/// watcher all speak to the bridge the same way.
+pub(crate) fn send_command(addr: &str, command: &Value) -> Result<Value> {
+    let mut stream = TcpStream::connect(addr)
+        .with_context(|| format!("connecting to the control bridge at {addr}"))?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .context("setting the reply timeout")?;
+    writeln!(stream, "{command}").context("sending the command")?;
+    stream.flush().context("sending the command")?;
+    let mut reader = BufReader::new(stream);
+    // The bridge may interleave a status frame; the reply is the first frame carrying `cmd`.
+    for _ in 0..8 {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).context("reading the reply")?;
+        if n == 0 {
+            break;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(line.trim())
+            && v.get("cmd").is_some()
+        {
+            return Ok(v);
+        }
+    }
+    anyhow::bail!("the control bridge at {addr} sent no reply")
 }
 
 /// Start a detached TCP bridge thread. The listener binds to all interfaces so it works
@@ -500,20 +569,64 @@ fn apply_command(req: ControlRequest, state: &ControlState, ledger: &AdmissionLe
                 json!({"ok": true, "cmd": "rescope", "regime": regime})
             },
         ),
-        ControlCommand::Approve => admitted(ledger, id, AdmittedInput::Approve, |key| {
-            grant_approval(state, ledger, key)
-        }),
-        ControlCommand::Deny { reason } => admitted(
-            ledger,
-            id,
-            AdmittedInput::Deny {
-                reason: reason.clone(),
-            },
-            |key| {
-                supersede(ledger, state.set_deny(key.clone(), reason.clone()), key);
-                json!({"ok": true, "cmd": "deny", "reason": reason})
-            },
-        ),
+        ControlCommand::Approve { by } => {
+            if let Some(trace) = state.armed_gate() {
+                // A gate resolution is keyed by the gate itself, so a redelivered approve and a
+                // resume both converge on the one record.
+                let key = Some(AdmissionKey::approve(&trace));
+                return admitted(ledger, key, AdmittedInput::Approve, |key| {
+                    let resolution =
+                        crucible_contract::GateResolution::granted(by.clone(), "native");
+                    state.resolve_gate(resolution);
+                    let _ = ledger.settle(
+                        key,
+                        AdmissionOutcome::Applied,
+                        &format!("gate granted{}", by_suffix(by.as_deref())),
+                    );
+                    json!({"ok": true, "cmd": "approve", "trace_id": trace, "by": by})
+                });
+            }
+            admitted(ledger, id, AdmittedInput::Approve, |key| {
+                grant_approval(state, ledger, key)
+            })
+        }
+        ControlCommand::Deny { reason, by } => {
+            if let Some(trace) = state.armed_gate() {
+                let key = Some(AdmissionKey::approve(&trace));
+                return admitted(
+                    ledger,
+                    key,
+                    AdmittedInput::Deny {
+                        reason: reason.clone(),
+                    },
+                    |key| {
+                        let resolution = crucible_contract::GateResolution::denied(
+                            reason.clone(),
+                            by.clone(),
+                            "native",
+                        );
+                        state.resolve_gate(resolution);
+                        let _ = ledger.settle(
+                            key,
+                            AdmissionOutcome::Applied,
+                            &format!("gate denied: {reason}{}", by_suffix(by.as_deref())),
+                        );
+                        json!({"ok": true, "cmd": "deny", "trace_id": trace, "reason": reason, "by": by})
+                    },
+                );
+            }
+            admitted(
+                ledger,
+                id,
+                AdmittedInput::Deny {
+                    reason: reason.clone(),
+                },
+                |key| {
+                    supersede(ledger, state.set_deny(key.clone(), reason.clone()), key);
+                    json!({"ok": true, "cmd": "deny", "reason": reason})
+                },
+            )
+        }
         ControlCommand::Status => {
             json!({"ok": true, "cmd": "status", "status": state.snapshot()})
         }
@@ -639,6 +752,10 @@ fn stop_the_run(id: Option<AdmissionKey>, input: AdmittedInput, ledger: &Admissi
 }
 
 /// Settle the admission a newly-armed one displaced as superseded.
+fn by_suffix(by: Option<&str>) -> String {
+    by.map(|who| format!(" by {who}")).unwrap_or_default()
+}
+
 fn supersede(ledger: &AdmissionLedger, displaced: Option<AdmissionKey>, by: &AdmissionKey) {
     if let Some(old) = displaced {
         let _ = ledger.settle(
@@ -686,9 +803,12 @@ enum ControlCommand {
     Rescope {
         regime: String,
     },
-    Approve,
+    Approve {
+        by: Option<String>,
+    },
     Deny {
         reason: String,
+        by: Option<String>,
     },
     Status,
     /// Subscribe to the live session broadcast, replaying retained lines with `seq > from_seq`
@@ -742,13 +862,25 @@ fn parse_id(raw: Option<&Value>) -> std::result::Result<Option<AdmissionKey>, St
     Ok(Some(AdmissionKey::new(id)))
 }
 
+/// Who sent an approve/deny, when the sender says. Free text, bounded like a key.
+fn parse_by(value: &Value) -> Option<String> {
+    value
+        .get("by")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|by| !by.is_empty())
+        .map(|by| by.chars().take(MAX_KEY_LEN).collect())
+}
+
 fn command_from_name(cmd: &str, value: &Value) -> std::result::Result<ControlCommand, String> {
     match cmd {
         "abort" => Ok(ControlCommand::Abort),
         "stop" => Ok(ControlCommand::Stop),
         "pause" => Ok(ControlCommand::Pause),
         "resume" => Ok(ControlCommand::Resume),
-        "approve" => Ok(ControlCommand::Approve),
+        "approve" => Ok(ControlCommand::Approve {
+            by: parse_by(value),
+        }),
         "deny" => {
             // Reason is optional (an operator may just reject); default to a generic note.
             let reason = value
@@ -757,7 +889,10 @@ fn command_from_name(cmd: &str, value: &Value) -> std::result::Result<ControlCom
                 .unwrap_or("rejected")
                 .trim()
                 .to_string();
-            Ok(ControlCommand::Deny { reason })
+            Ok(ControlCommand::Deny {
+                reason,
+                by: parse_by(value),
+            })
         }
         "status" => Ok(ControlCommand::Status),
         "tail" => {
@@ -1133,11 +1268,11 @@ mod tests {
     fn parses_approve_command() {
         assert_eq!(
             parse_command(r#"{"cmd":"approve"}"#).unwrap(),
-            ControlCommand::Approve
+            ControlCommand::Approve { by: None }
         );
         assert_eq!(
             parse_command(r#""approve""#).unwrap(),
-            ControlCommand::Approve
+            ControlCommand::Approve { by: None }
         );
     }
 
@@ -1146,14 +1281,16 @@ mod tests {
         assert_eq!(
             parse_command(r#"{"cmd":"deny","reason":"over budget"}"#).unwrap(),
             ControlCommand::Deny {
-                reason: "over budget".into()
+                reason: "over budget".into(),
+                by: None,
             }
         );
         // Bare deny defaults its reason.
         assert_eq!(
             parse_command(r#""deny""#).unwrap(),
             ControlCommand::Deny {
-                reason: "rejected".into()
+                reason: "rejected".into(),
+                by: None,
             }
         );
     }

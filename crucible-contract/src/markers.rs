@@ -61,6 +61,10 @@ pub const ENV_INGEST_TOKEN_PATH: &str = "CRUCIBLE_INGEST_TOKEN_PATH";
 /// pod name by construction.
 pub const ENV_POD_NAME: &str = "CRUCIBLE_POD_NAME";
 
+/// Env var naming the suspended pod whose `run-session` and `run-workspace` artifacts a resumed
+/// pod restores before the engine starts. Absent = a fresh run with nothing to restore.
+pub const ENV_RESUME_OF: &str = "CRUCIBLE_RESUME_OF";
+
 /// The audience the ingest projected ServiceAccount token is minted for. The ingest extractor
 /// requires TokenReview to echo this audience, so the token is useless against the kube API or any
 /// other service.

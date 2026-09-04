@@ -193,6 +193,56 @@ pub enum TaskKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tiebreak: Option<TaskName>,
     },
+    /// A human gate. The graph waits here until the named source resolves it; a grant passes
+    /// the task with the resolution as its output, a denial or a timeout fails it.
+    Approve {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+        #[serde(default)]
+        source: ApprovalSourceSpec,
+        /// A per-gate park ceiling, clamping the run's `--max-park`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_secs: Option<u64>,
+    },
+}
+
+/// Where an `approve` task's resolution comes from, as authored. A GitHub PR url or a Jira key
+/// may be a literal or an upstream task's emitted field, resolved when the gate is dispatched.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ApprovalSourceSpec {
+    #[default]
+    Native,
+    GithubPr {
+        url: RefOrLiteral,
+        until: crucible_contract::PrUntil,
+    },
+    Jira {
+        key: RefOrLiteral,
+        until: crucible_contract::JiraUntil,
+    },
+}
+
+impl ApprovalSourceSpec {
+    /// The upstream field the source reads, when it reads one.
+    pub fn reference(&self) -> Option<&OutputRef> {
+        match self {
+            ApprovalSourceSpec::Native => None,
+            ApprovalSourceSpec::GithubPr { url: r, .. }
+            | ApprovalSourceSpec::Jira { key: r, .. } => match r {
+                RefOrLiteral::Output(reference) => Some(reference),
+                RefOrLiteral::Literal(_) => None,
+            },
+        }
+    }
+}
+
+/// A value an author wrote out, or one an upstream task emits.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RefOrLiteral {
+    Output(OutputRef),
+    Literal(String),
 }
 
 impl TaskKind {
@@ -204,6 +254,7 @@ impl TaskKind {
             TaskKind::Evaluate { .. } => "evaluate",
             TaskKind::Report { .. } => "report",
             TaskKind::TopK { .. } => "top_k",
+            TaskKind::Approve { .. } => "approve",
             TaskKind::Engine { op, .. } => match op {
                 EngineOp::Propose => "engine_propose",
                 EngineOp::Apply => "engine_apply",
@@ -377,6 +428,12 @@ pub enum PlanError {
         "task {task:?}: emits is not accepted on {kind} tasks; their outputs are engine-defined"
     )]
     EmitsOnEngineTask { task: String, kind: &'static str },
+    #[error("approve task {task:?} cannot take {what}: a gate waits, it does not run work")]
+    ApproveMisuse { task: String, what: &'static str },
+    #[error(
+        "approve task {task:?} reads its source from {from:?}, which is not among its dependencies"
+    )]
+    ApproveSourceNotDependency { task: String, from: String },
     #[error(
         "task {task:?} declares invalid output field {field:?}; use 1-64 ASCII letters, digits, or `_`"
     )]
@@ -671,6 +728,34 @@ impl Plan {
                 && !t.emits.iter().any(|f| f.0 == "score")
             {
                 return Err(PlanError::ThresholdedEvaluateOmitsScore { task: task() });
+            }
+            if let TaskKind::Approve { source, .. } = &t.task {
+                if !t.emits.is_empty() || !t.emits_files.is_empty() {
+                    return Err(PlanError::EmitsOnEngineTask {
+                        task: task(),
+                        kind: t.task.label(),
+                    });
+                }
+                if t.isolation.is_some() {
+                    return Err(PlanError::ApproveMisuse {
+                        task: task(),
+                        what: "isolation",
+                    });
+                }
+                if t.over.is_some() {
+                    return Err(PlanError::ApproveMisuse {
+                        task: task(),
+                        what: "over",
+                    });
+                }
+                if let Some(reference) = source.reference()
+                    && !t.depends_on.contains(&reference.task)
+                {
+                    return Err(PlanError::ApproveSourceNotDependency {
+                        task: task(),
+                        from: reference.task.0.clone(),
+                    });
+                }
             }
             if let Some(session) = &t.session {
                 if session.is_empty()

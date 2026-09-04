@@ -327,6 +327,8 @@ Running `crucible` without a subcommand starts an optimization loop and requires
 | `crucible plan show` | Validates and displays a work-graph plan. |
 | `crucible plan run` | Executes a plan with the shell runner or a manifest-backed agent. |
 | `crucible watch-pr` | Converts authorized pull-request review comments into live steering or a reseed file. |
+| `crucible approve` / `crucible deny` | Resolves the approval gate a live run is parked on, over its control bridge. |
+| `crucible fetch-resume` | Restores a suspended run's session log and workspace from the controller before resuming it. |
 | `crucible fetch` | Downloads one exact S3 object URI to a local file. |
 | `crucible rank-grounded` | Performs one read-only, code-grounded ranking turn over an existing checkout. |
 | `crucible build` | Executes a named build configuration and prints the resulting digest-pinned image reference. |

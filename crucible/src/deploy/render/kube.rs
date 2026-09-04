@@ -132,6 +132,13 @@ pub struct RenderOpts {
     /// Playbook launch: the wrapper runs `crucible plan run` over the manifest's `[workflow]` rather
     /// than the agent loop. `None` renders the loop.
     pub playbook: Option<PlaybookLaunch>,
+    /// What a playbook does when an approval gate has parked as long as it may. Rendered as
+    /// `--park-policy`; the default matches the CLI's.
+    pub park_policy: crate::plan::ParkPolicy,
+    /// A resumed run: restore a suspended predecessor's snapshot before the wrapper starts, and
+    /// hand the engine the gate resolutions the controller already holds. `None` renders a fresh
+    /// start.
+    pub resume: Option<ResumeRender>,
 }
 
 impl Default for RenderOpts {
@@ -146,6 +153,8 @@ impl Default for RenderOpts {
             harness: None,
             model: None,
             playbook: None,
+            park_policy: crate::plan::ParkPolicy::default(),
+            resume: None,
         }
     }
 }
@@ -166,6 +175,30 @@ pub struct PlaybookLaunch {
     pub max_time: crate::duration::MaxTime,
     pub max_cost: f64,
     pub params: BTreeMap<String, String>,
+}
+
+/// The knobs a resumed run supplies (see [`RenderOpts::resume`]).
+#[derive(Debug, Clone)]
+pub struct ResumeRender {
+    /// The suspended pod whose `run-session` and `run-workspace` artifacts this one restores.
+    pub of_pod: String,
+    /// Gate resolutions the controller settled while the run was suspended, by trace id.
+    pub approvals: Vec<(String, crucible_contract::GateResolution)>,
+}
+
+/// One `--approval` argument, in the grammar [`crucible_contract::parse_approval_arg`] reads
+/// back. A reason cannot carry `@`, which that grammar reserves for the resolver's name.
+fn approval_arg(trace: &str, resolution: &crucible_contract::GateResolution) -> String {
+    let mut arg = format!("{trace}={}", resolution.decision.as_str());
+    if let Some(reason) = resolution.reason.as_deref().filter(|r| !r.is_empty()) {
+        arg.push(':');
+        arg.push_str(&reason.replace('@', " "));
+    }
+    if let Some(by) = resolution.by.as_deref().filter(|b| !b.is_empty()) {
+        arg.push('@');
+        arg.push_str(by);
+    }
+    arg
 }
 
 /// The in-pod mount dir for the projected Tier 2 ingest ServiceAccount token (Tier 2 ingest). The turn
@@ -190,6 +223,10 @@ const PACK_WORKDIR_VOLUME: &str = "pack-workdir";
 /// A ConfigMap's hard size limit (1 MiB of keys). Packs are capped well under this upstream (#134);
 /// this is a defensive floor so an oversize pack fails the render loudly, not the kubelet silently.
 const CONFIGMAP_MAX_BYTES: usize = 900 * 1024;
+
+/// How long the kubelet waits between `preStop` and SIGKILL. Long enough for a parked run to
+/// notice the stop file, snapshot its workspace, and post it to the drop-box.
+const TERMINATION_GRACE_SECS: i64 = 300;
 
 /// POSIX single-quote one argv element for the `/bin/sh -c` wrapper.
 fn sh_quote(s: &str) -> String {
@@ -675,6 +712,7 @@ impl Renderer<'_> {
             env: Some(self.env()?),
             volume_mounts: Some(self.volume_mounts()),
             resources: Some(self.resources()),
+            lifecycle: Some(self.lifecycle()),
             ..Default::default()
         };
 
@@ -718,6 +756,7 @@ impl Renderer<'_> {
                 affinity: node_avoid_affinity(self.profile),
                 host_aliases: self.host_aliases(),
                 init_containers: self.init_containers(),
+                termination_grace_period_seconds: Some(TERMINATION_GRACE_SECS),
                 containers: vec![container],
                 volumes: Some(self.volumes()),
                 ..Default::default()
@@ -741,32 +780,129 @@ impl Renderer<'_> {
     /// projection into the writable domain-dir emptyDir so the main container reads AND writes there
     /// (`STEER.md`, `state/`, the workspace clone). `-L` dereferences the ConfigMap's `..data` symlinks
     /// into real files. Reuses the loop image (it has `/bin/sh` + `cp`), no extra pull.
+    /// The stop the kubelet delivers before SIGTERM. `ctrlc` handles SIGINT only, so a pod
+    /// deletion reaches the engine as the cross-process stop file instead: a parked run reads it,
+    /// settles, and under `park-then-suspend` snapshots itself rather than dying mid-gate.
+    fn lifecycle(&self) -> core::Lifecycle {
+        let control = format!("{}/state/control.json", self.domain_dir());
+        core::Lifecycle {
+            pre_stop: Some(core::LifecycleHandler {
+                exec: Some(core::ExecAction {
+                    command: Some(vec![
+                        "/bin/sh".to_string(),
+                        "-c".to_string(),
+                        format!(
+                            "mkdir -p {} && printf '{{\"stop\":true}}' > {}",
+                            sh_quote(&format!("{}/state", self.domain_dir())),
+                            sh_quote(&control)
+                        ),
+                    ]),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
     fn init_containers(&self) -> Option<Vec<core::Container>> {
-        let _pack = self.opts.pack.as_ref()?;
         let domain_dir = self.domain_dir();
-        Some(vec![core::Container {
-            name: "pack-stage".to_string(),
+        let mut init = Vec::new();
+        if self.opts.pack.is_some() {
+            init.push(core::Container {
+                name: "pack-stage".to_string(),
+                image: Some(self.image.clone()),
+                image_pull_policy: Some("IfNotPresent".to_string()),
+                command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
+                args: Some(vec![format!(
+                    "set -e\nmkdir -p {domain_dir}\ncp -rL {PACK_SRC_DIR}/. {domain_dir}/\n"
+                )]),
+                volume_mounts: Some(vec![
+                    core::VolumeMount {
+                        name: PACK_CM_VOLUME.to_string(),
+                        mount_path: PACK_SRC_DIR.to_string(),
+                        read_only: Some(true),
+                        ..Default::default()
+                    },
+                    core::VolumeMount {
+                        name: PACK_WORKDIR_VOLUME.to_string(),
+                        mount_path: domain_dir.clone(),
+                        ..Default::default()
+                    },
+                ]),
+                ..Default::default()
+            });
+        }
+        // After the pack: the staged domain dir is where the snapshot lands, so restoring first
+        // would have it copied over.
+        if let Some(resume) = &self.opts.resume {
+            init.push(self.resume_restore(resume, &domain_dir));
+        }
+        (!init.is_empty()).then_some(init)
+    }
+
+    /// Pull the suspended predecessor's `run-session` and `run-workspace` artifacts back into the
+    /// domain dir, so the wrapper's `--resume` sees only files. The drop-box env is the loop
+    /// container's own, and the pod token authorizes the read against `resume_of`.
+    fn resume_restore(&self, resume: &ResumeRender, domain_dir: &str) -> core::Container {
+        let workspace = Path::new(self.input.workspace_dir)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "workspace".to_string());
+        let mut env = vec![
+            core::EnvVar {
+                name: crucible_contract::ENV_RESUME_OF.to_string(),
+                value: Some(resume.of_pod.clone()),
+                value_from: None,
+            },
+            core::EnvVar {
+                name: crucible_contract::ENV_POD_NAME.to_string(),
+                value: None,
+                value_from: Some(core::EnvVarSource {
+                    field_ref: Some(core::ObjectFieldSelector {
+                        field_path: "metadata.name".to_string(),
+                        api_version: None,
+                    }),
+                    ..Default::default()
+                }),
+            },
+        ];
+        env.extend(self.ingest_env());
+        core::Container {
+            name: "resume-restore".to_string(),
             image: Some(self.image.clone()),
             image_pull_policy: Some("IfNotPresent".to_string()),
             command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
             args: Some(vec![format!(
-                "set -e\nmkdir -p {domain_dir}\ncp -rL {PACK_SRC_DIR}/. {domain_dir}/\n"
+                "set -e\ncrucible fetch-resume --into {} --workspace {}\n",
+                sh_quote(domain_dir),
+                sh_quote(&workspace)
             )]),
-            volume_mounts: Some(vec![
-                core::VolumeMount {
-                    name: PACK_CM_VOLUME.to_string(),
-                    mount_path: PACK_SRC_DIR.to_string(),
-                    read_only: Some(true),
-                    ..Default::default()
-                },
-                core::VolumeMount {
-                    name: PACK_WORKDIR_VOLUME.to_string(),
-                    mount_path: domain_dir,
-                    ..Default::default()
-                },
-            ]),
+            env: Some(env),
+            volume_mounts: Some(self.resume_mounts(domain_dir)),
             ..Default::default()
-        }])
+        }
+    }
+
+    /// What `resume-restore` writes into: the same domain dir the loop container sees, plus the
+    /// ingest token it reads the drop-box with.
+    fn resume_mounts(&self, domain_dir: &str) -> Vec<core::VolumeMount> {
+        let mut mounts = Vec::new();
+        if self.opts.pack.is_some() {
+            mounts.push(core::VolumeMount {
+                name: PACK_WORKDIR_VOLUME.to_string(),
+                mount_path: domain_dir.to_string(),
+                ..Default::default()
+            });
+        }
+        if self.ingest_url().is_some() {
+            mounts.push(core::VolumeMount {
+                name: INGEST_TOKEN_VOLUME.to_string(),
+                mount_path: INGEST_TOKEN_DIR.to_string(),
+                read_only: Some(true),
+                ..Default::default()
+            });
+        }
+        mounts
     }
 
     /// The broker-child + gate env, projected from the manifest (the source of truth) + the profile. The
@@ -967,15 +1103,36 @@ impl Renderer<'_> {
         // loop where to POST its run-session (and, when the R5 collector produced one, the otel log)
         // and where its projected `crucible-ingest`-audience token is. Absent = no drop-box; the loop
         // falls back to the `SESSION` delimiter the wrapper still emits (old controller / local run).
-        if let Some(ingest_url) = &self.profile.cluster.ingest_url {
-            env.push(plain(crucible_contract::ENV_INGEST_URL, ingest_url.clone()));
-            env.push(plain(
-                crucible_contract::ENV_INGEST_TOKEN_PATH,
-                format!("{INGEST_TOKEN_DIR}/token"),
-            ));
-        }
+        env.extend(self.ingest_env());
 
         Ok(env)
+    }
+
+    /// The controller's drop-box URL, when the profile names one.
+    fn ingest_url(&self) -> Option<&str> {
+        self.profile.cluster.ingest_url.as_deref()
+    }
+
+    /// The drop-box env: where to POST artifacts (and read them back), and the projected
+    /// `crucible-ingest`-audience token that authorizes both. Empty without a drop-box.
+    fn ingest_env(&self) -> Vec<core::EnvVar> {
+        let Some(url) = self.ingest_url() else {
+            return Vec::new();
+        };
+        [
+            (crucible_contract::ENV_INGEST_URL, url.to_string()),
+            (
+                crucible_contract::ENV_INGEST_TOKEN_PATH,
+                format!("{INGEST_TOKEN_DIR}/token"),
+            ),
+        ]
+        .into_iter()
+        .map(|(name, value)| core::EnvVar {
+            name: name.to_string(),
+            value: Some(value),
+            value_from: None,
+        })
+        .collect()
     }
 
     /// The container args: the openshell-loop wrapper. Captures the pristine per-component base sha
@@ -989,6 +1146,17 @@ impl Renderer<'_> {
     /// When it is absent (an old controller, or a local run) the wrapper falls back to the
     /// `SESSION (rc=…)` delimiter contract, the controller scrapes everything after the shared
     /// [`crucible_contract::RUN_SESSION_DELIMITER`] line as the run's session log.
+    /// The `--park-policy` token, taken from clap's vocabulary so the flag and the enum cannot
+    /// drift.
+    fn park_policy_name(&self) -> String {
+        use clap::ValueEnum as _;
+        self.opts
+            .park_policy
+            .to_possible_value()
+            .map(|v| v.get_name().to_string())
+            .unwrap_or_default()
+    }
+
     fn wrapper_script(&self) -> Result<String> {
         let domain_dir = self.domain_dir();
         let manifest_file = self.manifest_file;
@@ -1007,9 +1175,25 @@ impl Renderer<'_> {
             };
             let harness_flag = crate::deploy::render::turn::harness_flag(self.opts.harness, '=');
             let model_flag = crate::deploy::render::turn::model_flag(self.opts.model.as_ref(), '=');
+            let park_policy_flag = format!(" --park-policy={}", self.park_policy_name());
+            // A resume is named by the controller, not sniffed from the state dir: the init
+            // container restores the snapshot, and only the controller knows it did.
+            let (resume_flag, approval_flags) = match &self.opts.resume {
+                Some(resume) => (
+                    " --resume",
+                    resume
+                        .approvals
+                        .iter()
+                        .map(|(trace, r)| {
+                            format!(" --approval {}", sh_quote(&approval_arg(trace, r)))
+                        })
+                        .collect::<String>(),
+                ),
+                None => ("", String::new()),
+            };
             return Ok(format!(
                 r#"D={domain_dir}
-crucible plan run --manifest "$D/{manifest_file}" --max-cost {max_cost} --max-time {max_time}{driver_flag}{harness_flag}{model_flag}{param_flags}
+crucible plan run --manifest "$D/{manifest_file}" --max-cost {max_cost} --max-time {max_time}{driver_flag}{harness_flag}{model_flag}{park_policy_flag}{resume_flag}{approval_flags}{param_flags}
 rc=$?
 if [ -z "${{CRUCIBLE_INGEST_URL:-}}" ]; then
   echo "=================== {session_delimiter}$rc) ==================="
@@ -1818,6 +2002,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                ..Default::default()
             },
         )
         .expect("render");
@@ -1977,6 +2162,7 @@ mod tests {
                     harness: None,
                     model: None,
                     playbook: None,
+                    ..Default::default()
                 },
             )
             .expect("render")
@@ -2022,6 +2208,7 @@ mod tests {
                     harness,
                     model: model.map(str::to_string),
                     playbook: None,
+                    ..Default::default()
                 },
             )
             .expect("render")
@@ -2063,6 +2250,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                ..Default::default()
             },
         )
         .expect("render");
@@ -2178,6 +2366,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                ..Default::default()
             },
         )
         .expect("render");
@@ -2296,6 +2485,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                ..Default::default()
             },
         )
         .expect("render");
@@ -2353,6 +2543,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                ..Default::default()
             },
         )
         .expect("render")
@@ -2545,6 +2736,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                ..Default::default()
             },
         )
         .expect("render");
@@ -2622,6 +2814,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                ..Default::default()
             },
         )
         .expect("render");
@@ -2708,6 +2901,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                ..Default::default()
             },
         )
         .expect("render");
@@ -2803,6 +2997,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                ..Default::default()
             },
         )
         .expect("render");
@@ -2913,6 +3108,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                ..Default::default()
             },
         )
         .expect("render");
@@ -3028,6 +3224,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                ..Default::default()
             },
         )
         .expect("render");
@@ -3079,6 +3276,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                ..Default::default()
             },
         ) {
             Err(e) => e,
@@ -3184,6 +3382,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                ..Default::default()
             },
         )
         .expect("render")
@@ -3370,6 +3569,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                ..Default::default()
             },
         )
         .expect("render");
@@ -4001,6 +4201,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: Some(playbook),
+                ..Default::default()
             },
         )
         .expect("render")
@@ -4041,6 +4242,7 @@ mod tests {
                     harness,
                     model: model.map(str::to_string),
                     playbook: Some(playbook_launch()),
+                    ..Default::default()
                 },
             )
             .expect("render")
@@ -4048,7 +4250,7 @@ mod tests {
         let set = render_with(Some(crate::manifest::Harness::Codex), Some("gpt-5.6-luna"));
         assert!(
             set.contains(
-                "--compute-driver=kubernetes --harness=codex --model=gpt-5.6-luna --param"
+                "--compute-driver=kubernetes --harness=codex --model=gpt-5.6-luna --park-policy=park-then-deny --param"
             ),
             "{set}"
         );
@@ -4247,6 +4449,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: Some(playbook_launch()),
+                ..Default::default()
             },
         )
         .expect("render");
@@ -4255,5 +4458,165 @@ mod tests {
         assert!(yaml.contains("pack-stage"), "{yaml}");
         assert!(yaml.contains(PACK_WORKDIR_VOLUME), "{yaml}");
         assert!(yaml.contains("crucible plan run --manifest"), "{yaml}");
+    }
+
+    fn resume_render() -> ResumeRender {
+        ResumeRender {
+            of_pod: "crucible-run-42-a".to_string(),
+            approvals: vec![
+                (
+                    "approve:run-42:ship".to_string(),
+                    crucible_contract::GateResolution {
+                        decision: crucible_contract::GateDecision::Granted,
+                        reason: None,
+                        by: Some("wseaton".to_string()),
+                        source: Some("github_pr".to_string()),
+                    },
+                ),
+                (
+                    "approve:run-42:deploy".to_string(),
+                    crucible_contract::GateResolution {
+                        decision: crucible_contract::GateDecision::Denied,
+                        reason: Some("not this quarter".to_string()),
+                        by: None,
+                        source: Some("native".to_string()),
+                    },
+                ),
+            ],
+        }
+    }
+
+    fn render_playbook_opts(profile: &DeployProfile, opts: RenderOpts, dir: &Path) -> String {
+        let manifest = playbook_manifest();
+        let input = RenderInput::from_playbook_manifest(&manifest, "alpha");
+        render(input, dir, "crucible.toml", profile, &opts).expect("render")
+    }
+
+    /// Every `--approval` the renderer emits must parse back to the resolution it came from,
+    /// including the `by` the grammar reserves `@` for.
+    #[test]
+    fn approval_args_round_trip_through_the_contract_parser() {
+        for (trace, resolution) in resume_render().approvals {
+            let arg = approval_arg(&trace, &resolution);
+            let (back_trace, back) =
+                crucible_contract::parse_approval_arg(&arg).expect("the render's own arg parses");
+            assert_eq!(back_trace, trace, "{arg}");
+            assert_eq!(back.decision, resolution.decision, "{arg}");
+            assert_eq!(back.reason, resolution.reason, "{arg}");
+            assert_eq!(back.by, resolution.by, "{arg}");
+        }
+    }
+
+    /// A reason cannot carry `@`: the grammar reads everything after the last one as the resolver's
+    /// name, so an unescaped `@` would silently rewrite who denied the gate.
+    #[test]
+    fn an_at_sign_in_a_reason_cannot_forge_the_resolver() {
+        let arg = approval_arg(
+            "t",
+            &crucible_contract::GateResolution {
+                decision: crucible_contract::GateDecision::Denied,
+                reason: Some("ask ops@example.com".to_string()),
+                by: Some("real-denier".to_string()),
+                source: None,
+            },
+        );
+        let (_, back) = crucible_contract::parse_approval_arg(&arg).expect("parses");
+        assert_eq!(back.by.as_deref(), Some("real-denier"), "{arg}");
+        assert_eq!(back.reason.as_deref(), Some("ask ops example.com"), "{arg}");
+    }
+
+    /// The park policy is a substrate fact the pod cannot infer: without it every gate takes
+    /// clap's park-then-deny default, and a run the controller meant to suspend fails instead.
+    #[test]
+    fn playbook_wrapper_always_names_the_park_policy() {
+        let yaml = render_playbook(&k8s_profile(""), playbook_launch());
+        assert!(
+            yaml.contains("--park-policy=park-then-deny"),
+            "the default policy is still rendered explicitly: {yaml}"
+        );
+        let suspending = render_playbook_opts(
+            &k8s_profile(""),
+            RenderOpts {
+                playbook: Some(playbook_launch()),
+                park_policy: crate::plan::ParkPolicy::ParkThenSuspend,
+                ..Default::default()
+            },
+            std::path::Path::new("/opt/crucible/domains/alpha"),
+        );
+        assert!(
+            suspending.contains("--park-policy=park-then-suspend"),
+            "{suspending}"
+        );
+    }
+
+    /// A resumed pod restores its predecessor's snapshot in an init container, then runs with
+    /// `--resume` and the resolutions the controller already settled.
+    #[test]
+    fn a_resumed_playbook_restores_the_snapshot_and_replays_its_resolutions() {
+        let tmp = Scratch::new("resume-pack");
+        let dir = tmp.path().join("alpha");
+        std::fs::create_dir_all(&dir).expect("mkdir pack");
+        write_pack_dir(&dir);
+        let yaml = render_playbook_opts(
+            &k8s_profile(r#"ingest_url = "https://controller.example/ingest""#),
+            RenderOpts {
+                playbook: Some(playbook_launch()),
+                pack: Some(PackDelivery {
+                    configmap_name: "crucible-run-42-pack".to_string(),
+                }),
+                resume: Some(resume_render()),
+                ..Default::default()
+            },
+            &dir,
+        );
+        assert!(yaml.contains("name: resume-restore"), "{yaml}");
+        assert!(yaml.contains("crucible fetch-resume --into"), "{yaml}");
+        assert!(
+            yaml.contains("value: crucible-run-42-a"),
+            "the init container is told which pod to restore: {yaml}"
+        );
+        assert!(yaml.contains(crucible_contract::ENV_RESUME_OF), "{yaml}");
+        // The snapshot lands in the staged domain dir, so it must be restored after the pack copy
+        // rather than have the pack overwrite it.
+        let pack_at = yaml.find("name: pack-stage").expect("pack-stage rendered");
+        let resume_at = yaml.find("name: resume-restore").expect("resume-restore");
+        assert!(pack_at < resume_at, "pack-stage must run first: {yaml}");
+        assert!(yaml.contains(" --resume"), "{yaml}");
+        assert!(
+            yaml.contains("--approval 'approve:run-42:ship=granted@wseaton'"),
+            "{yaml}"
+        );
+        assert!(
+            yaml.contains("--approval 'approve:run-42:deploy=denied:not this quarter'"),
+            "{yaml}"
+        );
+    }
+
+    /// A fresh playbook pod carries neither the init container nor `--resume`: a resume is the
+    /// controller naming a predecessor, never something the pod discovers for itself.
+    #[test]
+    fn a_fresh_playbook_has_no_resume_container_and_no_resume_flag() {
+        let yaml = render_playbook(&k8s_profile(""), playbook_launch());
+        assert!(!yaml.contains("resume-restore"), "{yaml}");
+        assert!(!yaml.contains("--resume"), "{yaml}");
+        assert!(!yaml.contains("--approval"), "{yaml}");
+    }
+
+    /// A pod deletion must reach a parked run as a stop it can act on. `ctrlc` handles SIGINT
+    /// only, so the preStop hook writes the cross-process stop file and the grace period is long
+    /// enough for the run to snapshot itself before SIGKILL.
+    #[test]
+    fn every_pod_stops_gracefully_through_the_control_file() {
+        let yaml = render_k8s(&k8s_profile(""));
+        assert!(
+            yaml.contains("terminationGracePeriodSeconds: 300"),
+            "{yaml}"
+        );
+        assert!(yaml.contains("preStop:"), "{yaml}");
+        assert!(
+            yaml.contains("/opt/crucible/domains/alpha/state/control.json"),
+            "the hook writes the path the engine polls: {yaml}"
+        );
+        assert!(yaml.contains(r#"{"stop":true}"#), "{yaml}");
     }
 }

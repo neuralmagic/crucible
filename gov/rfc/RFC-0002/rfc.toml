@@ -29,6 +29,7 @@ clauses = [
     "clauses/C-PLAYBOOK-RESUME.toml",
     "clauses/C-REPORTS.toml",
     "clauses/C-SETTLED-JOIN.toml",
+    "clauses/C-PLAYBOOK-APPROVAL.toml",
 ]
 
 [[changelog]]
