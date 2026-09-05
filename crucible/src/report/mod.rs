@@ -14,7 +14,8 @@ pub(crate) mod session;
 pub(crate) mod stream;
 
 use crate::args::{Args, Paths};
-use crate::report::session::{Phase, Row};
+use crate::report::session::Row;
+use crucible_contract::LoopPhase;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -133,8 +134,8 @@ pub struct AgentTurn {
 pub trait Reporter {
     /// The run is starting with this goal and objective label.
     fn start(&mut self, goal: &str, objective: &str);
-    /// A new stage began.
-    fn phase(&mut self, phase: Phase);
+    /// The loop moved to `phase` at iteration `iter` (0 before the first).
+    fn phase(&mut self, phase: LoopPhase, iter: u32);
     /// A free-form progress note (setup steps, steer injection, ...).
     fn note(&mut self, msg: &str);
     /// A decided row (baseline / keep / discard); `solved` flags a winning fix.

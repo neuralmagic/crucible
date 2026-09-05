@@ -263,7 +263,7 @@ fn stderr_tail(stderr: &str) -> String {
 mod tests {
     use super::*;
     use crate::args::{Args, Paths};
-    use crate::report::session::{Phase, Row};
+    use crate::report::session::Row;
     use crate::report::{AgentTurn, Stop, TurnBudget};
 
     /// Collects notes; every other `Reporter` call is inert. Preflight only ever notes.
@@ -271,7 +271,7 @@ mod tests {
     struct Notes(Vec<String>);
     impl Reporter for Notes {
         fn start(&mut self, _: &str, _: &str) {}
-        fn phase(&mut self, _: Phase) {}
+        fn phase(&mut self, _: crucible_contract::LoopPhase, _: u32) {}
         fn note(&mut self, msg: &str) {
             self.0.push(msg.to_string());
         }

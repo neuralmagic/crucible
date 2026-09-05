@@ -9,8 +9,9 @@ use crate::agent;
 use crate::agent::event::{AgentEvent, RawStream};
 use crate::args::{Args, Paths};
 use crate::process::STOP;
-use crate::report::session::{Phase, Row};
+use crate::report::session::Row;
 use crate::report::{AgentTurn, Reporter, Stop, TurnBudget};
+use crucible_contract::LoopPhase;
 use std::io::{IsTerminal, Write};
 use std::sync::atomic::Ordering;
 
@@ -22,11 +23,10 @@ impl Reporter for ConsoleReporter {
         println!("== objective: {objective} ==");
     }
 
-    fn phase(&mut self, phase: Phase) {
+    fn phase(&mut self, phase: LoopPhase, iter: u32) {
         match phase {
-            Phase::Preflight => println!("== preflight =="),
-            Phase::Baseline => println!("== baseline =="),
-            Phase::Iteration(it) => println!("\n== iteration {it} =="),
+            LoopPhase::Iteration => println!("\n== iteration {iter} =="),
+            other => println!("== {other} =="),
         }
     }
 

@@ -705,6 +705,18 @@ A `row` event's wire record (`RowWire`) carries an additive, optional `phase` fi
 = "Option::is_none"`, so a deep-only run's wire bytes are unchanged from before wide rounds
 existed.
 
+A `phase` event's `phase` is one of `starting`/`preflight`/`baseline`/`wide`/`iteration`/
+`paused`/`parked`/`distressed`/`escalated`/`epilogue`/`finished`, the same token the control
+bridge's `status` reply carries, emitted once each time the loop's `(phase, iter)` pair changes.
+The three tokens logs carried before contract 1.3.0 are a subset, so old logs still decode.
+
+A `task_result` event whose `status` is `blocked` carries an additive `blocked` object:
+`{ reason, task? }` with `reason` one of `required_task_failed`/`budget_ceiling`/
+`wall_clock_ceiling`/`dependency_did_not_pass`/`staging_refused` and `task` naming the required
+task whose failure short-circuited the plan (present only for `required_task_failed`). `note`
+stays the rendered form of the same reason. `report.json`'s per-task entries carry the same
+object.
+
 Additive event kinds beyond the compat set include:
 
 - **`identity`**: the run's `RunIdentity` (below), emitted once at setup and again on

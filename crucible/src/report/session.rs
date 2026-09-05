@@ -1,9 +1,9 @@
-//! The in-process [`Row`] and [`Phase`] and their bridge to the session log wire format.
+//! The in-process [`Row`] and its bridge to the session log wire format.
 //!
 //! The wire format itself ([`SessionEvent`], [`RowWire`], [`PrLinkWire`], `encode`/`decode`) lives
-//! in `crucible_contract::session` and is re-exported here unchanged. This module adds the two
-//! CLI/in-process types that must stay out of the wire-format leaf and their conversions:
-//! [`IntoRow`] (`RowWire` -> `Row`) and [`SessionPhase`] (`SessionEvent` <-> `Phase`).
+//! in `crucible_contract::session` and is re-exported here unchanged. This module adds the one
+//! CLI/in-process type that must stay out of the wire-format leaf and its conversion:
+//! [`IntoRow`] (`RowWire` -> `Row`).
 
 pub use crucible_contract::session::*;
 
@@ -42,15 +42,6 @@ pub struct Row {
     /// The agent's whole CANDIDATE.md (`note` is its 120-char single-line fold). The PR
     /// body prints this; every table keeps using `note`. Empty when the agent wrote none.
     pub candidate_md: String,
-}
-
-/// Which stage of the loop is running, for the progress display.
-#[derive(Clone, Copy)]
-pub enum Phase {
-    /// The zero-agent-cost rung ladder against the unmodified tree, before any baseline.
-    Preflight,
-    Baseline,
-    Iteration(u32),
 }
 
 impl From<&Row> for RowWire {
@@ -99,60 +90,9 @@ impl IntoRow for RowWire {
     }
 }
 
-/// Bridges [`Phase`] (in-process state) to [`SessionEvent`]'s wire `Phase { phase, iter }` shape.
-/// A trait rather than an inherent impl since `SessionEvent` is defined in `crucible-contract`.
-pub trait SessionPhase: Sized {
-    /// Encode a [`Phase`] into the wire shape.
-    fn phase(p: Phase) -> Self;
-}
-
-impl SessionPhase for SessionEvent {
-    fn phase(p: Phase) -> Self {
-        match p {
-            Phase::Preflight => SessionEvent::Phase {
-                phase: "preflight".into(),
-                iter: 0,
-            },
-            Phase::Baseline => SessionEvent::Phase {
-                phase: "baseline".into(),
-                iter: 0,
-            },
-            Phase::Iteration(it) => SessionEvent::Phase {
-                phase: "iteration".into(),
-                iter: it,
-            },
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crucible_contract::session::{decode, encode};
-
-    /// The `Row`/`Phase` bridge round-trips through the wire codec exactly like every other
-    /// variant (the pure-wire round-trip is covered in `crucible_contract::session`'s own tests).
-    #[test]
-    fn phase_bridge_round_trips() {
-        for (phase, want_phase, want_iter) in [
-            (Phase::Preflight, "preflight", 0),
-            (Phase::Baseline, "baseline", 0),
-            (Phase::Iteration(2), "iteration", 2),
-        ] {
-            let ev = SessionEvent::phase(phase);
-            let line = encode(&ev);
-            let decoded = decode(&line).unwrap_or_else(|| panic!("decode failed: {line}"));
-            let SessionEvent::Phase {
-                phase: wire_phase,
-                iter,
-            } = decoded
-            else {
-                panic!("expected a Phase event, got {line}");
-            };
-            assert_eq!(wire_phase, want_phase);
-            assert_eq!(iter, want_iter);
-        }
-    }
 
     #[test]
     fn row_bridge_round_trips() {

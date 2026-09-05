@@ -17,6 +17,7 @@ use crate::args::Paths;
 use crate::control::admission::{AdmissionLedger, Admitted};
 use crate::process::STOP;
 use anyhow::{Context, Result};
+use crucible_contract::LoopPhase;
 use crucible_contract::admission::{
     AdmissionKey, AdmissionOutcome, AdmittedInput, MAX_KEY_LEN, SteerSource,
 };
@@ -135,49 +136,6 @@ pub(crate) struct ControlState {
     /// A rejected pending approval, drained by the park as the terminal "not granted"
     /// outcome.
     deny: Mutex<Option<(AdmissionKey, String)>>,
-}
-
-/// Where the loop is, as the control plane reports it. The serialized form is the `phase`
-/// token on the `status` reply; [`LoopPhase::as_str`] is the same token for anything that
-/// prints it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum LoopPhase {
-    Starting,
-    Preflight,
-    Baseline,
-    Wide,
-    Iteration,
-    Paused,
-    Parked,
-    Distressed,
-    Escalated,
-    Epilogue,
-    Finished,
-}
-
-impl LoopPhase {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            LoopPhase::Starting => "starting",
-            LoopPhase::Preflight => "preflight",
-            LoopPhase::Baseline => "baseline",
-            LoopPhase::Wide => "wide",
-            LoopPhase::Iteration => "iteration",
-            LoopPhase::Paused => "paused",
-            LoopPhase::Parked => "parked",
-            LoopPhase::Distressed => "distressed",
-            LoopPhase::Escalated => "escalated",
-            LoopPhase::Epilogue => "epilogue",
-            LoopPhase::Finished => "finished",
-        }
-    }
-}
-
-impl std::fmt::Display for LoopPhase {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
 }
 
 #[derive(Clone, Debug, Serialize)]

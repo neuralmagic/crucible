@@ -275,6 +275,9 @@ pub struct TaskResult {
     /// with the result rather than being inferred from its output's shape.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fanout: Option<FanoutSummary>,
+    /// Present exactly when `status` is [`TaskStatus::Blocked`]; `note` is its `Display`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked: Option<BlockedReason>,
 }
 
 impl TaskResult {
@@ -288,7 +291,10 @@ impl TaskResult {
 
 impl TaskResult {
     fn blocked(reason: &BlockedReason) -> Self {
-        Self::undispatched(TaskStatus::Blocked, reason.to_string())
+        TaskResult {
+            blocked: Some(reason.clone()),
+            ..Self::undispatched(TaskStatus::Blocked, reason.to_string())
+        }
     }
 
     fn undispatched(status: TaskStatus, note: impl Into<String>) -> Self {
@@ -299,6 +305,7 @@ impl TaskResult {
             output: None,
             note: Some(note.into()),
             fanout: None,
+            blocked: None,
         }
     }
 }
@@ -700,6 +707,7 @@ pub fn execute(
                         output: None,
                         note: Some(why),
                         fanout: None,
+                        blocked: None,
                     };
                     record(
                         &mut *runner,
@@ -1271,6 +1279,7 @@ fn fold_instances(settled: Vec<(String, TaskResult)>) -> TaskResult {
         )
     });
     TaskResult {
+        blocked: None,
         status: if failed == 0 {
             TaskStatus::Pass
         } else {
@@ -1393,6 +1402,7 @@ fn settle_attempt(
             output,
             note,
             fanout: None,
+            blocked: None,
         },
         event,
     ))
@@ -1426,6 +1436,7 @@ fn transport_result(
             output: None,
             note: Some(note),
             fanout: None,
+            blocked: None,
         },
         event,
     )
@@ -1560,6 +1571,7 @@ fn reduce_top_k(inputs: &BTreeMap<TaskName, Value>, k: u32, direction: Direction
                     output: None,
                     note: Some(format!("input {name} has no finite numeric `score` field")),
                     fanout: None,
+                    blocked: None,
                 };
             }
         }
@@ -1580,6 +1592,7 @@ fn reduce_top_k(inputs: &BTreeMap<TaskName, Value>, k: u32, direction: Direction
         output: Some(serde_json::json!({ "kept": kept })),
         note: None,
         fanout: None,
+        blocked: None,
     }
 }
 
@@ -1941,6 +1954,10 @@ mod tests {
 
         assert!(!out.valid);
         assert_eq!(out.results[&"grade".into()].status, TaskStatus::Blocked);
+        assert_eq!(
+            out.results[&"grade".into()].blocked,
+            Some(BlockedReason::DependencyDidNotPass)
+        );
         assert_eq!(
             runner.dispatched,
             vec![("trace".to_string(), 1), ("racecheck".to_string(), 1)]
@@ -3198,6 +3215,7 @@ mod tests {
             output: Some(serde_json::json!({"targets": ["alpha"]})),
             note: None,
             fanout: None,
+            blocked: None,
         };
         for status in [
             TaskStatus::Fail,
