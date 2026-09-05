@@ -1233,7 +1233,7 @@ emits = ["verdict", "dirty"]
     /// session to the Tier 2 drop-box exactly as a loop run does, on the failing path too.
     #[test]
     fn manifest_plan_run_delivers_its_session_to_the_dropbox() {
-        let _guard = crate::testing::test_env_lock();
+        let _guard = crucible::test_support::env_lock();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let receiver = std::thread::spawn(move || {

@@ -2618,7 +2618,7 @@ mod tests {
 
     #[test]
     fn info_and_warn_notes_fold_onto_the_decided_row() {
-        let _g = crate::control::distress::testing::env_lock();
+        let _g = crucible::test_support::env_lock();
         let root = crate::control::distress::testing::Root::new("loop-notes");
         std::fs::write(
             root.dir.join("distress-notes.jsonl"),
@@ -2642,7 +2642,7 @@ mod tests {
 
     #[test]
     fn turn_meta_is_stamped_for_the_distress_page() {
-        let _g = crate::control::distress::testing::env_lock();
+        let _g = crucible::test_support::env_lock();
         let root = crate::control::distress::testing::Root::new("loop-turnmeta");
         write_turn_meta(7, 12.5);
         let v: serde_json::Value = serde_json::from_str(
@@ -3096,7 +3096,7 @@ mod tests {
     }
 
     fn fixture(iterations: u32, max_cost: f64, no_early_stop: bool) -> Fixture {
-        let _lock = crate::control::distress::testing::env_lock();
+        let _lock = crucible::test_support::env_lock();
         let dir = tempfile_dir::TempDir::new();
         let workspace = dir.path().to_path_buf();
         let state = workspace.join("state");

@@ -644,7 +644,7 @@ mod tests {
     /// Serializes the tests that point the process-global GITHUB_API_URL at a listener, the
     /// crate-wide guard shared with `scope`/`run` so cross-module env races can't happen.
     fn github_env_lock() -> std::sync::MutexGuard<'static, ()> {
-        crate::testing::test_env_lock()
+        crucible::test_support::env_lock()
     }
 
     /// The turn's two no-verdict cases must not collapse into one: a failed turn names the

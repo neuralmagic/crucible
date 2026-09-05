@@ -306,7 +306,7 @@ mod tests {
 
     #[test]
     fn from_env_needs_all_three_vars() {
-        let _guard = crate::testing::test_env_lock();
+        let _guard = crucible::test_support::env_lock();
         for k in [
             crucible_contract::ENV_INGEST_URL,
             crucible_contract::ENV_INGEST_TOKEN_PATH,

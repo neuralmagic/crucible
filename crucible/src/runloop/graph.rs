@@ -605,7 +605,7 @@ impl<R: Reporter> LoopTaskRunner<R> {
             },
             TurnVerdict::Discard => {
                 self.signal = Some(Signal::Discard("turn failed".to_string()));
-                fail(cost, "turn failed; iteration discarded".to_string())
+                Attempt::failed(cost, "turn failed; iteration discarded".to_string())
             }
             // Transport-class turn death: hand the executor a Transport outcome so
             // `run_with_retries` re-runs the turn (the session resumes where it died).
@@ -615,15 +615,15 @@ impl<R: Reporter> LoopTaskRunner<R> {
             },
             TurnVerdict::Escalate => {
                 self.signal = Some(Signal::Escalate);
-                fail(cost, "agent escalated".to_string())
+                Attempt::failed(cost, "agent escalated".to_string())
             }
             TurnVerdict::Park(pp) => {
                 self.signal = Some(Signal::Park(pp));
-                fail(cost, "parked on a pending approval".to_string())
+                Attempt::failed(cost, "parked on a pending approval".to_string())
             }
             TurnVerdict::Stop => {
                 self.signal = Some(Signal::Stop);
-                fail(cost, "stop signal".to_string())
+                Attempt::failed(cost, "stop signal".to_string())
             }
         }
     }
@@ -638,7 +638,7 @@ impl<R: Reporter> LoopTaskRunner<R> {
                     self.it
                 ));
                 self.signal = Some(Signal::Discard(format!("apply failed: {e:#}")));
-                fail(0.0, format!("apply failed: {e:#}"))
+                Attempt::failed(0.0, format!("apply failed: {e:#}"))
             }
         }
     }
@@ -658,7 +658,7 @@ impl<R: Reporter> LoopTaskRunner<R> {
             Err(e) => {
                 // Propagate after the executor unwinds.
                 self.fatal = Some(e);
-                fail(0.0, "measure errored; aborting the run".to_string())
+                Attempt::failed(0.0, "measure errored; aborting the run".to_string())
             }
         }
     }
@@ -671,16 +671,16 @@ impl<R: Reporter> LoopTaskRunner<R> {
         inputs: &BTreeMap<TaskName, Value>,
     ) -> Attempt {
         let Some(source) = source else {
-            return fail(0.0, "grade dispatched without a score source".to_string());
+            return Attempt::failed(0.0, "grade dispatched without a score source".to_string());
         };
         let Some(primary) = inputs.get(source) else {
-            return fail(
+            return Attempt::failed(
                 0.0,
                 format!("grade score source {source} did not produce passing evidence"),
             );
         };
         let Some(score) = primary.get("score").and_then(Value::as_f64) else {
-            return fail(
+            return Attempt::failed(
                 0.0,
                 format!("grade score source {source} has no numeric `score`"),
             );
@@ -753,14 +753,14 @@ impl<R: Reporter> LoopTaskRunner<R> {
 
     fn decide(&mut self, task: &Task, source: Option<&TaskName>) -> Attempt {
         let Some(source) = source else {
-            return fail(
+            return Attempt::failed(
                 0.0,
                 "decide dispatched without a measurement source".to_string(),
             );
         };
         // Admission prevents two decisions from consuming one measurement.
         let Some(m) = self.measured.remove(source) else {
-            return fail(
+            return Attempt::failed(
                 0.0,
                 format!("decide source {source} has no measured candidate"),
             );
@@ -818,7 +818,7 @@ impl<R: Reporter> TaskRunner for LoopTaskRunner<R> {
                 op: EngineOp::MeasureDiff,
                 ..
             }
-            | TaskKind::TopK { .. } => fail(
+            | TaskKind::TopK { .. } => Attempt::failed(
                 0.0,
                 format!(
                     "unexpected task kind in the loop template: {}",
@@ -871,13 +871,6 @@ fn pass(v: Value) -> Attempt {
     Attempt {
         outcome: AttemptOutcome::Pass(v),
         cost_usd: 0.0,
-    }
-}
-
-fn fail(cost_usd: f64, note: String) -> Attempt {
-    Attempt {
-        outcome: AttemptOutcome::fail(note),
-        cost_usd,
     }
 }
 
@@ -1163,10 +1156,10 @@ impl<R: Reporter> WideRunner<'_, R> {
             self.measure_note_emitted = true;
         }
         if STOP.load(Ordering::SeqCst) {
-            return fail(0.0, "stop requested".to_string());
+            return Attempt::failed(0.0, "stop requested".to_string());
         }
         let Some(id) = candidate_id(&task.name) else {
-            return fail(0.0, format!("task {} has no candidate id", task.name));
+            return Attempt::failed(0.0, format!("task {} has no candidate id", task.name));
         };
         let approach = self.approaches.get(&id).cloned().unwrap_or_default();
         let diff = inputs
@@ -1186,7 +1179,7 @@ impl<R: Reporter> WideRunner<'_, R> {
                 phase: Some("wide".into()),
                 ..Default::default()
             });
-            return fail(0.0, "no diff produced".to_string());
+            return Attempt::failed(0.0, "no diff produced".to_string());
         }
         self.r.note(&format!(
             "wide candidate {id}: measuring (approach: {approach})"
@@ -1195,7 +1188,7 @@ impl<R: Reporter> WideRunner<'_, R> {
             self.r
                 .note(&format!("wide candidate {id}: apply failed: {e:#}"));
             if !self.restore_or_fatal() {
-                return fail(0.0, "restore failed".to_string());
+                return Attempt::failed(0.0, "restore failed".to_string());
             }
             self.rows.push(Row {
                 iter: 0,
@@ -1204,13 +1197,13 @@ impl<R: Reporter> WideRunner<'_, R> {
                 phase: Some("wide".into()),
                 ..Default::default()
             });
-            return fail(0.0, format!("apply failed: {e:#}"));
+            return Attempt::failed(0.0, format!("apply failed: {e:#}"));
         }
         if let Err(e) = self.world.apply() {
             self.r
                 .note(&format!("wide candidate {id}: world apply failed: {e:#}"));
             if !self.restore_or_fatal() {
-                return fail(0.0, "restore failed".to_string());
+                return Attempt::failed(0.0, "restore failed".to_string());
             }
             self.rows.push(Row {
                 iter: 0,
@@ -1219,7 +1212,7 @@ impl<R: Reporter> WideRunner<'_, R> {
                 phase: Some("wide".into()),
                 ..Default::default()
             });
-            return fail(0.0, format!("world apply failed: {e:#}"));
+            return Attempt::failed(0.0, format!("world apply failed: {e:#}"));
         }
         let ctx = MeasureCtx {
             baseline_score: Some(self.baseline_score),
@@ -1252,13 +1245,13 @@ impl<R: Reporter> WideRunner<'_, R> {
                 self.r.row(&row, false);
                 self.rows.push(row);
                 if !self.restore_or_fatal() {
-                    return fail(0.0, "restore failed".to_string());
+                    return Attempt::failed(0.0, "restore failed".to_string());
                 }
                 match reading.score {
                     Some(s) if s.is_finite() => pass(serde_json::json!({ "score": s })),
                     // The reducer needs a finite number, so a scoreless candidate
                     // does not rank.
-                    _ => fail(0.0, "no finite score to rank".to_string()),
+                    _ => Attempt::failed(0.0, "no finite score to rank".to_string()),
                 }
             }
             Err(e) => {
@@ -1272,9 +1265,9 @@ impl<R: Reporter> WideRunner<'_, R> {
                     ..Default::default()
                 });
                 if !self.restore_or_fatal() {
-                    return fail(0.0, "restore failed".to_string());
+                    return Attempt::failed(0.0, "restore failed".to_string());
                 }
-                fail(0.0, format!("measure failed: {e:#}"))
+                Attempt::failed(0.0, format!("measure failed: {e:#}"))
             }
         }
     }
@@ -1286,12 +1279,15 @@ impl<R: Reporter> TaskRunner for WideRunner<'_, R> {
             TaskKind::Agent { prompt, .. } => {
                 // A batch of one (wide n=1) lands here instead of run_many.
                 let Some(id) = candidate_id(&task.name) else {
-                    return fail(0.0, format!("task {} has no candidate id", task.name));
+                    return Attempt::failed(0.0, format!("task {} has no candidate id", task.name));
                 };
                 let pending = match crate::plan::worktree::capture_diff(&self.p.workspace) {
                     Ok(p) => p,
                     Err(e) => {
-                        return fail(0.0, format!("capturing the workspace state failed: {e:#}"));
+                        return Attempt::failed(
+                            0.0,
+                            format!("capturing the workspace state failed: {e:#}"),
+                        );
                     }
                 };
                 wide_propose(
@@ -1308,7 +1304,7 @@ impl<R: Reporter> TaskRunner for WideRunner<'_, R> {
                 op: EngineOp::MeasureDiff,
                 ..
             } => self.measure_diff(task, inputs),
-            other => fail(
+            other => Attempt::failed(
                 0.0,
                 format!(
                     "unexpected task kind in the wide template: {}",
@@ -1329,7 +1325,10 @@ impl<R: Reporter> TaskRunner for WideRunner<'_, R> {
             Ok(p) => p,
             Err(e) => {
                 let note = format!("capturing the workspace state failed: {e:#}");
-                return batch.iter().map(|_| fail(0.0, note.clone())).collect();
+                return batch
+                    .iter()
+                    .map(|_| Attempt::failed(0.0, note.clone()))
+                    .collect();
             }
         };
         std::thread::scope(|s| {
@@ -1349,15 +1348,18 @@ impl<R: Reporter> TaskRunner for WideRunner<'_, R> {
                         Some((id, prompt)) => {
                             wide_propose(&args, &workspace, &wide_dir, skills, id, &prompt, pending)
                         }
-                        None => fail(0.0, "non-agent task in a propose batch".to_string()),
+                        None => {
+                            Attempt::failed(0.0, "non-agent task in a propose batch".to_string())
+                        }
                     })
                 })
                 .collect();
             handles
                 .into_iter()
                 .map(|h| {
-                    h.join()
-                        .unwrap_or_else(|_| fail(0.0, "propose thread panicked".to_string()))
+                    h.join().unwrap_or_else(|_| {
+                        Attempt::failed(0.0, "propose thread panicked".to_string())
+                    })
                 })
                 .collect()
         })
@@ -1382,20 +1384,20 @@ fn wide_propose(
     }
     let worktree = wide_dir.join(format!("candidate-{id}"));
     if let Err(e) = crate::plan::worktree::setup(workspace, &worktree, pending) {
-        return fail(0.0, format!("worktree setup failed: {e:#}"));
+        return Attempt::failed(0.0, format!("worktree setup failed: {e:#}"));
     }
     let cand_paths = Paths::for_worktree(worktree.clone(), skills);
     let _ = std::fs::create_dir_all(&cand_paths.state);
     let turn = agent::run_turn(args, &cand_paths, prompt, false, |_line, _stream, _ev| {});
     if let Some(failure) = turn.failure() {
         let _ = std::fs::remove_dir_all(&worktree);
-        return fail(turn.cost_usd, failure.to_string());
+        return Attempt::failed(turn.cost_usd, failure.to_string());
     }
     let diff = crate::plan::worktree::capture_diff(&worktree);
     let _ = std::fs::remove_dir_all(&worktree);
     match diff {
         Ok(diff) => pass(serde_json::json!({ "diff": diff })),
-        Err(e) => fail(0.0, format!("capturing the candidate diff failed: {e:#}")),
+        Err(e) => Attempt::failed(0.0, format!("capturing the candidate diff failed: {e:#}")),
     }
 }
 

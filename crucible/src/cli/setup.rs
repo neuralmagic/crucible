@@ -7,7 +7,7 @@ use crate::control::broker;
 use crate::manifest;
 use anyhow::{Context, Result};
 use crucible_vcs::vcs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// What the frozen manifest projects onto a run: the bounds the broker enforces, and the grants
 /// the capability disclosure covers.
@@ -190,11 +190,7 @@ pub(crate) fn prep_plan_runner_with_params(
     agent: crate::args::AgentOverride,
 ) -> Result<(crate::plan::harness::HarnessRunner, manifest::Manifest)> {
     let mut m = manifest::Manifest::load_frozen(manifest_path)?;
-    let manifest_dir = manifest_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
+    let manifest_dir = manifest::manifest_dir(manifest_path);
     m.resolve_workflow_with(&manifest_dir, params)?;
     let workspace = manifest_dir.join(&m.workspace.dir);
     let state = manifest_dir.join("state");
@@ -467,7 +463,7 @@ mod tests {
     /// credentials and no-ops the whole run (synthetic "Not logged in" result, subtype=success, $0).
     #[test]
     fn openshell_backend_relays_pod_vertex_env_when_manifest_has_none() {
-        let _guard = crate::testing::test_env_lock();
+        let _guard = crucible::test_support::env_lock();
         unsafe {
             std::env::set_var("CLAUDE_CODE_USE_VERTEX", "1");
         }
@@ -516,7 +512,7 @@ mod tests {
     /// The manifest's `[agent.env]` stays authoritative, the relay only fills missing keys.
     #[test]
     fn manifest_agent_env_wins_over_the_pod_env() {
-        let _guard = crate::testing::test_env_lock();
+        let _guard = crucible::test_support::env_lock();
         unsafe {
             std::env::set_var("ANTHROPIC_VERTEX_PROJECT_ID", "proj-from-pod");
         }
@@ -563,7 +559,7 @@ mod tests {
     /// natively, so `args.env` stays exactly the manifest's.
     #[test]
     fn command_backend_does_not_relay_the_pod_env() {
-        let _guard = crate::testing::test_env_lock();
+        let _guard = crucible::test_support::env_lock();
         unsafe {
             std::env::set_var("CLAUDE_CODE_USE_VERTEX", "1");
         }

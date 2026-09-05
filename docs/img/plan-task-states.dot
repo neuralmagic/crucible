@@ -27,7 +27,6 @@ digraph task {
     Pending -> Blocked [label="budget ceiling", color="#8a4b1c", fontcolor="#8a4b1c"];
     Pending -> Blocked [label="wall clock ceiling", color="#8a4b1c", fontcolor="#8a4b1c"];
     Pending -> Blocked [label="staging refused", color="#8a4b1c", fontcolor="#8a4b1c"];
-    Pending -> Blocked [label="plan halted", color="#8a4b1c", fontcolor="#8a4b1c"];
     Pending -> Truncated [label="plan truncated", color="#8a4b1c", fontcolor="#8a4b1c"];
     Pending -> Fail [label="fanout items invalid", color="#8a4b1c", fontcolor="#8a4b1c"];
     Running -> Pass [label="passed"];

@@ -139,14 +139,6 @@ pub fn check_profile(
     out
 }
 
-fn manifest_dir_of(manifest_path: &Path) -> PathBuf {
-    manifest_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
 /// One warning naming every `[agent].env` credential with no `[[capabilities.secret]]` entry
 /// stating its reach (RFC-0001:C-CAPABILITY-DISCLOSURE). A warning, not a finding.
 fn undeclared_credential_warnings(m: &Manifest) -> Vec<String> {
@@ -173,7 +165,7 @@ fn check_single(manifest_path: &Path) -> Result<CheckOutcome> {
         Ok(m) => m,
         Err(e) => return Ok(CheckOutcome::fail(format!("manifest parse failed: {e:#}"))),
     };
-    let manifest_dir = manifest_dir_of(manifest_path);
+    let manifest_dir = crate::manifest::manifest_dir(manifest_path);
     let workspace = manifest_dir.join(&m.workspace.dir);
 
     let mut out = CheckOutcome {
@@ -348,7 +340,7 @@ fn check_composite(manifest_path: &Path) -> Result<CheckOutcome> {
             )));
         }
     };
-    let manifest_dir = manifest_dir_of(manifest_path);
+    let manifest_dir = crate::manifest::manifest_dir(manifest_path);
 
     let mut out = CheckOutcome {
         exposure: crate::exposure::render(&crate::exposure::compute_composite(&m)),

@@ -6,18 +6,6 @@ use clap::Parser;
 use std::fs;
 use std::path::PathBuf;
 
-/// One crate-wide lock for tests that mutate a process-global env var (`GITHUB_API_URL`, …). The
-/// environ is a single global, so per-module locks wouldn't serialize tests in different modules
-/// racing through it (`scope`, `run`, `rank_grounded` all point `GITHUB_API_URL` at a local
-/// listener); this is the one guard they share.
-pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
-    use std::sync::{Mutex, OnceLock};
-    static L: OnceLock<Mutex<()>> = OnceLock::new();
-    L.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-}
-
 pub(crate) fn manifest_toml(effort_line: &str) -> String {
     format!(
         r#"

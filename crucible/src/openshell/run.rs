@@ -1514,7 +1514,7 @@ mod tests {
 
     #[test]
     fn codex_auth_selection_can_switch_between_named_keys_and_chatgpt() {
-        let _guard = crate::testing::test_env_lock();
+        let _guard = crucible::test_support::env_lock();
         const KEY: &str = "CRUCIBLE_TEST_WORK";
         let key_env = codex_api_key_env(Some(KEY));
         assert_eq!(key_env, "OPENAI_API_KEY_CRUCIBLE_TEST_WORK");
@@ -1547,7 +1547,7 @@ mod tests {
 
     #[test]
     fn explicit_api_auth_never_silently_falls_back_to_chatgpt() {
-        let _guard = crate::testing::test_env_lock();
+        let _guard = crucible::test_support::env_lock();
         const KEY: &str = "CRUCIBLE_TEST_MISSING";
         let key_env = codex_api_key_env(Some(KEY));
         unsafe { std::env::remove_var(&key_env) };
@@ -1823,7 +1823,7 @@ mod tests {
     /// controller that sends no list withholds everything rather than leaking each secret.
     #[test]
     fn only_the_named_projections_reach_the_agent() {
-        let _guard = crate::testing::test_env_lock();
+        let _guard = crucible::test_support::env_lock();
         let secrets = [
             decl("pr", Some("GH_TOKEN")),
             decl("push", Some("REG_TOKEN")),
@@ -1862,7 +1862,7 @@ mod tests {
     /// Unset relays nothing, so a deploy that names no identity is unchanged.
     #[test]
     fn the_run_identity_reaches_the_agent_and_a_manifest_value_wins() {
-        let _guard = crate::testing::test_env_lock();
+        let _guard = crucible::test_support::env_lock();
         for key in crate::openshell::policy::IDENTITY_RELAY_KEYS {
             unsafe { std::env::remove_var(key) };
         }
@@ -1905,7 +1905,7 @@ mod tests {
     /// A file projection has no env name to relay, and a manifest value is not overwritten.
     #[test]
     fn a_file_projection_relays_nothing_and_a_manifest_value_wins() {
-        let _guard = crate::testing::test_env_lock();
+        let _guard = crucible::test_support::env_lock();
         let secrets = [decl("kube", None), decl("pr", Some("GH_TOKEN"))];
         unsafe {
             std::env::set_var(AGENT_VISIBLE_ENV, "GH_TOKEN");
@@ -1933,7 +1933,7 @@ mod tests {
 
     #[test]
     fn relay_copies_set_nonempty_keys_and_skips_empty_and_unset() {
-        let _guard = crate::testing::test_env_lock();
+        let _guard = crucible::test_support::env_lock();
         clear_relay_keys();
         unsafe {
             std::env::set_var("CLAUDE_CODE_USE_VERTEX", "1");
@@ -1963,7 +1963,7 @@ mod tests {
 
     #[test]
     fn manifest_provided_values_win_over_the_process_env() {
-        let _guard = crate::testing::test_env_lock();
+        let _guard = crucible::test_support::env_lock();
         clear_relay_keys();
         unsafe {
             std::env::set_var("ANTHROPIC_VERTEX_PROJECT_ID", "from-process");

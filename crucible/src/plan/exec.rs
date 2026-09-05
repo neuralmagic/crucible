@@ -93,6 +93,22 @@ pub struct Attempt {
     pub cost_usd: f64,
 }
 
+impl Attempt {
+    pub fn failed(cost_usd: f64, note: String) -> Self {
+        Self {
+            outcome: AttemptOutcome::fail(note),
+            cost_usd,
+        }
+    }
+
+    pub fn transport(note: String) -> Self {
+        Self {
+            outcome: AttemptOutcome::Transport(note),
+            cost_usd: 0.0,
+        }
+    }
+}
+
 /// One task of a concurrent dispatch batch (see [`TaskRunner::run_many`]).
 pub struct BatchItem<'a> {
     pub task: &'a Task,
@@ -304,18 +320,41 @@ pub enum PlanExit {
     TimeExceeded,
 }
 
-impl PlanExit {
-    /// The plan-machine event that fixes this exit; `Completed` is not a halt.
-    fn event(&self) -> Option<PlanEvent> {
-        Some(match self {
-            PlanExit::Completed => return None,
-            PlanExit::Truncated { .. } => PlanEvent::RequiredTaskUnrunnable,
-            PlanExit::ShortCircuit { .. } => PlanEvent::RequiredTaskFailed,
-            PlanExit::BudgetExceeded => PlanEvent::BudgetCeiling,
-            PlanExit::TimeExceeded => PlanEvent::WallClockCeiling,
-        })
+/// Why the plan stopped dispatching, fixed on the first halt. Everything still pending settles
+/// as blocked on this reason.
+enum Halt {
+    ShortCircuit(TaskName),
+    Budget,
+    Time,
+}
+
+impl Halt {
+    fn exit(&self) -> PlanExit {
+        match self {
+            Halt::ShortCircuit(task) => PlanExit::ShortCircuit { task: task.clone() },
+            Halt::Budget => PlanExit::BudgetExceeded,
+            Halt::Time => PlanExit::TimeExceeded,
+        }
     }
 
+    fn event(&self) -> PlanEvent {
+        match self {
+            Halt::ShortCircuit(_) => PlanEvent::RequiredTaskFailed,
+            Halt::Budget => PlanEvent::BudgetCeiling,
+            Halt::Time => PlanEvent::WallClockCeiling,
+        }
+    }
+
+    fn blocked(&self) -> BlockedReason {
+        match self {
+            Halt::ShortCircuit(task) => BlockedReason::RequiredTaskFailed(task.clone()),
+            Halt::Budget => BlockedReason::BudgetCeiling,
+            Halt::Time => BlockedReason::WallClockCeiling,
+        }
+    }
+}
+
+impl PlanExit {
     /// The shutdown-outcome token this exit reports, in the vocabulary the shutdown event
     /// carries. A run whose graph completed without passing every required task is still an
     /// error, which the caller decides from the verdict rather than from the exit.
@@ -420,7 +459,7 @@ pub fn execute(
     let mut results: BTreeMap<TaskName, TaskResult> = BTreeMap::new();
     let mut spent = 0.0f64;
     let budget = plan.plan().budget.usd;
-    let mut halted: Option<PlanExit> = None;
+    let mut halted: Option<Halt> = None;
 
     // Readiness scan: repeated topo passes. Each pass settles everything decidable
     // without dispatch (halt-blocked, skipped, dep-failed, over-budget), then dispatches
@@ -436,7 +475,7 @@ pub fn execute(
                       event: TaskEvent,
                       results: &mut BTreeMap<TaskName, TaskResult>,
                       machines: &mut BTreeMap<TaskName, TaskMachine>,
-                      halted: &mut Option<PlanExit>,
+                      halted: &mut Option<Halt>,
                       plan_machine: &mut PlanMachine,
                       gates: bool|
      -> Result<(), IllegalTransition> {
@@ -451,13 +490,7 @@ pub fn execute(
         on_result(t, &r);
         results.insert(t.name.clone(), r);
         if gates && failed && t.required && t.stage == Stage::Iteration {
-            halt(
-                halted,
-                plan_machine,
-                PlanExit::ShortCircuit {
-                    task: t.name.clone(),
-                },
-            )?;
+            halt(halted, plan_machine, Halt::ShortCircuit(t.name.clone()))?;
         }
         Ok(())
     };
@@ -479,18 +512,11 @@ pub fn execute(
             // The epilogue is what reports a required failure, so a short-circuit is the one
             // halt it outlives. A ceiling still blocks it.
             let reports_the_short_circuit =
-                t.stage == Stage::Epilogue && matches!(halted, Some(PlanExit::ShortCircuit { .. }));
-            if let Some(exit) = &halted
+                t.stage == Stage::Epilogue && matches!(halted, Some(Halt::ShortCircuit(_)));
+            if let Some(halt) = &halted
                 && !reports_the_short_circuit
             {
-                let reason = match exit {
-                    PlanExit::ShortCircuit { task } => {
-                        BlockedReason::RequiredTaskFailed(task.clone())
-                    }
-                    PlanExit::BudgetExceeded => BlockedReason::BudgetCeiling,
-                    PlanExit::TimeExceeded => BlockedReason::WallClockCeiling,
-                    _ => BlockedReason::Halted,
-                };
+                let reason = halt.blocked();
                 let r = TaskResult::blocked(&reason);
                 record(
                     &mut *runner,
@@ -558,7 +584,7 @@ pub fn execute(
                 continue;
             }
             if spent >= budget {
-                halt(&mut halted, &mut plan_machine, PlanExit::BudgetExceeded)?;
+                halt(&mut halted, &mut plan_machine, Halt::Budget)?;
                 let reason = BlockedReason::BudgetCeiling;
                 let r = TaskResult::blocked(&reason);
                 record(
@@ -580,7 +606,7 @@ pub fn execute(
                 .wall_clock
                 .is_some_and(|limit| started.elapsed() >= limit)
             {
-                halt(&mut halted, &mut plan_machine, PlanExit::TimeExceeded)?;
+                halt(&mut halted, &mut plan_machine, Halt::Time)?;
                 let reason = BlockedReason::WallClockCeiling;
                 let r = TaskResult::blocked(&reason);
                 record(
@@ -754,7 +780,7 @@ pub fn execute(
                         let (batch_results, budget_exceeded) =
                             run_batch_with_retries(batch, cfg, runner, &mut spent, budget);
                         if budget_exceeded {
-                            halt(&mut halted, &mut plan_machine, PlanExit::BudgetExceeded)?;
+                            halt(&mut halted, &mut plan_machine, Halt::Budget)?;
                         }
                         for ((task, result, event), key) in batch_results.into_iter().zip(&keys) {
                             runner.settled(task, result.status == TaskStatus::Pass);
@@ -777,19 +803,15 @@ pub fn execute(
                         // dispatched until this one has settled.
                         for (instance, key) in instances.iter().zip(&keys) {
                             if spent >= budget {
-                                halt(&mut halted, &mut plan_machine, PlanExit::BudgetExceeded)?;
+                                halt(&mut halted, &mut plan_machine, Halt::Budget)?;
                             } else if cfg
                                 .wall_clock
                                 .is_some_and(|limit| started.elapsed() >= limit)
                             {
-                                halt(&mut halted, &mut plan_machine, PlanExit::TimeExceeded)?;
+                                halt(&mut halted, &mut plan_machine, Halt::Time)?;
                             }
-                            if let Some(exit) = &halted {
-                                let reason = match exit {
-                                    PlanExit::BudgetExceeded => BlockedReason::BudgetCeiling,
-                                    PlanExit::TimeExceeded => BlockedReason::WallClockCeiling,
-                                    _ => BlockedReason::Halted,
-                                };
+                            if let Some(halt) = &halted {
+                                let reason = halt.blocked();
                                 let r = TaskResult::blocked(&reason);
                                 settled.push((key.clone(), r.clone()));
                                 record(
@@ -818,7 +840,7 @@ pub fn execute(
                                 budget,
                             );
                             if budget_exceeded {
-                                halt(&mut halted, &mut plan_machine, PlanExit::BudgetExceeded)?;
+                                halt(&mut halted, &mut plan_machine, Halt::Budget)?;
                             }
                             runner.settled(instance, result.status == TaskStatus::Pass);
                             settled.push((key.clone(), result.clone()));
@@ -880,7 +902,7 @@ pub fn execute(
                 }
             };
             if budget_exceeded {
-                halt(&mut halted, &mut plan_machine, PlanExit::BudgetExceeded)?;
+                halt(&mut halted, &mut plan_machine, Halt::Budget)?;
             }
             runner.settled(t, result.status == TaskStatus::Pass);
             record(
@@ -915,7 +937,7 @@ pub fn execute(
             let (batch_results, budget_exceeded) =
                 run_batch_with_retries(batch, cfg, runner, &mut spent, budget);
             if budget_exceeded {
-                halt(&mut halted, &mut plan_machine, PlanExit::BudgetExceeded)?;
+                halt(&mut halted, &mut plan_machine, Halt::Budget)?;
             }
             for (t, result, event) in batch_results {
                 runner.settled(t, result.status == TaskStatus::Pass);
@@ -935,7 +957,10 @@ pub fn execute(
     }
 
     plan_machine.advance(PlanEvent::Settled)?;
-    let exit = halted.unwrap_or(PlanExit::Completed);
+    let exit = halted
+        .as_ref()
+        .map(Halt::exit)
+        .unwrap_or(PlanExit::Completed);
     let valid = exit == PlanExit::Completed
         && plan
             .tasks_topo()
@@ -951,17 +976,15 @@ pub fn execute(
 
 /// Fix the plan's exit on its first halt; later ceilings do not change how it ended.
 fn halt(
-    halted: &mut Option<PlanExit>,
+    halted: &mut Option<Halt>,
     plan_machine: &mut PlanMachine,
-    exit: PlanExit,
+    halt: Halt,
 ) -> Result<(), IllegalTransition> {
     if halted.is_some() {
         return Ok(());
     }
-    if let Some(event) = exit.event() {
-        plan_machine.advance(event)?;
-    }
-    *halted = Some(exit);
+    plan_machine.advance(halt.event())?;
+    *halted = Some(halt);
     Ok(())
 }
 
@@ -1153,7 +1176,7 @@ fn settled_entry(r: &TaskResult, files: bool) -> serde_json::Map<String, Value> 
 fn main_graph_outcome(
     plan: &ValidPlan,
     results: &BTreeMap<TaskName, TaskResult>,
-    halted: Option<&PlanExit>,
+    halted: Option<&Halt>,
 ) -> Value {
     let tasks: serde_json::Map<String, Value> = plan
         .tasks_topo()
@@ -1164,7 +1187,7 @@ fn main_graph_outcome(
         })
         .collect();
     serde_json::json!({
-        "exit": halted.unwrap_or(&PlanExit::Completed).shutdown_token(),
+        "exit": halted.map(Halt::exit).unwrap_or(PlanExit::Completed).shutdown_token(),
         "tasks": Value::Object(tasks),
     })
 }
@@ -1343,6 +1366,73 @@ fn enforce_emits(task: &Task, outcome: AttemptOutcome) -> AttemptOutcome {
     }
 }
 
+/// A finished attempt as the task's result, or the transport note when it should be retried.
+fn settle_attempt(
+    outcome: AttemptOutcome,
+    attempts: u32,
+    cost_usd: f64,
+) -> Result<(TaskResult, TaskEvent), String> {
+    let (status, output, note, event) = match outcome {
+        AttemptOutcome::Pass(output) => (TaskStatus::Pass, Some(output), None, TaskEvent::Passed),
+        AttemptOutcome::Skipped(output, note) => (
+            TaskStatus::Skipped,
+            Some(output),
+            Some(note),
+            TaskEvent::SkippedByTask,
+        ),
+        AttemptOutcome::Fail { note, output } => {
+            (TaskStatus::Fail, output, Some(note), TaskEvent::Failed)
+        }
+        AttemptOutcome::Transport(note) => return Err(note),
+    };
+    Ok((
+        TaskResult {
+            status,
+            attempts,
+            cost_usd,
+            output,
+            note,
+            fanout: None,
+        },
+        event,
+    ))
+}
+
+/// A task that died on transport and will not be retried: the retries ran out, or the budget
+/// did with retries still allowed.
+fn transport_result(
+    attempts: u32,
+    max_attempts: u32,
+    cost_usd: f64,
+    note: &str,
+    cut_by_budget: bool,
+) -> (TaskResult, TaskEvent) {
+    let (note, event) = if cut_by_budget {
+        (
+            format!("budget ceiling reached after transport attempt: {note}"),
+            TaskEvent::TransportCutByBudget,
+        )
+    } else {
+        (
+            format!("transport retries exhausted ({max_attempts} attempts): {note}"),
+            TaskEvent::TransportExhausted,
+        )
+    };
+    (
+        TaskResult {
+            status: TaskStatus::Transport,
+            attempts,
+            cost_usd,
+            output: None,
+            note: Some(note),
+            fanout: None,
+        },
+        event,
+    )
+}
+
+/// Run one task, retrying transport-class failures up to `cfg.transport_retries` times while
+/// the budget allows. The flag says whether this task's spend crossed the budget.
 fn run_with_retries(
     t: &Task,
     inputs: &BTreeMap<TaskName, Value>,
@@ -1360,90 +1450,25 @@ fn run_with_retries(
         let a = runner.run(t, attempts, inputs);
         cost += a.cost_usd;
         *spent += a.cost_usd;
-        match enforce_emits(t, a.outcome) {
-            AttemptOutcome::Pass(output) => {
-                return (
-                    TaskResult {
-                        status: TaskStatus::Pass,
-                        attempts,
-                        cost_usd: cost,
-                        output: Some(output),
-                        note: None,
-                        fanout: None,
-                    },
-                    TaskEvent::Passed,
-                    *spent > budget,
-                );
-            }
-            AttemptOutcome::Skipped(output, note) => {
-                return (
-                    TaskResult {
-                        status: TaskStatus::Skipped,
-                        attempts,
-                        cost_usd: cost,
-                        output: Some(output),
-                        note: Some(note),
-                        fanout: None,
-                    },
-                    TaskEvent::SkippedByTask,
-                    *spent > budget,
-                );
-            }
-            AttemptOutcome::Fail { note, output } => {
-                return (
-                    TaskResult {
-                        status: TaskStatus::Fail,
-                        attempts,
-                        cost_usd: cost,
-                        output,
-                        note: Some(note),
-                        fanout: None,
-                    },
-                    TaskEvent::Failed,
-                    *spent > budget,
-                );
-            }
-            AttemptOutcome::Transport(note) => {
+        match settle_attempt(enforce_emits(t, a.outcome), attempts, cost) {
+            Ok((result, event)) => return (result, event, *spent > budget),
+            Err(note) => {
                 if *spent > budget || (*spent >= budget && attempts < max_attempts) {
-                    return (
-                        TaskResult {
-                            status: TaskStatus::Transport,
-                            attempts,
-                            cost_usd: cost,
-                            output: None,
-                            note: Some(format!(
-                                "budget ceiling reached after transport attempt: {note}"
-                            )),
-                            fanout: None,
-                        },
-                        TaskEvent::TransportCutByBudget,
-                        true,
-                    );
+                    let (result, event) =
+                        transport_result(attempts, max_attempts, cost, &note, true);
+                    return (result, event, true);
                 }
                 last_transport_note = note;
             }
         }
     }
-    (
-        TaskResult {
-            status: TaskStatus::Transport,
-            attempts,
-            cost_usd: cost,
-            output: None,
-            note: Some(format!(
-                "transport retries exhausted ({max_attempts} attempts): {last_transport_note}"
-            )),
-            fanout: None,
-        },
-        TaskEvent::TransportExhausted,
-        *spent > budget,
-    )
+    let (result, event) =
+        transport_result(attempts, max_attempts, cost, &last_transport_note, false);
+    (result, event, *spent > budget)
 }
 
-/// Run a concurrent batch through [`TaskRunner::run_many`], re-batching the
-/// transport-failed subset until everything is terminal or retries are exhausted:
-/// the same bounded-retry semantics as the serial path, one wave per attempt number.
-/// Returns results paired with their tasks in the batch's (declaration) order.
+/// Run a batch of isolated tasks through the runner's parallel path, retrying the transport
+/// failures as a smaller wave until every task has a result or retries run out.
 fn run_batch_with_retries<'a>(
     batch: Vec<BatchItem<'a>>,
     cfg: ExecCfg,
@@ -1452,7 +1477,6 @@ fn run_batch_with_retries<'a>(
     budget: f64,
 ) -> (Vec<(&'a Task, TaskResult, TaskEvent)>, bool) {
     let max_attempts = 1 + cfg.transport_retries;
-    // (batch position, accumulated cost) so the final fold restores declaration order.
     let mut done: BTreeMap<usize, (TaskResult, TaskEvent)> = BTreeMap::new();
     let mut cost_so_far: Vec<f64> = vec![0.0; batch.len()];
     let order: Vec<&'a Task> = batch.iter().map(|b| b.task).collect();
@@ -1480,56 +1504,11 @@ fn run_batch_with_retries<'a>(
         budget_exceeded |= *spent > budget;
         let mut next: Vec<(usize, BatchItem<'a>)> = Vec::new();
         for (idx, item, outcome) in attempted {
-            match outcome {
-                AttemptOutcome::Pass(output) => {
-                    done.insert(
-                        idx,
-                        (
-                            TaskResult {
-                                status: TaskStatus::Pass,
-                                attempts: item.attempt,
-                                cost_usd: cost_so_far[idx],
-                                output: Some(output),
-                                note: None,
-                                fanout: None,
-                            },
-                            TaskEvent::Passed,
-                        ),
-                    );
+            match settle_attempt(outcome, item.attempt, cost_so_far[idx]) {
+                Ok(settled) => {
+                    done.insert(idx, settled);
                 }
-                AttemptOutcome::Skipped(output, note) => {
-                    done.insert(
-                        idx,
-                        (
-                            TaskResult {
-                                status: TaskStatus::Skipped,
-                                attempts: item.attempt,
-                                cost_usd: cost_so_far[idx],
-                                output: Some(output),
-                                note: Some(note),
-                                fanout: None,
-                            },
-                            TaskEvent::SkippedByTask,
-                        ),
-                    );
-                }
-                AttemptOutcome::Fail { note, output } => {
-                    done.insert(
-                        idx,
-                        (
-                            TaskResult {
-                                status: TaskStatus::Fail,
-                                attempts: item.attempt,
-                                cost_usd: cost_so_far[idx],
-                                output,
-                                note: Some(note),
-                                fanout: None,
-                            },
-                            TaskEvent::Failed,
-                        ),
-                    );
-                }
-                AttemptOutcome::Transport(note) => {
+                Err(note) => {
                     if item.attempt < max_attempts && !retry_budget_blocked {
                         next.push((
                             idx,
@@ -1540,34 +1519,16 @@ fn run_batch_with_retries<'a>(
                             },
                         ));
                     } else {
-                        if item.attempt < max_attempts && retry_budget_blocked {
-                            budget_exceeded = true;
-                        }
                         let cut_by_budget = item.attempt < max_attempts;
+                        budget_exceeded |= cut_by_budget;
                         done.insert(
                             idx,
-                            (
-                                TaskResult {
-                                    status: TaskStatus::Transport,
-                                    attempts: item.attempt,
-                                    cost_usd: cost_so_far[idx],
-                                    output: None,
-                                    note: Some(if cut_by_budget {
-                                        format!(
-                                            "budget ceiling reached after transport attempt: {note}"
-                                        )
-                                    } else {
-                                        format!(
-                                            "transport retries exhausted ({max_attempts} attempts): {note}"
-                                        )
-                                    }),
-                                    fanout: None,
-                                },
-                                if cut_by_budget {
-                                    TaskEvent::TransportCutByBudget
-                                } else {
-                                    TaskEvent::TransportExhausted
-                                },
+                            transport_result(
+                                item.attempt,
+                                max_attempts,
+                                cost_so_far[idx],
+                                &note,
+                                cut_by_budget,
                             ),
                         );
                     }

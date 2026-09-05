@@ -1104,7 +1104,7 @@ fn goal_from_issue(repo: &str, number: u64) -> Result<String, crate::scope::issu
 /// Fall back to the pack manifest's own `[agent].goal`/`goal_file` (composite and single-domain
 /// manifests share the same `[agent]` shape).
 fn manifest_goal(manifest_path: &Path) -> Result<(String, String)> {
-    let manifest_dir = manifest_dir_of(manifest_path);
+    let manifest_dir = crate::manifest::manifest_dir(manifest_path);
     let agent = load_agent_cfg(manifest_path)?;
     match (&agent.goal, &agent.goal_file) {
         (Some(g), _) => Ok((g.clone(), "pack manifest [agent].goal".to_string())),
@@ -1133,18 +1133,10 @@ fn load_agent_cfg(manifest_path: &Path) -> Result<manifest::AgentCfg> {
     }
 }
 
-fn manifest_dir_of(manifest_path: &Path) -> PathBuf {
-    manifest_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
 /// Build the pack's `RunIdentity` (single-domain or composite), the same freeze fingerprint a
 /// run stamps at startup, computed here before any loop iteration exists.
 fn compute_identity(manifest_path: &Path) -> Result<RunIdentity> {
-    let manifest_dir = manifest_dir_of(manifest_path);
+    let manifest_dir = crate::manifest::manifest_dir(manifest_path);
     if manifest::is_composite(manifest_path) {
         let m = manifest::CompositeManifest::load_frozen(manifest_path)?;
         let components = m.resolve_components(&manifest_dir)?;
@@ -2157,7 +2149,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
 
         // Share the crate-wide env guard: `GITHUB_API_URL` is a process global, and other modules'
         // tests (`run`, `rank_grounded`) point it at their own listeners concurrently.
-        let _env = crate::testing::test_env_lock();
+        let _env = crucible::test_support::env_lock();
         let dir = tempdir("issue-source");
         scaffold_pack(&dir);
 
