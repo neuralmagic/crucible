@@ -14,12 +14,12 @@ repos:
         language: system
         pass_filenames: false
         files: ^(crucible/src/plan/starlark|docs/dsl-reference\.md)
-      - id: loop-docs
-        name: regenerate the loop control states page
-        entry: scripts/loop-docs.sh
+      - id: state-docs
+        name: regenerate the control-state pages
+        entry: scripts/state-docs.sh
         language: system
         pass_filenames: false
-        files: ^(crucible/src/runloop/machine\.rs|docs/loop-states\.md|docs/img/loop-states\.(dot|svg))
+        files: ^(crucible/src/(runloop|plan)/machine\.rs|crucible/src/diagram\.rs|docs/(loop|plan)-states\.md|docs/img/(loop|plan|plan-task)-states\.(dot|svg))
 
       - id: gov-render
         name: render RFCs from the governance SSOT

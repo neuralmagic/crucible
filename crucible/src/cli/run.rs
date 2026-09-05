@@ -194,6 +194,21 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                 mermaid,
                 render,
             } => crate::plan::cli::show(file, &caps.iter().cloned().collect(), *mermaid, *render),
+            crate::cli::PlanAction::States { format, graph } => {
+                let digraph = match graph {
+                    crate::cli::StatesGraph::Task => crate::plan::machine::task_digraph,
+                    crate::cli::StatesGraph::Plan => crate::plan::machine::plan_digraph,
+                };
+                print!(
+                    "{}",
+                    match format {
+                        crate::cli::StatesFormat::Markdown => crate::plan::machine::markdown(),
+                        crate::cli::StatesFormat::Mermaid => digraph().mermaid(),
+                        crate::cli::StatesFormat::Dot => digraph().dot(),
+                    }
+                );
+                Ok(())
+            }
             crate::cli::PlanAction::DslReference { format } => {
                 match format {
                     crate::cli::DslFormat::Markdown => {

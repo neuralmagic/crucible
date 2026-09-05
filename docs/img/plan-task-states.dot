@@ -1,0 +1,41 @@
+digraph task {
+    graph [rankdir=TB, fontname="Helvetica", fontsize=11, fontcolor="#55606a", pad=0.4, nodesep=0.5, ranksep=0.7, splines=true, newrank=true];
+    node [shape=box, style="rounded,filled", fillcolor="#e4ebe7", color="#2b6f62", fontname="Helvetica", fontsize=12, fontcolor="#1d2329", margin="0.18,0.1"];
+    edge [fontname="Helvetica", fontsize=10, color="#55606a", fontcolor="#55606a", arrowsize=0.8];
+    start [shape=point, width=0.14, color="#1d2329"];
+    subgraph cluster_0 {
+        label="open"; style=dashed; color="#c8d0cc"; labeljust=l;
+        Pending;
+        Running;
+        Fanout [peripheries=2];
+    }
+    subgraph cluster_1 {
+        label="settled: the task's status"; style=dashed; color="#c8d0cc"; labeljust=l;
+        Pass [fillcolor="#f5ebe1", color="#8a4b1c"];
+        Fail [fillcolor="#f5ebe1", color="#8a4b1c"];
+        Skipped [fillcolor="#f5ebe1", color="#8a4b1c"];
+        Transport [fillcolor="#f5ebe1", color="#8a4b1c"];
+        Blocked [fillcolor="#f5ebe1", color="#8a4b1c"];
+        Truncated [fillcolor="#f5ebe1", color="#8a4b1c"];
+    }
+    start -> Pending;
+    Pending -> Running [label="dispatched"];
+    Pending -> Fanout [label="fanned out"];
+    Pending -> Skipped [label="unrunnable", color="#8a4b1c", fontcolor="#8a4b1c"];
+    Pending -> Blocked [label="dependency did not pass", color="#8a4b1c", fontcolor="#8a4b1c"];
+    Pending -> Blocked [label="required task failed", color="#8a4b1c", fontcolor="#8a4b1c"];
+    Pending -> Blocked [label="budget ceiling", color="#8a4b1c", fontcolor="#8a4b1c"];
+    Pending -> Blocked [label="wall clock ceiling", color="#8a4b1c", fontcolor="#8a4b1c"];
+    Pending -> Blocked [label="staging refused", color="#8a4b1c", fontcolor="#8a4b1c"];
+    Pending -> Blocked [label="plan halted", color="#8a4b1c", fontcolor="#8a4b1c"];
+    Pending -> Truncated [label="plan truncated", color="#8a4b1c", fontcolor="#8a4b1c"];
+    Pending -> Fail [label="fanout items invalid", color="#8a4b1c", fontcolor="#8a4b1c"];
+    Running -> Pass [label="passed"];
+    Running -> Fail [label="failed", color="#8a4b1c", fontcolor="#8a4b1c"];
+    Running -> Skipped [label="skipped by task", color="#8a4b1c", fontcolor="#8a4b1c"];
+    Running -> Running [label="transport retried"];
+    Running -> Transport [label="transport exhausted", color="#8a4b1c", fontcolor="#8a4b1c"];
+    Running -> Transport [label="transport cut by budget", color="#8a4b1c", fontcolor="#8a4b1c"];
+    Fanout -> Pass [label="instances passed"];
+    Fanout -> Fail [label="instances failed", color="#8a4b1c", fontcolor="#8a4b1c"];
+}

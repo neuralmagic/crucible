@@ -1,0 +1,26 @@
+digraph plan {
+    graph [rankdir=TB, fontname="Helvetica", fontsize=11, fontcolor="#55606a", pad=0.4, nodesep=0.5, ranksep=0.7, splines=true, newrank=true];
+    node [shape=box, style="rounded,filled", fillcolor="#e4ebe7", color="#2b6f62", fontname="Helvetica", fontsize=12, fontcolor="#1d2329", margin="0.18,0.1"];
+    edge [fontname="Helvetica", fontsize=10, color="#55606a", fontcolor="#55606a", arrowsize=0.8];
+    start [shape=point, width=0.14, color="#1d2329"];
+    subgraph cluster_0 {
+        label="execution"; style=dashed; color="#c8d0cc"; labeljust=l;
+        Admitted;
+        Dispatching [peripheries=2];
+        Draining;
+    }
+    subgraph cluster_1 {
+        label="exit: the shutdown token"; style=dashed; color="#c8d0cc"; labeljust=l;
+        Completed [fillcolor="#f5ebe1", color="#8a4b1c"];
+        Halted [fillcolor="#f5ebe1", color="#8a4b1c"];
+        Truncated [fillcolor="#f5ebe1", color="#8a4b1c"];
+    }
+    start -> Admitted;
+    Admitted -> Truncated [label="required task unrunnable\n→ error", color="#8a4b1c", fontcolor="#8a4b1c"];
+    Admitted -> Dispatching [label="started"];
+    Dispatching -> Draining [label="required task failed\n→ error", color="#8a4b1c", fontcolor="#8a4b1c"];
+    Dispatching -> Draining [label="budget ceiling\n→ budget", color="#8a4b1c", fontcolor="#8a4b1c"];
+    Dispatching -> Draining [label="wall clock ceiling\n→ budget", color="#8a4b1c", fontcolor="#8a4b1c"];
+    Dispatching -> Completed [label="settled\n→ finished"];
+    Draining -> Halted [label="settled"];
+}
