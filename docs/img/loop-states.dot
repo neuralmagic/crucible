@@ -1,0 +1,65 @@
+digraph loop {
+    graph [rankdir=TB, fontname="Helvetica", fontsize=11, fontcolor="#55606a", pad=0.4, nodesep=0.5, ranksep=0.7, splines=true, newrank=true];
+    node [shape=box, style="rounded,filled", fillcolor="#e4ebe7", color="#2b6f62", fontname="Helvetica", fontsize=12, fontcolor="#1d2329", margin="0.18,0.1"];
+    edge [fontname="Helvetica", fontsize=10, color="#55606a", fontcolor="#55606a", arrowsize=0.8];
+    start [shape=point, width=0.14, color="#1d2329"];
+    subgraph cluster_0 {
+        label="before the loop"; style=dashed; color="#c8d0cc"; labeljust=l;
+        Setup;
+        Preflight;
+        Baseline;
+        Wide;
+    }
+    subgraph cluster_1 {
+        label="the loop"; style=dashed; color="#c8d0cc"; labeljust=l;
+        Head;
+        Turn [peripheries=2];
+        Paused [style="rounded,filled,dashed"];
+        ParkedApproval [style="rounded,filled,dashed"];
+        ParkedDistress [style="rounded,filled,dashed"];
+    }
+    subgraph cluster_2 {
+        label="after the loop"; style=dashed; color="#c8d0cc"; labeljust=l;
+        Wrapup;
+        Epilogue;
+        Publish;
+        Done [shape=doublecircle, label="", width=0.22, fillcolor="#1d2329", color="#1d2329"];
+    }
+    start -> Setup;
+    Setup -> Preflight [label="preflight started"];
+    Setup -> Baseline [label="baseline started"];
+    Setup -> Head [label="resumed"];
+    Preflight -> Baseline [label="preflight passed"];
+    Preflight -> Done [label="stopped", color="#8a4b1c", fontcolor="#8a4b1c"];
+    Baseline -> Head [label="baseline measured"];
+    Baseline -> Head [label="resumed"];
+    Head -> Wide [label="wide started"];
+    Wide -> Head [label="wide done"];
+    Head -> Turn [label="turn started"];
+    Head -> Paused [label="paused"];
+    Head -> ParkedApproval [label="approval pending"];
+    Head -> Head [label="rescoped"];
+    Head -> ParkedDistress [label="distress marked"];
+    Head -> Wrapup [label="interrupted\n→ stopped", color="#8a4b1c", fontcolor="#8a4b1c"];
+    Head -> Wrapup [label="over budget\n→ budget", color="#8a4b1c", fontcolor="#8a4b1c"];
+    Head -> Wrapup [label="solved", color="#8a4b1c", fontcolor="#8a4b1c"];
+    Head -> Wrapup [label="iterations exhausted\n→ finished", color="#8a4b1c", fontcolor="#8a4b1c"];
+    Paused -> Head [label="unpaused"];
+    ParkedApproval -> Head [label="approval granted"];
+    ParkedApproval -> Wrapup [label="approval denied\n→ escalated", color="#8a4b1c", fontcolor="#8a4b1c"];
+    ParkedApproval -> Wrapup [label="stopped", color="#8a4b1c", fontcolor="#8a4b1c"];
+    ParkedDistress -> Head [label="distress cleared"];
+    ParkedDistress -> Wrapup [label="park timed out\n→ stopped", color="#8a4b1c", fontcolor="#8a4b1c"];
+    ParkedDistress -> Wrapup [label="stopped", color="#8a4b1c", fontcolor="#8a4b1c"];
+    Turn -> Head [label="kept"];
+    Turn -> Head [label="discarded"];
+    Turn -> Head [label="turn never started"];
+    Turn -> Head [label="parked"];
+    Turn -> Wrapup [label="stalled", color="#8a4b1c", fontcolor="#8a4b1c"];
+    Turn -> Wrapup [label="escalated", color="#8a4b1c", fontcolor="#8a4b1c"];
+    Turn -> Wrapup [label="stopped", color="#8a4b1c", fontcolor="#8a4b1c"];
+    Wrapup -> Epilogue [label="epilogue started"];
+    Wrapup -> Publish [label="publish started"];
+    Epilogue -> Wrapup [label="epilogue done"];
+    Publish -> Done [label="shutdown"];
+}

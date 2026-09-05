@@ -17,6 +17,7 @@
 
 - [Implementation contract](./crucible-contract.md)
 - [Work graphs](./work-graphs.md)
+- [Loop control states](./loop-states.md)
 - [Workflow DSL reference](./dsl-reference.md)
 - [Hand-rolled codegen pipelines](./hand-rolled-pipelines.md)
 - [The codex harness](./codex-harness.md)

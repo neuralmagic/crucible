@@ -27,6 +27,7 @@ use crate::runloop::step::{
 };
 
 use crate::control::recovery::ResumeState;
+use crate::runloop::machine::{Event, LoopExit, Machine, State};
 
 #[derive(Debug, thiserror::Error)]
 #[error("winner produced no diff")]
@@ -160,49 +161,6 @@ fn output_tally(args: &Args, p: &Paths) -> crate::outputs::OutputTally {
 /// run forever (run 6 burned 7 of 9 iterations on a single sandbox that never came up).
 const MAX_DEAD_TURN_ATTEMPTS: u32 = 3;
 
-/// How a run ended, the single enumeration of every way the loop exits, replacing the old
-/// `escalated: Option` flag plus the scattered `break`s. Mapped to an [`Outcome`] once
-/// at the end of [`run_loop`].
-enum LoopExit {
-    /// The `for` ran every iteration without an early exit.
-    Finished,
-    /// A kept candidate satisfied the win condition.
-    Solved,
-    /// A cost or time cap was reached.
-    Budget,
-    /// Ctrl+C / a stop signal (at an interrupt checkpoint or while parked).
-    Stopped,
-    /// The agent declared the harness inadequate, or a `block` approval was denied with no
-    /// fallback: halt for human review. The escalation itself is reported and the world rolled
-    /// back eagerly at the break site (differently per site) so the variant only needs to
-    /// mark the run as "needs human" for the exit code.
-    Escalated,
-    /// [`MAX_DEAD_TURN_ATTEMPTS`] consecutive turns died on transport before starting: the
-    /// run is stalled on infrastructure, not out of iterations.
-    Stalled,
-}
-
-impl LoopExit {
-    /// The wire token + human-readable reason for [`Reporter::shutdown`]. `error` (a bail from
-    /// inside the loop, never reaching this variant) is reported separately by [`run_loop`].
-    fn shutdown_reason(&self) -> (&'static str, &'static str) {
-        match self {
-            LoopExit::Finished => ("finished", "all iterations completed"),
-            LoopExit::Solved => ("solved", "a kept candidate satisfied the win condition"),
-            LoopExit::Budget => ("budget", "a cost or time cap was reached"),
-            LoopExit::Stopped => ("stopped", "stop signal received"),
-            LoopExit::Escalated => (
-                "escalated",
-                "the agent declared the harness inadequate — halted for human review",
-            ),
-            LoopExit::Stalled => (
-                "stalled",
-                "the run stalled on consecutive transport failures — no turn could start",
-            ),
-        }
-    }
-}
-
 /// One turn's linear protocol, typed so its illegal orderings stop compiling: the candidate
 /// moves `Proposed → Applied → Measured`, and only a `Measured` can be decided. You cannot
 /// `measure` before `apply` (no method), nor `decide` without a [`crucible::crucible::Reading`] (the
@@ -308,6 +266,7 @@ fn run_loop_body<R: Reporter>(
     let heartbeat_handle = runtime.heartbeat.as_ref();
     let heartbeat = heartbeat_handle.map(std::sync::Arc::as_ref);
     let started = runner.started;
+    let mut machine = Machine::new(control.clone());
     let start_iter: u32;
     let is_resume = runtime.resume.is_some();
     // Held across the whole body: an approved re-scope re-baselines, and re-measuring a rescoped
@@ -354,9 +313,8 @@ fn run_loop_body<R: Reporter>(
             outputs: output_tally(args, p),
             segment,
         };
-        update_control_status(
+        update_control_progress(
             control.as_deref(),
-            "resume",
             start_iter.saturating_sub(1),
             run.segment.best_score,
             run.spent,
@@ -407,9 +365,9 @@ fn run_loop_body<R: Reporter>(
             && !run.segment.baseline_score.is_finite()
         {
             runner.r.phase(Phase::Preflight);
-            update_control_status(
+            machine.advance(Event::PreflightStarted)?;
+            update_control_progress(
                 control.as_deref(),
-                "preflight",
                 start_iter.saturating_sub(1),
                 run.segment.best_score,
                 run.spent,
@@ -421,11 +379,15 @@ fn run_loop_body<R: Reporter>(
                 &mut runner.r,
             );
             match preflight {
-                Ok(seeded) => preflight_baseline = seeded,
+                Ok(seeded) => {
+                    machine.advance(Event::PreflightPassed)?;
+                    preflight_baseline = seeded;
+                }
                 Err(e)
                     if e.downcast_ref::<crate::runloop::preflight::PreflightStopped>()
                         .is_some() =>
                 {
+                    machine.advance(Event::Stopped)?;
                     let (outcome, reason) = LoopExit::Stopped.shutdown_reason();
                     runner.r.shutdown(outcome, reason);
                     return Ok(Outcome::default());
@@ -469,6 +431,7 @@ fn run_loop_body<R: Reporter>(
         }
 
         write_results(p, &prep.goal, &prep.prior, &run.rows)?;
+        machine.advance(Event::Resumed)?;
         run
     } else {
         runner.r.start(&prep.goal, &judge.objective());
@@ -477,7 +440,8 @@ fn run_loop_body<R: Reporter>(
 
         if let Some(cfg) = &prep.preflight {
             runner.r.phase(Phase::Preflight);
-            update_control_status(control.as_deref(), "preflight", 0, f64::INFINITY, 0.0);
+            machine.advance(Event::PreflightStarted)?;
+            update_control_progress(control.as_deref(), 0, f64::INFINITY, 0.0);
             let preflight = crate::runloop::preflight::run(
                 cfg,
                 &prep.preflight_modes,
@@ -485,11 +449,15 @@ fn run_loop_body<R: Reporter>(
                 &mut runner.r,
             );
             match preflight {
-                Ok(seeded) => preflight_baseline = seeded,
+                Ok(seeded) => {
+                    machine.advance(Event::PreflightPassed)?;
+                    preflight_baseline = seeded;
+                }
                 Err(e)
                     if e.downcast_ref::<crate::runloop::preflight::PreflightStopped>()
                         .is_some() =>
                 {
+                    machine.advance(Event::Stopped)?;
                     let (outcome, reason) = LoopExit::Stopped.shutdown_reason();
                     runner.r.shutdown(outcome, reason);
                     return Ok(Outcome::default());
@@ -511,7 +479,10 @@ fn run_loop_body<R: Reporter>(
         }
 
         runner.r.phase(Phase::Baseline);
-        update_control_status(control.as_deref(), "baseline", 0, f64::INFINITY, 0.0);
+        if machine.state() == State::Setup {
+            machine.advance(Event::BaselineStarted)?;
+        }
+        update_control_progress(control.as_deref(), 0, f64::INFINITY, 0.0);
         let (segment, base_row) = Segment::baseline(
             &**world,
             &**judge,
@@ -542,13 +513,8 @@ fn run_loop_body<R: Reporter>(
         runner.r.row(&base_row, false);
         run.rows.push(base_row);
         write_results(p, &prep.goal, &prep.prior, &run.rows)?;
-        update_control_status(
-            control.as_deref(),
-            "baseline",
-            0,
-            run.segment.best_score,
-            run.spent,
-        );
+        update_control_progress(control.as_deref(), 0, run.segment.best_score, run.spent);
+        machine.advance(Event::BaselineMeasured)?;
         run
     };
 
@@ -571,6 +537,7 @@ fn run_loop_body<R: Reporter>(
         // serial diff scoring, engine top_k) on both loop paths. The winner diff travels
         // as text: the candidate worktrees are removed before seed time, so re-deriving a
         // diff from one silently yields nothing.
+        machine.advance(Event::WideStarted)?;
         let result = crate::runloop::graph::run_wide_tournament(
             &wide_cfg,
             args,
@@ -622,11 +589,11 @@ fn run_loop_body<R: Reporter>(
                 .r
                 .note("wide round produced no winners — deep loop starts from baseline");
         }
+        machine.advance(Event::WideDone)?;
     }
 
     // How this run ends. Each early exit sets it before breaking; a loop that runs out of
     // iterations leaves it `Finished`. One match below folds it into the `Outcome`.
-    let mut exit = LoopExit::Finished;
     // `it` advances only when a turn actually started: a never-started attempt re-runs the
     // same iteration (hence a `while`, not a `for`), and `dead_turns` counts the consecutive
     // never-started attempts that bound the re-runs.
@@ -638,12 +605,17 @@ fn run_loop_body<R: Reporter>(
     let mut bad_marker_seen: Option<Option<std::time::SystemTime>> = None;
     let mut it = start_iter;
     while it <= args.iterations {
-        wait_if_paused(control.as_deref(), &mut runner.r);
+        if control.as_deref().is_some_and(|c| c.is_paused()) {
+            machine.advance(Event::Paused)?;
+            wait_if_paused(control.as_deref(), &mut runner.r);
+            machine.advance(Event::Unpaused)?;
+        }
         // The agent blocked on a pending approval last turn (it had no frozen-regime fallback).
         // Park here (idle, budget-paused) until the approval lands as a re-scope (the broker
         // fires it over the control bridge) or we're told to stop. The drain below then
         // re-baselines into the granted regime.
         if let Some(pp) = run.pending_block.take() {
+            machine.advance(Event::ApprovalPending)?;
             let parked = park_for_approval(
                 control.as_deref(),
                 ledger,
@@ -652,7 +624,10 @@ fn run_loop_body<R: Reporter>(
                 args.max_park(),
             );
             match parked {
-                ParkOutcome::Resumed => {} // the re-scope drain below re-baselines
+                // The re-scope drain below re-baselines.
+                ParkOutcome::Resumed => {
+                    machine.advance(Event::ApprovalGranted)?;
+                }
                 ParkOutcome::Denied(why) => {
                     // `block` means the agent had no frozen-regime fallback, a denial leaves
                     // nothing to do, so escalate-halt for a human.
@@ -660,19 +635,18 @@ fn run_loop_body<R: Reporter>(
                         "approval denied — escalating (no fallback): provisioning for '{}' was not granted: {why}",
                         pp.trace_id
                     ));
-                    update_control_status(
+                    update_control_progress(
                         control.as_deref(),
-                        "escalated",
                         it,
                         run.segment.best_score,
                         run.spent,
                     );
                     world.restore(run.segment.best_snap.as_str())?;
-                    exit = LoopExit::Escalated;
+                    machine.advance(Event::ApprovalDenied)?;
                     break;
                 }
                 ParkOutcome::Stopped => {
-                    exit = LoopExit::Stopped;
+                    machine.advance(Event::Stopped)?;
                     break;
                 }
             }
@@ -680,6 +654,7 @@ fn run_loop_body<R: Reporter>(
         // An approved judge-changing grant arrived (via the control channel / MCP): re-baseline
         // into the new regime and open a fresh segment before this iteration measures.
         if let Some((rescope_key, new_regime)) = control.as_ref().and_then(|c| c.take_rescope()) {
+            machine.advance(Event::Rescoped)?;
             // Close any open approval bracket: a rescope IS the grant. Harmless when no
             // wait was open (the classifier treats an unmatched resolve as a no-op).
             runner.r.approval_resolved("granted", &new_regime);
@@ -759,18 +734,13 @@ fn run_loop_body<R: Reporter>(
                 for item in &marker.evidence {
                     runner.r.note(&format!("distress evidence: {item}"));
                 }
-                update_control_status(
-                    control.as_deref(),
-                    "distressed",
-                    it,
-                    run.segment.best_score,
-                    run.spent,
-                );
+                update_control_progress(control.as_deref(), it, run.segment.best_score, run.spent);
                 runner.r.approval_wait(
                     crate::control::distress::HANDLE,
                     crate::control::distress::HANDLE,
                     provisioning::WaitMode::Block,
                 );
+                machine.advance(Event::DistressMarked)?;
                 let parked = park_for_distress(
                     p,
                     &run.rows,
@@ -780,6 +750,7 @@ fn run_loop_body<R: Reporter>(
                 );
                 match parked {
                     DistressOutcome::Cleared => {
+                        machine.advance(Event::DistressCleared)?;
                         runner
                             .r
                             .approval_resolved("granted", "distress cleared by operator");
@@ -788,14 +759,14 @@ fn run_loop_body<R: Reporter>(
                         continue;
                     }
                     DistressOutcome::Stopped => {
-                        exit = LoopExit::Stopped;
+                        machine.advance(Event::Stopped)?;
                         break;
                     }
                     DistressOutcome::TimedOut => {
                         runner
                             .r
                             .note("distress park timed out, stopping with state preserved");
-                        exit = LoopExit::Stopped;
+                        machine.advance(Event::ParkTimedOut)?;
                         break;
                     }
                 }
@@ -814,7 +785,7 @@ fn run_loop_body<R: Reporter>(
             _ => {}
         }
         if matches!(runner.r.check_interrupt(p, &run.rows), Stop::Quit) {
-            exit = LoopExit::Stopped;
+            machine.advance(Event::Interrupted)?;
             break;
         }
         if over_budget(
@@ -825,10 +796,11 @@ fn run_loop_body<R: Reporter>(
             run.parked_total,
             &mut runner.r,
         ) {
-            exit = LoopExit::Budget;
+            machine.advance(Event::OverBudget)?;
             break;
         }
         runner.r.phase(Phase::Iteration(it));
+        machine.advance(Event::TurnStarted)?;
         // One span per loop round, entered for the iteration's whole body on this thread: the
         // turn span, gate evaluations, and broker traceparent files all nest under it, so a trace
         // groups by iteration and `iter` is queryable directly.
@@ -837,13 +809,7 @@ fn run_loop_body<R: Reporter>(
         // The broker's distress page prints the iteration it fired on; best-effort by design, a
         // missing stamp only costs the page a "?".
         write_turn_meta(it, run.spent);
-        update_control_status(
-            control.as_deref(),
-            "iteration",
-            it,
-            run.segment.best_score,
-            run.spent,
-        );
+        update_control_progress(control.as_deref(), it, run.segment.best_score, run.spent);
         beat_position(heartbeat, it, run.spent);
         write_results(p, &prep.goal, &prep.prior, &run.rows)?;
 
@@ -984,8 +950,16 @@ fn run_loop_body<R: Reporter>(
             verdict,
             reading,
         } = match step {
-            IterStep::Decided(d) => *d,
+            IterStep::Decided(d) => {
+                machine.advance(if d.verdict.keep {
+                    Event::Kept
+                } else {
+                    Event::Discarded
+                })?;
+                *d
+            }
             IterStep::Discarded { reason } => {
+                machine.advance(Event::Discarded)?;
                 let mut row = Row {
                     iter: it,
                     decision: "discarded".to_string(),
@@ -1020,41 +994,31 @@ fn run_loop_body<R: Reporter>(
                     runner.r.note(&format!(
                         "{dead_turns} consecutive turns died before starting — the run is stalled"
                     ));
-                    exit = LoopExit::Stalled;
+                    machine.advance(Event::Stalled)?;
                     break;
                 }
                 runner.r.note(&format!(
                     "turn never started (attempt {dead_turns}/{MAX_DEAD_TURN_ATTEMPTS}) — re-running iter {it} without consuming it"
                 ));
+                machine.advance(Event::TurnNeverStarted)?;
                 continue;
             }
             IterStep::Escalated => {
-                update_control_status(
-                    control.as_deref(),
-                    "escalated",
-                    it,
-                    run.segment.best_score,
-                    run.spent,
-                );
+                update_control_progress(control.as_deref(), it, run.segment.best_score, run.spent);
                 world.restore(run.segment.best_snap.as_str())?;
-                exit = LoopExit::Escalated;
+                machine.advance(Event::Escalated)?;
                 break;
             }
             IterStep::Parked(pp) => {
-                update_control_status(
-                    control.as_deref(),
-                    "parked",
-                    it,
-                    run.segment.best_score,
-                    run.spent,
-                );
+                machine.advance(Event::Parked)?;
+                update_control_progress(control.as_deref(), it, run.segment.best_score, run.spent);
                 run.pending_block = Some(pp);
                 write_results(p, &prep.goal, &prep.prior, &run.rows)?;
                 it += 1;
                 continue;
             }
             IterStep::Stopped => {
-                exit = LoopExit::Stopped;
+                machine.advance(Event::Stopped)?;
                 break;
             }
         };
@@ -1067,13 +1031,7 @@ fn run_loop_body<R: Reporter>(
                 // carrying a stale tiebreak forward would compare the next tie against a
                 // scalar the current best never earned.
                 run.segment.best_tiebreak = reading.tiebreak;
-                update_control_status(
-                    control.as_deref(),
-                    "iteration",
-                    it,
-                    run.segment.best_score,
-                    run.spent,
-                );
+                update_control_progress(control.as_deref(), it, run.segment.best_score, run.spent);
             }
             // The World owns reversibility now: snapshot commits the kept state (git memory)
             // and captures any external state; the engine never touches git directly.
@@ -1138,15 +1096,19 @@ fn run_loop_body<R: Reporter>(
             run.parked_total,
             &mut runner.r,
         ) {
-            exit = LoopExit::Budget;
+            machine.advance(Event::OverBudget)?;
             break;
         }
         if verdict.keep && verdict.solved && !args.no_early_stop {
-            exit = LoopExit::Solved;
+            machine.advance(Event::Solved)?;
             break;
         }
         it += 1;
     }
+    if machine.state() == State::Head {
+        machine.advance(Event::IterationsExhausted)?;
+    }
+    let exit = machine.exit()?;
 
     // Run-scoped epilogue: expensive one-shot checks (a 90-minute racecheck, a slow perf
     // rung) that cannot ride the per-iteration graph run once here, against the final kept
@@ -1158,6 +1120,7 @@ fn run_loop_body<R: Reporter>(
         LoopExit::Finished | LoopExit::Budget | LoopExit::Solved
     ) && let Some(workflow) = args.workflow.as_ref().filter(|w| w.has_epilogue())
     {
+        machine.advance(Event::EpilogueStarted)?;
         let kept = run
             .rows
             .iter()
@@ -1206,14 +1169,14 @@ fn run_loop_body<R: Reporter>(
                 }
             }
         }
+        machine.advance(Event::EpilogueDone)?;
     }
 
     runner
         .r
         .summary(&run.rows, &judge.objective(), run.segment.best_score);
-    update_control_status(
+    update_control_progress(
         control.as_deref(),
-        "finished",
         args.iterations,
         run.segment.best_score,
         run.spent,
@@ -1237,6 +1200,7 @@ fn run_loop_body<R: Reporter>(
         .and_then(|base| world.publish_components(base, run.segment.best_snap.as_str()))
         .map(|pc| publish::composite_targets(pc, &args.component_pr_repos))
         .unwrap_or_default();
+    machine.advance(Event::PublishStarted)?;
     let prs = publish::publish(
         &mut runner.r,
         &publish::Record {
@@ -1280,6 +1244,7 @@ fn run_loop_body<R: Reporter>(
 
     let (shutdown_outcome, shutdown_reason) = exit.shutdown_reason();
     runner.r.shutdown(shutdown_outcome, shutdown_reason);
+    machine.advance(Event::Shutdown)?;
 
     Ok(Outcome {
         improved,
@@ -1423,20 +1388,14 @@ fn beat_position(heartbeat: Option<&crate::control::heartbeat::Heartbeat>, iter:
     }
 }
 
-fn update_control_status(
+fn update_control_progress(
     control: Option<&control::ControlState>,
-    phase: &str,
     iter: u32,
     best_score: f64,
     spend: f64,
 ) {
     if let Some(control) = control {
-        control.set_status(
-            phase,
-            iter,
-            best_score.is_finite().then_some(best_score),
-            spend,
-        );
+        control.set_progress(iter, best_score.is_finite().then_some(best_score), spend);
     }
 }
 

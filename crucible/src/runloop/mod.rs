@@ -2,6 +2,7 @@
 
 pub(crate) mod driver;
 pub(crate) mod graph;
+pub(crate) mod machine;
 pub(crate) mod preflight;
 pub(crate) mod publish;
 pub(crate) mod selftest;

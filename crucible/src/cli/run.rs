@@ -159,6 +159,18 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
     // One code-grounded ranking turn over an existing checkout. A cheap, checkout-backed agent turn
     // that gates scope spend by confirming an API-tier verdict. Prints verdict JSON. The controller
     // shells this from its escalation arm.
+    if let Some(Cmd::LoopStates { format }) = &cli.command {
+        print!(
+            "{}",
+            match format {
+                crate::cli::StatesFormat::Markdown => crate::runloop::machine::markdown(),
+                crate::cli::StatesFormat::Mermaid => crate::runloop::machine::mermaid(),
+                crate::cli::StatesFormat::Dot => crate::runloop::machine::dot(),
+            }
+        );
+        return Ok(());
+    }
+
     if let Some(Cmd::RankGrounded(args)) = cli.command {
         // Constructing the engine runtime publishes the handle an openshell grounded turn reaches.
         let _engine = crate::agent::engine::EngineCtx::new()?;

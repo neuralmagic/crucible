@@ -56,6 +56,9 @@ flowchart TD
     remember -->|ingest API, optional| ctl["control plane<br/>(crucible-contract ingest)"]
 ```
 
+The control shell around that loop, the gates between iterations and the ways a run ends, is
+its own generated diagram: [Loop control states](./loop-states.md).
+
 ## The stages
 
 | Stage | What happens | Deeper |
