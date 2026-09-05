@@ -1,6 +1,6 @@
 # Loop control states
 
-Generated from `crucible/src/runloop/machine.rs` by `crucible loop-states`; `scripts/loop-docs.sh --check` keeps it current. The driver advances through this table at every gate, so an edge missing here is a transition the loop cannot take.
+Generated from `crucible/src/runloop/machine.rs` by `crucible loop-states`; `scripts/state-docs.sh --check` keeps it current. The driver advances through this table at every gate, so an edge missing here is a transition the loop cannot take.
 
 Each **Turn** is one iteration's work graph (propose → apply → measure → decide), rendered in [Work graphs](./work-graphs.md). Everything else is the control shell around it: the gates at the **Head**, the parks, and how a run ends. Dashed states are idle; the colored edges are the ways out.
 

@@ -787,7 +787,19 @@ fn task_worktree_name(name: &TaskName) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::exec::{ExecCfg, PlanExit, Substrate, TaskStatus, execute};
+    use crate::plan::exec::{ExecCfg, PlanExit, Substrate, TaskStatus};
+
+    /// The executor's own transitions are in its table; a test that trips one fails here.
+    fn execute(
+        plan: &crate::plan::ir::ValidPlan,
+        substrate: &Substrate,
+        cfg: ExecCfg,
+        runner: &mut dyn crate::plan::exec::TaskRunner,
+        on_result: impl FnMut(&crate::plan::ir::Task, &crate::plan::exec::TaskResult),
+    ) -> crate::plan::exec::PlanOutcome {
+        crate::plan::exec::execute(plan, substrate, cfg, runner, on_result)
+            .expect("an executor transition its table does not list")
+    }
     use crate::plan::ir::{Join, Plan, Stage};
 
     fn scratch(tag: &str) -> (std::path::PathBuf, Paths) {

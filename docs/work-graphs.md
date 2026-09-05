@@ -124,6 +124,9 @@ engine-defined.
 
 ## Execution semantics
 
+How the executor walks a graph, what one task goes through and how the plan as a whole
+ends, is its own generated diagram: [Plan execution states](./plan-states.md).
+
 **Readiness.** A task dispatches when its dependencies are terminal and its join is satisfied.
 Dispatch order is declaration-stable, so the event stream is deterministic.
 

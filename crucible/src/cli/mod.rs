@@ -233,6 +233,16 @@ pub(crate) enum PlanAction {
         #[arg(long, default_value = "markdown")]
         format: DslFormat,
     },
+    /// Print the executor's control states: the task and plan transition tables it runs on,
+    /// as the reference page (`docs/plan-states.md` is generated from it) or one graph as
+    /// Graphviz dot or mermaid.
+    States {
+        #[arg(long, default_value = "markdown")]
+        format: StatesFormat,
+        /// Which table `--format dot` or `mermaid` draws.
+        #[arg(long, default_value = "task")]
+        graph: StatesGraph,
+    },
     /// Print a workflow source's `params` block as a JSON Schema document, without evaluating
     /// the source. One declaration serves command-line validation, ask validation, and a
     /// generated launch form.
@@ -315,6 +325,12 @@ pub(crate) enum StatesFormat {
     Markdown,
     Mermaid,
     Dot,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum StatesGraph {
+    Task,
+    Plan,
 }
 
 /// `crucible deploy <render|apply>`: emit the deployment YAML, or render-and-`kubectl apply`.

@@ -7,6 +7,7 @@
 //! the driver, reported as [`IllegalTransition`] rather than silently taken.
 
 use crate::control::{ControlState, LoopPhase};
+use crucible::diagram::{self, Cluster, Cursor, Digraph, Edge, IllegalTransition, Node, NodeKind};
 use std::sync::Arc;
 
 /// Where the loop is. Terminal is [`State::Done`]; everything else has a way out.
@@ -150,15 +151,7 @@ impl Event {
 
     /// The edge label in the rendered diagram: the variant name as words.
     fn label(self) -> String {
-        let name = format!("{self:?}");
-        let mut out = String::with_capacity(name.len() + 4);
-        for (i, c) in name.chars().enumerate() {
-            if c.is_uppercase() && i > 0 {
-                out.push(' ');
-            }
-            out.extend(c.to_lowercase());
-        }
-        out
+        diagram::words(&format!("{self:?}"))
     }
 }
 
@@ -207,13 +200,6 @@ pub(crate) const TRANSITIONS: &[(State, Event, State)] = {
 };
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-#[error("loop control bug: no transition from {from:?} on {event:?}")]
-pub(crate) struct IllegalTransition {
-    pub(crate) from: State,
-    pub(crate) event: Event,
-}
-
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error("loop control bug: the loop left {state:?} without an exit event")]
 pub(crate) struct NoExit {
     pub(crate) state: State,
@@ -242,7 +228,7 @@ impl State {
 /// The driver's cursor over [`TRANSITIONS`]. With a control state attached, every advance
 /// publishes the new phase, so the status an operator reads is the machine's and nothing else's.
 pub(crate) struct Machine {
-    state: State,
+    cursor: Cursor<State, Event>,
     exit: Option<LoopExit>,
     control: Option<Arc<ControlState>>,
 }
@@ -250,31 +236,23 @@ pub(crate) struct Machine {
 impl Machine {
     pub(crate) fn new(control: Option<Arc<ControlState>>) -> Self {
         Self {
-            state: State::Setup,
+            cursor: Cursor::new("loop", TRANSITIONS, State::Setup),
             exit: None,
             control,
         }
     }
 
     pub(crate) fn state(&self) -> State {
-        self.state
+        self.cursor.state()
     }
 
     /// Take `event` from the current state. The first exit-carrying event fixes how the run
     /// ended; later ones cannot change it.
     pub(crate) fn advance(&mut self, event: Event) -> Result<State, IllegalTransition> {
-        let to = TRANSITIONS
-            .iter()
-            .find(|(from, ev, _)| *from == self.state && *ev == event)
-            .map(|(_, _, to)| *to)
-            .ok_or(IllegalTransition {
-                from: self.state,
-                event,
-            })?;
+        let to = self.cursor.advance(event)?;
         if let Some(exit) = event.exit() {
             self.exit.get_or_insert(exit);
         }
-        self.state = to;
         if let Some(control) = &self.control {
             control.set_phase(to.phase(self.exit));
         }
@@ -283,91 +261,75 @@ impl Machine {
 
     /// How the run ended; an error while the loop is still going.
     pub(crate) fn exit(&self) -> Result<LoopExit, NoExit> {
-        self.exit.ok_or(NoExit { state: self.state })
+        self.exit.ok_or(NoExit {
+            state: self.state(),
+        })
     }
 }
 
-/// The table as a mermaid `stateDiagram-v2`, one edge per transition, exits labeled.
-pub(crate) fn mermaid() -> String {
-    let mut out = String::from("stateDiagram-v2\n    [*] --> Setup\n");
-    for (from, event, to) in TRANSITIONS {
-        let label = match event.exit() {
-            Some(exit) if exit.shutdown_reason().0 != event.label() => {
-                format!("{} → {}", event.label(), exit.shutdown_reason().0)
-            }
-            _ => event.label(),
-        };
-        out.push_str(&format!("    {from:?} --> {to:?}: {label}\n"));
-    }
-    out.push_str("    Done --> [*]\n");
-    out
-}
-
-/// The table as a Graphviz digraph: states grouped by when they happen, idle states dashed,
+/// The table laid out for drawing: states grouped by when they happen, idle states dashed,
 /// exit edges in the exit color and labeled with the shutdown token.
-pub(crate) fn dot() -> String {
-    let group = |s: State| match s {
-        State::Setup | State::Preflight | State::Baseline | State::Wide => 0,
-        State::Head
-        | State::Turn
-        | State::Paused
-        | State::ParkedApproval
-        | State::ParkedDistress => 1,
-        State::Wrapup | State::Epilogue | State::Publish | State::Done => 2,
+pub(crate) fn digraph() -> Digraph {
+    let kind = |s: State| match s {
+        State::Paused | State::ParkedApproval | State::ParkedDistress => NodeKind::Idle,
+        State::Turn => NodeKind::Nested,
+        State::Done => NodeKind::Terminal,
+        _ => NodeKind::Plain,
     };
-    let mut out = String::from(
-        "digraph loop {\n\
-         \x20   graph [rankdir=TB, fontname=\"Helvetica\", fontsize=11, fontcolor=\"#55606a\", \
-         pad=0.4, nodesep=0.5, ranksep=0.7, splines=true, newrank=true];\n\
-         \x20   node [shape=box, style=\"rounded,filled\", fillcolor=\"#e4ebe7\", color=\"#2b6f62\", \
-         fontname=\"Helvetica\", fontsize=12, fontcolor=\"#1d2329\", margin=\"0.18,0.1\"];\n\
-         \x20   edge [fontname=\"Helvetica\", fontsize=10, color=\"#55606a\", fontcolor=\"#55606a\", \
-         arrowsize=0.8];\n\
-         \x20   start [shape=point, width=0.14, color=\"#1d2329\"];\n",
-    );
-    let mut states: Vec<State> = TRANSITIONS.iter().flat_map(|(a, _, b)| [*a, *b]).collect();
-    states.sort();
-    states.dedup();
-    for (label, g) in [
-        ("before the loop", 0),
-        ("the loop", 1),
-        ("after the loop", 2),
-    ] {
-        out.push_str(&format!(
-            "    subgraph cluster_{g} {{\n        label=\"{label}\"; style=dashed; color=\"#c8d0cc\"; \
-             labeljust=l;\n"
-        ));
-        for s in states.iter().filter(|s| group(**s) == g) {
-            let attrs = match s {
-                State::Paused | State::ParkedApproval | State::ParkedDistress => {
-                    " [style=\"rounded,filled,dashed\"]"
-                }
-                State::Turn => " [peripheries=2]",
-                State::Done => {
-                    " [shape=doublecircle, label=\"\", width=0.22, fillcolor=\"#1d2329\", color=\"#1d2329\"]"
-                }
-                _ => "",
-            };
-            out.push_str(&format!("        {s:?}{attrs};\n"));
-        }
-        out.push_str("    }\n");
-    }
-    out.push_str("    start -> Setup;\n");
-    for (from, event, to) in TRANSITIONS {
-        let (label, style) = match event.exit() {
-            Some(exit) if exit.shutdown_reason().0 != event.label() => (
-                format!("{}\\n→ {}", event.label(), exit.shutdown_reason().0),
-                ", color=\"#8a4b1c\", fontcolor=\"#8a4b1c\"",
+    let cluster = |label, states: &[State]| Cluster {
+        label,
+        nodes: states
+            .iter()
+            .map(|s| Node {
+                name: format!("{s:?}"),
+                kind: kind(*s),
+            })
+            .collect(),
+    };
+    Digraph {
+        name: "loop",
+        start: "Setup".into(),
+        clusters: vec![
+            cluster(
+                "before the loop",
+                &[State::Setup, State::Preflight, State::Baseline, State::Wide],
             ),
-            Some(_) => (event.label(), ", color=\"#8a4b1c\", fontcolor=\"#8a4b1c\""),
-            None => (event.label(), ""),
-        };
-        out.push_str(&format!(
-            "    {from:?} -> {to:?} [label=\"{label}\"{style}];\n"
-        ));
+            cluster(
+                "the loop",
+                &[
+                    State::Head,
+                    State::Turn,
+                    State::Paused,
+                    State::ParkedApproval,
+                    State::ParkedDistress,
+                ],
+            ),
+            cluster(
+                "after the loop",
+                &[State::Wrapup, State::Epilogue, State::Publish, State::Done],
+            ),
+        ],
+        edges: TRANSITIONS
+            .iter()
+            .map(|(from, event, to)| Edge {
+                from: format!("{from:?}"),
+                to: format!("{to:?}"),
+                label: match event.exit() {
+                    Some(exit) => diagram::exit_label(&event.label(), exit.shutdown_reason().0),
+                    None => event.label(),
+                },
+                exit: event.exit().is_some(),
+            })
+            .collect(),
     }
-    out.push_str("}\n");
-    out
+}
+
+pub(crate) fn mermaid() -> String {
+    digraph().mermaid()
+}
+
+pub(crate) fn dot() -> String {
+    digraph().dot()
 }
 
 /// The generated reference page: the diagram and the exit vocabulary it labels edges with.
@@ -375,7 +337,7 @@ pub(crate) fn markdown() -> String {
     let mut out = String::from(
         "# Loop control states\n\n\
          Generated from `crucible/src/runloop/machine.rs` by `crucible loop-states`; \
-         `scripts/loop-docs.sh --check` keeps it current. The driver advances through this \
+         `scripts/state-docs.sh --check` keeps it current. The driver advances through this \
          table at every gate, so an edge missing here is a transition the loop cannot take.\n\n\
          Each **Turn** is one iteration's work graph (propose → apply → measure → decide), \
          rendered in [Work graphs](./work-graphs.md). Everything else is the control shell \
@@ -403,39 +365,11 @@ mod tests {
     }
 
     #[test]
-    fn every_state_is_reachable_from_setup() {
-        let mut seen = HashSet::from([State::Setup]);
-        let mut frontier = vec![State::Setup];
-        while let Some(s) = frontier.pop() {
-            for (from, _, to) in TRANSITIONS {
-                if *from == s && seen.insert(*to) {
-                    frontier.push(*to);
-                }
-            }
-        }
-        for s in states() {
-            assert!(seen.contains(&s), "{s:?} is unreachable");
-        }
-    }
-
-    #[test]
-    fn every_state_but_done_leads_somewhere_and_done_leads_nowhere() {
-        for s in states() {
-            let out = TRANSITIONS.iter().filter(|(from, _, _)| *from == s).count();
-            if s == State::Done {
-                assert_eq!(out, 0, "Done must be terminal");
-            } else {
-                assert!(out > 0, "{s:?} is a dead end");
-            }
-        }
-    }
-
-    #[test]
-    fn a_state_and_event_name_one_transition() {
-        let mut seen = HashSet::new();
-        for (from, ev, _) in TRANSITIONS {
-            assert!(seen.insert((*from, *ev)), "{from:?} on {ev:?} listed twice");
-        }
+    fn the_table_is_well_formed() {
+        assert_eq!(
+            crucible::diagram::table_problems(TRANSITIONS, State::Setup, |s| s == State::Done),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -473,13 +407,9 @@ mod tests {
         );
         m.advance(Event::BaselineStarted).unwrap();
         m.advance(Event::BaselineMeasured).unwrap();
-        assert_eq!(
-            m.advance(Event::Kept),
-            Err(IllegalTransition {
-                from: State::Head,
-                event: Event::Kept
-            })
-        );
+        let err = m.advance(Event::Kept).unwrap_err();
+        assert_eq!(err.machine, "loop");
+        assert_eq!((err.from.as_str(), err.event.as_str()), ("Head", "Kept"));
         m.advance(Event::TurnStarted).unwrap();
         m.advance(Event::Escalated).unwrap();
         m.advance(Event::PublishStarted).unwrap();
@@ -501,6 +431,7 @@ mod tests {
             );
         }
         assert!(diagram.contains("over budget → budget"));
+        assert!(dot().contains("Head -> Wrapup [label=\"over budget\\n→ budget\", color="));
     }
 
     #[test]

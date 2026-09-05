@@ -114,7 +114,7 @@ pub(crate) fn run_iteration<R: Reporter>(
                 result,
             ));
         },
-    );
+    )?;
     for ev in &task_events {
         runner.r.plan_event(ev);
     }
@@ -356,7 +356,7 @@ pub(crate) fn run_epilogue<R: Reporter>(
                 result,
             ));
         },
-    );
+    )?;
     for ev in &task_events {
         r.plan_event(ev);
     }
@@ -987,7 +987,7 @@ pub(crate) fn run_wide_tournament<R: Reporter>(
                 result,
             ));
         },
-    );
+    )?;
     for ev in &task_events {
         runner.r.plan_event(ev);
     }

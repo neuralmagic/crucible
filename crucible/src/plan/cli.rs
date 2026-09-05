@@ -700,7 +700,7 @@ pub fn run(
                 );
             }
         },
-    );
+    )?;
     for t in plan.tasks_topo() {
         if let Some(r) = out.results.get(&t.name) {
             println!(

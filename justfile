@@ -54,9 +54,9 @@ modgraph *ARGS:
 dsl-docs:
     ./scripts/dsl-docs.sh
 
-# Regenerate docs/loop-states.md from the loop driver's transition table.
-loop-docs:
-    ./scripts/loop-docs.sh
+# Regenerate docs/loop-states.md and docs/plan-states.md from the engine's transition tables.
+state-docs:
+    ./scripts/state-docs.sh
 
 # Render the published RFCs from gov/ (the pre-commit hook's job, without a commit).
 gov-docs:
