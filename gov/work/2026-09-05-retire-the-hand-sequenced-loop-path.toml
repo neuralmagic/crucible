@@ -3,9 +3,10 @@
 [govctl]
 id = "WI-2026-09-05-001"
 title = "Retire the hand-sequenced loop path"
-status = "active"
+status = "done"
 created = "2026-09-05"
 started = "2026-09-05"
+completed = "2026-09-05"
 refs = [
     "RFC-0001:C-WORKFLOW",
     "RFC-0001:C-WIRE",
