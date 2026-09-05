@@ -93,6 +93,13 @@ pub(crate) enum Cmd {
         #[command(subcommand)]
         action: PlanAction,
     },
+    /// Print the loop's control states: the transition table the driver runs on, as the
+    /// reference page (`docs/loop-states.md` is generated from it), as Graphviz dot (the
+    /// page's diagram), or as mermaid.
+    LoopStates {
+        #[arg(long, default_value = "markdown")]
+        format: StatesFormat,
+    },
     /// Watch one or more draft PRs' review comments and either steer a live run or reseed the next
     /// one: each NEW human comment is delivered either to a live run's control bridge as a `steer`,
     /// or appended to a reseed file that the next run's first turn reads, exactly one of
@@ -301,6 +308,13 @@ pub(crate) enum PlanAction {
 pub(crate) enum DslFormat {
     Markdown,
     Json,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum StatesFormat {
+    Markdown,
+    Mermaid,
+    Dot,
 }
 
 /// `crucible deploy <render|apply>`: emit the deployment YAML, or render-and-`kubectl apply`.

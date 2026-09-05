@@ -137,9 +137,52 @@ pub(crate) struct ControlState {
     deny: Mutex<Option<(AdmissionKey, String)>>,
 }
 
+/// Where the loop is, as the control plane reports it. The serialized form is the `phase`
+/// token on the `status` reply; [`LoopPhase::as_str`] is the same token for anything that
+/// prints it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LoopPhase {
+    Starting,
+    Preflight,
+    Baseline,
+    Wide,
+    Iteration,
+    Paused,
+    Parked,
+    Distressed,
+    Escalated,
+    Epilogue,
+    Finished,
+}
+
+impl LoopPhase {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            LoopPhase::Starting => "starting",
+            LoopPhase::Preflight => "preflight",
+            LoopPhase::Baseline => "baseline",
+            LoopPhase::Wide => "wide",
+            LoopPhase::Iteration => "iteration",
+            LoopPhase::Paused => "paused",
+            LoopPhase::Parked => "parked",
+            LoopPhase::Distressed => "distressed",
+            LoopPhase::Escalated => "escalated",
+            LoopPhase::Epilogue => "epilogue",
+            LoopPhase::Finished => "finished",
+        }
+    }
+}
+
+impl std::fmt::Display for LoopPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct StatusSnapshot {
-    pub phase: String,
+    pub phase: LoopPhase,
     pub iter: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub best_score: Option<f64>,
@@ -152,7 +195,7 @@ pub(crate) struct StatusSnapshot {
 impl Default for StatusSnapshot {
     fn default() -> Self {
         Self {
-            phase: "starting".into(),
+            phase: LoopPhase::Starting,
             iter: 0,
             best_score: None,
             spend: 0.0,
@@ -182,11 +225,24 @@ impl ControlState {
         self.rescope.lock().is_ok_and(|g| g.is_some())
     }
 
-    pub(crate) fn set_status(&self, phase: &str, iter: u32, best_score: Option<f64>, spend: f64) {
+    #[cfg(test)]
+    pub(crate) fn phase(&self) -> LoopPhase {
+        self.status
+            .lock()
+            .map(|s| s.phase)
+            .unwrap_or(LoopPhase::Starting)
+    }
+
+    pub(crate) fn set_phase(&self, phase: LoopPhase) {
+        if let Ok(mut status) = self.status.lock() {
+            status.phase = phase;
+        }
+    }
+
+    pub(crate) fn set_progress(&self, iter: u32, best_score: Option<f64>, spend: f64) {
         let Ok(mut status) = self.status.lock() else {
             return;
         };
-        status.phase = phase.to_string();
         status.iter = iter;
         status.best_score = best_score;
         status.spend = spend;

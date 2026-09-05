@@ -97,6 +97,9 @@ jobs:
       - name: DSL reference is current
         run: ./scripts/dsl-docs.sh --check
 
+      - name: Loop states page is current
+        run: ./scripts/loop-docs.sh --check
+
       - name: Install govctl
         uses: jaxxstorm/action-install-gh-release@v2.1.0
         with:
