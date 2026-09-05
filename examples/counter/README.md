@@ -20,7 +20,7 @@ crucible plan compile-workflow \
   --manifest examples/counter/crucible.toml
 
 crucible --manifest examples/counter/crucible.toml \
-  --graph-loop --iterations 2 --no-early-stop --ui jsonl
+  --iterations 2 --no-early-stop --ui jsonl
 ```
 
 Expected: `value.txt` ratchets 0→1→2 across kept iterations and the event stream contains
@@ -40,7 +40,7 @@ export OPENSHELL_PODMAN_SOCKET="$(podman machine inspect \
   --format '{{.ConnectionInfo.PodmanSocket.Path}}')"
 
 crucible --manifest examples/counter/crucible.toml \
-  --graph-loop --iterations 2 --no-early-stop --ui stream \
+  --iterations 2 --no-early-stop --ui stream \
   --agent-backend openshell --compute-driver podman \
   --sandbox-image ghcr.io/nvidia/openshell-community/sandboxes/base:latest
 ```

@@ -48,12 +48,6 @@ pub(crate) struct Args {
     /// meaningful when `--wide > 0`. Overrides `[search].policy_k`.
     #[arg(long, default_value_t = 1)]
     pub wide_keep: u32,
-    /// Run each iteration as a canonical work-graph plan (propose → apply → measure → decide)
-    /// through the shared plan executor instead of the hand-sequenced stages. Same events,
-    /// same decisions (parity-gated), plus additive plan lines on the session log.
-    /// Default off while the rollout soaks.
-    #[arg(long)]
-    pub graph_loop: bool,
     /// Don't stop early when an iteration solves the gate, run the full `--iterations` budget.
     /// For ablations: observe what each effort tier does with extra shots *after* solving
     /// (does it keep gold-plating, find more, or regress?). Default: stop on the first solve.

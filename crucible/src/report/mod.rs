@@ -193,7 +193,7 @@ pub trait Reporter {
             esc.category, esc.reason
         ));
     }
-    /// An additive work-graph wire line (`PlanAdmitted` / `TaskResult`) from a graph-loop
+    /// An additive work-graph wire line (`PlanAdmitted` / `TaskResult`) from a loop iteration's plan
     /// iteration. Default no-op: only the session reporter persists them; the console
     /// front-end has no plan rendering, and the legacy sequencing path never emits one.
     fn plan_event(&mut self, _ev: &crate::report::session::SessionEvent) {}

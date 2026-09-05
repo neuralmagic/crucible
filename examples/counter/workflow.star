@@ -1,5 +1,5 @@
 # The smallest complete autoresearch workflow. Binding the proposer to the `solver` session
-# makes repeated graph-loop iterations resume one logical agent conversation; omitting `session`
+# makes repeated loop iterations resume one logical agent conversation; omitting `session`
 # restores the historical fresh-turn behavior.
 
 solver = session(name = "solver")

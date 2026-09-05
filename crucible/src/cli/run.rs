@@ -700,14 +700,9 @@ fn drive_loop(
     world: Arc<dyn World>,
     judge: Arc<dyn Judge>,
 ) -> Result<()> {
-    let mut args = args;
     install_ctrlc()?;
     if args.control_port.is_some() && !args.resume && args.ui != Ui::Stream {
         return Err(RunError::ControlPortNeedsStream.into());
-    }
-
-    if workflow_implies_graph_loop(&args) {
-        args.graph_loop = true;
     }
 
     // When the controller dispatched this loop pod, adopt its dispatch span as the run's trace
@@ -879,19 +874,10 @@ fn open_admission_ledger(
     crate::control::admission::AdmissionLedger::open(&p.admissions, mode).map(std::sync::Arc::new)
 }
 
-/// An engine-task workflow only executes on the graph path; running it hand-sequenced would
-/// silently ignore the authored graph (and its sessions). Authoring one is the opt-in, so
-/// `--graph-loop` is implied. Legacy splice workflows run on both paths and imply nothing.
-fn workflow_implies_graph_loop(args: &Args) -> bool {
-    args.workflow
-        .as_ref()
-        .is_some_and(|w| !w.is_legacy_splice())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{args_from, workflow_from};
+    use crate::testing::args_from;
     use clap::Parser;
 
     // A minimal `command`-backend manifest (no broker, no Vertex) so `apply_agent_cfg` is
@@ -936,57 +922,6 @@ mod tests {
             <crate::cli::Cli as clap::Parser>::try_parse_from(argv).is_ok(),
             "both flags parse with a manifest"
         );
-    }
-
-    #[test]
-    fn engine_workflow_implies_graph_loop() {
-        let mut a = args_from(&["crucible"]);
-        a.workflow = Some(workflow_from(
-            r#"
-            result = "decide"
-            [[task]]
-            name = "propose"
-            kind = "engine"
-            op = "propose"
-            [[task]]
-            name = "apply"
-            kind = "engine"
-            op = "apply"
-            depends_on = ["propose"]
-            [[task]]
-            name = "measure"
-            kind = "engine"
-            op = "measure"
-            depends_on = ["apply"]
-            [[task]]
-            name = "decide"
-            kind = "engine"
-            op = "decide"
-            source = "measure"
-            depends_on = ["measure"]
-        "#,
-        ));
-        assert!(workflow_implies_graph_loop(&a));
-    }
-
-    #[test]
-    fn legacy_splice_workflow_does_not_imply_graph_loop() {
-        let mut a = args_from(&["crucible"]);
-        a.workflow = Some(workflow_from(
-            r#"
-            [[task]]
-            name = "lint"
-            kind = "command"
-            command = "true"
-        "#,
-        ));
-        assert!(!workflow_implies_graph_loop(&a));
-    }
-
-    #[test]
-    fn no_workflow_does_not_imply_graph_loop() {
-        let a = args_from(&["crucible"]);
-        assert!(!workflow_implies_graph_loop(&a));
     }
 
     fn deploy_args(extra: &[&str]) -> crate::cli::DeployArgs {

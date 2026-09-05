@@ -40,7 +40,3 @@ pub(crate) fn tempdir(name: &str) -> PathBuf {
     fs::create_dir_all(&dir).expect("mkdir tmp");
     dir
 }
-
-pub(crate) fn workflow_from(toml_src: &str) -> crate::plan::workflow::WorkflowCfg {
-    toml::from_str(toml_src).unwrap()
-}

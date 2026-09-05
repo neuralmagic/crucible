@@ -1579,7 +1579,6 @@ mod tests {
     #[test]
     fn a_rejecting_pack_task_discards_the_iteration_before_measuring() {
         let trace = run_counter_cfg(
-            true,
             2,
             BUMP,
             false,
@@ -1709,7 +1708,7 @@ mod tests {
             source = "grade"
             depends_on = ["grade"]
         "#;
-        let trace = run_counter_cfg(true, 2, BUMP, false, Some(workflow));
+        let trace = run_counter_cfg(2, BUMP, false, Some(workflow));
         assert_eq!(trace.best, 3.0, "{}", describe(&trace));
         assert_eq!(
             trace
@@ -1784,7 +1783,7 @@ mod tests {
             source = "grade"
             depends_on = ["grade"]
         "#;
-        let trace = run_counter_cfg(true, 1, BUMP, false, Some(workflow));
+        let trace = run_counter_cfg(1, BUMP, false, Some(workflow));
         assert_eq!(
             trace
                 .rows
@@ -1873,7 +1872,7 @@ mod tests {
             source = "grade"
             depends_on = ["grade"]
         "#;
-        let trace = run_counter_cfg(true, 1, BUMP, false, Some(workflow));
+        let trace = run_counter_cfg(1, BUMP, false, Some(workflow));
         assert_eq!(
             trace
                 .rows
@@ -1934,12 +1933,11 @@ mod tests {
     /// git workspace, a real command-backend turn, and a real measure subprocess: once per
     /// path. sh stands in for nu so the fixture is self-contained. The measure declares
     /// solved at value >= 3, so a multi-iteration run exercises the early stop.
-    fn run_counter(graph_loop: bool, iterations: u32, bump: &str) -> RunTrace {
-        run_counter_cfg(graph_loop, iterations, bump, false, None)
+    fn run_counter(iterations: u32, bump: &str) -> RunTrace {
+        run_counter_cfg(iterations, bump, false, None)
     }
 
     fn run_counter_cfg(
-        graph_loop: bool,
         iterations: u32,
         bump: &str,
         wide: bool,
@@ -1949,7 +1947,7 @@ mod tests {
         // the same name, and the first thing this does is remove_dir_all.
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "crucible-graph-parity-{}-{}",
+            "crucible-counter-{}-{}",
             std::process::id(),
             SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
@@ -2017,7 +2015,6 @@ mod tests {
         args.agent_backend = manifest::AgentBackend::Command;
         args.agent_cmd = m.agent.agent_cmd.clone();
         args.iterations = iterations;
-        args.graph_loop = graph_loop;
         args.search = m.search.clone();
         args.workflow = m.workflow.clone();
 
@@ -2136,67 +2133,31 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
     }
 
-    /// Diff two traces: rows, best, commits, shutdown outcome, and the event kind
-    /// sequence with the graph run's additive plan lines filtered out.
-    fn assert_parity(legacy: &RunTrace, graph: &RunTrace) {
-        assert_eq!(legacy.rows, graph.rows, "decided rows must match");
-        assert_eq!(legacy.best, graph.best, "summary best_score must match");
-        assert_eq!(
-            legacy.commits, graph.commits,
-            "kept commit count must match"
-        );
-        assert_eq!(
-            legacy.shutdown, graph.shutdown,
-            "shutdown outcome must match"
-        );
-        // Both traces may carry additive plan lines (the wide tournament is graph-shaped
-        // on both loop paths); the parity claim is about everything else.
-        let strip = |t: &RunTrace| -> Vec<String> {
-            t.kinds
-                .iter()
-                .filter(|k| k.as_str() != "plan_admitted" && k.as_str() != "task_result")
-                .cloned()
-                .collect()
-        };
-        assert_eq!(
-            strip(legacy),
-            strip(graph),
-            "event kind sequence must be identical minus additive plan lines"
-        );
-    }
-
     /// One iteration, identical under both paths.
     #[test]
-    fn counter_parity_between_typestate_and_graph_paths() {
-        let legacy = run_counter(false, 1, BUMP);
-        let graph = run_counter(true, 1, BUMP);
-        assert_parity(&legacy, &graph);
-        assert_eq!(legacy.shutdown, "finished");
+    fn counter_runs_one_iteration_as_a_plan() {
+        let t = run_counter(1, BUMP);
+        let decisions: Vec<&str> = t.rows.iter().map(|(_, d, _)| d.as_str()).collect();
+        assert_eq!(decisions, ["baseline", "keep"], "{}", describe(&t));
+        let scores: Vec<Option<f64>> = t.rows.iter().map(|(_, _, s)| *s).collect();
+        assert_eq!(scores, [Some(1.0), Some(2.0)]);
+        assert_eq!(t.shutdown, "finished");
         assert_eq!(
-            graph.kinds.iter().filter(|k| *k == "plan_admitted").count(),
+            t.kinds.iter().filter(|k| *k == "plan_admitted").count(),
             1,
             "one admitted plan for the single iteration"
         );
         assert_eq!(
-            graph.kinds.iter().filter(|k| *k == "task_result").count(),
+            t.kinds.iter().filter(|k| *k == "task_result").count(),
             4,
             "one terminal result per template task"
         );
     }
 
-    /// The wide tournament as a template: parallel isolated proposes, serial
-    /// diff scoring, top_k, winner seed: produces the same rows, notes order, seed
-    /// state, and event sequence under both paths, then the deep loop runs on
-    /// top of the seeded workspace under both paths.
     #[test]
-    fn counter_parity_wide_tournament() {
-        let legacy = run_counter_cfg(false, 2, BUMP, true, None);
-        let graph = run_counter_cfg(true, 2, BUMP, true, None);
-
-        // Shape pinned on the legacy path first: 3 measured candidates at value 2 (each
-        // row appears twice on the wire: once at measure time, once in the driver's
-        // fold), then the seeded deep loop solves at 3 on its first iteration.
-        let decisions: Vec<&str> = legacy.rows.iter().map(|(_, d, _)| d.as_str()).collect();
+    fn counter_wide_tournament_seeds_the_deep_round() {
+        let t = run_counter_cfg(2, BUMP, true, None);
+        let decisions: Vec<&str> = t.rows.iter().map(|(_, d, _)| d.as_str()).collect();
         assert_eq!(
             decisions,
             [
@@ -2208,9 +2169,11 @@ mod tests {
                 "wide-keep",
                 "wide-keep", // driver re-emissions
                 "keep",      // deep iteration on the seeded workspace
-            ]
+            ],
+            "{}",
+            describe(&t)
         );
-        let scores: Vec<Option<f64>> = legacy.rows.iter().map(|(_, _, s)| *s).collect();
+        let scores: Vec<Option<f64>> = t.rows.iter().map(|(_, _, s)| *s).collect();
         assert_eq!(
             scores,
             [
@@ -2225,54 +2188,43 @@ mod tests {
             ],
             "the winner seed must actually land: the deep iteration starts from 2"
         );
-        assert_eq!(legacy.shutdown, "solved");
-
-        assert_parity(&legacy, &graph);
+        assert_eq!(t.shutdown, "solved");
         assert_eq!(
-            graph.kinds.iter().filter(|k| *k == "plan_admitted").count(),
+            t.kinds.iter().filter(|k| *k == "plan_admitted").count(),
             2,
             "one admitted plan for the tournament, one for the deep round"
         );
         assert_eq!(
-            graph.kinds.iter().filter(|k| *k == "task_result").count(),
+            t.kinds.iter().filter(|k| *k == "task_result").count(),
             7 + 4,
             "3 proposes + 3 measures + pick, then the 4 deep-round tasks"
         );
     }
 
-    /// The full round loop under the graph path: keep, a regression that
-    /// exercises discard/restore, then the solve that stops the run early (3 of 5
-    /// budgeted iterations): identical to the typestate path.
     #[test]
-    fn counter_parity_multi_iteration_with_discard_restore_and_early_stop() {
-        let legacy = run_counter(false, 5, ZIGZAG);
-        let graph = run_counter(true, 5, ZIGZAG);
-
-        // The intended shape, pinned on the legacy path first so a bug in BOTH paths
-        // can't slide through as "parity".
-        let decisions: Vec<&str> = legacy.rows.iter().map(|(_, d, _)| d.as_str()).collect();
+    fn counter_multi_iteration_discards_restores_and_stops_early() {
+        let t = run_counter(5, ZIGZAG);
+        let decisions: Vec<&str> = t.rows.iter().map(|(_, d, _)| d.as_str()).collect();
         assert_eq!(
             decisions,
             ["baseline", "keep", "discard", "keep"],
-            "legacy path: {}",
-            describe(&legacy)
+            "{}",
+            describe(&t)
         );
-        let scores: Vec<Option<f64>> = legacy.rows.iter().map(|(_, _, s)| *s).collect();
+        let scores: Vec<Option<f64>> = t.rows.iter().map(|(_, _, s)| *s).collect();
         assert_eq!(
             scores,
             [Some(1.0), Some(2.0), Some(1.0), Some(3.0)],
             "the discard's restore must rewind value.txt to the kept best"
         );
-        assert_eq!(legacy.shutdown, "solved", "value 3 stops the run early");
-
-        assert_parity(&legacy, &graph);
+        assert_eq!(t.shutdown, "solved", "value 3 stops the run early");
         assert_eq!(
-            graph.kinds.iter().filter(|k| *k == "plan_admitted").count(),
+            t.kinds.iter().filter(|k| *k == "plan_admitted").count(),
             3,
             "one admitted plan per executed round"
         );
         assert_eq!(
-            graph.task_iters,
+            t.task_iters,
             [1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3],
             "task_result lines carry their loop round"
         );

@@ -65,7 +65,7 @@ crucible plan compile-workflow \
 
 # The graph loop capability-admits and executes the generated workflow.
 crucible --manifest examples/adversarial-review/crucible.toml \
-  --graph-loop --iterations 2 --no-early-stop
+  --iterations 2 --no-early-stop
 
 # The standalone plan-runner fixture remains useful for inspecting the graph itself.
 crucible plan show --file examples/adversarial-review/plan-panel-hack.toml
