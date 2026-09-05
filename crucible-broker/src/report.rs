@@ -200,6 +200,7 @@ mod tests {
                 status: "pass".into(),
                 cost_usd: 0.25,
                 blocked: None,
+                transport: None,
             }],
             results: Default::default(),
         };
@@ -222,6 +223,7 @@ mod tests {
                 status: "pass".into(),
                 cost_usd: 0.0,
                 blocked: None,
+                transport: None,
             }],
             results: Default::default(),
         };
@@ -242,6 +244,7 @@ mod tests {
                 status: "pass".into(),
                 cost_usd: 0.0,
                 blocked: None,
+                transport: None,
             }],
             results: BTreeMap::from([(
                 "card".into(),
@@ -281,6 +284,7 @@ mod tests {
                     status: "pass".into(),
                     cost_usd: 0.0,
                     blocked: None,
+                    transport: None,
                 }],
                 results: Default::default(),
             })

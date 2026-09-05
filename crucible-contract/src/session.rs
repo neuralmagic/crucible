@@ -264,6 +264,27 @@ pub enum BlockedReasonKind {
     StagingRefused,
 }
 
+/// Why an attempt died before the task could be judged. The executor retries these, bounded; the
+/// last attempt's cause lands on the result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportCause {
+    /// The openshell gateway could not be booted, authenticated, or reached.
+    Gateway,
+    /// The sandbox could not be created, made ready, or given its policy.
+    Sandbox,
+    /// The agent process or its exec stream broke before it reported.
+    Agent,
+    /// The model provider refused or dropped the turn: auth, rate limit, overload, connection.
+    Provider,
+    /// Preparing the task's workspace failed: inputs, worktree, toolbox, injects, session state.
+    Workspace,
+    /// A command task could not be spawned.
+    Command,
+    /// A transport failure this engine does not classify further.
+    Other,
+}
+
 /// One event in the session log. Mirrors the `crucible::reporter::Reporter` calls so the
 /// viewer can rebuild identical state by folding the sequence (the same fold `App` does
 /// over `UiMsg`).
@@ -403,6 +424,9 @@ pub enum SessionEvent {
         /// Present exactly when `status` is `blocked`; `note` is its rendered form.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         blocked: Option<TaskBlocked>,
+        /// Present exactly when `status` is `transport`: what the last attempt died on.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transport: Option<TransportCause>,
         #[serde(default)]
         secs: f64,
         #[serde(default)]
@@ -834,6 +858,7 @@ mod tests {
             output: Some(serde_json::json!({"score": 234.0})),
             note: String::new(),
             blocked: None,
+            transport: None,
             secs: 0.0,
             trace_id: String::new(),
             span_id: String::new(),
@@ -849,6 +874,7 @@ mod tests {
                 attempts,
                 output,
                 blocked,
+                transport,
                 ..
             } => {
                 assert_eq!(task, "t");
@@ -856,6 +882,7 @@ mod tests {
                 assert_eq!(attempts, 0);
                 assert!(output.is_none());
                 assert!(blocked.is_none());
+                assert!(transport.is_none());
             }
             other => panic!("wrong variant: {other:?}"),
         }
@@ -880,6 +907,7 @@ mod tests {
                 reason: BlockedReasonKind::RequiredTaskFailed,
                 task: Some("brief".into()),
             }),
+            transport: None,
             secs: 0.0,
             trace_id: String::new(),
             span_id: String::new(),
@@ -912,6 +940,48 @@ mod tests {
         ] {
             assert_eq!(
                 serde_json::to_string(&kind).unwrap(),
+                format!("\"{token}\"")
+            );
+        }
+    }
+
+    #[test]
+    fn a_transport_task_result_carries_what_the_last_attempt_died_on() {
+        let ev = SessionEvent::TaskResult {
+            task: "triage[linux-default]".into(),
+            status: "transport".into(),
+            plan_version: 1,
+            task_kind: "agent".into(),
+            iter: 0,
+            digest: String::new(),
+            job: String::new(),
+            attempts: 3,
+            cost_usd: 0.0,
+            metric: None,
+            output: None,
+            note: "transport retries exhausted (3 attempts): gateway did not become healthy".into(),
+            blocked: None,
+            transport: Some(TransportCause::Gateway),
+            secs: 0.0,
+            trace_id: String::new(),
+            span_id: String::new(),
+        };
+        assert_eq!(
+            encode(&ev),
+            r#"{"v":1,"kind":"task_result","task":"triage[linux-default]","status":"transport","plan_version":1,"task_kind":"agent","iter":0,"digest":"","job":"","attempts":3,"cost_usd":0.0,"note":"transport retries exhausted (3 attempts): gateway did not become healthy","transport":"gateway","secs":0.0,"trace_id":"","span_id":""}"#
+        );
+        assert_round_trips(ev);
+        for (cause, token) in [
+            (TransportCause::Gateway, "gateway"),
+            (TransportCause::Sandbox, "sandbox"),
+            (TransportCause::Agent, "agent"),
+            (TransportCause::Provider, "provider"),
+            (TransportCause::Workspace, "workspace"),
+            (TransportCause::Command, "command"),
+            (TransportCause::Other, "other"),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&cause).unwrap(),
                 format!("\"{token}\"")
             );
         }

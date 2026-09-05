@@ -66,6 +66,7 @@ pub(crate) fn task_result_event(
             .blocked
             .as_ref()
             .map(crate::plan::machine::BlockedReason::wire),
+        transport: r.transport,
         secs: 0.0,
         trace_id,
         span_id,
