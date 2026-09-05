@@ -202,7 +202,7 @@ fn ready_deadline(
 /// The gateway's local mTLS client-cert directory for the registered gateway (`gateway add
 /// --local --name ci` writes `ca.crt`/`tls.crt`/`tls.key` here). Honors `XDG_CONFIG_HOME`,
 /// falling back to `~/.config`, exactly as the CLI resolves it.
-fn mtls_dir() -> Result<PathBuf> {
+pub(crate) fn mtls_dir() -> Result<PathBuf> {
     let base = match std::env::var("XDG_CONFIG_HOME") {
         Ok(x) if !x.is_empty() => PathBuf::from(x),
         _ => {

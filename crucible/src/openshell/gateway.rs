@@ -17,10 +17,10 @@
 //! The daemons (podman service, gateway) are spawned detached and live for the run; crucible
 //! is the pod entrypoint, so the container runtime reaps them when crucible exits.
 
-use crate::openshell::grpc::{GATEWAY_NAME, GATEWAY_PORT};
+use crate::openshell::grpc::{GATEWAY_NAME, GATEWAY_PORT, mtls_dir};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -42,6 +42,8 @@ pub enum GatewayError {
     },
     #[error("generate-certs failed: {stderr}")]
     GenerateCertsFailed { stderr: String },
+    #[error("gateway remove {name} failed: {stderr}")]
+    RemoveRegistrationFailed { name: &'static str, stderr: String },
     #[error("gateway register failed within 30s: {last}\n{log_tail}")]
     RegisterTimeout { last: String, log_tail: String },
     #[error(
@@ -320,6 +322,37 @@ fn registration_matches(body: &[u8], port: u16) -> bool {
     })
 }
 
+/// Whether the CLI's registered client material is the copy `gateway add` would take from
+/// `tls_dir` now. False when either side is missing.
+fn client_certs_match(mtls_dir: &Path, tls_dir: &Path) -> bool {
+    [
+        ("ca.crt", "ca.crt"),
+        ("tls.crt", "client/tls.crt"),
+        ("tls.key", "client/tls.key"),
+    ]
+    .iter()
+    .all(|(registered, generated)| {
+        match (
+            std::fs::read(mtls_dir.join(registered)),
+            std::fs::read(tls_dir.join(generated)),
+        ) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        }
+    })
+}
+
+/// Whether something already accepts connections on the gateway port. A gateway from an
+/// earlier boot in this process (or a previous process on the same host) holds it; a second
+/// spawn would die on the bind and truncate the live one's log.
+fn gateway_listening(port: u16) -> bool {
+    std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_secs(1),
+    )
+    .is_ok()
+}
+
 fn registration_exists(port: u16) -> bool {
     Command::new("openshell")
         .args(["gateway", "list", "--output", "json"])
@@ -498,25 +531,44 @@ async fn boot(driver: ComputeDriver, supervisor_image: Option<&str>) -> Result<(
     //    of discarding them, so a failure below (register/health timeout) can quote the
     //    gateway's own diagnostics rather than a bare "did not become healthy".
     let log_path = state_dir()?.join("gateway.log");
-    let log_out = std::fs::File::create(&log_path)
-        .with_context(|| format!("creating gateway log {}", log_path.display()))?;
-    let log_err = log_out
-        .try_clone()
-        .with_context(|| format!("cloning gateway log handle {}", log_path.display()))?;
-    let mut gw = Command::new("openshell-gateway");
-    gw.args(["--db-url", "sqlite::memory:", "--log-level", "info"])
-        .stdout(Stdio::from(log_out))
-        .stderr(Stdio::from(log_err));
-    if scrub_k8s_vars(driver) {
-        for var in K8S_DETECTION_VARS {
-            gw.env_remove(var);
+    if !gateway_listening(GATEWAY_PORT) {
+        let log_out = std::fs::File::create(&log_path)
+            .with_context(|| format!("creating gateway log {}", log_path.display()))?;
+        let log_err = log_out
+            .try_clone()
+            .with_context(|| format!("cloning gateway log handle {}", log_path.display()))?;
+        let mut gw = Command::new("openshell-gateway");
+        gw.args(["--db-url", "sqlite::memory:", "--log-level", "info"])
+            .stdout(Stdio::from(log_out))
+            .stderr(Stdio::from(log_err));
+        if scrub_k8s_vars(driver) {
+            for var in K8S_DETECTION_VARS {
+                gw.env_remove(var);
+            }
+        }
+        gw.spawn().context("spawn openshell-gateway")?;
+    }
+
+    // 5. register, retrying until the gateway is listening; 6. wait healthy. `gateway add`
+    //    copies the client material out of `tls_dir` and refuses an existing name, so a
+    //    registration whose copy no longer matches is removed and made again.
+    let mut last = String::new();
+    let current = registration_exists(GATEWAY_PORT)
+        && mtls_dir().is_ok_and(|dir| client_certs_match(&dir, &tls_dir));
+    if !current && registration_exists(GATEWAY_PORT) {
+        let removed = Command::new("openshell")
+            .args(["gateway", "remove", GATEWAY_NAME])
+            .output()
+            .context("exec openshell gateway remove")?;
+        if !removed.status.success() {
+            return Err(GatewayError::RemoveRegistrationFailed {
+                name: GATEWAY_NAME,
+                stderr: String::from_utf8_lossy(&removed.stderr).trim().to_owned(),
+            }
+            .into());
         }
     }
-    gw.spawn().context("spawn openshell-gateway")?;
-
-    // 5. register, retrying until the gateway is listening; 6. wait healthy.
-    let mut last = String::new();
-    let registered = registration_exists(GATEWAY_PORT)
+    let registered = current
         || wait_for(Duration::from_secs(30), || {
             match Command::new("openshell")
                 .args(register_args(GATEWAY_PORT))
@@ -1065,6 +1117,45 @@ mod tests {
         assert_eq!(
             ComputeDriver::Kubernetes.broker_host(),
             "host.openshell.internal"
+        );
+    }
+
+    #[test]
+    fn a_bound_port_reads_as_a_listening_gateway_and_a_closed_one_does_not() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(gateway_listening(port));
+        drop(listener);
+        assert!(!gateway_listening(port));
+    }
+
+    #[test]
+    fn a_registration_is_current_only_when_its_copy_matches_the_generated_client_material() {
+        let root = tempfile::tempdir().unwrap();
+        let mtls = root.path().join("mtls");
+        let tls = root.path().join("tls");
+        std::fs::create_dir_all(&mtls).unwrap();
+        std::fs::create_dir_all(tls.join("client")).unwrap();
+        assert!(!client_certs_match(&mtls, &tls), "nothing on either side");
+        for (registered, generated, bytes) in [
+            ("ca.crt", "ca.crt", "ca-1"),
+            ("tls.crt", "client/tls.crt", "client-1"),
+            ("tls.key", "client/tls.key", "key-1"),
+        ] {
+            std::fs::write(mtls.join(registered), bytes).unwrap();
+            std::fs::write(tls.join(generated), bytes).unwrap();
+        }
+        assert!(client_certs_match(&mtls, &tls));
+        std::fs::write(tls.join("ca.crt"), "ca-2").unwrap();
+        assert!(
+            !client_certs_match(&mtls, &tls),
+            "a regenerated CA invalidates the registered copy"
+        );
+        std::fs::remove_file(mtls.join("tls.key")).unwrap();
+        std::fs::write(tls.join("ca.crt"), "ca-1").unwrap();
+        assert!(
+            !client_certs_match(&mtls, &tls),
+            "a missing registered file"
         );
     }
 }
