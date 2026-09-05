@@ -302,15 +302,8 @@ pub(crate) fn distress(
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Read, Write};
-    use std::sync::{Mutex, MutexGuard};
 
-    /// `FORGE_STORAGE_ROOT` (and the Slack/pod vars) are process-global: the file tests must not
-    /// interleave.
-    static ENV: Mutex<()> = Mutex::new(());
-
-    fn env_lock() -> MutexGuard<'static, ()> {
-        ENV.lock().unwrap_or_else(|e| e.into_inner())
-    }
+    use crate::test_support::env_lock;
 
     struct Root {
         dir: std::path::PathBuf,

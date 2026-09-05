@@ -49,3 +49,16 @@ pub use approval::{ApprovalBackend, ApprovalChannel, ApprovalRequest, ApprovalSt
 pub use bounds::Bounds;
 pub use broker::{Broker, NullResolver, TraceResolver};
 pub use types::{JudgeImpact, Resolution, TraceId, TraceParams, judge_impact, trace_id};
+
+/// Support for tests that mutate the process environment: one lock, since the environ is a
+/// single global and per-module locks would not serialize tests in different modules.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV: Mutex<()> = Mutex::new(());
+
+    pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
+        ENV.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
