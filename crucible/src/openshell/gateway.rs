@@ -372,11 +372,16 @@ fn libc_getuid() -> u32 {
 ///
 /// `supervisor_image` flows into the podman driver block (default emulator image used
 /// when `None`).
+/// Fan-out instances run their turns on concurrent threads and each arrives here; a second
+/// `generate-certs` under a live gateway rotates the CA its clients were issued from.
+static BOOT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tracing::instrument(name = "gateway_boot", skip_all, fields(driver = ?driver))]
 pub async fn ensure_running(
     driver: ComputeDriver,
     supervisor_image: Option<&str>,
 ) -> Result<Option<String>> {
+    let _boot = BOOT.lock().await;
     if !is_running().await {
         // The loop pod sets OPENSHELL_SUPERVISOR_IMAGE (e.g. the aws-provider supervisor);
         // honor it when the caller didn't pass one explicitly.
