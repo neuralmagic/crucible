@@ -1270,6 +1270,15 @@ pub fn ensure_injects_resolve(m: &Manifest, manifest_dir: &Path) -> Result<(), M
     })
 }
 
+/// The directory a manifest path anchors: its parent, or `.` for a bare file name.
+pub fn manifest_dir(manifest_path: &Path) -> PathBuf {
+    manifest_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

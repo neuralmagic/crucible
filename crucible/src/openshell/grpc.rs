@@ -1429,7 +1429,7 @@ pYBZ
     /// reaching the panicking path and prove nothing.
     #[test]
     fn channel_construction_runs_on_the_engine_runtime() {
-        let _guard = crate::test_env_lock();
+        let _guard = crate::test_support::env_lock();
         let dir = std::env::temp_dir().join(format!("crucible-grpc-certs-{}", std::process::id()));
         let mtls = dir.join("openshell/gateways/ci/mtls");
         std::fs::create_dir_all(&mtls).unwrap();
@@ -1462,7 +1462,7 @@ pYBZ
 
     #[test]
     fn mtls_dir_lands_under_the_named_gateway() {
-        let _guard = crate::test_env_lock();
+        let _guard = crate::test_support::env_lock();
         unsafe {
             std::env::set_var("XDG_CONFIG_HOME", "/cfg");
         }
@@ -2196,7 +2196,7 @@ pYBZ
 
     #[test]
     fn pull_timeout_defaults_to_thirty_minutes_and_honors_the_env() {
-        let _guard = crate::test_env_lock();
+        let _guard = crate::test_support::env_lock();
         unsafe {
             std::env::remove_var("OPENSHELL_PULL_TIMEOUT");
         }

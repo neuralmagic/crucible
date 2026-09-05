@@ -304,7 +304,10 @@ impl TaskRunner for HarnessRunner {
             Ok(p) => p,
             Err(e) => {
                 let note = format!("capturing the workspace's uncommitted state failed: {e:#}");
-                return batch.iter().map(|_| fail(0.0, note.clone())).collect();
+                return batch
+                    .iter()
+                    .map(|_| Attempt::failed(0.0, note.clone()))
+                    .collect();
             }
         };
         let captured = &self.captured_bytes;
@@ -335,8 +338,9 @@ impl TaskRunner for HarnessRunner {
             handles
                 .into_iter()
                 .map(|h| {
-                    h.join()
-                        .unwrap_or_else(|_| fail(0.0, "task thread panicked".to_string()))
+                    h.join().unwrap_or_else(|_| {
+                        Attempt::failed(0.0, "task thread panicked".to_string())
+                    })
                 })
                 .collect()
         })
@@ -370,7 +374,7 @@ fn run_task(
     } = *cx;
     let Some(Isolation::Worktree) = task.isolation else {
         if let Err(e) = materialize_inputs(&paths.state, &paths.workspace, staged) {
-            return transport(e);
+            return Attempt::transport(e);
         }
         let before = PriorContents::of(&paths.workspace, &task.emits_files);
         let attempt_out = prepare_and_run(args, paths, task, attempt, inputs);
@@ -388,7 +392,7 @@ fn run_task(
     // coding tasks whose diff has to survive (the wide tournament carries those out itself).
     let root = paths.state.join("plan-iso");
     if let Err(e) = std::fs::create_dir_all(&root) {
-        return transport(format!("creating the isolation root failed: {e}"));
+        return Attempt::transport(format!("creating the isolation root failed: {e}"));
     }
     let worktree = root.join(task_worktree_name(&task.name));
     let captured;
@@ -400,7 +404,7 @@ fn run_task(
                 &captured
             }
             Err(e) => {
-                return fail(
+                return Attempt::failed(
                     0.0,
                     format!("capturing the workspace's uncommitted state failed: {e:#}"),
                 );
@@ -408,13 +412,13 @@ fn run_task(
         },
     };
     if let Err(e) = crate::plan::worktree::setup(&paths.workspace, &worktree, pending) {
-        return transport(format!("worktree setup failed: {e:#}"));
+        return Attempt::transport(format!("worktree setup failed: {e:#}"));
     }
     // `inputs/` is excluded from the workspace's git memory, so neither the clone nor the
     // pending patch carries it. Lay this task's own staged set down here, or an isolated
     // consumer never sees what its ancestors declared.
     if let Err(e) = materialize_inputs(&paths.state, &worktree, staged) {
-        return transport(e);
+        return Attempt::transport(e);
     }
     let iso = Paths::for_worktree(worktree.clone(), paths.skills.clone());
     let _ = std::fs::create_dir_all(&iso.state);
@@ -593,7 +597,7 @@ fn prepare_and_run(
 ) -> Attempt {
     for (src, dst) in &args.workflow_frozen_injects {
         if let Err(e) = crate::manifest::apply_inject(src, &paths.workspace.join(dst)) {
-            return transport(format!(
+            return Attempt::transport(format!(
                 "restoring frozen inject {} -> {} failed: {e:#}",
                 src.display(),
                 dst.display()
@@ -635,10 +639,10 @@ fn run_in(
             };
         }
         TaskKind::TopK { .. } => {
-            return fail(0.0, "reducer task reached the runner".to_string());
+            return Attempt::failed(0.0, "reducer task reached the runner".to_string());
         }
         TaskKind::Engine { .. } => {
-            return fail(0.0, "engine task reached a non-loop runner".to_string());
+            return Attempt::failed(0.0, "engine task reached a non-loop runner".to_string());
         }
     };
 
@@ -653,7 +657,9 @@ fn run_in(
     if let Some(h) = harness {
         match crate::manifest::Harness::from_str(h, true) {
             Ok(h) => args.harness = Some(h),
-            Err(e) => return fail(0.0, format!("task names unknown harness {h:?}: {e}")),
+            Err(e) => {
+                return Attempt::failed(0.0, format!("task names unknown harness {h:?}: {e}"));
+            }
         }
     }
     if let Some(m) = model {
@@ -662,7 +668,9 @@ fn run_in(
     if let Some(e) = effort {
         match crate::manifest::ReasoningEffort::from_str(e, true) {
             Ok(e) => args.reasoning_effort = Some(e),
-            Err(err) => return fail(0.0, format!("task names unknown effort {e:?}: {err}")),
+            Err(err) => {
+                return Attempt::failed(0.0, format!("task names unknown effort {e:?}: {err}"));
+            }
         }
     }
     if let Err(e) = crate::cli::workspace::install_toolbox(
@@ -670,12 +678,12 @@ fn run_in(
         &args.workflow_toolbox_exclude,
         args.harness().skills_dir(),
     ) {
-        return transport(format!("installing the task toolbox failed: {e:#}"));
+        return Attempt::transport(format!("installing the task toolbox failed: {e:#}"));
     }
 
     let inputs_json = match serde_json::to_string_pretty(inputs) {
         Ok(j) => j,
-        Err(e) => return fail(0.0, format!("inputs not serializable: {e}")),
+        Err(e) => return Attempt::failed(0.0, format!("inputs not serializable: {e}")),
     };
     let full_prompt = format!(
         "{prompt}\n\n## Task inputs\n\nUpstream task results, as JSON:\n\n{inputs_json}\n\n\
@@ -692,7 +700,7 @@ fn run_in(
     let prepared =
         match crate::agent::agent_session::prepare_named(&paths.state, task.session.as_deref()) {
             Ok(prepared) => prepared,
-            Err(note) => return transport(note),
+            Err(note) => return Attempt::transport(note),
         };
     let turn = crate::agent::run_turn_with_session(
         &args,
@@ -729,7 +737,7 @@ fn run_in(
                     outcome: AttemptOutcome::Pass(v),
                     cost_usd: cost,
                 },
-                Err(e) => fail(cost, format!("{RESULT_FILE} is not valid JSON: {e}")),
+                Err(e) => Attempt::failed(cost, format!("{RESULT_FILE} is not valid JSON: {e}")),
             }
         }
         Err(_) => match transport_error {
@@ -737,25 +745,11 @@ fn run_in(
                 outcome: AttemptOutcome::Transport(note),
                 cost_usd: cost,
             },
-            None => fail(
+            None => Attempt::failed(
                 cost,
                 format!("turn ended without writing {RESULT_FILE} — nothing to grade"),
             ),
         },
-    }
-}
-
-fn fail(cost_usd: f64, note: String) -> Attempt {
-    Attempt {
-        outcome: AttemptOutcome::fail(note),
-        cost_usd,
-    }
-}
-
-fn transport(note: String) -> Attempt {
-    Attempt {
-        outcome: AttemptOutcome::Transport(note),
-        cost_usd: 0.0,
     }
 }
 
@@ -1961,7 +1955,7 @@ workflow(type = "playbook", tasks = [good, bad, after])
     /// the ceilings come from whoever launched it. There is no plan file anywhere.
     #[test]
     fn a_playbook_launches_from_its_manifest_under_supplied_ceilings() {
-        let _guard = crate::testing::test_env_lock();
+        let _guard = crucible::test_support::env_lock();
         let dir = std::env::temp_dir().join(format!("crucible-launch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

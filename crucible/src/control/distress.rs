@@ -81,17 +81,6 @@ pub(crate) fn drain_notes() -> Vec<(String, String)> {
 #[cfg(test)]
 pub(crate) mod testing {
     use std::path::PathBuf;
-    use std::sync::{Mutex, MutexGuard};
-
-    static ENV: Mutex<()> = Mutex::new(());
-
-    /// Exclusive access to `FORGE_STORAGE_ROOT`. Anything that drives the loop's iteration head
-    /// touches the storage root whether or not it means to (the distress marker, `turn-meta.json`),
-    /// so the run_loop fixture takes this lock too. It is NOT reentrant: a test that has a fixture
-    /// already holds it and must not call this.
-    pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
-        ENV.lock().unwrap_or_else(|e| e.into_inner())
-    }
 
     pub(crate) struct Root {
         pub dir: PathBuf,
@@ -123,7 +112,8 @@ pub(crate) mod testing {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::distress::testing::{Root, env_lock};
+    use crate::control::distress::testing::Root;
+    use crucible::test_support::env_lock;
 
     #[test]
     fn a_written_marker_round_trips_and_survives_the_read() {

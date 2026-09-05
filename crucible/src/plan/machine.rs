@@ -57,8 +57,6 @@ pub enum TaskEvent {
     WallClockCeiling,
     /// The runner refused to stage its inputs.
     StagingRefused,
-    /// The plan halted for a reason that is not one of the named ceilings.
-    PlanHalted,
     /// A required task is unrunnable, so nothing in the plan runs.
     PlanTruncated,
     /// The fan-out node's `over` input was not a list of items.
@@ -79,7 +77,6 @@ pub const TASK_TRANSITIONS: &[(TaskState, TaskEvent, TaskState)] = {
         (S::Pending, E::BudgetCeiling, S::Blocked),
         (S::Pending, E::WallClockCeiling, S::Blocked),
         (S::Pending, E::StagingRefused, S::Blocked),
-        (S::Pending, E::PlanHalted, S::Blocked),
         (S::Pending, E::PlanTruncated, S::Truncated),
         (S::Pending, E::FanoutItemsInvalid, S::Fail),
         (S::Running, E::Passed, S::Pass),
@@ -101,9 +98,6 @@ pub enum BlockedReason {
     WallClockCeiling,
     DependencyDidNotPass,
     StagingRefused(String),
-    /// The plan halted on an exit that names no ceiling (never reached today: the executor
-    /// only halts on the three above; kept so the fallback stays visible).
-    Halted,
 }
 
 impl BlockedReason {
@@ -114,7 +108,6 @@ impl BlockedReason {
             BlockedReason::WallClockCeiling => TaskEvent::WallClockCeiling,
             BlockedReason::DependencyDidNotPass => TaskEvent::DependencyDidNotPass,
             BlockedReason::StagingRefused(_) => TaskEvent::StagingRefused,
-            BlockedReason::Halted => TaskEvent::PlanHalted,
         }
     }
 }
@@ -127,7 +120,6 @@ impl std::fmt::Display for BlockedReason {
             BlockedReason::WallClockCeiling => f.write_str("wall-clock ceiling reached"),
             BlockedReason::DependencyDidNotPass => f.write_str("dependency did not pass"),
             BlockedReason::StagingRefused(why) => f.write_str(why),
-            BlockedReason::Halted => f.write_str("halted"),
         }
     }
 }
@@ -432,7 +424,6 @@ mod tests {
             BlockedReason::WallClockCeiling,
             BlockedReason::DependencyDidNotPass,
             BlockedReason::StagingRefused("no room".into()),
-            BlockedReason::Halted,
         ] {
             let ev = reason.event();
             assert!(TASK_TRANSITIONS.contains(&(TaskState::Pending, ev, TaskState::Blocked)));

@@ -28,11 +28,14 @@ impl TaskRunner for ShellRunner {
         if task.isolation.is_some() {
             // Fail loud: a runner that quietly ran an isolation-marked task in the shared
             // workdir would hand back a result the plan's author has no reason to trust.
-            return fail(format!(
-                "task {} requests isolation, which this runner cannot provide (run the plan \
+            return Attempt::failed(
+                0.0,
+                format!(
+                    "task {} requests isolation, which this runner cannot provide (run the plan \
                  with --manifest so tasks get a real workspace to clone)",
-                task.name
-            ));
+                    task.name
+                ),
+            );
         }
         self.run_in_workdir(task, inputs)
     }
@@ -46,10 +49,10 @@ impl ShellRunner {
         inputs: &BTreeMap<TaskName, Value>,
     ) -> Attempt {
         if task.isolation != Some(crate::plan::ir::Isolation::Worktree) {
-            return fail(format!(
-                "task {} was not declared for worktree isolation",
-                task.name
-            ));
+            return Attempt::failed(
+                0.0,
+                format!("task {} was not declared for worktree isolation", task.name),
+            );
         }
         self.run_in_workdir(task, inputs)
     }
@@ -63,7 +66,7 @@ impl ShellRunner {
                 cmd.env("CRUCIBLE_INPUTS", json);
             }
             Err(e) => {
-                return fail(format!("inputs not serializable: {e}"));
+                return Attempt::failed(0.0, format!("inputs not serializable: {e}"));
             }
         }
         match &task.task {
@@ -77,7 +80,8 @@ impl ShellRunner {
                 effort,
             } => {
                 let Some(agent_cmd) = &self.agent_cmd else {
-                    return fail(
+                    return Attempt::failed(
+                        0.0,
                         "agent task refused: this runner has no agent command (pass --agent-cmd)"
                             .to_string(),
                     );
@@ -111,17 +115,17 @@ impl ShellRunner {
                         ),
                         cost_usd: 0.0,
                     },
-                    Err(error) => fail(error),
+                    Err(error) => Attempt::failed(0.0, error),
                 };
             }
             TaskKind::TopK { .. } => {
                 // The executor owns reducers; reaching the runner is an executor bug.
-                return fail("reducer task reached the runner".to_string());
+                return Attempt::failed(0.0, "reducer task reached the runner".to_string());
             }
             TaskKind::Engine { .. } => {
                 // Engine ops only exist in the loop's canonical template; its runner
                 // handles them, this one can't.
-                return fail("engine task reached a non-loop runner".to_string());
+                return Attempt::failed(0.0, "engine task reached a non-loop runner".to_string());
             }
         }
         let out = match cmd.output() {
@@ -149,14 +153,17 @@ impl ShellRunner {
             };
         }
         let Some(last) = stdout.lines().rev().find(|l| !l.trim().is_empty()) else {
-            return fail("no output: expected a JSON result on the last stdout line".to_string());
+            return Attempt::failed(
+                0.0,
+                "no output: expected a JSON result on the last stdout line".to_string(),
+            );
         };
         match serde_json::from_str::<Value>(last.trim()) {
             Ok(v) => evaluation_attempt(task, v),
-            Err(e) => fail(format!(
-                "last stdout line is not JSON ({e}): {}",
-                last.trim()
-            )),
+            Err(e) => Attempt::failed(
+                0.0,
+                format!("last stdout line is not JSON ({e}): {}", last.trim()),
+            ),
         }
     }
 }
@@ -243,7 +250,7 @@ fn evaluation_attempt(task: &Task, mut value: Value) -> Attempt {
         };
     };
     let Some(object) = value.as_object_mut() else {
-        return fail("evaluate result must be a JSON object".to_string());
+        return Attempt::failed(0.0, "evaluate result must be a JSON object".to_string());
     };
     // `pass` may narrow a threshold gate, never widen it.
     let within_threshold = match (threshold, direction) {
@@ -261,7 +268,9 @@ fn evaluation_attempt(task: &Task, mut value: Value) -> Attempt {
     let declared_pass = match object.get("pass") {
         None => true,
         Some(Value::Bool(passed)) => *passed,
-        Some(_) => return fail("evaluate result `pass` must be a boolean".to_string()),
+        Some(_) => {
+            return Attempt::failed(0.0, "evaluate result `pass` must be a boolean".to_string());
+        }
     };
     let passed = within_threshold && declared_pass;
     object.insert("pass".to_string(), Value::Bool(passed));
@@ -293,13 +302,6 @@ fn evaluation_attempt(task: &Task, mut value: Value) -> Attempt {
             },
             cost_usd: 0.0,
         }
-    }
-}
-
-fn fail(note: String) -> Attempt {
-    Attempt {
-        outcome: AttemptOutcome::fail(note),
-        cost_usd: 0.0,
     }
 }
 

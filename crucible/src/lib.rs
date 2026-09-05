@@ -18,13 +18,17 @@ pub mod plan;
 pub mod task_judge;
 pub mod turn_trace;
 
-/// One crate-wide lock for tests that mutate a process-global env var. The environ is a single
-/// global, so per-module locks wouldn't serialize tests in different modules racing through it.
-#[cfg(test)]
-pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
-    use std::sync::{Mutex, OnceLock};
-    static L: OnceLock<Mutex<()>> = OnceLock::new();
-    L.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+/// Support for tests in this crate and the binary that mutate the process environment.
+#[doc(hidden)]
+pub mod test_support {
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV: Mutex<()> = Mutex::new(());
+
+    /// One lock for every test that sets or reads a process-global environment variable. The
+    /// environ is a single global, so per-module locks would not serialize tests in different
+    /// modules racing through it. Not reentrant: a fixture that holds it must not take it again.
+    pub fn env_lock() -> MutexGuard<'static, ()> {
+        ENV.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
