@@ -1,145 +1,119 @@
-# Linked boundary, the Vertex move, and the self-host demo: handoff
+# Control flow as data, and the wire fields that would carry it: handoff
 
-Date: 2026-08-25. Three arcs ran together and are entangled, so read the demo section last: it
-is blocked on the other two.
+Date: 2026-09-05. Six PRs landed in two days; the next piece is a contract bump, so read
+"Closing the boundary" before touching `crucible-contract`. The 2026-08-25 handoff this replaces
+is in git history; every arc in it shipped.
 
-## What this was
+## What landed (all on main, oldest first)
 
-A self-hosted demo loop (crucible optimizing its own agent-stream decoder) turned into two
-deeper things. Adopting it on prod failed on a flag the controller had been sending to an engine
-that never accepted it, which is the argv boundary failing exactly as designed, so RFC-0004 now
-governs that boundary and the engine half has shipped. Separately, the move to the
-`crucible-729940` Vertex project collided with a live Google outage and then with a credential
-binding bug that only a sandboxed turn could reveal.
+| PR | Head | What |
+|---|---|---|
+| #108 | `4e44425` | `cargo xtask modgraph` (item-level module graph, `--check` fails on cycles, in CI); main.rs split into `args`, `cli`, `process`; 14 module cycles broken by moving items; run.rs split into `cli/{run,setup,workspace}`; the bin's flat modules regrouped into `agent/`, `runloop/`, `control/`, `report/`, `scope/`, `cli/`. The reporter is handed to a run-scoped `LoopTaskRunner` (no `Arc<Mutex<R>>`). |
+| #109 | `45e0cb5` | `runloop::machine`: the loop's states, events, and transition table; the driver advances it at every gate; `LoopPhase` (control-plane status) is a projection of it. `docs/loop-states.md` rendered from the table. |
+| #110 | `a0a48ae` | `plan::machine`: per-task and per-plan tables the executor asserts at every decision; `BlockedReason` typed (its `Display` is the unchanged note text); `execute` returns `Result`. `crucible::diagram` holds the cursor, table checks, and dot/mermaid renderers both machines use. `docs/plan-states.md`. |
+| #111 | `a65c107` | Incidental complexity the tables exposed: one attempt-settling path in the executor, a three-variant `Halt`, one test env lock, one `manifest_dir`, `Attempt::failed`/`transport`. |
+| #112 | `e04cda6` | Work items WI-2026-09-05-001 and -002 (gov/work). |
+| #113 | `f2d540c` | WI-001 done: `--graph-loop` and the `Iteration<Proposed, Applied, Measured>` typestate are gone; every iteration runs as an executor plan; ADR-0004 carries the addendum. Plus the broker's env-mutating tests on one lock. |
 
-## The demo pack
+The lib/bin split stays (RFC-0004: the controller links the lib). `crucible::plan`, `manifest`,
+`deploy`, `flow`, `exposure`, `errors` paths are an API; bin-side modules move freely.
 
-`examples/selfhost` is on main. It scores `StreamJsonParser` in ns per input line over a
-deterministic synthetic corpus. The bench hashes every emitted event, so a candidate that drops
-or reshapes events reports invalid rather than fast; the bench and `measure.sh` are frozen
-injects, the gate also runs the crate's tests and clippy with warnings denied, and the self-test
-proves discrimination by decoding every line twice.
+## In flight right now
 
-Proven locally on 2026-08-25 with the `local` backend: three iterations, three keeps,
-891 to 176.6 ns per line, $7.89, run ended `finished`. It has never completed on prod.
+- **Core pin bump.** The controller repo (`crucible-domains`) follows this repo's main
+  automatically: `.github/workflows/core-pin-bump.yml` polls every 15 minutes and opens a queued
+  PR per new head. Bumps to `45e0cb5`, `a0a48ae`, `e04cda6` merged on 2026-09-05. **PR #622
+  (bump to `f2d540c`) was open with CI running at 09:20 PT.** Check with
+  `gh -R neuralmagic/crucible-domains pr view 622`. Nothing manual is needed; if it fails, the
+  failure is the controller compiling against the new lib, and that is the thing to read.
+- **fips-watch run after the bump.** Will wants a controller workflow exercised on the new
+  engine. Launch with the crucible MCP: `crucible_launch id=fips-watch max_cost=5 max_time=30m`
+  (params empty; `downstream_repo` defaults to `opendatahub-io/modelexpress`). The last manual run
+  was `playbook:fips-watch:01a04841-…`, $2.00, dispatched as a pod on cluster `waldorf`. To prove
+  the new engine ran it, read the loop image off the pod while it runs:
+  `oc --context coreweave-waldorf -n crucible-system get pod <pod> -o jsonpath='{.spec.containers[*].image}'`
+  and compare to the `crucible-loop` image crucible-domains' docker.yml published after #622 merged.
+  The controller itself serves from the spoke prod cluster; that `oc` context needs a fresh login.
 
-`examples/selfhost/scenario.json` is the adoption body. It carries no `git_ref` on purpose: see
-the traps below.
+## Closing the boundary: the next PR pair
 
-## Engine (this repo), all merged to main
+Typed state now stops at the process boundary. The session log still carries a blocked task's
+reason as prose and ignores most of the loop's phases. Two additive fields close it.
 
-| What | Commit |
-| --- | --- |
-| The self-host pack, the bench, the Rust images, `docs/domain-images.md` | `ab48d5e` (#70) |
-| Bind the regional Vertex hosts | `7a97f2b` (#73) |
-| Split crucible into a library and a thin binary; contract version; `--repo-ref` | `7b59a44` (#72) |
-| Keep the AWS SDK out of the linked library; trace the renders | `71a2918` (#74) |
+### Facts that constrain the design (verified 2026-09-05)
 
-The runtime image built from `71a2918` is
-`ghcr.io/neuralmagic/crucible@sha256:cff37efd7abdbfb7431d1fe526b2acb37bef1c2591b52282efb3639e64300216`
-and carries `io.crucible.contract-version=1.0.0`. Its build fails if that label disagrees with
-the binary it ships.
+- The controller ingests session events into its own `Ev` enum (`crucible-controller/src/ingest.rs`,
+  `#[serde(tag = "kind")]`): row, summary, budget, identity, pr_links, plan_admitted,
+  task_result, shutdown; everything else is `Other`. Task results land in `run_task_results`
+  (status, note, cost, secs). `failure_cause()` takes the first non-empty note of a
+  fail/transport/truncated task; blocked tasks never contribute.
+- "run errored: {reason}: {cause}" (`model.rs` `ParkReason::RunErrored`) is the shutdown reason
+  string plus that note.
+- `SessionEvent::Phase { phase, iter }` already exists on the wire with three values
+  (preflight, baseline, iteration), emitted through `Reporter::phase`. The controller drops it.
+- The heartbeat is deliberately not a session event (OTLP span + pod log only). Do not carry
+  phase on it.
+- `report.json` (`crucible_contract::report::TaskReport`: name, status, cost) is consumed by the
+  broker's Slack card, not the controller.
+- **Contract versions match only by equality** (RFC-0004 C-CONTRACT-VERSION). `CONTRACT_VERSION`
+  is `1.2.0` and has never been bumped since it was introduced. The auto pin-bump moves
+  `crucible-contract` and `crucible` together, so a controller compiled after the bump carries the
+  new version; the runtime image is labeled with it (`Containerfile.runtime` asserts the label
+  equals `crucible --contract-version`). Between the image publish and the controller rollout
+  (imagepatcher moves the deployment to `latest`), dispatch to the new image is refused and
+  ledgered by design. This will be the first exercise of that path.
 
-RFC-0004 is on main in `spec`. It has not been advanced; whether the engine half shipping is
-enough to seal the candidate is a call for whoever picks this up.
+### Engine PR (this repo)
 
-Open here: **#75** (this handoff and the work items), #65 and #51 from earlier arcs.
+1. `crucible-contract`: add
+   `TaskBlocked { reason: BlockedReasonKind, task: Option<String> }` with
+   `BlockedReasonKind` = required_task_failed | budget_ceiling | wall_clock_ceiling |
+   dependency_did_not_pass | staging_refused (snake_case). Add it as
+   `#[serde(default, skip_serializing_if = "Option::is_none")] blocked: Option<TaskBlocked>` to
+   `SessionEvent::TaskResult` and to `report::TaskReport`. Extend the documented `phase`
+   vocabulary to the `LoopPhase` tokens: starting, preflight, baseline, wide, iteration, paused,
+   parked, distressed, escalated, epilogue, finished. Bump `CONTRACT_VERSION` to `1.3.0`.
+2. `plan::exec::TaskResult` gains `blocked: Option<BlockedReason>`; `TaskResult::blocked(&reason)`
+   fills it. `BlockedReason` gets a `wire()` returning the contract type. The note stays
+   byte-identical (tests pin it).
+3. `plan::events::task_result_event` and `plan::cli`'s `report.tasks.push` copy `blocked`.
+4. `runloop::machine::Machine::advance` reports the phase through the reporter on every change,
+   not only preflight/baseline/iteration. Replace the reporter's `Phase` enum with
+   `(LoopPhase, iter)` or map `LoopPhase` into `SessionPhase`; `report/session.rs` owns the
+   mapping. The control-plane `set_phase` stays as is.
+5. Tests: a session-log round trip for a blocked task shows both the note and the typed reason;
+   the loop tests assert the phase sequence for a parked run; `scripts/state-docs.sh --check` and
+   `cargo xtask modgraph --check` stay green.
+6. Ship, then watch the pin bump: confirm the controller's compile against 1.3.0 passes CI and
+   that its config endpoint shows the dispatch-image mismatch clearing after rollout.
 
-## Controller (`~/git/agentic-epp-autoresearch`)
+### Controller PR (crucible-domains)
 
-**#459 is the gate.** Branch `linked-boundary`, pinned to engine `71a2918`. It replaces every
-render subprocess with a linked call, records the contract version, compares it against every
-configured dispatch image, and refuses a launch against a mismatched image with a ledger entry
-naming both versions and a `ContractRejected` park. 1210 tests plus 16 e2e green against a live
-database, clippy clean, both guardrails green. It has been rebased twice, and main is moving
-under it roughly hourly, so expect a third.
+1. `Ev::TaskResult` gains `blocked: Option<TaskBlocked>` (default). Migration: nullable
+   `blocked_reason` and `blocked_by` on `run_task_results`.
+2. `failure_cause()` and `RunErrored` derive from the typed reason when present: "blocked:
+   required task brief failed" from data, not substring matching.
+3. Handle `Ev::Phase` instead of dropping it: keep the latest phase on the run row and show it in
+   the runs table and run page, so a parked or distressed run reads that way while it happens.
+4. The broker's Slack card can group non-passing tasks by `blocked.reason`.
 
-Also open: **#462** (work items), #461, #426, #408, #372.
+## Also queued
 
-Merged today: #451 (Vertex project flip), #456 (us-east5 pin), #457 (the revert of #456).
+- **WI-2026-09-05-002**, collapse the claude/codex/hermes harness backends onto one spec plus the
+  methods that genuinely differ. Scope and criteria are in gov/work; measure first (the
+  per-backend tests are the regression net).
+- Transition coverage: nothing yet records which table edges the suites exercise.
 
-## Prod state right now
+## Gotchas learned this week
 
-MPP `crucible--runtime-ext`, Argo `Application/crucible-controller`, sync is manual.
-
-- Vertex project `crucible-729940`, service account `crucible-agent@crucible-729940`, secret
-  `crucible-vertex-adc` rolled on both MPP and waldorf.
-- `CLOUD_ML_REGION` is back to `global` after the revert. This is a stopgap.
-- Loop image `ghcr.io/neuralmagic/crucible-loop:main@sha256:5aca6eed...`, which predates every
-  engine change above.
-- `run_iterations=10`, `run_max_cost=40` in the overrides ConfigMap. **Every Argo sync resets
-  these to null.** Re-run `scripts/roll-vertex-project.fish knobs` after each sync.
-- Four adopted scenarios are parked, all at $0: `01a03a0f` and `01a03ac3` on the `--repo-ref`
-  failure, `01a03ad1` and `01a03b22` on the credential binding.
-
-## Three traps, each of which cost an hour
-
-**A region other than `global` breaks every sandboxed turn** until a loop image carries `7a97f2b`.
-The gateway resolves a region to its own apex domain (`us-east5-aiplatform.googleapis.com`), the
-engine bound the credential only to `aiplatform.googleapis.com` and its dot-subdomains, and a
-hyphen-prefixed apex domain is not a dot-subdomain. The credential goes unbound, the metadata
-emulator answers 503, and the agent exits 1 with nothing on stderr. A direct `rawPredict` probe
-proves nothing about this: it bypasses the gateway. Probe with a real turn in a pod.
-
-**The `global` endpoint is degraded.** It returned NOT_FOUND for enabled models on 30 to 70
-percent of calls through the evening. Claude Code probes availability before a turn and falls
-back to `claude-sonnet-4-5`, which this project is not entitled to, so a blip is fatal to the
-turn. Enabled: `claude-opus-4-6`, `claude-opus-4-6[1m]`, `claude-sonnet-5`,
-`claude-haiku-4-5@20251001`. Not enabled: `claude-sonnet-4-5` (worth asking for, it makes the
-fallback survivable) and `claude-opus-4-5@20251101` (the undated id is the one that exists).
-
-**A scenario adopted with a `git_ref` fails at argument parsing** on any loop image older than
-`7b59a44`. The controller has sent `--repo-ref` since 2026-08-02 and no engine accepted it.
-Adopt without one until prod carries the new image.
-
-## Live bugs found by the audit, not yet fixed
-
-An audit of the controller after linking found 21 sites rebuilding engine meaning from text.
-Two are wrong today:
-
-- `validate_params` builds every jsonschema instance as a string, so a pack declaring an
-  integer, number, boolean, or array parameter cannot be launched through the controller, even
-  though the engine's binder accepts the same text.
-- `task_evidence::session_result` never reads a `task_result`'s status and serves whichever line
-  came last, so a failing attempt after a passing one reports as passing.
-
-Tracked as WI-2026-08-25-002 in the controller repo, gated on WI-2026-08-25-005 here.
-
-## Work items
-
-Here: 001 launch an existing pack without a scope turn (queue), 002 `--repo-ref` (active, one
-criterion left: prod on a loop image built from the pin), 003 linked renders (done), 004
-reachable-model catalog (queue), 005 expose the types the controller must not mirror (queue),
-006 carry a brokered measure through the turn render (queue).
-
-Controller: 001 link the renders and check the contract version (active, #459), 002 decode
-engine outcomes from the linked types (queue), 003 re-pin the Vertex region (queue).
-
-006 is worth understanding: the controller has also been sending `--broker-measure`, which no
-engine ever accepted, so brokered scope turns have been failing silently. Linking turned that
-into a typed refusal at dispatch. The engine needs the field before the refusal can go away.
-
-## To finish the demo, in order
-
-1. Merge #459 once `build-and-test` clears, rebasing again if main moved.
-2. Wait for the `crucible-loop` image built from that merge; take its digest.
-3. One controller values PR: bump the turn profile's `loop` pin to that digest **and** re-pin
-   `CLOUD_ML_REGION` and `vertex.region` to `us-east5` (both, or the region change is half
-   applied). That closes WI-003 there and the last criterion of 002 here.
-4. `scripts/roll-vertex-project.fish sync`, then `restart`, then `knobs`.
-5. Port-forward 8899, then `scripts/roll-vertex-project.fish adopt`. It strips `git_ref` for
-   you. Watch the scope turn through `/api/issues/{key}/scope-transcript`, which is the only
-   place the sandbox's own stderr surfaces.
-
-`scripts/roll-vertex-project.fish` takes `sa`, `secrets`, `sync`, `restart`, `knobs`,
-`park <key>`, and `adopt`.
-
-## Smaller things
-
-- Local `#[sqlx::test]` runs need `DATABASE_URL=postgres://postgres:ci@localhost:55432/crucible`.
-  Without it they fail in a way that reads exactly like a session-ingest regression. It cost an
-  hour before the tests turned out to be fine.
-- Linker errors saying nothing useful were a full disk. Each worktree carries its own `target`,
-  and they run 8 to 83 GB. `.claude/worktrees` under this repo held another 25 GB.
-- Prod's vault-sync CronJob was crash-looping on a rustls provider panic. Fixed on controller
-  main by `1410728`, unrelated to this work.
+- `govctl work move <id> done` runs the project's default guards, including
+  `cargo test --workspace`; a flaky test anywhere in the workspace blocks the close. Notes take
+  `--add`, description takes `--set --stdin`, and an ADR may not mention a work item id.
+- `cargo fmt` reshapes text between reading and patching it; anchor edits on the formatted text.
+- libtest runs tests in name order; a test that mutates process-global state (pids, environ)
+  changes who it races when it is renamed or moved. Every such test now takes
+  `crucible::test_support::env_lock()` (engine) or `crate::test_support::env_lock()` (broker).
+- `execute` is fallible; the executor's and harness's test modules wrap it once (`fn execute`
+  shadowing the import) rather than touching every call.
+- The docs SVGs are rendered locally with graphviz and committed; CI checks the `.dot` and the
+  pages, not the SVG. `just state-docs` regenerates all three.
