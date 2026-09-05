@@ -267,7 +267,7 @@ fn runs_external_commands(m: &Manifest) -> bool {
     hooks.into_iter().flatten().any(|c| !c.trim().is_empty())
         || m.workflow
             .as_ref()
-            .is_some_and(crate::manifest::WorkflowCfg::runs_host_commands)
+            .is_some_and(crate::plan::workflow::WorkflowCfg::runs_host_commands)
 }
 
 /// The grants a resolved disclosure covers, by kind. A grant supplied from outside the pack (a

@@ -16,11 +16,11 @@ use starlark::values::tuple::{TupleRef, UnpackTuple};
 use starlark::values::{Heap, Value, ValueLike};
 use starlark_syntax::codemap::FileSpan;
 
-use crate::manifest::{WorkflowCfg, WorkflowType};
 use crate::plan::starlark as dsl;
 use crate::plan::starlark::values::{
     ExternalText, OutputRefValue, SessionValue, TaskValue, WorkflowValue,
 };
+use crate::plan::workflow::{WorkflowCfg, WorkflowType};
 
 /// Constructors that historically took one positional argument. Everything else is named-only.
 const POSITIONAL: &[&str] = &["prompt_file", "param", "workflow", "default_autoresearch"];

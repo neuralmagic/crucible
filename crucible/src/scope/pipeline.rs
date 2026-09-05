@@ -1,19 +1,20 @@
-use crate::Paths;
-use crate::activity::ActivityFeed;
-use crate::agent::{self, TurnOutcome};
-use crate::check::{self, CheckOutcome};
+use crate::agent::activity::ActivityFeed;
+use crate::agent::event::{AgentEvent, RawStream};
+use crate::agent::turn::TurnOutcome;
+use crate::agent::{self};
+use crate::args::Paths;
+use crate::cli::check::{self, CheckOutcome};
+use crate::cli::init::MANIFEST_FILE;
 use crate::deploy::ProposeTier;
-use crate::event::{AgentEvent, RawStream};
 use crate::identity::{self, RunIdentity};
-use crate::init::MANIFEST_FILE;
 use crate::manifest;
 use crate::manifest::AgentBackend;
-use crate::refine::{self, MIN_PROPOSED_SELFTEST_RUNS};
 use crate::scope::pack::{
     PACK_WORK_DIR, drop_repo_checkouts, ensure_out_dir, frozen_workspace_dir,
     normalize_frozen_manifest, scratch_dir, strip_controls_and_selftest, sync_pack_from_workspace,
 };
 use crate::scope::progress::emit_progress;
+use crate::scope::refine::{self, MIN_PROPOSED_SELFTEST_RUNS};
 use crate::scope::transcript::{transcript_event, transcript_note, write_seed_context};
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -163,7 +164,7 @@ impl Stage for Ingest {
 
     fn run(&self, ctx: &mut ScopeCtx) -> Result<String> {
         let (goal, source) = if let Some(issue) = &self.issue {
-            let (repo, number) = crate::issue::parse_ref(issue)?;
+            let (repo, number) = crate::scope::issue::parse_ref(issue)?;
             (goal_from_issue(&repo, number)?, format!("--issue {issue}"))
         } else if let Some(f) = &self.goal_file {
             let goal = std::fs::read_to_string(f)
@@ -248,7 +249,7 @@ impl Stage for Propose {
             .context("propose needs a resolved goal (ingest must have run first)")?;
 
         let scratch = scratch_dir("scope-propose-repo");
-        crate::run::clone_repo(&self.opts.repo, None, &scratch)
+        crate::cli::workspace::clone_repo(&self.opts.repo, None, &scratch)
             .context("checking out --repo for the propose turn")?;
         write_seed_context(&scratch, &goal)?;
         std::fs::create_dir_all(scratch.join(PACK_WORK_DIR))
@@ -906,8 +907,8 @@ fn render_propose_prompt(
 /// Build the one-turn run args both scope turns share. Precedence mirrors `rank-grounded`: an
 /// explicit `agent_cmd_override` (the scripted test double) wins, else the `--agent-backend`
 /// choice; the sandbox image rides along for `openshell`.
-fn turn_args(opts: &ProposeOpts) -> crate::Args {
-    let mut args = crate::Cli::parse_from(["crucible"]).run;
+fn turn_args(opts: &ProposeOpts) -> crate::args::Args {
+    let mut args = crate::cli::Cli::parse_from(["crucible"]).run;
     match &opts.agent_cmd_override {
         Some(cmd) => {
             args.agent_backend = AgentBackend::Command;
@@ -1036,7 +1037,7 @@ impl Stage for Validate {
 fn render_workflow_preview(manifest_path: &Path, pack: &Path) -> Result<(u32, u32)> {
     let mut manifest = manifest::Manifest::load(manifest_path)?;
     manifest.resolve_workflow(crate::plan::starlark::parent_or_cwd(manifest_path))?;
-    let mut workflow_caps = manifest::WorkflowCaps::for_lane(
+    let mut workflow_caps = crate::plan::workflow::WorkflowCaps::for_lane(
         manifest
             .workflow
             .as_ref()
@@ -1047,7 +1048,7 @@ fn render_workflow_preview(manifest_path: &Path, pack: &Path) -> Result<(u32, u3
         workflow_caps = workflow_caps.with_persistent_sessions();
     }
     let plan = match manifest.workflow.as_ref() {
-        Some(workflow) if workflow.workflow_type == manifest::WorkflowType::Custom => {
+        Some(workflow) if workflow.workflow_type == crate::plan::workflow::WorkflowType::Custom => {
             workflow.validate()?;
             crate::plan::ir::Plan {
                 version: 1,
@@ -1057,7 +1058,7 @@ fn render_workflow_preview(manifest_path: &Path, pack: &Path) -> Result<(u32, u3
             }
             .validate()?
         }
-        workflow => crate::loop_graph::iteration_template(workflow, &workflow_caps)?,
+        workflow => crate::runloop::graph::iteration_template(workflow, &workflow_caps)?,
     };
     // Preview authored capabilities; execution still admits against the real substrate.
     let caps = plan
@@ -1095,8 +1096,8 @@ impl Stage for Freeze {
 }
 
 /// The goal text for `--issue`: `# title\n\nbody`.
-fn goal_from_issue(repo: &str, number: u64) -> Result<String, crate::issue::IssueError> {
-    let issue = crate::issue::fetch(repo, number, "crucible-scope")?;
+fn goal_from_issue(repo: &str, number: u64) -> Result<String, crate::scope::issue::IssueError> {
+    let issue = crate::scope::issue::fetch(repo, number, "crucible-scope")?;
     Ok(format!("# {}\n\n{}\n", issue.title, issue.body))
 }
 
@@ -1282,8 +1283,8 @@ fn render_refine_section(rounds: &[RoundRecord]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::activity::{ACTIVITY_MIN_INTERVAL, ACTIVITY_TEXT_CAP, ACTIVITY_TOOL_CAP};
-    use crate::event::Tokens;
+    use crate::agent::activity::{ACTIVITY_MIN_INTERVAL, ACTIVITY_TEXT_CAP, ACTIVITY_TOOL_CAP};
+    use crate::agent::event::Tokens;
     use crate::manifest::AgentBackend;
     use crate::scope::cli::{SCOPE_REPORT_MARKER, execute};
     use crate::scope::pack::{
@@ -2156,7 +2157,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
 
         // Share the crate-wide env guard: `GITHUB_API_URL` is a process global, and other modules'
         // tests (`run`, `rank_grounded`) point it at their own listeners concurrently.
-        let _env = crate::test_env_lock();
+        let _env = crate::testing::test_env_lock();
         let dir = tempdir("issue-source");
         scaffold_pack(&dir);
 
@@ -3626,7 +3627,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         // Back-compat: every call site predating the `--tier` flag never set --tier, and must keep
         // drafting T0-shaped packs exactly as before.
         use clap::Parser;
-        let cli = crate::Cli::parse_from([
+        let cli = crate::cli::Cli::parse_from([
             "crucible",
             "scope",
             "--propose",
@@ -3637,7 +3638,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             "--out",
             "/tmp/x",
         ]);
-        let crate::Cmd::Scope(args) = cli.command.expect("scope subcommand") else {
+        let crate::cli::Cmd::Scope(args) = cli.command.expect("scope subcommand") else {
             panic!("expected Scope");
         };
         assert_eq!(args.tier, None, "no --tier flag on the CLI");

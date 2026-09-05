@@ -12,8 +12,9 @@ use std::process::Command;
 
 use serde_json::Value;
 
+use crate::crucible::Direction;
 use crate::plan::exec::{Attempt, AttemptOutcome, TaskRunner};
-use crate::plan::ir::{Direction, Task, TaskKind, TaskName};
+use crate::plan::ir::{Task, TaskKind, TaskName};
 
 pub struct ShellRunner {
     pub workdir: PathBuf,
@@ -305,8 +306,9 @@ fn fail(note: String) -> Attempt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crucible::Direction;
     use crate::plan::exec::{ExecCfg, PlanExit, Substrate, TaskStatus, execute};
-    use crate::plan::ir::{Direction, Join, Plan, PlanBudget, Stage};
+    use crate::plan::ir::{Join, Plan, PlanBudget, Stage};
 
     fn runner() -> ShellRunner {
         ShellRunner {

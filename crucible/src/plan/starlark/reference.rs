@@ -5,11 +5,12 @@
 //! [`crate::plan::starlark::known_kwargs`], so a constructor cannot be added, renamed, or given a
 //! new argument without the reference following it.
 
-use crate::manifest::KEPT_INPUT;
-#[cfg(test)]
-use crate::manifest::WorkflowType;
-use crate::plan::exec::{DeclaredStatus, ITEM_INPUT, OUTCOME_INPUT};
+use crate::plan::exec::DeclaredStatus;
+use crate::plan::ir::KEPT_INPUT;
 use crate::plan::ir::MAX_FANOUT_CEILING;
+use crate::plan::ir::{ITEM_INPUT, OUTCOME_INPUT};
+#[cfg(test)]
+use crate::plan::workflow::WorkflowType;
 
 /// Which lanes see a constructor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -617,10 +618,10 @@ fn reserved_rows(rows: Vec<Reserved>) -> serde_json::Value {
 mod tests {
     use std::collections::BTreeSet;
 
-    use crate::manifest::WorkflowType;
     use crate::plan::exec::{DeclaredStatus, TaskStatus};
     use crate::plan::starlark::reference::functions;
     use crate::plan::starlark::{dsl_functions, known_kwargs, lane_globals};
+    use crate::plan::workflow::WorkflowType;
 
     /// The reference is the global surface, per lane, in both directions: a constructor the
     /// evaluator registers but the table omits is undocumented, and one the table names but the
@@ -712,7 +713,7 @@ mod tests {
                 .iter()
                 .map(|row| row.name)
                 .collect::<Vec<_>>(),
-            crate::plan::exec::RESERVED_INPUTS,
+            crate::plan::ir::RESERVED_INPUTS,
             "an input the engine writes is undocumented, or a documented one is invented"
         );
     }

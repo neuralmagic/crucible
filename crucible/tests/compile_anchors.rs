@@ -4,7 +4,8 @@
 
 use std::path::Path;
 
-use crucible::plan::starlark::{CompileError, read_params};
+use crucible::plan::starlark::error::CompileError;
+use crucible::plan::starlark::read_params;
 
 fn rejected(source: &str) -> CompileError {
     read_params(source, Path::new("workflow.star")).expect_err("refused")
@@ -51,7 +52,7 @@ fn an_anchor_survives_a_round_trip_as_data() {
         .anchor()
         .expect("anchored");
     let encoded = serde_json::to_string(&anchor).expect("serialize");
-    let decoded: crucible::plan::starlark::SourceAnchor =
+    let decoded: crucible::plan::starlark::error::SourceAnchor =
         serde_json::from_str(&encoded).expect("deserialize");
     assert_eq!(decoded, anchor);
 }

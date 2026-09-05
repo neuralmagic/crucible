@@ -3,28 +3,11 @@
 //! keep/discard generically by `direction`. No domain Rust, the win condition lives in the
 //! command (which the engine feeds `CRUCIBLE_BASELINE_*`/`CRUCIBLE_BEST_SCORE`).
 
-use crate::crucible::{Decision, Judge, MeasureCtx, Reading};
+use crate::crucible::{Decision, Direction, Judge, MeasureCtx, Reading};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::process::Command;
-
-/// Which way is better. `lower` (latency, failures) or `higher` (throughput, score).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Direction {
-    Lower,
-    Higher,
-}
-
-impl Direction {
-    /// Strictly-better test for the keep rule (and the gate self-test's discrimination check).
-    pub fn better(self, score: f64, best: f64) -> bool {
-        match self {
-            Direction::Lower => score < best,
-            Direction::Higher => score > best,
-        }
-    }
-}
 
 /// The shape a measure command prints on its last JSON line (the rest is free-form `detail`).
 #[derive(Deserialize, Default)]

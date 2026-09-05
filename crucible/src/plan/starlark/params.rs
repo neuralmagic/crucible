@@ -14,7 +14,7 @@ use starlark_syntax::syntax::AstModule;
 use starlark_syntax::syntax::ast::{AstLiteral, Expr, Stmt};
 
 use crate::plan::diag;
-use crate::plan::starlark::CompileError;
+use crate::plan::starlark::error::CompileError;
 
 type Result<T> = std::result::Result<T, CompileError>;
 

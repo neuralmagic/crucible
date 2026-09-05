@@ -255,23 +255,6 @@ impl TurnOpts {
     }
 }
 
-/// Render an optional `--harness <h>` wrapper flag. The value is clap's own `ValueEnum` name, so
-/// the string the wrapper emits is by construction the one the in-pod CLI parses back.
-pub(super) fn harness_flag(harness: Option<crate::manifest::Harness>, sep: char) -> String {
-    use clap::ValueEnum as _;
-    harness
-        .and_then(|h| h.to_possible_value())
-        .map(|v| format!(" --harness{sep}{}", v.get_name()))
-        .unwrap_or_default()
-}
-
-/// Render an optional `--model <m>` wrapper flag.
-pub(super) fn model_flag(model: Option<&String>, sep: char) -> String {
-    model
-        .map(|m| format!(" --model{sep}{m}"))
-        .unwrap_or_default()
-}
-
 /// The `crucible.io/work-kind` label value a grounded-rank turn pod carries, the selector a
 /// controller sweep reconciles its `work_pods` rows against.
 pub const GROUNDED_RANK_WORK_KIND: &str = "grounded-rank";

@@ -1,8 +1,11 @@
 //! Repo automation, cargo-xtask style (`cargo xtask <task>`).
 //!
 //! `openshell-rev` prints the openshell-core git rev pinned in the workspace Cargo.lock.
+//! `modgraph` prints the crucible crate's module dependency graph; `--check` fails on cycles.
 //! crucible's build.rs keeps its own minimal parse of the same lockfile entry (a build script
 //! can't depend on a workspace crate), so change both together if the lockfile shape moves.
+
+mod modgraph;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -20,12 +23,20 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Some("modgraph") => match modgraph::run(&args.collect::<Vec<_>>()) {
+            Ok(true) => ExitCode::SUCCESS,
+            Ok(false) => ExitCode::FAILURE,
+            Err(e) => {
+                eprintln!("xtask modgraph: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Some(other) => {
-            eprintln!("xtask: unknown task '{other}' (available: openshell-rev)");
+            eprintln!("xtask: unknown task '{other}' (available: openshell-rev, modgraph)");
             ExitCode::FAILURE
         }
         None => {
-            eprintln!("usage: cargo xtask <task>  (available: openshell-rev)");
+            eprintln!("usage: cargo xtask <task>  (available: openshell-rev, modgraph)");
             ExitCode::FAILURE
         }
     }

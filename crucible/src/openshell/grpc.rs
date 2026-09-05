@@ -6,7 +6,6 @@
 //! RPC server-side (there is no local child to signal). Boot and file upload/download stay on the
 //! CLI, see [`crate::openshell::gateway`] and `openshell::run`.
 
-use crate::openshell::gateway::{GATEWAY_NAME, GATEWAY_PORT};
 use anyhow::{Context, Result};
 use openshell_core::auth::EdgeAuthInterceptor;
 use openshell_core::proto::open_shell_client::OpenShellClient;
@@ -27,6 +26,11 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
+
+/// Gateway bind/connect port.
+pub const GATEWAY_PORT: u16 = 17670;
+/// The registered gateway name.
+pub const GATEWAY_NAME: &str = "ci";
 
 /// The concrete client type: the generated OpenShell client over the mTLS channel, wrapped in the
 /// trace-propagating interceptor (which composes the no-op, mTLS-only edge auth).
@@ -980,7 +984,7 @@ impl Gateway {
     /// Stream `ExecSandbox` output. Consumes the tonic server stream directly: each stdout
     /// [`ExecSandboxEvent`](openshell_core::proto::ExecSandboxEvent) chunk is split into complete
     /// lines and handed to `on_stdout_line` (the caller feeds them to a
-    /// `agent::StreamPump`); stderr is collected and returned in the [`ExecResult`]. The
+    /// `crate::agent::turn::StreamPump`); stderr is collected and returned in the [`ExecResult`]. The
     /// exit code is not surfaced (the old CLI-child path ignored it too).
     ///
     /// Cancellation: `select!`s `cancel` against `stream.message()`. On trip the stream is dropped,
@@ -1350,7 +1354,7 @@ fn dedup(values: &[String]) -> Vec<String> {
 }
 
 /// Split a stream of byte-chunks into complete lines, invoking a callback per line. Used for both
-/// exec output streams: stdout lines flow to the `agent::StreamPump`, stderr lines into a
+/// exec output streams: stdout lines flow to the `crate::agent::turn::StreamPump`, stderr lines into a
 /// collected `Vec`. The async exec has no `impl Read` path, so it splits bytes into lines itself,
 /// in order. The trailing partial (unterminated) line is flushed by
 /// [`LineSplitter::finish`].

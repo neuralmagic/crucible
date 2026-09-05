@@ -44,6 +44,11 @@ bench-stream:
 lint:
     cargo fmt --check && cargo clippy --workspace --all-targets && cargo test --workspace
 
+# Module dependency graph of the crucible crate: cycles, fan-in/out, duplicate item names.
+# `just modgraph --check` fails on any module cycle (CI runs that).
+modgraph *ARGS:
+    cargo run --quiet -p xtask -- modgraph {{ARGS}}
+
 # Regenerate docs/dsl-reference.md from the compiler's DSL tables (the pre-commit hook's job,
 # for when you want it without a commit).
 dsl-docs:

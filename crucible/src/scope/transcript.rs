@@ -1,5 +1,5 @@
-use crate::event::AgentEvent;
-use crate::session::SessionEvent;
+use crate::agent::event::AgentEvent;
+use crate::report::session::SessionEvent;
 use anyhow::{Context, Result};
 use std::io::Write as _;
 use std::path::Path;

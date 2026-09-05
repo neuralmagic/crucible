@@ -17,6 +17,7 @@
 //! The daemons (podman service, gateway) are spawned detached and live for the run; crucible
 //! is the pod entrypoint, so the container runtime reaps them when crucible exits.
 
+use crate::openshell::grpc::{GATEWAY_NAME, GATEWAY_PORT};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -52,16 +53,11 @@ pub enum GatewayError {
     },
 }
 
-/// Gateway bind/connect port.
-pub const GATEWAY_PORT: u16 = 17670;
 /// The in-process OTLP collector's bind port for sandboxed turns. Fixed, not OS-assigned: under
 /// the kubernetes driver the loop pod's deny-ingress NetworkPolicy admits sandbox traffic per
 /// port, and a random port cannot be named there. 17671 rides next to the gateway port, which the
 /// same policy already covers.
 pub const OTEL_COLLECTOR_PORT: u16 = 17671;
-/// The registered gateway name.
-pub const GATEWAY_NAME: &str = "ci";
-
 /// The Secret name carrying the generated client mTLS material to sandbox pods (see
 /// [`KubernetesDriverConfig::client_tls_secret_name`]). Published by `boot()` into the sandbox
 /// namespace from the local certgen output. Used verbatim only where one gateway owns the

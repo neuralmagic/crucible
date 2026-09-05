@@ -1,8 +1,21 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use crate::crucible::Direction;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+
+/// The reserved input a mapped instance receives its own item under. Reserved like the
+/// epilogue's kept-candidate input: a task may not declare a dependency by this name.
+pub const ITEM_INPUT: &str = "item";
+/// Reserved epilogue input key: `loop_graph` injects the kept candidate's
+/// context into every epilogue task's inputs under this name.
+pub const KEPT_INPUT: &str = "kept";
+/// The reserved input every epilogue task receives the main graph's outcome under.
+pub const OUTCOME_INPUT: &str = "outcome";
+/// Every key the engine writes into a task's inputs itself. A dependency named after one of
+/// them would have its entry overwritten, so [`crate::plan::ir::Plan::validate`] refuses it.
+pub const RESERVED_INPUTS: [&str; 3] = [ITEM_INPUT, KEPT_INPUT, OUTCOME_INPUT];
 
 /// Task identity: cache key component, wire label, UI label. Unique within a plan.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -37,14 +50,6 @@ impl std::fmt::Display for OutputRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}.{}", self.task, self.field.0)
     }
-}
-
-/// Grading direction for reducers, mirroring the judge's convention.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Direction {
-    Lower,
-    Higher,
 }
 
 /// A controller-configured publication sink. The workflow selects a key, never an endpoint or
@@ -329,7 +334,7 @@ impl ValidPlan {
 pub const MAX_FANOUT_CEILING: u32 = 256;
 
 /// Everything [`Plan::validate`] can reject. Structural only: capability admission and
-/// autoresearch shape live in [`crate::manifest::WorkflowCfg`].
+/// autoresearch shape live in [`crate::plan::workflow::WorkflowCfg`].
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum PlanError {
     #[error("unsupported plan version {version}; this build supports only version 1")]
@@ -528,7 +533,7 @@ impl Plan {
                         dependency: d.0.clone(),
                     });
                 }
-                if crate::plan::exec::RESERVED_INPUTS.contains(&d.0.as_str()) {
+                if crate::plan::ir::RESERVED_INPUTS.contains(&d.0.as_str()) {
                     return Err(PlanError::ReservedDependencyName {
                         task: task(),
                         dependency: d.0.clone(),
@@ -1495,7 +1500,7 @@ mod tests {
     /// built, so a dependency named after one of them loses the entry the plan promised it.
     #[test]
     fn a_dependency_named_after_a_reserved_input_is_refused() {
-        for reserved in crate::plan::exec::RESERVED_INPUTS {
+        for reserved in crate::plan::ir::RESERVED_INPUTS {
             assert_eq!(
                 plan(vec![agent(reserved, &[]), agent("consumer", &[reserved])])
                     .validate()

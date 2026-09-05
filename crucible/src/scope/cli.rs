@@ -1,6 +1,6 @@
-use crate::activity::ActivityFeed;
+use crate::agent::activity::ActivityFeed;
+use crate::cli::init::MANIFEST_FILE;
 use crate::deploy::ProposeTier;
-use crate::init::MANIFEST_FILE;
 use crate::manifest::AgentBackend;
 use crate::scope::pack::{SCOPE_PACK_MARKER, pack_gz, pack_marker_line};
 use crate::scope::pipeline::{Freeze, Ingest, Propose, ProposeOpts, ScopeCtx, Stage, Validate};
@@ -204,8 +204,10 @@ pub fn run(a: ScopeArgs) -> Result<()> {
     // `openshell_turn` nests under the controller's tree instead of floating orphaned. `None` (a
     // local run, or telemetry off) changes nothing. Closed right after the turn, not at fn end,
     // the failure tail exits via `process::exit`, which would skip the drop and lose the span.
-    let turn_span =
-        crate::engine::turn_span(crate::engine::TurnSpanKind::Scope, a.issue.as_deref());
+    let turn_span = crate::agent::engine::turn_span(
+        crate::agent::engine::TurnSpanKind::Scope,
+        a.issue.as_deref(),
+    );
     let report = {
         let _turn_guard = turn_span.as_ref().map(tracing::Span::enter);
         execute(
@@ -225,7 +227,7 @@ pub fn run(a: ScopeArgs) -> Result<()> {
     // pack + transcript POST there (before the termination message) and ride the Tier 1 manifest.
     // Absent = the old marker path (a local run, or an old controller). `artifacts` is the manifest the
     // envelope carries.
-    let ingest = crate::ingest_client::IngestConfig::from_env();
+    let ingest = crate::report::ingest_client::IngestConfig::from_env();
     let mut artifacts: Vec<crucible_contract::ArtifactRef> = Vec::new();
 
     // Deliver the preserved transcript (capped, gzipped). Over the drop-box it POSTs; on the marker
@@ -240,7 +242,7 @@ pub fn run(a: ScopeArgs) -> Result<()> {
         }
         if a.json && a.marker {
             if let Some(cfg) = &ingest {
-                artifacts.push(crate::ingest_client::post_artifact(
+                artifacts.push(crate::report::ingest_client::post_artifact(
                     cfg,
                     crucible_contract::ArtifactKind::ScopeTranscript,
                     &gz,
@@ -261,7 +263,7 @@ pub fn run(a: ScopeArgs) -> Result<()> {
         if survived {
             match &ingest {
                 Some(cfg) => match pack_gz(&pack) {
-                    Ok(gz) => artifacts.push(crate::ingest_client::post_artifact(
+                    Ok(gz) => artifacts.push(crate::report::ingest_client::post_artifact(
                         cfg,
                         crucible_contract::ArtifactKind::ScopePack,
                         &gz,
@@ -292,7 +294,7 @@ pub fn run(a: ScopeArgs) -> Result<()> {
             // the controller prefers it and falls back to this marker. Its `artifacts` manifest is the
             // authoritative index of the Tier 2 uploads above (empty on the marker path), so a missing or
             // undelivered artifact is caught against the kubelet-authenticated message.
-            crate::result_mode::emit_with_artifacts(
+            crate::report::result_mode::emit_with_artifacts(
                 crucible_contract::EnvelopeKind::ScopeReport,
                 serde_json::to_value(&report)?,
                 artifacts,
@@ -318,7 +320,7 @@ pub fn run(a: ScopeArgs) -> Result<()> {
 
     if failed {
         // `process::exit` skips `EngineCtx::Drop`; flush buffered spans first.
-        crate::engine::flush();
+        crate::agent::engine::flush();
         std::process::exit(1);
     }
     Ok(())

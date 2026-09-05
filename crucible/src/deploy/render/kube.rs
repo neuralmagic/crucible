@@ -1,9 +1,8 @@
 use crate::deploy::profile::DeployProfile;
 use crate::deploy::render::{DigestResolver, pin_image};
 use crate::manifest::{AgentCfg, CompositeManifest, DeployCfg, Manifest, MeasureCfg};
-use crate::openshell::gateway::{
-    CLIENT_TLS_SECRET, ComputeDriver, GATEWAY_PORT, OTEL_COLLECTOR_PORT,
-};
+use crate::openshell::gateway::{CLIENT_TLS_SECRET, ComputeDriver, OTEL_COLLECTOR_PORT};
+use crate::openshell::grpc::GATEWAY_PORT;
 use anyhow::{Context, Result};
 use forge::fleet::ClusterEntry;
 use k8s_openapi::api::core::v1 as core;
@@ -1005,8 +1004,8 @@ impl Renderer<'_> {
                 ComputeDriver::Kubernetes => " --compute-driver=kubernetes",
                 ComputeDriver::Podman => "",
             };
-            let harness_flag = crate::deploy::render::turn::harness_flag(self.opts.harness, '=');
-            let model_flag = crate::deploy::render::turn::model_flag(self.opts.model.as_ref(), '=');
+            let harness_flag = harness_flag(self.opts.harness, '=');
+            let model_flag = model_flag(self.opts.model.as_ref(), '=');
             return Ok(format!(
                 r#"D={domain_dir}
 crucible plan run --manifest "$D/{manifest_file}" --max-cost {max_cost} --max-time {max_time}{driver_flag}{harness_flag}{model_flag}{param_flags}
@@ -1040,8 +1039,8 @@ exit $rc
             ComputeDriver::Kubernetes => " --compute-driver=kubernetes",
             ComputeDriver::Podman => "",
         };
-        let harness_flag = crate::deploy::render::turn::harness_flag(self.opts.harness, '=');
-        let model_flag = crate::deploy::render::turn::model_flag(self.opts.model.as_ref(), '=');
+        let harness_flag = harness_flag(self.opts.harness, '=');
+        let model_flag = model_flag(self.opts.model.as_ref(), '=');
         // Persistent state: a non-empty session log on the mounted PVC means a prior pod of this
         // run already produced rows, so this start is a continuation, not a fresh run.
         let resume_flag = if self.state_pvc().is_some() {
@@ -1773,6 +1772,23 @@ pub(in crate::deploy) fn node_avoid_affinity(profile: &DeployProfile) -> Option<
         }),
         ..Default::default()
     })
+}
+
+/// Render an optional `--harness <h>` wrapper flag. The value is clap's own `ValueEnum` name, so
+/// the string the wrapper emits is by construction the one the in-pod CLI parses back.
+fn harness_flag(harness: Option<crate::manifest::Harness>, sep: char) -> String {
+    use clap::ValueEnum as _;
+    harness
+        .and_then(|h| h.to_possible_value())
+        .map(|v| format!(" --harness{sep}{}", v.get_name()))
+        .unwrap_or_default()
+}
+
+/// Render an optional `--model <m>` wrapper flag.
+fn model_flag(model: Option<&String>, sep: char) -> String {
+    model
+        .map(|m| format!(" --model{sep}{m}"))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
