@@ -717,6 +717,11 @@ task whose failure short-circuited the plan (present only for `required_task_fai
 stays the rendered form of the same reason. `report.json`'s per-task entries carry the same
 object.
 
+A `task_result` event whose `status` is `transport` carries an additive `transport` token
+(contract 1.4.0): what the last attempt died on, one of `gateway`/`sandbox`/`agent`/`provider`/
+`workspace`/`command`/`other`. `note` stays the retry summary with the last attempt's detail.
+`report.json`'s per-task entries carry the same token.
+
 Additive event kinds beyond the compat set include:
 
 - **`identity`**: the run's `RunIdentity` (below), emitted once at setup and again on

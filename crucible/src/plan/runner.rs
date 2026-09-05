@@ -15,6 +15,7 @@ use serde_json::Value;
 use crate::crucible::Direction;
 use crate::plan::exec::{Attempt, AttemptOutcome, TaskRunner};
 use crate::plan::ir::{Task, TaskKind, TaskName};
+use crucible_contract::TransportCause;
 
 pub struct ShellRunner {
     pub workdir: PathBuf,
@@ -131,10 +132,7 @@ impl ShellRunner {
         let out = match cmd.output() {
             Ok(out) => out,
             Err(e) => {
-                return Attempt {
-                    outcome: AttemptOutcome::Transport(format!("spawn failed: {e}")),
-                    cost_usd: 0.0,
-                };
+                return Attempt::transport(TransportCause::Command, format!("spawn failed: {e}"));
             }
         };
         let stdout = String::from_utf8_lossy(&out.stdout);

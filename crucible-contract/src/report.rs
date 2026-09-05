@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::session::TaskBlocked;
+use crate::session::{TaskBlocked, TransportCause};
 
 pub const REPORT_FILE: &str = "report.json";
 
@@ -16,6 +16,9 @@ pub struct TaskReport {
     /// Present exactly when `status` is `blocked`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked: Option<TaskBlocked>,
+    /// Present exactly when `status` is `transport`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<TransportCause>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

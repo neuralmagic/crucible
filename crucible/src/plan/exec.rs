@@ -23,6 +23,7 @@ use crate::plan::ir::{
 use crate::plan::machine::{
     BlockedReason, PlanEvent, PlanMachine, TaskEvent, TaskMachine, TaskState,
 };
+use crucible_contract::TransportCause;
 
 /// What the substrate can measure. Missing caps truncate the plan fail-closed.
 #[derive(Clone, Debug, Default)]
@@ -50,7 +51,29 @@ pub enum AttemptOutcome {
     /// walker's own skip (a task filtered out by substrate caps, which never ran at all).
     Skipped(Value, String),
     /// Transport failure (infra, not the work). Retried, bounded, every attempt visible.
-    Transport(String),
+    Transport(TransportFailure),
+}
+
+/// What an attempt died on before the task could be judged, and the engine's account of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransportFailure {
+    pub cause: TransportCause,
+    pub note: String,
+}
+
+impl TransportFailure {
+    pub fn new(cause: TransportCause, note: impl Into<String>) -> Self {
+        Self {
+            cause,
+            note: note.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for TransportFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.note)
+    }
 }
 
 impl AttemptOutcome {
@@ -101,9 +124,9 @@ impl Attempt {
         }
     }
 
-    pub fn transport(note: String) -> Self {
+    pub fn transport(cause: TransportCause, note: impl Into<String>) -> Self {
         Self {
-            outcome: AttemptOutcome::Transport(note),
+            outcome: AttemptOutcome::Transport(TransportFailure::new(cause, note)),
             cost_usd: 0.0,
         }
     }
@@ -278,6 +301,9 @@ pub struct TaskResult {
     /// Present exactly when `status` is [`TaskStatus::Blocked`]; `note` is its `Display`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocked: Option<BlockedReason>,
+    /// Present exactly when `status` is [`TaskStatus::Transport`]: what the last attempt died on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport: Option<TransportCause>,
 }
 
 impl TaskResult {
@@ -306,6 +332,7 @@ impl TaskResult {
             note: Some(note.into()),
             fanout: None,
             blocked: None,
+            transport: None,
         }
     }
 }
@@ -708,6 +735,7 @@ pub fn execute(
                         note: Some(why),
                         fanout: None,
                         blocked: None,
+                        transport: None,
                     };
                     record(
                         &mut *runner,
@@ -1280,6 +1308,7 @@ fn fold_instances(settled: Vec<(String, TaskResult)>) -> TaskResult {
     });
     TaskResult {
         blocked: None,
+        transport: None,
         status: if failed == 0 {
             TaskStatus::Pass
         } else {
@@ -1380,7 +1409,7 @@ fn settle_attempt(
     outcome: AttemptOutcome,
     attempts: u32,
     cost_usd: f64,
-) -> Result<(TaskResult, TaskEvent), String> {
+) -> Result<(TaskResult, TaskEvent), TransportFailure> {
     let (status, output, note, event) = match outcome {
         AttemptOutcome::Pass(output) => (TaskStatus::Pass, Some(output), None, TaskEvent::Passed),
         AttemptOutcome::Skipped(output, note) => (
@@ -1392,7 +1421,7 @@ fn settle_attempt(
         AttemptOutcome::Fail { note, output } => {
             (TaskStatus::Fail, output, Some(note), TaskEvent::Failed)
         }
-        AttemptOutcome::Transport(note) => return Err(note),
+        AttemptOutcome::Transport(failure) => return Err(failure),
     };
     Ok((
         TaskResult {
@@ -1403,6 +1432,7 @@ fn settle_attempt(
             note,
             fanout: None,
             blocked: None,
+            transport: None,
         },
         event,
     ))
@@ -1414,17 +1444,17 @@ fn transport_result(
     attempts: u32,
     max_attempts: u32,
     cost_usd: f64,
-    note: &str,
+    failure: &TransportFailure,
     cut_by_budget: bool,
 ) -> (TaskResult, TaskEvent) {
     let (note, event) = if cut_by_budget {
         (
-            format!("budget ceiling reached after transport attempt: {note}"),
+            format!("budget ceiling reached after transport attempt: {failure}"),
             TaskEvent::TransportCutByBudget,
         )
     } else {
         (
-            format!("transport retries exhausted ({max_attempts} attempts): {note}"),
+            format!("transport retries exhausted ({max_attempts} attempts): {failure}"),
             TaskEvent::TransportExhausted,
         )
     };
@@ -1437,6 +1467,7 @@ fn transport_result(
             note: Some(note),
             fanout: None,
             blocked: None,
+            transport: Some(failure.cause),
         },
         event,
     )
@@ -1455,7 +1486,7 @@ fn run_with_retries(
     let max_attempts = 1 + cfg.transport_retries;
     let mut attempts = 0;
     let mut cost = 0.0;
-    let mut last_transport_note = String::new();
+    let mut last_transport = TransportFailure::new(TransportCause::Other, String::new());
     while attempts < max_attempts {
         attempts += 1;
         let a = runner.run(t, attempts, inputs);
@@ -1463,18 +1494,17 @@ fn run_with_retries(
         *spent += a.cost_usd;
         match settle_attempt(enforce_emits(t, a.outcome), attempts, cost) {
             Ok((result, event)) => return (result, event, *spent > budget),
-            Err(note) => {
+            Err(failure) => {
                 if *spent > budget || (*spent >= budget && attempts < max_attempts) {
                     let (result, event) =
-                        transport_result(attempts, max_attempts, cost, &note, true);
+                        transport_result(attempts, max_attempts, cost, &failure, true);
                     return (result, event, true);
                 }
-                last_transport_note = note;
+                last_transport = failure;
             }
         }
     }
-    let (result, event) =
-        transport_result(attempts, max_attempts, cost, &last_transport_note, false);
+    let (result, event) = transport_result(attempts, max_attempts, cost, &last_transport, false);
     (result, event, *spent > budget)
 }
 
@@ -1519,7 +1549,7 @@ fn run_batch_with_retries<'a>(
                 Ok(settled) => {
                     done.insert(idx, settled);
                 }
-                Err(note) => {
+                Err(failure) => {
                     if item.attempt < max_attempts && !retry_budget_blocked {
                         next.push((
                             idx,
@@ -1538,7 +1568,7 @@ fn run_batch_with_retries<'a>(
                                 item.attempt,
                                 max_attempts,
                                 cost_so_far[idx],
-                                &note,
+                                &failure,
                                 cut_by_budget,
                             ),
                         );
@@ -1572,6 +1602,7 @@ fn reduce_top_k(inputs: &BTreeMap<TaskName, Value>, k: u32, direction: Direction
                     note: Some(format!("input {name} has no finite numeric `score` field")),
                     fanout: None,
                     blocked: None,
+                    transport: None,
                 };
             }
         }
@@ -1593,6 +1624,7 @@ fn reduce_top_k(inputs: &BTreeMap<TaskName, Value>, k: u32, direction: Direction
         note: None,
         fanout: None,
         blocked: None,
+        transport: None,
     }
 }
 
@@ -2021,9 +2053,24 @@ mod tests {
             10.0,
         );
         let mut r = ScriptRunner::new();
-        r.on("t", 1, || AttemptOutcome::Transport("blip".into()), 0.1);
-        r.on("t", 2, || AttemptOutcome::Transport("blip".into()), 0.1);
-        r.on("t", 3, || AttemptOutcome::Transport("blip".into()), 0.1);
+        r.on(
+            "t",
+            1,
+            || AttemptOutcome::Transport(TransportFailure::new(TransportCause::Other, "blip")),
+            0.1,
+        );
+        r.on(
+            "t",
+            2,
+            || AttemptOutcome::Transport(TransportFailure::new(TransportCause::Other, "blip")),
+            0.1,
+        );
+        r.on(
+            "t",
+            3,
+            || AttemptOutcome::Transport(TransportFailure::new(TransportCause::Other, "blip")),
+            0.1,
+        );
         r.on("f", 1, || AttemptOutcome::fail("wrong answer"), 0.1);
         let out = execute(
             &plan,
@@ -2053,9 +2100,24 @@ mod tests {
             10.0,
         );
         let mut r = ScriptRunner::new();
-        r.on("t", 1, || AttemptOutcome::Transport("x".into()), 0.1);
-        r.on("t", 2, || AttemptOutcome::Transport("x".into()), 0.1);
-        r.on("t", 3, || AttemptOutcome::Transport("x".into()), 0.1);
+        r.on(
+            "t",
+            1,
+            || AttemptOutcome::Transport(TransportFailure::new(TransportCause::Other, "x")),
+            0.1,
+        );
+        r.on(
+            "t",
+            2,
+            || AttemptOutcome::Transport(TransportFailure::new(TransportCause::Other, "x")),
+            0.1,
+        );
+        r.on(
+            "t",
+            3,
+            || AttemptOutcome::Transport(TransportFailure::new(TransportCause::Other, "x")),
+            0.1,
+        );
         let out = execute(
             &plan,
             &any_substrate(),
@@ -2065,6 +2127,55 @@ mod tests {
         );
         assert!(!out.valid);
         assert_eq!(out.exit, PlanExit::ShortCircuit { task: "t".into() });
+    }
+
+    #[test]
+    fn the_last_attempts_transport_cause_lands_on_the_result() {
+        let plan = valid(vec![task("t", &[], "any", false)], 10.0);
+        let mut r = ScriptRunner::new();
+        r.on(
+            "t",
+            1,
+            || AttemptOutcome::Transport(TransportFailure::new(TransportCause::Sandbox, "pull")),
+            0.1,
+        );
+        r.on(
+            "t",
+            2,
+            || AttemptOutcome::Transport(TransportFailure::new(TransportCause::Sandbox, "pull")),
+            0.1,
+        );
+        r.on(
+            "t",
+            3,
+            || {
+                AttemptOutcome::Transport(TransportFailure::new(
+                    TransportCause::Gateway,
+                    "gateway did not become healthy",
+                ))
+            },
+            0.1,
+        );
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        let t = &out.results[&"t".into()];
+        assert_eq!(t.status, TaskStatus::Transport);
+        assert_eq!(t.transport, Some(TransportCause::Gateway));
+        assert_eq!(
+            t.note.as_deref(),
+            Some("transport retries exhausted (3 attempts): gateway did not become healthy")
+        );
+        let passed = &out.results;
+        assert!(
+            passed
+                .values()
+                .all(|r| r.status != TaskStatus::Pass || r.transport.is_none())
+        );
     }
 
     #[test]
@@ -2125,7 +2236,12 @@ mod tests {
     fn transport_retry_stops_when_the_budget_is_consumed() {
         let plan = valid(vec![task("a", &[], "any", true)], 0.5);
         let mut r = ScriptRunner::new();
-        r.on("a", 1, || AttemptOutcome::Transport("blip".into()), 0.5);
+        r.on(
+            "a",
+            1,
+            || AttemptOutcome::Transport(TransportFailure::new(TransportCause::Other, "blip")),
+            0.5,
+        );
         let out = execute(
             &plan,
             &any_substrate(),
@@ -2574,7 +2690,10 @@ mod tests {
                         outcome: if x.task.name.0 == "iso-a" {
                             AttemptOutcome::Pass(serde_json::json!({}))
                         } else {
-                            AttemptOutcome::Transport("flaky".into())
+                            AttemptOutcome::Transport(TransportFailure::new(
+                                TransportCause::Other,
+                                "flaky",
+                            ))
                         },
                         cost_usd: 0.1,
                     })
@@ -3216,6 +3335,7 @@ mod tests {
             note: None,
             fanout: None,
             blocked: None,
+            transport: None,
         };
         for status in [
             TaskStatus::Fail,
@@ -3598,7 +3718,12 @@ mod tests {
             r.on(
                 "flaky",
                 attempt,
-                || AttemptOutcome::Transport("the broker hung up".to_string()),
+                || {
+                    AttemptOutcome::Transport(TransportFailure::new(
+                        TransportCause::Other,
+                        "the broker hung up",
+                    ))
+                },
                 0.0,
             );
         }
@@ -4033,7 +4158,12 @@ mod tests {
             r.on(
                 "flaky",
                 attempt,
-                || AttemptOutcome::Transport("the broker hung up".to_string()),
+                || {
+                    AttemptOutcome::Transport(TransportFailure::new(
+                        TransportCause::Other,
+                        "the broker hung up",
+                    ))
+                },
                 0.0,
             );
         }

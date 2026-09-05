@@ -18,6 +18,7 @@ use crate::args::{Args, Paths, Prepared};
 
 use crate::agent;
 use crate::control;
+use crate::plan::exec::TransportFailure;
 use crate::plan::exec::{
     Attempt, AttemptOutcome, BatchItem, ExecCfg, Substrate, TaskRunner, TaskStatus, execute,
 };
@@ -32,6 +33,7 @@ use crate::report::{Reporter, TurnBudget};
 use crate::runloop::step::{Decided, IterStep, Measured, TurnVerdict};
 use crucible::crucible::Direction;
 use crucible::crucible::{Judge, MeasureCtx, Reading, World};
+use crucible_contract::TransportCause;
 
 #[derive(Debug, thiserror::Error)]
 #[error("graph iteration ended with neither a decision nor a control signal (exit: {exit})")]
@@ -610,7 +612,10 @@ impl<R: Reporter> LoopTaskRunner<R> {
             // Transport-class turn death: hand the executor a Transport outcome so
             // `run_with_retries` re-runs the turn (the session resumes where it died).
             TurnVerdict::Retry(why) => Attempt {
-                outcome: AttemptOutcome::Transport(why),
+                outcome: AttemptOutcome::Transport(TransportFailure::new(
+                    TransportCause::Provider,
+                    why,
+                )),
                 cost_usd: cost,
             },
             TurnVerdict::Escalate => {

@@ -3,6 +3,7 @@
 use crate::agent::event::{AgentEvent, RawStream, Tokens, cost_of};
 use crate::agent::harness::StreamDecoder;
 use crate::args::Args;
+use crucible_contract::TransportCause;
 
 /// How a turn ended when it did not complete: the agent never produced output because the
 /// transport itself failed. Distinct from a turn that ran and answered badly.
@@ -11,9 +12,22 @@ pub enum TurnFailure {
     /// The local transport could not be launched (bad argv, missing binary, harness error).
     #[error("agent spawn failed: {0}")]
     Spawn(String),
-    /// The openshell driver's multi-step flow failed (gateway, provider, sandbox, exec, transfer).
-    #[error("openshell orchestration failed: {0}")]
-    Orchestration(String),
+    /// The openshell driver's multi-step flow failed; `cause` says at which step.
+    #[error("openshell orchestration failed: {message}")]
+    Orchestration {
+        cause: TransportCause,
+        message: String,
+    },
+}
+
+impl TurnFailure {
+    /// What the failure counts as on a task result.
+    pub fn transport_cause(&self) -> TransportCause {
+        match self {
+            TurnFailure::Spawn(_) => TransportCause::Agent,
+            TurnFailure::Orchestration { cause, .. } => *cause,
+        }
+    }
 }
 
 /// One turn's result: what it cost, and whether it ran at all. `failure` is `Some` when the turn

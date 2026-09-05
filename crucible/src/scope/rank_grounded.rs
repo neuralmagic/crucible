@@ -688,7 +688,10 @@ mod tests {
         let report = report_from_turn(
             TurnOutcome::failed(
                 0.42,
-                TurnFailure::Orchestration("sandbox exec failed".into()),
+                TurnFailure::Orchestration {
+                    cause: crucible_contract::TransportCause::Sandbox,
+                    message: "sandbox exec failed".into(),
+                },
             ),
             buf,
             0.25,
