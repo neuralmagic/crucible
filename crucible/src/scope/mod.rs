@@ -16,3 +16,6 @@ mod progress;
 mod transcript;
 
 pub use cli::{ScopeArgs, run};
+pub(crate) mod issue;
+pub(crate) mod rank_grounded;
+pub(crate) mod refine;

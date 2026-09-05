@@ -15,10 +15,20 @@ use starlark::values::{
     Heap, NoSerialize, ProvidesStaticType, StarlarkValue, Value, starlark_value,
 };
 
-use crate::manifest::WorkflowCfg;
 use crate::plan::diag;
 use crate::plan::ir::{OutputField, OutputRef, Task};
-use crate::plan::starlark::{CompileError, SessionDecl};
+use crate::plan::starlark::error::CompileError;
+use crate::plan::workflow::WorkflowCfg;
+
+/// A `session(...)` declaration: a durable conversation name plus optional agent
+/// defaults that materialize onto the agent tasks bound to it.
+#[derive(Clone, Debug)]
+pub(crate) struct SessionDecl {
+    pub(crate) name: String,
+    pub(crate) harness: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) effort: Option<String>,
+}
 
 #[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
 pub(crate) struct TaskValue(#[allocative(skip)] pub(crate) Task);

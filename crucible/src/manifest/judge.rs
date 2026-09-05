@@ -1,4 +1,4 @@
-use crate::command_judge::Direction;
+use crate::crucible::Direction;
 use crate::manifest::selftest::SelftestCfg;
 use anyhow::{Context, Result};
 use serde::Deserialize;

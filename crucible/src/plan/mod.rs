@@ -8,6 +8,7 @@ pub mod ir;
 pub mod runner;
 pub mod starlark;
 pub mod term_img;
+pub mod workflow;
 pub mod worktree;
 
 /// The environment variable naming the task a turn runs, set by both the command runner and the

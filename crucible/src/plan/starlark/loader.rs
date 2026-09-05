@@ -40,7 +40,7 @@ pub(crate) fn resolve<'a>(
     state: &'a dsl::CompileState,
     globals: &Globals,
     root_bytes: usize,
-    lane: crate::manifest::WorkflowType,
+    lane: crate::plan::workflow::WorkflowType,
 ) -> dsl::Result<PackLoader<'a>> {
     let mut resolver = Resolver {
         state,
@@ -61,7 +61,7 @@ pub(crate) fn resolve<'a>(
 
 struct Resolver<'a, 'g> {
     state: &'a dsl::CompileState,
-    lane: crate::manifest::WorkflowType,
+    lane: crate::plan::workflow::WorkflowType,
     globals: &'g Globals,
     modules: HashMap<String, FrozenModule>,
     /// Frozen modules by canonical path, so two spellings of one file are evaluated once.

@@ -15,7 +15,10 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::plan::ir::{Direction, Join, Stage, Task, TaskKind, TaskName, ValidPlan};
+use crate::crucible::Direction;
+use crate::plan::ir::{
+    ITEM_INPUT, Join, OUTCOME_INPUT, Stage, Task, TaskKind, TaskName, ValidPlan,
+};
 
 /// What the substrate can measure. Missing caps truncate the plan fail-closed.
 #[derive(Clone, Debug, Default)]
@@ -723,17 +726,6 @@ pub fn execute(
         results,
     }
 }
-
-/// The reserved input a mapped instance receives its own item under. Reserved like the
-/// epilogue's kept-candidate input: a task may not declare a dependency by this name.
-pub const ITEM_INPUT: &str = "item";
-
-/// The reserved input every epilogue task receives the main graph's outcome under.
-pub const OUTCOME_INPUT: &str = "outcome";
-
-/// Every key the engine writes into a task's inputs itself. A dependency named after one of
-/// them would have its entry overwritten, so [`crate::plan::ir::Plan::validate`] refuses it.
-pub const RESERVED_INPUTS: [&str; 3] = [ITEM_INPUT, crate::manifest::KEPT_INPUT, OUTCOME_INPUT];
 
 /// One instance's name, `node[key]`. The key is the item, never its position: a list that comes
 /// back reordered or shorter still names the same work the same way, which is what makes a

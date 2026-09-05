@@ -80,6 +80,12 @@ jobs:
           ./tools/check-dep-dups.sh
           ./tools/check-heavy-dep-allowlist.sh
 
+      # The crucible crate's module graph is a DAG: `cargo xtask modgraph` prints it and
+      # `--check` fails on any cycle, so a module cannot quietly grow a dependency on one of
+      # its own dependents.
+      - name: Module layout guard
+        run: cargo run --quiet -p xtask -- modgraph --check
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked --no-deps -- -D warnings
 

@@ -3,7 +3,7 @@
 //! the ordinary `decision: "keep"` shape (score `None`) so publish, resume, and the flow
 //! renderer work unchanged.
 
-use crate::command_judge::Direction;
+use crate::crucible::Direction;
 use crate::crucible::{Decision, Judge, MeasureCtx, Reading};
 use anyhow::Result;
 

@@ -102,7 +102,7 @@ fn ensure_adc() -> Result<()> {
 }
 
 /// The short-lived material a codex sandbox is handed, via its seeded `$CODEX_HOME/auth.json`
-/// ([`crate::harness::codex`]): one access token, the account it belongs to, and the id token
+/// ([`crate::agent::harness::codex`]): one access token, the account it belongs to, and the id token
 /// codex echoes back. No refresh token, by construction: the loop process is the single
 /// refresher, so a sandbox that outlives its access token fails loudly instead of racing the
 /// host for a rotation. No gateway provider is involved (provider env resolves to a placeholder

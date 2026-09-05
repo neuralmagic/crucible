@@ -1,12 +1,14 @@
 //! The `crucible plan` CLI: `show` compiles and prints a plan; `run` executes one.
 
+use crate::args::AgentOverride;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
 
 use crate::plan::exec::{Substrate, TaskResult, TaskStatus, runnable_set};
-use crate::plan::ir::{Direction, Plan, Task, TaskKind, ValidPlan};
+use crate::plan::ir::{Plan, Task, TaskKind, ValidPlan};
+use crucible::crucible::Direction;
 use xai_grok_mermaid::{MermaidTheme, RenderLimits, RenderParams, default_engine, render_checked};
 
 #[derive(Debug, thiserror::Error)]
@@ -318,79 +320,13 @@ fn render_mermaid_styled(
 
 /// Serialize an admitted plan for the event stream.
 /// The `Shutdown.outcome` token a finished plan reports, in the vocabulary
-/// [`crate::recovery::ShutdownOutcome`] parses. Only a plan that ran its whole graph is
+/// [`crate::control::recovery::ShutdownOutcome`] parses. Only a plan that ran its whole graph is
 /// `finished`.
 fn shutdown_outcome(out: &crate::plan::exec::PlanOutcome) -> &'static str {
     use crate::plan::exec::PlanExit;
     match out.exit {
         PlanExit::Completed if !out.valid => "error",
         ref exit => exit.shutdown_token(),
-    }
-}
-
-pub(crate) fn plan_admitted_event(plan: &ValidPlan) -> crate::session::SessionEvent {
-    let p = plan.plan();
-    crate::session::SessionEvent::PlanAdmitted {
-        plan_version: p.version,
-        reason: p.reason.clone().unwrap_or_default(),
-        budget_usd: p.budget.usd,
-        tasks: plan
-            .tasks_topo()
-            .map(|t| crate::session::PlanTaskWire {
-                name: t.name.0.clone(),
-                kind: t.task.label().to_string(),
-                depends_on: t.depends_on.iter().map(|d| d.0.clone()).collect(),
-                session: t.session.clone().unwrap_or_default(),
-                needs: t.needs.clone(),
-                required: t.required,
-                join: t.join.as_str().to_string(),
-                stage: t.stage.as_str().to_string(),
-                over: t
-                    .over
-                    .as_ref()
-                    .map(crate::plan::ir::OutputRef::to_string)
-                    .unwrap_or_default(),
-                max_fanout: t.max_fanout.unwrap_or_default(),
-            })
-            .collect(),
-    }
-}
-
-/// One terminal task result on the wire. `iter` is the loop round (0 for a standalone
-/// `plan run`); fields belonging to other emitters stay at their defaults. `trace_id`/`span_id`
-/// carry the emitter's current trace context (the iteration's span) so a RESULTS row links
-/// straight to its trace; no active span leaves them empty.
-pub(crate) fn task_result_event(
-    plan_version: u32,
-    iter: u32,
-    task: &crate::plan::ir::Task,
-    r: &crate::plan::exec::TaskResult,
-) -> crate::session::SessionEvent {
-    let (trace_id, span_id) = crate::engine::current_trace_env()
-        .and_then(|(tp, _)| {
-            let f: Vec<&str> = tp.split('-').collect();
-            match f.as_slice() {
-                [_, tid, sid, ..] => Some((tid.to_string(), sid.to_string())),
-                _ => None,
-            }
-        })
-        .unwrap_or_default();
-    crate::session::SessionEvent::TaskResult {
-        task: task.name.0.clone(),
-        status: r.status.as_str().to_string(),
-        plan_version,
-        task_kind: task.task.label().to_string(),
-        iter,
-        digest: String::new(),
-        job: String::new(),
-        attempts: r.attempts,
-        cost_usd: r.cost_usd,
-        metric: None,
-        output: r.output.clone(),
-        note: r.note.clone().unwrap_or_default(),
-        secs: 0.0,
-        trace_id,
-        span_id,
     }
 }
 
@@ -543,15 +479,6 @@ pub struct RunOpts {
     pub agent: AgentOverride,
 }
 
-/// The agent a launch names in place of the manifest's `[agent]` defaults. A task that pins its
-/// own harness or model keeps it; the override replaces only what the manifest would have
-/// supplied.
-#[derive(Debug, Clone, Default)]
-pub struct AgentOverride {
-    pub harness: Option<crate::manifest::Harness>,
-    pub model: Option<String>,
-}
-
 #[derive(Debug, thiserror::Error)]
 #[error(
     "a playbook needs {missing} from whoever launches it. Its source may not declare a limit its \
@@ -611,18 +538,21 @@ pub fn run(
     }
 
     // Either the plan was handed to us, or the manifest names the graph and we compile it.
-    let mut evidence: Option<crate::Paths> = None;
+    let mut evidence: Option<crate::args::Paths> = None;
     let (plan, mut runner, events): (ValidPlan, Box<dyn TaskRunner>, Option<std::fs::File>) =
         match (path, manifest) {
             (_, Some(m)) => {
-                let (prepared, loaded) =
-                    crate::run::prep_plan_runner_with_params(m, params, compute_driver, agent)?;
+                let (prepared, loaded) = crate::cli::setup::prep_plan_runner_with_params(
+                    m,
+                    params,
+                    compute_driver,
+                    agent,
+                )?;
                 let session_log = prepared.paths.session_log.clone();
                 evidence = Some(prepared.paths.clone());
-                let playbook = loaded
-                    .workflow
-                    .as_ref()
-                    .is_some_and(|w| w.workflow_type == crate::manifest::WorkflowType::Playbook);
+                let playbook = loaded.workflow.as_ref().is_some_and(|w| {
+                    w.workflow_type == crate::plan::workflow::WorkflowType::Playbook
+                });
                 if playbook {
                     let missing = match (ceilings.usd, ceilings.wall_clock) {
                         (None, None) => Some("--max-cost and --max-time"),
@@ -643,9 +573,10 @@ pub fn run(
                         let workflow = loaded.workflow.as_ref().ok_or_else(|| NoGraph {
                             manifest: m.display().to_string(),
                         })?;
-                        let caps = crate::manifest::WorkflowCaps::for_lane(workflow.workflow_type)
-                            .with_persistent_sessions();
-                        if workflow.workflow_type == crate::manifest::WorkflowType::Playbook {
+                        let caps =
+                            crate::plan::workflow::WorkflowCaps::for_lane(workflow.workflow_type)
+                                .with_persistent_sessions();
+                        if workflow.workflow_type == crate::plan::workflow::WorkflowType::Playbook {
                             workflow
                                 .admit(&caps)
                                 .context("admitting one-pass playbook")?;
@@ -658,7 +589,7 @@ pub fn run(
                             .validate()
                             .context("building one-pass playbook")?
                         } else {
-                            crate::loop_graph::iteration_template(Some(workflow), &caps)?
+                            crate::runloop::graph::iteration_template(Some(workflow), &caps)?
                         }
                     }
                 };
@@ -692,13 +623,13 @@ pub fn run(
     // Manifest runs append plan wire events to the run's session log so tailers (and the
     // controller's ingest) see the graph and its live progress; shell runs have no state dir.
     let substrate = Substrate { caps: caps.clone() };
-    let append = |f: &std::fs::File, ev: &crate::session::SessionEvent| {
+    let append = |f: &std::fs::File, ev: &crate::report::session::SessionEvent| {
         use std::io::Write;
         let mut w = f;
-        let _ = writeln!(w, "{}", crate::session::encode(ev));
+        let _ = writeln!(w, "{}", crate::report::session::encode(ev));
     };
     if let Some(f) = &events {
-        append(f, &plan_admitted_event(&plan));
+        append(f, &crate::plan::events::plan_admitted_event(&plan));
     }
     let selected_results: std::collections::BTreeSet<_> = plan
         .tasks_topo()
@@ -763,7 +694,10 @@ pub fn run(
             }
             write_report(&report);
             if let Some(f) = &events {
-                append(f, &task_result_event(plan.plan().version, 0, task, result));
+                append(
+                    f,
+                    &crate::plan::events::task_result_event(plan.plan().version, 0, task, result),
+                );
             }
         },
     );
@@ -796,14 +730,14 @@ pub fn run(
     if let Some(f) = &events {
         append(
             f,
-            &crate::session::SessionEvent::Shutdown {
+            &crate::report::session::SessionEvent::Shutdown {
                 outcome: shutdown_outcome(&out).to_string(),
                 reason: exit.clone(),
             },
         );
     }
     if let Some(p) = &evidence {
-        crate::run::deliver_run_evidence(p);
+        crate::report::ingest_client::deliver_run_evidence(p);
     }
     println!(
         "plan v{}: {} — spent ${:.4} of ${}",
@@ -913,7 +847,7 @@ mod tests {
     #[test]
     fn a_precompiled_plan_takes_no_parameters() {
         use clap::Parser;
-        let parse = |args: &[&str]| <crate::Cli>::try_parse_from(args).is_ok();
+        let parse = |args: &[&str]| <crate::cli::Cli>::try_parse_from(args).is_ok();
         assert!(
             !parse(&[
                 "crucible", "plan", "run", "--file", "p.toml", "--param", "a=b"
@@ -1138,10 +1072,11 @@ mod tests {
     #[test]
     fn wire_events_round_trip_through_the_contract_codec() {
         let plan = Plan::from_toml_str(SRC).unwrap().validate().unwrap();
-        let admitted = plan_admitted_event(&plan);
-        let back = crate::session::decode(&crate::session::encode(&admitted)).unwrap();
+        let admitted = crate::plan::events::plan_admitted_event(&plan);
+        let back =
+            crate::report::session::decode(&crate::report::session::encode(&admitted)).unwrap();
         match back {
-            crate::session::SessionEvent::PlanAdmitted {
+            crate::report::session::SessionEvent::PlanAdmitted {
                 plan_version,
                 tasks,
                 ..
@@ -1162,10 +1097,12 @@ mod tests {
             note: None,
             fanout: None,
         };
-        let back = crate::session::decode(&crate::session::encode(&task_result_event(1, 0, t, &r)))
-            .unwrap();
+        let back = crate::report::session::decode(&crate::report::session::encode(
+            &crate::plan::events::task_result_event(1, 0, t, &r),
+        ))
+        .unwrap();
         match back {
-            crate::session::SessionEvent::TaskResult {
+            crate::report::session::SessionEvent::TaskResult {
                 task,
                 status,
                 task_kind,
@@ -1296,7 +1233,7 @@ emits = ["verdict", "dirty"]
     /// session to the Tier 2 drop-box exactly as a loop run does, on the failing path too.
     #[test]
     fn manifest_plan_run_delivers_its_session_to_the_dropbox() {
-        let _guard = crate::test_env_lock();
+        let _guard = crate::testing::test_env_lock();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let receiver = std::thread::spawn(move || {
@@ -1407,9 +1344,9 @@ emits = ["verdict", "dirty"]
             .expect("gunzip");
             assert!(text.contains("probe"), "the session's tasks: {text}");
             let last = text.lines().last().expect("a delivered session");
-            let ev = crate::session::decode(last).expect("the last line decodes");
+            let ev = crate::report::session::decode(last).expect("the last line decodes");
             match ev {
-                crate::session::SessionEvent::Shutdown { outcome: got, .. } => {
+                crate::report::session::SessionEvent::Shutdown { outcome: got, .. } => {
                     assert_eq!(got, outcome, "{text}")
                 }
                 other => panic!("the session must end in a shutdown, got {other:?}: {text}"),

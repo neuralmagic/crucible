@@ -14,9 +14,10 @@ use starlark_syntax::syntax::ast::{ArgumentP, AssignTarget, AstLiteral, AstNoPay
 use starlark_syntax::syntax::module::AstModuleFields;
 use starlark_syntax::syntax::uniplate::Visit;
 
-use crate::manifest::WorkflowType;
 use crate::plan::diag;
-use crate::plan::starlark::{CompileError, dsl_functions};
+use crate::plan::starlark::dsl_functions;
+use crate::plan::starlark::error::CompileError;
+use crate::plan::workflow::WorkflowType;
 
 /// One call's named arguments, and where each was written.
 #[derive(Debug)]

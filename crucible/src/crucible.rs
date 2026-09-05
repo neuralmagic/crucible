@@ -20,6 +20,7 @@
 //! from a `crucible.toml` manifest; domains are manifests, not engine code.
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 
 /// One measurement of the current candidate. Domain-neutral by design: `score` is the
 /// fitness, `solved` is the win flag the measure step emits, and `detail` is free-form JSON
@@ -70,6 +71,24 @@ pub struct PublishComponent {
     pub base_sha: String,
     /// The kept-candidate tip sha (recorded in the best snapshot token).
     pub head_sha: String,
+}
+
+/// Which way is better. `lower` (latency, failures) or `higher` (throughput, score).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Direction {
+    Lower,
+    Higher,
+}
+
+impl Direction {
+    /// Strictly-better test for the keep rule (and the gate self-test's discrimination check).
+    pub fn better(self, score: f64, best: f64) -> bool {
+        match self {
+            Direction::Lower => score < best,
+            Direction::Higher => score > best,
+        }
+    }
 }
 
 /// The reversibly-mutable state the agent changes each turn.
@@ -155,5 +174,5 @@ pub trait Judge: Send + Sync {
 
     /// Which way is better, for engine-side score seeding (e.g. a skipped baseline starts at the
     /// worst value so any valid candidate is kept).
-    fn direction(&self) -> crate::command_judge::Direction;
+    fn direction(&self) -> Direction;
 }

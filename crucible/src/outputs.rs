@@ -15,7 +15,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 /// The run's resolved bounds plus the parameter values an open target binds against. Cloned onto
-/// [`crate::Args`] so every engine-side mediation point reads the value the broker was handed.
+/// [`crate::args::Args`] so every engine-side mediation point reads the value the broker was handed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunBounds {
     resolved: ResolvedOutputs,

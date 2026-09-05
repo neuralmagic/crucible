@@ -2,7 +2,7 @@
 //! frozen manifest text and the resolved injects, then hands the digest inputs to
 //! `RunIdentity::new`.
 //!
-//! **Split from [`crate::loop_driver`]'s segment fingerprint.** The fingerprint tracks the
+//! **Split from [`crate::runloop::driver`]'s segment fingerprint.** The fingerprint tracks the
 //! *regime* within a run (goal + objective + regime label; changes on a re-scope). `RunIdentity`
 //! tracks the *world* across runs (source + manifest + frozen inputs + judge + deployment; changes on a
 //! re-compose). Neither hashes the other's inputs, they share only the FNV-1a primitive

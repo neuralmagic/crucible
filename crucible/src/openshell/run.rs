@@ -5,22 +5,23 @@
 //! create the sandbox (attaching that provider) → apply the egress policy → upload the
 //! workspace → targeted-upload each relayed cred to its sandbox path → upload the env script
 //! and the prompt → optionally restore a private Claude session → exec claude (prompt over stdin), streaming its `stream-json` into the shared
-//! [`crate::agent::StreamPump`] → sweep the sandbox log for egress denials
+//! [`crate::agent::turn::StreamPump`] → sweep the sandbox log for egress denials
 //! (blocked-connection attempts are turn telemetry) → download the workspace and private session back → delete
 //! the sandbox (per-turn-fresh, so a discarded iteration leaves no residue).
 //!
 //! The sandbox name is derived per (process, workspace), so parallel wide-round candidates and parallel
 //! crucible processes sharing one gateway never collide on a fixed name.
 
-use crate::agent::{self, TurnFailure, TurnOutcome};
-use crate::event::{AgentEvent, RawStream, cost_of, estimate_cost};
-use crate::harness::{
+use crate::agent::event::{AgentEvent, RawStream, cost_of, estimate_cost};
+use crate::agent::harness::{
     AuthProvider, HarnessRuntime, SandboxLayout, TranscriptLocator, TurnArtifacts,
 };
+use crate::agent::relay;
+use crate::agent::turn::{TurnFailure, TurnOutcome};
+use crate::args::{Args, Paths};
 use crate::manifest::Harness;
 use crate::openshell::grpc::Gateway;
 use crate::openshell::{gateway, grpc, policy, provider, sandbox};
-use crate::{Args, Paths, relay};
 use anyhow::{Context, Result};
 
 /// Failures of the `openshell` CLI shell-outs and the private-transcript path checks. The
@@ -66,14 +67,14 @@ pub fn turn(
     p: &Paths,
     prompt: &str,
     json: bool,
-    session: Option<&crate::agent_session::SessionTurn>,
+    session: Option<&crate::agent::agent_session::SessionTurn>,
     mut sink: impl FnMut(&str, RawStream, Option<&AgentEvent>),
 ) -> TurnOutcome {
     // The whole turn is async; the engine runtime drives it. The one `block_on` in the openshell
     // path, reached from the published handle rather than threaded through `run_turn` and the
-    // reporter trait (see `crate::engine`). A missing runtime surfaces like any orchestration
+    // reporter trait (see `crate::agent::engine`). A missing runtime surfaces like any orchestration
     // failure (through the sink, a $0 no-op turn).
-    let handle = match crate::engine::handle() {
+    let handle = match crate::agent::engine::handle() {
         Ok(h) => h,
         Err(e) => {
             let message = format!("{e:#}");
@@ -117,7 +118,7 @@ impl CostMeter {
 }
 
 /// Aborts the wrapped task on drop. Guards the STOP→cancel bridge so it stops when the turn ends
-/// (normally or via `?`), instead of leaking a task that keeps polling `crate::STOP`.
+/// (normally or via `?`), instead of leaking a task that keeps polling `crate::process::STOP`.
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
 impl Drop for AbortOnDrop {
@@ -126,13 +127,13 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// Spawn the per-turn Ctrl-C bridge: poll [`crate::STOP`] every 50ms and trip `cancel` when it is
+/// Spawn the per-turn Ctrl-C bridge: poll [`crate::process::STOP`] every 50ms and trip `cancel` when it is
 /// set, so the exec stream (and the cancellable upload/download children) unwind promptly. STOP
 /// stays the single source of truth the loop driver already owns; this only translates it into the
 /// token the async I/O `select!`s on. The returned guard aborts the task at turn end.
 fn spawn_stop_bridge(cancel: CancellationToken) -> AbortOnDrop {
     AbortOnDrop(tokio::spawn(async move {
-        while !crate::STOP.load(Ordering::SeqCst) {
+        while !crate::process::STOP.load(Ordering::SeqCst) {
             if cancel.is_cancelled() {
                 return;
             }
@@ -215,7 +216,7 @@ async fn try_turn(
     p: &Paths,
     prompt: &str,
     json: bool,
-    session: Option<&crate::agent_session::SessionTurn>,
+    session: Option<&crate::agent::agent_session::SessionTurn>,
     spent: &CostMeter,
     sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
 ) -> Result<f64> {
@@ -260,8 +261,8 @@ async fn try_turn(
     //    host-refreshed ChatGPT OAuth token. Either is seeded as auth.json (step 7b), since Codex
     //    reads the real bytes off disk and its L4 WebSocket never crosses a placeholder-resolving
     //    proxy hop.
-    let inference = crate::inference::InferenceEnv::from_process_env()?;
-    let auth = crate::harness::resolve_auth(harness, &inference);
+    let inference = crate::agent::inference::InferenceEnv::from_process_env()?;
+    let auth = crate::agent::harness::resolve_auth(harness, &inference);
     let codex_auth = match auth {
         AuthProvider::Vertex => {
             let token = provider::mint_vertex_token()
@@ -365,9 +366,11 @@ async fn try_turn(
             };
             sink("", RawStream::Stderr, Some(&ev));
         }
-        if let Err(e) =
-            write_traceparent_files(&forge::storage_root(), crate::engine::current_trace_env())
-                .await
+        if let Err(e) = write_traceparent_files(
+            &forge::storage_root(),
+            crate::agent::engine::current_trace_env(),
+        )
+        .await
         {
             let ev = AgentEvent::Raw {
                 text: format!("turn-traceparent write failed (broker spans self-root): {e:#}"),
@@ -384,10 +387,10 @@ async fn try_turn(
     // `CRUCIBLE_OTEL`; a bind failure degrades to telemetry-off (no `otel_summary`, the
     // pricing-table estimate stays the cost fallback). Its `otel.jsonl` is the `otel-log` Tier 2
     // artifact.
-    let collector = if harness.otel_capable() && agent::otel_enabled(args) {
+    let collector = if harness.otel_capable() && crate::agent::turn::otel_enabled(args) {
         // The agent's exporter can't attribute its spans to a loop turn; the forwarder stamps
         // session + turn as resource attributes at the same boundary where it re-parents.
-        let forward = agent::otel_forward(args).map(|f| {
+        let forward = crate::agent::turn::otel_forward(args).map(|f| {
             let (name, turn) = session
                 .map(|s| (s.logical_name.clone(), s.completed_turns + 1))
                 .unwrap_or((String::new(), 1));
@@ -589,7 +592,7 @@ async fn try_turn(
                 .context("building continuing sandbox harness argv")?,
             None => harness.sandbox_argv(args, !seeds.is_empty()),
         };
-        let wrapper = crate::harness::exec_wrapper(&basename, &argv);
+        let wrapper = crate::agent::harness::exec_wrapper(&basename, &argv);
         let exec_opts = ExecOpts {
             model: args.model(),
             json,
@@ -626,7 +629,11 @@ async fn try_turn(
             })),
             AuthProvider::Codex | AuthProvider::AnthropicKey => None,
         };
-        let decoder = harness.decoder(args, meters.as_ref(), crate::agent::tool_io_full(args));
+        let decoder = harness.decoder(
+            args,
+            meters.as_ref(),
+            crate::agent::turn::tool_io_full(args),
+        );
         let exec_result =
             exec_and_stream(&gw, &name, &wrapper, decoder, &exec_opts, spent, sink).await;
         if let Some(refresher) = &refresher {
@@ -672,7 +679,9 @@ async fn try_turn(
         // The post-turn transcript fetch: pure telemetry garnish for claude (export-gated), but
         // a backfill harness's ONLY source of result events + cost, so for those it runs
         // unconditionally and a failure is loud (see `graft_turn_telemetry`).
-        if harness.backfill_required() || crate::engine::TurnExport::resolve().emits_anything() {
+        if harness.backfill_required()
+            || crate::agent::engine::TurnExport::resolve().emits_anything()
+        {
             cost = graft_turn_telemetry(harness, &gw, &name, &cancel, cost, sink).await;
             spent.raise(cost);
         }
@@ -839,7 +848,7 @@ struct ExecOpts<'a> {
     cancel: &'a CancellationToken,
 }
 
-/// Exec the agent over the gateway's `ExecSandbox` stream, driving a [`agent::StreamPump`] with the
+/// Exec the agent over the gateway's `ExecSandbox` stream, driving a [`crate::agent::turn::StreamPump`] with the
 /// stdout lines the stream yields, and return the turn's cost (estimated from tokens if none was
 /// reported). The stream's stderr is replayed through the sink after the agent exits, mirroring the
 /// old CLI-child behavior. `cancel` unwinds the exec on Ctrl-C (see [`Gateway::exec`]).
@@ -847,12 +856,12 @@ async fn exec_and_stream(
     gw: &Gateway,
     name: &str,
     command: &[String],
-    decoder: crate::harness::StreamDecoder,
+    decoder: crate::agent::harness::StreamDecoder,
     opts: &ExecOpts<'_>,
     spent: &CostMeter,
     sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
 ) -> Result<f64> {
-    let mut pump = agent::StreamPump::new(decoder);
+    let mut pump = crate::agent::turn::StreamPump::new(decoder);
     let exec = gw
         .exec(name, command, opts.cancel, |line| {
             pump.push(line, opts.json, sink)
@@ -994,7 +1003,7 @@ pub(crate) fn inference_env(
     env: &mut Vec<(String, String)>,
     harness: Harness,
     auth: AuthProvider,
-    inference: &crate::inference::InferenceEnv,
+    inference: &crate::agent::inference::InferenceEnv,
     codex_auth: Option<&provider::CodexAuth>,
 ) {
     let set = |env: &mut Vec<(String, String)>, key: &str, value: &str| {
@@ -1002,22 +1011,22 @@ pub(crate) fn inference_env(
         env.push((key.to_string(), value.to_string()));
     };
     if auth == AuthProvider::AnthropicKey {
-        env.retain(|(k, _)| !crate::inference::VERTEX_SELECTORS.contains(&k.as_str()));
+        env.retain(|(k, _)| !crate::agent::inference::VERTEX_SELECTORS.contains(&k.as_str()));
         if let Some(key) = inference.anthropic_key.as_deref() {
-            set(env, crate::inference::ANTHROPIC_API_KEY, key);
+            set(env, crate::agent::inference::ANTHROPIC_API_KEY, key);
         }
     }
     match harness {
         Harness::Claude | Harness::Hermes => {
             if let Some(url) = inference.anthropic_base_url.as_deref() {
-                set(env, crate::inference::ANTHROPIC_BASE_URL, url);
+                set(env, crate::agent::inference::ANTHROPIC_BASE_URL, url);
             }
         }
         Harness::Codex => {
             if let Some(url) = inference.openai_base_url.as_deref() {
-                set(env, crate::inference::OPENAI_BASE_URL, url);
+                set(env, crate::agent::inference::OPENAI_BASE_URL, url);
                 if let Some(provider::CodexAuth::ApiKey(key)) = codex_auth {
-                    set(env, crate::inference::OPENAI_API_KEY_ENV, key);
+                    set(env, crate::agent::inference::OPENAI_API_KEY_ENV, key);
                 }
             }
         }
@@ -1115,7 +1124,7 @@ async fn graft_turn_telemetry(
         return cost;
     };
 
-    let export = crate::engine::TurnExport::resolve();
+    let export = crate::agent::engine::TurnExport::resolve();
     // One infallible parse over the in-memory transcript feeds span export and (backfill
     // harnesses) the turn's result; skip it when nothing consumes it.
     let artifacts = if export.spans() || harness.backfill_required() {
@@ -1126,7 +1135,7 @@ async fn graft_turn_telemetry(
     if export.emits_anything() {
         let span = tracing::Span::current();
         if export.spans() {
-            crate::engine::synthesize_tool_spans(
+            crate::agent::engine::synthesize_tool_spans(
                 &span,
                 &artifacts.tool_calls,
                 std::time::SystemTime::now(),
@@ -1136,7 +1145,7 @@ async fn graft_turn_telemetry(
             // Content logs come from the harness's own transcript reader (claude maps its jsonl;
             // hermes: Phase B), off the same in-memory bytes, no re-read.
             let records = harness.content_records(&bytes);
-            crate::engine::emit_conversation_logs(&span, &records);
+            crate::agent::engine::emit_conversation_logs(&span, &records);
         }
     }
 
@@ -1156,15 +1165,17 @@ const PRIVATE_SESSION_DIR: &str = "agent-session-private";
 
 fn private_session_paths(
     p: &Paths,
-    session: &crate::agent_session::SessionTurn,
+    session: &crate::agent::agent_session::SessionTurn,
 ) -> (std::path::PathBuf, std::path::PathBuf) {
     let root = p.state.join(PRIVATE_SESSION_DIR).join(&session.provider_id);
     (root.join("locator"), root.join("transcript.jsonl"))
 }
 
-fn valid_private_remote(remote: &str, session: &crate::agent_session::SessionTurn) -> bool {
-    remote.starts_with(&format!("{}/", crate::harness::claude::CLAUDE_PROJECTS))
-        && remote.ends_with(&format!("/{}.jsonl", session.provider_id))
+fn valid_private_remote(remote: &str, session: &crate::agent::agent_session::SessionTurn) -> bool {
+    remote.starts_with(&format!(
+        "{}/",
+        crate::agent::harness::claude::CLAUDE_PROJECTS
+    )) && remote.ends_with(&format!("/{}.jsonl", session.provider_id))
         && !remote.contains("..")
         && std::path::Path::new(remote).is_absolute()
 }
@@ -1174,7 +1185,7 @@ fn valid_private_remote(remote: &str, session: &crate::agent_session::SessionTur
 /// session UUID before it is used as an upload target.
 async fn restore_private_session(
     p: &Paths,
-    session: &crate::agent_session::SessionTurn,
+    session: &crate::agent::agent_session::SessionTurn,
     gw: &Gateway,
     name: &str,
     cancel: &CancellationToken,
@@ -1212,7 +1223,7 @@ async fn restore_private_session(
 /// private engine file, mode 0600, and is never part of the public session-event/publish contract.
 async fn persist_private_session(
     p: &Paths,
-    session: &crate::agent_session::SessionTurn,
+    session: &crate::agent::agent_session::SessionTurn,
     gw: &Gateway,
     name: &str,
     cancel: &CancellationToken,
@@ -1220,8 +1231,8 @@ async fn persist_private_session(
     let remote = newest_transcript_path(
         gw,
         name,
-        crate::harness::claude::CLAUDE_PROJECTS,
-        crate::harness::claude::TRANSCRIPT_GLOB,
+        crate::agent::harness::claude::CLAUDE_PROJECTS,
+        crate::agent::harness::claude::TRANSCRIPT_GLOB,
         cancel,
     )
     .await
@@ -1503,7 +1514,7 @@ mod tests {
 
     #[test]
     fn codex_auth_selection_can_switch_between_named_keys_and_chatgpt() {
-        let _guard = crate::test_env_lock();
+        let _guard = crate::testing::test_env_lock();
         const KEY: &str = "CRUCIBLE_TEST_WORK";
         let key_env = codex_api_key_env(Some(KEY));
         assert_eq!(key_env, "OPENAI_API_KEY_CRUCIBLE_TEST_WORK");
@@ -1536,7 +1547,7 @@ mod tests {
 
     #[test]
     fn explicit_api_auth_never_silently_falls_back_to_chatgpt() {
-        let _guard = crate::test_env_lock();
+        let _guard = crate::testing::test_env_lock();
         const KEY: &str = "CRUCIBLE_TEST_MISSING";
         let key_env = codex_api_key_env(Some(KEY));
         unsafe { std::env::remove_var(&key_env) };
@@ -1632,15 +1643,15 @@ mod tests {
         }
         assert_eq!(
             newest_jsonl_script(
-                crate::harness::claude::CLAUDE_PROJECTS,
-                crate::harness::claude::TRANSCRIPT_GLOB
+                crate::agent::harness::claude::CLAUDE_PROJECTS,
+                crate::agent::harness::claude::TRANSCRIPT_GLOB
             ),
             "ls -1t /sandbox/.claude/projects/*/*.jsonl 2>/dev/null | head -n 1"
         );
         assert_eq!(
             newest_jsonl_script(
-                crate::harness::codex::SESSIONS,
-                crate::harness::codex::TRANSCRIPT_GLOB
+                crate::agent::harness::codex::SESSIONS,
+                crate::agent::harness::codex::TRANSCRIPT_GLOB
             ),
             "ls -1t /sandbox/.codex/sessions/*/*/*/rollout-*.jsonl 2>/dev/null | head -n 1"
         );
@@ -1656,7 +1667,7 @@ mod tests {
             ),
             ("KEEP_ME".to_string(), "yes".to_string()),
         ];
-        let inference = crate::inference::InferenceEnv {
+        let inference = crate::agent::inference::InferenceEnv {
             anthropic_key: Some("sk-ant".into()),
             anthropic_base_url: Some("https://claude.corp/v1".into()),
             ..Default::default()
@@ -1696,7 +1707,7 @@ mod tests {
         assert!(plain.is_empty(), "{plain:?}");
 
         let mut custom = Vec::new();
-        let inference = crate::inference::InferenceEnv {
+        let inference = crate::agent::inference::InferenceEnv {
             openai_base_url: Some("http://vllm.internal:8000/v1".into()),
             ..Default::default()
         };
@@ -1729,7 +1740,7 @@ mod tests {
 
     #[test]
     fn private_session_locator_is_pinned_to_claude_and_the_opaque_id() {
-        let session = crate::agent_session::SessionTurn {
+        let session = crate::agent::agent_session::SessionTurn {
             logical_name: "solver".into(),
             provider_id: "018f47a0-0000-7000-8000-000000000000".into(),
             completed_turns: 1,
@@ -1812,7 +1823,7 @@ mod tests {
     /// controller that sends no list withholds everything rather than leaking each secret.
     #[test]
     fn only_the_named_projections_reach_the_agent() {
-        let _guard = crate::test_env_lock();
+        let _guard = crate::testing::test_env_lock();
         let secrets = [
             decl("pr", Some("GH_TOKEN")),
             decl("push", Some("REG_TOKEN")),
@@ -1851,7 +1862,7 @@ mod tests {
     /// Unset relays nothing, so a deploy that names no identity is unchanged.
     #[test]
     fn the_run_identity_reaches_the_agent_and_a_manifest_value_wins() {
-        let _guard = crate::test_env_lock();
+        let _guard = crate::testing::test_env_lock();
         for key in crate::openshell::policy::IDENTITY_RELAY_KEYS {
             unsafe { std::env::remove_var(key) };
         }
@@ -1894,7 +1905,7 @@ mod tests {
     /// A file projection has no env name to relay, and a manifest value is not overwritten.
     #[test]
     fn a_file_projection_relays_nothing_and_a_manifest_value_wins() {
-        let _guard = crate::test_env_lock();
+        let _guard = crate::testing::test_env_lock();
         let secrets = [decl("kube", None), decl("pr", Some("GH_TOKEN"))];
         unsafe {
             std::env::set_var(AGENT_VISIBLE_ENV, "GH_TOKEN");
@@ -1922,7 +1933,7 @@ mod tests {
 
     #[test]
     fn relay_copies_set_nonempty_keys_and_skips_empty_and_unset() {
-        let _guard = crate::test_env_lock();
+        let _guard = crate::testing::test_env_lock();
         clear_relay_keys();
         unsafe {
             std::env::set_var("CLAUDE_CODE_USE_VERTEX", "1");
@@ -1952,7 +1963,7 @@ mod tests {
 
     #[test]
     fn manifest_provided_values_win_over_the_process_env() {
-        let _guard = crate::test_env_lock();
+        let _guard = crate::testing::test_env_lock();
         clear_relay_keys();
         unsafe {
             std::env::set_var("ANTHROPIC_VERTEX_PROJECT_ID", "from-process");

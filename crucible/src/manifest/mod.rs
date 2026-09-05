@@ -16,9 +16,9 @@ mod search;
 mod secret;
 mod selftest;
 mod wiring;
-mod workflow;
 mod world;
 
+use crate::plan::workflow::{WorkflowCfg, WorkflowType};
 pub use backend::{AgentBackend, UnknownBackend};
 pub use broker::{BrokerCfg, broker_endpoint_from_url, broker_port, resolve_broker_url};
 pub use capability::{CapabilitiesCfg, CredentialContext};
@@ -32,10 +32,9 @@ pub use relay::RelayFile;
 pub use search::SearchCfg;
 pub use secret::{SecretDecl, SecretError, SecretKind};
 pub use selftest::SelftestCfg;
-pub use workflow::{KEPT_INPUT, WorkflowCaps, WorkflowCfg, WorkflowError, WorkflowType};
 pub use world::WorldCfg;
 
-use crate::command_judge::Direction;
+use crate::crucible::Direction;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::BTreeMap;
