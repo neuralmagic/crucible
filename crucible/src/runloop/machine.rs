@@ -6,8 +6,10 @@
 //! which event moves it, and how a run ends. A transition the table does not list is a bug in
 //! the driver, reported as [`IllegalTransition`] rather than silently taken.
 
-use crate::control::{ControlState, LoopPhase};
+use crate::control::ControlState;
+use crate::report::Reporter;
 use crucible::diagram::{self, Cluster, Cursor, Digraph, Edge, IllegalTransition, Node, NodeKind};
+use crucible_contract::LoopPhase;
 use std::sync::Arc;
 
 /// Where the loop is. Terminal is [`State::Done`]; everything else has a way out.
@@ -225,12 +227,16 @@ impl State {
     }
 }
 
-/// The driver's cursor over [`TRANSITIONS`]. With a control state attached, every advance
-/// publishes the new phase, so the status an operator reads is the machine's and nothing else's.
+/// The driver's cursor over [`TRANSITIONS`]. Every move publishes the phase: to the control
+/// state when one is attached, and to the reporter whenever the `(phase, iter)` pair changes,
+/// so the status an operator reads and the session log's `phase` lines are the machine's and
+/// nothing else's.
 pub(crate) struct Machine {
     cursor: Cursor<State, Event>,
     exit: Option<LoopExit>,
     control: Option<Arc<ControlState>>,
+    iter: u32,
+    reported: Option<(LoopPhase, u32)>,
 }
 
 impl Machine {
@@ -239,6 +245,8 @@ impl Machine {
             cursor: Cursor::new("loop", TRANSITIONS, State::Setup),
             exit: None,
             control,
+            iter: 0,
+            reported: None,
         }
     }
 
@@ -248,15 +256,34 @@ impl Machine {
 
     /// Take `event` from the current state. The first exit-carrying event fixes how the run
     /// ended; later ones cannot change it.
-    pub(crate) fn advance(&mut self, event: Event) -> Result<State, IllegalTransition> {
+    pub(crate) fn advance<R: Reporter>(
+        &mut self,
+        event: Event,
+        r: &mut R,
+    ) -> Result<State, IllegalTransition> {
         let to = self.cursor.advance(event)?;
         if let Some(exit) = event.exit() {
             self.exit.get_or_insert(exit);
         }
-        if let Some(control) = &self.control {
-            control.set_phase(to.phase(self.exit));
-        }
+        self.publish(r);
         Ok(to)
+    }
+
+    /// The iteration the loop is on, for the phase it reports.
+    pub(crate) fn set_iter<R: Reporter>(&mut self, iter: u32, r: &mut R) {
+        self.iter = iter;
+        self.publish(r);
+    }
+
+    fn publish<R: Reporter>(&mut self, r: &mut R) {
+        let phase = self.state().phase(self.exit);
+        if let Some(control) = &self.control {
+            control.set_phase(phase);
+        }
+        if self.reported != Some((phase, self.iter)) {
+            self.reported = Some((phase, self.iter));
+            r.phase(phase, self.iter);
+        }
     }
 
     /// How the run ended; an error while the loop is still going.
@@ -396,26 +423,98 @@ mod tests {
         }
     }
 
+    /// Records the phases the machine reports; every other `Reporter` call is inert.
+    #[derive(Default)]
+    struct Phases(Vec<(LoopPhase, u32)>);
+
+    impl Reporter for Phases {
+        fn start(&mut self, _: &str, _: &str) {}
+        fn phase(&mut self, phase: LoopPhase, iter: u32) {
+            self.0.push((phase, iter));
+        }
+        fn note(&mut self, _: &str) {}
+        fn row(&mut self, _: &crate::report::session::Row, _: bool) {}
+        fn run_agent(
+            &mut self,
+            _: &crate::args::Args,
+            _: &crate::args::Paths,
+            _: u32,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: crate::report::TurnBudget,
+        ) -> crate::report::AgentTurn {
+            crate::report::AgentTurn::default()
+        }
+        fn check_interrupt(
+            &mut self,
+            _: &crate::args::Paths,
+            _: &[crate::report::session::Row],
+        ) -> crate::report::Stop {
+            crate::report::Stop::Continue
+        }
+        fn summary(&mut self, _: &[crate::report::session::Row], _: &str, _: f64) {}
+    }
+
     #[test]
     fn the_machine_keeps_its_first_exit_and_refuses_unlisted_moves() {
         let mut m = Machine::new(None);
+        let r = &mut Phases::default();
         assert_eq!(
             m.exit(),
             Err(NoExit {
                 state: State::Setup
             })
         );
-        m.advance(Event::BaselineStarted).unwrap();
-        m.advance(Event::BaselineMeasured).unwrap();
-        let err = m.advance(Event::Kept).unwrap_err();
+        m.advance(Event::BaselineStarted, r).unwrap();
+        m.advance(Event::BaselineMeasured, r).unwrap();
+        let err = m.advance(Event::Kept, r).unwrap_err();
         assert_eq!(err.machine, "loop");
         assert_eq!((err.from.as_str(), err.event.as_str()), ("Head", "Kept"));
-        m.advance(Event::TurnStarted).unwrap();
-        m.advance(Event::Escalated).unwrap();
-        m.advance(Event::PublishStarted).unwrap();
-        m.advance(Event::Shutdown).unwrap();
+        m.advance(Event::TurnStarted, r).unwrap();
+        m.advance(Event::Escalated, r).unwrap();
+        m.advance(Event::PublishStarted, r).unwrap();
+        m.advance(Event::Shutdown, r).unwrap();
         assert_eq!(m.state(), State::Done);
         assert_eq!(m.exit(), Ok(LoopExit::Escalated));
+    }
+
+    #[test]
+    fn the_reporter_hears_each_phase_once_with_the_iteration_it_belongs_to() {
+        let mut m = Machine::new(None);
+        let r = &mut Phases::default();
+        m.advance(Event::PreflightStarted, r).unwrap();
+        m.advance(Event::PreflightPassed, r).unwrap();
+        m.advance(Event::BaselineMeasured, r).unwrap();
+        m.set_iter(1, r);
+        m.advance(Event::TurnStarted, r).unwrap();
+        m.advance(Event::Discarded, r).unwrap();
+        m.set_iter(2, r);
+        m.advance(Event::DistressMarked, r).unwrap();
+        m.advance(Event::DistressCleared, r).unwrap();
+        m.advance(Event::TurnStarted, r).unwrap();
+        m.advance(Event::Parked, r).unwrap();
+        m.set_iter(3, r);
+        m.advance(Event::ApprovalPending, r).unwrap();
+        m.advance(Event::ApprovalDenied, r).unwrap();
+        m.advance(Event::PublishStarted, r).unwrap();
+        m.advance(Event::Shutdown, r).unwrap();
+        assert_eq!(
+            r.0,
+            vec![
+                (LoopPhase::Preflight, 0),
+                (LoopPhase::Baseline, 0),
+                (LoopPhase::Iteration, 0),
+                (LoopPhase::Iteration, 1),
+                (LoopPhase::Iteration, 2),
+                (LoopPhase::Distressed, 2),
+                (LoopPhase::Iteration, 2),
+                (LoopPhase::Iteration, 3),
+                (LoopPhase::Parked, 3),
+                (LoopPhase::Escalated, 3),
+                (LoopPhase::Finished, 3),
+            ]
+        );
     }
 
     #[test]
@@ -451,13 +550,14 @@ mod tests {
     fn an_attached_control_state_sees_every_phase_the_machine_enters() {
         let control = Arc::new(ControlState::default());
         let mut m = Machine::new(Some(Arc::clone(&control)));
-        m.advance(Event::BaselineStarted).unwrap();
+        let r = &mut Phases::default();
+        m.advance(Event::BaselineStarted, r).unwrap();
         assert_eq!(control.phase(), LoopPhase::Baseline);
-        m.advance(Event::BaselineMeasured).unwrap();
-        m.advance(Event::TurnStarted).unwrap();
-        m.advance(Event::Escalated).unwrap();
+        m.advance(Event::BaselineMeasured, r).unwrap();
+        m.advance(Event::TurnStarted, r).unwrap();
+        m.advance(Event::Escalated, r).unwrap();
         assert_eq!(control.phase(), LoopPhase::Escalated);
-        m.advance(Event::PublishStarted).unwrap();
+        m.advance(Event::PublishStarted, r).unwrap();
         assert_eq!(control.phase(), LoopPhase::Finished);
     }
 

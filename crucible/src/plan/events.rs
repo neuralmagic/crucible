@@ -62,6 +62,10 @@ pub(crate) fn task_result_event(
         metric: None,
         output: r.output.clone(),
         note: r.note.clone().unwrap_or_default(),
+        blocked: r
+            .blocked
+            .as_ref()
+            .map(crate::plan::machine::BlockedReason::wire),
         secs: 0.0,
         trace_id,
         span_id,

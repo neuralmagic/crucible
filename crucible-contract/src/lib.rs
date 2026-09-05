@@ -27,7 +27,7 @@ pub mod verdict;
 /// `crucible --contract-version` and the runtime image carries it as the
 /// `io.crucible.contract-version` OCI label, so a deployed image can be matched against the
 /// controller it talks to without a probe.
-pub const CONTRACT_VERSION: &str = "1.2.0";
+pub const CONTRACT_VERSION: &str = "1.3.0";
 
 pub use admission::{
     ADMISSION_WIRE_VERSION, AdmissionEvent, AdmissionKey, AdmissionOutcome, AdmittedInput,
@@ -58,6 +58,9 @@ pub use refine::{
 };
 pub use report::{REPORT_FILE, ReportResult, RunReport, TaskReport};
 pub use scope::{ScopeReport, StageName, StageResult};
-pub use session::{PrLinkWire, RowWire, SessionEvent, WIRE_VERSION, decode, encode};
+pub use session::{
+    BlockedReasonKind, LoopPhase, PrLinkWire, RowWire, SessionEvent, TaskBlocked, WIRE_VERSION,
+    decode, encode,
+};
 pub use tier::{Disposition, Tier, TierParseError};
 pub use verdict::{GroundedErrorKind, GroundedVerdict};
