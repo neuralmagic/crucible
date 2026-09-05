@@ -1,0 +1,49 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-09-05-001"
+title = "Retire the hand-sequenced loop path"
+status = "queue"
+created = "2026-09-05"
+refs = [
+    "RFC-0001:C-WORKFLOW",
+    "RFC-0001:C-WIRE",
+    "ADR-0004",
+]
+
+[content]
+description = "The loop runs one iteration two ways: the graph path, where `run_iteration` admits the canonical `propose -> apply -> measure -> decide` plan and walks it through the shared executor, and the hand-sequenced path, where the driver calls the agent directly and steps the candidate through the `Iteration<Proposed, Applied, Measured>` typestate. The graph path is opt-in through `--graph-loop` (or implied by an authored engine workflow) and is described as soaking; a parity harness in `runloop/graph.rs` exists only to prove the two paths agree. The loop's control-state table has one `Turn` state, and the code should too. This item makes the graph path the only iteration path: the flag, the typestate iteration, `workflow_implies_graph_loop`, the parity tests, and the hand-sequenced branch go, and every run emits the plan lines the graph path already writes. The controller does not pass the flag, so pods pick up the change on the next core bump; the parity harness is the evidence that the default run's decisions and rows do not change."
+notes = ["The loop control-state table (`runloop/machine.rs`) and its generated page already model one `Turn`; nothing there changes. The `Turn` event vocabulary (kept, discarded, turn never started, parked, stalled, escalated, stopped) is the contract the graph path must keep meeting."]
+
+[[content.acceptance_criteria]]
+text = "the --graph-loop flag and workflow_implies_graph_loop are gone; every loop run admits and executes the iteration plan"
+status = "pending"
+category = "removed"
+
+[[content.acceptance_criteria]]
+text = "the Iteration<Proposed, Applied, Measured> typestate and the hand-sequenced turn in runloop::driver are gone, with run_iteration the one caller of the agent turn"
+status = "pending"
+category = "removed"
+
+[[content.acceptance_criteria]]
+text = "a default loop run's session log carries the plan_admitted and task_result lines the graph path emits, and its rows, decisions, shutdown token, and exit code are unchanged from the hand-sequenced path, proven by the existing counter parity harness before it is removed"
+status = "pending"
+category = "changed"
+
+[[content.acceptance_criteria]]
+text = "the parity tests that compared the two paths are gone, and the counter end-to-end test runs the graph path alone"
+status = "pending"
+category = "removed"
+
+[[content.acceptance_criteria]]
+text = "[[ADR-0004]] records that the typestate iteration it chose is retired in favor of the executor-run plan, with the reason"
+status = "pending"
+category = "chore"
+
+[[content.acceptance_criteria]]
+text = "docs/how-it-works.md and docs/work-graphs.md no longer describe the graph loop as optional"
+status = "pending"
+category = "chore"
+
+[verification]
+required_guards = ["GUARD-CARGO-TEST"]
