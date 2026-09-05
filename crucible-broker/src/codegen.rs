@@ -3221,6 +3221,7 @@ mod tests {
 
     #[test]
     fn model_pvc_unset_means_no_weights_mount() {
+        let _env = crate::test_support::env_lock();
         // SAFETY: no other test reads these vars; the mutation scopes this assertion.
         unsafe {
             std::env::set_var("BROKER_CODEGEN_NAMESPACE", "ns");
@@ -3778,6 +3779,7 @@ mod tests {
 
     #[test]
     fn export_tree_reproduces_exactly_the_hashed_tree() {
+        let _env = crate::test_support::env_lock();
         let repo = std::env::temp_dir().join(format!(
             "codegen-export-test-{}-{}",
             std::process::id(),

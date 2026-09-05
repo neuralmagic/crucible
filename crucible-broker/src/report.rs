@@ -189,9 +189,6 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::io::{Read, Write};
-    use std::sync::Mutex;
-
-    static ENV: Mutex<()> = Mutex::new(());
 
     #[test]
     fn payload_contains_only_the_typed_engine_snapshot() {
@@ -267,7 +264,7 @@ mod tests {
 
     #[test]
     fn deliver_posts_the_engine_snapshot_to_a_real_socket() {
-        let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::env_lock();
         let root = std::env::temp_dir().join(format!("crucible-report-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
