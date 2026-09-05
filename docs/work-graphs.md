@@ -171,8 +171,8 @@ dependency, then folds the non-empty passing set. It fails closed if none can ru
 
 ## The loop as a plan
 
-`--graph-loop` runs each loop iteration as a capability-admitted `autoresearch` workflow. With no
-authored workflow, the default expands to ordinary tasks:
+Each loop iteration runs as a capability-admitted `autoresearch` workflow. With no authored
+workflow, the default expands to ordinary tasks:
 
 ```mermaid
 flowchart LR

@@ -3,8 +3,9 @@
 [govctl]
 id = "WI-2026-09-05-001"
 title = "Retire the hand-sequenced loop path"
-status = "queue"
+status = "active"
 created = "2026-09-05"
+started = "2026-09-05"
 refs = [
     "RFC-0001:C-WORKFLOW",
     "RFC-0001:C-WIRE",
@@ -17,32 +18,32 @@ notes = ["The loop control-state table (`runloop/machine.rs`) and its generated 
 
 [[content.acceptance_criteria]]
 text = "the --graph-loop flag and workflow_implies_graph_loop are gone; every loop run admits and executes the iteration plan"
-status = "pending"
+status = "done"
 category = "removed"
 
 [[content.acceptance_criteria]]
 text = "the Iteration<Proposed, Applied, Measured> typestate and the hand-sequenced turn in runloop::driver are gone, with run_iteration the one caller of the agent turn"
-status = "pending"
+status = "done"
 category = "removed"
 
 [[content.acceptance_criteria]]
 text = "a default loop run's session log carries the plan_admitted and task_result lines the graph path emits, and its rows, decisions, shutdown token, and exit code are unchanged from the hand-sequenced path, proven by the existing counter parity harness before it is removed"
-status = "pending"
+status = "done"
 category = "changed"
 
 [[content.acceptance_criteria]]
 text = "the parity tests that compared the two paths are gone, and the counter end-to-end test runs the graph path alone"
-status = "pending"
+status = "done"
 category = "removed"
 
 [[content.acceptance_criteria]]
 text = "[[ADR-0004]] records that the typestate iteration it chose is retired in favor of the executor-run plan, with the reason"
-status = "pending"
+status = "done"
 category = "chore"
 
 [[content.acceptance_criteria]]
 text = "docs/how-it-works.md and docs/work-graphs.md no longer describe the graph loop as optional"
-status = "pending"
+status = "done"
 category = "chore"
 
 [verification]

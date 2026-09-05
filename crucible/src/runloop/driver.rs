@@ -12,7 +12,7 @@ use crate::control::provisioning;
 use crate::process::STOP;
 use crate::report::session;
 use crate::report::session::{Phase, Row};
-use crate::report::{Outcome, Reporter, Stop, TurnBudget};
+use crate::report::{Outcome, Reporter, Stop};
 use crate::runloop::publish;
 use anyhow::{Context, Result};
 use crucible::crucible::{Judge, World};
@@ -21,10 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use crate::runloop::step::{
-    Decided, IterStep, Measured, TurnVerdict, decide_row, drain_turn_markers, live_max_cost,
-    measure_candidate, reading_total,
-};
+use crate::runloop::step::{Decided, IterStep, live_max_cost, reading_total};
 
 use crate::control::recovery::ResumeState;
 use crate::runloop::machine::{Event, LoopExit, Machine, State};
@@ -160,64 +157,6 @@ fn output_tally(args: &Args, p: &Paths) -> crate::outputs::OutputTally {
 /// iteration instead of consuming it, so without this bound one dead node could spin the
 /// run forever (run 6 burned 7 of 9 iterations on a single sandbox that never came up).
 const MAX_DEAD_TURN_ATTEMPTS: u32 = 3;
-
-/// One turn's linear protocol, typed so its illegal orderings stop compiling: the candidate
-/// moves `Proposed → Applied → Measured`, and only a `Measured` can be decided. You cannot
-/// `measure` before `apply` (no method), nor `decide` without a [`crucible::crucible::Reading`] (the
-/// `Measured` carries it). The outer loop owns the cyclic shell + shared [`Run`]; this owns
-/// the straight line through the middle of each iteration.
-struct Iteration<S> {
-    it: u32,
-    state: S,
-}
-
-/// The agent staged a candidate in the world this turn; nothing applied or measured yet.
-struct Proposed;
-/// [`World::apply`] succeeded, the candidate is live and the judge can measure it.
-struct Applied;
-impl Iteration<Proposed> {
-    fn proposed(it: u32) -> Self {
-        Iteration {
-            it,
-            state: Proposed,
-        }
-    }
-
-    /// Make the candidate live. An `Err` is an unscoreable candidate (the caller discards it and
-    /// rolls back), never measured, so the `Applied` state is unreachable without a clean apply.
-    fn apply(self, world: &dyn World) -> Result<Iteration<Applied>> {
-        world.apply()?;
-        Ok(Iteration {
-            it: self.it,
-            state: Applied,
-        })
-    }
-}
-
-impl Iteration<Applied> {
-    /// Measure the live candidate and capture its note + staged diff. Only an `Applied` reaches
-    /// here, so "measure before apply" cannot be written.
-    fn measure(
-        self,
-        judge: &dyn Judge,
-        ctx: &crucible::crucible::MeasureCtx,
-        p: &Paths,
-        world: &dyn World,
-    ) -> Result<Iteration<Measured>> {
-        Ok(Iteration {
-            it: self.it,
-            state: measure_candidate(judge, ctx, p, world)?,
-        })
-    }
-}
-
-impl Iteration<Measured> {
-    /// Rule keep/discard and build the results row. Consumes the `Measured`, so the reading the row
-    /// reports and the keep path commits is the one that was actually measured.
-    fn decide(self, judge: &dyn Judge, best_score: f64, best_tiebreak: Option<f64>) -> Decided {
-        decide_row(judge, best_score, best_tiebreak, self.it, self.state)
-    }
-}
 
 /// The single orchestration loop. Drives the gate; talks only to `r`. With `resume`,
 /// it skips the baseline and continues from the restored state (the live deployment already
@@ -843,94 +782,23 @@ fn run_loop_body<R: Reporter>(
             seed,
         );
 
-        let step = if args.graph_loop {
-            // One canonical-template plan per iteration through the shared executor.
-            // Between-round control (park, steer, re-scope, budget) stays right here in
-            // the driver; the runner emits the same notes/events at the same points.
-            let (step, cost) = crate::runloop::graph::run_iteration(
-                crate::runloop::graph::IterCtx {
-                    it,
-                    prompt: &prompt,
-                    resume_prompt: &resume_prompt,
-                    rows: &run.rows,
-                    baseline_score: run.segment.baseline_score,
-                    baseline_total: run.segment.baseline_total,
-                    best_score: run.segment.best_score,
-                    best_tiebreak: run.segment.best_tiebreak,
-                    spent_before: run.spent,
-                    workflow: args.workflow.as_ref(),
-                },
-                runner,
-            )?;
-            run.spent += cost;
-            beat_position(heartbeat, it, run.spent);
-            step
-        } else {
-            let turn = runner.r.run_agent(
-                args,
-                p,
+        let (step, cost) = crate::runloop::graph::run_iteration(
+            crate::runloop::graph::IterCtx {
                 it,
-                &prompt,
-                None,
-                None,
-                TurnBudget {
-                    spent_before: run.spent,
-                    started,
-                    max_cost: live_max_cost(args, control.as_deref()),
-                    heartbeat: heartbeat_handle.cloned(),
-                },
-            );
-            run.spent += turn.cost;
-            if let Some(control) = control.as_ref() {
-                control.set_spend(run.spent);
-            }
-            beat_position(heartbeat, it, run.spent);
-            runner.r.budget(run.spent, started.elapsed());
-
-            let turn_verdict =
-                drain_turn_markers(&mut runner.r, p, control.as_deref(), it, &turn, &run.rows);
-            match turn_verdict {
-                TurnVerdict::Proceed => {
-                    // Make the candidate live (deploy domains build+push+set-image); a no-op
-                    // for the agent-edit/git worlds where the edit IS the candidate. A failed
-                    // apply is an unscoreable candidate: roll back to best and move on.
-                    match Iteration::proposed(it).apply(&**world) {
-                        Ok(applied) => {
-                            let ctx = crucible::crucible::MeasureCtx {
-                                baseline_score: Some(run.segment.baseline_score),
-                                baseline_total: Some(run.segment.baseline_total),
-                                best_score: Some(run.segment.best_score),
-                            };
-                            IterStep::Decided(Box::new(
-                                applied.measure(&**judge, &ctx, p, &**world)?.decide(
-                                    &**judge,
-                                    run.segment.best_score,
-                                    run.segment.best_tiebreak,
-                                ),
-                            ))
-                        }
-                        Err(e) => {
-                            runner
-                                .r
-                                .note(&format!("apply failed (discarding iter {it}): {e:#}"));
-                            IterStep::Discarded {
-                                reason: format!("apply failed: {e:#}"),
-                            }
-                        }
-                    }
-                }
-                TurnVerdict::Discard => IterStep::Discarded {
-                    reason: "turn failed".to_string(),
-                },
-                // The classic driver has no per-task retry loop; a transport death means
-                // the turn never started, so the driver re-runs this iteration (the graph
-                // path retries in-task first and reaches the same fold on exhaustion).
-                TurnVerdict::Retry(why) => IterStep::NeverStarted { reason: why },
-                TurnVerdict::Escalate => IterStep::Escalated,
-                TurnVerdict::Park(pp) => IterStep::Parked(pp),
-                TurnVerdict::Stop => IterStep::Stopped,
-            }
-        };
+                prompt: &prompt,
+                resume_prompt: &resume_prompt,
+                rows: &run.rows,
+                baseline_score: run.segment.baseline_score,
+                baseline_total: run.segment.baseline_total,
+                best_score: run.segment.best_score,
+                best_tiebreak: run.segment.best_tiebreak,
+                spent_before: run.spent,
+                workflow: args.workflow.as_ref(),
+            },
+            runner,
+        )?;
+        run.spent += cost;
+        beat_position(heartbeat, it, run.spent);
 
         // Any step other than NeverStarted proves a turn started: reset the stall streak.
         // A started turn carried the steer batch in its prompt, which settles an admitted
@@ -1834,6 +1702,7 @@ mod tests {
     use crate::control::recovery::{ResumeFold, resume_finished};
     use crate::report::session::{Phase, Row};
     use crate::report::{AgentTurn, Stop, TurnBudget};
+    use crate::runloop::step::{TurnVerdict, drain_turn_markers};
     use crucible_contract::admission::AdmissionKey;
 
     fn world_of(w: impl World + 'static) -> Arc<dyn World> {
@@ -3112,7 +2981,6 @@ mod tests {
             iterations,
             wide: 0,
             wide_keep: 1,
-            graph_loop: false,
             no_early_stop,
             ui: crate::args::Ui::Headless,
             goal: None,
@@ -3620,10 +3488,10 @@ mod tests {
     }
 
     #[test]
-    fn never_started_turn_does_not_consume_the_iteration() {
-        // One iteration, first turn dies on transport: the driver must re-run iter 1 (two
-        // run_agent calls), record the dead attempt as an infra-dead row, and still decide
-        // the re-run as iter 1 — a "finished" exit with both rows present.
+    fn a_transport_death_is_retried_inside_the_turn_and_the_iteration_still_decides() {
+        // One iteration, first attempt dies on transport: the propose task retries in place
+        // (two run_agent calls), no dead attempt reaches the driver, and the re-run is
+        // measured and decided as iter 1 — a "finished" exit with one decided row.
         let f = fixture(1, 0.0, false);
         let judge = judge_of(FakeJudge {
             keep: false,
@@ -3643,63 +3511,26 @@ mod tests {
             &judge,
             LoopRuntime::default(),
         );
-        outcome.expect("a re-run dead turn is a clean finish, not an error");
-        assert_eq!(r.agent_calls, 2, "iter 1 re-ran after the dead turn");
+        outcome.expect("a retried dead turn is a clean finish, not an error");
+        assert_eq!(
+            r.agent_calls, 2,
+            "the turn was retried once inside the task"
+        );
         assert_eq!(
             r.shutdowns,
             vec![("finished".into(), "all iterations completed".into())]
         );
         assert!(
-            r.rows.iter().any(|row| row.iter == 1
-                && row.decision == "infra-dead"
-                && row.phase.as_deref() == Some("infra")),
-            "the dead attempt stays on the record: {:?}",
+            !r.rows.iter().any(|row| row.decision == "infra-dead"),
+            "an in-task retry is not a dead attempt: {:?}",
             r.rows
         );
         assert!(
             r.rows
                 .iter()
                 .any(|row| row.iter == 1 && row.decision == "discard"),
-            "the re-run turn was measured and decided as iter 1: {:?}",
+            "the retried turn was measured and decided as iter 1: {:?}",
             r.rows
-        );
-    }
-
-    #[test]
-    fn consecutive_dead_turns_stall_the_run() {
-        // Every turn dies on transport: the run must halt as "stalled" after
-        // MAX_DEAD_TURN_ATTEMPTS consecutive dead attempts, never burn to the iteration
-        // cap and report "finished" (run 6 did exactly that, 7 dead iterations deep).
-        let f = fixture(5, 0.0, false);
-        let judge = judge_of(FakeJudge {
-            keep: false,
-            solved: false,
-            fail_baseline: false,
-        });
-        let r = RecordingReporter {
-            agent_is_error: true,
-            agent_error: Some("connection refused".into()),
-            ..Default::default()
-        };
-        let (r, outcome) = run_loop(
-            &f.args,
-            &f.paths,
-            &f.prepared,
-            r,
-            &world_of(FakeWorld),
-            &judge,
-            LoopRuntime::default(),
-        );
-        outcome.expect("a stall is a clean exit, not an error");
-        assert_eq!(r.agent_calls, MAX_DEAD_TURN_ATTEMPTS, "bounded attempts");
-        assert_eq!(r.shutdowns.len(), 1, "one shutdown: {:?}", r.shutdowns);
-        assert_eq!(r.shutdowns[0].0, "stalled");
-        assert!(
-            r.shutdowns[0]
-                .1
-                .contains("stalled on consecutive transport failures"),
-            "the reason names the stall, not iteration completion: {}",
-            r.shutdowns[0].1
         );
     }
 
@@ -3743,15 +3574,9 @@ mod tests {
     // --- the same exit paths through the graph loop (--graph-loop): the template + runner
     // must preserve every LoopExit the typestate path produces ---
 
-    fn graph_fixture(iterations: u32, max_cost: f64) -> Fixture {
-        let mut f = fixture(iterations, max_cost, false);
-        f.args.graph_loop = true;
-        f
-    }
-
     #[test]
-    fn graph_loop_shutdown_once_on_a_clean_finish() {
-        let f = graph_fixture(1, 0.0);
+    fn shutdown_once_on_a_clean_finish() {
+        let f = fixture(1, 0.0, false);
         let judge = judge_of(FakeJudge {
             keep: false,
             solved: false,
@@ -3776,8 +3601,8 @@ mod tests {
     }
 
     #[test]
-    fn graph_loop_stops_early_on_solved() {
-        let f = graph_fixture(3, 0.0);
+    fn stops_early_on_solved() {
+        let f = fixture(3, 0.0, false);
         let judge = judge_of(FakeJudge {
             keep: true,
             solved: true,
@@ -3800,8 +3625,8 @@ mod tests {
     }
 
     #[test]
-    fn graph_loop_discards_an_is_error_turn_before_measuring() {
-        let f = graph_fixture(1, 0.0);
+    fn discards_an_is_error_turn_before_measuring() {
+        let f = fixture(1, 0.0, false);
         let judge = judge_of(FakeJudge {
             keep: true,
             solved: true,
@@ -3834,11 +3659,11 @@ mod tests {
     }
 
     #[test]
-    fn graph_loop_budget_stop_still_measures_the_over_cap_turn() {
+    fn budget_stop_still_measures_the_over_cap_turn() {
         // The iteration template carries no plan-level budget (f64::MAX) by design: the
         // driver owns the cap and checks it between rounds, so a turn that blows the cap
         // is still measured and decided (a keep!) before the run stops on budget.
-        let f = graph_fixture(3, 1.0);
+        let f = fixture(3, 1.0, false);
         let judge = judge_of(FakeJudge {
             keep: true,
             solved: false,
@@ -3863,8 +3688,8 @@ mod tests {
     }
 
     #[test]
-    fn graph_loop_escalation_halts_for_review() {
-        let f = graph_fixture(3, 0.0);
+    fn escalation_halts_for_review() {
+        let f = fixture(3, 0.0, false);
         let judge = judge_of(FakeJudge {
             keep: false,
             solved: false,
@@ -3890,11 +3715,11 @@ mod tests {
     }
 
     #[test]
-    fn graph_loop_stalls_on_dead_propose_turns() {
+    fn stalls_on_dead_propose_turns() {
         // The graph path retries a transport-dead turn inside the propose task first
         // (ExecCfg transport_retries); only an exhausted task counts as one dead attempt
         // toward the driver's stall bound.
-        let f = graph_fixture(5, 0.0);
+        let f = fixture(5, 0.0, false);
         let judge = judge_of(FakeJudge {
             keep: false,
             solved: false,
