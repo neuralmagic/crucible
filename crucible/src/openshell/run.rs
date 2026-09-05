@@ -23,6 +23,32 @@ use crate::manifest::Harness;
 use crate::openshell::grpc::Gateway;
 use crate::openshell::{gateway, grpc, policy, provider, sandbox};
 use anyhow::{Context, Result};
+use crucible_contract::TransportCause;
+
+/// Which step of the turn an orchestration error came from, read off the typed errors in its
+/// chain. The gateway is checked first: a sandbox call that failed because the gateway was down
+/// carries both, and the gateway is the thing to fix.
+pub(crate) fn transport_cause(e: &anyhow::Error) -> TransportCause {
+    if e.chain()
+        .any(|c| c.downcast_ref::<gateway::GatewayError>().is_some())
+    {
+        return TransportCause::Gateway;
+    }
+    if e.chain()
+        .any(|c| c.downcast_ref::<grpc::GrpcError>().is_some())
+    {
+        return TransportCause::Sandbox;
+    }
+    match e
+        .chain()
+        .find_map(|c| c.downcast_ref::<OpenshellCliError>())
+    {
+        Some(OpenshellCliError::AgentExit { .. } | OpenshellCliError::ExecStreamBroke { .. }) => {
+            TransportCause::Agent
+        }
+        _ => TransportCause::Other,
+    }
+}
 
 /// Failures of the `openshell` CLI shell-outs and the private-transcript path checks. The
 /// surrounding turn plumbing stays `anyhow`; these are the checks this module owns.
@@ -83,20 +109,27 @@ pub fn turn(
                 message: message.clone(),
             };
             sink("", RawStream::Stderr, Some(&ev));
-            return TurnOutcome::failed(0.0, TurnFailure::Orchestration(message));
+            return TurnOutcome::failed(
+                0.0,
+                TurnFailure::Orchestration {
+                    cause: TransportCause::Other,
+                    message,
+                },
+            );
         }
     };
     let spent = CostMeter::default();
     match handle.block_on(try_turn(args, p, prompt, json, session, &spent, &mut sink)) {
         Ok(cost) => TurnOutcome::completed(cost),
         Err(e) => {
+            let cause = transport_cause(&e);
             let message = format!("{e:#}");
             let ev = AgentEvent::Error {
                 error_type: "openshell".into(),
                 message: message.clone(),
             };
             sink("", RawStream::Stderr, Some(&ev));
-            TurnOutcome::failed(spent.get(), TurnFailure::Orchestration(message))
+            TurnOutcome::failed(spent.get(), TurnFailure::Orchestration { cause, message })
         }
     }
 }
@@ -1513,6 +1546,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_orchestration_error_is_classified_by_the_typed_error_in_its_chain() {
+        let gateway = anyhow::Error::from(gateway::GatewayError::HealthTimeout {
+            last_status: String::new(),
+            log_tail: String::new(),
+        })
+        .context("ensuring the openshell gateway is up");
+        assert_eq!(transport_cause(&gateway), TransportCause::Gateway);
+        let sandbox = anyhow::Error::from(grpc::GrpcError::SandboxErrorPhase {
+            name: "ci-1".into(),
+        })
+        .context("creating the openshell sandbox");
+        assert_eq!(transport_cause(&sandbox), TransportCause::Sandbox);
+        let exited = anyhow::Error::from(OpenshellCliError::AgentExit { code: 127 });
+        assert_eq!(transport_cause(&exited), TransportCause::Agent);
+        let broke = anyhow::Error::from(OpenshellCliError::ExecStreamBroke {
+            code: tonic::Code::Unavailable,
+            message: "reset".into(),
+        });
+        assert_eq!(transport_cause(&broke), TransportCause::Agent);
+        let cli = anyhow::Error::from(OpenshellCliError::Failed {
+            label: "provider register".into(),
+            stderr: "denied".into(),
+        });
+        assert_eq!(transport_cause(&cli), TransportCause::Other);
+        assert_eq!(
+            transport_cause(&anyhow::Error::from(std::io::Error::other("no runtime"))),
+            TransportCause::Other
+        );
+    }
+
+    #[test]
     fn codex_auth_selection_can_switch_between_named_keys_and_chatgpt() {
         let _guard = crucible::test_support::env_lock();
         const KEY: &str = "CRUCIBLE_TEST_WORK";
@@ -1586,7 +1650,10 @@ mod tests {
         spent.raise(0.20629125);
         let outcome = TurnOutcome::failed(
             spent.get(),
-            TurnFailure::Orchestration(OpenshellCliError::AgentExit { code: 1 }.to_string()),
+            TurnFailure::Orchestration {
+                cause: TransportCause::Agent,
+                message: OpenshellCliError::AgentExit { code: 1 }.to_string(),
+            },
         );
         assert_eq!(outcome.cost_usd, 0.20629125);
         assert!(outcome.failure.is_some());

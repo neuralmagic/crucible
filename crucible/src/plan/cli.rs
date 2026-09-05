@@ -687,6 +687,11 @@ pub fn run(
                 name: task.name.0.clone(),
                 status: result.status.as_str().to_string(),
                 cost_usd: result.cost_usd,
+                blocked: result
+                    .blocked
+                    .as_ref()
+                    .map(crate::plan::machine::BlockedReason::wire),
+                transport: result.transport,
             });
             if let Some(selected) = report.results.get_mut(&task.name.0) {
                 selected.status = result.status.as_str().to_string();
@@ -1096,6 +1101,8 @@ mod tests {
             output: Some(serde_json::json!({"score": 3})),
             note: None,
             fanout: None,
+            blocked: None,
+            transport: None,
         };
         let back = crate::report::session::decode(&crate::report::session::encode(
             &crate::plan::events::task_result_event(1, 0, t, &r),
@@ -1149,6 +1156,8 @@ emits = ["verdict", "dirty"]
             })),
             note: None,
             fanout: None,
+            blocked: None,
+            transport: None,
         };
 
         assert_eq!(

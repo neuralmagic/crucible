@@ -15,9 +15,10 @@ use serde_json::Value;
 
 use crate::agent::event::{AgentEvent, RawStream};
 use crate::agent::harness::HarnessRuntime;
-use crate::plan::exec::{Attempt, AttemptOutcome, BatchItem, TaskRunner};
+use crate::plan::exec::{Attempt, AttemptOutcome, BatchItem, TaskRunner, TransportFailure};
 use crate::plan::ir::{Isolation, Task, TaskKind, TaskName};
 use crate::plan::runner::ShellRunner;
+use crucible_contract::TransportCause;
 use std::path::{Path, PathBuf};
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -374,7 +375,7 @@ fn run_task(
     } = *cx;
     let Some(Isolation::Worktree) = task.isolation else {
         if let Err(e) = materialize_inputs(&paths.state, &paths.workspace, staged) {
-            return Attempt::transport(e);
+            return Attempt::transport(TransportCause::Workspace, e);
         }
         let before = PriorContents::of(&paths.workspace, &task.emits_files);
         let attempt_out = prepare_and_run(args, paths, task, attempt, inputs);
@@ -392,7 +393,10 @@ fn run_task(
     // coding tasks whose diff has to survive (the wide tournament carries those out itself).
     let root = paths.state.join("plan-iso");
     if let Err(e) = std::fs::create_dir_all(&root) {
-        return Attempt::transport(format!("creating the isolation root failed: {e}"));
+        return Attempt::transport(
+            TransportCause::Workspace,
+            format!("creating the isolation root failed: {e}"),
+        );
     }
     let worktree = root.join(task_worktree_name(&task.name));
     let captured;
@@ -412,13 +416,16 @@ fn run_task(
         },
     };
     if let Err(e) = crate::plan::worktree::setup(&paths.workspace, &worktree, pending) {
-        return Attempt::transport(format!("worktree setup failed: {e:#}"));
+        return Attempt::transport(
+            TransportCause::Workspace,
+            format!("worktree setup failed: {e:#}"),
+        );
     }
     // `inputs/` is excluded from the workspace's git memory, so neither the clone nor the
     // pending patch carries it. Lay this task's own staged set down here, or an isolated
     // consumer never sees what its ancestors declared.
     if let Err(e) = materialize_inputs(&paths.state, &worktree, staged) {
-        return Attempt::transport(e);
+        return Attempt::transport(TransportCause::Workspace, e);
     }
     let iso = Paths::for_worktree(worktree.clone(), paths.skills.clone());
     let _ = std::fs::create_dir_all(&iso.state);
@@ -597,11 +604,14 @@ fn prepare_and_run(
 ) -> Attempt {
     for (src, dst) in &args.workflow_frozen_injects {
         if let Err(e) = crate::manifest::apply_inject(src, &paths.workspace.join(dst)) {
-            return Attempt::transport(format!(
-                "restoring frozen inject {} -> {} failed: {e:#}",
-                src.display(),
-                dst.display()
-            ));
+            return Attempt::transport(
+                TransportCause::Workspace,
+                format!(
+                    "restoring frozen inject {} -> {} failed: {e:#}",
+                    src.display(),
+                    dst.display()
+                ),
+            );
         }
     }
     let out = run_in(args, paths, task, attempt, inputs);
@@ -678,7 +688,10 @@ fn run_in(
         &args.workflow_toolbox_exclude,
         args.harness().skills_dir(),
     ) {
-        return Attempt::transport(format!("installing the task toolbox failed: {e:#}"));
+        return Attempt::transport(
+            TransportCause::Workspace,
+            format!("installing the task toolbox failed: {e:#}"),
+        );
     }
 
     let inputs_json = match serde_json::to_string_pretty(inputs) {
@@ -696,11 +709,11 @@ fn run_in(
     let _ = std::fs::remove_file(&result_path);
 
     let name = task.name.0.clone();
-    let mut transport_error: Option<String> = None;
+    let mut transport_error: Option<TransportFailure> = None;
     let prepared =
         match crate::agent::agent_session::prepare_named(&paths.state, task.session.as_deref()) {
             Ok(prepared) => prepared,
-            Err(note) => return Attempt::transport(note),
+            Err(note) => return Attempt::transport(TransportCause::Workspace, note),
         };
     let turn = crate::agent::run_turn_with_session(
         &args,
@@ -712,21 +725,24 @@ fn run_in(
             if !line.trim().is_empty() && stream == RawStream::Stderr {
                 eprintln!("[{name}] {line}");
             }
-            if let Some(note) = ev.and_then(agent_transport_error) {
-                transport_error = Some(note);
+            if let Some(failure) = ev.and_then(agent_transport_error) {
+                transport_error = Some(failure);
             }
         },
     );
     let cost = turn.cost_usd;
     if let Some(failure) = turn.failure() {
-        transport_error = Some(failure.to_string());
+        transport_error = Some(TransportFailure::new(
+            failure.transport_cause(),
+            failure.to_string(),
+        ));
     }
     if let Some(note) = crate::agent::agent_session::commit_if_ok(
         &paths.state,
         prepared.as_ref(),
         transport_error.is_none(),
     ) {
-        transport_error = Some(note);
+        transport_error = Some(TransportFailure::new(TransportCause::Workspace, note));
     }
 
     match std::fs::read_to_string(&result_path) {
@@ -741,8 +757,8 @@ fn run_in(
             }
         }
         Err(_) => match transport_error {
-            Some(note) => Attempt {
-                outcome: AttemptOutcome::Transport(note),
+            Some(failure) => Attempt {
+                outcome: AttemptOutcome::Transport(failure),
                 cost_usd: cost,
             },
             None => Attempt::failed(
@@ -753,22 +769,27 @@ fn run_in(
     }
 }
 
-fn agent_transport_error(event: &AgentEvent) -> Option<String> {
+/// An agent-stream error the turn cannot recover from. A typed `Error` event is the provider or
+/// the CLI refusing the turn; an errored `Result` is the agent itself ending badly.
+fn agent_transport_error(event: &AgentEvent) -> Option<TransportFailure> {
     match event {
         AgentEvent::Error {
             error_type,
             message,
-        } => Some(format!("{error_type}: {message}")),
+        } => Some(TransportFailure::new(
+            TransportCause::Provider,
+            format!("{error_type}: {message}"),
+        )),
         AgentEvent::Result {
             is_error: true,
             error,
             ..
-        } => Some(
+        } => Some(TransportFailure::new(
+            TransportCause::Agent,
             error
                 .as_deref()
-                .unwrap_or("agent turn ended with an unspecified error")
-                .to_string(),
-        ),
+                .unwrap_or("agent turn ended with an unspecified error"),
+        )),
         _ => None,
     }
 }
@@ -1349,8 +1370,11 @@ workflow(type = "playbook", tasks = [prod, cons, serial_stranger, isolated_stran
             message: "try later".into(),
         };
         assert_eq!(
-            agent_transport_error(&overloaded).as_deref(),
-            Some("overloaded: try later")
+            agent_transport_error(&overloaded),
+            Some(TransportFailure::new(
+                TransportCause::Provider,
+                "overloaded: try later"
+            ))
         );
         let failed_result = AgentEvent::Result {
             subtype: "success".into(),
@@ -1360,8 +1384,11 @@ workflow(type = "playbook", tasks = [prod, cons, serial_stranger, isolated_stran
             error: Some("not logged in".into()),
         };
         assert_eq!(
-            agent_transport_error(&failed_result).as_deref(),
-            Some("not logged in")
+            agent_transport_error(&failed_result),
+            Some(TransportFailure::new(
+                TransportCause::Agent,
+                "not logged in"
+            ))
         );
     }
 
@@ -3274,7 +3301,10 @@ workflow(type = "playbook", tasks = [producer, report])
         let counter = AtomicU64::new(0);
         let before = prior(&paths, &task);
         for outcome in [
-            AttemptOutcome::Transport("the broker hung up".to_string()),
+            AttemptOutcome::Transport(TransportFailure::new(
+                TransportCause::Other,
+                "the broker hung up",
+            )),
             AttemptOutcome::Skipped(Value::Null, "not applicable here".to_string()),
         ] {
             let out = capture_declared(

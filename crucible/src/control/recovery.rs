@@ -5,7 +5,7 @@
 use crate::agent::event::AgentEvent;
 use crate::control::provisioning::{self, WaitMode};
 use crate::report::session::Row;
-use crate::report::session::{self, RecoveryClass, SessionEvent};
+use crate::report::session::{self, LoopPhase, RecoveryClass, SessionEvent};
 use anyhow::{Context, Result};
 use crucible_contract::admission::AdmissionKey;
 use std::io::BufRead;
@@ -364,6 +364,7 @@ struct TailScan {
     /// predecessor's Shutdown, so any later event clears it.
     shutdown: Option<(String, String)>,
     saw_iteration_phase: bool,
+    last_phase: Option<LoopPhase>,
     /// Any decided (non-wide, non-infra) row.
     saw_any_row: bool,
     last_row_iter: u32,
@@ -381,6 +382,12 @@ struct TailScan {
 }
 
 impl TailScan {
+    /// Logs written before the loop reported every phase carry no `wide` line; there the
+    /// tournament is whatever ran before the first `iteration` phase.
+    fn in_wide_round(&self) -> bool {
+        self.last_phase == Some(LoopPhase::Wide) || !self.saw_iteration_phase
+    }
+
     fn feed(&mut self, ev: &SessionEvent) {
         if self.shutdown.is_some() && !matches!(ev, SessionEvent::Shutdown { .. }) {
             self.shutdown = None;
@@ -390,7 +397,8 @@ impl TailScan {
                 self.shutdown = Some((outcome.clone(), reason.clone()));
             }
             SessionEvent::Phase { phase, iter } => {
-                if phase == "iteration" {
+                self.last_phase = Some(*phase);
+                if *phase == LoopPhase::Iteration {
                     self.saw_iteration_phase = true;
                     self.last_phase_iter = *iter;
                     // Safety net for paths that account an iteration without a Row.
@@ -465,7 +473,7 @@ impl TailScan {
                     plan_version: *plan_version,
                     declared: tasks.iter().map(|t| t.name.clone()).collect(),
                     resulted: Vec::new(),
-                    wide: !self.saw_iteration_phase,
+                    wide: self.in_wide_round(),
                 });
             }
             SessionEvent::TaskResult { task, .. } => {
@@ -505,7 +513,7 @@ impl TailScan {
             }
         } else if !self.saw_any_row {
             Classification::DiedInBaseline
-        } else if !self.saw_iteration_phase {
+        } else if self.in_wide_round() {
             Classification::DiedInWideRound {
                 plan: self.open_plan,
                 turn: self.open_turn,
@@ -750,7 +758,7 @@ mod tests {
 
     fn iteration_phase(iter: u32) -> SessionEvent {
         SessionEvent::Phase {
-            phase: "iteration".into(),
+            phase: LoopPhase::Iteration,
             iter,
         }
     }
@@ -967,6 +975,32 @@ mod tests {
             "{:?}",
             got.classification
         );
+    }
+
+    #[test]
+    fn a_plan_admitted_under_the_wide_phase_classifies_died_in_wide_round() {
+        let events = vec![
+            row(0, "baseline", 240.0),
+            iteration_phase(0),
+            SessionEvent::Phase {
+                phase: LoopPhase::Wide,
+                iter: 0,
+            },
+            SessionEvent::PlanAdmitted {
+                plan_version: 1,
+                reason: String::new(),
+                budget_usd: 5.0,
+                tasks: vec![],
+            },
+        ];
+        let got = classify("wide-phased", &events);
+        match &got.classification {
+            Classification::DiedInWideRound { plan, turn } => {
+                assert!(plan.as_ref().is_some_and(|p| p.wide));
+                assert!(turn.is_none());
+            }
+            other => panic!("expected DiedInWideRound, got {other:?}"),
+        }
     }
 
     #[test]

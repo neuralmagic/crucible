@@ -12,10 +12,10 @@ use crate::agent;
 use crate::agent::event::AgentEvent;
 use crate::args::{Args, Paths};
 use crate::process::STOP;
-use crate::report::session::{self, RowWire, SessionEvent, SessionPhase};
-use crate::report::session::{Phase, Row};
+use crate::report::session::{self, Row, RowWire, SessionEvent};
 use crate::report::{AgentTurn, Reporter, RunMeta, Stop, TurnBudget};
 use anyhow::{Context, Result};
+use crucible_contract::LoopPhase;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::sync::atomic::Ordering;
@@ -118,8 +118,8 @@ impl Reporter for SessionReporter {
         });
     }
 
-    fn phase(&mut self, phase: Phase) {
-        self.emit(&SessionEvent::phase(phase));
+    fn phase(&mut self, phase: LoopPhase, iter: u32) {
+        self.emit(&SessionEvent::Phase { phase, iter });
     }
 
     fn note(&mut self, msg: &str) {

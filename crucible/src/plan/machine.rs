@@ -5,6 +5,7 @@
 
 use crate::diagram::{self, Cluster, Cursor, Digraph, Edge, IllegalTransition, Node, NodeKind};
 use crate::plan::ir::TaskName;
+use crucible_contract::{BlockedReasonKind, TaskBlocked};
 
 /// Where one task is. The six settled states are exactly the task statuses the session log
 /// reports (`TaskState::status` in `plan::exec` maps them).
@@ -109,6 +110,27 @@ impl BlockedReason {
             BlockedReason::DependencyDidNotPass => TaskEvent::DependencyDidNotPass,
             BlockedReason::StagingRefused(_) => TaskEvent::StagingRefused,
         }
+    }
+}
+
+impl BlockedReason {
+    pub fn wire(&self) -> TaskBlocked {
+        let (reason, task) = match self {
+            BlockedReason::RequiredTaskFailed(task) => {
+                (BlockedReasonKind::RequiredTaskFailed, Some(task.0.clone()))
+            }
+            BlockedReason::BudgetCeiling => (BlockedReasonKind::BudgetCeiling, None),
+            BlockedReason::WallClockCeiling => (BlockedReasonKind::WallClockCeiling, None),
+            BlockedReason::DependencyDidNotPass => (BlockedReasonKind::DependencyDidNotPass, None),
+            BlockedReason::StagingRefused(_) => (BlockedReasonKind::StagingRefused, None),
+        };
+        TaskBlocked { reason, task }
+    }
+}
+
+impl serde::Serialize for BlockedReason {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.wire().serialize(serializer)
     }
 }
 
@@ -435,6 +457,20 @@ mod tests {
         assert_eq!(
             BlockedReason::StagingRefused("no room".into()).to_string(),
             "no room"
+        );
+        assert_eq!(
+            BlockedReason::RequiredTaskFailed(TaskName("gate".into())).wire(),
+            TaskBlocked {
+                reason: BlockedReasonKind::RequiredTaskFailed,
+                task: Some("gate".into()),
+            }
+        );
+        assert_eq!(
+            BlockedReason::StagingRefused("no room".into()).wire(),
+            TaskBlocked {
+                reason: BlockedReasonKind::StagingRefused,
+                task: None,
+            }
         );
     }
 

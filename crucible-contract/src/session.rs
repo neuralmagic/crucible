@@ -190,6 +190,101 @@ impl std::fmt::Display for RecoveryClass {
     }
 }
 
+/// Where the loop is. The same token the control plane's `status` reply carries as `phase`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoopPhase {
+    Starting,
+    Preflight,
+    Baseline,
+    Wide,
+    Iteration,
+    Paused,
+    Parked,
+    Distressed,
+    Escalated,
+    Epilogue,
+    Finished,
+}
+
+impl LoopPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LoopPhase::Starting => "starting",
+            LoopPhase::Preflight => "preflight",
+            LoopPhase::Baseline => "baseline",
+            LoopPhase::Wide => "wide",
+            LoopPhase::Iteration => "iteration",
+            LoopPhase::Paused => "paused",
+            LoopPhase::Parked => "parked",
+            LoopPhase::Distressed => "distressed",
+            LoopPhase::Escalated => "escalated",
+            LoopPhase::Epilogue => "epilogue",
+            LoopPhase::Finished => "finished",
+        }
+    }
+
+    pub const ALL: [LoopPhase; 11] = [
+        LoopPhase::Starting,
+        LoopPhase::Preflight,
+        LoopPhase::Baseline,
+        LoopPhase::Wide,
+        LoopPhase::Iteration,
+        LoopPhase::Paused,
+        LoopPhase::Parked,
+        LoopPhase::Distressed,
+        LoopPhase::Escalated,
+        LoopPhase::Epilogue,
+        LoopPhase::Finished,
+    ];
+}
+
+impl std::fmt::Display for LoopPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Why the executor never dispatched a task. `task` names the required task whose failure
+/// short-circuited the plan and is absent for every other reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskBlocked {
+    pub reason: BlockedReasonKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockedReasonKind {
+    RequiredTaskFailed,
+    BudgetCeiling,
+    WallClockCeiling,
+    DependencyDidNotPass,
+    StagingRefused,
+}
+
+/// Why an attempt died before the task could be judged. The executor retries these, bounded; the
+/// last attempt's cause lands on the result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportCause {
+    /// The openshell gateway could not be booted, authenticated, or reached.
+    Gateway,
+    /// The sandbox could not be created, made ready, or given its policy.
+    Sandbox,
+    /// The agent process or its exec stream broke before it reported.
+    Agent,
+    /// The model provider refused or dropped the turn: auth, rate limit, overload, connection.
+    Provider,
+    /// Preparing the task's workspace failed: inputs, worktree, toolbox, injects, session state.
+    Workspace,
+    /// A command task could not be spawned.
+    Command,
+    /// A transport failure this engine does not classify further.
+    Other,
+}
+
 /// One event in the session log. Mirrors the `crucible::reporter::Reporter` calls so the
 /// viewer can rebuild identical state by folding the sequence (the same fold `App` does
 /// over `UiMsg`).
@@ -206,9 +301,10 @@ pub enum SessionEvent {
         max_cost: f64,
         max_secs: u64,
     },
-    /// `phase` is `preflight`, `baseline`, or `iteration`; `iter` is meaningful only for the last.
+    /// The loop entered `phase`; emitted once per change. `iter` is the iteration the loop is
+    /// on, 0 before the first.
     Phase {
-        phase: String,
+        phase: LoopPhase,
         #[serde(default)]
         iter: u32,
     },
@@ -325,6 +421,12 @@ pub enum SessionEvent {
         output: Option<serde_json::Value>,
         #[serde(default)]
         note: String,
+        /// Present exactly when `status` is `blocked`; `note` is its rendered form.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        blocked: Option<TaskBlocked>,
+        /// Present exactly when `status` is `transport`: what the last attempt died on.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transport: Option<TransportCause>,
         #[serde(default)]
         secs: f64,
         #[serde(default)]
@@ -504,15 +606,19 @@ mod tests {
                 max_secs: 1800,
             },
             SessionEvent::Phase {
-                phase: "preflight".into(),
+                phase: LoopPhase::Preflight,
                 iter: 0,
             },
             SessionEvent::Phase {
-                phase: "baseline".into(),
+                phase: LoopPhase::Baseline,
                 iter: 0,
             },
             SessionEvent::Phase {
-                phase: "iteration".into(),
+                phase: LoopPhase::Iteration,
+                iter: 2,
+            },
+            SessionEvent::Phase {
+                phase: LoopPhase::Distressed,
                 iter: 2,
             },
             SessionEvent::Note {
@@ -751,6 +857,8 @@ mod tests {
             metric: None,
             output: Some(serde_json::json!({"score": 234.0})),
             note: String::new(),
+            blocked: None,
+            transport: None,
             secs: 0.0,
             trace_id: String::new(),
             span_id: String::new(),
@@ -765,15 +873,140 @@ mod tests {
                 status,
                 attempts,
                 output,
+                blocked,
+                transport,
                 ..
             } => {
                 assert_eq!(task, "t");
                 assert_eq!(status, "fail");
                 assert_eq!(attempts, 0);
                 assert!(output.is_none());
+                assert!(blocked.is_none());
+                assert!(transport.is_none());
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_blocked_task_result_carries_its_reason_as_data_beside_the_note() {
+        let ev = SessionEvent::TaskResult {
+            task: "deliver".into(),
+            status: "blocked".into(),
+            plan_version: 1,
+            task_kind: "agent".into(),
+            iter: 0,
+            digest: String::new(),
+            job: String::new(),
+            attempts: 0,
+            cost_usd: 0.0,
+            metric: None,
+            output: None,
+            note: "required task brief failed".into(),
+            blocked: Some(TaskBlocked {
+                reason: BlockedReasonKind::RequiredTaskFailed,
+                task: Some("brief".into()),
+            }),
+            transport: None,
+            secs: 0.0,
+            trace_id: String::new(),
+            span_id: String::new(),
+        };
+        assert_eq!(
+            encode(&ev),
+            r#"{"v":1,"kind":"task_result","task":"deliver","status":"blocked","plan_version":1,"task_kind":"agent","iter":0,"digest":"","job":"","attempts":0,"cost_usd":0.0,"note":"required task brief failed","blocked":{"reason":"required_task_failed","task":"brief"},"secs":0.0,"trace_id":"","span_id":""}"#
+        );
+        assert_round_trips(ev);
+        let ceiling = TaskBlocked {
+            reason: BlockedReasonKind::BudgetCeiling,
+            task: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&ceiling).unwrap(),
+            r#"{"reason":"budget_ceiling"}"#
+        );
+        for (kind, token) in [
+            (
+                BlockedReasonKind::RequiredTaskFailed,
+                "required_task_failed",
+            ),
+            (BlockedReasonKind::BudgetCeiling, "budget_ceiling"),
+            (BlockedReasonKind::WallClockCeiling, "wall_clock_ceiling"),
+            (
+                BlockedReasonKind::DependencyDidNotPass,
+                "dependency_did_not_pass",
+            ),
+            (BlockedReasonKind::StagingRefused, "staging_refused"),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&kind).unwrap(),
+                format!("\"{token}\"")
+            );
+        }
+    }
+
+    #[test]
+    fn a_transport_task_result_carries_what_the_last_attempt_died_on() {
+        let ev = SessionEvent::TaskResult {
+            task: "triage[linux-default]".into(),
+            status: "transport".into(),
+            plan_version: 1,
+            task_kind: "agent".into(),
+            iter: 0,
+            digest: String::new(),
+            job: String::new(),
+            attempts: 3,
+            cost_usd: 0.0,
+            metric: None,
+            output: None,
+            note: "transport retries exhausted (3 attempts): gateway did not become healthy".into(),
+            blocked: None,
+            transport: Some(TransportCause::Gateway),
+            secs: 0.0,
+            trace_id: String::new(),
+            span_id: String::new(),
+        };
+        assert_eq!(
+            encode(&ev),
+            r#"{"v":1,"kind":"task_result","task":"triage[linux-default]","status":"transport","plan_version":1,"task_kind":"agent","iter":0,"digest":"","job":"","attempts":3,"cost_usd":0.0,"note":"transport retries exhausted (3 attempts): gateway did not become healthy","transport":"gateway","secs":0.0,"trace_id":"","span_id":""}"#
+        );
+        assert_round_trips(ev);
+        for (cause, token) in [
+            (TransportCause::Gateway, "gateway"),
+            (TransportCause::Sandbox, "sandbox"),
+            (TransportCause::Agent, "agent"),
+            (TransportCause::Provider, "provider"),
+            (TransportCause::Workspace, "workspace"),
+            (TransportCause::Command, "command"),
+            (TransportCause::Other, "other"),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&cause).unwrap(),
+                format!("\"{token}\"")
+            );
+        }
+    }
+
+    #[test]
+    fn loop_phase_tokens_are_snake_case_and_display_matches_serde() {
+        for phase in LoopPhase::ALL {
+            let line = encode(&SessionEvent::Phase { phase, iter: 3 });
+            assert!(
+                line.contains(&format!(r#""phase":"{}""#, phase.as_str())),
+                "{line}"
+            );
+            assert_eq!(phase.to_string(), phase.as_str());
+            assert_round_trips(SessionEvent::Phase { phase, iter: 3 });
+        }
+        let old = decode(r#"{"v":1,"kind":"phase","phase":"iteration","iter":2}"#)
+            .expect("a pre-1.3 phase line decodes");
+        assert!(matches!(
+            old,
+            SessionEvent::Phase {
+                phase: LoopPhase::Iteration,
+                iter: 2
+            }
+        ));
     }
 
     #[test]

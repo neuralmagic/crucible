@@ -199,6 +199,8 @@ mod tests {
                 name: "roundup".into(),
                 status: "pass".into(),
                 cost_usd: 0.25,
+                blocked: None,
+                transport: None,
             }],
             results: Default::default(),
         };
@@ -220,6 +222,8 @@ mod tests {
                 name: "task<@everyone>".into(),
                 status: "pass".into(),
                 cost_usd: 0.0,
+                blocked: None,
+                transport: None,
             }],
             results: Default::default(),
         };
@@ -239,6 +243,8 @@ mod tests {
                 name: "card".into(),
                 status: "pass".into(),
                 cost_usd: 0.0,
+                blocked: None,
+                transport: None,
             }],
             results: BTreeMap::from([(
                 "card".into(),
@@ -277,6 +283,8 @@ mod tests {
                     name: "roundup".into(),
                     status: "pass".into(),
                     cost_usd: 0.0,
+                    blocked: None,
+                    transport: None,
                 }],
                 results: Default::default(),
             })
