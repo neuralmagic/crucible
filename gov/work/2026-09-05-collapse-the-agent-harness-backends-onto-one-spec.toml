@@ -1,0 +1,38 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-09-05-002"
+title = "Collapse the agent harness backends onto one spec"
+status = "queue"
+created = "2026-09-05"
+refs = [
+    "ADR-0001",
+    "RFC-0001:C-TRANSPORT",
+]
+
+[content]
+description = "The claude, codex, and hermes backends under `agent/harness` are three copies of the same shape. Each defines its own DEFAULT_BINARIES, SKILLS_DIR, TRANSCRIPT_FETCH_TIMEOUT, LOCAL_ENV_DEFAULTS, a home or config path, and its own `local_argv`, `sandbox_argv`, `env_script`, `seed_files`, `parse_transcript`, and `content_records`, at 24, 42, and 18 functions respectively; the module-graph tool lists eight names defined in all three. What genuinely differs per backend is the invocation argv, the rendered config file (MCP config JSON, config.toml, config.yaml), the credential seeding, and the transcript format. What does not differ is how those pieces are assembled into an env script, a seed-file set, and the runtime's `HarnessRuntime` surface. This item separates the two: a per-backend spec of data (binaries, skills dir, home, config path, env defaults, transcript timeout and glob) plus the handful of methods that truly differ, with the assembly written once. The backends' existing tests are the behavior specification and stay green unchanged; the change is structural."
+notes = ["Measure first: the per-backend test counts (claude 12, codex 20, hermes 8) are the regression net; a backend whose behavior is only reachable through a shared path afterwards should still have its own tests naming that behavior."]
+
+[[content.acceptance_criteria]]
+text = "each backend's binaries, skills dir, home and config paths, env defaults, transcript timeout and glob are one spec value rather than per-file constants, and no constant name is defined in more than one backend"
+status = "pending"
+category = "changed"
+
+[[content.acceptance_criteria]]
+text = "env script assembly, seed-file plumbing, and content-record extraction are implemented once and parameterized by the spec, with only argv construction, config rendering, credential seeding, and transcript parsing left per backend"
+status = "pending"
+category = "changed"
+
+[[content.acceptance_criteria]]
+text = "every existing backend test passes unchanged, including the transcript fixture tests, so the rendered argv, config files, env scripts, and parsed records are byte-identical"
+status = "pending"
+category = "chore"
+
+[[content.acceptance_criteria]]
+text = "cargo xtask modgraph lists no item name shared by two harness backends"
+status = "pending"
+category = "chore"
+
+[verification]
+required_guards = ["GUARD-CARGO-TEST"]
