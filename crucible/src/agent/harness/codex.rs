@@ -10,44 +10,80 @@
 //! only an `openshell:resolve:env:` placeholder that the L7 egress proxy resolves, while Codex
 //! uses an L4 WebSocket tunnel. The real credential therefore has to be in the auth file.
 
-use crate::agent::harness::{SeedFile, TurnArtifacts, append_manifest_env};
+use crate::agent::harness::{
+    AuthProvider, Backend, Broker, HarnessSpec, SandboxAuth, SeedFile, StreamDecoder,
+    TranscriptLocator, TurnArtifacts,
+};
+use crate::agent::inference::InferenceEnv;
 use crate::args::Args;
 use crate::manifest::{Harness, ReasoningEffort};
 use crate::openshell::provider::CodexAuth;
 use crate::turn_trace::{self, GenAiRecord, ToolCall, ToolInvocation};
+use crucible_harness::{CodexJsonParser, LiveMeters};
 use jiff::Timestamp;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
-/// The codex CLI's path in the sandbox image.
-pub(crate) const DEFAULT_BINARIES: &[&str] = &["/usr/local/bin/codex"];
-
-/// Codex has no skills discovery; the toolbox still lands where domain prompts reference it.
-pub(crate) const SKILLS_DIR: &str = ".claude/skills";
-
-/// `$CODEX_HOME` inside the sandbox: relocates config, auth, and the rollout store off `~/.codex`.
-pub(crate) const CODEX_HOME: &str = "/sandbox/.codex";
-
-/// The rollout store, `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl`.
-pub(crate) const SESSIONS: &str = "/sandbox/.codex/sessions";
-
-/// The rollout file's glob relative to [`SESSIONS`]: three date segments, then the file.
-pub(crate) const TRANSCRIPT_GLOB: &str = "*/*/*/rollout-*.jsonl";
-
-/// Codex's config file (model, approvals, MCP servers), rendered host-side and seeded.
-pub(crate) const CONFIG: &str = "/sandbox/.codex/config.toml";
-
 /// Where the seeded access token lands; codex reads it at startup.
 pub(crate) const AUTH: &str = "/sandbox/.codex/auth.json";
 
-/// The live `--json` stream carries result + usage, so the rollout fetch is telemetry only and
-/// must never wedge the turn: claude's number.
-pub(crate) const TRANSCRIPT_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) struct Codex;
 
-/// Harness env defaults for a local codex spawn (manifest `[agent].env` still wins). `CODEX_HOME`
-/// is deliberately absent: a local spawn uses the operator's own `~/.codex`.
-pub(crate) const LOCAL_ENV_DEFAULTS: &[(&str, &str)] = &[("AGENT_TOOL", "codex")];
+impl Codex {
+    pub(crate) const SPEC: HarnessSpec = HarnessSpec {
+        name: "codex",
+        binaries: &["/usr/local/bin/codex"],
+        // Codex has no skills discovery; the toolbox still lands where domain prompts reference it.
+        skills_dir: ".claude/skills",
+        // Relocates config, auth, and the rollout store off `~/.codex`.
+        home_var: "CODEX_HOME",
+        home: "/sandbox/.codex",
+        config: "/sandbox/.codex/config.toml",
+        sandbox_env: &[],
+        // `CODEX_HOME` is deliberately absent: a local spawn uses the operator's own `~/.codex`.
+        local_env: &[],
+        // `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl`: three date segments, then the file.
+        transcript: TranscriptLocator::NewestJsonl {
+            sandbox_root: "/sandbox/.codex/sessions",
+            glob: "*/*/*/rollout-*.jsonl",
+        },
+        // The live `--json` stream carries result + usage, so the rollout fetch is telemetry only
+        // and must never wedge the turn: claude's number.
+        transcript_fetch_timeout: Duration::from_secs(30),
+        auth: AuthProvider::Codex,
+        otel_capable: false,
+        backfill_required: false,
+    };
+
+    /// The shared invocation prefix: `codex exec --json --dangerously-bypass-approvals-and-sandbox
+    /// --skip-git-repo-check --color never -m <model> [-c model_reasoning_effort=<tier>]`. Prompt
+    /// delivery is appended by the caller. The bypass flag is what makes the run headless; the
+    /// sandboxing crucible cares about is openshell's, not codex's own. `--skip-git-repo-check` keeps
+    /// a workdir that is not a repo runnable, and `--color never` keeps ANSI escapes out of the
+    /// captured stream.
+    fn base_args(args: &Args) -> Vec<String> {
+        let mut a = vec![
+            "codex".to_string(),
+            "exec".to_string(),
+            "--json".to_string(),
+            "--dangerously-bypass-approvals-and-sandbox".to_string(),
+            "--skip-git-repo-check".to_string(),
+            "--color".to_string(),
+            "never".to_string(),
+            "-m".to_string(),
+            model(args).to_string(),
+        ];
+        if let Some(effort) = args.reasoning_effort {
+            a.push("-c".to_string());
+            a.push(format!(
+                "model_reasoning_effort={}",
+                reasoning_effort(effort)
+            ));
+        }
+        a
+    }
+}
 
 /// The model for this turn: `[agent.codex].model` overrides the shared `[agent].model`, and a
 /// Claude name in the shared slot falls back to the codex default model. Both `--model` and the
@@ -68,61 +104,6 @@ pub(crate) fn reasoning_effort(effort: ReasoningEffort) -> &'static str {
         ReasoningEffort::Medium => "medium",
         ReasoningEffort::High | ReasoningEffort::Xhigh | ReasoningEffort::Max => "high",
     }
-}
-
-/// The shared invocation prefix: `codex exec --json --dangerously-bypass-approvals-and-sandbox
-/// --skip-git-repo-check --color never -m <model> [-c model_reasoning_effort=<tier>]`. Prompt
-/// delivery is appended by the caller. The bypass flag is what makes the run headless; the
-/// sandboxing crucible cares about is openshell's, not codex's own. `--skip-git-repo-check` keeps
-/// a workdir that is not a repo runnable, and `--color never` keeps ANSI escapes out of the
-/// captured stream.
-fn base_args(args: &Args) -> Vec<String> {
-    let mut a = vec![
-        "codex".to_string(),
-        "exec".to_string(),
-        "--json".to_string(),
-        "--dangerously-bypass-approvals-and-sandbox".to_string(),
-        "--skip-git-repo-check".to_string(),
-        "--color".to_string(),
-        "never".to_string(),
-        "-m".to_string(),
-        model(args).to_string(),
-    ];
-    if let Some(effort) = args.reasoning_effort {
-        a.push("-c".to_string());
-        a.push(format!(
-            "model_reasoning_effort={}",
-            reasoning_effort(effort)
-        ));
-    }
-    a
-}
-
-/// The full local-spawn argv: the prompt rides inline as the trailing positional.
-pub(crate) fn local_argv(args: &Args, prompt: &str) -> Vec<String> {
-    let mut a = base_args(args);
-    a.push(prompt.to_string());
-    a
-}
-
-/// The sandbox argv: a trailing `-` reads the prompt from stdin, which the shared exec wrapper
-/// redirects from the uploaded prompt file. Codex reads MCP servers from its `config.toml`, not
-/// argv, so `mcp_seeded` is accepted and unused by design.
-pub(crate) fn sandbox_argv(args: &Args, _mcp_seeded: bool) -> Vec<String> {
-    let mut a = base_args(args);
-    a.push("-".to_string());
-    a
-}
-
-/// The agent's env script (sourced before codex runs in the sandbox): `AGENT_TOOL`, `CODEX_HOME`,
-/// then the manifest's `[agent].env`. The credential is not exported; it reaches Codex only
-/// through the seeded `auth.json` ([`auth_json`]).
-pub(crate) fn env_script(env: &[(String, String)]) -> String {
-    let lines = vec![
-        "export AGENT_TOOL=codex".to_string(),
-        format!("export CODEX_HOME={CODEX_HOME}"),
-    ];
-    append_manifest_env(lines, env)
 }
 
 /// `$CODEX_HOME/auth.json` in the shape Codex expects for the selected auth mode.
@@ -151,45 +132,6 @@ fn auth_json(auth: &CodexAuth, last_refresh: &str) -> String {
 /// token remains in the loop process, which is the single refresher.
 pub(crate) const WITHHELD_REFRESH_TOKEN: &str = "withheld-crucible-refreshes-host-side";
 
-/// Files seeded into the sandbox before exec: codex's `config.toml`, ALWAYS (it carries the model
-/// and the approval/sandbox posture), plus `auth.json` whenever Codex auth was resolved. When the
-/// broker is on, its streamable-HTTP MCP server is merged into the config with a bearer token,
-/// since the broker binds `0.0.0.0` and the token is what makes the sandbox its only caller.
-pub(crate) fn seed_files(
-    args: &Args,
-    broker_url: Option<&str>,
-    broker_token: Option<&str>,
-    auth: Option<&CodexAuth>,
-    inference: &crate::agent::inference::InferenceEnv,
-) -> Vec<SeedFile> {
-    let endpoint = inference
-        .openai_base_url
-        .as_deref()
-        .map(|base_url| CustomEndpoint {
-            base_url,
-            wire_api: inference
-                .wire_api
-                .unwrap_or(crate::agent::inference::WireApi::Chat),
-        });
-    let mut seeds = vec![SeedFile {
-        content: config_toml(
-            model(args),
-            &args.broker.name,
-            broker_url,
-            broker_token,
-            endpoint.as_ref(),
-        ),
-        dest: CONFIG,
-    }];
-    if let Some(auth) = auth {
-        seeds.push(SeedFile {
-            content: auth_json(auth, &Timestamp::now().to_string()),
-            dest: AUTH,
-        });
-    }
-    seeds
-}
-
 /// The custom OpenAI-speaking endpoint a turn runs against, as codex's `model_providers` entry.
 /// Codex reads the key for a non-built-in provider from `env_key`, so the sandbox env carries
 /// `OPENAI_API_KEY` for this case where the built-in provider reads `auth.json`.
@@ -205,9 +147,7 @@ pub(crate) const CUSTOM_PROVIDER_ID: &str = "crucible";
 /// token or server name carrying a quote cannot break out of its value.
 fn config_toml(
     model: &str,
-    broker_name: &str,
-    broker_url: Option<&str>,
-    token: Option<&str>,
+    broker: Option<&Broker<'_>>,
     endpoint: Option<&CustomEndpoint<'_>>,
 ) -> String {
     let mut cfg = toml::Table::new();
@@ -228,10 +168,10 @@ fn config_toml(
         providers.insert(CUSTOM_PROVIDER_ID.into(), provider.into());
         cfg.insert("model_providers".into(), providers.into());
     }
-    if let Some(url) = broker_url {
+    if let Some(b) = broker {
         let mut server = toml::Table::new();
-        server.insert("url".into(), url.into());
-        if let Some(t) = token {
+        server.insert("url".into(), b.url.into());
+        if let Some(t) = b.token {
             // Codex's schema has no inline `bearer_token`; the choices are `bearer_token_env_var`
             // (an env name) or static `http_headers`. The header keeps the token in the seeded
             // file rather than the sandbox env, same posture as hermes's config.yaml.
@@ -240,10 +180,82 @@ fn config_toml(
             server.insert("http_headers".into(), headers.into());
         }
         let mut servers = toml::Table::new();
-        servers.insert(broker_name.into(), server.into());
+        servers.insert(b.name.into(), server.into());
         cfg.insert("mcp_servers".into(), servers.into());
     }
     toml::to_string(&cfg).unwrap_or_default()
+}
+
+impl Backend for Codex {
+    fn spec(&self) -> &'static HarnessSpec {
+        &Self::SPEC
+    }
+
+    /// The prompt rides inline as the trailing positional.
+    fn local_argv(&self, args: &Args, prompt: &str) -> Vec<String> {
+        let mut a = Self::base_args(args);
+        a.push(prompt.to_string());
+        a
+    }
+
+    /// A trailing `-` reads the prompt from stdin, which the shared exec wrapper redirects from
+    /// the uploaded prompt file. Codex reads MCP servers from its `config.toml`, not argv, so
+    /// `mcp_seeded` is accepted and unused by design.
+    fn sandbox_argv(&self, args: &Args, _mcp_seeded: bool) -> Vec<String> {
+        let mut a = Self::base_args(args);
+        a.push("-".to_string());
+        a
+    }
+
+    /// `config.toml`, ALWAYS (it carries the model and the approval/sandbox posture). When the
+    /// broker is on, its streamable-HTTP MCP server is merged in with a bearer token.
+    fn config(
+        &self,
+        args: &Args,
+        broker: Option<&Broker<'_>>,
+        inference: &InferenceEnv,
+    ) -> Option<String> {
+        let endpoint = inference
+            .openai_base_url
+            .as_deref()
+            .map(|base_url| CustomEndpoint {
+                base_url,
+                wire_api: inference
+                    .wire_api
+                    .unwrap_or(crate::agent::inference::WireApi::Chat),
+            });
+        Some(config_toml(model(args), broker, endpoint.as_ref()))
+    }
+
+    /// `auth.json` whenever Codex auth was resolved; the credential reaches Codex only through it,
+    /// never the env script.
+    fn credential(&self, auth: &SandboxAuth) -> Option<SeedFile> {
+        auth.codex().map(|auth| SeedFile {
+            content: auth_json(auth, &Timestamp::now().to_string()),
+            dest: AUTH,
+        })
+    }
+
+    fn decoder(
+        &self,
+        args: &Args,
+        _meters: Option<&LiveMeters>,
+        tool_io: bool,
+    ) -> Box<dyn StreamDecoder> {
+        Box::new(
+            CodexJsonParser::new(model(args))
+                .with_price(crate::agent::event::estimate_cost)
+                .with_tool_io(tool_io),
+        )
+    }
+
+    fn parse_transcript(&self, content: &[u8]) -> TurnArtifacts {
+        rollout_spans(content)
+    }
+
+    fn content_records(&self, content: &[u8]) -> Vec<GenAiRecord> {
+        rollout_records(content)
+    }
 }
 
 /// The longest tool hint kept on a span, matched to `turn_trace`'s cap (identical span behavior).
@@ -292,7 +304,7 @@ fn field(payload: &Value, key: &str) -> String {
 
 /// Tool spans recovered from the downloaded rollout JSONL. The live stream is the turn's source of
 /// result + cost (`backfill_required` is false), so an unreadable rollout costs only trace detail.
-pub(crate) fn parse_transcript(content: &[u8]) -> TurnArtifacts {
+fn rollout_spans(content: &[u8]) -> TurnArtifacts {
     let text = String::from_utf8_lossy(content);
     let redact = turn_trace::redact_enabled();
     let mut order: Vec<ToolInvocation> = Vec::new();
@@ -446,7 +458,7 @@ fn first_line(input: &str) -> String {
 /// The turn's conversation records for content-log export, from the same rollout bytes. Codex
 /// keeps the conversation in `response_item` envelopes: `message` per role, `custom_tool_call` for
 /// each tool the assistant invoked, `custom_tool_call_output` for what came back.
-pub(crate) fn content_records(content: &[u8]) -> Vec<GenAiRecord> {
+fn rollout_records(content: &[u8]) -> Vec<GenAiRecord> {
     let text = String::from_utf8_lossy(content);
     let redact = turn_trace::redact_enabled();
     let mut model: Option<String> = None;
@@ -536,8 +548,30 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    const CONFIG: &str = Codex::SPEC.config;
+    const DEFAULT_BINARIES: &[&str] = Codex::SPEC.binaries;
+
     fn args() -> Args {
         crate::cli::Cli::parse_from(["crucible"]).run
+    }
+
+    fn seed_files(
+        args: &Args,
+        broker_url: Option<&str>,
+        broker_token: Option<&str>,
+        auth: Option<&CodexAuth>,
+        inference: &InferenceEnv,
+    ) -> Vec<SeedFile> {
+        let auth = auth.map_or(SandboxAuth::Gateway, |a| SandboxAuth::Codex(a.clone()));
+        Codex.seed_files(args, broker_url, broker_token, &auth, inference)
+    }
+
+    fn sandbox_argv(args: &Args, mcp_seeded: bool) -> Vec<String> {
+        Codex.sandbox_argv(args, mcp_seeded)
+    }
+
+    fn env_script(env: &[(String, String)]) -> String {
+        Codex.env_script(env)
     }
 
     const PREFIX: &[&str] = &[
@@ -554,7 +588,7 @@ mod tests {
     fn invocation_is_headless_exec_with_the_model() {
         let mut a = args();
         a.codex.model = Some("gpt-5.6-sol".to_string());
-        let local = local_argv(&a, "do the thing");
+        let local = Codex.local_argv(&a, "do the thing");
         assert_eq!(&local[..PREFIX.len()], PREFIX);
         assert_eq!(
             &local[PREFIX.len()..PREFIX.len() + 2],
@@ -800,7 +834,7 @@ mod tests {
 
     #[test]
     fn the_rollout_yields_one_span_per_tool_call() {
-        let art = parse_transcript(ROLLOUT);
+        let art = Codex.parse_transcript(ROLLOUT);
         assert!(art.events.is_empty(), "the live stream owns the result");
         assert!(art.cost_usd.is_none(), "and the cost");
         let names: Vec<&str> = art.tool_calls.iter().map(|c| c.name.as_str()).collect();
@@ -819,7 +853,7 @@ mod tests {
 
     #[test]
     fn the_rollout_yields_the_conversation_records() {
-        let records = content_records(ROLLOUT);
+        let records = Codex.content_records(ROLLOUT);
         assert!(
             records
                 .iter()
@@ -886,9 +920,9 @@ mod tests {
 
     #[test]
     fn garbage_transcript_is_empty_never_panics() {
-        let art = parse_transcript(b"not jsonl");
+        let art = Codex.parse_transcript(b"not jsonl");
         assert!(art.events.is_empty() && art.cost_usd.is_none() && art.tool_calls.is_empty());
-        assert!(content_records(b"").is_empty());
+        assert!(Codex.content_records(b"").is_empty());
         // Invalid UTF-8, a torn line, and an envelope with no payload all degrade, never panic.
         let torn = [
             &b"{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\""[..],
@@ -897,8 +931,8 @@ mod tests {
             &b"{}\n"[..],
         ]
         .concat();
-        assert!(parse_transcript(&torn).tool_calls.is_empty());
-        assert!(content_records(&torn).is_empty());
+        assert!(Codex.parse_transcript(&torn).tool_calls.is_empty());
+        assert!(Codex.content_records(&torn).is_empty());
         assert_eq!(DEFAULT_BINARIES, ["/usr/local/bin/codex"]);
     }
 }

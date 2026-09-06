@@ -14,7 +14,7 @@
 
 use crate::agent::event::{AgentEvent, RawStream, cost_of, estimate_cost};
 use crate::agent::harness::{
-    AuthProvider, HarnessRuntime, SandboxLayout, TranscriptLocator, TurnArtifacts,
+    AuthProvider, HarnessRuntime, SandboxAuth, SandboxLayout, TranscriptLocator, TurnArtifacts,
 };
 use crate::agent::relay;
 use crate::agent::turn::{TurnFailure, TurnOutcome};
@@ -268,6 +268,7 @@ async fn try_turn(
     // The agent harness for this turn (claude default): argv grammar, env script, seed files,
     // stream decoder, and the post-turn transcript contract all come from here.
     let harness = args.harness();
+    let backend = harness.backend();
 
     // 1. Gateway up (idempotent, boots on the first turn, no-ops after). `None` = the
     //    default supervisor emulator image; the *agent* image is `--from` on create below.
@@ -296,24 +297,24 @@ async fn try_turn(
     //    proxy hop.
     let inference = crate::agent::inference::InferenceEnv::from_process_env()?;
     let auth = crate::agent::harness::resolve_auth(harness, &inference);
-    let codex_auth = match auth {
+    let sandbox_auth = match auth {
         AuthProvider::Vertex => {
             let token = provider::mint_vertex_token()
                 .await
                 .context("minting the Vertex access token")?;
             let (project, region) = vertex_config(&args.env);
             ensure_provider(&gw, &token, &project, &region).await?;
-            None
+            SandboxAuth::Gateway
         }
-        AuthProvider::AnthropicKey => None,
-        AuthProvider::Codex => match selected_codex_api_key(&args.codex)? {
-            Some(key) => Some(provider::CodexAuth::ApiKey(key)),
-            None => Some(provider::CodexAuth::ChatGpt(
+        AuthProvider::AnthropicKey => SandboxAuth::AnthropicKey,
+        AuthProvider::Codex => SandboxAuth::Codex(match selected_codex_api_key(&args.codex)? {
+            Some(key) => provider::CodexAuth::ApiKey(key),
+            None => provider::CodexAuth::ChatGpt(
                 provider::mint_codex_token()
                     .await
                     .context("minting the codex ChatGPT access token")?,
-            )),
-        },
+            ),
+        }),
     };
 
     // 2b. Sandbox S3 reads (the read half of the S3 role split): a gateway-minted `aws-s3`
@@ -420,7 +421,7 @@ async fn try_turn(
     // `CRUCIBLE_OTEL`; a bind failure degrades to telemetry-off (no `otel_summary`, the
     // pricing-table estimate stays the cost fallback). Its `otel.jsonl` is the `otel-log` Tier 2
     // artifact.
-    let collector = if harness.otel_capable() && crate::agent::turn::otel_enabled(args) {
+    let collector = if harness.spec().otel_capable && crate::agent::turn::otel_enabled(args) {
         // The agent's exporter can't attribute its spans to a loop turn; the forwarder stamps
         // session + turn as resource attributes at the same boundary where it re-parents.
         let forward = crate::agent::turn::otel_forward(args).map(|f| {
@@ -476,7 +477,7 @@ async fn try_turn(
         };
         let mut endpoints = policy::resolve_endpoints(
             &args.openshell,
-            &harness.default_endpoints(),
+            &policy::default_endpoints(harness),
             broker_ep.as_deref(),
         );
         if let Some(c) = &collector {
@@ -514,7 +515,7 @@ async fn try_turn(
         }
         gw.update_policy_wait(
             &name,
-            &policy::resolve_binaries(&args.openshell, harness.default_binaries()),
+            &policy::resolve_binaries(&args.openshell, harness.spec().binaries),
             &endpoints,
             &credential_bindings,
         )
@@ -553,14 +554,8 @@ async fn try_turn(
                 &c.sandbox_endpoint(driver.broker_host()),
             ));
         }
-        inference_env(
-            &mut turn_env,
-            harness,
-            auth,
-            &inference,
-            codex_auth.as_ref(),
-        );
-        let env_tmp = write_temp("env", &harness.env_script(&turn_env)).await?;
+        inference_env(&mut turn_env, harness, auth, &inference, &sandbox_auth);
+        let env_tmp = write_temp("env", &backend.env_script(&turn_env)).await?;
         run_os(
             &sandbox::file_upload_args(
                 &name,
@@ -591,11 +586,11 @@ async fn try_turn(
         } else {
             args.broker_token.clone()
         };
-        let seeds = harness.seed_files(
+        let seeds = backend.seed_files(
             args,
             broker_url.as_deref(),
             seed_token.as_deref(),
-            codex_auth.as_ref(),
+            &sandbox_auth,
             &inference,
         );
         for seed in &seeds {
@@ -621,9 +616,10 @@ async fn try_turn(
         stage(sink, "sandbox ready — starting the agent");
         let argv = match session {
             Some(session) => harness
+                .backend()
                 .sandbox_session_argv(args, !seeds.is_empty(), session)
                 .context("building continuing sandbox harness argv")?,
-            None => harness.sandbox_argv(args, !seeds.is_empty()),
+            None => backend.sandbox_argv(args, !seeds.is_empty()),
         };
         let wrapper = crate::agent::harness::exec_wrapper(&basename, &argv);
         let exec_opts = ExecOpts {
@@ -662,7 +658,7 @@ async fn try_turn(
             })),
             AuthProvider::Codex | AuthProvider::AnthropicKey => None,
         };
-        let decoder = harness.decoder(
+        let decoder = backend.decoder(
             args,
             meters.as_ref(),
             crate::agent::turn::tool_io_full(args),
@@ -712,7 +708,7 @@ async fn try_turn(
         // The post-turn transcript fetch: pure telemetry garnish for claude (export-gated), but
         // a backfill harness's ONLY source of result events + cost, so for those it runs
         // unconditionally and a failure is loud (see `graft_turn_telemetry`).
-        if harness.backfill_required()
+        if harness.spec().backfill_required
             || crate::agent::engine::TurnExport::resolve().emits_anything()
         {
             cost = graft_turn_telemetry(harness, &gw, &name, &cancel, cost, sink).await;
@@ -889,7 +885,7 @@ async fn exec_and_stream(
     gw: &Gateway,
     name: &str,
     command: &[String],
-    decoder: crate::agent::harness::StreamDecoder,
+    decoder: Box<dyn crate::agent::harness::StreamDecoder>,
     opts: &ExecOpts<'_>,
     spent: &CostMeter,
     sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
@@ -1037,7 +1033,7 @@ pub(crate) fn inference_env(
     harness: Harness,
     auth: AuthProvider,
     inference: &crate::agent::inference::InferenceEnv,
-    codex_auth: Option<&provider::CodexAuth>,
+    sandbox_auth: &SandboxAuth,
 ) {
     let set = |env: &mut Vec<(String, String)>, key: &str, value: &str| {
         env.retain(|(k, _)| k != key);
@@ -1058,8 +1054,12 @@ pub(crate) fn inference_env(
         Harness::Codex => {
             if let Some(url) = inference.openai_base_url.as_deref() {
                 set(env, crate::agent::inference::OPENAI_BASE_URL, url);
-                if let Some(provider::CodexAuth::ApiKey(key)) = codex_auth {
-                    set(env, crate::agent::inference::OPENAI_API_KEY_ENV, key);
+                if let Some(provider::CodexAuth::ApiKey(key)) = sandbox_auth.codex() {
+                    set(
+                        env,
+                        crate::agent::inference::OPENAI_API_KEY_ENV,
+                        key.as_str(),
+                    );
                 }
             }
         }
@@ -1141,12 +1141,12 @@ async fn graft_turn_telemetry(
     sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
 ) -> f64 {
     let fetched = tokio::time::timeout(
-        harness.transcript_fetch_timeout(),
+        harness.spec().transcript_fetch_timeout,
         fetch_transcript(harness, gw, name, cancel),
     )
     .await;
     let Ok(Some(bytes)) = fetched else {
-        if harness.backfill_required() {
+        if harness.spec().backfill_required {
             let ev = AgentEvent::Error {
                 error_type: "transcript".into(),
                 message: "transcript fetch failed — the turn's result and cost are unavailable"
@@ -1160,8 +1160,8 @@ async fn graft_turn_telemetry(
     let export = crate::agent::engine::TurnExport::resolve();
     // One infallible parse over the in-memory transcript feeds span export and (backfill
     // harnesses) the turn's result; skip it when nothing consumes it.
-    let artifacts = if export.spans() || harness.backfill_required() {
-        harness.parse_transcript(&bytes)
+    let artifacts = if export.spans() || harness.spec().backfill_required {
+        harness.backend().parse_transcript(&bytes)
     } else {
         TurnArtifacts::default()
     };
@@ -1177,13 +1177,13 @@ async fn graft_turn_telemetry(
         if export.content() {
             // Content logs come from the harness's own transcript reader (claude maps its jsonl;
             // hermes: Phase B), off the same in-memory bytes, no re-read.
-            let records = harness.content_records(&bytes);
+            let records = harness.backend().content_records(&bytes);
             crate::agent::engine::emit_conversation_logs(&span, &records);
         }
     }
 
     let mut cost = cost;
-    if harness.backfill_required() {
+    if harness.spec().backfill_required {
         for ev in &artifacts.events {
             sink("", RawStream::Stdout, Some(ev));
         }
@@ -1205,10 +1205,12 @@ fn private_session_paths(
 }
 
 fn valid_private_remote(remote: &str, session: &crate::agent::agent_session::SessionTurn) -> bool {
-    remote.starts_with(&format!(
-        "{}/",
-        crate::agent::harness::claude::CLAUDE_PROJECTS
-    )) && remote.ends_with(&format!("/{}.jsonl", session.provider_id))
+    Harness::Claude
+        .spec()
+        .transcript
+        .jsonl_tree()
+        .is_some_and(|(root, _)| remote.starts_with(&format!("{root}/")))
+        && remote.ends_with(&format!("/{}.jsonl", session.provider_id))
         && !remote.contains("..")
         && std::path::Path::new(remote).is_absolute()
 }
@@ -1261,15 +1263,14 @@ async fn persist_private_session(
     name: &str,
     cancel: &CancellationToken,
 ) -> Result<()> {
-    let remote = newest_transcript_path(
-        gw,
-        name,
-        crate::agent::harness::claude::CLAUDE_PROJECTS,
-        crate::agent::harness::claude::TRANSCRIPT_GLOB,
-        cancel,
-    )
-    .await
-    .context("Claude turn produced no resumable private transcript")?;
+    let (root, glob) = Harness::Claude
+        .spec()
+        .transcript
+        .jsonl_tree()
+        .context("claude keeps its transcripts in a jsonl tree")?;
+    let remote = newest_transcript_path(gw, name, root, glob, cancel)
+        .await
+        .context("Claude turn produced no resumable private transcript")?;
     if !valid_private_remote(&remote, session) {
         return Err(OpenshellCliError::TranscriptSessionMismatch.into());
     }
@@ -1326,7 +1327,7 @@ async fn fetch_transcript(
     name: &str,
     cancel: &CancellationToken,
 ) -> Option<Vec<u8>> {
-    let locator = harness.transcript_locator();
+    let locator = harness.spec().transcript;
     let remote = match &locator {
         TranscriptLocator::NewestJsonl { sandbox_root, glob } => {
             newest_transcript_path(gw, name, sandbox_root, glob, cancel).await?
@@ -1695,11 +1696,11 @@ mod tests {
     #[test]
     fn the_newest_jsonl_script_matches_each_harness_tree() {
         for harness in [Harness::Claude, Harness::Codex] {
-            let TranscriptLocator::NewestJsonl { sandbox_root, glob } =
-                harness.transcript_locator()
-            else {
-                panic!("{harness:?} reads a jsonl tree");
-            };
+            let (sandbox_root, glob) = harness
+                .spec()
+                .transcript
+                .jsonl_tree()
+                .unwrap_or_else(|| panic!("{harness:?} reads a jsonl tree"));
             let script = newest_jsonl_script(sandbox_root, glob);
             assert!(script.starts_with("ls -1t "), "{script}");
             assert!(script.ends_with(" 2>/dev/null | head -n 1"), "{script}");
@@ -1709,17 +1710,11 @@ mod tests {
             assert_eq!(pattern, format!("{sandbox_root}/{glob}"));
         }
         assert_eq!(
-            newest_jsonl_script(
-                crate::agent::harness::claude::CLAUDE_PROJECTS,
-                crate::agent::harness::claude::TRANSCRIPT_GLOB
-            ),
+            newest_jsonl_script("/sandbox/.claude/projects", "*/*.jsonl"),
             "ls -1t /sandbox/.claude/projects/*/*.jsonl 2>/dev/null | head -n 1"
         );
         assert_eq!(
-            newest_jsonl_script(
-                crate::agent::harness::codex::SESSIONS,
-                crate::agent::harness::codex::TRANSCRIPT_GLOB
-            ),
+            newest_jsonl_script("/sandbox/.codex/sessions", "*/*/*/rollout-*.jsonl"),
             "ls -1t /sandbox/.codex/sessions/*/*/*/rollout-*.jsonl 2>/dev/null | head -n 1"
         );
     }
@@ -1744,7 +1739,7 @@ mod tests {
             Harness::Claude,
             AuthProvider::AnthropicKey,
             &inference,
-            None,
+            &SandboxAuth::AnthropicKey,
         );
         let get = |k: &str| {
             env.iter()
@@ -1762,14 +1757,14 @@ mod tests {
     /// a base URL is set; against the built-in provider it stays in `auth.json`.
     #[test]
     fn codex_exports_its_key_only_for_a_custom_endpoint() {
-        let auth = provider::CodexAuth::ApiKey("sk-oa".to_string());
+        let auth = SandboxAuth::Codex(provider::CodexAuth::ApiKey("sk-oa".to_string()));
         let mut plain = Vec::new();
         inference_env(
             &mut plain,
             Harness::Codex,
             AuthProvider::Codex,
             &Default::default(),
-            Some(&auth),
+            &auth,
         );
         assert!(plain.is_empty(), "{plain:?}");
 
@@ -1783,7 +1778,7 @@ mod tests {
             Harness::Codex,
             AuthProvider::Codex,
             &inference,
-            Some(&auth),
+            &auth,
         );
         assert!(custom.contains(&(
             "OPENAI_BASE_URL".to_string(),

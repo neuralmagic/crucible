@@ -121,14 +121,14 @@ pub(crate) fn tool_io_full(args: &Args) -> bool {
 /// gRPC stream. Splitting the loop from the byte source is what lets the async exec path reuse the
 /// exact same accounting + sink dispatch from any line source (BufReader or gRPC stream).
 pub(crate) struct StreamPump {
-    decoder: StreamDecoder,
+    decoder: Box<dyn StreamDecoder>,
     cost: f64,
     best_tokens: Option<Tokens>,
 }
 
 impl StreamPump {
-    /// A fresh pump over the harness's `decoder` (see [`crate::manifest::Harness::decoder`]).
-    pub(crate) fn new(decoder: StreamDecoder) -> Self {
+    /// A fresh pump over the harness's `decoder` (see `Backend::decoder`).
+    pub(crate) fn new(decoder: Box<dyn StreamDecoder>) -> Self {
         Self {
             decoder,
             cost: 0.0,

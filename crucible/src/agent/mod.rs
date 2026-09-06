@@ -169,8 +169,11 @@ fn spawn_local(
     session: Option<&crate::agent::agent_session::SessionTurn>,
 ) -> std::io::Result<Spawned> {
     let argv = match session {
-        Some(session) => args.harness().local_session_argv(args, prompt, session)?,
-        None => args.harness().local_argv(args, prompt),
+        Some(session) => args
+            .harness()
+            .backend()
+            .local_session_argv(args, prompt, session)?,
+        None => args.harness().backend().local_argv(args, prompt),
     };
     let Some((program, rest)) = argv.split_first() else {
         return Err(std::io::Error::other("harness produced an empty argv"));
@@ -187,7 +190,7 @@ fn spawn_local(
     // env_script is built from the manifest env, not the process env).
     cmd.env_remove("TRACEPARENT").env_remove("TRACESTATE");
     // Harness defaults first, so a manifest `[agent].env` override takes precedence.
-    for (k, v) in args.harness().local_env_defaults() {
+    for (k, v) in args.harness().backend().local_env() {
         cmd.env(k, v);
     }
     for (k, v) in &args.env {
@@ -261,7 +264,7 @@ fn run_turn_with(
     // pricing-table estimate stays the cost fallback. The `otel.jsonl` lands next to the session
     // log, the `otel-log` Tier 2 artifact.
     let collector = if matches!(source, AgentSource::LocalClaude)
-        && args.harness().otel_capable()
+        && args.harness().spec().otel_capable
         && otel_enabled(args)
     {
         match OtelCollector::start(
@@ -329,9 +332,10 @@ fn run_turn_with(
         if matches!(source, AgentSource::LocalClaude) {
             // Local agent: decode via the harness's stream decoder (shared with the openshell
             // exec path).
-            let decoder = args
-                .harness()
-                .decoder(args, meters.as_ref(), tool_io_full(args));
+            let decoder =
+                args.harness()
+                    .backend()
+                    .decoder(args, meters.as_ref(), tool_io_full(args));
             let (c, bt) = pump_stream(out, json, decoder, &mut sink);
             cost = c;
             best_tokens = bt;
@@ -362,8 +366,8 @@ fn run_turn_with(
     // A backfill harness has no machine-readable event stream: its result events + cost arrive
     // post-hoc from the local session store. Dead for claude (`backfill_required` is false).
     if matches!(source, AgentSource::LocalClaude)
-        && args.harness().backfill_required()
-        && let Some(artifacts) = args.harness().local_backfill(p)
+        && args.harness().spec().backfill_required
+        && let Some(artifacts) = args.harness().backend().local_backfill(p)
     {
         for ev in &artifacts.events {
             account(ev, &mut cost, &mut best_tokens);
@@ -421,7 +425,7 @@ fn line_event(line: &str, stream: RawStream) -> Option<AgentEvent> {
 pub(crate) fn pump_stream(
     reader: impl Read,
     json: bool,
-    decoder: StreamDecoder,
+    decoder: Box<dyn StreamDecoder>,
     sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
 ) -> (f64, Option<Tokens>) {
     let mut pump = StreamPump::new(decoder);

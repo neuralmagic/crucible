@@ -686,7 +686,7 @@ fn run_in(
     if let Err(e) = crate::cli::workspace::install_toolbox(
         paths,
         &args.workflow_toolbox_exclude,
-        args.harness().skills_dir(),
+        args.harness().spec().skills_dir,
     ) {
         return Attempt::transport(
             TransportCause::Workspace,
@@ -1103,7 +1103,7 @@ mod tests {
             overridden
                 .paths
                 .workspace
-                .join(crate::manifest::Harness::Codex.skills_dir())
+                .join(crate::manifest::Harness::Codex.spec().skills_dir)
                 .join("demo")
                 .is_dir(),
             "the toolbox lands in the override harness's skills dir"

@@ -214,7 +214,11 @@ pub(crate) fn prep_plan_runner_with_params(
     std::fs::create_dir_all(&p.state)
         .with_context(|| format!("creating state dir {}", p.state.display()))?;
     let harness = agent.harness.unwrap_or(m.agent.harness);
-    crate::cli::workspace::install_toolbox(&p, &m.agent.toolbox_exclude, harness.skills_dir())?;
+    crate::cli::workspace::install_toolbox(
+        &p,
+        &m.agent.toolbox_exclude,
+        harness.spec().skills_dir,
+    )?;
     // Default Args (as if `crucible` ran flagless) carrying the launch's own agent flags, then
     // the manifest's [agent] folded on top — the same resolution a loop run does.
     let mut args = Args::defaults().context("constructing default args")?;
