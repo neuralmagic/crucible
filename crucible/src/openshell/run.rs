@@ -615,8 +615,7 @@ async fn try_turn(
         // 8. Exec the agent (prompt over stdin), streaming its stdout through the harness decoder.
         stage(sink, "sandbox ready — starting the agent");
         let argv = match session {
-            Some(session) => harness
-                .backend()
+            Some(session) => backend
                 .sandbox_session_argv(args, !seeds.is_empty(), session)
                 .context("building continuing sandbox harness argv")?,
             None => backend.sandbox_argv(args, !seeds.is_empty()),

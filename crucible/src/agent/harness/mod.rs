@@ -140,7 +140,6 @@ impl StreamDecoder for RawLines {
 
 /// The credential a sandbox turn resolved for its [`AuthProvider`], handed to the backend so it
 /// can seed whatever its CLI reads off disk.
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SandboxAuth {
     /// Served by the gateway's metadata emulator; nothing to seed.
     Gateway,
@@ -233,7 +232,7 @@ pub(crate) trait Backend: Sync {
         _prompt: &str,
         _session: &crate::agent::agent_session::SessionTurn,
     ) -> std::io::Result<Vec<String>> {
-        Err(self.no_sessions())
+        Err(no_sessions(self.spec()))
     }
 
     /// Sandbox counterpart of [`Backend::local_session_argv`].
@@ -243,14 +242,7 @@ pub(crate) trait Backend: Sync {
         _mcp_seeded: bool,
         _session: &crate::agent::agent_session::SessionTurn,
     ) -> std::io::Result<Vec<String>> {
-        Err(self.no_sessions())
-    }
-
-    fn no_sessions(&self) -> std::io::Error {
-        std::io::Error::other(format!(
-            "{} does not support Crucible-managed sessions",
-            self.spec().name
-        ))
+        Err(no_sessions(self.spec()))
     }
 
     /// The config file seeded at [`HarnessSpec::config`] before the agent execs, rendered
@@ -350,6 +342,13 @@ pub(crate) trait Backend: Sync {
         seeds.extend(self.credential(auth));
         seeds
     }
+}
+
+fn no_sessions(spec: &HarnessSpec) -> std::io::Error {
+    std::io::Error::other(format!(
+        "{} does not support Crucible-managed sessions",
+        spec.name
+    ))
 }
 
 /// The manifest's harness token, resolved to its backend.

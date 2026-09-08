@@ -41,15 +41,12 @@ impl Codex {
         home: "/sandbox/.codex",
         config: "/sandbox/.codex/config.toml",
         sandbox_env: &[],
-        // `CODEX_HOME` is deliberately absent: a local spawn uses the operator's own `~/.codex`.
         local_env: &[],
         // `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl`: three date segments, then the file.
         transcript: TranscriptLocator::NewestJsonl {
             sandbox_root: "/sandbox/.codex/sessions",
             glob: "*/*/*/rollout-*.jsonl",
         },
-        // The live `--json` stream carries result + usage, so the rollout fetch is telemetry only
-        // and must never wedge the turn: claude's number.
         transcript_fetch_timeout: Duration::from_secs(30),
         auth: AuthProvider::Codex,
         otel_capable: false,
@@ -89,7 +86,7 @@ impl Codex {
 /// Claude name in the shared slot falls back to the codex default model. Both `--model` and the
 /// manifest's `[agent].model` default to a Claude model (the default harness owns that default),
 /// and the ChatGPT backend rejects an Anthropic model name with a 400.
-pub(crate) fn model(args: &Args) -> &str {
+fn model(args: &Args) -> &str {
     match args.codex.model.as_deref() {
         Some(m) => m,
         None if args.model().starts_with("claude") => Harness::Codex.default_model(),
@@ -98,7 +95,7 @@ pub(crate) fn model(args: &Args) -> &str {
 }
 
 /// Crucible's five reasoning tiers onto codex's three (`model_reasoning_effort`).
-pub(crate) fn reasoning_effort(effort: ReasoningEffort) -> &'static str {
+fn reasoning_effort(effort: ReasoningEffort) -> &'static str {
     match effort {
         ReasoningEffort::Low => "low",
         ReasoningEffort::Medium => "medium",

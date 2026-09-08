@@ -44,8 +44,6 @@ impl Hermes {
         transcript: TranscriptLocator::File {
             sandbox_path: "/sandbox/.hermes/state.db",
         },
-        // The state.db carries the turn's result + cost, so the fetch gets more headroom than
-        // claude's telemetry-only 30s.
         transcript_fetch_timeout: Duration::from_secs(60),
         auth: AuthProvider::Vertex,
         otel_capable: false,
@@ -89,6 +87,16 @@ fn config_yaml(model: &str, broker: Option<&Broker<'_>>) -> String {
         cfg.insert("mcp_servers".into(), serde_json::json!({ b.name: server }));
     }
     serde_norway::to_string(&serde_json::Value::Object(cfg)).unwrap_or_default()
+}
+
+impl From<crate::agent::hermes_trace::HermesTurn> for TurnArtifacts {
+    fn from(t: crate::agent::hermes_trace::HermesTurn) -> Self {
+        TurnArtifacts {
+            events: t.events,
+            cost_usd: t.cost_usd,
+            tool_calls: t.tool_calls,
+        }
+    }
 }
 
 impl Backend for Hermes {
@@ -140,11 +148,7 @@ impl Backend for Hermes {
     /// surfaces the failure loudly, never as a $0-quiet success.
     fn parse_transcript(&self, content: &[u8]) -> TurnArtifacts {
         match crate::agent::hermes_trace::read_turn(content) {
-            Some(t) => TurnArtifacts {
-                events: t.events,
-                cost_usd: t.cost_usd,
-                tool_calls: t.tool_calls,
-            },
+            Some(t) => TurnArtifacts::from(t),
             None => TurnArtifacts::default(),
         }
     }
@@ -169,11 +173,7 @@ impl Backend for Hermes {
                     .map(|h| std::path::PathBuf::from(h).join(".hermes"))
             })?;
         let t = crate::agent::hermes_trace::read_turn_path(&home.join("state.db"))?;
-        Some(TurnArtifacts {
-            events: t.events,
-            cost_usd: t.cost_usd,
-            tool_calls: t.tool_calls,
-        })
+        Some(TurnArtifacts::from(t))
     }
 }
 

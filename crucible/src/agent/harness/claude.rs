@@ -1,7 +1,5 @@
 //! The claude arm of the harness boundary: Claude Code's argv grammar, env defaults, `.mcp.json`
-//! seeding, and transcript layout. Pure extraction, every function here moved verbatim from
-//! `agent.rs` / `openshell/run.rs`, and the tests moved with them (they are the byte-identity
-//! guard for the harness refactor).
+//! seeding, and transcript layout.
 
 use crate::agent::harness::{
     AuthProvider, Backend, Broker, HarnessSpec, StreamDecoder, TranscriptLocator, TurnArtifacts,
