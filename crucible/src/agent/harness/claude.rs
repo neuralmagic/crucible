@@ -1,42 +1,50 @@
 //! The claude arm of the harness boundary: Claude Code's argv grammar, env defaults, `.mcp.json`
-//! seeding, and transcript layout. Pure extraction, every function here moved verbatim from
-//! `agent.rs` / `openshell/run.rs`, and the tests moved with them (they are the byte-identity
-//! guard for the harness refactor).
+//! seeding, and transcript layout.
 
-use crate::agent::harness::{SeedFile, TurnArtifacts, append_manifest_env};
+use crate::agent::harness::{
+    AuthProvider, Backend, Broker, HarnessSpec, StreamDecoder, TranscriptLocator, TurnArtifacts,
+};
+use crate::agent::inference::InferenceEnv;
 use crate::args::Args;
+use crate::stream_json::StreamJsonParser;
 use crate::turn_trace::GenAiRecord;
+use crucible_harness::LiveMeters;
 use std::time::Duration;
 
-/// Binaries always allowed to open egress for a claude sandbox turn.
-pub(crate) const DEFAULT_BINARIES: &[&str] = &["/usr/local/bin/claude", "/usr/local/bin/opencode"];
+pub(crate) struct Claude;
 
-/// Where the toolbox skills install in the workspace (claude discovers them there).
-pub(crate) const SKILLS_DIR: &str = ".claude/skills";
-
-/// Where the generated `.mcp.json` (the provisioning-broker endpoint) lands; claude loads it via
-/// `--mcp-config`. Absolute `/tmp`, like the env/prompt uploads. Only seeded when the broker is on.
-pub(crate) const MCP_CONFIG: &str = "/tmp/.crucible-mcp.json";
-
-/// Where the agent's native session transcripts live: claude writes them under
-/// `$CLAUDE_CONFIG_DIR/projects/<slug>/<session>.jsonl`, and the env script pins
-/// `CLAUDE_CONFIG_DIR=/sandbox/.claude` (see [`env_script`]).
-pub(crate) const CLAUDE_PROJECTS: &str = "/sandbox/.claude/projects";
-
-/// The transcript's glob relative to [`CLAUDE_PROJECTS`]: one project-slug segment, then the file.
-pub(crate) const TRANSCRIPT_GLOB: &str = "*/*.jsonl";
-
-/// The transcript fetch is pure telemetry for claude and must never wedge the turn:
-/// elapsed = silent no-op, the turn's tree just stays at the root span.
-pub(crate) const TRANSCRIPT_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Harness env defaults for a local claude spawn (manifest `[agent].env` still wins).
-pub(crate) const LOCAL_ENV_DEFAULTS: &[(&str, &str)] = &[
-    ("AGENT_TOOL", "claude"),
-    ("DISABLE_AUTOUPDATER", "1"),
-    // `-p` sets sessionKind, which breaks `--continue` lookup (claude-code#43013).
-    ("CLAUDE_CODE_ENTRYPOINT", "sdk-cli"),
-];
+impl Claude {
+    pub(crate) const SPEC: HarnessSpec = HarnessSpec {
+        name: "claude",
+        binaries: &["/usr/local/bin/claude", "/usr/local/bin/opencode"],
+        skills_dir: ".claude/skills",
+        home_var: "CLAUDE_CONFIG_DIR",
+        home: "/sandbox/.claude",
+        // The generated `.mcp.json` (the provisioning-broker endpoint), loaded via
+        // `--mcp-config`. Absolute `/tmp`, like the env/prompt uploads.
+        config: "/tmp/.crucible-mcp.json",
+        sandbox_env: &[
+            ("CLAUDE_CODE_PLUGIN_SEED_DIR", "/sandbox/.claude-seed"),
+            ("CLAUDE_CODE_SYNC_PLUGIN_INSTALL", "1"),
+            ("DISABLE_AUTOUPDATER", "1"),
+            ("CLAUDE_CODE_MAX_RETRIES", "20"),
+        ],
+        local_env: &[
+            ("DISABLE_AUTOUPDATER", "1"),
+            // `-p` sets sessionKind, which breaks `--continue` lookup (claude-code#43013).
+            ("CLAUDE_CODE_ENTRYPOINT", "sdk-cli"),
+        ],
+        // `$CLAUDE_CONFIG_DIR/projects/<slug>/<session>.jsonl`: one project-slug segment.
+        transcript: TranscriptLocator::NewestJsonl {
+            sandbox_root: "/sandbox/.claude/projects",
+            glob: "*/*.jsonl",
+        },
+        transcript_fetch_timeout: Duration::from_secs(30),
+        auth: AuthProvider::Vertex,
+        otel_capable: true,
+        backfill_required: false,
+    };
+}
 
 /// Ends option parsing, so a prompt is a prompt however it starts.
 ///
@@ -78,28 +86,6 @@ pub(crate) fn claude_base_args(args: &Args) -> Vec<String> {
     a
 }
 
-/// The full `claude` argument vector (program name first) for a direct local turn:
-/// the base args plus the prompt.
-pub(crate) fn local_argv(args: &Args, prompt: &str) -> Vec<String> {
-    let mut a = claude_base_args(args);
-    a.push(END_OF_OPTIONS.to_string());
-    a.push(prompt.to_string());
-    a
-}
-
-/// Start or resume a local Claude session with an opaque UUID.
-pub(crate) fn local_session_argv(
-    args: &Args,
-    prompt: &str,
-    session: &crate::agent::agent_session::SessionTurn,
-) -> Vec<String> {
-    let mut a = claude_base_args(args);
-    insert_session_flags(&mut a, session);
-    a.push(END_OF_OPTIONS.to_string());
-    a.push(prompt.to_string());
-    a
-}
-
 /// Inserts `--resume|--session-id <id>` just before the trailing `-p` that
 /// [`claude_base_args`] guarantees.
 fn insert_session_flags(a: &mut Vec<String>, session: &crate::agent::agent_session::SessionTurn) {
@@ -111,65 +97,6 @@ fn insert_session_flags(a: &mut Vec<String>, session: &crate::agent::agent_sessi
     };
     a.insert(at, session.provider_id.clone());
     a.insert(at, flag.to_string());
-}
-
-/// The claude argv (program name first) for a sandbox turn: the shared base args, plus
-/// `--mcp-config <path>` when an MCP config was seeded, so the agent sees the broker's
-/// `request_trace` / `check_capture` tools. The flag goes just before the trailing `-p`, the
-/// boundary [`claude_base_args`] guarantees (it ends with `-p`; the prompt arrives over stdin).
-pub(crate) fn sandbox_argv(args: &Args, mcp_seeded: bool) -> Vec<String> {
-    let mut a = claude_base_args(args);
-    if mcp_seeded {
-        let at = a.len().saturating_sub(1); // before the trailing `-p`
-        a.insert(at, MCP_CONFIG.to_string());
-        a.insert(at, "--mcp-config".to_string());
-    }
-    a
-}
-
-/// Start or resume a sandbox session; the prompt still arrives over stdin.
-pub(crate) fn sandbox_session_argv(
-    args: &Args,
-    mcp_seeded: bool,
-    session: &crate::agent::agent_session::SessionTurn,
-) -> Vec<String> {
-    let mut a = sandbox_argv(args, mcp_seeded);
-    insert_session_flags(&mut a, session);
-    a
-}
-
-/// The agent's env script (sourced before claude runs in the sandbox). Claude defaults +
-/// the manifest's `[agent].env` (which already carries the Vertex vars); no token, the
-/// metadata emulator serves it.
-pub(crate) fn env_script(env: &[(String, String)]) -> String {
-    let lines: Vec<String> = [
-        "export AGENT_TOOL=claude",
-        "export CLAUDE_CONFIG_DIR=/sandbox/.claude",
-        "export CLAUDE_CODE_PLUGIN_SEED_DIR=/sandbox/.claude-seed",
-        "export CLAUDE_CODE_SYNC_PLUGIN_INSTALL=1",
-        "export DISABLE_AUTOUPDATER=1",
-        "export CLAUDE_CODE_MAX_RETRIES=20",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
-    append_manifest_env(lines, env)
-}
-
-/// Files seeded into the sandbox before exec: the `.mcp.json` pointing claude at the
-/// provisioning broker, only when the broker is on.
-pub(crate) fn seed_files(
-    args: &Args,
-    broker_url: Option<&str>,
-    broker_token: Option<&str>,
-) -> Vec<SeedFile> {
-    let Some(url) = broker_url else {
-        return Vec::new();
-    };
-    vec![SeedFile {
-        content: mcp_config_json(&args.broker.name, url, broker_token),
-        dest: MCP_CONFIG,
-    }]
 }
 
 /// The `.mcp.json` seeded into the sandbox: one streamable-http server pointing at the broker.
@@ -184,35 +111,114 @@ fn mcp_config_json(name: &str, url: &str, token: Option<&str>) -> String {
     serde_json::json!({ "mcpServers": { name: server } }).to_string()
 }
 
-/// Parse a claude session transcript's in-memory bytes into [`TurnArtifacts`]. For claude this is
-/// trace garnish: tool spans only, the live `stream-json` feed already carried the events and
-/// cost, so `events` stays empty and `cost_usd` stays `None` (byte-identical turn behavior).
-/// Non-UTF-8 bytes yield empty artifacts, matching the old `read_to_string` failure path.
-pub(crate) fn parse_transcript(content: &[u8]) -> TurnArtifacts {
-    let Ok(text) = std::str::from_utf8(content) else {
-        return TurnArtifacts::default();
-    };
-    TurnArtifacts {
-        events: Vec::new(),
-        cost_usd: None,
-        tool_calls: crate::turn_trace::parse_transcript(text),
+impl Backend for Claude {
+    fn spec(&self) -> &'static HarnessSpec {
+        &Self::SPEC
     }
-}
 
-/// The turn's conversation as GenAI records, mapped from claude's jsonl message format for
-/// content-log export. Same in-memory bytes as [`parse_transcript`] (no re-read); non-UTF-8 or
-/// empty transcript yields no records.
-pub(crate) fn content_records(content: &[u8]) -> Vec<GenAiRecord> {
-    match std::str::from_utf8(content) {
-        Ok(text) => crate::turn_trace::parse_messages(text),
-        Err(_) => Vec::new(),
+    /// The base args plus the prompt.
+    fn local_argv(&self, args: &Args, prompt: &str) -> Vec<String> {
+        let mut a = claude_base_args(args);
+        a.push(END_OF_OPTIONS.to_string());
+        a.push(prompt.to_string());
+        a
+    }
+
+    /// Start or resume a local Claude session with an opaque UUID.
+    fn local_session_argv(
+        &self,
+        args: &Args,
+        prompt: &str,
+        session: &crate::agent::agent_session::SessionTurn,
+    ) -> std::io::Result<Vec<String>> {
+        let mut a = claude_base_args(args);
+        insert_session_flags(&mut a, session);
+        a.push(END_OF_OPTIONS.to_string());
+        a.push(prompt.to_string());
+        Ok(a)
+    }
+
+    /// The shared base args, plus `--mcp-config <path>` when an MCP config was seeded, so the
+    /// agent sees the broker's `request_trace` / `check_capture` tools. The flag goes just before
+    /// the trailing `-p`, the boundary [`claude_base_args`] guarantees (it ends with `-p`; the
+    /// prompt arrives over stdin).
+    fn sandbox_argv(&self, args: &Args, mcp_seeded: bool) -> Vec<String> {
+        let mut a = claude_base_args(args);
+        if mcp_seeded {
+            let at = a.len().saturating_sub(1); // before the trailing `-p`
+            a.insert(at, Self::SPEC.config.to_string());
+            a.insert(at, "--mcp-config".to_string());
+        }
+        a
+    }
+
+    /// Start or resume a sandbox session; the prompt still arrives over stdin.
+    fn sandbox_session_argv(
+        &self,
+        args: &Args,
+        mcp_seeded: bool,
+        session: &crate::agent::agent_session::SessionTurn,
+    ) -> std::io::Result<Vec<String>> {
+        let mut a = self.sandbox_argv(args, mcp_seeded);
+        insert_session_flags(&mut a, session);
+        Ok(a)
+    }
+
+    /// The `.mcp.json` pointing claude at the provisioning broker, only when the broker is on.
+    fn config(
+        &self,
+        _args: &Args,
+        broker: Option<&Broker<'_>>,
+        _inference: &InferenceEnv,
+    ) -> Option<String> {
+        broker.map(|b| mcp_config_json(b.name, b.url, b.token))
+    }
+
+    fn decoder(
+        &self,
+        _args: &Args,
+        meters: Option<&LiveMeters>,
+        tool_io: bool,
+    ) -> Box<dyn StreamDecoder> {
+        Box::new(
+            match meters {
+                Some(m) => StreamJsonParser::with_meters(m.clone()),
+                None => StreamJsonParser::default(),
+            }
+            .with_tool_io(tool_io),
+        )
+    }
+
+    /// Trace garnish: tool spans only, the live `stream-json` feed already carried the events and
+    /// cost, so `events` stays empty and `cost_usd` stays `None`. Non-UTF-8 bytes yield empty
+    /// artifacts, matching the old `read_to_string` failure path.
+    fn parse_transcript(&self, content: &[u8]) -> TurnArtifacts {
+        let Ok(text) = std::str::from_utf8(content) else {
+            return TurnArtifacts::default();
+        };
+        TurnArtifacts {
+            events: Vec::new(),
+            cost_usd: None,
+            tool_calls: crate::turn_trace::parse_transcript(text),
+        }
+    }
+
+    /// Mapped from claude's jsonl message format; non-UTF-8 or empty transcript yields no records.
+    fn content_records(&self, content: &[u8]) -> Vec<GenAiRecord> {
+        match std::str::from_utf8(content) {
+            Ok(text) => crate::turn_trace::parse_messages(text),
+            Err(_) => Vec::new(),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::harness::{SandboxAuth, SeedFile};
     use clap::Parser;
+
+    const MCP_CONFIG: &str = Claude::SPEC.config;
 
     /// Parse a bare arg list into [`Args`] via the top-level CLI (the loop is the
     /// default subcommand), so we exercise the real clap wiring.
@@ -222,6 +228,16 @@ mod tests {
         crate::cli::Cli::parse_from(argv).run
     }
 
+    fn seeds(args: &Args, broker_url: Option<&str>, broker_token: Option<&str>) -> Vec<SeedFile> {
+        Claude.seed_files(
+            args,
+            broker_url,
+            broker_token,
+            &SandboxAuth::Gateway,
+            &Default::default(),
+        )
+    }
+
     /// A prompt is a prompt however it starts. Without the end-of-options marker a prompt
     /// beginning with `-` is read as a flag and the turn dies before it starts; a SKILL.md opens
     /// with `---`, which is how this was found, and it cost a real run to find.
@@ -229,7 +245,7 @@ mod tests {
     fn a_prompt_that_starts_with_a_dash_is_not_read_as_a_flag() {
         let a = args(&[]);
         for prompt in ["---\nname: analyze\n---\n\nDo it.\n", "-p", "--help", "-"] {
-            let v = local_argv(&a, prompt);
+            let v = Claude.local_argv(&a, prompt);
             let end = v.iter().position(|s| s == "--").expect("no end-of-options");
             assert_eq!(v.last().unwrap(), prompt, "{prompt:?}");
             assert_eq!(v.len(), end + 2, "argv continues past the prompt: {v:?}");
@@ -239,7 +255,7 @@ mod tests {
                 provider_id: "11111111-1111-1111-1111-111111111111".into(),
                 completed_turns: 0,
             };
-            let v = local_session_argv(&a, prompt, &session);
+            let v = Claude.local_session_argv(&a, prompt, &session).unwrap();
             let end = v.iter().position(|s| s == "--").expect("no end-of-options");
             assert_eq!(v.len(), end + 2, "session argv: {v:?}");
         }
@@ -248,7 +264,7 @@ mod tests {
     #[test]
     fn claude_args_are_stream_json_print_mode() {
         let a = args(&[]);
-        let v = local_argv(&a, "do the thing");
+        let v = Claude.local_argv(&a, "do the thing");
         assert_eq!(v.last().unwrap(), "do the thing");
         assert!(v.windows(3).any(|w| w == ["-p", "--", "do the thing"]));
         assert!(
@@ -309,7 +325,9 @@ mod tests {
             provider_id: "018f47a0-0000-7000-8000-000000000000".into(),
             completed_turns: 0,
         };
-        let started = local_session_argv(&args(&[]), "try one", &first);
+        let started = Claude
+            .local_session_argv(&args(&[]), "try one", &first)
+            .unwrap();
         assert!(
             started
                 .windows(2)
@@ -321,7 +339,9 @@ mod tests {
             completed_turns: 1,
             ..first
         };
-        let continued = local_session_argv(&args(&[]), "try two", &resumed);
+        let continued = Claude
+            .local_session_argv(&args(&[]), "try two", &resumed)
+            .unwrap();
         assert!(
             continued
                 .windows(2)
@@ -329,7 +349,9 @@ mod tests {
         );
         assert!(!continued.iter().any(|arg| arg == "--session-id"));
 
-        let sandbox = sandbox_session_argv(&args(&[]), true, &resumed);
+        let sandbox = Claude
+            .sandbox_session_argv(&args(&[]), true, &resumed)
+            .unwrap();
         assert!(
             sandbox
                 .windows(2)
@@ -341,7 +363,7 @@ mod tests {
 
     #[test]
     fn env_script_has_claude_defaults_and_manifest_env() {
-        let s = env_script(&[
+        let s = Claude.env_script(&[
             ("CLAUDE_CODE_USE_VERTEX".into(), "1".into()),
             (
                 "ANTHROPIC_VERTEX_PROJECT_ID".into(),
@@ -364,13 +386,13 @@ mod tests {
     fn sandbox_args_inject_mcp_config_only_when_broker_on() {
         let a = args(&[]);
         // Not seeded: identical to the base args (ends with `-p`, no `--mcp-config`).
-        let off = sandbox_argv(&a, false);
+        let off = Claude.sandbox_argv(&a, false);
         assert_eq!(off, claude_base_args(&a));
         assert!(!off.iter().any(|s| s == "--mcp-config"));
         assert_eq!(off.last().unwrap(), "-p");
 
         // Seeded: `--mcp-config <path>` inserted right before the trailing `-p`.
-        let on = sandbox_argv(&a, true);
+        let on = Claude.sandbox_argv(&a, true);
         let i = on
             .iter()
             .position(|s| s == "--mcp-config")
@@ -382,7 +404,7 @@ mod tests {
     #[test]
     fn sandbox_args_keep_effort_and_mcp_config_before_prompt() {
         let a = args(&["--effort", "max"]);
-        let v = sandbox_argv(&a, true);
+        let v = Claude.sandbox_argv(&a, true);
         // Both flags land before the trailing `-p`; the prompt flag stays last.
         assert!(v.windows(2).any(|w| w == ["--effort", "max"]));
         assert!(v.iter().any(|s| s == "--mcp-config"));
@@ -429,9 +451,9 @@ mod tests {
     #[test]
     fn seed_files_only_when_broker_url_present() {
         let mut a = args(&[]);
-        assert!(seed_files(&a, None, None).is_empty());
+        assert!(seeds(&a, None, None).is_empty());
         a.broker.enabled = true;
-        let seeds = seed_files(&a, Some("http://host.containers.internal:8849/mcp"), None);
+        let seeds = seeds(&a, Some("http://host.containers.internal:8849/mcp"), None);
         assert_eq!(seeds.len(), 1);
         assert_eq!(seeds[0].dest, MCP_CONFIG);
         let v: serde_json::Value = serde_json::from_str(&seeds[0].content).expect("valid json");

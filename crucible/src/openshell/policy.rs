@@ -101,8 +101,8 @@ pub const IDENTITY_RELAY_KEYS: &[&str] = &[
     "GIT_COMMITTER_EMAIL",
 ];
 
-/// The harness's built-in endpoints (`defaults`, see
-/// `HarnessRuntime::default_endpoints`) plus the domain's extras, de-duplicated, order
+/// The harness's built-in endpoints (`defaults`, see [`default_endpoints`]) plus the domain's
+/// extras, de-duplicated, order
 /// preserved, then with `deny_endpoints` subtracted. With `inherit_defaults = false` the built-ins
 /// are dropped and only the domain's are allowed.
 ///
@@ -143,7 +143,7 @@ pub fn resolve_endpoints(
     out
 }
 
-/// The harness's agent-CLI binaries (`defaults`, see `HarnessRuntime::default_binaries`)
+/// The harness's agent-CLI binaries (`defaults`, see `HarnessSpec::binaries`)
 /// plus the domain's extras, de-duplicated, order preserved, then with `deny_binaries`
 /// subtracted. With `inherit_defaults = false` an unlisted agent CLI gets no network at all.
 pub fn resolve_binaries(cfg: &OpenshellCfg, defaults: &[&str]) -> Vec<String> {

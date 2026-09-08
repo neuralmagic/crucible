@@ -473,7 +473,11 @@ fn run_from_manifest(args: Args) -> Result<()> {
     // The toolbox lands where the resolved harness discovers skills (CLI `--harness` wins,
     // matching `apply_agent_cfg`'s resolution below).
     let harness = args.harness.unwrap_or(m.agent.harness);
-    crate::cli::workspace::install_toolbox(&p, &m.agent.toolbox_exclude, harness.skills_dir())?;
+    crate::cli::workspace::install_toolbox(
+        &p,
+        &m.agent.toolbox_exclude,
+        harness.spec().skills_dir,
+    )?;
 
     // Fold the manifest's [agent] config onto Args (+ spawn the broker for openshell).
     let mut args = args;
@@ -613,7 +617,11 @@ fn run_composite(args: Args, manifest_path: PathBuf) -> Result<()> {
     std::fs::create_dir_all(&p.state)
         .with_context(|| format!("creating state dir {}", p.state.display()))?;
     let harness = args.harness.unwrap_or(m.agent.harness);
-    crate::cli::workspace::install_toolbox(&p, &m.agent.toolbox_exclude, harness.skills_dir())?;
+    crate::cli::workspace::install_toolbox(
+        &p,
+        &m.agent.toolbox_exclude,
+        harness.spec().skills_dir,
+    )?;
 
     let mut args = args;
     // A composite has no single-repo [publish]; its forks are per component.
