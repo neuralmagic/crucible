@@ -1336,16 +1336,20 @@ exit $rc
         resources(self.profile)
     }
 
-    /// The spoke's `host_aliases` (hostname -> IP) as pod-spec hostAliases, grouped by IP with
-    /// hostnames sorted (BTreeMap order) so the render is deterministic. The DNS-dark tier.
+    /// Pod-spec `hostAliases` merged from the cluster profile and the spoke entry (if any),
+    /// grouped by IP with hostnames sorted (BTreeMap order) so the render is deterministic.
     fn host_aliases(&self) -> Option<Vec<core::HostAlias>> {
-        let (_, entry) = self.spoke.as_ref()?;
-        if entry.host_aliases.is_empty() {
-            return None;
-        }
         let mut by_ip: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-        for (hostname, ip) in &entry.host_aliases {
+        for (hostname, ip) in &self.profile.cluster.host_aliases {
             by_ip.entry(ip.as_str()).or_default().push(hostname.clone());
+        }
+        if let Some((_, entry)) = self.spoke.as_ref() {
+            for (hostname, ip) in &entry.host_aliases {
+                by_ip.entry(ip.as_str()).or_default().push(hostname.clone());
+            }
+        }
+        if by_ip.is_empty() {
+            return None;
         }
         Some(
             by_ip

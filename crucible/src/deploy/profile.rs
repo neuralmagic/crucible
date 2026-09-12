@@ -228,6 +228,8 @@ pub struct Cluster {
     /// restricted PSA/SCC instead of scheduling it. Requires an SCC that permits them.
     #[serde(default)]
     pub buildah_capabilities: bool,
+    #[serde(default)]
+    pub host_aliases: BTreeMap<String, String>,
 }
 
 /// `state_pvc = "name"` (existing claim) or a `[cluster.state_pvc]` template.
@@ -431,6 +433,26 @@ mod tests {
         );
         let profile: DeployProfile = toml::from_str(&text).expect("profile parses");
         assert_eq!(profile.cluster.avoid_nodes, vec!["g12e022", "g12e099"]);
+    }
+
+    #[test]
+    fn cluster_host_aliases_parse_and_default_empty() {
+        let profile: DeployProfile = toml::from_str(BASE).expect("profile parses");
+        assert!(profile.cluster.host_aliases.is_empty());
+
+        let text = BASE.replace(
+            "[image]",
+            "[cluster.host_aliases]\n\"maas.example.com\" = \"10.0.0.1\"\n\n[image]",
+        );
+        let profile: DeployProfile = toml::from_str(&text).expect("profile parses");
+        assert_eq!(
+            profile
+                .cluster
+                .host_aliases
+                .get("maas.example.com")
+                .map(String::as_str),
+            Some("10.0.0.1")
+        );
     }
 
     fn tempdir(name: &str) -> std::path::PathBuf {
