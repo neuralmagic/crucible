@@ -20,7 +20,8 @@ use openshell_core::proto::{
     SandboxSpec, SandboxTemplate, ServiceStatus, UpdateConfigRequest, UpdateProviderRequest,
     exec_sandbox_event::Payload as ExecPayload, policy_merge_operation::Operation as MergeOp,
 };
-use std::collections::HashMap;
+use prost_types::{Struct, Value, value::Kind};
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
@@ -477,10 +478,19 @@ impl Gateway {
         labels: &[(String, String)],
         read_only_paths: &[String],
     ) -> Result<()> {
-        let template = image.map(|img| SandboxTemplate {
-            image: img.to_string(),
-            ..SandboxTemplate::default()
-        });
+        let driver_config = Self::sandbox_host_aliases_driver_config()?;
+        let template = match (image, driver_config) {
+            (Some(img), driver_config) => Some(SandboxTemplate {
+                image: img.to_string(),
+                driver_config,
+                ..SandboxTemplate::default()
+            }),
+            (None, Some(driver_config)) => Some(SandboxTemplate {
+                driver_config: Some(driver_config),
+                ..SandboxTemplate::default()
+            }),
+            (None, None) => None,
+        };
         // The filesystem half of the policy is STATIC: the gateway refuses to change it after
         // creation, so it rides the create request. The network half stays absent here and is
         // merged in afterwards by `update_policy_wait` (merge ops are additive, and only network
@@ -504,6 +514,57 @@ impl Gateway {
             .await
             .map_err(GrpcError::rpc(format!("create_sandbox({name})")))?;
         self.wait_ready(name).await
+    }
+
+    /// Carry the deployment profile's DNS-dark host aliases into the selected OpenShell
+    /// Kubernetes driver's sandbox template. The public API wraps selected-driver config
+    /// under the driver name; the driver then renders these names as pod-spec hostAliases.
+    fn sandbox_host_aliases_driver_config() -> Result<Option<Struct>> {
+        let Ok(raw) = std::env::var("CRUCIBLE_SANDBOX_HOST_ALIASES") else {
+            return Ok(None);
+        };
+        let aliases: BTreeMap<String, String> =
+            serde_json::from_str(&raw).context("parsing CRUCIBLE_SANDBOX_HOST_ALIASES")?;
+        if aliases.is_empty() {
+            return Ok(None);
+        }
+
+        let alias_fields = aliases
+            .into_iter()
+            .map(|(hostname, ip)| {
+                (
+                    hostname,
+                    Value {
+                        kind: Some(Kind::StringValue(ip)),
+                    },
+                )
+            })
+            .collect();
+        let pod = Struct {
+            fields: BTreeMap::from([(
+                "pod".to_string(),
+                Value {
+                    kind: Some(Kind::StructValue(Struct {
+                        fields: BTreeMap::from([(
+                            "host_aliases".to_string(),
+                            Value {
+                                kind: Some(Kind::StructValue(Struct {
+                                    fields: alias_fields,
+                                })),
+                            },
+                        )]),
+                    })),
+                },
+            )]),
+        };
+        Ok(Some(Struct {
+            fields: BTreeMap::from([(
+                "kubernetes".to_string(),
+                Value {
+                    kind: Some(Kind::StructValue(pod)),
+                },
+            )]),
+        }))
     }
 
     /// Poll `GetSandbox` until the sandbox is `Ready` (or `Error`/timeout). A fresh create starts
@@ -1519,6 +1580,29 @@ pYBZ
     #[test]
     fn no_declared_paths_sends_no_policy() {
         assert!(sandbox_filesystem_policy(&[]).is_none());
+    }
+
+    #[test]
+    fn sandbox_host_aliases_are_wrapped_for_the_kubernetes_driver() {
+        let _guard = crate::test_support::env_lock();
+        unsafe {
+            std::env::set_var(
+                "CRUCIBLE_SANDBOX_HOST_ALIASES",
+                r#"{"maas.example.com":"10.0.0.8"}"#,
+            );
+        }
+        let config = Gateway::sandbox_host_aliases_driver_config()
+            .expect("host aliases should parse")
+            .expect("configured aliases should produce driver config");
+        unsafe {
+            std::env::remove_var("CRUCIBLE_SANDBOX_HOST_ALIASES");
+        }
+
+        let value = openshell_core::proto_struct::struct_to_json_value(&config);
+        assert_eq!(
+            value["kubernetes"]["pod"]["host_aliases"]["maas.example.com"],
+            "10.0.0.8"
+        );
     }
 
     #[test]

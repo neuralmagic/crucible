@@ -1,0 +1,34 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-09-12-001"
+title = "Propagate DNS-dark host aliases into OpenShell sandboxes"
+status = "active"
+created = "2026-09-12"
+started = "2026-09-12"
+refs = ["ADR-0015"]
+
+[content]
+description = "Carry declarative DNS-dark host aliases from the Crucible deployment profile into OpenShell Kubernetes sandbox pods. This closes the reachability gap for TLS-preserving external inference endpoints whose names resolve in neither the loop pod nor the sibling sandbox pod."
+
+[[content.acceptance_criteria]]
+text = "deployment-profile host aliases are projected to the loop and turn runtime so the engine can pass them to sandbox creation"
+status = "pending"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "OpenShell Kubernetes sandbox pod specs render custom hostAliases alongside the existing gateway aliases"
+status = "pending"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "focused Rust tests and formatting cover alias propagation and preserve the no-alias behavior"
+status = "pending"
+category = "chore"
+
+[verification]
+required_guards = [
+    "GUARD-CARGO-FMT",
+    "GUARD-CARGO-CLIPPY",
+    "GUARD-CARGO-TEST",
+]
