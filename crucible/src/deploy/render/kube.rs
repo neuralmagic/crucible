@@ -1744,6 +1744,11 @@ pub(super) fn kubernetes_sandbox_env(
             profile.image.pull_secret.clone(),
         ));
     }
+    if !profile.cluster.host_aliases.is_empty() {
+        let aliases = serde_json::to_string(&profile.cluster.host_aliases)
+            .expect("host aliases are JSON-serializable strings");
+        env.push(plain("CRUCIBLE_SANDBOX_HOST_ALIASES", aliases));
+    }
     env.push(plain(
         "CRUCIBLE_SANDBOX_APP_ARMOR_PROFILE",
         "Unconfined".to_string(),
