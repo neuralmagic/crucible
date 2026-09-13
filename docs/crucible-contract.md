@@ -55,6 +55,13 @@ goal          = "raise the score"             # OR goal_file = "goals/x.md" (man
 toolbox_dir   = "commands"                    # optional; copied into <workspace>/.claude/skills
 backend       = "local"                       # local | openshell | command   (see §6)
 sandbox_image = "ghcr.io/<org>/<domain>-sandbox:<tag>"  # openshell backend only
+allow_unverified_image = false            # launch on an image the controller's catalog cannot vouch for
+
+[agent.requires]                          # what the sandbox image must provide; the controller refuses a launch otherwise
+"toolchain.go" = ">=1.25"
+
+[agent.prefers]                           # ranks compatible images in the controller's picker
+"toolchain.go" = ">=1.26"
 agent_cmd     = "..."                          # command backend only (§6)
 [agent.env]                                   # injected into the agent process (creds, Vertex, etc.)
 ANTHROPIC_VERTEX_PROJECT_ID = "my-gcp-project"
