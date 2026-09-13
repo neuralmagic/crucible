@@ -677,6 +677,18 @@ pub struct AgentCfg {
     pub backend: AgentBackend,
     #[serde(default)]
     pub sandbox_image: Option<String>,
+    /// Capability predicates the sandbox image must provide, predicate -> semver range
+    /// (`"toolchain.go" = ">=1.25"`). Read by the controller's launch preflight against the
+    /// image's `io.crucible.capabilities.v1` document; the engine carries them unread.
+    #[serde(default)]
+    pub requires: BTreeMap<String, String>,
+    /// Predicates that rank compatible images in the controller's picker; never refuse a launch.
+    #[serde(default)]
+    pub prefers: BTreeMap<String, String>,
+    /// Launch on an image the controller's catalog does not know or that carries no capability
+    /// document, instead of being refused at preflight.
+    #[serde(default)]
+    pub allow_unverified_image: bool,
     #[serde(default)]
     pub agent_cmd: Option<String>,
     #[serde(default)]
@@ -2763,5 +2775,35 @@ dst = "traces/median_block.txt"
             ),
             "{err:#}"
         );
+    }
+}
+
+#[cfg(test)]
+mod agent_requires_tests {
+    use crate::manifest::AgentCfg;
+
+    #[test]
+    fn requires_prefers_and_the_override_parse_and_default_empty() {
+        let agent: AgentCfg = toml::from_str(
+            r#"
+            backend = "openshell"
+            sandbox_image = "ghcr.io/acme/sandbox-go-cc:latest"
+            allow_unverified_image = true
+
+            [requires]
+            "toolchain.go" = ">=1.25"
+
+            [prefers]
+            "toolchain.go" = ">=1.26"
+            "#,
+        )
+        .expect("parses");
+        assert_eq!(agent.requires["toolchain.go"], ">=1.25");
+        assert_eq!(agent.prefers["toolchain.go"], ">=1.26");
+        assert!(agent.allow_unverified_image);
+
+        let bare: AgentCfg = toml::from_str("backend = \"local\"\n").expect("parses");
+        assert!(bare.requires.is_empty() && bare.prefers.is_empty());
+        assert!(!bare.allow_unverified_image);
     }
 }
