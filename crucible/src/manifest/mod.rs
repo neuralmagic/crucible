@@ -571,7 +571,8 @@ pub fn apply_inject(src: &Path, dst: &Path) -> Result<()> {
 
 /// Which agent harness runs the turn. `claude` is the default everywhere; `hermes` (Nous
 /// Research's hermes-agent) and `codex` (OpenAI's Codex CLI) are selected per-domain for harness
-/// ablations.
+/// ablations; `opencode` and `pi` are the harnesses that speak OpenAI Chat Completions to an
+/// endpoint that offers nothing else, which the newer claude and codex CLIs cannot.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Harness {
@@ -579,6 +580,9 @@ pub enum Harness {
     Claude,
     Hermes,
     Codex,
+    #[value(name = "opencode")]
+    OpenCode,
+    Pi,
 }
 
 impl Harness {
@@ -588,6 +592,18 @@ impl Harness {
             Harness::Claude => "claude-opus-4-6",
             Harness::Hermes => "claude-opus-4-6",
             Harness::Codex => "gpt-5.6-sol",
+            Harness::OpenCode | Harness::Pi => "claude-opus-4-6",
+        }
+    }
+
+    /// The manifest and CLI spelling of the harness.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Harness::Claude => "claude",
+            Harness::Hermes => "hermes",
+            Harness::Codex => "codex",
+            Harness::OpenCode => "opencode",
+            Harness::Pi => "pi",
         }
     }
 }

@@ -5,7 +5,7 @@ A crucible run uses two pods, and a domain that needs a toolchain has to put it 
 | Pod | What runs there | Base image | Derive with |
 | --- | --- | --- | --- |
 | loop pod | the engine, `setup_cmd`, `measure_cmd`, `[judge.selftest]`, git memory | `ghcr.io/neuralmagic/crucible` (`Containerfile.runtime`) | `Containerfile.runtime-<domain>` |
-| agent sandbox | the agent turn (`claude`/`codex` + whatever the agent shells) | `quay.io/aipcc/agentic-ci/claude-sandbox` | `Containerfile.sandbox-<domain>` |
+| agent sandbox | the agent turn (`claude`/`codex`/`opencode`/`pi` + whatever the agent shells) | `quay.io/aipcc/agentic-ci/claude-sandbox` | `Containerfile.sandbox-<domain>` |
 
 The runtime image is domain-neutral on purpose: it ships `gcc`, `openssl-devel`, `python3`,
 `git`, `jq`, and nothing else a measure might want. The sandbox ships the agent CLI and

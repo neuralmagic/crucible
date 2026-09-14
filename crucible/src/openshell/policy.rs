@@ -65,13 +65,19 @@ pub const CODEX_ENDPOINTS: &[&str] = &[
     "ab.chatgpt.com:443:full",
 ];
 
+/// The one OpenAI host a key-authenticated harness (opencode, pi) reaches when no custom base URL
+/// redirects it; a custom endpoint's host is added per turn from `OPENAI_BASE_URL` instead.
+pub const OPENAI_API_ENDPOINTS: &[&str] = &["api.openai.com:443:full"];
+
 /// The egress allowlist built-ins for `harness`: the shared defaults, plus the model backend's
 /// own hosts for a harness that does not talk to Vertex. Per-harness so a claude turn's allowlist
 /// never grows the OpenAI hosts a codex turn needs.
 pub fn default_endpoints(harness: Harness) -> Vec<&'static str> {
     let mut out = DEFAULT_ENDPOINTS.to_vec();
-    if harness == Harness::Codex {
-        out.extend_from_slice(CODEX_ENDPOINTS);
+    match harness {
+        Harness::Codex => out.extend_from_slice(CODEX_ENDPOINTS),
+        Harness::OpenCode | Harness::Pi => out.extend_from_slice(OPENAI_API_ENDPOINTS),
+        Harness::Claude | Harness::Hermes => {}
     }
     out
 }
