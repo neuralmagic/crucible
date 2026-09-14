@@ -69,6 +69,9 @@ impl WireApi {
 pub struct InferenceEnv {
     pub anthropic_key: Option<String>,
     pub anthropic_base_url: Option<String>,
+    /// The OpenAI-speaking key a key-authenticated harness (opencode, pi) relays into the sandbox;
+    /// codex selects its own key by name through `[agent.codex]` instead.
+    pub openai_key: Option<String>,
     pub openai_base_url: Option<String>,
     pub wire_api: Option<WireApi>,
 }
@@ -87,6 +90,7 @@ impl InferenceEnv {
         let env = InferenceEnv {
             anthropic_key: non_empty(ANTHROPIC_API_KEY),
             anthropic_base_url: non_empty(ANTHROPIC_BASE_URL),
+            openai_key: non_empty(OPENAI_API_KEY_ENV),
             openai_base_url: non_empty(OPENAI_BASE_URL),
             wire_api: non_empty(WIRE_API)
                 .map(|w| WireApi::parse(&w))
@@ -103,11 +107,17 @@ impl InferenceEnv {
         Ok(env)
     }
 
-    /// The custom base URL the harness will talk to, if any.
+    /// The custom base URL the harness will talk to, if any. A harness that speaks both API
+    /// families (opencode, pi) takes the OpenAI one first, the same precedence
+    /// `crate::agent::harness::api_endpoint` resolves its provider by.
     pub fn base_url_for(&self, harness: Harness) -> Option<&str> {
         match harness {
             Harness::Claude | Harness::Hermes => self.anthropic_base_url.as_deref(),
             Harness::Codex => self.openai_base_url.as_deref(),
+            Harness::OpenCode | Harness::Pi => self
+                .openai_base_url
+                .as_deref()
+                .or(self.anthropic_base_url.as_deref()),
         }
     }
 

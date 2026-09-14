@@ -77,6 +77,11 @@ pub enum OpenshellCliError {
         "workspace retrieval failed after bounded retry; sandbox '{sandbox}' was preserved for operator recovery: {detail}"
     )]
     WorkspaceRecovery { sandbox: String, detail: String },
+    #[error(
+        "the {harness} harness authenticates with a direct API key, and neither OPENAI_API_KEY \
+         nor ANTHROPIC_API_KEY is set"
+    )]
+    NoApiKey { harness: &'static str },
 }
 use crucible_harness::OtelCollector;
 use std::sync::atomic::Ordering;
@@ -307,6 +312,15 @@ async fn try_turn(
             SandboxAuth::Gateway
         }
         AuthProvider::AnthropicKey => SandboxAuth::AnthropicKey,
+        AuthProvider::ApiKey => {
+            if inference.openai_key.is_none() && inference.anthropic_key.is_none() {
+                return Err(OpenshellCliError::NoApiKey {
+                    harness: harness.as_str(),
+                }
+                .into());
+            }
+            SandboxAuth::ApiKey
+        }
         AuthProvider::Codex => SandboxAuth::Codex(match selected_codex_api_key(&args.codex)? {
             Some(key) => provider::CodexAuth::ApiKey(key),
             None => provider::CodexAuth::ChatGpt(
@@ -368,7 +382,7 @@ async fn try_turn(
     ];
     let mut providers = match auth {
         AuthProvider::Vertex => vec![provider::PROVIDER_NAME.to_string()],
-        AuthProvider::Codex | AuthProvider::AnthropicKey => Vec::new(),
+        AuthProvider::Codex | AuthProvider::AnthropicKey | AuthProvider::ApiKey => Vec::new(),
     };
     if aws_provider {
         providers.push(provider::AWS_PROVIDER_NAME.to_string());
@@ -656,7 +670,7 @@ async fn try_turn(
                     }
                 }
             })),
-            AuthProvider::Codex | AuthProvider::AnthropicKey => None,
+            AuthProvider::Codex | AuthProvider::AnthropicKey | AuthProvider::ApiKey => None,
         };
         let decoder = backend.decoder(
             args,
@@ -1027,7 +1041,8 @@ async fn publish_workspace(staged: &std::path::Path, workspace: &std::path::Path
 /// Vertex selectors the manifest set (Claude Code prefers Vertex whenever they are present), and
 /// a custom base URL rides under the name its harness reads. Codex reads a custom endpoint's key
 /// from the environment where the built-in provider reads `auth.json`, so the key is exported only
-/// in that case.
+/// in that case. A key-authenticated harness (opencode, pi) gets every key and base URL the env
+/// carries: its seeded provider table names which variable it reads.
 pub(crate) fn inference_env(
     env: &mut Vec<(String, String)>,
     harness: Harness,
@@ -1060,6 +1075,30 @@ pub(crate) fn inference_env(
                         crate::agent::inference::OPENAI_API_KEY_ENV,
                         key.as_str(),
                     );
+                }
+            }
+        }
+        Harness::OpenCode | Harness::Pi => {
+            for (key, value) in [
+                (
+                    crate::agent::inference::OPENAI_API_KEY_ENV,
+                    &inference.openai_key,
+                ),
+                (
+                    crate::agent::inference::OPENAI_BASE_URL,
+                    &inference.openai_base_url,
+                ),
+                (
+                    crate::agent::inference::ANTHROPIC_API_KEY,
+                    &inference.anthropic_key,
+                ),
+                (
+                    crate::agent::inference::ANTHROPIC_BASE_URL,
+                    &inference.anthropic_base_url,
+                ),
+            ] {
+                if let Some(v) = value.as_deref() {
+                    set(env, key, v);
                 }
             }
         }

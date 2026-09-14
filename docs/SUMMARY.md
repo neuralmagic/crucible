@@ -22,6 +22,7 @@
 - [Workflow DSL reference](./dsl-reference.md)
 - [Hand-rolled codegen pipelines](./hand-rolled-pipelines.md)
 - [The codex harness](./codex-harness.md)
+- [The opencode and pi harnesses](./opencode-pi-harnesses.md)
 - [The OpenShell fork](./openshell-fork.md)
 - [JIRA tools (mediated)](./jira-proxy.md)
 

@@ -12,7 +12,7 @@
 
 use crate::agent::harness::{
     AuthProvider, Backend, Broker, HarnessSpec, SandboxAuth, SeedFile, StreamDecoder,
-    TranscriptLocator, TurnArtifacts,
+    TranscriptLocator, TurnArtifacts, json_str,
 };
 use crate::agent::inference::InferenceEnv;
 use crate::args::Args;
@@ -290,15 +290,6 @@ fn payload_type(payload: &Value) -> &str {
     payload.get("type").and_then(Value::as_str).unwrap_or("")
 }
 
-/// A payload's string field, empty when absent.
-fn field(payload: &Value, key: &str) -> String {
-    payload
-        .get(key)
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string()
-}
-
 /// Tool spans recovered from the downloaded rollout JSONL. The live stream is the turn's source of
 /// result + cost (`backfill_required` is false), so an unreadable rollout costs only trace detail.
 fn rollout_spans(content: &[u8]) -> TurnArtifacts {
@@ -312,10 +303,10 @@ fn rollout_spans(content: &[u8]) -> TurnArtifacts {
         }
         match payload_type(&line.payload) {
             "custom_tool_call" => {
-                let input = field(&line.payload, "input");
-                let name = tool_name(&input, &field(&line.payload, "name"));
-                let status = field(&line.payload, "status");
-                by_id.insert(field(&line.payload, "call_id"), order.len());
+                let input = json_str(&line.payload, "input");
+                let name = tool_name(&input, &json_str(&line.payload, "name"));
+                let status = json_str(&line.payload, "status");
+                by_id.insert(json_str(&line.payload, "call_id"), order.len());
                 order.push(ToolInvocation {
                     name: name.clone(),
                     start: line.at,
@@ -325,7 +316,7 @@ fn rollout_spans(content: &[u8]) -> TurnArtifacts {
                 });
             }
             "custom_tool_call_output" => {
-                if let Some(i) = by_id.get(&field(&line.payload, "call_id")).copied()
+                if let Some(i) = by_id.get(&json_str(&line.payload, "call_id")).copied()
                     && let Some(call) = order.get_mut(i)
                 {
                     call.end = Some(line.at);
@@ -368,7 +359,7 @@ fn call_summary(name: &str, input: &str, redact: bool) -> String {
     let hint = match name {
         "shell" => first_json_object(input)
             .as_ref()
-            .map(|o| field(o, "cmd"))
+            .map(|o| json_str(o, "cmd"))
             .filter(|c| !c.is_empty())
             .unwrap_or_else(|| first_line(input)),
         "apply_patch" => {
@@ -462,7 +453,7 @@ fn rollout_records(content: &[u8]) -> Vec<GenAiRecord> {
     let mut out = Vec::new();
     for line in rollout_lines(&text) {
         if line.kind == "turn_context" {
-            let m = field(&line.payload, "model");
+            let m = json_str(&line.payload, "model");
             if !m.is_empty() {
                 model = Some(m);
             }
@@ -476,7 +467,7 @@ fn rollout_records(content: &[u8]) -> Vec<GenAiRecord> {
                 let Some(content) = body(&message_text(&line.payload), redact) else {
                     continue;
                 };
-                match field(&line.payload, "role").as_str() {
+                match json_str(&line.payload, "role").as_str() {
                     "developer" | "system" => out.push(GenAiRecord::System { content }),
                     "user" => out.push(GenAiRecord::User { content }),
                     "assistant" => out.push(GenAiRecord::Assistant {
@@ -489,20 +480,20 @@ fn rollout_records(content: &[u8]) -> Vec<GenAiRecord> {
                 }
             }
             "custom_tool_call" => {
-                let input = field(&line.payload, "input");
+                let input = json_str(&line.payload, "input");
                 out.push(GenAiRecord::Assistant {
                     text: None,
                     reasoning: None,
                     tool_calls: vec![ToolCall {
-                        id: field(&line.payload, "call_id"),
-                        name: tool_name(&input, &field(&line.payload, "name")),
+                        id: json_str(&line.payload, "call_id"),
+                        name: tool_name(&input, &json_str(&line.payload, "name")),
                         arguments: body(&input, redact).unwrap_or_default(),
                     }],
                     model: model.clone(),
                 });
             }
             "custom_tool_call_output" => out.push(GenAiRecord::Tool {
-                id: field(&line.payload, "call_id"),
+                id: json_str(&line.payload, "call_id"),
                 content: body(&message_text(&line.payload), redact).unwrap_or_default(),
                 is_error: false,
             }),
