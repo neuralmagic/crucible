@@ -1,5 +1,5 @@
-//! The pi arm of the harness boundary: Pi (Mario Zechner's coding agent) as a harness for an
-//! endpoint that speaks only OpenAI Chat Completions (or a direct Anthropic/OpenAI key).
+//! The pi arm of the harness boundary: Pi (pi.dev) as a harness for an endpoint that speaks only
+//! OpenAI Chat Completions (or a direct Anthropic/OpenAI key).
 //!
 //! `pi --mode json --print` emits a complete type-tagged JSONL event stream from its own
 //! process, so the live decoder carries the turn's result and token usage and

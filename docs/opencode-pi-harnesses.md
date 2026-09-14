@@ -2,11 +2,11 @@
 
 `crucible --harness opencode` or `--harness pi` (or `[agent].harness = "opencode" | "pi"`) runs
 the turn with [OpenCode](https://opencode.ai) or [Pi](https://pi.dev) instead of Claude Code.
-Both exist for one reason: an inference endpoint that speaks only OpenAI Chat Completions. The
-newer Claude Code and Codex CLIs cannot talk to such an endpoint (Claude Code needs the Messages
-API, Codex the Responses API), and these two can. Everything downstream of the decoder is
-unchanged: the turn still emits `AgentEvent` NDJSON, and keep/discard still reads the same
-`Result`.
+Both exist for one reason: an inference endpoint that speaks only OpenAI Chat Completions. Claude
+Code speaks the Anthropic Messages API, and Codex dropped its `chat` wire API in early 2026 and
+speaks only the Responses API, so neither can drive such an endpoint; these two can. Everything
+downstream of the decoder is unchanged: the turn still emits `AgentEvent` NDJSON, and
+keep/discard still reads the same `Result`.
 
 ```toml
 [agent]
@@ -41,7 +41,8 @@ through `{env:OPENAI_API_KEY}`, pi gets a `models.json` with the `crucible` prov
   silently starting fresh.
 - **No OTEL.** Cost is the endpoint's own number when the CLI priced the model (it never does for
   the `crucible` provider) and otherwise the pricing-table estimate over the token usage the stream
-  reports.
+  reports. OpenCode also spends one extra model request per turn generating the session's title,
+  which its export counts in the turn's usage.
 - **Egress.** Both add `api.openai.com` to the sandbox allowlist; a custom base URL's host is added
   per turn as it is for codex. A claude turn's allowlist is unchanged.
 - **Pi has no MCP client.** The provisioning broker is unreachable from a pi turn, so a pack whose
