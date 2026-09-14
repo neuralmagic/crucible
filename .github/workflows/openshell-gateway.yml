@@ -111,14 +111,18 @@ jobs:
           fetch-depth: 0
 
       # The release tags describe needs live on UPSTREAM nvidia/OpenShell; the fork's own tags
-      # are stale, so actions/checkout's fetch-tags would not help. Refspecs only support `*`
-      # globs (no character classes), so fetch all v* tags; build.rs's
-      # `git describe --match 'v[0-9]*'` still excludes non-release tags at describe time.
+      # are stale, so actions/checkout's fetch-tags would not help. Do not fetch every v* tag
+      # directly: upstream also has non-release tags such as vm-runtime, which collide with tags
+      # already present in the fork. Resolve only numeric release tags and fetch them by SHA.
       - name: Fetch upstream release tags for the version stamp
         if: steps.exists.outputs.skip != 'true'
         run: |
-          git -C openshell-src fetch --no-tags https://github.com/nvidia/OpenShell \
-            'refs/tags/v*:refs/tags/v*'
+          upstream=https://github.com/nvidia/OpenShell
+          mapfile -t release_tags < <(
+            git ls-remote --tags --refs "$upstream" 'refs/tags/v*' \
+              | awk '$2 ~ /^refs\/tags\/v[0-9]/ { print $1 ":" $2 }'
+          )
+          git -C openshell-src fetch --no-tags "$upstream" "${release_tags[@]}"
 
       # Cache only. The toolchain the fork build actually uses is its rust-toolchain.toml pin,
       # auto-installed by rustup on the first cargo run in openshell-src; a `target:` here
