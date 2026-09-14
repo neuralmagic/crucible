@@ -513,11 +513,12 @@ async fn try_turn(
                 }
             }));
         }
-        gw.update_policy_wait(
+        gw.update_policy_wait_with_tls_skip(
             &name,
             &policy::resolve_binaries(&args.openshell, harness.spec().binaries),
             &endpoints,
             &credential_bindings,
+            &args.openshell.tls_skip_endpoints,
         )
         .await
         .context("applying the sandbox egress policy")?;

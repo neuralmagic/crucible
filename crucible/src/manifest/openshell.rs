@@ -14,6 +14,13 @@ pub struct OpenshellCfg {
     /// e.g. `"aiplatform.googleapis.com:443:read-write"`.
     #[serde(default)]
     pub endpoints: Vec<String>,
+    /// Endpoints whose HTTPS traffic must pass through as an opaque TLS tunnel.
+    ///
+    /// This is for private endpoints with a certificate that the OpenShell upstream
+    /// proxy cannot validate. The agent still validates the endpoint certificate, so
+    /// its trust store must contain the endpoint's CA. Entries are exact `host:port`.
+    #[serde(default)]
+    pub tls_skip_endpoints: Vec<String>,
     /// Binaries allowed to open egress, merged with the agent CLI. Descendants inherit a
     /// parent's egress, so usually only the root agent needs listing.
     #[serde(default)]
@@ -64,6 +71,7 @@ impl Default for OpenshellCfg {
     fn default() -> Self {
         Self {
             endpoints: Vec::new(),
+            tls_skip_endpoints: Vec::new(),
             binaries: Vec::new(),
             inherit_defaults: true,
             deny_endpoints: Vec::new(),
@@ -105,10 +113,15 @@ mod tests {
             [agent.openshell]
             inherit_defaults = false
             endpoints = [\"registry.internal:443:read-only\"]
+            tls_skip_endpoints = [\"registry.internal:443\"]
             binaries = [\"/usr/local/bin/claude\"]
         "
         ))
         .unwrap();
         assert!(!m.agent.openshell.inherit_defaults);
+        assert_eq!(
+            m.agent.openshell.tls_skip_endpoints,
+            ["registry.internal:443"]
+        );
     }
 }

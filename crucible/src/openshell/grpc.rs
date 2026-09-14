@@ -942,7 +942,34 @@ impl Gateway {
         endpoints: &[String],
         credential_bindings: &[EndpointCredentialBinding],
     ) -> Result<()> {
-        let merge_operations = build_merge_operations(binaries, endpoints, credential_bindings)?;
+        self.update_policy_wait_with_tls_skip(name, binaries, endpoints, credential_bindings, &[])
+            .await
+    }
+
+    /// Push the egress policy while allowing selected HTTPS endpoints to bypass the
+    /// upstream TLS inspector. The sandbox still owns client-side certificate validation.
+    #[tracing::instrument(skip_all, fields(
+        rpc = "update_config",
+        phase = "policy_wait",
+        sandbox = name,
+        attempts = tracing::field::Empty,
+        elapsed_ms = tracing::field::Empty,
+        outcome = tracing::field::Empty,
+    ))]
+    pub async fn update_policy_wait_with_tls_skip(
+        &self,
+        name: &str,
+        binaries: &[String],
+        endpoints: &[String],
+        credential_bindings: &[EndpointCredentialBinding],
+        tls_skip_endpoints: &[String],
+    ) -> Result<()> {
+        let merge_operations = build_merge_operations_with_tls_skip(
+            binaries,
+            endpoints,
+            credential_bindings,
+            tls_skip_endpoints,
+        )?;
         let version = self
             .client()
             .update_config(UpdateConfigRequest {
@@ -1213,11 +1240,25 @@ pub struct EndpointCredentialBinding {
 /// Build the incremental `UpdateConfig` merge operations: one add-rule per endpoint, each rule
 /// carrying every agent binary. Mirrors the CLI's `policy update --binary … --add-endpoint …`
 /// plan (the binaries attach to each added rule; descendants inherit egress from a parent).
+#[cfg(test)]
 fn build_merge_operations(
     binaries: &[String],
     endpoints: &[String],
     credential_bindings: &[EndpointCredentialBinding],
 ) -> Result<Vec<PolicyMergeOperation>> {
+    build_merge_operations_with_tls_skip(binaries, endpoints, credential_bindings, &[])
+}
+
+fn build_merge_operations_with_tls_skip(
+    binaries: &[String],
+    endpoints: &[String],
+    credential_bindings: &[EndpointCredentialBinding],
+    tls_skip_endpoints: &[String],
+) -> Result<Vec<PolicyMergeOperation>> {
+    let tls_skip_endpoints = tls_skip_endpoints
+        .iter()
+        .map(|spec| parse_tls_skip_endpoint(spec).map_err(anyhow::Error::from))
+        .collect::<Result<Vec<_>>>()?;
     let net_binaries: Vec<NetworkBinary> = dedup(binaries)
         .into_iter()
         .map(|path| NetworkBinary {
@@ -1229,6 +1270,12 @@ fn build_merge_operations(
         .iter()
         .map(|spec| {
             let mut endpoint = parse_endpoint_spec(spec)?;
+            if tls_skip_endpoints
+                .iter()
+                .any(|(host, port)| endpoint.host == *host && endpoint.port == *port)
+            {
+                endpoint.tls = "skip".to_string();
+            }
             if let Some(b) = credential_bindings
                 .iter()
                 .find(|b| endpoint.host == b.host && endpoint.port == b.port)
@@ -1254,6 +1301,39 @@ fn build_merge_operations(
             })
         })
         .collect()
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("TLS-skip endpoint '{spec}' must be host:port with a port in 1..=65535")]
+struct InvalidTlsSkipEndpoint {
+    spec: String,
+}
+
+fn parse_tls_skip_endpoint(
+    spec: &str,
+) -> std::result::Result<(String, u32), InvalidTlsSkipEndpoint> {
+    let mut parts = spec.split(':');
+    let host = parts
+        .next()
+        .filter(|host| !host.is_empty() && !host.contains(char::is_whitespace))
+        .ok_or_else(|| InvalidTlsSkipEndpoint {
+            spec: spec.to_string(),
+        })?;
+    let port = parts
+        .next()
+        .ok_or_else(|| InvalidTlsSkipEndpoint {
+            spec: spec.to_string(),
+        })?
+        .parse::<u32>()
+        .map_err(|_| InvalidTlsSkipEndpoint {
+            spec: spec.to_string(),
+        })?;
+    if parts.next().is_some() || port == 0 || port > 65535 {
+        return Err(InvalidTlsSkipEndpoint {
+            spec: spec.to_string(),
+        });
+    }
+    Ok((host.to_string(), port))
 }
 
 /// The rule name the CLI generates for an endpoint (`allow_<host>_<port>`, host punctuation
@@ -1645,6 +1725,37 @@ pYBZ
         assert!(parse_endpoint_spec("host:443:full:ftp").is_err());
         // enforcement without a protocol segment is rejected.
         assert!(parse_endpoint_spec("host:443:full::enforce").is_err());
+    }
+
+    #[test]
+    fn merge_operations_mark_selected_endpoints_as_tls_skip() {
+        let ops = build_merge_operations_with_tls_skip(
+            &[],
+            &[
+                "maas.example:443:full".to_string(),
+                "github.com:443:full".to_string(),
+            ],
+            &[],
+            &["maas.example:443".to_string()],
+        )
+        .unwrap();
+        let endpoints: Vec<&NetworkEndpoint> = ops
+            .iter()
+            .filter_map(|op| match &op.operation {
+                Some(MergeOp::AddRule(add)) => add.rule.as_ref()?.endpoints.first(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(endpoints[0].tls, "skip");
+        assert_eq!(endpoints[1].tls, "");
+    }
+
+    #[test]
+    fn tls_skip_endpoint_requires_exact_host_and_port() {
+        assert!(parse_tls_skip_endpoint("maas.example").is_err());
+        assert!(parse_tls_skip_endpoint("maas.example:notaport").is_err());
+        assert!(parse_tls_skip_endpoint("maas.example:443:extra").is_err());
+        assert!(parse_tls_skip_endpoint("maas.example:0").is_err());
     }
 
     #[test]
