@@ -70,7 +70,8 @@ claude's and codex's.
 
 ## Sandbox images
 
-The sandbox needs the CLI on the egress binary allowlist: `/usr/local/bin/opencode` must resolve
-to the native opencode binary (npm's launcher never opens the socket itself), and
-`/usr/local/bin/pi` is the npm-installed `pi` launcher. The `opencode` and `pi` features of the
-controller's image feedstock install exactly that.
+The sandbox needs the process that opens the socket on the egress binary allowlist, which
+OpenShell matches by the kernel-resolved binary: `/usr/local/bin/opencode` must resolve to the
+native opencode binary (npm's launcher never opens the socket itself), and pi is a node script,
+so its allowlist carries `/usr/bin/node` and `/usr/local/bin/node` beside `/usr/local/bin/pi`.
+The `opencode` and `pi` features of the controller's image feedstock install exactly that.
