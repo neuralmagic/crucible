@@ -306,8 +306,9 @@ pub(crate) trait Backend: Sync {
     fn local_argv(&self, args: &Args, prompt: &str) -> Vec<String>;
 
     /// The sandbox exec argv (program name first, no prompt, it arrives over stdin).
-    /// `mcp_seeded` says whether [`Backend::seed_files`] delivered a config this turn, so a
-    /// harness that takes its MCP config on argv can point at it.
+    /// `mcp_seeded` says whether the broker is on this turn, and so whether
+    /// [`Backend::seed_files`] delivered an MCP config, so a harness that takes it on argv
+    /// (claude's `--mcp-config`, pi's `-e` for the adapter) can point at it.
     fn sandbox_argv(&self, args: &Args, mcp_seeded: bool) -> Vec<String>;
 
     /// Start or resume a Crucible-managed session locally.
@@ -342,6 +343,13 @@ pub(crate) trait Backend: Sync {
     /// The credential file a harness seeds when its credential cannot ride the gateway as-is:
     /// codex's `auth.json`, pi's Vertex extension.
     fn credential(&self, _args: &Args, _auth: &SandboxAuth) -> Option<SeedFile> {
+        None
+    }
+
+    /// The MCP config a harness seeds beside its own config when the broker is on: pi's
+    /// `mcp.json` for the adapter extension. Claude and hermes carry the broker inside
+    /// [`Backend::config`] instead.
+    fn mcp_config(&self, _broker: &Broker<'_>) -> Option<SeedFile> {
         None
     }
 
@@ -426,6 +434,9 @@ pub(crate) trait Backend: Sync {
             .into_iter()
             .collect();
         seeds.extend(self.credential(args, auth));
+        if let Some(b) = broker.as_ref() {
+            seeds.extend(self.mcp_config(b));
+        }
         seeds
     }
 }
