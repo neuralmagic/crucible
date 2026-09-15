@@ -18,7 +18,7 @@ use crate::agent::harness::{
     ApiEndpoint, AuthProvider, Backend, Broker, CRUCIBLE_PROVIDER_ID, HarnessSpec, StreamDecoder,
     TranscriptLocator, TurnArtifacts, api_endpoint, json_str,
 };
-use crate::agent::inference::InferenceEnv;
+use crate::agent::inference::{InferenceEnv, WireApi};
 use crate::args::Args;
 use crate::turn_trace::{self, GenAiRecord, ToolCall, ToolInvocation};
 use crucible_harness::tool_summary::summarize;
@@ -142,10 +142,13 @@ fn config_json(model: &str, endpoint: &ApiEndpoint, broker: Option<&Broker<'_>>)
         })
     };
     let (provider_id, mut provider) = match endpoint {
-        ApiEndpoint::OpenAi { base_url, .. } => (
+        ApiEndpoint::OpenAi { base_url, wire_api } => (
             CRUCIBLE_PROVIDER_ID,
             keyed(
-                "@ai-sdk/openai-compatible",
+                match wire_api {
+                    WireApi::Chat => "@ai-sdk/openai-compatible",
+                    WireApi::Responses => "@ai-sdk/openai",
+                },
                 base_url,
                 crate::agent::inference::OPENAI_API_KEY_ENV,
             ),
@@ -625,6 +628,25 @@ mod tests {
 
     /// A direct Anthropic key selects the anthropic SDK against Anthropic's API (or the base URL
     /// the env names), keyed off `ANTHROPIC_API_KEY`.
+    #[test]
+    fn config_rides_the_openai_sdk_on_the_vendors_own_api() {
+        let mut a = args();
+        a.model = Some("gpt-5.6-luna".to_string());
+        let key_only = InferenceEnv {
+            openai_key: Some("sk-oa".into()),
+            ..Default::default()
+        };
+        let seeds = seed_files(&a, None, None, &key_only);
+        let v: Value = serde_json::from_str(&seeds[0].content).expect("valid json");
+        let p = &v["provider"]["crucible"];
+        assert_eq!(
+            p["npm"], "@ai-sdk/openai",
+            "Responses, not chat completions"
+        );
+        assert_eq!(p["options"]["baseURL"], "https://api.openai.com/v1");
+        assert_eq!(p["options"]["apiKey"], "{env:OPENAI_API_KEY}");
+    }
+
     #[test]
     fn config_registers_anthropic_for_a_direct_anthropic_key() {
         let a = args();

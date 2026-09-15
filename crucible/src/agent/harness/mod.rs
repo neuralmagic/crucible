@@ -71,7 +71,9 @@ pub(crate) enum ApiEndpoint {
 /// Where a provider-table turn sends `model`: Vertex when the env names neither a key nor a base
 /// URL (`manifest_env` carries the project and region); else an OpenAI-speaking endpoint when the
 /// env names one (`OPENAI_BASE_URL`) or carries only an OpenAI key, else Anthropic. A model named
-/// `claude-*` with both keys present goes to Anthropic.
+/// `claude-*` with both keys present goes to Anthropic. The wire API is the env's when it names
+/// one; otherwise api.openai.com itself speaks Responses (its current models refuse tool calls
+/// over chat completions) and a custom endpoint speaks chat completions.
 pub(crate) fn api_endpoint(
     model: &str,
     inference: &InferenceEnv,
@@ -86,12 +88,13 @@ pub(crate) fn api_endpoint(
         || (inference.openai_key.is_some()
             && (inference.anthropic_key.is_none() || !model.starts_with("claude")));
     if openai {
+        let (base_url, default_wire) = match inference.openai_base_url.clone() {
+            Some(url) => (url, WireApi::Chat),
+            None => ("https://api.openai.com/v1".to_string(), WireApi::Responses),
+        };
         ApiEndpoint::OpenAi {
-            base_url: inference
-                .openai_base_url
-                .clone()
-                .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
-            wire_api: inference.wire_api.unwrap_or(WireApi::Chat),
+            base_url,
+            wire_api: inference.wire_api.unwrap_or(default_wire),
         }
     } else {
         ApiEndpoint::Anthropic {
@@ -673,8 +676,9 @@ mod tests {
             api_endpoint("gpt-5.6-sol", &env(Some("k"), None, None), &[]),
             ApiEndpoint::OpenAi {
                 base_url: "https://api.openai.com/v1".into(),
-                wire_api: WireApi::Chat
-            }
+                wire_api: WireApi::Responses
+            },
+            "the vendor's own API speaks Responses"
         );
         assert_eq!(
             api_endpoint("claude-opus-4-6", &env(Some("k"), Some("a"), None), &[]),
@@ -686,7 +690,7 @@ mod tests {
             api_endpoint("gpt-5.6-sol", &env(Some("k"), Some("a"), None), &[]),
             ApiEndpoint::OpenAi {
                 base_url: "https://api.openai.com/v1".into(),
-                wire_api: WireApi::Chat
+                wire_api: WireApi::Responses
             }
         );
         assert_eq!(
