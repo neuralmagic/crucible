@@ -4,7 +4,8 @@
 //! spell the same thing.
 //!
 //! Absent, every field is `None` and a turn authenticates the way it always has: Vertex through
-//! the gateway's metadata emulator for Claude, the selected `[agent.codex]` auth for Codex.
+//! the gateway's metadata emulator for Claude (and for opencode and pi, which speak Vertex through
+//! their own provider tables), the selected `[agent.codex]` auth for Codex.
 
 use crate::manifest::Harness;
 use anyhow::{Context, Result};
@@ -107,6 +108,15 @@ impl InferenceEnv {
         Ok(env)
     }
 
+    /// Nothing named: no key, no base URL. The turn runs on the deploy profile's ambient
+    /// credentials, which for every harness that can speak it means Vertex.
+    pub fn is_ambient(&self) -> bool {
+        self.anthropic_key.is_none()
+            && self.anthropic_base_url.is_none()
+            && self.openai_key.is_none()
+            && self.openai_base_url.is_none()
+    }
+
     /// The custom base URL the harness will talk to, if any. A harness that speaks both API
     /// families (opencode, pi) takes the OpenAI one first, the same precedence
     /// `crate::agent::harness::api_endpoint` resolves its provider by.
@@ -127,6 +137,39 @@ impl InferenceEnv {
     }
 }
 
+/// The Vertex project and region a turn's manifest env names, with sane fallbacks: the gateway
+/// provider is registered against them, and a harness that speaks Vertex through its own
+/// provider table (opencode, pi) is seeded with them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VertexConfig {
+    pub project: String,
+    pub region: String,
+}
+
+impl VertexConfig {
+    pub fn from_env(env: &[(String, String)]) -> VertexConfig {
+        let get = |keys: &[&str]| {
+            keys.iter()
+                .find_map(|k| env.iter().find(|(ek, _)| ek == k).map(|(_, v)| v.clone()))
+        };
+        VertexConfig {
+            project: get(&["ANTHROPIC_VERTEX_PROJECT_ID", "GCP_PROJECT_ID"]).unwrap_or_default(),
+            region: get(&["CLOUD_ML_REGION", "VERTEX_LOCATION"]).unwrap_or_else(|| "global".into()),
+        }
+    }
+
+    /// The Vertex AI host for the region: `global` is the apex, `us`/`eu` are the multi-region
+    /// `rep` hosts, anything else is region-prefixed. The same hosts
+    /// `crate::openshell::policy::VERTEX_CREDENTIAL_HOSTS` binds the credential to.
+    pub fn host(&self) -> String {
+        match self.region.as_str() {
+            "global" => "aiplatform.googleapis.com".to_string(),
+            "us" | "eu" => format!("aiplatform.{}.rep.googleapis.com", self.region),
+            region => format!("{region}-aiplatform.googleapis.com"),
+        }
+    }
+}
+
 /// A base URL as the sandbox policy's `host:port:full` entry.
 pub fn egress_endpoint(base_url: &str) -> Result<String> {
     crate::manifest::broker_endpoint_from_url(base_url)
@@ -135,6 +178,39 @@ pub fn egress_endpoint(base_url: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vertex_config_reads_manifest_keys_with_fallback() {
+        let vertex = VertexConfig::from_env(&[
+            ("ANTHROPIC_VERTEX_PROJECT_ID".into(), "proj-x".into()),
+            ("CLOUD_ML_REGION".into(), "us-east5".into()),
+        ]);
+        assert_eq!(vertex.project, "proj-x");
+        assert_eq!(vertex.region, "us-east5");
+        assert_eq!(vertex.host(), "us-east5-aiplatform.googleapis.com");
+        let unset = VertexConfig::from_env(&[]);
+        assert_eq!(unset.region, "global");
+        assert_eq!(unset.host(), "aiplatform.googleapis.com");
+        let multi = VertexConfig::from_env(&[("VERTEX_LOCATION".into(), "eu".into())]);
+        assert_eq!(multi.host(), "aiplatform.eu.rep.googleapis.com");
+    }
+
+    #[test]
+    fn ambient_means_no_key_and_no_base_url() {
+        assert!(InferenceEnv::default().is_ambient());
+        for env in [
+            InferenceEnv {
+                anthropic_key: Some("k".into()),
+                ..Default::default()
+            },
+            InferenceEnv {
+                openai_base_url: Some("http://vllm:8000/v1".into()),
+                ..Default::default()
+            },
+        ] {
+            assert!(!env.is_ambient(), "{env:?}");
+        }
+    }
 
     #[test]
     fn a_base_url_becomes_an_egress_entry_on_its_own_port() {
