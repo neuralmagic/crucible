@@ -295,7 +295,8 @@ async fn try_turn(
     let gw = Gateway::connect().context("connecting to the openshell gateway over gRPC")?;
 
     // 2. Resolve this harness's model credential: Vertex's static credential becomes a gateway
-    //    provider the metadata emulator serves to claude/hermes (see `provider` docs); codex gets
+    //    provider the metadata emulator serves to claude/hermes, and to opencode/pi when the
+    //    env names no key (see `provider` docs); codex gets
     //    the auth mode selected by `[agent.codex]`: an API key from the named env or a
     //    host-refreshed ChatGPT OAuth token. Either is seeded as auth.json (step 7b), since Codex
     //    reads the real bytes off disk and its L4 WebSocket never crosses a placeholder-resolving
@@ -307,8 +308,8 @@ async fn try_turn(
             let token = provider::mint_vertex_token()
                 .await
                 .context("minting the Vertex access token")?;
-            let (project, region) = vertex_config(&args.env);
-            ensure_provider(&gw, &token, &project, &region).await?;
+            let vertex = crate::agent::inference::VertexConfig::from_env(&args.env);
+            ensure_provider(&gw, &token, &vertex.project, &vertex.region).await?;
             SandboxAuth::Gateway
         }
         AuthProvider::AnthropicKey => SandboxAuth::AnthropicKey,
@@ -1035,8 +1036,6 @@ async fn publish_workspace(staged: &std::path::Path, workspace: &std::path::Path
     Ok(())
 }
 
-/// The Vertex project + region for the provider config, read from the manifest env,
-/// with sane fallbacks.
 /// The model-reach variables this turn's sandbox carries. A direct Anthropic key replaces the
 /// Vertex selectors the manifest set (Claude Code prefers Vertex whenever they are present), and
 /// a custom base URL rides under the name its harness reads. Codex reads a custom endpoint's key
@@ -1103,16 +1102,6 @@ pub(crate) fn inference_env(
             }
         }
     }
-}
-
-fn vertex_config(env: &[(String, String)]) -> (String, String) {
-    let get = |keys: &[&str]| {
-        keys.iter()
-            .find_map(|k| env.iter().find(|(ek, _)| ek == k).map(|(_, v)| v.clone()))
-    };
-    let project = get(&["ANTHROPIC_VERTEX_PROJECT_ID", "GCP_PROJECT_ID"]).unwrap_or_default();
-    let region = get(&["CLOUD_ML_REGION", "VERTEX_LOCATION"]).unwrap_or_else(|| "global".into());
-    (project, region)
 }
 
 /// Write this turn's boundary token where the broker's candidate budget reads it
@@ -1824,19 +1813,6 @@ mod tests {
             "http://vllm.internal:8000/v1".to_string()
         )));
         assert!(custom.contains(&("OPENAI_API_KEY".to_string(), "sk-oa".to_string())));
-    }
-
-    #[test]
-    fn vertex_config_reads_manifest_keys_with_fallback() {
-        let (proj, region) = vertex_config(&[
-            ("ANTHROPIC_VERTEX_PROJECT_ID".into(), "proj-x".into()),
-            ("CLOUD_ML_REGION".into(), "us-east5".into()),
-        ]);
-        assert_eq!(proj, "proj-x");
-        assert_eq!(region, "us-east5");
-        // Region falls back to "global" when unset.
-        let (_, region2) = vertex_config(&[]);
-        assert_eq!(region2, "global");
     }
 
     #[test]

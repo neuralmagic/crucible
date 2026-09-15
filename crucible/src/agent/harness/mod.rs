@@ -43,30 +43,45 @@ pub(crate) enum AuthProvider {
 }
 
 /// Which credential this turn runs on: the harness's default, unless the environment carries a
-/// direct Anthropic key for a Claude-speaking harness.
+/// direct Anthropic key for a Claude-speaking harness, or nothing at all for a key-authenticated
+/// one, which then runs on the ambient Vertex credential the way claude does.
 pub(crate) fn resolve_auth(
     harness: Harness,
     inference: &crate::agent::inference::InferenceEnv,
 ) -> AuthProvider {
     match (harness.spec().auth, inference.anthropic_key.as_deref()) {
         (AuthProvider::Vertex, Some(_)) => AuthProvider::AnthropicKey,
+        (AuthProvider::ApiKey, _) if inference.is_ambient() => AuthProvider::Vertex,
         (auth, _) => auth,
     }
 }
 
-/// The API family an [`AuthProvider::ApiKey`] turn talks to, with the base URL it is reached at.
+/// The API family a provider-table harness (opencode, pi) talks to, with the base URL it is
+/// reached at.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ApiEndpoint {
     /// An OpenAI-speaking service: a custom endpoint, or api.openai.com itself.
     OpenAi { base_url: String, wire_api: WireApi },
     /// An Anthropic Messages service: a custom endpoint, or api.anthropic.com itself.
     Anthropic { base_url: String },
+    /// Anthropic on Vertex AI, on the gateway's ambient credential rather than a key.
+    Vertex(crate::agent::inference::VertexConfig),
 }
 
-/// Where a key-authenticated turn sends `model`: an OpenAI-speaking endpoint when the env names
-/// one (`OPENAI_BASE_URL`) or carries only an OpenAI key, else Anthropic. A model named `claude-*`
-/// with both keys present goes to Anthropic.
-pub(crate) fn api_endpoint(model: &str, inference: &InferenceEnv) -> ApiEndpoint {
+/// Where a provider-table turn sends `model`: Vertex when the env names neither a key nor a base
+/// URL (`manifest_env` carries the project and region); else an OpenAI-speaking endpoint when the
+/// env names one (`OPENAI_BASE_URL`) or carries only an OpenAI key, else Anthropic. A model named
+/// `claude-*` with both keys present goes to Anthropic.
+pub(crate) fn api_endpoint(
+    model: &str,
+    inference: &InferenceEnv,
+    manifest_env: &[(String, String)],
+) -> ApiEndpoint {
+    if inference.is_ambient() {
+        return ApiEndpoint::Vertex(crate::agent::inference::VertexConfig::from_env(
+            manifest_env,
+        ));
+    }
     let openai = inference.openai_base_url.is_some()
         || (inference.openai_key.is_some()
             && (inference.anthropic_key.is_none() || !model.starts_with("claude")));
@@ -321,8 +336,9 @@ pub(crate) trait Backend: Sync {
         inference: &InferenceEnv,
     ) -> Option<String>;
 
-    /// The credential file a harness seeds when its credential cannot ride the gateway.
-    fn credential(&self, _auth: &SandboxAuth) -> Option<SeedFile> {
+    /// The credential file a harness seeds when its credential cannot ride the gateway as-is:
+    /// codex's `auth.json`, pi's Vertex extension.
+    fn credential(&self, _args: &Args, _auth: &SandboxAuth) -> Option<SeedFile> {
         None
     }
 
@@ -406,7 +422,7 @@ pub(crate) trait Backend: Sync {
             })
             .into_iter()
             .collect();
-        seeds.extend(self.credential(auth));
+        seeds.extend(self.credential(args, auth));
         seeds
     }
 }
@@ -631,7 +647,11 @@ mod tests {
             }
         };
         assert_eq!(
-            api_endpoint("qwen", &env(Some("k"), None, Some("http://vllm:8000/v1"))),
+            api_endpoint(
+                "qwen",
+                &env(Some("k"), None, Some("http://vllm:8000/v1")),
+                &[]
+            ),
             ApiEndpoint::OpenAi {
                 base_url: "http://vllm:8000/v1".into(),
                 wire_api: WireApi::Chat
@@ -640,7 +660,8 @@ mod tests {
         assert_eq!(
             api_endpoint(
                 "claude-opus-4-6",
-                &env(None, Some("a"), Some("http://vllm:8000/v1"))
+                &env(None, Some("a"), Some("http://vllm:8000/v1")),
+                &[]
             ),
             ApiEndpoint::OpenAi {
                 base_url: "http://vllm:8000/v1".into(),
@@ -649,38 +670,52 @@ mod tests {
             "a named OpenAI endpoint wins even for a claude model name"
         );
         assert_eq!(
-            api_endpoint("gpt-5.6-sol", &env(Some("k"), None, None)),
+            api_endpoint("gpt-5.6-sol", &env(Some("k"), None, None), &[]),
             ApiEndpoint::OpenAi {
                 base_url: "https://api.openai.com/v1".into(),
                 wire_api: WireApi::Chat
             }
         );
         assert_eq!(
-            api_endpoint("claude-opus-4-6", &env(Some("k"), Some("a"), None)),
+            api_endpoint("claude-opus-4-6", &env(Some("k"), Some("a"), None), &[]),
             ApiEndpoint::Anthropic {
                 base_url: "https://api.anthropic.com".into()
             }
         );
         assert_eq!(
-            api_endpoint("gpt-5.6-sol", &env(Some("k"), Some("a"), None)),
+            api_endpoint("gpt-5.6-sol", &env(Some("k"), Some("a"), None), &[]),
             ApiEndpoint::OpenAi {
                 base_url: "https://api.openai.com/v1".into(),
                 wire_api: WireApi::Chat
             }
         );
         assert_eq!(
-            api_endpoint("claude-opus-4-6", &env(None, None, None)),
+            api_endpoint(
+                "claude-opus-4-6",
+                &env(None, None, None),
+                &[
+                    ("ANTHROPIC_VERTEX_PROJECT_ID".into(), "proj-x".into()),
+                    ("CLOUD_ML_REGION".into(), "us-east5".into()),
+                ]
+            ),
+            ApiEndpoint::Vertex(crate::agent::inference::VertexConfig {
+                project: "proj-x".into(),
+                region: "us-east5".into(),
+            }),
+            "no key and no base URL is the ambient Vertex credential"
+        );
+        assert_eq!(
+            api_endpoint("claude-opus-4-6", &env(None, Some("a"), None), &[]),
             ApiEndpoint::Anthropic {
                 base_url: "https://api.anthropic.com".into()
-            },
-            "no key at all still names a shape; the sandbox runner refuses the turn"
+            }
         );
         let responses = crate::agent::inference::InferenceEnv {
             wire_api: Some(WireApi::Responses),
             ..env(Some("k"), None, Some("http://vllm:8000/v1"))
         };
         assert!(matches!(
-            api_endpoint("m", &responses),
+            api_endpoint("m", &responses, &[]),
             ApiEndpoint::OpenAi {
                 wire_api: WireApi::Responses,
                 ..
@@ -857,13 +892,19 @@ mod tests {
             resolve_auth(Harness::Claude, &Default::default()),
             AuthProvider::Vertex
         );
-        // The key-authenticated harnesses are key-authenticated whatever the env carries.
+        // The provider-table harnesses take any key the env carries, and Vertex when it carries
+        // nothing, the same ambient credential claude runs on.
         for harness in [Harness::OpenCode, Harness::Pi] {
             assert_eq!(resolve_auth(harness, &keyed), AuthProvider::ApiKey);
             assert_eq!(
                 resolve_auth(harness, &Default::default()),
-                AuthProvider::ApiKey
+                AuthProvider::Vertex
             );
+            let url_only = crate::agent::inference::InferenceEnv {
+                openai_base_url: Some("http://vllm:8000/v1".into()),
+                ..Default::default()
+            };
+            assert_eq!(resolve_auth(harness, &url_only), AuthProvider::ApiKey);
         }
     }
 
