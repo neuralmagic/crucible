@@ -630,11 +630,12 @@ async fn try_turn(
 
         // 8. Exec the agent (prompt over stdin), streaming its stdout through the harness decoder.
         stage(sink, "sandbox ready — starting the agent");
+        let mcp_seeded = broker_url.is_some();
         let argv = match session {
             Some(session) => backend
-                .sandbox_session_argv(args, !seeds.is_empty(), session)
+                .sandbox_session_argv(args, mcp_seeded, session)
                 .context("building continuing sandbox harness argv")?,
-            None => backend.sandbox_argv(args, !seeds.is_empty()),
+            None => backend.sandbox_argv(args, mcp_seeded),
         };
         let wrapper = crate::agent::harness::exec_wrapper(&basename, &argv);
         let exec_opts = ExecOpts {
