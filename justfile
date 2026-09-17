@@ -72,6 +72,11 @@ hooks:
 forge-capture-e2e:
     scripts/forge-capture-e2e.sh
 
+# End-to-end proof of a revise loop through a real OpenShell sandbox on local podman, with a
+# model-free `claude` image (examples/revise-loop). Needs podman, openshell, openshell-gateway.
+revise-loop-e2e:
+    scripts/revise-loop-e2e.sh
+
 # Spoke smoketest (hub-spoke delegated jobs): submit a CPU-only sentinel Job to <cluster> through
 # the full production submit/stream/parse path and print the typed result JSON. `cluster` is a
 # [clusters.<name>] entry in the deploy profile; pass `context` to run it against a local

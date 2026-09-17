@@ -25,6 +25,12 @@ pub(crate) fn plan_admitted_event(plan: &ValidPlan) -> crate::report::session::S
                     .map(crate::plan::ir::OutputRef::to_string)
                     .unwrap_or_default(),
                 max_fanout: t.max_fanout.unwrap_or_default(),
+                revise: t
+                    .revise
+                    .as_ref()
+                    .map(|r| r.task.0.clone())
+                    .unwrap_or_default(),
+                max_rounds: t.revise.as_ref().map_or(0, |r| r.max_rounds),
             })
             .collect(),
     }
@@ -70,5 +76,45 @@ pub(crate) fn task_result_event(
         secs: 0.0,
         trace_id,
         span_id,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::plan::ir::Plan;
+    use crate::report::session::SessionEvent;
+
+    #[test]
+    fn the_admitted_plan_names_each_revise_loop_and_its_bound() {
+        let plan = Plan::from_toml_str(
+            r#"
+            version = 1
+            [budget]
+            usd = 1.0
+            [[task]]
+            name = "author"
+            kind = "command"
+            command = "true"
+            [[task]]
+            name = "repro"
+            kind = "command"
+            command = "true"
+            depends_on = ["author"]
+            revise = { task = "author", max_rounds = 3 }
+            "#,
+        )
+        .unwrap()
+        .validate()
+        .unwrap();
+        let SessionEvent::PlanAdmitted { tasks, .. } =
+            crate::plan::events::plan_admitted_event(&plan)
+        else {
+            panic!("not a plan_admitted event");
+        };
+        assert_eq!((tasks[0].revise.as_str(), tasks[0].max_rounds), ("", 0));
+        assert_eq!(
+            (tasks[1].revise.as_str(), tasks[1].max_rounds),
+            ("author", 3)
+        );
     }
 }

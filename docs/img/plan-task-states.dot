@@ -8,6 +8,7 @@ digraph task {
         Pending;
         Running;
         Fanout [peripheries=2];
+        Revising [peripheries=2];
     }
     subgraph cluster_1 {
         label="settled: the task's status"; style=dashed; color="#c8d0cc"; labeljust=l;
@@ -37,4 +38,10 @@ digraph task {
     Running -> Transport [label="transport cut by budget", color="#8a4b1c", fontcolor="#8a4b1c"];
     Fanout -> Pass [label="instances passed"];
     Fanout -> Fail [label="instances failed", color="#8a4b1c", fontcolor="#8a4b1c"];
+    Pending -> Revising [label="rounds started"];
+    Revising -> Pass [label="rounds passed"];
+    Revising -> Fail [label="rounds failed", color="#8a4b1c", fontcolor="#8a4b1c"];
+    Revising -> Skipped [label="rounds skipped", color="#8a4b1c", fontcolor="#8a4b1c"];
+    Revising -> Transport [label="rounds transport", color="#8a4b1c", fontcolor="#8a4b1c"];
+    Revising -> Blocked [label="rounds blocked", color="#8a4b1c", fontcolor="#8a4b1c"];
 }

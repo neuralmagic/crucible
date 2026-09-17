@@ -928,6 +928,8 @@ mod tests {
                     stage: String::new(),
                     over: String::new(),
                     max_fanout: 0,
+                    revise: String::new(),
+                    max_rounds: 0,
                 },
                 PlanTaskWire {
                     name: "measure".into(),
@@ -940,6 +942,8 @@ mod tests {
                     stage: String::new(),
                     over: String::new(),
                     max_fanout: 0,
+                    revise: String::new(),
+                    max_rounds: 0,
                 },
             ],
         });

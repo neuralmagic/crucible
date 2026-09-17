@@ -18,6 +18,8 @@ pub enum TaskState {
     Running,
     /// A fan-out node whose instances are running; it settles when they fold.
     Fanout,
+    /// A task in a revise loop whose rounds are running; it settles on its last round.
+    Revising,
     Pass,
     Fail,
     Skipped,
@@ -30,7 +32,7 @@ impl TaskState {
     pub fn settled(self) -> bool {
         !matches!(
             self,
-            TaskState::Pending | TaskState::Running | TaskState::Fanout
+            TaskState::Pending | TaskState::Running | TaskState::Fanout | TaskState::Revising
         )
     }
 }
@@ -64,6 +66,13 @@ pub enum TaskEvent {
     FanoutItemsInvalid,
     InstancesPassed,
     InstancesFailed,
+    /// A reviewer and the task it revises entered their rounds.
+    RoundsStarted,
+    RoundsPassed,
+    RoundsFailed,
+    RoundsSkipped,
+    RoundsTransport,
+    RoundsBlocked,
 }
 
 pub const TASK_TRANSITIONS: &[(TaskState, TaskEvent, TaskState)] = {
@@ -88,6 +97,12 @@ pub const TASK_TRANSITIONS: &[(TaskState, TaskEvent, TaskState)] = {
         (S::Running, E::TransportCutByBudget, S::Transport),
         (S::Fanout, E::InstancesPassed, S::Pass),
         (S::Fanout, E::InstancesFailed, S::Fail),
+        (S::Pending, E::RoundsStarted, S::Revising),
+        (S::Revising, E::RoundsPassed, S::Pass),
+        (S::Revising, E::RoundsFailed, S::Fail),
+        (S::Revising, E::RoundsSkipped, S::Skipped),
+        (S::Revising, E::RoundsTransport, S::Transport),
+        (S::Revising, E::RoundsBlocked, S::Blocked),
     ]
 };
 
@@ -247,7 +262,7 @@ impl Default for PlanMachine {
 
 fn task_kind(s: TaskState) -> NodeKind {
     match s {
-        TaskState::Fanout => NodeKind::Nested,
+        TaskState::Fanout | TaskState::Revising => NodeKind::Nested,
         s if s.settled() => NodeKind::Outcome,
         _ => NodeKind::Plain,
     }
@@ -271,7 +286,12 @@ pub fn task_digraph() -> Digraph {
         clusters: vec![
             cluster(
                 "open",
-                &[TaskState::Pending, TaskState::Running, TaskState::Fanout],
+                &[
+                    TaskState::Pending,
+                    TaskState::Running,
+                    TaskState::Fanout,
+                    TaskState::Revising,
+                ],
             ),
             cluster(
                 "settled: the task's status",
