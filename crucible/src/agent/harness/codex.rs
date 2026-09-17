@@ -226,7 +226,7 @@ impl Backend for Codex {
 
     /// `auth.json` whenever Codex auth was resolved; the credential reaches Codex only through it,
     /// never the env script.
-    fn credential(&self, auth: &SandboxAuth) -> Option<SeedFile> {
+    fn credential(&self, _args: &Args, auth: &SandboxAuth) -> Option<SeedFile> {
         auth.codex().map(|auth| SeedFile {
             content: auth_json(auth, &Timestamp::now().to_string()),
             dest: AUTH,

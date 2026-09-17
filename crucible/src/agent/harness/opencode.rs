@@ -7,15 +7,18 @@
 //! `opencode export` after `run` exits and leaves the session at [`EXPORT`], and that export is
 //! the turn's transcript and its ONLY source of result + cost (`backfill_required`).
 //!
-//! Auth is a direct API key relayed into the sandbox env. The seeded `opencode.json` registers
-//! the endpoint as the `crucible` provider, reading the key back through `{env:…}`, so a custom
-//! endpoint, api.openai.com, and api.anthropic.com all take the same shape.
+//! Auth is a direct API key relayed into the sandbox env, or the gateway's ambient Vertex
+//! credential when the env names none. The seeded `opencode.json` names the turn's model and
+//! registers its endpoint: a keyed one as the `crucible` provider, reading the key back through
+//! `{env:…}`, so a custom endpoint, api.openai.com, and api.anthropic.com all take the same
+//! shape; Vertex as opencode's own `google-vertex-anthropic` provider, whose google-auth client
+//! reaches the metadata emulator like claude's does.
 
 use crate::agent::harness::{
     ApiEndpoint, AuthProvider, Backend, Broker, CRUCIBLE_PROVIDER_ID, HarnessSpec, StreamDecoder,
     TranscriptLocator, TurnArtifacts, api_endpoint, json_str,
 };
-use crate::agent::inference::InferenceEnv;
+use crate::agent::inference::{InferenceEnv, WireApi};
 use crate::args::Args;
 use crate::turn_trace::{self, GenAiRecord, ToolCall, ToolInvocation};
 use crucible_harness::tool_summary::summarize;
@@ -76,10 +79,11 @@ impl OpenCode {
     };
 
     /// The wrapper invocation up to and including `opencode run`'s flags: `bash -c <wrapper>
-    /// crucible-opencode <export> run --format json --auto --model crucible/<model>`. Prompt
-    /// delivery is appended by the caller. `--auto` answers every permission ask, the
-    /// sandboxing crucible cares about is openshell's.
-    fn base_args(args: &Args, export: &str) -> Vec<String> {
+    /// crucible-opencode <export> run --format json --auto`. The model comes from the seeded
+    /// config (which provider it rides on depends on the endpoint) and prompt delivery is
+    /// appended by the caller. `--auto` answers every permission ask, the sandboxing crucible
+    /// cares about is openshell's.
+    fn base_args(export: &str) -> Vec<String> {
         vec![
             "bash".to_string(),
             "-c".to_string(),
@@ -90,15 +94,21 @@ impl OpenCode {
             "--format".to_string(),
             "json".to_string(),
             "--auto".to_string(),
-            "--model".to_string(),
-            model_ref(args),
         ]
     }
 }
 
-/// The model as opencode names it: `<provider>/<model>` under the seeded provider.
-fn model_ref(args: &Args) -> String {
-    format!("{CRUCIBLE_PROVIDER_ID}/{}", args.model())
+/// OpenCode's built-in Anthropic-on-Vertex provider, the one whose google-auth client the
+/// gateway's metadata emulator serves.
+const VERTEX_PROVIDER_ID: &str = "google-vertex-anthropic";
+
+/// The model as opencode names it: `<provider>/<model>`, under the provider the endpoint lands on.
+fn model_ref(model: &str, endpoint: &ApiEndpoint) -> String {
+    let provider = match endpoint {
+        ApiEndpoint::OpenAi { .. } | ApiEndpoint::Anthropic { .. } => CRUCIBLE_PROVIDER_ID,
+        ApiEndpoint::Vertex(_) => VERTEX_PROVIDER_ID,
+    };
+    format!("{provider}/{model}")
 }
 
 /// Where a local turn's wrapper leaves the export: the same place under this machine's data home.
@@ -116,37 +126,54 @@ fn local_export_path() -> std::path::PathBuf {
     data_home.join("opencode/crucible-export.json")
 }
 
-/// Render `opencode.json`: every permission allowed, the turn's model under the `crucible`
-/// provider (the endpoint, its API family, and the env var the key is read from), and the
-/// broker as a remote MCP server when it is on.
+/// Render `opencode.json`: every permission allowed, the turn's model under its provider (a
+/// keyed endpoint as `crucible`: the URL, its API family, and the env var the key is read from;
+/// Vertex as opencode's own provider carrying the project and region), and the broker as a
+/// remote MCP server when it is on.
 fn config_json(model: &str, endpoint: &ApiEndpoint, broker: Option<&Broker<'_>>) -> String {
-    let (npm, base_url, key_env) = match endpoint {
-        ApiEndpoint::OpenAi { base_url, .. } => (
-            "@ai-sdk/openai-compatible",
-            base_url.as_str(),
-            crate::agent::inference::OPENAI_API_KEY_ENV,
+    let keyed = |npm: &str, base_url: &str, key_env: &str| {
+        json!({
+            "npm": npm,
+            "name": "Crucible inference endpoint",
+            "options": {
+                "baseURL": base_url,
+                "apiKey": format!("{{env:{key_env}}}"),
+            },
+        })
+    };
+    let (provider_id, mut provider) = match endpoint {
+        ApiEndpoint::OpenAi { base_url, wire_api } => (
+            CRUCIBLE_PROVIDER_ID,
+            keyed(
+                match wire_api {
+                    WireApi::Chat => "@ai-sdk/openai-compatible",
+                    WireApi::Responses => "@ai-sdk/openai",
+                },
+                base_url,
+                crate::agent::inference::OPENAI_API_KEY_ENV,
+            ),
         ),
         ApiEndpoint::Anthropic { base_url } => (
-            "@ai-sdk/anthropic",
-            base_url.as_str(),
-            crate::agent::inference::ANTHROPIC_API_KEY,
+            CRUCIBLE_PROVIDER_ID,
+            keyed(
+                "@ai-sdk/anthropic",
+                base_url,
+                crate::agent::inference::ANTHROPIC_API_KEY,
+            ),
+        ),
+        ApiEndpoint::Vertex(vertex) => (
+            VERTEX_PROVIDER_ID,
+            json!({
+                "options": { "project": vertex.project, "location": vertex.region },
+            }),
         ),
     };
+    provider["models"] = json!({ model: { "name": model } });
     let mut cfg = json!({
         "$schema": "https://opencode.ai/config.json",
-        "model": format!("{CRUCIBLE_PROVIDER_ID}/{model}"),
+        "model": model_ref(model, endpoint),
         "permission": { "*": "allow" },
-        "provider": {
-            CRUCIBLE_PROVIDER_ID: {
-                "npm": npm,
-                "name": "Crucible inference endpoint",
-                "options": {
-                    "baseURL": base_url,
-                    "apiKey": format!("{{env:{key_env}}}"),
-                },
-                "models": { model: { "name": model } },
-            }
-        },
+        "provider": { provider_id: provider },
     });
     if let Some(b) = broker {
         let mut server = json!({ "type": "remote", "url": b.url, "enabled": true });
@@ -163,20 +190,23 @@ impl Backend for OpenCode {
         &Self::SPEC
     }
 
-    /// The prompt rides as the message positional after `--`, so one starting with `-` is still
-    /// a message.
+    /// A local turn has no seeded config, so the model is named on the command line under the
+    /// `crucible` provider this machine's own opencode config is expected to carry. The prompt
+    /// rides as the message positional after `--`, so one starting with `-` is still a message.
     fn local_argv(&self, args: &Args, prompt: &str) -> Vec<String> {
-        let mut a = Self::base_args(args, &local_export_path().to_string_lossy());
+        let mut a = Self::base_args(&local_export_path().to_string_lossy());
+        a.push("--model".to_string());
+        a.push(format!("{CRUCIBLE_PROVIDER_ID}/{}", args.model()));
         a.push("--".to_string());
         a.push(prompt.to_string());
         a
     }
 
     /// No message positional: `run` reads a piped stdin as the message, which the shared exec
-    /// wrapper redirects from the uploaded prompt file. OpenCode reads MCP servers from its
-    /// config, not argv, so `mcp_seeded` is accepted and unused by design.
-    fn sandbox_argv(&self, args: &Args, _mcp_seeded: bool) -> Vec<String> {
-        Self::base_args(args, EXPORT)
+    /// wrapper redirects from the uploaded prompt file. The model and the MCP servers come from
+    /// the seeded config, not argv, so `args` and `mcp_seeded` are accepted and unused by design.
+    fn sandbox_argv(&self, _args: &Args, _mcp_seeded: bool) -> Vec<String> {
+        Self::base_args(EXPORT)
     }
 
     /// `opencode.json`, ALWAYS (it carries the model, the provider, and the permission posture).
@@ -188,7 +218,7 @@ impl Backend for OpenCode {
     ) -> Option<String> {
         Some(config_json(
             args.model(),
-            &api_endpoint(args.model(), inference),
+            &api_endpoint(args.model(), inference, &args.env),
             broker,
         ))
     }
@@ -453,10 +483,11 @@ mod tests {
         }
     }
 
-    const RUN_FLAGS: &[&str] = &["run", "--format", "json", "--auto", "--model"];
+    const RUN_FLAGS: &[&str] = &["run", "--format", "json", "--auto"];
 
     /// The argv is the bash wrapper around `opencode run`, with the export path as its first
-    /// argument, the run flags after it, and the prompt over stdin in the sandbox.
+    /// argument, the run flags after it, and the prompt over stdin in the sandbox. The sandbox
+    /// names no model (the seeded config does); a local turn names it under `crucible`.
     #[test]
     fn invocation_is_the_export_wrapper_around_headless_run() {
         let mut a = args();
@@ -466,9 +497,7 @@ mod tests {
         assert_eq!(sandbox[2], WRAPPER);
         assert_eq!(sandbox[3], "crucible-opencode");
         assert_eq!(sandbox[4], EXPORT);
-        assert_eq!(&sandbox[5..10], RUN_FLAGS);
-        assert_eq!(sandbox[10], "crucible/qwen-3-8-27b");
-        assert_eq!(sandbox.len(), 11, "no message positional: stdin carries it");
+        assert_eq!(&sandbox[5..], RUN_FLAGS, "no model, no message positional");
 
         let local = OpenCode.local_argv(&a, "--- looks like a flag");
         assert_eq!(&local[..4], &sandbox[..4]);
@@ -476,7 +505,38 @@ mod tests {
             local[4].ends_with("opencode/crucible-export.json"),
             "{local:?}"
         );
+        assert_eq!(&local[5..9], RUN_FLAGS);
+        assert_eq!(&local[9..11], &["--model", "crucible/qwen-3-8-27b"]);
         assert_eq!(&local[local.len() - 2..], &["--", "--- looks like a flag"]);
+    }
+
+    /// No key and no base URL is the ambient Vertex credential: the config rides opencode's own
+    /// Vertex Anthropic provider with the manifest's project and region, no `crucible` provider
+    /// and no key reference, and the model is named under it.
+    #[test]
+    fn config_rides_opencodes_vertex_provider_on_the_ambient_credential() {
+        let mut a = args();
+        a.model = Some("claude-sonnet-5".to_string());
+        a.env = vec![
+            ("ANTHROPIC_VERTEX_PROJECT_ID".into(), "proj-x".into()),
+            ("CLOUD_ML_REGION".into(), "us-east5".into()),
+        ];
+        let seeds = OpenCode.seed_files(
+            &a,
+            None,
+            None,
+            &SandboxAuth::Gateway,
+            &InferenceEnv::default(),
+        );
+        assert_eq!(seeds.len(), 1);
+        let v: Value = serde_json::from_str(&seeds[0].content).expect("valid json");
+        assert_eq!(v["model"], "google-vertex-anthropic/claude-sonnet-5");
+        let p = &v["provider"]["google-vertex-anthropic"];
+        assert_eq!(p["options"]["project"], "proj-x");
+        assert_eq!(p["options"]["location"], "us-east5");
+        assert_eq!(p["models"]["claude-sonnet-5"]["name"], "claude-sonnet-5");
+        assert!(v["provider"].get("crucible").is_none());
+        assert!(!seeds[0].content.contains("apiKey"), "{}", seeds[0].content);
     }
 
     /// The wrapper has to parse where it runs, and it must forward `run`'s exit status rather
@@ -568,6 +628,25 @@ mod tests {
 
     /// A direct Anthropic key selects the anthropic SDK against Anthropic's API (or the base URL
     /// the env names), keyed off `ANTHROPIC_API_KEY`.
+    #[test]
+    fn config_rides_the_openai_sdk_on_the_vendors_own_api() {
+        let mut a = args();
+        a.model = Some("gpt-5.6-luna".to_string());
+        let key_only = InferenceEnv {
+            openai_key: Some("sk-oa".into()),
+            ..Default::default()
+        };
+        let seeds = seed_files(&a, None, None, &key_only);
+        let v: Value = serde_json::from_str(&seeds[0].content).expect("valid json");
+        let p = &v["provider"]["crucible"];
+        assert_eq!(
+            p["npm"], "@ai-sdk/openai",
+            "Responses, not chat completions"
+        );
+        assert_eq!(p["options"]["baseURL"], "https://api.openai.com/v1");
+        assert_eq!(p["options"]["apiKey"], "{env:OPENAI_API_KEY}");
+    }
+
     #[test]
     fn config_registers_anthropic_for_a_direct_anthropic_key() {
         let a = args();
