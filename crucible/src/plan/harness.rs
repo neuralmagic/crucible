@@ -844,6 +844,7 @@ mod tests {
             emits_files: files.iter().map(|f| (*f).to_string()).collect(),
             over: None,
             max_fanout: None,
+            revise: None,
         }
     }
 
@@ -2523,6 +2524,7 @@ workflow(type = "playbook", tasks = [analyze, implement, report])
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            revise: None,
         };
         let mut runner = HarnessRunner {
             args: <crate::cli::Cli as clap::Parser>::try_parse_from(["crucible"])
@@ -3598,6 +3600,142 @@ workflow(type = "playbook", tasks = [discover, audit])
         assert!(
             !dir.join("state/files/audit[alpha]").exists(),
             "a node that never expanded kept an earlier run's instance set"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The proposer is an agent turn resuming one session across rounds; the reviewer is a command
+    /// reading the staged draft. Round one's draft carries no verdict and is rejected; round two's
+    /// carries it and passes.
+    #[test]
+    fn a_revise_loop_resumes_the_proposers_session_and_commits_each_passing_round() {
+        let dir = playbook_pack(
+            "revise-session",
+            r#"
+author = agent(
+    name = "author",
+    prompt = "write a probe that reproduces the bug",
+    session = "author",
+    emits_files = ["PROBE.md"],
+)
+repro = command(
+    name = "repro",
+    run = "mkdir -p evidence && if grep -q '\"revision\"' inputs/author/PROBE.md; then printf '{\"reproduced\": true}\n' > evidence/repro.json && cat evidence/repro.json; else printf '{\"reproduced\": false}\n' > evidence/repro.json && cat evidence/repro.json && exit 1; fi",
+    depends_on = [author],
+    emits_files = ["evidence/repro.json"],
+    revise = author,
+    max_rounds = 3,
+)
+workflow(type = "playbook", tasks = [author, repro])
+"#,
+        );
+        std::fs::write(
+            dir.join("agents.json"),
+            r#"{"author": {
+                "writes": {"PROBE.md": "{ENV:CRUCIBLE_PROMPT}"},
+                "appends": {"SESSION.log": "{ENV:CRUCIBLE_AGENT_SESSION_ACTION}\n"},
+                "result": {"drafted": true}
+            }}"#,
+        )
+        .unwrap();
+        let mut manifest = crate::manifest::Manifest::load(&dir.join("crucible.toml")).unwrap();
+        manifest.resolve_workflow(&dir).unwrap();
+        let workflow = manifest.workflow.as_ref().unwrap();
+        let plan = crate::runloop::graph::iteration_template(
+            Some(workflow),
+            &crate::plan::workflow::WorkflowCaps::for_lane(workflow.workflow_type)
+                .with_persistent_sessions(),
+        )
+        .unwrap();
+        let mut runner = crate::cli::setup::prep_plan_runner(&dir.join("crucible.toml"))
+            .unwrap()
+            .0;
+        let mut rows = Vec::new();
+        let out = execute(
+            &plan,
+            &Substrate::default(),
+            ExecCfg::default(),
+            &mut runner,
+            |task, result| rows.push((task.name.0.clone(), result.status.as_str())),
+        );
+
+        assert!(out.valid, "{:?}", out.results);
+        assert_eq!(
+            rows,
+            [
+                ("author[round-1]".to_string(), "pass"),
+                ("repro[round-1]".to_string(), "fail"),
+                ("author[round-2]".to_string(), "pass"),
+                ("repro[round-2]".to_string(), "pass"),
+                ("author".to_string(), "pass"),
+                ("repro".to_string(), "pass"),
+            ]
+        );
+        let workspace = dir.join("workspace");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("SESSION.log")).unwrap(),
+            "start\nresume\n",
+            "the second round did not resume the first round's conversation"
+        );
+        let prompt = std::fs::read_to_string(dir.join("state/files/author/PROBE.md")).unwrap();
+        let inputs: serde_json::Value = prompt
+            .split_once("Upstream task results, as JSON:\n\n")
+            .and_then(|(_, rest)| rest.split_once("\n\n## Result contract"))
+            .and_then(|(json, _)| serde_json::from_str(json).ok())
+            .unwrap_or_else(|| panic!("no inputs block in the turn's prompt: {prompt}"));
+        let revision = &inputs["revision"];
+        assert_eq!(revision["round"], 2);
+        assert_eq!(revision["max_rounds"], 3);
+        assert_eq!(revision["review"]["status"], "fail");
+        assert_eq!(revision["review"]["output"]["reproduced"], false);
+        assert_eq!(revision["review"]["files"], true);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("state/files/repro/evidence/repro.json")).unwrap(),
+            "{\"reproduced\": true}\n"
+        );
+        let log = git_output(&workspace, &["log", "--format=%s"]);
+        assert_eq!(
+            log.lines().filter(|l| *l == "task author").count(),
+            2,
+            "each passing round commits: {log}"
+        );
+        assert_eq!(
+            log.lines().filter(|l| *l == "task repro").count(),
+            1,
+            "{log}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The rejected round's captured evidence is laid down for the revision under the reviewer's
+    /// name, the same place a settled consumer would find it.
+    #[test]
+    fn a_revision_reads_the_reviewers_captured_evidence_from_its_inputs() {
+        let dir = playbook_pack(
+            "revise-files",
+            r#"
+author = command(
+    name = "author",
+    run = "if [ -f inputs/repro/evidence/repro.json ]; then cp inputs/repro/evidence/repro.json REVIEWED.json; fi && printf 'draft\n' > PROBE.txt && printf '{\"drafted\": true}\n'",
+    emits_files = ["PROBE.txt"],
+)
+repro = command(
+    name = "repro",
+    run = "mkdir -p evidence && printf '{\"why\": \"wrong encoding\"}\n' > evidence/repro.json && if [ -f REVIEWED.json ]; then printf '{\"ok\": true}\n'; else printf '{\"ok\": false}\n' && exit 1; fi",
+    depends_on = [author],
+    emits_files = ["evidence/repro.json"],
+    revise = author,
+    max_rounds = 2,
+)
+workflow(type = "playbook", tasks = [author, repro])
+"#,
+        );
+        let out = run_playbook(&dir);
+
+        assert!(out.valid, "{:?}", out.results);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("workspace/REVIEWED.json")).unwrap(),
+            "{\"why\": \"wrong encoding\"}\n"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -1,0 +1,7 @@
+{
+  "author": {
+    "writes": {"PROBE.md": "{ENV:CRUCIBLE_PROMPT}"},
+    "appends": {"SESSION.log": "{ENV:CRUCIBLE_AGENT_SESSION_ACTION}\n"},
+    "result": {"drafted": true}
+  }
+}

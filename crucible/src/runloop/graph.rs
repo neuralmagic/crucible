@@ -219,6 +219,7 @@ pub(crate) fn iteration_template(
                 emits_files: Vec::new(),
                 over: None,
                 max_fanout: None,
+                revise: None,
             }
         };
     let mut tasks = vec![engine("propose", EngineOp::Propose, None, vec![])];
@@ -1072,6 +1073,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            revise: None,
         });
     }
     for id in 0..cfg.n {
@@ -1093,6 +1095,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            revise: None,
         });
     }
     tasks.push(Task {
@@ -1114,6 +1117,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
         emits_files: Vec::new(),
         over: None,
         max_fanout: None,
+        revise: None,
     });
     Plan {
         version: 1,

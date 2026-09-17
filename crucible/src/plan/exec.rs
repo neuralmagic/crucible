@@ -18,7 +18,7 @@ use serde_json::Value;
 use crate::crucible::Direction;
 use crate::diagram::IllegalTransition;
 use crate::plan::ir::{
-    ITEM_INPUT, Join, OUTCOME_INPUT, Stage, Task, TaskKind, TaskName, ValidPlan,
+    ITEM_INPUT, Join, OUTCOME_INPUT, REVISION_INPUT, Stage, Task, TaskKind, TaskName, ValidPlan,
 };
 use crate::plan::machine::{
     BlockedReason, PlanEvent, PlanMachine, TaskEvent, TaskMachine, TaskState,
@@ -266,7 +266,9 @@ impl TaskState {
             TaskState::Transport => TaskStatus::Transport,
             TaskState::Blocked => TaskStatus::Blocked,
             TaskState::Truncated => TaskStatus::Truncated,
-            TaskState::Pending | TaskState::Running | TaskState::Fanout => return None,
+            TaskState::Pending | TaskState::Running | TaskState::Fanout | TaskState::Revising => {
+                return None;
+            }
         })
     }
 }
@@ -489,6 +491,12 @@ pub fn execute(
     }
     plan_machine.advance(PlanEvent::Started)?;
 
+    // A proposer whose reviewer can run on this substrate: the pair dispatches as one revise loop.
+    let revised_by: BTreeMap<&TaskName, &Task> = plan
+        .tasks_topo()
+        .filter(|t| runnable.contains(&t.name))
+        .filter_map(|t| Some((&t.revise.as_ref()?.task, t)))
+        .collect();
     let started = Instant::now();
     let mut results: BTreeMap<TaskName, TaskResult> = BTreeMap::new();
     let mut spent = 0.0f64;
@@ -584,22 +592,15 @@ pub fn execute(
             if t.depends_on.iter().any(|d| !results.contains_key(d)) {
                 continue;
             }
-            let deps_ok = match t.join {
-                Join::All => t
-                    .depends_on
+            let reviewer = revised_by.get(&t.name).copied();
+            if reviewer.is_some_and(|r| {
+                r.depends_on
                     .iter()
-                    .all(|d| results.get(d).map(|r| r.status) == Some(TaskStatus::Pass)),
-                // Only passing outputs feed a lossy join. A mapped node contributes when any
-                // of its instances passed, so a fan-out reads the same as a set of siblings.
-                Join::Passed => t
-                    .depends_on
-                    .iter()
-                    .any(|d| results.get(d).is_some_and(TaskResult::contributed)),
-                // Every dependency already holds a result by the guard above, so terminality is
-                // established and no status blocks the dispatch.
-                Join::Settled => true,
-            };
-            if !deps_ok {
+                    .any(|d| d != &t.name && !results.contains_key(d))
+            }) {
+                continue;
+            }
+            if !dependencies_allow(t, &results) {
                 // Nothing runs on top of a failure (or a skip): advisory failures gate
                 // their dependents even though they never gate validity.
                 let reason = BlockedReason::DependencyDidNotPass;
@@ -658,8 +659,9 @@ pub fn execute(
             }
             if dispatch.is_empty() {
                 dispatch.push(t);
-                if t.over.is_some() {
-                    // A mapped task is dispatched alone: its own instances are the batch.
+                if t.over.is_some() || reviewer.is_some() {
+                    // A mapped task or a revise loop is dispatched alone: its own instances or
+                    // rounds are the batch.
                     break;
                 }
                 if t.isolation.is_none() {
@@ -757,6 +759,7 @@ pub fn execute(
                             emits_files: node.emits_files.clone(),
                             over: None,
                             max_fanout: None,
+                            revise: None,
                             ..node.clone()
                         })
                         .collect();
@@ -911,6 +914,189 @@ pub fn execute(
                         true,
                     )?;
                 }
+            }
+        } else if let Some(reviewer) = revised_by.get(&first.name).copied() {
+            let proposer = *first;
+            let max_rounds = reviewer.revise.as_ref().map_or(1, |r| r.max_rounds);
+            let base = inputs_for_dispatch
+                .remove(&proposer.name)
+                .unwrap_or_default();
+            for t in [proposer, reviewer] {
+                machines
+                    .entry(t.name.clone())
+                    .or_default()
+                    .advance(TaskEvent::RoundsStarted)?;
+            }
+            let mut rounds: Vec<(TaskResult, TaskResult)> = Vec::new();
+            for round in 1..=max_rounds {
+                let mut proposer_inputs = base.clone();
+                if let Some((_, verdict)) = rounds.last() {
+                    if halted.is_some() {
+                        break;
+                    }
+                    if spent >= budget {
+                        halt(&mut halted, &mut plan_machine, Halt::Budget)?;
+                        break;
+                    }
+                    if cfg
+                        .wall_clock
+                        .is_some_and(|limit| started.elapsed() >= limit)
+                    {
+                        halt(&mut halted, &mut plan_machine, Halt::Time)?;
+                        break;
+                    }
+                    let mut producers = file_producers(plan, proposer, &results, &*runner);
+                    let review_files = runner.has_captured_files(reviewer);
+                    if review_files {
+                        producers.push(reviewer.clone());
+                    }
+                    let staged: Vec<&Task> = producers.iter().collect();
+                    if let Err(why) = runner.stage(proposer, &staged) {
+                        let refused = BlockedReason::StagingRefused(why);
+                        let pair = (
+                            TaskResult::blocked(&refused),
+                            TaskResult::blocked(&BlockedReason::DependencyDidNotPass),
+                        );
+                        for (t, r) in [(proposer, &pair.0), (reviewer, &pair.1)] {
+                            let reason = r
+                                .blocked
+                                .clone()
+                                .unwrap_or(BlockedReason::DependencyDidNotPass);
+                            record(
+                                &mut *runner,
+                                &round_task(t, round),
+                                r.clone(),
+                                reason.event(),
+                                &mut results,
+                                &mut machines,
+                                &mut halted,
+                                &mut plan_machine,
+                                false,
+                            )?;
+                        }
+                        rounds.push(pair);
+                        break;
+                    }
+                    proposer_inputs.insert(
+                        TaskName(REVISION_INPUT.to_string()),
+                        serde_json::json!({
+                            "round": round,
+                            "max_rounds": max_rounds,
+                            "reviewer": reviewer.name.0,
+                            "review": Value::Object(settled_entry(verdict, review_files)),
+                        }),
+                    );
+                }
+                let proposed = round_task(proposer, round);
+                machines
+                    .entry(proposed.name.clone())
+                    .or_default()
+                    .advance(TaskEvent::Dispatched)?;
+                let (result, event, budget_exceeded) =
+                    run_with_retries(proposer, &proposer_inputs, cfg, runner, &mut spent, budget);
+                if budget_exceeded {
+                    halt(&mut halted, &mut plan_machine, Halt::Budget)?;
+                }
+                runner.settled(proposer, result.status == TaskStatus::Pass);
+                record(
+                    &mut *runner,
+                    &proposed,
+                    result.clone(),
+                    event,
+                    &mut results,
+                    &mut machines,
+                    &mut halted,
+                    &mut plan_machine,
+                    false,
+                )?;
+
+                let mut view = results.clone();
+                view.insert(proposer.name.clone(), result.clone());
+                let reviewed = round_task(reviewer, round);
+                let blocked = if halted.is_none() && spent >= budget {
+                    halt(&mut halted, &mut plan_machine, Halt::Budget)?;
+                    halted.as_ref().map(Halt::blocked)
+                } else if halted.is_none()
+                    && cfg
+                        .wall_clock
+                        .is_some_and(|limit| started.elapsed() >= limit)
+                {
+                    halt(&mut halted, &mut plan_machine, Halt::Time)?;
+                    halted.as_ref().map(Halt::blocked)
+                } else if let Some(halt) = &halted {
+                    Some(halt.blocked())
+                } else if !dependencies_allow(reviewer, &view) {
+                    Some(BlockedReason::DependencyDidNotPass)
+                } else {
+                    None
+                };
+                let mut staged_for_review = Vec::new();
+                let blocked = blocked.or_else(|| {
+                    staged_for_review = file_producers(plan, reviewer, &view, &*runner);
+                    let staged: Vec<&Task> = staged_for_review.iter().collect();
+                    runner
+                        .stage(reviewer, &staged)
+                        .err()
+                        .map(BlockedReason::StagingRefused)
+                });
+                if let Some(reason) = blocked {
+                    let r = TaskResult::blocked(&reason);
+                    record(
+                        &mut *runner,
+                        &reviewed,
+                        r.clone(),
+                        reason.event(),
+                        &mut results,
+                        &mut machines,
+                        &mut halted,
+                        &mut plan_machine,
+                        false,
+                    )?;
+                    rounds.push((result, r));
+                    break;
+                }
+                let reviewer_inputs = inputs_for(plan, reviewer, &view, &staged_for_review);
+                machines
+                    .entry(reviewed.name.clone())
+                    .or_default()
+                    .advance(TaskEvent::Dispatched)?;
+                let (verdict, event, budget_exceeded) =
+                    run_with_retries(reviewer, &reviewer_inputs, cfg, runner, &mut spent, budget);
+                if budget_exceeded {
+                    halt(&mut halted, &mut plan_machine, Halt::Budget)?;
+                }
+                runner.settled(reviewer, verdict.status == TaskStatus::Pass);
+                record(
+                    &mut *runner,
+                    &reviewed,
+                    verdict.clone(),
+                    event,
+                    &mut results,
+                    &mut machines,
+                    &mut halted,
+                    &mut plan_machine,
+                    false,
+                )?;
+                let again = verdict.status == TaskStatus::Fail;
+                rounds.push((result, verdict));
+                if !again {
+                    break;
+                }
+            }
+            let (proposed, reviewed) = fold_rounds(&rounds);
+            for (t, r) in [(proposer, proposed), (reviewer, reviewed)] {
+                let event = rounds_event(r.status);
+                record(
+                    &mut *runner,
+                    t,
+                    r,
+                    event,
+                    &mut results,
+                    &mut machines,
+                    &mut halted,
+                    &mut plan_machine,
+                    true,
+                )?;
             }
         } else if dispatch.len() == 1 {
             let t = first;
@@ -1107,6 +1293,7 @@ fn file_producers(
                     name: name.clone(),
                     over: None,
                     max_fanout: None,
+                    revise: None,
                     ..p.clone()
                 };
                 if contributes(p, &instance, r) {
@@ -1273,6 +1460,63 @@ fn fanout_items(
         keys.push(key.to_owned());
     }
     Ok(keys)
+}
+
+/// One round of a revise loop, `task[round-N]`. It shares the instance naming, so a reader groups
+/// rounds under their task the way it groups a fan-out's items.
+fn round_task(t: &Task, round: u32) -> Task {
+    Task {
+        name: instance_name(&t.name, &format!("round-{round}")),
+        revise: None,
+        ..t.clone()
+    }
+}
+
+/// The result the graph sees for each side of a revise loop: its last round, carrying the spend of
+/// every round.
+fn fold_rounds(rounds: &[(TaskResult, TaskResult)]) -> (TaskResult, TaskResult) {
+    let Some((proposed, reviewed)) = rounds.last() else {
+        let never = TaskResult::blocked(&BlockedReason::DependencyDidNotPass);
+        return (never.clone(), never);
+    };
+    let fold = |last: &TaskResult, cost_usd: f64| TaskResult {
+        attempts: last.attempts.min(1),
+        cost_usd,
+        ..last.clone()
+    };
+    (
+        fold(proposed, rounds.iter().map(|(p, _)| p.cost_usd).sum()),
+        fold(reviewed, rounds.iter().map(|(_, r)| r.cost_usd).sum()),
+    )
+}
+
+fn rounds_event(status: TaskStatus) -> TaskEvent {
+    match status {
+        TaskStatus::Pass => TaskEvent::RoundsPassed,
+        TaskStatus::Fail => TaskEvent::RoundsFailed,
+        TaskStatus::Skipped => TaskEvent::RoundsSkipped,
+        TaskStatus::Transport => TaskEvent::RoundsTransport,
+        TaskStatus::Blocked | TaskStatus::Truncated => TaskEvent::RoundsBlocked,
+    }
+}
+
+/// Whether `t`'s join lets it dispatch on its dependencies' settled results.
+fn dependencies_allow(t: &Task, results: &BTreeMap<TaskName, TaskResult>) -> bool {
+    match t.join {
+        Join::All => t
+            .depends_on
+            .iter()
+            .all(|d| results.get(d).map(|r| r.status) == Some(TaskStatus::Pass)),
+        // Only passing outputs feed a lossy join. A mapped node contributes when any of its
+        // instances passed, so a fan-out reads the same as a set of siblings.
+        Join::Passed => t
+            .depends_on
+            .iter()
+            .any(|d| results.get(d).is_some_and(TaskResult::contributed)),
+        // Every dependency already holds a result by the caller's guard, so terminality is
+        // established and no status blocks the dispatch.
+        Join::Settled => true,
+    }
 }
 
 /// Fold what the instances did into the one result the graph sees for the node.
@@ -1682,6 +1926,11 @@ mod tests {
         /// Producers this runner claims to hold a complete captured set for.
         captured: BTreeSet<String>,
         dropped: Vec<String>,
+        /// Outcomes consumed one per dispatch of a task, ahead of `script`: a revise loop runs
+        /// the same task and attempt number once per round.
+        rounds: BTreeMap<String, std::collections::VecDeque<fn() -> AttemptOutcome>>,
+        /// Every dispatch's inputs, in order; `seen_values` keeps only the last per task.
+        runs: Vec<(String, BTreeMap<TaskName, Value>)>,
     }
 
     impl ScriptRunner {
@@ -1695,7 +1944,13 @@ mod tests {
                 staged: BTreeMap::new(),
                 captured: BTreeSet::new(),
                 dropped: Vec::new(),
+                rounds: BTreeMap::new(),
+                runs: Vec::new(),
             }
+        }
+        fn rounds(&mut self, task: &str, outcomes: &[fn() -> AttemptOutcome]) {
+            self.rounds
+                .insert(task.to_string(), outcomes.iter().copied().collect());
         }
         fn on(&mut self, task: &str, attempt: u32, f: fn() -> AttemptOutcome, cost: f64) {
             self.script.insert((task.to_string(), attempt), (f, cost));
@@ -1735,6 +1990,17 @@ mod tests {
                 inputs.keys().map(|k| k.0.clone()).collect(),
             );
             self.seen_values.insert(task.name.0.clone(), inputs.clone());
+            self.runs.push((task.name.0.clone(), inputs.clone()));
+            if let Some(outcome) = self
+                .rounds
+                .get_mut(&task.name.0)
+                .and_then(std::collections::VecDeque::pop_front)
+            {
+                return Attempt {
+                    outcome: outcome(),
+                    cost_usd: self.default_cost,
+                };
+            }
             match self.script.get(&(task.name.0.clone(), attempt)) {
                 Some((f, cost)) => Attempt {
                     outcome: f(),
@@ -1765,6 +2031,7 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            revise: None,
         }
     }
 
@@ -2278,6 +2545,7 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            revise: None,
         });
         let plan = valid(tasks, 10.0);
         let mut r = ScriptRunner::new();
@@ -2336,6 +2604,7 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            revise: None,
         });
         let plan = valid(tasks, 10.0);
         let mut r = ScriptRunner::new();
@@ -2527,6 +2796,7 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            revise: None,
         };
         tasks.push(pick);
         let plan = valid(tasks, 10.0);
@@ -4448,6 +4718,450 @@ mod tests {
         assert_eq!(
             outcome["tasks"]["after"]["note"],
             "required task probe failed"
+        );
+    }
+
+    fn reviewing(name: &str, deps: &[&str], target: &str, max_rounds: u32) -> Task {
+        let mut t = task(name, deps, "any", true);
+        t.revise = Some(crate::plan::ir::Revise {
+            task: target.into(),
+            max_rounds,
+        });
+        t
+    }
+
+    fn rejected() -> AttemptOutcome {
+        AttemptOutcome::Fail {
+            note: "probe hit an unrelated 400".into(),
+            output: Some(serde_json::json!({"status": "fail", "why": "wrong encoding"})),
+        }
+    }
+
+    fn approved() -> AttemptOutcome {
+        AttemptOutcome::Pass(serde_json::json!({"verdict": "reproduced"}))
+    }
+
+    fn drafted() -> AttemptOutcome {
+        AttemptOutcome::Pass(serde_json::json!({"draft": "probe"}))
+    }
+
+    fn rows_of(plan: &ValidPlan, r: &mut ScriptRunner) -> (PlanOutcome, Vec<(String, TaskStatus)>) {
+        let mut rows = Vec::new();
+        let out = execute(
+            plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            r,
+            |t, result| rows.push((t.name.0.clone(), result.status)),
+        );
+        (out, rows)
+    }
+
+    fn row(name: &str, status: TaskStatus) -> (String, TaskStatus) {
+        (name.to_string(), status)
+    }
+
+    fn dispatches(r: &ScriptRunner) -> Vec<&str> {
+        r.dispatched.iter().map(|(n, _)| n.as_str()).collect()
+    }
+
+    #[test]
+    fn a_review_that_passes_the_first_draft_runs_one_round_and_sends_nothing_back() {
+        let plan = valid(
+            vec![
+                task("author", &[], "any", true),
+                reviewing("repro", &["author"], "author", 3),
+                task("pick", &["repro"], "any", true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        let (out, rows) = rows_of(&plan, &mut r);
+
+        assert!(out.valid);
+        assert_eq!(dispatches(&r), ["author", "repro", "pick"]);
+        assert_eq!(
+            rows,
+            [
+                row("author[round-1]", TaskStatus::Pass),
+                row("repro[round-1]", TaskStatus::Pass),
+                row("author", TaskStatus::Pass),
+                row("repro", TaskStatus::Pass),
+                row("pick", TaskStatus::Pass),
+            ]
+        );
+        assert!(!r.seen_inputs["author"].contains(&REVISION_INPUT.to_string()));
+    }
+
+    #[test]
+    fn a_failing_review_sends_its_verdict_back_until_a_round_passes() {
+        let plan = valid(
+            vec![
+                task("author", &[], "any", true),
+                reviewing("repro", &["author"], "author", 3),
+                task("pick", &["author", "repro"], "any", true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.rounds("author", &[drafted, drafted]);
+        r.rounds("repro", &[rejected, approved]);
+        let (out, rows) = rows_of(&plan, &mut r);
+
+        assert!(out.valid, "{:?}", out.results);
+        assert_eq!(out.exit, PlanExit::Completed);
+        assert_eq!(
+            dispatches(&r),
+            ["author", "repro", "author", "repro", "pick"]
+        );
+        assert_eq!(
+            rows,
+            [
+                row("author[round-1]", TaskStatus::Pass),
+                row("repro[round-1]", TaskStatus::Fail),
+                row("author[round-2]", TaskStatus::Pass),
+                row("repro[round-2]", TaskStatus::Pass),
+                row("author", TaskStatus::Pass),
+                row("repro", TaskStatus::Pass),
+                row("pick", TaskStatus::Pass),
+            ]
+        );
+
+        let authored: Vec<&BTreeMap<TaskName, Value>> = r
+            .runs
+            .iter()
+            .filter(|(n, _)| n == "author")
+            .map(|(_, inputs)| inputs)
+            .collect();
+        assert!(!authored[0].contains_key(&TaskName(REVISION_INPUT.into())));
+        let revision = &authored[1][&TaskName(REVISION_INPUT.into())];
+        assert_eq!(revision["round"], 2);
+        assert_eq!(revision["max_rounds"], 3);
+        assert_eq!(revision["reviewer"], "repro");
+        assert_eq!(revision["review"]["status"], "fail");
+        assert_eq!(revision["review"]["note"], "probe hit an unrelated 400");
+        assert_eq!(revision["review"]["output"]["why"], "wrong encoding");
+        assert_eq!(revision["review"]["files"], false);
+
+        let repro = &out.results[&"repro".into()];
+        assert_eq!(
+            repro.output,
+            Some(serde_json::json!({"verdict": "reproduced"}))
+        );
+        assert!(
+            (repro.cost_usd - 0.2).abs() < 1e-9,
+            "the node row carries every round's spend: {}",
+            repro.cost_usd
+        );
+        assert!((out.spent_usd - 0.5).abs() < 1e-9, "{}", out.spent_usd);
+        assert_eq!(
+            r.seen_values["pick"][&TaskName("repro".into())],
+            serde_json::json!({"verdict": "reproduced"}),
+            "a dependent reads the round that passed"
+        );
+    }
+
+    #[test]
+    fn a_reviewer_that_rejects_every_round_stops_at_max_rounds_and_short_circuits() {
+        let plan = valid(
+            vec![
+                task("author", &[], "any", true),
+                reviewing("repro", &["author"], "author", 2),
+                task("pick", &["repro"], "any", true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.rounds("repro", &[rejected, rejected, approved]);
+        let (out, rows) = rows_of(&plan, &mut r);
+
+        assert!(!out.valid);
+        assert_eq!(
+            out.exit,
+            PlanExit::ShortCircuit {
+                task: "repro".into()
+            }
+        );
+        assert_eq!(dispatches(&r), ["author", "repro", "author", "repro"]);
+        assert_eq!(rows.len(), 7, "{rows:?}");
+        assert_eq!(rows[5], row("repro", TaskStatus::Fail));
+        assert_eq!(rows[6], row("pick", TaskStatus::Blocked));
+        assert_eq!(
+            out.results[&"repro".into()].note.as_deref(),
+            Some("probe hit an unrelated 400")
+        );
+    }
+
+    #[test]
+    fn a_round_that_does_not_fail_ends_the_loop_whatever_else_it_settled_as() {
+        fn skipped() -> AttemptOutcome {
+            AttemptOutcome::Pass(serde_json::json!({"status": "skipped"}))
+        }
+        fn hung_up() -> AttemptOutcome {
+            AttemptOutcome::Transport(TransportFailure::new(
+                TransportCause::Other,
+                "the broker hung up",
+            ))
+        }
+        for (outcome, status) in [
+            (skipped as fn() -> AttemptOutcome, TaskStatus::Skipped),
+            (hung_up, TaskStatus::Transport),
+        ] {
+            let plan = valid(
+                vec![task("author", &[], "any", false), {
+                    let mut t = reviewing("repro", &["author"], "author", 3);
+                    t.required = false;
+                    t
+                }],
+                10.0,
+            );
+            let mut r = ScriptRunner::new();
+            r.rounds("repro", &[outcome, outcome, outcome]);
+            let (out, _) = rows_of(&plan, &mut r);
+            assert_eq!(out.results[&"repro".into()].status, status);
+            assert_eq!(
+                dispatches(&r).iter().filter(|n| **n == "author").count(),
+                1,
+                "{status:?} is not a verdict to revise against"
+            );
+        }
+    }
+
+    #[test]
+    fn a_revision_that_fails_blocks_its_review_and_ends_the_loop() {
+        let plan = valid(
+            vec![
+                task("author", &[], "any", true),
+                reviewing("repro", &["author"], "author", 3),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.rounds("author", &[drafted, || AttemptOutcome::fail("gave up")]);
+        r.rounds("repro", &[rejected]);
+        let (out, rows) = rows_of(&plan, &mut r);
+
+        assert_eq!(dispatches(&r), ["author", "repro", "author"]);
+        assert_eq!(
+            rows,
+            [
+                row("author[round-1]", TaskStatus::Pass),
+                row("repro[round-1]", TaskStatus::Fail),
+                row("author[round-2]", TaskStatus::Fail),
+                row("repro[round-2]", TaskStatus::Blocked),
+                row("author", TaskStatus::Fail),
+                row("repro", TaskStatus::Blocked),
+            ]
+        );
+        assert_eq!(
+            out.exit,
+            PlanExit::ShortCircuit {
+                task: "author".into()
+            }
+        );
+        assert_eq!(
+            out.results[&"repro".into()].blocked,
+            Some(BlockedReason::DependencyDidNotPass)
+        );
+    }
+
+    #[test]
+    fn a_settled_reviewer_still_reviews_a_failed_revision() {
+        let mut repro = reviewing("repro", &["author"], "author", 2);
+        repro.join = Join::Settled;
+        let plan = valid(vec![task("author", &[], "any", true), repro], 10.0);
+        let mut r = ScriptRunner::new();
+        r.rounds("author", &[drafted, || AttemptOutcome::fail("gave up")]);
+        r.rounds("repro", &[rejected, rejected]);
+        let (out, _) = rows_of(&plan, &mut r);
+
+        assert_eq!(dispatches(&r), ["author", "repro", "author", "repro"]);
+        assert_eq!(
+            r.entry("repro", "author")["status"],
+            "fail",
+            "the reviewer read the revision that failed, not the draft before it"
+        );
+        assert_eq!(out.results[&"author".into()].status, TaskStatus::Fail);
+    }
+
+    #[test]
+    fn a_budget_spent_by_a_round_stops_the_loop_before_the_next() {
+        let plan = valid(
+            vec![
+                task("author", &[], "any", true),
+                reviewing("repro", &["author"], "author", 3),
+                task("pick", &["repro"], "any", true),
+            ],
+            0.25,
+        );
+        let mut r = ScriptRunner::new();
+        r.default_cost = 0.15;
+        r.rounds("repro", &[rejected, approved]);
+        let (out, rows) = rows_of(&plan, &mut r);
+
+        assert_eq!(out.exit, PlanExit::BudgetExceeded);
+        assert!(!out.valid);
+        assert_eq!(dispatches(&r), ["author", "repro"]);
+        assert_eq!(
+            rows,
+            [
+                row("author[round-1]", TaskStatus::Pass),
+                row("repro[round-1]", TaskStatus::Fail),
+                row("author", TaskStatus::Pass),
+                row("repro", TaskStatus::Fail),
+                row("pick", TaskStatus::Blocked),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_proposer_that_spends_the_budget_leaves_its_review_blocked() {
+        let plan = valid(
+            vec![
+                task("author", &[], "any", true),
+                reviewing("repro", &["author"], "author", 3),
+            ],
+            0.25,
+        );
+        let mut r = ScriptRunner::new();
+        r.default_cost = 0.3;
+        let (out, rows) = rows_of(&plan, &mut r);
+
+        assert_eq!(out.exit, PlanExit::BudgetExceeded);
+        assert_eq!(dispatches(&r), ["author"]);
+        assert_eq!(rows[1], row("repro[round-1]", TaskStatus::Blocked));
+        assert_eq!(
+            out.results[&"repro".into()].blocked,
+            Some(BlockedReason::BudgetCeiling)
+        );
+    }
+
+    #[test]
+    fn an_exhausted_wall_clock_dispatches_no_round() {
+        let plan = valid(
+            vec![
+                task("author", &[], "any", true),
+                reviewing("repro", &["author"], "author", 3),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.rounds("repro", &[rejected, approved]);
+        let mut rows = Vec::new();
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg {
+                wall_clock: Some(Duration::ZERO),
+                ..ExecCfg::default()
+            },
+            &mut r,
+            |t, result| rows.push((t.name.0.clone(), result.status)),
+        );
+        assert_eq!(out.exit, PlanExit::TimeExceeded);
+        assert!(r.dispatched.is_empty(), "{:?}", r.dispatched);
+        assert!(
+            rows.iter().all(|(_, s)| *s == TaskStatus::Blocked),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn the_reviewers_captured_evidence_is_staged_into_the_revision() {
+        let plan = valid(
+            vec![
+                task("baseline", &[], "any", true),
+                task("author", &["baseline"], "any", true),
+                reviewing("repro", &["author", "baseline"], "author", 3),
+            ],
+            10.0,
+        );
+        let mut plan_tasks = plan.plan().tasks.clone();
+        for t in &mut plan_tasks {
+            t.emits_files = vec![format!("{}.json", t.name)];
+        }
+        let plan = valid(plan_tasks, 10.0);
+        let mut r = ScriptRunner::new();
+        r.captured.insert("repro".into());
+        r.rounds("repro", &[rejected, approved]);
+        let (out, _) = rows_of(&plan, &mut r);
+
+        assert!(out.valid);
+        assert_eq!(r.staged["author"], ["baseline", "repro"]);
+        assert_eq!(r.staged["repro"], ["baseline", "author"]);
+        let revision = &r.seen_values["author"][&TaskName(REVISION_INPUT.into())];
+        assert_eq!(revision["review"]["files"], true);
+    }
+
+    #[test]
+    fn a_loop_waits_for_the_reviewers_other_dependencies_before_its_first_round() {
+        let plan = valid(
+            vec![
+                task("author", &[], "any", true),
+                task("rig", &[], "any", true),
+                reviewing("repro", &["author", "rig"], "author", 2),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.rounds("repro", &[rejected, approved]);
+        let (out, _) = rows_of(&plan, &mut r);
+
+        assert!(out.valid);
+        assert_eq!(
+            dispatches(&r),
+            ["rig", "author", "repro", "author", "repro"]
+        );
+    }
+
+    #[test]
+    fn a_dependent_of_the_proposer_waits_for_the_loop_and_reads_the_last_draft() {
+        let plan = valid(
+            vec![
+                task("author", &[], "any", true),
+                task("notify", &["author"], "any", true),
+                reviewing("repro", &["author"], "author", 3),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.rounds(
+            "author",
+            &[
+                || AttemptOutcome::Pass(serde_json::json!({"draft": 1})),
+                || AttemptOutcome::Pass(serde_json::json!({"draft": 2})),
+            ],
+        );
+        r.rounds("repro", &[rejected, approved]);
+        let (out, _) = rows_of(&plan, &mut r);
+
+        assert!(out.valid);
+        assert_eq!(
+            dispatches(&r),
+            ["author", "repro", "author", "repro", "notify"]
+        );
+        assert_eq!(
+            r.seen_values["notify"][&TaskName("author".into())],
+            serde_json::json!({"draft": 2})
+        );
+    }
+
+    #[test]
+    fn a_reviewer_this_substrate_cannot_run_leaves_the_proposer_a_plain_task() {
+        let mut repro = reviewing("repro", &["author"], "author", 3);
+        repro.needs = "gpu".into();
+        repro.required = false;
+        let plan = valid(vec![task("author", &[], "any", true), repro], 10.0);
+        let mut r = ScriptRunner::new();
+        let (out, rows) = rows_of(&plan, &mut r);
+
+        assert!(out.valid);
+        assert_eq!(
+            rows,
+            [
+                row("author", TaskStatus::Pass),
+                row("repro", TaskStatus::Skipped)
+            ]
         );
     }
 }
