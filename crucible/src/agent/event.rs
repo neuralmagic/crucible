@@ -30,7 +30,9 @@ pub fn cost_of(ev: &AgentEvent) -> Option<f64> {
 /// Anthropic: cache_read ≈ 0.1× input, cache_write ≈ 1.25× input (default 5-min ephemeral).
 /// OpenAI: cached input is 0.1× input and there is no cache-write premium (1.0× input).
 /// Sources: claude-api pricing (Opus 4.x $5/$25, Sonnet 4.6 $3/$15, Haiku 4.5 $1/$5 per MTok) and
-/// OpenAI's published per-MTok rates (see [`openai_prices`]).
+/// OpenAI's published per-MTok rates (see [`openai_prices`]). A name from neither family is a
+/// self-hosted model reached through a custom endpoint (qwen on an in-house MaaS, say): its
+/// tokens are counted but priced at nothing, since no vendor bills for them.
 fn model_prices(model: &str) -> (f64, f64, f64, f64) {
     let m = model.to_ascii_lowercase();
     let per = 1e-6;
@@ -41,9 +43,12 @@ fn model_prices(model: &str) -> (f64, f64, f64, f64) {
         (1.0, 5.0)
     } else if m.contains("sonnet") {
         (3.0, 15.0)
-    } else {
-        // Opus (and unknown, Opus is the loop default).
+    } else if m.contains("opus") || m.contains("claude") {
+        // Opus, and any other claude-* name: the family's most expensive tier, so an
+        // unrecognized Anthropic name never under-charges the budget line.
         (5.0, 25.0)
+    } else {
+        return (0.0, 0.0, 0.0, 0.0);
     };
     (
         input * per,
@@ -113,8 +118,8 @@ mod tests {
             ("claude-opus-4-6", 5.0, 25.0),
             ("claude-sonnet-4-6", 3.0, 15.0),
             ("claude-haiku-4-5", 1.0, 5.0),
-            // Unknown models price as Opus, the loop default.
-            ("mystery-model", 5.0, 25.0),
+            // An unrecognized claude spelling prices as Opus, the family's ceiling.
+            ("claude-mystery-9", 5.0, 25.0),
         ] {
             let want = input + output + input * 0.1 + input * 1.25;
             let got = estimate_cost(model, &sample());
@@ -141,6 +146,23 @@ mod tests {
     }
 
     /// The OpenAI rows must not shadow the Anthropic table, and vice versa.
+    /// A model from neither vendor family is self-hosted: the estimate counts its tokens at $0
+    /// rather than billing a qwen turn on an in-house endpoint as Opus.
+    #[test]
+    fn a_self_hosted_model_prices_at_zero() {
+        for model in [
+            "qwen-3-8-27b",
+            "Qwen/Qwen3-235B",
+            "llama-4-maverick",
+            "deepseek-v4",
+        ] {
+            assert_eq!(estimate_cost(model, &sample()), 0.0, "{model}");
+        }
+        // An unrecognized claude spelling still prices as Opus.
+        let want = 5.0 + 25.0 + 5.0 * 0.1 + 5.0 * 1.25;
+        assert!((estimate_cost("claude-fable-5", &sample()) - want).abs() < 1e-9);
+    }
+
     #[test]
     fn the_pricing_tables_stay_on_their_own_side() {
         assert_eq!(openai_prices("claude-opus-4-6"), None);

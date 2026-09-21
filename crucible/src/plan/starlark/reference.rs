@@ -7,8 +7,8 @@
 
 use crate::plan::exec::DeclaredStatus;
 use crate::plan::ir::KEPT_INPUT;
-use crate::plan::ir::MAX_FANOUT_CEILING;
-use crate::plan::ir::{ITEM_INPUT, OUTCOME_INPUT};
+use crate::plan::ir::{ITEM_INPUT, OUTCOME_INPUT, REVISION_INPUT};
+use crate::plan::ir::{MAX_FANOUT_CEILING, MAX_ROUNDS_CEILING};
 #[cfg(test)]
 use crate::plan::workflow::WorkflowType;
 use crucible_contract::decision::UNCERTAIN;
@@ -112,6 +112,21 @@ fn task_knobs() -> Vec<Kwarg> {
             "int",
             format!(
                 "Instance cap for `over`, within the engine's ceiling of {MAX_FANOUT_CEILING}."
+            ),
+        ),
+        Kwarg::new(
+            "revise",
+            "task",
+            "A direct dependency this task sends back when it settles failing. The dependency runs \
+             again with the verdict under `revision`, then this task does, until this task stops \
+             failing or `max_rounds` is spent. Playbooks only; not with `over`.",
+        ),
+        Kwarg::new(
+            "max_rounds",
+            "int",
+            format!(
+                "Round cap for `revise`, counting the first, from 2 to the engine's ceiling of \
+                 {MAX_ROUNDS_CEILING}."
             ),
         ),
         Kwarg::new(
@@ -560,6 +575,13 @@ pub fn reserved_inputs() -> Vec<Reserved> {
             "How the main graph ended and what each of its tasks settled as, as \
              `{\"exit\": str, \"tasks\": {name: {\"status\", \"note\"}}}`, in an epilogue \
              task only.",
+        ),
+        Reserved::new(
+            REVISION_INPUT,
+            "object",
+            "The verdict that sent this task back, as `{\"round\": int, \"max_rounds\": int, \
+             \"reviewer\": str, \"review\": {\"status\", \"note\", \"output\", \"files\"}}`, \
+             from the second round of a revise loop on.",
         ),
     ]
 }

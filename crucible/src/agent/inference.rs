@@ -4,7 +4,8 @@
 //! spell the same thing.
 //!
 //! Absent, every field is `None` and a turn authenticates the way it always has: Vertex through
-//! the gateway's metadata emulator for Claude, the selected `[agent.codex]` auth for Codex.
+//! the gateway's metadata emulator for Claude (and for opencode and pi, which speak Vertex through
+//! their own provider tables), the selected `[agent.codex]` auth for Codex.
 
 use crate::manifest::Harness;
 use anyhow::{Context, Result};
@@ -81,9 +82,12 @@ pub struct AgentSelection {
 /// Whether `harness` is a client of `protocol`.
 pub fn speaks(harness: Harness, protocol: InferenceProtocol) -> bool {
     match protocol {
-        InferenceProtocol::Messages => matches!(harness, Harness::Claude | Harness::Hermes),
+        InferenceProtocol::Messages => matches!(
+            harness,
+            Harness::Claude | Harness::Hermes | Harness::OpenCode | Harness::Pi
+        ),
         InferenceProtocol::ChatCompletions | InferenceProtocol::Responses => {
-            harness == Harness::Codex
+            matches!(harness, Harness::Codex | Harness::OpenCode | Harness::Pi)
         }
         InferenceProtocol::SystemOne => false,
     }
@@ -108,10 +112,11 @@ impl AgentSelection {
 pub struct InferenceEnv {
     pub anthropic_key: Option<String>,
     pub anthropic_base_url: Option<String>,
+    /// The OpenAI-speaking key a key-authenticated harness (opencode, pi) relays into the sandbox;
+    /// codex selects its own key by name through `[agent.codex]` instead.
+    pub openai_key: Option<String>,
     pub openai_base_url: Option<String>,
     pub wire_api: Option<WireApi>,
-    /// The key an injected binding names for Codex. Takes the place of `[agent.codex]`'s own.
-    pub codex_key: Option<String>,
     /// Set exactly when an agent binding was injected.
     pub selection: Option<AgentSelection>,
 }
@@ -134,11 +139,11 @@ impl InferenceEnv {
         let env = InferenceEnv {
             anthropic_key: non_empty(ANTHROPIC_API_KEY),
             anthropic_base_url: non_empty(ANTHROPIC_BASE_URL),
+            openai_key: non_empty(OPENAI_API_KEY_ENV),
             openai_base_url: non_empty(OPENAI_BASE_URL),
             wire_api: non_empty(WIRE_API)
                 .map(|w| WireApi::parse(&w))
                 .transpose()?,
-            codex_key: None,
             selection: None,
         };
         for (key, url) in [
@@ -185,7 +190,7 @@ impl InferenceEnv {
                 env.anthropic_base_url = binding.url.clone();
             }
             InferenceProtocol::ChatCompletions | InferenceProtocol::Responses => {
-                env.codex_key = key;
+                env.openai_key = key;
                 env.openai_base_url = binding.url.clone();
                 env.wire_api = Some(match binding.protocol {
                     InferenceProtocol::Responses => WireApi::Responses,
@@ -202,17 +207,65 @@ impl InferenceEnv {
         Ok(env)
     }
 
-    /// The custom base URL the harness will talk to, if any.
+    /// Nothing named: no key, no base URL. The turn runs on the deploy profile's ambient
+    /// credentials, which for every harness that can speak it means Vertex.
+    pub fn is_ambient(&self) -> bool {
+        self.anthropic_key.is_none()
+            && self.anthropic_base_url.is_none()
+            && self.openai_key.is_none()
+            && self.openai_base_url.is_none()
+    }
+
+    /// The custom base URL the harness will talk to, if any. A harness that speaks both API
+    /// families (opencode, pi) takes the OpenAI one first, the same precedence
+    /// `crate::agent::harness::api_endpoint` resolves its provider by.
     pub fn base_url_for(&self, harness: Harness) -> Option<&str> {
         match harness {
             Harness::Claude | Harness::Hermes => self.anthropic_base_url.as_deref(),
             Harness::Codex => self.openai_base_url.as_deref(),
+            Harness::OpenCode | Harness::Pi => self
+                .openai_base_url
+                .as_deref()
+                .or(self.anthropic_base_url.as_deref()),
         }
     }
 
     /// The egress entry the sandbox needs for the harness's custom base URL, if there is one.
     pub fn egress_endpoint_for(&self, harness: Harness) -> Result<Option<String>> {
         self.base_url_for(harness).map(egress_endpoint).transpose()
+    }
+}
+
+/// The Vertex project and region a turn's manifest env names, with sane fallbacks: the gateway
+/// provider is registered against them, and a harness that speaks Vertex through its own
+/// provider table (opencode, pi) is seeded with them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VertexConfig {
+    pub project: String,
+    pub region: String,
+}
+
+impl VertexConfig {
+    pub fn from_env(env: &[(String, String)]) -> VertexConfig {
+        let get = |keys: &[&str]| {
+            keys.iter()
+                .find_map(|k| env.iter().find(|(ek, _)| ek == k).map(|(_, v)| v.clone()))
+        };
+        VertexConfig {
+            project: get(&["ANTHROPIC_VERTEX_PROJECT_ID", "GCP_PROJECT_ID"]).unwrap_or_default(),
+            region: get(&["CLOUD_ML_REGION", "VERTEX_LOCATION"]).unwrap_or_else(|| "global".into()),
+        }
+    }
+
+    /// The Vertex AI host for the region: `global` is the apex, `us`/`eu` are the multi-region
+    /// `rep` hosts, anything else is region-prefixed. The same hosts
+    /// `crate::openshell::policy::VERTEX_CREDENTIAL_HOSTS` binds the credential to.
+    pub fn host(&self) -> String {
+        match self.region.as_str() {
+            "global" => "aiplatform.googleapis.com".to_string(),
+            "us" | "eu" => format!("aiplatform.{}.rep.googleapis.com", self.region),
+            region => format!("{region}-aiplatform.googleapis.com"),
+        }
     }
 }
 
@@ -317,7 +370,7 @@ mod tests {
                 Some("http://vllm.internal:8000/v1")
             );
             assert_eq!(env.wire_api, Some(wire));
-            assert_eq!(env.codex_key.as_deref(), Some("sk-1"));
+            assert_eq!(env.openai_key.as_deref(), Some("sk-1"));
             assert_eq!(
                 env.anthropic_key, None,
                 "an OpenAI key is not an Anthropic key"
@@ -434,8 +487,51 @@ mod tests {
             assert_eq!(select(protocol).harness(Harness::Claude), Harness::Codex);
             assert_eq!(select(protocol).harness(Harness::Hermes), Harness::Codex);
         }
-        for harness in [Harness::Claude, Harness::Hermes, Harness::Codex] {
+        for both in [Harness::OpenCode, Harness::Pi] {
+            assert_eq!(messages.harness(both), both);
+            assert_eq!(select(InferenceProtocol::Responses).harness(both), both);
+        }
+        for harness in [
+            Harness::Claude,
+            Harness::Hermes,
+            Harness::Codex,
+            Harness::OpenCode,
+            Harness::Pi,
+        ] {
             assert!(!speaks(harness, InferenceProtocol::SystemOne));
+        }
+    }
+
+    #[test]
+    fn vertex_config_reads_manifest_keys_with_fallback() {
+        let vertex = VertexConfig::from_env(&[
+            ("ANTHROPIC_VERTEX_PROJECT_ID".into(), "proj-x".into()),
+            ("CLOUD_ML_REGION".into(), "us-east5".into()),
+        ]);
+        assert_eq!(vertex.project, "proj-x");
+        assert_eq!(vertex.region, "us-east5");
+        assert_eq!(vertex.host(), "us-east5-aiplatform.googleapis.com");
+        let unset = VertexConfig::from_env(&[]);
+        assert_eq!(unset.region, "global");
+        assert_eq!(unset.host(), "aiplatform.googleapis.com");
+        let multi = VertexConfig::from_env(&[("VERTEX_LOCATION".into(), "eu".into())]);
+        assert_eq!(multi.host(), "aiplatform.eu.rep.googleapis.com");
+    }
+
+    #[test]
+    fn ambient_means_no_key_and_no_base_url() {
+        assert!(InferenceEnv::default().is_ambient());
+        for env in [
+            InferenceEnv {
+                anthropic_key: Some("k".into()),
+                ..Default::default()
+            },
+            InferenceEnv {
+                openai_base_url: Some("http://vllm:8000/v1".into()),
+                ..Default::default()
+            },
+        ] {
+            assert!(!env.is_ambient(), "{env:?}");
         }
     }
 

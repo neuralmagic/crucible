@@ -729,13 +729,13 @@ A `task_result` event whose `status` is `transport` carries an additive `transpo
 `workspace`/`command`/`other`. `note` stays the retry summary with the last attempt's detail.
 `report.json`'s per-task entries carry the same token.
 
-A `task_result` event's `status` may be `not_taken` (contract 1.5.0): the task's `when` was not
+A `task_result` event's `status` may be `not_taken` (contract 1.6.0): the task's `when` was not
 satisfied, or it joins `all` on a task that settled that way. It was never dispatched, cost
 nothing, and is not a failure. A `plan_admitted` task carries an additive `when` string,
 `route.question in a|b`, empty when the task is unconditional.
 
 An orchestrator tells the engine where models are reached through one JSON document in
-`CRUCIBLE_INFERENCE` (contract 1.6.0), typed as `crucible_contract::inference::ResolvedInference`:
+`CRUCIBLE_INFERENCE` (contract 1.7.0), typed as `crucible_contract::inference::ResolvedInference`:
 `{"version":1,"bindings":[{"role","protocol","url"?,"model","key_env"?}]}`. `role` is `agent` or
 `decision`; `protocol` is `messages`, `chat_completions`, `responses`, or `system_one`. `key_env`
 names the variable holding the credential and the document never holds the value. An unknown
@@ -876,7 +876,7 @@ noted here tersely so this doc stays the map of what's authoritative:
   freeze applies identically regardless of which arm sourced the goal.
 - **`crucible ps [--namespace <ns>] [--json]`**: lists loop pods across the cluster, selecting on
   the `app.kubernetes.io/managed-by=crucible` label every rendered loop pod carries. `ITER` ships
-  as `-` (reserved, see `ps.rs`'s module doc for why it isn't wired up yet).
+  as `-` (reserved, see `crucible/src/cli/ps.rs`'s module doc for why it isn't wired up yet).
 - **`crucible deploy render|apply --manifest <path> --profile <path> [--iterations N]
   [--max-cost USD] [--no-pin] [--pack [--pack-configmap-name <name>]] [--pr-repo <owner/repo>]
   [--clusters <path>] [--harness <h>] [--model <m>] [--playbook --max-time <dur> [--param

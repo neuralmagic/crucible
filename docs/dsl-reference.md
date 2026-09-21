@@ -33,6 +33,8 @@ An agent turn driven by a prompt.
 | `emits_files` | `list[str]` | Workspace files the task produces. A dependent is staged with the declared files of every dependency that passed. |
 | `over` | `producer.field` | Map the task over a dependency's emitted list, one instance per item. |
 | `max_fanout` | `int` | Instance cap for `over`, within the engine's ceiling of 256. |
+| `revise` | `task` | A direct dependency this task sends back when it settles failing. The dependency runs again with the verdict under `revision`, then this task does, until this task stops failing or `max_rounds` is spent. Playbooks only; not with `over`. |
+| `max_rounds` | `int` | Round cap for `revise`, counting the first, from 2 to the engine's ceiling of 5. |
 | `stage` | `"iteration" \| "epilogue"` | `epilogue` runs once after the loop concludes, and only if the run kept a candidate. |
 | `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
 | `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice. |
@@ -59,6 +61,8 @@ An agent turn whose prompt is a skill's instructions plus its arguments.
 | `emits_files` | `list[str]` | Workspace files the task produces. A dependent is staged with the declared files of every dependency that passed. |
 | `over` | `producer.field` | Map the task over a dependency's emitted list, one instance per item. |
 | `max_fanout` | `int` | Instance cap for `over`, within the engine's ceiling of 256. |
+| `revise` | `task` | A direct dependency this task sends back when it settles failing. The dependency runs again with the verdict under `revision`, then this task does, until this task stops failing or `max_rounds` is spent. Playbooks only; not with `over`. |
+| `max_rounds` | `int` | Round cap for `revise`, counting the first, from 2 to the engine's ceiling of 5. |
 | `stage` | `"iteration" \| "epilogue"` | `epilogue` runs once after the loop concludes, and only if the run kept a candidate. |
 | `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
 | `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice. |
@@ -80,6 +84,8 @@ A deterministic shell task in the candidate workspace.
 | `emits_files` | `list[str]` | Workspace files the task produces. A dependent is staged with the declared files of every dependency that passed. |
 | `over` | `producer.field` | Map the task over a dependency's emitted list, one instance per item. |
 | `max_fanout` | `int` | Instance cap for `over`, within the engine's ceiling of 256. |
+| `revise` | `task` | A direct dependency this task sends back when it settles failing. The dependency runs again with the verdict under `revision`, then this task does, until this task stops failing or `max_rounds` is spent. Playbooks only; not with `over`. |
+| `max_rounds` | `int` | Round cap for `revise`, counting the first, from 2 to the engine's ceiling of 5. |
 | `stage` | `"iteration" \| "epilogue"` | `epilogue` runs once after the loop concludes, and only if the run kept a candidate. |
 | `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
 | `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice. |
@@ -103,6 +109,8 @@ A measurement command. Its last non-empty stdout line is a JSON object; `pass = 
 | `emits_files` | `list[str]` | Workspace files the task produces. A dependent is staged with the declared files of every dependency that passed. |
 | `over` | `producer.field` | Map the task over a dependency's emitted list, one instance per item. |
 | `max_fanout` | `int` | Instance cap for `over`, within the engine's ceiling of 256. |
+| `revise` | `task` | A direct dependency this task sends back when it settles failing. The dependency runs again with the verdict under `revision`, then this task does, until this task stops failing or `max_rounds` is spent. Playbooks only; not with `over`. |
+| `max_rounds` | `int` | Round cap for `revise`, counting the first, from 2 to the engine's ceiling of 5. |
 | `stage` | `"iteration" \| "epilogue"` | `epilogue` runs once after the loop concludes, and only if the run kept a candidate. |
 | `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
 | `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice. |
@@ -287,3 +295,4 @@ Present alongside the dependency entries, never wrapped in one.
 | `item` | `str` | This mapped instance's key, one per item of the list `over` names. |
 | `kept` | `object` | The kept candidate, in an epilogue task only. |
 | `outcome` | `object` | How the main graph ended and what each of its tasks settled as, as `{"exit": str, "tasks": {name: {"status", "note"}}}`, in an epilogue task only. |
+| `revision` | `object` | The verdict that sent this task back, as `{"round": int, "max_rounds": int, "reviewer": str, "review": {"status", "note", "output", "files"}}`, from the second round of a revise loop on. |

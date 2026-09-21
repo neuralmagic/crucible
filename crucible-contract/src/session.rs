@@ -145,6 +145,13 @@ pub struct PlanTaskWire {
     /// `route.question in a|b` when the task runs only on those answers, empty otherwise.
     #[serde(default)]
     pub when: String,
+    /// The dependency this task sends back when it settles failing, empty otherwise. Each round
+    /// reports as `task[round-N]`, so a renderer draws the loop from this before any round runs.
+    #[serde(default)]
+    pub revise: String,
+    /// The most rounds `revise` may run, the first included; 0 when the task revises nothing.
+    #[serde(default)]
+    pub max_rounds: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -817,6 +824,8 @@ mod tests {
                 over: "discover.targets".into(),
                 max_fanout: 8,
                 when: String::new(),
+                revise: "draft".into(),
+                max_rounds: 3,
             }],
         });
     }

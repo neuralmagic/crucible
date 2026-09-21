@@ -169,6 +169,11 @@ pub enum WorkflowError {
     UnknownCustomResult { result: String },
     #[error("playbook task {task:?} names engine operation {op:?}: a playbook has no scored loop")]
     PlaybookEngineTask { task: String, op: EngineOp },
+    #[error(
+        "task {task:?} declares revise, which only a playbook runs; a scored loop already sends \
+         a failed candidate back through its next iteration"
+    )]
+    ReviseOutsidePlaybook { task: String },
     #[error("engine task {task:?} cannot run in the epilogue (the loop is over)")]
     EngineTaskInEpilogue { task: String },
     #[error("report task {task:?} must run in the epilogue")]
@@ -287,6 +292,13 @@ impl WorkflowCfg {
             });
         }
 
+        if self.workflow_type != WorkflowType::Playbook
+            && let Some(task) = self.tasks.iter().find(|task| task.revise.is_some())
+        {
+            return Err(WorkflowError::ReviseOutsidePlaybook {
+                task: task.name.0.clone(),
+            });
+        }
         if self.is_legacy_splice() {
             self.validate_stages()?;
             return self.validate_legacy_splice();

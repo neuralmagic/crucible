@@ -37,11 +37,11 @@ status = "done"
 category = "added"
 
 [[content.acceptance_criteria]]
-text = "CONTRACT_VERSION 1.6.0, the wire doc, and the example pack describe the document"
-status = "done"
-category = "chore"
-
-[[content.acceptance_criteria]]
 text = "an agent binding fixes the run's model, keeps or replaces the harness by protocol, supplies the endpoint and wire API, and its credential replaces the manifest's own in every Codex auth mode, each replacement logged; with a binding present the ambient inference variables are not read"
 status = "done"
 category = "changed"
+
+[[content.acceptance_criteria]]
+text = "CONTRACT_VERSION 1.7.0, the wire doc, and the example pack describe the document"
+status = "done"
+category = "chore"

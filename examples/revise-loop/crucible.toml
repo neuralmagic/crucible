@@ -1,0 +1,23 @@
+# revise-loop: a proposer/reviewer revise loop through a real OpenShell sandbox on podman, with no
+# model. The sandbox image's `claude` is tools/fake-agent.py behind Claude Code's argv and
+# stream-json result, so the container, session, upload, and download paths are the real ones.
+#
+#   just revise-loop-e2e
+
+[workspace]
+inject = ["check.sh"]
+
+[agent]
+backend = "openshell"
+harness = "claude"
+model = "fake"
+sandbox_image = "localhost/crucible-fake-claude:dev"
+goal = "Write a probe the reviewer accepts."
+
+[agent.env]
+FAKE_AGENT_SCRIPT = "/usr/local/share/fake-agent/agents.json"
+FAKE_AGENT_STATE = "/tmp/fake-agent"
+
+[workflow]
+type = "playbook"
+file = "workflow.star"

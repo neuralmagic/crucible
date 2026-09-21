@@ -1,0 +1,24 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-REVISE-LOOP"
+title = "A reviewer's bounded send-back"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = """
+A task MAY declare revise, naming one task, together with max_rounds. The named task is the target and the declaring task is its reviewer. The engine MUST reject revise without max_rounds and max_rounds without revise, MUST reject max_rounds outside 2 to 5 inclusive, and MUST reject a target that is not a direct dependency of its reviewer. The engine MUST reject a revise loop in which either task is anything other than an agent, command, or evaluate task, or in which either task maps over a list. The engine MUST reject a target named by two reviewers, a target that is itself a reviewer, and a reviewer that is itself a target: revise loops do not nest or chain. The engine MUST reject a reviewer with any other dependency from which the target is reachable, because that dependency would read a draft a later round replaces. The engine MUST reject revise in every workflow type other than "playbook". The name "revision" is a reserved input under [[RFC-0002:C-SETTLED-JOIN]], and the engine MUST reject a dependency named after it.
+
+The engine MUST NOT dispatch the loop's first round until the target is ready under its own join and every other dependency of the reviewer has settled, and MUST NOT dispatch a dependent of either task until both have settled under their own names. Where the reviewer cannot run on the substrate, the engine MUST dispatch the target as a task outside any loop and MUST settle the reviewer as [[RFC-0002:C-PLAYBOOK-CAPS]] requires.
+
+A round dispatches the target, then dispatches the reviewer against that round's target result under the reviewer's own join. A reviewer whose join that result does not satisfy MUST settle blocked for that round, as any task would. The engine MUST begin another round when, and only when, the reviewer's round settled failing and fewer than max_rounds rounds have run. A reviewer round that passed, skipped, transport-failed, or was blocked ends the loop, as does a target round whose failure leaves the reviewer blocked. Before every round after the first, and before every reviewer dispatch, the engine MUST check the cost and wall-clock ceilings; an exhausted ceiling ends the loop and halts the run as it would halt any dispatch, and a reviewer not dispatched for it MUST settle blocked on that ceiling.
+
+From the second round on, the engine MUST give the target the reserved input "revision", carrying under "round" the round about to run, under "max_rounds" the declared bound, under "reviewer" the reviewer's name, and under "review" the reviewer's previous round as the entry [[RFC-0002:C-SETTLED-JOIN]] defines for a settled dependency. Where the engine holds a complete file set captured from that failing reviewer round, it MUST stage that set into the target under the reviewer's name, and the entry's staged-file flag MUST say whether it did. The engine MUST NOT give the target "revision" in the first round. A target that declares a session MUST resume that session in every round.
+
+Each round of each task MUST produce one session row named after the task followed by "[round-N]", written as that round settles and carrying that round's status, output, note, and spend. Once the loop ends, each task MUST produce one row under its own name carrying its last round's status, output, note, blocked reason, and transport cause, and the sum of every round's spend. A round row MUST NOT affect the verdict or halt the run; the rows under the tasks' own names do, exactly as [[RFC-0002:C-PLAYBOOK-LANE]] states for any task. A dependent of either task MUST read the last round's output and captured files.
+
+Every round settles its work as any task does. A passing round's workspace changes MUST be committed to the run's git memory and a failing round's MUST be discarded, as [[RFC-0002:C-PLAYBOOK-LANE]] requires, so a later round runs on top of every earlier passing round. A round's captured file set MUST replace the set its task published in an earlier round under the rules of [[RFC-0002:C-TASK-FILES]] and [[RFC-0002:C-SETTLED-JOIN]].
+
+The admitted-plan event MUST carry a reviewer's target under "revise" and its bound under "max_rounds", and MUST carry an empty string and zero for every other task."""

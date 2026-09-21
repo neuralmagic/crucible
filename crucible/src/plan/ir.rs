@@ -14,9 +14,12 @@ pub const ITEM_INPUT: &str = "item";
 pub const KEPT_INPUT: &str = "kept";
 /// The reserved input every epilogue task receives the main graph's outcome under.
 pub const OUTCOME_INPUT: &str = "outcome";
+/// The reserved input a revised task receives its reviewer's last verdict under, from its second
+/// round on.
+pub const REVISION_INPUT: &str = "revision";
 /// Every key the engine writes into a task's inputs itself. A dependency named after one of
 /// them would have its entry overwritten, so [`crate::plan::ir::Plan::validate`] refuses it.
-pub const RESERVED_INPUTS: [&str; 3] = [ITEM_INPUT, KEPT_INPUT, OUTCOME_INPUT];
+pub const RESERVED_INPUTS: [&str; 4] = [ITEM_INPUT, KEPT_INPUT, OUTCOME_INPUT, REVISION_INPUT];
 
 /// Task identity: cache key component, wire label, UI label. Unique within a plan.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -344,7 +347,21 @@ pub struct Task {
     pub max_fanout: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub when: Option<When>,
+    /// Sends a failing verdict back to a dependency (see [`Revise`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revise: Option<Revise>,
 }
+
+/// A reviewer's bounded send-back: when the reviewer settles failing, `task` runs again with the
+/// verdict, then the reviewer does, for at most `max_rounds` rounds in all.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Revise {
+    pub task: TaskName,
+    pub max_rounds: u32,
+}
+
+/// The most rounds one revise loop may run. Operator-owned, like [`MAX_FANOUT_CEILING`].
+pub const MAX_ROUNDS_CEILING: u32 = 5;
 
 /// Executor-enforced accounting limit; overruns fail the plan.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -603,6 +620,53 @@ pub enum PlanError {
         route: String,
         question: String,
         labels: Vec<String>,
+    },
+    #[error(
+        "task {task:?} revises {target:?} but does not depend on it; a reviewer reads the work it \
+         sends back from a direct dependency"
+    )]
+    ReviseTargetNotADependency { task: String, target: String },
+    #[error("task {task:?}: max_rounds = {got} is outside 2..={MAX_ROUNDS_CEILING}")]
+    RoundsOutOfRange { task: String, got: u32 },
+    #[error(
+        "task {task:?} revises {target:?}, a {kind} task; only agent, command, and evaluate tasks \
+         take part in a revise loop"
+    )]
+    ReviseOnUnsupportedTask {
+        task: String,
+        target: String,
+        kind: &'static str,
+    },
+    #[error(
+        "task {task:?} revises {target:?}, and one of them maps over a list; a round re-runs one \
+         task, not a fan-out"
+    )]
+    ReviseWithFanout { task: String, target: String },
+    #[error(
+        "task {task:?} revises {target:?} and declares when; a reviewer runs whenever what it \
+         revises does, so put the when on {target:?}"
+    )]
+    WhenOnReviewer { task: String, target: String },
+    #[error("tasks {left:?} and {right:?} both revise {target:?}; a task has at most one reviewer")]
+    ReviseTargetRevisedTwice {
+        left: String,
+        right: String,
+        target: String,
+    },
+    #[error(
+        "task {task:?} revises {target:?}, which is itself in another revise loop; revise loops \
+         do not nest or chain"
+    )]
+    NestedRevise { task: String, target: String },
+    #[error(
+        "task {task:?} revises {target:?} and also depends on {dependency:?}, which depends on \
+         {target:?}; a round re-runs only {target:?} and {task:?}, so {dependency:?} would read \
+         a draft the loop replaces"
+    )]
+    ReviseAroundADependent {
+        task: String,
+        target: String,
+        dependency: String,
     },
     #[error("plan has a dependency cycle involving: {}", .tasks.join(", "))]
     DependencyCycle { tasks: Vec<String> },
@@ -999,6 +1063,81 @@ impl Plan {
                     }
                 }
             }
+            if let Some(revise) = &t.revise {
+                let target = || revise.task.0.clone();
+                if t.when.is_some() {
+                    return Err(PlanError::WhenOnReviewer {
+                        task: task(),
+                        target: target(),
+                    });
+                }
+                if !t.depends_on.contains(&revise.task) {
+                    return Err(PlanError::ReviseTargetNotADependency {
+                        task: task(),
+                        target: target(),
+                    });
+                }
+                if !(2..=MAX_ROUNDS_CEILING).contains(&revise.max_rounds) {
+                    return Err(PlanError::RoundsOutOfRange {
+                        task: task(),
+                        got: revise.max_rounds,
+                    });
+                }
+                let Some(&proposer) = index.get(&revise.task) else {
+                    return Err(PlanError::UnknownDependency {
+                        task: task(),
+                        dependency: target(),
+                    });
+                };
+                let proposer = &self.tasks[proposer];
+                for member in [t, proposer] {
+                    if !matches!(
+                        member.task,
+                        TaskKind::Agent { .. }
+                            | TaskKind::Command { .. }
+                            | TaskKind::Evaluate { .. }
+                    ) {
+                        return Err(PlanError::ReviseOnUnsupportedTask {
+                            task: task(),
+                            target: target(),
+                            kind: member.task.label(),
+                        });
+                    }
+                    if member.over.is_some() {
+                        return Err(PlanError::ReviseWithFanout {
+                            task: task(),
+                            target: target(),
+                        });
+                    }
+                }
+                if proposer.revise.is_some() {
+                    return Err(PlanError::NestedRevise {
+                        task: task(),
+                        target: target(),
+                    });
+                }
+                for other in &self.tasks {
+                    let Some(other_revise) = &other.revise else {
+                        continue;
+                    };
+                    if other.name == t.name {
+                        continue;
+                    }
+                    if other_revise.task == revise.task {
+                        return Err(PlanError::ReviseTargetRevisedTwice {
+                            left: task(),
+                            right: other.name.0.clone(),
+                            target: target(),
+                        });
+                    }
+                    if other_revise.task == t.name {
+                        return Err(PlanError::NestedRevise {
+                            task: other.name.0.clone(),
+                            target: task(),
+                        });
+                    }
+                }
+            }
         }
         let mut handled: BTreeMap<(&TaskName, &QuestionId), BTreeSet<&Label>> = BTreeMap::new();
         for t in &self.tasks {
@@ -1102,6 +1241,21 @@ impl Plan {
                 }
             }
         }
+        for t in &self.tasks {
+            let Some(revise) = &t.revise else { continue };
+            let Some(&proposer) = index.get(&revise.task) else {
+                continue;
+            };
+            for d in t.depends_on.iter().filter(|d| **d != revise.task) {
+                if index.get(d).is_some_and(|&i| reaches(proposer, i)) {
+                    return Err(PlanError::ReviseAroundADependent {
+                        task: t.name.0.clone(),
+                        target: revise.task.0.clone(),
+                        dependency: d.0.clone(),
+                    });
+                }
+            }
+        }
         Ok(ValidPlan { plan: self, topo })
     }
 }
@@ -1131,6 +1285,7 @@ mod tests {
             over: None,
             max_fanout: None,
             when: None,
+            revise: None,
         }
     }
 
@@ -1668,6 +1823,7 @@ mod tests {
             over: None,
             max_fanout: None,
             when: None,
+            revise: None,
         };
         let err = plan(vec![t]).validate().unwrap_err();
         assert_eq!(
@@ -1796,6 +1952,7 @@ mod tests {
             over: None,
             max_fanout: None,
             when: None,
+            revise: None,
         }
     }
 
@@ -2232,5 +2389,221 @@ mod tests {
             .validate()
             .expect("one stage, one graph");
         assert_eq!(ok.plan().tasks.len(), 2);
+    }
+
+    fn reviewer(name: &str, deps: &[&str], target: &str, max_rounds: u32) -> Task {
+        let mut t = agent(name, deps);
+        t.revise = Some(Revise {
+            task: target.into(),
+            max_rounds,
+        });
+        t
+    }
+
+    fn refused(tasks: Vec<Task>) -> PlanError {
+        plan(tasks).validate().unwrap_err()
+    }
+
+    /// A plan that arrives as JSON never passes through the starlark front end, so every
+    /// structural fact about a revise loop is checked here or nowhere.
+    #[test]
+    fn a_revise_loop_round_trips_and_validates_on_the_json_route() {
+        let p = plan(vec![
+            agent("author", &[]),
+            reviewer("repro", &["author"], "author", 3),
+        ]);
+        let json = serde_json::to_value(&p).unwrap();
+        assert_eq!(
+            json["task"][1]["revise"],
+            serde_json::json!({"task": "author", "max_rounds": 3})
+        );
+        assert!(json["task"][0].get("revise").is_none(), "{json}");
+        let back = Plan::from_json_str(&json.to_string())
+            .unwrap()
+            .validate()
+            .unwrap();
+        assert_eq!(
+            back.get(&"repro".into()).and_then(|t| t.revise.clone()),
+            Some(Revise {
+                task: "author".into(),
+                max_rounds: 3
+            })
+        );
+    }
+
+    #[test]
+    fn a_reviewer_cannot_be_conditional_and_what_it_revises_can() {
+        let gate = output_route("gate", "classify", &["frontend", "uncertain"]);
+        let base = || vec![agent("classify", &[]), gate.clone()];
+        let mut tasks = base();
+        tasks.push(on(
+            agent("author", &["gate"]),
+            "gate",
+            "area",
+            &["scheduler"],
+        ));
+        tasks.push(reviewer("repro", &["author"], "author", 3));
+        plan(tasks).validate().unwrap();
+
+        let mut tasks = base();
+        tasks.push(agent("author", &[]));
+        tasks.push(on(
+            reviewer("repro", &["author", "gate"], "author", 3),
+            "gate",
+            "area",
+            &["scheduler"],
+        ));
+        assert_eq!(
+            plan(tasks).validate().unwrap_err(),
+            PlanError::WhenOnReviewer {
+                task: "repro".into(),
+                target: "author".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_reviewer_must_depend_on_what_it_revises() {
+        assert_eq!(
+            refused(vec![
+                agent("author", &[]),
+                reviewer("repro", &[], "author", 3)
+            ]),
+            PlanError::ReviseTargetNotADependency {
+                task: "repro".into(),
+                target: "author".into()
+            }
+        );
+    }
+
+    #[test]
+    fn max_rounds_is_bounded_on_both_sides() {
+        for got in [0, 1, MAX_ROUNDS_CEILING + 1] {
+            assert_eq!(
+                refused(vec![
+                    agent("author", &[]),
+                    reviewer("repro", &["author"], "author", got)
+                ]),
+                PlanError::RoundsOutOfRange {
+                    task: "repro".into(),
+                    got
+                }
+            );
+        }
+        for ok in [2, MAX_ROUNDS_CEILING] {
+            assert!(
+                plan(vec![
+                    agent("author", &[]),
+                    reviewer("repro", &["author"], "author", ok)
+                ])
+                .validate()
+                .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn only_agent_command_and_evaluate_tasks_take_part_in_a_revise_loop() {
+        let mut reducer = top_k("pick", &["author"]);
+        reducer.revise = Some(Revise {
+            task: "author".into(),
+            max_rounds: 2,
+        });
+        assert_eq!(
+            refused(vec![emitting("author", &[], &["score"]), reducer]),
+            PlanError::ReviseOnUnsupportedTask {
+                task: "pick".into(),
+                target: "author".into(),
+                kind: "top_k"
+            }
+        );
+        assert_eq!(
+            refused(vec![
+                emitting("author", &[], &["score"]),
+                top_k("fold", &["author"]),
+                reviewer("repro", &["fold"], "fold", 2),
+            ]),
+            PlanError::ReviseOnUnsupportedTask {
+                task: "repro".into(),
+                target: "fold".into(),
+                kind: "top_k"
+            }
+        );
+    }
+
+    #[test]
+    fn a_revise_loop_does_not_run_over_a_fanout() {
+        let targets = OutputRef {
+            task: "discover".into(),
+            field: OutputField("targets".into()),
+        };
+        let mut mapped = agent("audit", &["discover"]);
+        mapped.over = Some(targets);
+        mapped.max_fanout = Some(4);
+        assert_eq!(
+            refused(vec![
+                emitting("discover", &[], &["targets"]),
+                mapped,
+                reviewer("repro", &["audit"], "audit", 2),
+            ]),
+            PlanError::ReviseWithFanout {
+                task: "repro".into(),
+                target: "audit".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_task_has_at_most_one_reviewer_and_loops_do_not_chain() {
+        assert_eq!(
+            refused(vec![
+                agent("author", &[]),
+                reviewer("left", &["author"], "author", 2),
+                reviewer("right", &["author"], "author", 2),
+            ]),
+            PlanError::ReviseTargetRevisedTwice {
+                left: "left".into(),
+                right: "right".into(),
+                target: "author".into()
+            }
+        );
+        assert_eq!(
+            refused(vec![
+                agent("author", &[]),
+                reviewer("repro", &["author"], "author", 2),
+                reviewer("confirm", &["repro"], "repro", 2),
+            ]),
+            PlanError::NestedRevise {
+                task: "confirm".into(),
+                target: "repro".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_reviewer_cannot_read_the_draft_through_another_dependency() {
+        assert_eq!(
+            refused(vec![
+                agent("author", &[]),
+                agent("build", &["author"]),
+                reviewer("repro", &["author", "build"], "author", 2),
+            ]),
+            PlanError::ReviseAroundADependent {
+                task: "repro".into(),
+                target: "author".into(),
+                dependency: "build".into()
+            }
+        );
+    }
+
+    #[test]
+    fn revision_is_a_reserved_input_name() {
+        assert_eq!(
+            refused(vec![agent("revision", &[]), agent("author", &["revision"])]),
+            PlanError::ReservedDependencyName {
+                task: "author".into(),
+                dependency: "revision".into()
+            }
+        );
     }
 }

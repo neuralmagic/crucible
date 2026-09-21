@@ -12,15 +12,17 @@
 pub(crate) mod claude;
 pub(crate) mod codex;
 pub(crate) mod hermes;
+pub(crate) mod opencode;
+pub(crate) mod pi;
 
 use crate::agent::event::{AgentEvent, RawStream};
-use crate::agent::inference::InferenceEnv;
+use crate::agent::inference::{InferenceEnv, WireApi};
 use crate::args::Args;
 use crate::manifest::Harness;
 use crate::openshell::provider::CodexAuth;
 use crate::stream_json::StreamJsonParser;
 use crate::turn_trace::{GenAiRecord, ToolInvocation};
-use crucible_harness::{CodexJsonParser, LiveMeters};
+use crucible_harness::{CodexJsonParser, LiveMeters, OpenCodeJsonParser, PiJsonParser};
 use std::time::Duration;
 
 /// How a sandbox turn gets its model credential. Vertex mints a `cloud-platform` access token from
@@ -33,18 +35,87 @@ pub(crate) enum AuthProvider {
     /// A direct Anthropic API key from the environment ([`crate::agent::inference::ANTHROPIC_API_KEY`]),
     /// relayed into the sandbox; no gateway provider, no metadata emulator.
     AnthropicKey,
+    /// A direct API key from the environment for whichever API the turn's endpoint speaks
+    /// ([`api_endpoint`]): `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`, relayed into the sandbox
+    /// alongside its base URL. The harnesses that take a provider table (opencode, pi) read the
+    /// key back from that env through their seeded config.
+    ApiKey,
 }
 
 /// Which credential this turn runs on: the harness's default, unless the environment carries a
-/// direct Anthropic key for a Claude-speaking harness.
+/// direct Anthropic key for a Claude-speaking harness, or nothing at all for a key-authenticated
+/// one, which then runs on the ambient Vertex credential the way claude does.
 pub(crate) fn resolve_auth(
     harness: Harness,
     inference: &crate::agent::inference::InferenceEnv,
 ) -> AuthProvider {
     match (harness.spec().auth, inference.anthropic_key.as_deref()) {
         (AuthProvider::Vertex, Some(_)) => AuthProvider::AnthropicKey,
+        (AuthProvider::ApiKey, _) if inference.is_ambient() => AuthProvider::Vertex,
         (auth, _) => auth,
     }
+}
+
+/// The API family a provider-table harness (opencode, pi) talks to, with the base URL it is
+/// reached at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ApiEndpoint {
+    /// An OpenAI-speaking service: a custom endpoint, or api.openai.com itself.
+    OpenAi { base_url: String, wire_api: WireApi },
+    /// An Anthropic Messages service: a custom endpoint, or api.anthropic.com itself.
+    Anthropic { base_url: String },
+    /// Anthropic on Vertex AI, on the gateway's ambient credential rather than a key.
+    Vertex(crate::agent::inference::VertexConfig),
+}
+
+/// Where a provider-table turn sends `model`: Vertex when the env names neither a key nor a base
+/// URL (`manifest_env` carries the project and region); else an OpenAI-speaking endpoint when the
+/// env names one (`OPENAI_BASE_URL`) or carries only an OpenAI key, else Anthropic. A model named
+/// `claude-*` with both keys present goes to Anthropic. The wire API is the env's when it names
+/// one; otherwise api.openai.com itself speaks Responses (its current models refuse tool calls
+/// over chat completions) and a custom endpoint speaks chat completions.
+pub(crate) fn api_endpoint(
+    model: &str,
+    inference: &InferenceEnv,
+    manifest_env: &[(String, String)],
+) -> ApiEndpoint {
+    if inference.is_ambient() {
+        return ApiEndpoint::Vertex(crate::agent::inference::VertexConfig::from_env(
+            manifest_env,
+        ));
+    }
+    let openai = inference.openai_base_url.is_some()
+        || (inference.openai_key.is_some()
+            && (inference.anthropic_key.is_none() || !model.starts_with("claude")));
+    if openai {
+        let (base_url, default_wire) = match inference.openai_base_url.clone() {
+            Some(url) => (url, WireApi::Chat),
+            None => ("https://api.openai.com/v1".to_string(), WireApi::Responses),
+        };
+        ApiEndpoint::OpenAi {
+            base_url,
+            wire_api: inference.wire_api.unwrap_or(default_wire),
+        }
+    } else {
+        ApiEndpoint::Anthropic {
+            base_url: inference
+                .anthropic_base_url
+                .clone()
+                .unwrap_or_else(|| "https://api.anthropic.com".to_string()),
+        }
+    }
+}
+
+/// The provider id a key-authenticated harness's seeded provider table registers the turn's
+/// endpoint under, and the prefix its model rides on (`crucible/<model>`).
+pub(crate) const CRUCIBLE_PROVIDER_ID: &str = "crucible";
+
+/// A JSON object's string field, empty when absent or not a string.
+pub(crate) fn json_str(v: &serde_json::Value, key: &str) -> String {
+    v.get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string()
 }
 
 /// The filesystem contract between crucible and the agent harness inside the sandbox: where
@@ -121,6 +192,18 @@ impl StreamDecoder for CodexJsonParser {
     }
 }
 
+impl StreamDecoder for OpenCodeJsonParser {
+    fn push(&mut self, line: &str) -> Vec<AgentEvent> {
+        OpenCodeJsonParser::push(self, line)
+    }
+}
+
+impl StreamDecoder for PiJsonParser {
+    fn push(&mut self, line: &str) -> Vec<AgentEvent> {
+        PiJsonParser::push(self, line)
+    }
+}
+
 /// One `Raw` event per non-empty line.
 pub(crate) struct RawLines;
 
@@ -145,6 +228,8 @@ pub(crate) enum SandboxAuth {
     Gateway,
     /// Relayed into the sandbox env; nothing to seed.
     AnthropicKey,
+    /// Relayed into the sandbox env under the endpoint's own variable; nothing to seed.
+    ApiKey,
     Codex(CodexAuth),
 }
 
@@ -152,7 +237,7 @@ impl SandboxAuth {
     pub(crate) fn codex(&self) -> Option<&CodexAuth> {
         match self {
             SandboxAuth::Codex(auth) => Some(auth),
-            SandboxAuth::Gateway | SandboxAuth::AnthropicKey => None,
+            SandboxAuth::Gateway | SandboxAuth::AnthropicKey | SandboxAuth::ApiKey => None,
         }
     }
 }
@@ -221,8 +306,9 @@ pub(crate) trait Backend: Sync {
     fn local_argv(&self, args: &Args, prompt: &str) -> Vec<String>;
 
     /// The sandbox exec argv (program name first, no prompt, it arrives over stdin).
-    /// `mcp_seeded` says whether [`Backend::seed_files`] delivered a config this turn, so a
-    /// harness that takes its MCP config on argv can point at it.
+    /// `mcp_seeded` says whether the broker is on this turn, and so whether
+    /// [`Backend::seed_files`] delivered an MCP config, so a harness that takes it on argv
+    /// (claude's `--mcp-config`, pi's `-e` for the adapter) can point at it.
     fn sandbox_argv(&self, args: &Args, mcp_seeded: bool) -> Vec<String>;
 
     /// Start or resume a Crucible-managed session locally.
@@ -254,8 +340,16 @@ pub(crate) trait Backend: Sync {
         inference: &InferenceEnv,
     ) -> Option<String>;
 
-    /// The credential file a harness seeds when its credential cannot ride the gateway.
-    fn credential(&self, _auth: &SandboxAuth) -> Option<SeedFile> {
+    /// The credential file a harness seeds when its credential cannot ride the gateway as-is:
+    /// codex's `auth.json`, pi's Vertex extension.
+    fn credential(&self, _args: &Args, _auth: &SandboxAuth) -> Option<SeedFile> {
+        None
+    }
+
+    /// The MCP config a harness seeds beside its own config when the broker is on: pi's
+    /// `mcp.json` for the adapter extension. Claude and hermes carry the broker inside
+    /// [`Backend::config`] instead.
+    fn mcp_config(&self, _broker: &Broker<'_>) -> Option<SeedFile> {
         None
     }
 
@@ -339,7 +433,10 @@ pub(crate) trait Backend: Sync {
             })
             .into_iter()
             .collect();
-        seeds.extend(self.credential(auth));
+        seeds.extend(self.credential(args, auth));
+        if let Some(b) = broker.as_ref() {
+            seeds.extend(self.mcp_config(b));
+        }
         seeds
     }
 }
@@ -369,6 +466,8 @@ impl HarnessRuntime for Harness {
             Harness::Claude => &claude::Claude,
             Harness::Hermes => &hermes::Hermes,
             Harness::Codex => &codex::Codex,
+            Harness::OpenCode => &opencode::OpenCode,
+            Harness::Pi => &pi::Pi,
         }
     }
 }
@@ -455,7 +554,12 @@ mod tests {
         assert_eq!(t.harness, Harness::Claude);
         let t: T = toml::from_str("harness = \"codex\"").expect("parse");
         assert_eq!(t.harness, Harness::Codex);
+        let t: T = toml::from_str("harness = \"opencode\"").expect("parse");
+        assert_eq!(t.harness, Harness::OpenCode);
+        let t: T = toml::from_str("harness = \"pi\"").expect("parse");
+        assert_eq!(t.harness, Harness::Pi);
         assert!(toml::from_str::<T>("harness = \"Claude\"").is_err());
+        assert!(toml::from_str::<T>("harness = \"open-code\"").is_err());
     }
 
     #[test]
@@ -466,6 +570,31 @@ mod tests {
             Harness::Codex
         );
         assert!(Harness::from_str("Codex", false).is_err());
+    }
+
+    /// The CLI spelling, the manifest spelling, and `as_str` agree for every harness, so a
+    /// controller rendering `--harness=<as_str>` and a manifest naming the same token select the
+    /// same backend; `OpenCode` in particular must not kebab-case to `open-code`.
+    #[test]
+    fn every_harness_spells_the_same_on_the_cli_and_in_the_manifest() {
+        use clap::ValueEnum;
+        for harness in Harness::value_variants() {
+            let cli = harness
+                .to_possible_value()
+                .expect("every variant is selectable")
+                .get_name()
+                .to_string();
+            assert_eq!(cli, harness.as_str(), "{harness:?}");
+            assert_eq!(
+                Harness::from_str(&cli, false).expect("round trip"),
+                *harness
+            );
+            assert_eq!(
+                cli,
+                harness.spec().name,
+                "the AGENT_TOOL name is the same token"
+            );
+        }
     }
 
     #[test]
@@ -503,6 +632,110 @@ mod tests {
         }
         // L4 only: an entry carrying `protocol=rest` would break CONNECT tunneling.
         assert!(!codex.iter().any(|e| e.contains("protocol=rest")));
+        // The key-authenticated harnesses reach api.openai.com and nothing of ChatGPT's.
+        for harness in [Harness::OpenCode, Harness::Pi] {
+            let got = endpoints(harness);
+            assert_eq!(
+                &got[..crate::openshell::policy::DEFAULT_ENDPOINTS.len()],
+                crate::openshell::policy::DEFAULT_ENDPOINTS
+            );
+            assert_eq!(
+                &got[crate::openshell::policy::DEFAULT_ENDPOINTS.len()..],
+                crate::openshell::policy::OPENAI_API_ENDPOINTS,
+                "{harness:?}"
+            );
+            assert!(!got.iter().any(|e| e.contains("chatgpt.com")));
+        }
+    }
+
+    /// Where a key-authenticated turn goes: a named OpenAI base URL wins outright; otherwise the
+    /// keys decide, with a `claude-*` model preferring Anthropic when both keys are present.
+    #[test]
+    fn api_endpoint_follows_the_base_url_then_the_keys() {
+        let env = |openai_key: Option<&str>, anthropic_key: Option<&str>, url: Option<&str>| {
+            crate::agent::inference::InferenceEnv {
+                openai_key: openai_key.map(str::to_string),
+                anthropic_key: anthropic_key.map(str::to_string),
+                openai_base_url: url.map(str::to_string),
+                ..Default::default()
+            }
+        };
+        assert_eq!(
+            api_endpoint(
+                "qwen",
+                &env(Some("k"), None, Some("http://vllm:8000/v1")),
+                &[]
+            ),
+            ApiEndpoint::OpenAi {
+                base_url: "http://vllm:8000/v1".into(),
+                wire_api: WireApi::Chat
+            }
+        );
+        assert_eq!(
+            api_endpoint(
+                "claude-opus-4-6",
+                &env(None, Some("a"), Some("http://vllm:8000/v1")),
+                &[]
+            ),
+            ApiEndpoint::OpenAi {
+                base_url: "http://vllm:8000/v1".into(),
+                wire_api: WireApi::Chat
+            },
+            "a named OpenAI endpoint wins even for a claude model name"
+        );
+        assert_eq!(
+            api_endpoint("gpt-5.6-sol", &env(Some("k"), None, None), &[]),
+            ApiEndpoint::OpenAi {
+                base_url: "https://api.openai.com/v1".into(),
+                wire_api: WireApi::Responses
+            },
+            "the vendor's own API speaks Responses"
+        );
+        assert_eq!(
+            api_endpoint("claude-opus-4-6", &env(Some("k"), Some("a"), None), &[]),
+            ApiEndpoint::Anthropic {
+                base_url: "https://api.anthropic.com".into()
+            }
+        );
+        assert_eq!(
+            api_endpoint("gpt-5.6-sol", &env(Some("k"), Some("a"), None), &[]),
+            ApiEndpoint::OpenAi {
+                base_url: "https://api.openai.com/v1".into(),
+                wire_api: WireApi::Responses
+            }
+        );
+        assert_eq!(
+            api_endpoint(
+                "claude-opus-4-6",
+                &env(None, None, None),
+                &[
+                    ("ANTHROPIC_VERTEX_PROJECT_ID".into(), "proj-x".into()),
+                    ("CLOUD_ML_REGION".into(), "us-east5".into()),
+                ]
+            ),
+            ApiEndpoint::Vertex(crate::agent::inference::VertexConfig {
+                project: "proj-x".into(),
+                region: "us-east5".into(),
+            }),
+            "no key and no base URL is the ambient Vertex credential"
+        );
+        assert_eq!(
+            api_endpoint("claude-opus-4-6", &env(None, Some("a"), None), &[]),
+            ApiEndpoint::Anthropic {
+                base_url: "https://api.anthropic.com".into()
+            }
+        );
+        let responses = crate::agent::inference::InferenceEnv {
+            wire_api: Some(WireApi::Responses),
+            ..env(Some("k"), None, Some("http://vllm:8000/v1"))
+        };
+        assert!(matches!(
+            api_endpoint("m", &responses, &[]),
+            ApiEndpoint::OpenAi {
+                wire_api: WireApi::Responses,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -557,6 +790,23 @@ mod tests {
             matches!(&events[0], AgentEvent::Init { model, .. } if model == "gpt-5.6-terra"),
             "{events:?}"
         );
+        args.model = Some("qwen-3-8-27b".to_string());
+        let events = Harness::OpenCode
+            .backend()
+            .decoder(&args, None, false)
+            .push(r#"{"type":"step_start","sessionID":"ses_1","part":{"type":"step-start"}}"#);
+        assert!(
+            matches!(&events[0], AgentEvent::Init { model, .. } if model == "qwen-3-8-27b"),
+            "{events:?}"
+        );
+        let events = Harness::Pi
+            .backend()
+            .decoder(&args, None, false)
+            .push(r#"{"type":"session","version":3,"id":"u","timestamp":"t","cwd":"/w"}"#);
+        assert!(
+            matches!(&events[0], AgentEvent::Init { model, .. } if model == "qwen-3-8-27b"),
+            "{events:?}"
+        );
     }
 
     /// Each `NewestJsonl` harness names the glob its transcript tree actually needs: claude's
@@ -570,6 +820,7 @@ mod tests {
                 "/sandbox/.codex/sessions",
                 "*/*/*/rollout-*.jsonl",
             ),
+            (Harness::Pi, "/sandbox/.pi/agent/sessions", "*/*.jsonl"),
         ] {
             let (sandbox_root, g) = harness
                 .spec()
@@ -586,13 +837,25 @@ mod tests {
                 sandbox_path: "/sandbox/.hermes/state.db"
             }
         );
+        assert_eq!(
+            Harness::OpenCode.spec().transcript,
+            TranscriptLocator::File {
+                sandbox_path: "/sandbox/.local/share/opencode/crucible-export.json"
+            }
+        );
     }
 
     /// The env script and local env are the spec, rendered: `AGENT_TOOL` first, the home var
     /// second, then the spec's own exports, then the manifest's quoted overrides.
     #[test]
     fn env_assembly_reads_every_backend_off_its_spec() {
-        for harness in [Harness::Claude, Harness::Hermes, Harness::Codex] {
+        for harness in [
+            Harness::Claude,
+            Harness::Hermes,
+            Harness::Codex,
+            Harness::OpenCode,
+            Harness::Pi,
+        ] {
             let spec = harness.spec();
             let script = harness.backend().env_script(&[("K".into(), "v w".into())]);
             let lines: Vec<&str> = script.lines().collect();
@@ -644,6 +907,20 @@ mod tests {
             resolve_auth(Harness::Claude, &Default::default()),
             AuthProvider::Vertex
         );
+        // The provider-table harnesses take any key the env carries, and Vertex when it carries
+        // nothing, the same ambient credential claude runs on.
+        for harness in [Harness::OpenCode, Harness::Pi] {
+            assert_eq!(resolve_auth(harness, &keyed), AuthProvider::ApiKey);
+            assert_eq!(
+                resolve_auth(harness, &Default::default()),
+                AuthProvider::Vertex
+            );
+            let url_only = crate::agent::inference::InferenceEnv {
+                openai_base_url: Some("http://vllm:8000/v1".into()),
+                ..Default::default()
+            };
+            assert_eq!(resolve_auth(harness, &url_only), AuthProvider::ApiKey);
+        }
     }
 
     #[test]
@@ -660,5 +937,13 @@ mod tests {
         assert!(Harness::Hermes.spec().backfill_required);
         // The codex `--json` stream carries result + usage, so the rollout is garnish.
         assert!(!Harness::Codex.spec().backfill_required);
+        // OpenCode's mirrored stream can lose its tail in a container: the export closes the
+        // turn. Pi's stream is its own process's and complete.
+        assert_eq!(Harness::OpenCode.spec().auth, AuthProvider::ApiKey);
+        assert_eq!(Harness::Pi.spec().auth, AuthProvider::ApiKey);
+        assert!(!Harness::OpenCode.spec().otel_capable);
+        assert!(!Harness::Pi.spec().otel_capable);
+        assert!(Harness::OpenCode.spec().backfill_required);
+        assert!(!Harness::Pi.spec().backfill_required);
     }
 }

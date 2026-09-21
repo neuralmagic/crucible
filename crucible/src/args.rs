@@ -98,7 +98,8 @@ pub(crate) struct Args {
     /// resolved harness's own default applies (see `Args::model`).
     #[arg(long)]
     pub model: Option<String>,
-    /// The agent harness that runs each turn: `claude` (default), `hermes`, or `codex`. Overrides
+    /// The agent harness that runs each turn: `claude` (default), `hermes`, `codex`, `opencode`,
+    /// or `pi`. Overrides
     /// the manifest's `[agent].harness`; when neither is set the engine defaults to claude (see
     /// `apply_agent_cfg`).
     #[arg(long, value_enum)]

@@ -5,8 +5,8 @@ hyper v1.10.1
 hyper-rustls v0.24.2
 hyper-rustls v0.27.9
 rustls v0.21.12
-rustls v0.23.41
+rustls v0.23.45
 rustls-webpki v0.101.7
-rustls-webpki v0.103.13
+rustls-webpki v0.103.15
 tokio-rustls v0.24.1
 tokio-rustls v0.26.4
