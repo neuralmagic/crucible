@@ -19,30 +19,30 @@ notes = ["Playbook resume is not implemented in plan::exec on this branch, so RF
 
 [[content.acceptance_criteria]]
 text = "workflow.star compiles route, noul, choice and when into manifest IR in the playbook and custom lanes, and rejects them in autoresearch"
-status = "pending"
+status = "done"
 category = "added"
 
 [[content.acceptance_criteria]]
 text = "validation rejects unknown route, question, or label in when, and any routed label neither handled nor dropped, with did-you-mean"
-status = "pending"
+status = "done"
 category = "added"
 
 [[content.acceptance_criteria]]
 text = "not taken is a terminal status that spends nothing, never gates validity or short-circuits, and propagates through all joins"
-status = "pending"
+status = "done"
 category = "added"
 
 [[content.acceptance_criteria]]
 text = "the broker System One client resolves low-confidence answers to uncertain and fails on any undeclared label or malformed response"
-status = "pending"
+status = "done"
 category = "added"
 
 [[content.acceptance_criteria]]
 text = "unit tests per layer and an end-to-end playbook run against a real local System One HTTP server"
-status = "pending"
+status = "done"
 category = "chore"
 
 [[content.acceptance_criteria]]
 text = "a route task's output carries the resolved label, confidence, and distribution per question, so the task result alone records the decision"
-status = "pending"
+status = "done"
 category = "added"
