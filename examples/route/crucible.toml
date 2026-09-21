@@ -1,0 +1,25 @@
+# route — a playbook that branches on a typed decision. `gate` asks a System One decision model
+# two questions about a support ticket; each downstream task runs only on the answer it names.
+#
+#   export CRUCIBLE_SYSTEMONE_URL=http://127.0.0.1:8011/v1/systemone
+#   TICKET=billing crucible plan run --manifest examples/route/crucible.toml \
+#                                    --max-cost 1 --max-time 5m
+#
+# TICKET names a file under tickets/ (outage, billing, feature) and defaults to outage.
+#
+# Any server speaking POST /v1/systemone works: the hosted Jev API, or vLLM's DiffusionGemma
+# structured-reads server. Without the URL the run truncates at `gate` before spending anything.
+# Swap `min_confidence = 0.8` for `source = read` in workflow.star to decide from read.sh's own
+# output instead, with no model at all.
+
+[workspace]
+inject = ["read.sh", "act.sh", "tickets"]
+
+[agent]
+backend   = "command"
+agent_cmd = "true"
+goal      = "Route a support ticket."
+
+[workflow]
+type = "playbook"
+file = "workflow.star"

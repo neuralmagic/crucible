@@ -62,10 +62,10 @@ impl std::error::Error for DecideError {}
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WireAnswer {
     Noul {
-        noul: f64,
+        noul: serde_json::Number,
     },
     Choice {
-        probabilities: BTreeMap<String, f64>,
+        probabilities: BTreeMap<String, serde_json::Number>,
     },
 }
 
@@ -136,8 +136,13 @@ fn probabilities(
     answer: WireAnswer,
 ) -> Result<BTreeMap<Label, f64>, DecideError> {
     let invalid = |m: String| DecideError::Invalid(m);
+    let float = |n: serde_json::Number| {
+        n.as_f64()
+            .ok_or_else(|| invalid(format!("question {id:?}: {n} is not a probability")))
+    };
     match (&question.kind, answer) {
         (QuestionKind::Noul, WireAnswer::Noul { noul }) => {
+            let noul = float(noul)?;
             let label =
                 |s: &str| Label::new(s).map_err(|e| invalid(format!("question {id:?}: {e}")));
             Ok(BTreeMap::from([
@@ -148,9 +153,9 @@ fn probabilities(
         (QuestionKind::Choice { .. }, WireAnswer::Choice { probabilities }) => probabilities
             .into_iter()
             .map(|(name, p)| {
-                Label::new(name)
-                    .map(|l| (l, p))
-                    .map_err(|e| invalid(format!("question {id:?}: {e}")))
+                let label =
+                    Label::new(name).map_err(|e| invalid(format!("question {id:?}: {e}")))?;
+                Ok((label, float(p)?))
             })
             .collect(),
         (QuestionKind::Noul, WireAnswer::Choice { .. }) => Err(invalid(format!(

@@ -209,7 +209,7 @@ impl Default for ExecCfg {
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
-#[error("task status must be pass|fail|transport|skipped|blocked|truncated, got {got:?}")]
+#[error("task status must be pass|fail|transport|skipped|not_taken|blocked|truncated, got {got:?}")]
 pub struct UnknownTaskStatus {
     pub got: String,
 }
