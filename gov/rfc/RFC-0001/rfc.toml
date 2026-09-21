@@ -34,6 +34,7 @@ clauses = [
     "clauses/C-OUTPUTS.toml",
     "clauses/C-CAPABILITY-DISCLOSURE.toml",
     "clauses/C-ROUTE.toml",
+    "clauses/C-INFERENCE.toml",
 ]
 
 [[changelog]]
@@ -43,6 +44,7 @@ notes = "Admit the playbook lane"
 added = [
     "route, noul, choice constructors and the when predicate; not-taken terminal status (C-ROUTE)",
     "a route decides from a model or, deterministically, from a dependency's output",
+    "injected inference bindings, one typed document for every model the engine or its sandboxes reach (C-INFERENCE)",
 ]
 changed = [
     "DSL grammar admits dictionaries, conditionals, comprehensions, iteration, user-defined functions, load() and the pure standard library",

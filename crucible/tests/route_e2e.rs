@@ -127,18 +127,32 @@ struct Run {
     stderr: String,
 }
 
+fn inference(url: &str, key_env: Option<&str>) -> String {
+    let mut binding = serde_json::json!({
+        "role": "decision", "protocol": "system_one", "url": url, "model": "dgemma",
+    });
+    if let Some(name) = key_env {
+        binding["key_env"] = name.into();
+    }
+    serde_json::json!({"version": 1, "bindings": [binding]}).to_string()
+}
+
 fn run(dir: &Path, url: Option<&str>, key: Option<&str>) -> Run {
+    let document = url.map(|url| inference(url, key.map(|_| "ROUTE_E2E_KEY")));
+    run_with(dir, document.as_deref(), key)
+}
+
+fn run_with(dir: &Path, document: Option<&str>, key: Option<&str>) -> Run {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_crucible"));
     cmd.args(["plan", "run", "--file", "plan.toml"])
         .current_dir(dir)
-        .env_remove("CRUCIBLE_SYSTEMONE_URL")
-        .env_remove("CRUCIBLE_SYSTEMONE_API_KEY")
-        .env("CRUCIBLE_SYSTEMONE_MODEL", "dgemma");
-    if let Some(url) = url {
-        cmd.env("CRUCIBLE_SYSTEMONE_URL", url);
+        .env_remove("CRUCIBLE_INFERENCE")
+        .env_remove("ROUTE_E2E_KEY");
+    if let Some(document) = document {
+        cmd.env("CRUCIBLE_INFERENCE", document);
     }
     if let Some(key) = key {
-        cmd.env("CRUCIBLE_SYSTEMONE_API_KEY", key);
+        cmd.env("ROUTE_E2E_KEY", key);
     }
     let out = cmd.output().expect("run crucible");
     Run {
@@ -238,6 +252,44 @@ fn a_model_route_with_no_endpoint_configured_truncates_before_any_dispatch() {
     assert!(!run.ok, "{}", run.stdout);
     assert!(run.stdout.contains("truncated at gate"), "{}", run.stdout);
     assert_eq!(ran(&dir), Vec::<String>::new());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_binding_whose_named_key_is_unset_fails_the_route_without_calling_the_endpoint() {
+    let (url, seen) = serve("200 OK", answers(0.93, 0.02));
+    let dir = workdir("keyless", MODEL_PLAN);
+    let run = run_with(&dir, Some(&inference(&url, Some("ROUTE_E2E_KEY"))), None);
+    assert!(!run.ok, "{}", run.stdout);
+    assert_eq!(status_of(&run.stdout, "gate"), "fail");
+    assert!(
+        run.stdout.contains("\"ROUTE_E2E_KEY\" is unset"),
+        "{}",
+        run.stdout
+    );
+    assert_eq!(seen.lock().unwrap().len(), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_malformed_document_stops_the_run_before_any_task() {
+    let dir = workdir("malformed", MODEL_PLAN);
+    for (document, needle) in [
+        (r#"{"version":9,"bindings":[]}"#, "version 9"),
+        (
+            r#"{"version":1,"bindings":[{"role":"decision","protocol":"system_one","url":"http://h/x","model":"m","api_key":"sk"}]}"#,
+            "api_key",
+        ),
+        (
+            r#"{"version":1,"bindings":[{"role":"decision","protocol":"messages","url":"http://h/x","model":"m"}]}"#,
+            "does not serve that role",
+        ),
+    ] {
+        let run = run_with(&dir, Some(document), None);
+        assert!(!run.ok, "{document}: {}", run.stdout);
+        assert!(run.stderr.contains(needle), "{needle}: {}", run.stderr);
+        assert_eq!(ran(&dir), Vec::<String>::new(), "{document}");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 

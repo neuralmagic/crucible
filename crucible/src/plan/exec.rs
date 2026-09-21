@@ -28,6 +28,7 @@ use crucible_contract::TransportCause;
 use crucible_contract::decision::{
     Answer, Decision, Label, NOUL_NO, NOUL_YES, Question, QuestionId,
 };
+use crucible_contract::inference::{InferenceRole, ResolvedInference};
 
 /// What the substrate can measure. Missing caps truncate the plan fail-closed.
 #[derive(Clone, Debug, Default)]
@@ -36,9 +37,9 @@ pub struct Substrate {
 }
 
 impl Substrate {
-    /// `caps` plus the capabilities this process can verify it provides itself.
-    pub fn detecting(mut caps: BTreeSet<String>) -> Self {
-        if crucible_broker::systemone::Endpoint::from_env().is_ok() {
+    /// `caps` plus the capabilities the run's inference bindings provide.
+    pub fn detecting(mut caps: BTreeSet<String>, inference: &ResolvedInference) -> Self {
+        if inference.binding(InferenceRole::Decision).is_some() {
             caps.insert(crate::plan::ir::NEEDS_SYSTEMONE.to_owned());
         }
         Substrate { caps }

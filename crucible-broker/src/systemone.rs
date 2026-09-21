@@ -6,14 +6,10 @@ use std::time::Duration;
 use crucible_contract::decision::{
     Answer, Decision, Label, NOUL_NO, NOUL_YES, Question, QuestionId, QuestionKind,
 };
+use crucible_contract::inference::InferenceBinding;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-pub const ENV_URL: &str = "CRUCIBLE_SYSTEMONE_URL";
-pub const ENV_API_KEY: &str = "CRUCIBLE_SYSTEMONE_API_KEY";
-pub const ENV_MODEL: &str = "CRUCIBLE_SYSTEMONE_MODEL";
-
-const DEFAULT_MODEL: &str = "jev-latest";
 const TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,18 +20,31 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
-    pub fn from_env() -> Result<Self, DecideError> {
-        let url = std::env::var(ENV_URL)
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .ok_or_else(|| DecideError::Invalid(format!("{ENV_URL} is unset")))?;
+    /// `lookup` reads an environment variable by name.
+    pub fn from_binding(
+        binding: &InferenceBinding,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self, DecideError> {
+        let api_key = match &binding.key_env {
+            None => None,
+            Some(name) => Some(
+                lookup(name.as_str())
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| {
+                        DecideError::Invalid(format!(
+                            "the decision binding's credential variable {name:?} is unset"
+                        ))
+                    })?,
+            ),
+        };
+        let url = binding
+            .url
+            .clone()
+            .ok_or_else(|| DecideError::Invalid("the decision binding names no url".to_owned()))?;
         Ok(Endpoint {
             url,
-            api_key: std::env::var(ENV_API_KEY).ok().filter(|v| !v.is_empty()),
-            model: std::env::var(ENV_MODEL)
-                .ok()
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| DEFAULT_MODEL.to_owned()),
+            api_key,
+            model: binding.model.clone(),
         })
     }
 }
@@ -304,6 +313,51 @@ mod tests {
             url,
             api_key: api_key.map(str::to_owned),
             model: "dgemma".into(),
+        }
+    }
+
+    fn binding(key_env: Option<&str>) -> InferenceBinding {
+        use crucible_contract::inference::{EnvName, InferenceProtocol, InferenceRole};
+        InferenceBinding {
+            role: InferenceRole::Decision,
+            protocol: InferenceProtocol::SystemOne,
+            url: Some("http://dgemma:8011/v1/systemone".into()),
+            model: "dgemma".into(),
+            key_env: key_env.map(|name| EnvName::new(name).unwrap()),
+        }
+    }
+
+    #[test]
+    fn an_endpoint_takes_its_url_and_model_from_the_binding() {
+        let got = Endpoint::from_binding(&binding(None), |_| panic!("no key to look up")).unwrap();
+        assert_eq!(
+            got,
+            Endpoint {
+                url: "http://dgemma:8011/v1/systemone".into(),
+                api_key: None,
+                model: "dgemma".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn an_endpoint_reads_its_key_from_the_variable_the_binding_names() {
+        let got = Endpoint::from_binding(&binding(Some("DECISION_KEY")), |name| {
+            (name == "DECISION_KEY").then(|| "sekret".to_owned())
+        })
+        .unwrap();
+        assert_eq!(got.api_key.as_deref(), Some("sekret"));
+    }
+
+    #[test]
+    fn a_named_key_that_is_unset_or_blank_is_an_error_not_an_open_endpoint() {
+        for value in [None, Some(String::new()), Some("  ".to_owned())] {
+            let err = Endpoint::from_binding(&binding(Some("DECISION_KEY")), |_| value.clone())
+                .unwrap_err();
+            match err {
+                DecideError::Invalid(m) => assert!(m.contains("\"DECISION_KEY\" is unset"), "{m}"),
+                other => panic!("{other:?}"),
+            }
         }
     }
 
