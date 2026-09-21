@@ -13,7 +13,7 @@ refs = [
 ]
 
 [content]
-description = "An orchestrator injects inference as one versioned document, CRUCIBLE_INFERENCE, typed in crucible-contract, in place of a set of harness-named environment variables per consumer. A binding carries a role (agent, decision), a protocol, a model, an optional URL, and the name of the credential's variable, never its value. The engine derives delivery from the role's consumer: direct when the engine is the client, relayed into the sandbox when a harness is. This item delivers the document and the decision role. The agent role is specified and left for a change that lands with the controller's side."
+description = "An orchestrator injects inference as one versioned document, CRUCIBLE_INFERENCE, typed in crucible-contract, in place of a set of harness-named environment variables per consumer. A binding carries a role (agent, decision), a protocol, a model, an optional URL, and the name of the credential's variable, never its value. The engine derives delivery from the role's consumer: direct when the engine is the client, relayed into the sandbox when a harness is. Both roles are read. With no agent binding a run reaches its model as its manifest and ambient environment say, so this can ship ahead of an orchestrator that emits the document."
 notes = ["Agent role seams found while reading: Claude picks Vertex or direct key by whether ANTHROPIC_API_KEY is present (agent/harness/mod.rs resolve_auth); Codex picks ChatGPT OAuth or API key by [agent.codex].auth, and its key variable is derived from the manifest as OPENAI_API_KEY_<name> (openshell/run.rs codex_api_key_env). A binding's key_env has to supersede that carrier, and the controller repo follows core main automatically, so dropping the ambient variables before the controller emits the document would silently send keyed turns to Vertex."]
 
 [[content.acceptance_criteria]]
@@ -42,6 +42,6 @@ status = "done"
 category = "chore"
 
 [[content.acceptance_criteria]]
-text = "an agent turn takes its endpoint, protocol, model, harness, and credential variable from the agent binding, replacing ANTHROPIC_BASE_URL, OPENAI_BASE_URL, CRUCIBLE_INFERENCE_WIRE_API, and the --harness/--model flags the pod wrapper passes"
-status = "pending"
+text = "an agent binding fixes the run's model, keeps or replaces the harness by protocol, supplies the endpoint and wire API, and its credential replaces the manifest's own in every Codex auth mode, each replacement logged; with a binding present the ambient inference variables are not read"
+status = "done"
 category = "changed"

@@ -73,6 +73,43 @@ pub(crate) fn broker_bounds_env(
     ])
 }
 
+/// The harness and model a run uses. An injected agent binding decides first: its model, and the
+/// preferred harness when that harness speaks the binding's protocol, else the one that does.
+/// Without a binding the launch's own flag wins over the manifest's `[agent]`.
+pub(crate) fn select_agent(
+    flag_harness: Option<manifest::Harness>,
+    flag_model: Option<&str>,
+    agent: &manifest::AgentCfg,
+    inference: &crate::agent::inference::InferenceEnv,
+) -> (manifest::Harness, String) {
+    let preferred = flag_harness.unwrap_or(agent.harness);
+    let asked = flag_model.unwrap_or(&agent.model);
+    let Some(selection) = &inference.selection else {
+        return (preferred, asked.to_string());
+    };
+    let harness = selection.harness(preferred);
+    if harness != preferred || selection.model != asked {
+        tracing::info!(
+            protocol = %selection.protocol,
+            harness = ?harness,
+            model = %selection.model,
+            replaced_harness = ?preferred,
+            replaced_model = %asked,
+            "the injected agent binding replaces the run's harness or model"
+        );
+    }
+    (harness, selection.model.clone())
+}
+
+/// Resolve [`select_agent`] against the process environment and pin the result on `args`.
+pub(crate) fn pin_agent(args: &mut Args, agent: &manifest::AgentCfg) -> Result<manifest::Harness> {
+    let inference = crate::agent::inference::InferenceEnv::from_process_env()?;
+    let (harness, model) = select_agent(args.harness, args.model.as_deref(), agent, &inference);
+    args.harness = Some(harness);
+    args.model = Some(model);
+    Ok(harness)
+}
+
 /// Fold a manifest's `[agent]` config onto `Args` and, for the openshell backend, spawn the
 /// provisioning broker. Shared by the single-domain and composite run paths.
 pub(crate) fn apply_agent_cfg(
@@ -213,12 +250,6 @@ pub(crate) fn prep_plan_runner_with_params(
     );
     std::fs::create_dir_all(&p.state)
         .with_context(|| format!("creating state dir {}", p.state.display()))?;
-    let harness = agent.harness.unwrap_or(m.agent.harness);
-    crate::cli::workspace::install_toolbox(
-        &p,
-        &m.agent.toolbox_exclude,
-        harness.spec().skills_dir,
-    )?;
     // Default Args (as if `crucible` ran flagless) carrying the launch's own agent flags, then
     // the manifest's [agent] folded on top — the same resolution a loop run does.
     let mut args = Args::defaults().context("constructing default args")?;
@@ -226,6 +257,12 @@ pub(crate) fn prep_plan_runner_with_params(
     args.compute_driver = compute_driver;
     args.harness = agent.harness;
     args.model = agent.model;
+    let harness = pin_agent(&mut args, &m.agent)?;
+    crate::cli::workspace::install_toolbox(
+        &p,
+        &m.agent.toolbox_exclude,
+        harness.spec().skills_dir,
+    )?;
     let frozen = frozen_projection(
         &m,
         m.publish.as_ref().and_then(|p| p.pr_repo.as_deref()),
@@ -258,6 +295,67 @@ mod tests {
     use super::*;
     use crate::testing::{args_from, manifest_toml, tempdir};
     use std::fs;
+
+    fn injected(
+        protocol: crucible_contract::inference::InferenceProtocol,
+    ) -> crate::agent::inference::InferenceEnv {
+        crate::agent::inference::InferenceEnv {
+            selection: Some(crate::agent::inference::AgentSelection {
+                protocol,
+                model: "bound-model".into(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn without_a_binding_the_flag_wins_over_the_manifest() {
+        use manifest::Harness;
+        let m: manifest::Manifest = toml::from_str(&manifest_toml("")).unwrap();
+        let none = Default::default();
+        assert_eq!(
+            select_agent(None, None, &m.agent, &none),
+            (m.agent.harness, m.agent.model.clone())
+        );
+        assert_eq!(
+            select_agent(Some(Harness::Codex), Some("flag-model"), &m.agent, &none),
+            (Harness::Codex, "flag-model".to_string())
+        );
+    }
+
+    #[test]
+    fn a_binding_fixes_the_model_and_keeps_or_replaces_the_harness_by_protocol() {
+        use crucible_contract::inference::InferenceProtocol;
+        use manifest::Harness;
+        let m: manifest::Manifest = toml::from_str(&manifest_toml("")).unwrap();
+        assert_eq!(
+            select_agent(
+                Some(Harness::Hermes),
+                Some("flag-model"),
+                &m.agent,
+                &injected(InferenceProtocol::Messages)
+            ),
+            (Harness::Hermes, "bound-model".to_string())
+        );
+        assert_eq!(
+            select_agent(
+                Some(Harness::Claude),
+                None,
+                &m.agent,
+                &injected(InferenceProtocol::Responses)
+            ),
+            (Harness::Codex, "bound-model".to_string())
+        );
+        assert_eq!(
+            select_agent(
+                Some(Harness::Codex),
+                None,
+                &m.agent,
+                &injected(InferenceProtocol::Messages)
+            ),
+            (Harness::Claude, "bound-model".to_string())
+        );
+    }
 
     #[test]
     fn effort_defaults_to_medium_when_unset() {

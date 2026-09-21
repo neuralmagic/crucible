@@ -739,10 +739,13 @@ An orchestrator tells the engine where models are reached through one JSON docum
 `{"version":1,"bindings":[{"role","protocol","url"?,"model","key_env"?}]}`. `role` is `agent` or
 `decision`; `protocol` is `messages`, `chat_completions`, `responses`, or `system_one`. `key_env`
 names the variable holding the credential and the document never holds the value. An unknown
-field or version fails the run before any task. The engine reads the `decision` binding today;
-the `agent` binding is specified and not yet read, and agent turns still take their endpoint
-from `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL` / `CRUCIBLE_INFERENCE_WIRE_API` and their keys
-from the harness's own variables.
+field or version fails the run before any task. A `decision` binding is what a model-decided
+route asks. An `agent` binding is the whole answer for agent turns: its model is the run's model,
+its protocol keeps the selected harness when that harness speaks it and otherwise selects the one
+that does, its key replaces `[agent.codex]`'s own, and the ambient `ANTHROPIC_API_KEY`,
+`ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, and `CRUCIBLE_INFERENCE_WIRE_API` are not consulted.
+Each replacement is logged. With no `agent` binding those ambient variables and the manifest
+decide, which is how a run from an operator's shell works.
 
 Additive event kinds beyond the compat set include:
 

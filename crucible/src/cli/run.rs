@@ -431,7 +431,7 @@ fn playbook_launch(args: &crate::cli::DeployArgs) -> Result<Option<deploy::Playb
 /// Load a `crucible.toml`, build the World + Judge from it, and drive the loop. The one run
 /// path: every domain flows through here. Front-ends: headless / jsonl / stream,
 /// plus `--resume`.
-fn run_from_manifest(args: Args) -> Result<()> {
+fn run_from_manifest(mut args: Args) -> Result<()> {
     let manifest_path = args.manifest.clone().context(
         "crucible needs a manifest: pass --manifest <crucible.toml> (see docs/crucible-contract.md)",
     )?;
@@ -470,9 +470,8 @@ fn run_from_manifest(args: Args) -> Result<()> {
     vcs::ensure_repo(&workspace).context("ensuring workspace is a git repo")?;
     std::fs::create_dir_all(&p.state)
         .with_context(|| format!("creating state dir {}", p.state.display()))?;
-    // The toolbox lands where the resolved harness discovers skills (CLI `--harness` wins,
-    // matching `apply_agent_cfg`'s resolution below).
-    let harness = args.harness.unwrap_or(m.agent.harness);
+    // The toolbox lands where the resolved harness discovers skills.
+    let harness = crate::cli::setup::pin_agent(&mut args, &m.agent)?;
     crate::cli::workspace::install_toolbox(
         &p,
         &m.agent.toolbox_exclude,
@@ -480,7 +479,6 @@ fn run_from_manifest(args: Args) -> Result<()> {
     )?;
 
     // Fold the manifest's [agent] config onto Args (+ spawn the broker for openshell).
-    let mut args = args;
     let frozen = crate::cli::setup::frozen_projection(
         &m,
         m.publish
@@ -565,7 +563,7 @@ fn read_seed_diff(manifest_dir: &Path, seed_diff: Option<&str>) -> Result<Option
 /// Run a composite domain: set up each component's checkout under one base workspace, build
 /// the multi-workspace [`CompositeWorld`] + the combined gate, and drive the same loop. The components
 /// co-locate under the base so the agent has one cwd / one sandbox upload tree spanning both repos.
-fn run_composite(args: Args, manifest_path: PathBuf) -> Result<()> {
+fn run_composite(mut args: Args, manifest_path: PathBuf) -> Result<()> {
     let m = manifest::CompositeManifest::load_frozen(&manifest_path)?;
     let manifest_dir = manifest_path
         .parent()
@@ -616,14 +614,13 @@ fn run_composite(args: Args, manifest_path: PathBuf) -> Result<()> {
     let p = Paths::for_manifest(base, state, &manifest_dir, skills);
     std::fs::create_dir_all(&p.state)
         .with_context(|| format!("creating state dir {}", p.state.display()))?;
-    let harness = args.harness.unwrap_or(m.agent.harness);
+    let harness = crate::cli::setup::pin_agent(&mut args, &m.agent)?;
     crate::cli::workspace::install_toolbox(
         &p,
         &m.agent.toolbox_exclude,
         harness.spec().skills_dir,
     )?;
 
-    let mut args = args;
     // A composite has no single-repo [publish]; its forks are per component.
     let bounds = crate::cli::setup::run_bounds(
         &m.outputs,
