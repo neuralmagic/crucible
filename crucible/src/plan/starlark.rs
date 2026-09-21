@@ -67,6 +67,8 @@ struct CompileContext {
     /// Every task a DSL constructor built, keyed by name. A constructed-but-dropped task
     /// silently never runs, so it is a compile error.
     constructed_tasks: BTreeMap<String, FileSpan>,
+    /// Tasks with `otherwise = True`, expanded in `workflow()`.
+    otherwise: BTreeSet<String>,
     /// `session(...)` declarations by name, with the declaring site.
     sessions: BTreeMap<String, (SessionDecl, FileSpan)>,
     /// Declared sessions bound to at least one task.
@@ -312,6 +314,7 @@ impl CompileState {
                 prompt_files: BTreeSet::new(),
                 total_prompt_bytes: 0,
                 constructed_tasks: BTreeMap::new(),
+                otherwise: BTreeSet::new(),
                 sessions: BTreeMap::new(),
                 bound_sessions: BTreeSet::new(),
                 string_session_refs: BTreeMap::new(),
@@ -529,6 +532,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "emits_files",
             "when",
             "answers",
+            "otherwise",
         ],
         "skill" => &[
             "name",
@@ -552,6 +556,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "emits_files",
             "when",
             "answers",
+            "otherwise",
         ],
         "command" => &[
             "name",
@@ -570,6 +575,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "emits_files",
             "when",
             "answers",
+            "otherwise",
         ],
         "evaluate" => &[
             "name",
@@ -590,6 +596,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "emits_files",
             "when",
             "answers",
+            "otherwise",
         ],
         "top_k" => &["name", "k", "direction", "depends_on", "required"],
         "route" => &[
@@ -603,6 +610,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "stage",
             "when",
             "answers",
+            "otherwise",
         ],
         "noul" => &["ask", "drop"],
         "choice" => &["ask", "options", "drop"],
@@ -638,7 +646,11 @@ fn constructor(
             }
         };
         let tasks = match take_value(&mut named, "tasks")? {
-            Value::List(tasks) => task_list("workflow", tasks)?,
+            Value::List(tasks) => {
+                let mut tasks = task_list("workflow", tasks)?;
+                expand_otherwise(&mut tasks, state)?;
+                tasks
+            }
             _ => return Err(CompileError::TasksNotList),
         };
         let result = take_optional_task_name(&mut named, "result")?;
@@ -746,14 +758,14 @@ fn constructor(
                 model,
                 effort,
             };
-            dsl_task(&mut named, name, kind, session.map(|decl| decl.name))?
+            dsl_task(&mut named, state, name, kind, session.map(|decl| decl.name))?
         }
         "command" => {
             let name = take_declared_name(&mut named, "name")?;
             let kind = TaskKind::Command {
                 command: take_string(&mut named, "run")?,
             };
-            dsl_task(&mut named, name, kind, None)?
+            dsl_task(&mut named, state, name, kind, None)?
         }
         "evaluate" => {
             let name = take_declared_name(&mut named, "name")?;
@@ -762,7 +774,7 @@ fn constructor(
                 threshold: take_optional_number(&mut named, "threshold")?,
                 direction: take_optional_direction(&mut named, "direction")?,
             };
-            dsl_task(&mut named, name, kind, None)?
+            dsl_task(&mut named, state, name, kind, None)?
         }
         "report" => Task {
             name: take_declared_name(&mut named, "name")?,
@@ -854,7 +866,7 @@ fn constructor(
                 over: None,
                 max_fanout: None,
                 revise: None,
-                when: take_when(&mut named)?,
+                when: take_when(&mut named, state, &name)?,
                 name,
             }
         }
@@ -1080,10 +1092,12 @@ fn engine_task(
 
 fn dsl_task(
     named: &mut BTreeMap<String, Value>,
+    state: &CompileState,
     name: TaskName,
     kind: TaskKind,
     session: Option<String>,
 ) -> Result<Task> {
+    let when = take_when(named, state, &name)?;
     let task = Task {
         name,
         task: kind,
@@ -1098,7 +1112,7 @@ fn dsl_task(
         emits_files: take_emitted_files(named)?,
         over: take_over(named)?,
         max_fanout: take_optional_fanout(named)?,
-        when: take_when(named)?,
+        when,
         revise: take_revise(named)?,
     };
     check_fanout(&task)?;
@@ -1252,19 +1266,40 @@ fn take_questions(named: &mut BTreeMap<String, Value>) -> Result<BTreeMap<Questi
         .collect()
 }
 
-/// `when = gate.area, answers = [...]`. A noul's `answers` defaults to `"yes"`.
-fn take_when(named: &mut BTreeMap<String, Value>) -> Result<Option<When>> {
+/// `when = gate.area` with `answers = [...]` or `otherwise = True`. A noul's `answers` defaults
+/// to `"yes"`.
+fn take_when(
+    named: &mut BTreeMap<String, Value>,
+    state: &CompileState,
+    task: &TaskName,
+) -> Result<Option<When>> {
     let answers = take_labels(named, "answers")?;
+    let otherwise = take_bool_default(named, "otherwise", false)?;
     let asked = match named.remove("when") {
         None | Some(Value::None) => {
-            return match answers {
-                Some(_) => Err(CompileError::AnswersWithoutWhen),
-                None => Ok(None),
+            return match (answers, otherwise) {
+                (Some(_), _) => Err(CompileError::AnswersWithoutWhen),
+                (None, true) => Err(CompileError::OtherwiseWithoutWhen),
+                (None, false) => Ok(None),
             };
         }
         Some(Value::Answer(asked)) => asked,
         Some(_) => return Err(CompileError::WhenNotAnAnswer),
     };
+    if otherwise {
+        if answers.is_some() {
+            return Err(CompileError::OtherwiseWithAnswers);
+        }
+        state.context_mut().otherwise.insert(task.0.clone());
+        return Ok(Some(When {
+            task: asked.task,
+            question: asked.question,
+            is: Vec::new(),
+        }));
+    }
+    if answers.as_ref().is_some_and(Vec::is_empty) {
+        return Err(CompileError::EmptyAnswers);
+    }
     let is = match (answers, &asked.asked.kind) {
         (Some(answers), _) => answers,
         (None, QuestionKind::Noul) => vec![identifier("answers", Label::new(NOUL_YES))?],
@@ -1295,6 +1330,64 @@ fn take_when(named: &mut BTreeMap<String, Value>) -> Result<Option<When>> {
         question: asked.question,
         is,
     }))
+}
+
+/// Replace each `otherwise` with the labels no other `when` lists.
+fn expand_otherwise(tasks: &mut [Task], state: &CompileState) -> Result<()> {
+    let context = state.context_mut();
+    if context.otherwise.is_empty() {
+        return Ok(());
+    }
+    let pending = |task: &Task| context.otherwise.contains(&task.name.0);
+    let mut listed: BTreeMap<(TaskName, QuestionId), BTreeSet<Label>> = BTreeMap::new();
+    for task in tasks.iter().filter(|task| !pending(task)) {
+        if let Some(when) = &task.when {
+            listed
+                .entry((when.task.clone(), when.question.clone()))
+                .or_default()
+                .extend(when.is.iter().cloned());
+        }
+    }
+    let mut expanded: Vec<(usize, Vec<Label>)> = Vec::new();
+    for (index, task) in tasks.iter().enumerate().filter(|(_, task)| pending(task)) {
+        let Some(when) = &task.when else { continue };
+        let asked = tasks.iter().find_map(|route| match &route.task {
+            TaskKind::Route { questions, .. } if route.name == when.task => {
+                questions.get(&when.question)
+            }
+            _ => None,
+        });
+        let Some(asked) = asked else { continue };
+        let listed_here = listed.get(&(when.task.clone(), when.question.clone()));
+        let rest: Vec<Label> = asked
+            .labels()
+            .into_iter()
+            .chain([Label::uncertain()])
+            .filter(|label| !listed_here.is_some_and(|l| l.contains(label)))
+            .filter(|label| !asked.drop.contains(label))
+            .collect();
+        if rest.is_empty() {
+            let error = CompileError::UnreachableOtherwise {
+                task: task.name.0.clone(),
+                asked: format!("{}.{}", when.task, when.question),
+            };
+            return Err(match context.constructed_tasks.get(&task.name.0) {
+                Some(site) => CompileError::At {
+                    at: site.clone(),
+                    inner: Box::new(error),
+                },
+                None => error,
+            });
+        }
+        expanded.push((index, rest));
+    }
+    drop(context);
+    for (index, rest) in expanded {
+        if let Some(when) = &mut tasks[index].when {
+            when.is = rest;
+        }
+    }
+    Ok(())
 }
 
 fn take_over(named: &mut BTreeMap<String, Value>) -> Result<Option<OutputRef>> {
@@ -3004,6 +3097,171 @@ workflow(type = "playbook", tasks = [classify, gate, fix, punt, page, wrap], res
     }
 
     #[test]
+    fn otherwise_expands_to_the_unlisted_labels() {
+        let pack = temp_pack("otherwise");
+        let source = ROUTED.replace(
+            "when = gate.area, answers = [\"frontend\"])",
+            "when = gate.area, otherwise = True)",
+        );
+        let compiled = compile_source(&source, &pack.join("workflow.star"), &pack).unwrap();
+        let when = |name: &str| {
+            compiled
+                .workflow
+                .tasks
+                .iter()
+                .find(|t| t.name.0 == name)
+                .unwrap()
+                .when
+                .as_ref()
+                .map(ToString::to_string)
+        };
+        assert_eq!(when("fix").as_deref(), Some("gate.area in scheduler"));
+        assert_eq!(
+            when("punt").as_deref(),
+            Some("gate.area in frontend"),
+            "uncertain is dropped by the question, so otherwise does not claim it"
+        );
+        let text = toml::to_string(&compiled.workflow).unwrap();
+        assert!(!text.contains("otherwise"), "{text}");
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn otherwise_catches_uncertain_when_the_question_does_not_drop_it() {
+        let pack = temp_pack("otherwise-uncertain");
+        let source = ROUTED
+            .replace("            drop = [\"uncertain\"],\n", "")
+            .replace(
+                "when = gate.area, answers = [\"frontend\"])",
+                "when = gate.area, otherwise = True)",
+            );
+        let compiled = compile_source(&source, &pack.join("workflow.star"), &pack).unwrap();
+        let punt = compiled
+            .workflow
+            .tasks
+            .iter()
+            .find(|t| t.name.0 == "punt")
+            .unwrap();
+        assert_eq!(
+            punt.when.as_ref().unwrap().to_string(),
+            "gate.area in frontend|uncertain"
+        );
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn otherwise_on_a_noul_takes_no_and_uncertain_in_place_of_the_yes_default() {
+        let pack = temp_pack("otherwise-noul");
+        let source = format!(
+            "{}\n",
+            ROUTED
+                .replace(", drop = [\"no\", \"uncertain\"])", ")")
+                .replace(
+                    "wrap = command(",
+                    "calm = command(name = \"calm\", run = \"./calm.sh\", depends_on = [gate], when = gate.urgent, otherwise = True, required = False)\nwrap = command(",
+                )
+                .replace("tasks = [classify, gate, fix, punt, page, wrap]", "tasks = [classify, gate, fix, punt, page, calm, wrap]")
+        );
+        let compiled = compile_source(&source, &pack.join("workflow.star"), &pack).unwrap();
+        let calm = compiled
+            .workflow
+            .tasks
+            .iter()
+            .find(|t| t.name.0 == "calm")
+            .unwrap();
+        assert_eq!(
+            calm.when.as_ref().unwrap().to_string(),
+            "gate.urgent in no|uncertain"
+        );
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn two_otherwise_tasks_on_one_question_get_the_same_labels() {
+        let pack = temp_pack("otherwise-two");
+        let source = ROUTED
+            .replace(
+                "when = gate.area, answers = [\"frontend\"])",
+                "when = gate.area, otherwise = True)",
+            )
+            .replace(
+                "wrap = command(",
+                "note = command(name = \"note\", run = \"./note.sh\", depends_on = [gate], when = gate.area, otherwise = True, required = False)\nwrap = command(",
+            )
+            .replace("tasks = [classify, gate, fix, punt, page, wrap]", "tasks = [classify, gate, fix, punt, page, note, wrap]");
+        let compiled = compile_source(&source, &pack.join("workflow.star"), &pack).unwrap();
+        for name in ["punt", "note"] {
+            let task = compiled
+                .workflow
+                .tasks
+                .iter()
+                .find(|t| t.name.0 == name)
+                .unwrap();
+            assert_eq!(
+                task.when.as_ref().unwrap().to_string(),
+                "gate.area in frontend"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn an_unreachable_otherwise_is_an_error_at_its_argument() {
+        let source = ROUTED.replace(
+            "wrap = command(",
+            "rest = command(name = \"rest\", run = \"./rest.sh\", depends_on = [gate], when = gate.area, otherwise = True, required = False)\nwrap = command(",
+        ).replace("tasks = [classify, gate, fix, punt, page, wrap]", "tasks = [classify, gate, fix, punt, page, rest, wrap]");
+        let err = routed_error("otherwise-empty", &source);
+        assert!(err.contains("unreachable otherwise on \"rest\""), "{err}");
+        assert!(err.contains("gate.area"), "{err}");
+        let line = source
+            .lines()
+            .position(|l| l.starts_with("rest = "))
+            .unwrap();
+        let column = source.lines().nth(line).unwrap().find("otherwise").unwrap() + 1;
+        assert!(
+            err.contains(&format!("workflow.star:{}:{column}", line + 1)),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn otherwise_is_exclusive_with_answers_and_needs_when() {
+        let err = routed_error(
+            "otherwise-both",
+            &ROUTED.replace(
+                "answers = \"scheduler\")",
+                "answers = \"scheduler\", otherwise = True)",
+            ),
+        );
+        assert!(
+            err.contains("\"answers\" or \"otherwise\", not both"),
+            "{err}"
+        );
+        let err = routed_error(
+            "otherwise-no-when",
+            &ROUTED.replace(
+                "when = gate.area, answers = \"scheduler\")",
+                "otherwise = True)",
+            ),
+        );
+        assert!(
+            err.contains("\"otherwise\" has no meaning without \"when\""),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_empty_answers_list_is_refused_where_it_is_written() {
+        let err = routed_error(
+            "answers-empty",
+            &ROUTED.replace("answers = [\"frontend\"]", "answers = []"),
+        );
+        assert!(err.contains("\"answers\" lists no labels"), "{err}");
+        assert!(err.contains("workflow.star:16:"), "{err}");
+    }
+
+    #[test]
     fn a_custom_workflow_has_the_route_constructors() {
         let pack = temp_pack("routed-custom");
         let source = ROUTED.replace("type = \"playbook\"", "type = \"custom\"");
@@ -3266,23 +3524,23 @@ workflow(type = "custom", tasks = [e], result = e)
             ),
             (
                 "agent",
-                "g = route(name = \"g\", source = None, min_confidence = 0.5, questions = {\"q\": noul(ask = \"q?\", drop = [\"no\", \"uncertain\"])})\na = agent(name = \"a\", prompt = \"p\", depends_on = [g], required = False, when = g.q, answers = \"yes\"{extra})\nw = command(name = \"w\", run = \"true\", depends_on = [a], join = \"settled\")\nworkflow(type = \"custom\", tasks = [g, a, w], result = w)\n",
+                "g = route(name = \"g\", source = None, min_confidence = 0.5, questions = {\"q\": noul(ask = \"q?\", drop = [\"no\", \"uncertain\"])})\na = agent(name = \"a\", prompt = \"p\", depends_on = [g], required = False, when = g.q, answers = \"yes\", otherwise = False{extra})\nw = command(name = \"w\", run = \"true\", depends_on = [a], join = \"settled\")\nworkflow(type = \"custom\", tasks = [g, a, w], result = w)\n",
             ),
             (
                 "skill",
-                "g = route(name = \"g\", min_confidence = 0.5, questions = {\"q\": noul(ask = \"q?\", drop = [\"no\", \"uncertain\"])})\na = skill(name = \"a\", skill = \"skills/demo\", depends_on = [g], when = g.q, answers = \"yes\"{extra})\nw = command(name = \"w\", run = \"true\", depends_on = [a], join = \"settled\")\nworkflow(type = \"custom\", tasks = [g, a, w], result = w)\n",
+                "g = route(name = \"g\", min_confidence = 0.5, questions = {\"q\": noul(ask = \"q?\", drop = [\"no\", \"uncertain\"])})\na = skill(name = \"a\", skill = \"skills/demo\", depends_on = [g], when = g.q, answers = \"yes\", otherwise = False{extra})\nw = command(name = \"w\", run = \"true\", depends_on = [a], join = \"settled\")\nworkflow(type = \"custom\", tasks = [g, a, w], result = w)\n",
             ),
             (
                 "command",
-                "g = route(name = \"g\", min_confidence = 0.5, questions = {\"q\": noul(ask = \"q?\", drop = [\"no\", \"uncertain\"])})\nc = command(name = \"c\", run = \"true\", depends_on = [g], when = g.q, answers = \"yes\"{extra})\nw = command(name = \"w\", run = \"true\", depends_on = [c], join = \"settled\")\nworkflow(type = \"custom\", tasks = [g, c, w], result = w)\n",
+                "g = route(name = \"g\", min_confidence = 0.5, questions = {\"q\": noul(ask = \"q?\", drop = [\"no\", \"uncertain\"])})\nc = command(name = \"c\", run = \"true\", depends_on = [g], when = g.q, answers = \"yes\", otherwise = False{extra})\nw = command(name = \"w\", run = \"true\", depends_on = [c], join = \"settled\")\nworkflow(type = \"custom\", tasks = [g, c, w], result = w)\n",
             ),
             (
                 "evaluate",
-                "g = route(name = \"g\", min_confidence = 0.5, questions = {\"q\": noul(ask = \"q?\", drop = [\"no\", \"uncertain\"])})\ne = evaluate(name = \"e\", run = \"true\", depends_on = [g], when = g.q, answers = \"yes\"{extra})\nw = command(name = \"w\", run = \"true\", depends_on = [e], join = \"settled\")\nworkflow(type = \"custom\", tasks = [g, e, w], result = w)\n",
+                "g = route(name = \"g\", min_confidence = 0.5, questions = {\"q\": noul(ask = \"q?\", drop = [\"no\", \"uncertain\"])})\ne = evaluate(name = \"e\", run = \"true\", depends_on = [g], when = g.q, answers = \"yes\", otherwise = False{extra})\nw = command(name = \"w\", run = \"true\", depends_on = [e], join = \"settled\")\nworkflow(type = \"custom\", tasks = [g, e, w], result = w)\n",
             ),
             (
                 "route",
-                "u = command(name = \"u\", run = \"true\", emits = [\"q\", \"r\"])\ng = route(name = \"g\", source = u, min_confidence = None, depends_on = [u], required = True, join = \"all\", stage = \"iteration\", questions = {\"q\": noul(ask = \"q?\", drop = [\"no\", \"uncertain\"])})\nh = route(name = \"h\", source = u, depends_on = [u, g], when = g.q, answers = \"yes\", questions = {\"r\": noul(ask = \"r?\")}{extra})\nw = command(name = \"w\", run = \"true\", depends_on = [h], join = \"settled\")\nworkflow(type = \"custom\", tasks = [u, g, h, w], result = w)\n",
+                "u = command(name = \"u\", run = \"true\", emits = [\"q\", \"r\"])\ng = route(name = \"g\", source = u, min_confidence = None, depends_on = [u], required = True, join = \"all\", stage = \"iteration\", questions = {\"q\": noul(ask = \"q?\", drop = [\"no\", \"uncertain\"])})\nh = route(name = \"h\", source = u, depends_on = [u, g], when = g.q, answers = \"yes\", otherwise = False, questions = {\"r\": noul(ask = \"r?\")}{extra})\nw = command(name = \"w\", run = \"true\", depends_on = [h], join = \"settled\")\nworkflow(type = \"custom\", tasks = [u, g, h, w], result = w)\n",
             ),
             (
                 "noul",

@@ -26,13 +26,12 @@ oncall = command(name = "oncall", run = "./act.sh oncall", depends_on = [gate], 
 
 finance = command(name = "finance", run = "./act.sh finance", depends_on = [gate], when = gate.bucket, answers = "billing")
 
-# A low-confidence read lands with a human, the same as a feature request.
 backlog = command(
     name = "backlog",
     run = "./act.sh backlog",
     depends_on = [gate],
     when = gate.bucket,
-    answers = ["feature", "uncertain"],
+    otherwise = True,
 )
 
 filed = command(

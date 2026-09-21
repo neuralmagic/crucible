@@ -1,0 +1,30 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-09-21-002"
+title = "Let a task take whatever answers no other task lists"
+status = "active"
+created = "2026-09-21"
+started = "2026-09-21"
+refs = [
+    "RFC-0001:C-ROUTE",
+    "RFC-0001:C-WORKFLOW",
+]
+
+[content]
+description = "`otherwise = True` on a task's `when` expands at compile time to the question's labels that no other task lists and the question does not drop. The generated TOML carries the expanded list."
+
+[[content.acceptance_criteria]]
+text = "otherwise = True expands to the unlisted, undropped labels, uncertain included; the generated TOML has the list and no otherwise"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "compile errors at the argument for an unreachable otherwise, otherwise with answers, otherwise without when, and answers = []"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "DSL reference entry and the route example"
+status = "pending"
+category = "chore"
