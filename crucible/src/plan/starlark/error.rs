@@ -384,6 +384,34 @@ pub enum CompileError {
     #[error("argument \"emits\" must be a list of field-name strings")]
     EmitsNotList,
 
+    #[error("argument {argument:?}: {error}")]
+    InvalidIdentifier {
+        argument: String,
+        error: crucible_contract::decision::IdentError,
+    },
+    #[error("{error}")]
+    InvalidQuestion {
+        error: crucible_contract::decision::QuestionError,
+    },
+    #[error(
+        "route {task:?} needs exactly one of min_confidence (a decision model answers) or \
+         source (a dependency's output answers)"
+    )]
+    RouteDecider { task: String },
+    #[error("argument \"when\" must be one question of a route task, like `gate.area`")]
+    WhenNotAnAnswer,
+    #[error("argument \"answers\" has no meaning without \"when\"")]
+    AnswersWithoutWhen,
+    #[error(
+        "{asked} cannot answer {label:?}{} (it answers: {declared})",
+        diag::hint(.suggestion.as_deref())
+    )]
+    UnknownAnswer {
+        asked: String,
+        label: String,
+        suggestion: Option<String>,
+        declared: String,
+    },
     #[error("missing required argument {argument:?}")]
     MissingArgument { argument: String },
     /// One arm for every scalar-kwarg type check; `expected` completes the sentence.

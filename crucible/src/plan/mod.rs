@@ -6,6 +6,7 @@ pub(crate) mod diag;
 pub mod exec;
 pub mod ir;
 pub mod machine;
+pub mod route;
 pub mod runner;
 pub mod starlark;
 pub mod term_img;

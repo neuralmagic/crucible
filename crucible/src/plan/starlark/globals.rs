@@ -18,7 +18,8 @@ use starlark_syntax::codemap::FileSpan;
 
 use crate::plan::starlark as dsl;
 use crate::plan::starlark::values::{
-    ExternalText, OutputRefValue, SessionValue, TaskValue, WorkflowValue,
+    AnswerRefValue, ExternalText, OutputRefValue, QuestionValue, SessionValue, TaskValue,
+    WorkflowValue,
 };
 use crate::plan::workflow::{WorkflowCfg, WorkflowType};
 
@@ -98,6 +99,34 @@ pub(crate) fn common(builder: &mut GlobalsBuilder) {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Value<'v>> {
         dispatch("workflow", args, kwargs, eval)
+    }
+}
+
+/// Typed decisions, for the playbook and custom lanes.
+#[starlark_module]
+pub(crate) fn routed(builder: &mut GlobalsBuilder) {
+    fn choice<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("choice", args, kwargs, eval)
+    }
+
+    fn noul<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("noul", args, kwargs, eval)
+    }
+
+    fn route<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("route", args, kwargs, eval)
     }
 }
 
@@ -327,13 +356,19 @@ fn convert_at(value: Value<'_>, depth: usize) -> dsl::Result<dsl::Value> {
         return Ok(dsl::Value::External(external.0.clone()));
     }
     if let Some(task) = TaskValue::from_value(value) {
-        return Ok(dsl::Value::Task(task.0.clone()));
+        return Ok(dsl::Value::Task(Box::new(task.0.clone())));
     }
     if let Some(output) = OutputRefValue::from_value(value) {
         return output.resolve().map(dsl::Value::Output);
     }
     if let Some(session) = SessionValue::from_value(value) {
         return Ok(dsl::Value::Session(session.0.clone()));
+    }
+    if let Some(question) = QuestionValue::from_value(value) {
+        return Ok(dsl::Value::Question(question.0.clone()));
+    }
+    if let Some(answer) = AnswerRefValue::from_value(value) {
+        return Ok(dsl::Value::Answer(answer.0.clone()));
     }
     if let Some(workflow) = WorkflowValue::from_value(value) {
         return Ok(dsl::Value::Workflow(workflow.0.clone()));
@@ -368,12 +403,14 @@ fn alloc_at<'v>(heap: Heap<'v>, value: dsl::Value, depth: usize) -> Value<'v> {
         dsl::Value::External(segments) => heap.alloc(ExternalText(segments)),
         // A dictionary never travels back out: the constructors consume it.
         dsl::Value::Map(_) => Value::new_none(),
-        dsl::Value::Task(task) => heap.alloc(TaskValue(task)),
+        dsl::Value::Task(task) => heap.alloc(TaskValue(*task)),
         dsl::Value::Output(reference) => heap.alloc(OutputRefValue {
             declared: vec![reference.field.0.clone()],
             reference,
         }),
         dsl::Value::Session(session) => heap.alloc(SessionValue(session)),
+        dsl::Value::Question(question) => heap.alloc(QuestionValue(question)),
+        dsl::Value::Answer(answer) => heap.alloc(AnswerRefValue(answer)),
         dsl::Value::Workflow(workflow) => heap.alloc(WorkflowValue(workflow)),
     }
 }

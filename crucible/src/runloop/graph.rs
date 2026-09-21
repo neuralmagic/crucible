@@ -104,7 +104,7 @@ pub(crate) fn run_iteration<R: Reporter>(
     let mut task_events = Vec::new();
     let outcome = execute(
         &plan,
-        &Substrate::default(),
+        &Substrate::detecting(Default::default()),
         ExecCfg::default(),
         &mut *runner,
         |task, result| {
@@ -219,6 +219,7 @@ pub(crate) fn iteration_template(
                 emits_files: Vec::new(),
                 over: None,
                 max_fanout: None,
+                when: None,
             }
         };
     let mut tasks = vec![engine("propose", EngineOp::Propose, None, vec![])];
@@ -347,7 +348,7 @@ pub(crate) fn run_epilogue<R: Reporter>(
     let mut task_events = Vec::new();
     let outcome = execute(
         &plan,
-        &Substrate::default(),
+        &Substrate::detecting(Default::default()),
         ExecCfg::default(),
         &mut runner,
         |task, result| {
@@ -370,7 +371,9 @@ pub(crate) fn run_epilogue<R: Reporter>(
         };
         let (decision, failed) = match result.status {
             TaskStatus::Pass => ("epilogue", false),
-            TaskStatus::Skipped | TaskStatus::Blocked => ("epilogue-skip", false),
+            TaskStatus::Skipped | TaskStatus::NotTaken | TaskStatus::Blocked => {
+                ("epilogue-skip", false)
+            }
             TaskStatus::Fail | TaskStatus::Transport | TaskStatus::Truncated => {
                 ("epilogue-fail", true)
             }
@@ -734,6 +737,7 @@ impl<R: Reporter> LoopTaskRunner<R> {
                         TaskStatus::Fail => EvidenceDisposition::Failed,
                         TaskStatus::Transport
                         | TaskStatus::Skipped
+                        | TaskStatus::NotTaken
                         | TaskStatus::Blocked
                         | TaskStatus::Truncated => EvidenceDisposition::Skipped,
                     },
@@ -793,6 +797,7 @@ impl<R: Reporter> TaskRunner for LoopTaskRunner<R> {
             TaskKind::Agent { .. }
             | TaskKind::Command { .. }
             | TaskKind::Evaluate { .. }
+            | TaskKind::Route { .. }
             | TaskKind::Report { .. } => self.workflow_runner.run(task, attempt, inputs),
             TaskKind::Engine {
                 op: EngineOp::Propose,
@@ -974,7 +979,7 @@ pub(crate) fn run_wide_tournament<R: Reporter>(
     let mut task_events = Vec::new();
     let outcome = execute(
         &plan,
-        &Substrate::default(),
+        &Substrate::detecting(Default::default()),
         ExecCfg::default(),
         &mut runner,
         |task, result| {
@@ -1072,6 +1077,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            when: None,
         });
     }
     for id in 0..cfg.n {
@@ -1093,6 +1099,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            when: None,
         });
     }
     tasks.push(Task {
@@ -1114,6 +1121,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
         emits_files: Vec::new(),
         over: None,
         max_fanout: None,
+        when: None,
     });
     Plan {
         version: 1,

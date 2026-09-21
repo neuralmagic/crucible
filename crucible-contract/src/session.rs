@@ -142,6 +142,9 @@ pub struct PlanTaskWire {
     /// worst-case width before any spend.
     #[serde(default)]
     pub max_fanout: u32,
+    /// `route.question in a|b` when the task runs only on those answers, empty otherwise.
+    #[serde(default)]
+    pub when: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -813,6 +816,7 @@ mod tests {
                 stage: "iteration".into(),
                 over: "discover.targets".into(),
                 max_fanout: 8,
+                when: String::new(),
             }],
         });
     }

@@ -21,6 +21,8 @@ pub enum TaskState {
     Pass,
     Fail,
     Skipped,
+    /// Its `when` was not satisfied, or it joins `all` on a task that settled this way.
+    NotTaken,
     Transport,
     Blocked,
     Truncated,
@@ -52,6 +54,10 @@ pub enum TaskEvent {
     TransportCutByBudget,
     /// The substrate cannot run it (`needs` unmet).
     Unrunnable,
+    /// The route it is conditional on resolved to a label its `when` does not list.
+    ConditionUnmet,
+    /// An `all`-join dependency settled not taken.
+    BranchNotTaken,
     DependencyDidNotPass,
     RequiredTaskFailed,
     BudgetCeiling,
@@ -73,6 +79,8 @@ pub const TASK_TRANSITIONS: &[(TaskState, TaskEvent, TaskState)] = {
         (S::Pending, E::Dispatched, S::Running),
         (S::Pending, E::FannedOut, S::Fanout),
         (S::Pending, E::Unrunnable, S::Skipped),
+        (S::Pending, E::ConditionUnmet, S::NotTaken),
+        (S::Pending, E::BranchNotTaken, S::NotTaken),
         (S::Pending, E::DependencyDidNotPass, S::Blocked),
         (S::Pending, E::RequiredTaskFailed, S::Blocked),
         (S::Pending, E::BudgetCeiling, S::Blocked),
@@ -279,6 +287,7 @@ pub fn task_digraph() -> Digraph {
                     TaskState::Pass,
                     TaskState::Fail,
                     TaskState::Skipped,
+                    TaskState::NotTaken,
                     TaskState::Transport,
                     TaskState::Blocked,
                     TaskState::Truncated,

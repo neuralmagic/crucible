@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use crate::crucible::Direction;
 use crate::plan::exec::{Attempt, AttemptOutcome, TaskRunner};
-use crate::plan::ir::{Task, TaskKind, TaskName};
+use crate::plan::ir::{Decider, Task, TaskKind, TaskName};
 use crucible_contract::TransportCause;
 
 pub struct ShellRunner {
@@ -118,6 +118,27 @@ impl ShellRunner {
                     },
                     Err(error) => Attempt::failed(0.0, error),
                 };
+            }
+            TaskKind::Route {
+                questions,
+                decider: Decider::Model { min_confidence },
+            } => {
+                let endpoint = match crucible_broker::systemone::Endpoint::from_env() {
+                    Ok(endpoint) => endpoint,
+                    Err(error) => return Attempt::failed(0.0, error.to_string()),
+                };
+                return crate::plan::route::model_attempt(
+                    &endpoint,
+                    questions,
+                    *min_confidence,
+                    inputs,
+                );
+            }
+            TaskKind::Route {
+                decider: Decider::Output { .. },
+                ..
+            } => {
+                return Attempt::failed(0.0, "output-decided route reached the runner".to_string());
             }
             TaskKind::TopK { .. } => {
                 // The executor owns reducers; reaching the runner is an executor bug.
@@ -348,6 +369,7 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            when: None,
         }
     }
 
@@ -368,6 +390,7 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            when: None,
         }
     }
 
@@ -536,6 +559,7 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            when: None,
         };
         let passed = run_plan(vec![evaluate("latency", 9.5)], None);
         assert_eq!(passed.results[&"latency".into()].status, TaskStatus::Pass);
@@ -567,6 +591,7 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            when: None,
         };
         let over = run_plan(
             vec![evaluate("over", r#"{"score": 100, "pass": true}"#)],
@@ -605,6 +630,7 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            when: None,
         };
         let green = run_plan(vec![evaluate("green", r#"{"pass": true}"#)], None);
         assert_eq!(green.results[&"green".into()].status, TaskStatus::Pass);
@@ -632,6 +658,7 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            when: None,
         };
         let out = run_plan(vec![task], None);
         let result = &out.results[&"malformed".into()];
@@ -667,6 +694,7 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            when: None,
         };
         let out = run_plan(vec![t], None);
         assert_eq!(out.results[&"a".into()].status, TaskStatus::Fail);
@@ -694,6 +722,7 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            when: None,
         };
         let out = run_plan(
             vec![t],
@@ -747,6 +776,7 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            when: None,
         };
         let measure = |name: &str, dep: &str| {
             command(
@@ -773,6 +803,7 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            when: None,
         };
         let out = run_plan(
             vec![

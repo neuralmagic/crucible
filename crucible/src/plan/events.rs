@@ -25,6 +25,7 @@ pub(crate) fn plan_admitted_event(plan: &ValidPlan) -> crate::report::session::S
                     .map(crate::plan::ir::OutputRef::to_string)
                     .unwrap_or_default(),
                 max_fanout: t.max_fanout.unwrap_or_default(),
+                when: t.when.as_ref().map(ToString::to_string).unwrap_or_default(),
             })
             .collect(),
     }

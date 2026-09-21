@@ -1,0 +1,47 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-09-20-001"
+title = "Route a playbook on a typed model decision"
+status = "active"
+created = "2026-09-20"
+started = "2026-09-20"
+refs = [
+    "RFC-0001:C-ROUTE",
+    "RFC-0001:C-WORKFLOW",
+    "RFC-0002:C-SETTLED-JOIN",
+    "RFC-0002:C-PLAYBOOK-CAPS",
+]
+
+[content]
+description = "Playbook and custom workflows gain a route task that asks a System One decision model typed noul/choice questions through the broker, and a when predicate that lets any task run only on a declared answer. An untaken branch settles not taken, a new terminal status that never gates validity. Routing today costs a full agent turn whose confidence is self-reported; a route is one bounded call whose answer can only be a declared label."
+
+[[content.acceptance_criteria]]
+text = "workflow.star compiles route, noul, choice and when into manifest IR in the playbook and custom lanes, and rejects them in autoresearch"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "validation rejects unknown route, question, or label in when, and any routed label neither handled nor dropped, with did-you-mean"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "not taken is a terminal status that spends nothing, never gates validity or short-circuits, and propagates through all joins"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "the broker System One client resolves low-confidence answers to uncertain and fails on any undeclared label or malformed response"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "a route task's output carries the label and distribution per question and is folded, not re-asked, on resume"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "unit tests per layer and an end-to-end playbook run against a real local System One HTTP server"
+status = "pending"
+category = "chore"
