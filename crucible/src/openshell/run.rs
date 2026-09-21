@@ -77,6 +77,11 @@ pub enum OpenshellCliError {
         "workspace retrieval failed after bounded retry; sandbox '{sandbox}' was preserved for operator recovery: {detail}"
     )]
     WorkspaceRecovery { sandbox: String, detail: String },
+    #[error(
+        "the {harness} harness authenticates with a direct API key, and neither OPENAI_API_KEY \
+         nor ANTHROPIC_API_KEY is set"
+    )]
+    NoApiKey { harness: &'static str },
 }
 use crucible_harness::OtelCollector;
 use std::sync::atomic::Ordering;
@@ -290,7 +295,8 @@ async fn try_turn(
     let gw = Gateway::connect().context("connecting to the openshell gateway over gRPC")?;
 
     // 2. Resolve this harness's model credential: Vertex's static credential becomes a gateway
-    //    provider the metadata emulator serves to claude/hermes (see `provider` docs); codex gets
+    //    provider the metadata emulator serves to claude/hermes, and to opencode/pi when the
+    //    env names no key (see `provider` docs); codex gets
     //    the auth mode selected by `[agent.codex]`: an API key from the named env or a
     //    host-refreshed ChatGPT OAuth token. Either is seeded as auth.json (step 7b), since Codex
     //    reads the real bytes off disk and its L4 WebSocket never crosses a placeholder-resolving
@@ -302,11 +308,20 @@ async fn try_turn(
             let token = provider::mint_vertex_token()
                 .await
                 .context("minting the Vertex access token")?;
-            let (project, region) = vertex_config(&args.env);
-            ensure_provider(&gw, &token, &project, &region).await?;
+            let vertex = crate::agent::inference::VertexConfig::from_env(&args.env);
+            ensure_provider(&gw, &token, &vertex.project, &vertex.region).await?;
             SandboxAuth::Gateway
         }
         AuthProvider::AnthropicKey => SandboxAuth::AnthropicKey,
+        AuthProvider::ApiKey => {
+            if inference.openai_key.is_none() && inference.anthropic_key.is_none() {
+                return Err(OpenshellCliError::NoApiKey {
+                    harness: harness.as_str(),
+                }
+                .into());
+            }
+            SandboxAuth::ApiKey
+        }
         AuthProvider::Codex => SandboxAuth::Codex(match selected_codex_api_key(&args.codex)? {
             Some(key) => provider::CodexAuth::ApiKey(key),
             None => provider::CodexAuth::ChatGpt(
@@ -368,7 +383,7 @@ async fn try_turn(
     ];
     let mut providers = match auth {
         AuthProvider::Vertex => vec![provider::PROVIDER_NAME.to_string()],
-        AuthProvider::Codex | AuthProvider::AnthropicKey => Vec::new(),
+        AuthProvider::Codex | AuthProvider::AnthropicKey | AuthProvider::ApiKey => Vec::new(),
     };
     if aws_provider {
         providers.push(provider::AWS_PROVIDER_NAME.to_string());
@@ -615,11 +630,12 @@ async fn try_turn(
 
         // 8. Exec the agent (prompt over stdin), streaming its stdout through the harness decoder.
         stage(sink, "sandbox ready — starting the agent");
+        let mcp_seeded = broker_url.is_some();
         let argv = match session {
             Some(session) => backend
-                .sandbox_session_argv(args, !seeds.is_empty(), session)
+                .sandbox_session_argv(args, mcp_seeded, session)
                 .context("building continuing sandbox harness argv")?,
-            None => backend.sandbox_argv(args, !seeds.is_empty()),
+            None => backend.sandbox_argv(args, mcp_seeded),
         };
         let wrapper = crate::agent::harness::exec_wrapper(&basename, &argv);
         let exec_opts = ExecOpts {
@@ -656,7 +672,7 @@ async fn try_turn(
                     }
                 }
             })),
-            AuthProvider::Codex | AuthProvider::AnthropicKey => None,
+            AuthProvider::Codex | AuthProvider::AnthropicKey | AuthProvider::ApiKey => None,
         };
         let decoder = backend.decoder(
             args,
@@ -1021,13 +1037,12 @@ async fn publish_workspace(staged: &std::path::Path, workspace: &std::path::Path
     Ok(())
 }
 
-/// The Vertex project + region for the provider config, read from the manifest env,
-/// with sane fallbacks.
 /// The model-reach variables this turn's sandbox carries. A direct Anthropic key replaces the
 /// Vertex selectors the manifest set (Claude Code prefers Vertex whenever they are present), and
 /// a custom base URL rides under the name its harness reads. Codex reads a custom endpoint's key
 /// from the environment where the built-in provider reads `auth.json`, so the key is exported only
-/// in that case.
+/// in that case. A key-authenticated harness (opencode, pi) gets every key and base URL the env
+/// carries: its seeded provider table names which variable it reads.
 pub(crate) fn inference_env(
     env: &mut Vec<(String, String)>,
     harness: Harness,
@@ -1063,17 +1078,31 @@ pub(crate) fn inference_env(
                 }
             }
         }
+        Harness::OpenCode | Harness::Pi => {
+            for (key, value) in [
+                (
+                    crate::agent::inference::OPENAI_API_KEY_ENV,
+                    &inference.openai_key,
+                ),
+                (
+                    crate::agent::inference::OPENAI_BASE_URL,
+                    &inference.openai_base_url,
+                ),
+                (
+                    crate::agent::inference::ANTHROPIC_API_KEY,
+                    &inference.anthropic_key,
+                ),
+                (
+                    crate::agent::inference::ANTHROPIC_BASE_URL,
+                    &inference.anthropic_base_url,
+                ),
+            ] {
+                if let Some(v) = value.as_deref() {
+                    set(env, key, v);
+                }
+            }
+        }
     }
-}
-
-fn vertex_config(env: &[(String, String)]) -> (String, String) {
-    let get = |keys: &[&str]| {
-        keys.iter()
-            .find_map(|k| env.iter().find(|(ek, _)| ek == k).map(|(_, v)| v.clone()))
-    };
-    let project = get(&["ANTHROPIC_VERTEX_PROJECT_ID", "GCP_PROJECT_ID"]).unwrap_or_default();
-    let region = get(&["CLOUD_ML_REGION", "VERTEX_LOCATION"]).unwrap_or_else(|| "global".into());
-    (project, region)
 }
 
 /// Write this turn's boundary token where the broker's candidate budget reads it
@@ -1785,19 +1814,6 @@ mod tests {
             "http://vllm.internal:8000/v1".to_string()
         )));
         assert!(custom.contains(&("OPENAI_API_KEY".to_string(), "sk-oa".to_string())));
-    }
-
-    #[test]
-    fn vertex_config_reads_manifest_keys_with_fallback() {
-        let (proj, region) = vertex_config(&[
-            ("ANTHROPIC_VERTEX_PROJECT_ID".into(), "proj-x".into()),
-            ("CLOUD_ML_REGION".into(), "us-east5".into()),
-        ]);
-        assert_eq!(proj, "proj-x");
-        assert_eq!(region, "us-east5");
-        // Region falls back to "global" when unset.
-        let (_, region2) = vertex_config(&[]);
-        assert_eq!(region2, "global");
     }
 
     #[test]

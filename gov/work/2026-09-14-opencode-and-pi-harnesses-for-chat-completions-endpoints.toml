@@ -1,0 +1,54 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-09-14-001"
+title = "OpenCode and Pi harnesses for chat-completions-only endpoints"
+status = "active"
+created = "2026-09-14"
+started = "2026-09-14"
+refs = ["RFC-0001:C-TRANSPORT"]
+
+[content]
+description = """
+Some inference endpoints (the WDC MaaS qwen deployment among them) speak only OpenAI Chat
+Completions. The current Claude Code CLI needs the Messages API and the current Codex CLI the
+Responses API, so neither existing harness can run a turn against such an endpoint. Add OpenCode
+and Pi as harnesses that can: the Harness::OpenCode and Harness::Pi arms (argv, env script,
+seeded provider config, transcript parsing), live JSONL decoders for `opencode run --format json`
+and `pi --mode json`, a direct-API-key auth mode that relays OPENAI_API_KEY/ANTHROPIC_API_KEY and
+their base URLs into the sandbox, per-harness egress defaults, and the docs. OpenCode's mirrored
+event stream can lose its tail in a container, so its turn result comes from a post-run
+`opencode export` (a backfill harness like hermes); pi's stream is complete and closes the turn
+live. Sessions and OTEL cost are out of scope (stubbed like codex)."""
+notes = [
+    "Pi has no MCP client, so the provisioning broker is unreachable from a pi turn; opencode takes the broker as a remote MCP server in its config.",
+    "Both CLIs register the endpoint as a provider named `crucible` in their seeded config, so a custom endpoint, api.openai.com, and api.anthropic.com take one shape and the CLI's own model catalog is never consulted.",
+    "The decoders are pinned by golden captures of both CLIs run against a scripted chat-completions server (fixtures under crucible-harness/src/testdata and crucible/src/testdata, paths redacted).",
+]
+
+[[content.acceptance_criteria]]
+text = "--harness opencode and --harness pi run a sandbox turn end to end against a chat-completions endpoint named by OPENAI_BASE_URL + OPENAI_API_KEY: seeded provider config, live stream decoded to AgentEvents, estimator cost stamped, transcript parsed"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "OpenCodeJsonParser and PiJsonParser map each CLI's JSON event schema onto AgentEvent, pinned by golden tests on real captures; opencode's Result comes from the session export and a missing export is a loud transcript error"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "a key-authenticated turn with neither OPENAI_API_KEY nor ANTHROPIC_API_KEY is refused before the sandbox starts, as a typed error"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "claude, hermes, and codex turns keep their argv, env scripts, config files, egress defaults, and parsed records byte-identical"
+status = "pending"
+category = "chore"
+
+[verification]
+required_guards = [
+    "GUARD-CARGO-FMT",
+    "GUARD-CARGO-CLIPPY",
+    "GUARD-CARGO-TEST",
+]
