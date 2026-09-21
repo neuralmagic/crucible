@@ -1,0 +1,47 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-09-21-001"
+title = "Carry injected inference as one typed document"
+status = "active"
+created = "2026-09-21"
+started = "2026-09-21"
+refs = [
+    "RFC-0001:C-INFERENCE",
+    "RFC-0001:C-ROUTE",
+    "RFC-0002:C-PLAYBOOK-CAPS",
+]
+
+[content]
+description = "An orchestrator injects inference as one versioned document, CRUCIBLE_INFERENCE, typed in crucible-contract, in place of a set of harness-named environment variables per consumer. A binding carries a role (agent, decision), a protocol, a model, an optional URL, and the name of the credential's variable, never its value. The engine derives delivery from the role's consumer: direct when the engine is the client, relayed into the sandbox when a harness is. This item delivers the document and the decision role. The agent role is specified and left for a change that lands with the controller's side."
+notes = ["Agent role seams found while reading: Claude picks Vertex or direct key by whether ANTHROPIC_API_KEY is present (agent/harness/mod.rs resolve_auth); Codex picks ChatGPT OAuth or API key by [agent.codex].auth, and its key variable is derived from the manifest as OPENAI_API_KEY_<name> (openshell/run.rs codex_api_key_env). A binding's key_env has to supersede that carrier, and the controller repo follows core main automatically, so dropping the ambient variables before the controller emits the document would silently send keyed turns to Vertex."]
+
+[[content.acceptance_criteria]]
+text = "crucible-contract defines ResolvedInference with a wire version, and rejects unknown fields, unknown versions, a duplicate role, a protocol that does not serve its role, a bad URL, and a bad credential variable name"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "a model-decided route takes its endpoint, model, and credential variable from the decision binding; the CRUCIBLE_SYSTEMONE_* variables are gone"
+status = "done"
+category = "changed"
+
+[[content.acceptance_criteria]]
+text = "the systemone capability exists exactly when a decision binding does, and a malformed document stops the run before any task"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "a named credential variable that is unset fails the route without calling the endpoint"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "CONTRACT_VERSION 1.6.0, the wire doc, and the example pack describe the document"
+status = "done"
+category = "chore"
+
+[[content.acceptance_criteria]]
+text = "an agent turn takes its endpoint, protocol, model, harness, and credential variable from the agent binding, replacing ANTHROPIC_BASE_URL, OPENAI_BASE_URL, CRUCIBLE_INFERENCE_WIRE_API, and the --harness/--model flags the pod wrapper passes"
+status = "pending"
+category = "changed"

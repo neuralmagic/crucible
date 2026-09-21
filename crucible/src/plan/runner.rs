@@ -16,6 +16,7 @@ use crate::crucible::Direction;
 use crate::plan::exec::{Attempt, AttemptOutcome, TaskRunner};
 use crate::plan::ir::{Decider, Task, TaskKind, TaskName};
 use crucible_contract::TransportCause;
+use crucible_contract::inference::{ENV_INFERENCE, InferenceRole};
 
 pub struct ShellRunner {
     pub workdir: PathBuf,
@@ -123,10 +124,23 @@ impl ShellRunner {
                 questions,
                 decider: Decider::Model { min_confidence },
             } => {
-                let endpoint = match crucible_broker::systemone::Endpoint::from_env() {
-                    Ok(endpoint) => endpoint,
+                let inference = match crate::inference::from_process_env() {
+                    Ok(inference) => inference,
                     Err(error) => return Attempt::failed(0.0, error.to_string()),
                 };
+                let Some(binding) = inference.binding(InferenceRole::Decision) else {
+                    return Attempt::failed(
+                        0.0,
+                        format!("{ENV_INFERENCE} holds no decision binding"),
+                    );
+                };
+                let endpoint =
+                    match crucible_broker::systemone::Endpoint::from_binding(binding, |name| {
+                        std::env::var(name).ok()
+                    }) {
+                        Ok(endpoint) => endpoint,
+                        Err(error) => return Attempt::failed(0.0, error.to_string()),
+                    };
                 return crate::plan::route::model_attempt(
                     &endpoint,
                     questions,

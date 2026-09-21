@@ -104,7 +104,10 @@ pub(crate) fn run_iteration<R: Reporter>(
     let mut task_events = Vec::new();
     let outcome = execute(
         &plan,
-        &Substrate::detecting(Default::default()),
+        &Substrate::detecting(
+            Default::default(),
+            &crucible::inference::from_process_env()?,
+        ),
         ExecCfg::default(),
         &mut *runner,
         |task, result| {
@@ -348,7 +351,10 @@ pub(crate) fn run_epilogue<R: Reporter>(
     let mut task_events = Vec::new();
     let outcome = execute(
         &plan,
-        &Substrate::detecting(Default::default()),
+        &Substrate::detecting(
+            Default::default(),
+            &crucible::inference::from_process_env()?,
+        ),
         ExecCfg::default(),
         &mut runner,
         |task, result| {
@@ -979,7 +985,10 @@ pub(crate) fn run_wide_tournament<R: Reporter>(
     let mut task_events = Vec::new();
     let outcome = execute(
         &plan,
-        &Substrate::detecting(Default::default()),
+        &Substrate::detecting(
+            Default::default(),
+            &crucible::inference::from_process_env()?,
+        ),
         ExecCfg::default(),
         &mut runner,
         |task, result| {

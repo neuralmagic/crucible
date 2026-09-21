@@ -734,6 +734,16 @@ satisfied, or it joins `all` on a task that settled that way. It was never dispa
 nothing, and is not a failure. A `plan_admitted` task carries an additive `when` string,
 `route.question in a|b`, empty when the task is unconditional.
 
+An orchestrator tells the engine where models are reached through one JSON document in
+`CRUCIBLE_INFERENCE` (contract 1.6.0), typed as `crucible_contract::inference::ResolvedInference`:
+`{"version":1,"bindings":[{"role","protocol","url"?,"model","key_env"?}]}`. `role` is `agent` or
+`decision`; `protocol` is `messages`, `chat_completions`, `responses`, or `system_one`. `key_env`
+names the variable holding the credential and the document never holds the value. An unknown
+field or version fails the run before any task. The engine reads the `decision` binding today;
+the `agent` binding is specified and not yet read, and agent turns still take their endpoint
+from `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL` / `CRUCIBLE_INFERENCE_WIRE_API` and their keys
+from the harness's own variables.
+
 Additive event kinds beyond the compat set include:
 
 - **`identity`**: the run's `RunIdentity` (below), emitted once at setup and again on
