@@ -5,7 +5,13 @@
 #   TICKET=billing crucible plan run --manifest examples/route/crucible.toml \
 #                                    --max-cost 1 --max-time 5m
 #
-# TICKET names a file under tickets/ (outage, billing, feature) and defaults to outage.
+# TICKET names a file under tickets/ and defaults to outage. outage, billing, and feature are
+# clear-cut. torn belongs to two queues and sits near min_confidence, so it lands on either
+# `finance` or, as "uncertain", `backlog`. vague fits no queue, and shows what min_confidence does
+# not catch: with no "other" option the model still picks the nearest one, confidently.
+#
+# serving/ builds and deploys the DiffusionGemma endpoint: `just route-serving-image`, then
+# `just route-serving-deploy <image>` and `just route-serving-forward`.
 #
 # Any server speaking POST /v1/systemone works: the hosted Jev API, or vLLM's DiffusionGemma
 # structured-reads server. Without the URL the run truncates at `gate` before spending anything.
