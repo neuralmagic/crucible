@@ -25,8 +25,8 @@ use crate::crucible::Direction;
 use crate::errors::FileError;
 use crate::plan::diag;
 use crate::plan::ir::{
-    Decider, EngineOp, Isolation, Join, MAX_FANOUT_CEILING, OutputField, OutputRef,
-    ReportDestination, SlackDestination, Stage, Task, TaskKind, TaskName, When,
+    Decider, EngineOp, Isolation, Join, MAX_FANOUT_CEILING, MAX_ROUNDS_CEILING, OutputField,
+    OutputRef, ReportDestination, Revise, SlackDestination, Stage, Task, TaskKind, TaskName, When,
 };
 use crate::plan::starlark::error::{
     CompileError, MAX_CALLSTACK, MAX_CONSTRUCTED_TASKS, MAX_EVAL_HEAP_BYTES, MAX_EVAL_TICKS,
@@ -524,6 +524,8 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "stage",
             "over",
             "max_fanout",
+            "revise",
+            "max_rounds",
             "emits_files",
             "when",
             "answers",
@@ -545,6 +547,8 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "stage",
             "over",
             "max_fanout",
+            "revise",
+            "max_rounds",
             "emits_files",
             "when",
             "answers",
@@ -561,6 +565,8 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "stage",
             "over",
             "max_fanout",
+            "revise",
+            "max_rounds",
             "emits_files",
             "when",
             "answers",
@@ -579,6 +585,8 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "stage",
             "over",
             "max_fanout",
+            "revise",
+            "max_rounds",
             "emits_files",
             "when",
             "answers",
@@ -778,6 +786,7 @@ fn constructor(
             over: None,
             max_fanout: None,
             when: None,
+            revise: None,
         },
         "top_k" => {
             let k = take_int(&mut named, "k")?;
@@ -814,6 +823,7 @@ fn constructor(
                 emits_files: Vec::new(),
                 over: None,
                 max_fanout: None,
+                revise: None,
                 when: None,
             }
         }
@@ -843,6 +853,7 @@ fn constructor(
                 emits_files: Vec::new(),
                 over: None,
                 max_fanout: None,
+                revise: None,
                 when: take_when(&mut named)?,
                 name,
             }
@@ -1088,8 +1099,17 @@ fn dsl_task(
         over: take_over(named)?,
         max_fanout: take_optional_fanout(named)?,
         when: take_when(named)?,
+        revise: take_revise(named)?,
     };
     check_fanout(&task)?;
+    if let Some(revise) = &task.revise
+        && !task.depends_on.contains(&revise.task)
+    {
+        return Err(CompileError::ReviseNotADependency {
+            task: task.name.0.clone(),
+            target: revise.task.0.clone(),
+        });
+    }
     if task.join == Join::Settled && task.depends_on.is_empty() {
         return Err(CompileError::SettledJoinWithoutDependencies {
             task: task.name.0.clone(),
@@ -1294,6 +1314,26 @@ fn take_optional_fanout(named: &mut BTreeMap<String, Value>) -> Result<Option<u3
     }
 }
 
+/// `revise` and `max_rounds` are one declaration written as two kwargs: a send-back states how
+/// many rounds it may take before it runs.
+fn take_revise(named: &mut BTreeMap<String, Value>) -> Result<Option<Revise>> {
+    let task = take_optional_task_name(named, "revise")?;
+    let rounds = match named.remove("max_rounds") {
+        None | Some(Value::None) => None,
+        Some(Value::Int(n)) => match u32::try_from(n) {
+            Ok(n) if (2..=MAX_ROUNDS_CEILING).contains(&n) => Some(n),
+            _ => return Err(CompileError::RoundsOutOfRange { got: n }),
+        },
+        Some(_) => return Err(CompileError::RoundsNotInteger),
+    };
+    match (task, rounds) {
+        (None, None) => Ok(None),
+        (Some(task), Some(max_rounds)) => Ok(Some(Revise { task, max_rounds })),
+        (Some(task), None) => Err(CompileError::ReviseWithoutRounds { target: task.0 }),
+        (None, Some(_)) => Err(CompileError::RoundsWithoutRevise),
+    }
+}
+
 fn parse_stage(value: &str) -> Result<Stage> {
     match value {
         "iteration" => Ok(Stage::Iteration),
@@ -1324,6 +1364,7 @@ fn engine(name: &str, op: EngineOp, source: Option<TaskName>, depends_on: Vec<Ta
         over: None,
         max_fanout: None,
         when: None,
+        revise: None,
     }
 }
 
@@ -3197,7 +3238,7 @@ workflow(type = "custom", tasks = [e], result = e)
             ),
             (
                 "agent",
-                "s = session(name = \"sess\")\nu = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = agent(name = \"a\", prompt = \"p\", harness = \"claude\", model = \"m\", effort = \"high\", session = s, emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\"{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
+                "s = session(name = \"sess\")\nu = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = agent(name = \"a\", prompt = \"p\", harness = \"claude\", model = \"m\", effort = \"high\", session = s, emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", revise = u, max_rounds = 2{extra})\nworkflow(type = \"playbook\", tasks = [u, a])\n",
             ),
             (
                 "command",
@@ -3213,7 +3254,15 @@ workflow(type = "custom", tasks = [e], result = e)
             ),
             (
                 "skill",
-                "s = session(name = \"sess\")\nu = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = skill(name = \"a\", skill = \"skills/demo\", args = {\"k\": 1}, harness = \"claude\", model = \"m\", effort = \"high\", session = s, emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\"{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
+                "s = session(name = \"sess\")\nu = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = skill(name = \"a\", skill = \"skills/demo\", args = {\"k\": 1}, harness = \"claude\", model = \"m\", effort = \"high\", session = s, emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", revise = u, max_rounds = 2{extra})\nworkflow(type = \"playbook\", tasks = [u, a])\n",
+            ),
+            (
+                "command",
+                "u = command(name = \"u\", run = \"true\")\nc = command(name = \"c\", run = \"true\", depends_on = [u], revise = u, max_rounds = 3{extra})\nworkflow(type = \"playbook\", tasks = [u, c])\n",
+            ),
+            (
+                "evaluate",
+                "u = command(name = \"u\", run = \"true\")\ne = evaluate(name = \"e\", run = \"true\", depends_on = [u], revise = u, max_rounds = 3{extra})\nworkflow(type = \"playbook\", tasks = [u, e])\n",
             ),
             (
                 "agent",
@@ -3276,7 +3325,8 @@ workflow(type = "custom", tasks = [e], result = e)
                 "c = command(name = \"c\", run = \"true\")\nworkflow(type = \"custom\", tasks = [c], result = c{extra})\n",
             ),
         ];
-        // `over` excludes only `session`, so a constructor taking both needs two templates.
+        // `over` excludes `session` and `revise`, so a constructor taking both needs two
+        // templates.
         // Coverage is the union across a function's templates.
         let mut by_function: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
         for (function, template) in cases {
@@ -3802,6 +3852,90 @@ workflow(type = "playbook", tasks = [discover, audit])
             );
             assert!(error.contains(expected), "{clause}: {error}");
         }
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn a_reviewer_compiles_to_a_bounded_revise_loop() {
+        let pack = temp_pack("revise");
+        let source = r#"
+author = agent(name = "author", prompt = "write the probe", session = "author")
+repro = evaluate(
+    name = "repro",
+    run = "python3 tools/probe.py",
+    depends_on = [author],
+    revise = author,
+    max_rounds = 3,
+)
+workflow(type = "playbook", tasks = [author, repro])
+"#;
+        let compiled = compile_source(source, &pack.join("workflow.star"), &pack).unwrap();
+        assert_eq!(
+            compiled.workflow.tasks[1].revise,
+            Some(Revise {
+                task: "author".into(),
+                max_rounds: 3
+            })
+        );
+        assert_eq!(compiled.workflow.tasks[0].revise, None);
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn a_revise_loop_names_its_target_and_states_its_rounds() {
+        let pack = temp_pack("revise-coherence");
+        let cases = [
+            (
+                "depends_on = [author],\n    revise = author",
+                "without max_rounds",
+            ),
+            (
+                "depends_on = [author],\n    max_rounds = 2",
+                "without \"revise\"",
+            ),
+            (
+                "depends_on = [],\n    revise = author,\n    max_rounds = 2",
+                "add \"author\" to depends_on",
+            ),
+            (
+                "depends_on = [author],\n    revise = author,\n    max_rounds = 1",
+                "max_rounds = 1 is outside 2..=5",
+            ),
+            (
+                "depends_on = [author],\n    revise = author,\n    max_rounds = 6",
+                "max_rounds = 6 is outside 2..=5",
+            ),
+            (
+                "depends_on = [author],\n    revise = author,\n    max_rounds = \"3\"",
+                "\"max_rounds\" must be an integer",
+            ),
+            (
+                "depends_on = [author],\n    revise = [author],\n    max_rounds = 3",
+                "argument \"revise\" must be",
+            ),
+        ];
+        for (clause, expected) in cases {
+            let source = format!(
+                "author = agent(name = \"author\", prompt = \"p\")\nrepro = agent(\n    name = \"repro\",\n    prompt = \"p\",\n    {clause},\n)\nworkflow(type = \"playbook\", tasks = [author, repro])\n"
+            );
+            let error = crate::errors::report(
+                &compile_source(&source, &pack.join("workflow.star"), &pack)
+                    .err()
+                    .unwrap_or_else(|| panic!("{clause}: compiled")),
+            );
+            assert!(error.contains(expected), "{clause}: {error}");
+        }
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn a_scored_workflow_refuses_a_revise_loop() {
+        let pack = temp_pack("revise-lane");
+        let source = "author = agent(name = \"author\", prompt = \"p\")\nrepro = agent(name = \"repro\", prompt = \"p\", depends_on = [author], revise = author, max_rounds = 2)\nworkflow(type = \"custom\", tasks = [author, repro], result = repro)\n";
+        let error = crate::errors::report(
+            &compile_source(source, &pack.join("workflow.star"), &pack).unwrap_err(),
+        );
+        assert!(error.contains("which only a playbook runs"), "{error}");
         let _ = std::fs::remove_dir_all(&pack);
     }
 

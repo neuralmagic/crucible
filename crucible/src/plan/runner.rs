@@ -370,6 +370,7 @@ mod tests {
             over: None,
             max_fanout: None,
             when: None,
+            revise: None,
         }
     }
 
@@ -391,6 +392,7 @@ mod tests {
             over: None,
             max_fanout: None,
             when: None,
+            revise: None,
         }
     }
 
@@ -560,6 +562,7 @@ mod tests {
             over: None,
             max_fanout: None,
             when: None,
+            revise: None,
         };
         let passed = run_plan(vec![evaluate("latency", 9.5)], None);
         assert_eq!(passed.results[&"latency".into()].status, TaskStatus::Pass);
@@ -592,6 +595,7 @@ mod tests {
             over: None,
             max_fanout: None,
             when: None,
+            revise: None,
         };
         let over = run_plan(
             vec![evaluate("over", r#"{"score": 100, "pass": true}"#)],
@@ -631,6 +635,7 @@ mod tests {
             over: None,
             max_fanout: None,
             when: None,
+            revise: None,
         };
         let green = run_plan(vec![evaluate("green", r#"{"pass": true}"#)], None);
         assert_eq!(green.results[&"green".into()].status, TaskStatus::Pass);
@@ -659,6 +664,7 @@ mod tests {
             over: None,
             max_fanout: None,
             when: None,
+            revise: None,
         };
         let out = run_plan(vec![task], None);
         let result = &out.results[&"malformed".into()];
@@ -695,6 +701,7 @@ mod tests {
             over: None,
             max_fanout: None,
             when: None,
+            revise: None,
         };
         let out = run_plan(vec![t], None);
         assert_eq!(out.results[&"a".into()].status, TaskStatus::Fail);
@@ -723,6 +730,7 @@ mod tests {
             over: None,
             max_fanout: None,
             when: None,
+            revise: None,
         };
         let out = run_plan(
             vec![t],
@@ -777,6 +785,7 @@ mod tests {
             over: None,
             max_fanout: None,
             when: None,
+            revise: None,
         };
         let measure = |name: &str, dep: &str| {
             command(
@@ -804,6 +813,7 @@ mod tests {
             over: None,
             max_fanout: None,
             when: None,
+            revise: None,
         };
         let out = run_plan(
             vec![

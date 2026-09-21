@@ -2,7 +2,7 @@
 
 use crate::errors::FileError;
 use crate::plan::diag;
-use crate::plan::ir::MAX_FANOUT_CEILING;
+use crate::plan::ir::{MAX_FANOUT_CEILING, MAX_ROUNDS_CEILING};
 use crate::plan::workflow::WorkflowError;
 use starlark_syntax::codemap::FileSpan;
 
@@ -379,6 +379,21 @@ pub enum CompileError {
     BracketInTaskName { task: String },
     #[error("task {task:?} declares max_fanout without \"over\"; there is nothing to bound")]
     FanoutWithoutOver { task: String },
+    #[error("\"max_rounds\" must be an integer")]
+    RoundsNotInteger,
+    #[error("max_rounds = {got} is outside 2..={MAX_ROUNDS_CEILING}")]
+    RoundsOutOfRange { got: i32 },
+    #[error(
+        "revise = {target:?} without max_rounds; a revise loop states how many rounds it may \
+         take before it runs, not after"
+    )]
+    ReviseWithoutRounds { target: String },
+    #[error("max_rounds without \"revise\"; there is no loop to bound")]
+    RoundsWithoutRevise,
+    #[error(
+        "task {task:?} revises {target:?} but does not depend on it; add {target:?} to depends_on"
+    )]
+    ReviseNotADependency { task: String, target: String },
     #[error("emits entries must be strings")]
     EmitsEntryNotString,
     #[error("argument \"emits\" must be a list of field-name strings")]

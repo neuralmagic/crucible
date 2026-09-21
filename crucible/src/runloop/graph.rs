@@ -220,6 +220,7 @@ pub(crate) fn iteration_template(
                 over: None,
                 max_fanout: None,
                 when: None,
+                revise: None,
             }
         };
     let mut tasks = vec![engine("propose", EngineOp::Propose, None, vec![])];
@@ -1078,6 +1079,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
             over: None,
             max_fanout: None,
             when: None,
+            revise: None,
         });
     }
     for id in 0..cfg.n {
@@ -1100,6 +1102,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
             over: None,
             max_fanout: None,
             when: None,
+            revise: None,
         });
     }
     tasks.push(Task {
@@ -1122,6 +1125,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
         over: None,
         max_fanout: None,
         when: None,
+        revise: None,
     });
     Plan {
         version: 1,

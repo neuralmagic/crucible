@@ -9,7 +9,7 @@ since = "0.1.0"
 
 [content]
 text = """
-A playbook's graph says what runs before what, and what must pass before what runs. It does not say how many times anything runs. The graph is dispatched once, so a task that must retry, poll, or converge does that inside its own execution, where the author's command or the agent's own turn loop owns the repetition. A repair loop is therefore one task, not an edge back into the graph, and the engine never sees the iteration at all.
+A playbook's graph says what runs before what, and what must pass before what runs. The graph is dispatched once, so a task that must retry, poll, or converge does that inside its own execution, where the author's command or the agent's own turn loop owns the repetition. The one repetition the graph states is a revise loop under [[RFC-0002:C-REVISE-LOOP]]: a reviewer sends a failing verdict back to the single dependency it names, for a number of rounds fixed before any spend. It is declared on an edge that already exists, so it adds no node and no edge, and its bound is visible in the compiled graph. A repair that re-runs more than one producer, or whose bound depends on what a task finds, is still one task, and the engine never sees that iteration at all.
 
 This is also why an item set discovered at run time cannot become new nodes. The only two things a run can do with such a set are handle it inside one task or emit it as asks under [[RFC-0002:C-ASKS]], and which one is right turns on whether the items deserve their own budget, isolation, and verdict.
 
