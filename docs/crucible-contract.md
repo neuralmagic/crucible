@@ -729,6 +729,11 @@ A `task_result` event whose `status` is `transport` carries an additive `transpo
 `workspace`/`command`/`other`. `note` stays the retry summary with the last attempt's detail.
 `report.json`'s per-task entries carry the same token.
 
+A `task_result` event's `status` may be `not_taken` (contract 1.6.0): the task's `when` was not
+satisfied, or it joins `all` on a task that settled that way. It was never dispatched, cost
+nothing, and is not a failure. A `plan_admitted` task carries an additive `when` string,
+`route.question in a|b`, empty when the task is unconditional.
+
 Additive event kinds beyond the compat set include:
 
 - **`identity`**: the run's `RunIdentity` (below), emitted once at setup and again on

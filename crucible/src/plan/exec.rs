@@ -18,12 +18,16 @@ use serde_json::Value;
 use crate::crucible::Direction;
 use crate::diagram::IllegalTransition;
 use crate::plan::ir::{
-    ITEM_INPUT, Join, OUTCOME_INPUT, REVISION_INPUT, Stage, Task, TaskKind, TaskName, ValidPlan,
+    Decider, ITEM_INPUT, Join, OUTCOME_INPUT, REVISION_INPUT, Stage, Task, TaskKind, TaskName,
+    ValidPlan,
 };
 use crate::plan::machine::{
     BlockedReason, PlanEvent, PlanMachine, TaskEvent, TaskMachine, TaskState,
 };
 use crucible_contract::TransportCause;
+use crucible_contract::decision::{
+    Answer, Decision, Label, NOUL_NO, NOUL_YES, Question, QuestionId,
+};
 
 /// What the substrate can measure. Missing caps truncate the plan fail-closed.
 #[derive(Clone, Debug, Default)]
@@ -32,6 +36,14 @@ pub struct Substrate {
 }
 
 impl Substrate {
+    /// `caps` plus the capabilities this process can verify it provides itself.
+    pub fn detecting(mut caps: BTreeSet<String>) -> Self {
+        if crucible_broker::systemone::Endpoint::from_env().is_ok() {
+            caps.insert(crate::plan::ir::NEEDS_SYSTEMONE.to_owned());
+        }
+        Substrate { caps }
+    }
+
     fn supports(&self, needs: &str) -> bool {
         needs == "any" || self.caps.contains(needs)
     }
@@ -198,7 +210,7 @@ impl Default for ExecCfg {
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
-#[error("task status must be pass|fail|transport|skipped|blocked|truncated, got {got:?}")]
+#[error("task status must be pass|fail|transport|skipped|not_taken|blocked|truncated, got {got:?}")]
 pub struct UnknownTaskStatus {
     pub got: String,
 }
@@ -214,6 +226,7 @@ pub enum TaskStatus {
     Fail,
     Transport,
     Skipped,
+    NotTaken,
     Blocked,
     Truncated,
 }
@@ -226,6 +239,7 @@ impl TaskStatus {
             TaskStatus::Fail => "fail",
             TaskStatus::Transport => "transport",
             TaskStatus::Skipped => "skipped",
+            TaskStatus::NotTaken => "not_taken",
             TaskStatus::Blocked => "blocked",
             TaskStatus::Truncated => "truncated",
         }
@@ -247,6 +261,7 @@ impl std::str::FromStr for TaskStatus {
             "fail" => Ok(TaskStatus::Fail),
             "transport" => Ok(TaskStatus::Transport),
             "skipped" => Ok(TaskStatus::Skipped),
+            "not_taken" => Ok(TaskStatus::NotTaken),
             "blocked" => Ok(TaskStatus::Blocked),
             "truncated" => Ok(TaskStatus::Truncated),
             other => Err(UnknownTaskStatus {
@@ -263,6 +278,7 @@ impl TaskState {
             TaskState::Pass => TaskStatus::Pass,
             TaskState::Fail => TaskStatus::Fail,
             TaskState::Skipped => TaskStatus::Skipped,
+            TaskState::NotTaken => TaskStatus::NotTaken,
             TaskState::Transport => TaskStatus::Transport,
             TaskState::Blocked => TaskStatus::Blocked,
             TaskState::Truncated => TaskStatus::Truncated,
@@ -522,10 +538,13 @@ pub fn execute(
                       gates: bool|
      -> Result<(), IllegalTransition> {
         settle(machines.entry(t.name.clone()).or_default(), &r, event)?;
-        let failed = r.status != TaskStatus::Pass;
+        let failed = !matches!(r.status, TaskStatus::Pass | TaskStatus::NotTaken);
         if matches!(
             r.status,
-            TaskStatus::Skipped | TaskStatus::Transport | TaskStatus::Blocked
+            TaskStatus::Skipped
+                | TaskStatus::NotTaken
+                | TaskStatus::Transport
+                | TaskStatus::Blocked
         ) {
             runner.drop_captured(t);
         }
@@ -598,6 +617,21 @@ pub fn execute(
                     .iter()
                     .any(|d| d != &t.name && !results.contains_key(d))
             }) {
+                continue;
+            }
+            if let Some((event, note)) = not_taken(t, &results) {
+                let r = TaskResult::undispatched(TaskStatus::NotTaken, note);
+                record(
+                    &mut *runner,
+                    t,
+                    r,
+                    event,
+                    &mut results,
+                    &mut machines,
+                    &mut halted,
+                    &mut plan_machine,
+                    true,
+                )?;
                 continue;
             }
             if !dependencies_allow(t, &results) {
@@ -759,6 +793,7 @@ pub fn execute(
                             emits_files: node.emits_files.clone(),
                             over: None,
                             max_fanout: None,
+                            when: None,
                             revise: None,
                             ..node.clone()
                         })
@@ -1115,7 +1150,23 @@ pub fn execute(
                     };
                     (reduced, event, false)
                 }
-                TaskKind::Agent { .. }
+                TaskKind::Route {
+                    questions,
+                    decider: Decider::Output { task: source },
+                } => {
+                    let decided = decide_from_output(&inputs, questions, source);
+                    let event = if decided.status == TaskStatus::Pass {
+                        TaskEvent::Passed
+                    } else {
+                        TaskEvent::Failed
+                    };
+                    (decided, event, false)
+                }
+                TaskKind::Route {
+                    decider: Decider::Model { .. },
+                    ..
+                }
+                | TaskKind::Agent { .. }
                 | TaskKind::Command { .. }
                 | TaskKind::Evaluate { .. }
                 | TaskKind::Report { .. }
@@ -1187,7 +1238,12 @@ pub fn execute(
         && plan
             .tasks_topo()
             .filter(|t| t.required && t.stage == Stage::Iteration)
-            .all(|t| results.get(&t.name).map(|r| r.status) == Some(TaskStatus::Pass));
+            .all(|t| {
+                matches!(
+                    results.get(&t.name).map(|r| r.status),
+                    Some(TaskStatus::Pass | TaskStatus::NotTaken)
+                )
+            });
     Ok(PlanOutcome {
         valid,
         exit,
@@ -1293,6 +1349,7 @@ fn file_producers(
                     name: name.clone(),
                     over: None,
                     max_fanout: None,
+                    when: None,
                     revise: None,
                     ..p.clone()
                 };
@@ -1496,7 +1553,9 @@ fn rounds_event(status: TaskStatus) -> TaskEvent {
         TaskStatus::Fail => TaskEvent::RoundsFailed,
         TaskStatus::Skipped => TaskEvent::RoundsSkipped,
         TaskStatus::Transport => TaskEvent::RoundsTransport,
-        TaskStatus::Blocked | TaskStatus::Truncated => TaskEvent::RoundsBlocked,
+        TaskStatus::Blocked | TaskStatus::NotTaken | TaskStatus::Truncated => {
+            TaskEvent::RoundsBlocked
+        }
     }
 }
 
@@ -1832,6 +1891,130 @@ fn run_batch_with_retries<'a>(
 
 /// Engine-built-in fold: keep the k best inputs by their `score` field.
 /// Output: `{"kept": [{"task": ..., "score": ...}, ...]}`, best first.
+/// Why `t` settles not taken without dispatch, if it does. Every dependency holds a result.
+fn not_taken(t: &Task, results: &BTreeMap<TaskName, TaskResult>) -> Option<(TaskEvent, String)> {
+    let status = |d: &TaskName| results.get(d).map(|r| r.status);
+    if let Some(when) = &t.when {
+        match status(&when.task) {
+            Some(TaskStatus::NotTaken) => {
+                return Some((
+                    TaskEvent::BranchNotTaken,
+                    format!("route {} was not taken", when.task),
+                ));
+            }
+            Some(TaskStatus::Pass) => {
+                let label = results
+                    .get(&when.task)
+                    .and_then(|r| r.output.as_ref())
+                    .and_then(|o| o.get(when.question.as_str()))
+                    .and_then(|a| a.get("label"))
+                    .and_then(Value::as_str);
+                if !when.is.iter().any(|l| Some(l.as_str()) == label) {
+                    return Some((
+                        TaskEvent::ConditionUnmet,
+                        format!(
+                            "{}.{} resolved to {}",
+                            when.task,
+                            when.question,
+                            label.unwrap_or("nothing")
+                        ),
+                    ));
+                }
+            }
+            _ if t.join != Join::All => {
+                return Some((
+                    TaskEvent::ConditionUnmet,
+                    format!("route {} did not decide", when.task),
+                ));
+            }
+            _ => {}
+        }
+    }
+    if t.join == Join::All
+        && let Some(d) = t
+            .depends_on
+            .iter()
+            .find(|d| status(d) == Some(TaskStatus::NotTaken))
+    {
+        return Some((
+            TaskEvent::BranchNotTaken,
+            format!("dependency {d} was not taken"),
+        ));
+    }
+    None
+}
+
+/// The deterministic decider: read one declared label per question from `source`'s output.
+fn decide_from_output(
+    inputs: &BTreeMap<TaskName, Value>,
+    questions: &BTreeMap<QuestionId, Question>,
+    source: &TaskName,
+) -> TaskResult {
+    let fail = |note: String| TaskResult {
+        status: TaskStatus::Fail,
+        attempts: 1,
+        cost_usd: 0.0,
+        output: None,
+        note: Some(note),
+        fanout: None,
+        blocked: None,
+        transport: None,
+    };
+    let Some(output) = inputs.get(source) else {
+        return fail(format!("source {source} contributed no output"));
+    };
+    let mut decision = BTreeMap::new();
+    for (id, question) in questions {
+        let raw = match output.get(id.as_str()) {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Bool(true)) => NOUL_YES.to_owned(),
+            Some(Value::Bool(false)) => NOUL_NO.to_owned(),
+            Some(other) => {
+                return fail(format!(
+                    "{source}.{id} is {other}, not a label string or boolean"
+                ));
+            }
+            None => return fail(format!("{source} emitted no field {id:?}")),
+        };
+        let label = match Label::new(raw) {
+            Ok(label) if question.resolves_to(&label) => label,
+            Ok(label) => {
+                return fail(format!(
+                    "{source}.{id} is {label:?}, which the question does not declare"
+                ));
+            }
+            Err(e) => return fail(format!("{source}.{id}: {e}")),
+        };
+        let probabilities = if label.is_uncertain() {
+            BTreeMap::new()
+        } else {
+            BTreeMap::from([(label.clone(), 1.0)])
+        };
+        let confidence = if label.is_uncertain() { 0.0 } else { 1.0 };
+        decision.insert(
+            id.clone(),
+            Answer {
+                label,
+                confidence,
+                probabilities,
+            },
+        );
+    }
+    match serde_json::to_value(Decision(decision)) {
+        Ok(output) => TaskResult {
+            status: TaskStatus::Pass,
+            attempts: 1,
+            cost_usd: 0.0,
+            output: Some(output),
+            note: None,
+            fanout: None,
+            blocked: None,
+            transport: None,
+        },
+        Err(e) => fail(format!("encoding the decision: {e}")),
+    }
+}
+
 fn reduce_top_k(inputs: &BTreeMap<TaskName, Value>, k: u32, direction: Direction) -> TaskResult {
     let mut scored: Vec<(&TaskName, f64)> = Vec::with_capacity(inputs.len());
     for (name, v) in inputs {
@@ -2031,6 +2214,7 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            when: None,
             revise: None,
         }
     }
@@ -2545,6 +2729,7 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            when: None,
             revise: None,
         });
         let plan = valid(tasks, 10.0);
@@ -2604,6 +2789,7 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            when: None,
             revise: None,
         });
         let plan = valid(tasks, 10.0);
@@ -2796,6 +2982,7 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            when: None,
             revise: None,
         };
         tasks.push(pick);
@@ -3108,6 +3295,320 @@ mod tests {
             ab.output.is_some(),
             "the record keeps what the task reported"
         );
+    }
+
+    fn label(s: &str) -> Label {
+        Label::new(s).unwrap()
+    }
+
+    fn question(kind: crucible_contract::decision::QuestionKind, drop: &[&str]) -> Question {
+        Question {
+            instructions: "decide".into(),
+            kind,
+            drop: drop.iter().map(|l| label(l)).collect(),
+        }
+    }
+
+    fn area(drop: &[&str]) -> Question {
+        use crucible_contract::decision::{ChoiceOption, QuestionKind};
+        question(
+            QuestionKind::Choice {
+                options: ["scheduler", "frontend"]
+                    .iter()
+                    .map(|o| ChoiceOption {
+                        label: label(o),
+                        description: None,
+                    })
+                    .collect(),
+            },
+            drop,
+        )
+    }
+
+    fn gate(id: &str, asked: Question, required: bool) -> Task {
+        Task {
+            task: TaskKind::Route {
+                questions: BTreeMap::from([(QuestionId::new(id).unwrap(), asked)]),
+                decider: Decider::Output {
+                    task: "classify".into(),
+                },
+            },
+            ..task("gate", &["classify"], "any", required)
+        }
+    }
+
+    fn when(mut t: Task, id: &str, is: &[&str]) -> Task {
+        t.when = Some(crate::plan::ir::When {
+            task: "gate".into(),
+            question: QuestionId::new(id).unwrap(),
+            is: is.iter().map(|l| label(l)).collect(),
+        });
+        t
+    }
+
+    fn joining(mut t: Task, join: Join) -> Task {
+        t.join = join;
+        t
+    }
+
+    /// classify -> gate(area) -> fix [scheduler] -> verify
+    ///                        -> punt [frontend, uncertain]
+    ///             fix, punt, verify -> wrap (passed)
+    fn branching() -> ValidPlan {
+        valid(
+            vec![
+                task("classify", &[], "any", true),
+                gate("area", area(&[]), true),
+                when(task("fix", &["gate"], "any", true), "area", &["scheduler"]),
+                task("verify", &["fix"], "any", true),
+                when(
+                    task("punt", &["gate"], "any", true),
+                    "area",
+                    &["frontend", "uncertain"],
+                ),
+                joining(task("wrap", &["verify", "punt"], "any", true), Join::Passed),
+            ],
+            10.0,
+        )
+    }
+
+    fn says_scheduler() -> AttemptOutcome {
+        AttemptOutcome::Pass(serde_json::json!({"area": "scheduler"}))
+    }
+    fn says_frontend() -> AttemptOutcome {
+        AttemptOutcome::Pass(serde_json::json!({"area": "frontend"}))
+    }
+    fn says_uncertain() -> AttemptOutcome {
+        AttemptOutcome::Pass(serde_json::json!({"area": "uncertain"}))
+    }
+    fn says_kv_cache() -> AttemptOutcome {
+        AttemptOutcome::Pass(serde_json::json!({"area": "kv_cache"}))
+    }
+    fn says_a_number() -> AttemptOutcome {
+        AttemptOutcome::Pass(serde_json::json!({"area": 3}))
+    }
+    fn says_nothing() -> AttemptOutcome {
+        AttemptOutcome::Pass(serde_json::json!({"severity": "high"}))
+    }
+    fn says_true() -> AttemptOutcome {
+        AttemptOutcome::Pass(serde_json::json!({"urgent": true}))
+    }
+    fn says_false() -> AttemptOutcome {
+        AttemptOutcome::Pass(serde_json::json!({"urgent": false}))
+    }
+    fn breaks() -> AttemptOutcome {
+        AttemptOutcome::fail("boom".to_string())
+    }
+
+    fn run_branching(classify: fn() -> AttemptOutcome) -> (PlanOutcome, ScriptRunner) {
+        let mut r = ScriptRunner::new();
+        r.on("classify", 1, classify, 0.1);
+        let out = execute(
+            &branching(),
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        (out, r)
+    }
+
+    fn names(r: &ScriptRunner) -> Vec<&str> {
+        r.dispatched.iter().map(|(n, _)| n.as_str()).collect()
+    }
+
+    #[test]
+    fn the_taken_branch_runs_and_the_other_settles_not_taken_without_dispatch() {
+        let (out, r) = run_branching(says_scheduler);
+        assert_eq!(names(&r), ["classify", "fix", "verify", "wrap"]);
+        let punt = &out.results[&"punt".into()];
+        assert_eq!(punt.status, TaskStatus::NotTaken);
+        assert_eq!(punt.attempts, 0);
+        assert_eq!(punt.cost_usd, 0.0);
+        assert_eq!(
+            punt.note.as_deref(),
+            Some("gate.area resolved to scheduler")
+        );
+        assert!(out.valid, "an untaken required task does not invalidate");
+        assert_eq!(out.exit, PlanExit::Completed);
+        assert!(r.dropped.contains(&"punt".to_string()));
+    }
+
+    #[test]
+    fn not_taken_propagates_through_all_joins_to_the_leaves() {
+        let (out, r) = run_branching(says_frontend);
+        assert_eq!(names(&r), ["classify", "punt", "wrap"]);
+        assert_eq!(out.results[&"fix".into()].status, TaskStatus::NotTaken);
+        let verify = &out.results[&"verify".into()];
+        assert_eq!(verify.status, TaskStatus::NotTaken);
+        assert_eq!(verify.note.as_deref(), Some("dependency fix was not taken"));
+        assert!(out.valid);
+    }
+
+    #[test]
+    fn an_uncertain_answer_takes_the_branch_that_lists_it() {
+        let (out, r) = run_branching(says_uncertain);
+        assert_eq!(names(&r), ["classify", "punt", "wrap"]);
+        let answer = &out.results[&"gate".into()].output.as_ref().unwrap()["area"];
+        assert_eq!(answer["label"], "uncertain");
+        assert_eq!(answer["confidence"], 0.0);
+        assert!(out.valid);
+    }
+
+    #[test]
+    fn a_route_records_its_label_confidence_and_distribution_and_spends_nothing() {
+        let (out, _) = run_branching(says_scheduler);
+        let gate = &out.results[&"gate".into()];
+        assert_eq!(gate.status, TaskStatus::Pass);
+        assert_eq!(gate.cost_usd, 0.0);
+        assert_eq!(
+            gate.output,
+            Some(serde_json::json!({"area": {
+                "label": "scheduler",
+                "confidence": 1.0,
+                "probabilities": {"scheduler": 1.0}
+            }}))
+        );
+    }
+
+    #[test]
+    fn a_required_task_failing_inside_the_taken_branch_invalidates_the_run() {
+        let mut r = ScriptRunner::new();
+        r.on("classify", 1, says_scheduler, 0.1);
+        r.on("fix", 1, breaks, 0.1);
+        let out = execute(
+            &branching(),
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        assert!(!out.valid);
+        assert_eq!(out.exit, PlanExit::ShortCircuit { task: "fix".into() });
+        assert_eq!(out.results[&"verify".into()].status, TaskStatus::Blocked);
+    }
+
+    #[test]
+    fn an_answer_the_question_does_not_declare_fails_the_route() {
+        for (classify, needle) in [
+            (says_kv_cache as fn() -> AttemptOutcome, "does not declare"),
+            (says_a_number, "not a label string"),
+            (says_nothing, "emitted no field"),
+        ] {
+            let (out, r) = run_branching(classify);
+            let gate = &out.results[&"gate".into()];
+            assert_eq!(gate.status, TaskStatus::Fail);
+            assert!(gate.note.as_deref().unwrap().contains(needle), "{gate:?}");
+            assert_eq!(
+                names(&r),
+                ["classify"],
+                "nothing runs on an undecided route"
+            );
+            assert!(!out.valid);
+        }
+    }
+
+    #[test]
+    fn a_boolean_answers_a_noul() {
+        use crucible_contract::decision::QuestionKind;
+        for (classify, ran) in [
+            (
+                says_true as fn() -> AttemptOutcome,
+                vec!["classify", "page"],
+            ),
+            (says_false, vec!["classify"]),
+        ] {
+            let plan = valid(
+                vec![
+                    task("classify", &[], "any", true),
+                    gate(
+                        "urgent",
+                        question(QuestionKind::Noul, &["no", "uncertain"]),
+                        true,
+                    ),
+                    when(task("page", &["gate"], "any", true), "urgent", &["yes"]),
+                ],
+                10.0,
+            );
+            let mut r = ScriptRunner::new();
+            r.on("classify", 1, classify, 0.1);
+            let out = execute(
+                &plan,
+                &any_substrate(),
+                ExecCfg::default(),
+                &mut r,
+                |_, _| {},
+            );
+            assert_eq!(names(&r), ran);
+            assert!(out.valid, "a dropped answer leaves a valid run");
+        }
+    }
+
+    #[test]
+    fn a_settled_join_sees_the_untaken_dependency_as_not_taken() {
+        let plan = valid(
+            vec![
+                task("classify", &[], "any", true),
+                gate("area", area(&["frontend", "uncertain"]), true),
+                when(task("fix", &["gate"], "any", true), "area", &["scheduler"]),
+                joining(task("report", &["fix"], "any", true), Join::Settled),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.on("classify", 1, says_frontend, 0.1);
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        assert_eq!(names(&r), ["classify", "report"]);
+        assert_eq!(r.entry("report", "fix")["status"], "not_taken");
+        assert!(out.valid);
+    }
+
+    #[test]
+    fn a_conditional_task_joining_passed_on_an_undecided_route_is_not_taken() {
+        let plan = valid(
+            vec![
+                task("classify", &[], "any", false),
+                gate("area", area(&["frontend", "uncertain"]), false),
+                joining(
+                    when(task("fix", &["gate"], "any", false), "area", &["scheduler"]),
+                    Join::Passed,
+                ),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.on("classify", 1, says_kv_cache, 0.1);
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        assert_eq!(out.results[&"gate".into()].status, TaskStatus::Fail);
+        let fix = &out.results[&"fix".into()];
+        assert_eq!(fix.status, TaskStatus::NotTaken);
+        assert_eq!(fix.note.as_deref(), Some("route gate did not decide"));
+    }
+
+    #[test]
+    fn not_taken_round_trips_its_wire_token() {
+        assert_eq!(TaskStatus::NotTaken.as_str(), "not_taken");
+        assert_eq!(
+            "not_taken".parse::<TaskStatus>().unwrap(),
+            TaskStatus::NotTaken
+        );
+        assert_eq!(
+            serde_json::to_string(&TaskStatus::NotTaken).unwrap(),
+            "\"not_taken\""
+        );
+        assert!(!TaskStatus::NotTaken.passed());
     }
 
     #[test]
@@ -4763,6 +5264,78 @@ mod tests {
 
     fn dispatches(r: &ScriptRunner) -> Vec<&str> {
         r.dispatched.iter().map(|(n, _)| n.as_str()).collect()
+    }
+
+    /// classify -> gate(area) -> author [scheduler] <-> repro (revise, 3 rounds)
+    ///                        -> punt   [frontend, uncertain]
+    ///             repro, punt -> wrap (passed)
+    fn routed_review() -> ValidPlan {
+        valid(
+            vec![
+                task("classify", &[], "any", true),
+                gate("area", area(&[]), true),
+                when(
+                    task("author", &["gate"], "any", true),
+                    "area",
+                    &["scheduler"],
+                ),
+                reviewing("repro", &["author"], "author", 3),
+                when(
+                    task("punt", &["gate"], "any", true),
+                    "area",
+                    &["frontend", "uncertain"],
+                ),
+                joining(task("wrap", &["repro", "punt"], "any", true), Join::Passed),
+            ],
+            10.0,
+        )
+    }
+
+    #[test]
+    fn an_untaken_revise_target_starts_no_round_and_its_reviewer_is_not_taken() {
+        let mut r = ScriptRunner::new();
+        r.on("classify", 1, says_frontend, 0.1);
+        let (out, rows) = rows_of(&routed_review(), &mut r);
+
+        assert!(out.valid, "an untaken loop does not invalidate the run");
+        assert_eq!(dispatches(&r), ["classify", "punt", "wrap"]);
+        assert!(
+            !rows.iter().any(|(name, _)| name.contains("[round-")),
+            "{rows:?}"
+        );
+        assert_eq!(out.results[&"author".into()].status, TaskStatus::NotTaken);
+        let repro = &out.results[&"repro".into()];
+        assert_eq!(repro.status, TaskStatus::NotTaken);
+        assert_eq!(
+            repro.note.as_deref(),
+            Some("dependency author was not taken")
+        );
+        assert_eq!(repro.cost_usd, 0.0);
+    }
+
+    #[test]
+    fn a_taken_revise_target_loops_as_it_would_unconditionally() {
+        let mut r = ScriptRunner::new();
+        r.on("classify", 1, says_scheduler, 0.1);
+        r.rounds("author", &[drafted, drafted]);
+        r.rounds("repro", &[rejected, approved]);
+        let (out, rows) = rows_of(&routed_review(), &mut r);
+
+        assert!(out.valid);
+        assert_eq!(
+            dispatches(&r),
+            ["classify", "author", "repro", "author", "repro", "wrap"]
+        );
+        assert!(
+            rows.contains(&row("repro[round-1]", TaskStatus::Fail)),
+            "{rows:?}"
+        );
+        assert!(
+            rows.contains(&row("repro[round-2]", TaskStatus::Pass)),
+            "{rows:?}"
+        );
+        assert_eq!(out.results[&"punt".into()].status, TaskStatus::NotTaken);
+        assert!(r.seen_inputs["author"].contains(&REVISION_INPUT.to_string()));
     }
 
     #[test]

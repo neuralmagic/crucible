@@ -97,3 +97,22 @@ stop source="operator": install-tools
 # Read-only JSON snapshot of the running (or finished) loop session.
 session ws="workspace": install-tools
     session --workspace {{ws}}
+
+# Build the DiffusionGemma structured-reads vLLM image on waldorf; prints the build job's name.
+route-serving-image tag="dgemma-reads" namespace="weaton-dev" context="coreweave-waldorf":
+    buildit build quay.io/wseaton/vllm:{{tag}} -n {{namespace}} --kubecontext {{context}} \
+        -c examples/route/serving -f Containerfile --mode job --request cpu=8 --request memory=32Gi
+
+# Deploy that image with the System One server in front of it, and wait for it to load the model.
+route-serving-deploy image namespace="weaton-dev" context="coreweave-waldorf":
+    sed 's|image: IMAGE|image: {{image}}|' examples/route/serving/deploy.yaml \
+        | kubectl --context {{context}} -n {{namespace}} apply -f -
+    kubectl --context {{context}} -n {{namespace}} rollout status deploy/dgemma-systemone --timeout=45m
+
+# Forward the System One endpoint to localhost:8011 for `examples/route`.
+route-serving-forward namespace="weaton-dev" context="coreweave-waldorf":
+    kubectl --context {{context}} -n {{namespace}} port-forward svc/dgemma-systemone 8011:8011
+
+# Remove the deployment and free its GPU.
+route-serving-down namespace="weaton-dev" context="coreweave-waldorf":
+    kubectl --context {{context}} -n {{namespace}} delete deploy/dgemma-systemone svc/dgemma-systemone --ignore-not-found

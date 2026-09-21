@@ -39,6 +39,7 @@ pub mod report;
 pub mod server;
 pub(crate) mod slack;
 pub(crate) mod steps;
+pub mod systemone;
 pub mod telemetry;
 pub(crate) mod turn;
 pub mod types;

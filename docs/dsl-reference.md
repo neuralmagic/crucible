@@ -36,6 +36,8 @@ An agent turn driven by a prompt.
 | `revise` | `task` | A direct dependency this task sends back when it settles failing. The dependency runs again with the verdict under `revision`, then this task does, until this task stops failing or `max_rounds` is spent. Playbooks only; not with `over`. |
 | `max_rounds` | `int` | Round cap for `revise`, counting the first, from 2 to the engine's ceiling of 5. |
 | `stage` | `"iteration" \| "epilogue"` | `epilogue` runs once after the loop concludes, and only if the run kept a candidate. |
+| `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
+| `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice. |
 
 ### `skill()`
 
@@ -62,6 +64,8 @@ An agent turn whose prompt is a skill's instructions plus its arguments.
 | `revise` | `task` | A direct dependency this task sends back when it settles failing. The dependency runs again with the verdict under `revision`, then this task does, until this task stops failing or `max_rounds` is spent. Playbooks only; not with `over`. |
 | `max_rounds` | `int` | Round cap for `revise`, counting the first, from 2 to the engine's ceiling of 5. |
 | `stage` | `"iteration" \| "epilogue"` | `epilogue` runs once after the loop concludes, and only if the run kept a candidate. |
+| `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
+| `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice. |
 
 ### `command()`
 
@@ -83,6 +87,8 @@ A deterministic shell task in the candidate workspace.
 | `revise` | `task` | A direct dependency this task sends back when it settles failing. The dependency runs again with the verdict under `revision`, then this task does, until this task stops failing or `max_rounds` is spent. Playbooks only; not with `over`. |
 | `max_rounds` | `int` | Round cap for `revise`, counting the first, from 2 to the engine's ceiling of 5. |
 | `stage` | `"iteration" \| "epilogue"` | `epilogue` runs once after the loop concludes, and only if the run kept a candidate. |
+| `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
+| `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice. |
 
 ### `evaluate()`
 
@@ -106,6 +112,8 @@ A measurement command. Its last non-empty stdout line is a JSON object; `pass = 
 | `revise` | `task` | A direct dependency this task sends back when it settles failing. The dependency runs again with the verdict under `revision`, then this task does, until this task stops failing or `max_rounds` is spent. Playbooks only; not with `over`. |
 | `max_rounds` | `int` | Round cap for `revise`, counting the first, from 2 to the engine's ceiling of 5. |
 | `stage` | `"iteration" \| "epilogue"` | `epilogue` runs once after the loop concludes, and only if the run kept a candidate. |
+| `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
+| `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice. |
 
 ### `report()`
 
@@ -225,6 +233,46 @@ Engine-owned reducer: the best `k` dependency outputs by numeric score.
 Expand the built-in propose/apply/measure/decide loop into visible nodes, plus the tasks passed to it.
 
 Takes one positional argument, `extra_tasks`.
+
+## Playbook and custom lanes only
+
+Available to `type = "playbook"` and `type = "custom"`. An autoresearch workflow keeps or discards on a frozen measure, so it has neither these nor `when`.
+
+### `route()`
+
+Engine-owned decision: answers typed questions about its dependencies' outputs and records one label per question, which other tasks branch on with `when`. Every label of a question some `when` refers to, `"uncertain"` included, must be listed by a `when` or by the question's `drop`.
+
+| Argument | Type | Purpose |
+| --- | --- | --- |
+| `name` | `str` | Task identity, unique within the workflow. |
+| `questions` | `dict[str, question]` | Question id to `noul()` or `choice()`. `gate.<id>` names one for `when`. |
+| `min_confidence` | `number` | A decision model answers, through the broker's `systemone` capability. An answer whose probability is below this, in (0, 1], is recorded as `"uncertain"`. Exactly one of `min_confidence` and `source`. |
+| `source` | `task` | A dependency's output answers instead: it emits one declared label (or a boolean, for a noul) under each question id. Deterministic, free, and needs no capability. Any other value fails the route. |
+| `depends_on` | `list[task]` | Dependencies. Their outputs are the state the questions are asked about. |
+| `required` | `bool` | False makes the route advisory. |
+| `join` | `"all" \| "passed" \| "settled"` | Which dependency outputs form the state, as on any task. |
+| `stage` | `"iteration" \| "epilogue"` | As on any task. |
+| `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
+| `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice. |
+
+### `noul()`
+
+A yes/no question for `route()`. It answers `"yes"` or `"no"`.
+
+| Argument | Type | Purpose |
+| --- | --- | --- |
+| `ask` | `str` | What to decide. |
+| `drop` | `str \| list[str]` | Answers that deliberately lead nowhere, so no `when` has to list them. |
+
+### `choice()`
+
+A one-of-N question for `route()`.
+
+| Argument | Type | Purpose |
+| --- | --- | --- |
+| `ask` | `str` | What to decide. |
+| `options` | `list[str] \| dict[str, str \| None]` | At least two distinct identifier labels, optionally each with a description the model sees. `"uncertain"` is reserved. |
+| `drop` | `str \| list[str]` | Answers that deliberately lead nowhere, so no `when` has to list them. |
 
 ## Reserved fields
 

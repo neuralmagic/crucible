@@ -142,6 +142,9 @@ pub struct PlanTaskWire {
     /// worst-case width before any spend.
     #[serde(default)]
     pub max_fanout: u32,
+    /// `route.question in a|b` when the task runs only on those answers, empty otherwise.
+    #[serde(default)]
+    pub when: String,
     /// The dependency this task sends back when it settles failing, empty otherwise. Each round
     /// reports as `task[round-N]`, so a renderer draws the loop from this before any round runs.
     #[serde(default)]
@@ -820,6 +823,7 @@ mod tests {
                 stage: "iteration".into(),
                 over: "discover.targets".into(),
                 max_fanout: 8,
+                when: String::new(),
                 revise: "draft".into(),
                 max_rounds: 3,
             }],

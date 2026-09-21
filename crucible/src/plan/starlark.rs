@@ -25,8 +25,8 @@ use crate::crucible::Direction;
 use crate::errors::FileError;
 use crate::plan::diag;
 use crate::plan::ir::{
-    EngineOp, Isolation, Join, MAX_FANOUT_CEILING, MAX_ROUNDS_CEILING, OutputField, OutputRef,
-    ReportDestination, Revise, SlackDestination, Stage, Task, TaskKind, TaskName,
+    Decider, EngineOp, Isolation, Join, MAX_FANOUT_CEILING, MAX_ROUNDS_CEILING, OutputField,
+    OutputRef, ReportDestination, Revise, SlackDestination, Stage, Task, TaskKind, TaskName, When,
 };
 use crate::plan::starlark::error::{
     CompileError, MAX_CALLSTACK, MAX_CONSTRUCTED_TASKS, MAX_EVAL_HEAP_BYTES, MAX_EVAL_TICKS,
@@ -35,6 +35,9 @@ use crate::plan::starlark::error::{
 };
 use crate::plan::starlark::values::{SessionDecl, WorkflowValue};
 use crate::plan::workflow::{WorkflowCfg, WorkflowType};
+use crucible_contract::decision::{
+    ChoiceOption, IdentError, Label, NOUL_YES, Question, QuestionId, QuestionKind, UNCERTAIN,
+};
 
 type Result<T> = std::result::Result<T, CompileError>;
 
@@ -382,6 +385,10 @@ enum Value {
     Output(OutputRef),
     Session(SessionDecl),
     Workflow(WorkflowCfg),
+    /// A `noul(...)` or `choice(...)` declaration.
+    Question(Question),
+    /// `route.question`, carrying the labels it can resolve to.
+    Answer(values::AnswerRef),
     /// A starlark value outside the DSL's own space: a dict, a function, a struct. The `take_*`
     /// helpers report it with the same wrong-type sentence a wrong scalar gets.
     Opaque,
@@ -479,6 +486,9 @@ const SCORED_FUNCTIONS: &[&str] = &[
     "top_k",
 ];
 
+/// Typed decisions, present in the playbook and custom lanes and absent from autoresearch.
+const ROUTED_FUNCTIONS: &[&str] = &["choice", "noul", "route"];
+
 /// The callable surface of one lane, for unknown-function suggestions. A playbook author is
 /// never offered a constructor the lane would then refuse. Built from the two tables above so a
 /// constructor cannot be added to one and forgotten in the other.
@@ -486,6 +496,9 @@ fn dsl_functions(lane: WorkflowType) -> Vec<&'static str> {
     let mut names = COMMON_FUNCTIONS.to_vec();
     if lane != WorkflowType::Playbook {
         names.extend_from_slice(SCORED_FUNCTIONS);
+    }
+    if lane != WorkflowType::Autoresearch {
+        names.extend_from_slice(ROUTED_FUNCTIONS);
     }
     names.sort_unstable();
     names
@@ -514,6 +527,8 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "revise",
             "max_rounds",
             "emits_files",
+            "when",
+            "answers",
         ],
         "skill" => &[
             "name",
@@ -535,6 +550,8 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "revise",
             "max_rounds",
             "emits_files",
+            "when",
+            "answers",
         ],
         "command" => &[
             "name",
@@ -551,6 +568,8 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "revise",
             "max_rounds",
             "emits_files",
+            "when",
+            "answers",
         ],
         "evaluate" => &[
             "name",
@@ -569,8 +588,24 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "revise",
             "max_rounds",
             "emits_files",
+            "when",
+            "answers",
         ],
         "top_k" => &["name", "k", "direction", "depends_on", "required"],
+        "route" => &[
+            "name",
+            "questions",
+            "min_confidence",
+            "source",
+            "depends_on",
+            "required",
+            "join",
+            "stage",
+            "when",
+            "answers",
+        ],
+        "noul" => &["ask", "drop"],
+        "choice" => &["ask", "options", "drop"],
         "report" => &["name", "destination", "template", "result", "required"],
         "propose" => &["name", "session", "depends_on"],
         "apply" | "measure" => &["name", "depends_on"],
@@ -641,6 +676,27 @@ fn constructor(
             .sessions
             .insert(decl.name.clone(), (decl.clone(), at.clone()));
         return Ok(Value::Session(decl));
+    }
+    if matches!(function, "noul" | "choice") {
+        let instructions = take_string(&mut named, "ask")?;
+        let kind = if function == "noul" {
+            QuestionKind::Noul
+        } else {
+            QuestionKind::Choice {
+                options: take_options(&mut named)?,
+            }
+        };
+        let drop = take_labels(&mut named, "drop")?.unwrap_or_default();
+        no_unknown_kwargs(function, &named)?;
+        let question = Question {
+            instructions,
+            kind,
+            drop,
+        };
+        question
+            .validate()
+            .map_err(|error| CompileError::InvalidQuestion { error })?;
+        return Ok(Value::Question(question));
     }
     if matches!(function, "prompt_file" | "param" | "default_autoresearch") {
         return Err(CompileError::NotOnePositional {
@@ -729,6 +785,7 @@ fn constructor(
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            when: None,
             revise: None,
         },
         "top_k" => {
@@ -767,6 +824,38 @@ fn constructor(
                 over: None,
                 max_fanout: None,
                 revise: None,
+                when: None,
+            }
+        }
+        "route" => {
+            let name = take_declared_name(&mut named, "name")?;
+            let questions = take_questions(&mut named)?;
+            let min_confidence = take_optional_number(&mut named, "min_confidence")?;
+            let source = take_optional_task_name(&mut named, "source")?;
+            let (decider, needs) = match (min_confidence, source) {
+                (Some(min_confidence), None) => (
+                    Decider::Model { min_confidence },
+                    crate::plan::ir::NEEDS_SYSTEMONE,
+                ),
+                (None, Some(task)) => (Decider::Output { task }, "any"),
+                _ => return Err(CompileError::RouteDecider { task: name.0 }),
+            };
+            Task {
+                task: TaskKind::Route { questions, decider },
+                depends_on: take_task_names(&mut named)?,
+                session: None,
+                needs: needs.to_owned(),
+                required: take_bool_default(&mut named, "required", true)?,
+                isolation: None,
+                join: parse_join(&take_string_default(&mut named, "join", "all")?)?,
+                stage: parse_stage(&take_string_default(&mut named, "stage", "iteration")?)?,
+                emits: Vec::new(),
+                emits_files: Vec::new(),
+                over: None,
+                max_fanout: None,
+                revise: None,
+                when: take_when(&mut named)?,
+                name,
             }
         }
         "propose" => {
@@ -1009,6 +1098,7 @@ fn dsl_task(
         emits_files: take_emitted_files(named)?,
         over: take_over(named)?,
         max_fanout: take_optional_fanout(named)?,
+        when: take_when(named)?,
         revise: take_revise(named)?,
     };
     check_fanout(&task)?;
@@ -1091,6 +1181,122 @@ fn take_emitted_files(named: &mut BTreeMap<String, Value>) -> Result<Vec<String>
     Ok(paths)
 }
 
+fn identifier<T>(argument: &str, made: std::result::Result<T, IdentError>) -> Result<T> {
+    made.map_err(|error| CompileError::InvalidIdentifier {
+        argument: argument.to_owned(),
+        error,
+    })
+}
+
+/// `name = "a"` or `name = ["a", "b"]`, as labels. `None` when the argument is absent.
+fn take_labels(named: &mut BTreeMap<String, Value>, name: &str) -> Result<Option<Vec<Label>>> {
+    let items = match named.remove(name) {
+        None | Some(Value::None) => return Ok(None),
+        Some(Value::String(one)) => vec![Value::String(one)],
+        Some(Value::List(items)) => items,
+        Some(_) => return Err(wrong_type(name, "a label or a list of labels")),
+    };
+    items
+        .into_iter()
+        .map(|item| match item {
+            Value::String(label) => identifier(name, Label::new(label)),
+            _ => Err(wrong_type(name, "a label or a list of labels")),
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
+/// `options = ["a", "b"]`, or `options = {"a": "what a means", "b": None}`.
+fn take_options(named: &mut BTreeMap<String, Value>) -> Result<Vec<ChoiceOption>> {
+    let expected = "a list of labels or a dict of label to description";
+    match take_value(named, "options")? {
+        Value::List(items) => items
+            .into_iter()
+            .map(|item| match item {
+                Value::String(label) => Ok(ChoiceOption {
+                    label: identifier("options", Label::new(label))?,
+                    description: None,
+                }),
+                _ => Err(wrong_type("options", expected)),
+            })
+            .collect(),
+        Value::Map(entries) => entries
+            .into_iter()
+            .map(|(label, description)| {
+                let description = match description {
+                    Value::None => None,
+                    Value::String(text) => Some(text),
+                    _ => return Err(wrong_type("options", expected)),
+                };
+                Ok(ChoiceOption {
+                    label: identifier("options", Label::new(label))?,
+                    description,
+                })
+            })
+            .collect(),
+        _ => Err(wrong_type("options", expected)),
+    }
+}
+
+fn take_questions(named: &mut BTreeMap<String, Value>) -> Result<BTreeMap<QuestionId, Question>> {
+    let expected = "a dict of question id to noul(...) or choice(...)";
+    let Value::Map(entries) = take_value(named, "questions")? else {
+        return Err(wrong_type("questions", expected));
+    };
+    entries
+        .into_iter()
+        .map(|(id, asked)| match asked {
+            Value::Question(asked) => Ok((identifier("questions", QuestionId::new(id))?, asked)),
+            _ => Err(wrong_type("questions", expected)),
+        })
+        .collect()
+}
+
+/// `when = gate.area, answers = [...]`. A noul's `answers` defaults to `"yes"`.
+fn take_when(named: &mut BTreeMap<String, Value>) -> Result<Option<When>> {
+    let answers = take_labels(named, "answers")?;
+    let asked = match named.remove("when") {
+        None | Some(Value::None) => {
+            return match answers {
+                Some(_) => Err(CompileError::AnswersWithoutWhen),
+                None => Ok(None),
+            };
+        }
+        Some(Value::Answer(asked)) => asked,
+        Some(_) => return Err(CompileError::WhenNotAnAnswer),
+    };
+    let is = match (answers, &asked.asked.kind) {
+        (Some(answers), _) => answers,
+        (None, QuestionKind::Noul) => vec![identifier("answers", Label::new(NOUL_YES))?],
+        (None, QuestionKind::Choice { .. }) => {
+            return Err(CompileError::MissingArgument {
+                argument: "answers".to_owned(),
+            });
+        }
+    };
+    if let Some(label) = is.iter().find(|label| !asked.asked.resolves_to(label)) {
+        let declared: Vec<String> = asked
+            .asked
+            .labels()
+            .iter()
+            .map(ToString::to_string)
+            .chain([UNCERTAIN.to_owned()])
+            .collect();
+        return Err(CompileError::UnknownAnswer {
+            asked: format!("{}.{}", asked.task, asked.question),
+            label: label.to_string(),
+            suggestion: diag::suggest(label.as_str(), declared.iter().map(String::as_str))
+                .map(str::to_owned),
+            declared: declared.join(", "),
+        });
+    }
+    Ok(Some(When {
+        task: asked.task,
+        question: asked.question,
+        is,
+    }))
+}
+
 fn take_over(named: &mut BTreeMap<String, Value>) -> Result<Option<OutputRef>> {
     match named.remove("over") {
         None | Some(Value::None) => Ok(None),
@@ -1157,6 +1363,7 @@ fn engine(name: &str, op: EngineOp, source: Option<TaskName>, depends_on: Vec<Ta
         emits_files: Vec::new(),
         over: None,
         max_fanout: None,
+        when: None,
         revise: None,
     }
 }
@@ -2021,8 +2228,9 @@ fn catching_panics<T>(evaluate: impl FnOnce() -> T) -> Result<T> {
 fn lane_globals(lane: WorkflowType) -> Globals {
     let builder = GlobalsBuilder::standard().with(globals::common);
     match lane {
-        WorkflowType::Playbook => builder.build(),
-        _ => builder.with(globals::scored).build(),
+        WorkflowType::Playbook => builder.with(globals::routed).build(),
+        WorkflowType::Custom => builder.with(globals::scored).with(globals::routed).build(),
+        WorkflowType::Autoresearch => builder.with(globals::scored).build(),
     }
 }
 
@@ -2531,6 +2739,278 @@ workflow(type = "custom", tasks = [score, strict, lossy], result = strict)
         let _ = std::fs::remove_dir_all(&pack);
     }
 
+    const ROUTED: &str = r#"classify = command(name = "classify", run = "./classify.sh", emits = ["urgent"])
+gate = route(
+    name = "gate",
+    depends_on = [classify],
+    min_confidence = 0.8,
+    questions = {
+        "area": choice(
+            ask = "Which component?",
+            options = {"scheduler": "batching and queueing", "frontend": None},
+            drop = ["uncertain"],
+        ),
+        "urgent": noul(ask = "Reply within the hour?", drop = ["no", "uncertain"]),
+    },
+)
+fix = command(name = "fix", run = "./fix.sh", depends_on = [gate], when = gate.area, answers = "scheduler")
+punt = command(name = "punt", run = "./punt.sh", depends_on = [gate], when = gate.area, answers = ["frontend"])
+page = command(name = "page", run = "./page.sh", depends_on = [gate], when = gate.urgent, required = False)
+wrap = command(name = "wrap", run = "./wrap.sh", depends_on = [fix, punt], join = "passed")
+workflow(type = "playbook", tasks = [classify, gate, fix, punt, page, wrap], result = wrap)
+"#;
+
+    fn routed_error(tag: &str, source: &str) -> String {
+        let pack = temp_pack(tag);
+        let err = crate::errors::report(
+            &compile_source(source, &pack.join("workflow.star"), &pack).unwrap_err(),
+        );
+        let _ = std::fs::remove_dir_all(&pack);
+        err
+    }
+
+    #[test]
+    fn a_routed_playbook_compiles_to_route_and_when_ir() {
+        let pack = temp_pack("routed");
+        let compiled = compile_source(ROUTED, &pack.join("workflow.star"), &pack).unwrap();
+        let tasks = &compiled.workflow.tasks;
+        let gate = tasks.iter().find(|t| t.name.0 == "gate").unwrap();
+        assert_eq!(gate.needs, "systemone");
+        let TaskKind::Route { questions, decider } = &gate.task else {
+            panic!("gate is not a route");
+        };
+        assert_eq!(
+            *decider,
+            Decider::Model {
+                min_confidence: 0.8
+            }
+        );
+        let area = &questions[&QuestionId::new("area").unwrap()];
+        assert_eq!(
+            area.labels().iter().map(Label::as_str).collect::<Vec<_>>(),
+            ["frontend", "scheduler"]
+        );
+        let QuestionKind::Choice { options } = &area.kind else {
+            panic!("area is not a choice");
+        };
+        assert_eq!(
+            options[1].description.as_deref(),
+            Some("batching and queueing")
+        );
+        assert_eq!(
+            questions[&QuestionId::new("urgent").unwrap()].kind,
+            QuestionKind::Noul
+        );
+        let when = |name: &str| {
+            tasks
+                .iter()
+                .find(|t| t.name.0 == name)
+                .unwrap()
+                .when
+                .as_ref()
+                .map(ToString::to_string)
+        };
+        assert_eq!(when("fix").as_deref(), Some("gate.area in scheduler"));
+        assert_eq!(when("punt").as_deref(), Some("gate.area in frontend"));
+        assert_eq!(when("page").as_deref(), Some("gate.urgent in yes"));
+        assert_eq!(when("wrap"), None);
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn a_compiled_route_survives_the_generated_toml() {
+        let pack = temp_pack("routed-toml");
+        let compiled = compile_source(ROUTED, &pack.join("workflow.star"), &pack).unwrap();
+        let text = toml::to_string(&compiled.workflow).unwrap();
+        let back: WorkflowCfg = toml::from_str(&text).unwrap();
+        back.validate().unwrap();
+        assert_eq!(toml::to_string(&back).unwrap(), text);
+        assert!(text.contains("min_confidence = 0.8"), "{text}");
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn an_output_decided_route_needs_no_capability() {
+        let pack = temp_pack("routed-output");
+        let source = ROUTED
+            .replace("min_confidence = 0.8", "source = classify")
+            .replace("emits = [\"urgent\"]", "emits = [\"urgent\", \"area\"]");
+        let compiled = compile_source(&source, &pack.join("workflow.star"), &pack).unwrap();
+        let gate = compiled
+            .workflow
+            .tasks
+            .iter()
+            .find(|t| t.name.0 == "gate")
+            .unwrap();
+        assert_eq!(gate.needs, "any");
+        assert!(matches!(
+            &gate.task,
+            TaskKind::Route { decider: Decider::Output { task }, .. } if task.0 == "classify"
+        ));
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn a_route_takes_exactly_one_decider() {
+        for source in [
+            ROUTED.replace("    min_confidence = 0.8,\n", ""),
+            ROUTED.replace(
+                "min_confidence = 0.8",
+                "min_confidence = 0.8, source = classify",
+            ),
+        ] {
+            let err = routed_error("routed-decider", &source);
+            assert!(err.contains("needs exactly one of min_confidence"), "{err}");
+            assert!(err.contains("workflow.star:3:"), "{err}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_answer_is_located_at_the_argument_with_a_suggestion() {
+        let err = routed_error(
+            "routed-answer",
+            &ROUTED.replace("answers = \"scheduler\"", "answers = \"schedular\""),
+        );
+        assert!(
+            err.contains("gate.area cannot answer \"schedular\""),
+            "{err}"
+        );
+        assert!(err.contains("did you mean \"scheduler\"?"), "{err}");
+        assert!(err.contains("frontend, scheduler, uncertain"), "{err}");
+        let column = ROUTED.lines().nth(14).unwrap().find("answers").unwrap() + 1;
+        assert!(err.contains(&format!("workflow.star:15:{column}")), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_question_lists_the_ones_the_route_declares() {
+        let err = routed_error(
+            "routed-question",
+            &ROUTED.replace(
+                "when = gate.area, answers = \"scheduler\"",
+                "when = gate.aria, answers = \"scheduler\"",
+            ),
+        );
+        assert!(err.contains("\"aria\""), "{err}");
+        assert!(err.contains("did you mean \"area\"?"), "{err}");
+        assert!(err.contains("workflow.star:15:"), "{err}");
+    }
+
+    #[test]
+    fn when_must_be_a_route_question() {
+        let err = routed_error(
+            "routed-when-type",
+            &ROUTED.replace("when = gate.urgent", "when = \"urgent\""),
+        );
+        assert!(
+            err.contains("must be one question of a route task"),
+            "{err}"
+        );
+        let column = ROUTED.lines().nth(16).unwrap().find("when").unwrap() + 1;
+        assert!(err.contains(&format!("workflow.star:17:{column}")), "{err}");
+
+        let err = routed_error(
+            "routed-when-output",
+            &ROUTED.replace("when = gate.urgent", "when = classify.urgent"),
+        );
+        assert!(
+            err.contains("must be one question of a route task"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_choice_needs_answers_and_answers_need_when() {
+        let err = routed_error(
+            "routed-no-answers",
+            &ROUTED.replace(
+                "when = gate.area, answers = \"scheduler\"",
+                "when = gate.area",
+            ),
+        );
+        assert!(
+            err.contains("missing required argument \"answers\""),
+            "{err}"
+        );
+        let err = routed_error(
+            "routed-no-when",
+            &ROUTED.replace(
+                "when = gate.area, answers = \"scheduler\"",
+                "answers = \"scheduler\"",
+            ),
+        );
+        assert!(err.contains("has no meaning without \"when\""), "{err}");
+    }
+
+    #[test]
+    fn an_unrouted_label_is_a_compile_error() {
+        let err = routed_error(
+            "routed-unrouted",
+            &ROUTED.replace("            drop = [\"uncertain\"],\n", ""),
+        );
+        assert!(err.contains("no task runs on uncertain"), "{err}");
+    }
+
+    #[test]
+    fn question_declarations_are_validated_where_they_are_written() {
+        for (from, to, needle) in [
+            (
+                "\"frontend\": None",
+                "\"front-end\": None",
+                "is not an identifier",
+            ),
+            (
+                "drop = [\"uncertain\"]",
+                "drop = [\"ghost\"]",
+                "drop names \"ghost\"",
+            ),
+            (
+                "ask = \"Reply within the hour?\"",
+                "ask = \" \"",
+                "instructions are empty",
+            ),
+            (
+                "\"urgent\": noul(",
+                "\"is urgent\": noul(",
+                "is not an identifier",
+            ),
+        ] {
+            let err = routed_error("routed-question-shape", &ROUTED.replace(from, to));
+            assert!(err.contains(needle), "{needle}: {err}");
+        }
+        let err = routed_error(
+            "routed-one-option",
+            &ROUTED.replace(
+                "{\"scheduler\": \"batching and queueing\", \"frontend\": None}",
+                "[\"scheduler\"]",
+            ),
+        );
+        assert!(err.contains("at least two options"), "{err}");
+    }
+
+    #[test]
+    fn autoresearch_has_no_route_constructors_and_is_never_offered_one() {
+        let source = "g = route(name = \"g\", source = None, questions = {})\nworkflow([g])\n";
+        let err = routed_error("routed-autoresearch", source);
+        assert!(
+            err.contains("unknown workflow DSL function \"route\""),
+            "{err}"
+        );
+        let typo = "g = rout(name = \"g\")\nworkflow([g])\n";
+        let err = routed_error("routed-autoresearch-typo", typo);
+        assert!(!err.contains("did you mean \"route\""), "{err}");
+        let playbook_typo = format!("{}\n", ROUTED.replace("gate = route(", "gate = rout("));
+        let err = routed_error("routed-playbook-typo", &playbook_typo);
+        assert!(err.contains("did you mean \"route\"?"), "{err}");
+    }
+
+    #[test]
+    fn a_custom_workflow_has_the_route_constructors() {
+        let pack = temp_pack("routed-custom");
+        let source = ROUTED.replace("type = \"playbook\"", "type = \"custom\"");
+        compile_source(&source, &pack.join("workflow.star"), &pack).unwrap();
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
     #[test]
     fn unknown_kwarg_function_and_variable_errors_carry_location_and_suggestion() {
         let pack = temp_pack("diagnostics");
@@ -2783,6 +3263,34 @@ workflow(type = "custom", tasks = [e], result = e)
             (
                 "evaluate",
                 "u = command(name = \"u\", run = \"true\")\ne = evaluate(name = \"e\", run = \"true\", depends_on = [u], revise = u, max_rounds = 3{extra})\nworkflow(type = \"playbook\", tasks = [u, e])\n",
+            ),
+            (
+                "agent",
+                "g = route(name = \"g\", source = None, min_confidence = 0.5, questions = {\"q\": noul(ask = \"q?\", drop = [\"no\", \"uncertain\"])})\na = agent(name = \"a\", prompt = \"p\", depends_on = [g], required = False, when = g.q, answers = \"yes\"{extra})\nw = command(name = \"w\", run = \"true\", depends_on = [a], join = \"settled\")\nworkflow(type = \"custom\", tasks = [g, a, w], result = w)\n",
+            ),
+            (
+                "skill",
+                "g = route(name = \"g\", min_confidence = 0.5, questions = {\"q\": noul(ask = \"q?\", drop = [\"no\", \"uncertain\"])})\na = skill(name = \"a\", skill = \"skills/demo\", depends_on = [g], when = g.q, answers = \"yes\"{extra})\nw = command(name = \"w\", run = \"true\", depends_on = [a], join = \"settled\")\nworkflow(type = \"custom\", tasks = [g, a, w], result = w)\n",
+            ),
+            (
+                "command",
+                "g = route(name = \"g\", min_confidence = 0.5, questions = {\"q\": noul(ask = \"q?\", drop = [\"no\", \"uncertain\"])})\nc = command(name = \"c\", run = \"true\", depends_on = [g], when = g.q, answers = \"yes\"{extra})\nw = command(name = \"w\", run = \"true\", depends_on = [c], join = \"settled\")\nworkflow(type = \"custom\", tasks = [g, c, w], result = w)\n",
+            ),
+            (
+                "evaluate",
+                "g = route(name = \"g\", min_confidence = 0.5, questions = {\"q\": noul(ask = \"q?\", drop = [\"no\", \"uncertain\"])})\ne = evaluate(name = \"e\", run = \"true\", depends_on = [g], when = g.q, answers = \"yes\"{extra})\nw = command(name = \"w\", run = \"true\", depends_on = [e], join = \"settled\")\nworkflow(type = \"custom\", tasks = [g, e, w], result = w)\n",
+            ),
+            (
+                "route",
+                "u = command(name = \"u\", run = \"true\", emits = [\"q\", \"r\"])\ng = route(name = \"g\", source = u, min_confidence = None, depends_on = [u], required = True, join = \"all\", stage = \"iteration\", questions = {\"q\": noul(ask = \"q?\", drop = [\"no\", \"uncertain\"])})\nh = route(name = \"h\", source = u, depends_on = [u, g], when = g.q, answers = \"yes\", questions = {\"r\": noul(ask = \"r?\")}{extra})\nw = command(name = \"w\", run = \"true\", depends_on = [h], join = \"settled\")\nworkflow(type = \"custom\", tasks = [u, g, h, w], result = w)\n",
+            ),
+            (
+                "noul",
+                "g = route(name = \"g\", min_confidence = 0.5, questions = {\"q\": noul(ask = \"q?\", drop = \"no\"{extra})})\nworkflow(type = \"custom\", tasks = [g], result = g)\n",
+            ),
+            (
+                "choice",
+                "g = route(name = \"g\", min_confidence = 0.5, questions = {\"q\": choice(ask = \"q?\", options = [\"a\", \"b\"], drop = [\"b\"]{extra})})\nworkflow(type = \"custom\", tasks = [g], result = g)\n",
             ),
             (
                 "top_k",

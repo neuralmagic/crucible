@@ -15,6 +15,7 @@ digraph task {
         Pass [fillcolor="#f5ebe1", color="#8a4b1c"];
         Fail [fillcolor="#f5ebe1", color="#8a4b1c"];
         Skipped [fillcolor="#f5ebe1", color="#8a4b1c"];
+        NotTaken [fillcolor="#f5ebe1", color="#8a4b1c"];
         Transport [fillcolor="#f5ebe1", color="#8a4b1c"];
         Blocked [fillcolor="#f5ebe1", color="#8a4b1c"];
         Truncated [fillcolor="#f5ebe1", color="#8a4b1c"];
@@ -23,6 +24,8 @@ digraph task {
     Pending -> Running [label="dispatched"];
     Pending -> Fanout [label="fanned out"];
     Pending -> Skipped [label="unrunnable", color="#8a4b1c", fontcolor="#8a4b1c"];
+    Pending -> NotTaken [label="condition unmet", color="#8a4b1c", fontcolor="#8a4b1c"];
+    Pending -> NotTaken [label="branch not taken", color="#8a4b1c", fontcolor="#8a4b1c"];
     Pending -> Blocked [label="dependency did not pass", color="#8a4b1c", fontcolor="#8a4b1c"];
     Pending -> Blocked [label="required task failed", color="#8a4b1c", fontcolor="#8a4b1c"];
     Pending -> Blocked [label="budget ceiling", color="#8a4b1c", fontcolor="#8a4b1c"];

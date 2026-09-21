@@ -16,7 +16,9 @@ use starlark::values::{
 };
 
 use crate::plan::diag;
-use crate::plan::ir::{OutputField, OutputRef, Task};
+use crucible_contract::decision::{Question, QuestionId};
+
+use crate::plan::ir::{OutputField, OutputRef, Task, TaskKind, TaskName};
 use crate::plan::starlark::error::CompileError;
 use crate::plan::workflow::WorkflowCfg;
 
@@ -48,6 +50,25 @@ impl<'v> StarlarkValue<'v> for TaskValue {
     /// `emits`, and the constructor that consumes the reference is where a useful message can
     /// name the task, the field, and what the task does declare.
     fn get_attr(&self, attribute: &str, heap: Heap<'v>) -> Option<Value<'v>> {
+        if let TaskKind::Route { questions, .. } = &self.0.task {
+            let asked = QuestionId::new(attribute)
+                .ok()
+                .and_then(|id| questions.get_key_value(&id));
+            return Some(match asked {
+                Some((question, asked)) => heap.alloc(AnswerRefValue(AnswerRef {
+                    task: self.0.name.clone(),
+                    question: question.clone(),
+                    asked: asked.clone(),
+                })),
+                None => heap.alloc(OutputRefValue {
+                    reference: OutputRef {
+                        task: self.0.name.clone(),
+                        field: OutputField(attribute.to_owned()),
+                    },
+                    declared: questions.keys().map(ToString::to_string).collect(),
+                }),
+            });
+        }
         Some(heap.alloc(OutputRefValue {
             reference: OutputRef {
                 task: self.0.name.clone(),
@@ -95,6 +116,43 @@ impl Display for OutputRefValue {
 
 #[starlark_value(type = "output")]
 impl<'v> StarlarkValue<'v> for OutputRefValue {}
+
+/// A `noul(...)` or `choice(...)` declaration, consumed by `route(questions = ...)`.
+#[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
+pub(crate) struct QuestionValue(#[allocative(skip)] pub(crate) Question);
+
+starlark_simple_value!(QuestionValue);
+
+impl Display for QuestionValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "question({})", self.0.instructions)
+    }
+}
+
+#[starlark_value(type = "question")]
+impl<'v> StarlarkValue<'v> for QuestionValue {}
+
+/// One question of one route, as `when = gate.area` yields it.
+#[derive(Clone, Debug)]
+pub(crate) struct AnswerRef {
+    pub(crate) task: TaskName,
+    pub(crate) question: QuestionId,
+    pub(crate) asked: Question,
+}
+
+#[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
+pub(crate) struct AnswerRefValue(#[allocative(skip)] pub(crate) AnswerRef);
+
+starlark_simple_value!(AnswerRefValue);
+
+impl Display for AnswerRefValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}", self.0.task, self.0.question)
+    }
+}
+
+#[starlark_value(type = "answer")]
+impl<'v> StarlarkValue<'v> for AnswerRefValue {}
 
 /// Text that carries where each of its spans came from.
 ///

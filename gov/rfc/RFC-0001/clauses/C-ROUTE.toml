@@ -1,0 +1,32 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-ROUTE"
+title = "Typed model decisions and conditional tasks"
+kind = "normative"
+status = "active"
+since = "0.2.0"
+
+[content]
+text = """
+A route task answers a fixed set of questions about the outputs of its dependencies and emits one typed answer per question. The engine owns the decision: no agent turn runs, and the task's output is the engine's record of it. A route must declare exactly one decider. A model decider asks a decision model. An output decider reads the answers from one named dependency's output, and is deterministic given that output.
+
+A route must declare at least one question. Each question has an id, instructions, and a type. A noul question answers "yes" or "no". A choice question answers exactly one of its declared options, of which there must be at least two, all distinct. Question ids and option labels must be identifiers, and the label "uncertain" is reserved. Questions, options, and thresholds are authored at compile time and must reach the generated TOML; nothing a task emits at run time may add, remove, or rename one.
+
+The state sent to the model is the route's dependency inputs, exactly as any other task would receive them under its join. It is untrusted data. Whatever it contains, the answer to a question must be one of that question's declared labels or "uncertain", and the engine must fail the task rather than forward any other value.
+
+A model-decided route must declare min_confidence in (0, 1]. When the probability the model assigns its chosen label is below it, the engine must record the answer as "uncertain". The task's output must carry, for each question, the resolved label and the full probability distribution the model returned, so the record that resume folds under [[RFC-0002:C-PLAYBOOK-RESUME]] is the decision itself and a resumed run never asks again.
+
+An output-decided route must name a task among its dependencies. That task's output must carry, under each question id, one of the question's declared labels or "uncertain" as a string; a noul also accepts a boolean. A missing field, any other value, or any other type must fail the route. When the named task declares emits, validation must reject a question id the declaration omits. The recorded answer carries probability 1 for the label read, and an empty distribution with confidence 0 for "uncertain". An output-decided route makes no network call, spends nothing, and needs no capability.
+
+The engine must reach the decision model through the broker, at an endpoint and credential the controller configures and the workflow cannot name. A model-decided route task must declare needs = "systemone", verified before dispatch under [[RFC-0002:C-PLAYBOOK-CAPS]]. The request and response follow the System One decision API: a state object and a map of question id to type, instructions, and options, answered by a probability for a noul and by per-option probabilities for a choice. A response that omits a question, names an undeclared option, or carries a probability outside [0, 1] must fail the task. Failure to reach the endpoint is a transport failure and retries as one.
+
+Any task may declare when, a predicate over one question of one route task it depends on, satisfied when that question's resolved label is among the labels the predicate lists. Validation must reject a when that names a task that is not a route, a task outside the declaring task's dependencies, an unknown question, an empty label list, or a label that is neither declared by the question nor "uncertain", each with a diagnostic at the argument and a did-you-mean over the declared names. Every label of a routed question, including "uncertain", must either be listed by at least one when or be named in that question's drop list, so an answer that leads nowhere is one the author wrote down rather than one they forgot. A drop list must name only that question's labels or "uncertain". A question no when refers to is exempt.
+
+A task that revises another under [[RFC-0002:C-REVISE-LOOP]] must not declare when: a reviewer runs whenever what it revises does, so the condition belongs on the revised task, and validation must reject the reviewer's. When a revised task settles not taken no round starts, and its reviewer settles not taken with it.
+
+A task whose when is not satisfied must settle as not taken, without dispatch and without spend. A when over a route that itself settled not taken is not satisfied. A when over a route that settled any other way without passing is not satisfied either, except that a task joining "all" on that route is blocked by the failure as any dependent is. Not taken is a terminal status distinct from skipped. It must not count against validity, must not short-circuit the run, and must not be reported as a failure. A task joining "all" on a dependency that settled not taken must itself settle not taken, so an untaken branch is untaken to its leaves. A task joining "passed" or "settled" is dispatched as those joins already define, and is how branches rejoin. A required task is required when taken: if its when is satisfied it gates validity as any required task does. The workflow's result task must not be conditional and must not be able to settle not taken through "all" joins alone.
+
+A route task must not declare over; routing each element of a list is not defined by this clause.
+
+The route and when constructs are admitted in the playbook and custom lanes. An autoresearch workflow must reject both: the keep rule is sourced from a frozen measure, and a model decision must not sit on the path to it."""

@@ -637,7 +637,10 @@ fn run_in(
             model,
             effort,
         } => (prompt, harness, model, effort),
-        TaskKind::Command { .. } | TaskKind::Evaluate { .. } | TaskKind::Report { .. } => {
+        TaskKind::Command { .. }
+        | TaskKind::Evaluate { .. }
+        | TaskKind::Route { .. }
+        | TaskKind::Report { .. } => {
             let mut shell = ShellRunner {
                 workdir: paths.workspace.clone(),
                 agent_cmd: None,
@@ -844,6 +847,7 @@ mod tests {
             emits_files: files.iter().map(|f| (*f).to_string()).collect(),
             over: None,
             max_fanout: None,
+            when: None,
             revise: None,
         }
     }
@@ -2524,6 +2528,7 @@ workflow(type = "playbook", tasks = [analyze, implement, report])
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            when: None,
             revise: None,
         };
         let mut runner = HarnessRunner {
