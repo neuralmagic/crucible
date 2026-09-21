@@ -1,0 +1,18 @@
+# A sandbox whose `claude` is the deterministic stand-in. The build context is this directory with
+# tools/fake-agent.py copied in, which scripts/revise-loop-e2e.sh arranges.
+FROM docker.io/library/python:3.12-slim-bookworm
+
+RUN groupadd -g 1000 sandbox \
+    && useradd -u 1000 -g sandbox -d /sandbox -s /bin/bash sandbox \
+    && mkdir -p /sandbox && chown sandbox:sandbox /sandbox && chmod 0775 /sandbox \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends git iproute2 iptables nftables dnsutils \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY fake-agent.py agents.json /usr/local/share/fake-agent/
+COPY claude /usr/local/bin/claude
+RUN chmod 0755 /usr/local/bin/claude
+
+ENV HOME=/sandbox
+USER sandbox
+WORKDIR /sandbox

@@ -169,6 +169,56 @@ workspace.
 `join = "all"` (default) requires every dependency to pass. `join = "passed"` waits for every
 dependency, then folds the non-empty passing set. It fails closed if none can run or pass.
 
+### `revise`
+
+A reviewer sends a failing verdict back to the one dependency it names, for a bounded number of
+rounds. Playbooks only, and the only repetition the graph itself states.
+
+```python
+author = agent(
+    name = "author",
+    prompt = "Write PROBE.md, a probe that demonstrates the reported bug.",
+    session = "author",
+    emits_files = ["PROBE.md"],
+)
+
+review = command(
+    name = "review",
+    run = "./check.sh",
+    depends_on = [author],
+    emits_files = ["evidence/review.json"],
+    revise = author,
+    max_rounds = 3,
+)
+```
+
+`review` runs against the draft as any dependent would. When it settles failing and rounds
+remain, `author` runs again and then `review` does, until `review` stops failing or the third
+round is spent. Any other reviewer outcome ends the loop, as does a revision that fails and
+leaves the reviewer blocked. The engine checks the ceilings before every round.
+
+From the second round the target's inputs carry the reserved `revision` key:
+
+```json
+{"round": 2, "max_rounds": 3, "reviewer": "review",
+ "review": {"status": "fail", "note": "exit 1: ", "files": true,
+            "output": {"accepted": false, "why": "the probe hit an unrelated 400"}}}
+```
+
+`files` says whether the reviewer's declared files from that failing round were staged, which
+they are under `inputs/<reviewer>/`, the same place a `join = "settled"` consumer finds them. A
+target that declares a `session` resumes it each round, so it remembers what it already tried.
+
+Each round settles in its own right: a passing round commits, a failing one is discarded, and
+each reports as `task[round-N]`, the naming a mapped node's instances use. Once the loop ends,
+each task reports one row under its own name carrying its last round and the spend of every
+round, and those rows alone gate the verdict. A dependent reads the last round.
+
+The bound is 2 to 5 and is never defaulted. Validation refuses a target that is not a direct
+dependency, a fan-out on either side, two reviewers for one target, nested or chained loops, and
+a reviewer dependency that can reach the target (it would read a draft a later round replaces).
+Anything less bounded, or a repair that re-runs more than one producer, stays inside one task.
+
 ## The loop as a plan
 
 Each loop iteration runs as a capability-admitted `autoresearch` workflow. With no authored
@@ -317,6 +367,11 @@ fails without truncation. A required report makes rendering or delivery failure 
 it does not rely on an agent remembering to call a tool.
 
 ## Worked example
+
+`examples/revise-loop` is the smallest revise loop: an agent drafts a probe, a command rejects
+the draft written without a verdict in hand, and the revision written with it passes.
+`just revise-loop-e2e` runs it through real OpenShell sandboxes on local podman with a
+model-free `claude` image, and checks the rounds, the resumed session, and the commits.
 
 `examples/adversarial-review` puts a review task between a code node and the gate below it, in
 single-reviewer and two-reviewer panel shapes. The panel runs isolated reviewers concurrently
