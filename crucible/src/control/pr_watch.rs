@@ -261,7 +261,7 @@ pub enum Sink {
     /// A live run's control-bridge address (host:port); delivered over TCP as a `steer` command.
     Steer(String),
     /// A file (typically the next run's `STEER.md`) appended directly, in the same
-    /// `<!-- steer @ts by control -->` shape `control::append_steer` writes, no run needs to be up.
+    /// `<!-- steer @ts by control -->` shape `control::bridge::append_steer` writes, no run needs to be up.
     Reseed(PathBuf),
 }
 
@@ -283,7 +283,7 @@ impl Sink {
                 send_steer(addr, text, key).context("sending steer over the control bridge")
             }
             Sink::Reseed(path) => {
-                control::append_steer(path, text).context("appending to reseed file")
+                control::bridge::append_steer(path, text).context("appending to reseed file")
             }
         }
     }
@@ -591,7 +591,7 @@ mod tests {
 
     #[test]
     fn reseed_sink_appends_the_same_shape_the_loop_reads() {
-        // No live run: the reseed sink writes straight to a file (`control::append_steer`'s exact
+        // No live run: the reseed sink writes straight to a file (`control::bridge::append_steer`'s exact
         // marker-wrapped shape), which the next run's first steer drain reads.
         let path = std::env::temp_dir().join(format!(
             "crucible-pr-watch-reseed-{}-{}.md",

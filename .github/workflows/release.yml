@@ -65,7 +65,7 @@ jobs:
         env:
           CRUCIBLE_GIT_SHA: ${{ github.sha }}
           SQLX_OFFLINE: "true"
-        run: cargo build --release --locked -p crucible -p forge -p crucible-controller -p crux --bins
+        run: cargo build --release --locked -p crucible -p forge -p crucible-controller -p crux --bins --features crucible/autoresearch
 
       # Collect every top-level executable from target/release (same pattern the Containerfile
       # uses to stage /art/bin) into one tarball + a no-tooling sha256 integrity file.

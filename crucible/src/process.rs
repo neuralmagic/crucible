@@ -4,6 +4,7 @@ use std::sync::atomic::AtomicBool;
 
 pub(crate) static STOP: AtomicBool = AtomicBool::new(false);
 
+#[cfg(feature = "autoresearch")]
 /// Send SIGTERM to one PID (no-op if zero/negative), via libc rather than the `kill` binary.
 pub(crate) fn kill_pid(pid: i32) {
     if pid > 0 {
@@ -30,6 +31,7 @@ pub(crate) mod pid_registry {
         }
     }
 
+    #[cfg(feature = "autoresearch")]
     pub fn kill_all() {
         if let Ok(v) = PIDS.lock() {
             for &pid in v.iter() {

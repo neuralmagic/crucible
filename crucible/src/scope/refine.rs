@@ -9,11 +9,7 @@
 //! orchestration and this stays trivially unit-testable. The records themselves are
 //! [`crucible_contract::refine`], which a controller depends on directly to read a frozen trail.
 
-use crate::runloop::selftest::SelftestReport;
-use crucible_contract::refine::{
-    Attack, ControlEvidence, FailureEvidence, ReadingEvidence, RoundOutcome, RoundRecord,
-    SelftestEvidence,
-};
+use crucible_contract::refine::{Attack, FailureEvidence, RoundOutcome, RoundRecord};
 use serde::{Deserialize, Serialize};
 
 /// The engine-embedded refine prompt: seeded from `scope-propose.md`'s contract sections, focused
@@ -110,39 +106,6 @@ pub fn render_adversary_prompt(
         .replace("{{OUT_DIR}}", &out_dir.display().to_string())
         .replace("{{TRAIL}}", &trail)
 }
-impl From<&SelftestReport> for SelftestEvidence {
-    fn from(r: &SelftestReport) -> Self {
-        let direction = match r.direction {
-            crucible::crucible::Direction::Higher => "higher",
-            crucible::crucible::Direction::Lower => "lower",
-        }
-        .to_string();
-        SelftestEvidence {
-            direction,
-            runs: r.runs,
-            good: control_evidence(&r.good),
-            bad: control_evidence(&r.bad),
-        }
-    }
-}
-
-fn control_evidence(c: &crate::runloop::selftest::ControlResult) -> ControlEvidence {
-    ControlEvidence {
-        cmd: c.cmd.clone(),
-        mean: c.mean_score,
-        all_valid: c.all_valid,
-        readings: c
-            .readings
-            .iter()
-            .map(|r| ReadingEvidence {
-                valid: r.valid,
-                score: r.score,
-                note: r.note.clone(),
-            })
-            .collect(),
-    }
-}
-
 /// Render the refine prompt for `round`: the goal, the pack's on-disk location (the agent edits in
 /// place), the concrete failure evidence from the prior round, the round number, and the
 /// confirmed tier so a refine turn doesn't quietly slide a T1 harness back toward a

@@ -6,8 +6,8 @@
 //! which event moves it, and how a run ends. A transition the table does not list is a bug in
 //! the driver, reported as [`IllegalTransition`] rather than silently taken.
 
-use crate::control::ControlState;
-use crate::report::Reporter;
+use crate::control::bridge::ControlState;
+use crate::report::reporter::Reporter;
 use crucible::diagram::{self, Cluster, Cursor, Digraph, Edge, IllegalTransition, Node, NodeKind};
 use crucible_contract::LoopPhase;
 use std::sync::Arc;
@@ -442,16 +442,16 @@ mod tests {
             _: &str,
             _: Option<&str>,
             _: Option<&str>,
-            _: crate::report::TurnBudget,
-        ) -> crate::report::AgentTurn {
-            crate::report::AgentTurn::default()
+            _: crate::report::reporter::TurnBudget,
+        ) -> crate::report::reporter::AgentTurn {
+            crate::report::reporter::AgentTurn::default()
         }
         fn check_interrupt(
             &mut self,
             _: &crate::args::Paths,
             _: &[crate::report::session::Row],
-        ) -> crate::report::Stop {
-            crate::report::Stop::Continue
+        ) -> crate::report::reporter::Stop {
+            crate::report::reporter::Stop::Continue
         }
         fn summary(&mut self, _: &[crate::report::session::Row], _: &str, _: f64) {}
     }

@@ -27,7 +27,7 @@ build from source:
 ```bash
 git clone https://github.com/neuralmagic/crucible.git
 cd crucible
-cargo build --release -p crucible
+cargo build --release -p crucible --features autoresearch
 install -m 755 target/release/crucible ~/.local/bin/   # or anywhere on PATH
 ```
 
@@ -53,7 +53,7 @@ memory) with no cluster and no model.
 
 ```bash
 crucible --manifest examples/counter/crucible.toml --iterations 6
-# or, from a source checkout: cargo run -p crucible -- --manifest examples/counter/crucible.toml --iterations 6
+# or, from a source checkout: cargo run -p crucible --features autoresearch -- --manifest examples/counter/crucible.toml --iterations 6
 ```
 
 The manifest is the whole story (`examples/counter/crucible.toml`):

@@ -99,6 +99,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked --no-deps -- -D warnings
 
+      - name: Clippy (engine, default features)
+        run: cargo clippy -p crucible --all-targets --locked --no-deps -- -D warnings
+
       # The controller's `#[sqlx::test]` suite needs a live Postgres at DATABASE_URL; each test
       # creates (and drops) its own database on it. An ephemeral host port so concurrent jobs on
       # a shared self-hosted runner never collide. Compilation stays on the checked-in `.sqlx/`
@@ -190,6 +193,9 @@ jobs:
       # which nextest does not execute.
       - name: Test
         run: cargo nextest run --workspace --all-features --locked
+
+      - name: Test (engine, default features)
+        run: cargo nextest run -p crucible --locked
 
       # Nextest deliberately excludes ignored tests; this one proves an idle controller tick
       # opens no span while an ingest still traces.

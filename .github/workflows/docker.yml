@@ -72,7 +72,8 @@ jobs:
       # the loop pod runs) + forge (engine-side build/deploy bins).
       - name: Build release binaries
         run: |
-          cargo build --release --locked -p crucible -p crucible-broker -p forge --bins
+          cargo build --release --locked -p crucible -p crucible-broker -p forge --bins \
+            --features crucible/autoresearch
           mkdir -p prebuilt/bin
           find target/release -maxdepth 1 -type f -executable -exec cp {} prebuilt/bin/ \;
           echo "staged binaries:" && ls -la prebuilt/bin/

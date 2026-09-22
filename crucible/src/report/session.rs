@@ -64,12 +64,14 @@ impl From<&Row> for RowWire {
     }
 }
 
+#[cfg(feature = "autoresearch")]
 /// Bridges [`RowWire`] (the wire mirror) back to [`Row`] (in-process state). A trait rather than
 /// an inherent method since `RowWire` is defined in `crucible-contract`.
 pub trait IntoRow {
     fn into_row(self) -> Row;
 }
 
+#[cfg(feature = "autoresearch")]
 impl IntoRow for RowWire {
     fn into_row(self) -> Row {
         Row {
@@ -90,9 +92,9 @@ impl IntoRow for RowWire {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "autoresearch"))]
 mod tests {
-    use super::*;
+    use crate::report::session::*;
 
     #[test]
     fn row_bridge_round_trips() {

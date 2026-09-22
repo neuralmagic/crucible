@@ -17,8 +17,9 @@
 
 use crate::args::{Args, Paths};
 use crate::flow::model::{finite, goal_line};
+use crate::object_store::{Backend, ObjectUriError, backend, parse_s3_uri};
 use crate::outputs::OutputTally;
-use crate::report::Reporter;
+use crate::report::reporter::Reporter;
 use crate::report::session::Row;
 use anyhow::{Context, Result};
 use crucible_contract::outputs::{BoundViolation, OutputKind};
@@ -409,28 +410,6 @@ fn keys(base: &str, goal_slug: &str, run_id: &str) -> Keys {
     }
 }
 
-/// A publish destination: S3 (`s3://bucket[/prefix]`) or a mounted filesystem
-/// (`file:///abs/path`, e.g. an artifacts PVC on a cluster with no S3 reach). Both write the
-/// exact same key layout, so reporting tools walk either.
-enum Backend {
-    // The S3 half re-parses the URI where it's used (the async block owns bucket/base), so the
-    // variant carries nothing.
-    S3,
-    File { root: std::path::PathBuf },
-}
-
-fn backend(uri: &str) -> Result<Backend, PublishError> {
-    match uri.strip_prefix("file://") {
-        Some(path) if path.starts_with('/') => Ok(Backend::File {
-            root: std::path::PathBuf::from(path),
-        }),
-        Some(_) => Err(PublishError::FileRootRelative {
-            uri: uri.to_owned(),
-        }),
-        None => parse_s3_uri(uri).map(|_| Backend::S3),
-    }
-}
-
 /// Write the run record to whichever backend the results URI names.
 fn record(rec: &Record<'_>, prs: &[PrLink]) -> Result<String> {
     match backend(&rec.args.results_bucket)? {
@@ -633,47 +612,6 @@ fn s3_record(rec: &Record<'_>, prs: &[PrLink]) -> Result<String> {
     Ok(record_uri)
 }
 
-/// Download one published object at an exact `s3://bucket/key` URI to a local file, the general
-/// GetObject the controller's artifact proxy shells (`crucible fetch`), keeping every S3 client out
-/// of `crucible-controller` (that crate has no aws-sdk and never learns the bucket layout). Nothing
-/// is appended to the URI: the caller passes the exact key it wants. Reuses the same IRSA creds the
-/// publisher uses (GetObject is in the role's policy).
-pub fn fetch_object(uri: &str, dest: &std::path::Path) -> Result<()> {
-    if let Backend::File { root } = backend(uri)? {
-        // The file URI IS the object path; a plain copy is the whole fetch.
-        std::fs::copy(&root, dest)
-            .with_context(|| format!("copying {} to {}", root.display(), dest.display()))?;
-        return Ok(());
-    }
-    let (bucket, key) = parse_s3_uri(uri)?;
-    if key.is_empty() {
-        return Err(PublishError::NoKey {
-            uri: uri.to_owned(),
-        }
-        .into());
-    }
-    crate::agent::engine::handle()?.block_on(async {
-        let conf = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-        let client = aws_sdk_s3::Client::new(&conf);
-        let out = client
-            .get_object()
-            .bucket(&bucket)
-            .key(&key)
-            .send()
-            .await
-            .with_context(|| format!("GetObject s3://{bucket}/{key}"))?;
-        let data = out
-            .body
-            .collect()
-            .await
-            .context("read object body")?
-            .into_bytes();
-        std::fs::write(dest, &data)
-            .with_context(|| format!("writing {} ({} bytes)", dest.display(), data.len()))?;
-        Ok::<(), anyhow::Error>(())
-    })
-}
-
 /// Cross-run memory: fetch the PREVIOUS run's tried-ideas ledger for this goal from S3, so a fresh
 /// run inherits what's already been tried instead of re-walking dead ends. Reads the per-goal
 /// `latest.json` pointer, then that run's `RESULTS.md`, and returns its candidate rows (baseline
@@ -769,14 +707,8 @@ async fn put(
 /// publishing refuses on its own terms; everything else is plumbing and stays `anyhow`.
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum PublishError {
-    #[error("results bucket must be an s3:// or file:// URI, got `{uri}`")]
-    NotAnS3Uri { uri: String },
-    #[error("file:// results root must be absolute: `{uri}`")]
-    FileRootRelative { uri: String },
-    #[error("results bucket URI has no bucket: `{uri}`")]
-    NoBucket { uri: String },
-    #[error("fetch object URI has no key: `{uri}`")]
-    NoKey { uri: String },
+    #[error(transparent)]
+    Uri(#[from] ObjectUriError),
     #[error("gh pr edit failed: {stderr}")]
     PrEditFailed { stderr: String },
     #[error("gh pr create failed: {stderr}")]
@@ -788,23 +720,6 @@ pub enum PublishError {
         refspec: String,
         status: std::process::ExitStatus,
     },
-}
-
-/// `s3://bucket[/prefix]` → (bucket, prefix). Prefix is trimmed of slashes and may
-/// be empty.
-fn parse_s3_uri(uri: &str) -> Result<(String, String), PublishError> {
-    let rest = uri
-        .strip_prefix("s3://")
-        .ok_or_else(|| PublishError::NotAnS3Uri {
-            uri: uri.to_owned(),
-        })?;
-    let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
-    if bucket.is_empty() {
-        return Err(PublishError::NoBucket {
-            uri: uri.to_owned(),
-        });
-    }
-    Ok((bucket.to_string(), prefix.trim_matches('/').to_string()))
 }
 
 // --- git PR channel --------------------------------------------------------
@@ -1458,7 +1373,7 @@ fn kept_section(row: &Row) -> String {
     if !row.evidence.is_empty() {
         s.push_str(&format!(
             "\nDeclared checks: {}\n",
-            crate::report::evidence_line(&row.evidence)
+            crate::report::reporter::evidence_line(&row.evidence)
         ));
     }
     s.push('\n');
@@ -1903,7 +1818,7 @@ mod tests {
 
         // fetch_object: the file URI is the object path.
         let dest = base.join("fetched.txt");
-        fetch_object(
+        crate::object_store::fetch_object(
             &format!(
                 "file://{}",
                 run.join("artifacts/codegen-out/summary.txt").display()
@@ -2558,24 +2473,6 @@ mod tests {
         assert!(rows.contains("lock contention tweak"));
         assert!(rows.contains("skip double JSON parse"));
         assert_eq!(rows.lines().count(), 2);
-    }
-
-    #[test]
-    fn parse_s3_uri_splits_bucket_and_prefix() {
-        assert_eq!(
-            parse_s3_uri("s3://my-bucket/autoresearch").unwrap(),
-            ("my-bucket".into(), "autoresearch".into())
-        );
-        assert_eq!(
-            parse_s3_uri("s3://my-bucket").unwrap(),
-            ("my-bucket".into(), String::new())
-        );
-        assert_eq!(
-            parse_s3_uri("s3://my-bucket/a/b/").unwrap(),
-            ("my-bucket".into(), "a/b".into())
-        );
-        assert!(parse_s3_uri("https://nope").is_err());
-        assert!(parse_s3_uri("s3:///just-prefix").is_err());
     }
 
     /// A run bounded to `count` draft PRs against `repo`, and nothing else.

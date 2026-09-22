@@ -14,10 +14,13 @@
 //! [`args::Paths`], [`args::Prepared`]); [`cli`] parses the command line and dispatches it;
 //! [`runloop`] holds the single orchestration loop; [`agent`] runs one turn; [`control`] steers a
 //! running loop from outside; [`report`] is how the loop talks to a human or a log; [`scope`]
-//! is the scoping pipeline. The loop talks only to a [`report::Reporter`], so one loop drives
+//! is the scoping pipeline. The loop talks only to a [`report::reporter::Reporter`], so one loop drives
 //! multiple front-ends: [`report::console::ConsoleReporter`] for headless runs and the NDJSON
 //! [`report::stream::SessionReporter`] for stdout/session-log runs. The choice is just `--ui`
 //! (default: auto by TTY).
+//!
+//! The loop, [`scope`], and the loop-only parts of [`control`] and [`report`] build only with the
+//! `autoresearch` feature; without it the binary is the playbook workflow engine.
 //!
 //! Operator ergonomics:
 //!
@@ -28,10 +31,14 @@ mod agent;
 mod args;
 mod cli;
 mod control;
+#[cfg(feature = "autoresearch")]
 mod identity;
+mod object_store;
 mod process;
 mod report;
+#[cfg(feature = "autoresearch")]
 mod runloop;
+#[cfg(feature = "autoresearch")]
 mod scope;
 #[cfg(test)]
 mod testing;
@@ -61,6 +68,7 @@ mod plan {
     pub mod cli;
     pub mod events;
     pub mod harness;
+    pub mod template;
 }
 
 use anyhow::Result;
