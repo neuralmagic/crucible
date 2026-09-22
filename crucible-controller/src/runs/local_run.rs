@@ -43,15 +43,12 @@ fn session_log(dir: &Path) -> PathBuf {
     dir.join("pack").join("state").join("session.jsonl")
 }
 
-/// Where the engine keeps its forge storage (the report handoff among it) inside a local run's
-/// directory. The pod mounts an emptyDir at the same role.
+/// The engine's forge storage root inside a local run's directory.
 fn forge_root(dir: &Path) -> PathBuf {
     dir.join("forge")
 }
 
-/// Mark every file in an unpacked pack executable, as the pod's pack ConfigMap mount does
-/// (`default_mode: 0o755`). A draft stores its files with no mode, so its scripts would
-/// otherwise reach a local run as 0644 and fail where the same pack runs in a pod.
+/// Mark every file in an unpacked pack 0755, matching the pod's pack mount.
 fn grant_pack_exec(dir: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
@@ -67,8 +64,7 @@ fn grant_pack_exec(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The host facts every local run keeps: its process identity, through which the host harness
-/// finds its own login, and the Podman API socket an OpenShell sandbox is booted against.
+/// Host variables every local run inherits.
 const HOST_ENV: [&str; 4] = ["PATH", "HOME", "USER", "OPENSHELL_PODMAN_SOCKET"];
 
 /// The environment one local run is spawned with. Local mode has no registry and no grant, so the
@@ -425,7 +421,7 @@ mod tests {
         }
     }
 
-    /// Local mode has no registry, so the subprocess starts from nothing: its host facts,
+    /// Local mode has no registry, so the subprocess starts from nothing: the host variables,
     /// the run's own `CRUCIBLE_*` set, and whatever an operator named. Everything else the
     /// controller holds — its database URL, its Vault login, its tokens — stays with the controller.
     #[test]

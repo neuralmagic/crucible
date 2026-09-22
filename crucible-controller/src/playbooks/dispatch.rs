@@ -470,8 +470,6 @@ mod tests {
         assert!(pack_agent(dir.path()).is_err());
     }
 
-    /// The laptop case the whole surface exists for: local mode runs every backend the engine
-    /// takes, `openshell` included, since the engine boots its sandbox on the host's podman.
     #[test]
     fn local_mode_takes_every_backend() {
         let cap = capability(PlaybookExecutor::Local, false);
@@ -647,8 +645,8 @@ mod tests {
     }
 
     /// A command backend brings its own process, and local mode spawns on the machine the
-    /// controller runs on, where a `local` agent is the point. An `openshell` turn needs its image
-    /// wherever it runs.
+    /// controller runs on, where a `local` agent is the point. `openshell` needs an image in both
+    /// modes.
     #[test]
     fn a_command_backend_and_local_mode_earn_no_spawn_defect() {
         assert_eq!(

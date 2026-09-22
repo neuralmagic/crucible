@@ -76,10 +76,8 @@ dev-pg:
     fi
     echo "DATABASE_URL=postgres://postgres:ci@localhost:55432/crucible"
 
-# Postgres in podman, no token, no Vault, no cluster. The API binds loopback, every request lands
-# as `user` (an admin), playbook launches run as local `crucible plan run` subprocesses, and the
-# database lives in the `crucible-local-pg` volume. See docs/controller-local.md.
-# Run the controller on this machine, to drive the UI.
+# See docs/controller-local.md.
+# Run the controller on this machine: Postgres in podman, no auth, no Vault, no cluster.
 controller-local port="8787" user=env_var("USER"):
     #!/usr/bin/env bash
     set -euo pipefail

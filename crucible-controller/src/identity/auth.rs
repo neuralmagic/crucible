@@ -257,8 +257,7 @@ pub(crate) struct BearerGuard {
     pub(crate) expected: Option<SharedToken>,
     pub(crate) proxy: Option<SharedToken>,
     pub(crate) static_identity: Option<HeaderValue>,
-    /// `CONTROLLER_DEV_IDENTITY`: the login every request lands as while the guard is open. Only
-    /// constructible on an open guard, so it never names a caller on a routable bind.
+    /// `CONTROLLER_DEV_IDENTITY`: the login every request lands as while the guard is open.
     pub(crate) dev_identity: Option<HeaderValue>,
     pub(crate) kube: Option<crate::identity::kube_user::KubeUserAuth>,
     pub(crate) oidc: Option<Arc<crate::identity::oidc::OidcProvider>>,
@@ -318,9 +317,7 @@ impl BearerGuard {
         guard.with_dev_identity(std::env::var("CONTROLLER_DEV_IDENTITY").ok())
     }
 
-    /// Land every request on an open guard as `login`. Refused on a closed guard: a deployment
-    /// with a token or an issuer has real callers to tell apart, and would hand this name to all
-    /// of them.
+    /// Land every request on an open guard as `login`. Errors on a closed guard.
     pub(crate) fn with_dev_identity(mut self, login: Option<String>) -> anyhow::Result<Self> {
         let Some(login) = login
             .map(|l| l.trim().to_string())
@@ -1653,8 +1650,6 @@ mod tests {
             assert_eq!(body, "anonymous|");
         }
 
-        /// A dev identity names every open-guard caller, and whatever the client asserted is
-        /// dropped first, so a browser and a curl that writes the edge's headers land the same.
         #[tokio::test]
         async fn an_open_guard_with_a_dev_identity_names_every_caller() {
             let guard = BearerGuard::default()
