@@ -79,6 +79,6 @@ allow-git = [
     # The OpenShell fork pin: the gateway's native gRPC clients + auth interceptor, one pin
     # for every crate that talks to the gateway.
     "https://github.com/wseaton/OpenShell",
-    # The broker's pinned jira-mcp dep.
-    "https://github.com/wseaton/jira-mcp",
+    # The broker's pinned ujira dep.
+    "https://github.com/wseaton/ujira",
 ]

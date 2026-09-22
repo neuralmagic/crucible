@@ -12,7 +12,7 @@ use crate::draft_pr::DraftPrApproval;
 use crate::gpu_check::GpuCheck;
 use crate::types::{Resolution, TraceParams};
 use crucible_contract::outputs::OutputKind;
-use jira_mcp::{JiraClient, render};
+use ujira::{JiraClient, render};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};

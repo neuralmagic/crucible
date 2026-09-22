@@ -1823,7 +1823,6 @@ dependencies = [
  "clap",
  "crucible-contract",
  "forge",
- "jira-mcp",
  "minijinja",
  "openshell-core",
  "opentelemetry 0.32.0",
@@ -1840,6 +1839,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry 0.33.0",
  "tracing-subscriber",
+ "ujira",
 ]
 
 [[package]]
@@ -4036,23 +4036,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "875a5a69ac2bab1a891711cf5eccbec1ce0341ea805560dcd90b7a2e925132e8"
 dependencies = [
  "jiff-tzdb",
-]
-
-[[package]]
-name = "jira-mcp"
-version = "0.3.0"
-source = "git+https://github.com/wseaton/jira-mcp?tag=v0.4.0#09d99958caa0b06d387da9ad2dc25f3a6a39bc2c"
-dependencies = [
- "anyhow",
- "clap",
- "keyring",
- "reqwest 0.13.4",
- "rmcp 1.8.0",
- "schemars 0.8.22",
- "serde",
- "serde_json",
- "tokio",
- "toml 1.1.4+spec-1.1.0",
 ]
 
 [[package]]
@@ -6466,6 +6449,7 @@ dependencies = [
  "js-sys",
  "log",
  "mime",
+ "mime_guess",
  "percent-encoding",
  "pin-project-lite",
  "quinn",
@@ -6980,18 +6964,6 @@ dependencies = [
 
 [[package]]
 name = "schemars"
-version = "0.8.22"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3fbf2ae1b8bc8e02df939598064d22402220cd5bbcca1c76f7d6a310974d5615"
-dependencies = [
- "dyn-clone",
- "schemars_derive 0.8.22",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "schemars"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4cd191f9397d57d581cddd31014772520aa448f65ef991055d7f61582c65165f"
@@ -7011,21 +6983,9 @@ dependencies = [
  "chrono",
  "dyn-clone",
  "ref-cast",
- "schemars_derive 1.2.1",
+ "schemars_derive",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "schemars_derive"
-version = "0.8.22"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32e265784ad618884abaea0600a9adf15393368d840e0222d101a072f3f7534d"
-dependencies = [
- "proc-macro2",
- "quote",
- "serde_derive_internals",
- "syn 2.0.118",
 ]
 
 [[package]]
@@ -8941,6 +8901,25 @@ dependencies = [
  "memoffset",
  "tempfile",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "ujira"
+version = "0.7.0"
+source = "git+https://github.com/wseaton/ujira?tag=v0.7.0#7cd04bc9e2c71d609f416ce15370f6c313ae9640"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "clap",
+ "keyring",
+ "reqwest 0.13.4",
+ "rmcp 3.1.2",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml 1.1.4+spec-1.1.0",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

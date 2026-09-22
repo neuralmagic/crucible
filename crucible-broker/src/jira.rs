@@ -1,10 +1,10 @@
 //! The broker's JIRA policy: one constructor, so both broker binaries get the same ceiling.
 //!
 //! The client itself (REST calls, the curated custom-field map, the compact renderers) lives in the
-//! shared `jira-mcp` crate, which the standalone MCP server also uses. What belongs HERE is the part
+//! shared `ujira` crate, which the standalone MCP server also uses. What belongs HERE is the part
 //! that is crucible's business: how much authority the sandboxed agent's JIRA reach carries.
 
-use jira_mcp::{Access, Config, JiraClient};
+use ujira::{Access, Config, JiraClient};
 use std::sync::Arc;
 
 /// The shared client, or `None` when JIRA isn't configured (the `jira_*` tools then report
