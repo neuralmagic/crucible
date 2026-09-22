@@ -4,8 +4,8 @@
 //! shared `ujira` crate, which the standalone MCP server also uses. What belongs HERE is the part
 //! that is crucible's business: how much authority the sandboxed agent's JIRA reach carries.
 
-use ujira::{Access, Config, JiraClient};
 use std::sync::Arc;
+use ujira::{Access, Config, JiraClient};
 
 /// The shared client, or `None` when JIRA isn't configured (the `jira_*` tools then report
 /// `disabled` rather than failing the run).

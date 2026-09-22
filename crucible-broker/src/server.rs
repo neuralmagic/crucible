@@ -12,13 +12,13 @@ use crate::draft_pr::DraftPrApproval;
 use crate::gpu_check::GpuCheck;
 use crate::types::{Resolution, TraceParams};
 use crucible_contract::outputs::OutputKind;
-use ujira::{JiraClient, render};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
 use rmcp::{ServerHandler, schemars, tool, tool_router};
 use serde::Deserialize;
 use std::sync::Arc;
+use ujira::{JiraClient, render};
 
 /// MCP tool arguments (a JSON-schema'd struct on the wire), mapped to the core [`TraceParams`].
 /// Kept separate so the core type stays free of the `schemars` dependency.
