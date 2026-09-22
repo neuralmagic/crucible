@@ -4,9 +4,19 @@
 
 # crucible
 
-Crucible is an engine for running goal-directed optimization loops against a codebase or
-other reversible system. An agent proposes a change, a domain-provided judge measures it,
-and the engine either keeps the candidate or restores the last accepted state.
+Crucible runs agent work as a declared graph of tasks. Agent turns, commands, evaluations
+and engine-owned decisions are written in Starlark, compiled into a static plan, and
+executed against one Git workspace under a cost budget.
+
+The graph is not a DAG at runtime. A `route()` task answers typed questions about its
+dependencies' output and the tasks downstream of it branch on the answers; a reviewer can
+send its proposer back with a verdict for a bounded number of rounds until the work stops
+failing. Neither is decided at compile time.
+
+There are two lanes. A **playbook** runs the graph once and ships what it produced. An
+**autoresearch** run wraps the graph in an optimization loop: an agent proposes a change, a
+domain-provided judge measures it, and the engine either keeps the candidate or restores
+the last accepted state.
 
 <p align="center">
   <img src="docs/img/controller-run.png" alt="A playbook run in the crucible control plane: the admitted task graph with a fanned-out build and measure, one failed instance, and the judge that kept the winner." width="960">
@@ -17,7 +27,13 @@ use any language; no Rust integration is required.
 
 ## Execution model
 
-For each run, Crucible:
+A playbook run compiles the plan, admits it against the capabilities the substrate offers,
+and executes its tasks in dependency order in one workspace: branches settle `not_taken`
+without spending, revise pairs run their rounds, and the run ends when the result task
+settles or the budget is gone.
+
+A scored (autoresearch) run puts that graph inside the keep-or-discard loop. For each
+iteration, Crucible:
 
 1. prepares a Git workspace from `[repo]` and `[workspace]`;
 2. records a baseline measurement unless `[judge].skip_baseline` is enabled;
@@ -54,17 +70,19 @@ on top of the runtime image.
   <img src="docs/img/controller-studio.png" alt="The draft studio: a playbook pack edited in place, compiled on save, with its launch form and task graph beside the editor." width="800">
 </p>
 
-## Why not a general workflow engine
+## Why not Argo or Tekton
 
 Crucible executes its own graph rather than delegating to Argo Workflows, Tekton, or a
 similar system. The reason is not the graph, which is ordinary, but the loop around it and
 the state under it.
 
-The compiled plan is deliberately loop-free. Starlark control flow unrolls at compile time
-and the resulting plan is static; the only loop is the engine's iteration over that plan,
-which carries the accepted state, the best score so far, and the remaining budget across
-rounds. A workflow engine would have to host that loop, and neither hosts it well: Tekton
-has no loop construct at all, since a pipeline cannot reference itself and `matrix` covers
+The task set is fixed at compile time: Starlark control flow unrolls into tasks, and
+nothing creates a task during a run. Execution over that fixed set is cyclic. A `revise`
+pair re-dispatches a settled task with the reviewer's verdict under `revision`, round after
+round, until it stops failing or `max_rounds` is spent; a scored run repeats the whole graph
+across iterations, carrying the accepted state, the best score so far, and the remaining
+budget. A workflow engine would have to host both, and neither hosts them well: Tekton has
+no loop construct at all, since a pipeline cannot reference itself and `matrix` covers
 fan-out only, and Argo expresses iteration as template recursion, which accumulates every
 round's nodes in a single workflow object.
 
@@ -216,9 +234,10 @@ is a task: unsupervised general-purpose work where every completed turn is kept
 
 ### Workflow DSL
 
-A domain can define its iteration graph in a `workflow.star` file beside
-`crucible.toml`. The file uses a declarative subset of Starlark to create a directed acyclic
-graph of agent, command, evaluation, and engine tasks.
+A domain defines its graph in a `workflow.star` file beside `crucible.toml`. The file uses
+a declarative subset of Starlark to create a graph of agent, command, evaluation, and engine
+tasks. The dependency edges are acyclic; execution over them is not, since `revise` sends a
+task back for another round and `when` decides at runtime whether a branch runs at all.
 
 `workflow.star` is authoring syntax. Crucible compiles it into the manifest's generated
 `[workflow]` and `[[workflow.task]]` tables; the generated manifest data is the runtime
@@ -258,6 +277,55 @@ workflow(
 )
 ```
 
+A playbook has no judge. It branches on a `route()` instead, and a task that settles failing
+can send a dependency back:
+
+```python
+read = command(name = "read", run = "./read.sh", emits = ["ticket"])
+
+gate = route(
+    name = "gate",
+    depends_on = [read],
+    min_confidence = 0.8,
+    questions = {
+        "bucket": choice(
+            ask = "Which queue owns this ticket?",
+            options = {
+                "outage": "the product is down or unusable",
+                "billing": "charges, invoices, refunds",
+                "feature": "a request for something new",
+            },
+        ),
+    },
+)
+
+oncall = command(name = "oncall", run = "./act.sh oncall", depends_on = [gate],
+                 when = gate.bucket, answers = "outage")
+backlog = command(name = "backlog", run = "./act.sh backlog", depends_on = [gate],
+                  when = gate.bucket, otherwise = True)
+
+filed = command(name = "filed", run = "./act.sh filed",
+                depends_on = [oncall, backlog], join = "passed")
+
+workflow(type = "playbook", tasks = [read, gate, oncall, backlog, filed], result = filed)
+```
+
+A branch no answer selected settles `not_taken`: it never dispatches, spends nothing, and
+does not invalidate the run, which is why `filed` rejoins on `join = "passed"`. `otherwise`
+covers every answer no other task claimed, so adding an option to the question cannot
+silently strand a ticket.
+
+The revise pair is the other runtime cycle. `review` re-runs `author` with its verdict under
+`revision` until it stops failing or the rounds are spent:
+
+```python
+author = agent(name = "author", prompt = "Write PROBE.md.", emits_files = ["PROBE.md"])
+review = command(name = "review", run = "./check.sh", depends_on = [author],
+                 revise = author, max_rounds = 3)
+
+workflow(type = "playbook", tasks = [author, review])
+```
+
 Every constructor, the lane it belongs to, and its keyword arguments are in
 [docs/dsl-reference.md](docs/dsl-reference.md), which is generated from the compiler's own
 tables. Print the same thing for the binary in hand:
@@ -289,9 +357,10 @@ Edit `workflow.star`, not the generated manifest block. `crucible scope` automat
 recompiles a sibling `workflow.star` before validation and freeze. A materialized engine
 workflow automatically selects graph execution when the loop runs.
 
-See [docs/work-graphs.md](docs/work-graphs.md) for plan execution and task output semantics,
-and [examples/counter/workflow.star](examples/counter/workflow.star) for a complete executable
-example.
+See [docs/work-graphs.md](docs/work-graphs.md) for plan execution and task output semantics.
+Complete executable examples: [examples/counter](examples/counter) (scored),
+[examples/route](examples/route) (branching) and [examples/revise-loop](examples/revise-loop)
+(bounded rounds).
 
 ### Measurement protocol
 
@@ -362,7 +431,10 @@ Common loop controls include `--iterations`, `--wide`, `--wide-keep`, `--max-cos
 
 | Path | Contents |
 | --- | --- |
-| `crucible/` | CLI, loop engine, manifest loading, agent backends, deployment rendering, and reporting. |
+| `crucible/` | CLI, plan executor, loop engine, manifest loading, agent backends, deployment rendering, and reporting. |
+| `crucible-controller/` | The control plane: Postgres ledger, reconciling daemon, HTTP API, and the embedded React UI. |
+| `crux/` | CLI and MCP tool library over the controller API. |
+| `capability/` | The image capability vocabulary the controller and the image feedstock share. |
 | `crucible-contract/` | Shared wire types for events, identities, sessions, and artifacts. |
 | `crucible-vcs/` | Git-backed workspace and history operations. |
 | `crucible-harness/` | Harness stream processing and telemetry support. |
