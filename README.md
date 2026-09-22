@@ -8,6 +8,10 @@ Crucible is an engine for running goal-directed optimization loops against a cod
 other reversible system. An agent proposes a change, a domain-provided judge measures it,
 and the engine either keeps the candidate or restores the last accepted state.
 
+<p align="center">
+  <img src="docs/img/controller-run.png" alt="A playbook run in the crucible control plane: the admitted task graph with a fanned-out build and measure, one failed instance, and the judge that kept the winner." width="960">
+</p>
+
 A domain is defined by a `crucible.toml` manifest and executable commands. Domain code can
 use any language; no Rust integration is required.
 
@@ -42,6 +46,13 @@ and a hosted MCP surface. `crux/` is the CLI and MCP tool library over that API,
 under `images/` share. The controller links the engine in-process
 ([RFC-0004](docs/rfc/RFC-0004.md)) and ships as `ghcr.io/neuralmagic/crucible-controller`
 on top of the runtime image.
+
+<p align="center">
+  <img src="docs/img/controller-dashboard.png" alt="The dashboard: pipeline volume, capacity against the admission caps, and today's spend by kind." width="800">
+</p>
+<p align="center">
+  <img src="docs/img/controller-studio.png" alt="The draft studio: a playbook pack edited in place, compiled on save, with its launch form and task graph beside the editor." width="800">
+</p>
 
 ## Why not a general workflow engine
 
