@@ -124,7 +124,12 @@ impl Ledger {
 
 /// Terminate a half-written last line. The torn record is unrecoverable, but without
 /// this the NEXT append would be glued onto it and lost too.
+///
+/// The lock covers the inspection, not just the write: a live appender's line is in the file
+/// before its terminator is, so a tail read without the lock reads as torn while a whole line is
+/// landing, and the newline gets spliced in behind that appender.
 fn heal_torn_tail(file: &mut File) -> io::Result<()> {
+    let _guard = FlockGuard::acquire(file)?;
     let len = file.metadata()?.len();
     if len == 0 {
         return Ok(());
@@ -133,7 +138,6 @@ fn heal_torn_tail(file: &mut File) -> io::Result<()> {
     let mut last = [0u8; 1];
     file.read_exact(&mut last)?;
     if last[0] != b'\n' {
-        let _guard = FlockGuard::acquire(file)?;
         file.write_all(b"\n")?;
         file.flush()?;
     }
@@ -327,5 +331,41 @@ mod tests {
         let (_l, folded) = Ledger::open(&path, Open::Fold, Durability::Flush, ident).expect("open");
         assert_eq!(folded.records.len(), 200);
         assert_eq!(folded.skipped, 0, "every line is whole");
+    }
+
+    /// A writer holds the lock across a line: the bytes are in the file before the terminator is.
+    /// An open that inspects the tail without the lock reads that as torn and splices a newline
+    /// behind the writer, which folds as one blank line: the `skipped: 1` this ledger's concurrent
+    /// appenders hit in CI.
+    #[test]
+    fn opening_mid_append_waits_for_the_line_instead_of_terminating_it() {
+        let path = tmp("heal-race");
+        Ledger::append_only(&path, Durability::Flush).expect("create");
+        let writing = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let writer = {
+            let path = path.clone();
+            let writing = std::sync::Arc::clone(&writing);
+            std::thread::spawn(move || {
+                let mut file = OpenOptions::new()
+                    .read(true)
+                    .append(true)
+                    .open(&path)
+                    .expect("open");
+                let _guard = FlockGuard::acquire(&file).expect("lock");
+                file.write_all(b"half").expect("write");
+                file.flush().expect("flush");
+                writing.wait();
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                file.write_all(b"-whole;\n").expect("write");
+                file.flush().expect("flush");
+            })
+        };
+        writing.wait();
+        let _ = Ledger::open(&path, Open::Keep, Durability::Flush, ident).expect("open");
+        writer.join().expect("join");
+
+        let folded = fold(&path, ident);
+        assert_eq!(folded.records, vec!["half-whole".to_string()]);
+        assert_eq!(folded.skipped, 0, "the open terminated a line mid-write");
     }
 }
