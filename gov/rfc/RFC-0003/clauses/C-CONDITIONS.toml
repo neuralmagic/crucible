@@ -1,0 +1,11 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-CONDITIONS"
+title = "Rule conditions"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = "A policy rule or share MAY carry a not-after time; the decision MUST evaluate it against the controller's clock at decision time, and an expired rule or share MUST NOT allow anything. Expiry MUST be visible wherever the rule or share is listed. The `dispatch` action on a dispatch target MUST be decided per target through policy rules, so that which principals may dispatch onto which cluster or brought target is a policy fact and not a separate configuration; absent a rule, a target admits only its owner as [[RFC-0003:C-POLICY]] grants, and a platform-owned target admits every authenticated user principal by the default policy set. A launch or firing whose subject may not `dispatch` onto its resolved target MUST be refused before any pod exists. The policy schema MUST admit both conditions from its first version; other conditions are later amendments."

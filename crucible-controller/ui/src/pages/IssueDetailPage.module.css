@@ -1,0 +1,224 @@
+/* Issue detail page + scope progress styling — reuses activity card patterns */
+
+/* --- spacing / color utilities shared by ScopeProgressPage, ScopeFormPage, NewScenarioPage,
+   NewJiraPage and TurnLivePage --- */
+
+.subtle {
+  color: var(--ink-3);
+}
+
+.mt05 {
+  margin-top: 0.5rem;
+}
+
+.mt1 {
+  margin-top: 1rem;
+}
+
+.mt15 {
+  margin-top: 1.5rem;
+}
+
+.mb05 {
+  margin-bottom: 0.5rem;
+}
+
+.mb1 {
+  margin-bottom: 1rem;
+}
+
+.ml05 {
+  margin-left: 0.5rem;
+}
+
+.spinnerGap {
+  margin-right: 0.5rem;
+}
+
+.breadcrumb {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+  font-family: var(--mono);
+  font-size: var(--text-data);
+  color: var(--ink-3);
+}
+
+.breadcrumb a:hover {
+  color: var(--ink);
+}
+
+.breadcrumbSep {
+  user-select: none;
+}
+
+.section {
+  margin-bottom: 1.5rem;
+}
+
+.sectionTitle {
+  font-family: var(--mono);
+  font-size: var(--text-label);
+  font-weight: 600;
+  color: var(--ink-2);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-section);
+  margin-bottom: 0.75rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--rule);
+}
+
+.parkedBox {
+  padding: 0.75rem 1rem;
+  background: var(--sunk);
+  border: 1px solid var(--amber);
+  color: var(--ink);
+}
+
+/* event timeline on the detail page (reuses ActivityPage patterns) */
+.eventCard {
+  display: flex;
+  gap: 0;
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  overflow: hidden;
+}
+
+.eventCard:hover {
+  border-color: var(--rule-hard);
+}
+
+.eventAccent {
+  width: 4px;
+  flex-shrink: 0;
+}
+
+.eventAccent[data-color="blue"] {
+  background: var(--blue);
+}
+
+.eventAccent[data-color="green"] {
+  background: var(--green);
+}
+
+.eventAccent[data-color="orange"] {
+  background: var(--amber);
+}
+
+.eventAccent[data-color="grey"] {
+  background: var(--rule-hard);
+}
+
+.eventAccent[data-color="red"] {
+  background: var(--red);
+}
+
+.eventContent {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding: 0.5rem 0.75rem;
+  flex: 1;
+}
+
+.eventHeader {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.transition {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.arrow {
+  color: var(--ink-3);
+  font-family: var(--mono);
+  font-size: var(--text-data);
+  user-select: none;
+}
+
+.eventReason {
+  color: var(--ink-2);
+  font-size: var(--text-body);
+  line-height: 1.5;
+}
+
+.eventTimestamp {
+  font-family: var(--mono);
+  font-size: var(--text-label);
+  color: var(--ink-3);
+  cursor: help;
+}
+
+.actorBadge {
+  margin-left: auto;
+  padding: 1px 5px;
+  border: 1px solid var(--rule-hard);
+  color: var(--ink-2);
+  font-family: var(--mono);
+  font-size: var(--text-label);
+}
+
+.eventList {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+/* scope progress */
+.progressCard {
+  padding: 1.5rem;
+  background: var(--surface);
+  border: 1px solid var(--rule-hard);
+  text-align: center;
+}
+
+.progressStatus {
+  font-size: var(--text-figure);
+  font-weight: 700;
+  margin-bottom: 0.5rem;
+}
+
+.progressElapsed {
+  font-family: var(--mono);
+  font-size: var(--text-data);
+  color: var(--ink-3);
+}
+
+.progressSuccess {
+  border-color: var(--green);
+}
+
+.progressFailure {
+  border-color: var(--amber);
+}
+
+/* scope form */
+.formWarning {
+  padding: 0.75rem 1rem;
+  background: var(--sunk);
+  border: 1px solid var(--amber);
+  color: var(--ink);
+  font-size: var(--text-body);
+  line-height: 1.6;
+  margin-bottom: 1rem;
+}
+
+.formActions {
+  display: flex;
+  gap: 0.75rem;
+  margin-top: 1.5rem;
+}
+
+.adminGate {
+  padding: 1rem;
+  background: var(--sunk);
+  border: 1px solid var(--red);
+  text-align: center;
+  color: var(--ink);
+}

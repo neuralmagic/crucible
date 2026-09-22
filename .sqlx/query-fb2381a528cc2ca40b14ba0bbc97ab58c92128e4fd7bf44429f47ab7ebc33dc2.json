@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE playbook_draft_versions SET schema_digest = NULL, params_schema = NULL WHERE version = 3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "fb2381a528cc2ca40b14ba0bbc97ab58c92128e4fd7bf44429f47ab7ebc33dc2"
+}

@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT token_cipher AS \"token_cipher!\", key_id AS \"key_id!\"\n               FROM user_credentials WHERE sub = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "token_cipher!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "key_id!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "5030bf8b70be95c43bec7457978606299fd66d7ec3220f57dac8c6f9309058c2"
+}

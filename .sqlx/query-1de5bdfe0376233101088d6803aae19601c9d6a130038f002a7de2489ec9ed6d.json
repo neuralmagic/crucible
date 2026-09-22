@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE issues SET pre_park_status = CASE WHEN status = 'parked' THEN pre_park_status ELSE status END, status = 'parked', parked_reason = $1, parked_by = $2, updated_at = $3 WHERE key = $4",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1de5bdfe0376233101088d6803aae19601c9d6a130038f002a7de2489ec9ed6d"
+}

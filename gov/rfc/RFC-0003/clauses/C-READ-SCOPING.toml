@@ -1,0 +1,11 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-READ-SCOPING"
+title = "Read scoping"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = "Reading a governed resource is the `read` action and MUST be authorized like any other. A list endpoint MUST return only the items the caller may read and MUST NOT reveal whether items were withheld. When a caller lacks `read` on a resource, every action on that resource MUST return the same response as for a resource that does not exist; the structured denial of [[RFC-0003:C-DECISION]] is returned only when the caller may read the resource. A child resource is read under its parent's scope as [[RFC-0003:C-HIERARCHY]] defines, and a resource's shares are read with it. Team memberships and the active policy set are governed resources read under the same rule."

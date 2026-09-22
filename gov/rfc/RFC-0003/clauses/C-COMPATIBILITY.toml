@@ -1,0 +1,11 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-COMPATIBILITY"
+title = "Compatibility and migration"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = "Adoption MUST NOT grant any principal an action the prior mechanisms denied, except grants the active policy set makes explicitly to user owners, team roles, and shares, and every such grant MUST be attributable to a policy rule. Existing governed resources MUST be backfilled with an owner in this precedence: the recorded owner snapshot if present, else the recorded creator, else the platform administrator team. A resource owned by a `group:<path>` principal MUST be migrated to a team whose sole member is that group at the `owner` role, created for the purpose when none exists; the team's slug is the group path's last segment lowercased with every character outside `[a-z0-9-]` replaced by `-`, suffixed with `-2`, `-3`, and so on when taken; the mapping MUST be audited. Existing administrator and operator login and group lists MUST be migrated into a platform administrator team and a platform operator team with policy rules granting the actions those roles gate today, as the route bindings of [[RFC-0003:C-ENFORCEMENT]] record them; the existing cluster policy MUST be migrated into `dispatch` rules under [[RFC-0003:C-CONDITIONS]]. A fresh install, or one whose platform administrator team has no membership that resolves to a user, MUST seed that team from configuration at startup and MUST NOT offer any request path that creates the first administrator. During migration a resource governed by both an existing guard and the new decision MUST be allowed only when both allow. The existing principal spellings `user:<login>` and `group:<path>` MUST remain valid and unchanged; `team:<slug>` and `run:<id>` are additive. The decisions that today define secret ownership and brought-cluster ownership will be amended to defer to this RFC on who may act; their custody, delivery, and probing content is untouched."

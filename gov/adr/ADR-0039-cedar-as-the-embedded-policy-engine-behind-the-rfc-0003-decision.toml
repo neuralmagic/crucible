@@ -1,0 +1,113 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0039"
+title = "Cedar as the embedded policy engine behind the RFC-0003 decision"
+status = "proposed"
+date = "2026-09-13"
+refs = [
+    "RFC-0003",
+    "ADR-0028",
+    "ADR-0030",
+    "ADR-0035",
+]
+
+[content]
+context = """
+[[RFC-0003]] requires one deny-by-default decision for every API operation, taken over a policy set that is stored, validated against a published schema, identified by a content digest, and activated at runtime through the `activate` action. The decision's inputs are a subject set (a user, the groups a credential proves, and the teams those principals reach through a nested-team graph with a role per team), an actor, an action from a fixed `<resource>:<verb>` vocabulary, a resource with an owner principal and an ancestor chain, the shares on that resource and its ancestors, and the current time. It must answer with a structured reason naming the rule that decided. Conditions (a not-after time on a rule or share, per-target `dispatch` admission) are in the first schema version.
+
+The controller has nothing shaped like this. `Roles` is two login lists and a group list read from the environment; `Principals::covers` is an exact-string comparison on secrets and personal dispatch targets; the GitHub approver check is a third allowlist. None of them can be replaced without a redeploy, none names a rule, and none can express a team, a share, or an expiry.
+
+An engine has to give us: a policy language with a schema so an invalid set is refused before activation rather than misbehaving at request time; an entity model with hierarchy, so `user in group in team in team` is a graph the engine walks and not a join the controller writes per route; in-process evaluation, because the decision sits on every request including firings inside the daemon; and diagnostics that name the policy that allowed or forbade, for the structured reason and the audit row."""
+decision = '''
+The decision is evaluated by the `cedar-policy` crate (4.x), embedded in the controller process.
+
+A policy set is Cedar policy text plus a Cedar JSON schema, stored as one `policy_sets` row. Its digest is the SHA-256 of the policy text with `\r\n` folded to `\n` and trailing whitespace stripped per line; the schema is versioned separately by the controller (`schema_version`), because the schema is generated from the Rust action and principal vocabularies and is not policy-author input. The default set ships in the crate as files and is validated at startup with Cedar's validator; a set that fails validation, or fails the two structural checks [[RFC-0003]] names (a rule granting `manage-members` or `transfer` on a team below the `owner` role, or a set under which no user or team principal holds `activate`), is refused with the failing policy id.
+
+Every policy carries an `@id("...")` annotation. The decision's structured reason is the set of policy ids in the response diagnostics, or `no-rule` when the set is empty, and that reason is what the API returns and the audit row stores.
+
+Entities are built per request from what the controller already resolved. The subject is one principal entity (a user, a team firing a standing launch, or a run) whose tags map every principal it acts as to the role it holds there: its own user and each proven group at `owner`, each team at the role membership resolution produced. The engine never walks the team graph; nested membership, group and rule members, and the configured admin and operator lists are resolved by the controller, which is what [[RFC-0003:C-PRINCIPALS]] requires of team principals. The resource is one entity carrying its `id`, `owner`, `owner_kind`, the role the subject holds in that owner (`owner_role`, absent when none), the best unexpired share role the subject holds on it or an ancestor (`share`), and the run it belongs to (`run`). A child's `owner_role` and `share` come from its root, which is how the ancestor chain of [[RFC-0003:C-HIERARCHY]] reaches the engine. The clock is `context.now` as epoch seconds; expiry on a rule compares against it, and an expired share is dropped before the entity is built.
+
+Cedar's own policy templates are not used for shares or memberships. Linking a template per share would make the link table a second policy store with its own digest question; attributes keep the set closed, and the default set decides what a share role confers.
+
+The action vocabulary is a Rust enum. The Cedar schema is rendered from it at startup: one entity type per resource type, a group action per verb so a rule can name `Action::"read"` for every type's read, and one action per `<resource>:<verb>` with its `appliesTo` resource type. A route cannot name an action the schema does not know, and the schema's principal types are rendered from the registered scheme list of [[RFC-0003:C-PRINCIPALS]], so an unregistered scheme has no entity type and denies. Route bindings are a static table of method, path, action, and resolver; a test holds it equal to the served OpenAPI route table, and the binding middleware refuses any route the table does not name.'''
+consequences = """
+The controller gains a new dependency, `cedar-policy`, maintained by Amazon with a stable 4.x line and a published formal semantics. It is a large crate; the controller's build gets longer.
+
+Policy authors write Cedar. The default set is small (owner grants, team-role grants, platform-admin grant, the open platform-target dispatch grant, the run-principal grants), but an operator amending it needs to read Cedar and the schema. The `GET /api/authz/actions` and schema endpoints exist so the vocabulary is discoverable rather than remembered.
+
+Per-request cost is the entity build, which is a team-graph read for the subject and a parent-chain read for the resource, plus an in-memory evaluation. The team graph is small and reads are cached within the group refresh window the RFC already permits for group-derived membership; direct memberships take effect immediately.
+
+The structured reason depends on every policy carrying an `@id` annotation; validation refuses a set with an unannotated or duplicate id.
+
+Shares as entity attributes means share semantics (which actions a `viewer`, `launcher`, `editor` confers) live in the default policy set. That is what [[RFC-0003:C-SHARING]] asks for, and it means an amendment to the share vocabulary is a policy-set change plus an enum change, not a schema migration.
+
+Time is `context.now` in epoch seconds rather than Cedar's `datetime` extension, so the schema has no extension-type dependency and a policy compares two longs. A later amendment can adopt the extension once the crate's stable line ships it without a feature flag.
+
+Nothing about the storage of teams, owners, or shares is decided here: those are Postgres tables in the controller, the engine only sees the entities the controller builds from them."""
+
+[[content.alternatives]]
+text = "Embed cedar-policy and evaluate in-process over entities built per request"
+status = "accepted"
+pros = [
+    "Schema-validated policies: an invalid set is refused before activation, which C-POLICY requires",
+    "Entity hierarchy is native: user in group in team in team is a parents chain the evaluator walks",
+    "In-process, no network hop, usable from the daemon's firing path and the API alike",
+    "Diagnostics name the policies that decided, which is the structured reason and the audit row",
+    "Maintained by Amazon on a stable 4.x line with a formal semantics and a verified evaluator",
+]
+cons = [
+    "A large dependency; the controller build gets slower",
+    "Operators amending policy write Cedar, a language new to this codebase",
+    "Entities are rebuilt per decision, so the team graph read is on the request path",
+]
+
+[[content.alternatives]]
+text = "Embed oso (the polar language library)"
+status = "rejected"
+pros = ["Expressive rule language with role hierarchies in the library's own idiom"]
+cons = [
+    "The open-source library is dormant since January 2024; development moved to a hosted product",
+    "No schema, so a mistyped rule is discovered at request time",
+]
+
+[[content.alternatives]]
+text = "Embed casbin-rs with a PERM model"
+status = "rejected"
+pros = ["Small crate, widely used, model file plus policy CSV is easy to read"]
+cons = [
+    "No schema or type checking over the policy rows; validation would be ours to write",
+    "Matchers are string functions; a nested-team role minimum along a path has no native shape",
+    "No structured reason: an allow is a boolean, not the rule that decided",
+]
+
+[[content.alternatives]]
+text = "Run OpenFGA (Zanzibar relation tuples) as a sidecar service"
+status = "rejected"
+pros = [
+    "Relation tuples model nested teams and shares directly",
+    "Proven at scale for exactly this ownership-and-sharing shape",
+]
+cons = [
+    "A separate Go service with its own datastore; the daemon's firing path would need it reachable",
+    "The Rust client is thin and the tuple store duplicates what Postgres already holds about owners and members",
+    "The policy set becomes an authorization model plus tuples, which does not fit one digest and one activate action",
+]
+
+[[content.alternatives]]
+text = "Biscuit tokens carrying Datalog authorization facts"
+status = "rejected"
+pros = ["Offline attenuation of a credential is elegant for the run principal"]
+cons = [
+    "Authorization facts travel in the token; [[RFC-0003]] wants a server-side decision over server-side state",
+    "Every existing credential path (session, JWT, api key, cluster token) would need a biscuit minted beside it",
+]
+
+[[content.alternatives]]
+text = "Hand-written Rust rules over the same inputs"
+status = "rejected"
+pros = ["No new dependency and every rule is ordinary Rust the team already reviews"]
+cons = [
+    "Not a policy set as data: activate would be a redeploy, and a published schema would be prose",
+    "The structured reason and the validation rules become a second hand-maintained layer over the match arms",
+]

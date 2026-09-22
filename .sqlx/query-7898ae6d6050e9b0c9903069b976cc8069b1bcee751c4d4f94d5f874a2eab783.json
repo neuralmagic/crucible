@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        DELETE FROM scope_transcripts\n        WHERE issue_key = $1\n          AND id NOT IN (\n              SELECT id FROM scope_transcripts WHERE issue_key = $2 ORDER BY id DESC LIMIT $3\n          )\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7898ae6d6050e9b0c9903069b976cc8069b1bcee751c4d4f94d5f874a2eab783"
+}

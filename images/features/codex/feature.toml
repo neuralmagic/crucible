@@ -1,0 +1,8 @@
+summary = "OpenAI Codex CLI"
+layer = 90
+
+[pins]
+codex = "0.154.0"
+
+[capabilities]
+"agent.codex" = { pin = "codex" }

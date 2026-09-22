@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO user_credentials (sub, token_cipher, key_id, failures, created_at, updated_at)\n         VALUES ($1, $2, $3, 0, $4, $4)\n         ON CONFLICT (sub) DO UPDATE\n            SET token_cipher = EXCLUDED.token_cipher,\n                key_id = EXCLUDED.key_id,\n                last_error = NULL,\n                failures = 0,\n                updated_at = EXCLUDED.updated_at",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0049cc8118d58d5acff12ff7caa4c9c7dba5fd348d0eb0826af22ed3e51510ba"
+}

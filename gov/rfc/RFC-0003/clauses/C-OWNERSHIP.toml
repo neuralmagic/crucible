@@ -1,0 +1,11 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-OWNERSHIP"
+title = "Ownership of governed resources"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = "Every governed resource MUST carry exactly one owner principal that is a user or a team. The governed resources are: registered playbooks, playbook drafts, pack imports, autoresearch scopes, standing launches and their triggers (schedules, watches, portals), one-shot launches, runs, secrets and their bindings, model providers and dispatch defaults scoped below the platform, dispatch targets including brought clusters, API keys, policy sets, teams, and every child resource named in [[RFC-0003:C-HIERARCHY]]. An API key's owner MUST be the user it acts as. For a root resource the owner MUST be chosen by the creator from the principals the request acts as, defaulting to the creator's user principal; a creator MUST NOT set an owner they do not act as, and acting as the intended owner is necessary and not sufficient: `create` on that owner is still decided by policy. For a child resource the owner is its parent's owner and is not chosen; `create` on the child is decided against the parent's owner and scope. The owner MUST NOT change except through the `transfer` action on a root resource. Ownership MUST be transferable only to a principal the transferring caller acts as or, for a platform administrator, to any user or team; a transfer that would collide with an identifier the new owner already holds under [[RFC-0003:C-NAMES]] MUST be refused; and every transfer MUST be audited. A resource whose owner is a team MUST remain usable when any individual member leaves; a resource whose owner is a user MUST remain visible to platform administrators so it can be transferred when the user departs."

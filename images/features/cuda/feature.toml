@@ -1,0 +1,24 @@
+summary = "CUDA toolkit for compiling kernels (vllm csrc and friends)"
+layer = 5
+repofiles = ["repos/cuda-rhel10.repo"]
+rpms = [
+    "cuda-minimal-build-13-0",
+    "cuda-libraries-devel-13-0",
+    "cuda-command-line-tools-13-0",
+    "cuda-nvml-devel-13-0",
+]
+
+# 13.0 is the CUDA variant of the PyPI torch wheels vllm 0.28 pins (torch 2.13);
+# a csrc build must link against the same major.minor the baked venv runs.
+intro = """
+CUDA toolkit 13.0 at /usr/local/cuda (CUDA_HOME set, nvcc on PATH). This is
+the CUDA variant the /opt/vllm wheels were built against, so csrc rebuilds link
+cleanly. No GPU driver is in the image; device access comes from the pod spec.
+"""
+
+[env]
+CUDA_HOME = "/usr/local/cuda"
+PATH = "/usr/local/cuda/bin:$PATH"
+
+[capabilities]
+"toolchain.cuda" = "13.0"

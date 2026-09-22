@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE scopes SET approved_by='alice', approved_at='2026-07-02T00:00:00Z' WHERE id=$1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9324fc019c243a8e9aa83d8b757e0742e9ea8b070f935141342278bbba86f063"
+}

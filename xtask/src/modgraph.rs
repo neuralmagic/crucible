@@ -1,14 +1,17 @@
-//! `cargo xtask modgraph [--check] [--json] [SRC_ROOT]`
+//! `cargo xtask modgraph [--check] [--json] [--root SRC_ROOT]`
 //!
-//! Item-level dependency graph of one crate's source tree. Every `.rs` file is a module
+//! Item-level dependency graph of one crate's source tree (the controller's by default). Every `.rs` file is a module
 //! (`a/b.rs` is `a::b`, `a/mod.rs` is `a`, `main.rs`/`lib.rs` are `root`). Each cross-module
 //! reference is resolved through the file's `use` aliases to the item it names, including paths
 //! inside macro bodies. References made from a `#[cfg(test)]` module are tagged `test` and
 //! ignored by the cycle check.
 //!
 //! `--check` fails when any set of modules depends on itself (a strongly connected component of
-//! more than one module). `--json` prints the raw graph for further analysis.
+//! more than one module); `--max-cyclic N` fails only when more than N modules sit in such
+//! components, the ratchet CI holds while the cycles are being broken. `--json` prints the raw
+//! graph for further analysis.
 
+use anyhow::{Context as _, Result};
 use proc_macro2::{TokenStream, TokenTree};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -42,39 +45,31 @@ struct Graph {
     edges: Vec<(Edge, usize)>,
 }
 
-pub fn run(args: &[String]) -> Result<bool, String> {
-    let mut check = false;
-    let mut json = false;
-    let mut root = None;
-    for a in args {
-        match a.as_str() {
-            "--check" => check = true,
-            "--json" => json = true,
-            other if other.starts_with('-') => return Err(format!("unknown flag {other}")),
-            other => root = Some(PathBuf::from(other)),
-        }
-    }
-    let root = root.unwrap_or_else(|| {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("crucible")
-            .join("src")
-    });
-    let graph = extract(&root)?;
+pub fn run(root: &Path, check: bool, max_cyclic: Option<usize>, json: bool) -> Result<bool> {
+    let graph = extract(root)?;
     if json {
-        let out = serde_json::to_string_pretty(&graph)
-            .map_err(|e| format!("serializing the graph: {e}"))?;
+        let out = serde_json::to_string_pretty(&graph).context("serializing the graph")?;
         println!("{out}");
         return Ok(true);
     }
     let cycles = report(&graph);
-    Ok(!check || cycles.is_empty())
+    let cyclic: usize = cycles.iter().map(Vec::len).sum();
+    if check && !cycles.is_empty() {
+        return Ok(false);
+    }
+    if let Some(max) = max_cyclic
+        && cyclic > max
+    {
+        println!("\n{cyclic} modules in cycles exceeds the ratchet of {max}");
+        return Ok(false);
+    }
+    Ok(true)
 }
 
-fn module_of(root: &Path, file: &Path) -> Result<String, String> {
+fn module_of(root: &Path, file: &Path) -> Result<String> {
     let rel = file
         .strip_prefix(root)
-        .map_err(|e| format!("{} is outside {}: {e}", file.display(), root.display()))?
+        .with_context(|| format!("{} is outside {}", file.display(), root.display()))?
         .with_extension("");
     let mut parts: Vec<String> = rel
         .components()
@@ -93,11 +88,11 @@ fn module_of(root: &Path, file: &Path) -> Result<String, String> {
     })
 }
 
-fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
-    let entries = std::fs::read_dir(dir).map_err(|e| format!("reading {}: {e}", dir.display()))?;
+fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    let entries = std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))?;
     for entry in entries {
         let path = entry
-            .map_err(|e| format!("reading {}: {e}", dir.display()))?
+            .with_context(|| format!("reading {}", dir.display()))?
             .path();
         if path.is_dir() {
             walk(&path, out)?;
@@ -169,7 +164,7 @@ impl Collector<'_> {
                 .collect::<Vec<_>>()
         };
         let mut full = match first {
-            "crate" | "crucible" => segs[1..].to_vec(),
+            "crate" | "crucible_controller" => segs[1..].to_vec(),
             "self" => {
                 let mut v = own();
                 v.extend_from_slice(&segs[1..]);
@@ -342,14 +337,14 @@ impl<'ast> Visit<'ast> for Collector<'_> {
     }
 }
 
-fn parse(file: &Path) -> Result<(String, syn::File), String> {
+fn parse(file: &Path) -> Result<(String, syn::File)> {
     let src =
-        std::fs::read_to_string(file).map_err(|e| format!("reading {}: {e}", file.display()))?;
-    let ast = syn::parse_file(&src).map_err(|e| format!("parsing {}: {e}", file.display()))?;
+        std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+    let ast = syn::parse_file(&src).with_context(|| format!("parsing {}", file.display()))?;
     Ok((src, ast))
 }
 
-fn extract(root: &Path) -> Result<Graph, String> {
+fn extract(root: &Path) -> Result<Graph> {
     let mut files = Vec::new();
     walk(root, &mut files)?;
     files.sort();
@@ -387,7 +382,7 @@ fn extract(root: &Path) -> Result<Graph, String> {
         }
         let file = f
             .strip_prefix(root)
-            .map_err(|e| format!("{}: {e}", f.display()))?
+            .with_context(|| f.display().to_string())?
             .display()
             .to_string();
         graph.modules.insert(
@@ -531,4 +526,109 @@ fn top(m: &BTreeMap<&str, usize>) -> Vec<(String, usize)> {
     v.sort_by_key(|(k, n)| (std::cmp::Reverse(*n), k.clone()));
     v.truncate(10);
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::path::Path;
+
+    use crate::modgraph::{cycles, extract, module_of, run};
+
+    fn adj<'a>(pairs: &[(&'a str, &'a str)]) -> BTreeMap<&'a str, BTreeSet<&'a str>> {
+        let mut m: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        for (a, b) in pairs {
+            m.entry(a).or_default().insert(b);
+            m.entry(b).or_default();
+        }
+        m
+    }
+
+    #[test]
+    fn a_module_path_is_its_file_path_with_mod_main_and_lib_folded_into_the_parent() {
+        let root = Path::new("/src");
+        for (file, want) in [
+            ("/src/lib.rs", "root"),
+            ("/src/main.rs", "root"),
+            ("/src/api.rs", "api"),
+            ("/src/api/mod.rs", "api"),
+            ("/src/api/tests.rs", "api::tests"),
+            ("/src/secrets/store.rs", "secrets::store"),
+        ] {
+            assert_eq!(module_of(root, Path::new(file)).unwrap(), want, "{file}");
+        }
+        assert!(module_of(root, Path::new("/elsewhere/x.rs")).is_err());
+    }
+
+    #[test]
+    fn cycles_are_the_components_of_more_than_one_module_largest_first() {
+        let graph = adj(&[
+            ("a", "b"),
+            ("b", "a"),
+            ("c", "d"),
+            ("d", "e"),
+            ("e", "c"),
+            ("e", "f"),
+            ("f", "g"),
+        ]);
+        assert_eq!(
+            cycles(&graph),
+            vec![
+                vec!["c".to_string(), "d".to_string(), "e".to_string()],
+                vec!["a".to_string(), "b".to_string()],
+            ]
+        );
+        assert!(cycles(&adj(&[("a", "b"), ("b", "c")])).is_empty());
+    }
+
+    #[test]
+    fn a_crate_with_a_cycle_fails_check_and_passes_a_ratchet_that_allows_it() {
+        let dir = std::env::temp_dir().join(format!("modgraph-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("lib.rs"),
+            "pub mod a;
+pub mod b;
+pub mod c;
+",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("a.rs"),
+            "pub struct A;
+pub fn f() -> crate::b::B { crate::b::B }
+",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("b.rs"),
+            "use crate::a::A;
+pub struct B;
+pub fn g() -> A { A }
+",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("c.rs"),
+            "pub fn h() -> crate::a::A { crate::a::A }
+",
+        )
+        .unwrap();
+        let graph = extract(&dir).unwrap();
+        let edge = |from: &str, to: &str, item: &str| {
+            graph
+                .edges
+                .iter()
+                .any(|(e, _)| e.from == from && e.to == to && e.item == item && !e.test)
+        };
+        assert!(edge("a", "b", "B"));
+        assert!(edge("b", "a", "A"), "a `use` alias resolves to its item");
+        assert!(edge("c", "a", "A"));
+        assert!(!run(&dir, true, None, false).unwrap());
+        assert!(run(&dir, false, Some(2), false).unwrap());
+        assert!(!run(&dir, false, Some(1), false).unwrap());
+        assert!(run(&dir, false, None, false).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -1,0 +1,11 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-SHARING"
+title = "Per-resource shares"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = "A subject holding `share` on a governed resource MAY grant another principal a share role on that one resource. A share names the resource, the grantee principal, a share role from a fixed vocabulary of at least `viewer` (`read`), `launcher` (`read` and `launch`), and `editor` (`read`, `update`, `launch`, `bind`), and optionally a not-after time under [[RFC-0003:C-CONDITIONS]]. A share role confers only the actions the resource type defines. A share MUST NOT confer `transfer`, `delete`, `share`, `approve`, `activate`, or `manage-members`, and a grant of a role containing any action the sharer does not hold on the resource MUST be refused rather than clipped. A share is a resource-scoped rule stored with the resource, outside the digested policy set of [[RFC-0003:C-POLICY]]; the shares on a resource are part of its `read`. A share MUST be revocable by any subject holding `share` on the resource or by a platform administrator, and MUST be audited on grant, change, and revocation. Transferring a resource MUST preserve its shares. A share on a parent applies to its children under [[RFC-0003:C-HIERARCHY]]; a share is otherwise never inherited."

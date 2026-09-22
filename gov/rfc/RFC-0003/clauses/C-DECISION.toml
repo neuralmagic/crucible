@@ -1,0 +1,11 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-DECISION"
+title = "One authorization decision"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = "Every API operation MUST be authorized by one decision that takes: the subject principal set and the team role held under each team principal in it; the actor; one action from [[RFC-0003:C-ACTIONS]]; the resource type, the resource's owner principal, its ancestor chain under [[RFC-0003:C-HIERARCHY]], and where the action is `dispatch` the resolved target (or, for `create` and listing, the resource type with the intended owner and parent); the active policy set; the shares on the resource and its ancestors; and the current time. It MUST answer allow or deny with a structured reason naming the rule that decided or the absence of one. The decision MUST be deny by default: an empty subject set, an action outside the vocabulary, or an unresolvable resource MUST deny. The same decision MUST serve the browser, the API-key path, the MCP surface, run principals, and non-interactive re-checks, so that what a preview shows, what a launch is refused with, and what a firing standing launch may do agree. A standing launch, watch, or portal MUST fire with its owner as subject and that owner's memberships resolved at firing time, never from a stored snapshot; when the owner is a team, the firing's subject is that team principal at the `maintainer` role. The actor of a firing is the submitter when one exists, otherwise the owner. A firing whose owner cannot be resolved (a deleted user, a team with no resolvable member) or whose decision denies MUST be refused, handled under [[RFC-0001:C-RECURRING-POLICY]], and audited. An `update` that changes what a standing launch fires (its playbook, inputs, resolved target, or bindings) MUST additionally be decided as a launch by the updating subject, who MUST hold `launch` on the playbook, `dispatch` on the resolved target, and `bind` on each bound secret, or the update MUST be refused. Roles, ownership, team membership, shares, and approver sets MUST all be inputs to this one decision; an endpoint MUST NOT consult an independent allowlist, environment list, or role check instead of it. Disclosure of a denial is governed by [[RFC-0003:C-READ-SCOPING]]."

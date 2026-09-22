@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT key AS \"key!\" FROM issues WHERE status <> 'done' ORDER BY key",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "key!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "7cbfb32625a8f5cd22301cdaf67b4648f91c0d237ff93a316bb0c13aa195a14b"
+}

@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT kind AS \"tag!: String\", SUM(cost_usd) AS \"total_usd!: f64\"\n        FROM ledger WHERE substr(ts, 1, 10) = $1\n        GROUP BY kind ORDER BY SUM(cost_usd) DESC, kind ASC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "tag!: String",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "total_usd!: f64",
+        "type_info": "Float8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "69a7dc2e8f73f43312f0cef140571ac730baeb93b66c819d3e3e89212097b59a"
+}

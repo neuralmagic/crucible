@@ -1,0 +1,11 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-RUN-PRINCIPAL"
+title = "Run principal"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = "Every run MUST act under its own principal `run:<run id>`, proven by a credential issued at dispatch that proves only that run, and MUST NOT act under its launcher's or owner's credential. The run principal's subject set is the run principal alone; its actor is the owner principal of the launch that produced it. The default policy set MUST grant a run principal exactly: `read` on its launch, on itself, and on their children under [[RFC-0003:C-HIERARCHY]]; and `publish` on itself, where `publish` is recording an output the launch's declared exposure permits under [[RFC-0001:C-EXPOSURE]]. Task logs, artifacts, events, and spend are recorded through the pod-bound ingest surface that [[RFC-0003:C-ENFORCEMENT]] places outside this contract and are not actions of the run principal. The grants of the policy set and vocabulary to authenticated user principals do not extend to run principals. A run credential MUST expire when the run reaches a terminal state and MUST be refused after that regardless of expiry. A request under a run principal for any resource outside its launch MUST return the not-found response of [[RFC-0003:C-READ-SCOPING]]."

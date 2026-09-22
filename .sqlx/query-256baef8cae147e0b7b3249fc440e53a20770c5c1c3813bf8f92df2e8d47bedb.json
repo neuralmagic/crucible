@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE builds SET state = 'dispatched', dispatch_id = $1, dispatched_at = $2 WHERE id = $3 AND state = 'pending'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "256baef8cae147e0b7b3249fc440e53a20770c5c1c3813bf8f92df2e8d47bedb"
+}

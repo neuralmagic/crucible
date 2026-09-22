@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT r.issue AS \"key!\", r.run_id AS \"run_id!\"\n        FROM runs r\n        WHERE r.dispatch = 'local' AND r.status = 'running' AND r.issue IS NOT NULL\n        ORDER BY r.seq\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "key!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "run_id!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      true,
+      false
+    ]
+  },
+  "hash": "b1afe75f9c7335b32d563a959f8748fffe6c8e2ad95469d4211742f5fc793167"
+}

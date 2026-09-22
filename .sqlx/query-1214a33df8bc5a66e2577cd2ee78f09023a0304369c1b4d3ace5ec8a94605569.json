@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT scope, session_uri, status FROM runs WHERE run_id = 'adopted-1'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "scope",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "session_uri",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "status",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "1214a33df8bc5a66e2577cd2ee78f09023a0304369c1b4d3ace5ec8a94605569"
+}

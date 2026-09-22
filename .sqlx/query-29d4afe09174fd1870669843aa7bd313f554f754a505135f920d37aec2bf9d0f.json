@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE playbook_draft_versions SET schema_digest = 'sha256:moved' WHERE version = 3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "29d4afe09174fd1870669843aa7bd313f554f754a505135f920d37aec2bf9d0f"
+}

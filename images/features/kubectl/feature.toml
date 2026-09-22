@@ -1,0 +1,13 @@
+summary = "kubectl for talking to the rig from .nu tools and packs"
+layer = 30
+
+intro = """
+kubectl v{pin.kubectl} is at /usr/local/bin/kubectl; the kubeconfig, when
+one is provided, comes from the environment, not the image.
+"""
+
+[pins]
+kubectl = "1.31.0"
+
+[capabilities]
+"tool.kubectl" = "1.31"

@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE issues SET evidence_url = 'https://tampered' WHERE key = 'owner/repo#3'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "52fc72b0c367b5c14f07d3fa583af0e41c43adf13144b62536fb028bdb037300"
+}

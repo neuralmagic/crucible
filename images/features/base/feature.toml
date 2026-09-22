@@ -1,0 +1,39 @@
+summary = "Substrate every sandbox assumes: vcs, shell tooling, node, python + uv"
+layer = 0
+rpms = [
+    "git",
+    "jq",
+    "tar",
+    "gzip",
+    "unzip",
+    "which",
+    "findutils",
+    "procps-ng",
+    "rpm",
+    "skopeo",
+    "nodejs",
+    "npm",
+    "python3.12",
+    "python3.12-pip",
+]
+
+intro = """
+Python 3.12 is `python3.12`; use `uv` for all python package work. Git, `jq`,
+`gh` (works unauthenticated against public GitHub), node/npm, `ujira` (JIRA MCP
+server), and `cargo-binstall` are on PATH in /usr/local/bin.
+"""
+
+[pins]
+uv = "0.8.14"
+gh = "2.98.0"
+cargo-binstall = "1.22.0"
+ujira = "0.7.0"
+
+[capabilities]
+"tool.skopeo" = "1"
+"vcs.git" = "2"
+"runtime.node" = "22"
+"runtime.python" = "3.12"
+"python.uv" = "0.8"
+"tool.gh" = "2"
+"mcp.ujira" = "0.7"

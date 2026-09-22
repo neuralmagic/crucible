@@ -1,0 +1,70 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0040"
+title = "Retire the stdio MCP server and the personal bearer paths in favor of minted api keys"
+status = "proposed"
+date = "2026-09-15"
+refs = ["ADR-0035"]
+
+[content]
+context = """
+The `crucible-mcp` crate grew three ways to prove who a caller is, each built when it was the only path that worked against the deployment: a cluster token read from the kubeconfig and resolved by the controller against its own cluster's `users/~` (with an automatic `oc login --web` on expiry and a `kubectl port-forward` fallback), an OIDC device grant whose cached JWT the controller validated against a public device-flow client, and break-glass identity headers the process wrote by hand. Around them sat a stdio MCP server, because a stdio server on a laptop was how an agent reached the tools before the controller hosted them.
+
+[[ADR-0035]] admitted a minted `crk_` key on the human router beside the MCP surface, and the controller has hosted the same tools at `/mcp` over HTTP since. In the deployment as run, `auth.kubeBearer` is disabled, no device-flow client is provisioned, native mode drops asserted headers, and the machine Route exposes `/api` and `/mcp` on one hostname. Every one of the personal bearer paths is therefore either off or dead against the controller it targets, and the stdio server duplicates a surface the controller already serves with a credential the SPA already mints.
+
+What the extra paths cost is real: the crate carried a kubeconfig parser, an OIDC client, a subprocess supervisor, and three auth precedence rules, each with a chart knob, a render guard, a golden, and a doc section; and the served co-draft handoff still told a human to run a login that no deployment could answer.
+"""
+decision = """
+One credential reaches the controller from a machine: a bearer in `CONTROLLER_API_TOKEN`, which is a minted `crk_` key that authenticates as its owner, or the static controller token that authenticates as nobody. `crux` reads it from a flag, an env var, or `api_token` in `config.toml` under `$XDG_CONFIG_HOME/crux`, and sends it on every request. It resolves no other credential, spawns no subprocess, and runs no login.
+
+The crate is `crux`: a CLI, and the tool library the controller embeds at `/mcp`. The stdio server, the `login` and `logout` subcommands, the `crucible-mcp` binary, and the break-glass flags are removed rather than deprecated, because nothing that spoke to them survives.
+
+The chart no longer offers `auth.kubeBearer`, `auth.jwtBearer`, or `auth.oidc.deviceClientId`; the machine Route is documented as the api-key surface it is. The co-draft handoff mints a key on the Settings page and points the MCP client at the hosted `/mcp`.
+"""
+consequences = """
+An agent in a shell and an agent on MCP hold the same credential, so the question of which surface a capability belongs on is argued on its merits, as [[ADR-0035]] anticipated.
+
+Key lifecycle is the whole access story for machines. Expiry, revocation, and `last used` on the Settings page matter more, and a leaked key reaches every API route its owner can.
+
+A deployment with no issuer cannot mint a key and so has no MCP path at all; it reaches `/api` with the static bearer only. Local development of the co-draft loop moves to a deployment with an issuer.
+
+Existing `~/.config/crucible-mcp/config.toml` files are not read; the directory is `crux`, and a file carrying a retired key is refused with the key named, so a stale file fails loudly rather than being half-honored.
+
+The controller's cluster-token and device-client bearer code stays behind env vars the chart no longer sets until its removal, with the tests that prove it, is approved on its own; nothing routes a caller to either path in the deployment as run.
+"""
+
+[[content.alternatives]]
+text = "Remove the stdio server and the personal bearer paths; one api-key credential for CLI and MCP"
+status = "accepted"
+pros = [
+    "One credential and one precedence rule; the crate loses a kubeconfig parser, an OIDC client, and a subprocess supervisor",
+    "The chart, the docs, and the served co-draft handoff describe the path the deployment actually answers",
+    "The hosted /mcp already exists, so nothing an agent could do is lost on the deployment",
+]
+cons = [
+    "A deployment with no issuer loses its only MCP path",
+    "Every existing config file and MCP client entry has to be redone once",
+]
+
+[[content.alternatives]]
+text = "Keep the stdio server and the login paths behind deprecation warnings for a release"
+status = "rejected"
+pros = [
+    "Nobody's config breaks on the day the PR lands",
+]
+cons = [
+    "The paths are already dead against the deployment, so the warning period protects nothing but the code's own weight",
+    "Two credentials and two surfaces stay documented, and the co-draft handoff keeps offering a login that cannot succeed",
+]
+
+[[content.alternatives]]
+text = "Admit the static bearer and the open guard on /mcp so an issuer-less deployment keeps an MCP path"
+status = "rejected"
+pros = [
+    "Local development would keep its MCP loop without a key",
+]
+cons = [
+    "Reopens the guard separation [[ADR-0035]] preserved: the MCP surface would take a credential that names nobody",
+    "Solves a development convenience with a change to the production surface's admission rule",
+]

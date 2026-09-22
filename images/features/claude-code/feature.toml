@@ -1,0 +1,9 @@
+summary = "Claude Code CLI"
+layer = 90
+
+[pins]
+claude-code = "2.1.274"
+node = "22.16.0"
+
+[capabilities]
+"agent.claude-code" = { pin = "claude-code" }

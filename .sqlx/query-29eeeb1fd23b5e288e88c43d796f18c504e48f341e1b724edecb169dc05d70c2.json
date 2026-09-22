@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE issues SET priority = $1, updated_at = $2 WHERE key = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "29eeeb1fd23b5e288e88c43d796f18c504e48f341e1b724edecb169dc05d70c2"
+}

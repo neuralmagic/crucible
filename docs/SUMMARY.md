@@ -30,6 +30,7 @@
 
 - [RFC-0001: Implementation contract](./rfc/RFC-0001.md)
 - [RFC-0002: Playbook workflows](./rfc/RFC-0002.md)
+- [RFC-0003: Teams, ownership, and policy-based authorization](./rfc/RFC-0003.md)
 - [RFC-0004: Linked controller/engine boundary](./rfc/RFC-0004.md)
 
 # Architecture decisions

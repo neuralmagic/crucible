@@ -1,0 +1,11 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-TEAMS"
+title = "Teams"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = "A team is a controller-managed record with a unique slug, a display name, and a member set. Each member MUST be a user principal, a group principal, another team, or a membership rule, paired with a team role. Team roles are totally ordered `member` < `maintainer` < `owner`; an amendment adding a role MUST place it in this order. A membership rule is a predicate over attributes of a controller-validated identity (at least: email domain, and group path prefix); it MUST be evaluated only against attributes the identity layer verified, and a change to a rule MUST be audited like a change to a listed member. Team membership MUST form a directed acyclic graph and a membership that would close a cycle MUST be refused. Along a nesting path the conferred role is the minimum of the roles on that path; a user's role in a team is the maximum over all paths that reach them. Group-derived and rule-derived membership MUST reflect the identity provider within one group refresh window. A team is itself a governed resource whose owner principal is the team; a team is not transferable and `transfer` on a team MUST deny. On creation the request MUST list at least one member at the `owner` role that currently resolves to a user; absent an explicit list, the creator is listed at `owner`. Creating a team, changing its members, rules, or roles, renaming it, and deleting it MUST be authorized by the decision in [[RFC-0003:C-DECISION]] and audited as [[RFC-0003:C-AUDIT]] requires. A team MUST NOT be deleted while it owns any other governed resource; the refusal MUST name the blocking resources the caller may read and the count of any others. A team none of whose memberships currently resolve to any user MUST remain the owner of its resources and MUST be listed as unreachable in the team listing available to platform administrators. Platform administration MUST be a team, so that administrator membership can be held through a group and changed without a redeploy."

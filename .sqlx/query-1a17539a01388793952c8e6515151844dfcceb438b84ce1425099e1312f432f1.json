@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE user_credentials\n                 SET token_cipher = $2, key_id = $3, refreshed_at = $4, updated_at = $4,\n                     last_error = NULL, failures = 0\n                 WHERE sub = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1a17539a01388793952c8e6515151844dfcceb438b84ce1425099e1312f432f1"
+}

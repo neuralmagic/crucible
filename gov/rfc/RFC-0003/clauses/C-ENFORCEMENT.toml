@@ -1,0 +1,11 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-ENFORCEMENT"
+title = "Enforcement at the boundary"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = "Every served route MUST be bound to exactly one action and one resource resolution, and a request to a route with no binding MUST be denied for every caller. The route-to-action bindings MUST be retrievable so that conformance can be checked against the served route table. A response MUST NOT reflect any effect of a request the decision denied. A list MAY be narrowed only by applying the same decision per item. Machine surfaces that authenticate by a pod-bound credential rather than a principal (the ingest drop-box, metrics) are outside this contract and MUST NOT be granted any action from [[RFC-0003:C-ACTIONS]]."

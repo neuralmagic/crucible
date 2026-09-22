@@ -1,0 +1,289 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0042"
+title = "Pluggable rig backends — defer the rig to an external renderer (burrito + Kueue + ephemeral namespaces)"
+status = "proposed"
+date = "2026-06-30"
+
+[content]
+context = """
+Related: [ADR-0012](./0012-rendered-deployments.md) (rendered deployments — this generalizes the rig
+half into a pluggable backend), [ADR-0009](./0009-composite-domains.md) (the composite rig that needs
+standing up), [ADR-0005](./0005-engine-side-builds.md) (forge builds the candidate the backend applies),
+[ADR-0004](./0004-core-loop-state-model.md) (park/resume — the loop must survive a preempted/recreated
+rig), [ADR-0002](./0002-mediated-provisioning-mcp.md) (the broker still holds the privileged approvals),
+[ADR-0001](./0001-adaptive-harness.md) (the rig is the frozen workload, out of the loop's reach).
+
+Standing up a crucible loop on a cluster today is a six-step, personal-credential runbook
+(see [Getting started, Act 3](../getting-started.md)), and it doesn't scale to a team:
+
+- **Every teammate replays admin work**, with *their own* tokens against *personal* namespaces.
+- **The rig is hand-rolled.** `deploy/<domain>/<overlay>/up.sh` is bespoke per rig: a `helm upgrade`,
+  a `modelservers.yaml`, a GAIE CRD check, an HF-token secret, and a `gpu-pruner.io/ack-until=+24h`
+  annotation hack to stop the cluster's idle-GPU reaper from reclaiming the rig during the agent's
+  think-time. Fighting the scheduler instead of using it.
+- **No isolation, no lifecycle.** The rendered loop pod is `<composite>-loop` in a shared persistent
+  namespace, so two teammates collide; nothing reclaims a rig when a run dies.
+
+The sister repo `neuralmagic/llm-d-downstream-infra` already runs llm-d benchmarks at team scale in CI
+on **[burrito](https://github.com/neuralmagic/burrito)**: rigs are **helmfiles**, `burrito run` renders
+them, wraps the workloads in an **AppWrapper**, admits via **Kueue** in an **ephemeral namespace**,
+overrides the candidate with `--vllm-image`, injects **Vector metrics sidecars** (→ NDJSON on a PVC),
+runs a **GuideLLM benchmark Job**, and cleans up. Shared `base/kueue/` holds the ClusterQueue,
+ResourceFlavors and TAS topology; the pull secret is copied from a shared `llm-d-pull-secrets`
+namespace; cross-repo auth is a GitHub App identity, not personal PATs.
+
+That's the substrate Act 3 should sit on. But crucible should **not** marry burrito: burrito is one
+opinionated way to materialize a rig, and adapting every future domain to its model is expensive. The
+right abstraction is to treat rig provisioning as a **pluggable backend** that crucible *defers the
+render to*, the same way it already defers proposal to a pluggable `[agent].backend`. Burrito is the
+reference backend; the existing helm path becomes another.
+
+One genuine mismatch to resolve, not assume away: **burrito's rig model is one-shot jobs**
+(deploy → benchmark → teardown), while crucible's loop is iterative. Whether crucible holds one warm
+rig and swaps candidates into it, or runs a burrito one-shot per candidate, is the central open
+question this ADR's spike answers (see [Open question](#open-question-the-one-shot-vs-warm-rig-spike))."""
+decision = """
+Introduce a **pluggable rig backend** and make burrito the reference implementation. Split Act 3 into a
+platform layer (set up once) and a one-command self-serve layer (any teammate).
+
+## 1. A first-class `[rig].backend`, analogous to `[agent].backend`
+
+The manifest selects how the live rig is materialized, the engine doesn't hardcode it. `burrito` and
+`helm` are **compiled-in** backends; `command` is the escape hatch that runs user-provided commands,
+exactly mirroring `[agent].backend` (`local`/`openshell`/`command`).
+
+The rig definition can be **external** (referenced, shared with CI) or **inline** (vendored in the
+domain) — both are supported:
+
+```toml
+# external: reference a rig def that lives in llm-d-downstream-infra (single source of truth with CI)
+[rig]
+backend = "burrito"
+def     = "llm-d-downstream-infra//ci/helmfiles/pd@<ref>"
+
+# inline: vendor the helmfile/overlay in the crucible domain
+[rig]
+backend  = "helm"
+helmfile = "rigs/lora-routing/helmfile.yaml.gotmpl"
+overlay  = "rigs/lora-routing/overlays/ci"
+```
+
+crucible **defers rendering to the backend** (an external renderer): burrito renders its own
+helmfile → AppWrapper → Kueue; it is not crucible's job to know the rig's YAML. If burrito needs a
+contract change to serve the loop, that's acceptable and expected (see the spike).
+
+## 2. The RigBackend contract surface
+
+```
+up(namespace)            -> RigHandle { endpoints, ... }   # render + admit + wait-ready, into a given ns
+apply_candidate(ref)     -> ()        # swap the digest-pinned candidate onto the rig
+benchmark()              -> Bundle    # run the workload, return the metrics bundle location
+down()                   -> ()        # teardown (and, where the backend owns it, the rig)
+```
+
+- **The backend owns `apply_candidate`.** forge builds the digest-pinned candidate (ADR-0005); the
+  backend swaps it onto the rig because *it* knows the deployment/container topology (burrito's
+  `--vllm-image` is exactly this). crucible never needs per-rig topology knowledge.
+- **The backend runs the benchmark.** Measurement is post-hoc over the bundle (§4).
+- `up`/`down` are deliberately vague on rig *lifetime* (one warm rig vs one-shot per candidate); the
+  spike settles that and pins the contract (see [Open question](#open-question-the-one-shot-vs-warm-rig-spike)).
+
+## 3. crucible owns the (ephemeral) namespace; the backend renders into it
+
+crucible creates the run's namespace (plus minimal RBAC) and **injects it** into the backend
+(`up(namespace)`), rather than letting each backend invent its own. burrito already supports rendering
+into a pre-created namespace, so this composes. Today rigs may land in a persistent namespace; the
+**direction is a fully ephemeral, run-id-scoped rig namespace** (`crucible-<rig>-<run_id>`), which is
+what gives collision-free concurrent team use and automatic cleanup. Owning the namespace centrally
+(not per-backend) keeps that property backend-agnostic.
+
+## 4. Measurement: the backend benchmarks, the gate reads the bundle
+
+Each iteration the backend runs its benchmark (burrito's GuideLLM job), and crucible's gate reads the
+resulting **metrics bundle** post-hoc to emit `{valid, score}`. Because the workload is the *same*
+GuideLLM benchmark CI runs, the loop optimizes the exact number CI regresses on, closing the gate/CI
+drift gap from earlier isolation work.
+
+**Amendments (2026-07-01):**
+
+- **Scoring locus: the engine, not the broker or the backend.** The backend runs the workload and
+  produces the bundle; the **engine** runs the domain's `measure_cmd` over it — `measure_cmd` stays the
+  single engine↔domain contract (ADR-0009's rule, unchanged). The §11 rig tools only *relay* the
+  engine-computed `{valid, score}`; no backend ever computes a score.
+- **Paired baseline per one-shot.** Under the one-shot model every measurement lands on a fresh rig
+  instance, so cross-instance variance would sit inside the gate. Each one-shot job therefore includes
+  a **baseline reference measurement on the same rig instance**, and the gate scores the candidate as
+  the delta against it (ADR-0001 safeguard 3 adapted: the frozen baseline becomes a frozen *paired
+  procedure*). Costs ~2× benchmark time per candidate, not 2× rig standups.
+- **Run identity.** The rig definition ref (`[rig].def` / helmfile@ref) and the backend name+version
+  join the ADR-0008/0009 comparability tuple; two runs are comparable only if those match too.
+
+**The bundle and the `measure_cmd` are co-designed as a pair — a domain concern — and this refactor
+does not change that.** crucible does *not* impose a normalized cross-backend bundle schema: the
+backend produces a bundle, and the domain's `measure_cmd` is authored against *that* bundle, exactly
+as today. Re-pointing a rig at a different backend may mean re-co-designing the bundle↔measure pair
+for it; that is expected, not a regression. (The bundle is the whole Vector→NDJSON set burrito already
+produces, so for the burrito backend the gate is typically a post-hoc read with no bespoke scraping.)
+
+## 5. Port the existing helm rig as a backend (don't force burrito on everyone)
+
+Define the boundary and ship **two** real implementations: the existing `up.sh`/helm logic as a
+`helm` backend, and a `burrito` backend. This proves the abstraction with more than one impl and keeps
+a no-Kueue / less-opinionated option for domains that shouldn't take on burrito's full model. Kueue
+admission (via the burrito backend) replaces the gpu-pruner ack hack for rigs that use it.
+
+The helm backend is **ported at parity first** — today's persistent shared namespace + gpu-pruner
+ack — to keep churn on the working path low. Whether the helm backend *also* adopts the ephemeral
+namespace model (§3) is **deferred until the spike settles burrito's namespace lifecycle**, then
+revisited; ephemeral + Kueue is the burrito backend's property to start.
+
+## 6. Kueue: a dedicated cohort for interactive loops
+
+Interactive loops get their **own ClusterQueue / quota, separate from CI benchmarks**, so the two
+don't preempt each other. A human is waiting on a loop; a CI run is retryable; carving the GPU pool by
+cohort keeps both predictable rather than racing.
+
+## 7. The loop pod stays crucible's; the backend provides only the rig
+
+`crucible run` creates the lightweight (CPU) loop pod into the run namespace; the backend provides the
+GPU rig. (How the loop pod itself is rendered, reuse ADR-0012 or create it directly, is an
+implementation detail under `crucible run`, not a fork in this decision.)
+
+## 8. Credentials (W4) are a separate later phase
+
+The identity overhaul, shared `llm-d-pull-secrets` source ns, a team machine identity for push/PRs,
+workload identity for cloud, External Secrets, is **deferred to its own phase after W0/W3**. The spike
+and sprint-1 reuse existing creds. The ADR-0002 trust boundary is unchanged throughout.
+
+## 9. One cluster now, multi-cluster-ready
+
+Build for `wharf`, but keep the backend cluster-agnostic and per-cluster facts in the
+profile, so a second cluster is a new profile, not a refactor. No multi-cluster orchestration yet.
+
+## 10. The self-serve surface
+
+```
+# platform owner, once per cluster (mostly: depend on llm-d-downstream-infra/base + the loop cohort)
+crucible platform init --cluster wharf
+
+# any teammate, per run
+crucible run <rig> --goal goals/<g>.md     # run-id ns + backend-provisioned rig + loop + tail, isolated
+crucible ps                                # active runs across the team
+```
+
+## 11. Agent-facing rig tools over MCP, with per-run delegated auth (ADR-0002)
+
+In the one-shot model the sandboxed agent has **zero cluster privilege** (ADR-0002 deny-by-default),
+so "request a rig/benchmark job and monitor it" is a set of **mediated broker tools**, extending the
+proven async `deploy_composite` → `deploy_status` pattern. Dedicated tools (not a reused deploy tool):
+
+```
+rig_run(rig, candidate_ref)      -> { run_id }          # submit a one-shot job, returns immediately
+rig_status(run_id)               -> { phase, queue_pos, result? }
+rig_logs(run_id [, cursor])      -> { chunk, next_cursor }   # on-demand, pull-based
+rig_result(run_id)               -> { bundle_ref, result }
+```
+
+- **Transport stays stateless.** The agent polls `rig_status` (the broker is stateless because stateful
+  mode currently makes Claude Code surface zero tools, the `get_info` capability gotcha). `rig_status`
+  returns a coarse `phase` (queued/admitted/running/benchmarking/done/failed) and the Kueue
+  `queue_pos` while waiting; on completion it carries the `bundle_ref` and the broker-computed
+  `{valid, score, note}`. `rig_logs` is pulled on demand (optionally cursor-paged) so a long log tail
+  never floods the agent's context. SSE/streaming progress is a future option, contingent on fixing the
+  stateful tool-discovery regression first.
+- **Per-run delegated auth.** The broker mints a **short-lived, per-run credential** (a per-run
+  ServiceAccount token) scoped to the run's ephemeral namespace, and the one-shot job runs under it, so
+  the job's blast radius is the run namespace. The agent's MCP call carries no cluster privilege; the
+  broker holds the host creds and does the minting (the ADR-0002 boundary is unchanged). **This in-cluster
+  per-run delegation is distinct from the deferred W4 work** (where the broker's *own* creds come from,
+  machine/workload identity, ESO): the rig tools get scoped delegation now; W4 is the credential-source
+  overhaul later.
+- **Score stays host-side, computed by the engine.** On job completion the **engine** runs the domain's
+  `measure_cmd` over the bundle (§4 amendment); the broker relays the result in `rig_status`/`rig_result`.
+  The gate never enters the sandbox and never leaves the engine (ADR-0001/0009 trust boundary).
+- **Admission is quota + cap, never open-ended.** `rig_run` is agent-initiated GPU spend, so it is
+  bounded twice: the loop cohort's ClusterQueue quota (§6, team fair-share) and a **broker-enforced
+  per-run budget** (max rig runs / GPU-minutes from the manifest, like the existing per-turn cap), so a
+  looping agent can't starve its own cohort. This is ADR-0002's "the agent cannot provision" stated for
+  rigs: the agent asks; quota and cap admit.
+
+## Open question: the one-shot vs warm-rig spike
+
+burrito's entire rig model is one-shot jobs. Before W0 commits to a contract, a spike must prove that
+model is compatible with an iterative agent loop, specifically that **the agent can request a
+rig/benchmark run and monitor its progress, and the measurement gates produce valid scores off the
+bundle**. Two candidate shapes for `apply_candidate` + `benchmark`:
+
+- **(a) Warm rig:** `up` once, hold the rig admitted for the loop, `apply_candidate` swaps the image
+  in place, `benchmark` re-runs against the warm rig. Fast per iteration; needs a burrito "admit and
+  hold, don't tear down" affordance (`--no-cleanup` + pre-created ns gets close).
+- **(b) One-shot per candidate:** each iteration is a fresh burrito run (rig + candidate + benchmark +
+  teardown) that the agent requests and monitors. Uses burrito as-is; pays a cold start per iteration.
+
+**Working hypothesis: (b) one-shot-per-candidate.** It uses burrito untouched, the agent requests a
+fresh `burrito run` per candidate and monitors it via the `rig_*` tools (§11), trading a per-iteration
+cold start for zero burrito-side changes and the simplest lifecycle (no warm rig to hold or
+garbage-collect). The spike's job is to *refute* it, the failure modes to watch are the cold-start
+cost per iteration, the agent's request/monitor UX over polling, and gate correctness off the bundle
+(scored as the paired-baseline delta — see the §4 amendments).
+We fall back to (a) warm-rig only if (b) proves too slow or flaky.
+
+The spike confirms or refutes (b) on a real rig (lora-routing) and feeds the W0 contract: (b) holding
+lets W0 ship without a burrito-side change (and makes the "hold the warm rig" affordance unnecessary);
+(a) winning files that affordance. Its outcome also gates the helm backend's namespace model (§5):
+once the burrito lifecycle is settled, we revisit whether `helm` adopts the ephemeral ns or stays
+persistent.
+
+## Workstreams
+
+| # | Workstream | Notes |
+| --- | --- | --- |
+| **Spike** | One-shot vs warm-rig on lora-routing (agent request/monitor + gate correctness) | Picks (a)/(b); de-risks W0 |
+| **W0** | `[rig].backend` abstraction + RigBackend contract; port `helm`, add `burrito` | Keystone; retires `up.sh`/gpu-pruner hack |
+| **W2** | Broker `rig_*` MCP tools (run/status/logs/result) + per-run scoped credential minting | The agent's mediated path to one-shot jobs (§11); pairs with W0 |
+| **W3** | `crucible run <rig>` one-shot (preflight → backend up → loop → teardown), run-id ns isolation | Sprint 1 with W0 |
+| **W1** | Deploy profile → cluster-identity base + per-run overlay (no copy-paste) | Multi-cluster-ready |
+| **W5** | `crucible ps` / team run status (wrap `burrito list`/`monitor` + the leaderboard) | |
+| **W6** | `crucible platform init` (depend on `llm-d-downstream-infra/base` + the loop cohort) | |
+| **W4** | Credentials: shared pull-secret ns + machine identity + workload identity + ESO | **Deferred to its own phase** |
+| **Dep** | burrito "hold the warm rig" affordance (`--no-benchmark --wait-ready`) | Only if the spike picks (a) |
+
+**Slicing:** **spike** first; then **sprint 1: W0 + W2 + W3** (backend + its mediated tools + the one
+command); then **W1 + W5 + W6**; then the **W4 phase**.
+Tracked in epic **ACME-8332**."""
+consequences = """
+**Good:**
+- Act 3 collapses to `crucible run <rig>`; the gpu-pruner hack dies; concurrent team use falls out of
+  run-id-scoped namespaces + a dedicated Kueue cohort.
+- Rig provisioning is pluggable (`helm` and `burrito` to start), so no domain is forced onto burrito's
+  opinionated model, and the abstraction has two real impls from day one.
+- Rigs (under the burrito backend) are helmfiles shared with CI, and the gate measures the same
+  GuideLLM workload CI does, so loop and benchmark can't drift.
+- Personal tokens leave the per-run path (in the W4 phase); the ADR-0002 boundary is unchanged.
+
+**Costs / risks:**
+- A new abstraction (`[rig].backend` + RigBackend) plus a dependency on burrito + Kueue + AppWrapper +
+  the `llm-d-downstream-infra/base` platform. Local, cluster-free runs (Act 1/2) are unaffected.
+- The one-shot/warm-rig mismatch is unresolved until the spike; W0's contract depends on its outcome.
+- Kueue preemption (even within a cohort) can recreate a rig mid-loop; the loop must treat that as
+  discard-and-resume via the ADR-0004 state model (needs a "rig recreated/evicted" exit path).
+- New broker machinery: the `rig_*` tools plus **per-run credential minting** (a per-run SA token
+  scoped to the ephemeral ns) — the broker gains the ability to mint and scope tokens.
+- Monitoring is **poll-only** (stateless transport); richer streaming progress is blocked on first
+  fixing the stateful tool-discovery regression.
+- Two contracts to version: the backend boundary and (for burrito) its CLI/helmfile/guides refs."""
+
+[[content.alternatives]]
+text = "Adopt burrito directly as the rig provisioner (no backend abstraction)"
+status = "rejected"
+rejection_reason = "burrito is one opinionated way to materialize a rig; adapting every future domain to its model is expensive. Rig provisioning becomes a pluggable backend crucible defers the render to, with burrito as the reference implementation."
+
+[[content.alternatives]]
+text = "One-shot burrito run per candidate (rig + candidate + benchmark + teardown each iteration)"
+status = "accepted"
+
+[[content.alternatives]]
+text = "Warm rig held for the loop, candidate swapped in place per iteration"
+status = "considered"

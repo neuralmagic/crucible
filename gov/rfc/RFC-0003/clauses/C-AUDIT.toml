@@ -1,0 +1,11 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-AUDIT"
+title = "Audit"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = "The controller MUST record an audit event for: team creation, membership, rule, and role changes, and deletion; ownership assignment at creation and every transfer; share grant, change, and revocation; activation of a policy set; issuance of a run credential; and every denied mutation. Each record MUST carry the actor, the subject when it differs, the credential path that proved the request, the action, the resource type and identifier, the rule that decided, the prior and resulting state where the operation changed one, and the time. An operation whose audit record cannot be persisted MUST fail. Audit records MUST be retrievable by the owner of the affected resource, by the affected team's owners, and by platform administrators, under the read scoping of the resource they concern. This extends [[RFC-0001:C-AUDIT]] from administrator policy changes to authorization changes generally."

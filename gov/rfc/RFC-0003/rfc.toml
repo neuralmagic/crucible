@@ -1,0 +1,43 @@
+#:schema ../../schema/rfc.schema.json
+
+[govctl]
+id = "RFC-0003"
+title = "Teams, ownership, and policy-based authorization"
+version = "0.1.0"
+status = "normative"
+phase = "spec"
+owners = ["@Will Eaton"]
+created = "2026-09-13"
+updated = "2026-09-13"
+
+[[sections]]
+title = "Summary"
+clauses = ["clauses/C-CONTEXT.toml"]
+
+[[sections]]
+title = "Specification"
+clauses = [
+    "clauses/C-PRINCIPALS.toml",
+    "clauses/C-TEAMS.toml",
+    "clauses/C-OWNERSHIP.toml",
+    "clauses/C-ACTIONS.toml",
+    "clauses/C-DECISION.toml",
+    "clauses/C-ENFORCEMENT.toml",
+    "clauses/C-POLICY.toml",
+    "clauses/C-APPROVALS.toml",
+    "clauses/C-READ-SCOPING.toml",
+    "clauses/C-CREDENTIAL-PARITY.toml",
+    "clauses/C-AUDIT.toml",
+    "clauses/C-COMPATIBILITY.toml",
+    "clauses/C-TEAM-UX.toml",
+    "clauses/C-RUN-PRINCIPAL.toml",
+    "clauses/C-SHARING.toml",
+    "clauses/C-HIERARCHY.toml",
+    "clauses/C-CONDITIONS.toml",
+    "clauses/C-NAMES.toml",
+]
+
+[[changelog]]
+version = "0.1.0"
+date = "2026-09-13"
+notes = "Initial draft"

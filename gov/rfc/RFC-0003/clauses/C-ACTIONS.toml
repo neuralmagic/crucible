@@ -1,0 +1,11 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-ACTIONS"
+title = "Action vocabulary"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = "Authorization MUST be expressed over a fixed, documented action vocabulary per resource type, using stable identifiers of the form `<resource>:<verb>`. Every resource type MUST define at least `read`, `create`, `update`, `delete`, `transfer`, and `share`; playbooks, drafts, and standing launches MUST additionally define `launch`; imports, scopes, and drafts (graduation) MUST define `approve`; secrets MUST define `bind` and `rotate`; dispatch targets MUST define `dispatch`; runs MUST define `publish`; policy sets MUST define `activate`; teams MUST define `manage-members`. `transfer` on a child resource resolves to `transfer` on its root under [[RFC-0003:C-HIERARCHY]]. The vocabulary MUST be retrievable from the API by any authenticated user principal. Adding an action is a compatible change; renaming or removing one is a breaking change under the RFC lifecycle. A request naming an action or resource type outside the vocabulary MUST be refused."

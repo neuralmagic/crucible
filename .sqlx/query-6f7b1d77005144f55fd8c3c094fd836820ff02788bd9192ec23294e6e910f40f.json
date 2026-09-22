@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE builds SET state = 'pending', dispatch_id = NULL, digest_ref = NULL, evidence_url = NULL, dispatch_attempts = 0, dispatched_at = NULL, finished_at = NULL WHERE id = $1 AND state IN ('succeeded', 'failed', 'timed-out')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6f7b1d77005144f55fd8c3c094fd836820ff02788bd9192ec23294e6e910f40f"
+}

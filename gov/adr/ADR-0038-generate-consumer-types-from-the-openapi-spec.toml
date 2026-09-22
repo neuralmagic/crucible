@@ -1,0 +1,41 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0038"
+title = "Generate consumer types from the OpenAPI spec"
+status = "proposed"
+date = "2026-09-03"
+refs = ["ADR-0033", "ADR-0037"]
+
+[content]
+context = """
+Every API resource is spelled up to three times: the domain struct in the controller, an API DTO with a hand-written conversion (33 such conversions across 113 serializable API types), and a hand-written response type in the MCP crate. The MCP copy carries 179 serde defaults whose only purpose is to survive drift from the spec it is not derived from: a renamed field defaults silently instead of failing. The SPA already avoids this by regenerating its TypeScript types from `openapi.json` on every build.
+
+The watch surface of [[ADR-0037]] added a fourth set of the same shapes. Decision drivers: one spelling per wire shape, drift that fails a build rather than defaulting at runtime, and no new runtime dependency between the controller and its consumers."""
+decision = """
+The OpenAPI spec the controller already emits is the single source of the wire shapes. The MCP crate generates its response types from `openapi.json` at build time, so a spec change that renames or removes a field fails the MCP build; its compact renderers read the generated types by field name. On the controller side an API DTO exists only where it reshapes the domain struct (hides a field, renders a derived value); where it is a field-for-field copy, the domain struct is serialized directly with serde attributes and the parallel type and conversion are deleted. The spec is what the UI and the MCP consume, so the spec, not the Rust types, is the compatibility surface a change is judged against."""
+consequences = """
+- One wire shape per resource; consumers cannot drift silently.
+- The MCP crate gains a build-time step that needs the spec: either the controller binary in the build (as the UI does) or a committed spec snapshot with a freshness check in CI. The freshness check is the cost of not building the controller to build the MCP.
+- Serializing domain structs directly couples the API to their field names; a rename becomes a wire change and shows in the spec, which is the point.
+- DTOs that reshape stay, so the reduction is partial by design."""
+
+[[content.alternatives]]
+text = "Keep hand-written types in each consumer, defaulting missing fields"
+status = "rejected"
+pros = ["No build-time dependency on the spec."]
+cons = ["Drift defaults silently at runtime.", "Three spellings of every shape to keep aligned by hand."]
+rejection_reason = "This is the current state and the reason for the decision."
+
+[[content.alternatives]]
+text = "A shared wire-types crate depended on by the controller and the MCP"
+status = "rejected"
+pros = ["Rust types shared directly; no codegen."]
+cons = ["The MCP would depend on a controller-side crate and its heavy dependency tree, or the types would move out of the controller into a crate that then owns the API shape.", "The UI still consumes the spec, so the spec stays authoritative anyway."]
+rejection_reason = "Makes the Rust types the compatibility surface when the spec already is one for the UI."
+
+[[content.alternatives]]
+text = "Generate every consumer's types from the OpenAPI spec and serialize domain structs directly where a DTO only copies"
+status = "accepted"
+pros = ["One authoritative shape.", "Drift fails a build.", "Matches what the UI already does."]
+cons = ["A build-time step in the MCP crate.", "Partial reduction: reshaping DTOs remain."]

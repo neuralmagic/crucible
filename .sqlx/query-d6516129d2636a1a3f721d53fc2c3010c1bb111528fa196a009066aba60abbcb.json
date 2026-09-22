@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE work_pods\n        SET state = $1,\n            result = COALESCE($2, result),\n            error = COALESCE($3, error),\n            updated_at = $4,\n            terminal_at = COALESCE(terminal_at, $5)\n        WHERE pod_name = $6\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d6516129d2636a1a3f721d53fc2c3010c1bb111528fa196a009066aba60abbcb"
+}

@@ -1,0 +1,53 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0045"
+title = "InputKind — non-upstream issue sources (adopted scenarios)"
+status = "accepted"
+date = "2026-07-12"
+refs = ["ADR-0043", "ADR-0044"]
+
+[content]
+context = """
+Related: [[ADR-0043]] (triage/autopilot; `InputKind` is the source-shape
+this discovery pipeline was built around), [[ADR-0044]] (the
+`issues` table this adds a discriminant column to), [ADR-0014](./0014-scoping-pipeline.md) (the
+`--issue`/`--goal-file` ingest arms a scenario's goal text rides).
+
+`crucible-controller` discovers work from one source: GitHub issues. Every reconcile gate — rank
+horizon, tier ranking, grounded prescope, daily/scope caps, the draft-PR approval gate — assumes a
+live upstream item to fetch freshness, priority, and a close/comment channel from. A human who
+wants the loop to chase a free-text problem statement (no GitHub issue exists yet, or never will)
+had no path in."""
+decision = """
+`Issue` gains a closed-but-growing `InputKind` enum (`GitHub { .. }` / `Scenario { id }` /
+`Unknown { tag }`, the last an inert forward/backward-compat fallback in the `ParkReason::Legacy`
+verbatim-fallback style), persisted as a `issues.input_kind` discriminant column
+(`0021_input_kind.sql`, additive, existing rows backfill to `github`). Two capability predicates —
+`has_upstream()`, `accepts_pr_backlink()` — replace every GitHub-shaped assumption in reconcile
+with a `match`-free branch, so a future source (Jira, a forge) that has an upstream but no PR
+backlink, or vice versa, isn't forced into either extreme.
+
+A non-upstream issue's human adoption **is** its tier/priority authorization: `reconcile_new`
+branches on `!issue.kind.has_upstream()` immediately after the existing `ScopeNow` fast-path and
+routes straight to the scope turn, bypassing the rank-horizon gate, `confirm_tier`, grounded
+prescope, and the daily/scopes-per-day caps — the same bypass shape `reconcile_scope_now` already
+has for a human-triggered GitHub issue, expressed as a capability predicate instead of a stash
+flag so it survives pod re-drives idempotently. The goal text is ledgered free form at adoption
+(`scenarios` sidecar table) and flows to the engine via `--goal-file`, never `--issue`, under the
+same de-prescription rules as any GitHub issue body (see `docs/crucible-contract.md` §9). A kind
+with no PR backlink skips the draft-PR approval gate entirely; the UI's own approve endpoint
+(`POST /api/scenarios/{key}/approve`) stamps `approved_at` directly, reusing the run-launch gate
+unchanged.
+
+`POST /api/scenarios` is admin-gated and ledgered like every other human-authorized mutation. It
+targets any resolvable git URL/path at adopt time, not the `repos` watch-set — a scenario's
+subject repo is a one-off pick, not a swept source."""
+consequences = """
+- Every GitHub-ism in reconcile (comment refresh, stale/closed parks, pr_url publish-back, the
+  draft-PR approval) degrades to a no-op for a non-upstream kind instead of wedging the row; `Unknown`
+  is inert everywhere by construction, so a corrupt or forward-rolled tag can't bail the sweep.
+- Existing GitHub issues are unaffected: `upsert_issue`'s INSERT omits `input_kind`, picking up the
+  `github` default, so the live ingest path needed zero changes.
+- A future upstream-but-no-PR-backlink source (or the reverse) is one more `InputKind` variant and
+  two predicate answers, not a second reconcile path."""

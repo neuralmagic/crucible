@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id AS \"id!\", issue_key AS \"issue_key!\", pod_name, survived AS \"survived!\",\n               report_json AS \"report_json!\", created_at AS \"created_at!\"\n        FROM scope_reports WHERE issue_key = $1 ORDER BY id DESC LIMIT 1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "issue_key!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "pod_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "survived!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 4,
+        "name": "report_json!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "created_at!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "4d9e76abaac56031b527b65d5def57e2d46d6dca59d443dd32b0b178a5b8e7a9"
+}

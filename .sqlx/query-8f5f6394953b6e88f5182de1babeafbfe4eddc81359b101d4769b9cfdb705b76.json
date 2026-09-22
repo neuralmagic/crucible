@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE playbook_drafts SET graduation_repo = $1, graduation_path = $2 WHERE id = 'studio'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8f5f6394953b6e88f5182de1babeafbfe4eddc81359b101d4769b9cfdb705b76"
+}

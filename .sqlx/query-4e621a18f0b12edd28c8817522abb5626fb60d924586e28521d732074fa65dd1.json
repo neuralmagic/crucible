@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO repos (repo, watched, paused, added_by, added_at)\n        VALUES ($1, TRUE, FALSE, $2, $3)\n        ON CONFLICT(repo) DO NOTHING\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4e621a18f0b12edd28c8817522abb5626fb60d924586e28521d732074fa65dd1"
+}

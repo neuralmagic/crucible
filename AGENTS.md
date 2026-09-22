@@ -61,6 +61,9 @@ whether the code works.
 - No global state (`lazy_static!`, `Once`); thread explicit context structs
   (a run-scoped tally is a field on the run, not a static).
 - `crate::` paths, not `super::`.
+- TypeScript: never `as` (except `as const`), never `any`. Model the real
+  shapes; regenerate `schema.d.ts` when DTOs change (`bun run generate` in
+  `crucible-controller/ui`), and keep `tsc --noEmit` clean.
 
 ## Tests
 
@@ -72,6 +75,9 @@ whether the code works.
   fixtures break, fix the fixture, never soften the guard.
 - Test names are sentences. Tests live at the bottom of the module in
   `mod tests {}`.
+- Controller DB tests use `#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]`
+  against a real Postgres; never change a query string without re-running
+  `cargo sqlx prepare` so `.sqlx/` stays current.
 
 ## Vocabulary
 

@@ -1,0 +1,100 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0035"
+title = "Minted API keys authenticate on the API surface"
+status = "proposed"
+date = "2026-08-29"
+refs = [
+    "ADR-0048",
+    "ADR-0028",
+    "ADR-0029",
+]
+
+[content]
+context = """
+The deployment has no machine credential for `/api/*`. A minted API key (`crk_…`) is admitted by `require_api_key`, which is mounted on the `/mcp` route and nowhere else. The human guard, `require_auth`, accepts a session cookie, the edge's header assertions, the static machine token, or a cluster token — and in prod `auth.kubeBearer.enabled` is false, so the cluster-token path is off. No public device-flow client is provisioned, so the OIDC device grant cannot run either. The `crucible-api` route exists and is described in the values file as "the machine /api surface for cluster-token bearers", with that bearer path disabled.
+
+The practical result is that an agent can drive the controller only through MCP tools. The CLI in the same binary is the larger half of that crate — 37 subcommands against 34 tools, over the same `ops` code — and is unusable against the deployment for want of a credential, not for want of features. Every capability an agent needs has therefore been built as an MCP tool, because that is the only authenticated machine path that exists. That pressure shows: the tool surface has grown to 34 entries, and work that would be a shell one-liner becomes a tool.
+
+`require_api_key` was deliberately kept out of `require_auth`, and its rationale says why: the two guards stay apart so a bug in either cannot widen the other, matching the shape `/metrics`, the ingest drop-box and `/redeem` already use. That rationale is about not merging the credential logic. It is not an argument that the API surface should be unreachable by a key, and the same comment describes the surfaces it guards as "reached by agents holding one long-lived credential" — which is exactly what a CLI-driven agent is.
+
+`api_key::looks_like_key` already exists, documented as the check `require_auth` "asks to stay out of the way", and has no callers. The intent was recorded and never implemented.
+"""
+decision = """
+A minted API key authenticates on the human router, chosen by the credential the caller presents rather than by the route.
+
+A new `require_auth_or_api_key` middleware replaces `require_auth` on that router and does one thing: if the request's bearer claims to be an API key, it runs `require_api_key`; otherwise it runs `require_auth`. Neither guard's logic moves, and neither learns about the other. The dispatch is total and decided before any credential is verified.
+
+A bearer that claims to be a key is handled by the key guard and by nothing else. There is no fallback to the human guard on failure, because the fallback is the only way this composition could widen anything: a revoked or malformed key must not be retried as whatever weaker identity the human guard would have allowed. A key that does not verify is refused as a key, and told which of the four things is wrong with it.
+
+What the key stamps is unchanged: the owner's login, subject, and the groups their last login recorded, with every `X-Auth-Request-*` header stripped first, so the key is the only thing naming the caller. Handlers see the same `Resolved` they always did and need not know a key was involved.
+"""
+consequences = """
+One credential now reaches both surfaces. An agent exports a key and works in a shell, which is what the CLI was built for; `crux` becomes usable against the deployment without provisioning an IdP client or enabling cluster-token auth. The pressure to express every capability as an MCP tool drops, and the tool surface can be argued on its merits rather than because it is the only way in.
+
+The blast radius of a leaked key grows. It was already an admin-capable credential on the MCP surface, which fronts the same operations, so the change is narrower than it looks — but a key now also reaches any API route the MCP surface does not expose. Key lifecycle, revocation and `last used` reporting matter more than they did.
+
+Authorization is untouched. A key carries its owner's identity and groups, so the admin and operator lists decide what it may do exactly as they do for that person signed in through a browser. A key cannot become more privileged than the human who minted it.
+
+Anything reading `AuthPath` sees `ApiKey` on requests that previously could not occur, which is a widening of the values a handler or audit row can observe on the API surface.
+
+The two-guard separation the original rationale protects is preserved: this composes the guards, it does not merge them. The risk moves from "a bug in one widens the other" to "the dispatch picks the wrong guard", which is a smaller and more testable surface — one predicate over the Authorization header.
+
+Provisioning a device-flow client and enabling `kubeBearer` remain open and are not foreclosed; a deployment that turns either on gains a second machine path, and the dispatch already routes non-key bearers to the human guard unchanged.
+"""
+
+[[content.alternatives]]
+text = "Accept minted keys on the human router, dispatched by the presented credential"
+status = "accepted"
+pros = [
+    "One credential reaches both the MCP and API surfaces, which is what an agent in a shell needs",
+    "No IdP work and no cluster access required, unlike the other two paths",
+    "Neither guard's logic changes; the composition is a single predicate over the Authorization header",
+    "A key carries its owner's identity and groups, so authorization is unchanged and a key cannot outrank its minter",
+]
+cons = [
+    "A leaked key reaches API routes the MCP surface does not expose",
+    "Widens a boundary that was drawn deliberately, so the separation argument has to be re-made rather than assumed",
+    "AuthPath::ApiKey becomes observable on the API surface, which anything auditing it must expect",
+]
+
+[[content.alternatives]]
+text = "Enable auth.kubeBearer so cluster tokens work on the api route"
+status = "rejected"
+pros = [
+    "Deployment-only change, no code and no new credential type",
+    "The api route already exists for exactly this, and the values file describes it that way",
+    "A cluster token is short-lived, so a leak expires on its own",
+]
+cons = [
+    "Authenticates against the controller's own cluster, so a caller working from any other cluster context is still locked out",
+    "Requires every agent to hold an oc login for that cluster, which is a heavier prerequisite than a key",
+    "Leaves the MCP and CLI on different credentials, so the surfaces stay divided",
+]
+
+[[content.alternatives]]
+text = "Provision a public device-flow client so the OIDC device grant works"
+status = "rejected"
+pros = [
+    "The most conventional answer, and gives a real user identity with real groups",
+    "The CLI already implements the device grant, including caching and refresh",
+]
+cons = [
+    "IdP-side work outside this repo, on a realm whose current client registers a callback and nothing else",
+    "Interactive by construction: a browser approval is wrong for an unattended agent, which is the case being served",
+    "The realm's native scopes omit offline_access, so there is no refresh token and the login expires under a long-running agent",
+]
+
+[[content.alternatives]]
+text = "Leave it as it is and keep building MCP tools"
+status = "rejected"
+pros = [
+    "No security boundary moves, and the two guards stay trivially separate",
+    "The MCP surface already works and is the path agents use today",
+]
+cons = [
+    "Every capability has to become a tool, whatever its natural shape, and the surface is already 34 entries",
+    "The CLI stays complete and unusable, which is a standing cost nobody is paying down",
+    "An agent cannot compose operations in a shell, which is the thing a CLI is for",
+]

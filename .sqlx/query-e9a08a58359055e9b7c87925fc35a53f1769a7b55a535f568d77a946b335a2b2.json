@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE builds SET state = $1, evidence_url = COALESCE($2, evidence_url), finished_at = $3 WHERE id = $4",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e9a08a58359055e9b7c87925fc35a53f1769a7b55a535f568d77a946b335a2b2"
+}
