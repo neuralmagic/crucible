@@ -1130,7 +1130,7 @@ mod tests {
                     Some("quay.io/x/sandbox:dev".to_string()),
                 )),
                 &crate::playbooks::dispatch::DispatchCapability::new(
-                    crate::config::PlaybookExecutor::Local,
+                    crate::config::PlaybookExecutor::Pod,
                     false,
                 ),
                 &[],
@@ -1152,11 +1152,11 @@ mod tests {
         assert_eq!(v["dispatch"]["backend"], "openshell");
         assert_eq!(v["dispatch"]["sandbox_image"], "quay.io/x/sandbox:dev");
         assert_eq!(v["dispatch"]["dispatchable"], false);
-        assert_eq!(v["dispatch"]["local_mode"], true);
+        assert_eq!(v["dispatch"]["local_mode"], false);
         assert!(
             v["dispatch"]["refusal"]
                 .as_str()
-                .is_some_and(|r| r.contains("openshell")),
+                .is_some_and(|r| r.contains("CONTROLLER_DEPLOY_PROFILE")),
             "{v:#}"
         );
         assert_eq!(v["actions"], serde_json::json!(["read", "manage-members"]));

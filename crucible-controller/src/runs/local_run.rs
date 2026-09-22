@@ -43,8 +43,32 @@ fn session_log(dir: &Path) -> PathBuf {
     dir.join("pack").join("state").join("session.jsonl")
 }
 
+/// The engine's forge storage root inside a local run's directory.
+fn forge_root(dir: &Path) -> PathBuf {
+    dir.join("forge")
+}
+
+/// Mark every file in an unpacked pack 0755, matching the pod's pack mount.
+fn grant_pack_exec(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        let path = entry?.path();
+        let meta = std::fs::symlink_metadata(&path)?;
+        if meta.is_dir() {
+            grant_pack_exec(&path)?;
+        } else if meta.is_file() {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .with_context(|| format!("marking {} executable", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Host variables every local run inherits.
+const HOST_ENV: [&str; 4] = ["PATH", "HOME", "USER", "OPENSHELL_PODMAN_SOCKET"];
+
 /// The environment one local run is spawned with. Local mode has no registry and no grant, so the
-/// only credentials a subprocess can reach are the ones an operator named in `allowlist`;
+/// only credentials handed over as environment are the ones an operator named in `allowlist`;
 /// everything else the controller's own environment holds stays with the controller.
 ///
 /// `item` comes from the launch, never from the inherited set: the engine reads
@@ -69,7 +93,7 @@ fn run_env(
         if allowlisted && !disclosed.is_some_and(|e| e.covers_agent_credential(&name)) {
             return Err(UndisclosedGrant { name });
         }
-        if name == "PATH" || name.starts_with("CRUCIBLE_") || allowlisted {
+        if HOST_ENV.contains(&name.as_str()) || name.starts_with("CRUCIBLE_") || allowlisted {
             env.push((name, value));
         }
     }
@@ -159,7 +183,8 @@ pub async fn start(
     let pack = dir.join("pack");
     let unpack_to = pack.clone();
     tokio::task::spawn_blocking(move || {
-        crate::playbooks::packs::unpack_pack_tgz(&tar_gz, &unpack_to)
+        crate::playbooks::packs::unpack_pack_tgz(&tar_gz, &unpack_to)?;
+        grant_pack_exec(&unpack_to)
     })
     .await
     .context("joining the local pack unpack")?
@@ -177,13 +202,17 @@ pub async fn start(
         RunRenderOpts::Loop { .. } => CEILING_SLACK,
     };
     let exposure = crate::launches::store::exposure_for_issue(db.pool(), issue_key).await?;
-    let env = run_env(
+    let mut env = run_env(
         std::env::vars(),
         &cfg.local_secret_allowlist,
         opts.tracker_item(issue_key),
         exposure.as_ref(),
     )
     .with_context(|| format!("preparing the local environment for {issue_key}"))?;
+    env.push((
+        "FORGE_STORAGE_ROOT".to_string(),
+        forge_root(&dir).to_string_lossy().into_owned(),
+    ));
     let child = tokio::process::Command::new(&bin)
         .args(&argv)
         .current_dir(&pack)
@@ -374,13 +403,34 @@ where
 
 #[cfg(test)]
 mod tests {
-    /// Local mode has no registry, so the subprocess starts from nothing: `PATH`, the run's own
-    /// `CRUCIBLE_*` set, and whatever an operator named. Everything else the controller holds —
-    /// its database URL, its Vault login, its tokens — stays with the controller.
     #[test]
-    fn a_local_run_inherits_only_path_the_crucible_set_and_the_allowlist() {
+    fn every_unpacked_pack_file_is_executable_like_the_pod_mount() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("inbox")).expect("mkdir");
+        std::fs::write(dir.path().join("role.sh"), "#!/bin/sh\n").expect("write");
+        std::fs::write(dir.path().join("inbox/a.md"), "a").expect("write");
+        std::os::unix::fs::symlink("role.sh", dir.path().join("alias.sh")).expect("symlink");
+        grant_pack_exec(dir.path()).expect("grant");
+        for f in ["role.sh", "inbox/a.md"] {
+            let mode = std::fs::metadata(dir.path().join(f))
+                .expect("stat")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o755, "{f}");
+        }
+    }
+
+    /// Local mode has no registry, so the subprocess starts from nothing: the host variables,
+    /// the run's own `CRUCIBLE_*` set, and whatever an operator named. Everything else the
+    /// controller holds — its database URL, its Vault login, its tokens — stays with the controller.
+    #[test]
+    fn a_local_run_inherits_only_host_facts_the_crucible_set_and_the_allowlist() {
         let inherited = [
             ("PATH", "/usr/bin"),
+            ("HOME", "/home/wren"),
+            ("USER", "wren"),
+            ("OPENSHELL_PODMAN_SOCKET", "/run/podman.sock"),
             ("CRUCIBLE_BIN", "/opt/crucible"),
             ("DATABASE_URL", "postgres://secret"),
             ("VAULT_SECRET_ID", "hunter2"),
@@ -397,7 +447,17 @@ mod tests {
         )
         .expect("a disclosed allowlisted value is handed over");
         let names: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
-        assert_eq!(names, ["PATH", "CRUCIBLE_BIN", "GH_TOKEN"]);
+        assert_eq!(
+            names,
+            [
+                "PATH",
+                "HOME",
+                "USER",
+                "OPENSHELL_PODMAN_SOCKET",
+                "CRUCIBLE_BIN",
+                "GH_TOKEN"
+            ]
+        );
     }
 
     /// The allowlist names what the operator is willing to hand over; the pack still has to say

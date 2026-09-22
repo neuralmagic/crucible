@@ -8,6 +8,7 @@ of the runtime image, so the engine binaries it launches are in the same image.
 
 This page covers what the controller needs from you and how it is wired. Identity is on
 [Authentication](./controller-auth.md); the secrets registry is on [Vault](./controller-vault.md).
+To try it on a laptop first, see [Running the controller locally](./controller-local.md).
 
 ## What it needs
 

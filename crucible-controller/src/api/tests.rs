@@ -6778,7 +6778,7 @@ async fn launching_with_bad_values_is_422_naming_each_field(pool: PgPool) -> Res
 const OPENSHELL_MANIFEST: &str = "[repo]\npath = \".\"\n\n[workflow]\ntype = \"playbook\"\nfile = \"workflow.star\"\n\n\
      [agent]\nbackend = \"openshell\"\nsandbox_image = \"quay.io/x/sandbox:dev\"\n";
 
-/// A deployment that runs playbooks locally cannot give an OpenShell pack its sandbox, and says so
+/// A pod deployment with no deploy profile cannot give an OpenShell pack its sandbox, and says so
 /// at launch — where a person is watching — instead of at the bottom of a failed reconcile.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn launching_a_backend_this_deployment_cannot_dispatch_is_refused(
@@ -6788,7 +6788,7 @@ async fn launching_a_backend_this_deployment_cannot_dispatch_is_refused(
     let app = router(ApiState {
         roles: crate::identity::auth::Roles::new(vec!["wren".to_string()], vec![], vec![]),
         dispatch: crate::playbooks::dispatch::DispatchCapability::new(
-            crate::config::PlaybookExecutor::Local,
+            crate::config::PlaybookExecutor::Pod,
             false,
         ),
         ..ApiState::test(db.clone(), Arc::new(Recorder::default()))
@@ -6813,7 +6813,7 @@ async fn launching_a_backend_this_deployment_cannot_dispatch_is_refused(
         "quay.io/x/sandbox:dev"
     );
     assert_eq!(listed[0]["dispatch"]["dispatchable"], false);
-    assert_eq!(listed[0]["dispatch"]["local_mode"], true);
+    assert_eq!(listed[0]["dispatch"]["local_mode"], false);
 
     let (status, body) = post_launch(
         &app,
@@ -6828,7 +6828,7 @@ async fn launching_a_backend_this_deployment_cannot_dispatch_is_refused(
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     let message = body["fields"][0]["message"].as_str().unwrap_or_default();
-    assert!(message.contains("openshell"), "{body}");
+    assert!(message.contains("CONTROLLER_DEPLOY_PROFILE"), "{body}");
     assert_eq!(
         body["error"], "this deployment cannot dispatch the pack's agent backend",
         "the headline names the refusal; the parameters were fine"
