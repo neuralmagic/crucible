@@ -1,5 +1,6 @@
 //! Raw SQL over the run and candidate tables.
 
+#[cfg(feature = "autoresearch")]
 use crate::issues::model::KeptPr;
 use crate::model::SortDir;
 use crate::runs::model::{
@@ -502,6 +503,7 @@ pub async fn insert_candidate(ex: impl PgExecutor<'_>, cand: &NewCandidate) -> R
 
 /// Every kept-candidate draft PR tied back to the issue that produced it — the working
 /// set the review-comment poll checks. One row per (issue, distinct pr_url) with a `keep` decision.
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.kept_candidate_prs", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql"), err)]
 pub(crate) async fn kept_candidate_prs(ex: impl PgExecutor<'_>) -> Result<Vec<KeptPr>> {
     let rows = sqlx::query!(
@@ -569,13 +571,19 @@ pub(crate) async fn count_running(ex: impl PgExecutor<'_>) -> Result<i64> {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "autoresearch")]
     use crate::issues::model::NewScope;
+    #[cfg(feature = "autoresearch")]
     use crate::issues::store::tests::seed_rows;
+    #[cfg(feature = "autoresearch")]
     use crate::issues::store::*;
+    #[cfg(feature = "autoresearch")]
     use crate::launches::model::NewPlaybookLaunch;
 
+    #[cfg(feature = "autoresearch")]
     use crate::launches::store::*;
 
+    #[cfg(feature = "autoresearch")]
     use anyhow::Result;
     use sqlx::PgPool;
 
@@ -633,6 +641,7 @@ mod tests {
     /// The runs leaderboard's `kind=autoresearch` means "not a playbook launch", not "has a scope
     /// row". A goal run and an adopted run carry no scope and still belong on the board; anchoring
     /// the filter to `scope IS NOT NULL` silently hid every one of them.
+    #[cfg(feature = "autoresearch")]
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn autoresearch_runs_keep_the_scopeless_ones_and_drop_only_playbooks(
         pool: PgPool,
@@ -774,6 +783,7 @@ mod tests {
     /// A run's issue link lives on the row: derived from its scope for an autoresearch run,
     /// stamped at launch for a playbook run (which has no scope), and kept when a later fold
     /// upserts the row without knowing it. Every by-issue lookup reads that column.
+    #[cfg(feature = "autoresearch")]
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn run_lookups_go_through_the_row_issue_link(pool: PgPool) -> Result<()> {
         seed_rows(&pool).await?;

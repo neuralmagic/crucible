@@ -38,21 +38,27 @@ struct Inner {
     run_iterations: Histogram,
     run_best_score: Histogram,
     turns_total: IntCounterVec,
+    #[cfg(feature = "autoresearch")]
     turn_duration_seconds: HistogramVec,
 
     // --- declarative image builds ------------------------------------------------------------
+    #[cfg(feature = "autoresearch")]
     builds_total: IntCounterVec,
 
     // --- ranking + spend ---------------------------------------------------------------------
+    #[cfg(feature = "autoresearch")]
     rank_verdicts_total: IntCounterVec,
     spend_usd_total: CounterVec,
 
     // --- workpods + approvals (durations moved; counts refreshed on scrape) -----------------------
+    #[cfg(feature = "autoresearch")]
     workpod_queue_wait_seconds: Histogram,
+    #[cfg(feature = "autoresearch")]
     approval_latency_seconds: Histogram,
 
     // --- reconcile + upstream ----------------------------------------------------------------
     reconcile_duration_seconds: HistogramVec,
+    #[cfg(feature = "autoresearch")]
     github_api_requests_total: IntCounterVec,
     ingest_failures_total: IntCounter,
 
@@ -85,6 +91,7 @@ fn run_duration_buckets() -> Vec<f64> {
 }
 
 /// Buckets sized seconds-to-tens-of-minutes: one bounded agent turn (a grounded-rank pod).
+#[cfg(feature = "autoresearch")]
 fn turn_duration_buckets() -> Vec<f64> {
     vec![
         1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1200.0, 1800.0,
@@ -135,6 +142,7 @@ impl Metrics {
             ),
             &["kind", "outcome"],
         )?;
+        #[cfg(feature = "autoresearch")]
         let turn_duration_seconds = HistogramVec::new(
             HistogramOpts::new(
                 "crucible_turn_duration_seconds",
@@ -144,6 +152,7 @@ impl Metrics {
             &["kind"],
         )?;
 
+        #[cfg(feature = "autoresearch")]
         let builds_total = IntCounterVec::new(
             Opts::new(
                 "crucible_builds_total",
@@ -152,6 +161,7 @@ impl Metrics {
             &["outcome"],
         )?;
 
+        #[cfg(feature = "autoresearch")]
         let rank_verdicts_total = IntCounterVec::new(
             Opts::new(
                 "crucible_rank_verdicts_total",
@@ -164,6 +174,7 @@ impl Metrics {
             &["cost_tag"],
         )?;
 
+        #[cfg(feature = "autoresearch")]
         let workpod_queue_wait_seconds = Histogram::with_opts(
             HistogramOpts::new(
                 "crucible_workpod_queue_wait_seconds",
@@ -173,6 +184,7 @@ impl Metrics {
                 1.0, 5.0, 15.0, 60.0, 300.0, 900.0, 1800.0, 3600.0, 21600.0,
             ]),
         )?;
+        #[cfg(feature = "autoresearch")]
         let approval_latency_seconds = Histogram::with_opts(
             HistogramOpts::new(
                 "crucible_approval_latency_seconds",
@@ -193,6 +205,7 @@ impl Metrics {
             ]),
             &["outcome"],
         )?;
+        #[cfg(feature = "autoresearch")]
         let github_api_requests_total = IntCounterVec::new(
             Opts::new(
                 "crucible_github_api_requests_total",
@@ -289,13 +302,19 @@ impl Metrics {
         registry.register(Box::new(run_iterations.clone()))?;
         registry.register(Box::new(run_best_score.clone()))?;
         registry.register(Box::new(turns_total.clone()))?;
+        #[cfg(feature = "autoresearch")]
         registry.register(Box::new(turn_duration_seconds.clone()))?;
+        #[cfg(feature = "autoresearch")]
         registry.register(Box::new(builds_total.clone()))?;
+        #[cfg(feature = "autoresearch")]
         registry.register(Box::new(rank_verdicts_total.clone()))?;
         registry.register(Box::new(spend_usd_total.clone()))?;
+        #[cfg(feature = "autoresearch")]
         registry.register(Box::new(workpod_queue_wait_seconds.clone()))?;
+        #[cfg(feature = "autoresearch")]
         registry.register(Box::new(approval_latency_seconds.clone()))?;
         registry.register(Box::new(reconcile_duration_seconds.clone()))?;
+        #[cfg(feature = "autoresearch")]
         registry.register(Box::new(github_api_requests_total.clone()))?;
         registry.register(Box::new(ingest_failures_total.clone()))?;
         registry.register(Box::new(live_streams.clone()))?;
@@ -318,13 +337,19 @@ impl Metrics {
             run_iterations,
             run_best_score,
             turns_total,
+            #[cfg(feature = "autoresearch")]
             turn_duration_seconds,
+            #[cfg(feature = "autoresearch")]
             builds_total,
+            #[cfg(feature = "autoresearch")]
             rank_verdicts_total,
             spend_usd_total,
+            #[cfg(feature = "autoresearch")]
             workpod_queue_wait_seconds,
+            #[cfg(feature = "autoresearch")]
             approval_latency_seconds,
             reconcile_duration_seconds,
+            #[cfg(feature = "autoresearch")]
             github_api_requests_total,
             ingest_failures_total,
             live_streams,
@@ -393,11 +418,13 @@ impl Metrics {
 
     /// A declarative image build reached `outcome` (`dispatched`/`succeeded`/`failed`/`timed-out`/
     /// `capped`) — moved at the [`crate::builds::lifecycle`] dispatch/poll choke points.
+    #[cfg(feature = "autoresearch")]
     pub(crate) fn record_build(&self, outcome: &str) {
         self.0.builds_total.with_label_values(&[outcome]).inc();
     }
 
     /// A dispatched turn's measured wall-clock duration.
+    #[cfg(feature = "autoresearch")]
     pub(crate) fn observe_turn_duration(&self, kind: &str, secs: f64) {
         if secs.is_finite() && secs >= 0.0 {
             self.0
@@ -408,6 +435,7 @@ impl Metrics {
     }
 
     /// A ranking verdict was applied (`apply_verdict`'s CAS-winning branches).
+    #[cfg(feature = "autoresearch")]
     pub(crate) fn record_verdict(
         &self,
         tier: &str,
@@ -433,6 +461,7 @@ impl Metrics {
     }
 
     /// A queued turn was promoted; `secs` is how long it waited.
+    #[cfg(feature = "autoresearch")]
     pub(crate) fn observe_queue_wait(&self, secs: f64) {
         if secs.is_finite() && secs >= 0.0 {
             self.0.workpod_queue_wait_seconds.observe(secs);
@@ -440,6 +469,7 @@ impl Metrics {
     }
 
     /// A human approval landed; `secs` is the turnaround since the approval opened.
+    #[cfg(feature = "autoresearch")]
     pub(crate) fn observe_approval_latency(&self, secs: f64) {
         if secs.is_finite() && secs >= 0.0 {
             self.0.approval_latency_seconds.observe(secs);
@@ -457,6 +487,7 @@ impl Metrics {
     }
 
     /// A GitHub API call completed (`ok`/`error`).
+    #[cfg(feature = "autoresearch")]
     pub(crate) fn record_github(&self, ok: bool) {
         self.0
             .github_api_requests_total
@@ -558,6 +589,7 @@ impl Metrics {
     /// differential harness (no injectable metrics recorder exists, so tests read the real counter
     /// before/after driving a fixture). Reading via `with_label_values` never increments; an
     /// untouched series reads 0.
+    #[cfg(feature = "autoresearch")]
     #[cfg(test)]
     pub(crate) fn turns_total(&self, kind: &str, outcome: &str) -> u64 {
         self.0.turns_total.with_label_values(&[kind, outcome]).get()
@@ -566,6 +598,7 @@ impl Metrics {
     /// The current `crucible_turn_duration_seconds{kind}` sample COUNT (not the sum) — enough to
     /// assert whether `observe_turn_duration` fired for `kind`, without depending on wall-clock
     /// duration values.
+    #[cfg(feature = "autoresearch")]
     #[cfg(test)]
     pub(crate) fn turn_duration_samples(&self, kind: &str) -> u64 {
         self.0
@@ -586,6 +619,7 @@ impl Drop for LiveStreamGuard {
 }
 
 /// The stable string a `bool` label renders as (never a `Debug`-formatted `true`/`false` drift).
+#[cfg(feature = "autoresearch")]
 fn bool_label(b: bool) -> &'static str {
     if b { "true" } else { "false" }
 }
@@ -608,6 +642,7 @@ mod tests {
     use super::*;
     use crate::client::Db;
 
+    #[cfg(feature = "autoresearch")]
     #[test]
     fn new_registers_every_family_without_collision() {
         let m = Metrics::new().expect("metrics build");

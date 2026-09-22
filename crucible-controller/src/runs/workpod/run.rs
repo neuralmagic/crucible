@@ -2,19 +2,25 @@
 
 use crate::client::Db;
 use crate::config::ControllerCfg;
+#[cfg(feature = "autoresearch")]
 use crate::issues::engine::{self, GroundedVerdict};
 use crate::playbooks::providers::{AgentSelection, ModelProvider};
+#[cfg(feature = "autoresearch")]
 use crate::runs::workpod::spec::{self, TurnSpec as _};
 use crate::runs::workpod::*;
 use anyhow::{Context, Result, bail};
 use crucible::deploy::{DigestResolver, PackDelivery, PlaybookLaunch, RenderOpts, render_yaml};
-use crucible_contract::{ArtifactKind, ArtifactRef, Envelope, EnvelopeKind, content_digest};
+#[cfg(feature = "autoresearch")]
+use crucible_contract::{ArtifactKind, content_digest};
+#[cfg(feature = "autoresearch")]
+use crucible_contract::{ArtifactRef, Envelope, EnvelopeKind};
 use k8s_openapi::api::core::v1::{ConfigMap, Container, EnvVar, Pod};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
+#[cfg(feature = "autoresearch")]
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------------------------
@@ -822,6 +828,7 @@ pub async fn collect_run_pod(
 /// (compat: a new controller reads either an old engine image's marker or a new image's envelope —
 /// both directions). A parseable verdict envelope is authoritative, INCLUDING its `{"error":…}`
 /// no-verdict payload, so only an absent/unparseable/wrong-kind message reaches the marker scrape.
+#[cfg(feature = "autoresearch")]
 pub(crate) fn collect_verdict(message: Option<&str>, logs: &str) -> Result<GroundedVerdict> {
     if let Some(result) = message.and_then(verdict_from_termination) {
         return result;
@@ -833,6 +840,7 @@ pub(crate) fn collect_verdict(message: Option<&str>, logs: &str) -> Result<Groun
 /// envelope (the inner `Result` then carries the verdict or the no-verdict error), `None` when the
 /// message isn't our envelope at all (empty, old-image marker text, or a wrong-kind envelope) so the
 /// caller can fall back to the marker scrape.
+#[cfg(feature = "autoresearch")]
 fn verdict_from_termination(message: &str) -> Option<Result<GroundedVerdict>> {
     let env: Envelope = serde_json::from_str(message.trim()).ok()?;
     if env.kind != EnvelopeKind::Verdict {
@@ -858,6 +866,7 @@ fn verdict_from_termination(message: &str) -> Option<Result<GroundedVerdict>> {
 ///   * [`DispatchOutcome::AlreadyCollected`] — a concurrent collector (a timeout sweep or a
 ///     re-drive) won the row's terminal CAS and is booking the cost + applying the verdict; this
 ///     caller must do NOTHING (not finalize, not keep the text tier), the winner owns it.
+#[cfg(feature = "autoresearch")]
 #[derive(Debug, Clone)]
 pub enum DispatchOutcome {
     Verdict(GroundedVerdict),
@@ -888,6 +897,7 @@ pub enum DispatchOutcome {
     skip(db, cfg, dispatcher),
     fields(otel.kind = "producer", %issue_key)
 )]
+#[cfg(feature = "autoresearch")]
 pub(crate) async fn dispatch_grounded_rank(
     db: &Db,
     cfg: &ControllerCfg,
@@ -1069,6 +1079,7 @@ pub(crate) async fn dispatch_grounded_rank(
 ///
 /// Traced: the caller only reaches it once the pod is terminal, so entering here means a real
 /// collection (scrape the pod's logs, parse the verdict, book the cost), never an idle poll.
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(skip(db, cfg, dispatcher), fields(%issue_key))]
 pub(crate) async fn adopt_grounded_turn(
     db: &Db,
@@ -1085,6 +1096,7 @@ pub(crate) async fn adopt_grounded_turn(
 /// [`spec::TurnCollected`] → [`DispatchOutcome`]: `Failed` drops the reason (the unit variant here
 /// keeps the caller on the text tier without a string to thread), `AlreadyCollected` maps straight
 /// across.
+#[cfg(feature = "autoresearch")]
 fn grounded_into_dispatch_outcome(
     collected: spec::TurnCollected<GroundedVerdict>,
 ) -> DispatchOutcome {
@@ -1096,6 +1108,7 @@ fn grounded_into_dispatch_outcome(
 }
 
 /// The outcome of a scope turn dispatched on the WorkPod primitive.
+#[cfg(feature = "autoresearch")]
 #[derive(Debug, Clone)]
 pub enum ScopeOutcome {
     /// The scope turn completed and produced a ScopeReport, with its cost already booked.
@@ -1136,6 +1149,7 @@ pub enum ScopeOutcome {
     skip(db, cfg, dispatcher, inputs),
     fields(otel.kind = "producer", %issue_key)
 )]
+#[cfg(feature = "autoresearch")]
 pub async fn dispatch_scope(
     db: &Db,
     cfg: &ControllerCfg,
@@ -1164,6 +1178,7 @@ pub async fn dispatch_scope(
 /// through the existing [`scope_into_outcome`] tail mapper, `Failed{reason}` keeps the reason
 /// (`ScopeOutcome::Failed` carries a `String`, matching the launch-fail create-context string
 /// surviving into the reconcile event).
+#[cfg(feature = "autoresearch")]
 fn scope_dispatch_into_outcome(dispatch: spec::TurnDispatch<engine::ScopeReport>) -> ScopeOutcome {
     match dispatch {
         spec::TurnDispatch::Launched => ScopeOutcome::Launched,
@@ -1179,6 +1194,7 @@ fn scope_dispatch_into_outcome(dispatch: spec::TurnDispatch<engine::ScopeReport>
 /// grounded pre-pass blocks repeated. `Some(row)` only when adoption is safe NOW; a still-running
 /// orphan (or no orphan at all) is `None` — left for the shared pod-completion watch to re-drive
 /// this key when the pod goes terminal.
+#[cfg(feature = "autoresearch")]
 pub(crate) async fn peek_running_adoptable(
     db: &Db,
     cfg: &ControllerCfg,
@@ -1208,6 +1224,7 @@ pub(crate) async fn peek_running_adoptable(
 ///
 /// Traced for the same reason as [`adopt_grounded_turn`]: reaching it means collecting a finished
 /// scope turn, which is work worth a trace.
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(skip(db, cfg, dispatcher), fields(%issue_key))]
 pub(crate) async fn adopt_scope_turn(
     db: &Db,
@@ -1224,6 +1241,7 @@ pub(crate) async fn adopt_scope_turn(
 /// [`spec::TurnCollected`] → [`ScopeOutcome`]: `Failed` keeps the reason (`ScopeOutcome::Failed`
 /// carries a `String`, unlike the grounded mapper's unit variant), `AlreadyCollected` maps straight
 /// across.
+#[cfg(feature = "autoresearch")]
 fn scope_into_outcome(collected: spec::TurnCollected<engine::ScopeReport>) -> ScopeOutcome {
     match collected {
         spec::TurnCollected::Result { result, pod_name } => ScopeOutcome::Report {
@@ -1238,6 +1256,7 @@ fn scope_into_outcome(collected: spec::TurnCollected<engine::ScopeReport>) -> Sc
 /// Prefer the kubelet-captured termination-message envelope for the scope report, falling back to
 /// the marker log scrape (compat, exactly as [`collect_verdict`]). A parseable scope-report envelope
 /// is authoritative; only an absent/unparseable/wrong-kind message reaches the marker scrape.
+#[cfg(feature = "autoresearch")]
 pub(crate) fn collect_scope_report(
     message: Option<&str>,
     logs: &str,
@@ -1250,6 +1269,7 @@ pub(crate) fn collect_scope_report(
 
 /// Decode a scope report from the termination message: `Some` once the message parses to a
 /// scope-report envelope, `None` when it isn't our envelope so the caller falls back to the marker.
+#[cfg(feature = "autoresearch")]
 fn scope_report_from_termination(message: &str, logs: &str) -> Option<Result<engine::ScopeReport>> {
     let env: Envelope = serde_json::from_str(message.trim()).ok()?;
     if env.kind != EnvelopeKind::ScopeReport {
@@ -1262,6 +1282,7 @@ fn scope_report_from_termination(message: &str, logs: &str) -> Option<Result<eng
 /// termination message, but the pack + transcript are log markers, so they attach from the logs
 /// exactly as [`parse_scope_report_logs`] does. `raw` is the report's own JSON (what the
 /// `scope_reports` store keeps), matching the marker path where `raw` is the marker line body.
+#[cfg(feature = "autoresearch")]
 fn scope_report_from_envelope(env: Envelope, logs: &str) -> Result<engine::ScopeReport> {
     let raw = serde_json::to_string(&env.payload)
         .context("re-serializing the scope report from the termination envelope")?;
@@ -1276,6 +1297,7 @@ fn scope_report_from_envelope(env: Envelope, logs: &str) -> Result<engine::Scope
 /// The Tier 1 artifacts manifest carried by a scope-report termination message, or empty when the
 /// message is absent/unparseable/not our envelope (the old-engine marker path — no manifest, so the
 /// drop-box preference is a no-op and the log-scraped payloads stand).
+#[cfg(feature = "autoresearch")]
 pub(crate) fn manifest_from_message(message: Option<&str>) -> Vec<ArtifactRef> {
     let Some(m) = message else {
         return Vec::new();
@@ -1298,6 +1320,7 @@ pub(crate) fn manifest_from_message(message: Option<&str>) -> Vec<ArtifactRef> {
 /// the exact bytes, this returns `Err` with a loud reason (→ a NoReport that lands on the work_pods
 /// row). The transcript is best-effort — a problem there is logged, not fatal, matching the marker
 /// path's long-standing discipline (a garbled transcript never failed a report).
+#[cfg(feature = "autoresearch")]
 pub(crate) async fn apply_dropbox_artifacts(
     report: &mut engine::ScopeReport,
     manifest: &[ArtifactRef],
@@ -1342,6 +1365,7 @@ pub(crate) async fn apply_dropbox_artifacts(
 /// Resolve one manifest entry to its drop-box bytes, validating the content digest. `Err` when the
 /// pod marked it undelivered, no artifact is stored, or the stored digest doesn't match the
 /// manifest.
+#[cfg(feature = "autoresearch")]
 async fn resolve_dropbox_artifact(
     pool: &sqlx::PgPool,
     pod: &str,
@@ -1372,6 +1396,7 @@ async fn resolve_dropbox_artifact(
 
 /// Seconds elapsed since an RFC3339 `…Z` stamp (the ledger's format), for observing how long a
 /// queued turn waited before it drained. Never negative (a clock skew clamps to zero).
+#[cfg(feature = "autoresearch")]
 pub(crate) fn elapsed_secs_since(ts: &str) -> Result<f64> {
     let then = parse_ts(ts)?;
     Ok(std::time::SystemTime::now()
@@ -1383,6 +1408,7 @@ pub(crate) fn elapsed_secs_since(ts: &str) -> Result<f64> {
 /// A turn's wall-clock duration at collection, from its running row's `created_at` dispatch stamp —
 /// the turn-duration metric's source now that collection is out-of-band (the start isn't on this
 /// stack). A skewed or unparseable stamp yields 0 rather than a bogus negative/huge sample.
+#[cfg(feature = "autoresearch")]
 pub(crate) fn turn_age_secs(created_at: &str) -> f64 {
     elapsed_secs_since(created_at).unwrap_or(0.0)
 }

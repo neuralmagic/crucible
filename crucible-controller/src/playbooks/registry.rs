@@ -431,6 +431,7 @@ struct WorkflowTable {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PackWorkflowKind {
     Playbook,
+    #[cfg(feature = "autoresearch")]
     Autoresearch,
 }
 
@@ -438,6 +439,7 @@ impl PackWorkflowKind {
     fn declared_type(self) -> &'static str {
         match self {
             Self::Playbook => PLAYBOOK_WORKFLOW_TYPE,
+            #[cfg(feature = "autoresearch")]
             Self::Autoresearch => "autoresearch",
         }
     }

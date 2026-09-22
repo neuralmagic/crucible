@@ -55,13 +55,16 @@ modgraph *ARGS:
 # the checked-in `.sqlx/` cache rather than whatever the dev database was last migrated to.
 build-controller:
     SQLX_OFFLINE=true cargo build -p crucible-controller
+    SQLX_OFFLINE=true cargo build -p crucible-controller --features autoresearch
 
 test-controller:
     SQLX_OFFLINE=true cargo test -p crucible-controller
-    SQLX_OFFLINE=true cargo test -p crucible-controller --lib -- --ignored an_idle_tick_creates_no_span_but_an_ingest_still_traces
+    SQLX_OFFLINE=true cargo test -p crucible-controller --features autoresearch
+    SQLX_OFFLINE=true cargo test -p crucible-controller --features autoresearch --lib -- --ignored an_idle_tick_creates_no_span_but_an_ingest_still_traces
 
 lint-controller:
     cargo fmt --check && SQLX_OFFLINE=true cargo clippy -p crucible-controller -p crux --all-targets --all-features -- -D warnings
+    SQLX_OFFLINE=true cargo clippy -p crucible-controller -p crux --all-targets -- -D warnings
 
 # A throwaway Postgres for the controller's sqlx tests (DATABASE_URL=postgres://postgres:ci@localhost:55432/crucible).
 dev-pg:

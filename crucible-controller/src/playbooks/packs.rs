@@ -70,6 +70,7 @@ fn append_dir(
 /// Store a pod-delivered pack tarball for `key`, validating it first (a scratch unpack runs the
 /// same traversal rejection every materialization does, so a hostile blob is refused before it
 /// becomes the durable pack). Returns the stored digest.
+#[cfg(feature = "autoresearch")]
 pub(crate) async fn store_pack_tarball(pool: &PgPool, key: &str, tar_gz: &[u8]) -> Result<String> {
     let scratch = tempfile::tempdir().context("pack validation scratch dir")?;
     unpack_pack_tgz(tar_gz, &scratch.path().join("pack")).context("validating the pack tarball")?;
@@ -138,6 +139,7 @@ pub(crate) async fn materialize_pack(pool: &PgPool, key: &str) -> Result<Option<
 /// [`materialize_pack`], falling back to an empty scratch tree when no pack is stored — the
 /// pre-tarball semantics of a missing `packs/<key>/` dir (`plan_builds` sees no manifest; a real
 /// `deploy render` fails loudly at dispatch).
+#[cfg(feature = "autoresearch")]
 pub(crate) async fn materialize_pack_or_empty(
     pool: &PgPool,
     key: &str,
@@ -156,6 +158,7 @@ pub(crate) async fn materialize_pack_or_empty(
 
 /// Read one file (by pack-relative path) straight out of `key`'s stored tarball, no disk touch.
 /// `None` when no pack is stored or the file isn't in it.
+#[cfg(feature = "autoresearch")]
 pub(crate) async fn read_pack_file(pool: &PgPool, key: &str, name: &str) -> Result<Option<String>> {
     use std::io::Read as _;
     let slug = crate::model::sanitize_key(key);
@@ -295,6 +298,7 @@ mod tests {
         assert!(!pack.path().join("STEER.md").exists(), "no steering rows");
     }
 
+    #[cfg(feature = "autoresearch")]
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn missing_pack_is_none_and_or_empty_gives_a_bare_tree(pool: sqlx::PgPool) {
         assert!(
@@ -361,6 +365,7 @@ mod tests {
         assert_eq!(text, read_steer(&second));
     }
 
+    #[cfg(feature = "autoresearch")]
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_traversal_tarball_is_refused_before_it_is_stored(pool: sqlx::PgPool) {
         use std::io::Write as _;
@@ -393,6 +398,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "autoresearch")]
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn read_pack_file_scans_the_tarball_in_memory(pool: sqlx::PgPool) {
         let tree = sample_tree();

@@ -29,6 +29,7 @@ pub(crate) struct Cli {
 pub(crate) enum Cmd {
     /// Discovery (lane B): scan watched repos' issues (since each repo's watermark), rank them by
     /// judge-tier, and upsert them into the controller ledger.
+    #[cfg(feature = "autoresearch")]
     Triage {
         #[command(flatten)]
         cfg: crucible_controller::ControllerCfg,
@@ -83,6 +84,7 @@ pub(crate) enum Cmd {
     /// disagreement matrix, cost, wall time) plus the raw rows as JSONL. Read-only over the ledger:
     /// it writes no tiers, only `rank-compare` ledger rows, and is resumable (skips issues already
     /// in the out JSONL).
+    #[cfg(feature = "autoresearch")]
     RankCompare {
         #[command(flatten)]
         cfg: crucible_controller::ControllerCfg,
@@ -183,6 +185,7 @@ pub(crate) enum DbAction {
 fn main() -> Result<()> {
     crucible_controller::install_crypto_provider();
     match Cli::parse().command {
+        #[cfg(feature = "autoresearch")]
         Cmd::Triage { cfg, full } => dispatch_triage(cfg, full),
         Cmd::Autopilot { cfg, once } => dispatch_autopilot(cfg, once),
         Cmd::Db { action } => dispatch_db(action),
@@ -201,6 +204,7 @@ fn main() -> Result<()> {
             crucible_controller::identity::oidc::claims_probe::run(&cfg, &mut std::io::stdout())
                 .await
         }),
+        #[cfg(feature = "autoresearch")]
         Cmd::RankCompare {
             cfg,
             repo,
@@ -273,6 +277,7 @@ async fn push_cluster_snapshot(
 
 /// `crucible-controller triage`: open the ledger, triage every watched repo (fetch changed issues,
 /// rank by judge-tier, upsert), and print a summary table.
+#[cfg(feature = "autoresearch")]
 fn dispatch_triage(cfg: crucible_controller::ControllerCfg, full: bool) -> Result<()> {
     if cfg.repos.is_empty() {
         anyhow::bail!(
@@ -305,6 +310,7 @@ fn dispatch_triage(cfg: crucible_controller::ControllerCfg, full: bool) -> Resul
 
 /// `crucible-controller rank-compare`: open the ledger, run the grounded ranker against each
 /// already-ranked issue in `repo`, and emit the comparison report + JSONL.
+#[cfg(feature = "autoresearch")]
 fn dispatch_rank_compare(
     cfg: crucible_controller::ControllerCfg,
     repo: String,
@@ -777,10 +783,15 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
 
     // Fail loud at startup if the grounded executor is misconfigured (a missing profile/sandbox for
     // `pod` mode), never silently per verdict — the exact failure the old env gate had.
+    cfg.validate_autoresearch()?;
     cfg.validate_grounded()
         .context("validating the grounded-rank executor configuration")?;
     cfg.validate_scope()
         .context("validating the scope executor configuration")?;
+    tracing::info!(
+        autoresearch = cfg.autoresearch_enabled(),
+        "autopilot: autoresearch lane"
+    );
 
     // One metrics registry for the process, attached to the ledger before it's cloned into the
     // reconcile wiring + the HTTP surface, so every choke point re-exports what it ingests and
@@ -792,19 +803,22 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
         .context("opening the controller ledger")?
         .with_metrics(metrics.clone());
 
-    // The autopilot flag: one instance shared between the HTTP surface (POST flips it) and the
-    // reconcile wiring (reads the AtomicBool cache per pass). Loaded once, cloned for serve().
-    let autopilot = crucible_controller::AutopilotFlag::load(db.pool())
-        .await
-        .context("loading the autopilot flag")?;
-    cfg.autopilot = Some(autopilot.clone());
-    // A flip written through any replica reaches this process's AtomicBool within the poll
-    // interval; the task dies with the process.
-    tokio::spawn(
-        autopilot
-            .clone()
-            .refresh_loop(std::time::Duration::from_secs(5)),
-    );
+    #[cfg(feature = "autoresearch")]
+    if cfg.autoresearch_enabled() {
+        // The autopilot flag: one instance shared between the HTTP surface (POST flips it) and the
+        // reconcile wiring (reads the AtomicBool cache per pass). Loaded once, cloned for serve().
+        let autopilot = crucible_controller::AutopilotFlag::load(db.pool())
+            .await
+            .context("loading the autopilot flag")?;
+        cfg.autopilot = Some(autopilot.clone());
+        // A flip written through any replica reaches this process's AtomicBool within the poll
+        // interval; the task dies with the process.
+        tokio::spawn(
+            autopilot
+                .clone()
+                .refresh_loop(std::time::Duration::from_secs(5)),
+        );
+    }
 
     // The runtime override store (Lane O2): defaults from the parsed cfg, live overrides from a
     // watched ConfigMap. Create-if-missing + an initial load so the first reconcile sees any
@@ -894,12 +908,18 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
             contracts.check_all(targets).await;
         });
     }
-    // The build backend, when `--build-backends` is set with creds: routes a declared build to the
-    // forge cluster/github dispatcher. Off ⇒ the not-installed stub parks a `[build]` pack with a
-    // clear reason rather than dispatching a build no one configured creds for.
-    if let Some(backend) = crucible_controller::builds::lifecycle::forge_backend_from_cfg(&cfg) {
-        tracing::info!("autopilot: build backends installed (cluster + github-actions)");
-        crucible_controller::builds::lifecycle::install_build_backend(std::sync::Arc::new(backend));
+    #[cfg(feature = "autoresearch")]
+    if cfg.autoresearch_enabled() {
+        // The build backend, when `--build-backends` is set with creds: routes a declared build to the
+        // forge cluster/github dispatcher. Off ⇒ the not-installed stub parks a `[build]` pack with a
+        // clear reason rather than dispatching a build no one configured creds for.
+        if let Some(backend) = crucible_controller::builds::lifecycle::forge_backend_from_cfg(&cfg)
+        {
+            tracing::info!("autopilot: build backends installed (cluster + github-actions)");
+            crucible_controller::builds::lifecycle::install_build_backend(std::sync::Arc::new(
+                backend,
+            ));
+        }
     }
 
     // The drift check runs far less often than discovery (a rebuild-and-diff is expensive) and only
@@ -1044,7 +1064,6 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
         db.clone(),
         serve_sink,
         std::sync::Arc::new(queue.clone()),
-        autopilot.clone(),
         clusters.clone(),
         Some(config_store.clone()),
         reconcile_now.clone(),
@@ -1102,12 +1121,15 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
             "autopilot: pack agent backfill failed; unstamped packs cannot launch"
         ),
     }
-    // Seed the runtime repo watch-set (Lane O3) from the boot-time env config: idempotent, and
-    // never un-watches or overwrites a row an admin already added/paused/unwatched. Discovery
-    // itself never reads `cfg.repos` again after this — see `Db::watched_repos`.
-    crucible_controller::issues::repo_watch::seed_watched_repos(db.pool(), &cfg.repos)
-        .await
-        .context("seeding the watched-repo set from CONTROLLER_WATCHED_REPOS")?;
+    #[cfg(feature = "autoresearch")]
+    if cfg.autoresearch_enabled() {
+        // Seed the runtime repo watch-set (Lane O3) from the boot-time env config: idempotent, and
+        // never un-watches or overwrites a row an admin already added/paused/unwatched. Discovery
+        // itself never reads `cfg.repos` again after this — see `Db::watched_repos`.
+        crucible_controller::issues::repo_watch::seed_watched_repos(db.pool(), &cfg.repos)
+            .await
+            .context("seeding the watched-repo set from CONTROLLER_WATCHED_REPOS")?;
+    }
     // Recover the dispatch location of runs written before `runs.cluster` existed, so the live
     // relay stops asking the hub about pods that only ever existed on a spoke. Needs the cluster
     // registry above to ask each spoke for its namespace, so it runs here rather than beside the
@@ -1150,14 +1172,17 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
         cfg.effective().failed_pod_keep,
     )
     .await;
-    // Re-adopt in-flight builds by listing Jobs/runs (never from memory): a build whose Job/run
-    // vanished during downtime resolves from the registry in one pass instead of waiting out its
-    // full timeout. Best-effort — a failed sweep only delays that resolution to the next poll.
-    if let Err(e) = crucible_controller::builds::lifecycle::adopt_builds(&db, &cfg).await {
-        tracing::warn!(
-            error = %format!("{e:#}"),
-            "autopilot: build startup adoption failed, the next reconcile poll retries"
-        );
+    #[cfg(feature = "autoresearch")]
+    if cfg.autoresearch_enabled() {
+        // Re-adopt in-flight builds by listing Jobs/runs (never from memory): a build whose Job/run
+        // vanished during downtime resolves from the registry in one pass instead of waiting out its
+        // full timeout. Best-effort — a failed sweep only delays that resolution to the next poll.
+        if let Err(e) = crucible_controller::builds::lifecycle::adopt_builds(&db, &cfg).await {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "autopilot: build startup adoption failed, the next reconcile poll retries"
+            );
+        }
     }
     // Settle the local-mode runs a restart orphaned before anything re-drives them: the
     // supervisor died with the last process, so their launches would sit at `running` forever.
@@ -1172,20 +1197,24 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
         count = keys.len(),
         "autopilot: non-terminal issues re-enqueued at startup"
     );
-    // Backfill `upstream_updated_at` for rows ingested before the column existed, so the rank
-    // horizon can gate on it. Spawned (a rate-limited GitHub must not stall boot) and repeated by
-    // the discovery cycle while NULL rows remain, so a failure here only delays the stamp.
-    let backfill_db = db.clone();
-    tokio::spawn(async move {
-        if let Err(e) =
-            crucible_controller::issues::triage::backfill_upstream_updated_at(&backfill_db).await
-        {
-            tracing::warn!(
-                error = %format!("{e:#}"),
-                "autopilot: upstream_updated_at backfill failed, the next discovery cycle retries"
-            );
-        }
-    });
+    #[cfg(feature = "autoresearch")]
+    if cfg.autoresearch_enabled() {
+        // Backfill `upstream_updated_at` for rows ingested before the column existed, so the rank
+        // horizon can gate on it. Spawned (a rate-limited GitHub must not stall boot) and repeated by
+        // the discovery cycle while NULL rows remain, so a failure here only delays the stamp.
+        let backfill_db = db.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                crucible_controller::issues::triage::backfill_upstream_updated_at(&backfill_db)
+                    .await
+            {
+                tracing::warn!(
+                    error = %format!("{e:#}"),
+                    "autopilot: upstream_updated_at backfill failed, the next discovery cycle retries"
+                );
+            }
+        });
+    }
     // The MLflow exporter: a controller-only background task that pushes each folded run's traces
     // and metrics to a per-deployment MLflow, off unless CONTROLLER_MLFLOW_TRACKING_URI is set.
     // Post-fold, allow-failure — a failed export marks its bookkeeping row and retries.
@@ -1254,18 +1283,26 @@ const CONTROLLER_API_PORT: u16 = 8870;
 
 #[cfg(test)]
 mod tests {
-    use crate::{Cli, dispatch_db_rebuild, dispatch_triage};
+    #[cfg(feature = "autoresearch")]
+    use crate::dispatch_triage;
+    #[cfg(feature = "autoresearch")]
+    use crate::{Cli, dispatch_db_rebuild};
+    #[cfg(feature = "autoresearch")]
     use clap::Parser;
+    #[cfg(feature = "autoresearch")]
     use std::fs;
+    #[cfg(feature = "autoresearch")]
     use std::path::PathBuf;
 
     /// Serializes the tests below that point the process-global `GITHUB_API_URL` at a local
     /// listener — two such tests would otherwise race on the one environ.
+    #[cfg(feature = "autoresearch")]
     fn github_env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    #[cfg(feature = "autoresearch")]
     fn tempdir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "crucible-controller-bin-test-{name}-{}-{}",
@@ -1279,6 +1316,7 @@ mod tests {
         dir
     }
 
+    #[cfg(feature = "autoresearch")]
     fn controller_cfg_from(argv: &[&str]) -> crucible_controller::ControllerCfg {
         #[derive(clap::Parser)]
         struct Harness {
@@ -1290,6 +1328,7 @@ mod tests {
 
     /// A unique ledger URL on the test server, so tests never write into the `DATABASE_URL`
     /// database itself (that's the sqlx-prepare schema database).
+    #[cfg(feature = "autoresearch")]
     fn test_ledger_url(name: &str) -> String {
         let base =
             std::env::var("DATABASE_URL").expect("DATABASE_URL must point at the test server");
@@ -1303,6 +1342,7 @@ mod tests {
     /// `crucible-controller triage --full` parses to `Cmd::Triage { full: true, .. }` (the
     /// backfill/repair flag threaded from clap into [`dispatch_triage`]); omitting it defaults to
     /// `false` — a normal sweep never accidentally pays for a full resync.
+    #[cfg(feature = "autoresearch")]
     #[test]
     fn triage_full_flag_parses_and_defaults_to_false() {
         let cli = Cli::parse_from([
@@ -1326,6 +1366,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "autoresearch")]
     #[test]
     fn dispatch_triage_requires_at_least_one_watched_repo() {
         let dir = tempdir("triage-no-repos");
@@ -1338,6 +1379,7 @@ mod tests {
 
     /// A one-shot listener standing in for api.github.com: drains the request headers and answers
     /// `200 OK` with `body`.
+    #[cfg(feature = "autoresearch")]
     fn stub_github(body: &'static str) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
         use std::io::{Read as _, Write as _};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -1365,6 +1407,7 @@ mod tests {
     /// `crucible-controller triage` end to end against a real listener standing in for
     /// api.github.com: fetch, upsert, and confirm the row lands in the ledger this CLI path opens —
     /// with no tier (triage is pure discovery, tiering is the ranker's job alone at reconcile time).
+    #[cfg(feature = "autoresearch")]
     #[test]
     fn dispatch_triage_fetches_and_upserts_into_the_ledger() {
         let _guard = github_env_lock();
@@ -1418,6 +1461,7 @@ mod tests {
     /// answers 200 with an undecodable body (no retries — an immediate hard error, unlike a
     /// per-run evidence gap), then asserts the live database's rows are untouched and no
     /// `_rebuild_tmp` scratch database is left behind.
+    #[cfg(feature = "autoresearch")]
     #[test]
     fn dispatch_db_rebuild_leaves_the_live_ledger_untouched_on_failure() {
         let _guard = github_env_lock();

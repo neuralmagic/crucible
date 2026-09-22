@@ -12,12 +12,12 @@
 #![allow(clippy::disallowed_macros)]
 
 use crate::model::ParkReason;
+use crate::runs::engine::{ITEM_ENV, open_draft_pr, repo_clone_url};
 use anyhow::{Context, Result, bail};
 use crucible_contract::{Disposition, Tier};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use crate::runs::engine::{ITEM_ENV, open_draft_pr, repo_clone_url};
 
 /// One stage of the scope pipeline, mirrored from `crucible::scope::StageResult` on the wire (the
 /// second consumer of that shape — a plain serde mirror, decoupled from the
@@ -565,5 +565,4 @@ mod tests {
         anyhow::ensure!(status.success(), "git {args:?} failed");
         Ok(())
     }
-
 }

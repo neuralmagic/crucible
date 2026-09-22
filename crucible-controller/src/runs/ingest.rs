@@ -944,6 +944,7 @@ mod tests {
         assert_eq!(parsed.pr_links[1].name, "epp");
     }
 
+    #[cfg(feature = "autoresearch")]
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn ingest_populates_pr_url_on_kept_rows_only(pool: PgPool) -> Result<()> {
         let (db, _d) = db_with(pool);
@@ -1009,6 +1010,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "autoresearch")]
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn ingest_leaves_composite_pr_url_null_and_documents_the_limit(
         pool: PgPool,

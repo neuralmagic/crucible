@@ -601,7 +601,7 @@ fn classify_pod_line(
         }
         return Some(RelayEvent::Log {
             ord: cursor.log,
-            line: crate::runs::turn_live::cap_line(trimmed, LOG_LINE_CAP),
+            line: cap_line(trimmed, LOG_LINE_CAP),
         });
     }
     if trimmed.is_empty() {
@@ -771,6 +771,18 @@ pub(crate) async fn live_response(
 
     let rx = spawn_relay(addr, resume.session, metrics);
     relay_sse(rx, resume)
+}
+
+/// Truncate to at most `cap` bytes on a char boundary, marking the cut.
+pub(crate) fn cap_line(s: &str, cap: usize) -> String {
+    if s.len() <= cap {
+        return s.to_string();
+    }
+    let mut end = cap;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…[truncated]", &s[..end])
 }
 
 #[cfg(test)]

@@ -36,14 +36,6 @@ pub(super) async fn reconcile_new(db: &Db, cfg: &ControllerCfg, issue: &Issue) -
     // on the scope_now stash) makes this idempotent across pod re-drives: a scenario always takes
     // this branch regardless of stash state, so a non-blocking pod dispatch that re-drives the key
     // won't fall through into the rank-horizon gate and get parked.
-    // A playbook launch has no scope turn ahead of it: the pack is registered and pinned, and the
-    // validated POST that wrote its launch row is the authorization the scope/approval gates stand
-    // in for elsewhere. Keyed on the kind, so a re-drive after the non-blocking dispatch takes the
-    // same branch rather than falling into the scope path.
-    if matches!(issue.kind, crate::issues::model::InputKind::Playbook { .. }) {
-        return crate::runs::launch::launch(db, cfg, issue).await;
-    }
-
     if !issue.kind.has_upstream() {
         let max_cost = cfg.effective().per_reconcile_cost;
         return run_scope_and_transition(db, cfg, issue, max_cost, "adopted scenario").await;

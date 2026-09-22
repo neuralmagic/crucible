@@ -100,6 +100,7 @@ fn pack_pr_token() -> Option<String> {
 /// App that fails to mint is an error, never a silent PAT fallback — the retry re-drives it.
 /// Installation tokens are documented to work both as the `x-access-token` git password and as
 /// `GH_TOKEN` for `gh`, so one credential serves both halves of [`open_pack_pr`].
+#[cfg(feature = "autoresearch")]
 pub(crate) async fn resolve_pack_pr_token(
     cfg: &crate::config::ControllerCfg,
 ) -> Result<Option<String>> {
@@ -465,6 +466,7 @@ mod tests {
 
     /// The pack-PR credential preference order: a configured GitHub App wins over a set PAT
     /// (minting through a wiremock exchange, never the real GitHub); no App ⇒ the env chain.
+    #[cfg(feature = "autoresearch")]
     #[tokio::test]
     async fn resolve_pack_pr_token_prefers_the_app_over_the_pat_chain() -> Result<()> {
         use wiremock::matchers::{method, path};

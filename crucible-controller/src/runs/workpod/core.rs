@@ -1,8 +1,11 @@
 use crate::wire_enum::{ParseError, wire_enum};
+#[cfg(feature = "autoresearch")]
 use crucible::deploy::{DigestResolver, ProposeTier, TurnOpts};
+#[cfg(feature = "autoresearch")]
 use crucible_contract::Tier;
 use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
+#[cfg(feature = "autoresearch")]
 use std::sync::Arc;
 
 /// What a dispatched work pod does. `AgentTurn` is one bounded turn (dispatched non-blocking,
@@ -142,6 +145,7 @@ pub struct NewWorkPod {
 /// Whether a turn may spawn now or must queue: under BOTH the per-kind concurrency cap AND the
 /// per-kind daily turn budget → spawn; over either → queue. Layered under the global daily cost
 /// ceiling the reconcile already enforces (this never loosens that; it only adds a per-kind gate).
+#[cfg(feature = "autoresearch")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Admission {
     Spawn,
@@ -149,6 +153,7 @@ pub enum Admission {
 }
 
 /// The pure admission decision (see [`Admission`]).
+#[cfg(feature = "autoresearch")]
 pub(crate) fn admit(active: u32, cap: u32, turns_today: u32, daily_budget: u32) -> Admission {
     if active < cap && turns_today < daily_budget {
         Admission::Spawn
@@ -161,10 +166,12 @@ pub(crate) fn admit(active: u32, cap: u32, turns_today: u32, daily_budget: u32) 
 /// DNS-1123-label safe (lowercase alphanumerics + `-`, ≤63 chars) and unique per dispatch (the
 /// suffix is the low bits of a monotonic-ish clock). The controller owns the name so its `work_pods`
 /// PK + the pod's ownerRef both key on a value it chose, before the pod exists.
+#[cfg(feature = "autoresearch")]
 pub(crate) fn grounded_rank_pod_name(issue_key: &str) -> String {
     work_pod_name("crucible-turn-", issue_key)
 }
 
+#[cfg(feature = "autoresearch")]
 fn work_pod_name(prefix: &str, key: &str) -> String {
     let sani = sanitize_dns_label(key);
     let nanos = std::time::SystemTime::now()
@@ -199,6 +206,7 @@ pub(crate) fn sanitize_dns_label(s: &str) -> String {
 
 /// The controller-owned k8s object name for a scope turn pod: `crucible-scope-<sanitized-issue>-<suffix>`,
 /// DNS-1123-label safe, following the same pattern as [`grounded_rank_pod_name`].
+#[cfg(feature = "autoresearch")]
 pub(crate) fn scope_pod_name(issue_key: &str) -> String {
     work_pod_name("crucible-scope-", issue_key)
 }
@@ -207,6 +215,7 @@ pub(crate) fn scope_pod_name(issue_key: &str) -> String {
 /// than off config. Grouped into one struct because they used to be four positional parameters
 /// threaded through five signatures — two of them `Option<String>`, so a transposed `goal_text` /
 /// `git_ref` pair compiled fine and only showed up as a turn cloning the wrong branch.
+#[cfg(feature = "autoresearch")]
 #[derive(Debug, Clone, Default)]
 pub struct TurnInputs {
     /// The issue's confirmed tier, forwarded as `--tier t0|t1`. Scope turns only.
@@ -240,6 +249,7 @@ pub struct TurnInputs {
 
 /// A turn input the linked engine's [`TurnOpts`] has no field for. Refused at dispatch as a
 /// contract rejection (ledgered, parked, never retried), so the contract is never silently dropped.
+#[cfg(feature = "autoresearch")]
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum UnsupportedTurnOption {
     #[error("the stored pack path is not one the engine will render: {detail}")]
@@ -251,6 +261,7 @@ pub enum UnsupportedTurnOption {
     BrokerMeasure { contract: String },
 }
 
+#[cfg(feature = "autoresearch")]
 impl UnsupportedTurnOption {
     /// The render option a `kind` turn carrying `codegen_contract` would need and the linked
     /// engine has no field for.
@@ -265,6 +276,7 @@ impl UnsupportedTurnOption {
 }
 
 /// Everything one turn dispatch needs to render + create its turn pod.
+#[cfg(feature = "autoresearch")]
 #[derive(Debug, Clone)]
 pub struct WorkPodSpec {
     pub(crate) kind: WorkKind,
@@ -307,6 +319,7 @@ pub struct WorkPodSpec {
     agent: crate::playbooks::providers::AgentSelection,
 }
 
+#[cfg(feature = "autoresearch")]
 impl WorkPodSpec {
     /// A grounded-rank turn spec. `git_ref` pins the clone to a branch/tag (`None` = default
     /// branch).
@@ -440,6 +453,7 @@ impl WorkPodSpec {
 /// (round-trips verbatim, unlike the lossy label), the managed-by pod-watch selector, and — when the
 /// controller knows its own identity — an ownerReference so kind GC ties the pod's lifetime to the
 /// controller. render-turn already set the name + the `work-kind` label, so this only adds ownership.
+#[cfg(feature = "autoresearch")]
 pub(crate) fn stamp_pod(pod: &mut Pod, spec: &WorkPodSpec, owner: Option<OwnerReference>) {
     apply_managed_meta(pod, &spec.issue_key, owner);
 }

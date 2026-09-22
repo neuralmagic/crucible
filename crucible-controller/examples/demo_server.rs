@@ -46,7 +46,6 @@ async fn main() -> anyhow::Result<()> {
     cfg.profile.max_scopes_per_day = 10;
     cfg.profile.daily_cost_ceiling = 50.0;
 
-    let autopilot = crucible_controller::AutopilotFlag::load(db.pool()).await?;
     let clusters = Arc::new(crucible_controller::runs::clusters::ClusterClients::new(
         None,
     ));
@@ -58,7 +57,6 @@ async fn main() -> anyhow::Result<()> {
         db,
         sink,
         Arc::new(queue),
-        autopilot,
         clusters,
         None,
         reconcile_now,

@@ -54,6 +54,24 @@ The admission caps bound what the daemon may spend on its own:
 Autopilot can be switched off at runtime from the admin page; that pauses machine-initiated
 spend and nothing else.
 
+## The autoresearch lane
+
+Playbooks are the controller's core: the registry, drafts, launches, schedules, watches and
+their runs. The autoresearch lane is separate and off by default. It covers GitHub discovery
+and triage, ranking, scope proposal and its approval gate, image builds, and scored loop runs.
+It takes two switches:
+
+- the `autoresearch` cargo feature, which compiles it in
+  (`cargo build -p crucible-controller --features autoresearch`; the published image and
+  release binaries carry it), and
+- `CONTROLLER_AUTORESEARCH=true`, which turns it on in a build that has it. The controller
+  refuses to start with the variable set on a build without the feature.
+
+With the lane off, its routes are not served, its discovery polls do not run, and a row that is
+not a playbook launch is left where it is. `GET /api/version` reports `autoresearch`, and the UI
+hides the lane's pages. The engine has the matching `autoresearch` feature for the scored loop
+and `crucible scope`; a deployment that turns the lane on needs both.
+
 ## On Kubernetes
 
 The controller runs as a Deployment. In a cluster, replicas contend on a Lease

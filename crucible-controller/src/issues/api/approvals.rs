@@ -2,7 +2,10 @@
 
 use crate::api::dto::*;
 use crate::api::state::*;
-use axum::extract::{Path, State};
+#[cfg(feature = "autoresearch")]
+use axum::extract::Path;
+use axum::extract::State;
+#[cfg(feature = "autoresearch")]
 use axum::response::{IntoResponse, Response};
 
 #[utoipa::path(
@@ -15,9 +18,21 @@ use axum::response::{IntoResponse, Response};
 pub(crate) async fn get_approvals(
     State(state): State<ApiState>,
 ) -> Result<Json<ApprovalsDto>, AppError> {
-    let awaiting = crate::issues::store::awaiting_approval_scopes(state.db.pool()).await?;
-    let prs = crate::runs::store::kept_candidate_prs(state.db.pool()).await?;
     let imports = crate::playbooks::imports::pending(state.db.pool()).await?;
+    #[cfg(feature = "autoresearch")]
+    let (awaiting, prs) = if state.autoresearch {
+        (
+            crate::issues::store::awaiting_approval_scopes(state.db.pool()).await?,
+            crate::runs::store::kept_candidate_prs(state.db.pool()).await?,
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    #[cfg(not(feature = "autoresearch"))]
+    let (awaiting, prs): (
+        Vec<crate::issues::model::AwaitingApproval>,
+        Vec<crate::issues::model::KeptPr>,
+    ) = (Vec::new(), Vec::new());
     Ok(Json(ApprovalsDto {
         awaiting_approval: awaiting
             .into_iter()
@@ -33,6 +48,7 @@ pub(crate) async fn get_approvals(
 /// issue's stored pack tarball ([`crate::playbooks::packs::read_pack_file`]) and parses the fenced round trail
 /// out of it via [`crate::issues::refine_trail::extract_trail`]. Missing or trail-less packs answer with an
 /// empty `rounds` list, never an error — only an unknown scope id 404s.
+#[cfg(feature = "autoresearch")]
 #[utoipa::path(
     get,
     path = "/api/approvals/{scope_id}/evidence",
@@ -71,6 +87,7 @@ pub(crate) async fn get_scope_evidence(
 /// pass/fail, the refine round trail, cost, and the work pod that ran it. Stored verbatim by the
 /// reconcile on every turn that produced a report (success or failure), so a parked issue keeps
 /// its evidence where the ScopeProgress page can render it instead of the flattened park reason.
+#[cfg(feature = "autoresearch")]
 #[utoipa::path(
     get,
     path = "/api/issues/{key}/scope-report",
@@ -96,6 +113,7 @@ pub(crate) async fn get_scope_report(
 /// the session NDJSON the propose/refine/adversary turns streamed (round-delimited `note` lines,
 /// nested agent events), stored gzipped by the reconcile and decompressed here for the SPA's
 /// session renderer. Absent for pre-feature turns and turns that delivered no transcript.
+#[cfg(feature = "autoresearch")]
 #[utoipa::path(
     get,
     path = "/api/issues/{key}/scope-transcript",

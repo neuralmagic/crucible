@@ -205,7 +205,7 @@ jobs:
           CRUCIBLE_GIT_SHA: ${{ github.sha }}
           SQLX_OFFLINE: "true"
         run: |
-          cargo build --release --locked -p crucible-controller -p crux --bins
+          cargo build --release --locked -p crucible-controller -p crux --bins --features crucible-controller/autoresearch
           mkdir -p prebuilt/bin
           cp target/release/crucible-controller target/release/crux prebuilt/bin/
           ls -la prebuilt/bin/

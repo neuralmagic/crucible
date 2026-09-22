@@ -247,6 +247,7 @@ pub(crate) async fn live_run(
         (status = 404, description = "Turn not found", body = ErrorBody)
     )
 )]
+#[cfg(feature = "autoresearch")]
 pub(crate) async fn live_turn(
     State(state): State<ApiState>,
     Path(pod_name): Path<String>,

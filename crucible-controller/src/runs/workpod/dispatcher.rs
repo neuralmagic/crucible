@@ -1,8 +1,13 @@
 use crate::runs::workpod::*;
-use anyhow::{Context, Result};
+#[cfg(feature = "autoresearch")]
+use anyhow::Context;
+use anyhow::Result;
+#[cfg(feature = "autoresearch")]
 use crucible::deploy::{DeployProfile, DigestResolver, render_turn};
 use k8s_openapi::api::core::v1::{ConfigMap, Pod, Secret};
+#[cfg(feature = "autoresearch")]
 use std::path::Path;
+#[cfg(feature = "autoresearch")]
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -63,6 +68,7 @@ pub trait PodDispatcher: Send + Sync {
 /// A transient or auth-rejected API failure also defers adoption: an unanswered call does not
 /// establish that the pod is gone, and adopting then would record a possibly-live turn as lost.
 /// Only a definitive 404 (or a non-kube error, matching pre-existing behavior) adopts.
+#[cfg(feature = "autoresearch")]
 pub(crate) async fn turn_pod_adoptable(
     dispatcher: &dyn PodDispatcher,
     cluster: &str,
@@ -85,6 +91,7 @@ pub(crate) async fn turn_pod_adoptable(
 /// Render one turn pod through the linked engine (`crucible::deploy::render_turn`, the library form
 /// of `deploy render-turn`), returning the parsed, unstamped [`Pod`]. Blocking (profile read, image
 /// pinning), so the caller runs it under `spawn_blocking`.
+#[cfg(feature = "autoresearch")]
 pub(crate) fn render_turn_pod(
     spec: &WorkPodSpec,
     profile_path: &Path,
