@@ -257,6 +257,9 @@ pub(crate) struct BearerGuard {
     pub(crate) expected: Option<SharedToken>,
     pub(crate) proxy: Option<SharedToken>,
     pub(crate) static_identity: Option<HeaderValue>,
+    /// `CONTROLLER_DEV_IDENTITY`: the login every request lands as while the guard is open. Only
+    /// constructible on an open guard, so it never names a caller on a routable bind.
+    pub(crate) dev_identity: Option<HeaderValue>,
     pub(crate) kube: Option<crate::identity::kube_user::KubeUserAuth>,
     pub(crate) oidc: Option<Arc<crate::identity::oidc::OidcProvider>>,
     /// The pool the `users` table is read through, to tell a cluster token that names a known SSO
@@ -276,6 +279,7 @@ impl Default for BearerGuard {
             expected: None,
             proxy: None,
             static_identity: None,
+            dev_identity: None,
             kube: None,
             oidc: None,
             users: None,
@@ -311,7 +315,29 @@ impl BearerGuard {
                 "CONTROLLER_AUTH_MODE=native without CONTROLLER_OIDC_ISSUER: native mode has no identity provider to run a login against"
             );
         }
-        Ok(guard)
+        guard.with_dev_identity(std::env::var("CONTROLLER_DEV_IDENTITY").ok())
+    }
+
+    /// Land every request on an open guard as `login`. Refused on a closed guard: a deployment
+    /// with a token or an issuer has real callers to tell apart, and would hand this name to all
+    /// of them.
+    pub(crate) fn with_dev_identity(mut self, login: Option<String>) -> anyhow::Result<Self> {
+        let Some(login) = login
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+        else {
+            return Ok(self);
+        };
+        if !self.is_open() {
+            anyhow::bail!(
+                "CONTROLLER_DEV_IDENTITY is set on a guarded deployment (CONTROLLER_API_TOKEN or CONTROLLER_OIDC_ISSUER is configured), so every caller would land as {login}"
+            );
+        }
+        self.dev_identity =
+            Some(HeaderValue::from_str(&login).map_err(|_| {
+                anyhow::anyhow!("CONTROLLER_DEV_IDENTITY is not a valid header value")
+            })?);
+        Ok(self)
     }
 
     /// Refuse the combinations that would silently hand a machine caller the edge's power to name
@@ -356,6 +382,7 @@ impl BearerGuard {
             expected,
             proxy,
             static_identity,
+            dev_identity: None,
             kube,
             oidc: None,
             users: None,
@@ -405,7 +432,8 @@ impl BearerGuard {
 }
 
 /// Middleware: 401 any request that doesn't carry a credential the guard recognizes. With no
-/// expected token and no issuer, every request passes and the surface is loopback-bound.
+/// expected token and no issuer, every request passes, as `CONTROLLER_DEV_IDENTITY` when one is
+/// set, and the surface is loopback-bound.
 ///
 /// Which credential it is decides who the caller may claim to be.
 ///
@@ -439,10 +467,16 @@ pub(crate) async fn require_auth(
     let source = guard.source();
 
     if guard.is_open() {
-        let resolved = if native {
-            Resolved::anonymous(source)
-        } else {
-            resolved_from_headers(req.headers(), source)
+        let resolved = match &guard.dev_identity {
+            Some(value) => {
+                let Ok(name) = value.to_str().map(str::to_string) else {
+                    return unauthorized();
+                };
+                stamp_identity(req.headers_mut(), Some(value.clone()));
+                Resolved::named(source, name)
+            }
+            None if native => Resolved::anonymous(source),
+            None => resolved_from_headers(req.headers(), source),
         };
         admit(&mut req, AuthPath::Open, resolved);
         return next.run(req).await;
@@ -1618,6 +1652,44 @@ mod tests {
             assert_eq!(status, StatusCode::OK);
             assert_eq!(body, "anonymous|");
         }
+
+        /// A dev identity names every open-guard caller, and whatever the client asserted is
+        /// dropped first, so a browser and a curl that writes the edge's headers land the same.
+        #[tokio::test]
+        async fn an_open_guard_with_a_dev_identity_names_every_caller() {
+            let guard = BearerGuard::default()
+                .with_dev_identity(Some(" wren ".into()))
+                .expect("an open guard takes a dev identity");
+            let app = app(guard);
+            let (status, body) = call(app.clone(), req(None, &[])).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body, "wren|");
+            let (status, body) = call(app, req(Some("Bearer anything"), &CLAIMS)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body, "wren|");
+        }
+
+        #[test]
+        fn a_dev_identity_is_refused_on_a_guarded_deployment() {
+            let refusal = match static_only().with_dev_identity(Some("wren".into())) {
+                Ok(_) => panic!("expected a refusal"),
+                Err(e) => e.to_string(),
+            };
+            assert!(refusal.contains("guarded deployment"), "{refusal}");
+        }
+
+        #[test]
+        fn a_blank_dev_identity_is_none_and_a_bad_one_fails_boot() {
+            let guard = BearerGuard::default()
+                .with_dev_identity(Some("  ".into()))
+                .expect("blank is unset");
+            assert!(guard.dev_identity.is_none());
+            assert!(
+                BearerGuard::default()
+                    .with_dev_identity(Some("wr\nen".into()))
+                    .is_err()
+            );
+        }
     }
 
     /// Native mode: identity is a cookie this controller minted or a JWT it validated, and nothing
@@ -2196,6 +2268,10 @@ mod tests {
             assert!(
                 !guard.is_open(),
                 "a deployment with logins is never the open shape"
+            );
+            assert!(
+                guard.with_dev_identity(Some("wren".into())).is_err(),
+                "an issuer alone refuses a dev identity"
             );
         }
     }

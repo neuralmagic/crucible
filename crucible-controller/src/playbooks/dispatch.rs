@@ -115,8 +115,8 @@ const DEFAULT_BACKEND: &str = "local";
 /// time, so it is refused here instead — at launch, where someone is watching.
 const KNOWN_BACKENDS: [&str; 3] = ["local", "openshell", "command"];
 
-/// The backend that needs an OpenShell gateway, which only a cluster deployment has.
-const CLUSTER_ONLY_BACKEND: &str = "openshell";
+/// The backend that runs each turn in an OpenShell sandbox, launched from `sandbox_image`.
+const SANDBOX_BACKEND: &str = "openshell";
 
 #[derive(Debug, Deserialize)]
 struct ManifestAgent {
@@ -205,11 +205,6 @@ impl DispatchCapability {
             ));
         }
         match self.executor {
-            PlaybookExecutor::Local if backend == CLUSTER_ONLY_BACKEND => Some(format!(
-                "the pack declares [agent] backend {backend:?}, which needs an OpenShell sandbox \
-                 on a cluster; this deployment runs playbooks as a local subprocess \
-                 (CONTROLLER_PLAYBOOK_EXECUTOR=local)"
-            )),
             PlaybookExecutor::Local => None,
             PlaybookExecutor::Pod if !self.cluster => Some(
                 "this deployment cannot dispatch a work pod (no CONTROLLER_DEPLOY_PROFILE) and \
@@ -223,17 +218,16 @@ impl DispatchCapability {
     /// Why an agent turn declared like this cannot be spawned where this deployment would dispatch
     /// it, or `None`. Asked where a pack is written; [`Self::refusal`] is the launch verdict.
     pub fn spawn_defect(&self, agent: &PackAgent) -> Option<SpawnDefect> {
-        if self.executor != PlaybookExecutor::Pod {
-            return None;
-        }
         match agent.backend.as_str() {
-            CLUSTER_ONLY_BACKEND => agent
+            SANDBOX_BACKEND => agent
                 .sandbox_image
                 .is_none()
                 .then_some(SpawnDefect::NoSandboxImage),
-            DEFAULT_BACKEND => Some(SpawnDefect::InProcessBackend {
-                backend: agent.backend.clone(),
-            }),
+            DEFAULT_BACKEND if self.executor == PlaybookExecutor::Pod => {
+                Some(SpawnDefect::InProcessBackend {
+                    backend: agent.backend.clone(),
+                })
+            }
             _ => None,
         }
     }
@@ -476,19 +470,14 @@ mod tests {
         assert!(pack_agent(dir.path()).is_err());
     }
 
-    /// The laptop case the whole surface exists for: local mode runs a `local` pack and refuses an
-    /// `openshell` one, naming both sides of the mismatch.
+    /// The laptop case the whole surface exists for: local mode runs every backend the engine
+    /// takes, `openshell` included, since the engine boots its sandbox on the host's podman.
     #[test]
-    fn local_mode_takes_local_and_command_but_not_openshell() {
+    fn local_mode_takes_every_backend() {
         let cap = capability(PlaybookExecutor::Local, false);
-        assert_eq!(cap.refusal(&agent("local")), None);
-        assert_eq!(cap.refusal(&agent("command")), None);
-        let refusal = cap.refusal(&agent("openshell")).expect("refused");
-        assert!(refusal.contains("openshell"), "{refusal}");
-        assert!(
-            refusal.contains("CONTROLLER_PLAYBOOK_EXECUTOR"),
-            "{refusal}"
-        );
+        for backend in KNOWN_BACKENDS {
+            assert_eq!(cap.refusal(&agent(backend)), None, "{backend}");
+        }
     }
 
     /// Pod mode with no deploy profile dispatches nothing at all: the render it would need has no
@@ -658,20 +647,26 @@ mod tests {
     }
 
     /// A command backend brings its own process, and local mode spawns on the machine the
-    /// controller runs on, where a `local` agent is the point.
+    /// controller runs on, where a `local` agent is the point. An `openshell` turn needs its image
+    /// wherever it runs.
     #[test]
     fn a_command_backend_and_local_mode_earn_no_spawn_defect() {
         assert_eq!(
             capability(PlaybookExecutor::Pod, true).spawn_defect(&agent("command")),
             None
         );
-        for backend in KNOWN_BACKENDS {
-            assert_eq!(
-                capability(PlaybookExecutor::Local, false).spawn_defect(&agent(backend)),
-                None,
-                "{backend}"
-            );
-        }
+        let local = capability(PlaybookExecutor::Local, false);
+        assert_eq!(local.spawn_defect(&agent("local")), None);
+        assert_eq!(local.spawn_defect(&agent("command")), None);
+        assert_eq!(
+            local.spawn_defect(&agent("openshell")),
+            Some(SpawnDefect::NoSandboxImage)
+        );
+        let complete = PackAgent::new(
+            "openshell".to_string(),
+            Some("localhost/sandbox:dev".to_string()),
+        );
+        assert_eq!(local.spawn_defect(&complete), None);
     }
 
     /// The spawn check is the authoring path's alone. Every pack the launch path already accepts

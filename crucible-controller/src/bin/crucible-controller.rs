@@ -818,10 +818,17 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
         Some(metrics),
         Some(db.events().clone()),
     );
-    if let Err(e) = config_store.ensure_configmap().await {
-        tracing::warn!(error = %format!("{e:#}"), "autopilot: overrides create-if-missing failed");
+    let overrides_watched = kube::Config::infer().await.is_ok();
+    if overrides_watched {
+        if let Err(e) = config_store.ensure_configmap().await {
+            tracing::warn!(error = %format!("{e:#}"), "autopilot: overrides create-if-missing failed");
+        }
+        config_store.reload_once().await;
+    } else {
+        tracing::info!(
+            "no Kubernetes config to infer; runtime overrides are off and the parsed config stands"
+        );
     }
-    config_store.reload_once().await;
     cfg.overrides = Some(config_store.clone());
 
     // The WorkPod dispatcher (grounded-rank turns + loop runs + future kinds): the real kube
@@ -933,11 +940,13 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
 
     // The overrides watch: re-list the ConfigMap on a fixed cadence, swap on a valid change, keep
     // last-good otherwise. Shares the daemon's shutdown signal so it stops cleanly.
-    tokio::spawn(crucible_controller::daemon::overrides_store::watch_loop(
-        config_store.clone(),
-        std::time::Duration::from_secs(30),
-        shutdown.clone(),
-    ));
+    if overrides_watched {
+        tokio::spawn(crucible_controller::daemon::overrides_store::watch_loop(
+            config_store.clone(),
+            std::time::Duration::from_secs(30),
+            shutdown.clone(),
+        ));
+    }
 
     // One work queue shared between the worker and the override sink (human park/unpark/bump lands
     // in the same FIFO as the discovery/approval/pod-watch sources); the store carries the intent
