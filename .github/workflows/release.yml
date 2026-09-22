@@ -50,8 +50,22 @@ jobs:
 
       # The same crates the runtime image builds: crucible (engine) + forge (engine-side
       # build/deploy bins).
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+
+      # The controller embeds the SPA at compile time, so the bundle has to exist first.
+      - name: Build UI
+        working-directory: crucible-controller/ui
+        env:
+          SQLX_OFFLINE: "true"
+        run: |
+          bun install --frozen-lockfile
+          bun run build
+
       - name: Build release binaries
-        run: cargo build --release --locked -p crucible -p forge --bins
+        env:
+          CRUCIBLE_GIT_SHA: ${{ github.sha }}
+          SQLX_OFFLINE: "true"
+        run: cargo build --release --locked -p crucible -p forge -p crucible-controller -p crux --bins
 
       # Collect every top-level executable from target/release (same pattern the Containerfile
       # uses to stage /art/bin) into one tarball + a no-tooling sha256 integrity file.

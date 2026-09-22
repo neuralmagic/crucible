@@ -13,6 +13,12 @@
 - [Tasks: general-purpose orchestration](./task-lane.md)
 - [Images for a new domain](./domain-images.md)
 
+# The control plane
+
+- [Deploying the controller](./controller-deploy.md)
+- [Authentication](./controller-auth.md)
+- [Vault and the secrets registry](./controller-vault.md)
+
 # Reference
 
 - [Implementation contract](./crucible-contract.md)
