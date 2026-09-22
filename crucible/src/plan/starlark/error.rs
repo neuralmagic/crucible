@@ -417,6 +417,14 @@ pub enum CompileError {
     WhenNotAnAnswer,
     #[error("argument \"answers\" has no meaning without \"when\"")]
     AnswersWithoutWhen,
+    #[error("argument \"answers\" lists no labels")]
+    EmptyAnswers,
+    #[error("argument \"otherwise\" has no meaning without \"when\"")]
+    OtherwiseWithoutWhen,
+    #[error("a task takes \"answers\" or \"otherwise\", not both")]
+    OtherwiseWithAnswers,
+    #[error("unreachable otherwise on {task:?}: every answer of {asked} is listed or dropped")]
+    UnreachableOtherwise { task: String, asked: String },
     #[error(
         "{asked} cannot answer {label:?}{} (it answers: {declared})",
         diag::hint(.suggestion.as_deref())

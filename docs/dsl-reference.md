@@ -38,6 +38,7 @@ An agent turn driven by a prompt.
 | `stage` | `"iteration" \| "epilogue"` | `epilogue` runs once after the loop concludes, and only if the run kept a candidate. |
 | `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
 | `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice. |
+| `otherwise` | `bool` | In place of `answers`: every answer no other task lists and the question does not `drop`, `"uncertain"` included. Expanded at compile time. An unreachable `otherwise` is an error. |
 
 ### `skill()`
 
@@ -66,6 +67,7 @@ An agent turn whose prompt is a skill's instructions plus its arguments.
 | `stage` | `"iteration" \| "epilogue"` | `epilogue` runs once after the loop concludes, and only if the run kept a candidate. |
 | `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
 | `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice. |
+| `otherwise` | `bool` | In place of `answers`: every answer no other task lists and the question does not `drop`, `"uncertain"` included. Expanded at compile time. An unreachable `otherwise` is an error. |
 
 ### `command()`
 
@@ -89,6 +91,7 @@ A deterministic shell task in the candidate workspace.
 | `stage` | `"iteration" \| "epilogue"` | `epilogue` runs once after the loop concludes, and only if the run kept a candidate. |
 | `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
 | `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice. |
+| `otherwise` | `bool` | In place of `answers`: every answer no other task lists and the question does not `drop`, `"uncertain"` included. Expanded at compile time. An unreachable `otherwise` is an error. |
 
 ### `evaluate()`
 
@@ -114,6 +117,7 @@ A measurement command. Its last non-empty stdout line is a JSON object; `pass = 
 | `stage` | `"iteration" \| "epilogue"` | `epilogue` runs once after the loop concludes, and only if the run kept a candidate. |
 | `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
 | `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice. |
+| `otherwise` | `bool` | In place of `answers`: every answer no other task lists and the question does not `drop`, `"uncertain"` included. Expanded at compile time. An unreachable `otherwise` is an error. |
 
 ### `report()`
 
@@ -254,6 +258,7 @@ Engine-owned decision: answers typed questions about its dependencies' outputs a
 | `stage` | `"iteration" \| "epilogue"` | As on any task. |
 | `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
 | `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice. |
+| `otherwise` | `bool` | In place of `answers`: every answer no other task lists and the question does not `drop`, `"uncertain"` included. Expanded at compile time. An unreachable `otherwise` is an error. |
 
 ### `noul()`
 

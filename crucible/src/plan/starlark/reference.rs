@@ -136,6 +136,7 @@ fn task_knobs() -> Vec<Kwarg> {
         ),
         when_kwarg(),
         answers_kwarg(),
+        otherwise_kwarg(),
     ]
 }
 
@@ -147,6 +148,18 @@ fn when_kwarg() -> Kwarg {
          Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, \
          and every `all`-join dependent is not taken with it. Rejoin branches with \
          `join = \"passed\"` or `join = \"settled\"`. Playbook and custom workflows only.",
+    )
+}
+
+fn otherwise_kwarg() -> Kwarg {
+    Kwarg::new(
+        "otherwise",
+        "bool",
+        format!(
+            "In place of `answers`: every answer no other task lists and the question does not \
+             `drop`, `\"{UNCERTAIN}\"` included. Expanded at compile time. An unreachable \
+             `otherwise` is an error."
+        ),
     )
 }
 
@@ -473,6 +486,7 @@ pub fn functions() -> Vec<Function> {
                 Kwarg::new("stage", "\"iteration\" | \"epilogue\"", "As on any task."),
                 when_kwarg(),
                 answers_kwarg(),
+                otherwise_kwarg(),
             ],
         },
         Function {
