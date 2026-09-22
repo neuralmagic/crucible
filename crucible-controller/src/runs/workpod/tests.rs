@@ -2757,7 +2757,7 @@ async fn a_loop_run_exports_its_item_and_a_playbook_launch_exports_none(
         matches!(out, RunAdmission::Launched { .. }),
         "expected a launch, got {out:?}"
     );
-    let item = only_pod_env(&pods, crate::issues::engine::ITEM_ENV);
+    let item = only_pod_env(&pods, crate::runs::engine::ITEM_ENV);
     assert!(!item.is_empty());
     assert!(
         item.iter().all(|v| v.as_deref() == Some("owner/repo#7")),
@@ -2794,7 +2794,7 @@ async fn a_loop_run_exports_its_item_and_a_playbook_launch_exports_none(
         "expected a launch, got {out:?}"
     );
     assert!(
-        only_pod_env(&pods, crate::issues::engine::ITEM_ENV)
+        only_pod_env(&pods, crate::runs::engine::ITEM_ENV)
             .iter()
             .all(Option::is_none),
         "a launch with no upstream item addresses no tracker item"

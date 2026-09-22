@@ -85,7 +85,7 @@ impl RunRenderOpts {
     }
 
     /// The tracker item this run is parameterized by, exported as
-    /// [`crate::issues::engine::ITEM_ENV`]. A playbook launch has no upstream item, so the engine's
+    /// [`crate::runs::engine::ITEM_ENV`]. A playbook launch has no upstream item, so the engine's
     /// `tracker-comment` default resolves to nothing and refuses every write of that kind.
     pub(crate) fn tracker_item<'a>(&self, issue_key: &'a str) -> Option<&'a str> {
         match self {
@@ -649,7 +649,7 @@ pub async fn dispatch_run(
         let (mut pod, cm) = render_run_docs(&pack, &profile, &cm_name, &opts, digests)?;
         stamp_run_pod(&mut pod, &name, &issue, &run, owner, overlay.as_deref());
         if let Some(item) = opts.tracker_item(&issue) {
-            set_container_env(&mut pod, crate::issues::engine::ITEM_ENV, item);
+            set_container_env(&mut pod, crate::runs::engine::ITEM_ENV, item);
         }
         if let Some(url) = public_url.as_deref() {
             set_container_env(&mut pod, "CRUCIBLE_UI_BASE_URL", url.trim_end_matches('/'));

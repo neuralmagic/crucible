@@ -11,6 +11,7 @@ pub mod clusters;
 pub mod completion;
 pub mod contract;
 pub mod dispatch_target;
+pub mod engine;
 pub mod export;
 pub(crate) mod flow_enriched;
 pub mod ingest;

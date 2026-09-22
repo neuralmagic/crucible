@@ -1020,7 +1020,7 @@ pub(crate) async fn graduate_playbook_draft(
     let repo = normalize_repo(body.repo.trim()).to_string();
     let path = body.path.unwrap_or_default().trim().to_string();
     let token =
-        match crate::issues::engine::resolve_pack_pr_token_for(state.pack_pr_app.as_ref()).await {
+        match crate::runs::engine::resolve_pack_pr_token_for(state.pack_pr_app.as_ref()).await {
             Ok(t) => t,
             Err(e) => return AppError::from(e).into_response(),
         };

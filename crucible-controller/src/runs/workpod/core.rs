@@ -1,4 +1,3 @@
-use crate::issues::engine::{self};
 use crate::wire_enum::{ParseError, wire_enum};
 use crucible::deploy::{DigestResolver, ProposeTier, TurnOpts};
 use crucible_contract::Tier;
@@ -324,7 +323,7 @@ impl WorkPodSpec {
             pod_name,
             issue_key,
             // The ledger stores bare `owner/repo`; the turn wrapper git-clones, so it needs a URL.
-            repo_url: crate::issues::engine::repo_clone_url(&repo_url),
+            repo_url: crate::runs::engine::repo_clone_url(&repo_url),
             max_cost,
             sandbox_image,
             tier: None,
@@ -358,7 +357,7 @@ impl WorkPodSpec {
             pod_name,
             issue_key,
             // The ledger stores bare `owner/repo`; the turn wrapper git-clones, so it needs a URL.
-            repo_url: crate::issues::engine::repo_clone_url(&repo_url),
+            repo_url: crate::runs::engine::repo_clone_url(&repo_url),
             max_cost,
             sandbox_image,
             tier: inputs.tier,
@@ -456,7 +455,7 @@ pub(crate) fn apply_managed_meta(pod: &mut Pod, issue_key: &str, owner: Option<O
         .get_or_insert_with(Default::default)
         .insert(
             crate::daemon::ISSUE_KEY_LABEL.to_string(),
-            engine::issue_key_label_value(issue_key),
+            crate::runs::engine::issue_key_label_value(issue_key),
         );
 }
 

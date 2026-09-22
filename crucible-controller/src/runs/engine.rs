@@ -1,0 +1,532 @@
+//! The controller-to-engine boundary. The controller drives the `crucible` engine as a
+//! **subprocess**: it is a sibling binary staged on `PATH` in both images, so [`resolve_bin`]
+//! defaults to the bare `crucible` name; `CRUCIBLE_BIN` overrides it (tests point it at a scripted
+//! stand-in). Also the git/`gh` plumbing that pushes a tree as a branch pair and opens the draft PR
+//! whose diff is exactly that tree.
+
+#![allow(clippy::disallowed_macros)]
+
+use anyhow::{Context, Result, bail};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// The item a run is parameterized by, read by `crucible_contract::outputs::DefaultTargets` as the
+/// engine default target for `tracker-comment`. Unset, the engine refuses every write of that kind.
+pub(crate) const ITEM_ENV: &str = "CRUCIBLE_ITEM";
+
+/// The `crucible` engine binary: `CRUCIBLE_BIN` if set, else the bare name on `PATH` (both images
+/// stage the engine alongside this binary).
+pub fn resolve_bin() -> PathBuf {
+    match std::env::var_os("CRUCIBLE_BIN") {
+        Some(bin) => PathBuf::from(bin),
+        None => PathBuf::from("crucible"),
+    }
+}
+
+/// Download one object by shelling `crucible fetch --uri … --out …` — S3 access stays behind the
+/// engine subprocess boundary; local paths never come here. A nonzero exit carries the engine's
+/// stderr verbatim: the invoking shell may lack the pod's S3 credentials, and that stderr is the
+/// only diagnostic.
+pub async fn fetch_object(uri: &str, out: &Path) -> Result<()> {
+    let bin = resolve_bin();
+    crate::runs::workpod::admit_contract(
+        crate::runs::contract::RequestKind::Fetch,
+        &[crate::runs::contract::DispatchTarget::Binary(bin.clone())],
+    )
+    .await?;
+    let output = tokio::process::Command::new(&bin)
+        .arg("fetch")
+        .arg("--uri")
+        .arg(uri)
+        .arg("--out")
+        .arg(out)
+        .output()
+        .await
+        .with_context(|| format!("spawning `{} fetch`", bin.display()))?;
+    if !output.status.success() {
+        bail!(
+            "`crucible fetch {uri}` exited {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// The clone URL for a watched `owner/repo` (scope's `--repo`, the code under test). A value that
+/// already looks like a URL or local path is passed through untouched.
+pub(crate) fn repo_clone_url(repo: &str) -> String {
+    if repo.contains("://") || repo.contains('@') || repo.starts_with('/') || repo.ends_with(".git")
+    {
+        repo.to_string()
+    } else {
+        format!("https://github.com/{repo}.git")
+    }
+}
+
+/// The pushed branch pair for a pack: the pristine (empty) base and the pack head, so the draft PR's
+/// diff is *exactly* the pack files (the `publish.rs` pinned-base trick). Deterministic per issue, so
+/// a re-open reuses the branches rather than spawning duplicates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackBranches {
+    base: String,
+    head: String,
+}
+
+/// The branch names for an issue's pack PR: `crucible-pack/<key>[-base]`, the key sanitized to a
+/// git-ref-safe token (`owner/repo#7` → `owner_repo_7`).
+fn pack_branches(issue_key: &str) -> PackBranches {
+    let safe = crate::model::sanitize_key(issue_key);
+    PackBranches {
+        base: format!("crucible-pack/{safe}-base"),
+        head: format!("crucible-pack/{safe}"),
+    }
+}
+
+/// The forge PAT for pushing the pack + opening the PR — `AUTORESEARCH_PR_TOKEN` (fallback
+/// `GITHUB_TOKEN`/`GH_TOKEN`), the same credential the publisher and the broker share. The
+/// fallback arm of [`resolve_pack_pr_token`]; deploys with a GitHub App configured never get here.
+fn pack_pr_token() -> Option<String> {
+    std::env::var("AUTORESEARCH_PR_TOKEN")
+        .or_else(|_| std::env::var("GITHUB_TOKEN"))
+        .or_else(|_| std::env::var("GH_TOKEN"))
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// The pack-PR credential: an App installation token when the deploy configured one
+/// (`cfg.github_app`, from the `CONTROLLER_GITHUB_APP_*` env vars — the durable path, since the
+/// org's token policy forbids long-lived PATs), else the [`pack_pr_token`] env chain. A configured
+/// App that fails to mint is an error, never a silent PAT fallback — the retry re-drives it.
+/// Installation tokens are documented to work both as the `x-access-token` git password and as
+/// `GH_TOKEN` for `gh`, so one credential serves both halves of [`open_pack_pr`].
+pub(crate) async fn resolve_pack_pr_token(
+    cfg: &crate::config::ControllerCfg,
+) -> Result<Option<String>> {
+    resolve_pack_pr_token_for(cfg.github_app.as_ref()).await
+}
+
+/// [`resolve_pack_pr_token`] against the App source alone, for callers that hold the source rather
+/// than the whole parsed config.
+pub(crate) async fn resolve_pack_pr_token_for(
+    app: Option<&crate::secrets::github_app::GithubAppTokenSource>,
+) -> Result<Option<String>> {
+    if let Some(app) = app {
+        let token = app
+            .token()
+            .await
+            .context("minting the GitHub App installation token for the pack PR")?;
+        return Ok(Some(token));
+    }
+    Ok(pack_pr_token())
+}
+
+/// Push a tree as a branch pair to `repo` and open the draft PR whose diff is exactly that tree.
+/// `branch_key` names the pair through [`pack_branches`], so re-opening the same key reuses the
+/// branches rather than spawning duplicates. Blocking; `token` is resolved by the async caller.
+pub(crate) fn open_draft_pr(
+    repo: &str,
+    branch_key: &str,
+    pack_out: &Path,
+    title: &str,
+    body: &str,
+    token: Option<&str>,
+) -> Result<String> {
+    let branches = pack_branches(branch_key);
+
+    // Idempotent: if the PR already exists for this head branch, return it without re-pushing.
+    if let Some(url) = find_pack_pr(repo, &branches.head, token)? {
+        return Ok(url);
+    }
+
+    let push_url = pack_push_url(repo, token);
+    push_pack_branches(pack_out, &push_url, &branches)
+        .with_context(|| format!("pushing pack branches for {branch_key} to {repo}"))?;
+
+    gh_open_draft_pr(repo, title, body, &branches, token)
+        .with_context(|| format!("opening the draft PR on {repo}"))
+}
+
+/// The authenticated push URL (`x-access-token` is GitHub's token-as-password convention, and it
+/// accepts App installation tokens (`ghs_…`) exactly like PATs — documented GitHub behavior, so
+/// the App path needs no separate plumbing here). Kept out
+/// of every error message (see [`push_pack_branches`]) so the token never lands in a log. No token →
+/// a plain URL, relying on the ambient git credential helper.
+fn pack_push_url(repo: &str, token: Option<&str>) -> String {
+    match token {
+        Some(t) => format!("https://x-access-token:{t}@github.com/{repo}.git"),
+        None => format!("https://github.com/{repo}.git"),
+    }
+}
+
+/// Turn the pack dir into a one-commit git repo on top of an empty base and push both refs. The
+/// empty base pinned as a branch makes the PR diff exactly the pack files, pristine-relative (the
+/// `publish.rs` base-branch trick). Uses the SYSTEM git binary (the runtime image's libgit2 has no
+/// TLS backend — the same reason `publish::push_ref` shells git). `--force` makes a re-push idempotent.
+fn push_pack_branches(pack_out: &Path, push_url: &str, branches: &PackBranches) -> Result<()> {
+    let git = |args: &[&str]| -> Result<()> {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(pack_out)
+            .args(args)
+            .status()
+            .context("running `git` (is it on PATH?)")?;
+        if !status.success() {
+            // `args` never carries the token (that's only in the push URL, handled separately).
+            bail!("git {:?} failed ({status})", args.first().unwrap_or(&""));
+        }
+        Ok(())
+    };
+
+    // Fresh repo (idempotent on re-run), identity set locally so no global config is required.
+    git(&["init", "-q"])?;
+    git(&["config", "user.email", "autoresearch@crucible.local"])?;
+    git(&["config", "user.name", "crucible autoresearch"])?;
+    // The pristine empty base commit, then the pack head on top of it.
+    git(&["checkout", "-q", "-B", "crucible-pack-base"])?;
+    git(&["commit", "-q", "--allow-empty", "-m", "pristine base"])?;
+    let base_sha = git_stdout(pack_out, &["rev-parse", "HEAD"])?;
+    git(&["checkout", "-q", "-B", "crucible-pack-head"])?;
+    git(&["add", "-A"])?;
+    git(&["commit", "-q", "--allow-empty", "-m", "scope pack"])?;
+
+    // Push the head (kept commit) and the pinned base. `git push` keeps the token-bearing URL out of
+    // its own error output only if we do — so wrap failures with a token-free message.
+    push_ref(pack_out, push_url, "HEAD", &branches.head)?;
+    push_ref(pack_out, push_url, base_sha.trim(), &branches.base)?;
+    Ok(())
+}
+
+/// `git -C <dir> <args>` capturing stdout (trimmed by the caller).
+fn git_stdout(dir: &Path, args: &[&str]) -> Result<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .context("running `git`")?;
+    if !out.status.success() {
+        bail!(
+            "git {:?} failed: {}",
+            args.first().unwrap_or(&""),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Push `local_ref` (a branch, `HEAD`, or a bare SHA) to `url` as `refs/heads/{branch}`. `--force`
+/// makes a re-push idempotent. `url` may carry the PAT, so it is excluded from the error message.
+fn push_ref(workspace: &Path, url: &str, local_ref: &str, branch: &str) -> Result<()> {
+    let refspec = format!("{local_ref}:refs/heads/{branch}");
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .arg("push")
+        .arg("--force")
+        .arg(url)
+        .arg(&refspec)
+        .status()
+        .context("running `git push`")?;
+    if !status.success() {
+        bail!("git push of {refspec} failed ({status})");
+    }
+    Ok(())
+}
+
+/// The existing draft PR's url for `head`, if one is already open (idempotency). Shells `gh pr list`.
+fn find_pack_pr(repo: &str, head: &str, token: Option<&str>) -> Result<Option<String>> {
+    let mut cmd = Command::new("gh");
+    cmd.args([
+        "pr", "list", "--repo", repo, "--head", head, "--state", "open",
+    ])
+    .args(["--json", "url", "--jq", ".[0].url // \"\""]);
+    if let Some(t) = token {
+        cmd.env("GH_TOKEN", t);
+    }
+    let out = cmd.output().context("running `gh pr list`")?;
+    if !out.status.success() {
+        bail!(
+            "gh pr list failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    Ok((!url.is_empty()).then_some(url))
+}
+
+/// Open the DRAFT PR via `gh pr create` (already in the loop/controller image; the broker + the
+/// publisher shell `gh` too). Both head and base are branches in `repo`, so it's an internal PR.
+fn gh_open_draft_pr(
+    repo: &str,
+    title: &str,
+    body: &str,
+    branches: &PackBranches,
+    token: Option<&str>,
+) -> Result<String> {
+    let mut cmd = Command::new("gh");
+    cmd.args([
+        "pr",
+        "create",
+        "--repo",
+        repo,
+        "--draft",
+        "--head",
+        &branches.head,
+        "--base",
+        &branches.base,
+        "--title",
+        title,
+        "--body",
+        body,
+    ]);
+    if let Some(t) = token {
+        cmd.env("GH_TOKEN", t);
+    }
+    let out = cmd.output().context("running `gh pr create`")?;
+    if !out.status.success() {
+        bail!(
+            "gh pr create failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let url = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .rfind(|l| l.starts_with("https://"))
+        .unwrap_or("")
+        .to_string();
+    if url.is_empty() {
+        bail!("gh pr create succeeded but printed no PR url");
+    }
+    Ok(url)
+}
+
+/// Encode an issue key into a Kubernetes label *value* (alphanumeric plus `-_.`, ≤63 chars, must
+/// start/end alphanumeric) for [`crate::daemon::ISSUE_KEY_LABEL`]: every other char (`/`, `#`, …)
+/// becomes `-`. `owner/repo#42` → `owner-repo-42`. Deliberately lossy — a human-readable hint
+/// only. The key the watch reads back rides [`crate::daemon::ISSUE_KEY_ANNOTATION`] verbatim
+/// (annotation values are unrestricted, so it round-trips exactly).
+pub(crate) fn issue_key_label_value(key: &str) -> String {
+    let mut v: String = key
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    v.truncate(63);
+    let trimmed = v.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+    trimmed.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::runs::engine::*;
+
+    #[test]
+    fn repo_clone_url_builds_github_https_for_a_bare_slug() {
+        assert_eq!(
+            repo_clone_url("neuralmagic/crucible"),
+            "https://github.com/neuralmagic/crucible.git"
+        );
+    }
+
+    #[test]
+    fn repo_clone_url_passes_through_urls_and_paths() {
+        assert_eq!(
+            repo_clone_url("https://example.com/x.git"),
+            "https://example.com/x.git"
+        );
+        assert_eq!(repo_clone_url("/abs/local/repo"), "/abs/local/repo");
+        assert_eq!(
+            repo_clone_url("git@github.com:o/r.git"),
+            "git@github.com:o/r.git"
+        );
+    }
+
+    #[test]
+    fn issue_key_label_value_is_k8s_label_safe() {
+        assert_eq!(issue_key_label_value("owner/repo#42"), "owner-repo-42");
+        assert_eq!(issue_key_label_value("a_b.c-1"), "a_b.c-1");
+        let v = issue_key_label_value("owner/repo#42");
+        assert!(v.len() <= 63);
+        assert!(v.chars().next().unwrap().is_ascii_alphanumeric());
+        assert!(v.chars().last().unwrap().is_ascii_alphanumeric());
+    }
+
+    #[test]
+    fn resolve_bin_honors_the_env_override() {
+        // Serialize on the crate-wide env lock: `set_var`/`remove_var` race any other test that
+        // reads the environ or spawns a subprocess (the whole crate shares one guard). A sync test
+        // runs outside any tokio runtime, so `blocking_lock` is the sanctioned acquire.
+        let _g = crate::ENV_LOCK.blocking_lock();
+        unsafe {
+            std::env::set_var("CRUCIBLE_BIN", "/tmp/fake-crucible");
+        }
+        assert_eq!(resolve_bin(), PathBuf::from("/tmp/fake-crucible"));
+        unsafe {
+            std::env::remove_var("CRUCIBLE_BIN");
+        }
+    }
+
+    #[test]
+    fn pack_branches_are_ref_safe_and_deterministic() {
+        let b = pack_branches("owner/repo#7");
+        assert_eq!(b.head, "crucible-pack/owner_repo_7");
+        assert_eq!(b.base, "crucible-pack/owner_repo_7-base");
+        // Ref-safe: no `/`-in-key, `#`, or `:` leaks through (the sanitizer maps them to `_`).
+        assert!(
+            !b.head
+                .trim_start_matches("crucible-pack/")
+                .contains(['#', ':'])
+        );
+        // Deterministic so a re-open reuses the branch.
+        assert_eq!(pack_branches("owner/repo#7"), b);
+    }
+
+    /// The git half of `open_pack_pr` against a local bare remote (the `gh pr create` leg needs
+    /// network/auth, the same boundary `publish.rs` draws). Hermetic: real `git` throughout, no
+    /// mocks. Asserts the pack's head + pristine base branches land on the remote.
+    #[test]
+    fn push_pack_branches_pushes_head_and_base_to_a_remote() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("crucible-packpush-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root)?;
+
+        let remote = root.join("remote.git");
+        run_git(&["init", "--bare", "-q", remote.to_str().unwrap()])?;
+
+        let pack = root.join("pack");
+        std::fs::create_dir_all(&pack)?;
+        std::fs::write(pack.join("crucible.toml"), "[repo]\nurl = \"x\"\n")?;
+        std::fs::write(pack.join("SCOPE.md"), "identity: v1:beef\n")?;
+
+        let branches = pack_branches("owner/repo#7");
+        push_pack_branches(&pack, remote.to_str().unwrap(), &branches)?;
+
+        let refs = String::from_utf8(
+            Command::new("git")
+                .args(["ls-remote", "--heads", remote.to_str().unwrap()])
+                .output()?
+                .stdout,
+        )?;
+        assert!(
+            refs.contains(&format!("refs/heads/{}", branches.head)),
+            "head branch pushed: {refs}"
+        );
+        assert!(
+            refs.contains(&format!("refs/heads/{}", branches.base)),
+            "pristine base branch pushed: {refs}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    /// `fetch_object` shells `CRUCIBLE_BIN fetch` (here a script) and surfaces a nonzero exit's
+    /// stderr — the only diagnostic when the operator's shell lacks S3 credentials.
+    #[tokio::test]
+    async fn fetch_object_shells_the_engine_and_surfaces_stderr() {
+        let _g = crate::ENV_LOCK.lock().await;
+        let root = std::env::temp_dir().join(format!("crucible-fetchobj-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let bin = root.join("crucible-fake");
+        crate::testing::write_exec(
+            &bin,
+            "#!/bin/sh\n[ \"$1\" = fetch ] || exit 1\nshift\nwhile [ $# -gt 0 ]; do\n  case \"$1\" in\n    --uri) uri=\"$2\"; shift 2;;\n    --out) out=\"$2\"; shift 2;;\n    *) shift;;\n  esac\ndone\ncase \"$uri\" in\n  s3://b/ok*) printf 'fetched' > \"$out\";;\n  *) echo 'AccessDenied: no credentials' >&2; exit 1;;\nesac\n",
+        );
+        unsafe {
+            std::env::set_var("CRUCIBLE_BIN", &bin);
+        }
+
+        let out = root.join("session.jsonl");
+        fetch_object("s3://b/ok/session.jsonl", &out)
+            .await
+            .expect("fetch succeeds");
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "fetched");
+
+        let err = fetch_object("s3://b/missing", &out).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("AccessDenied: no credentials"),
+            "stderr rides the error: {err:#}"
+        );
+
+        unsafe {
+            std::env::remove_var("CRUCIBLE_BIN");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The pack-PR credential preference order: a configured GitHub App wins over a set PAT
+    /// (minting through a wiremock exchange, never the real GitHub); no App ⇒ the env chain.
+    #[tokio::test]
+    async fn resolve_pack_pr_token_prefers_the_app_over_the_pat_chain() -> Result<()> {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _g = crate::ENV_LOCK.lock().await;
+        let vars = ["AUTORESEARCH_PR_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"];
+        let prior: Vec<_> = vars.iter().map(std::env::var_os).collect();
+        unsafe {
+            std::env::set_var("AUTORESEARCH_PR_TOKEN", "pat-chain-token");
+        }
+        unsafe {
+            std::env::remove_var("GITHUB_TOKEN");
+        }
+        unsafe {
+            std::env::remove_var("GH_TOKEN");
+        }
+
+        // No App threaded → the PAT chain answers.
+        let mut cfg = crate::testing::cfg_from_args(["ctl"]);
+        assert_eq!(
+            resolve_pack_pr_token(&cfg).await?.as_deref(),
+            Some("pat-chain-token")
+        );
+
+        // App threaded → the installation token wins even with the PAT still set.
+        let server = MockServer::start().await;
+        let expires = jiff::Timestamp::from_second(jiff::Timestamp::now().as_second() + 3600)?;
+        Mock::given(method("POST"))
+            .and(path("/app/installations/7/access_tokens"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "token": "ghs_app_token",
+                "expires_at": expires.to_string(),
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir()?;
+        let key = crate::secrets::github_app::testkey::write_test_key(dir.path());
+        cfg.github_app = Some(crate::secrets::github_app::GithubAppTokenSource::new(
+            "4210340",
+            "7",
+            key,
+            server.uri(),
+        ));
+        assert_eq!(
+            resolve_pack_pr_token(&cfg).await?.as_deref(),
+            Some("ghs_app_token")
+        );
+
+        for (v, p) in vars.iter().zip(prior) {
+            match p {
+                Some(val) => unsafe { std::env::set_var(v, val) },
+                None => unsafe { std::env::remove_var(v) },
+            }
+        }
+        Ok(())
+    }
+
+    fn run_git(args: &[&str]) -> Result<()> {
+        let status = Command::new("git").args(args).status()?;
+        anyhow::ensure!(status.success(), "git {args:?} failed");
+        Ok(())
+    }
+}

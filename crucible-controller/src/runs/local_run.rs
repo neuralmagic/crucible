@@ -72,7 +72,7 @@ const HOST_ENV: [&str; 4] = ["PATH", "HOME", "USER", "OPENSHELL_PODMAN_SOCKET"];
 /// everything else the controller's own environment holds stays with the controller.
 ///
 /// `item` comes from the launch, never from the inherited set: the engine reads
-/// [`crate::issues::engine::ITEM_ENV`] as the tracker item a run may comment on, and a value the controller
+/// [`crate::runs::engine::ITEM_ENV`] as the tracker item a run may comment on, and a value the controller
 /// happens to hold addresses somebody else's.
 ///
 /// An allowlisted value reaches the agent, so the pack has to disclose it, exactly as a bound
@@ -86,7 +86,7 @@ fn run_env(
 ) -> Result<Vec<(String, String)>, UndisclosedGrant> {
     let mut env = Vec::new();
     for (name, value) in inherited {
-        if name == crate::issues::engine::ITEM_ENV {
+        if name == crate::runs::engine::ITEM_ENV {
             continue;
         }
         let allowlisted = allowlist.contains(&name);
@@ -97,7 +97,7 @@ fn run_env(
             env.push((name, value));
         }
     }
-    env.extend(item.map(|i| (crate::issues::engine::ITEM_ENV.to_string(), i.to_string())));
+    env.extend(item.map(|i| (crate::runs::engine::ITEM_ENV.to_string(), i.to_string())));
     Ok(env)
 }
 
@@ -193,7 +193,7 @@ pub async fn start(
         .stage_cursor_file(issue_key, &pack)
         .await?;
 
-    let bin = crate::issues::engine::resolve_bin();
+    let bin = crate::runs::engine::resolve_bin();
     let argv = run_argv(&pack.join("crucible.toml"), &opts);
     let deadline = match &opts {
         RunRenderOpts::Playbook { max_time, .. } => {
@@ -524,7 +524,7 @@ mod tests {
         let inherited = || {
             [
                 ("PATH", "/usr/bin"),
-                (crate::issues::engine::ITEM_ENV, "owner/repo#1"),
+                (crate::runs::engine::ITEM_ENV, "owner/repo#1"),
             ]
             .into_iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -534,7 +534,7 @@ mod tests {
             vec![
                 ("PATH".to_string(), "/usr/bin".to_string()),
                 (
-                    crate::issues::engine::ITEM_ENV.to_string(),
+                    crate::runs::engine::ITEM_ENV.to_string(),
                     "owner/repo#9".to_string()
                 ),
             ]

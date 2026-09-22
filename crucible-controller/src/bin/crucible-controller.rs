@@ -500,7 +500,7 @@ fn dispatch_db_adopt(
         let (_guard, local_path) = if session_uri.starts_with("s3://") {
             let dir = tempfile::tempdir().context("adopt download scratch dir")?;
             let out = dir.path().join("session.jsonl");
-            crucible_controller::issues::engine::fetch_object(&session_uri, &out).await?;
+            crucible_controller::runs::engine::fetch_object(&session_uri, &out).await?;
             (Some(dir), out)
         } else {
             let path = PathBuf::from(&session_uri);
@@ -888,7 +888,7 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
         let contracts = contracts.clone();
         let targets = crucible_controller::runs::contract::configured_targets(
             &cfg,
-            crucible_controller::issues::engine::resolve_bin(),
+            crucible_controller::runs::engine::resolve_bin(),
         );
         tokio::spawn(async move {
             contracts.check_all(targets).await;

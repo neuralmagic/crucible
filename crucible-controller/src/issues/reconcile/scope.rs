@@ -297,7 +297,7 @@ pub(super) async fn run_scope_and_transition(
         .await?;
         return apply_pod_scope_outcome(db, cfg, issue, outcome, scoped_reason).await;
     }
-    let bin = engine::resolve_bin();
+    let bin = crate::runs::engine::resolve_bin();
     if let Err(failure) = crate::runs::workpod::admit_contract(
         crate::runs::contract::RequestKind::LocalScope,
         &[crate::runs::contract::DispatchTarget::Binary(bin.clone())],
@@ -631,7 +631,7 @@ pub(super) async fn reconcile_scoped(db: &Db, cfg: &ControllerCfg, issue: &Issue
                 issue.key
             )
         })?;
-    let token = engine::resolve_pack_pr_token(cfg).await?;
+    let token = crate::runs::engine::resolve_pack_pr_token(cfg).await?;
     let Some(pr_url) = engine::open_pack_pr(&issue.key, pack.path(), token)? else {
         return Ok(());
     };

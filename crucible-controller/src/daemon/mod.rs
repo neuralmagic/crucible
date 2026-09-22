@@ -698,7 +698,7 @@ mod tests {
             annotations.insert(ISSUE_KEY_ANNOTATION.to_string(), k.to_string());
             labels.insert(
                 ISSUE_KEY_LABEL.to_string(),
-                crate::issues::engine::issue_key_label_value(k),
+                crate::runs::engine::issue_key_label_value(k),
             );
         }
         Pod {

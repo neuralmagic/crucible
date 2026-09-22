@@ -421,7 +421,7 @@ pub(crate) async fn spawn_turn_pod(
             crate::secrets::deliver::stamp(&mut pod, &stamp_name, &for_stamp);
             set_container_env(
                 &mut pod,
-                crate::issues::engine::ITEM_ENV,
+                crate::runs::engine::ITEM_ENV,
                 &spec_cl.issue_key,
             );
             Ok(pod)
@@ -1551,7 +1551,7 @@ mod tests {
                 c.env
                     .iter()
                     .flatten()
-                    .find(|v| v.name == crate::issues::engine::ITEM_ENV)
+                    .find(|v| v.name == crate::runs::engine::ITEM_ENV)
                     .and_then(|v| v.value.as_deref()),
                 Some("o/r#33")
             );

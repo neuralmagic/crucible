@@ -997,7 +997,7 @@ pub(crate) fn unprocessable(msg: impl Into<String>) -> Response {
 /// Reduce a pasted GitHub URL to the `owner/repo` slug the rest of the controller keys on
 /// (`CONTROLLER_PR_REPO_MAP` lookups, per-repo checkouts, the issues table's repo grouping all
 /// assume slugs). Anything that isn't a GitHub URL passes through untouched — non-GitHub remotes
-/// stay full URLs on purpose ([`crate::issues::engine::repo_clone_url`] passes them through).
+/// stay full URLs on purpose ([`crate::runs::engine::repo_clone_url`] passes them through).
 pub(crate) fn normalize_repo(repo: &str) -> &str {
     let Some(path) = repo
         .strip_prefix("https://github.com/")
