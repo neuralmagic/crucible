@@ -1,0 +1,11 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-PRINCIPALS"
+title = "Principals"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = "A principal is `<scheme>:<id>`. Schemes are registered: this RFC registers `user`, `group`, `team`, and `run`, and a later amendment MAY register more. The policy schema of [[RFC-0003:C-POLICY]] MUST be versioned over the registered schemes, and a principal whose scheme is not registered MUST deny. `user:<login>` and `team:<slug>` MUST be stored and compared lowercased and trimmed. `group:<path>` MUST be stored and compared exactly as the identity layer normalizes it, applied identically at write and at comparison, so that distinct identity-provider groups are never merged by the controller. A team slug MUST match `[a-z0-9][a-z0-9-]{1,62}` and MUST be unique per controller. User and group principals MUST derive from a controller-validated identity (the session, token, or key the controller itself verified); a caller MUST NOT be able to assert a group by supplying it in a request. Team principals MUST derive from the controller's own team membership records; run principals from [[RFC-0003:C-RUN-PRINCIPAL]]. Every request has a subject, the principal set the decision evaluates, and an actor, the principal that caused the request: the authenticated user for an interactive or API-key call, the submitter when a portal records one, otherwise the owner principal of the launch or standing launch that fired. Subject and actor coincide for interactive and API-key calls and differ for firings, portal submissions, and runs. The subject set is the subject's own principal, every group principal the credential proves, and every team principal whose membership those principals satisfy under [[RFC-0003:C-TEAMS]]. The group refresh window is the configured interval at which the identity layer re-reads a credential's groups from the identity provider; a downgraded session is one whose refresh the provider refused. A credential that cannot prove groups (a static token, a cluster token, a downgraded session) MUST act as its user principal plus the team memberships whose derivation contains no group or rule member, including through nested teams, and MUST NOT act as any group-derived or rule-derived membership."

@@ -10,7 +10,11 @@ set -euo pipefail
 readonly ALLOWED=0
 readonly ATTR='#![allow(clippy::disallowed_macros)]'
 
-count=$(grep -rlF --include='*.rs' "$ATTR" . | grep -cv '^./third_party/' || true)
+# The control plane came in from its own repo with anyhow's macros throughout; those crates
+# convert module by module and join the count when they are done.
+count=$(grep -rlF --include='*.rs' "$ATTR" . \
+    | grep -Ev '^./(third_party|crucible-controller|crux|xtask)/' \
+    | grep -c . || true)
 
 if [ "$count" -gt "$ALLOWED" ]; then
     echo "typed-error-ratchet: $count modules opt out of the ban, was $ALLOWED." >&2

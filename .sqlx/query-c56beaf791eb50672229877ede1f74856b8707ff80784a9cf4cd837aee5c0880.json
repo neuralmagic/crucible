@@ -1,0 +1,50 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT status, best_score, cost_usd, identity_digest, pod, scope FROM runs WHERE run_id = 'run-xyz'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "best_score",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 2,
+        "name": "cost_usd",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 3,
+        "name": "identity_digest",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "pod",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "scope",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "c56beaf791eb50672229877ede1f74856b8707ff80784a9cf4cd837aee5c0880"
+}

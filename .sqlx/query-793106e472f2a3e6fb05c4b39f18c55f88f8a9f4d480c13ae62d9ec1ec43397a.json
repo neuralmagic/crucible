@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE issues SET ranked_content_hash = NULL, updated_at = $1 WHERE key = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "793106e472f2a3e6fb05c4b39f18c55f88f8a9f4d480c13ae62d9ec1ec43397a"
+}

@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT r.pod\n        FROM runs r\n        WHERE r.issue = $1\n        ORDER BY r.seq DESC LIMIT 1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "pod",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "133115535e4c405294a6d18e69bbe4d8bef8126ebea497f0829d32cd157355c1"
+}

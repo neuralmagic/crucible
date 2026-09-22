@@ -1,0 +1,202 @@
+[package]
+name = "crucible-controller"
+description = "The outer-loop controller's ledger and daemon core: Postgres working state, the bors-style DB layer, the event log, and config. Async stops here."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+# Typed parse errors for the wire-vocabulary enums (`wire_enum!`): one Display/Error shape so `?`
+# in an anyhow fn still absorbs them and the API boundary's `.map_err(|e| e.to_string())` holds.
+thiserror.workspace = true
+strum.workspace = true
+# The shared turn-result wire contract: the marker literals the scrapers match, the managed-by
+# selector, the Tier 1 envelope, and the AgentEvent NDJSON types the SSE relay reads — one
+# source of truth, no cross-crate "keep in sync" drift.
+crucible-contract = { path = "../crucible-contract" }
+crucible = { path = "../crucible", default-features = false }
+# The cluster-boundary traits (PodDispatcher, ConfigMapApi) are async + used as `dyn`, which
+# native async-fn-in-trait can't do; async-trait boxes the futures.
+async-trait = "0.1"
+serde.workspace = true
+serde_json.workspace = true
+# Reads the pack manifest's `[build.<name>]` blocks into `forge::spec::BuildSpec`. Also a
+# workspace-standard dep this crate's dev-deps use.
+toml = "0.8"
+# The build spec/backends: `forge::spec` (the canonical `[build]` parser + `content_digest` +
+# `validate_builds`), `forge::build::dispatch_cluster` (detached rootless-buildah Job), and
+# `forge::github::dispatch_github` (`workflow_dispatch` + poll). Both dispatch fns are blocking,
+# so the async reconcile path drives them on `spawn_blocking`.
+forge = { path = "../forge" }
+# Reads a dispatch image's OCI config labels for the contract-version check (`contract.rs`); the
+# same client and version forge's digest pinning uses, so no new tree.
+oci-client = "0.17.0"
+crucible-capability = { path = "../capability", features = ["openapi"] }
+clap.workspace = true
+# Parses the cron expressions on `playbook_schedules`; `crate::schedules::cron` drives its field
+# matchers over a jiff calendar walk.
+croner.workspace = true
+# The `crucible-controller` binary's autopilot Ctrl-C handler (the same crate the engine binary
+# uses for its own).
+ctrlc = "3"
+jiff.workspace = true
+# TTL caches: the ingest TokenReview accept/reject caches (sync), and the OIDC-mirror /
+# github-app single-flight refreshes (`future::Cache::get_with` coalesces concurrent inits).
+moka.workspace = true
+# `sync` on top of the workspace feature set: the queue's coalescing state waits on
+# `tokio::sync::Notify`, and the daemon's graceful-shutdown signal is one too.
+tokio = { workspace = true, features = ["sync", "process"] }
+# Async storage: Postgres working state + embedded migrations, compile-time checked queries in
+# offline mode (checked-in `.sqlx/`). The controller is the workspace's only sqlx user.
+# The `sqlite` driver exists ONLY for `db import-sqlite` (the one-shot cutover reader of a
+# pre-Postgres ledger file, runtime queries only) — never write new sqlite-facing code.
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "postgres",
+    "sqlite",
+    "tls-rustls",
+    "migrate",
+    "macros",
+    "json",
+] }
+uuid.workspace = true
+jsonschema.workspace = true
+# Scratch-database URL derivation for `db verify`/`db rebuild` (swap the database name in the
+# ledger URL); already in the tree via reqwest.
+url = "2"
+# The daemon's pod watch (lane D only — no other crate needs the async kube client;
+# `forge::kube` is the sync, block_on-wrapped client the rest of the engine uses).
+kube = { version = "4.0", default-features = false, features = ["client", "runtime", "rustls-tls"] }
+k8s-openapi = { version = "0.28", features = ["v1_32"] }
+futures-util = "0.3"
+# Parse the rendered loop-pod YAML in the kube launch path (the maintained serde_yaml fork the
+# `crucible`/`forge` deploy renderers already use) so the launcher can stamp the issue-key
+# annotation/label before creating the Pod.
+serde_norway = "0.9"
+# rustls 0.23 needs a process-level CryptoProvider chosen explicitly when several are in the dep
+# tree (aws-lc-rs is, via aws-sdk) — installed once before the pod watch's first client connect,
+# same as `forge::kube`.
+rustls = "0.23"
+# The TLS listener behind the redemption Route's reencrypt hop (`tls.rs`). rustls' own async
+# adapter; already in the tree at this version via kube's rustls stack, so it adds no new build.
+tokio-rustls = { version = "0.26", default-features = false }
+# Triage's GitHub client (async — crucible/src/scope.rs's `goal_from_issue` is the sync sibling).
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+# The MCP host answers its own API calls by calling the api router as a `tower::Service` — the
+# same in-process `oneshot` the handler tests use (the bors pattern, no TCP), in production.
+tower = { version = "0.5", features = ["util"] }
+# The hosted MCP surface. rmcp's streamable-HTTP server is itself a `tower::Service`, so it nests
+# into axum directly. Same version the CLI's stdio server speaks.
+rmcp = { version = "1.8", features = ["server", "macros", "transport-streamable-http-server"] }
+# The tool surface, written once and hosted over either wire.
+crux = { path = "../crux" }
+# Building and draining the synthetic requests the MCP host hands its own router.
+http = "1"
+http-body-util = "0.1"
+# Signs the GitHub App's RS256 JWT (github_app.rs) — the credential exchanged for the pack-PR
+# installation token. Already in the workspace tree via oci-client, so this adds no new build.
+jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
+# The OIDC relying party: discovery, the authorization-code + PKCE request, the token exchange, and
+# ID token validation against the issuer's JWKS. `default-features = false` drops its bundled
+# reqwest 0.12 — the HTTP calls run on this crate's own reqwest 0.13 client through the
+# `AsyncHttpClient` closure in `oidc::http_client`, so no second http/tls generation enters the tree.
+openidconnect = { version = "4", default-features = false }
+# The HTTP API (lane F): default features give the Json/Form extractors the frozen routes need
+# (API clients POST JSON, the ingest drop-box POSTs urlencoded).
+axum = "0.8"
+# Server-side HTTP sessions (cookie id -> Postgres row) on the human surface. Held at 0.14: the
+# sqlx store below pins tower-sessions-core 0.14 — bump both together.
+tower-sessions = { version = "0.14", default-features = false, features = ["axum-core"] }
+tower-sessions-sqlx-store = { version = "0.15", default-features = false, features = ["postgres"] }
+# The tier-ranking cache key (stage 2, lane J): sha256 of an issue's title+body+labels, and the
+# digest an api key's secret half is stored as.
+sha2 = "0.10"
+# The CSPRNG an api key's secret half comes out of. Already in the tree; named here because the
+# secret's unpredictability is the whole security property.
+rand = "0.10"
+# Percent-encodes the MLflow experiment name into a query string (mlflow.rs), and the form bodies
+# the OIDC logout and revoke requests carry.
+percent-encoding = "2"
+# AES-256-GCM for the offline credential at rest, under the chart-mounted key. Already the crypto
+# provider under rustls and jsonwebtoken in this tree, so it adds no new build.
+aws-lc-rs = "1.18"
+# Mints the ranker's Vertex access token from ADC (the crucible::openshell::provider pattern,
+# in-process here since ranking never shells out to a `claude` CLI the loop image doesn't carry).
+# genai's vertex adapter expects a pre-minted OAuth2 bearer (it does no ADC itself), so the mint
+# stays here and is injected through genai's ServiceTargetResolver.
+gcp_auth = "0.12"
+# The ranker's multi-provider LLM client (lane J2): Claude-on-Vertex and the OpenAI-compatible
+# custom-endpoint arm (vLLM/llm-d, wiremock in tests) behind one `exec_chat` interface.
+genai = "0.6.5"
+# The Prometheus client (the de-facto tikv crate, not the `metrics` facade): the controller
+# re-exports what it already ingests at `/metrics`. `default-features = false` drops the protobuf
+# exposition path — we serve only the text format the shared kube-prometheus-stack scrapes.
+prometheus = { version = "0.14", default-features = false }
+# Structured logging: the controller's `eprintln!`s become leveled `tracing` events, and the
+# entrypoint installs a subscriber (OTLP-ready, behind `OTEL_EXPORTER_OTLP_ENDPOINT`).
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# OTLP trace export, wired but OFF by default: only when `OTEL_EXPORTER_OTLP_ENDPOINT` is set does
+# the entrypoint install the layer, so unset = zero overhead, no connection attempt. The HTTP/proto
+# exporter with the blocking reqwest client needs no runtime on the batch thread (plaintext OTLP;
+# an https collector is a follow-up). tonic is deliberately avoided to keep the dep tree lean.
+tracing-opentelemetry = "0.32"
+opentelemetry = { version = "0.31", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = [
+    "trace",
+    "http-proto",
+    "reqwest-blocking-client",
+] }
+# OpenAPI schema generation for the typed API contract.
+utoipa = "5.5"
+utoipa-axum = "0.2"
+# Embed the built React SPA into the controller binary at compile time.
+rust-embed = "8"
+mime_guess = "2"
+# On-demand analytics sidecars (`GET /api/export/*.parquet`), replacing the SSG's parquet files so
+# DuckDB keeps reading over the API. Same version/features as `crucible`'s report.rs writer so the
+# on-disk format is identical (schema mirrored from report.rs — see `export.rs`).
+parquet = { version = "59.0.0", default-features = false, features = ["snap"] }
+parquet_derive = "59.0.0"
+# Stream a downloaded artifact temp file back through axum without buffering it in memory (the
+# artifact proxy — session.jsonl can be tens of MB).
+tokio-util = { version = "0.7", features = ["io"] }
+# Scratch dir the artifact proxy downloads an s3:// object into (via the engine subprocess) before
+# streaming it back; the guard lives as long as the response.
+tempfile = "3"
+# Scope-turn transcripts arrive gzipped (base64 on the pod-log marker line, raw bytes from the
+# local executor's --transcript-out file); stored compressed, decompressed on serve.
+base64 = "0.22"
+flate2 = "1"
+# A surviving scope pack arrives from the turn pod as a gzip'd tar on its own marker line and is
+# unpacked (traversal-guarded) into the controller's pack_out dir.
+tar = "0.4"
+# MLflow export (R6). `with-serde` deserializes captured OTLP/JSON trace records — hex
+# traceId/spanId/parentSpanId fields decode to bytes exactly like agentic-ci's `_fixup_ids`
+# did — straight into the proto types; `prost` re-encodes them to the wire protobuf MLflow's
+# `/v1/traces` ingests. `gen-tonic-messages` brings the collector's ExportTraceServiceRequest
+# message (no gRPC stack). Already in the tree via opentelemetry-otlp, so no new transitive
+# build.
+opentelemetry-proto = { version = "0.31", default-features = false, features = [
+    "gen-tonic-messages",
+    "trace",
+    "with-serde",
+] }
+prost = "0.14"
+# Compile-on-save's placeholder for an unvalued required parameter: `regex-syntax` parses the
+# parameter's declared `pattern` into the HIR the generator walks, `regex` confirms the string it
+# built matches before it reaches the engine's argv. Both are already in the tree via jsonschema.
+regex = "1"
+regex-syntax = "0.8"
+cedar-policy = "4.12.0"
+
+[dev-dependencies]
+tempfile = "3"
+# Fake-GitHub HTTP server for the triage fetch tests (work plan sanctions it).
+wiremock = "0.6"
+# UI-page and JSON-payload golden snapshots. "filters" redacts the rendered-at timestamps that
+# would otherwise make every page snapshot flaky.
+insta = { version = "1", features = ["filters"] }

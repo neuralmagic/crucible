@@ -1,0 +1,50 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT i.key AS \"key!\", i.repo AS \"repo!\", s.id AS \"scope_id!\",\n               s.approval_pr AS \"approval_pr!\", s.stale AS \"stale!\",\n               s.exposure_digest\n        FROM issues i\n        JOIN scopes s ON s.id = (\n            SELECT id FROM scopes WHERE issue = i.key ORDER BY id DESC LIMIT 1\n        )\n        WHERE i.status = 'awaiting-approval'\n          AND s.approval_pr IS NOT NULL\n          AND s.approved_at IS NULL\n        ORDER BY i.key\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "key!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "repo!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "scope_id!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "approval_pr!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "stale!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 5,
+        "name": "exposure_digest",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "cae58736a58fe253fb5771e19c74fe91239661fdfd32c9c0643f70b55701b563"
+}

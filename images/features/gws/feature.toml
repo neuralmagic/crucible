@@ -1,0 +1,15 @@
+summary = "gws (Google Workspace CLI) for Sheets/Drive/Docs from the sandbox, with its Sheets agent skills"
+layer = 30
+
+intro = """
+`gws` {pin.gws} (Google Workspace CLI) is at /usr/local/bin/gws. It reads a
+service-account key from GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE; no login is
+baked in. The gws Sheets skills (gws-shared, gws-sheets, gws-sheets-read,
+gws-sheets-append) are under /usr/local/share/gws/skills.
+"""
+
+[pins]
+gws = "0.22.5"
+
+[capabilities]
+"tool.gws" = { pin = "gws" }

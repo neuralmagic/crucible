@@ -1,0 +1,102 @@
+schema = 1
+
+# Sandbox image matrix: each entry is base (implicit) + features, expanded by
+# `cargo xtask images gen` into images/generated/<name>/. Canonical layer order
+# comes from each feature's `layer`, so every *-cc / *-codex pair shares its
+# toolchain layer prefix and differs only in the agent layer.
+
+[[image]]
+name = "sandbox-go-cc"
+features = ["go", "claude-code", "gws"]
+
+[[image]]
+name = "sandbox-go-codex"
+features = ["go", "codex", "gws"]
+
+[[image]]
+name = "sandbox-rust-cc"
+features = ["rust", "claude-code", "gws"]
+
+[[image]]
+name = "sandbox-rust-codex"
+features = ["rust", "codex", "gws"]
+
+# The chat-completions harnesses: an endpoint that speaks only OpenAI Chat Completions runs
+# opencode or pi, so the light toolchain columns get both.
+[[image]]
+name = "sandbox-go-opencode"
+features = ["go", "opencode", "gws"]
+
+[[image]]
+name = "sandbox-go-pi"
+features = ["go", "pi", "gws"]
+
+[[image]]
+name = "sandbox-rust-opencode"
+features = ["rust", "opencode", "gws"]
+
+[[image]]
+name = "sandbox-rust-pi"
+features = ["rust", "pi", "gws"]
+
+# vllm images are amd64-only: no dependable aarch64 vllm wheels, and the deploy
+# targets are amd64 clusters.
+[[image]]
+name = "sandbox-vllm-{ver}-cc"
+features = ["vllm-dev", "claude-code", "gws"]
+heavy = true
+arches = ["amd64"]
+
+[image.versions]
+vllm = ["0.28.0", "0.27.1", "0.26.0", "0.25.1"]
+
+[[image]]
+name = "sandbox-vllm-{ver}-codex"
+features = ["vllm-dev", "codex", "gws"]
+heavy = true
+arches = ["amd64"]
+
+[image.versions]
+vllm = ["0.28.0", "0.27.1", "0.26.0", "0.25.1"]
+
+[[image]]
+name = "sandbox-vllm-{ver}-go-cc"
+features = ["vllm-dev", "go", "claude-code", "gws"]
+heavy = true
+arches = ["amd64"]
+
+[image.versions]
+vllm = ["0.28.0", "0.27.1", "0.26.0", "0.25.1"]
+
+[[image]]
+name = "sandbox-vllm-{ver}-go-codex"
+features = ["vllm-dev", "go", "codex", "gws"]
+heavy = true
+arches = ["amd64"]
+
+[image.versions]
+vllm = ["0.28.0", "0.27.1", "0.26.0", "0.25.1"]
+
+[[image]]
+name = "sandbox-omnibus"
+features = ["go", "rust", "vllm-dev", "claude-code", "codex", "opencode", "pi", "gws"]
+heavy = true
+arches = ["amd64"]
+
+[[image]]
+name = "loop-base"
+features = ["go", "rust", "kubectl", "nushell"]
+
+# CVE-triage pack sandbox: everything it needs (skopeo + rpm image inspection,
+# gh, ujira) ships in base, so this is the minimal agent image.
+[[image]]
+name = "sandbox-triage-cc"
+features = ["claude-code", "gws"]
+
+[[image]]
+name = "sandbox-triage-opencode"
+features = ["opencode", "gws"]
+
+[[image]]
+name = "sandbox-triage-pi"
+features = ["pi", "gws"]

@@ -1,0 +1,27 @@
+summary = "vLLM development environment in a uv-managed venv"
+layer = 10
+rpms = [
+    "gcc",
+    "gcc-c++",
+    "cmake",
+    "git-lfs",
+    "python3.12-devel",
+]
+
+intro = """
+A ready venv at /opt/vllm has `vllm=={pin.vllm}` and its full dependency
+tree including torch. Reuse it; never reinstall torch. Add packages with
+`uv pip install --python /opt/vllm/bin/python <pkg>`. For a vllm source checkout
+with python-only changes, `VLLM_USE_PRECOMPILED=1 uv pip install --python
+/opt/vllm/bin/python -e .` reuses the prebuilt kernels of this pinned version, so
+keep the checkout near {pin.vllm} for kernel compatibility.
+"""
+
+# Default for images without a versions window (omnibus); the matrix pins the
+# window explicitly for the versioned sandbox columns.
+[pins]
+vllm = "0.28.0"
+
+[capabilities]
+"domain.vllm-dev" = { pin = "vllm" }
+"toolchain.cc" = "gcc"

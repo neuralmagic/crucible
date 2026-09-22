@@ -1,0 +1,267 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0043"
+title = "The outer loop — discovery and scheduling (`crucible triage` + `crucible autopilot`)"
+status = "proposed"
+date = "2026-07-02"
+refs = ["ADR-0041", "ADR-0042", "ADR-0044"]
+
+[content]
+context = """
+Related: [ADR-0014](./0014-scoping-pipeline.md) (the scoping pipeline each reconcile drives),
+[ADR-0003](./0003-async-approval-waits.md) (the park/resume machinery the approval gate reuses),
+[[ADR-0041]] (the PR feedback edge that closes the cycle),
+[ADR-0012](./0012-rendered-deployments.md) (the renderer that gains a controller-Deployment template),
+[[ADR-0042]] (admission for the pods the controller launches),
+the `analyze/` judge-tier ranking (the discovery logic this promotes to an engine primitive).
+External: *Loop Engineering* (Steinberger / Cherny / Osmani, June 2026) — the five-moves
+vocabulary this ADR borrows.
+
+Loop Engineering decomposes one turn of a self-running system into five moves: **discovery**
+(the loop finds its own work), **handoff** (each task gets an isolated working directory),
+**verification** (an independent check that can say "no"), **persistence** (state on disk, not
+in a context window), and **scheduling** (a real trigger, not a human pressing go). Skip one and
+you get a named failure: the blind, tangled, nodding, amnesiac, or manual loop.
+
+Scored against that taxonomy, crucible today is a superb single turn wrapped in a **blind,
+manual** loop:
+
+| Move | Crucible today |
+| --- | --- |
+| Verification | Measurement judge + `[judge.selftest]` + `crucible check` — stronger than the paper asks (deterministic, not an LLM skeptic) |
+| Handoff | Wide-round worktrees, per-lane sandboxes, rendered loop pods |
+| Persistence | Git-as-memory, session NDJSON, `RESULTS.md`, S3 publish |
+| Discovery | **A human picks the issue.** The `analyze/` tier ranking exists but is operator-run scripts |
+| Scheduling | **Every run is a human `kubectl apply`** or a `just` target |
+
+The missing two moves are outer-loop plumbing, not engine work: everything a reconcile needs
+(scope, check, selftest, render, publish, watch-pr, `ps`) already exists as a subcommand. What
+does not exist is the thing that chains them on a timer and remembers what it already tried.
+
+The paper's costs sharpen the requirements. Its four silent debts (verification debt,
+comprehension rot, cognitive surrender, token blowout) all have the same guard: hard caps set
+before the loop runs unattended, plus a human checkpoint the loop cannot remove. ADR-0014
+already made the scope-approval gate mandatory; [[ADR-0041]] already made kept candidates land as
+draft PRs that are never auto-merged. **Fully automating the loop therefore means automating
+everything between the approvals — never the approvals.**"""
+decision = """
+Add the outer loop as a discovery primitive plus a small controller daemon, with **SQLite as
+the working state and an append-only event log as the history**.
+
+1. **`crucible triage`** — discovery as an engine primitive, and *only* discovery. Scan a
+   repo's open issues and upsert them into the **state database** (`state/outer.sqlite`):
+   one row per issue with title/author/labels, status (`new` / `scoped` / `awaiting-approval`
+   / `running` / `pr-open` / `parked` / `done`), and the evidence pointer — **no tier**.
+   Idempotent by construction — an issue already tracked is never re-fetched unless its
+   upstream state changed. Runs standalone (it opens the same database the daemon uses), so
+   discovery is useful the day it lands.
+
+   **All tiering is the LLM ranker, at reconcile time.** The tier vocabulary: T0 test-gate
+   bug / T1 measured-workload perf / T2 / **T3 multi-component-live-rig required** /
+   N-unscopeable. The first step of reconciling a `new` issue is one bounded ranking call
+   (the `analyze/` `rank-prompt.md` judgment, in-process per the execution ruling below),
+   recording tier + rationale as the row's evidence and the call's cost to the ledger, cached
+   by issue-content hash (a comment that changes the issue re-ranks; a re-poll never
+   re-spends). An N verdict parks the issue (machine, "unscopeable per ranker"); a **T3**
+   verdict leaves the row `new` but excluded from the pick behind a profile flag — nothing is
+   wrong with a T3 issue, the v1 autopilot just can't build its gate (see "Not GPU-rig
+   autopilot (yet)"); the T3 queue is the standing demand signal for [[ADR-0042]]. Unranked rows
+   (tier NULL) sort first in the pick by priority/recency — "rank me" is the cheapest possible
+   reconcile. A failed or cap-declined ranking leaves the tier NULL and retries through the
+   queue's backoff; there is deliberately **no keyword-heuristic fallback** — a prose-keyword
+   classifier was built as a prior and then deleted: it misranked, every issue gets exactly
+   one cached LLM verdict anyway (identical spend), and a wrong cheap tier is worse than an
+   honest NULL. Ranking inside reconcile keeps polling free and puts all model spend under
+   the §4 caps; the automated call follows the house rule for headless model use (Vertex,
+   never a personal account).
+
+   **The ranking ladder has a second rung: a grounded confirmation gates every scope spend.**
+   The API verdict above is cheap and text-only — good for ordering the queue, not good enough to
+   spend a scope turn on alone. Before `reconcile_new` hands an issue to `scope --propose`, it
+   requires a code-grounded verdict: the same checkout-backed turn the low-confidence escalation
+   already runs (`crucible rank-grounded`, one sandboxed agent turn against a maintained per-repo
+   checkout), now required on *every* T0/T1/T2/T3 row the API tier clears, not just the ones the
+   text-only ranker flagged as unsure. Its tier, when it confirms or improves on the API one,
+   overwrites the row and the scope turn proceeds; a demotion to N or a failed/verdict-less
+   grounded call parks or defers exactly like the API tier's own N-park / no-verdict-no-spend
+   rules. Cached by content hash the same way the API tier is (`grounded_content_hash`), so a
+   re-sweep of unchanged content never re-spends. The economics: a 20-issue comparison against
+   llm-d-inference-scheduler found grounded ranking runs roughly 9x the API arm's cost but a
+   wasted scope turn costs roughly 20x more than that — the gate pays for itself the first time it
+   catches one. It is enabled by default (`ControllerCfg::prescope_grounded`,
+   `CONTROLLER_PRESCOPE_GROUNDED` to opt out for GPU-free / quick-loop scenarios where an
+   occasional wasted scope turn is cheaper than grounding every issue).
+
+   **The dominant failure mode it catches is staleness, not mistiering.** The same comparison
+   found the API ranker calling T0 ("do this now") on issues whose fix was *already implemented*
+   in the checkout — a scope turn on a solved problem is pure waste, and no tier would have caught
+   it. The grounded verdict vocabulary therefore has a disposition beside the tiers: **`stale`**,
+   which supersedes every tier definition — if the requested change already exists in the code,
+   the verdict is `stale`, never a tier, with file:line evidence in the rationale. Reconcile treats
+   `stale` as a park (`machine`, "stale per grounded ranker: already implemented"), visible in the
+   inbox with the rationale as the evidence; it does not auto-comment upstream (a approval for later).
+
+2. **`crucible autopilot`** — the controller daemon. Its core is a pure **reconcile function**
+   over the database: pick the top-ranked `new` issue within budget → `scope --propose` it
+   (ADR-0014 S2; check + selftest are the mechanical "no"-sayers, a dead proposal parks with
+   its reason) → a surviving pack goes to the **approval gate** (draft PR, ADR-0014 S4) and
+   the issue sits in `awaiting-approval` → on approval, render the loop pod (ADR-0012) and
+   launch it under the admission caps → record outcomes. Around that core the daemon holds the
+   **event edges that made cron lose**: the ADR-0003 approval signal, a kube watch on its loop
+   pods (completion handled in seconds, not next tick), and the [[ADR-0041]] review-comment poll —
+   absorbing today's separately-babysat `watch-pr` process into the one lifecycle. Every state
+   transition is one SQLite transaction, so overlapping work cannot double-scope an issue, and
+   each transition also appends to an NDJSON **event log** (the session-log discipline applied
+   to the outer loop): the database is what *is*, the log is what *happened*.
+
+   **Internally, events feed a work queue** — the controller-runtime workqueue pattern,
+   borrowed without the CRDs. Sources (the discovery timer, the approval signal, the pod
+   watch, the review-comment poll) never act and never touch the database; they only
+   **enqueue a key** (`owner/repo#N`). A worker dequeues a key and runs the reconcile
+   function for it, reading current state from the database — so an event is a *hint to look*,
+   never a payload to trust, and a stale or duplicate event is harmless by construction.
+   Queue semantics: dedup/coalesce by key (ten pod events while an issue is queued collapse
+   into one reconcile), exponential-backoff requeue on a failed reconcile, park with the
+   recorded error after the retry budget. The queue itself is in-memory and deliberately
+   lossless-by-derivation: on startup the daemon enqueues every non-terminal row from the
+   database, so a dropped event or a crash costs latency, never work. One worker for v1 —
+   serialized reconciles keep SQLite's single-writer trivially true; per-key sharding is the
+   later concurrency knob if discovery volume ever warrants it.
+
+   **`crucible autopilot --once`** is the same machinery run to quiescence: enqueue all
+   non-terminal rows, drain the queue, exit — the dev/test/break-glass mode. Kill the daemon
+   at any point and restart it; it re-derives everything from the database. There is no
+   in-memory state a restart can lose.
+
+   The state model itself — the DB-as-rebuildable-index truth rule, controller-pull ingest,
+   per-candidate granularity, the schema, migrations, the override API, and the sqlx choice —
+   is its own record: [[ADR-0044]]. The short version:
+   SQLite generalizes into the orchestration ledger (provenance graph, admission ledger,
+   later the [[ADR-0042]] rig-lease table and wide-round resume) for exactly one resident writer,
+   while runs stay self-contained log-and-git artifacts that never open a database.
+
+3. **Deployment** — `crucible deploy render --controller` renders a one-replica Deployment
+   (one more ADR-0012 template: the loop pod minus the agent, plus the state volume for the
+   database + event log). The kubelet restart policy is the supervisor; single-replica means
+   single-writer, which is exactly what SQLite wants — no leader election, no DB server, no
+   HA machinery for a component whose failure mode is "restarts and reconciles." Discovery
+   cadence, budgets, and caps live in the deploy profile — the environment half — not the
+   manifest.
+
+4. **Caps, set before it runs unattended** (the paper's token-blowout circuit breakers, all
+   enforced inside the reconcile function):
+   - per-reconcile cost ceiling (scope turns + launched runs);
+   - max concurrent loop pods (admission = the `ps` count against the profile's cap, until
+     [[ADR-0042]]'s Kueue cohort quota subsumes it);
+   - max new scopes per day;
+   - a global daily ceiling that parks the autopilot entirely when crossed.
+
+5. **The approvals stay open.** Two human checkpoints, both already load-bearing, both unremovable
+   by configuration: pack approval before any budget is spent on an issue (ADR-0014 stage 4),
+   and PR review before anything merges ([[ADR-0041]]). The inbox for everything else is the
+   database's `parked` rows — the controller never silently drops work, it parks it with a
+   reason a human can query.
+
+6. **Upstream issue changes re-rank; what else they may do depends on status.** A poll with a
+   per-repo watermark (`GET issues?since=…`, conditional requests — no webhook, no public
+   ingress) is one more source: it enqueues changed issue keys, nothing else. Because ranking
+   was never materialized (the pick is `ORDER BY tier, priority` at reconcile time), re-ranking
+   is just re-tiering the row — no queue surgery, idempotent under duplicate events, and every
+   tier flip is an event-log line the ranker can later be tuned against. Beyond re-tiering,
+   a comment's power is status-dependent:
+   - **`new`** — re-tier, done.
+   - **`parked`** — a *machine* park (no repro, can't isolate) auto-unparks to `new` when the
+     issue content materially changed, reason recorded; a *human* park is sticky — no comment
+     overrides an operator's "don't touch this."
+   - **`scoped` / `awaiting-approval`** — the goal froze from the old text, so the pack may be
+     stale: mark the row stale and refresh a comment on the approval PR with the upstream
+     diff. The human at the approval decides — approve anyway or bounce to re-scope. No automatic
+     re-scope: comments must not be able to burn scope turns.
+   - **`running`** — the ADR-0001 wall: comments never steer a live run. One exception:
+     the issue **closing upstream** stops the run (via the run's own stop machinery, so it
+     publishes what it has — a kept candidate still lands its draft PR) and parks the row as
+     "upstream closed." Budget is not spent on solved problems.
+   - **`done` / `pr-open`** — record only.
+
+## Failure modes, by the paper's names
+
+- **Blind loop** — killed by workstream O0: discovery is `triage`, not a human's morning.
+- **Manual loop** — killed by O2: the controller Deployment is the trigger; the operator's
+  laptop being closed no longer stops the research program.
+- **Nodding loop** — already dead: the judge is a measurement the agent cannot edit, selftest-
+  proven to discriminate; scope proposals die mechanically in check/selftest before a human
+  reads them.
+- **Amnesiac loop** — killed by the state database; reconciles share memory on disk, runs
+  share `RESULTS.md` and S3, review feedback reseeds the next run.
+- **Tangled loop** — already dead: per-lane sandboxes and per-candidate worktrees shipped in
+  v0.1.0.
+
+## What this is NOT
+
+- **Not auto-merge, not auto-approve.** The two approvals are the point. An autopilot profile
+  cannot express "skip approval"; there is no flag.
+- **Not an adaptive loop.** The ADR-0001 wall stands reconcile-to-reconcile: scoping adapts once per
+  issue, freezes, and the optimizing run never overlaps its own scoping.
+- **Not an operator.** No CRDs, no webhooks, no reconciling of Kubernetes objects it didn't
+  create. It *is* a daemon, and that call deserves its reasoning: a CronJob-tick design was
+  considered and lost because every interesting edge in this loop is event-shaped — approval
+  granted (ADR-0003 is a park/resume waiting for a signal), loop pod finished (a kube watch),
+  review comment landed ([[ADR-0041]]) — and cron converts each into up-to-one-interval of
+  latency. Worse, the cron design didn't remove the daemons, it scattered them: `watch-pr`
+  and the control bridge are already long-running processes someone babysits separately. One
+  controller unifies those lifecycles. The escape hatch keeps it honest: the reconcile core
+  is a pure function, `--once` runs it by hand, and the daemon holds no state a restart can
+  lose.
+- **Not a database server.** SQLite on the state volume, single-writer by construction
+  (one replica). Transactions and SQL are what the access patterns need (claim an issue,
+  flip a status from an external signal, query the inbox); HA Postgres is what they don't.
+- **Not GPU-rig autopilot (yet).** v1 targets the ADR-0014 v1 shape: test-gate and
+  local/GitWorld domains plus the GPU-free rigs. Composite GPU rigs join when [[ADR-0042]] gives
+  admission a real quota to lean on. The **T3 tier** is this boundary made queryable: issues
+  the ranker judges to need a multi-component live rig stay `new`, excluded from the pick
+  behind a profile flag that flips when rig backends land — a visible, auditable queue
+  instead of silent drops.
+
+## Workstreams
+
+| # | Workstream | Builds on |
+| --- | --- | --- |
+| O0 | `crucible triage`: tier ranking in-engine + the `state/outer.sqlite` schema (versioned like the session log) + the event log | `analyze/` scripts, native issue fetch |
+| O1 | The reconcile function + `autopilot --once`: pick → scope → park-or-approval → launch → record, with the four caps | ADR-0014 S2, `check`, `selftest`, `deploy`, `ps` |
+| O2 | The daemon shell: work queue (dedup by key, backoff requeue, startup re-enqueue) + sources (timer, kube pod watch) + the Deployment render + profile schema (cadence, budgets, concurrency cap, state volume) | ADR-0012 |
+| O3 | Approvals wiring: the ADR-0003 approval signal flips `awaiting-approval` rows; the review-comment watcher absorbs `watch-pr` and reseeds the next run | ADR-0003, [[ADR-0041]], ADR-0014 S4 |
+| O4 | Fleet visibility: `report` queries the database (timeline, parked-row inbox) | `report`, parquet sidecars |
+
+**Slicing:** O0 first — it is useful standalone the day it lands (a human running `triage` by
+hand is still better discovery than a human reading the issue tracker). O1 behind it, runnable
+by hand as `--once` long before O2 makes it a resident. O3 before the daemon runs unattended
+(the approvals must work end-to-end before reconciles happen while we sleep). O4 last."""
+consequences = """
+- **Positive:** the research program runs while nobody is at the keyboard, and the human's job
+  contracts to exactly the two judgment points (approve packs, review PRs) — the paper's
+  "stay the engineer, not just the one who presses go." Every existing subcommand becomes
+  load-bearing; none change contract; `watch-pr` stops being a separately-tended process. The
+  database + event log give the program an audit trail, and `crucible report` reads SQLite the
+  same way it reads the parquet sidecars, so the fleet page (O4) is a query, not a new format.
+- **Negative / cost:** unattended token spend is real even with caps (scope turns on issues
+  that die in validation are the price of discovery); the triage heuristics will misrank —
+  parked rows need periodic human sweeps or they rot into a graveyard; the controller is a new
+  always-on ops surface (liveness probe, upgrades, a PVC for the database, a scoped GitHub
+  token in the pod) — accepted because it consolidates lifecycles we already ran ad hoc; two
+  approvals mean latency — an approval can sit for days, which is correct but makes "fully
+  automated" honest-with-asterisks by design."""
+
+[[content.alternatives]]
+text = "A resident controller daemon with a work queue, SQLite working state, and an append-only event log"
+status = "accepted"
+
+[[content.alternatives]]
+text = "A CronJob-tick design instead of a resident daemon"
+status = "rejected"
+rejection_reason = "Every interesting edge in this loop is event-shaped (approval granted, loop pod finished, review comment landed) and cron converts each into up-to-one-interval of latency; the cron design also didn't remove the daemons, it scattered them (watch-pr and the control bridge were already babysat separately)."
+
+[[content.alternatives]]
+text = "A prose-keyword classifier as a tier-ranking fallback"
+status = "rejected"
+rejection_reason = "Built as a prior and then deleted: it misranked, every issue gets exactly one cached LLM verdict anyway (identical spend), and a wrong cheap tier is worse than an honest NULL."

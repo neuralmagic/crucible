@@ -1,0 +1,11 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-TEAM-UX"
+title = "Team-centric views"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = "The user interface MUST present governed resources filtered by an owner context the caller chooses among the principals they act as, with each team and the caller's own user principal as a context, and MUST include resources shared with that context. The owner picker on every creation surface MUST offer only the principals the caller acts as. A refusal MUST be shown with the reason the decision returned, verbatim. The interface MUST show the signed-in user's team memberships and roles as the controller resolves them, including memberships held through a group, a rule, or a nested team, and MUST show a resource's shares to anyone who may read it."

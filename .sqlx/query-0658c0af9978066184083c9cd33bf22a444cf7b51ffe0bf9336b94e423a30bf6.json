@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE runs SET status='no-session' WHERE run_id='run-88'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "0658c0af9978066184083c9cd33bf22a444cf7b51ffe0bf9336b94e423a30bf6"
+}

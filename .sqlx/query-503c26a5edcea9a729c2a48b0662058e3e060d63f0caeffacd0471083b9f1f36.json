@@ -1,0 +1,143 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT pl.key AS \"key!\", pl.playbook AS \"playbook!\", p.description AS \"description?\",\n               pl.params AS \"params!\", pl.schema_digest AS \"schema_digest!\",\n               p.schema_digest AS \"current_schema_digest?\", pl.max_cost AS \"max_cost!\",\n               pl.max_time AS \"max_time!\", pl.advance_dedupe AS \"advance_dedupe!\",\n               pl.origin AS \"origin!\", pl.draft_version, pl.dedupe_schedule,\n               i.status AS \"status!\", i.parked_reason, i.agent_provider, i.agent_model,\n               c.cost_usd AS \"cost_usd?\", c.runs AS \"runs!: i64\",\n               c.transport_losses AS \"transport_losses!: i64\",\n               pl.created_by, pl.created_at AS \"created_at!\"\n        FROM playbook_launches pl\n        JOIN issues i ON i.key = pl.key\n        LEFT JOIN playbooks p ON p.id = pl.playbook\n        LEFT JOIN LATERAL (\n            SELECT SUM(r.cost_usd) AS cost_usd, COUNT(*) AS runs,\n                   COALESCE(SUM((SELECT COUNT(*) FROM run_task_results t\n                                 WHERE t.run_id = r.run_id AND t.status = 'transport')), 0)::bigint\n                       AS transport_losses\n            FROM runs r\n            WHERE r.issue = pl.key\n        ) c ON TRUE\n        WHERE ($1::text IS NULL AND pl.origin <> 'schedule') OR pl.key = $1\n        ORDER BY pl.created_at DESC, pl.key DESC\n        LIMIT $2\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "key!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "playbook!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "description?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "params!",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 4,
+        "name": "schema_digest!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "current_schema_digest?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "max_cost!",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 7,
+        "name": "max_time!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "advance_dedupe!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 9,
+        "name": "origin!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "draft_version",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 11,
+        "name": "dedupe_schedule",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 12,
+        "name": "status!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 13,
+        "name": "parked_reason",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 14,
+        "name": "agent_provider",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 15,
+        "name": "agent_model",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 16,
+        "name": "cost_usd?",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 17,
+        "name": "runs!: i64",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 18,
+        "name": "transport_losses!: i64",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 19,
+        "name": "created_by",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 20,
+        "name": "created_at!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      null,
+      null,
+      null,
+      true,
+      false
+    ]
+  },
+  "hash": "503c26a5edcea9a729c2a48b0662058e3e060d63f0caeffacd0471083b9f1f36"
+}

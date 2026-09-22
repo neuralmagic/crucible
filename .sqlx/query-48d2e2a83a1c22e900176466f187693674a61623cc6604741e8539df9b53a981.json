@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT plan_version AS \"plan_version!: i64\", graph_json AS \"graph_json!\"\n        FROM run_plans WHERE run_id = $1 ORDER BY plan_version DESC LIMIT 1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "plan_version!: i64",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "graph_json!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "48d2e2a83a1c22e900176466f187693674a61623cc6604741e8539df9b53a981"
+}

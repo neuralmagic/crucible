@@ -31,6 +31,18 @@ The manifest, judge, and frozen injected evaluation files form the evaluation bo
 the [implementation contract](docs/crucible-contract.md) for the normative behavior and
 [ADR-0001](docs/adr/0001-adaptive-harness.md) for the trust model.
 
+## The control plane
+
+`crucible-controller/` is the outer loop around the engine: a Postgres ledger of issues,
+scopes, runs and launches, the daemon that reconciles them into loop pods on one or more
+clusters, an HTTP API with the embedded React UI, teams and policy-based authorization
+([RFC-0003](docs/rfc/RFC-0003.md)), native OIDC login, a secrets registry backed by Vault,
+and a hosted MCP surface. `crux/` is the CLI and MCP tool library over that API, and
+`capability/` is the image capability vocabulary the controller and the image feedstock
+under `images/` share. The controller links the engine in-process
+([RFC-0004](docs/rfc/RFC-0004.md)) and ships as `ghcr.io/neuralmagic/crucible-controller`
+on top of the runtime image.
+
 ## Why not a general workflow engine
 
 Crucible executes its own graph rather than delegating to Argo Workflows, Tekton, or a

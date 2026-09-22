@@ -1,0 +1,21 @@
+summary = "Go toolchain from the upstream tarball"
+layer = 20
+
+# 1.25.11 is llm-d-router's go.mod toolchain floor; the loop image runs go-test
+# gates against that module, so sandbox and loop must not sit below it.
+intro = """
+Go {pin.go} lives at /usr/local/go (`go` and `gofmt` symlinked into
+/usr/local/bin). GOTOOLCHAIN=local is set: the pinned toolchain is the only one,
+no auto-download. If a go.mod demands newer, that is a finding, not something to
+work around.
+"""
+
+[pins]
+go = "1.25.11"
+
+# Hard-freeze the pinned toolchain: no silent auto-download of a newer go.
+[env]
+GOTOOLCHAIN = "local"
+
+[capabilities]
+"toolchain.go" = "1.25"

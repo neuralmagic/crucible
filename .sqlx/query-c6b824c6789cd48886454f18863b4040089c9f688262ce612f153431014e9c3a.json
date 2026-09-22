@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT r.run_id AS \"run_id!\", r.scope, r.session_uri, r.pod\n        FROM runs r\n        WHERE r.issue = $1 AND r.status = 'running'\n        ORDER BY r.seq DESC LIMIT 1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "run_id!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "scope",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "session_uri",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "pod",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "c6b824c6789cd48886454f18863b4040089c9f688262ce612f153431014e9c3a"
+}

@@ -1,0 +1,100 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0047"
+title = "Controller MCP run logs: pull cursor with a local spool"
+status = "proposed"
+date = "2026-08-28"
+refs = [
+    "ADR-0042",
+    "ADR-0048",
+    "ADR-0049",
+]
+
+[content]
+context = """
+An agent driving the controller through MCP cannot see what a run is doing. The only observation available is polling a status field on `crucible_playbook_run` or `crucible_turns` for a terminal flip, so a run is opaque for its whole duration and the agent learns nothing until it lands. The evidence does not survive either: run pods are deleted promptly after collection, so `oc logs` is already NotFound minutes after a run finishes, and the live stream is the only capture window. The controller itself is not the gap. It already relays run output over SSE with a monotonic seq and `Last-Event-ID` resume; that stream simply has no consumer on the MCP side.
+
+Three constraints shape the answer. MCP has no streaming tool result, so a tool returns once and any incremental delivery has to be modelled on top. Agent result budgets are small and hard-capped, so a long log tail cannot be an ordinary return value; a 235KB read on this same surface already exceeded the cap and was spooled to a file instead of answering. And the MCP runs in two shapes: local stdio, where the server shares a filesystem with the agent, and remote HTTP, where it does not.
+
+[[ADR-0042]] already faced this for the broker and chose an on-demand pull cursor, `rig_logs(run_id [, cursor]) -> { chunk, next_cursor }`, explicitly so a long log tail never floods the agent's context, deferring SSE progress until the stateful tool-discovery regression is fixed. That precedent constrains this decision but does not settle it, because the local deployment has a capability the broker path did not assume: a shared filesystem, and an agent that already owns competent tools for reading files."""
+decision = """
+The controller MCP will expose run logs as a handle, never as a payload, in two layers over the existing SSE relay.
+
+The portable layer is a pull cursor carrying the shape [[ADR-0042]] already accepted for the broker: a bounded window plus the cursor to resume from. It is the floor, works in every deployment shape, and inherits its ordering and resume semantics from the relay's seq rather than defining a second cursor.
+
+The local layer is a spool. Where the MCP shares a filesystem with the agent, a background consumer in the server process subscribes to the run's stream and appends it to a file as one JSON object per line; the tool returns the path immediately and the agent reads it with the tools it already has. This wins because the reading problem is already solved outside the tool surface, and because the spool is what turns a live stream into evidence that outlives the pod.
+
+The cursor is the contract and the spool is an optimization over it, not a fork. Both refuse to put log bytes in a tool result."""
+consequences = """
+A run stops being opaque while it runs, and its output stops being lost when it ends. Because pods are deleted shortly after collection, capturing the stream live is the only way log evidence survives at all, and the spool makes that the default rather than something an operator has to think to do in advance. Delegating reading to the agent's own tools keeps follow, filter and search out of the tool surface entirely.
+
+The costs are real. Two delivery paths must stay behaviorally consistent, and the spool brings a lifecycle the tool surface did not previously have: size caps, rotation, and cleanup, so a runaway pod cannot fill the agent's disk. The spool also makes the server process stateful, holding a background subscriber per watched run; that state is invisible to the client, which still only ever pulls a path, so the stateful tool-discovery regression [[ADR-0042]] defers on does not apply to the stdio deployment, but it does bound how far this generalizes to a remote HTTP MCP. Keeping the pull cursor as the floor is the mitigation.
+
+The design is blocked on a relay fix rather than being independent of it: only session events currently carry a seq, so resume protects the session stream and not plain log lines. Extending seq to every event kind is a precondition, not a follow-up. Neutrally, this leaves the controller with two cursor consumers over one relay, so the seq becomes a contract the relay owes its subscribers rather than an internal detail. The concrete tool names, cursor type, and spool location remain open and belong to the implementing work."""
+
+[[content.alternatives]]
+text = "Pull cursor as the portable contract, plus a local spool the agent reads with its own tools"
+status = "accepted"
+pros = [
+    "One contract works in both deployment shapes: the cursor is the floor everywhere, the spool an optimization where a shared filesystem exists",
+    "The spool captures the stream while the run is live, which is the only window before the pod is deleted",
+    "Reading is delegated to tools the agent already has, so tail, grep and follow behavior need no equivalent in the tool surface",
+    "Neither path puts log bytes in a tool result, so a long tail cannot exhaust the agent's result budget",
+]
+cons = [
+    "Two delivery paths to build and keep behaviorally consistent",
+    "The spool needs a lifecycle of its own: size caps, rotation, and cleanup the agent does not have to think about",
+    "Depends on the relay assigning a seq to every event kind, which it does not do today",
+]
+
+[[content.alternatives]]
+text = "Pull cursor only, mirroring the broker's rig_logs exactly"
+status = "rejected"
+pros = [
+    "Exactly the shape [[ADR-0042]] already accepted, so no new precedent and no new client assumptions",
+    "Transport-agnostic, and stateless from the client's point of view",
+]
+cons = [
+    "Following a live run means the agent repeatedly calling a tool, spending a turn per poll on output it usually discards",
+    "Discards the local deployment's shared filesystem and the agent's own file tooling for no benefit",
+]
+rejection_reason = "It is the right floor but a poor ceiling: polling a cursor turn by turn is how an agent burns context to watch a quiet log, and on the local path the file the agent could have tailed already exists."
+
+[[content.alternatives]]
+text = "Local spool only, with no pull cursor"
+status = "rejected"
+pros = [
+    "Simplest to build: one background consumer, one file, no cursor arithmetic",
+    "Best ergonomics on the local path, where the agent's own tools do the reading",
+]
+cons = ["Silently unusable over remote HTTP, where the written file is on a host the agent cannot read"]
+rejection_reason = "It makes log access a property of how the MCP happens to be deployed, so the same tool call succeeds locally and returns an unreadable path remotely."
+
+[[content.alternatives]]
+text = "Stream progress through MCP progress and logging notifications"
+status = "rejected"
+pros = ["Purpose-built for incremental server-to-client delivery, and already part of the protocol"]
+cons = [
+    "Carries status text, not a queryable transcript: nothing is addressable or greppable after it scrolls past",
+    "Every frame costs agent context whether or not it is relevant, which is the flooding [[ADR-0042]] set out to avoid",
+    "Rendering is the client's choice, so delivery cannot be relied on",
+]
+rejection_reason = "Progress notifications answer how far along a run is, not what it printed, and they spend context on arrival rather than on demand."
+
+[[content.alternatives]]
+text = "Expose the log as an MCP resource and let clients subscribe to updates"
+status = "rejected"
+pros = ["The protocol's own model for a changing document, with subscription and update notification built in"]
+cons = [
+    "An update notification says only that the resource changed, so a client re-reads the whole log to learn what was appended",
+    "Client support is uneven, and unsupported subscription degrades to no updates at all",
+]
+rejection_reason = "Diffless change notification over an append-only log means quadratic re-reading of the exact payload that must not enter the agent's context."
+
+[[content.alternatives]]
+text = "Return the log body inline in the tool result"
+status = "rejected"
+pros = ["No new concepts: one call returns the logs"]
+cons = ["A real run's tail exceeds the agent's result cap, so the call fails to answer exactly when the logs matter most"]
+rejection_reason = "Already demonstrated on this surface: an unbounded read returned 235KB, blew the result cap, and was spooled to a file, arriving at the handle-return design by accident and after the fact."

@@ -1,0 +1,93 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0037"
+title = "Standing launches: one authorization core with trigger adapters (schedule, watch, portal)"
+status = "proposed"
+date = "2026-09-02"
+refs = [
+    "RFC-0001",
+    "ADR-0033",
+    "ADR-0045",
+    "ADR-0049",
+    "ADR-0028",
+    "ADR-0036",
+]
+
+[content]
+context = """
+The backport pipeline (PR 479) needs Jira tickets to launch a playbook without a human pressing go: a ticket carrying a form label appears, and a run starts with that ticket's key as a parameter. A service-desk style portal is next: an owner publishes a form for a playbook, a requester fills the exposed fields, and a run launches under the owner's authorization. [[ADR-0045]] reserved the Jira slot as a work source and the controller already has a tracker-agnostic `tracker.rs` boundary with a Jira search primitive waiting for a consumer. The recurring launch surface of [[ADR-0033]] gives schedules an adopted pack snapshot, launcher ceilings, an owner principal and group snapshot refreshed at fire time, a dispatch target, and auto-disable on consecutive failures, so a scheduled run can redeem bound secrets under [[ADR-0028]] and [[ADR-0036]] and fires exactly once across replicas under [[ADR-0049]]. All of that lives in `playbook_schedules` columns and in the schedule sweep's claimed-row-to-launch step.
+
+PR 479 shipped the watch as a daemon singleton: five environment variables on the controller config, one JQL query per deployment, a sweep hardwired to the Jira client, and a second launch-minting path beside the schedule's. Launches carried no owner or groups, so a watch-minted run could not redeem a bound secret. Threading the five values through `ControllerCfg` touched six test fixtures, and the module could not be composed with anything the launch surface already had. The one thing it got right, and the constraint any design must keep, is the self-retrigger loop: the pipeline's own report is a comment on the driving ticket, which bumps its update time, so a relaunch-on-update sweep feeds on its own output forever.
+
+With three standing triggers in view (a time, a tracker query, a form submission) the question is no longer how to add a Jira watch but where the authorization to launch lives. The recurring policy of [[ADR-0033]] also has to survive the split: a schedule may target a draft head under the administrator's development policy, and the sweep disables draft-head schedules before claiming while adopted-only is effective.
+
+Decision drivers: one launch path for every surface (the [[ADR-0033]] invariant), ownership that resolves secrets for every trigger, a tracker boundary rather than a Jira module, and adding a trigger as an adapter rather than a parallel subsystem with its own copy of the authorization columns."""
+decision = """
+Split the standing authorization to launch from the trigger that fires it. A `playbook_standing_launches` row is the core: adopted pack snapshot, base params, schema digest, ceilings, owner principal and group snapshot with its refresh state, dispatch target, agent provider and model, enabled, consecutive failures. Each trigger is a 1:1 sidecar keyed by the same id: `playbook_schedules` keeps only cron, zone, next due, last fired, and the dedupe cursor; `playbook_watches` holds tracker kind, native query, the key parameter, and the watermark; a future `playbook_portals` holds the slug, the exposed fields, and the groups allowed to submit. Existing schedules migrate onto the core in place, keeping their ids so the `dedupe_schedule` reference and the SPA links survive. The target lives on the core: `target_kind` and the adopted snapshot or the eligible draft version, so the fire builder resolves an adopted or draft-head target the same way for every trigger. The pre-claim draft-head disablement of [[ADR-0033]] stays on the schedule trigger, the only one that may name a draft head; watches and portals target adopted revisions only.
+
+One fire path. A trigger claims its sidecar row, supplies a per-firing overlay (a cursor value, an item identifier, a requester's fields) and its launch origin, and a single builder validates the composed params against the target's schema, mints the launch row through the one shared launch path, pins the adopted revision to it, carries the dispatch target and agent pin, and evaluates the owner snapshot for parking. The schedule sweep is refactored onto this builder rather than copied. A run is a run downstream; the only trigger-specific code is claiming and the overlay.
+
+The watch trigger is a discovery source on the tracker boundary: `tracker.rs` gains a search capability the Jira client implements, the daemon holds the trackers it has credentials for by kind, and a watch save refuses a kind that is not configured. Dedupe is a seen-set keyed by watch and item written in the launch's transaction: one automatic launch per item, ever; the watermark starts at the watch's creation and is the max update time over the seen-set thereafter, so a first sweep does not backfill a board, and an item that raced the watermark slack is re-seen and skipped. A per-item reset re-arms one item for the needs-info round trip.
+
+The portal trigger is direction, not decision: its sidecar would name the exposed subset of params and the groups that may submit, and a submission would launch under the owner's snapshot exactly as a watch or schedule firing does. What a submission must check and record is [[RFC-0001]]'s to state before the portal is built.
+
+This shape won because the authorization columns and the fire path already exist and are already tested for schedules; it moves them once instead of copying them per trigger, and every later trigger is a sidecar, a claim, and an overlay."""
+consequences = """
+- Every standing trigger launches under a refreshed owner snapshot with the same parking, dispatch target, secret redemption, and audit origin. Adding a trigger cannot regress ownership because the trigger never touches the authorization columns.
+- Migrating `playbook_schedules` onto the core is a real refactor of the schedule sweep and its queries; the existing schedule tests and the Keycloak fire-time refresh test are the regression net, and ids are preserved so nothing downstream re-links.
+- One-shots (`playbook_one_shots`) are frozen snapshots that fire once and are left as they are; folding them in as a deferred trigger is a follow-up, not a prerequisite.
+- Once-per-item is the safe watch policy but not the most useful: a ticket amended after a needs-info verdict does not relaunch on its own. The per-item reset and the ordinary launch form are the escape hatches; a smarter relaunch policy can build on the recorded update time without a schema change.
+- A new watch launches nothing already on the board unless the creator sets an explicit earlier bound, the opposite of the singleton's behavior; the form should make that default plain.
+- The draft-head lane is schedule-only. A watch or portal on a draft head would be a new decision, not an extension of this one.
+- The tracker registry stays deployment configuration (one Jira site per controller); per-watch tracker credentials are out of scope.
+- Portal access is group-bound at the sidecar; that is a new authorization surface with no contract yet.
+- The env-config watch has no deployed users, so nothing migrates from it."""
+
+[[content.alternatives]]
+text = "Daemon singleton configured by environment variables (PR 479's shape)"
+status = "rejected"
+pros = ["Smallest diff; no API, SPA, or MCP surface."]
+cons = ["One watch per deployment.", "Launches carry no owner or groups, so bound secrets cannot be redeemed.", "Five values threaded through the controller config and every test fixture.", "A second launch-minting path beside the schedule's."]
+rejection_reason = "Cannot own a run, cannot host more than one watch, and duplicates the launch path instead of composing with it."
+
+[[content.alternatives]]
+text = "A watches table that copies the schedule's authorization columns, sharing only a Rust type and the fire builder"
+status = "rejected"
+pros = ["Leaves playbook_schedules untouched.", "Smaller migration."]
+cons = ["Every authorization column exists twice, three times once the portal lands.", "Owner refresh, sign-in state, and auto-disable are queried per table."]
+rejection_reason = "Copies the columns the design is trying to share; the third trigger would make it a triplication."
+
+[[content.alternatives]]
+text = "One table with a trigger_kind discriminator and nullable trigger columns"
+status = "rejected"
+pros = ["No join on any read or claim.", "One migration, one row type."]
+cons = ["Every trigger's columns are nullable on every row, so a schedule's cron and a watch's watermark are enforced by CHECK constraints per kind rather than by the table.", "Adding a trigger widens a table every other trigger reads.", "The claim statements (a due window, an unseen hit) are unrelated queries that would share one hot table."]
+rejection_reason = "Per-kind constraints and per-kind claims want per-kind tables; the join is the cheaper cost."
+
+[[content.alternatives]]
+text = "Tracker-side handshake: the launch flips a label or status so the query stops matching, no seen-set"
+status = "rejected"
+pros = ["The tracker is the single source of truth; no controller state to reset."]
+cons = ["Needs write access to every watched tracker.", "A pack or the controller must know the handshake convention per tracker.", "A human who removes the label by hand relaunches the ticket silently."]
+rejection_reason = "Couples the watch to tracker write access and to a per-project labeling convention the controller cannot verify."
+
+[[content.alternatives]]
+text = "Relaunch on update, suppressing updates caused by the controller's own comments"
+status = "rejected"
+pros = ["An amended ticket relaunches without human action."]
+cons = ["Distinguishing self-updates from real ones needs comment-author tracking across every tracker.", "Any missed self-update loops the pipeline on its own output."]
+rejection_reason = "The self-retrigger loop is the failure mode this feature must be immune to; the suppression logic is fragile per tracker and the reset covers the round trip."
+
+[[content.alternatives]]
+text = "One module per tracker (jira_watch, github_watch), each with its own sweep and table"
+status = "rejected"
+pros = ["Each module can use its tracker's native paging and fields freely."]
+cons = ["Two sweeps, two seen-sets, two sets of endpoints and forms for the same behavior."]
+rejection_reason = "The tracker boundary already normalizes hits; the only tracker-specific piece is the search call."
+
+[[content.alternatives]]
+text = "One standing-launch authorization table with 1:1 trigger sidecars (schedule, watch, portal) and a single fire builder"
+status = "accepted"
+pros = ["Authorization columns and the fire path exist once and are already tested.", "A new trigger is a sidecar, a claim, and an overlay.", "Ownership cannot regress per trigger.", "Immune to the self-retrigger loop by construction."]
+cons = ["Migrates playbook_schedules in place and refactors its sweep.", "Once-per-item needs a reset for the amended-ticket case."]

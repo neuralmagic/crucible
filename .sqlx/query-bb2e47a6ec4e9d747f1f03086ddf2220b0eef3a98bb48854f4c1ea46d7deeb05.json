@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM work_pods WHERE issue_key = $1 AND state = 'queued'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "bb2e47a6ec4e9d747f1f03086ddf2220b0eef3a98bb48854f4c1ea46d7deeb05"
+}

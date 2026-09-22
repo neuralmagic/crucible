@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT k.secret_hash AS \"secret_hash!\", k.expires_at, k.revoked_at,\n                  u.sub AS \"sub!\", u.login AS \"login!\", u.groups AS \"groups!\"\n           FROM api_keys k JOIN users u ON u.sub = k.sub\n           WHERE k.id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "secret_hash!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "expires_at",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "revoked_at",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "sub!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "login!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "groups!",
+        "type_info": "Jsonb"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "46b8247e52a8d778b4a4e26f21b6a573ea7114d7de0a16ab1c6271a2e3beb3b9"
+}
