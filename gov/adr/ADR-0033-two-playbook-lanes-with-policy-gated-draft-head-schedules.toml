@@ -1,0 +1,34 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0033"
+title = "Two playbook lanes with policy-gated draft-head schedules"
+status = "accepted"
+date = "2026-08-27"
+refs = [
+    "RFC-0001",
+    "ADR-0027",
+]
+
+[content]
+context = "The launch architecture in [[ADR-0027]] deliberately kept recurring schedules on Git-pinned registry packs while drafts supported fast authoring and test fires. Agent-assisted authoring now makes the transition between those lanes common enough that operators want both a direct inspect-and-clone path and, in exceptional development deployments, a controlled way to let recurrence follow draft saves. This changes the earlier premises that packs live only in Git for durable operation, drafts always retire at graduation, and drafts can never be recurring targets. The default should retain the GitOps boundary while the exception remains explicit and reversible. [[RFC-0001]] owns the resulting product contract."
+decision = "Choose the two-lane, policy-gated design governed by [[RFC-0001]]. This decision retains [[ADR-0027]]'s registry, shared launch path, schema validation and generated forms, launcher-owned ceilings, claimed schedule sweep, distinct one-shot surface, controller-owned dedupe, import and authoring surfaces, and controller/engine authority boundary. It replaces the assumptions that durable operation always originates in Git, that every draft retires at graduation, and that drafts can never be recurring targets. Git-adopted revisions remain the normal lane; following a draft head is an administrator-enabled development exception because that balances rapid agent iteration with reviewable production provenance better than either an absolute prohibition or unconditional mutable recurrence."
+consequences = "The ordinary path keeps reviewable Git provenance and reproducible recurrence, while development operators can exercise a real recurring loop during agent-assisted authoring. The exception adds conceptual and implementation complexity around policy transitions and exact firing identity, but [[RFC-0001]] makes that cost visible and bounded. Superseding [[ADR-0027]] avoids leaving two contradictory playbook-launch decisions while preserving its unaffected architecture here."
+
+[[content.alternatives]]
+text = "Keep recurring schedules registry-only without an exception"
+status = "rejected"
+pros = ["Preserves the simplest and strongest GitOps boundary."]
+cons = ["Forces development operators to emulate recurrence manually during rapid iteration."]
+
+[[content.alternatives]]
+text = "Permit every draft to be scheduled unconditionally"
+status = "rejected"
+pros = ["Makes iterative recurring workflow development frictionless."]
+cons = ["Turns mutable controller state into the production default and obscures what future firings will execute."]
+
+[[content.alternatives]]
+text = "Keep adopted revisions as the default and gate draft-head recurrence behind an audited admin policy"
+status = "accepted"
+pros = ["Preserves Git-reviewed immutable recurrence by default while allowing an explicit development escape hatch."]
+cons = ["Adds policy-transition handling and requires each mutable firing to snapshot an exact draft version."]

@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE work_pods SET state = 'running', created_at = $1, updated_at = $2 WHERE pod_name = $3 AND state = 'queued'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "34b8f64898e6ef3f0fec12532d15ca478d54bc9e75ba2deae9129be8ff86d4d4"
+}

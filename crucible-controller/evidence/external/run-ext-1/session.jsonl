@@ -1,0 +1,7 @@
+{"v":1,"kind":"identity","identity":{"digest":"v1:feed"}}
+{"v":1,"kind":"row","row":{"iter":0,"decision":"baseline","score":300.0},"solved":false}
+{"v":1,"kind":"row","row":{"iter":1,"decision":"keep","score":250.0},"solved":false}
+{"v":1,"kind":"budget","spent":1.5,"elapsed_secs":200}
+{"v":1,"kind":"summary","rows":[],"gate":"bench","best_score":250.0}
+{"v":1,"kind":"pr_links","links":[{"url":"https://gh/pr/7","repo":"o/r","name":"","branch":"autoresearch/x/0"}]}
+{"v":1,"kind":"shutdown","outcome":"finished","reason":"done"}

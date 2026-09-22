@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT refreshed_at, last_error, failures AS \"failures!\"\n           FROM user_credentials WHERE sub = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "refreshed_at",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "last_error",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "failures!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "6dc8a4c7ddb37ba5c04b3201c509a791f438971ed1915ee3166f8741763c9b09"
+}

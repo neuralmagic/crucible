@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO work_pods\n            (pod_name, kind, issue_key, state, cost_tag, result, error, created_at, updated_at, terminal_at, cluster)\n        VALUES ($1, $2, $3, $4, $5, NULL, NULL, $6, $7, $8, $9)\n        -- The pod name is derived from the run id, and the row is written before the render that\n        -- can fail. A retry of the same run must reach that render and report its real error, not\n        -- collide here on the row its own previous attempt left.\n        ON CONFLICT (pod_name) DO NOTHING\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a8ab5b8d2b09bf1a4cad6ac38f661b4fe626d13aa64876ccb6b8c6a5f09a8a3b"
+}

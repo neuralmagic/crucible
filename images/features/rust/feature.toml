@@ -1,0 +1,22 @@
+summary = "Rust toolchain via rustup, pinned, with the native-build floor"
+layer = 20
+rpms = ["gcc", "make", "openssl-devel", "pkgconf-pkg-config"]
+
+intro = """
+Rust {pin.rust} via rustup at /usr/local/rustup (read-only, system-wide;
+RUSTUP_HOME is set). cargo, clippy, and rustfmt are on PATH; build caches land in
+~/.cargo. gcc, make, openssl-devel, and pkg-config are present for native builds.
+"""
+
+[pins]
+rust = "1.88.0"
+
+# System-wide read-only toolchain; CARGO_HOME stays unset so caches land in a
+# writable ~/.cargo for the unprivileged sandbox user.
+[env]
+RUSTUP_HOME = "/usr/local/rustup"
+PATH = "/usr/local/cargo/bin:$PATH"
+
+[capabilities]
+"toolchain.rust" = "1.88"
+"toolchain.cc" = "gcc"

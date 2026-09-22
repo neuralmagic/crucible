@@ -1,0 +1,7 @@
+# NVIDIA CUDA repo for RHEL10/UBI10; the cuda feature installs the toolkit from it.
+[cuda-rhel10-x86_64]
+name = NVIDIA CUDA (RHEL 10, x86_64)
+baseurl = https://developer.download.nvidia.com/compute/cuda/repos/rhel10/x86_64
+enabled = 1
+gpgcheck = 1
+gpgkey = https://developer.download.nvidia.com/compute/cuda/repos/rhel10/x86_64/CDF6BA43.pub

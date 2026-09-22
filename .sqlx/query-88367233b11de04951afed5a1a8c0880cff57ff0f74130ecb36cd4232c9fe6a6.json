@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE issues SET scope_now_justification = NULL, scope_now_max_cost = NULL WHERE key = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "88367233b11de04951afed5a1a8c0880cff57ff0f74130ecb36cd4232c9fe6a6"
+}

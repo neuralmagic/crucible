@@ -1,0 +1,88 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0030"
+title = "Bring-your-own cluster targets: user-registered namespaces as dispatch targets"
+status = "accepted"
+date = "2026-08-23"
+refs = [
+    "ADR-0046",
+    "ADR-0048",
+    "ADR-0027",
+    "ADR-0028",
+    "ADR-0029",
+]
+
+[content]
+context = """
+A dispatch target today is three things coupled at deploy time. A credential: a kubeconfig mounted by chart values under a clusters directory, where directory presence is the registration and the client cache never evicts; for fleet spokes the kubeconfig points `tokenFile` at a projected, kubelet-rotated SA token that the spoke's authn webhook trusts through the hub's issuer ([[ADR-0048]]), so no long-lived token is stored. A profile: the controller has one deploy profile for every cluster it dispatches to, mounted into the controller pod as a ConfigMap and passed by path to the core `render-turn` command; per-cluster profile files exist only on the standalone `crucible deploy render` path. A selection: one global dispatch-cluster setting; [[ADR-0048]] named multi-spoke configuration a non-goal. Work-pod rows record their cluster by name, and the ingest validator resolves a pod's cluster through that row.
+
+The spoke side has a contract that is not checked anywhere: a namespace, a turn service account, RBAC for the hub identity (pods create/get/list/watch/delete, `pods/log`, configmaps, and `tokenreviews` create as a ClusterRole), sandbox-driver grants for sibling pods and the OpenShell operator when the sandbox driver is `kubernetes`, a Kueue LocalQueue when the domain runs GPU measure jobs, pull secrets, an artifacts PVC or object store, and outbound reach from pods to the hub's external route. Dispatch requires that the hub reach the target's API server; push-only spokes receive no pods. Startup reconcile and the sweeps walk pod rows sequentially and hold a row on any non-404 error.
+
+Users want to point the shared control plane at a namespace they already own on a cluster the fleet does not manage, and run there. Every piece above is admin work, so this is not possible without a ticket per cluster, and issuer federation in particular is cluster-admin work on the target. The fleet spokes keep their current registration; this decision is about targets a user brings. It depends on [[ADR-0028]] for credential custody, the `hub` consumer class, and the grant path, and on [[ADR-0029]] only for a later as-user dispatch mode. Composing a profile per dispatch is a core `render-turn` change that ships with a pin bump before the controller release."""
+decision = """
+A brought target is a user-owned row backed by a kubeconfig secret in the registry; the spoke contract becomes a registration probe; pod identity is proven without cluster-scoped RBAC.
+
+**Registration.** A `cluster_targets` row: name, owner principal (user or idp group, as in [[ADR-0028]]), a reference to a registry secret of kind `kubeconfig` and consumer class `hub`, namespace, turn service account, pull secret names, artifacts backend, ingest URL (defaulting to the hub's external route), optional Kueue queue and measure substrate, sandbox driver, pod-identity mode, and a state (`probing`, `ready`, `failed`, `unreachable`, `credential_rejected`, `credential_unavailable`). Brought targets are addressed as `target:<uuid>` in pod rows; fleet names stay bare, cluster resolution handles both, and a brought target named like a fleet spoke is refused. Fleet spokes keep chart-mounted credentials and are not rows a user can edit.
+
+The credential is a long-lived Secret-backed service-account token, per [[ADR-0046]]. The `kubeconfig` kind is parsed at registration into a closed struct (server URL, inline CA data, inline bearer token); `exec` plugins, `tokenFile`, client certificate paths, and `proxy-url` are refused, and the hub constructs the kube client configuration itself rather than loading the file. The zero-stored-credentials rule of [[ADR-0048]] applies to fleet spokes; a brought target's credential is the user's, stored under the user's ownership, and read by the hub as an audited hub read with no acting principal. The hub writes the token to a tmpfs token file on first use so the client's own re-read handles rotation; on an auth rejection from the target the hub re-reads Vault and rewrites the file once, and if still rejected marks the target `credential_rejected`. The client is never rebuilt. If Vault is unavailable when the hub needs the credential, the target is `credential_unavailable` and its rows are skipped until the next watch rescan, which bounds the blind window.
+
+**Pod identity without cluster-scoped RBAC.** Ingest and grant redemption prove a pod's identity by TokenReview on the fleet, which needs a ClusterRole a namespace owner cannot grant. For brought targets the hub validates the pod's projected SA token offline instead: the token is a JWT carrying the pod name and UID claims, and the target's signing keys are readable at `/openid/v1/jwks` by any service account by default, so the hub fetches and caches them with the registered credential. Pod-identity mode is `tokenreview` for the fleet and `jwks` for brought targets; both require the token's pod UID to equal the UID recorded at create ([[ADR-0028]] section 4), and the ingest validator is keyed by mode. On an unknown key id the hub refetches at most once per cooldown per target, keeps the previous key set through the overlap, and returns 401 without a further fetch if the key is still unknown. Offline validation cannot see a deleted pod until its token expires, so the projected token is issued with a short expiry.
+
+**Profile as data.** The hub composes a profile per dispatch and passes it to `render-turn`, replacing the one mounted profile. Four buckets: per-target fields from the target row or the fleet file (namespace, service account, pull secrets, artifacts backend, ingest URL, queue, substrate, sandbox driver, optional image pins); per-domain fields from the registered pack or playbook (its declared secrets, env, and measure contract); hub-owned defaults (loop and supervisor images, pins); and free-form env with precedence target, then domain, then hub. Fleet spokes move to the composed render in this decision, with their current profile file as the per-target source.
+
+**Registration probe.** The row is created in `probing` and becomes `ready` or `failed`; a failed probe deletes its canary and leaves the row `failed` with the failing item named. Checks run with the registered credential: the API is reachable from the hub, the namespace exists, SelfSubjectAccessReview passes for each verb the hub needs, SelfSubjectRulesReview is reported with a warning for verbs outside the contract, pull secrets are present, the JWKS endpoint is readable, a LocalQueue is present when a queue is declared, the Sandbox CRD is present when the sandbox driver is `kubernetes`, and a canary pod (validated in `jwks` mode against the probing row) reaches the hub's external route and posts to ingest.
+
+**Selection and authorization.** The global dispatch cluster becomes the default. The playbook launch form ([[ADR-0027]]) lists the targets the launcher may use: fleet spokes by role, brought targets by ownership. A target may be bound to a playbook or repo with the same binding shape as secrets, and a launch onto a brought target requires the launcher's principals to cover the target's owner. Because whoever administers the target namespace can read anything projected into its pods, a launch onto a brought target may only use secrets whose owner principal is in the launcher's principal set or equals the target's owner principal, and the launch form says so.
+
+**Failure isolation.** A target is marked `unreachable` after N consecutive connection failures; startup reconcile and every sweep skip rows on targets in that state and time-box each target, so a dead brought target parks its own runs and never stalls a pass. A rejected credential is reported on the target, not as a transient network error.
+
+**Limits.** The target's API must be reachable from the hub, directly or through a fleet-configured proxy tier of [[ADR-0046]]; corp-internal namespaces the hub cannot reach are out of scope until a pull mode exists. The run-live raw-TCP relay is hub-only; brought targets get turn-live and SSE logs until portforward-over-API lands. GPU measure jobs require Kueue in the target namespace, and the `kubernetes` sandbox driver requires the OpenShell operator; the probe reports a namespace without them as agent-turns-only with nested podman. As-user dispatch (the hub acting with the user's own cluster identity through token exchange) is a later mode that depends on [[ADR-0029]] and is not part of this decision."""
+consequences = """
+- Self-service targets: a namespace owner registers a credential and a namespace, passes the probe, and launches, with no fleet admin involved and no chart change.
+- The hub holds many users' namespace credentials. A hub compromise reaches every brought namespace. Mitigations: credentials live in Vault under the owner's path and are revocable by the owner; the probe reports verbs beyond the contract at registration; the token rests only on tmpfs; the closed kubeconfig parser removes command execution and token exfiltration through a crafted file.
+- A brought target's namespace admins can read every secret projected into its pods and the pod's own service-account identity. The secret-owner rule at launch bounds that to secrets the launcher or the target owner already controls; it does not make a brought namespace a trust boundary the hub enforces.
+- One identity mechanism per target, keyed by mode. Offline JWKS validation is weaker than TokenReview only in revocation latency, bounded by the short token expiry; key rotation on the target is handled by the cooldown refetch with overlap.
+- Per-dispatch composed profiles replace the mounted ConfigMap for every target, fleet included; profile changes take effect on the next dispatch, and the core `render-turn` change plus pin bump precede the controller release.
+- Targets never contact Vault; they redeem grants against the hub, so clusters that cannot reach Vault work unchanged. The hub's ability to observe a brought target does depend on Vault at credential load, bounded by the watch rescan cadence.
+- Startup reconcile and the sweeps gain per-target state and time-boxing; a dead target isolates rather than stalls.
+- Brought targets enlarge the set of clusters whose tokens the hub validates on the ingest and redemption paths; the negative cache and WAF rate limit of [[ADR-0048]] cover them, and JWKS refetch is throttled per target.
+- Multi-spoke selection, previously a non-goal, becomes a launch-time choice with a default."""
+
+[[content.alternatives]]
+text = "User-owned target rows backed by a closed-form kubeconfig secret in the registry, offline JWKS validation of the pod's projected token, a composed profile per dispatch, a two-phase registration probe, and launch-time target selection"
+status = "accepted"
+
+[[content.alternatives]]
+text = "Issuer federation only, as with wharf: every target trusts the hub's issuer"
+status = "rejected"
+rejection_reason = "Requires an authn webhook or API-server OIDC configuration on the target, which is cluster-admin work; it stays the fleet path and is not something a namespace owner can do."
+
+[[content.alternatives]]
+text = "Registration through chart values and a mounted kubeconfig, as fleet spokes do today"
+status = "rejected"
+rejection_reason = "Registration by deploy is admin-only and per-release, which is the process this decision replaces."
+
+[[content.alternatives]]
+text = "TokenReview for brought targets, asking users to grant the ClusterRole"
+status = "rejected"
+rejection_reason = "A namespace owner cannot grant cluster-scoped RBAC; requiring it excludes the users this is for."
+
+[[content.alternatives]]
+text = "A hub-minted per-pod bearer placed in the pod spec instead of validating the projected token"
+status = "rejected"
+rejection_reason = "A second identity mechanism beside the projected token, with a value in the target's etcd and no kubelet rotation, when the projected token already carries the pod name and UID claims and its signing keys are readable by any service account."
+
+[[content.alternatives]]
+text = "Load the user's kubeconfig with the standard kube config loader"
+status = "rejected"
+rejection_reason = "The loader honors exec plugins, tokenFile, client certificate paths, and proxy-url, which lets a registrant run commands on the hub or make the hub send a fleet spoke's projected token to a server the registrant controls."
+
+[[content.alternatives]]
+text = "As-user dispatch now: the hub acts with the launcher's own cluster identity via token exchange"
+status = "considered"
+
+[[content.alternatives]]
+text = "A spoke-side agent installed by the user that pulls work from the hub"
+status = "rejected"
+rejection_reason = "Spoke-side controller components were ruled out in [[ADR-0048]]; a pull agent also needs its own credential to the hub, its own release cadence, and reintroduces per-cluster behavior the probe-plus-client model avoids. It is the only route to corp-internal namespaces the hub cannot reach; those are out of scope."

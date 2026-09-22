@@ -11,6 +11,7 @@ pub mod duration;
 pub mod errors;
 pub mod exposure;
 pub mod flow;
+pub mod inference;
 pub mod manifest;
 pub mod openshell;
 pub mod outputs;

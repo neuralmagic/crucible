@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO issues (key, repo, status, priority, evidence_url, title, author, body, labels, updated_at, upstream_updated_at)\n        VALUES ($1, $2, 'new', $3, $4, $5, $6, $7, $8, $9, $10)\n        ON CONFLICT(key) DO UPDATE SET\n            repo                 = excluded.repo,\n            evidence_url         = excluded.evidence_url,\n            title                = excluded.title,\n            author               = excluded.author,\n            body                 = excluded.body,\n            labels               = excluded.labels,\n            updated_at           = excluded.updated_at,\n            upstream_updated_at  = excluded.upstream_updated_at\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "cd9077c47f749886bb1a2a8ad087bbd9913b6051ed2517790b01a4b1dec016c1"
+}

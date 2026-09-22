@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT session_uri FROM runs WHERE run_id = 'adopted-rel'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "session_uri",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "a8925f490b9408ad48cc02fc68d52b5cebff6bebe84b22d51b4b15ffccf26f14"
+}

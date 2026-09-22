@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT r.issue AS \"issue_key?\", i.repo AS \"repo?\"\n        FROM runs r\n        LEFT JOIN issues i ON i.key = r.issue\n        WHERE r.run_id = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "issue_key?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "repo?",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      true,
+      false
+    ]
+  },
+  "hash": "4a798669769ca506721fa4e93a45976aa03f723a916bdd19cc76e83387316ecd"
+}

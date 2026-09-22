@@ -1,0 +1,70 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-09-17-001"
+title = "Send a failing review back for a bounded number of rounds"
+status = "done"
+created = "2026-09-17"
+started = "2026-09-17"
+completed = "2026-09-17"
+refs = [
+    "RFC-0002:C-REVISE-LOOP",
+    "RFC-0002:C-PLAYBOOK-SHAPE",
+    "RFC-0002:C-SETTLED-JOIN",
+    "RFC-0002:C-PLAYBOOK-LANE",
+]
+
+[content]
+description = """
+A playbook had no way to say "try again with this feedback". The graph runs once, so the backport pack's probe author carried its initial attempt and two repairs as skill prose, with no engine bound, no budget check between attempts, and attempt evidence the agent had to write down itself. The independent repro task that judged the probe could not send it back at all.
+
+`revise = <task>, max_rounds = N` on the reviewer makes that loop part of the graph. When the reviewer settles failing and rounds remain, the target runs again with the verdict under the reserved input `revision` (the settled entry for the reviewer's previous round, with its captured files staged under the reviewer's name), then the reviewer runs again. Any other reviewer outcome ends the loop. The bound is 2..=5 and required, the ceilings are checked before every round and every reviewer dispatch, and a target with a session resumes it each round.
+
+Each round reports as `task[round-N]` and the task-named rows carry the last round with every round's spend, so the existing verdict, short-circuit, dependents, and the controller's instance-row dedupe read the loop without change. The loop is declared on an edge that already exists, so the compiled graph keeps its nodes and edges; `plan_admitted` carries `revise` and `max_rounds` so a renderer can draw it before any spend, which bumps the contract to 1.5.0.
+
+Validation keeps the loop to one proposer and one reviewer: no fan-out on either, no nested or chained loops, no second reviewer for a target, and no other reviewer dependency that can reach the target. Scored lanes refuse it; their iteration already sends a failed candidate back."""
+
+[[content.acceptance_criteria]]
+text = "a reviewer that fails sends its settled entry back to the target as revision and the pair runs again until the reviewer stops failing or max_rounds is spent"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "a reviewer round that passes, skips, transport-fails, or is blocked ends the loop, as does a failed revision that blocks the reviewer"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "a budget or wall-clock ceiling ends the loop before the next round or reviewer dispatch and halts the run"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "each round settles as task[round-N]; the task-named rows carry the last round with summed spend and alone gate the verdict"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "the loop waits for the reviewer's other dependencies, dependents wait for the loop, and a reviewer the substrate cannot run leaves the target a plain task"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "through the harness runner a target's session resumes across rounds, each passing round commits, and the failed reviewer's captured files reach the revision"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "revise and max_rounds are refused unpaired, out of 2..=5, on a non-dependency, on unsupported kinds or fan-outs, twice on one target, nested, around a dependent of the target, and outside a playbook"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "plan_admitted carries revise and max_rounds, and the contract version moves to 1.5.0"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "the DSL reference documents revise, max_rounds, and the revision input, and the plan state reference documents Revising"
+status = "done"
+category = "chore"

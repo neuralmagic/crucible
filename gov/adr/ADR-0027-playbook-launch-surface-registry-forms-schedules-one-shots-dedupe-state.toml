@@ -1,0 +1,71 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0027"
+title = "Playbook launch surface: registry, forms, schedules, one-shots, dedupe state"
+status = "superseded"
+date = "2026-08-22"
+superseded_by = "ADR-0033"
+refs = [
+    "ADR-0045",
+    "ADR-0044",
+    "ADR-0049",
+    "ADR-0041",
+]
+
+[content]
+context = """
+The playbook lane landed in core: a workflow that runs its graph once and produces no score, declared parameters compiled to a JSON Schema (`crucible plan params`), fan-out instances keyed by item, and bounded compilation that turns any hostile source into a `file:line:col` compile error instead of a dead process. The controller can launch work pods and owns Postgres, the bors-style queue, and the SPA, but has no path from "a pack exists in a git repo" to "a person can run it, on a schedule, without reprocessing inputs". Related: [[ADR-0045]] (InputKind is the extension point for new work sources), [[ADR-0044]] (the ledger the launch rows join), [[ADR-0049]] (leader election; any sweep this ADR adds must fire exactly once across replicas), [[ADR-0041]] (the PR-push machinery authoring reuses).
+
+Decision drivers: the engine already emits everything a UI needs (schema, mermaid graph, compile diagnostics), so the question is ownership, not rendering. The queue's frozen rule is that a dequeued key carries no payload. Ceilings are the launcher's; a pack may not declare them. The engine compiles the graph; the controller must never interpret or subtract from a pack's inputs. Packs live in git; the controller holds pins."""
+decision = """
+Six surfaces, all thin layers over one launch path. The schema-driven direction wins because the engine already emits the schema, the graph, and precise diagnostics, so every alternative that moves authoring or interpretation into the controller duplicates an authority the pack already holds.
+
+**Registry.** A registered playbook is a git-pinned pack: repo, ref, path, rev, tarball, plus a `params_schema` JSONB extracted by running the pinned engine's `plan params` at registration and on every pin bump, stored with a digest of the schema so a pin bump that changes the form is detectable before it is accepted. Extraction failure fails registration with the engine's error; nothing half-registers.
+
+**Launch path.** `InputKind::Playbook`, key `playbook:{pack}:{uuidv7}`. Param values and launcher ceilings are stored on a `playbook_launches` row at adopt time and re-read by key at dispatch (the [[ADR-0045]] Jira precedent), rendered into the work pod as repeated `--param NAME=VALUE` plus `--max-cost`/`--max-time`. The POST endpoint validates values server-side against the stored schema; the SPA form is convenience, the endpoint is enforcement.
+
+**Forms.** The SPA renders the launch form from the stored schema with a hand-rolled component over the closed subset (string, pattern, default, doc, required). Launcher ceilings render as a visually separate section, bounded by admin caps.
+
+**Schedules.** A `schedules` table; the daemon sweep claims due rows with a single `UPDATE ... WHERE next_due_at <= now() AND enabled RETURNING`, recomputes `next_due_at`, and inserts an ordinary launch row, so a scheduled run is indistinguishable from a manual one downstream. Missed windows are skipped and recorded; consecutive firing failures auto-disable at a threshold that is deployment configuration. Next-firing previews are computed server-side so timezone interpretation has one owner.
+
+**One-shots.** Their own surface: frozen param snapshots, relaunch-by-prefill, and run-once-at as a deferred one-shot (`fire_at`, fires once, completes). A one-shot does not advance dedupe state unless opted in at launch.
+
+**Dedupe state.** Controller-side, never in the graph. v1 is a cursor: schedule config maps a field of the run result to a param of the next firing, stored only after a successful run. v2 is a seen-set keyed by (pack, input scope derived from identity params), recording only passing fan-out instances, item keys sharing the adopted-issue vocabulary, fed back as a launcher-materialized workspace file a pack may read.
+
+**Import and authoring** ride the same registry: import fetches a git URL, compiles server-side, and shows a preview gate (form, graph, diagnostics) before pinning; authoring edits controller-stored draft packs with a compile-on-save loop and graduates them to git as a PR over the [[ADR-0041]] push machinery, after which the draft retires. Core's bounded compilation is what makes compiling arbitrary fetched or typed sources server-side acceptable."""
+consequences = """
+- One launch path means every consumer (form, cron, one-shot, import test-fire, future asks) exercises the same validation and ledger rows; there is no second, weaker way to start a run.
+- The controller stays outside the graph: it never subtracts inputs, never rewrites a pack, and dedupe degrades gracefully — a pack that ignores the cursor or seen-set behaves exactly as today.
+- Costs: a new engine-subprocess dependency at registration time (mitigated by extracting once and storing the schema), a schema-subset coupling between the SPA renderer and the engine's params vocabulary (mitigated by the stored digest and the preview gate on pin bumps), and draft packs create a second place pack source can live (mitigated by graduation-and-retire, drafts never being schedulable targets of record without registration).
+- The seen-set's run-report ingestion path is new infrastructure; the cursor deliberately needs none, which is why it ships first.
+- Cron parsing adds a dependency."""
+
+[[content.alternatives]]
+text = "Schema-driven launch surface: the pack declares params, the controller extracts, stores, renders, and enforces; schedules, one-shots, and dedupe are thin layers over one launch path"
+status = "accepted"
+
+[[content.alternatives]]
+text = "Controller-authored forms: form definitions live in controller tables, decoupled from the pack"
+status = "rejected"
+rejection_reason = "Forks the source of truth: the pack's params block already is the form definition and one declaration must serve CLI validation, ask validation, and the launch form; a controller-side copy drifts on every pin bump."
+
+[[content.alternatives]]
+text = "Engine-side persistent state for dedupe: the pack carries its own seen-set across runs via durable workspace or git memory"
+status = "rejected"
+rejection_reason = "A pack run is one pass over its inputs; what has already been processed is scheduling state, and the engine has no durable cross-run home for it (state rides an emptyDir). Putting it engine-side couples runs to storage the launcher already owns."
+
+[[content.alternatives]]
+text = "Controller subtracts seen inputs from the graph's fan-out before dispatch"
+status = "rejected"
+rejection_reason = "Puts the controller inside the graph, violating the engine-compiles-the-graph boundary; the controller supplies state, the pack subtracts."
+
+[[content.alternatives]]
+text = "Cron as degenerate one-shots, one surface for both"
+status = "rejected"
+rejection_reason = "One-shots are the lane's native shape and carry different semantics: frozen snapshots, relaunch-by-prefill, no dedupe advancement by default; folding them into cron rows makes both surfaces worse."
+
+[[content.alternatives]]
+text = "Kubernetes CronJobs or per-schedule timers instead of an in-controller sweep"
+status = "rejected"
+rejection_reason = "A CronJob fires a pod, not a launch row, so scheduled runs would bypass the one launch path (validation, ledger, dedupe) or need a shim that reimplements it; per-schedule timers scatter timezone interpretation and firing state across processes. The sweep keeps one owner for both, and [[ADR-0049]] leader election already provides its single-writer guarantee."

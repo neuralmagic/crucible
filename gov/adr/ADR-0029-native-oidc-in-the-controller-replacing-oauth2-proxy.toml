@@ -1,0 +1,85 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0029"
+title = "Native OIDC in the controller, replacing oauth2-proxy"
+status = "accepted"
+date = "2026-08-23"
+refs = [
+    "ADR-0048",
+    "ADR-0049",
+    "ADR-0028",
+    "ADR-0030",
+]
+
+[content]
+context = """
+The controller sits behind an oauth2-proxy sidecar. The proxy runs the OIDC flow against Keycloak and the controller trusts identity from request headers: `X-Auth-Request-User` (preferred_username) and `X-Auth-Request-Email` from the checked-in chart, and `X-Auth-Request-Groups` (the IdP groups claim) from live proxy configuration the chart does not reproduce. The browser path passes the controller's bearer guard only because the proxy injects the static `CONTROLLER_API_TOKEN` as the Authorization header on every proxied request; the guard is layered outside the session layer, so it runs before any session is loaded. Server-side sessions already live in Postgres with a sliding 7-day expiry; the session identity source is a closed enum with one variant (proxy), and a source mismatch flushes the session. Two non-browser paths exist beside the proxy: the static API token presented directly, and a cluster-token bearer resolved through the own-cluster `users/~` endpoint, which yields an OpenShift username that need not equal the SSO login. The cluster-token path strips the user and email headers but not groups; the static-token path strips nothing, so a holder of the API token on the direct route can assert any login and any group. The static token is also the documented break-glass and CD path, and an unset token forces a loopback bind. The CLI path through the proxy uses `--extra-jwt-issuers` so a Keycloak access token can be presented as a bearer; the chart warns that naming the web client there would accept foreign tokens. The chart's default provider is GitHub OAuth with an org and team allowlist; the hub runs on OIDC. The SPA hardcodes `/oauth2/start` and `/oauth2/auth`. Schedules fire from a sweep that claims rows `FOR UPDATE` and counts every failure toward auto-disable; leader election ([[ADR-0049]] section 1) is not yet implemented.
+
+Four problems. The controller only ever sees the claims the proxy forwards, so every new claim is proxy configuration, and the groups header already lives outside the chart. The header trust boundary is a hazard; the static-token pass-through is one instance. The controller never holds a refresh token, which [[ADR-0028]] needs: a scheduled launch fires with no session, and re-fetching the owner's live IdP groups at fire time requires the controller to be the OIDC client. And the DB-sessions work already named hand-rolled OIDC, token exchange for SSO pass-through to remote clusters, and GitHub fork linking as the roadmap; [[ADR-0030]] wants token exchange later for launching as the user on a cluster the user brought.
+
+The integration is standard: authorization code with PKCE, JWKS fetch and cache, ID token validation, a session cookie the controller already knows how to issue, and JWT bearer validation for CLI callers."""
+decision = """
+The controller becomes the OIDC relying party. The oauth2-proxy sidecar, its route configuration, and the GitHub provider mode are removed after a one-release overlap.
+
+**Browser flow.** Authorization code with PKCE and a `state` nonce, on controller-owned routes: a login route that starts the flow, a callback that completes it, a logout route, and the existing whoami route as the session probe, which also reports the auth mode. The web client requests the `offline_access` scope. On callback the controller validates the ID token against the issuer's cached JWKS (issuer, audience, expiry, nonce), creates a session holding `sub`, login, email, and groups, and sets the session cookie. Logout deletes the session and calls the issuer's `end_session_endpoint`; RP-initiated logout revokes session-bound tokens, which is why the offline credential below must be an offline token.
+
+**Users.** A `users` table maps `sub` to the SSO login. A `user:` principal in [[ADR-0028]] is the SSO login; schedules and secrets store the owner's `sub`. A cluster-token identity resolves to a `users` row by login or cannot own secrets or schedules.
+
+**Offline credential.** The offline token is not session state. It lives in a per-user credentials table keyed by `sub`, one row per user, latest login wins, encrypted with a chart-mounted key, independent of session lifetime. Browser logout leaves it in place, so a user's schedules keep running after they close the tab. A user revokes it explicitly from their own settings, which parks their schedules that need team secrets until they sign in again. The Keycloak client is configured to permit refresh-token reuse (rotation revocation off, or reuse-max at least one), and each refresh persists the returned token inside the same transaction under `pg_advisory_xact_lock` keyed by `sub`, so two schedules of one owner firing in the same sweep cannot race a rotating token. A persist failure marks the schedule as needing sign-in. The relying-party client is restricted to a minimal scope and is not permitted token exchange.
+
+**Guard and extractors.** The session layer moves inside the guard so a request may authenticate by session cookie or by bearer. Non-GET requests authenticated by cookie require a same-origin `Sec-Fetch-Site` or `Origin` check, because the cookie is `SameSite=Lax` and every tenant on the cluster's apps wildcard is same-site. `Identity` and `Groups` keep their shape and are populated from the session or the validated token; every route, role check, and guard that consumes them is unchanged. A `native` session identity source is added; flipping back to proxy mode flushes native sessions and forces re-login. Client-supplied `X-Auth-Request-*` headers are ignored in native mode on every path. Session groups are refreshed from the offline credential at most every N minutes on use; a failed refresh downgrades the session to viewer until re-login.
+
+**Bearer paths.** Three: the static API token, which maps to a fixed configured identity and role (the admin break-glass and CD path) instead of carrying caller-asserted headers, and whose unset state means loopback-only when no issuer is configured either; the cluster-token path resolved through `users/~`; and a Keycloak access token presented as a bearer, validated by the controller against the same JWKS, replacing `--extra-jwt-issuers`. The JWT path requires `typ=Bearer`, `azp` equal to the public device-flow client, and rejects ID tokens and any token whose `azp` is the relying-party client. The device-flow client's scope must include the audience and groups mappers. Identity and groups on the JWT path come from the token's claims.
+
+**Group refresh for scheduled launches.** Before the sweep claims a due row, outside the claim transaction, the hub refreshes the owner's ID token from the offline credential and reads the groups. Issuer-unreachable is transient: no failure count, retry next tick. A definitive refresh failure (revoked, expired) falls back to the schedule-row snapshot of [[ADR-0028]] while inside its TTL, else parks the launch and marks the schedule as needing sign-in. The schedules view shows failures, disabled state, and sign-in needed. [[ADR-0049]] section 1 lands before fire-time refresh runs on more than one replica.
+
+**Unauthenticated routes stay where they are.** The ingest drop-box, the discovery mirror, and the grant redemption endpoint of [[ADR-0028]] are outside human auth by design ([[ADR-0048]]) and are untouched.
+
+**Rollout.** A chart value selects `proxy` or `native` for one release so production can flip and flip back. In proxy mode the controller's login route redirects to the proxy's start URL, callback and logout are no-ops, header trust stays on, and the SPA keeps `/oauth2/*` as its probe; in native mode the SPA uses the controller routes. Deployments on the GitHub provider must move to an OIDC issuer before the removal release. The proxy mode, the sidecar, and the GitHub provider are deleted in the release after. The relying-party client is registered in Keycloak with the controller's callback URL and the `offline_access` scope.
+
+**Library.** A maintained OIDC client crate rather than hand-rolled discovery and validation."""
+consequences = """
+- The controller sees the whole ID token. New claims are code, not proxy configuration, and the groups header stops living outside the chart.
+- The header trust boundary disappears in native mode; identity is a cookie the controller minted or a JWT it validated. The static-token pass-through hazard closes because that token carries a fixed identity.
+- Scheduled launches under team secrets follow live group membership, bounded by the offline token's lifetime rather than the controller's session lifetime. Offline tokens are the long-lived kind; whether the realm grants `offline_access` to this client is an ask to the SSO owners, and without it the design degrades to the schedule-row snapshot.
+- A new class of exposure: the credentials table plus the client secret can mint live tokens for any user who has signed in. Mitigations: the table is encrypted with a chart-mounted key, the client's scope is minimal and token exchange is disabled on it, and users can revoke their own credential.
+- Session-held groups are refreshed on use rather than only at login, so the launch check of [[ADR-0028]] runs against groups no older than the refresh interval.
+- GitHub-provider login is removed. The hub runs behind Keycloak and the GitHub org allowlist was the pre-SSO access model; GitHub identity returns later as fork linking on top of SSO identity, not as a login.
+- Token exchange for SSO pass-through and as-user dispatch on brought clusters ([[ADR-0030]]) becomes possible; it is not part of this decision.
+- One release of dual-mode chart configuration and SPA routes, then the oauth2-proxy templates, values, and route annotations are deleted. Flipping back to proxy mode forces every native session to re-login.
+- A new dependency."""
+
+[[content.alternatives]]
+text = "The controller is the OIDC relying party: PKCE code flow, JWKS validation, server-side sessions, a per-user encrypted offline credential for refresh, JWT bearer validation for CLI callers"
+status = "accepted"
+
+[[content.alternatives]]
+text = "Keep oauth2-proxy and forward more claims as headers"
+status = "rejected"
+rejection_reason = "Still no refresh token for the controller, so scheduled launches cannot re-fetch groups; the header trust boundary and the static-token pass-through remain; every claim is proxy configuration."
+
+[[content.alternatives]]
+text = "Keep oauth2-proxy for browsers and add a Keycloak service account for group lookups"
+status = "rejected"
+rejection_reason = "Adds a second credential and a directory integration to work around not being the OIDC client, when being the client gives the same answer through the standard refresh grant."
+
+[[content.alternatives]]
+text = "Store the refresh token in the session row"
+status = "rejected"
+rejection_reason = "Sessions expire after idle, are swept, and are deleted on logout, so the token would be gone exactly when a scheduled launch needs it; two concurrent sessions would also leave which token undefined. Durable credentials belong in a table keyed by user."
+
+[[content.alternatives]]
+text = "Session-bound refresh tokens instead of offline tokens"
+status = "rejected"
+rejection_reason = "RP-initiated logout and the SSO idle timeout revoke them, so a schedule owner who logs out or stays away parks every schedule; the offline token is the only kind that survives both."
+
+[[content.alternatives]]
+text = "OpenShift OAuth (the cluster's oauth-server) as the identity provider"
+status = "rejected"
+rejection_reason = "Ties browser identity to one cluster's OAuth, does not carry the IdP groups claim in the shape the controller already consumes, and does not help remote or brought clusters."
+
+[[content.alternatives]]
+text = "A different auth proxy (Keycloak Gatekeeper successors, Pomerium, and the like)"
+status = "rejected"
+rejection_reason = "Same category as oauth2-proxy: identity by header, refresh token held by the proxy, claims filtered by proxy config."

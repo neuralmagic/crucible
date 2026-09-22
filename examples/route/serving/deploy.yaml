@@ -1,0 +1,78 @@
+# DiffusionGemma structured reads on one H200: vLLM on :8000, and the PR's example server in
+# front of it on :8011 serving POST /v1/systemone. The image is set by `just route-serving-deploy`.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dgemma-systemone
+  labels: {app: dgemma-systemone}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: dgemma-systemone}
+  template:
+    metadata:
+      labels: {app: dgemma-systemone}
+    spec:
+      containers:
+        - name: vllm
+          image: IMAGE
+          command: ["vllm", "serve", "google/diffusiongemma-26B-A4B-it"]
+          args:
+            - --served-model-name=dgemma
+            - --port=8000
+            - '--diffusion-config={"canvas_length": 64}'
+            - --max-logprobs=32
+            - --enable-prefix-caching
+            - --async-scheduling
+            - --max-num-seqs=32
+            - --max-model-len=8192
+          env:
+            - {name: VLLM_LOGGING_LEVEL, value: INFO}
+          ports: [{containerPort: 8000, name: vllm}]
+          startupProbe:
+            httpGet: {path: /health, port: 8000}
+            periodSeconds: 10
+            failureThreshold: 180
+          readinessProbe:
+            httpGet: {path: /health, port: 8000}
+            periodSeconds: 10
+          resources:
+            requests: {cpu: "8", memory: 64Gi, nvidia.com/gpu: "1"}
+            limits: {cpu: "16", memory: 128Gi, nvidia.com/gpu: "1"}
+          volumeMounts:
+            - {name: hf-cache, mountPath: /root/.cache/huggingface}
+            - {name: shm, mountPath: /dev/shm}
+        - name: systemone
+          image: IMAGE
+          command: ["python3", "/opt/diffusion_reads/structured_server.py"]
+          args:
+            - --upstream=http://127.0.0.1:8000
+            - --model=dgemma
+            - --tokenizer=google/diffusiongemma-26B-A4B-it
+            - --canvas=64
+            - --port=8011
+          ports: [{containerPort: 8011, name: systemone}]
+          readinessProbe:
+            tcpSocket: {port: 8011}
+            periodSeconds: 10
+          resources:
+            requests: {cpu: "1", memory: 2Gi}
+            limits: {cpu: "4", memory: 8Gi}
+          volumeMounts:
+            - {name: hf-cache, mountPath: /root/.cache/huggingface}
+      volumes:
+        - name: hf-cache
+          emptyDir: {}
+        - name: shm
+          emptyDir: {medium: Memory, sizeLimit: 16Gi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dgemma-systemone
+spec:
+  selector: {app: dgemma-systemone}
+  ports:
+    - {name: systemone, port: 8011, targetPort: 8011}
+    - {name: vllm, port: 8000, targetPort: 8000}

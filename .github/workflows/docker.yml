@@ -10,7 +10,8 @@ name: Docker
 # runner's cargo cache rebuilds in minutes. The buildx cache stays for the remaining docker
 # layers (runtime dnf, tool installs), which are small enough to survive eviction.
 #
-# Tags (ghcr.io/<owner>/crucible):
+# Tags (ghcr.io/<owner>/crucible, and ghcr.io/<owner>/crucible-controller built on top of it
+# by the second job, same tag set):
 #   latest        the default branch's head
 #   sha-<short>   every build, immutable
 #   v<x.y.z>      release tags
@@ -38,6 +39,9 @@ env:
 
 jobs:
   build-push:
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+      version: ${{ steps.meta.outputs.version }}
     # The org's image-pool runners (AL2023, glibc 2.34): the runner's glibc must not exceed the
     # runtime base's (UBI10 = 2.39), and the smoke step below catches it before a push if the
     # AMI ever moves past it. Main-branch pushes only, so no fork ever lands here.
@@ -139,6 +143,7 @@ jobs:
       # amd64 only: the runtime base + payload are amd64. The buildx GHA cache reuses the
       # non-Rust layers across runs.
       - name: Build and push
+        id: push
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: .
@@ -154,3 +159,91 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache
           cache-to: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache,mode=max
+
+  # The control plane on top of the runtime image this run just published: the controller (with
+  # the SPA rust-embed folds in at compile time) and the crux CLI, staged the same way as above
+  # and packaged by Containerfile.controller FROM the runtime at its exact digest.
+  controller:
+    needs: build-push
+    runs-on: [self-hosted, linux, x64, beefy, image]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          cache: false
+
+      - name: Enable sccache + mold
+        run: |
+          {
+            echo "SCCACHE_BUCKET=llm-d-sccache-783952637884"
+            echo "SCCACHE_REGION=us-east-1"
+            echo "SCCACHE_S3_KEY_PREFIX=crucible"
+            echo "RUSTC_WRAPPER=sccache"
+            # -B, not -fuse-ld=mold: AL2023 ships GCC 11, which predates that flag.
+            echo "RUSTFLAGS=-C link-arg=-B/usr/local/libexec/mold"
+          } >> "$GITHUB_ENV"
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+
+      # The built SPA must exist before cargo: rust-embed folds crucible-controller/ui/dist into
+      # the controller binary.
+      - name: Build UI
+        working-directory: crucible-controller/ui
+        env:
+          SQLX_OFFLINE: "true"
+        run: |
+          bun install --frozen-lockfile
+          bun run build
+
+      - name: Build release binaries
+        env:
+          # The image is built from staged binaries rather than a source tree, so the commit is
+          # handed to build.rs here or the running controller cannot name where it came from.
+          CRUCIBLE_GIT_SHA: ${{ github.sha }}
+          SQLX_OFFLINE: "true"
+        run: |
+          cargo build --release --locked -p crucible-controller -p crux --bins
+          mkdir -p prebuilt/bin
+          cp target/release/crucible-controller target/release/crux prebuilt/bin/
+          ls -la prebuilt/bin/
+          rm -rf target
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
+
+      - name: Log in to GHCR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata (tags + labels)
+        id: meta
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
+        with:
+          images: ghcr.io/${{ github.repository }}-controller
+          tags: |
+            type=sha,format=short
+            type=ref,event=tag
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Build and push
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: Containerfile.controller
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            CRUCIBLE_RUNTIME=ghcr.io/${{ github.repository }}@${{ needs.build-push.outputs.digest }}
+            VERSION=${{ needs.build-push.outputs.version }}
+            REVISION=${{ github.sha }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

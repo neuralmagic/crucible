@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE issues SET redispatch_justification = NULL WHERE key = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d353531c4381f09af03aa56e5fb2d9c70f112bfa50c4abdac164f69d45e258f5"
+}

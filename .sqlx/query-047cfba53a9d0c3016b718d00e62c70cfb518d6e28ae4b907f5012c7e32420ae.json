@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT COALESCE(SUM(cost_usd), 0.0) AS \"total!: f64\" FROM ledger WHERE substr(ts, 1, 10) = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "total!: f64",
+        "type_info": "Float8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "047cfba53a9d0c3016b718d00e62c70cfb518d6e28ae4b907f5012c7e32420ae"
+}

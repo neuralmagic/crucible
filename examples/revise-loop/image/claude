@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+"""Claude Code's sandbox surface around tools/fake-agent.py: the prompt on stdin, the session on
+--session-id/--resume, a transcript where Claude Code keeps one, and a stream-json result."""
+
+import json
+import os
+import pathlib
+import subprocess
+import sys
+
+
+def flag(argv: list[str], name: str) -> str | None:
+    if name in argv and argv.index(name) + 1 < len(argv):
+        return argv[argv.index(name) + 1]
+    return None
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    resumed = flag(argv, "--resume")
+    session = resumed or flag(argv, "--session-id") or "no-session"
+    env = dict(
+        os.environ,
+        CRUCIBLE_PROMPT=sys.stdin.read(),
+        CRUCIBLE_AGENT_SESSION_ACTION="resume" if resumed else "start",
+    )
+    code = subprocess.call(
+        [sys.executable, "/usr/local/share/fake-agent/fake-agent.py"], env=env, stdout=sys.stderr
+    )
+
+    home = pathlib.Path(os.environ.get("CLAUDE_CONFIG_DIR", "/sandbox/.claude"))
+    transcript = home / "projects" / "-sandbox-workspace" / f"{session}.jsonl"
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    with transcript.open("a") as handle:
+        handle.write(json.dumps({"type": "user", "sessionId": session}) + "\n")
+
+    print(json.dumps({"type": "system", "subtype": "init", "model": "fake",
+                      "session_id": session, "tools": [], "agents": []}))
+    print(json.dumps({"type": "result", "subtype": "success", "is_error": code != 0,
+                      "num_turns": 1, "result": "fake turn", "session_id": session,
+                      "total_cost_usd": 0, "duration_ms": 1}))
+    return code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

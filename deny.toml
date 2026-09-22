@@ -35,12 +35,14 @@ ignore = [
     # h2 0.3.x empty-DATA-frame DoS; no patched 0.3 release. Reached only through the aws-sdk
     # legacy hyper 0.14 client (fixed-endpoint S3/STS); the workspace's h2 0.4 line is on 0.4.16.
     { id = "RUSTSEC-2026-0258", reason = "h2 0.3 via legacy aws-sdk hyper stack; client to fixed AWS endpoints, 0.4 line patched" },
+    { id = "RUSTSEC-2023-0071", reason = "rsa via openidconnect; the controller only verifies RS256 ID-token signatures with the issuer's public JWKS, no private-key operation exists for the timing side channel to leak, and no fixed release exists" },
 ]
 
 [licenses]
 version = 2
 allow = [
     "MIT",
+    "MIT-0",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",

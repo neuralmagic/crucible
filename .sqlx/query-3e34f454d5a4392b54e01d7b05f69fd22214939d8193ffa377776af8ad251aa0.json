@@ -1,0 +1,50 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT run_id AS \"run_id!\", kind, lane, iter, score, decision\n        FROM candidates ORDER BY run_id, COALESCE(iter, lane), seq\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "run_id!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "kind",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "lane",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "iter",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "score",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 5,
+        "name": "decision",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "3e34f454d5a4392b54e01d7b05f69fd22214939d8193ffa377776af8ad251aa0"
+}

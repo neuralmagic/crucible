@@ -8,3 +8,4 @@ examples/*/workspace-*/
 examples/*/state/
 book/
 *.jsonl
+crucible-controller/ui/node_modules/

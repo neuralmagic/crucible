@@ -1,0 +1,46 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id AS \"id!\", scope_report_id AS \"scope_report_id!\", issue_key AS \"issue_key!\",\n               transcript_gz AS \"transcript_gz!\", created_at AS \"created_at!\"\n        FROM scope_transcripts WHERE issue_key = $1 ORDER BY id DESC LIMIT 1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "scope_report_id!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "issue_key!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "transcript_gz!",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 4,
+        "name": "created_at!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "cb7e123aada2c215fd9a672f03eb9c58c0d380e2fe1c436b439d5a178eb09ea8"
+}

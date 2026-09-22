@@ -144,6 +144,14 @@ pub(crate) fn narrow(error: CompileError, idents: &Idents) -> CompileError {
         CompileError::UndeclaredSession { .. } | CompileError::SessionWrongType => {
             (None, "session")
         }
+        CompileError::WhenNotAnAnswer => (None, "when"),
+        CompileError::UnknownAnswer { .. }
+        | CompileError::AnswersWithoutWhen
+        | CompileError::EmptyAnswers => (None, "answers"),
+        CompileError::OtherwiseWithoutWhen
+        | CompileError::OtherwiseWithAnswers
+        | CompileError::UnreachableOtherwise { .. } => (None, "otherwise"),
+        CompileError::RouteDecider { .. } => (Some("route"), "name"),
         _ => {
             return CompileError::At { at, inner };
         }

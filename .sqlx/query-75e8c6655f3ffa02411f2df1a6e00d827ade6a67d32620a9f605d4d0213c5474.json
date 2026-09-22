@@ -1,0 +1,46 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT repo AS \"repo!\", watched, paused, added_by, added_at FROM repos WHERE repo = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "repo!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "watched",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 2,
+        "name": "paused",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 3,
+        "name": "added_by",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "added_at",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "75e8c6655f3ffa02411f2df1a6e00d827ade6a67d32620a9f605d4d0213c5474"
+}

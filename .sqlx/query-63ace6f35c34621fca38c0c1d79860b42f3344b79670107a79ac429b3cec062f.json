@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE scopes SET approved_by = $1, approved_at = $2, approved_exposure_digest = exposure_digest WHERE id = $3 AND approved_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "63ace6f35c34621fca38c0c1d79860b42f3344b79670107a79ac429b3cec062f"
+}

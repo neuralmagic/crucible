@@ -18,9 +18,13 @@ pub enum TaskState {
     Running,
     /// A fan-out node whose instances are running; it settles when they fold.
     Fanout,
+    /// A task in a revise loop whose rounds are running; it settles on its last round.
+    Revising,
     Pass,
     Fail,
     Skipped,
+    /// Its `when` was not satisfied, or it joins `all` on a task that settled this way.
+    NotTaken,
     Transport,
     Blocked,
     Truncated,
@@ -30,7 +34,7 @@ impl TaskState {
     pub fn settled(self) -> bool {
         !matches!(
             self,
-            TaskState::Pending | TaskState::Running | TaskState::Fanout
+            TaskState::Pending | TaskState::Running | TaskState::Fanout | TaskState::Revising
         )
     }
 }
@@ -52,6 +56,10 @@ pub enum TaskEvent {
     TransportCutByBudget,
     /// The substrate cannot run it (`needs` unmet).
     Unrunnable,
+    /// The route it is conditional on resolved to a label its `when` does not list.
+    ConditionUnmet,
+    /// An `all`-join dependency settled not taken.
+    BranchNotTaken,
     DependencyDidNotPass,
     RequiredTaskFailed,
     BudgetCeiling,
@@ -64,6 +72,13 @@ pub enum TaskEvent {
     FanoutItemsInvalid,
     InstancesPassed,
     InstancesFailed,
+    /// A reviewer and the task it revises entered their rounds.
+    RoundsStarted,
+    RoundsPassed,
+    RoundsFailed,
+    RoundsSkipped,
+    RoundsTransport,
+    RoundsBlocked,
 }
 
 pub const TASK_TRANSITIONS: &[(TaskState, TaskEvent, TaskState)] = {
@@ -73,6 +88,8 @@ pub const TASK_TRANSITIONS: &[(TaskState, TaskEvent, TaskState)] = {
         (S::Pending, E::Dispatched, S::Running),
         (S::Pending, E::FannedOut, S::Fanout),
         (S::Pending, E::Unrunnable, S::Skipped),
+        (S::Pending, E::ConditionUnmet, S::NotTaken),
+        (S::Pending, E::BranchNotTaken, S::NotTaken),
         (S::Pending, E::DependencyDidNotPass, S::Blocked),
         (S::Pending, E::RequiredTaskFailed, S::Blocked),
         (S::Pending, E::BudgetCeiling, S::Blocked),
@@ -88,6 +105,12 @@ pub const TASK_TRANSITIONS: &[(TaskState, TaskEvent, TaskState)] = {
         (S::Running, E::TransportCutByBudget, S::Transport),
         (S::Fanout, E::InstancesPassed, S::Pass),
         (S::Fanout, E::InstancesFailed, S::Fail),
+        (S::Pending, E::RoundsStarted, S::Revising),
+        (S::Revising, E::RoundsPassed, S::Pass),
+        (S::Revising, E::RoundsFailed, S::Fail),
+        (S::Revising, E::RoundsSkipped, S::Skipped),
+        (S::Revising, E::RoundsTransport, S::Transport),
+        (S::Revising, E::RoundsBlocked, S::Blocked),
     ]
 };
 
@@ -247,7 +270,7 @@ impl Default for PlanMachine {
 
 fn task_kind(s: TaskState) -> NodeKind {
     match s {
-        TaskState::Fanout => NodeKind::Nested,
+        TaskState::Fanout | TaskState::Revising => NodeKind::Nested,
         s if s.settled() => NodeKind::Outcome,
         _ => NodeKind::Plain,
     }
@@ -271,7 +294,12 @@ pub fn task_digraph() -> Digraph {
         clusters: vec![
             cluster(
                 "open",
-                &[TaskState::Pending, TaskState::Running, TaskState::Fanout],
+                &[
+                    TaskState::Pending,
+                    TaskState::Running,
+                    TaskState::Fanout,
+                    TaskState::Revising,
+                ],
             ),
             cluster(
                 "settled: the task's status",
@@ -279,6 +307,7 @@ pub fn task_digraph() -> Digraph {
                     TaskState::Pass,
                     TaskState::Fail,
                     TaskState::Skipped,
+                    TaskState::NotTaken,
                     TaskState::Transport,
                     TaskState::Blocked,
                     TaskState::Truncated,

@@ -27,3 +27,7 @@ examples/*/workspace-*/
 /mergetest/
 .govctl.lock
 .govctl/
+# Workflow-built release bins staged for the image packaging build.
+/prebuilt/
+# xtask output; CI regenerates and shares it as a build artifact.
+images/generated/

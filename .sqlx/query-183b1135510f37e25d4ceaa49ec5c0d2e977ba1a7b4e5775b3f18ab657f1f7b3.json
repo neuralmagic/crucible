@@ -1,0 +1,35 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT wp.pod_name AS \"pod_name!\", wp.issue_key,\n               COALESCE(i.status = 'parked', FALSE) AS \"parked!: bool\"\n        FROM work_pods wp\n        LEFT JOIN issues i ON i.key = wp.issue_key\n        WHERE wp.kind = $1 AND wp.state = 'queued'\n        ORDER BY wp.created_at ASC, wp.pod_name ASC\n        LIMIT $2\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "pod_name!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "issue_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "parked!: bool",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      null
+    ]
+  },
+  "hash": "183b1135510f37e25d4ceaa49ec5c0d2e977ba1a7b4e5775b3f18ab657f1f7b3"
+}

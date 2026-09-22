@@ -215,8 +215,22 @@ fn codex_api_key_env(selected: Option<&str>) -> String {
 /// OAuth mint. The explicit modes never silently cross over; only `auto` falls back. The key name
 /// is manifest-validated ([`crate::manifest::Manifest::load`]) and resolved by
 /// [`codex_api_key_env`].
-fn selected_codex_api_key(cfg: &crate::manifest::CodexCfg) -> Result<Option<String>> {
+fn selected_codex_api_key(
+    cfg: &crate::manifest::CodexCfg,
+    inference: &crate::agent::inference::InferenceEnv,
+) -> Result<Option<String>> {
     use crate::manifest::CodexAuthMode;
+
+    if let (Some(_), Some(key)) = (&inference.selection, &inference.openai_key) {
+        if cfg.api_key.is_some() || cfg.auth == CodexAuthMode::Chatgpt {
+            tracing::info!(
+                manifest_key = cfg.api_key.as_deref().unwrap_or(""),
+                manifest_auth = ?cfg.auth,
+                "the injected agent binding's credential replaces [agent.codex]'s own"
+            );
+        }
+        return Ok(Some(key.clone()));
+    }
 
     let env_name = codex_api_key_env(cfg.api_key.as_deref());
     let key = || {
@@ -322,14 +336,16 @@ async fn try_turn(
             }
             SandboxAuth::ApiKey
         }
-        AuthProvider::Codex => SandboxAuth::Codex(match selected_codex_api_key(&args.codex)? {
-            Some(key) => provider::CodexAuth::ApiKey(key),
-            None => provider::CodexAuth::ChatGpt(
-                provider::mint_codex_token()
-                    .await
-                    .context("minting the codex ChatGPT access token")?,
-            ),
-        }),
+        AuthProvider::Codex => {
+            SandboxAuth::Codex(match selected_codex_api_key(&args.codex, &inference)? {
+                Some(key) => provider::CodexAuth::ApiKey(key),
+                None => provider::CodexAuth::ChatGpt(
+                    provider::mint_codex_token()
+                        .await
+                        .context("minting the codex ChatGPT access token")?,
+                ),
+            })
+        }
     };
 
     // 2b. Sandbox S3 reads (the read half of the S3 role split): a gateway-minted `aws-s3`
@@ -630,11 +646,12 @@ async fn try_turn(
 
         // 8. Exec the agent (prompt over stdin), streaming its stdout through the harness decoder.
         stage(sink, "sandbox ready — starting the agent");
+        let mcp_seeded = broker_url.is_some();
         let argv = match session {
             Some(session) => backend
-                .sandbox_session_argv(args, !seeds.is_empty(), session)
+                .sandbox_session_argv(args, mcp_seeded, session)
                 .context("building continuing sandbox harness argv")?,
-            None => backend.sandbox_argv(args, !seeds.is_empty()),
+            None => backend.sandbox_argv(args, mcp_seeded),
         };
         let wrapper = crate::agent::harness::exec_wrapper(&basename, &argv);
         let exec_opts = ExecOpts {
@@ -1606,6 +1623,49 @@ mod tests {
     }
 
     #[test]
+    fn an_injected_codex_key_replaces_the_manifests_in_every_auth_mode() {
+        use crate::manifest::{CodexAuthMode, CodexCfg};
+        let injected = crate::agent::inference::InferenceEnv {
+            openai_key: Some("sk-bound".into()),
+            selection: Some(crate::agent::inference::AgentSelection {
+                protocol: crucible_contract::inference::InferenceProtocol::Responses,
+                model: "m".into(),
+            }),
+            ..Default::default()
+        };
+        for auth in [
+            CodexAuthMode::Auto,
+            CodexAuthMode::Api,
+            CodexAuthMode::Chatgpt,
+        ] {
+            let cfg = CodexCfg {
+                auth,
+                api_key: Some("CRUCIBLE_TEST_NEVER_SET".into()),
+                ..CodexCfg::default()
+            };
+            assert_eq!(
+                selected_codex_api_key(&cfg, &injected).unwrap().as_deref(),
+                Some("sk-bound"),
+                "{auth:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ambient_openai_key_does_not_replace_the_manifests_codex_choice() {
+        use crate::manifest::{CodexAuthMode, CodexCfg};
+        let ambient = crate::agent::inference::InferenceEnv {
+            openai_key: Some("sk-ambient".into()),
+            ..Default::default()
+        };
+        let cfg = CodexCfg {
+            auth: CodexAuthMode::Chatgpt,
+            ..CodexCfg::default()
+        };
+        assert_eq!(selected_codex_api_key(&cfg, &ambient).unwrap(), None);
+    }
+
+    #[test]
     fn codex_auth_selection_can_switch_between_named_keys_and_chatgpt() {
         let _guard = crucible::test_support::env_lock();
         const KEY: &str = "CRUCIBLE_TEST_WORK";
@@ -1620,22 +1680,32 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            selected_codex_api_key(&cfg).unwrap().as_deref(),
+            selected_codex_api_key(&cfg, &Default::default())
+                .unwrap()
+                .as_deref(),
             Some("sk-work")
         );
 
         cfg.auth = crate::manifest::CodexAuthMode::Auto;
         assert_eq!(
-            selected_codex_api_key(&cfg).unwrap().as_deref(),
+            selected_codex_api_key(&cfg, &Default::default())
+                .unwrap()
+                .as_deref(),
             Some("sk-work")
         );
 
         cfg.auth = crate::manifest::CodexAuthMode::Chatgpt;
-        assert_eq!(selected_codex_api_key(&cfg).unwrap(), None);
+        assert_eq!(
+            selected_codex_api_key(&cfg, &Default::default()).unwrap(),
+            None
+        );
         unsafe { std::env::remove_var(&key_env) };
 
         cfg.auth = crate::manifest::CodexAuthMode::Auto;
-        assert_eq!(selected_codex_api_key(&cfg).unwrap(), None);
+        assert_eq!(
+            selected_codex_api_key(&cfg, &Default::default()).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -1649,7 +1719,8 @@ mod tests {
             api_key: Some(KEY.to_string()),
             ..Default::default()
         };
-        let err = selected_codex_api_key(&cfg).expect_err("explicit API mode needs its key");
+        let err = selected_codex_api_key(&cfg, &Default::default())
+            .expect_err("explicit API mode needs its key");
         assert!(err.to_string().contains(&key_env), "{err}");
     }
 

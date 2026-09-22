@@ -8,6 +8,10 @@ Crucible is an engine for running goal-directed optimization loops against a cod
 other reversible system. An agent proposes a change, a domain-provided judge measures it,
 and the engine either keeps the candidate or restores the last accepted state.
 
+<p align="center">
+  <img src="docs/img/controller-run.png" alt="A playbook run in the crucible control plane: the admitted task graph with a fanned-out build and measure, one failed instance, and the judge that kept the winner." width="960">
+</p>
+
 A domain is defined by a `crucible.toml` manifest and executable commands. Domain code can
 use any language; no Rust integration is required.
 
@@ -30,6 +34,25 @@ commands through `[world]`.
 The manifest, judge, and frozen injected evaluation files form the evaluation boundary. See
 the [implementation contract](docs/crucible-contract.md) for the normative behavior and
 [ADR-0001](docs/adr/0001-adaptive-harness.md) for the trust model.
+
+## The control plane
+
+`crucible-controller/` is the outer loop around the engine: a Postgres ledger of issues,
+scopes, runs and launches, the daemon that reconciles them into loop pods on one or more
+clusters, an HTTP API with the embedded React UI, teams and policy-based authorization
+([RFC-0003](docs/rfc/RFC-0003.md)), native OIDC login, a secrets registry backed by Vault,
+and a hosted MCP surface. `crux/` is the CLI and MCP tool library over that API, and
+`capability/` is the image capability vocabulary the controller and the image feedstock
+under `images/` share. The controller links the engine in-process
+([RFC-0004](docs/rfc/RFC-0004.md)) and ships as `ghcr.io/neuralmagic/crucible-controller`
+on top of the runtime image.
+
+<p align="center">
+  <img src="docs/img/controller-dashboard.png" alt="The dashboard: pipeline volume, capacity against the admission caps, and today's spend by kind." width="800">
+</p>
+<p align="center">
+  <img src="docs/img/controller-studio.png" alt="The draft studio: a playbook pack edited in place, compiled on save, with its launch form and task graph beside the editor." width="800">
+</p>
 
 ## Why not a general workflow engine
 

@@ -1,0 +1,42 @@
+# vLLM with DiffusionGemma structured reads (vllm-project/vllm#57250), without compiling anything.
+#
+# The PR changes only Python. So: take the nightly image for its CUDA and Python dependencies,
+# install upstream's precompiled wheel for the PR's merge base, then copy in exactly the files
+# under vllm/ that differ between the merge base and the PR head.
+#
+# To move to a newer PR head, update PR_SHA. If the PR was rebased, update MERGE_BASE too:
+#   gh api 'repos/vllm-project/vllm/compare/main...mmastrac:structured-reads-main' \
+#     --jq .merge_base_commit.sha
+
+ARG BASE=vllm/vllm-openai:nightly-3df4ae153eb385e27b52f26c81f8edb9e20b9984
+FROM ${BASE}
+
+ARG MERGE_BASE=01f1f58f10c616850a5f5ade129a7b58d62075fb
+ARG PR_REPO=mmastrac/vllm
+ARG PR_SHA=407326b735c289a5f079a000a1b34c2e4be6b94c
+
+RUN set -eux; \
+    python3 -m pip install --no-cache-dir --no-deps --force-reinstall --pre \
+        --index-url "https://wheels.vllm.ai/${MERGE_BASE}/" vllm; \
+    python3 -m pip check 2>&1 | tee /tmp/pip-check.txt; \
+    if grep -iE '^vllm ' /tmp/pip-check.txt; then \
+        echo "the merge-base wheel does not fit this base image's dependencies" >&2; exit 1; \
+    fi
+
+RUN set -eux; \
+    cd /tmp; mkdir base pr; \
+    curl -fsSL "https://github.com/vllm-project/vllm/archive/${MERGE_BASE}.tar.gz" | tar xz -C base --strip-components=1; \
+    curl -fsSL "https://github.com/${PR_REPO}/archive/${PR_SHA}.tar.gz" | tar xz -C pr --strip-components=1; \
+    site="$(python3 -c 'import importlib.util, os; print(os.path.dirname(importlib.util.find_spec("vllm").origin))')"; \
+    (cd pr/vllm && find . -type f) | while read -r f; do \
+        cmp -s "pr/vllm/$f" "base/vllm/$f" || { install -D -m 0644 "pr/vllm/$f" "$site/$f"; echo "overlaid vllm/${f#./}"; }; \
+    done | tee /tmp/overlaid.txt; \
+    test -s /tmp/overlaid.txt; \
+    grep -q diffusion_seed_canvas "$site/sampling_params.py"; \
+    mkdir -p /opt/diffusion_reads; cp -r pr/examples/features/diffusion_reads/. /opt/diffusion_reads/; \
+    cp /tmp/overlaid.txt /opt/diffusion_reads/OVERLAID.txt; \
+    rm -rf base pr
+
+RUN python3 -c "import vllm, torch; print('vllm', vllm.__version__, 'torch', torch.__version__)"
+
+LABEL io.vllm.merge-base="${MERGE_BASE}" io.vllm.pr="57250" io.vllm.pr-sha="${PR_SHA}"

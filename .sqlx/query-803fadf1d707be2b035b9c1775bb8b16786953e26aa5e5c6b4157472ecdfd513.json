@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE issues SET upstream_updated_at = $1 WHERE key = $2 AND upstream_updated_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "803fadf1d707be2b035b9c1775bb8b16786953e26aa5e5c6b4157472ecdfd513"
+}

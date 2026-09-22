@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE issues SET pre_park_status = status, status = 'parked', parked_reason = $1, parked_by = $2, updated_at = $3 WHERE key = $4 AND status = $5",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "dad35dc84a0a01bc1c93626601c30cd7dc62adbdf8ef858347dbf957941033ea"
+}

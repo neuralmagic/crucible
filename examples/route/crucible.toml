@@ -1,0 +1,34 @@
+# route — a playbook that branches on a typed decision. `gate` asks a System One decision model
+# two questions about a support ticket; each downstream task runs only on the answer it names.
+#
+#   export CRUCIBLE_INFERENCE='{"version":1,"bindings":[{"role":"decision","protocol":"system_one",
+#     "url":"http://127.0.0.1:8011/v1/systemone","model":"dgemma"}]}'
+#   TICKET=billing crucible plan run --manifest examples/route/crucible.toml \
+#                                    --max-cost 1 --max-time 5m
+#
+# TICKET names a file under tickets/ and defaults to outage. outage, billing, and feature are
+# clear-cut. torn belongs to two queues and sits near min_confidence, so it lands on either
+# `finance` or, as "uncertain", `backlog`. vague fits no queue, and shows what min_confidence does
+# not catch: with no "other" option the model still picks the nearest one, confidently.
+#
+# serving/ builds and deploys the DiffusionGemma endpoint: `just route-serving-image`, then
+# `just route-serving-deploy <image>` and `just route-serving-forward`.
+#
+# Any server speaking POST /v1/systemone works: the hosted Jev API, or vLLM's DiffusionGemma
+# structured-reads server. An orchestrator injects that document; here it is set by hand. Add
+# "key_env":"SOME_VAR" to the binding for an endpoint that needs a bearer key, and put the key in
+# SOME_VAR. With no decision binding the run truncates at `gate` before spending anything.
+# Swap `min_confidence = 0.8` for `source = read` in workflow.star to decide from read.sh's own
+# output instead, with no model at all.
+
+[workspace]
+inject = ["read.sh", "act.sh", "tickets"]
+
+[agent]
+backend   = "command"
+agent_cmd = "true"
+goal      = "Route a support ticket."
+
+[workflow]
+type = "playbook"
+file = "workflow.star"

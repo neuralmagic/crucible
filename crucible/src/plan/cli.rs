@@ -125,11 +125,27 @@ pub fn render(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
                     .unwrap_or_default()
             ),
             TaskKind::TopK { k, .. } => format!("top_k[k={k}]"),
+            TaskKind::Route { questions, decider } => format!(
+                "route[{}; {}]",
+                questions
+                    .keys()
+                    .map(|q| q.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                match decider {
+                    crate::plan::ir::Decider::Model { min_confidence } =>
+                        format!("model >= {min_confidence}"),
+                    crate::plan::ir::Decider::Output { task } => format!("from {task}"),
+                }
+            ),
             TaskKind::Report { .. } => "report".to_string(),
             TaskKind::Engine { .. } => t.task.label().to_string(),
         };
         if let Some(session) = &t.session {
             detail.push_str(&format!(" session={session}"));
+        }
+        if let Some(when) = &t.when {
+            detail.push_str(&format!(" when={when}"));
         }
         out.push_str(&format!(
             "  {:<20} {:<28} needs={:<8} {} deps: {}{}\n",
@@ -224,6 +240,7 @@ fn render_mermaid_styled(
                 ..
             } => ("{{", "}}", CLASS_STYLES[3]),
             TaskKind::TopK { .. } => ("{{", "}}", CLASS_STYLES[4]),
+            TaskKind::Route { .. } => ("{", "}", CLASS_STYLES[4]),
             TaskKind::Report { .. } => ("[[", "]]", CLASS_STYLES[3]),
             TaskKind::Engine { .. } => ("[[", "]]", CLASS_STYLES[5]),
         };
@@ -256,6 +273,10 @@ fn render_mermaid_styled(
             | TaskKind::Report { .. }
             | TaskKind::Engine { .. } => String::new(),
             TaskKind::TopK { k, .. } => format!("<br/>k={k}"),
+            TaskKind::Route { questions, .. } => questions
+                .keys()
+                .map(|q| format!("<br/>{}?", mermaid_label(q.as_str())))
+                .collect(),
         };
         if let Some(session) = &t.session {
             detail.push_str(&format!("<br/>session: {}", mermaid_label(session)));
@@ -290,7 +311,19 @@ fn render_mermaid_styled(
             regular_nodes.push(node);
         }
         for d in &t.depends_on {
-            edges.push(format!("    {} --> {}\n", ids[d], ids[&t.name]));
+            match t.when.as_ref().filter(|when| &when.task == d) {
+                Some(when) => {
+                    let labels: Vec<&str> = when.is.iter().map(|l| l.as_str()).collect();
+                    edges.push(format!(
+                        "    {} -->|\"{}: {}\"| {}\n",
+                        ids[d],
+                        mermaid_label(when.question.as_str()),
+                        mermaid_label(&labels.join(" / ")),
+                        ids[&t.name]
+                    ));
+                }
+                None => edges.push(format!("    {} --> {}\n", ids[d], ids[&t.name])),
+            }
         }
     }
     for node in regular_nodes {
@@ -622,7 +655,7 @@ pub fn run(
         };
     // Manifest runs append plan wire events to the run's session log so tailers (and the
     // controller's ingest) see the graph and its live progress; shell runs have no state dir.
-    let substrate = Substrate { caps: caps.clone() };
+    let substrate = Substrate::detecting(caps.clone(), &crucible::inference::from_process_env()?);
     let append = |f: &std::fs::File, ev: &crate::report::session::SessionEvent| {
         use std::io::Write;
         let mut w = f;

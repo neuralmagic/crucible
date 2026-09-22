@@ -1,0 +1,28 @@
+[package]
+name = "crux"
+description = "A token-frugal CLI for the crucible controller API, and the MCP tool surface the controller hosts."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+# Same major + TLS backend as the controller's own client, so the dependency tree stays one tree.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+# The `Transport` trait is behind `dyn`, which native async-fn-in-trait cannot do; async-trait
+# boxes the futures. Same version the controller already uses.
+async-trait = "0.1"
+# The MCP tool surface the controller hosts. Version tracks the controller's.
+rmcp = { version = "1.8", features = ["server", "macros"] }
+# The config file. Same version the controller reads manifests with.
+toml = "0.8"
+
+[dev-dependencies]
+# Stands in for the controller in the client tests — same version family as the controller's own
+# server.
+axum = "0.8"
+tempfile = "3"

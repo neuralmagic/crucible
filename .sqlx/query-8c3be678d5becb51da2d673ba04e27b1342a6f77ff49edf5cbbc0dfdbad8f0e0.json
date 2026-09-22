@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM issue_comments\n         WHERE issue_key = $1 AND id <> ALL($2)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8Array"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8c3be678d5becb51da2d673ba04e27b1342a6f77ff49edf5cbbc0dfdbad8f0e0"
+}

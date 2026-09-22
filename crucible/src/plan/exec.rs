@@ -18,12 +18,17 @@ use serde_json::Value;
 use crate::crucible::Direction;
 use crate::diagram::IllegalTransition;
 use crate::plan::ir::{
-    ITEM_INPUT, Join, OUTCOME_INPUT, Stage, Task, TaskKind, TaskName, ValidPlan,
+    Decider, ITEM_INPUT, Join, OUTCOME_INPUT, REVISION_INPUT, Stage, Task, TaskKind, TaskName,
+    ValidPlan,
 };
 use crate::plan::machine::{
     BlockedReason, PlanEvent, PlanMachine, TaskEvent, TaskMachine, TaskState,
 };
 use crucible_contract::TransportCause;
+use crucible_contract::decision::{
+    Answer, Decision, Label, NOUL_NO, NOUL_YES, Question, QuestionId,
+};
+use crucible_contract::inference::{InferenceRole, ResolvedInference};
 
 /// What the substrate can measure. Missing caps truncate the plan fail-closed.
 #[derive(Clone, Debug, Default)]
@@ -32,6 +37,14 @@ pub struct Substrate {
 }
 
 impl Substrate {
+    /// `caps` plus the capabilities the run's inference bindings provide.
+    pub fn detecting(mut caps: BTreeSet<String>, inference: &ResolvedInference) -> Self {
+        if inference.binding(InferenceRole::Decision).is_some() {
+            caps.insert(crate::plan::ir::NEEDS_SYSTEMONE.to_owned());
+        }
+        Substrate { caps }
+    }
+
     fn supports(&self, needs: &str) -> bool {
         needs == "any" || self.caps.contains(needs)
     }
@@ -198,7 +211,7 @@ impl Default for ExecCfg {
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
-#[error("task status must be pass|fail|transport|skipped|blocked|truncated, got {got:?}")]
+#[error("task status must be pass|fail|transport|skipped|not_taken|blocked|truncated, got {got:?}")]
 pub struct UnknownTaskStatus {
     pub got: String,
 }
@@ -214,6 +227,7 @@ pub enum TaskStatus {
     Fail,
     Transport,
     Skipped,
+    NotTaken,
     Blocked,
     Truncated,
 }
@@ -226,6 +240,7 @@ impl TaskStatus {
             TaskStatus::Fail => "fail",
             TaskStatus::Transport => "transport",
             TaskStatus::Skipped => "skipped",
+            TaskStatus::NotTaken => "not_taken",
             TaskStatus::Blocked => "blocked",
             TaskStatus::Truncated => "truncated",
         }
@@ -247,6 +262,7 @@ impl std::str::FromStr for TaskStatus {
             "fail" => Ok(TaskStatus::Fail),
             "transport" => Ok(TaskStatus::Transport),
             "skipped" => Ok(TaskStatus::Skipped),
+            "not_taken" => Ok(TaskStatus::NotTaken),
             "blocked" => Ok(TaskStatus::Blocked),
             "truncated" => Ok(TaskStatus::Truncated),
             other => Err(UnknownTaskStatus {
@@ -263,10 +279,13 @@ impl TaskState {
             TaskState::Pass => TaskStatus::Pass,
             TaskState::Fail => TaskStatus::Fail,
             TaskState::Skipped => TaskStatus::Skipped,
+            TaskState::NotTaken => TaskStatus::NotTaken,
             TaskState::Transport => TaskStatus::Transport,
             TaskState::Blocked => TaskStatus::Blocked,
             TaskState::Truncated => TaskStatus::Truncated,
-            TaskState::Pending | TaskState::Running | TaskState::Fanout => return None,
+            TaskState::Pending | TaskState::Running | TaskState::Fanout | TaskState::Revising => {
+                return None;
+            }
         })
     }
 }
@@ -489,6 +508,12 @@ pub fn execute(
     }
     plan_machine.advance(PlanEvent::Started)?;
 
+    // A proposer whose reviewer can run on this substrate: the pair dispatches as one revise loop.
+    let revised_by: BTreeMap<&TaskName, &Task> = plan
+        .tasks_topo()
+        .filter(|t| runnable.contains(&t.name))
+        .filter_map(|t| Some((&t.revise.as_ref()?.task, t)))
+        .collect();
     let started = Instant::now();
     let mut results: BTreeMap<TaskName, TaskResult> = BTreeMap::new();
     let mut spent = 0.0f64;
@@ -514,10 +539,13 @@ pub fn execute(
                       gates: bool|
      -> Result<(), IllegalTransition> {
         settle(machines.entry(t.name.clone()).or_default(), &r, event)?;
-        let failed = r.status != TaskStatus::Pass;
+        let failed = !matches!(r.status, TaskStatus::Pass | TaskStatus::NotTaken);
         if matches!(
             r.status,
-            TaskStatus::Skipped | TaskStatus::Transport | TaskStatus::Blocked
+            TaskStatus::Skipped
+                | TaskStatus::NotTaken
+                | TaskStatus::Transport
+                | TaskStatus::Blocked
         ) {
             runner.drop_captured(t);
         }
@@ -584,22 +612,30 @@ pub fn execute(
             if t.depends_on.iter().any(|d| !results.contains_key(d)) {
                 continue;
             }
-            let deps_ok = match t.join {
-                Join::All => t
-                    .depends_on
+            let reviewer = revised_by.get(&t.name).copied();
+            if reviewer.is_some_and(|r| {
+                r.depends_on
                     .iter()
-                    .all(|d| results.get(d).map(|r| r.status) == Some(TaskStatus::Pass)),
-                // Only passing outputs feed a lossy join. A mapped node contributes when any
-                // of its instances passed, so a fan-out reads the same as a set of siblings.
-                Join::Passed => t
-                    .depends_on
-                    .iter()
-                    .any(|d| results.get(d).is_some_and(TaskResult::contributed)),
-                // Every dependency already holds a result by the guard above, so terminality is
-                // established and no status blocks the dispatch.
-                Join::Settled => true,
-            };
-            if !deps_ok {
+                    .any(|d| d != &t.name && !results.contains_key(d))
+            }) {
+                continue;
+            }
+            if let Some((event, note)) = not_taken(t, &results) {
+                let r = TaskResult::undispatched(TaskStatus::NotTaken, note);
+                record(
+                    &mut *runner,
+                    t,
+                    r,
+                    event,
+                    &mut results,
+                    &mut machines,
+                    &mut halted,
+                    &mut plan_machine,
+                    true,
+                )?;
+                continue;
+            }
+            if !dependencies_allow(t, &results) {
                 // Nothing runs on top of a failure (or a skip): advisory failures gate
                 // their dependents even though they never gate validity.
                 let reason = BlockedReason::DependencyDidNotPass;
@@ -658,8 +694,9 @@ pub fn execute(
             }
             if dispatch.is_empty() {
                 dispatch.push(t);
-                if t.over.is_some() {
-                    // A mapped task is dispatched alone: its own instances are the batch.
+                if t.over.is_some() || reviewer.is_some() {
+                    // A mapped task or a revise loop is dispatched alone: its own instances or
+                    // rounds are the batch.
                     break;
                 }
                 if t.isolation.is_none() {
@@ -757,6 +794,8 @@ pub fn execute(
                             emits_files: node.emits_files.clone(),
                             over: None,
                             max_fanout: None,
+                            when: None,
+                            revise: None,
                             ..node.clone()
                         })
                         .collect();
@@ -912,6 +951,189 @@ pub fn execute(
                     )?;
                 }
             }
+        } else if let Some(reviewer) = revised_by.get(&first.name).copied() {
+            let proposer = *first;
+            let max_rounds = reviewer.revise.as_ref().map_or(1, |r| r.max_rounds);
+            let base = inputs_for_dispatch
+                .remove(&proposer.name)
+                .unwrap_or_default();
+            for t in [proposer, reviewer] {
+                machines
+                    .entry(t.name.clone())
+                    .or_default()
+                    .advance(TaskEvent::RoundsStarted)?;
+            }
+            let mut rounds: Vec<(TaskResult, TaskResult)> = Vec::new();
+            for round in 1..=max_rounds {
+                let mut proposer_inputs = base.clone();
+                if let Some((_, verdict)) = rounds.last() {
+                    if halted.is_some() {
+                        break;
+                    }
+                    if spent >= budget {
+                        halt(&mut halted, &mut plan_machine, Halt::Budget)?;
+                        break;
+                    }
+                    if cfg
+                        .wall_clock
+                        .is_some_and(|limit| started.elapsed() >= limit)
+                    {
+                        halt(&mut halted, &mut plan_machine, Halt::Time)?;
+                        break;
+                    }
+                    let mut producers = file_producers(plan, proposer, &results, &*runner);
+                    let review_files = runner.has_captured_files(reviewer);
+                    if review_files {
+                        producers.push(reviewer.clone());
+                    }
+                    let staged: Vec<&Task> = producers.iter().collect();
+                    if let Err(why) = runner.stage(proposer, &staged) {
+                        let refused = BlockedReason::StagingRefused(why);
+                        let pair = (
+                            TaskResult::blocked(&refused),
+                            TaskResult::blocked(&BlockedReason::DependencyDidNotPass),
+                        );
+                        for (t, r) in [(proposer, &pair.0), (reviewer, &pair.1)] {
+                            let reason = r
+                                .blocked
+                                .clone()
+                                .unwrap_or(BlockedReason::DependencyDidNotPass);
+                            record(
+                                &mut *runner,
+                                &round_task(t, round),
+                                r.clone(),
+                                reason.event(),
+                                &mut results,
+                                &mut machines,
+                                &mut halted,
+                                &mut plan_machine,
+                                false,
+                            )?;
+                        }
+                        rounds.push(pair);
+                        break;
+                    }
+                    proposer_inputs.insert(
+                        TaskName(REVISION_INPUT.to_string()),
+                        serde_json::json!({
+                            "round": round,
+                            "max_rounds": max_rounds,
+                            "reviewer": reviewer.name.0,
+                            "review": Value::Object(settled_entry(verdict, review_files)),
+                        }),
+                    );
+                }
+                let proposed = round_task(proposer, round);
+                machines
+                    .entry(proposed.name.clone())
+                    .or_default()
+                    .advance(TaskEvent::Dispatched)?;
+                let (result, event, budget_exceeded) =
+                    run_with_retries(proposer, &proposer_inputs, cfg, runner, &mut spent, budget);
+                if budget_exceeded {
+                    halt(&mut halted, &mut plan_machine, Halt::Budget)?;
+                }
+                runner.settled(proposer, result.status == TaskStatus::Pass);
+                record(
+                    &mut *runner,
+                    &proposed,
+                    result.clone(),
+                    event,
+                    &mut results,
+                    &mut machines,
+                    &mut halted,
+                    &mut plan_machine,
+                    false,
+                )?;
+
+                let mut view = results.clone();
+                view.insert(proposer.name.clone(), result.clone());
+                let reviewed = round_task(reviewer, round);
+                let blocked = if halted.is_none() && spent >= budget {
+                    halt(&mut halted, &mut plan_machine, Halt::Budget)?;
+                    halted.as_ref().map(Halt::blocked)
+                } else if halted.is_none()
+                    && cfg
+                        .wall_clock
+                        .is_some_and(|limit| started.elapsed() >= limit)
+                {
+                    halt(&mut halted, &mut plan_machine, Halt::Time)?;
+                    halted.as_ref().map(Halt::blocked)
+                } else if let Some(halt) = &halted {
+                    Some(halt.blocked())
+                } else if !dependencies_allow(reviewer, &view) {
+                    Some(BlockedReason::DependencyDidNotPass)
+                } else {
+                    None
+                };
+                let mut staged_for_review = Vec::new();
+                let blocked = blocked.or_else(|| {
+                    staged_for_review = file_producers(plan, reviewer, &view, &*runner);
+                    let staged: Vec<&Task> = staged_for_review.iter().collect();
+                    runner
+                        .stage(reviewer, &staged)
+                        .err()
+                        .map(BlockedReason::StagingRefused)
+                });
+                if let Some(reason) = blocked {
+                    let r = TaskResult::blocked(&reason);
+                    record(
+                        &mut *runner,
+                        &reviewed,
+                        r.clone(),
+                        reason.event(),
+                        &mut results,
+                        &mut machines,
+                        &mut halted,
+                        &mut plan_machine,
+                        false,
+                    )?;
+                    rounds.push((result, r));
+                    break;
+                }
+                let reviewer_inputs = inputs_for(plan, reviewer, &view, &staged_for_review);
+                machines
+                    .entry(reviewed.name.clone())
+                    .or_default()
+                    .advance(TaskEvent::Dispatched)?;
+                let (verdict, event, budget_exceeded) =
+                    run_with_retries(reviewer, &reviewer_inputs, cfg, runner, &mut spent, budget);
+                if budget_exceeded {
+                    halt(&mut halted, &mut plan_machine, Halt::Budget)?;
+                }
+                runner.settled(reviewer, verdict.status == TaskStatus::Pass);
+                record(
+                    &mut *runner,
+                    &reviewed,
+                    verdict.clone(),
+                    event,
+                    &mut results,
+                    &mut machines,
+                    &mut halted,
+                    &mut plan_machine,
+                    false,
+                )?;
+                let again = verdict.status == TaskStatus::Fail;
+                rounds.push((result, verdict));
+                if !again {
+                    break;
+                }
+            }
+            let (proposed, reviewed) = fold_rounds(&rounds);
+            for (t, r) in [(proposer, proposed), (reviewer, reviewed)] {
+                let event = rounds_event(r.status);
+                record(
+                    &mut *runner,
+                    t,
+                    r,
+                    event,
+                    &mut results,
+                    &mut machines,
+                    &mut halted,
+                    &mut plan_machine,
+                    true,
+                )?;
+            }
         } else if dispatch.len() == 1 {
             let t = first;
             let inputs = inputs_for_dispatch.remove(&t.name).unwrap_or_default();
@@ -929,7 +1151,23 @@ pub fn execute(
                     };
                     (reduced, event, false)
                 }
-                TaskKind::Agent { .. }
+                TaskKind::Route {
+                    questions,
+                    decider: Decider::Output { task: source },
+                } => {
+                    let decided = decide_from_output(&inputs, questions, source);
+                    let event = if decided.status == TaskStatus::Pass {
+                        TaskEvent::Passed
+                    } else {
+                        TaskEvent::Failed
+                    };
+                    (decided, event, false)
+                }
+                TaskKind::Route {
+                    decider: Decider::Model { .. },
+                    ..
+                }
+                | TaskKind::Agent { .. }
                 | TaskKind::Command { .. }
                 | TaskKind::Evaluate { .. }
                 | TaskKind::Report { .. }
@@ -1001,7 +1239,12 @@ pub fn execute(
         && plan
             .tasks_topo()
             .filter(|t| t.required && t.stage == Stage::Iteration)
-            .all(|t| results.get(&t.name).map(|r| r.status) == Some(TaskStatus::Pass));
+            .all(|t| {
+                matches!(
+                    results.get(&t.name).map(|r| r.status),
+                    Some(TaskStatus::Pass | TaskStatus::NotTaken)
+                )
+            });
     Ok(PlanOutcome {
         valid,
         exit,
@@ -1107,6 +1350,8 @@ fn file_producers(
                     name: name.clone(),
                     over: None,
                     max_fanout: None,
+                    when: None,
+                    revise: None,
                     ..p.clone()
                 };
                 if contributes(p, &instance, r) {
@@ -1273,6 +1518,65 @@ fn fanout_items(
         keys.push(key.to_owned());
     }
     Ok(keys)
+}
+
+/// One round of a revise loop, `task[round-N]`. It shares the instance naming, so a reader groups
+/// rounds under their task the way it groups a fan-out's items.
+fn round_task(t: &Task, round: u32) -> Task {
+    Task {
+        name: instance_name(&t.name, &format!("round-{round}")),
+        revise: None,
+        ..t.clone()
+    }
+}
+
+/// The result the graph sees for each side of a revise loop: its last round, carrying the spend of
+/// every round.
+fn fold_rounds(rounds: &[(TaskResult, TaskResult)]) -> (TaskResult, TaskResult) {
+    let Some((proposed, reviewed)) = rounds.last() else {
+        let never = TaskResult::blocked(&BlockedReason::DependencyDidNotPass);
+        return (never.clone(), never);
+    };
+    let fold = |last: &TaskResult, cost_usd: f64| TaskResult {
+        attempts: last.attempts.min(1),
+        cost_usd,
+        ..last.clone()
+    };
+    (
+        fold(proposed, rounds.iter().map(|(p, _)| p.cost_usd).sum()),
+        fold(reviewed, rounds.iter().map(|(_, r)| r.cost_usd).sum()),
+    )
+}
+
+fn rounds_event(status: TaskStatus) -> TaskEvent {
+    match status {
+        TaskStatus::Pass => TaskEvent::RoundsPassed,
+        TaskStatus::Fail => TaskEvent::RoundsFailed,
+        TaskStatus::Skipped => TaskEvent::RoundsSkipped,
+        TaskStatus::Transport => TaskEvent::RoundsTransport,
+        TaskStatus::Blocked | TaskStatus::NotTaken | TaskStatus::Truncated => {
+            TaskEvent::RoundsBlocked
+        }
+    }
+}
+
+/// Whether `t`'s join lets it dispatch on its dependencies' settled results.
+fn dependencies_allow(t: &Task, results: &BTreeMap<TaskName, TaskResult>) -> bool {
+    match t.join {
+        Join::All => t
+            .depends_on
+            .iter()
+            .all(|d| results.get(d).map(|r| r.status) == Some(TaskStatus::Pass)),
+        // Only passing outputs feed a lossy join. A mapped node contributes when any of its
+        // instances passed, so a fan-out reads the same as a set of siblings.
+        Join::Passed => t
+            .depends_on
+            .iter()
+            .any(|d| results.get(d).is_some_and(TaskResult::contributed)),
+        // Every dependency already holds a result by the caller's guard, so terminality is
+        // established and no status blocks the dispatch.
+        Join::Settled => true,
+    }
 }
 
 /// Fold what the instances did into the one result the graph sees for the node.
@@ -1588,6 +1892,130 @@ fn run_batch_with_retries<'a>(
 
 /// Engine-built-in fold: keep the k best inputs by their `score` field.
 /// Output: `{"kept": [{"task": ..., "score": ...}, ...]}`, best first.
+/// Why `t` settles not taken without dispatch, if it does. Every dependency holds a result.
+fn not_taken(t: &Task, results: &BTreeMap<TaskName, TaskResult>) -> Option<(TaskEvent, String)> {
+    let status = |d: &TaskName| results.get(d).map(|r| r.status);
+    if let Some(when) = &t.when {
+        match status(&when.task) {
+            Some(TaskStatus::NotTaken) => {
+                return Some((
+                    TaskEvent::BranchNotTaken,
+                    format!("route {} was not taken", when.task),
+                ));
+            }
+            Some(TaskStatus::Pass) => {
+                let label = results
+                    .get(&when.task)
+                    .and_then(|r| r.output.as_ref())
+                    .and_then(|o| o.get(when.question.as_str()))
+                    .and_then(|a| a.get("label"))
+                    .and_then(Value::as_str);
+                if !when.is.iter().any(|l| Some(l.as_str()) == label) {
+                    return Some((
+                        TaskEvent::ConditionUnmet,
+                        format!(
+                            "{}.{} resolved to {}",
+                            when.task,
+                            when.question,
+                            label.unwrap_or("nothing")
+                        ),
+                    ));
+                }
+            }
+            _ if t.join != Join::All => {
+                return Some((
+                    TaskEvent::ConditionUnmet,
+                    format!("route {} did not decide", when.task),
+                ));
+            }
+            _ => {}
+        }
+    }
+    if t.join == Join::All
+        && let Some(d) = t
+            .depends_on
+            .iter()
+            .find(|d| status(d) == Some(TaskStatus::NotTaken))
+    {
+        return Some((
+            TaskEvent::BranchNotTaken,
+            format!("dependency {d} was not taken"),
+        ));
+    }
+    None
+}
+
+/// The deterministic decider: read one declared label per question from `source`'s output.
+fn decide_from_output(
+    inputs: &BTreeMap<TaskName, Value>,
+    questions: &BTreeMap<QuestionId, Question>,
+    source: &TaskName,
+) -> TaskResult {
+    let fail = |note: String| TaskResult {
+        status: TaskStatus::Fail,
+        attempts: 1,
+        cost_usd: 0.0,
+        output: None,
+        note: Some(note),
+        fanout: None,
+        blocked: None,
+        transport: None,
+    };
+    let Some(output) = inputs.get(source) else {
+        return fail(format!("source {source} contributed no output"));
+    };
+    let mut decision = BTreeMap::new();
+    for (id, question) in questions {
+        let raw = match output.get(id.as_str()) {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Bool(true)) => NOUL_YES.to_owned(),
+            Some(Value::Bool(false)) => NOUL_NO.to_owned(),
+            Some(other) => {
+                return fail(format!(
+                    "{source}.{id} is {other}, not a label string or boolean"
+                ));
+            }
+            None => return fail(format!("{source} emitted no field {id:?}")),
+        };
+        let label = match Label::new(raw) {
+            Ok(label) if question.resolves_to(&label) => label,
+            Ok(label) => {
+                return fail(format!(
+                    "{source}.{id} is {label:?}, which the question does not declare"
+                ));
+            }
+            Err(e) => return fail(format!("{source}.{id}: {e}")),
+        };
+        let probabilities = if label.is_uncertain() {
+            BTreeMap::new()
+        } else {
+            BTreeMap::from([(label.clone(), 1.0)])
+        };
+        let confidence = if label.is_uncertain() { 0.0 } else { 1.0 };
+        decision.insert(
+            id.clone(),
+            Answer {
+                label,
+                confidence,
+                probabilities,
+            },
+        );
+    }
+    match serde_json::to_value(Decision(decision)) {
+        Ok(output) => TaskResult {
+            status: TaskStatus::Pass,
+            attempts: 1,
+            cost_usd: 0.0,
+            output: Some(output),
+            note: None,
+            fanout: None,
+            blocked: None,
+            transport: None,
+        },
+        Err(e) => fail(format!("encoding the decision: {e}")),
+    }
+}
+
 fn reduce_top_k(inputs: &BTreeMap<TaskName, Value>, k: u32, direction: Direction) -> TaskResult {
     let mut scored: Vec<(&TaskName, f64)> = Vec::with_capacity(inputs.len());
     for (name, v) in inputs {
@@ -1682,6 +2110,11 @@ mod tests {
         /// Producers this runner claims to hold a complete captured set for.
         captured: BTreeSet<String>,
         dropped: Vec<String>,
+        /// Outcomes consumed one per dispatch of a task, ahead of `script`: a revise loop runs
+        /// the same task and attempt number once per round.
+        rounds: BTreeMap<String, std::collections::VecDeque<fn() -> AttemptOutcome>>,
+        /// Every dispatch's inputs, in order; `seen_values` keeps only the last per task.
+        runs: Vec<(String, BTreeMap<TaskName, Value>)>,
     }
 
     impl ScriptRunner {
@@ -1695,7 +2128,13 @@ mod tests {
                 staged: BTreeMap::new(),
                 captured: BTreeSet::new(),
                 dropped: Vec::new(),
+                rounds: BTreeMap::new(),
+                runs: Vec::new(),
             }
+        }
+        fn rounds(&mut self, task: &str, outcomes: &[fn() -> AttemptOutcome]) {
+            self.rounds
+                .insert(task.to_string(), outcomes.iter().copied().collect());
         }
         fn on(&mut self, task: &str, attempt: u32, f: fn() -> AttemptOutcome, cost: f64) {
             self.script.insert((task.to_string(), attempt), (f, cost));
@@ -1735,6 +2174,17 @@ mod tests {
                 inputs.keys().map(|k| k.0.clone()).collect(),
             );
             self.seen_values.insert(task.name.0.clone(), inputs.clone());
+            self.runs.push((task.name.0.clone(), inputs.clone()));
+            if let Some(outcome) = self
+                .rounds
+                .get_mut(&task.name.0)
+                .and_then(std::collections::VecDeque::pop_front)
+            {
+                return Attempt {
+                    outcome: outcome(),
+                    cost_usd: self.default_cost,
+                };
+            }
             match self.script.get(&(task.name.0.clone(), attempt)) {
                 Some((f, cost)) => Attempt {
                     outcome: f(),
@@ -1765,6 +2215,8 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            when: None,
+            revise: None,
         }
     }
 
@@ -2278,6 +2730,8 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            when: None,
+            revise: None,
         });
         let plan = valid(tasks, 10.0);
         let mut r = ScriptRunner::new();
@@ -2336,6 +2790,8 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            when: None,
+            revise: None,
         });
         let plan = valid(tasks, 10.0);
         let mut r = ScriptRunner::new();
@@ -2527,6 +2983,8 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            when: None,
+            revise: None,
         };
         tasks.push(pick);
         let plan = valid(tasks, 10.0);
@@ -2838,6 +3296,320 @@ mod tests {
             ab.output.is_some(),
             "the record keeps what the task reported"
         );
+    }
+
+    fn label(s: &str) -> Label {
+        Label::new(s).unwrap()
+    }
+
+    fn question(kind: crucible_contract::decision::QuestionKind, drop: &[&str]) -> Question {
+        Question {
+            instructions: "decide".into(),
+            kind,
+            drop: drop.iter().map(|l| label(l)).collect(),
+        }
+    }
+
+    fn area(drop: &[&str]) -> Question {
+        use crucible_contract::decision::{ChoiceOption, QuestionKind};
+        question(
+            QuestionKind::Choice {
+                options: ["scheduler", "frontend"]
+                    .iter()
+                    .map(|o| ChoiceOption {
+                        label: label(o),
+                        description: None,
+                    })
+                    .collect(),
+            },
+            drop,
+        )
+    }
+
+    fn gate(id: &str, asked: Question, required: bool) -> Task {
+        Task {
+            task: TaskKind::Route {
+                questions: BTreeMap::from([(QuestionId::new(id).unwrap(), asked)]),
+                decider: Decider::Output {
+                    task: "classify".into(),
+                },
+            },
+            ..task("gate", &["classify"], "any", required)
+        }
+    }
+
+    fn when(mut t: Task, id: &str, is: &[&str]) -> Task {
+        t.when = Some(crate::plan::ir::When {
+            task: "gate".into(),
+            question: QuestionId::new(id).unwrap(),
+            is: is.iter().map(|l| label(l)).collect(),
+        });
+        t
+    }
+
+    fn joining(mut t: Task, join: Join) -> Task {
+        t.join = join;
+        t
+    }
+
+    /// classify -> gate(area) -> fix [scheduler] -> verify
+    ///                        -> punt [frontend, uncertain]
+    ///             fix, punt, verify -> wrap (passed)
+    fn branching() -> ValidPlan {
+        valid(
+            vec![
+                task("classify", &[], "any", true),
+                gate("area", area(&[]), true),
+                when(task("fix", &["gate"], "any", true), "area", &["scheduler"]),
+                task("verify", &["fix"], "any", true),
+                when(
+                    task("punt", &["gate"], "any", true),
+                    "area",
+                    &["frontend", "uncertain"],
+                ),
+                joining(task("wrap", &["verify", "punt"], "any", true), Join::Passed),
+            ],
+            10.0,
+        )
+    }
+
+    fn says_scheduler() -> AttemptOutcome {
+        AttemptOutcome::Pass(serde_json::json!({"area": "scheduler"}))
+    }
+    fn says_frontend() -> AttemptOutcome {
+        AttemptOutcome::Pass(serde_json::json!({"area": "frontend"}))
+    }
+    fn says_uncertain() -> AttemptOutcome {
+        AttemptOutcome::Pass(serde_json::json!({"area": "uncertain"}))
+    }
+    fn says_kv_cache() -> AttemptOutcome {
+        AttemptOutcome::Pass(serde_json::json!({"area": "kv_cache"}))
+    }
+    fn says_a_number() -> AttemptOutcome {
+        AttemptOutcome::Pass(serde_json::json!({"area": 3}))
+    }
+    fn says_nothing() -> AttemptOutcome {
+        AttemptOutcome::Pass(serde_json::json!({"severity": "high"}))
+    }
+    fn says_true() -> AttemptOutcome {
+        AttemptOutcome::Pass(serde_json::json!({"urgent": true}))
+    }
+    fn says_false() -> AttemptOutcome {
+        AttemptOutcome::Pass(serde_json::json!({"urgent": false}))
+    }
+    fn breaks() -> AttemptOutcome {
+        AttemptOutcome::fail("boom".to_string())
+    }
+
+    fn run_branching(classify: fn() -> AttemptOutcome) -> (PlanOutcome, ScriptRunner) {
+        let mut r = ScriptRunner::new();
+        r.on("classify", 1, classify, 0.1);
+        let out = execute(
+            &branching(),
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        (out, r)
+    }
+
+    fn names(r: &ScriptRunner) -> Vec<&str> {
+        r.dispatched.iter().map(|(n, _)| n.as_str()).collect()
+    }
+
+    #[test]
+    fn the_taken_branch_runs_and_the_other_settles_not_taken_without_dispatch() {
+        let (out, r) = run_branching(says_scheduler);
+        assert_eq!(names(&r), ["classify", "fix", "verify", "wrap"]);
+        let punt = &out.results[&"punt".into()];
+        assert_eq!(punt.status, TaskStatus::NotTaken);
+        assert_eq!(punt.attempts, 0);
+        assert_eq!(punt.cost_usd, 0.0);
+        assert_eq!(
+            punt.note.as_deref(),
+            Some("gate.area resolved to scheduler")
+        );
+        assert!(out.valid, "an untaken required task does not invalidate");
+        assert_eq!(out.exit, PlanExit::Completed);
+        assert!(r.dropped.contains(&"punt".to_string()));
+    }
+
+    #[test]
+    fn not_taken_propagates_through_all_joins_to_the_leaves() {
+        let (out, r) = run_branching(says_frontend);
+        assert_eq!(names(&r), ["classify", "punt", "wrap"]);
+        assert_eq!(out.results[&"fix".into()].status, TaskStatus::NotTaken);
+        let verify = &out.results[&"verify".into()];
+        assert_eq!(verify.status, TaskStatus::NotTaken);
+        assert_eq!(verify.note.as_deref(), Some("dependency fix was not taken"));
+        assert!(out.valid);
+    }
+
+    #[test]
+    fn an_uncertain_answer_takes_the_branch_that_lists_it() {
+        let (out, r) = run_branching(says_uncertain);
+        assert_eq!(names(&r), ["classify", "punt", "wrap"]);
+        let answer = &out.results[&"gate".into()].output.as_ref().unwrap()["area"];
+        assert_eq!(answer["label"], "uncertain");
+        assert_eq!(answer["confidence"], 0.0);
+        assert!(out.valid);
+    }
+
+    #[test]
+    fn a_route_records_its_label_confidence_and_distribution_and_spends_nothing() {
+        let (out, _) = run_branching(says_scheduler);
+        let gate = &out.results[&"gate".into()];
+        assert_eq!(gate.status, TaskStatus::Pass);
+        assert_eq!(gate.cost_usd, 0.0);
+        assert_eq!(
+            gate.output,
+            Some(serde_json::json!({"area": {
+                "label": "scheduler",
+                "confidence": 1.0,
+                "probabilities": {"scheduler": 1.0}
+            }}))
+        );
+    }
+
+    #[test]
+    fn a_required_task_failing_inside_the_taken_branch_invalidates_the_run() {
+        let mut r = ScriptRunner::new();
+        r.on("classify", 1, says_scheduler, 0.1);
+        r.on("fix", 1, breaks, 0.1);
+        let out = execute(
+            &branching(),
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        assert!(!out.valid);
+        assert_eq!(out.exit, PlanExit::ShortCircuit { task: "fix".into() });
+        assert_eq!(out.results[&"verify".into()].status, TaskStatus::Blocked);
+    }
+
+    #[test]
+    fn an_answer_the_question_does_not_declare_fails_the_route() {
+        for (classify, needle) in [
+            (says_kv_cache as fn() -> AttemptOutcome, "does not declare"),
+            (says_a_number, "not a label string"),
+            (says_nothing, "emitted no field"),
+        ] {
+            let (out, r) = run_branching(classify);
+            let gate = &out.results[&"gate".into()];
+            assert_eq!(gate.status, TaskStatus::Fail);
+            assert!(gate.note.as_deref().unwrap().contains(needle), "{gate:?}");
+            assert_eq!(
+                names(&r),
+                ["classify"],
+                "nothing runs on an undecided route"
+            );
+            assert!(!out.valid);
+        }
+    }
+
+    #[test]
+    fn a_boolean_answers_a_noul() {
+        use crucible_contract::decision::QuestionKind;
+        for (classify, ran) in [
+            (
+                says_true as fn() -> AttemptOutcome,
+                vec!["classify", "page"],
+            ),
+            (says_false, vec!["classify"]),
+        ] {
+            let plan = valid(
+                vec![
+                    task("classify", &[], "any", true),
+                    gate(
+                        "urgent",
+                        question(QuestionKind::Noul, &["no", "uncertain"]),
+                        true,
+                    ),
+                    when(task("page", &["gate"], "any", true), "urgent", &["yes"]),
+                ],
+                10.0,
+            );
+            let mut r = ScriptRunner::new();
+            r.on("classify", 1, classify, 0.1);
+            let out = execute(
+                &plan,
+                &any_substrate(),
+                ExecCfg::default(),
+                &mut r,
+                |_, _| {},
+            );
+            assert_eq!(names(&r), ran);
+            assert!(out.valid, "a dropped answer leaves a valid run");
+        }
+    }
+
+    #[test]
+    fn a_settled_join_sees_the_untaken_dependency_as_not_taken() {
+        let plan = valid(
+            vec![
+                task("classify", &[], "any", true),
+                gate("area", area(&["frontend", "uncertain"]), true),
+                when(task("fix", &["gate"], "any", true), "area", &["scheduler"]),
+                joining(task("report", &["fix"], "any", true), Join::Settled),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.on("classify", 1, says_frontend, 0.1);
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        assert_eq!(names(&r), ["classify", "report"]);
+        assert_eq!(r.entry("report", "fix")["status"], "not_taken");
+        assert!(out.valid);
+    }
+
+    #[test]
+    fn a_conditional_task_joining_passed_on_an_undecided_route_is_not_taken() {
+        let plan = valid(
+            vec![
+                task("classify", &[], "any", false),
+                gate("area", area(&["frontend", "uncertain"]), false),
+                joining(
+                    when(task("fix", &["gate"], "any", false), "area", &["scheduler"]),
+                    Join::Passed,
+                ),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.on("classify", 1, says_kv_cache, 0.1);
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        assert_eq!(out.results[&"gate".into()].status, TaskStatus::Fail);
+        let fix = &out.results[&"fix".into()];
+        assert_eq!(fix.status, TaskStatus::NotTaken);
+        assert_eq!(fix.note.as_deref(), Some("route gate did not decide"));
+    }
+
+    #[test]
+    fn not_taken_round_trips_its_wire_token() {
+        assert_eq!(TaskStatus::NotTaken.as_str(), "not_taken");
+        assert_eq!(
+            "not_taken".parse::<TaskStatus>().unwrap(),
+            TaskStatus::NotTaken
+        );
+        assert_eq!(
+            serde_json::to_string(&TaskStatus::NotTaken).unwrap(),
+            "\"not_taken\""
+        );
+        assert!(!TaskStatus::NotTaken.passed());
     }
 
     #[test]
@@ -4448,6 +5220,522 @@ mod tests {
         assert_eq!(
             outcome["tasks"]["after"]["note"],
             "required task probe failed"
+        );
+    }
+
+    fn reviewing(name: &str, deps: &[&str], target: &str, max_rounds: u32) -> Task {
+        let mut t = task(name, deps, "any", true);
+        t.revise = Some(crate::plan::ir::Revise {
+            task: target.into(),
+            max_rounds,
+        });
+        t
+    }
+
+    fn rejected() -> AttemptOutcome {
+        AttemptOutcome::Fail {
+            note: "probe hit an unrelated 400".into(),
+            output: Some(serde_json::json!({"status": "fail", "why": "wrong encoding"})),
+        }
+    }
+
+    fn approved() -> AttemptOutcome {
+        AttemptOutcome::Pass(serde_json::json!({"verdict": "reproduced"}))
+    }
+
+    fn drafted() -> AttemptOutcome {
+        AttemptOutcome::Pass(serde_json::json!({"draft": "probe"}))
+    }
+
+    fn rows_of(plan: &ValidPlan, r: &mut ScriptRunner) -> (PlanOutcome, Vec<(String, TaskStatus)>) {
+        let mut rows = Vec::new();
+        let out = execute(
+            plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            r,
+            |t, result| rows.push((t.name.0.clone(), result.status)),
+        );
+        (out, rows)
+    }
+
+    fn row(name: &str, status: TaskStatus) -> (String, TaskStatus) {
+        (name.to_string(), status)
+    }
+
+    fn dispatches(r: &ScriptRunner) -> Vec<&str> {
+        r.dispatched.iter().map(|(n, _)| n.as_str()).collect()
+    }
+
+    /// classify -> gate(area) -> author [scheduler] <-> repro (revise, 3 rounds)
+    ///                        -> punt   [frontend, uncertain]
+    ///             repro, punt -> wrap (passed)
+    fn routed_review() -> ValidPlan {
+        valid(
+            vec![
+                task("classify", &[], "any", true),
+                gate("area", area(&[]), true),
+                when(
+                    task("author", &["gate"], "any", true),
+                    "area",
+                    &["scheduler"],
+                ),
+                reviewing("repro", &["author"], "author", 3),
+                when(
+                    task("punt", &["gate"], "any", true),
+                    "area",
+                    &["frontend", "uncertain"],
+                ),
+                joining(task("wrap", &["repro", "punt"], "any", true), Join::Passed),
+            ],
+            10.0,
+        )
+    }
+
+    #[test]
+    fn an_untaken_revise_target_starts_no_round_and_its_reviewer_is_not_taken() {
+        let mut r = ScriptRunner::new();
+        r.on("classify", 1, says_frontend, 0.1);
+        let (out, rows) = rows_of(&routed_review(), &mut r);
+
+        assert!(out.valid, "an untaken loop does not invalidate the run");
+        assert_eq!(dispatches(&r), ["classify", "punt", "wrap"]);
+        assert!(
+            !rows.iter().any(|(name, _)| name.contains("[round-")),
+            "{rows:?}"
+        );
+        assert_eq!(out.results[&"author".into()].status, TaskStatus::NotTaken);
+        let repro = &out.results[&"repro".into()];
+        assert_eq!(repro.status, TaskStatus::NotTaken);
+        assert_eq!(
+            repro.note.as_deref(),
+            Some("dependency author was not taken")
+        );
+        assert_eq!(repro.cost_usd, 0.0);
+    }
+
+    #[test]
+    fn a_taken_revise_target_loops_as_it_would_unconditionally() {
+        let mut r = ScriptRunner::new();
+        r.on("classify", 1, says_scheduler, 0.1);
+        r.rounds("author", &[drafted, drafted]);
+        r.rounds("repro", &[rejected, approved]);
+        let (out, rows) = rows_of(&routed_review(), &mut r);
+
+        assert!(out.valid);
+        assert_eq!(
+            dispatches(&r),
+            ["classify", "author", "repro", "author", "repro", "wrap"]
+        );
+        assert!(
+            rows.contains(&row("repro[round-1]", TaskStatus::Fail)),
+            "{rows:?}"
+        );
+        assert!(
+            rows.contains(&row("repro[round-2]", TaskStatus::Pass)),
+            "{rows:?}"
+        );
+        assert_eq!(out.results[&"punt".into()].status, TaskStatus::NotTaken);
+        assert!(r.seen_inputs["author"].contains(&REVISION_INPUT.to_string()));
+    }
+
+    #[test]
+    fn a_review_that_passes_the_first_draft_runs_one_round_and_sends_nothing_back() {
+        let plan = valid(
+            vec![
+                task("author", &[], "any", true),
+                reviewing("repro", &["author"], "author", 3),
+                task("pick", &["repro"], "any", true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        let (out, rows) = rows_of(&plan, &mut r);
+
+        assert!(out.valid);
+        assert_eq!(dispatches(&r), ["author", "repro", "pick"]);
+        assert_eq!(
+            rows,
+            [
+                row("author[round-1]", TaskStatus::Pass),
+                row("repro[round-1]", TaskStatus::Pass),
+                row("author", TaskStatus::Pass),
+                row("repro", TaskStatus::Pass),
+                row("pick", TaskStatus::Pass),
+            ]
+        );
+        assert!(!r.seen_inputs["author"].contains(&REVISION_INPUT.to_string()));
+    }
+
+    #[test]
+    fn a_failing_review_sends_its_verdict_back_until_a_round_passes() {
+        let plan = valid(
+            vec![
+                task("author", &[], "any", true),
+                reviewing("repro", &["author"], "author", 3),
+                task("pick", &["author", "repro"], "any", true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.rounds("author", &[drafted, drafted]);
+        r.rounds("repro", &[rejected, approved]);
+        let (out, rows) = rows_of(&plan, &mut r);
+
+        assert!(out.valid, "{:?}", out.results);
+        assert_eq!(out.exit, PlanExit::Completed);
+        assert_eq!(
+            dispatches(&r),
+            ["author", "repro", "author", "repro", "pick"]
+        );
+        assert_eq!(
+            rows,
+            [
+                row("author[round-1]", TaskStatus::Pass),
+                row("repro[round-1]", TaskStatus::Fail),
+                row("author[round-2]", TaskStatus::Pass),
+                row("repro[round-2]", TaskStatus::Pass),
+                row("author", TaskStatus::Pass),
+                row("repro", TaskStatus::Pass),
+                row("pick", TaskStatus::Pass),
+            ]
+        );
+
+        let authored: Vec<&BTreeMap<TaskName, Value>> = r
+            .runs
+            .iter()
+            .filter(|(n, _)| n == "author")
+            .map(|(_, inputs)| inputs)
+            .collect();
+        assert!(!authored[0].contains_key(&TaskName(REVISION_INPUT.into())));
+        let revision = &authored[1][&TaskName(REVISION_INPUT.into())];
+        assert_eq!(revision["round"], 2);
+        assert_eq!(revision["max_rounds"], 3);
+        assert_eq!(revision["reviewer"], "repro");
+        assert_eq!(revision["review"]["status"], "fail");
+        assert_eq!(revision["review"]["note"], "probe hit an unrelated 400");
+        assert_eq!(revision["review"]["output"]["why"], "wrong encoding");
+        assert_eq!(revision["review"]["files"], false);
+
+        let repro = &out.results[&"repro".into()];
+        assert_eq!(
+            repro.output,
+            Some(serde_json::json!({"verdict": "reproduced"}))
+        );
+        assert!(
+            (repro.cost_usd - 0.2).abs() < 1e-9,
+            "the node row carries every round's spend: {}",
+            repro.cost_usd
+        );
+        assert!((out.spent_usd - 0.5).abs() < 1e-9, "{}", out.spent_usd);
+        assert_eq!(
+            r.seen_values["pick"][&TaskName("repro".into())],
+            serde_json::json!({"verdict": "reproduced"}),
+            "a dependent reads the round that passed"
+        );
+    }
+
+    #[test]
+    fn a_reviewer_that_rejects_every_round_stops_at_max_rounds_and_short_circuits() {
+        let plan = valid(
+            vec![
+                task("author", &[], "any", true),
+                reviewing("repro", &["author"], "author", 2),
+                task("pick", &["repro"], "any", true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.rounds("repro", &[rejected, rejected, approved]);
+        let (out, rows) = rows_of(&plan, &mut r);
+
+        assert!(!out.valid);
+        assert_eq!(
+            out.exit,
+            PlanExit::ShortCircuit {
+                task: "repro".into()
+            }
+        );
+        assert_eq!(dispatches(&r), ["author", "repro", "author", "repro"]);
+        assert_eq!(rows.len(), 7, "{rows:?}");
+        assert_eq!(rows[5], row("repro", TaskStatus::Fail));
+        assert_eq!(rows[6], row("pick", TaskStatus::Blocked));
+        assert_eq!(
+            out.results[&"repro".into()].note.as_deref(),
+            Some("probe hit an unrelated 400")
+        );
+    }
+
+    #[test]
+    fn a_round_that_does_not_fail_ends_the_loop_whatever_else_it_settled_as() {
+        fn skipped() -> AttemptOutcome {
+            AttemptOutcome::Pass(serde_json::json!({"status": "skipped"}))
+        }
+        fn hung_up() -> AttemptOutcome {
+            AttemptOutcome::Transport(TransportFailure::new(
+                TransportCause::Other,
+                "the broker hung up",
+            ))
+        }
+        for (outcome, status) in [
+            (skipped as fn() -> AttemptOutcome, TaskStatus::Skipped),
+            (hung_up, TaskStatus::Transport),
+        ] {
+            let plan = valid(
+                vec![task("author", &[], "any", false), {
+                    let mut t = reviewing("repro", &["author"], "author", 3);
+                    t.required = false;
+                    t
+                }],
+                10.0,
+            );
+            let mut r = ScriptRunner::new();
+            r.rounds("repro", &[outcome, outcome, outcome]);
+            let (out, _) = rows_of(&plan, &mut r);
+            assert_eq!(out.results[&"repro".into()].status, status);
+            assert_eq!(
+                dispatches(&r).iter().filter(|n| **n == "author").count(),
+                1,
+                "{status:?} is not a verdict to revise against"
+            );
+        }
+    }
+
+    #[test]
+    fn a_revision_that_fails_blocks_its_review_and_ends_the_loop() {
+        let plan = valid(
+            vec![
+                task("author", &[], "any", true),
+                reviewing("repro", &["author"], "author", 3),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.rounds("author", &[drafted, || AttemptOutcome::fail("gave up")]);
+        r.rounds("repro", &[rejected]);
+        let (out, rows) = rows_of(&plan, &mut r);
+
+        assert_eq!(dispatches(&r), ["author", "repro", "author"]);
+        assert_eq!(
+            rows,
+            [
+                row("author[round-1]", TaskStatus::Pass),
+                row("repro[round-1]", TaskStatus::Fail),
+                row("author[round-2]", TaskStatus::Fail),
+                row("repro[round-2]", TaskStatus::Blocked),
+                row("author", TaskStatus::Fail),
+                row("repro", TaskStatus::Blocked),
+            ]
+        );
+        assert_eq!(
+            out.exit,
+            PlanExit::ShortCircuit {
+                task: "author".into()
+            }
+        );
+        assert_eq!(
+            out.results[&"repro".into()].blocked,
+            Some(BlockedReason::DependencyDidNotPass)
+        );
+    }
+
+    #[test]
+    fn a_settled_reviewer_still_reviews_a_failed_revision() {
+        let mut repro = reviewing("repro", &["author"], "author", 2);
+        repro.join = Join::Settled;
+        let plan = valid(vec![task("author", &[], "any", true), repro], 10.0);
+        let mut r = ScriptRunner::new();
+        r.rounds("author", &[drafted, || AttemptOutcome::fail("gave up")]);
+        r.rounds("repro", &[rejected, rejected]);
+        let (out, _) = rows_of(&plan, &mut r);
+
+        assert_eq!(dispatches(&r), ["author", "repro", "author", "repro"]);
+        assert_eq!(
+            r.entry("repro", "author")["status"],
+            "fail",
+            "the reviewer read the revision that failed, not the draft before it"
+        );
+        assert_eq!(out.results[&"author".into()].status, TaskStatus::Fail);
+    }
+
+    #[test]
+    fn a_budget_spent_by_a_round_stops_the_loop_before_the_next() {
+        let plan = valid(
+            vec![
+                task("author", &[], "any", true),
+                reviewing("repro", &["author"], "author", 3),
+                task("pick", &["repro"], "any", true),
+            ],
+            0.25,
+        );
+        let mut r = ScriptRunner::new();
+        r.default_cost = 0.15;
+        r.rounds("repro", &[rejected, approved]);
+        let (out, rows) = rows_of(&plan, &mut r);
+
+        assert_eq!(out.exit, PlanExit::BudgetExceeded);
+        assert!(!out.valid);
+        assert_eq!(dispatches(&r), ["author", "repro"]);
+        assert_eq!(
+            rows,
+            [
+                row("author[round-1]", TaskStatus::Pass),
+                row("repro[round-1]", TaskStatus::Fail),
+                row("author", TaskStatus::Pass),
+                row("repro", TaskStatus::Fail),
+                row("pick", TaskStatus::Blocked),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_proposer_that_spends_the_budget_leaves_its_review_blocked() {
+        let plan = valid(
+            vec![
+                task("author", &[], "any", true),
+                reviewing("repro", &["author"], "author", 3),
+            ],
+            0.25,
+        );
+        let mut r = ScriptRunner::new();
+        r.default_cost = 0.3;
+        let (out, rows) = rows_of(&plan, &mut r);
+
+        assert_eq!(out.exit, PlanExit::BudgetExceeded);
+        assert_eq!(dispatches(&r), ["author"]);
+        assert_eq!(rows[1], row("repro[round-1]", TaskStatus::Blocked));
+        assert_eq!(
+            out.results[&"repro".into()].blocked,
+            Some(BlockedReason::BudgetCeiling)
+        );
+    }
+
+    #[test]
+    fn an_exhausted_wall_clock_dispatches_no_round() {
+        let plan = valid(
+            vec![
+                task("author", &[], "any", true),
+                reviewing("repro", &["author"], "author", 3),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.rounds("repro", &[rejected, approved]);
+        let mut rows = Vec::new();
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg {
+                wall_clock: Some(Duration::ZERO),
+                ..ExecCfg::default()
+            },
+            &mut r,
+            |t, result| rows.push((t.name.0.clone(), result.status)),
+        );
+        assert_eq!(out.exit, PlanExit::TimeExceeded);
+        assert!(r.dispatched.is_empty(), "{:?}", r.dispatched);
+        assert!(
+            rows.iter().all(|(_, s)| *s == TaskStatus::Blocked),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn the_reviewers_captured_evidence_is_staged_into_the_revision() {
+        let plan = valid(
+            vec![
+                task("baseline", &[], "any", true),
+                task("author", &["baseline"], "any", true),
+                reviewing("repro", &["author", "baseline"], "author", 3),
+            ],
+            10.0,
+        );
+        let mut plan_tasks = plan.plan().tasks.clone();
+        for t in &mut plan_tasks {
+            t.emits_files = vec![format!("{}.json", t.name)];
+        }
+        let plan = valid(plan_tasks, 10.0);
+        let mut r = ScriptRunner::new();
+        r.captured.insert("repro".into());
+        r.rounds("repro", &[rejected, approved]);
+        let (out, _) = rows_of(&plan, &mut r);
+
+        assert!(out.valid);
+        assert_eq!(r.staged["author"], ["baseline", "repro"]);
+        assert_eq!(r.staged["repro"], ["baseline", "author"]);
+        let revision = &r.seen_values["author"][&TaskName(REVISION_INPUT.into())];
+        assert_eq!(revision["review"]["files"], true);
+    }
+
+    #[test]
+    fn a_loop_waits_for_the_reviewers_other_dependencies_before_its_first_round() {
+        let plan = valid(
+            vec![
+                task("author", &[], "any", true),
+                task("rig", &[], "any", true),
+                reviewing("repro", &["author", "rig"], "author", 2),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.rounds("repro", &[rejected, approved]);
+        let (out, _) = rows_of(&plan, &mut r);
+
+        assert!(out.valid);
+        assert_eq!(
+            dispatches(&r),
+            ["rig", "author", "repro", "author", "repro"]
+        );
+    }
+
+    #[test]
+    fn a_dependent_of_the_proposer_waits_for_the_loop_and_reads_the_last_draft() {
+        let plan = valid(
+            vec![
+                task("author", &[], "any", true),
+                task("notify", &["author"], "any", true),
+                reviewing("repro", &["author"], "author", 3),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.rounds(
+            "author",
+            &[
+                || AttemptOutcome::Pass(serde_json::json!({"draft": 1})),
+                || AttemptOutcome::Pass(serde_json::json!({"draft": 2})),
+            ],
+        );
+        r.rounds("repro", &[rejected, approved]);
+        let (out, _) = rows_of(&plan, &mut r);
+
+        assert!(out.valid);
+        assert_eq!(
+            dispatches(&r),
+            ["author", "repro", "author", "repro", "notify"]
+        );
+        assert_eq!(
+            r.seen_values["notify"][&TaskName("author".into())],
+            serde_json::json!({"draft": 2})
+        );
+    }
+
+    #[test]
+    fn a_reviewer_this_substrate_cannot_run_leaves_the_proposer_a_plain_task() {
+        let mut repro = reviewing("repro", &["author"], "author", 3);
+        repro.needs = "gpu".into();
+        repro.required = false;
+        let plan = valid(vec![task("author", &[], "any", true), repro], 10.0);
+        let mut r = ScriptRunner::new();
+        let (out, rows) = rows_of(&plan, &mut r);
+
+        assert!(out.valid);
+        assert_eq!(
+            rows,
+            [
+                row("author", TaskStatus::Pass),
+                row("repro", TaskStatus::Skipped)
+            ]
         );
     }
 }

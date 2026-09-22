@@ -1,0 +1,16 @@
+-- 0043_provider_harness.sql — which agent CLI a provider's models run under, when the kind or
+-- protocol alone does not say.
+--
+-- Until now the kind decided the harness outright and a custom provider's protocol did: Messages
+-- ran Claude Code, Chat Completions and Responses ran Codex. Two things changed. The current Codex
+-- CLI speaks only the Responses API, so an endpoint that offers only Chat Completions needs a
+-- harness that can (opencode or pi). And once more than one harness speaks a protocol, the
+-- registration is where the choice belongs: a provider is one place work is sent to think, and
+-- the CLI that does the thinking is part of that place.
+--
+-- NULL keeps the default for the kind or protocol ('claude' for anthropic/vertex/messages,
+-- 'codex' for openai/responses, 'opencode' for chat_completions), so every existing row resolves
+-- as it did, except that a chat_completions row now runs opencode, which is the only thing that
+-- can run it. 'claude' | 'hermes' | 'codex' | 'opencode' | 'pi', checked against the kind or
+-- protocol at registration.
+ALTER TABLE model_providers ADD COLUMN harness TEXT;

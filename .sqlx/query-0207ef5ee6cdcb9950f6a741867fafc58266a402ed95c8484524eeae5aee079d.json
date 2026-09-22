@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE issues SET status = COALESCE(pre_park_status, 'new'), pre_park_status = NULL,\n         parked_reason = NULL, parked_by = NULL, updated_at = $1\n         WHERE key = $2 AND status = 'parked'\n         RETURNING status AS \"status!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "status!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "0207ef5ee6cdcb9950f6a741867fafc58266a402ed95c8484524eeae5aee079d"
+}

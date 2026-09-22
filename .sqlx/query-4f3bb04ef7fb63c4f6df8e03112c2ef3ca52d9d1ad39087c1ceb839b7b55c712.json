@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT substr(ts, 1, 10) AS \"day!: String\", SUM(cost_usd) AS \"total_usd!: f64\"\n        FROM ledger GROUP BY substr(ts, 1, 10) ORDER BY substr(ts, 1, 10) DESC LIMIT $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "day!: String",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "total_usd!: f64",
+        "type_info": "Float8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "4f3bb04ef7fb63c4f6df8e03112c2ef3ca52d9d1ad39087c1ceb839b7b55c712"
+}

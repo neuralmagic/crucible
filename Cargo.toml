@@ -1,5 +1,16 @@
 [workspace]
-members = ["crucible", "crucible-contract", "crucible-vcs", "crucible-harness", "crucible-broker", "forge", "xtask"]
+members = [
+    "crucible",
+    "crucible-contract",
+    "crucible-vcs",
+    "crucible-harness",
+    "crucible-broker",
+    "forge",
+    "crucible-controller",
+    "crux",
+    "capability",
+    "xtask",
+]
 # Vendored upstream sources (see third_party/NOTICE). Excluded from the workspace so
 # `cargo fmt --all` / clippy lint our code and leave theirs byte-identical to upstream;
 # they are still consumed as path dependencies.
@@ -7,7 +18,7 @@ exclude = ["third_party/dagre_rust", "third_party/graphlib_rust", "third_party/m
 resolver = "3"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 # Dual-licensed like the repo (LICENSE-MIT / LICENSE-APACHE); the public export's cargo-deny
 # licenses check requires every workspace crate to declare it.
 license = "MIT OR Apache-2.0"
@@ -34,6 +45,16 @@ openshell-core = { git = "https://github.com/wseaton/OpenShell.git", rev = "3b41
 openshell-policy = { git = "https://github.com/wseaton/OpenShell.git", rev = "3b41f71e2ada135899de4dbb81dec7477697a629", default-features = false }
 tonic = { version = "0.14", features = ["channel", "tls-native-roots", "tls-ring"] }
 thiserror = "2"
+strum = { version = "0.27", features = ["derive"] }
+# Cron expression parsing for playbook schedules. Owns the pattern grammar only: it matches
+# civil fields as integers, so jiff stays the single timezone authority (croner and the older
+# `cron` crate both evaluate against chrono; nothing on crates.io evaluates against jiff).
+croner = "3"
+# Launch-time validation of playbook param values against the pack's stored params schema. The
+# de-facto Rust validator; `default-features = false` keeps remote `$ref` resolution off, so a
+# stored schema can never make the controller fetch a URL.
+jsonschema = { version = "0.50", default-features = false }
+moka = { version = "0.12", features = ["sync", "future"] }
 
 [profile.release]
 opt-level = 2

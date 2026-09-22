@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE repos SET closed_repaired_at = $1 WHERE repo = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "82c70cf2439bc4522862573780abadb0b4011717b898df70b32edbe1315bcd4e"
+}

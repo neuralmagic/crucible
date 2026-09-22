@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT COUNT(*) AS \"n!: i64\", COALESCE(SUM(cost_usd), 0.0) AS \"sum!: f64\" FROM ledger WHERE kind='rank-grounded'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "n!: i64",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "sum!: f64",
+        "type_info": "Float8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "2095a976bae79681bb3415b3aa3aa0760386f65a4f9baff5ab70188e828d33d2"
+}

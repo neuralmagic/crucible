@@ -7,10 +7,11 @@
 
 use crate::plan::exec::DeclaredStatus;
 use crate::plan::ir::KEPT_INPUT;
-use crate::plan::ir::MAX_FANOUT_CEILING;
-use crate::plan::ir::{ITEM_INPUT, OUTCOME_INPUT};
+use crate::plan::ir::{ITEM_INPUT, OUTCOME_INPUT, REVISION_INPUT};
+use crate::plan::ir::{MAX_FANOUT_CEILING, MAX_ROUNDS_CEILING};
 #[cfg(test)]
 use crate::plan::workflow::WorkflowType;
+use crucible_contract::decision::UNCERTAIN;
 
 /// Which lanes see a constructor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19,12 +20,18 @@ pub enum Lane {
     Common,
     /// The scored types (`autoresearch` and `custom`) only.
     Scored,
+    /// The types that may branch on a typed decision (`playbook` and `custom`).
+    Routed,
 }
 
 impl Lane {
     #[cfg(test)]
     fn includes(self, workflow: WorkflowType) -> bool {
-        self == Lane::Common || workflow != WorkflowType::Playbook
+        match self {
+            Lane::Common => true,
+            Lane::Scored => workflow != WorkflowType::Playbook,
+            Lane::Routed => workflow != WorkflowType::Autoresearch,
+        }
     }
 }
 
@@ -108,11 +115,63 @@ fn task_knobs() -> Vec<Kwarg> {
             ),
         ),
         Kwarg::new(
+            "revise",
+            "task",
+            "A direct dependency this task sends back when it settles failing. The dependency runs \
+             again with the verdict under `revision`, then this task does, until this task stops \
+             failing or `max_rounds` is spent. Playbooks only; not with `over`.",
+        ),
+        Kwarg::new(
+            "max_rounds",
+            "int",
+            format!(
+                "Round cap for `revise`, counting the first, from 2 to the engine's ceiling of \
+                 {MAX_ROUNDS_CEILING}."
+            ),
+        ),
+        Kwarg::new(
             "stage",
             "\"iteration\" | \"epilogue\"",
             "`epilogue` runs once after the loop concludes, and only if the run kept a candidate.",
         ),
+        when_kwarg(),
+        answers_kwarg(),
+        otherwise_kwarg(),
     ]
+}
+
+fn when_kwarg() -> Kwarg {
+    Kwarg::new(
+        "when",
+        "route.question",
+        "Run only on a listed answer to one question of a `route()` this task depends on. \
+         Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, \
+         and every `all`-join dependent is not taken with it. Rejoin branches with \
+         `join = \"passed\"` or `join = \"settled\"`. Playbook and custom workflows only.",
+    )
+}
+
+fn otherwise_kwarg() -> Kwarg {
+    Kwarg::new(
+        "otherwise",
+        "bool",
+        format!(
+            "In place of `answers`: every answer no other task lists and the question does not \
+             `drop`, `\"{UNCERTAIN}\"` included. Expanded at compile time. An unreachable \
+             `otherwise` is an error."
+        ),
+    )
+}
+
+fn answers_kwarg() -> Kwarg {
+    Kwarg::new(
+        "answers",
+        "str | list[str]",
+        format!(
+            "The answers `when` accepts: labels the question declares, or `\"{UNCERTAIN}\"`. \
+             Defaults to `\"yes\"` for a noul and is required for a choice."
+        ),
+    )
 }
 
 /// Agent knobs shared by `agent()` and `skill()`.
@@ -384,6 +443,87 @@ pub fn functions() -> Vec<Function> {
             ],
         },
         Function {
+            name: "route",
+            lane: Lane::Routed,
+            purpose: "Engine-owned decision: answers typed questions about its dependencies' \
+                      outputs and records one label per question, which other tasks branch on \
+                      with `when`. Every label of a question some `when` refers to, \
+                      `\"uncertain\"` included, must be listed by a `when` or by the question's \
+                      `drop`.",
+            positional: None,
+            kwargs: vec![
+                name_kwarg(),
+                Kwarg::new(
+                    "questions",
+                    "dict[str, question]",
+                    "Question id to `noul()` or `choice()`. `gate.<id>` names one for `when`.",
+                ),
+                Kwarg::new(
+                    "min_confidence",
+                    "number",
+                    "A decision model answers, through the broker's `systemone` capability. An \
+                     answer whose probability is below this, in (0, 1], is recorded as \
+                     `\"uncertain\"`. Exactly one of `min_confidence` and `source`.",
+                ),
+                Kwarg::new(
+                    "source",
+                    "task",
+                    "A dependency's output answers instead: it emits one declared label (or a \
+                     boolean, for a noul) under each question id. Deterministic, free, and \
+                     needs no capability. Any other value fails the route.",
+                ),
+                Kwarg::new(
+                    "depends_on",
+                    "list[task]",
+                    "Dependencies. Their outputs are the state the questions are asked about.",
+                ),
+                Kwarg::new("required", "bool", "False makes the route advisory."),
+                Kwarg::new(
+                    "join",
+                    "\"all\" | \"passed\" | \"settled\"",
+                    "Which dependency outputs form the state, as on any task.",
+                ),
+                Kwarg::new("stage", "\"iteration\" | \"epilogue\"", "As on any task."),
+                when_kwarg(),
+                answers_kwarg(),
+                otherwise_kwarg(),
+            ],
+        },
+        Function {
+            name: "noul",
+            lane: Lane::Routed,
+            purpose: "A yes/no question for `route()`. It answers `\"yes\"` or `\"no\"`.",
+            positional: None,
+            kwargs: vec![
+                Kwarg::new("ask", "str", "What to decide."),
+                Kwarg::new(
+                    "drop",
+                    "str | list[str]",
+                    "Answers that deliberately lead nowhere, so no `when` has to list them.",
+                ),
+            ],
+        },
+        Function {
+            name: "choice",
+            lane: Lane::Routed,
+            purpose: "A one-of-N question for `route()`.",
+            positional: None,
+            kwargs: vec![
+                Kwarg::new("ask", "str", "What to decide."),
+                Kwarg::new(
+                    "options",
+                    "list[str] | dict[str, str | None]",
+                    "At least two distinct identifier labels, optionally each with a description \
+                     the model sees. `\"uncertain\"` is reserved.",
+                ),
+                Kwarg::new(
+                    "drop",
+                    "str | list[str]",
+                    "Answers that deliberately lead nowhere, so no `when` has to list them.",
+                ),
+            ],
+        },
+        Function {
             name: "default_autoresearch",
             lane: Lane::Scored,
             purpose: "Expand the built-in propose/apply/measure/decide loop into visible nodes, \
@@ -450,6 +590,13 @@ pub fn reserved_inputs() -> Vec<Reserved> {
              `{\"exit\": str, \"tasks\": {name: {\"status\", \"note\"}}}`, in an epilogue \
              task only.",
         ),
+        Reserved::new(
+            REVISION_INPUT,
+            "object",
+            "The verdict that sent this task back, as `{\"round\": int, \"max_rounds\": int, \
+             \"reviewer\": str, \"review\": {\"status\", \"note\", \"output\", \"files\"}}`, \
+             from the second round of a revise loop on.",
+        ),
     ]
 }
 
@@ -513,6 +660,12 @@ pub fn markdown() -> String {
             "Available to `type = \"autoresearch\"` and `type = \"custom\"`. A playbook does not \
              have these in scope at all, so naming one is an unknown-name error and a \
              did-you-mean never offers one.",
+        ),
+        (
+            Lane::Routed,
+            "Playbook and custom lanes only",
+            "Available to `type = \"playbook\"` and `type = \"custom\"`. An autoresearch \
+             workflow keeps or discards on a frozen measure, so it has neither these nor `when`.",
         ),
     ] {
         out.push_str(&format!("## {heading}\n\n{blurb}\n\n"));
@@ -584,6 +737,7 @@ pub fn json() -> serde_json::Value {
                 "lane": match function.lane {
                     Lane::Common => "common",
                     Lane::Scored => "scored",
+                    Lane::Routed => "routed",
                 },
                 "purpose": function.purpose,
                 "positional": function.positional,

@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO builds (scope, name, image, tag, context_digest, backend, state, timeout_secs, created_at)\n        VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8)\n        RETURNING id AS \"id!\"\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "9017ac7d7b4d822fdec4461aa1e55072789d5f494a6b81be4b7e84a3bd0a1d95"
+}

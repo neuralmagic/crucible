@@ -3,6 +3,7 @@ use std::fmt;
 
 use crate::crucible::Direction;
 use anyhow::{Context, Result};
+use crucible_contract::decision::{Label, Question, QuestionError, QuestionId, UNCERTAIN};
 use serde::{Deserialize, Serialize};
 
 /// The reserved input a mapped instance receives its own item under. Reserved like the
@@ -13,9 +14,12 @@ pub const ITEM_INPUT: &str = "item";
 pub const KEPT_INPUT: &str = "kept";
 /// The reserved input every epilogue task receives the main graph's outcome under.
 pub const OUTCOME_INPUT: &str = "outcome";
+/// The reserved input a revised task receives its reviewer's last verdict under, from its second
+/// round on.
+pub const REVISION_INPUT: &str = "revision";
 /// Every key the engine writes into a task's inputs itself. A dependency named after one of
 /// them would have its entry overwritten, so [`crate::plan::ir::Plan::validate`] refuses it.
-pub const RESERVED_INPUTS: [&str; 3] = [ITEM_INPUT, KEPT_INPUT, OUTCOME_INPUT];
+pub const RESERVED_INPUTS: [&str; 4] = [ITEM_INPUT, KEPT_INPUT, OUTCOME_INPUT, REVISION_INPUT];
 
 /// Task identity: cache key component, wire label, UI label. Unique within a plan.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -176,7 +180,11 @@ pub enum TaskKind {
     /// A command whose final JSON object is graded by `pass` or a threshold.
     Evaluate {
         command: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "number::optional"
+        )]
         threshold: Option<f64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         direction: Option<Direction>,
@@ -191,6 +199,11 @@ pub enum TaskKind {
     },
     /// Engine-builtin deterministic fold: keep the k best upstream outputs by `score`.
     TopK { k: u32, direction: Direction },
+    /// Engine-owned call to a decision model; the output is one typed answer per question.
+    Route {
+        questions: BTreeMap<QuestionId, Question>,
+        decider: Decider,
+    },
     /// A capability-owned engine operation.
     Engine {
         op: EngineOp,
@@ -213,6 +226,7 @@ impl TaskKind {
             TaskKind::Evaluate { .. } => "evaluate",
             TaskKind::Report { .. } => "report",
             TaskKind::TopK { .. } => "top_k",
+            TaskKind::Route { .. } => "route",
             TaskKind::Engine { op, .. } => match op {
                 EngineOp::Propose => "engine_propose",
                 EngineOp::Apply => "engine_apply",
@@ -224,6 +238,57 @@ impl TaskKind {
         }
     }
 }
+
+/// `f64` fields deserialized through [`serde_json::Number`].
+mod number {
+    use serde::{Deserialize, Deserializer, de::Error};
+
+    fn finite<E: Error>(n: serde_json::Number) -> Result<f64, E> {
+        n.as_f64()
+            .ok_or_else(|| E::custom(format!("{n} is not representable as a float")))
+    }
+
+    pub fn required<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+        finite(serde_json::Number::deserialize(d)?)
+    }
+
+    pub fn optional<'de, D: Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
+        Option::<serde_json::Number>::deserialize(d)?
+            .map(finite)
+            .transpose()
+    }
+}
+
+/// What answers a route's questions.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Decider {
+    /// A System One decision model, reached through the broker.
+    Model {
+        #[serde(deserialize_with = "number::required")]
+        min_confidence: f64,
+    },
+    /// A dependency's output, which carries one declared label per question id.
+    Output { task: TaskName },
+}
+
+/// Run a task only when one question of a route it depends on resolved to a listed label.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct When {
+    pub task: TaskName,
+    pub question: QuestionId,
+    pub is: Vec<Label>,
+}
+
+impl fmt::Display for When {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let labels: Vec<&str> = self.is.iter().map(Label::as_str).collect();
+        write!(f, "{}.{} in {}", self.task, self.question, labels.join("|"))
+    }
+}
+
+/// The capability a model-decided route task needs.
+pub const NEEDS_SYSTEMONE: &str = "systemone";
 
 fn default_needs() -> String {
     "any".to_string()
@@ -280,7 +345,23 @@ pub struct Task {
     /// whatever a global default happened to be.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_fanout: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<When>,
+    /// Sends a failing verdict back to a dependency (see [`Revise`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revise: Option<Revise>,
 }
+
+/// A reviewer's bounded send-back: when the reviewer settles failing, `task` runs again with the
+/// verdict, then the reviewer does, for at most `max_rounds` rounds in all.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Revise {
+    pub task: TaskName,
+    pub max_rounds: u32,
+}
+
+/// The most rounds one revise loop may run. Operator-owned, like [`MAX_FANOUT_CEILING`].
+pub const MAX_ROUNDS_CEILING: u32 = 5;
 
 /// Executor-enforced accounting limit; overruns fail the plan.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -460,6 +541,133 @@ pub enum PlanError {
         dependency: String,
         dependency_stage: Stage,
     },
+    #[error("route task {task:?} declares no questions")]
+    RouteWithoutQuestions { task: String },
+    #[error("route task {task:?}, question {question:?}: {error}")]
+    InvalidQuestion {
+        task: String,
+        question: String,
+        error: QuestionError,
+    },
+    #[error("route task {task:?}: min_confidence must be in (0, 1], got {got}")]
+    MinConfidenceOutOfRange { task: String, got: f64 },
+    #[error(
+        "model-decided route task {task:?} must declare needs = \"{NEEDS_SYSTEMONE}\", got {got:?}"
+    )]
+    RouteNeeds { task: String, got: String },
+    #[error(
+        "route task {task:?} decides from {source_task:?}, which is not one of its dependencies"
+    )]
+    RouteSourceNotADependency { task: String, source_task: String },
+    #[error(
+        "route task {task:?} reads question {question:?} from {source_task:?}, which declares emits without it"
+    )]
+    RouteSourceOmitsQuestion {
+        task: String,
+        source_task: String,
+        question: String,
+    },
+    #[error("route task {task:?} declares `over`; routing each element of a list is not supported")]
+    RouteWithOver { task: String },
+    #[error("task {task:?}: when names {route:?}, which is not one of its dependencies")]
+    WhenNotADependency { task: String, route: String },
+    #[error("task {task:?}: when names {route:?}, which is a {kind} task, not a route")]
+    WhenNotARoute {
+        task: String,
+        route: String,
+        kind: &'static str,
+    },
+    #[error(
+        "task {task:?}: route {route:?} has no question {question:?}; it declares: {}",
+        .declared.join(", ")
+    )]
+    WhenUnknownQuestion {
+        task: String,
+        route: String,
+        question: String,
+        declared: Vec<String>,
+    },
+    #[error("task {task:?}: when on {route}.{question} lists no labels")]
+    WhenWithoutLabels {
+        task: String,
+        route: String,
+        question: String,
+    },
+    #[error("task {task:?}: when on {route}.{question} lists {label:?} twice")]
+    WhenRepeatedLabel {
+        task: String,
+        route: String,
+        question: String,
+        label: String,
+    },
+    #[error(
+        "task {task:?}: {route}.{question} cannot answer {label:?}; its labels are: {}",
+        .declared.join(", ")
+    )]
+    WhenUnknownLabel {
+        task: String,
+        route: String,
+        question: String,
+        label: String,
+        declared: Vec<String>,
+    },
+    #[error(
+        "route {route:?}, question {question:?}: no task runs on {}. Add a task with a matching \
+         when, or list them under the question's drop",
+        .labels.join(", ")
+    )]
+    UnroutedLabels {
+        route: String,
+        question: String,
+        labels: Vec<String>,
+    },
+    #[error(
+        "task {task:?} revises {target:?} but does not depend on it; a reviewer reads the work it \
+         sends back from a direct dependency"
+    )]
+    ReviseTargetNotADependency { task: String, target: String },
+    #[error("task {task:?}: max_rounds = {got} is outside 2..={MAX_ROUNDS_CEILING}")]
+    RoundsOutOfRange { task: String, got: u32 },
+    #[error(
+        "task {task:?} revises {target:?}, a {kind} task; only agent, command, and evaluate tasks \
+         take part in a revise loop"
+    )]
+    ReviseOnUnsupportedTask {
+        task: String,
+        target: String,
+        kind: &'static str,
+    },
+    #[error(
+        "task {task:?} revises {target:?}, and one of them maps over a list; a round re-runs one \
+         task, not a fan-out"
+    )]
+    ReviseWithFanout { task: String, target: String },
+    #[error(
+        "task {task:?} revises {target:?} and declares when; a reviewer runs whenever what it \
+         revises does, so put the when on {target:?}"
+    )]
+    WhenOnReviewer { task: String, target: String },
+    #[error("tasks {left:?} and {right:?} both revise {target:?}; a task has at most one reviewer")]
+    ReviseTargetRevisedTwice {
+        left: String,
+        right: String,
+        target: String,
+    },
+    #[error(
+        "task {task:?} revises {target:?}, which is itself in another revise loop; revise loops \
+         do not nest or chain"
+    )]
+    NestedRevise { task: String, target: String },
+    #[error(
+        "task {task:?} revises {target:?} and also depends on {dependency:?}, which depends on \
+         {target:?}; a round re-runs only {target:?} and {task:?}, so {dependency:?} would read \
+         a draft the loop replaces"
+    )]
+    ReviseAroundADependent {
+        task: String,
+        target: String,
+        dependency: String,
+    },
     #[error("plan has a dependency cycle involving: {}", .tasks.join(", "))]
     DependencyCycle { tasks: Vec<String> },
     #[error(
@@ -615,8 +823,120 @@ impl Plan {
                     });
                 }
             }
+            if let TaskKind::Route { questions, decider } = &t.task {
+                if questions.is_empty() {
+                    return Err(PlanError::RouteWithoutQuestions { task: task() });
+                }
+                for (id, question) in questions {
+                    question
+                        .validate()
+                        .map_err(|error| PlanError::InvalidQuestion {
+                            task: task(),
+                            question: id.to_string(),
+                            error,
+                        })?;
+                }
+                match decider {
+                    Decider::Model { min_confidence } => {
+                        if !(*min_confidence > 0.0 && *min_confidence <= 1.0) {
+                            return Err(PlanError::MinConfidenceOutOfRange {
+                                task: task(),
+                                got: *min_confidence,
+                            });
+                        }
+                        if t.needs != NEEDS_SYSTEMONE {
+                            return Err(PlanError::RouteNeeds {
+                                task: task(),
+                                got: t.needs.clone(),
+                            });
+                        }
+                    }
+                    Decider::Output { task: source } => {
+                        if !t.depends_on.contains(source) {
+                            return Err(PlanError::RouteSourceNotADependency {
+                                task: task(),
+                                source_task: source.0.clone(),
+                            });
+                        }
+                        let emits = &self.tasks[index[source]].emits;
+                        if let Some(missing) = questions.keys().find(|id| {
+                            !emits.is_empty() && !emits.iter().any(|f| f.0 == id.as_str())
+                        }) {
+                            return Err(PlanError::RouteSourceOmitsQuestion {
+                                task: task(),
+                                source_task: source.0.clone(),
+                                question: missing.to_string(),
+                            });
+                        }
+                    }
+                }
+                if t.over.is_some() {
+                    return Err(PlanError::RouteWithOver { task: task() });
+                }
+            }
+            if let Some(when) = &t.when {
+                let route = || when.task.0.clone();
+                let question = || when.question.to_string();
+                if !t.depends_on.contains(&when.task) {
+                    return Err(PlanError::WhenNotADependency {
+                        task: task(),
+                        route: route(),
+                    });
+                }
+                let target = &self.tasks[index[&when.task]];
+                let TaskKind::Route { questions, .. } = &target.task else {
+                    return Err(PlanError::WhenNotARoute {
+                        task: task(),
+                        route: route(),
+                        kind: target.task.label(),
+                    });
+                };
+                let Some(asked) = questions.get(&when.question) else {
+                    return Err(PlanError::WhenUnknownQuestion {
+                        task: task(),
+                        route: route(),
+                        question: question(),
+                        declared: questions.keys().map(ToString::to_string).collect(),
+                    });
+                };
+                if when.is.is_empty() {
+                    return Err(PlanError::WhenWithoutLabels {
+                        task: task(),
+                        route: route(),
+                        question: question(),
+                    });
+                }
+                let mut listed = BTreeSet::new();
+                for label in &when.is {
+                    if !asked.resolves_to(label) {
+                        return Err(PlanError::WhenUnknownLabel {
+                            task: task(),
+                            route: route(),
+                            question: question(),
+                            label: label.to_string(),
+                            declared: asked
+                                .labels()
+                                .iter()
+                                .map(ToString::to_string)
+                                .chain([UNCERTAIN.to_owned()])
+                                .collect(),
+                        });
+                    }
+                    if !listed.insert(label) {
+                        return Err(PlanError::WhenRepeatedLabel {
+                            task: task(),
+                            route: route(),
+                            question: question(),
+                            label: label.to_string(),
+                        });
+                    }
+                }
+            }
             if !t.emits.is_empty() {
-                if matches!(t.task, TaskKind::TopK { .. } | TaskKind::Engine { .. }) {
+                if matches!(
+                    t.task,
+                    TaskKind::TopK { .. } | TaskKind::Route { .. } | TaskKind::Engine { .. }
+                ) {
                     return Err(PlanError::EmitsOnEngineTask {
                         task: task(),
                         kind: t.task.label(),
@@ -743,6 +1063,112 @@ impl Plan {
                     }
                 }
             }
+            if let Some(revise) = &t.revise {
+                let target = || revise.task.0.clone();
+                if t.when.is_some() {
+                    return Err(PlanError::WhenOnReviewer {
+                        task: task(),
+                        target: target(),
+                    });
+                }
+                if !t.depends_on.contains(&revise.task) {
+                    return Err(PlanError::ReviseTargetNotADependency {
+                        task: task(),
+                        target: target(),
+                    });
+                }
+                if !(2..=MAX_ROUNDS_CEILING).contains(&revise.max_rounds) {
+                    return Err(PlanError::RoundsOutOfRange {
+                        task: task(),
+                        got: revise.max_rounds,
+                    });
+                }
+                let Some(&proposer) = index.get(&revise.task) else {
+                    return Err(PlanError::UnknownDependency {
+                        task: task(),
+                        dependency: target(),
+                    });
+                };
+                let proposer = &self.tasks[proposer];
+                for member in [t, proposer] {
+                    if !matches!(
+                        member.task,
+                        TaskKind::Agent { .. }
+                            | TaskKind::Command { .. }
+                            | TaskKind::Evaluate { .. }
+                    ) {
+                        return Err(PlanError::ReviseOnUnsupportedTask {
+                            task: task(),
+                            target: target(),
+                            kind: member.task.label(),
+                        });
+                    }
+                    if member.over.is_some() {
+                        return Err(PlanError::ReviseWithFanout {
+                            task: task(),
+                            target: target(),
+                        });
+                    }
+                }
+                if proposer.revise.is_some() {
+                    return Err(PlanError::NestedRevise {
+                        task: task(),
+                        target: target(),
+                    });
+                }
+                for other in &self.tasks {
+                    let Some(other_revise) = &other.revise else {
+                        continue;
+                    };
+                    if other.name == t.name {
+                        continue;
+                    }
+                    if other_revise.task == revise.task {
+                        return Err(PlanError::ReviseTargetRevisedTwice {
+                            left: task(),
+                            right: other.name.0.clone(),
+                            target: target(),
+                        });
+                    }
+                    if other_revise.task == t.name {
+                        return Err(PlanError::NestedRevise {
+                            task: other.name.0.clone(),
+                            target: task(),
+                        });
+                    }
+                }
+            }
+        }
+        let mut handled: BTreeMap<(&TaskName, &QuestionId), BTreeSet<&Label>> = BTreeMap::new();
+        for t in &self.tasks {
+            if let Some(when) = &t.when {
+                handled
+                    .entry((&when.task, &when.question))
+                    .or_default()
+                    .extend(&when.is);
+            }
+        }
+        for ((route, question), listed) in &handled {
+            let TaskKind::Route { questions, .. } = &self.tasks[index[route]].task else {
+                continue;
+            };
+            let Some(asked) = questions.get(question) else {
+                continue;
+            };
+            let unrouted: Vec<String> = asked
+                .labels()
+                .into_iter()
+                .chain([Label::uncertain()])
+                .filter(|l| !listed.contains(l) && !asked.drop.contains(l))
+                .map(|l| l.to_string())
+                .collect();
+            if !unrouted.is_empty() {
+                return Err(PlanError::UnroutedLabels {
+                    route: route.0.clone(),
+                    question: question.to_string(),
+                    labels: unrouted,
+                });
+            }
         }
         // Kahn's algorithm; leftovers mean a cycle. The ready set is a min-heap on the
         // declaration index so the order is deterministic and declaration-stable: ties
@@ -815,6 +1241,21 @@ impl Plan {
                 }
             }
         }
+        for t in &self.tasks {
+            let Some(revise) = &t.revise else { continue };
+            let Some(&proposer) = index.get(&revise.task) else {
+                continue;
+            };
+            for d in t.depends_on.iter().filter(|d| **d != revise.task) {
+                if index.get(d).is_some_and(|&i| reaches(proposer, i)) {
+                    return Err(PlanError::ReviseAroundADependent {
+                        task: t.name.0.clone(),
+                        target: revise.task.0.clone(),
+                        dependency: d.0.clone(),
+                    });
+                }
+            }
+        }
         Ok(ValidPlan { plan: self, topo })
     }
 }
@@ -843,6 +1284,8 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            when: None,
+            revise: None,
         }
     }
 
@@ -853,6 +1296,391 @@ mod tests {
             budget: PlanBudget { usd: 5.0 },
             tasks,
         }
+    }
+
+    fn label(s: &str) -> Label {
+        Label::new(s).unwrap()
+    }
+
+    fn qid(s: &str) -> QuestionId {
+        QuestionId::new(s).unwrap()
+    }
+
+    fn area_question(drop: &[&str]) -> Question {
+        use crucible_contract::decision::{ChoiceOption, QuestionKind};
+        Question {
+            instructions: "Which component?".into(),
+            kind: QuestionKind::Choice {
+                options: ["scheduler", "frontend"]
+                    .iter()
+                    .map(|o| ChoiceOption {
+                        label: label(o),
+                        description: None,
+                    })
+                    .collect(),
+            },
+            drop: drop.iter().map(|l| label(l)).collect(),
+        }
+    }
+
+    fn model_route(name: &str, deps: &[&str], drop: &[&str]) -> Task {
+        Task {
+            task: TaskKind::Route {
+                questions: BTreeMap::from([(qid("area"), area_question(drop))]),
+                decider: Decider::Model {
+                    min_confidence: 0.8,
+                },
+            },
+            needs: NEEDS_SYSTEMONE.into(),
+            ..agent(name, deps)
+        }
+    }
+
+    fn output_route(name: &str, source: &str, drop: &[&str]) -> Task {
+        Task {
+            task: TaskKind::Route {
+                questions: BTreeMap::from([(qid("area"), area_question(drop))]),
+                decider: Decider::Output {
+                    task: source.into(),
+                },
+            },
+            ..agent(name, &[source])
+        }
+    }
+
+    fn on(mut task: Task, route: &str, question: &str, is: &[&str]) -> Task {
+        task.when = Some(When {
+            task: route.into(),
+            question: qid(question),
+            is: is.iter().map(|l| label(l)).collect(),
+        });
+        task
+    }
+
+    fn routed() -> Vec<Task> {
+        vec![
+            agent("scan", &[]),
+            model_route("gate", &["scan"], &[]),
+            on(agent("fix", &["gate"]), "gate", "area", &["scheduler"]),
+            on(
+                agent("punt", &["gate"]),
+                "gate",
+                "area",
+                &["frontend", "uncertain"],
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_thresholded_evaluate_parses_from_json() {
+        let json = r#"{"version":1,"budget":{"usd":5.0},"task":[{"name":"e","kind":"evaluate","command":"x","threshold":0.5,"direction":"higher"}]}"#;
+        let plan = Plan::from_json_str(json).unwrap();
+        let TaskKind::Evaluate { threshold, .. } = &plan.tasks[0].task else {
+            panic!("e is not an evaluate");
+        };
+        assert_eq!(*threshold, Some(0.5));
+    }
+
+    #[test]
+    fn a_fully_routed_question_validates() {
+        plan(routed()).validate().unwrap();
+    }
+
+    #[test]
+    fn a_route_and_its_when_round_trip_through_toml_and_json() {
+        let original = plan(routed());
+        let text = toml::to_string(&original).unwrap();
+        let from_toml = Plan::from_toml_str(&text).unwrap();
+        let from_json = Plan::from_json_str(&serde_json::to_string(&original).unwrap()).unwrap();
+        for back in [from_toml, from_json] {
+            assert_eq!(back.tasks[2].when, original.tasks[2].when);
+            let TaskKind::Route { questions, decider } = &back.tasks[1].task else {
+                panic!("gate is not a route");
+            };
+            assert_eq!(questions[&qid("area")], area_question(&[]));
+            assert_eq!(
+                *decider,
+                Decider::Model {
+                    min_confidence: 0.8
+                }
+            );
+            back.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn an_integer_min_confidence_parses_from_toml() {
+        let text = toml::to_string(&plan(routed()))
+            .unwrap()
+            .replace("min_confidence = 0.8", "min_confidence = 1");
+        Plan::from_toml_str(&text).unwrap().validate().unwrap();
+    }
+
+    #[test]
+    fn a_task_without_when_serializes_without_the_key() {
+        let text = toml::to_string(&plan(vec![agent("a", &[])])).unwrap();
+        assert!(!text.contains("when"), "{text}");
+    }
+
+    #[test]
+    fn a_route_needs_questions() {
+        let mut gate = model_route("gate", &[], &[]);
+        gate.task = TaskKind::Route {
+            questions: BTreeMap::new(),
+            decider: Decider::Model {
+                min_confidence: 0.8,
+            },
+        };
+        assert_eq!(
+            plan(vec![gate]).validate().unwrap_err(),
+            PlanError::RouteWithoutQuestions {
+                task: "gate".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_route_rejects_an_invalid_question() {
+        let mut gate = model_route("gate", &[], &["ghost"]);
+        assert_eq!(
+            plan(vec![gate.clone()]).validate().unwrap_err(),
+            PlanError::InvalidQuestion {
+                task: "gate".into(),
+                question: "area".into(),
+                error: QuestionError::UnknownDrop {
+                    label: label("ghost")
+                },
+            }
+        );
+        if let TaskKind::Route { questions, .. } = &mut gate.task {
+            let q = questions.get_mut(&qid("area")).unwrap();
+            q.drop.clear();
+            q.instructions = String::new();
+        }
+        assert!(matches!(
+            plan(vec![gate]).validate().unwrap_err(),
+            PlanError::InvalidQuestion {
+                error: QuestionError::EmptyInstructions,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn min_confidence_must_lie_in_zero_exclusive_to_one_inclusive() {
+        for (value, ok) in [
+            (0.0, false),
+            (-0.5, false),
+            (1.01, false),
+            (f64::NAN, false),
+            (0.01, true),
+            (1.0, true),
+        ] {
+            let mut gate = model_route("gate", &[], &[]);
+            if let TaskKind::Route { decider, .. } = &mut gate.task {
+                *decider = Decider::Model {
+                    min_confidence: value,
+                };
+            }
+            let got = plan(vec![gate]).validate();
+            assert_eq!(got.is_ok(), ok, "min_confidence = {value}");
+            if !ok {
+                assert!(matches!(
+                    got.unwrap_err(),
+                    PlanError::MinConfidenceOutOfRange { .. }
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn a_model_route_must_need_systemone_and_an_output_route_need_not() {
+        let mut gate = model_route("gate", &[], &[]);
+        gate.needs = "any".into();
+        assert_eq!(
+            plan(vec![gate]).validate().unwrap_err(),
+            PlanError::RouteNeeds {
+                task: "gate".into(),
+                got: "any".into()
+            }
+        );
+        plan(vec![
+            agent("classify", &[]),
+            output_route("gate", "classify", &[]),
+        ])
+        .validate()
+        .unwrap();
+    }
+
+    #[test]
+    fn a_route_rejects_over_and_emits() {
+        let mut gate = model_route("gate", &["scan"], &[]);
+        gate.over = Some(OutputRef {
+            task: "scan".into(),
+            field: OutputField("issues".into()),
+        });
+        gate.max_fanout = Some(4);
+        assert_eq!(
+            plan(vec![agent("scan", &[]), gate]).validate().unwrap_err(),
+            PlanError::RouteWithOver {
+                task: "gate".into()
+            }
+        );
+        let mut gate = model_route("gate", &[], &[]);
+        gate.emits = vec![OutputField("area".into())];
+        assert_eq!(
+            plan(vec![gate]).validate().unwrap_err(),
+            PlanError::EmitsOnEngineTask {
+                task: "gate".into(),
+                kind: "route"
+            }
+        );
+    }
+
+    #[test]
+    fn an_output_route_reads_a_dependency_that_declares_the_question() {
+        let mut gate = output_route("gate", "classify", &[]);
+        gate.depends_on.clear();
+        assert_eq!(
+            plan(vec![agent("classify", &[]), gate])
+                .validate()
+                .unwrap_err(),
+            PlanError::RouteSourceNotADependency {
+                task: "gate".into(),
+                source_task: "classify".into()
+            }
+        );
+        let mut classify = agent("classify", &[]);
+        classify.emits = vec![OutputField("severity".into())];
+        assert_eq!(
+            plan(vec![
+                classify.clone(),
+                output_route("gate", "classify", &[])
+            ])
+            .validate()
+            .unwrap_err(),
+            PlanError::RouteSourceOmitsQuestion {
+                task: "gate".into(),
+                source_task: "classify".into(),
+                question: "area".into()
+            }
+        );
+        classify.emits.push(OutputField("area".into()));
+        plan(vec![classify, output_route("gate", "classify", &[])])
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn when_must_name_a_route_among_the_dependencies() {
+        let mut tasks = routed();
+        tasks[2].depends_on = vec!["scan".into()];
+        assert_eq!(
+            plan(tasks).validate().unwrap_err(),
+            PlanError::WhenNotADependency {
+                task: "fix".into(),
+                route: "gate".into()
+            }
+        );
+        let mut tasks = routed();
+        tasks[2] = on(
+            agent("fix", &["scan", "gate"]),
+            "scan",
+            "area",
+            &["scheduler"],
+        );
+        assert_eq!(
+            plan(tasks).validate().unwrap_err(),
+            PlanError::WhenNotARoute {
+                task: "fix".into(),
+                route: "scan".into(),
+                kind: "agent"
+            }
+        );
+    }
+
+    #[test]
+    fn when_must_name_a_declared_question_and_labels() {
+        let mut tasks = routed();
+        tasks[2] = on(agent("fix", &["gate"]), "gate", "aria", &["scheduler"]);
+        assert_eq!(
+            plan(tasks).validate().unwrap_err(),
+            PlanError::WhenUnknownQuestion {
+                task: "fix".into(),
+                route: "gate".into(),
+                question: "aria".into(),
+                declared: vec!["area".into()]
+            }
+        );
+        let mut tasks = routed();
+        tasks[2] = on(agent("fix", &["gate"]), "gate", "area", &["schedular"]);
+        assert_eq!(
+            plan(tasks).validate().unwrap_err(),
+            PlanError::WhenUnknownLabel {
+                task: "fix".into(),
+                route: "gate".into(),
+                question: "area".into(),
+                label: "schedular".into(),
+                declared: vec!["scheduler".into(), "frontend".into(), "uncertain".into()]
+            }
+        );
+        let mut tasks = routed();
+        tasks[2] = on(agent("fix", &["gate"]), "gate", "area", &[]);
+        assert!(matches!(
+            plan(tasks).validate().unwrap_err(),
+            PlanError::WhenWithoutLabels { .. }
+        ));
+        let mut tasks = routed();
+        tasks[2] = on(
+            agent("fix", &["gate"]),
+            "gate",
+            "area",
+            &["scheduler", "scheduler"],
+        );
+        assert!(matches!(
+            plan(tasks).validate().unwrap_err(),
+            PlanError::WhenRepeatedLabel { .. }
+        ));
+    }
+
+    #[test]
+    fn every_label_of_a_routed_question_is_handled_or_dropped() {
+        let mut tasks = routed();
+        tasks.pop();
+        assert_eq!(
+            plan(tasks.clone()).validate().unwrap_err(),
+            PlanError::UnroutedLabels {
+                route: "gate".into(),
+                question: "area".into(),
+                labels: vec!["frontend".into(), "uncertain".into()]
+            }
+        );
+        tasks[1] = model_route("gate", &["scan"], &["frontend", "uncertain"]);
+        plan(tasks).validate().unwrap();
+    }
+
+    #[test]
+    fn a_question_no_when_refers_to_need_not_be_routed() {
+        plan(vec![
+            agent("scan", &[]),
+            model_route("gate", &["scan"], &[]),
+        ])
+        .validate()
+        .unwrap();
+    }
+
+    #[test]
+    fn a_when_displays_as_route_question_in_labels() {
+        let task = on(
+            agent("punt", &["gate"]),
+            "gate",
+            "area",
+            &["frontend", "uncertain"],
+        );
+        assert_eq!(
+            task.when.unwrap().to_string(),
+            "gate.area in frontend|uncertain"
+        );
     }
 
     #[test]
@@ -994,6 +1822,8 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            when: None,
+            revise: None,
         };
         let err = plan(vec![t]).validate().unwrap_err();
         assert_eq!(
@@ -1121,6 +1951,8 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            when: None,
+            revise: None,
         }
     }
 
@@ -1557,5 +2389,221 @@ mod tests {
             .validate()
             .expect("one stage, one graph");
         assert_eq!(ok.plan().tasks.len(), 2);
+    }
+
+    fn reviewer(name: &str, deps: &[&str], target: &str, max_rounds: u32) -> Task {
+        let mut t = agent(name, deps);
+        t.revise = Some(Revise {
+            task: target.into(),
+            max_rounds,
+        });
+        t
+    }
+
+    fn refused(tasks: Vec<Task>) -> PlanError {
+        plan(tasks).validate().unwrap_err()
+    }
+
+    /// A plan that arrives as JSON never passes through the starlark front end, so every
+    /// structural fact about a revise loop is checked here or nowhere.
+    #[test]
+    fn a_revise_loop_round_trips_and_validates_on_the_json_route() {
+        let p = plan(vec![
+            agent("author", &[]),
+            reviewer("repro", &["author"], "author", 3),
+        ]);
+        let json = serde_json::to_value(&p).unwrap();
+        assert_eq!(
+            json["task"][1]["revise"],
+            serde_json::json!({"task": "author", "max_rounds": 3})
+        );
+        assert!(json["task"][0].get("revise").is_none(), "{json}");
+        let back = Plan::from_json_str(&json.to_string())
+            .unwrap()
+            .validate()
+            .unwrap();
+        assert_eq!(
+            back.get(&"repro".into()).and_then(|t| t.revise.clone()),
+            Some(Revise {
+                task: "author".into(),
+                max_rounds: 3
+            })
+        );
+    }
+
+    #[test]
+    fn a_reviewer_cannot_be_conditional_and_what_it_revises_can() {
+        let gate = output_route("gate", "classify", &["frontend", "uncertain"]);
+        let base = || vec![agent("classify", &[]), gate.clone()];
+        let mut tasks = base();
+        tasks.push(on(
+            agent("author", &["gate"]),
+            "gate",
+            "area",
+            &["scheduler"],
+        ));
+        tasks.push(reviewer("repro", &["author"], "author", 3));
+        plan(tasks).validate().unwrap();
+
+        let mut tasks = base();
+        tasks.push(agent("author", &[]));
+        tasks.push(on(
+            reviewer("repro", &["author", "gate"], "author", 3),
+            "gate",
+            "area",
+            &["scheduler"],
+        ));
+        assert_eq!(
+            plan(tasks).validate().unwrap_err(),
+            PlanError::WhenOnReviewer {
+                task: "repro".into(),
+                target: "author".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_reviewer_must_depend_on_what_it_revises() {
+        assert_eq!(
+            refused(vec![
+                agent("author", &[]),
+                reviewer("repro", &[], "author", 3)
+            ]),
+            PlanError::ReviseTargetNotADependency {
+                task: "repro".into(),
+                target: "author".into()
+            }
+        );
+    }
+
+    #[test]
+    fn max_rounds_is_bounded_on_both_sides() {
+        for got in [0, 1, MAX_ROUNDS_CEILING + 1] {
+            assert_eq!(
+                refused(vec![
+                    agent("author", &[]),
+                    reviewer("repro", &["author"], "author", got)
+                ]),
+                PlanError::RoundsOutOfRange {
+                    task: "repro".into(),
+                    got
+                }
+            );
+        }
+        for ok in [2, MAX_ROUNDS_CEILING] {
+            assert!(
+                plan(vec![
+                    agent("author", &[]),
+                    reviewer("repro", &["author"], "author", ok)
+                ])
+                .validate()
+                .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn only_agent_command_and_evaluate_tasks_take_part_in_a_revise_loop() {
+        let mut reducer = top_k("pick", &["author"]);
+        reducer.revise = Some(Revise {
+            task: "author".into(),
+            max_rounds: 2,
+        });
+        assert_eq!(
+            refused(vec![emitting("author", &[], &["score"]), reducer]),
+            PlanError::ReviseOnUnsupportedTask {
+                task: "pick".into(),
+                target: "author".into(),
+                kind: "top_k"
+            }
+        );
+        assert_eq!(
+            refused(vec![
+                emitting("author", &[], &["score"]),
+                top_k("fold", &["author"]),
+                reviewer("repro", &["fold"], "fold", 2),
+            ]),
+            PlanError::ReviseOnUnsupportedTask {
+                task: "repro".into(),
+                target: "fold".into(),
+                kind: "top_k"
+            }
+        );
+    }
+
+    #[test]
+    fn a_revise_loop_does_not_run_over_a_fanout() {
+        let targets = OutputRef {
+            task: "discover".into(),
+            field: OutputField("targets".into()),
+        };
+        let mut mapped = agent("audit", &["discover"]);
+        mapped.over = Some(targets);
+        mapped.max_fanout = Some(4);
+        assert_eq!(
+            refused(vec![
+                emitting("discover", &[], &["targets"]),
+                mapped,
+                reviewer("repro", &["audit"], "audit", 2),
+            ]),
+            PlanError::ReviseWithFanout {
+                task: "repro".into(),
+                target: "audit".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_task_has_at_most_one_reviewer_and_loops_do_not_chain() {
+        assert_eq!(
+            refused(vec![
+                agent("author", &[]),
+                reviewer("left", &["author"], "author", 2),
+                reviewer("right", &["author"], "author", 2),
+            ]),
+            PlanError::ReviseTargetRevisedTwice {
+                left: "left".into(),
+                right: "right".into(),
+                target: "author".into()
+            }
+        );
+        assert_eq!(
+            refused(vec![
+                agent("author", &[]),
+                reviewer("repro", &["author"], "author", 2),
+                reviewer("confirm", &["repro"], "repro", 2),
+            ]),
+            PlanError::NestedRevise {
+                task: "confirm".into(),
+                target: "repro".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_reviewer_cannot_read_the_draft_through_another_dependency() {
+        assert_eq!(
+            refused(vec![
+                agent("author", &[]),
+                agent("build", &["author"]),
+                reviewer("repro", &["author", "build"], "author", 2),
+            ]),
+            PlanError::ReviseAroundADependent {
+                task: "repro".into(),
+                target: "author".into(),
+                dependency: "build".into()
+            }
+        );
+    }
+
+    #[test]
+    fn revision_is_a_reserved_input_name() {
+        assert_eq!(
+            refused(vec![agent("revision", &[]), agent("author", &["revision"])]),
+            PlanError::ReservedDependencyName {
+                task: "author".into(),
+                dependency: "revision".into()
+            }
+        );
     }
 }

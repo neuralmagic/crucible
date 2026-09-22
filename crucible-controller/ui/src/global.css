@@ -1,0 +1,255 @@
+@import 'tailwindcss' source('../src');
+
+@import '@fontsource/public-sans/latin-400.css';
+@import '@fontsource/public-sans/latin-500.css';
+@import '@fontsource/public-sans/latin-600.css';
+@import '@fontsource/public-sans/latin-700.css';
+
+@import '@xyflow/react/dist/style.css';
+
+@font-face {
+  font-family: 'Ioskeley Mono';
+  src: url('/fonts/IoskeleyMono-Regular.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Ioskeley Mono';
+  src: url('/fonts/IoskeleyMono-Medium.woff2') format('woff2');
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Ioskeley Mono';
+  src: url('/fonts/IoskeleyMono-SemiBold.woff2') format('woff2');
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Ioskeley Mono';
+  src: url('/fonts/IoskeleyMono-Bold.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+@custom-variant dark (&:where([data-theme='dark'], [data-theme='dark'] *));
+
+@theme {
+  --color-paper: #edebe2;
+  --color-surface: #ffffff;
+  --color-raised: #ffffff;
+  --color-sunk: #dddacd;
+  --color-ink: #100f0e;
+  --color-ink-2: #464439;
+  --color-ink-3: #615f56;
+  --color-rule: #c4c0b0;
+  --color-rule-hard: #8a8676;
+  --color-green: #00663a;
+  --color-amber: #7e4f00;
+  --color-red: #96181f;
+  --color-blue: #1a4785;
+  --color-hi: #ffeda8;
+
+  --font-mono: 'Ioskeley Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  --font-sans: 'Public Sans', system-ui, -apple-system, 'Helvetica Neue', Arial, sans-serif;
+
+  --text-micro: 9px;
+  --text-label: 10px;
+  --text-data: 11px;
+  --text-data-lg: 12px;
+  --text-body: 13px;
+  --text-wordmark: 14px;
+  --text-lede: 15px;
+  --text-figure: 16px;
+  --text-title: 22px;
+  --text-display: 24px;
+
+  --tracking-title: -0.015em;
+  --tracking-display: 0.02em;
+  --tracking-data: 0.03em;
+  --tracking-action: 0.04em;
+  --tracking-label: 0.06em;
+  --tracking-group: 0.08em;
+  --tracking-section: 0.1em;
+  --tracking-eyebrow: 0.12em;
+  --tracking-brand: 0.14em;
+
+  --spacing-row: 30px;
+
+  --breakpoint-wide: 1100px;
+}
+
+:root[data-theme='dark'] {
+  --color-paper: #0a0a09;
+  --color-surface: #1c1c19;
+  --color-raised: #2a2a24;
+  --color-sunk: #040403;
+  --color-ink: #f5f3ea;
+  --color-ink-2: #adaa9d;
+  --color-ink-3: #878477;
+  --color-rule: #3a3830;
+  --color-rule-hard: #666254;
+  --color-green: #5acb86;
+  --color-amber: #dfa53f;
+  --color-red: #e56b69;
+  --color-blue: #83afe8;
+  --color-hi: #463d18;
+}
+
+:root {
+  --paper: var(--color-paper);
+  --surface: var(--color-surface);
+  --raised: var(--color-raised);
+  --sunk: var(--color-sunk);
+  --ink: var(--color-ink);
+  --ink-2: var(--color-ink-2);
+  --ink-3: var(--color-ink-3);
+  --rule: var(--color-rule);
+  --rule-hard: var(--color-rule-hard);
+  --green: var(--color-green);
+  --amber: var(--color-amber);
+  --red: var(--color-red);
+  --blue: var(--color-blue);
+  --hi: var(--color-hi);
+  --mono: var(--font-mono);
+  --sans: var(--font-sans);
+  --row: var(--spacing-row);
+}
+
+* {
+  box-sizing: border-box;
+  border-radius: 0;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--color-paper);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  font-size: var(--text-body);
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+  font-variant-numeric: tabular-nums;
+}
+
+@layer base {
+  a {
+    color: inherit;
+    text-decoration: none;
+  }
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-blue);
+  outline-offset: 1px;
+}
+
+/* React Flow paints from its own custom properties; mapping them onto the app's tokens is what
+   makes the compiled-plan graph follow the theme toggle. */
+.react-flow {
+  --xy-background-color: var(--color-paper);
+  --xy-background-pattern-dots-color: var(--color-rule);
+  --xy-edge-stroke: var(--color-rule-hard);
+  --xy-edge-stroke-selected: var(--color-ink);
+  --xy-node-color: var(--color-ink);
+  --xy-node-border: 1px solid var(--color-rule-hard);
+  --xy-node-background-color: var(--color-surface);
+  --xy-node-border-radius: 0;
+  --xy-handle-background-color: transparent;
+  --xy-handle-border-color: transparent;
+  --xy-selection-background-color: transparent;
+  --xy-selection-border: 1px dotted var(--color-rule-hard);
+  --xy-attribution-background-color: transparent;
+  --xy-controls-button-background-color: var(--color-surface);
+  --xy-controls-button-background-color-hover: var(--color-sunk);
+  --xy-controls-button-color: var(--color-ink-2);
+  --xy-controls-button-color-hover: var(--color-ink);
+  --xy-controls-button-border-color: var(--color-rule-hard);
+  --xy-controls-box-shadow: none;
+  --xy-minimap-background-color: var(--color-surface);
+  --xy-minimap-mask-background-color: color-mix(in srgb, var(--color-paper) 65%, transparent);
+  --xy-minimap-mask-stroke-color: var(--color-rule-hard);
+  --xy-minimap-node-background-color: var(--color-ink-3);
+  --xy-minimap-node-stroke-color: var(--color-ink-3);
+  font-family: var(--font-mono);
+}
+
+.react-flow__controls,
+.react-flow__minimap {
+  border: 1px solid var(--color-rule-hard);
+}
+
+.react-flow__controls {
+  margin: 6px;
+}
+
+.react-flow__controls-button {
+  width: 18px;
+  height: 18px;
+  padding: 3px;
+  border-bottom: 1px solid var(--color-rule);
+}
+
+.react-flow__controls-button:last-child {
+  border-bottom: none;
+}
+
+.react-flow__minimap {
+  margin: 6px;
+  width: 130px;
+  height: 84px;
+}
+
+.react-flow__attribution {
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+}
+
+.react-flow__attribution a {
+  color: var(--color-ink-3);
+}
+
+/* The theme covers every colour Monaco paints; these cover the two it cannot reach: the face its
+   chrome is set in, and the drop shadows this app has nowhere else. */
+.monaco-editor,
+.monaco-editor-hover,
+.monaco-menu {
+  --monaco-monospace-font: var(--font-mono);
+  font-family: var(--font-mono);
+}
+
+.monaco-editor .suggest-widget,
+.monaco-editor .suggest-details,
+.monaco-editor .monaco-hover,
+.monaco-editor .find-widget,
+.monaco-editor .parameter-hints-widget,
+.monaco-editor-hover,
+.monaco-menu {
+  font-size: var(--text-data);
+  box-shadow: none;
+  border: 1px solid var(--color-rule-hard);
+}
+
+.monaco-editor .scroll-decoration,
+.monaco-editor .shadow {
+  box-shadow: none;
+}
+
+.monaco-editor .margin-view-overlays .line-numbers {
+  font-size: var(--text-micro);
+}
+
+/* A textarea has no password type; text-security is the only way to mask multi-line content. */
+.masked {
+  -webkit-text-security: disc;
+  text-security: disc;
+}

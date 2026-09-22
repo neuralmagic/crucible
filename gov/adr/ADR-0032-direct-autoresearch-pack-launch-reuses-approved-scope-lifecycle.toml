@@ -1,0 +1,34 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0032"
+title = "Direct autoresearch pack launch reuses approved-scope lifecycle"
+status = "accepted"
+date = "2026-08-26"
+refs = ["ADR-0027"]
+
+[content]
+context = "Operators need to run an already-authored autoresearch pack on the hosted controller without paying for an LLM scope turn or asking an agent to reconstruct files that already exist. The controller already has a durable frozen-pack store and a mature scoped-to-approved-to-build-to-run lifecycle. ADR-0027 separately establishes a single downstream launch path for registered playbooks; the same duplication risk applies here."
+decision = "Direct autoresearch launch will fetch and freeze the administrator-named repository, revision, and pack path, validate it before adoption, and enter the existing autoresearch state machine at the approved-scope boundary. The endpoint is an adapter into the existing lifecycle rather than a second runner."
+consequences = "Direct launch avoids unnecessary model spend and preserves one implementation of build planning, pod admission, run tracking, and completion. The stored scope remains the immutable provenance link for the run. The initial adapter uses scenario-shaped issue provenance, which keeps the change small but may warrant a later generalized pack input kind if direct launches need distinct querying or policy."
+
+[[content.alternatives]]
+text = "Enter at the approved-scope boundary and reuse the existing autoresearch lifecycle"
+status = "accepted"
+pros = [
+    "Reuses frozen pack storage, build planning, pod dispatch, run tracking, completion, and ledger behavior",
+    "The launch POST is a clear human authorization for the exact fetched tarball",
+]
+cons = ["Direct launches retain scenario-shaped provenance until input kinds are generalized"]
+
+[[content.alternatives]]
+text = "Create an independent direct-run state machine and dispatch path"
+status = "rejected"
+pros = ["Could model direct-launch provenance with bespoke tables and statuses"]
+cons = ["Duplicates build, admission, dispatch, tracking, completion, and recovery logic"]
+
+[[content.alternatives]]
+text = "Register autoresearch packs as playbooks and use the playbook launch API"
+status = "rejected"
+pros = ["Uses the existing no-scope API surface"]
+cons = ["Conflates iterative scored autoresearch with single-pass playbook semantics"]

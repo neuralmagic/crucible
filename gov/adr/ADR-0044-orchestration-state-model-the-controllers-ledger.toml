@@ -1,0 +1,157 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0044"
+title = "Orchestration state model — the controller's ledger"
+status = "proposed"
+date = "2026-07-02"
+refs = ["ADR-0043", "ADR-0042"]
+
+[content]
+context = """
+Related: [[ADR-0043]] (the controller this ledger serves),
+[ADR-0004](./0004-core-loop-state-model.md) (the precedent: state model as its own record),
+[ADR-0010](./0010-candidate-portfolios-and-search.md) (the candidates this tracks),
+[[ADR-0042]] (rig leases, the named deferral),
+`session.rs` (the versioned append-only log discipline this leans on, and never replaces).
+
+[[ADR-0043]] gave the outer loop a controller daemon with SQLite working state. This ADR fixes the
+state model itself: what the database is *for*, what it may never become, and the schema's
+load-bearing decisions. The one-sentence version: **the database is the control plane's
+queryable index; the append-only logs, git, S3, and GitHub remain the data plane's truth.** A
+run's own history never moves into a database; anything that must be queried across runs or
+claimed transactionally never stays in a flat file.
+
+The generalization this buys, beyond [[ADR-0043]]'s issue tracking: the causal chain
+issue → scope → run → candidate → PR — today scattered across `SCOPE.md`, worktrees,
+`FORGE_LATEST_FILE`, `RESULTS.md`, and PR URLs buried in session events — becomes one
+provenance graph. Admission caps become ledger queries. Wide-round resume (today a killed wide
+round forgets its measured lanes) becomes "skip the candidates that already have scores." Rig
+leases (the wide/explore=one-shot, deep/exploit=warm-lease synthesis) become a lease table the
+day [[ADR-0042]] needs one."""
+decision = """
+## Truth model: the database is a rebuildable index
+
+The DB is a **materialized view** over the canonical stores — session logs, S3 run records,
+GitHub issue/PR state. Every row carries a pointer to its evidence (a session-log URI, an S3
+key, an issue/PR URL). `crucible db rebuild` reconstructs the whole database from those
+sources; if the DB and the evidence disagree, the evidence wins and the row is wrong.
+
+Because the chosen migration policy (below) means the rebuild path is *not* exercised on every
+upgrade, it must be kept honest deliberately: the controller periodically rebuilds into a temp
+database and diffs it against the live one — drift detection and fallback-testing in one move.
+
+**The named exception, deferred:** rig leases are control state that exists nowhere else — a
+lease is not derivable from any log. When [[ADR-0042]] lands them, they become a documented
+split-authority island (or gain their own event stream to derive from). Deferring leases out
+of v1 keeps the truth model pure today; the tension is recorded here so it is a decision, not
+a surprise.
+
+## Ingest: the controller pulls; runs never know the database exists
+
+The single-writer rule (one controller process, one node) means loop pods, brokers, and
+sandboxes never touch the DB. Outcomes flow in through the edges that already exist: the
+controller's pod watch sees a run finish, reads the run's session log / S3 record, and folds
+the outcome into rows inside its own transaction. This also ingests **hand-launched** runs for
+free — anything that publishes a record is visible to the pull path, whether or not the
+controller started it. A push endpoint (a run POSTing its exit report) is explicitly not v1;
+if mid-run row freshness ever matters, it arrives as a latency optimization on top of pull,
+never as a correctness dependency.
+
+## Granularity: per-candidate rows
+
+One row per wide-round lane and per deep-loop iteration — score, decision, worktree, sandbox
+name, PR URL — not just a per-run summary. This is what makes the provenance graph complete
+and wide-round resume real. The session log already carries all of it per-candidate (`row`
+events), so the pull path has its source.
+
+## Topology: one database per controller
+
+`state/outer.sqlite`, with repo/pack as columns, not as database boundaries. The DB's scope
+equals the process's scope equals the writer's scope — the global daily budget and the
+cross-repo inbox are single-database queries. Per-repo or per-pack databases were rejected:
+the outer loop is precisely the thing that spans them.
+
+## Migrations: real migrations, rebuild as disaster fallback
+
+Versioned SQL migrations run on startup (sqlx's embedded migrations). Rebuild-from-evidence is
+the fallback for disasters and the periodic drift check above — not the upgrade path, so
+upgrades stay fast and offline.
+
+## Retention: keep everything
+
+Rows are pointers and scalars, never payloads; the provenance graph is the product. SQLite is
+comfortable orders of magnitude beyond this workload. Revisit only if triaging a huge upstream
+tracker measurably bloats the file.
+
+## Overrides: an HTTP API on the controller, CLI first, UI later
+
+Humans change state (unpark, bump priority, force-done) through a small HTTP API on the
+controller — the control-bridge pattern the inner loop already uses. The CLI
+(`crucible triage park|unpark|bump …`) is client #1; a web UI is client #2 of the same
+endpoints, already anticipated. Override writes go through the work queue like any other
+event, so they compose with claims instead of racing them. Writing the SQLite file directly is
+documented only as daemon-stopped surgery. Reads are unrestricted — the report generator and
+any read-only UI can open the file (WAL mode) or query over the API.
+
+## Technology: sqlx (sqlite), and async stops at the controller's edge
+
+The controller is the codebase's one naturally-async component — kube watches, the override
+API, and now sqlx share one tokio runtime. The reconcile function itself stays synchronous
+engine code, entered via `spawn_blocking`; **no other crate in the workspace grows an async
+dependency because of this choice.** sqlx also supplies the embedded migrations above. Its
+compile-time query checking runs in offline mode (the checked-in `.sqlx` metadata), so builds
+need no live database.
+
+## Schema (v1 shape, illustrative)
+
+```sql
+repos(repo PRIMARY KEY, last_seen_updated_at)  -- the upstream-poll watermark ([[ADR-0043]] §6)
+issues(key PRIMARY KEY, repo, tier, status, priority, evidence_url,
+       parked_reason, parked_by /* machine|human: only machine parks auto-unpark */, updated_at)
+scopes(id, issue REFERENCES issues, pack_digest, check_outcome,
+       stale /* upstream changed after freeze; surfaced at the approval gate */,
+       approval_pr, approved_by, approved_at)
+runs(run_id PRIMARY KEY, scope REFERENCES scopes, identity_digest, status, pod, session_uri, best_score, cost_usd)
+candidates(run_id REFERENCES runs, kind, lane, iter, score, decision, worktree, sandbox, pr_url)
+ledger(ts, run_id, kind, cost_usd)          -- admission caps are SUM() queries over this
+_sqlx_migrations(...)                        -- schema version
+```
+
+Growth points, designed-for but not built: a durable `queue` table with lease columns (the day
+one worker is not enough), `leases(rig, holder_run, mode, expires_at)` ([[ADR-0042]]), and the
+whole schema ports to Postgres wholesale if multi-node ever becomes real — nothing above the
+storage layer changes.
+
+## What this is NOT
+
+- **Not the inner loop's state.** A `crucible --manifest …` run never opens a database; the
+  session log + git remain a run's complete, self-contained record. Local-first stays intact.
+- **Not a message bus.** Cross-pod communication does not go through SQLite (a shared-volume
+  SQLite is a corruption story). Pods report through logs/S3/exit status; the controller folds.
+- **Not precious.** Back it up if convenient; its loss is a rebuild, not an incident — leases,
+  when they exist, will be the one flagged exception."""
+consequences = """
+- **Positive:** the orchestration layer gains transactions, joins, and an audit trail without
+  a database server; wide-round resume and full provenance drop out of the granularity choice;
+  `crucible report` queries live state (DuckDB reads SQLite directly) next to the parquet
+  sidecars; the override API is the UI's foundation, already load-bearing for the CLI.
+- **Negative / cost:** the pull-ingest path must parse session logs robustly (it becomes a
+  second consumer of the log schema — version discipline now has two customers); sqlx makes
+  the controller an async island to maintain; the rebuild path is only as good as the periodic
+  drift check we actually run; per-candidate granularity means the pull path does real work
+  per run, not one upsert."""
+
+[[content.alternatives]]
+text = "One SQLite database per controller, a rebuildable index over the canonical stores"
+status = "accepted"
+
+[[content.alternatives]]
+text = "Per-repo or per-pack databases"
+status = "rejected"
+rejection_reason = "The outer loop is precisely the thing that spans them; the global daily budget and the cross-repo inbox need to be single-database queries."
+
+[[content.alternatives]]
+text = "A push endpoint (runs POSTing their exit reports) instead of controller-pull ingest"
+status = "rejected"
+rejection_reason = "Explicitly not v1: anything that publishes a record is already visible to the pull path; if mid-run freshness ever matters it arrives as a latency optimization on top of pull, never a correctness dependency."

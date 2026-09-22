@@ -44,10 +44,48 @@ bench-stream:
 lint:
     cargo fmt --check && cargo clippy --workspace --all-targets && cargo test --workspace
 
-# Module dependency graph of the crucible crate: cycles, fan-in/out, duplicate item names.
-# `just modgraph --check` fails on any module cycle (CI runs that).
+# Module dependency graph of one crate (crucible by default; `--root crucible-controller/src`
+# for the controller): cycles, fan-in/out, duplicate item names. `just modgraph --check` fails
+# on any module cycle; CI runs that over both crates.
 modgraph *ARGS:
     cargo run --quiet -p xtask -- modgraph {{ARGS}}
+
+# Scoped controller dev loop: build/test/lint only crucible-controller. The sqlx tests need a
+# Postgres at DATABASE_URL (`just dev-pg`) and SQLX_OFFLINE=true so the macros compile against
+# the checked-in `.sqlx/` cache rather than whatever the dev database was last migrated to.
+build-controller:
+    SQLX_OFFLINE=true cargo build -p crucible-controller
+
+test-controller:
+    SQLX_OFFLINE=true cargo test -p crucible-controller
+    SQLX_OFFLINE=true cargo test -p crucible-controller --lib -- --ignored an_idle_tick_creates_no_span_but_an_ingest_still_traces
+
+lint-controller:
+    cargo fmt --check && SQLX_OFFLINE=true cargo clippy -p crucible-controller -p crux --all-targets --all-features -- -D warnings
+
+# A throwaway Postgres for the controller's sqlx tests (DATABASE_URL=postgres://postgres:ci@localhost:55432/crucible).
+dev-pg:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! docker inspect crucible-test-pg >/dev/null 2>&1; then
+        docker run -d --name crucible-test-pg -e POSTGRES_PASSWORD=ci -e POSTGRES_DB=crucible \
+            -p 55432:5432 postgres:16 -c max_connections=400 >/dev/null
+        echo "created crucible-test-pg"
+    else
+        docker start crucible-test-pg >/dev/null
+    fi
+    echo "DATABASE_URL=postgres://postgres:ci@localhost:55432/crucible"
+
+# Regenerate the controller UI's OpenAPI spec + typed client (build artifacts, not committed):
+# `cargo run -p crucible-controller --bin openapi-spec` -> openapi.json -> openapi-typescript.
+# The UI's dev/check/test/build scripts run this themselves via pre-hooks.
+ui-types:
+    cd crucible-controller/ui && bun run generate
+
+# Regenerate the sandbox images under images/generated/ (one Containerfile and one INTRO.md per
+# image) from images/features/ + images/matrix.toml.
+gen-images:
+    cargo xtask images gen
 
 # Regenerate docs/dsl-reference.md from the compiler's DSL tables (the pre-commit hook's job,
 # for when you want it without a commit).
@@ -72,6 +110,11 @@ hooks:
 forge-capture-e2e:
     scripts/forge-capture-e2e.sh
 
+# End-to-end proof of a revise loop through a real OpenShell sandbox on local podman, with a
+# model-free `claude` image (examples/revise-loop). Needs podman, openshell, openshell-gateway.
+revise-loop-e2e:
+    scripts/revise-loop-e2e.sh
+
 # Spoke smoketest (hub-spoke delegated jobs): submit a CPU-only sentinel Job to <cluster> through
 # the full production submit/stream/parse path and print the typed result JSON. `cluster` is a
 # [clusters.<name>] entry in the deploy profile; pass `context` to run it against a local
@@ -92,3 +135,22 @@ stop source="operator": install-tools
 # Read-only JSON snapshot of the running (or finished) loop session.
 session ws="workspace": install-tools
     session --workspace {{ws}}
+
+# Build the DiffusionGemma structured-reads vLLM image on waldorf; prints the build job's name.
+route-serving-image tag="dgemma-reads" namespace="weaton-dev" context="coreweave-waldorf":
+    buildit build quay.io/wseaton/vllm:{{tag}} -n {{namespace}} --kubecontext {{context}} \
+        -c examples/route/serving -f Containerfile --mode job --request cpu=8 --request memory=32Gi
+
+# Deploy that image with the System One server in front of it, and wait for it to load the model.
+route-serving-deploy image namespace="weaton-dev" context="coreweave-waldorf":
+    sed 's|image: IMAGE|image: {{image}}|' examples/route/serving/deploy.yaml \
+        | kubectl --context {{context}} -n {{namespace}} apply -f -
+    kubectl --context {{context}} -n {{namespace}} rollout status deploy/dgemma-systemone --timeout=45m
+
+# Forward the System One endpoint to localhost:8011 for `examples/route`.
+route-serving-forward namespace="weaton-dev" context="coreweave-waldorf":
+    kubectl --context {{context}} -n {{namespace}} port-forward svc/dgemma-systemone 8011:8011
+
+# Remove the deployment and free its GPU.
+route-serving-down namespace="weaton-dev" context="coreweave-waldorf":
+    kubectl --context {{context}} -n {{namespace}} delete deploy/dgemma-systemone svc/dgemma-systemone --ignore-not-found

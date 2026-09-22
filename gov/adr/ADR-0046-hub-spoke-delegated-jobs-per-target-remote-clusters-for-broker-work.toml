@@ -1,0 +1,148 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0046"
+title = "Hub-spoke delegated jobs, per-target remote clusters for broker work"
+status = "accepted"
+date = "2026-07-30"
+
+[content]
+context = """
+Related: [ADR-0005](./0005-engine-side-builds.md), [ADR-0012](./0012-rendered-deployments.md)
+(secrets by name only), [ADR-0018](./0018-declarative-image-builds.md),
+[ADR-0020](./0020-candidate-build-modes.md), [ADR-0022](./0022-measure-task-dags.md).
+
+Every delegated job the broker runs today lands on exactly one cluster: its own. The codegen
+measure/profile Jobs (`crucible-broker/src/codegen.rs`), forge's cluster builds
+(`forge/src/build.rs::dispatch_cluster`), and the deploy hooks all route through the single client in
+`forge/src/kube.rs::client()`, which is `Client::try_default()`: the in-cluster SA when in a pod,
+else the ambient kubeconfig. Substrate facts (namespace, Kueue queue, PVCs, GPU ceiling) arrive as
+`BROKER_CODEGEN_*` env projected from the profile's `[measure]` table
+(`crucible/src/deploy/profile.rs::MeasureSubstrate::broker_env`). "Which cluster" is not a parameter
+anywhere.
+
+That stops working now that the GPUs are not where the loop runs. The hub (the MP+ cluster) sits
+behind VPN with no GPU headroom; the first spokes are an H200 cluster with a public API and a B200
+box with no S3 whose API is reachable only through an SSH bastion. Two existing properties make
+delegation cheap: job results ride the sentinel log path (`wrap_command` / `parse_result_json`), so
+metrics need no shared storage, and log collection is poll-based monotonic snapshots
+(`forge/src/measure_job.rs`), where a failed snapshot just skips a poll. The status poll is the
+exception: `wait_for_job` (`forge/src/kube.rs`) propagates any `api.get()` error out of the loop, so
+one transient failure on a far path (tunnel reconnect, WAN blip) would abort a measure whose GPU job
+keeps running. Cross-cluster requires bounded retry on the status poll; see §4."""
+decision = """
+Delegated **jobs only** gain a per-target cluster. The loop pod, its sandboxes, and the broker stay
+where they run today. Candidate builds also stay hub-side in v1: spokes pull candidate images from
+the registry like any other image; spoke-side builds are future work.
+
+## 1. Substrate addressing
+
+The profile's `[measure]` table gains an optional `cluster = "wharf"`. The `[clusters.<name>]`
+tables live in a fleet file resolved by one rule: `clusters.toml` in the profile's own directory
+(profiles are explicit paths handed to `crucible deploy render|apply`,
+`crucible/src/deploy/mod.rs`, so for `deploy/deepgemm/profile.wharf.toml` the fleet file is
+`deploy/deepgemm/clusters.toml`), overridable with an explicit `--clusters <path>` flag. A profile
+may override or add a `[clusters.<name>]` block locally, profile winning on conflict.
+
+```toml
+# deploy/<domain>/clusters.toml
+[clusters.wharf]
+kubeconfig_secret = "spoke-wharf-kubeconfig"   # scoped SA kubeconfig, see §2
+# host_aliases = { "api.spoke.example" = "10.0.0.1" }   # DNS-dark tier, §3
+# proxy_url = "http://10.0.0.9:3128"                     # proxy-reachable tier, §3a
+# [clusters.<name>.bastion] host/user/key_secret        # ssh-bastion tier, §3b
+```
+
+The renderer mounts the named secret at a fixed path and projects `BROKER_CODEGEN_KUBECONFIG`;
+`forge::kube::client()` grows an explicit-kubeconfig path (per-call target, not a global) beside
+`try_default()`. No `cluster` key means no new env and the `try_default()` path, so every existing
+profile keeps its exact behavior. Forge build jobs and deploy hooks address a cluster the same way.
+
+## 2. Credentials: hub-push
+
+The broker holds the spokes' credentials, never the reverse. Each spoke admin mints a
+namespace-scoped SA whose Role covers only job submission and observation (Jobs create/get/delete,
+pods/log, Kueue Workload reads), exports a kubeconfig, and stores it as a hub Secret the fleet file
+references by name. The kubeconfig must embed a long-lived Secret-based SA token (a
+`kubernetes.io/service-account-token` Secret), not `kubectl create token`: bound tokens default to
+1h and expire mid-job and mid-log-poll. Spokes fronted by an interactive OAuth IdP (GitHub)
+bootstrap via one human login to create the namespace, SA, and RoleBinding; automation never
+touches the IdP flow. Vault later owns token rotation; the Secret names do not change.
+
+The spoke kubeconfig Secret mounts on the loop pod, which shares a namespace with agent sandbox
+pods (the openshell kubernetes driver). The isolation claim, the broker holds spoke credentials and
+the agent never does, therefore requires that the sandbox SA has no Secret read in that namespace;
+the deployment RBAC must not grant it and `crucible check` validates it (a necessary but not
+sufficient probe; see the residual risk under Consequences).
+
+## 3. Reachability tiers
+
+1. **Public** (wharf): the kubeconfig alone.
+2. **Routable but DNS-dark**: `host_aliases` renders as pod-spec `hostAliases` on the loop pod
+   (precedent: the openshell kubernetes driver already injects `hostAliases` on sandbox pods via
+   `host_gateway_ip`, see `POD_IP_ENV` in `crucible/src/deploy/render/kube.rs`). Declarative, TLS
+   intact because the hostname is preserved. The alias is baked at render time, so a spoke API IP
+   change fails at connect until a re-render; the per-cluster `crucible check` probe (Risk section)
+   is the detector.
+3. **Non-routable**, in two flavors:
+   - **3a, proxy-reachable** (the pokprod class): the spoke API is reachable through an HTTP
+     CONNECT proxy (squid, e.g. `http://10.x.x.x:3128`) and needs no tunnel. The cluster entry's
+     optional `proxy_url` field feeds kube-rs's native proxy support (the `http-proxy` feature,
+     `Config::proxy_url`; kubeconfig `proxy-url` also flows through, the fleet-file field winning
+     on conflict). Pure config plus one client-construction branch; TLS to the API server is
+     end-to-end through the CONNECT tunnel.
+   - **3b, ssh-bastion** (the B200 box): a `bastion` block, served by an in-broker in-process
+     SSH tunnel using the `russh` crate (pure Rust, verified 0.62.4: tokio-based, default crypto
+     backend aws-lc-rs; Cargo.lock already carries aws-lc-rs 1.17.0 and forge installs it as the
+     rustls 0.23 CryptoProvider, `forge/src/kube.rs`). The broker opens a direct-tcpip channel to
+     the spoke API server and pipes a local TCP listener over it; the spoke kubeconfig targets
+     `https://127.0.0.1:<port>` with `tls_server_name` set to the real API hostname, so
+     certificate verification against the spoke CA is intact (verified: kube-client 4.0.0 exposes
+     `tls_server_name` on both `Config` and the kubeconfig `Cluster`). No ssh binary, no child
+     process; reconnect-with-backoff on channel errors is the supervision. Channel errors alone
+     do not catch a NAT/idle-timeout-killed tunnel, which dies silently and leaves in-flight
+     requests hanging on kernel TCP timeouts, so the client config sets russh's
+     `keepalive_interval`/`keepalive_max` and the tunneled kube client gets a per-request
+     timeout. Fallback ladder if russh disappoints: the `openssh` crate (0.11.6, async wrapper
+     over the system binary), then autossh.
+
+## 4. Execution, artifacts, failure
+
+Job semantics are unchanged: suspended submit, Kueue admission, `activeDeadlineSeconds`,
+`ttlSecondsAfterFinished`. The status poll (`wait_for_job`) gains bounded retry on transient
+`api.get()` errors so a reconnect window or WAN blip does not abort a measure whose GPU job is
+still running; the overall job deadline stays the backstop. Remote jobs self-reap if the hub broker
+dies mid-job; the one gap is a Job still suspended in queue, so the broker sweeps its own leftovers
+per spoke at startup. Because suspended is the normal state for anything waiting on Kueue
+admission, `managed-by=crucible` alone would reap a sibling broker's queued jobs; job labels
+therefore gain a per-broker instance id and the sweep selects on it, so a broker only ever reaps
+jobs it submitted itself. Results ride the sentinel log path, so the S3-less spoke needs nothing.
+Profile traces
+are the exception: `collect_trace_artifact` reads the artifacts PVC as a local mount, which does not
+exist cross-cluster. v1 keeps the size-capped base64-through-logs fallback on remote spokes; the
+follow-up is an API-mediated collector pod on the spoke, which is also the retrieval half of the
+publish-on-keep PVC results backend.
+
+An unreachable spoke is a typed tool error, never a hang: bounded connect timeout, and the agent
+sees `{"status":"error"}` naming the spoke and its tier. The MCP trace span and the run ledger's
+measure rows gain a `cluster` field, so a cross-spoke result is never mistaken for a hub-local one.
+
+## Non-goals
+
+Remote sandboxes and remote loop pods; spoke-side builds; Vault integration; multi-spoke scheduling
+policy; spoke-pull execution."""
+consequences = """
+- **Positive:** GPU capacity decouples from where the loop runs; one addressing vocabulary for
+  measure, build, and deploy delegation; existing profiles untouched; no child processes.
+- **Cost:** per-spoke SA lifecycle is manual until Vault; profile traces on remote spokes regress to
+  the size-capped fallback until the collector lands.
+- **Risk:** a stale spoke kubeconfig (or stale `host_aliases` IP) fails at job submit, not at
+  render; a `crucible check` probe per named cluster is the mitigation. A bound SA token minted via
+  `kubectl create token` 401s partway through a multi-hour rung; the bootstrap procedure mandates a
+  long-lived Secret-based token for exactly this reason.
+- **Residual risk (sandbox-SA isolation):** the `crucible check` SAR probe (secrets
+  get/list/watch) is necessary but not sufficient. Sandbox pods currently run as the loop SA, and
+  any SA with `pods/create` in the loop namespace can mount the spoke-kubeconfig Secret into a pod
+  of its own with no secrets RBAC at all. The real boundary is that sandbox pods must not run as
+  an SA with `pods/create` in the loop namespace, and must not automount that SA's token.
+  Follow-up: a dedicated no-permission sandbox SA, or a separate sandbox namespace."""

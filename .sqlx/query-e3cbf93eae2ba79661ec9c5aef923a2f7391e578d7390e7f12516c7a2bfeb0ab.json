@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT s.issue AS \"issue!\", c.pr_url AS \"pr_url!\"\n        FROM candidates c\n        JOIN runs r ON r.run_id = c.run_id\n        JOIN scopes s ON s.id = r.scope\n        WHERE c.pr_url IS NOT NULL AND c.decision = 'keep'\n        ORDER BY c.run_id ASC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "issue!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "pr_url!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "e3cbf93eae2ba79661ec9c5aef923a2f7391e578d7390e7f12516c7a2bfeb0ab"
+}

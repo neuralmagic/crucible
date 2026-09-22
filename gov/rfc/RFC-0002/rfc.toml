@@ -29,9 +29,11 @@ clauses = [
     "clauses/C-PLAYBOOK-RESUME.toml",
     "clauses/C-REPORTS.toml",
     "clauses/C-SETTLED-JOIN.toml",
+    "clauses/C-REVISE-LOOP.toml",
 ]
 
 [[changelog]]
 version = "0.1.0"
 date = "2026-08-21"
 notes = "Initial draft"
+changed = ["a settled join forwards a dependency that settled not taken"]

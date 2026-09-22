@@ -126,6 +126,16 @@ pub enum WorkflowError {
     EngineTaskIsolated { task: String },
     #[error("engine task {task:?} must use join = \"all\"")]
     EngineTaskJoin { task: String },
+    #[error(
+        "task {task:?} is a route or declares when; an autoresearch workflow decides from a \
+         frozen measure and accepts neither"
+    )]
+    RouteInAutoresearch { task: String },
+    #[error(
+        "workflow result {result:?} is conditional and could settle not taken; rejoin its \
+         branches with join = \"passed\" or join = \"settled\" and name that task"
+    )]
+    ConditionalResult { result: String },
     #[error("engine {op:?} task {task:?} requires source")]
     EngineSourceRequired { op: EngineOp, task: String },
     #[error("engine {op:?} task {task:?} does not accept source")]
@@ -159,6 +169,11 @@ pub enum WorkflowError {
     UnknownCustomResult { result: String },
     #[error("playbook task {task:?} names engine operation {op:?}: a playbook has no scored loop")]
     PlaybookEngineTask { task: String, op: EngineOp },
+    #[error(
+        "task {task:?} declares revise, which only a playbook runs; a scored loop already sends \
+         a failed candidate back through its next iteration"
+    )]
+    ReviseOutsidePlaybook { task: String },
     #[error("engine task {task:?} cannot run in the epilogue (the loop is over)")]
     EngineTaskInEpilogue { task: String },
     #[error("report task {task:?} must run in the epilogue")]
@@ -266,6 +281,24 @@ impl WorkflowCfg {
             return Ok(());
         }
 
+        if self.workflow_type == WorkflowType::Autoresearch
+            && let Some(task) = self
+                .tasks
+                .iter()
+                .find(|t| t.when.is_some() || matches!(t.task, TaskKind::Route { .. }))
+        {
+            return Err(WorkflowError::RouteInAutoresearch {
+                task: task.name.0.clone(),
+            });
+        }
+
+        if self.workflow_type != WorkflowType::Playbook
+            && let Some(task) = self.tasks.iter().find(|task| task.revise.is_some())
+        {
+            return Err(WorkflowError::ReviseOutsidePlaybook {
+                task: task.name.0.clone(),
+            });
+        }
         if self.is_legacy_splice() {
             self.validate_stages()?;
             return self.validate_legacy_splice();
@@ -399,14 +432,45 @@ impl WorkflowCfg {
 
         if self.workflow_type == WorkflowType::Autoresearch {
             self.validate_autoresearch()?;
-        } else if let Some(result) = &self.result
-            && !self.tasks.iter().any(|task| &task.name == result)
-        {
-            return Err(WorkflowError::UnknownCustomResult {
-                result: result.0.clone(),
-            });
+        } else if let Some(result) = &self.result {
+            if !self.tasks.iter().any(|task| &task.name == result) {
+                return Err(WorkflowError::UnknownCustomResult {
+                    result: result.0.clone(),
+                });
+            }
+            if self.may_settle_not_taken().contains(result) {
+                return Err(WorkflowError::ConditionalResult {
+                    result: result.0.clone(),
+                });
+            }
         }
         Ok(())
+    }
+
+    /// Tasks that carry a `when`, or reach one through `all` joins alone.
+    fn may_settle_not_taken(&self) -> BTreeSet<&TaskName> {
+        let mut conditional: BTreeSet<&TaskName> = self
+            .tasks
+            .iter()
+            .filter(|t| t.when.is_some())
+            .map(|t| &t.name)
+            .collect();
+        loop {
+            let grown: Vec<&TaskName> = self
+                .tasks
+                .iter()
+                .filter(|t| {
+                    t.join == Join::All
+                        && !conditional.contains(&t.name)
+                        && t.depends_on.iter().any(|d| conditional.contains(d))
+                })
+                .map(|t| &t.name)
+                .collect();
+            if grown.is_empty() {
+                return conditional;
+            }
+            conditional.extend(grown);
+        }
     }
 
     /// Require orchestrator authority for the workflow and its engine operations.
@@ -660,6 +724,50 @@ mod tests {
 
     fn parse(source: &str) -> WorkflowCfg {
         toml::from_str(source).expect("parse workflow")
+    }
+
+    const ROUTED: &str = "[[task]]\nname = \"classify\"\nkind = \"command\"\ncommand = \"./classify.sh\"\nemits = [\"area\"]\n\
+         [[task]]\nname = \"gate\"\nkind = \"route\"\ndepends_on = [\"classify\"]\ndecider = { kind = \"output\", task = \"classify\" }\n\
+         [task.questions.area]\ninstructions = \"Which component?\"\ntype = \"choice\"\ndrop = [\"uncertain\"]\noptions = [{ label = \"scheduler\" }, { label = \"frontend\" }]\n\
+         [[task]]\nname = \"fix\"\nkind = \"command\"\ncommand = \"./fix.sh\"\ndepends_on = [\"gate\"]\nwhen = { task = \"gate\", question = \"area\", is = [\"scheduler\"] }\n\
+         [[task]]\nname = \"punt\"\nkind = \"command\"\ncommand = \"./punt.sh\"\ndepends_on = [\"gate\"]\nwhen = { task = \"gate\", question = \"area\", is = [\"frontend\"] }\n\
+         [[task]]\nname = \"wrap\"\nkind = \"command\"\ncommand = \"./wrap.sh\"\ndepends_on = [\"fix\", \"punt\"]\njoin = \"passed\"\n";
+
+    #[test]
+    fn a_routed_playbook_is_admitted_and_a_routed_custom_workflow_validates() {
+        parse(&format!("type = \"playbook\"\nresult = \"wrap\"\n{ROUTED}"))
+            .admit(&WorkflowCaps::playbook_engine())
+            .unwrap();
+        parse(&format!("type = \"custom\"\nresult = \"wrap\"\n{ROUTED}"))
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn autoresearch_rejects_a_route_and_a_when() {
+        let workflow = parse(&format!("type = \"autoresearch\"\n{ROUTED}"));
+        assert_eq!(
+            workflow.validate().unwrap_err(),
+            WorkflowError::RouteInAutoresearch {
+                task: "gate".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_result_that_could_settle_not_taken_is_rejected() {
+        for result in ["fix", "after"] {
+            let workflow = parse(&format!(
+                "type = \"playbook\"\nresult = \"{result}\"\n{ROUTED}\
+                 [[task]]\nname = \"after\"\nkind = \"command\"\ncommand = \"true\"\ndepends_on = [\"fix\"]\n"
+            ));
+            assert_eq!(
+                workflow.validate().unwrap_err(),
+                WorkflowError::ConditionalResult {
+                    result: result.into()
+                }
+            );
+        }
     }
 
     #[test]

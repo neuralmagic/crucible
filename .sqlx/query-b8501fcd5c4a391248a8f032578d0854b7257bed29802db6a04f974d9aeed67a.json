@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE builds SET dispatch_attempts = dispatch_attempts + 1\n           WHERE id = $1 RETURNING dispatch_attempts AS \"dispatch_attempts!: i64\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "dispatch_attempts!: i64",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "b8501fcd5c4a391248a8f032578d0854b7257bed29802db6a04f974d9aeed67a"
+}

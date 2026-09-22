@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT repo AS \"repo!\" FROM repos\n           WHERE watched AND NOT paused AND closed_repaired_at IS NULL ORDER BY repo",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "repo!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "2db83b0e3d89283ef973546b42120c0f80582edb9f5e46ad0451c0815df0f156"
+}

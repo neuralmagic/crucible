@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO issues (key, repo, tier, status, priority, input_kind, title, updated_at) VALUES ($1, $2, $3, 'new', 0, 'playbook', $4, $5)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b7e6d2d4a6336af884b4e7a2a9daea1d188f959ad213031198c7bd6b813a3992"
+}

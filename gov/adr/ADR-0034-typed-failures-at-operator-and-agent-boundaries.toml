@@ -1,0 +1,76 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0034"
+title = "Typed failures at operator and agent boundaries"
+status = "proposed"
+date = "2026-08-28"
+refs = ["ADR-0044"]
+
+[content]
+context = """
+Failures that reach an operator or an agent are currently strings assembled by `anyhow` context, and they read like it. A live run parked with `run errored: short-circuited at scan`, which names where it stopped and not why; the actual cause, `transport retries exhausted (3 attempts): agent spawn failed: failed to launch agent source: No such file or directory (os error 2)`, survived only in a task note the rendered table truncated. A separate park reason reached the same surface as the bare string `insert_work_pod`, which is the name of a function, because a `.context("insert_work_pod")` intended for a developer's backtrace became the whole of a user-facing field. Nothing in the type system distinguishes those two audiences, so neither case is a bug anyone could have caught at compile time.
+
+The scale rules out a uniform answer: the controller carries 759 `.context` calls and 123 `bail!`/`anyhow!` sites. Most are internal plumbing where a backtrace is exactly the right product and no one is served by an enum. A minority cross a boundary into a durable, user-visible field: a park reason, a task note, a dispatch refusal, an API error body. Those are the ones with an audience.
+
+The house pattern for the second kind already exists and is used well in places: `TargetRefusal`, `ProbeFailure`, `AdmitFailure`, `ImportError`, `RegisterError` and `PutArtifactError` are all `thiserror` enums with written messages, and `thiserror` is already a workspace dependency. The gap is that the boundary is a convention rather than a type, so a raw `anyhow::Error` reaches a user-facing field without resistance. `DispatchCapability::refusal` returns `Option<String>`, which is a refusal reason with no type at all, and several existing enums use `#[error("{0}")]` over an opaque inner string, which buys the shape of a typed error without its description.
+
+Agents raise the stakes. An agent reads these fields as its only account of a failure, cannot open a terminal to investigate, and will act on whatever it is given. A reason that names a function rather than a cause is not merely unhelpful to it; it is misleading input."""
+decision = """
+A failure that crosses into a field a person or an agent reads will be a typed error with a written message. A failure that stays inside the process keeps `anyhow`, because a backtrace is the right product for a developer.
+
+The boundary is the audience, not the layer. It covers the durable ledger fields a reader is given as the account of what happened: park reasons, task notes, dispatch refusals, and API error bodies. Reconciliation writes most of these far from any HTTP handler, so the type has to travel with the failure rather than be applied at the edge.
+
+Each boundary type is a `thiserror` enum whose variants name causes rather than call sites, and whose messages are written for the reader who will act on them. A variant that says what to do next is doing its job; `#[error("{0}")]` over an opaque string is not, and does not count as typing the failure. Where a reportable failure is produced from internal plumbing, the conversion is explicit and names a cause: an `anyhow::Error` may not be laundered into a typed wrapper to satisfy the signature.
+
+The existing enums are the reference, and `DispatchCapability::refusal` returning `Option<String>` is the shape being retired."""
+consequences = """
+Failures acquire an audience the compiler knows about. A raw context string can no longer reach a park reason without someone writing a variant for it, so the class of defect that produced `insert_work_pod` in an operator-facing field stops being reachable by accident rather than being caught in review. Each variant becomes a place to say what to do next, which is the part an agent needs and a backtrace never supplied. Because the boundary set is small next to 759 context sites, this lands incrementally against in-flight work.
+
+The costs are a second idiom and a conversion. Two error styles now coexist, so the boundary has to stay legible or it degrades into folklore about which functions are "the typed ones"; the answer is that a type is required exactly where a failure becomes reportable, which is checkable in review. Conversion sites are where this decision can be defeated: wrapping an `anyhow::Error` in a transparent variant satisfies the signature while preserving the original problem, and the existing `#[error("{0}")]` variants show the temptation is real, so they are the thing to watch.
+
+Neutrally, the observable text of some failures changes, and anything asserting on today's wording moves with it. This does not settle how a failure is rendered once it has a type: truncation in a table and the wording of a turn record belong to the surfaces that display them."""
+
+[[content.alternatives]]
+text = "Type the failures that cross an operator or agent boundary; leave internal plumbing on anyhow"
+status = "accepted"
+pros = [
+    "Puts the type where the audience is: a field a person or an agent reads gets a written message, and the compiler enforces that a raw error cannot be assigned to one",
+    "Extends a pattern the codebase already uses well rather than introducing a new one",
+    "Bounded: the boundary set is small next to 759 context sites, so it can land incrementally without a freeze",
+    "Each variant is a place to say what to do next, which is what an agent needs and a backtrace never provides",
+]
+cons = [
+    "Two error idioms coexist, so the boundary has to be legible or the split becomes folklore",
+    "A conversion is needed wherever internal failure becomes reportable, and a lazy conversion can launder an opaque string into a typed wrapper",
+]
+
+[[content.alternatives]]
+text = "Migrate every anyhow site in the controller to typed errors"
+status = "rejected"
+pros = ["One idiom everywhere, no boundary to explain or police"]
+cons = [
+    "882 call sites of churn against a tree with in-flight work on most of them",
+    "Spends the same effort on plumbing nobody reads as on the fields that failed an operator",
+]
+rejection_reason = "The problem is audience, not idiom. anyhow is the right product for a failure whose reader is a developer with a backtrace, and typing those sites buys churn rather than clarity."
+
+[[content.alternatives]]
+text = "Keep anyhow everywhere and write better context strings"
+status = "rejected"
+pros = ["Cheapest possible change, and would have fixed both observed cases on its own"]
+cons = [
+    "Nothing stops the next raw context reaching a user-facing field, because nothing in the type system knows which fields those are",
+    "Leaves the message at the throw site, far from the surface that has to render it, so wording drifts per call site",
+]
+rejection_reason = "It fixes the instances and not the class. `insert_work_pod` was already a mistake anyone would catch in review; the defect is that nothing but review stood between it and a durable field an agent reads."
+
+[[content.alternatives]]
+text = "Keep anyhow internally and map to typed responses at the HTTP layer only"
+status = "rejected"
+pros = ["One conversion point, and the API already has to map failures to status codes"]
+cons = [
+    "The worst observed surfaces are not HTTP responses: a park reason and a task note are durable ledger fields written far from any handler",
+    "Mapping at the edge means the cause has already been flattened to a string by the time it is mapped",
+]
+rejection_reason = "It puts the boundary at the transport rather than at the audience. The fields that misled an operator are written into the ledger by background reconciliation, which never passes through an HTTP handler."
