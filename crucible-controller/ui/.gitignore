@@ -1,0 +1,11 @@
+node_modules
+dist
+# Generated API artifacts: the OpenAPI spec + typed client come from `npm run generate`
+# (see README.md), not the repo.
+openapi.json
+src/api/schema.d.ts
+
+# playwright
+/test-results/
+/playwright-report/
+/blob-report/

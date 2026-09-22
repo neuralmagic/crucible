@@ -1,0 +1,11 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-APPROVALS"
+title = "Approvers as policy"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = "Who may approve a pack import, a scope, or a draft graduation MUST be decided by the `approve` action through [[RFC-0003:C-DECISION]], with approver sets expressed as team roles or policy rules rather than a separate allowlist. An approval recorded from an external system (a source-forge review) MUST be attributed to a controller identity through a verified account link: an association between the external login and a controller user that the user established while authenticated to both. An external login with no verified link MUST NOT approve. Any existing approver allowlist or forge-association fallback MUST be honoured only through an explicit policy rule that names it, so that removing the rule removes the path."

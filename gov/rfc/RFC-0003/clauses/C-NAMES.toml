@@ -1,0 +1,11 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-NAMES"
+title = "Names are scoped to the owner"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = "The human-readable identifier of a governed root resource (a playbook id, a draft id, a secret name, a provider id, a target name) MUST be unique within its owner, and two resources with different owners MAY share an identifier. Team slugs are unique per controller as [[RFC-0003:C-PRINCIPALS]] requires. The API MUST address a governed resource by owner principal and identifier, with the owner principal carried as one percent-encoded path segment in its `<scheme>:<id>` spelling. The API MUST accept an unqualified identifier only where it resolves to exactly one resource the caller may read, and MUST refuse an ambiguous one as a conflict naming the count of candidates. Every existing resource keeps its identifier through the migration of [[RFC-0003:C-COMPATIBILITY]], since assigning owners cannot create a collision within one owner."

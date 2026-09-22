@@ -1,0 +1,13 @@
+summary = "nushell runtime for the .nu glue tools (static musl build)"
+layer = 30
+
+intro = """
+nushell {pin.nu} is at /usr/local/bin/nu (static build); the repo's .nu glue
+tools run through it.
+"""
+
+[pins]
+nu = "0.113.0"
+
+[capabilities]
+"shell.nu" = "0.113"

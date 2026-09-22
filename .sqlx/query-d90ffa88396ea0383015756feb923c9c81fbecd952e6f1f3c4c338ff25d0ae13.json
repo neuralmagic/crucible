@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT COUNT(*) AS \"n!: i64\" FROM candidates WHERE run_id = 'run-xyz'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "n!: i64",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "d90ffa88396ea0383015756feb923c9c81fbecd952e6f1f3c4c338ff25d0ae13"
+}

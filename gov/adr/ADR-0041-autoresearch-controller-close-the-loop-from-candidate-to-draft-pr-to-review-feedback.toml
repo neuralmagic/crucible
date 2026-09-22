@@ -1,0 +1,115 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0041"
+title = "Autoresearch controller — close the loop from candidate to draft PR to review feedback"
+status = "proposed"
+date = "2026-06-28"
+
+[content]
+context = """
+Related: [ADR-0004](./0004-core-loop-state-model.md) (the multi-iteration loop + git memory this
+orchestrates), [ADR-0003](./0003-async-approval-waits.md) (the draft-PR *watch* that already fires a
+re-scope on a human PR action — the foundation for the feedback edge), [ADR-0002](./0002-mediated-provisioning-mcp.md)
+(the broker + control bridge the controller drives), [ADR-0005](./0005-engine-side-builds.md) /
+[ADR-0009](./0009-composite-domains.md) (deploy-to-rank: a kept composite candidate is a tuple of
+per-component edits, published as a *set of linked* PRs), [ADR-0010](./0010-candidate-portfolios-and-search.md)
+(a portfolio of such candidates — the controller is what would drive a portfolio without a human babysitting).
+
+The composite P/D rollout-protection loop works end-to-end (ADR-0009 + the mediated composite deploy): the
+sandboxed agent edits both backends, calls `deploy_composite`, the broker builds+rolls both, the gate
+measures, and a kept candidate goes from **8% → 100%** live. A second turn seeded with reviewer feedback
+("hoist the duplicated factor list into one canonical compatibility function; decide fail-open vs
+fail-closed") produces an upstream-quality refinement at the same score, opened as linked draft PRs.
+
+The **engine** part of that is clean. The **orchestration** part is manual, and that manual work is
+the actual product gap. Driving the path from "loop produced a good candidate" to "reviewable draft PRs
+incorporating my feedback" by hand requires:
+
+1. Saving the kept candidate's diff out of the loop-pod log.
+2. Stuffing it into a configmap, mounting it, and having the wrapper `git apply` it so the *next* turn
+   refines instead of re-deriving.
+3. Re-seeding `CANDIDATE.md` with the feedback, re-pinning the pod, re-running, scraping the log for the
+   new diff + score.
+4. Syncing the forks, synthesizing a capture, running the publisher — then flipping the PRs to draft by hand.
+
+Three concrete defects fall out of that, each a seam the controller should own:
+
+- **Wrong base sha.** The loop wrapper emitted `git rev-parse HEAD` *after* the loop committed the kept
+  candidate, so the "base" was the candidate commit, not the upstream sha — it doesn't exist upstream, and
+  the publisher's base-content fetch 404s. (Fixed locally by capturing the base *before* the run.)
+- **Layered diff.** Because the prior candidate was applied via a configmap, the engine's captured diff was
+  a *delta on the applied prior*, not a full pristine-relative candidate. The publisher needs the full diff.
+- **Non-draft PRs.** The "draft PR" publisher opened non-draft PRs. (Fixed: pass `draft=true`.)
+
+None of this is a research problem. The loop is the search; everything above is plumbing between the loop,
+the broker, the publisher, and the human reviewer — and it should be one command, not a session of
+`kubectl` and log-grepping."""
+decision = """
+Introduce an **autoresearch controller**: a thin orchestrator that drives the existing pieces end-to-end and
+adds one new edge — PR review comments feeding back into the loop as a steer. It owns the candidate→PR→
+feedback cycle; it does **not** reimplement the loop, the broker, or the publisher.
+
+```text
+  ┌────────────────────────── controller ──────────────────────────┐
+  │                                                                 │
+  │   run N turns (ADR-0004 git memory carries the candidate)       │
+  │        │  kept candidate (one pristine-relative diff per repo)  │
+  │        ▼                                                        │
+  │   publish-on-keep ──► linked DRAFT PRs (ADR-0003 publisher)     │
+  │        │                                                        │
+  │        ▼                                                        │
+  │   watch PRs (ADR-0003 watch.rs) ──► review comments arrive      │
+  │        │                                                        │
+  │        ▼  comments → steer text                                │
+  │   control-bridge `steer` (control.rs) ──► next turn refines     │
+  │        │                                                        │
+  │        ▼  push the refined commit onto the SAME PR branch       │
+  └─────────────────────────────────────────────────────────────────┘
+```
+
+**The foundations already exist** — the work is orchestration plus the comment→steer translation:
+
+| Capability | Where it lives today | Controller's job |
+| --- | --- | --- |
+| Carry a candidate across turns | ADR-0004 loop driver + git memory (`--iterations N`, one pod) | use it instead of configmap-applying a prior diff |
+| Inject feedback into a running turn | `control.rs` `steer` (append to the steer file via the control port) | translate PR comments into steer text |
+| Open linked draft PRs on a kept candidate | native in `publish.rs` (`open_composite_prs`): one cross-linked draft PR per component fork, pushed from the live per-component git repos | invoke on keep (already wired) |
+| React to a human PR action | ADR-0003 `watch.rs` (`spawn_approval_watch` already fires a re-scope on approval) | generalize from "approved?" to "new review comments?" |
+| One pristine-relative diff per component | the loop's `staged_diff` is already baseline-relative | track the *true upstream base* (capture at run start, not post-commit) and publish that |
+
+**Loop semantics for refinement.** Refining a kept candidate is a normal multi-iteration run (ADR-0004),
+not a fresh pod with a hand-applied prior diff. The kept candidate is the loop's committed state; turn N+1
+sees it as the baseline and the captured diff stays full and pristine-relative. The configmap-apply hack
+exists only because refinement runs as a *separate* pod — the controller removes the need.
+
+**The feedback edge (the new part).** When a draft PR receives review comments, the watcher (the ADR-0003
+pattern, extended to read `pulls/comments` + `issues/comments`) collects them, formats them as a steer
+("reviewer asks: …"), and either steers a live turn or seeds the next turn's `CANDIDATE.md`. The refined
+candidate is pushed onto the *same* PR head branch, so the PR updates in place and the review thread stays
+coherent. Score must hold (the gate still gates); a refinement that regresses the metric is discarded
+exactly as any other candidate, and the controller says so on the PR.
+
+**Scope guard.** The controller is per-goal and human-gated at the edges: a human opens the review, a human
+merges. The controller never merges, never force-pushes, never posts as the user (it pushes commits to its
+own dedicated branch and updates the PR body; review *replies* are drafted for a human to post). It is the
+connective tissue, not an autonomous committer."""
+consequences = """
+- **The manual dance becomes `crucible loop --turns N --publish-prs --watch-feedback`** (or a
+  small `autoresearch` wrapper binary). The three defects above are fixed at their source rather than worked
+  around per run.
+- **Reviewability stays first-class.** Every candidate is a draft PR; every refinement is a push to that PR;
+  every keep/discard decision is visible. This is the [ADR-0010](./0010-candidate-portfolios-and-search.md)
+  "reviewable candidate" contract, now with a feedback channel.
+- **Composite-aware.** A kept composite candidate is a *set* of linked PRs (ADR-0009); a reviewer comment on
+  one repo's PR can steer a cross-cut refinement that touches both. The controller keeps the set linked.
+- **Open questions.**
+  - *Steer vs reseed.* Feeding comments into a *live* turn (steer) vs the *next* turn's `CANDIDATE.md` —
+    live steering is more responsive but races the turn; reseeding is simpler and deterministic. Start with
+    reseed; add live steer behind a flag.
+  - *Comment selection.* Not every comment is actionable (nits vs design asks). Either pass all review
+    comments verbatim and let the agent triage, or gate on a label/keyword. Start verbatim.
+  - *Base drift.* Upstream moves under a long-lived PR. The controller should rebase the candidate onto
+    current upstream before re-publishing (the publisher already 3-way-applies; make it explicit).
+  - *Cost.* Each feedback round is a full deploy+measure turn (GPU + build). The per-turn budget (ADR-0002
+    `turn::Budget`) and the keep/discard gate bound it, but a human still opts in to each round."""

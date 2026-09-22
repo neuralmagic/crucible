@@ -1,0 +1,11 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-CONTEXT"
+title = "Context and goals"
+kind = "informative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = "The controller authorizes today through three unrelated mechanisms: a global two-tier role ladder configured by login lists, principal ownership on secrets and personal dispatch targets, and a source-forge approver allowlist. Ownership is recorded on standing launches but never consulted on edit or delete, a team cannot own a schedule, ownership alone never suffices without a global role, every read surface is open to any authenticated caller, and an agent inside a run acts with its launcher's full authority. This RFC defines one authorization contract: an open principal registry that adds controller-managed teams (composed of users, groups, rules, and other teams) and run principals; an owner on every governed resource with per-resource shares and a parent relation; a single deny-by-default decision bound to every route; and a policy set with a published schema that expresses roles, ownership rules, shares, expiry, dispatch admission, and approver sets as data. The decisions that define the secrets registry and brought clusters will be amended to defer to it on who may act. It does not prescribe a policy engine, a storage layout, an evaluation architecture, or a user interface framework; those choices belong in decision records that reference this RFC."

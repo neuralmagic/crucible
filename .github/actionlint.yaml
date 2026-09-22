@@ -1,0 +1,6 @@
+# Self-hosted pools from the llm-d-downstream-infra gha-runners stack.
+self-hosted-runner:
+  labels:
+    - beefy
+    - rust
+    - image

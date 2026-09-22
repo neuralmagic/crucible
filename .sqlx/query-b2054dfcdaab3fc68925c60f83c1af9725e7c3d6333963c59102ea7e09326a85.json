@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO issue_comments (id, issue_key, author, created_at, updated_at, body)\n            VALUES ($1, $2, $3, $4, $5, $6)\n            ON CONFLICT(id) DO UPDATE SET\n                issue_key  = excluded.issue_key,\n                author     = excluded.author,\n                created_at = excluded.created_at,\n                updated_at = excluded.updated_at,\n                body       = excluded.body\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b2054dfcdaab3fc68925c60f83c1af9725e7c3d6333963c59102ea7e09326a85"
+}

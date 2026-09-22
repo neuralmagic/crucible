@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT COUNT(*) AS \"n!: i64\" FROM candidates WHERE run_id = 'adopted-2'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "n!: i64",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "4fc99f3afdb560be42bfc3727be50e4fe75171d8ef7fef584dd4652d507bfc39"
+}

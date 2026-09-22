@@ -13,6 +13,12 @@
 - [Tasks: general-purpose orchestration](./task-lane.md)
 - [Images for a new domain](./domain-images.md)
 
+# The control plane
+
+- [Deploying the controller](./controller-deploy.md)
+- [Authentication](./controller-auth.md)
+- [Vault and the secrets registry](./controller-vault.md)
+
 # Reference
 
 - [Implementation contract](./crucible-contract.md)
@@ -30,6 +36,7 @@
 
 - [RFC-0001: Implementation contract](./rfc/RFC-0001.md)
 - [RFC-0002: Playbook workflows](./rfc/RFC-0002.md)
+- [RFC-0003: Teams, ownership, and policy-based authorization](./rfc/RFC-0003.md)
 - [RFC-0004: Linked controller/engine boundary](./rfc/RFC-0004.md)
 
 # Architecture decisions

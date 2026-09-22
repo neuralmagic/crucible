@@ -1,0 +1,11 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-POLICY"
+title = "Policy as stored, validated data"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = "The rules the decision evaluates MUST be a policy set with a published schema over the principal, action, and resource vocabularies of this RFC. A policy set MUST be validated against that schema before it becomes active, and an invalid set MUST be refused with the failing rule named. Validation MUST also refuse a set that grants `manage-members` or `transfer` on a team to a role below `owner`, and a set under which no user or team principal would hold `activate`. The active policy set MUST be identified by a content digest, and the policy set is a governed resource read through the `read` action, which the default policy set MUST grant to all authenticated user principals. The controller MUST ship a default policy set that grants: a user owner every action on the resources they own; on a team-owned resource, the team's `member` role `read` and `launch`, the `maintainer` role additionally `create`, `update`, `bind`, and `rotate`, and the `owner` role every action including `transfer`, `share`, `delete`, and `manage-members`; every authenticated user principal `dispatch` on a dispatch target owned by the platform administrator team, matching the open default of the cluster policy it replaces; and the platform administrator team every action on every resource. Activating a policy set is the `activate` action, decided by the policy in force at that moment, and MUST be audited with the prior and new digests."

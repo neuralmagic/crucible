@@ -1,0 +1,119 @@
+/* Rendered markdown for the issue body, the scenario brief, and every mirrored comment. Prose is
+   sans at a readable measure; anything that is data (code, tables) is mono. */
+
+.markdown {
+  max-width: 74ch;
+  line-height: 1.6;
+  overflow-wrap: break-word;
+}
+
+.markdown > :first-child {
+  margin-top: 0;
+}
+
+.markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.markdown h1,
+.markdown h2,
+.markdown h3,
+.markdown h4,
+.markdown h5,
+.markdown h6 {
+  margin: 1rem 0 0.4rem;
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.markdown h1 { font-size: var(--text-lede); }
+.markdown h2 { font-size: var(--text-body); }
+.markdown h3,
+.markdown h4,
+.markdown h5,
+.markdown h6 { font-size: var(--text-body); }
+
+.markdown p,
+.markdown ul,
+.markdown ol {
+  margin: 0.5rem 0;
+}
+
+.markdown ul,
+.markdown ol {
+  padding-left: 1.4rem;
+}
+
+.markdown a {
+  color: var(--blue);
+  border-bottom: 1px solid var(--rule-hard);
+}
+
+.markdown a:hover {
+  border-bottom-color: var(--blue);
+}
+
+.markdown code {
+  font-family: var(--mono);
+  font-size: var(--text-data);
+  padding: 0 3px;
+  background: var(--sunk);
+  border: 1px solid var(--rule);
+}
+
+.markdown pre {
+  margin: 0.6rem 0;
+  padding: 8px 10px;
+  background: var(--sunk);
+  border: 1px solid var(--rule-hard);
+  overflow-x: auto;
+}
+
+.markdown pre code {
+  padding: 0;
+  border: none;
+  background: transparent;
+  line-height: 1.6;
+}
+
+.markdown blockquote {
+  margin: 0.6rem 0;
+  padding: 0 0 0 10px;
+  border-left: 2px solid var(--rule-hard);
+  color: var(--ink-2);
+}
+
+.markdown table {
+  border-collapse: collapse;
+  margin: 0.6rem 0;
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  font-family: var(--mono);
+  font-size: var(--text-data);
+}
+
+.markdown th,
+.markdown td {
+  border: 1px solid var(--rule);
+  padding: 3px 8px;
+  text-align: left;
+}
+
+.markdown th {
+  background: var(--sunk);
+  font-weight: 600;
+  letter-spacing: var(--tracking-group);
+  text-transform: uppercase;
+  color: var(--ink-2);
+}
+
+.markdown img {
+  max-width: 100%;
+}
+
+.markdown hr {
+  border: none;
+  border-top: 1px solid var(--rule);
+  margin: 0.8rem 0;
+}

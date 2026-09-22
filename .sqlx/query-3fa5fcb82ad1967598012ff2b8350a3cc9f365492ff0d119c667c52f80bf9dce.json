@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT MAX(version) AS \"version\" FROM _sqlx_migrations",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "version",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "3fa5fcb82ad1967598012ff2b8350a3cc9f365492ff0d119c667c52f80bf9dce"
+}

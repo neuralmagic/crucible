@@ -1,0 +1,8 @@
+summary = "OpenCode CLI"
+layer = 90
+
+[pins]
+opencode = "1.18.31"
+
+[capabilities]
+"agent.opencode" = { pin = "opencode" }

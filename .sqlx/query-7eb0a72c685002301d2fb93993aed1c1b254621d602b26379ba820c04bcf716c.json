@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT status AS \"status!\" FROM runs",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "status!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "7eb0a72c685002301d2fb93993aed1c1b254621d602b26379ba820c04bcf716c"
+}

@@ -1,0 +1,93 @@
+name: Base digest bump
+
+# Keeps the feedstock's UBI base pinned to what the tag currently serves: resolve the
+# BASE_IMAGE tag to its digest and open or refresh one PR that the merge queue lands once
+# CI is green. The rpms each feature installs are not pinned (UBI serves only the current
+# build of a package, so an exact pin stops resolving within hours); the base digest is the
+# one input that stays fixed between builds, and each image records the rpm set it actually
+# installed under /usr/share/crucible/rpms.
+on:
+  schedule:
+    - cron: '23 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: base-digest-bump
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Refresh the base digest
+        run: |
+          set -euo pipefail
+          ref=$(sed -n 's/^const BASE_IMAGE: &str = "\([^"]*\)".*/\1/p' xtask/src/generate.rs)
+          tag="${ref%%@*}"
+          old="${ref#*@}"
+          repo_path="${tag#registry.access.redhat.com/}"
+          new=$(curl -fsSI \
+            -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json" \
+            "https://registry.access.redhat.com/v2/${repo_path%%:*}/manifests/${tag##*:}" \
+            | tr -d '\r' | awk 'tolower($1) == "docker-content-digest:" {print $2}')
+          test -n "$new"
+          if [ "$new" != "$old" ]; then
+            sed -i "s|$tag@$old|$tag@$new|" xtask/src/generate.rs
+            echo "base digest: $old -> $new"
+          else
+            echo "base digest unchanged"
+          fi
+
+      - name: Detect drift
+        id: drift
+        run: |
+          set -euo pipefail
+          git add -A xtask
+          if git diff --cached --quiet; then
+            echo "changed=0" >> "$GITHUB_OUTPUT"
+            echo "the base digest matches the tag"
+          else
+            echo "changed=1" >> "$GITHUB_OUTPUT"
+            git diff --cached --stat
+          fi
+
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        if: steps.drift.outputs.changed == '1'
+        id: app
+        with:
+          app-id: ${{ secrets.CRUCIBLE_APP_ID }}
+          private-key: ${{ secrets.CRUCIBLE_APP_PRIVATE_KEY }}
+
+      - name: Open or refresh the PR
+        if: steps.drift.outputs.changed == '1'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          BOT: ${{ steps.app.outputs.app-slug }}[bot]
+        run: |
+          set -euo pipefail
+          branch="base-digest-bump"
+          title="Refresh the base digest"
+          body=$(printf 'The UBI tag moved under the pin:\n\n```\n%s\n```' "$(git diff --cached --stat)")
+          git config user.name "$BOT"
+          git config user.email "$BOT@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git checkout -b "$branch"
+          git commit -qm "$title"
+          if git fetch -q origin "$branch" 2>/dev/null && git diff --quiet "origin/$branch" HEAD -- .; then
+            echo "$branch already carries this refresh"
+          else
+            git push --force-with-lease=refs/remotes/origin/$branch origin "HEAD:$branch" 2>/dev/null \
+              || git push origin "HEAD:$branch"
+          fi
+          if [ -z "$(gh pr list --head "$branch" --state open --json number --jq '.[0].number')" ]; then
+            gh pr create --head "$branch" --title "$title" --body "$body"
+          fi
+          gh pr merge "$branch" --auto --merge

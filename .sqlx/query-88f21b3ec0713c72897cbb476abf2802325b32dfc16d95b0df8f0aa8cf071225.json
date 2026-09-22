@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT COUNT(*) AS \"n!: i64\", COALESCE(SUM(cost_usd), 0.0) AS \"sum!: f64\" FROM ledger WHERE kind='scope'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "n!: i64",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "sum!: f64",
+        "type_info": "Float8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "88f21b3ec0713c72897cbb476abf2802325b32dfc16d95b0df8f0aa8cf071225"
+}

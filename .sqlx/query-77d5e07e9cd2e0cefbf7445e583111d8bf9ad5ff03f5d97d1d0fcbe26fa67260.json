@@ -1,0 +1,70 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT playbook, params, schema_digest, max_cost, max_time, created_by, launcher_groups, draft_version, exposure FROM playbook_launches WHERE key = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "playbook",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "params",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 2,
+        "name": "schema_digest",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "max_cost",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 4,
+        "name": "max_time",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "created_by",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "launcher_groups",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 7,
+        "name": "draft_version",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 8,
+        "name": "exposure",
+        "type_info": "Jsonb"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "77d5e07e9cd2e0cefbf7445e583111d8bf9ad5ff03f5d97d1d0fcbe26fa67260"
+}

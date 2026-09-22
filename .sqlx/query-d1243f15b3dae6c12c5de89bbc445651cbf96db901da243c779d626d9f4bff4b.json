@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO repos (repo, last_seen_updated_at) VALUES ($1, $2)\n        ON CONFLICT(repo) DO UPDATE SET last_seen_updated_at = excluded.last_seen_updated_at\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d1243f15b3dae6c12c5de89bbc445651cbf96db901da243c779d626d9f4bff4b"
+}

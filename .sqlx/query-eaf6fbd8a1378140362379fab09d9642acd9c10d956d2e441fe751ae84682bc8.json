@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT COUNT(*) AS \"n!: i64\" FROM work_pods\n        WHERE kind = $1 AND state <> 'queued' AND substr(created_at, 1, 10) = $2\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "n!: i64",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "eaf6fbd8a1378140362379fab09d9642acd9c10d956d2e441fe751ae84682bc8"
+}

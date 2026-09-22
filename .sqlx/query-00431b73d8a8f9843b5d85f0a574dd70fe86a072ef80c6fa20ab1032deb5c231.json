@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE scopes SET frozen_issue_hash = $1 WHERE id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "00431b73d8a8f9843b5d85f0a574dd70fe86a072ef80c6fa20ab1032deb5c231"
+}

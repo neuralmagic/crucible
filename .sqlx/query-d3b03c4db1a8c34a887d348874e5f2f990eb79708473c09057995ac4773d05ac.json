@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT best_score, cost_usd, status FROM runs WHERE run_id='run-7'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "best_score",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 1,
+        "name": "cost_usd",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 2,
+        "name": "status",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "d3b03c4db1a8c34a887d348874e5f2f990eb79708473c09057995ac4773d05ac"
+}

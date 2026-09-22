@@ -1,0 +1,128 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0048"
+title = "Hub-spoke pod dispatch, the controller runs loops on spoke clusters"
+status = "accepted"
+date = "2026-07-30"
+refs = [
+    "ADR-0046",
+    "ADR-0036",
+]
+
+[content]
+context = """
+Related: [ADR-0012](./0012-rendered-deployments.md), [ADR-0019](./0019-openshell-kubernetes-driver.md),
+[[ADR-0046]].
+
+[[ADR-0046]] delegated broker **jobs** to spoke clusters and declared remote loop pods a non-goal.
+This ADR takes that on. The controller is live on the hub (`crucible--runtime-ext`, behind
+Keycloak) with dispatch parked and an internal-shard route only, unreachable from the GPU cloud.
+The GPUs, the loop namespaces, and the sandbox substrate are on wharf. v1 dispatches loop and
+turn pods from the hub controller to a single spoke (wharf); multi-spoke stays structurally
+possible (cluster column, target-aware dispatcher) but is not configured.
+
+The constraints that shape the design, all probe-verified:
+
+- the hub's SA issuer is `https://kubernetes.default.svc` (the default, shared by every the hub tenant),
+  its JWKS is not anonymously served (403 on VPN), and the hub API is unreachable from wharf
+  pods. Standard OIDC discovery cannot work; trust must bootstrap another way.
+- Wharf API-server auth is the github-authn-webhook (`~/git/llm-d-downstream-infra`,
+  `tools/github-authn-webhook`, Rust): a multi-provider OIDC webhook authenticator with
+  per-provider issuer/audiences/claimMappings/validationRules. It derives the discovery URL from
+  the issuer string (`src/jwt.rs:50-94`) and `ProviderConfig` (`src/config.rs:17-30`) has no
+  `discovery_url` override. Adding one is the enabling change (separate repo PR).
+- The controller holds 8 independent `Client::try_default()` sites (`kube_dispatcher.rs:19,40`,
+  `daemon.rs:281`, `live.rs:271`, `turn_live.rs:148`, `approvals.rs:771`, `overrides_store.rs:994`,
+  `lib.rs:175`); `work_pods` has no cluster column, so startup reconcile cannot attribute pods
+  to clusters. Pod specs are already profile-driven (rendered via `crucible deploy render-turn`,
+  namespace from `profile.cluster.loop_namespace`); only the API call targets are hardcoded."""
+decision = """
+## 1. Identity: workload identity federation, kubeconfigless
+
+The controller authenticates to wharf with a projected, auto-rotating SA token carrying a
+dedicated audience. Wharf's github-authn-webhook gains an optional `discovery_url` per
+provider plus an `hub-crucible` provider block. Because the issuer string is shared by every
+the hub tenant, the audience and a `sub` allowlist
+(`system:serviceaccount:crucible--runtime-ext:crucible-crucible-controller`) carry the entire
+trust. Zero stored credentials on either side.
+
+The controller serves a read-only OIDC discovery mirror, `/.well-known/openid-configuration`
+and `/openid/v1/jwks`, live-proxied from its own cluster API using its SA. This exists because
+the hub's issuer is not publicly discoverable and the hub's API is unreachable from wharf; the
+webhook's `discovery_url` points at the mirror instead of the issuer.
+
+## 2. Exposure: external router shard, two endpoints
+
+A second route on the external router shard (the WAF shard only accepts traffic from the WAF itself, which spokes cannot ride) exposes exactly the ingest drop-box and the discovery
+mirror. The SPA stays on the internal shard. This puts the drop-box on the internet for the
+first time; the layers are the WAF shard, the TokenReview check, and the bound-pod claim
+(a token is only accepted for the pod it names). WAF rate limiting on the drop-box route is
+required route config, not optional hardening: every invalid-token request otherwise costs a
+TokenReview against the spoke API (see §3).
+
+## 3. Ingest: per-spoke TokenReview through the federated client
+
+The drop-box (`POST /api/pods/{pod}/artifacts/{kind}`, `ingest_drop.rs:57`, outside
+oauth2-proxy) today validates via TokenReview on the controller's own cluster
+(`lib.rs:175-181`). Wharf tokens must be reviewed against wharf: `IngestValidator` gains a
+cluster-keyed validator map, pod rows carry their cluster, and each token is reviewed by the
+matching cluster's federated client. Each map entry carries its own expected namespace and
+ServiceAccount: the current single global pair (`pod_namespace` + `turn_service_account`)
+cannot validate wharf pods, whose loop namespace differs from the hub's. Pod-name binding is
+preserved. When a spoke API is unreachable the check fails closed with 503. The federated
+identity holds `tokenreviews` create on wharf (ClusterRole) for this.
+
+The accept cache stores accepts only, so an internet flood of invalid tokens would translate
+one-for-one into TokenReviews against the spoke API. The validator adds short-TTL negative
+caching for rejected tokens, paired with the required WAF rate limit from §2.
+
+Result delivery otherwise survives unchanged: tier 1 is a `pods/log` pull through the kube API
+(`reconcile/completion.rs:298`), which works cross-cluster through the federated client. The
+ingest URL is a plain profile string (`[cluster].ingest_url`, `profile.rs:273-278`) projected
+as `CRUCIBLE_INGEST_URL`; pointing spoke pods at the external hub route is a one-line profile
+change.
+
+## 4. Live view
+
+Turn-live (API log streaming, `turn_live.rs`) works cross-cluster. The run-live raw-TCP relay
+to `podIP:7777` (`live.rs:143`) is dead cross-cluster and stays hub-only in v1; remote runs
+keep the turn-live view and SSE logs. Portforward-over-API is the named follow-up.
+
+## 5. Client architecture
+
+One shared reconnecting client per target cluster replaces the per-call `try_default()`
+rebuilds. It is built via a new pub async constructor on forge's `KubeTarget`
+(`forge/src/kube.rs:43-110`, today private and sync-wrapped); fleet/cluster types
+(`ClusterEntry` and friends) sink from `crucible/src/deploy/profile.rs` into forge next to
+`KubeTarget`, since the controller cannot import crucible. The federated client's config must
+set `auth_info.token_file` rather than loading the projected token into a string at
+construction: kube-client re-reads the file and refreshes at least once per minute
+(kube-client 4.0.0, `src/client/auth/mod.rs:173`), which is what makes rotation work. The `PodDispatcher` trait
+(`workpod/dispatcher.rs:15-33`) is the target-aware boundary; `work_pods` gains a cluster
+column so startup reconcile and the sweep can attribute pods. The bounded-retry transient-error
+classification from hub-spoke S2 is applied to `await_terminal` (`kube_dispatcher.rs:50-84`),
+startup reconcile, and the sweep before any WAN exposure, so a blip neither aborts a live run
+nor reaps an unseen pod.
+
+RBAC for the wharf controller identity: pods get/list/watch/create/delete, `pods/log` get,
+configmaps create/delete and secrets create/delete (both namespaced; the secrets verbs carry the
+per-run mounted Secret of [[ADR-0036]]), plus `tokenreviews` create (ClusterRole). Sandbox-driver
+grants remain pod-identity grants on wharf, unchanged. The chart keeps rendering one
+turn-profile ConfigMap; the profile continues to describe wharf, only the dispatch target
+changes.
+
+## Non-goals
+
+Multi-spoke configuration (structure only); run-live raw TCP for remote pods; spoke-side
+controller components; portforward-over-API relay."""
+consequences = """
+- **Positive:** loops run where the GPUs are with zero stored credentials; token rotation is
+  the kubelet's job; multi-spoke is a config change, not a refactor.
+- **Cost:** the drop-box becomes internet-facing (mitigated per §2); run-live view lost for
+  remote pods until the portforward follow-up; a webhook change in a separate repo is on the
+  critical path.
+- **Risk:** the discovery mirror is a single point of trust bootstrap; if the controller is
+  down, wharf cannot validate new tokens (cached JWKS covers short outages). A shared issuer
+  string means the `sub` allowlist is load-bearing; the webhook config review must treat it as
+  a security boundary."""

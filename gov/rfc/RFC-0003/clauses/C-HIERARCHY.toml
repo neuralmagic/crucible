@@ -1,0 +1,11 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-HIERARCHY"
+title = "Resource hierarchy"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = "A governed resource MAY have exactly one parent resource, itself governed. A child MUST have the same owner as its parent, MUST inherit its parent's read scope and shares, and MUST NOT be transferred separately from its root. The parent relation is: a draft version's parent is its draft; a trigger's parent is its standing launch; a run's parent is the launch or standing launch that produced it; a run's task logs, artifacts, events, and spend records are children of the run; a binding's parent is its secret. Every spend record MUST carry, in addition to its inherited owner, the owner principal of its launch at the time of the spend; transfer changes the inherited owner and MUST NOT rewrite that attribution, so that spend sums by who spent it. Actions on a child that the vocabulary does not define for its type MUST resolve to the corresponding action on the nearest ancestor that defines it."

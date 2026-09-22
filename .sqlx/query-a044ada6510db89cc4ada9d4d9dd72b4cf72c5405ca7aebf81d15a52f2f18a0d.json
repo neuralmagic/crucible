@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE issues\n        SET tier = COALESCE($1, tier),\n            grounded_content_hash = $2,\n            ranked_content_hash = $3,\n            updated_at = $4\n        WHERE key = $5 AND (grounded_content_hash IS NULL OR grounded_content_hash <> $6)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a044ada6510db89cc4ada9d4d9dd72b4cf72c5405ca7aebf81d15a52f2f18a0d"
+}

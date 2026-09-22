@@ -1,43 +1,162 @@
 //! Repo automation, cargo-xtask style (`cargo xtask <task>`).
 //!
 //! `openshell-rev` prints the openshell-core git rev pinned in the workspace Cargo.lock.
-//! `modgraph` prints the crucible crate's module dependency graph; `--check` fails on cycles.
 //! crucible's build.rs keeps its own minimal parse of the same lockfile entry (a build script
 //! can't depend on a workspace crate), so change both together if the lockfile shape moves.
+//! `modgraph` prints one crate's module dependency graph; `--check` fails on cycles.
+//! `images` expands the sandbox image feedstock.
 
+mod generate;
+mod model;
 mod modgraph;
+mod plan;
 
 use std::path::PathBuf;
-use std::process::ExitCode;
 
-fn main() -> ExitCode {
-    let mut args = std::env::args().skip(1);
-    match args.next().as_deref() {
-        Some("openshell-rev") => match openshell_rev_from_workspace() {
-            Ok(rev) => {
-                println!("{rev}");
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("xtask openshell-rev: {e}");
-                ExitCode::FAILURE
-            }
-        },
-        Some("modgraph") => match modgraph::run(&args.collect::<Vec<_>>()) {
-            Ok(true) => ExitCode::SUCCESS,
-            Ok(false) => ExitCode::FAILURE,
-            Err(e) => {
-                eprintln!("xtask modgraph: {e}");
-                ExitCode::FAILURE
-            }
-        },
-        Some(other) => {
-            eprintln!("xtask: unknown task '{other}' (available: openshell-rev, modgraph)");
-            ExitCode::FAILURE
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+
+#[derive(Parser)]
+#[command(name = "xtask", about = "Repo automation tasks")]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// The openshell-core git rev pinned in the workspace Cargo.lock.
+    OpenshellRev,
+    /// Image feedstock: expand features + matrix into buildable outputs.
+    Images {
+        /// Feedstock root (holds features/ and matrix.toml; generated/ is output).
+        #[arg(long, default_value = "images")]
+        root: PathBuf,
+        #[command(subcommand)]
+        cmd: ImagesCmd,
+    },
+    /// Module dependency graph of one crate: cycles, fan-in/out, duplicate item names.
+    Modgraph {
+        /// The crate's src directory.
+        #[arg(long, default_value = "crucible/src")]
+        root: PathBuf,
+        /// Fail when any set of modules depends on itself.
+        #[arg(long)]
+        check: bool,
+        /// Fail when more than this many modules sit in cycles (the ratchet while they are
+        /// being broken).
+        #[arg(long)]
+        max_cyclic: Option<usize>,
+        /// Print the raw graph as JSON instead of the report.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ImagesCmd {
+    /// Regenerate images/generated/ from features/ and matrix.toml.
+    Gen,
+    /// Print image names, one per line (--json for a GHA matrix payload).
+    List {
+        #[arg(long)]
+        json: bool,
+        /// Omit images marked heavy = true in matrix.toml.
+        #[arg(long)]
+        skip_heavy: bool,
+    },
+    /// Print the images whose expanded feature set contains FEATURE.
+    Affected { feature: String },
+    /// Emit the CI matrix as JSON: {count, build: [{image, arch}], manifest: [{image, arches}]}.
+    Plan {
+        /// File of newline-separated changed paths ("-" reads stdin); omit for the full matrix.
+        #[arg(long)]
+        changed: Option<PathBuf>,
+        /// Omit images marked heavy = true in matrix.toml.
+        #[arg(long)]
+        skip_heavy: bool,
+    },
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    match cli.cmd {
+        Cmd::OpenshellRev => {
+            println!(
+                "{}",
+                openshell_rev_from_workspace().map_err(anyhow::Error::msg)?
+            );
+            Ok(())
         }
-        None => {
-            eprintln!("usage: cargo xtask <task>  (available: openshell-rev, modgraph)");
-            ExitCode::FAILURE
+        Cmd::Modgraph {
+            root,
+            check,
+            max_cyclic,
+            json,
+        } => {
+            let ok = crate::modgraph::run(&root, check, max_cyclic, json)?;
+            if !ok {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Cmd::Images { root, cmd } => {
+            let feedstock = crate::model::Feedstock::load(&root)?;
+            match cmd {
+                ImagesCmd::Gen => crate::generate::write(&feedstock, &root),
+                ImagesCmd::List { json, skip_heavy } => {
+                    let images: Vec<_> = feedstock
+                        .matrix
+                        .image
+                        .iter()
+                        .filter(|i| !(skip_heavy && i.heavy))
+                        .collect();
+                    if json {
+                        let names: Vec<&str> = images.iter().map(|i| i.name.as_str()).collect();
+                        println!("{}", serde_json::to_string(&names)?);
+                    } else {
+                        for image in images {
+                            println!("{}", image.name);
+                        }
+                    }
+                    Ok(())
+                }
+                ImagesCmd::Plan {
+                    changed,
+                    skip_heavy,
+                } => {
+                    let changed = match changed {
+                        None => None,
+                        Some(path) => {
+                            let raw = if path.as_os_str() == "-" {
+                                std::io::read_to_string(std::io::stdin())?
+                            } else {
+                                std::fs::read_to_string(&path)?
+                            };
+                            Some(
+                                raw.lines()
+                                    .map(str::trim)
+                                    .filter(|l| !l.is_empty())
+                                    .map(String::from)
+                                    .collect::<Vec<_>>(),
+                            )
+                        }
+                    };
+                    let matrix =
+                        crate::plan::ci_matrix(&feedstock, changed.as_deref(), skip_heavy)?;
+                    println!("{}", serde_json::to_string(&matrix)?);
+                    Ok(())
+                }
+                ImagesCmd::Affected { feature } => {
+                    for image in &feedstock.matrix.image {
+                        let resolved = feedstock.resolve(image)?;
+                        if resolved.features.iter().any(|f| f.name == feature) {
+                            println!("{}", image.name);
+                        }
+                    }
+                    Ok(())
+                }
+            }
         }
     }
 }

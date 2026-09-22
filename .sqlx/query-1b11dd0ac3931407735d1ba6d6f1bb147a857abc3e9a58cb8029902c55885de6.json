@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT watched, paused FROM repos WHERE repo = 'owner/repo'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "watched",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 1,
+        "name": "paused",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "1b11dd0ac3931407735d1ba6d6f1bb147a857abc3e9a58cb8029902c55885de6"
+}

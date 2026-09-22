@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE repos SET paused = $1 WHERE repo = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bool",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "895b4b403b206712f8af5ae6f6313138bad6f1b3e727e6f1494b61ff0c8616a6"
+}

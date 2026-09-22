@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT COUNT(*) AS \"n!: i64\" FROM run_task_results WHERE run_id = $1 AND status = 'transport'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "n!: i64",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "7ffa012e3403781a6e09eccfa779c9dd5c4153421dd2a69675472ef5a6b025e9"
+}

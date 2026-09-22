@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT schema_digest FROM playbook_draft_versions WHERE draft_id = $1 AND version = $2          FOR SHARE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "schema_digest",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "c621bef194a34b31ab395a41fa4a82ead570d3eeec23eda2e53074336b86e2fb"
+}

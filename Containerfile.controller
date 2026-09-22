@@ -1,0 +1,25 @@
+# produces: ghcr.io/neuralmagic/crucible-controller
+# The control plane on the runtime image: the runtime already carries the crucible engine,
+# crucible-broker and forge (the binaries the controller links against and launches), the
+# OpenShell gateway/CLI, podman/buildah and the control-plane tools. This overlay adds the
+# controller (with the SPA embedded) and the crux CLI.
+#
+# Build: .github/workflows/docker.yml compiles the workspace on the runner, builds the SPA
+# first (rust-embed folds crucible-controller/ui/dist into the controller binary), stages the
+# release executables into prebuilt/bin/, and passes the runtime image it just published as
+# CRUCIBLE_RUNTIME. This file only packages them.
+ARG CRUCIBLE_RUNTIME=unset--pass-build-arg-CRUCIBLE_RUNTIME
+FROM ${CRUCIBLE_RUNTIME}
+ARG CRUCIBLE_RUNTIME
+ARG VERSION=dev
+ARG REVISION=unknown
+LABEL org.opencontainers.image.title="crucible-controller" \
+      org.opencontainers.image.description="The crucible control plane: ledger, daemon, API and UI, on the crucible runtime" \
+      org.opencontainers.image.source="https://github.com/neuralmagic/crucible" \
+      org.opencontainers.image.licenses="MIT OR Apache-2.0" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${REVISION}" \
+      io.crucible.base-image="${CRUCIBLE_RUNTIME}"
+COPY prebuilt/bin/crucible-controller prebuilt/bin/crux /usr/local/bin/
+RUN crucible-controller --help >/dev/null && crux --help >/dev/null
+ENTRYPOINT ["crucible-controller"]

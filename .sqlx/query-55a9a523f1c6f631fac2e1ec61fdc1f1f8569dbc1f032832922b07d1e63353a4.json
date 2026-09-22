@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM user_credentials WHERE sub = $1\n           RETURNING token_cipher AS \"token_cipher!\", key_id AS \"key_id!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "token_cipher!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "key_id!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "55a9a523f1c6f631fac2e1ec61fdc1f1f8569dbc1f032832922b07d1e63353a4"
+}

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE builds SET dispatched_at = '2000-01-01T00:00:00Z' WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "89fb422cc5c3c6c822dfea7cc2a4526af9d5e79145c57b77c4bd5bcf8eb8a446"
+}

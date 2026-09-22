@@ -1,0 +1,225 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0049"
+title = "Controller high availability, leader election and the shared-state prerequisite"
+status = "accepted"
+date = "2026-08-19"
+refs = [
+    "ADR-0043",
+    "ADR-0044",
+    "ADR-0048",
+]
+
+[content]
+context = """
+The controller runs as exactly one pod: `replicas: 1` with a `Recreate` strategy, because the
+ledger was SQLite on a ReadWriteOnce PVC and two writers would corrupt it. Moving the ledger to
+Postgres removes that specific justification, so "why not run N replicas" becomes a fair
+question. The answer today is still no, for two reasons that are worth separating: one is a
+correctness invariant that survives the Postgres move, the other is a storage layout that does
+not have to.
+
+## The invariant that stays: at most one reconciler
+
+Postgres makes concurrent *statements* safe, not concurrent *decisions*. The status transitions
+are already race-proof (`claim_issue` is a single conditional UPDATE, so two racers cannot both
+win a claim). The admission caps are not: every one of them reads a count and then acts on it,
+which two reconcilers pass simultaneously.
+
+- `reconcile/tier.rs:74`, `reconcile/scope.rs:43`, `reconcile/scope.rs:113`,
+  `reconcile/lifecycle.rs:78`: `ledger_day_total(...) >= daily_cost_ceiling`.
+- `reconcile/scope.rs:118`: scopes started today against `max_scopes_per_day`.
+- `workpod/run.rs:304`: `active >= max_concurrent_pods`.
+- `workpod/sweep.rs:232`: active turn pods against the per-kind cap.
+
+What leaks through a lost race here is money and GPU time, not a corrupt row, which is why the
+guard has to be structural rather than advisory. Two reconcilers also duplicate every
+side effect the caps exist to bound: the discovery timer, the three approval polls, the kube
+pod-completion watch, and the scheduled drift check (`daemon.rs:128,151`) each fire once per
+replica, so PRs get double-commented and pods double-dispatched.
+
+The conclusion is that N>1 means *N-1 standbys plus one active reconciler*, never N concurrent
+reconcilers. Making reconcile itself concurrency-safe (per-issue row locks, a claim-based work
+queue over `FOR UPDATE SKIP LOCKED`) is a much larger change with no demand behind it: the
+workload is a handful of issues per minute, bounded by LLM spend, not by controller throughput.
+
+## The blocker that does not have to stay: the ReadWriteOnce volume
+
+`persistence.accessMode: ReadWriteOnce` (`values.yaml:282`) mounted at
+`/var/lib/crucible/state` (`deployment.yaml:343`). Two pods cannot mount it across nodes, so
+even a RollingUpdate deadlocks: the new pod blocks on a volume the old pod still holds. That is
+the direct cause of the `Recreate` strategy, and it means today's "failover" is a kubelet
+restart, tens of seconds of downtime with no standby.
+
+The volume is not just the event log. Live inventory from `crucible--runtime-ext` on
+hub-prod:
+
+| Path | Written by | Nature |
+| --- | --- | --- |
+| `controller-events.jsonl` (101 MB) | `event_log.rs:125` | append-only history, replay evidence |
+| `evidence/`, `runs/`, `adopted/` | ingest + adopt paths | run artifacts, immutable once written |
+| `packs/` | scope turns | pack markdown, read by the journey + API |
+| `checkouts/` | `engine.rs:119` | git working copies for rank-compare |
+| `autopilot.json` | `autopilot_flag.rs:45` | one runtime-mutable control flag |
+| `flow-cache/` | flow endpoint | derived cache, regenerable |
+
+Each of these has a different right answer, and only some of them need shared storage at all.
+
+## The event log is also a durability gap
+
+`transition()` writes the row and then appends a line to the file. Those cannot be one atomic
+act across a database and a filesystem, so a crash in between leaves the ledger and its history
+disagreeing. Rebuild treats the event log as the authority for replayed status
+(`rebuild.rs`, `replay_events`), which makes the gap load-bearing rather than cosmetic. This is
+worth fixing on its own merits, and it happens to also be the largest single item on the volume.
+
+## Why not object storage for the artifacts (amendment context, 2026-08-19)
+
+The first draft sent `evidence/`, `runs/` and `packs/` to object storage with a ReadWriteMany
+volume as the no-S3 fallback, and called that dependency out as the long pole: the hub has no
+provisioned object storage, and ReadWriteMany is a platform capability we never confirmed.
+Both problems dissolve if the bytes live in the database the controller already requires. The
+payloads fit the pattern: write-once, gzipped, sha256'd on ingest, and capped by
+`crucible-contract` (scope-pack 16 MiB, scope-transcript 32 MiB, run-session 128 MiB, otel-log
+32 MiB). The pointer table already exists: `pod_artifacts` stores `(pod, kind, path, digest,
+bytes)` precisely so the ledger row is a pointer at the evidence. Storing the payload beside
+the pointer removes the second storage system instead of adding one, and Aurora's backups and
+point-in-time recovery are strictly better durability than an unreplicated 5Gi PVC. The read
+paths are cold and whole-file (adopt-on-completion, MLflow export, rebuild), so the usual
+argument against database blobs, hot random access to large values, does not apply here."""
+decision = """
+## 1. Leader election: a Kubernetes Lease, fenced by a Postgres advisory lock
+
+A `coordination.k8s.io/v1` Lease in the controller's namespace elects the active replica.
+Standard k8s semantics (`holderIdentity`, `leaseDurationSeconds`, renew on an interval, take
+over on expiry), observable with `kubectl get lease`, and unaffected by a database blip.
+
+Election alone is not sufficient. A lease has the well-known stale-leader hole: a replica that
+stalls past its expiry still believes it leads and keeps writing, and what it writes here is
+spend. The active reconciler therefore also holds a session-scoped `pg_try_advisory_lock` on a
+dedicated connection, and treats losing it as an immediate step-down. The lock is the fence; the
+lease is the coordination.
+
+The lock guards writers Kubernetes cannot see, which is the second reason to have it. Both
+`db rebuild` (which issues `ALTER DATABASE ... RENAME`) and `db import-sqlite` are today
+protected only by a doc comment saying to stop the daemon first. They take the same lock and
+fail fast, turning a documented invariant into an enforced one. A laptop pointed at the
+production `DATABASE_URL` gets the same treatment.
+
+The lease is hand-rolled against the existing kube 4.0 client rather than taken as a
+dependency. The three candidate crates (`kube-lease-manager`, `kube-leader-election`, kubert's
+lease module) each pin their own kube generation, and a second kube in the tree is precisely
+what `tools/check-dep-dups.sh` exists to reject. A Lease is CRUD on one object.
+
+This section stands alone and is worth shipping before any storage change: it converts
+maintenance-command safety from convention to enforcement, and it is the half of HA that has to
+exist before replicas can ever be raised.
+
+## 2. The event log moves into Postgres
+
+An append-only `events` table replaces the JSONL file as the system of record, preserving the
+frozen line shape exactly (it is rebuild evidence, so its schema is a compatibility surface, not
+an implementation detail). The append joins the state transition in one transaction, closing the
+durability gap above. Replay becomes a query rather than a file scan, and live SSE subscribers
+read the table instead of tailing a file, which is what lets a standby serve the live view.
+
+The file does not disappear as a *format*: an export path keeps producing the same NDJSON for
+offline analysis and for the disaster case where the database is the thing that is gone.
+
+## 3. Artifact and pack bytes move into Postgres; caches stop being persistent
+
+*(Amended 2026-08-19. Supersedes the object-storage + ReadWriteMany plan.)*
+
+- **`evidence/`**: the payload moves into the database beside its existing pointer. Bytes are
+  stored gzipped, exactly as ingested, chunked into an `artifact_chunks(artifact_id, seq,
+  data bytea)` child table rather than one value per artifact: the 128 MiB run-session cap is
+  too large to materialize as a single bytea on both ends of every read, and chunking keeps
+  per-row TOAST and WAL amplification bounded. The drop-box keeps its contract: streamed
+  ingest, inline sha256, per-kind cap enforced mid-stream, at-least-once dedup on the
+  `(pod, kind)` key. `db rebuild` re-derives the ledger from these rows instead of the
+  evidence directory; the database becomes canonical for evidence, and the rebuild-from-disk
+  story is retired deliberately rather than silently.
+- **`runs/<id>/session.jsonl`, `adopted/`**: same treatment. Sessions are stored gzipped and
+  gunzipped by the two whole-file readers (ingest fold, flow render). No streaming read path
+  exists today and none is added.
+- **`packs/`**: the durable form becomes the gzipped tarball the pod executor already ships
+  (scrape already receives packs as base64 gzip tar). Working trees are materialized to
+  scratch when `git`, `gh` or the engine need one, and discarded after. The `STEER.md`
+  reseed-append, today the one human-driven mutation of on-disk state, moves to its own
+  `pack_steering` table and is injected into the tree at materialization, so the frozen pack
+  stays frozen.
+- **`checkouts/`, `flow-cache/`**: per-pod scratch. Both are derived and regenerable, so they
+  move to an `emptyDir` and stop being shared state at all.
+- **`autopilot.json`**: one flag, already mutable at runtime through `POST /api/autopilot`. It
+  becomes a row. Its original rationale (a file survives `db rebuild`) inverts once the
+  database is canonical for everything else, and N>1 requires the flag to be shared anyway.
+
+No Flatbuffers or other binary serialization layer: the payloads are already gzipped NDJSON
+and tarballs, the one schema'd stream (events) becomes columns, and zero-copy decode buys
+nothing after a gunzip.
+
+## 4. A one-shot migration tool moves the live volume
+
+`crucible-controller db migrate-state` walks an existing state directory and loads it into the
+tables above: evidence files into chunks with digests re-verified against `pod_artifacts`,
+session logs and adopted runs likewise, packs re-tarred with any appended `STEER.md` steering
+split into `pack_steering`, `controller-events.jsonl` into the events table, and
+`autopilot.json` into its row. It is idempotent (digest match short-circuits a re-copy),
+refuses to run against a daemon holding the §1 advisory lock, and reports what it skipped.
+The cutover is: stop daemon, run tool, deploy the release that reads Postgres, then drop the
+PVC once a `db rebuild --verify` passes against the migrated data.
+
+## 5. Only then: replicas > 1
+
+With §1 through §4 done, the deployment drops its ReadWriteOnce PVC, moves to `RollingUpdate`,
+and raises `replicas`. Standbys are not idle: they serve the read API and the SPA, which makes
+the UI highly available independently of reconcile. Write endpoints split by what they do.
+Single-statement writes (repo add, override set) are safe on any replica because Postgres makes
+them atomic. Endpoints that *dispatch work* (the human scope trigger, which deliberately
+bypasses the caps because a human authorized it) are leader-gated and forwarded, because they
+are reconcile decisions wearing an HTTP hat.
+
+## Non-goals
+
+Concurrent reconcile (N active writers, per-issue locking, work-stealing). Sharding issues
+across replicas. Multi-region or active-active. Automatic failover of the *spoke* dispatch
+identity, which is unchanged and per-cluster. Postgres HA itself, which is the database
+provider's problem (Aurora already does it). Retention policy for evidence and events: moving
+the bytes makes `DELETE WHERE` possible, but choosing the window is a separate decision."""
+consequences = """
+- **Positive:** failover becomes a standby takeover rather than a kubelet restart; rolling
+  updates become possible, so a deploy stops being an outage; the maintenance commands become
+  safe by construction; the state transition and its history become one atomic act; the UI stops
+  sharing a failure domain with reconcile; the deployment loses its only PVC and with it the
+  storage-class, appcode and CMDB friction of provisioning one; every artifact inherits
+  Aurora's backup and point-in-time-recovery posture.
+- **Cost:** database size grows by the artifact volume (gzipped, and boundable once retention
+  exists, but on Aurora storage that is billed). Large-value writes amplify WAL; chunking
+  bounds the per-row cost but the total is what it is. `db rebuild` changes meaning: it
+  re-derives the ledger from evidence *rows*, so losing the database now loses the evidence
+  too, and the NDJSON export in §2 plus Aurora PITR are the compensating controls. The event
+  log's frozen shape has to survive the move intact or rebuild silently degrades.
+- **Risk:** the fence's correctness depends on the advisory lock being session-scoped on a
+  connection that is not pooled in transaction mode. Aurora is addressed directly today, but
+  putting RDS Proxy or pgbouncer in front later would silently break the fence, so that pairing
+  needs a guard (a startup check, and a note wherever the connection string is configured).
+  Leader flapping under a slow API server is the usual lease failure mode; the renew interval
+  and expiry need to be tuned against the hub's observed API latency rather than copied from
+  defaults. Pack materialization to scratch adds a failure mode (disk pressure on the node's
+  emptyDir) that the PVC never had; the trees are small and short-lived, but the error path
+  has to say what ran out."""
+
+[[content.alternatives]]
+text = "Evidence, runs and packs to object storage (S3) with a ReadWriteMany volume as the no-S3 fallback"
+status = "rejected"
+rejection_reason = "the hub has no provisioned object storage and ReadWriteMany was never confirmed on target clusters; Postgres bytea removes the second storage system instead of adding one."
+
+[[content.alternatives]]
+text = "Payload bytes as chunked bytea in Postgres beside the existing pointer rows"
+status = "accepted"
+
+[[content.alternatives]]
+text = "Concurrent reconcile (N active writers over FOR UPDATE SKIP LOCKED)"
+status = "rejected"
+rejection_reason = "Much larger change with no demand: workload is bounded by LLM spend, not controller throughput."

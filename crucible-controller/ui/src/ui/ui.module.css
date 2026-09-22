@@ -1,0 +1,15 @@
+@keyframes crucible-swatch-pulse {
+  50% {
+    opacity: 0.25;
+  }
+}
+
+.pulse {
+  animation: crucible-swatch-pulse 1.6s steps(2) infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pulse {
+    animation: none;
+  }
+}

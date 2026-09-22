@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO run_plans (run_id, plan_version, graph_json) VALUES ($1, $2, $3)\n        ON CONFLICT (run_id, plan_version) DO UPDATE SET graph_json = excluded.graph_json\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0f99013b17881f188e883c93a86dd8caaa5e18c9ef70e750dc06fe96ad3d1580"
+}
