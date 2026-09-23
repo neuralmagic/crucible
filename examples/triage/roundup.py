@@ -3,6 +3,7 @@ per confirmed bug."""
 
 import json
 import os
+import re
 from pathlib import Path
 
 
@@ -22,12 +23,13 @@ def outputs_of(entry: object) -> dict[str, dict[str, str]]:
 
 FIX_WORKFLOW = "issue-fix"
 FIX_SEVERITIES = {"critical", "high"}
+REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+")
 
 
 def repo_of(entry: object) -> str:
     if isinstance(entry, dict):
         repo = entry.get("repo")
-        if isinstance(repo, str):
+        if isinstance(repo, str) and REPO.fullmatch(repo):
             return repo
     return ""
 
@@ -44,7 +46,8 @@ def fix_asks(repo: str, rows: list[tuple[str, dict[str, str]]]) -> list[dict[str
             "params": {"repo": repo, "issue": issue},
         }
         for issue, result in rows
-        if result.get("classification") == "bug"
+        if issue.isdigit()
+        and result.get("classification") == "bug"
         and result.get("severity") in FIX_SEVERITIES
         and result.get("confidence") == "high"
     ]
