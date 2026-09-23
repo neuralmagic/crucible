@@ -53,8 +53,9 @@ pub(crate) async fn set_run_image(
 /// Every run launched from one scope, oldest first.
 #[tracing::instrument(name = "db.list_runs_for_scope", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", scope = scope), err)]
 pub async fn list_runs_for_scope(ex: impl PgExecutor<'_>, scope: i64) -> Result<Vec<Run>> {
-    let sql = format!("SELECT {RUN_COLS} FROM runs WHERE scope = $1 ORDER BY run_id");
-    sqlx::query_as::<_, Run>(&sql)
+    let sql =
+        const_format::formatcp!("SELECT {RUN_COLS} FROM runs WHERE scope = $1 ORDER BY run_id");
+    sqlx::query_as::<_, Run>(sql)
         .bind(scope)
         .fetch_all(ex)
         .await
@@ -64,8 +65,8 @@ pub async fn list_runs_for_scope(ex: impl PgExecutor<'_>, scope: i64) -> Result<
 /// Fetch one run by id, or `None` if untracked.
 #[tracing::instrument(name = "db.get_run", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", run_id = %run_id), err)]
 pub(crate) async fn get_run(ex: impl PgExecutor<'_>, run_id: &str) -> Result<Option<Run>> {
-    let sql = format!("SELECT {RUN_COLS} FROM runs WHERE run_id = $1");
-    sqlx::query_as::<_, Run>(&sql)
+    let sql = const_format::formatcp!("SELECT {RUN_COLS} FROM runs WHERE run_id = $1");
+    sqlx::query_as::<_, Run>(sql)
         .bind(run_id)
         .fetch_optional(ex)
         .await
@@ -79,8 +80,10 @@ pub async fn list_candidates_for_run(
     ex: impl PgExecutor<'_>,
     run_id: &str,
 ) -> Result<Vec<Candidate>> {
-    let sql = format!("SELECT {CANDIDATE_COLS} FROM candidates WHERE run_id = $1 ORDER BY seq");
-    sqlx::query_as::<_, Candidate>(&sql)
+    let sql = const_format::formatcp!(
+        "SELECT {CANDIDATE_COLS} FROM candidates WHERE run_id = $1 ORDER BY seq"
+    );
+    sqlx::query_as::<_, Candidate>(sql)
         .bind(run_id)
         .fetch_all(ex)
         .await
@@ -132,7 +135,7 @@ pub(crate) async fn list_runs_page(ex: impl PgExecutor<'_>, q: &RunQuery) -> Res
         LIMIT $5 OFFSET $6
         "#
     );
-    let rows = sqlx::query(&sql)
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(&q.status)
         .bind(&q.status)
         .bind(&q.repo)
@@ -205,10 +208,10 @@ pub(crate) async fn list_candidates_for_run_by_iter(
     ex: impl PgExecutor<'_>,
     run_id: &str,
 ) -> Result<Vec<Candidate>> {
-    let sql = format!(
+    let sql = const_format::formatcp!(
         "SELECT {CANDIDATE_COLS} FROM candidates WHERE run_id = $1 ORDER BY COALESCE(iter, lane), seq"
     );
-    sqlx::query_as::<_, Candidate>(&sql)
+    sqlx::query_as::<_, Candidate>(sql)
         .bind(run_id)
         .fetch_all(ex)
         .await

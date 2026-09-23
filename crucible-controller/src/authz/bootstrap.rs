@@ -272,9 +272,9 @@ pub async fn migrate_group_owners(pool: &PgPool) -> Result<u64> {
         .context("opening the group owner migration")?;
     let mut groups: Vec<String> = Vec::new();
     for (table, column, _, _) in OWNER_COLUMNS {
-        let found: Vec<String> = sqlx::query_scalar(&format!(
+        let found: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT DISTINCT {column} FROM {table} WHERE {column} LIKE 'group:%'"
-        ))
+        )))
         .fetch_all(&mut *tx)
         .await
         .with_context(|| format!("listing group owners in {table}"))?;
@@ -291,9 +291,9 @@ pub async fn migrate_group_owners(pool: &PgPool) -> Result<u64> {
         let slug = team_for_group(&mut tx, &group, &now).await?;
         let team = Principal::Team(slug.clone());
         for (table, column, id_column, resource_type) in OWNER_COLUMNS {
-            let ids: Vec<String> = sqlx::query_scalar(&format!(
+            let ids: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                 "UPDATE {table} SET {column} = $2 WHERE {column} = $1 RETURNING {id_column}"
-            ))
+            )))
             .bind(&raw)
             .bind(team.to_string())
             .fetch_all(&mut *tx)

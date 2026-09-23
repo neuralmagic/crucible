@@ -39,7 +39,7 @@ the file exists so that nothing has to be exported.
 
 | Env | Flag | File key | Meaning |
 | --- | --- | --- | --- |
-| `CONTROLLER_URL` | `--url` | `url` | Controller base URL: the API route, not the browser route. |
+| `CONTROLLER_URL` | `--url` | `url` | Controller base URL: the API route, not the browser route. Defaults to `http://127.0.0.1:8870`, a controller on this machine. |
 | `CONTROLLER_API_TOKEN` | `--api-token` | `api_token` | A minted `crk_` key, or the static controller bearer. |
 | `CONTROLLER_CONFIG` | `--config` | — | The config file to read. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. |
 

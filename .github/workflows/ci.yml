@@ -211,10 +211,10 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.CARGO_HOME || format('{0}/.cargo', env.HOME) }}/bin/sqlx
-          key: sqlx-cli-0.8.6-${{ runner.os }}-${{ runner.arch }}
+          key: sqlx-cli-0.9.0-${{ runner.os }}-${{ runner.arch }}
       - name: Install sqlx-cli
         if: steps.sqlx-cli.outputs.cache-hit != 'true'
-        run: cargo install sqlx-cli --version 0.8.6 --no-default-features --features postgres,rustls --locked
+        run: cargo install sqlx-cli --version 0.9.0 --no-default-features --features postgres,rustls --locked
       - name: Check sqlx offline metadata is current
         env:
           SQLX_OFFLINE: "false"

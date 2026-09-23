@@ -6,107 +6,218 @@
       {
         "ordinal": 0,
         "name": "key!",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "playbook_launches",
+            "name": "key"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "playbook!",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "playbook_launches",
+            "name": "playbook"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "description?",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "playbooks",
+            "name": "description"
+          }
+        }
       },
       {
         "ordinal": 3,
         "name": "params!",
-        "type_info": "Jsonb"
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "playbook_launches",
+            "name": "params"
+          }
+        }
       },
       {
         "ordinal": 4,
         "name": "schema_digest!",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "playbook_launches",
+            "name": "schema_digest"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "current_schema_digest?",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "playbooks",
+            "name": "schema_digest"
+          }
+        }
       },
       {
         "ordinal": 6,
         "name": "max_cost!",
-        "type_info": "Float8"
+        "type_info": "Float8",
+        "origin": {
+          "Table": {
+            "table": "playbook_launches",
+            "name": "max_cost"
+          }
+        }
       },
       {
         "ordinal": 7,
         "name": "max_time!",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "playbook_launches",
+            "name": "max_time"
+          }
+        }
       },
       {
         "ordinal": 8,
         "name": "advance_dedupe!",
-        "type_info": "Bool"
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "playbook_launches",
+            "name": "advance_dedupe"
+          }
+        }
       },
       {
         "ordinal": 9,
         "name": "origin!",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "playbook_launches",
+            "name": "origin"
+          }
+        }
       },
       {
         "ordinal": 10,
         "name": "draft_version",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "playbook_launches",
+            "name": "draft_version"
+          }
+        }
       },
       {
         "ordinal": 11,
         "name": "dedupe_schedule",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "playbook_launches",
+            "name": "dedupe_schedule"
+          }
+        }
       },
       {
         "ordinal": 12,
         "name": "status!",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "issues",
+            "name": "status"
+          }
+        }
       },
       {
         "ordinal": 13,
         "name": "parked_reason",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "issues",
+            "name": "parked_reason"
+          }
+        }
       },
       {
         "ordinal": 14,
         "name": "agent_provider",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "issues",
+            "name": "agent_provider"
+          }
+        }
       },
       {
         "ordinal": 15,
         "name": "agent_model",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "issues",
+            "name": "agent_model"
+          }
+        }
       },
       {
         "ordinal": 16,
         "name": "cost_usd?",
-        "type_info": "Float8"
+        "type_info": "Float8",
+        "origin": "Expression"
       },
       {
         "ordinal": 17,
         "name": "runs!: i64",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": "Expression"
       },
       {
         "ordinal": 18,
         "name": "transport_losses!: i64",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": "Expression"
       },
       {
         "ordinal": 19,
         "name": "created_by",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "playbook_launches",
+            "name": "created_by"
+          }
+        }
       },
       {
         "ordinal": 20,
         "name": "created_at!",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "playbook_launches",
+            "name": "created_at"
+          }
+        }
       }
     ],
     "parameters": {
