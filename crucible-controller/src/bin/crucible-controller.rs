@@ -701,34 +701,38 @@ async fn swap_databases(live_url: &str, live_name: &str, tmp_name: &str) -> Resu
         .execute(&mut conn)
         .await
         .context("terminating straggler connections")?;
-    sqlx::query(&format!("DROP DATABASE IF EXISTS \"{backup_name}\""))
-        .execute(&mut conn)
-        .await
-        .context("dropping a leftover pre-rebuild backup")?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS \"{backup_name}\""
+    )))
+    .execute(&mut conn)
+    .await
+    .context("dropping a leftover pre-rebuild backup")?;
     let live_exists: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)")
             .bind(live_name)
             .fetch_one(&mut conn)
             .await?;
     if live_exists {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "ALTER DATABASE \"{live_name}\" RENAME TO \"{backup_name}\""
-        ))
+        )))
         .execute(&mut conn)
         .await
         .context("setting the live database aside")?;
     }
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "ALTER DATABASE \"{tmp_name}\" RENAME TO \"{live_name}\""
-    ))
+    )))
     .execute(&mut conn)
     .await
     .context("renaming the rebuilt database into place")?;
     if live_exists {
-        sqlx::query(&format!("DROP DATABASE \"{backup_name}\""))
-            .execute(&mut conn)
-            .await
-            .context("dropping the pre-rebuild database")?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE \"{backup_name}\""
+        )))
+        .execute(&mut conn)
+        .await
+        .context("dropping the pre-rebuild database")?;
     }
     Ok(())
 }

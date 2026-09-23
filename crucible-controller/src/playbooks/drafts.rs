@@ -817,7 +817,7 @@ pub async fn save_version(
 
 /// Every draft, newest first, each with the state of its newest save.
 pub async fn list(pool: &PgPool) -> Result<Vec<DraftSummary>> {
-    let rows = sqlx::query(&format!(
+    let rows = sqlx::query(const_format::formatcp!(
         "SELECT {DRAFT_COLUMNS}, v.version, v.schema_digest, v.diagnostics \
          {DRAFT_JOINS} \
          LEFT JOIN LATERAL ( \
@@ -850,7 +850,7 @@ pub async fn list(pool: &PgPool) -> Result<Vec<DraftSummary>> {
 
 /// One draft's metadata row.
 pub async fn get(pool: &PgPool, id: &str) -> Result<Option<DraftRow>> {
-    let row = sqlx::query(&format!(
+    let row = sqlx::query(const_format::formatcp!(
         "SELECT {DRAFT_COLUMNS} {DRAFT_JOINS} WHERE d.id = $1"
     ))
     .bind(id)
