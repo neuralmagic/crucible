@@ -1,0 +1,79 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0050"
+title = "Human-decided routes: a person answers typed questions over Slack"
+status = "accepted"
+date = "2026-09-23"
+refs = [
+    "RFC-0001:C-ROUTE",
+    "RFC-0002:C-PLAYBOOK-BUDGET",
+    "RFC-0002:C-PLAYBOOK-CAPS",
+    "RFC-0002:C-PLAYBOOK-RESUME",
+    "RFC-0002:C-REPORTS",
+    "ADR-0003",
+]
+
+[content]
+context = """
+A route answers typed noul/choice questions and other tasks branch on the label with `when`. Two deciders exist: a System One model reached through the broker, and a dependency's output. Some branches are a person's call (ship or hold a release, which team owns a regression), and today the only way to get a person into a playbook is to end the run and start another one by hand.
+
+The questions are already the right shape for a person: every answer is one of a closed set of labels, and `uncertain`, `drop` and `otherwise` already describe what happens when nobody can say. What is missing is a channel to ask on, a way for the answer to reach a run that is waiting for it, and a bound on the wait.
+
+Constraints that shape the design:
+
+- The run executes in a loop pod with no inbound network path. Slack delivers button clicks to one Request URL per Slack app, which is the controller's, not the pod's.
+- The pod already holds a controller-issued credential: a projected ServiceAccount token for the `crucible-ingest` audience, bound to the pod, which the controller validates with a TokenReview (runs/ingest_auth.rs).
+- `report()` posts engine-authored snapshots through an incoming webhook (C-REPORTS). A webhook can post buttons, but it cannot check who clicked or whether they belong in the channel, and it cannot edit the message afterwards.
+- A playbook runs under a wall-clock ceiling that must end the run no matter what a task is doing (C-PLAYBOOK-BUDGET), and a crashed run resumes from its session log without re-dispatching what settled (C-PLAYBOOK-RESUME).
+- [[ADR-0003]] already settled that a wait on a human belongs to the loop, never to an agent turn."""
+decision = """
+Add a third decider, `human`, declared in the DSL as `route(..., human = {"kind": "slack", "deadline": "4h"})` and in the IR as `decider = { kind = "human", via = "slack", deadline_secs = 14400 }`. A human-decided route needs the `human` capability.
+
+1. **The controller posts the question.** The engine never talks to Slack for this. It PUTs the route's typed questions and its deadline to an elicitation endpoint the controller configures (`CRUCIBLE_ELICIT_URL`, with the bearer read from the file `CRUCIBLE_ELICIT_TOKEN_PATH` names on every request; the controller points that at the pod's ingest token). The endpoint's presence is the `human` capability, so a run with no endpoint truncates before any spend. The controller holds the Slack bot token, posts one message to the one channel it is configured with, and edits it as answers arrive. The workflow cannot name a channel, user, token, or URL.
+
+2. **The answer returns by polling.** Slack delivers the click to the controller's interactivity endpoint. The controller verifies the Slack request signature, checks that the click came from the configured channel and that the user is a member of it, decodes the button into a (question, label) pair against the stored question, and records the first answer per question. The engine GETs the same URL every few seconds until every question is answered, the deadline passes, or the run's wall-clock ceiling arrives. Polling was chosen over a push into the pod because the pod has no inbound path and the ingest token already authenticates pod-to-controller calls.
+
+3. **What a run holds while it waits.** The loop process blocks in the executor on the route: no agent turn, no sandbox, no spend. The executor dispatches serially outside isolated batches, so a waiting route is a barrier for the tasks behind it in topological order. The wall-clock ceiling keeps running, unlike [[ADR-0003]]'s block mode, because the ceiling is the operator's bound on the whole run and a human wait is still part of the run.
+
+4. **Deadline and ceiling are different outcomes.** When the route's own deadline passes, unanswered questions are recorded as `uncertain` (empty distribution, confidence 0), answered ones keep their labels, and the route passes, so `otherwise` and `drop` cover a person who never replied. When the run's ceiling arrives first, the route fails and the run ends as having exhausted its wall-clock ceiling: the author did not ask for an uncertain answer at that time, the operator ended the run.
+
+5. **Resume.** The controller keys the question by (run, route task). The deadline is fixed on first delivery. A PUT for a key that exists returns the stored question's answers and the time left, and posts nothing. A transport retry and a resumed run that re-dispatches an unsettled route therefore pick up the same question, including answers given while the pod was down. A route that settled is folded from the session log and never asked again.
+
+6. **Security.** An answer is a typed label, never text: the message carries one button per declared label and no input element, and the controller decodes a click against the stored question, so a forged or stale button value that names an undeclared question or label is rejected. The engine validates again on read and fails the route on an undeclared question, an undeclared label, or `uncertain` from the endpoint. Only members of the configured channel can answer. The message carries only compile-time authored text (instructions, labels, option descriptions), the run and task names, the deadline, and the controller's run link; no task output reaches Slack through a question, so a question cannot become an exfiltration channel.
+
+7. **Recorded answer.** A chosen label is recorded exactly as an output-decided answer is: confidence 1 and probability 1 for that label. Who answered is the controller's audit record, not part of the route's output, so the decision shape stays identical across deciders.
+
+The engine, the contract types (request, status, Slack message rendering, click decoding), and the DSL/IR land first. The controller's endpoint, storage, Slack client and interactivity route are a separate work item."""
+consequences = """
+Positive: a playbook can stop on a person's typed judgment and branch on it with the same `when`/`otherwise`/`drop` machinery a model decision uses; no new agent-turn cost; a silent person degrades to `uncertain`, which the author already had to route. The Slack credential and the membership check stay on the controller, and no run-time data reaches the channel.
+
+Negative: a waiting route holds the loop pod and blocks serial dispatch behind it, so a long deadline costs a pod-hour per hour even when independent work could run. Polling adds one small GET every few seconds per waiting route. A run whose ceiling is shorter than the deadline can end on the ceiling with nobody having been slow; authors must size the ceiling to the question. The first answer per question is final, so a misclick needs a new run. Until the controller half ships, `human` is never available on a deployed run, which truncates such a playbook before dispatch."""
+
+[[content.alternatives]]
+text = "Controller posts with a bot token and receives the click; the engine polls the controller over its pod-bound token"
+status = "accepted"
+pros = [
+    "The Slack credential, the signature check, and the membership check live in one place the pack cannot reach",
+    "The pod needs no inbound path and no new credential",
+    "The stored question survives the pod, which is what makes resume and retries idempotent",
+]
+cons = [
+    "Polling latency of a few seconds",
+    "Needs a controller table and two routes before it works on a deployed run",
+]
+
+[[content.alternatives]]
+text = "Engine posts through the broker's Slack webhook as report() does, with buttons whose clicks reach the controller"
+status = "rejected"
+rejection_reason = "A webhook cannot check channel membership or edit the message, the click still has to be received and stored by the controller, and the engine would need to agree with the controller on a question it never registered. Splitting who posts from who receives buys nothing."
+
+[[content.alternatives]]
+text = "Agent turn asks the person (an MCP tool that waits for a reply)"
+status = "rejected"
+rejection_reason = "[[ADR-0003]]: a turn is ephemeral and paid, and a free-text reply is not a typed label."
+
+[[content.alternatives]]
+text = "Park the run on the question and resume it on the answer"
+status = "rejected"
+rejection_reason = "Parking needs a controller-driven resume of a playbook run that does not exist yet, and a blocked wait bounded by the run's own ceiling gives the same semantics with no new lifecycle. Worth revisiting once waits longer than a pod should live are common."
