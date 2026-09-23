@@ -43,7 +43,7 @@ pub(crate) fn iteration_template(
                 isolation: None,
                 join: Join::default(),
                 stage: Stage::Iteration,
-                emits: Vec::new(),
+                emits: crate::plan::ir::Emits::default(),
                 emits_files: Vec::new(),
                 over: None,
                 max_fanout: None,

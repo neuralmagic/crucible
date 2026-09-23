@@ -843,7 +843,7 @@ mod tests {
             isolation: None,
             join: Join::default(),
             stage: Stage::Iteration,
-            emits: Vec::new(),
+            emits: crate::plan::ir::Emits::default(),
             emits_files: files.iter().map(|f| (*f).to_string()).collect(),
             over: None,
             max_fanout: None,
@@ -1857,6 +1857,145 @@ workflow(type = "playbook", tasks = [discover, audit, roundup])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Typed emits through the real front end, subprocesses, and agent harness: a mapped instance
+    /// and a command whose output holds the wrong type each fail where they ran, with a note that
+    /// names the field, what arrived, and what was declared.
+    #[test]
+    fn a_wrongly_typed_output_fails_the_task_that_produced_it() {
+        let dir = std::env::temp_dir().join(format!("crucible-typed-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        let fake = root.join("tools/fake-agent.py");
+
+        std::fs::write(
+            dir.join("agents.json"),
+            r#"{
+              "audit[alpha]": {"result": {"findings": 0, "severity": "low"}},
+              "audit[beta]":  {"result": {"findings": "two", "severity": "high"}},
+              "audit[gamma]": {"result": {"findings": 1, "severity": "urgent"}}
+            }"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            dir.join("workflow.star"),
+            r##"
+discover = command(
+    name = "discover",
+    run = "printf '{\"targets\": [\"alpha\", \"beta\", \"gamma\"]}\n'",
+    emits = {"targets": "list"},
+)
+audit = agent(
+    name = "audit",
+    prompt = "audit one target",
+    depends_on = [discover],
+    over = discover.targets,
+    max_fanout = 8,
+    isolated = True,
+    required = False,
+    emits = {"findings": "integer", "severity": ["low", "high"]},
+)
+tally = command(
+    name = "tally",
+    run = "printf '{\"count\": \"3\"}\n'",
+    depends_on = [audit],
+    join = "passed",
+    required = False,
+    emits = {"count": "integer"},
+)
+workflow(type = "playbook", tasks = [discover, audit, tally])
+"##,
+        )
+        .unwrap();
+
+        std::fs::write(
+            dir.join("crucible.toml"),
+            format!(
+                r#"
+                [repo]
+                path = "."
+                [workspace]
+                dir = "workspace"
+                setup_cmd = "mkdir -p workspace && git -C workspace init -q && git -C workspace -c user.email=c@l -c user.name=c -c commit.gpgsign=false commit -q --allow-empty -m baseline"
+                [agent]
+                backend = "command"
+                agent_cmd = "python3 {}"
+                goal = "audit each discovered target"
+                [agent.env]
+                FAKE_AGENT_SCRIPT = "{}"
+                [workflow]
+                type = "playbook"
+                file = "workflow.star"
+                "#,
+                fake.display(),
+                dir.join("agents.json").display(),
+            ),
+        )
+        .unwrap();
+
+        let mut manifest = crate::manifest::Manifest::load(&dir.join("crucible.toml")).unwrap();
+        manifest.resolve_workflow(&dir).unwrap();
+        let workflow = manifest.workflow.as_ref().expect("workflow");
+        let plan = crate::plan::template::iteration_template(
+            Some(workflow),
+            &crate::plan::workflow::WorkflowCaps::for_lane(workflow.workflow_type),
+        )
+        .unwrap();
+
+        let mut rows: Vec<(String, &'static str, String)> = Vec::new();
+        let mut runner = crate::cli::setup::prep_plan_runner(&dir.join("crucible.toml"))
+            .unwrap()
+            .0;
+        let out = execute(
+            &plan,
+            &Substrate::default(),
+            ExecCfg::default(),
+            &mut runner,
+            |task, result| {
+                rows.push((
+                    task.name.0.clone(),
+                    result.status.as_str(),
+                    result.note.clone().unwrap_or_default(),
+                ))
+            },
+        );
+        let row = |name: &str| {
+            rows.iter()
+                .find(|(n, _, _)| n == name)
+                .map(|(_, status, note)| (*status, note.as_str()))
+                .unwrap_or_else(|| panic!("no row for {name}: {rows:?}"))
+        };
+
+        assert_eq!(row("discover"), ("pass", ""));
+        assert_eq!(row("audit[alpha]"), ("pass", ""));
+        assert_eq!(
+            row("audit[beta]"),
+            (
+                "fail",
+                "output field \"findings\" is string, declared integer"
+            )
+        );
+        assert_eq!(
+            row("audit[gamma]"),
+            (
+                "fail",
+                "output field \"severity\" is \"urgent\", declared one of low|high"
+            )
+        );
+        let node = &out.results[&"audit".into()];
+        assert_eq!(node.output.as_ref().expect("folded")["passed"], 1);
+        assert_eq!(
+            row("tally"),
+            ("fail", "output field \"count\" is string, declared integer")
+        );
+        assert_eq!(out.results[&"tally".into()].attempts, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Git memory, per task: what a passing task did becomes a commit, and what a failing task
     /// did is dropped. The second half is what needs proving. Leaving a failed task's edits in
     /// the shared tree does not merely fail to commit them; the next task to pass sweeps them
@@ -2524,7 +2663,7 @@ workflow(type = "playbook", tasks = [analyze, implement, report])
             isolation: None,
             join: Join::default(),
             stage: Stage::Iteration,
-            emits: Vec::new(),
+            emits: crate::plan::ir::Emits::default(),
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,

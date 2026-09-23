@@ -931,6 +931,7 @@ mod tests {
                     when: String::new(),
                     revise: String::new(),
                     max_rounds: 0,
+                    emits: Vec::new(),
                 },
                 PlanTaskWire {
                     name: "measure".into(),
@@ -946,6 +947,7 @@ mod tests {
                     when: String::new(),
                     revise: String::new(),
                     max_rounds: 0,
+                    emits: Vec::new(),
                 },
             ],
         });

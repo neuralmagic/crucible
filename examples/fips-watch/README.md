@@ -24,6 +24,12 @@ Finally, `card` folds the declared verdict and filing fields into a bounded resu
 engine-owned `report` epilogue renders that result as Slack Block Kit with a link to the run. The
 pack never supplies Slack blocks, a channel, or a webhook URL.
 
+Every task types its `emits`. `probe` promises `status` is `clean` or `dirty`, `triage` promises
+`confidence` is `high`, `medium`, or `low`, and the counts `roundup` and `card` report are
+integers. A script that drifts (a probe that prints `"unknown"`, a count that arrives as a string)
+fails the task that printed it instead of reaching the Slack card, and `over = scan.variants`
+compiles only because `variants` is declared a list.
+
 ## Why the verdict is a build graph, not a lockfile
 
 Three traps this pack exists to avoid, all observed on a real repository:

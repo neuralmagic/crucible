@@ -1,0 +1,63 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-09-23-001"
+title = "Let emits declare the type of each output field"
+status = "active"
+created = "2026-09-23"
+started = "2026-09-23"
+refs = [
+    "RFC-0001:C-WORKFLOW",
+    "RFC-0001:C-ROUTE",
+    "RFC-0004:C-CONTRACT-VERSION",
+]
+
+[content]
+description = """
+`emits = ["lines"]` promises only that a field is present. A consumer that reads the field as a list, a score, or a route label finds out at run time, downstream of the task that got it wrong, or not at all.
+
+`emits` also takes a dict from field name to type: `"string"`, `"integer"`, `"number"`, `"boolean"`, `"list"`, `"object"`, or a list of labels. The list form is unchanged. A passing attempt whose field holds the wrong type or a label outside the list is a measured failure at the producing task, like a missing field. At compile time the types are checked against every reader: `over` needs a list, a `top_k` dependency, grade source, or thresholded evaluate needs a numeric `score`, and an output-decided route needs labels its question answers, or a boolean for a noul.
+
+The IR carries the types (`Emits::Fields` or `Emits::Typed`), the generated TOML writes them as a table, and `plan_admitted` lists each field with its type, which bumps the contract to 1.8.0. The type vocabulary lives in `crucible-contract` so the wire and the engine share it.
+
+Naming the types in the result contract appended to an agent prompt is left for after open PR #152 lands; that code is not on main."""
+
+[[content.acceptance_criteria]]
+text = "emits accepts a dict from field name to type in the DSL and the TOML IR; the list form compiles and serializes unchanged"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "a passing attempt whose declared field is missing or of the wrong type, including a label outside its list, settles as a measured failure at the producer, through the executor, the mapped-instance path, and the real harness"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "validation refuses over on a typed non-list, a non-numeric typed score read by top_k, grade, or a thresholded evaluate, and a typed route source whose type cannot answer the question; the over refusal is located at the argument"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "malformed types (unknown token, empty or duplicate labels, non-identifier labels, wrong shape) are compile errors at the emits argument and parse errors in TOML"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "plan_admitted carries each declared field and its type; contract version 1.8.0"
+status = "done"
+category = "changed"
+
+[[content.acceptance_criteria]]
+text = "the exhaustive three-task executor test declares a typed score and adds an ill-typed pass outcome that must settle as a measured failure"
+status = "done"
+category = "changed"
+
+[[content.acceptance_criteria]]
+text = "[[RFC-0001:C-WORKFLOW]] and [[RFC-0001:C-ROUTE]] state the rules; DSL reference, work-graphs and contract docs, and the fips-watch example updated"
+status = "done"
+category = "chore"
+
+[[content.acceptance_criteria]]
+text = "the result contract appended to an agent prompt names each field's type (after PR #152 lands)"
+status = "pending"
+category = "added"

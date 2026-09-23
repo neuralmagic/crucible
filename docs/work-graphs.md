@@ -59,6 +59,7 @@ required = true             # default true
 isolation = "worktree"      # optional
 join = "all"                # default "all"
 emits = ["score"]           # optional declared output fields; absent = undeclared
+                            # or typed: emits = { score = "number", tier = ["high", "low"] }
 
 [[task]]
 name = "pick"
@@ -115,12 +116,44 @@ A task's output is JSON and becomes its dependents' input.
 `top_k` reads a finite numeric `score` from each input, so an upstream task that wants to rank
 must emit one. That contract is declarable: `emits = ["score"]` on an `agent`, `command`, or
 `evaluate` task names fields its JSON output promises to include. Validation rejects a `top_k`
-dependency, `grade` score source, or thresholded `evaluate` whose declared emits omits `score`,
-before anything runs; at runtime a passing attempt missing a declared field is converted to a
-measured failure at the producing task (never retried, blocks dependents), so output drift fails
-where it happened instead of downstream. An empty or absent `emits` declares nothing and is
+dependency, `grade` score source or tiebreak, or thresholded `evaluate` whose declared emits omits
+`score`, before anything runs; at runtime a passing attempt missing a declared field is converted
+to a measured failure at the producing task (never retried, blocks dependents), so output drift
+fails where it happened instead of downstream. An empty or absent `emits` declares nothing and is
 never checked. `top_k` and `engine` tasks cannot declare emits; their outputs are
 engine-defined.
+
+`emits` can also promise each field's type, as a dict from field name to type:
+
+```python
+scan = command(
+    name = "scan",
+    run = "./scan.sh",
+    emits = {"targets": "list", "count": "integer", "severity": ["high", "low"]},
+)
+```
+
+A type is `"string"`, `"integer"` (a number with no fractional part), `"number"`, `"boolean"`,
+`"list"`, `"object"`, or a list of labels, which declares a string equal to one of them. Labels
+are identifiers, like route labels. The list form keeps working and promises presence only.
+
+At runtime a passing attempt whose field holds the wrong type, or a string outside its labels,
+is a measured failure at the producing task, the same as a missing field, and the note names
+the field, what arrived, and what was declared. A task that settled itself skipped or failed
+owes nothing.
+
+At compile time the types are checked wherever the graph reads a field, before any spend:
+
+- `over = scan.targets` needs a field declared `"list"`, reported at the `over` argument.
+- A `top_k` dependency, a `grade` score source or tiebreak, and a thresholded `evaluate` need
+  `score` declared `"number"` or `"integer"`.
+- `route(source = scan, ...)` needs each question's field declared as labels the question
+  answers (its options, or `yes`/`no`, plus `uncertain`), or `"boolean"` for a `noul`. A
+  `"string"` is refused: it promises nothing about which label arrives.
+
+A field declared without a type (list form) or a task with no `emits` stays unchecked at compile
+time. The generated TOML carries the types as a table (`emits = { score = "number" }`) and the
+`plan_admitted` event lists each field with its type.
 
 ## Execution semantics
 

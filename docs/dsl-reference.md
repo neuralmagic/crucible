@@ -29,7 +29,7 @@ An agent turn driven by a prompt.
 | `join` | `"all" \| "passed" \| "settled"` | Which dependencies must have passed: `all` every one, `passed` at least one and only those are forwarded, `settled` none — it dispatches once every dependency is terminal, whatever it settled as, unless the run has already halted, and forwards each one as {status, note, output, files}. |
 | `required` | `bool` | False makes the task advisory: it blocks dependents but cannot invalidate the run. |
 | `isolated` | `bool` | Run in a disposable worktree. File changes are discarded; only JSON output continues. |
-| `emits` | `list[str]` | Result fields the task promises in its JSON output. |
+| `emits` | `list[str] \| dict[str, type]` | Result fields the task promises in its JSON output. The dict form also promises each field's type: `"string"`, `"integer"`, `"number"`, `"boolean"`, `"list"`, `"object"`, or a list of labels the value is one of. A passing output missing a field, or holding one of the wrong type, fails the task. Types are checked where the graph reads them: `over` needs a list, a `top_k` or grade score a number, and a `route(source = ...)` question labels it can answer. |
 | `emits_files` | `list[str]` | Workspace files the task produces. A dependent is staged with the declared files of every dependency that passed. |
 | `over` | `producer.field` | Map the task over a dependency's emitted list, one instance per item. |
 | `max_fanout` | `int` | Instance cap for `over`, within the engine's ceiling of 256. |
@@ -58,7 +58,7 @@ An agent turn whose prompt is a skill's instructions plus its arguments.
 | `join` | `"all" \| "passed" \| "settled"` | Which dependencies must have passed: `all` every one, `passed` at least one and only those are forwarded, `settled` none — it dispatches once every dependency is terminal, whatever it settled as, unless the run has already halted, and forwards each one as {status, note, output, files}. |
 | `required` | `bool` | False makes the task advisory: it blocks dependents but cannot invalidate the run. |
 | `isolated` | `bool` | Run in a disposable worktree. File changes are discarded; only JSON output continues. |
-| `emits` | `list[str]` | Result fields the task promises in its JSON output. |
+| `emits` | `list[str] \| dict[str, type]` | Result fields the task promises in its JSON output. The dict form also promises each field's type: `"string"`, `"integer"`, `"number"`, `"boolean"`, `"list"`, `"object"`, or a list of labels the value is one of. A passing output missing a field, or holding one of the wrong type, fails the task. Types are checked where the graph reads them: `over` needs a list, a `top_k` or grade score a number, and a `route(source = ...)` question labels it can answer. |
 | `emits_files` | `list[str]` | Workspace files the task produces. A dependent is staged with the declared files of every dependency that passed. |
 | `over` | `producer.field` | Map the task over a dependency's emitted list, one instance per item. |
 | `max_fanout` | `int` | Instance cap for `over`, within the engine's ceiling of 256. |
@@ -82,7 +82,7 @@ A deterministic shell task in the candidate workspace.
 | `join` | `"all" \| "passed" \| "settled"` | Which dependencies must have passed: `all` every one, `passed` at least one and only those are forwarded, `settled` none — it dispatches once every dependency is terminal, whatever it settled as, unless the run has already halted, and forwards each one as {status, note, output, files}. |
 | `required` | `bool` | False makes the task advisory: it blocks dependents but cannot invalidate the run. |
 | `isolated` | `bool` | Run in a disposable worktree. File changes are discarded; only JSON output continues. |
-| `emits` | `list[str]` | Result fields the task promises in its JSON output. |
+| `emits` | `list[str] \| dict[str, type]` | Result fields the task promises in its JSON output. The dict form also promises each field's type: `"string"`, `"integer"`, `"number"`, `"boolean"`, `"list"`, `"object"`, or a list of labels the value is one of. A passing output missing a field, or holding one of the wrong type, fails the task. Types are checked where the graph reads them: `over` needs a list, a `top_k` or grade score a number, and a `route(source = ...)` question labels it can answer. |
 | `emits_files` | `list[str]` | Workspace files the task produces. A dependent is staged with the declared files of every dependency that passed. |
 | `over` | `producer.field` | Map the task over a dependency's emitted list, one instance per item. |
 | `max_fanout` | `int` | Instance cap for `over`, within the engine's ceiling of 256. |
@@ -108,7 +108,7 @@ A measurement command. Its last non-empty stdout line is a JSON object; `pass = 
 | `join` | `"all" \| "passed" \| "settled"` | Which dependencies must have passed: `all` every one, `passed` at least one and only those are forwarded, `settled` none — it dispatches once every dependency is terminal, whatever it settled as, unless the run has already halted, and forwards each one as {status, note, output, files}. |
 | `required` | `bool` | False makes the task advisory: it blocks dependents but cannot invalidate the run. |
 | `isolated` | `bool` | Run in a disposable worktree. File changes are discarded; only JSON output continues. |
-| `emits` | `list[str]` | Result fields the task promises in its JSON output. |
+| `emits` | `list[str] \| dict[str, type]` | Result fields the task promises in its JSON output. The dict form also promises each field's type: `"string"`, `"integer"`, `"number"`, `"boolean"`, `"list"`, `"object"`, or a list of labels the value is one of. A passing output missing a field, or holding one of the wrong type, fails the task. Types are checked where the graph reads them: `over` needs a list, a `top_k` or grade score a number, and a `route(source = ...)` question labels it can answer. |
 | `emits_files` | `list[str]` | Workspace files the task produces. A dependent is staged with the declared files of every dependency that passed. |
 | `over` | `producer.field` | Map the task over a dependency's emitted list, one instance per item. |
 | `max_fanout` | `int` | Instance cap for `over`, within the engine's ceiling of 256. |
@@ -251,7 +251,7 @@ Engine-owned decision: answers typed questions about its dependencies' outputs a
 | `name` | `str` | Task identity, unique within the workflow. |
 | `questions` | `dict[str, question]` | Question id to `noul()` or `choice()`. `gate.<id>` names one for `when`. |
 | `min_confidence` | `number` | A decision model answers, through the broker's `systemone` capability. An answer whose probability is below this, in (0, 1], is recorded as `"uncertain"`. Exactly one of `min_confidence` and `source`. |
-| `source` | `task` | A dependency's output answers instead: it emits one declared label (or a boolean, for a noul) under each question id. Deterministic, free, and needs no capability. Any other value fails the route. |
+| `source` | `task` | A dependency's output answers instead: it emits one declared label (or a boolean, for a noul) under each question id. Deterministic, free, and needs no capability. Any other value fails the route. When the dependency types its emits, each question's field must be typed with labels the question answers, or `"boolean"` for a noul. |
 | `depends_on` | `list[task]` | Dependencies. Their outputs are the state the questions are asked about. |
 | `required` | `bool` | False makes the route advisory. |
 | `join` | `"all" \| "passed" \| "settled"` | Which dependency outputs form the state, as on any task. |

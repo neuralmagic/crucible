@@ -273,10 +273,13 @@ Declarations are compile-time only; the generated manifest carries the same per-
 
 Tasks may also declare their output contract: `emits = ["score", "pass"]` on `agent()`,
 `command()`, or `evaluate()` names fields the task's JSON output promises to include.
-Compilation rejects a `top_k` dependency, `grade` score source, or thresholded `evaluate` whose
-declared emits omits `score`; at runtime a passing attempt missing a declared field becomes a
-measured failure at the producing task instead of a mystery downstream. An absent `emits`
-declares nothing and changes nothing.
+Compilation rejects a `top_k` dependency, `grade` score source or tiebreak, or thresholded
+`evaluate` whose declared emits omits `score`; at runtime a passing attempt missing a declared
+field becomes a measured failure at the producing task instead of a mystery downstream. An absent `emits`
+declares nothing and changes nothing. A dict, `emits = {"score": "number", "tier": ["high",
+"low"]}`, also promises each field's type; a wrongly typed field fails the producing task the
+same way, and compilation checks the types against `over`, score readers, and output-decided
+routes. See [Work graphs](./work-graphs.md#task-output).
 
 Compile errors carry `file:line:col` and a did-you-mean suggestion for unknown functions,
 kwargs, variables, and session names. A behavioral change from earlier releases: a task
