@@ -1,0 +1,11 @@
+name = "crucible-spec"
+version = "0.1.0"
+defaultTargets = ["CrucibleSpec"]
+
+[[require]]
+name = "veil"
+git = "https://github.com/verse-lab/veil.git"
+rev = "517f2badbf9a7ba2b18a72242351ff20943cbdd7"
+
+[[lean_lib]]
+name = "CrucibleSpec"
