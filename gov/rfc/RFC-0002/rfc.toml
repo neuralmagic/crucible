@@ -36,4 +36,7 @@ clauses = [
 version = "0.1.0"
 date = "2026-08-21"
 notes = "Initial draft"
-changed = ["a settled join forwards a dependency that settled not taken"]
+changed = [
+    "a settled join forwards a dependency that settled not taken",
+    "the run's wall-clock ceiling is the default and maximum per-attempt deadline; a timed-out attempt fails measured and is not retried",
+]

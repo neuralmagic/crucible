@@ -15,6 +15,7 @@ use serde_json::Value;
 
 use crate::agent::event::{AgentEvent, RawStream};
 use crate::agent::harness::HarnessRuntime;
+use crate::agent::turn::TurnFailure;
 use crate::plan::exec::{Attempt, AttemptOutcome, BatchItem, TaskRunner, TransportFailure};
 use crate::plan::ir::{Isolation, Task, TaskKind, TaskName};
 use crate::plan::runner::ShellRunner;
@@ -24,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::args::{Args, Paths};
+use crucible::deadline::Deadline;
 
 const RESULT_FILE: &str = "PLAN_TASK_RESULT.json";
 
@@ -189,7 +191,13 @@ pub struct HarnessRunner {
 }
 
 impl TaskRunner for HarnessRunner {
-    fn run(&mut self, task: &Task, attempt: u32, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
+    fn run(
+        &mut self,
+        task: &Task,
+        attempt: u32,
+        inputs: &BTreeMap<TaskName, Value>,
+        deadline: Option<Deadline>,
+    ) -> Attempt {
         run_task(
             &Dispatch {
                 args: &self.args,
@@ -198,8 +206,11 @@ impl TaskRunner for HarnessRunner {
                 staged: self.staged.get(&task.name).map(Vec::as_slice),
             },
             task,
-            attempt,
-            inputs,
+            Job {
+                attempt,
+                inputs,
+                deadline,
+            },
             None,
         )
     }
@@ -294,8 +305,11 @@ impl TaskRunner for HarnessRunner {
                     staged: self.staged.get(&b.task.name).map(Vec::as_slice),
                 },
                 b.task,
-                b.attempt,
-                &b.inputs,
+                Job {
+                    attempt: b.attempt,
+                    inputs: &b.inputs,
+                    deadline: b.deadline,
+                },
                 None,
             )];
         }
@@ -329,8 +343,11 @@ impl TaskRunner for HarnessRunner {
                                 staged: staged.get(&b.task.name).map(Vec::as_slice),
                             },
                             b.task,
-                            b.attempt,
-                            &b.inputs,
+                            Job {
+                                attempt: b.attempt,
+                                inputs: &b.inputs,
+                                deadline: b.deadline,
+                            },
                             Some(pending),
                         )
                     })
@@ -357,16 +374,18 @@ struct Dispatch<'a> {
     staged: Option<&'a [StagedInput]>,
 }
 
+/// One attempt of one task: its number, its inputs, and when it must be over by.
+#[derive(Clone, Copy)]
+struct Job<'a> {
+    attempt: u32,
+    inputs: &'a BTreeMap<TaskName, Value>,
+    deadline: Option<Deadline>,
+}
+
 /// Dispatch one task, in the shared workspace or in a private worktree. `pending` is the
 /// shared workspace's uncommitted patch when a concurrent caller already captured it for
 /// the whole batch; `None` means capture it here.
-fn run_task(
-    cx: &Dispatch<'_>,
-    task: &Task,
-    attempt: u32,
-    inputs: &BTreeMap<TaskName, Value>,
-    pending: Option<&str>,
-) -> Attempt {
+fn run_task(cx: &Dispatch<'_>, task: &Task, job: Job<'_>, pending: Option<&str>) -> Attempt {
     let Dispatch {
         args,
         paths,
@@ -378,7 +397,7 @@ fn run_task(
             return Attempt::transport(TransportCause::Workspace, e);
         }
         let before = PriorContents::of(&paths.workspace, &task.emits_files);
-        let attempt_out = prepare_and_run(args, paths, task, attempt, inputs);
+        let attempt_out = prepare_and_run(args, paths, task, job);
         return capture_declared(
             paths,
             &paths.workspace,
@@ -430,7 +449,7 @@ fn run_task(
     let iso = Paths::for_worktree(worktree.clone(), paths.skills.clone());
     let _ = std::fs::create_dir_all(&iso.state);
     let before = PriorContents::of(&iso.workspace, &task.emits_files);
-    let attempt_out = prepare_and_run(args, &iso, task, attempt, inputs);
+    let attempt_out = prepare_and_run(args, &iso, task, job);
     // Before the worktree goes: a declared file is part of the task's output, not part of the
     // workspace state isolation discards, so it has to be taken while the tree is still there.
     let attempt_out = capture_declared(
@@ -471,6 +490,10 @@ fn capture_declared(
         AttemptOutcome::Pass(_) => false,
         AttemptOutcome::Fail { .. } => true,
         AttemptOutcome::Skipped(..) | AttemptOutcome::Transport(_) => return attempt,
+        AttemptOutcome::TimedOut(_) => {
+            let _ = std::fs::remove_dir_all(captured_dir(&paths.state, &task.name.0));
+            return attempt;
+        }
     };
     if task.emits_files.is_empty() {
         return attempt;
@@ -595,13 +618,7 @@ fn materialize_inputs(
     Ok(())
 }
 
-fn prepare_and_run(
-    args: &Args,
-    paths: &Paths,
-    task: &Task,
-    attempt: u32,
-    inputs: &BTreeMap<TaskName, Value>,
-) -> Attempt {
+fn prepare_and_run(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
     for (src, dst) in &args.workflow_frozen_injects {
         if let Err(e) = crate::manifest::apply_inject(src, &paths.workspace.join(dst)) {
             return Attempt::transport(
@@ -614,7 +631,7 @@ fn prepare_and_run(
             );
         }
     }
-    let out = run_in(args, paths, task, attempt, inputs);
+    let out = run_in(args, paths, task, job);
     Attempt {
         outcome: out.outcome.settle_declared(),
         cost_usd: out.cost_usd,
@@ -623,13 +640,12 @@ fn prepare_and_run(
 
 /// One task against a specific workspace. `Command` tasks go to the shell runner; `Agent`
 /// tasks run through the real [`crate::agent::run_turn`] with the task's knob overrides.
-fn run_in(
-    args: &Args,
-    paths: &Paths,
-    task: &Task,
-    attempt: u32,
-    inputs: &BTreeMap<TaskName, Value>,
-) -> Attempt {
+fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
+    let Job {
+        attempt,
+        inputs,
+        deadline,
+    } = job;
     let (prompt, harness, model, effort) = match &task.task {
         TaskKind::Agent {
             prompt,
@@ -646,9 +662,9 @@ fn run_in(
                 agent_cmd: None,
             };
             return if task.isolation == Some(Isolation::Worktree) {
-                shell.run_in_prepared_worktree(task, inputs)
+                shell.run_in_prepared_worktree(task, inputs, deadline)
             } else {
-                shell.run(task, attempt, inputs)
+                shell.run(task, attempt, inputs, deadline)
             };
         }
         TaskKind::TopK { .. } => {
@@ -724,6 +740,7 @@ fn run_in(
         &full_prompt,
         false,
         prepared.as_ref(),
+        deadline,
         |line, stream, ev| {
             if !line.trim().is_empty() && stream == RawStream::Stderr {
                 eprintln!("[{name}] {line}");
@@ -734,6 +751,10 @@ fn run_in(
         },
     );
     let cost = turn.cost_usd;
+    if let Some(TurnFailure::DeadlineExceeded(deadline)) = turn.failure() {
+        let _ = std::fs::remove_file(&result_path);
+        return Attempt::timed_out(cost, *deadline);
+    }
     if let Some(failure) = turn.failure() {
         transport_error = Some(TransportFailure::new(
             failure.transport_cause(),
@@ -849,6 +870,7 @@ mod tests {
             max_fanout: None,
             when: None,
             revise: None,
+            timeout: None,
         }
     }
 
@@ -1299,6 +1321,65 @@ workflow(type = "playbook", tasks = [prod_a, prod_b, con_a, con_b])
             "a batched consumer was handed a file no ancestor of its declared: {:?}",
             out.results[&"con_a".into()].note
         );
+        assert!(out.valid, "{:?}", out.results);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A batch runs concurrently, and each member runs under its own task's limit: `peer` outlives
+    /// the limit of both members that time out and still passes, and neither of them holds it up.
+    /// The serial agent proves a turn in the shared workspace ends at its deadline too.
+    #[test]
+    fn each_batch_member_runs_under_its_own_timeout_and_a_timeout_stalls_no_peer() {
+        let dir = std::env::temp_dir().join(format!("crucible-timeouts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("agents.json"),
+            r#"{
+                "agent_hang": {"sleep_ms": 60000, "result": {"ok": true}},
+                "peer": {"sleep_ms": 1500, "result": {"ok": true}},
+                "serial_hang": {"sleep_ms": 60000, "result": {"ok": true}}
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("workflow.star"),
+            r#"
+agent_hang = agent(name = "agent_hang", prompt = "p", isolated = True, required = False, timeout = "1s")
+command_hang = command(
+    name = "command_hang",
+    run = "sleep 60; printf '{\"ok\": true}\n'",
+    isolated = True,
+    required = False,
+    timeout = "1s",
+)
+peer = agent(name = "peer", prompt = "p", isolated = True, timeout = "30s")
+serial_hang = agent(name = "serial_hang", prompt = "p", required = False, timeout = "1s")
+workflow(type = "playbook", tasks = [agent_hang, command_hang, peer, serial_hang])
+"#,
+        )
+        .unwrap();
+        fake_agent_manifest(&dir);
+
+        let started = std::time::Instant::now();
+        let out = run_playbook(&dir);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "a timed-out task held the run: {:?}",
+            started.elapsed()
+        );
+        for hung in ["agent_hang", "command_hang", "serial_hang"] {
+            let r = &out.results[&hung.into()];
+            assert_eq!(r.status, TaskStatus::Fail, "{hung}: {:?}", r.note);
+            assert_eq!(r.attempts, 1, "{hung} was retried");
+            assert_eq!(
+                r.note.as_deref(),
+                Some("timed out: the task ran past its 1s limit"),
+                "{hung}"
+            );
+        }
+        let peer = &out.results[&"peer".into()];
+        assert_eq!(peer.status, TaskStatus::Pass, "{:?}", peer.note);
         assert!(out.valid, "{:?}", out.results);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2114,6 +2195,90 @@ workflow(type = "playbook", tasks = [good, bad, after])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The run's ceiling is the longest limit a task may declare, and it is enforced before any
+    /// dispatch; the limit a task does declare reaches the session log before anything runs; and
+    /// the ceiling itself ends an attempt still in flight when it falls.
+    #[test]
+    fn a_playbook_launch_bounds_every_task_by_its_run() {
+        let _guard = crucible::test_support::env_lock();
+        let dir = std::env::temp_dir().join(format!("crucible-bounded-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("agents.json"),
+            r#"{
+                "work": {"writes": {"out.txt": "done\n"}, "result": {"ok": true}},
+                "slow": {"sleep_ms": 60000, "result": {"ok": true}}
+            }"#,
+        )
+        .unwrap();
+        fake_agent_manifest(&dir);
+        let launch = |source: &str, max_time: &str| {
+            std::fs::write(dir.join("workflow.star"), source).unwrap();
+            crate::plan::cli::run(
+                None,
+                &BTreeMap::new(),
+                &std::collections::BTreeSet::new(),
+                None,
+                Some(&dir.join("crucible.toml")),
+                crate::plan::cli::RunOpts {
+                    ceilings: crate::plan::cli::Ceilings {
+                        usd: Some(1.0),
+                        wall_clock: crate::duration::parse_duration(max_time),
+                        wall_clock_raw: Some(max_time.to_string()),
+                    },
+                    ..Default::default()
+                },
+            )
+        };
+
+        let refused = launch(
+            "work = agent(name = \"work\", prompt = \"p\", timeout = \"2h\")\nworkflow(type = \"playbook\", tasks = [work])\n",
+            "10m",
+        )
+        .expect_err("a timeout past the run's ceiling must not dispatch");
+        assert!(
+            format!("{refused:#}").contains(
+                "task \"work\" declares timeout 2h, longer than this run's --max-time 10m"
+            ),
+            "{refused:#}"
+        );
+        assert!(
+            !dir.join("workspace/out.txt").exists(),
+            "a refused launch dispatched"
+        );
+
+        launch(
+            "work = agent(name = \"work\", prompt = \"p\", timeout = \"5m\")\nworkflow(type = \"playbook\", tasks = [work])\n",
+            "10m",
+        )
+        .expect("a timeout within the ceiling runs");
+        assert!(dir.join("workspace/out.txt").exists(), "the task never ran");
+        let log = std::fs::read_to_string(dir.join("state/session.jsonl")).unwrap();
+        assert!(log.contains("\"timeout\":\"5m\""), "{log}");
+
+        let started = std::time::Instant::now();
+        let cut = launch(
+            "slow = agent(name = \"slow\", prompt = \"p\")\nworkflow(type = \"playbook\", tasks = [slow])\n",
+            "1s",
+        )
+        .expect_err("a run its ceiling cut short has no valid verdict");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "the ceiling did not end the attempt in flight"
+        );
+        assert!(
+            format!("{cut:#}").contains("wall-clock ceiling reached"),
+            "{cut:#}"
+        );
+        let log = std::fs::read_to_string(dir.join("state/session.jsonl")).unwrap();
+        assert!(
+            log.contains("timed out: the run reached its 1s wall-clock ceiling"),
+            "{log}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A declared file is part of a task's output, not part of the workspace state isolation
     /// discards, and it reaches every descendant rather than only the next one.
     ///
@@ -2530,6 +2695,7 @@ workflow(type = "playbook", tasks = [analyze, implement, report])
             max_fanout: None,
             when: None,
             revise: None,
+            timeout: None,
         };
         let mut runner = HarnessRunner {
             args: <crate::cli::Cli as clap::Parser>::try_parse_from(["crucible"])
@@ -2545,7 +2711,7 @@ workflow(type = "playbook", tasks = [analyze, implement, report])
             captured_bytes: AtomicU64::new(0),
             staged: Default::default(),
         };
-        let a = runner.run(&t, 1, &BTreeMap::new());
+        let a = runner.run(&t, 1, &BTreeMap::new(), None);
         match a.outcome {
             AttemptOutcome::Fail { note, .. } => assert!(note.contains("unknown harness")),
             _ => panic!("expected a measured failure"),

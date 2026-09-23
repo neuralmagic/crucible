@@ -5,6 +5,7 @@
 pub mod command_judge;
 pub mod command_world;
 pub mod crucible;
+pub mod deadline;
 pub mod deploy;
 pub mod diagram;
 pub mod duration;

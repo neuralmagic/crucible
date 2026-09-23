@@ -33,9 +33,10 @@ use crate::agent::harness::{HarnessRuntime, StreamDecoder};
 use crate::args::{Args, Paths};
 #[cfg(feature = "autoresearch")]
 use crate::manifest::AgentBackend;
+use crucible::deadline::{Deadline, Supervised};
 use crucible_harness::OtelCollector;
 use std::io::{BufRead, BufReader, Read};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::thread;
 
 use crate::agent::turn::{
@@ -77,7 +78,7 @@ pub(crate) fn backend_supports_persistent_sessions(
 
 /// A spawned transport: a child process plus the streams a turn reads from it.
 struct Spawned {
-    child: Child,
+    child: Supervised,
     stdout: Option<Box<dyn Read + Send>>,
     stderr: Option<Box<dyn Read + Send>>,
 }
@@ -93,29 +94,48 @@ impl AgentSource {
         prompt: &str,
         extra_env: &[(String, String)],
         session: Option<&crate::agent::agent_session::SessionTurn>,
+        deadline: Option<Deadline>,
     ) -> std::io::Result<Spawned> {
-        match self {
-            AgentSource::LocalClaude => spawn_local(args, p, prompt, extra_env, session),
-            AgentSource::Command(cmd) => spawn_command(cmd, args, p, prompt, extra_env, session),
+        let mut cmd = match self {
+            AgentSource::LocalClaude => local_command(args, p, prompt, extra_env, session)?,
+            AgentSource::Command(cmd) => command_backend(cmd, args, p, prompt, extra_env, session),
             // The openshell driver runs a multi-step flow, not a single child; `run_turn`
             // intercepts it before `spawn`, so this is never reached.
-            AgentSource::OpenshellDriver => Err(std::io::Error::other(
-                "OpenshellDriver is driven by openshell::run::turn, not spawn",
-            )),
-        }
+            AgentSource::OpenshellDriver => {
+                return Err(std::io::Error::other(
+                    "OpenshellDriver is driven by openshell::run::turn, not spawn",
+                ));
+            }
+        };
+        let mut child = Supervised::spawn(&mut cmd, deadline)?;
+        let stdout = child
+            .child()
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>);
+        let stderr = child
+            .child()
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>);
+        Ok(Spawned {
+            child,
+            stdout,
+            stderr,
+        })
     }
 }
 
-/// Spawn the `command` backend's proposal: `sh -c <cmd>` in the workspace. Deterministic;
-/// its output is echoed through the sink like any other turn.
-fn spawn_command(
+/// The `command` backend's proposal: `sh -c <cmd>` in the workspace. Deterministic; its output
+/// is echoed through the sink like any other turn.
+fn command_backend(
     cmd: &str,
     args: &Args,
     p: &Paths,
     prompt: &str,
     extra_env: &[(String, String)],
     session: Option<&crate::agent::agent_session::SessionTurn>,
-) -> std::io::Result<Spawned> {
+) -> Command {
     let mut c = Command::new("sh");
     c.arg("-c")
         .arg(cmd)
@@ -146,32 +166,19 @@ fn spawn_command(
     // controller-dispatched run/scope/rank carries the engine's OWN trace parent. Whatever the
     // command shells out to (often `claude`) must not graft its spans onto our trace.
     c.env_remove("TRACEPARENT").env_remove("TRACESTATE");
-    let mut child = c.spawn()?;
-    let stdout = child
-        .stdout
-        .take()
-        .map(|s| Box::new(s) as Box<dyn Read + Send>);
-    let stderr = child
-        .stderr
-        .take()
-        .map(|s| Box::new(s) as Box<dyn Read + Send>);
-    Ok(Spawned {
-        child,
-        stdout,
-        stderr,
-    })
+    c
 }
 
-/// Spawn the harness CLI directly in the workspace for a local turn. The manifest's
+/// The harness CLI, run directly in the workspace for a local turn. The manifest's
 /// `[agent].env` already carries the Vertex/API-key cred config; we add a few harness
 /// defaults (manifest env still wins).
-fn spawn_local(
+fn local_command(
     args: &Args,
     p: &Paths,
     prompt: &str,
     extra_env: &[(String, String)],
     session: Option<&crate::agent::agent_session::SessionTurn>,
-) -> std::io::Result<Spawned> {
+) -> std::io::Result<Command> {
     let argv = match session {
         Some(session) => args
             .harness()
@@ -204,20 +211,7 @@ fn spawn_local(
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    let mut child = cmd.spawn()?;
-    let stdout = child
-        .stdout
-        .take()
-        .map(|s| Box::new(s) as Box<dyn Read + Send>);
-    let stderr = child
-        .stderr
-        .take()
-        .map(|s| Box::new(s) as Box<dyn Read + Send>);
-    Ok(Spawned {
-        child,
-        stdout,
-        stderr,
-    })
+    Ok(cmd)
 }
 
 #[cfg(feature = "autoresearch")]
@@ -231,16 +225,18 @@ pub fn run_turn(
     json: bool,
     sink: impl FnMut(&str, RawStream, Option<&AgentEvent>),
 ) -> TurnOutcome {
-    run_turn_with_session(args, p, prompt, json, None, sink)
+    run_turn_with_session(args, p, prompt, json, None, None, sink)
 }
 
-/// Run a turn using a prepared session; the caller commits successful transport afterward.
+/// Run a turn using a prepared session; the caller commits successful transport afterward. A turn
+/// still running at `deadline` is killed and fails with [`TurnFailure::DeadlineExceeded`].
 pub(crate) fn run_turn_with_session(
     args: &Args,
     p: &Paths,
     prompt: &str,
     json: bool,
     session: Option<&crate::agent::agent_session::SessionTurn>,
+    deadline: Option<Deadline>,
     sink: impl FnMut(&str, RawStream, Option<&AgentEvent>),
 ) -> TurnOutcome {
     let source = args.agent_source();
@@ -248,13 +244,14 @@ pub(crate) fn run_turn_with_session(
     // not a single streamed child, delegate to its module rather than the generic path. It
     // reaches the engine runtime handle itself (see `crate::agent::engine::handle`).
     if source == AgentSource::OpenshellDriver {
-        return crate::openshell::run::turn(args, p, prompt, json, session, sink);
+        return crate::openshell::run::turn(args, p, prompt, json, session, deadline, sink);
     }
-    run_turn_with(&source, args, p, prompt, json, session, sink)
+    run_turn_with(&source, args, p, prompt, json, session, deadline, sink)
 }
 
 /// Inner driver, generic over the source. Split out so the source is explicit and
 /// testable; [`run_turn`] is the convenience that resolves it from `args`.
+#[allow(clippy::too_many_arguments)]
 fn run_turn_with(
     source: &AgentSource,
     args: &Args,
@@ -262,6 +259,7 @@ fn run_turn_with(
     prompt: &str,
     json: bool,
     session: Option<&crate::agent::agent_session::SessionTurn>,
+    deadline: Option<Deadline>,
     mut sink: impl FnMut(&str, RawStream, Option<&AgentEvent>),
 ) -> TurnOutcome {
     // Start the in-process OTLP collector for a local claude turn when telemetry is opted in
@@ -297,7 +295,7 @@ fn run_turn_with(
         .unwrap_or_default();
     let meters = collector.as_ref().map(OtelCollector::meters);
 
-    let spawned = match source.spawn(args, p, prompt, &extra_env, session) {
+    let spawned = match source.spawn(args, p, prompt, &extra_env, session, deadline) {
         Ok(s) => s,
         Err(e) => {
             let message = format!("failed to launch agent source: {e}");
@@ -310,7 +308,7 @@ fn run_turn_with(
         }
     };
     let Spawned {
-        mut child,
+        child,
         stdout,
         stderr,
     } = spawned;
@@ -355,7 +353,7 @@ fn run_turn_with(
         }
     }
 
-    let _ = child.wait();
+    let killed_at = child.wait().ok().and_then(|reaped| reaped.killed_at);
     crate::process::pid_registry::deregister(child_pid);
 
     if let Ok(errlines) = stderr_handle.join() {
@@ -404,7 +402,10 @@ fn run_turn_with(
     {
         cost = estimate_cost(args.model(), t);
     }
-    TurnOutcome::completed(cost)
+    match killed_at {
+        Some(deadline) => TurnOutcome::failed(cost, TurnFailure::DeadlineExceeded(deadline)),
+        None => TurnOutcome::completed(cost),
+    }
 }
 
 /// Decode a command-backend line. Native `AgentEvent` JSON is preserved; all other
@@ -513,13 +514,85 @@ mod tests {
         let p = workspace("ran");
         let src = AgentSource::Command("echo ran".to_string());
         let mut lines = Vec::new();
-        let outcome = run_turn_with(&src, &a, &p, "prompt", false, None, |line, _s, _ev| {
-            lines.push(line.to_string())
-        });
+        let outcome = run_turn_with(
+            &src,
+            &a,
+            &p,
+            "prompt",
+            false,
+            None,
+            None,
+            |line, _s, _ev| lines.push(line.to_string()),
+        );
         let _ = std::fs::remove_dir_all(&p.workspace);
         assert_eq!(outcome.failure(), None, "the command ran to completion");
         assert_eq!(outcome.cost_usd, 0.0, "the command backend is free");
         assert!(lines.iter().any(|l| l == "ran"), "stdout reached the sink");
+    }
+
+    /// The stand-in forks a sleeper that holds stdout open, so the turn ends at its deadline only
+    /// if the whole process group dies with it.
+    #[test]
+    fn a_turn_still_running_at_its_deadline_is_killed_and_says_so() {
+        let a = args(&[]);
+        let p = workspace("deadline");
+        let src = AgentSource::Command("echo started; sleep 30 & wait".to_string());
+        let deadline = crucible::deadline::Deadline::for_attempt(
+            std::time::Instant::now(),
+            Some("0.5s".parse().unwrap()),
+            None,
+        );
+        let started = std::time::Instant::now();
+        let mut lines = Vec::new();
+        let outcome = run_turn_with(
+            &src,
+            &a,
+            &p,
+            "prompt",
+            false,
+            None,
+            deadline,
+            |line, _s, _ev| lines.push(line.to_string()),
+        );
+        let _ = std::fs::remove_dir_all(&p.workspace);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        match (outcome.failure(), deadline) {
+            (Some(TurnFailure::DeadlineExceeded(at)), Some(expected)) => {
+                assert_eq!(*at, expected);
+                assert_eq!(
+                    outcome.failure().map(ToString::to_string).as_deref(),
+                    Some("timed out: the task ran past its 0.5s limit")
+                );
+            }
+            other => panic!("expected the deadline to end the turn, got {other:?}"),
+        }
+        assert!(
+            lines.iter().any(|l| l == "started"),
+            "output before the kill is kept"
+        );
+    }
+
+    #[test]
+    fn a_turn_that_ends_before_its_deadline_completes() {
+        let a = args(&[]);
+        let p = workspace("in-time");
+        let deadline = crucible::deadline::Deadline::for_attempt(
+            std::time::Instant::now(),
+            Some("30s".parse().unwrap()),
+            None,
+        );
+        let outcome = run_turn_with(
+            &AgentSource::Command("echo done".to_string()),
+            &a,
+            &p,
+            "prompt",
+            false,
+            None,
+            deadline,
+            |_line, _s, _ev| {},
+        );
+        let _ = std::fs::remove_dir_all(&p.workspace);
+        assert_eq!(outcome.failure(), None);
     }
 
     /// A turn whose transport never launches is a failure, not a $0 turn that answered nothing.
@@ -536,6 +609,7 @@ mod tests {
             &p,
             "prompt",
             false,
+            None,
             None,
             |_line, _s, ev| {
                 if let Some(AgentEvent::Error { message, .. }) = ev {

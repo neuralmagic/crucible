@@ -59,6 +59,7 @@ required = true             # default true
 isolation = "worktree"      # optional
 join = "all"                # default "all"
 emits = ["score"]           # optional declared output fields; absent = undeclared
+timeout = "20m"             # optional per-attempt limit; agent, command, and evaluate only
 
 [[task]]
 name = "pick"
@@ -144,6 +145,17 @@ never reruns: a task that failed, failed.
 **Budget.** Cost is known only after an attempt completes, so an in-flight attempt may report a
 total above `budget.usd`. Any overrun invalidates the plan and blocks all further dispatch and
 retries. Reaching the budget exactly is valid only when no further retry or task is needed.
+
+**Time.** Elapsed time is known continuously, so it bounds every attempt while it runs. Each
+attempt gets a deadline: its task's `timeout` counted from when the attempt starts, or the run's
+`--max-time` ceiling if that falls first. A task with no `timeout` runs under the ceiling alone.
+At the deadline the runner kills the attempt's whole process group (a command and everything it
+started, or the agent turn) and the task settles as a measured failure with a note naming the
+limit, `timed out: the task ran past its 20m limit`. It is not retried: a rerun would spend the
+same time again. A required task that times out short-circuits like any other failure. An
+attempt the run's ceiling ends instead ends the run on that ceiling, and everything undispatched
+settles blocked on it. A playbook refuses a `timeout` longer than `--max-time` before it
+dispatches anything. In a concurrent batch each task runs under its own deadline.
 
 ### `needs`
 

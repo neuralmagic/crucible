@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::crucible::Direction;
+use crate::duration::TaskTimeout;
 use anyhow::{Context, Result};
 use crucible_contract::decision::{Label, Question, QuestionError, QuestionId, UNCERTAIN};
 use serde::{Deserialize, Serialize};
@@ -350,6 +351,9 @@ pub struct Task {
     /// Sends a failing verdict back to a dependency (see [`Revise`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revise: Option<Revise>,
+    /// How long one attempt may run before its runner kills it and it settles failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<TaskTimeout>,
 }
 
 /// A reviewer's bounded send-back: when the reviewer settles failing, `task` runs again with the
@@ -668,6 +672,11 @@ pub enum PlanError {
         target: String,
         dependency: String,
     },
+    #[error(
+        "task {task:?} declares a timeout, but {kind} tasks are engine work the runner does not \
+         time; only agent, command, and evaluate tasks take one"
+    )]
+    TimeoutOnUntimedTask { task: String, kind: &'static str },
     #[error("plan has a dependency cycle involving: {}", .tasks.join(", "))]
     DependencyCycle { tasks: Vec<String> },
     #[error(
@@ -783,6 +792,17 @@ impl Plan {
                         });
                     }
                 }
+            }
+            if t.timeout.is_some()
+                && !matches!(
+                    t.task,
+                    TaskKind::Agent { .. } | TaskKind::Command { .. } | TaskKind::Evaluate { .. }
+                )
+            {
+                return Err(PlanError::TimeoutOnUntimedTask {
+                    task: task(),
+                    kind: t.task.label(),
+                });
             }
             if let TaskKind::TopK { k, .. } = &t.task {
                 if *k == 0 {
@@ -1286,6 +1306,7 @@ mod tests {
             max_fanout: None,
             when: None,
             revise: None,
+            timeout: None,
         }
     }
 
@@ -1824,6 +1845,7 @@ mod tests {
             max_fanout: None,
             when: None,
             revise: None,
+            timeout: None,
         };
         let err = plan(vec![t]).validate().unwrap_err();
         assert_eq!(
@@ -1953,6 +1975,7 @@ mod tests {
             max_fanout: None,
             when: None,
             revise: None,
+            timeout: None,
         }
     }
 
@@ -2592,6 +2615,48 @@ mod tests {
                 task: "repro".into(),
                 target: "author".into(),
                 dependency: "build".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_timeout_round_trips_and_is_refused_where_nothing_would_enforce_it() {
+        let parsed = Plan::from_toml_str(
+            r#"
+            version = 1
+            [budget]
+            usd = 1.0
+            [[task]]
+            name = "build"
+            kind = "command"
+            command = "make"
+            timeout = "90m"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.tasks[0].timeout.map(|t| t.get()),
+            Some(std::time::Duration::from_secs(5400))
+        );
+        let json = serde_json::to_string(&parsed).unwrap();
+        assert!(json.contains("\"timeout\":\"90m\""), "{json}");
+        let back = Plan::from_json_str(&json).unwrap();
+        assert_eq!(back.tasks[0].timeout, parsed.tasks[0].timeout);
+        back.validate().unwrap();
+
+        let zero = Plan::from_toml_str(
+            "version = 1\n[budget]\nusd = 1.0\n[[task]]\nname = \"a\"\nkind = \"command\"\ncommand = \"true\"\ntimeout = \"0s\"\n",
+        )
+        .unwrap_err();
+        assert!(format!("{zero:#}").contains("positive"), "{zero:#}");
+
+        let mut fold = top_k("fold", &["a"]);
+        fold.timeout = Some("1m".parse().unwrap());
+        assert_eq!(
+            refused(vec![agent("a", &[]), fold]),
+            PlanError::TimeoutOnUntimedTask {
+                task: "fold".into(),
+                kind: "top_k",
             }
         );
     }

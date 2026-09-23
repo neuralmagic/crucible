@@ -734,6 +734,11 @@ satisfied, or it joins `all` on a task that settled that way. It was never dispa
 nothing, and is not a failure. A `plan_admitted` task carries an additive `when` string,
 `route.question in a|b`, empty when the task is unconditional.
 
+A `plan_admitted` task carries an additive `timeout` string (contract 1.8.0), the task's own
+per-attempt limit in the `--max-time` syntax (`90s`, `20m`, `2h`), empty when only the run's
+wall-clock ceiling bounds it. A task killed at its deadline settles `fail` with a `note` naming
+the limit that ended it.
+
 An orchestrator tells the engine where models are reached through one JSON document in
 `CRUCIBLE_INFERENCE` (contract 1.7.0), typed as `crucible_contract::inference::ResolvedInference`:
 `{"version":1,"bindings":[{"role","protocol","url"?,"model","key_env"?}]}`. `role` is `agent` or

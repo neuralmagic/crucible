@@ -96,6 +96,7 @@ impl Reporter for ConsoleReporter {
             crate::agent::agent_session::effective_prompt(prepared.as_ref(), prompt, resume_prompt),
             false,
             prepared.as_ref(),
+            None,
             |raw, stream, ev| {
                 if let Some(AgentEvent::Result {
                     is_error: e,

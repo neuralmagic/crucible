@@ -930,6 +930,7 @@ mod tests {
                     max_fanout: 0,
                     when: String::new(),
                     revise: String::new(),
+                    timeout: String::new(),
                     max_rounds: 0,
                 },
                 PlanTaskWire {
@@ -945,6 +946,7 @@ mod tests {
                     max_fanout: 0,
                     when: String::new(),
                     revise: String::new(),
+                    timeout: String::new(),
                     max_rounds: 0,
                 },
             ],
