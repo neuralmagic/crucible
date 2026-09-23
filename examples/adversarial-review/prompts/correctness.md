@@ -7,7 +7,7 @@ Review adversarially. Assume the implementation may satisfy verify.sh without be
 correct in general. Judge behavior only; another reviewer owns prose, so ignore typos,
 comments, and docstring wording entirely.
 
-Write a single JSON object to PLAN_TASK_RESULT.json:
+Write a single JSON object to the result file the Result contract below names:
 
 - `approved`: true only if is_prime is correct for all n, not merely the cases verify.sh tests
 - `finding`: one or two sentences naming the defect, or "" if approved

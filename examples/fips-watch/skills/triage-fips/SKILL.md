@@ -59,7 +59,7 @@ Nothing you print is read. Three files are your entire output:
    The title names the variant and the blocker. The body explains the edge, the proposed fix, and
    why it matters for the fork — it inherits this on the next sync. The `dedupe_key` must be
    stable across runs so a schedule updates one issue instead of opening a new one each firing.
-3. `PLAN_TASK_RESULT.json` — exactly:
+3. The result file the Result contract below names — exactly:
 
    {"blocker": "<crate>", "root_cause": "<one line>", "confidence": "high|medium|low"}
 

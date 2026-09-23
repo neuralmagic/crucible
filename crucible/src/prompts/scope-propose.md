@@ -200,10 +200,12 @@ turn ends. What goes in:
    `default_autoresearch([...])` expands the legacy four-stage flow. For visible measurement, use
    `evaluate` plus `grade(evidence = [...], score = primary)`; opaque `measure` remains valid.
    `prompt_file("prompts/x.md")` embeds a regular UTF-8 pack-relative file; absolute paths, `..`,
-   and symlinks are rejected. Isolated agents are concurrent read-only worktrees, so do not
-   isolate a synthesizer whose edits must survive. Each agent writes one JSON object to
-   `PLAN_TASK_RESULT.json`. Validation writes the admitted graph to `WORKFLOW.png`; do not supply
-   the image yourself.
+   and symlinks are rejected. `workspace = "readonly"` marks a task that only reads (critics,
+   reviewers); `workspace = "worktree"` one that writes a disposable clone. Either runs beside
+   its peers, and neither's edits survive, so leave a synthesizer whose edits must survive in the
+   shared workspace (the default). Each agent writes one JSON object to the result file its
+   prompt names, not a filename of your choosing. Validation writes the admitted graph to
+   `WORKFLOW.png`; do not supply the image yourself.
 
 ## Test your own draft before you submit it
 

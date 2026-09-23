@@ -23,12 +23,12 @@ An agent turn driven by a prompt.
 | `harness` | `str` | Agent harness, overriding `[agent]`. |
 | `model` | `str` | Model, overriding `[agent]`. |
 | `effort` | `str` | Reasoning effort, overriding `[agent]`. |
-| `session` | `session \| str` | Join a durable conversation. A task in a session cannot be isolated. |
+| `session` | `session \| str` | Join a durable conversation. A task in a session cannot run in a worktree. |
 | `depends_on` | `list[task]` | Dependencies. Readiness decides execution order; declaration order does not. |
 | `needs` | `"any" \| "all"` | How many dependencies must be admitted before the task is ready. |
 | `join` | `"all" \| "passed" \| "settled"` | Which dependencies must have passed: `all` every one, `passed` at least one and only those are forwarded, `settled` none — it dispatches once every dependency is terminal, whatever it settled as, unless the run has already halted, and forwards each one as {status, note, output, files}. |
 | `required` | `bool` | False makes the task advisory: it blocks dependents but cannot invalidate the run. |
-| `isolated` | `bool` | Run in a disposable worktree. File changes are discarded; only JSON output continues. |
+| `workspace` | `"shared" \| "readonly" \| "worktree"` | What the task needs of the workspace; the engine runs tasks at once when none of them writes the shared tree. `shared` (the default) writes it and runs alone. `readonly` does not write it and runs beside its peers; a change it leaves fails it and is discarded, and it cannot declare `emits_files`. `worktree` writes a disposable clone and runs beside its peers; its changes are discarded and only its declared output continues. |
 | `emits` | `list[str]` | Result fields the task promises in its JSON output. |
 | `emits_files` | `list[str]` | Workspace files the task produces. A dependent is staged with the declared files of every dependency that passed. |
 | `over` | `producer.field` | Map the task over a dependency's emitted list, one instance per item. |
@@ -52,12 +52,12 @@ An agent turn whose prompt is a skill's instructions plus its arguments.
 | `harness` | `str` | Agent harness, overriding `[agent]`. |
 | `model` | `str` | Model, overriding `[agent]`. |
 | `effort` | `str` | Reasoning effort, overriding `[agent]`. |
-| `session` | `session \| str` | Join a durable conversation. A task in a session cannot be isolated. |
+| `session` | `session \| str` | Join a durable conversation. A task in a session cannot run in a worktree. |
 | `depends_on` | `list[task]` | Dependencies. Readiness decides execution order; declaration order does not. |
 | `needs` | `"any" \| "all"` | How many dependencies must be admitted before the task is ready. |
 | `join` | `"all" \| "passed" \| "settled"` | Which dependencies must have passed: `all` every one, `passed` at least one and only those are forwarded, `settled` none — it dispatches once every dependency is terminal, whatever it settled as, unless the run has already halted, and forwards each one as {status, note, output, files}. |
 | `required` | `bool` | False makes the task advisory: it blocks dependents but cannot invalidate the run. |
-| `isolated` | `bool` | Run in a disposable worktree. File changes are discarded; only JSON output continues. |
+| `workspace` | `"shared" \| "readonly" \| "worktree"` | What the task needs of the workspace; the engine runs tasks at once when none of them writes the shared tree. `shared` (the default) writes it and runs alone. `readonly` does not write it and runs beside its peers; a change it leaves fails it and is discarded, and it cannot declare `emits_files`. `worktree` writes a disposable clone and runs beside its peers; its changes are discarded and only its declared output continues. |
 | `emits` | `list[str]` | Result fields the task promises in its JSON output. |
 | `emits_files` | `list[str]` | Workspace files the task produces. A dependent is staged with the declared files of every dependency that passed. |
 | `over` | `producer.field` | Map the task over a dependency's emitted list, one instance per item. |
@@ -81,7 +81,7 @@ A deterministic shell task in the candidate workspace.
 | `needs` | `"any" \| "all"` | How many dependencies must be admitted before the task is ready. |
 | `join` | `"all" \| "passed" \| "settled"` | Which dependencies must have passed: `all` every one, `passed` at least one and only those are forwarded, `settled` none — it dispatches once every dependency is terminal, whatever it settled as, unless the run has already halted, and forwards each one as {status, note, output, files}. |
 | `required` | `bool` | False makes the task advisory: it blocks dependents but cannot invalidate the run. |
-| `isolated` | `bool` | Run in a disposable worktree. File changes are discarded; only JSON output continues. |
+| `workspace` | `"shared" \| "readonly" \| "worktree"` | What the task needs of the workspace; the engine runs tasks at once when none of them writes the shared tree. `shared` (the default) writes it and runs alone. `readonly` does not write it and runs beside its peers; a change it leaves fails it and is discarded, and it cannot declare `emits_files`. `worktree` writes a disposable clone and runs beside its peers; its changes are discarded and only its declared output continues. |
 | `emits` | `list[str]` | Result fields the task promises in its JSON output. |
 | `emits_files` | `list[str]` | Workspace files the task produces. A dependent is staged with the declared files of every dependency that passed. |
 | `over` | `producer.field` | Map the task over a dependency's emitted list, one instance per item. |
@@ -107,7 +107,7 @@ A measurement command. Its last non-empty stdout line is a JSON object; `pass = 
 | `needs` | `"any" \| "all"` | How many dependencies must be admitted before the task is ready. |
 | `join` | `"all" \| "passed" \| "settled"` | Which dependencies must have passed: `all` every one, `passed` at least one and only those are forwarded, `settled` none — it dispatches once every dependency is terminal, whatever it settled as, unless the run has already halted, and forwards each one as {status, note, output, files}. |
 | `required` | `bool` | False makes the task advisory: it blocks dependents but cannot invalidate the run. |
-| `isolated` | `bool` | Run in a disposable worktree. File changes are discarded; only JSON output continues. |
+| `workspace` | `"shared" \| "readonly" \| "worktree"` | What the task needs of the workspace; the engine runs tasks at once when none of them writes the shared tree. `shared` (the default) writes it and runs alone. `readonly` does not write it and runs beside its peers; a change it leaves fails it and is discarded, and it cannot declare `emits_files`. `worktree` writes a disposable clone and runs beside its peers; its changes are discarded and only its declared output continues. |
 | `emits` | `list[str]` | Result fields the task promises in its JSON output. |
 | `emits_files` | `list[str]` | Workspace files the task produces. A dependent is staged with the declared files of every dependency that passed. |
 | `over` | `producer.field` | Map the task over a dependency's emitted list, one instance per item. |

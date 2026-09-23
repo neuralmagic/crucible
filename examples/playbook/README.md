@@ -6,15 +6,15 @@ score, and either reaches a valid verdict or does not. The manifest declares
 asks of an author.
 
 ```text
-                                  ┌─> audit-headings  (isolated) ─┐
-  draft ──> shape ──> polish ─────┼─> audit-bullets   (isolated) ─┼─> roundup
+                                  ┌─> audit-headings  (readonly) ─┐
+  draft ──> shape ──> polish ─────┼─> audit-bullets   (readonly) ─┼─> roundup
  (agent)  (command)  (agent)      └─> audit-freshness (advisory) ─┘   join = "passed"
     └────── session "scribe" ──────┘
 ```
 
 Nothing here is proposed, applied, measured, or decided. `draft` writes release notes from an
 inbox, `shape` refuses to let a miscounted draft reach the second turn, `polish` titles the
-file in the *same* agent conversation, three auditors read the result in private clones, and
+file in the *same* agent conversation, three auditors read the result side by side, and
 `roundup` folds whoever reported. The deterministic `command` backend (`role.sh`) stands in
 for every agent turn, so the whole graph runs in under two seconds with no model and no cost.
 
@@ -22,7 +22,8 @@ for every agent turn, so the whole graph runs in under two seconds with no model
 
 ```sh
 crucible plan run --file examples/playbook/plan.toml \
-                  --manifest examples/playbook/crucible.toml
+                  --manifest examples/playbook/crucible.toml \
+                  --max-cost 1 --max-time 10m
 ```
 
 Expected, exactly:
@@ -34,8 +35,9 @@ Expected, exactly:
   polish               pass       attempts=1 cost=$0.0000  out={"continued":true,"session":"scribe","titled":true}
   audit-headings       pass       attempts=1 cost=$0.0000  out={"findings":[],"topic":"headings"}
   audit-bullets        pass       attempts=1 cost=$0.0000  out={"findings":[],"topic":"bullets"}
-  audit-freshness      fail       attempts=1 cost=$0.0000  (turn ended without writing PLAN_TASK_RESULT.json — nothing to grade)
+  audit-freshness      fail       attempts=1 cost=$0.0000  (turn ended without writing PLAN_TASK_RESULT.808960994375e943.json: nothing to grade)
   roundup              pass       attempts=1 cost=$0.0000  out={"findings":[],"reporting":["audit-bullets","audit-headings"],"silent":["audit-freshness"]}
+  publish-report       fail       attempts=1 cost=$0.0000  (reading /var/lib/forge/report.json: No such file or directory (os error 2))
 plan v1: completed — spent $0.0000 of $1
 verdict: valid
 ```
@@ -51,8 +53,8 @@ crucible plan show --file examples/playbook/plan.toml --mermaid
 ```
 
 `--agent-cmd ./role.sh` is the other stand-in spelling, and it cannot run this pack: that
-runner has no workspace to clone, so it refuses the three isolated auditors, and no session
-ledger, so `polish` reports `continued: false`. Isolation and durable sessions need
+runner has no workspace to check, so it refuses the three readonly auditors, and no session
+ledger, so `polish` reports `continued: false`. Readonly tasks and durable sessions need
 `--manifest`, whose `[agent]` still resolves to `role.sh` and still costs nothing.
 
 ## Files
@@ -74,20 +76,22 @@ ledger, so `polish` reports `continued: false`. Isolation and durable sessions n
 - **A session across tasks.** `draft` and `polish` both declare `session = "scribe"`, with a
   command task between them. The engine hands the second turn the same conversation, which
   the stand-in proves by comparing `CRUCIBLE_AGENT_SESSION_ID` against the one `draft`
-  recorded: `continued: true`. Sessions must be dependency-ordered, and cannot be isolated.
+  recorded: `continued: true`. Sessions must be dependency-ordered, and cannot run in a
+  worktree.
 - **A command task gating agents.** `shape` reads `draft`'s declared `entries` out of
   `CRUCIBLE_INPUTS` and counts the bullets on disk. A nonzero exit is a measured failure, and
   `polish` sits downstream, so a miscounted draft never buys a second turn.
-- **Isolated peers.** The three auditors are `isolation = "worktree"`, so the executor
-  dispatches them as one concurrent batch, each against a private clone carrying the shared
-  workspace's uncommitted state. An isolated task's edits are discarded; only its result
-  leaves, which is why they are read-only reviewers.
+- **Readonly peers.** The three auditors are `workspace = "readonly"`: they read `NOTES.md`
+  and write nothing but their results, so the executor dispatches them as one concurrent batch
+  in the shared workspace, with no clone to pay for. Each writes its own result file. Had one
+  of them edited the workspace, every auditor in the batch would fail and the edit would be
+  discarded.
 - **`join = "passed"`.** `roundup` waits for all three auditors to reach a terminal state and
   receives only the ones that passed. Under the default `join = "all"` a single advisory
   failure would block it.
 - **An advisory task.** `audit-freshness` is `required = false` and fails on purpose: it wants
-  a `inbox/.last-release` cut line this pack never ships, so it writes no
-  `PLAN_TASK_RESULT.json` and the turn has nothing to grade. It blocks nothing downstream of
+  a `inbox/.last-release` cut line this pack never ships, so it writes no result file and
+  the turn has nothing to grade. It blocks nothing downstream of
   itself and does not touch the verdict. Make it required and the run exits nonzero.
 - **Declared outputs.** `draft` promises `entries`, each auditor promises `findings`. A
   passing attempt whose JSON omits a promised field is a failure, which is what lets `shape`

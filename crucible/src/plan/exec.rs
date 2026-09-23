@@ -4,10 +4,11 @@
 //! dispatch; advisory failures block dependents but not validity; a required failure
 //! short-circuits; budget fails closed.
 //!
-//! Dispatch is serial in topo order, with one exception: simultaneously-ready
-//! isolation-marked tasks go to the runner as a single [`TaskRunner::run_many`] batch
-//! (the wide fan-out), and their results are recorded in declaration order so the event
-//! stream stays deterministic regardless of completion order.
+//! Dispatch is serial in topo order, with one exception: simultaneously-ready tasks that leave
+//! the shared tree alone (`readonly` and `worktree`, see [`crate::plan::ir::Workspace`]) go to
+//! the runner as a single [`TaskRunner::run_many`] batch (the wide fan-out, a review panel),
+//! and their results are recorded in declaration order so the event stream stays deterministic
+//! regardless of completion order.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -19,7 +20,7 @@ use crate::crucible::Direction;
 use crate::diagram::IllegalTransition;
 use crate::plan::ir::{
     Decider, ITEM_INPUT, Join, OUTCOME_INPUT, REVISION_INPUT, Stage, Task, TaskKind, TaskName,
-    ValidPlan,
+    ValidPlan, Workspace,
 };
 use crate::plan::machine::{
     BlockedReason, PlanEvent, PlanMachine, TaskEvent, TaskMachine, TaskState,
@@ -158,10 +159,6 @@ pub struct BatchItem<'a> {
 pub trait TaskRunner {
     fn run(&mut self, task: &Task, attempt: u32, inputs: &BTreeMap<TaskName, Value>) -> Attempt;
 
-    /// Run several isolation-marked tasks, possibly concurrently. The executor only
-    /// batches tasks that are simultaneously ready, so items never depend on each other.
-    /// The default runs them serially through [`TaskRunner::run`]; a runner that can
-    /// parallelize (per-task worktrees) overrides this.
     /// Stage every declared file produced by the tasks named, into the workspace this task is
     /// about to run in. An error refuses the dispatch rather than running a task whose inputs
     /// are not there.
@@ -184,6 +181,11 @@ pub trait TaskRunner {
     /// producing evidence, so a set from an earlier run cannot outlive its producer's silence.
     fn drop_captured(&mut self, _task: &Task) {}
 
+    /// Run several tasks that leave the shared tree alone (readonly or worktree), possibly
+    /// concurrently. The executor only batches tasks that are simultaneously ready, so items
+    /// never depend on each other, and its readonly items are staged with the same files. The
+    /// default runs them serially through [`TaskRunner::run`]; a runner that can parallelize
+    /// overrides this.
     fn run_many(&mut self, batch: &[BatchItem<'_>]) -> Vec<Attempt> {
         batch
             .iter()
@@ -522,9 +524,10 @@ pub fn execute(
 
     // Readiness scan: repeated topo passes. Each pass settles everything decidable
     // without dispatch (halt-blocked, skipped, dep-failed, over-budget), then dispatches
-    // the first ready task and restarts, or, when the first ready task is
-    // isolation-marked, the whole simultaneously-ready isolated set as one batch. For a
-    // plan with no isolated tasks this reproduces the serial topo walk exactly.
+    // the first ready task and restarts, or, when the first ready task leaves the shared tree
+    // alone (readonly or worktree), every simultaneously-ready task that does too, as one
+    // batch. For a plan whose tasks all share the workspace this reproduces the serial topo
+    // walk exactly.
     // `gates` is false for one mapped instance: an instance is not a node of the graph, so its
     // failure is folded into the node's result and it is the node that short-circuits or does
     // not. Reporting still happens, because a reader wants the row per item.
@@ -559,6 +562,10 @@ pub fn execute(
     loop {
         let settled_before = results.len();
         let mut dispatch: Vec<&Task> = Vec::new();
+        // What the batch's readonly tasks are staged with. They share one `inputs/`, so a
+        // readonly task staged with anything else waits for a later batch rather than be handed
+        // files from ancestors it does not have, or hand its own to peers that do not.
+        let mut readonly_inputs: Option<Vec<TaskName>> = None;
         for t in plan.tasks_topo() {
             if results.contains_key(&t.name) {
                 continue;
@@ -693,22 +700,23 @@ pub fn execute(
                 )?;
                 continue;
             }
-            if dispatch.is_empty() {
-                dispatch.push(t);
-                if t.over.is_some() || reviewer.is_some() {
-                    // A mapped task or a revise loop is dispatched alone: its own instances or
-                    // rounds are the batch.
-                    break;
+            // A mapped task or a revise loop is dispatched alone: its own instances or rounds
+            // are the batch. A shared-workspace task is dispatched alone, in strict topo
+            // position, because it writes the tree every other task reads.
+            let alone = t.over.is_some() || reviewer.is_some() || !t.workspace.concurrent();
+            if !dispatch.is_empty() && alone {
+                break;
+            }
+            if t.workspace == Workspace::Readonly {
+                let staged = staged_producers(plan, t, &results, &*runner);
+                match &readonly_inputs {
+                    Some(batch) if *batch != staged => continue,
+                    Some(_) => {}
+                    None => readonly_inputs = Some(staged),
                 }
-                if t.isolation.is_none() {
-                    // Serial task: dispatch it alone, in strict topo position.
-                    break;
-                }
-                // Isolated: keep scanning for other ready isolated tasks to batch.
-            } else if t.isolation.is_some() {
-                dispatch.push(t);
-            } else {
-                // A serial task is a barrier after the ready isolated prefix.
+            }
+            dispatch.push(t);
+            if alone {
                 break;
             }
         }
@@ -725,7 +733,7 @@ pub fn execute(
         };
 
         // Every dispatched task is staged, in its own right and with its own ancestors: batched
-        // isolated tasks do not share an ancestor set, and a task with no producers still has to
+        // worktree tasks do not share an ancestor set, and a task with no producers still has to
         // say so, or the previous dispatch's inputs are still lying there when it runs.
         //
         // A settled entry's `files` key is read off this list, so the list is built first.
@@ -844,7 +852,7 @@ pub fn execute(
                     // Each instance settles in its own right, so a reader sees one row per item
                     // rather than one row standing for all of them.
                     let mut settled: Vec<(String, TaskResult)> = Vec::new();
-                    if node.isolation.is_some() {
+                    if node.workspace.concurrent() {
                         let batch: Vec<BatchItem<'_>> = instances
                             .iter()
                             .zip(&keys)
@@ -882,8 +890,8 @@ pub fn execute(
                         }
                     } else {
                         // Instances of a shared-workspace node are one serial task each: they
-                        // write the same tree and the same result file, so the next one is not
-                        // dispatched until this one has settled.
+                        // write the same tree, so the next one is not dispatched until this one
+                        // has settled.
                         for (instance, key) in instances.iter().zip(&keys) {
                             if spent >= budget {
                                 halt(&mut halted, &mut plan_machine, Halt::Budget)?;
@@ -1199,9 +1207,9 @@ pub fn execute(
                 true,
             )?;
         } else {
-            // A concurrent batch of independent isolated tasks; results are recorded in
-            // declaration order regardless of completion order, so the event stream
-            // stays deterministic.
+            // A concurrent batch of independent tasks that leave the shared tree alone; results
+            // are recorded in declaration order regardless of completion order, so the event
+            // stream stays deterministic.
             let batch: Vec<BatchItem<'_>> = dispatch
                 .iter()
                 .map(|t| BatchItem {
@@ -1318,6 +1326,19 @@ fn instance_key<'a>(node: &TaskName, name: &'a TaskName) -> Option<&'a str> {
 /// contain a bracket, so an instance name can never be mistaken for a task of its own.
 pub fn is_instance_of(node: &TaskName, name: &TaskName) -> bool {
     instance_key(node, name).is_some()
+}
+
+/// The names [`file_producers`] would stage into `t` for this dispatch.
+fn staged_producers(
+    plan: &ValidPlan,
+    t: &Task,
+    results: &BTreeMap<TaskName, TaskResult>,
+    runner: &dyn TaskRunner,
+) -> Vec<TaskName> {
+    file_producers(plan, t, results, runner)
+        .into_iter()
+        .map(|p| p.name)
+        .collect()
 }
 
 /// Which producers' declared files are staged into `t` for this dispatch.
@@ -1820,7 +1841,7 @@ fn run_with_retries(
     (result, event, *spent > budget)
 }
 
-/// Run a batch of isolated tasks through the runner's parallel path, retrying the transport
+/// Run a batch of concurrent tasks through the runner's parallel path, retrying the transport
 /// failures as a smaller wave until every task has a result or retries run out.
 fn run_batch_with_retries<'a>(
     batch: Vec<BatchItem<'a>>,
@@ -2102,7 +2123,7 @@ mod tests {
         crate::plan::exec::execute(plan, substrate, cfg, runner, on_result)
             .expect("an executor transition its table does not list")
     }
-    use crate::plan::ir::{Isolation, Join, Plan, PlanBudget, Stage};
+    use crate::plan::ir::{Join, Plan, PlanBudget, Stage, Workspace};
 
     type Script = BTreeMap<(String, u32), (fn() -> AttemptOutcome, f64)>;
 
@@ -2216,7 +2237,7 @@ mod tests {
             session: None,
             needs: needs.into(),
             required,
-            isolation: None,
+            workspace: Workspace::Shared,
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
@@ -2731,7 +2752,7 @@ mod tests {
             session: None,
             needs: "any".into(),
             required: true,
-            isolation: None,
+            workspace: Workspace::Shared,
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
@@ -2791,7 +2812,7 @@ mod tests {
             session: None,
             needs: "any".into(),
             required: false,
-            isolation: None,
+            workspace: Workspace::Shared,
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
@@ -2854,15 +2875,15 @@ mod tests {
     }
 
     #[test]
-    fn isolated_ready_tasks_dispatch_as_one_batch_in_declaration_order() {
-        // Three isolated roots + a serial collector. The roots must arrive at the runner
+    fn worktree_ready_tasks_dispatch_as_one_batch_in_declaration_order() {
+        // Three worktree roots + a serial collector. The roots must arrive at the runner
         // as ONE run_many batch; the collector dispatches alone afterwards; on_result
         // order stays declaration-stable regardless of (simulated) completion order.
         let mut tasks: Vec<Task> = ["p-a", "p-b", "p-c"]
             .iter()
             .map(|n| {
                 let mut t = task(n, &[], "any", false);
-                t.isolation = Some(crate::plan::ir::Isolation::Worktree);
+                t.workspace = Workspace::Worktree;
                 t
             })
             .collect();
@@ -2911,18 +2932,18 @@ mod tests {
                 vec!["p-a".to_string(), "p-b".into(), "p-c".into()],
                 vec!["collect".to_string()],
             ],
-            "isolated roots batch together; the serial collector dispatches alone"
+            "worktree roots batch together; the serial collector dispatches alone"
         );
         assert_eq!(seen, ["p-a", "p-b", "p-c", "collect"]);
     }
 
     #[test]
-    fn ready_serial_task_is_a_barrier_between_isolated_batches() {
+    fn ready_shared_task_is_a_barrier_between_concurrent_batches() {
         let mut a = task("a", &[], "any", false);
-        a.isolation = Some(crate::plan::ir::Isolation::Worktree);
+        a.workspace = Workspace::Worktree;
         let b = task("b", &[], "any", false);
         let mut c = task("c", &[], "any", false);
-        c.isolation = Some(crate::plan::ir::Isolation::Worktree);
+        c.workspace = Workspace::Worktree;
         let plan = valid(vec![a, b, c], 10.0);
         let mut r = ScriptRunner::new();
         let mut seen = Vec::new();
@@ -2945,12 +2966,157 @@ mod tests {
         );
     }
 
+    /// Runs `tasks` through a [`GraphRunner`] that passes everything, and returns its waves.
+    fn waves(tasks: Vec<Task>) -> Vec<Vec<String>> {
+        let names: Vec<String> = tasks.iter().map(|t| t.name.0.clone()).collect();
+        let plan = valid(tasks, 10.0);
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut runner = GraphRunner {
+            outcomes: names
+                .into_iter()
+                .map(|n| {
+                    let pass: fn() -> AttemptOutcome =
+                        || AttemptOutcome::Pass(serde_json::json!({}));
+                    (n, pass)
+                })
+                .collect(),
+            log: log.clone(),
+        };
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut runner,
+            |_, _| {},
+        );
+        assert!(out.valid, "{:?}", out.results);
+        log.borrow()
+            .iter()
+            .filter_map(|e| match e {
+                GraphEvent::Run(wave) => Some(wave.clone()),
+                GraphEvent::Settled(..) => None,
+            })
+            .collect()
+    }
+
+    fn wave(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| (*n).to_string()).collect()
+    }
+
+    /// Neither a readonly task nor a worktree task writes the shared tree, so the executor runs
+    /// them at once whichever each is; a shared task still runs alone between them.
+    #[test]
+    fn readonly_and_worktree_tasks_batch_and_a_shared_one_runs_alone() {
+        let with = |name: &str, workspace: Workspace| {
+            let mut t = task(name, &[], "any", true);
+            t.workspace = workspace;
+            t
+        };
+        assert_eq!(
+            waves(vec![
+                with("read-a", Workspace::Readonly),
+                with("clone", Workspace::Worktree),
+                with("read-b", Workspace::Readonly),
+                with("write", Workspace::Shared),
+                with("read-c", Workspace::Readonly),
+            ]),
+            [
+                wave(&["read-a", "clone", "read-b"]),
+                wave(&["write"]),
+                wave(&["read-c"]),
+            ]
+        );
+    }
+
+    /// Readonly peers share the one `inputs/` in the shared tree, so only peers staged with the
+    /// same producers run together. A mismatched one waits for its own batch rather than stopping
+    /// the scan, so a later match still joins.
+    #[test]
+    fn readonly_peers_staged_with_different_files_run_in_separate_batches() {
+        let producer = |name: &str, file: &str| {
+            let mut t = task(name, &[], "any", true);
+            t.emits_files = vec![file.to_string()];
+            t
+        };
+        let reader = |name: &str, dep: &str| {
+            let mut t = task(name, &[dep], "any", true);
+            t.workspace = Workspace::Readonly;
+            t
+        };
+        let mut clone = task("clone", &["p2"], "any", true);
+        clone.workspace = Workspace::Worktree;
+        assert_eq!(
+            waves(vec![
+                producer("p1", "a.md"),
+                producer("p2", "b.md"),
+                reader("r1", "p1"),
+                reader("r2", "p2"),
+                reader("r3", "p1"),
+                clone,
+            ]),
+            [
+                wave(&["p1"]),
+                wave(&["p2"]),
+                wave(&["r1", "r3", "clone"]),
+                wave(&["r2"]),
+            ]
+        );
+    }
+
+    /// A mapped node or a revise pair that becomes ready behind a concurrent task is not folded
+    /// into that task's batch as a plain task: it waits and then runs as its own dispatch, the
+    /// node as its instances and the pair as its rounds.
+    #[test]
+    fn a_mapped_node_or_revise_pair_never_joins_another_tasks_batch() {
+        let mut clone = task("clone", &["discover"], "any", true);
+        clone.workspace = Workspace::Worktree;
+        let mut node = mapped_node("audit", "discover", "targets", true);
+        node.workspace = Workspace::Worktree;
+        let plan = valid(vec![task("discover", &[], "any", true), clone, node], 5.0);
+        let mut runner = FanoutRunner::new(&["alpha", "beta"]);
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut runner,
+            |_, _| {},
+        );
+        assert!(out.valid, "{:?}", out.results);
+        assert!(
+            !runner.log.contains(&"run audit".to_string()),
+            "the node ran as a task: {:?}",
+            runner.log
+        );
+        assert!(
+            runner
+                .log
+                .windows(3)
+                .any(|w| w == ["batch of 2", "run audit[alpha]", "run audit[beta]"]),
+            "{:?}",
+            runner.log
+        );
+
+        let mut clone = task("clone", &[], "any", true);
+        clone.workspace = Workspace::Worktree;
+        let mut draft = task("draft", &[], "any", true);
+        draft.workspace = Workspace::Readonly;
+        let mut review = task("review", &["draft"], "any", true);
+        review.revise = Some(crate::plan::ir::Revise {
+            task: "draft".into(),
+            max_rounds: 2,
+        });
+        assert_eq!(
+            waves(vec![clone, draft, review]),
+            [wave(&["clone"]), wave(&["draft"]), wave(&["review"])]
+        );
+    }
+
     #[test]
     fn concurrent_batch_aggregate_overspend_fails_closed() {
         let mut a = task("a", &[], "any", true);
-        a.isolation = Some(crate::plan::ir::Isolation::Worktree);
+        a.workspace = Workspace::Worktree;
         let mut b = task("b", &[], "any", true);
-        b.isolation = Some(crate::plan::ir::Isolation::Worktree);
+        b.workspace = Workspace::Worktree;
         let plan = valid(vec![a, b], 0.5);
         let mut r = ScriptRunner::new();
         r.on("a", 1, || AttemptOutcome::Pass(serde_json::json!({})), 0.4);
@@ -2984,7 +3150,7 @@ mod tests {
             session: None,
             needs: "any".into(),
             required: false,
-            isolation: None,
+            workspace: Workspace::Shared,
             join: Join::Passed,
             stage: Stage::Iteration,
             emits: Vec::new(),
@@ -3129,9 +3295,9 @@ mod tests {
     #[test]
     fn batch_transport_failures_retry_bounded() {
         let mut a = task("iso-a", &[], "any", false);
-        a.isolation = Some(crate::plan::ir::Isolation::Worktree);
+        a.workspace = Workspace::Worktree;
         let mut b = task("iso-b", &[], "any", false);
-        b.isolation = Some(crate::plan::ir::Isolation::Worktree);
+        b.workspace = Workspace::Worktree;
         let plan = valid(vec![a, b], 10.0);
 
         // iso-a passes on attempt 1; iso-b transports forever. The retry waves must
@@ -3714,9 +3880,9 @@ mod tests {
     #[test]
     fn batch_path_enforces_emits_per_item() {
         let mut ok = emitting("iso-ok", &[], false, &["score"]);
-        ok.isolation = Some(crate::plan::ir::Isolation::Worktree);
+        ok.workspace = Workspace::Worktree;
         let mut bad = emitting("iso-bad", &[], false, &["score"]);
-        bad.isolation = Some(crate::plan::ir::Isolation::Worktree);
+        bad.workspace = Workspace::Worktree;
         let plan = valid(vec![ok, bad], 10.0);
         let mut r = ScriptRunner::new();
         r.on(
@@ -3893,12 +4059,12 @@ mod tests {
         }
     }
 
-    /// An isolated mapped node keeps its worktree-per-instance batch: concurrency is what
-    /// isolation buys, and a private tree is what makes it safe.
+    /// A worktree mapped node keeps its worktree-per-instance batch: concurrency is what
+    /// leaving the shared tree alone buys, and a private tree is what makes it safe.
     #[test]
-    fn isolated_instances_still_go_to_the_runner_as_one_batch() {
+    fn worktree_instances_still_go_to_the_runner_as_one_batch() {
         let mut node = mapped_node("audit", "discover", "targets", true);
-        node.isolation = Some(crate::plan::ir::Isolation::Worktree);
+        node.workspace = Workspace::Worktree;
         let plan = valid(vec![task("discover", &[], "any", true), node], 5.0);
         let mut runner = FanoutRunner::new(&["alpha", "beta"]);
         let out = execute(
@@ -3916,12 +4082,35 @@ mod tests {
         );
     }
 
+    /// A readonly node's instances leave the tree alone and each writes its own result file, so
+    /// they run as one concurrent batch in the shared workspace.
+    #[test]
+    fn readonly_instances_go_to_the_runner_as_one_batch() {
+        let mut node = mapped_node("audit", "discover", "targets", true);
+        node.workspace = Workspace::Readonly;
+        let plan = valid(vec![task("discover", &[], "any", true), node], 5.0);
+        let mut runner = FanoutRunner::new(&["alpha", "beta", "gamma"]);
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut runner,
+            |_, _| {},
+        );
+        assert!(out.valid, "{:?}", out.results);
+        assert!(
+            runner.log.contains(&"batch of 3".to_string()),
+            "{:?}",
+            runner.log
+        );
+    }
+
     /// The batch path keeps a failing instance's object on its own row, and the fold still
     /// reduces over the passing set alone.
     #[test]
     fn a_failing_instance_keeps_its_output_but_stays_out_of_the_fold() {
         let mut node = mapped_node("audit", "discover", "targets", false);
-        node.isolation = Some(crate::plan::ir::Isolation::Worktree);
+        node.workspace = Workspace::Worktree;
         let plan = valid(vec![task("discover", &[], "any", true), node], 5.0);
         let mut runner = FanoutRunner::new(&["alpha", "beta"]);
         runner.fail.insert("audit[beta]".to_string());
@@ -4348,9 +4537,9 @@ mod tests {
     #[test]
     fn an_epilogue_batch_crossing_the_budget_ceiling_does_not_relabel_a_short_circuit() {
         let mut first = epilogue("first", &[], true);
-        first.isolation = Some(crate::plan::ir::Isolation::Worktree);
+        first.workspace = Workspace::Worktree;
         let mut second = epilogue("second", &[], true);
-        second.isolation = Some(crate::plan::ir::Isolation::Worktree);
+        second.workspace = Workspace::Worktree;
         let plan = valid(vec![task("probe", &[], "any", true), first, second], 0.15);
         let mut r = ScriptRunner::new();
         r.on("probe", 1, || AttemptOutcome::fail("vetoed"), 0.1);
@@ -4375,7 +4564,7 @@ mod tests {
     fn a_mapped_epilogue_batch_crossing_the_budget_ceiling_does_not_relabel_a_short_circuit() {
         let mut fan = mapped_node("fan", "src", "items", true);
         fan.stage = Stage::Epilogue;
-        fan.isolation = Some(crate::plan::ir::Isolation::Worktree);
+        fan.workspace = Workspace::Worktree;
         let plan = valid(
             vec![
                 task("probe", &[], "any", true),
@@ -5784,16 +5973,16 @@ mod tests {
         assert!(r.dispatched.contains(&("report".to_string(), 1)));
     }
 
-    /// A required task that settles blocked later in the same scan pass stops the isolated batch
+    /// A required task that settles blocked later in the same scan pass stops the concurrent batch
     /// the pass had already collected: nothing undispatched runs after a short circuit.
     #[test]
     fn a_short_circuit_later_in_the_scan_stops_the_collected_batch() {
         let mut a = task("a", &[], "any", false);
-        a.isolation = None;
+        a.workspace = Workspace::Shared;
         let mut b = task("b", &[], "any", false);
-        b.isolation = Some(Isolation::Worktree);
+        b.workspace = Workspace::Worktree;
         let mut c = task("c", &["a"], "any", true);
-        c.isolation = Some(Isolation::Worktree);
+        c.workspace = Workspace::Worktree;
         c.join = Join::Passed;
         let plan = valid(vec![a, b, c], 10.0);
         let mut r = ScriptRunner::new();
@@ -5876,9 +6065,29 @@ mod tests {
         }
     }
 
+    /// The workspace assignments the exhaustive test runs every graph under: all shared, and
+    /// splits of the three tasks into readonly and worktree with at most one left shared. A lone
+    /// concurrent task among shared ones batches with nothing, so it adds no schedule the
+    /// all-shared row does not already cover. Every task that may declare files does, so
+    /// whether readonly peers are staged alike depends on which of their ancestors passed.
+    const WORKSPACE_SPLITS: &[[Workspace; 3]] = {
+        use Workspace::{Readonly as R, Shared as S, Worktree as W};
+        &[
+            [S, S, S],
+            [R, R, S],
+            [W, W, S],
+            [S, R, R],
+            [S, R, W],
+            [R, S, R],
+            [W, R, R],
+            [R, R, R],
+            [W, W, W],
+        ]
+    };
+
     /// The invariants formal/CrucibleSpec/PlanExec.lean proves for the model, checked against
     /// `execute` on every three-task graph: every edge set, stage split, required set, substrate
-    /// fit, join, isolation split, per-task outcome, and a budget that does and does not run out.
+    /// fit, join, workspace split, per-task outcome, and a budget that does and does not run out.
     #[test]
     fn every_three_task_graph_keeps_the_model_invariants() {
         const N: usize = 3;
@@ -5909,8 +6118,8 @@ mod tests {
                 if (0..N).any(|t| deps(t).iter().any(|&d| is_epilogue(t) != is_epilogue(d))) {
                     continue;
                 }
-                for (required, isolated) in
-                    (0..(1u32 << N)).flat_map(|r| [0u32, 0b011, 0b110, 0b111].map(|i| (r, i)))
+                for (required, spaces) in (0..(1u32 << N))
+                    .flat_map(|r| WORKSPACE_SPLITS.iter().map(move |spaces| (r, spaces)))
                 {
                     for gpu in [None, Some(0), Some(1), Some(2)] {
                         for join_pick in 0..(joins.len().pow(N as u32)) {
@@ -5933,8 +6142,9 @@ mod tests {
                                                 required & (1 << t) != 0,
                                             );
                                             task.join = join(t);
-                                            if isolated & (1 << t) != 0 {
-                                                task.isolation = Some(Isolation::Worktree);
+                                            task.workspace = spaces[t];
+                                            if spaces[t] != Workspace::Readonly {
+                                                task.emits_files = vec![format!("{}.out", name(t))];
                                             }
                                             if is_epilogue(t) {
                                                 task.stage = Stage::Epilogue;
@@ -6074,14 +6284,43 @@ mod tests {
                         assert_eq!(fresh.len(), wave.len(), "{}", ctx());
                     }
                     if wave.len() > 1 {
-                        // batch_is_isolated and batch_is_independent.
+                        // batch_leaves_the_shared_tree_alone and batch_is_independent: a shared
+                        // task never runs beside a peer.
                         for a in wave {
                             let t = find(a);
-                            assert!(t.isolation.is_some(), "{a} ran in a batch: {}", ctx());
+                            assert!(t.workspace.concurrent(), "{a} ran in a batch: {}", ctx());
                             for b in wave {
                                 assert!(!t.depends_on.iter().any(|d| &d.0 == b), "{}", ctx());
                             }
                         }
+                        // readonly_peers_are_staged_alike: they share one `inputs/`.
+                        let staged = |n: &str| -> BTreeSet<&str> {
+                            let mut seen: BTreeSet<&str> = BTreeSet::new();
+                            let mut todo: Vec<&str> = vec![n];
+                            while let Some(next) = todo.pop() {
+                                for d in &find(next).depends_on {
+                                    if seen.insert(d.0.as_str()) {
+                                        todo.push(d.0.as_str());
+                                    }
+                                }
+                            }
+                            seen.into_iter()
+                                .filter(|a| {
+                                    !find(a).emits_files.is_empty()
+                                        && settled.get(a) == Some(&TaskStatus::Pass)
+                                })
+                                .collect()
+                        };
+                        let readers: Vec<BTreeSet<&str>> = wave
+                            .iter()
+                            .filter(|n| find(n).workspace == Workspace::Readonly)
+                            .map(|n| staged(n))
+                            .collect();
+                        assert!(
+                            readers.windows(2).all(|pair| pair[0] == pair[1]),
+                            "readonly peers staged differently: {}",
+                            ctx()
+                        );
                     }
                     for n in &fresh {
                         let t = find(n);

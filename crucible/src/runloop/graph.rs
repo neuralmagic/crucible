@@ -23,7 +23,7 @@ use crate::plan::exec::{
     Attempt, AttemptOutcome, BatchItem, ExecCfg, Substrate, TaskRunner, TaskStatus, execute,
 };
 use crate::plan::ir::{
-    EngineOp, Isolation, Join, Plan, PlanBudget, Stage, Task, TaskKind, TaskName, ValidPlan,
+    EngineOp, Join, Plan, PlanBudget, Stage, Task, TaskKind, TaskName, ValidPlan, Workspace,
 };
 use crate::plan::workflow::{WorkflowCaps, WorkflowCfg};
 use crate::process::STOP;
@@ -986,7 +986,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
             session: None,
             needs: "any".to_string(),
             required: false,
-            isolation: Some(Isolation::Worktree),
+            workspace: Workspace::Worktree,
             join: Join::All,
             stage: Stage::Iteration,
             emits: Vec::new(),
@@ -1009,7 +1009,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
             session: None,
             needs: "any".to_string(),
             required: false,
-            isolation: None,
+            workspace: Workspace::Shared,
             join: Join::All,
             stage: Stage::Iteration,
             emits: Vec::new(),
@@ -1032,7 +1032,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
         session: None,
         needs: "any".to_string(),
         required: false,
-        isolation: None,
+        workspace: Workspace::Shared,
         join: Join::Passed,
         stage: Stage::Iteration,
         emits: Vec::new(),

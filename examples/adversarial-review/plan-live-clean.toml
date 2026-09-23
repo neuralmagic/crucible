@@ -26,7 +26,7 @@ Review adversarially. Assume the implementation may satisfy verify.sh without be
 correct in general, and decide whether is_prime returns the right answer for inputs
 verify.sh does not check.
 
-Write a single JSON object to PLAN_TASK_RESULT.json with these keys:
+Write a single JSON object to the result file the Result contract below names, with these keys:
   approved       true only if is_prime is correct for ALL n, not merely for the cases
                  verify.sh happens to test
   finding        one or two sentences naming the defect, or "" if approved

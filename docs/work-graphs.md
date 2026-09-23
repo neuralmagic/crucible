@@ -56,7 +56,7 @@ command = "./bench.sh"
 depends_on = ["propose"]
 needs = "gpu"               # default "any"
 required = true             # default true
-isolation = "worktree"      # optional
+isolation = "readonly"      # optional: "readonly" or "worktree"; absent = shared
 join = "all"                # default "all"
 emits = ["score"]           # optional declared output fields; absent = undeclared
 
@@ -86,10 +86,10 @@ frozen `Judge`.
 A command string is not a trust boundary by itself. If it invokes a script that must remain
 trusted after an agent task edits the workspace, declare that script as a frozen
 `[[workspace.inject]]` in the manifest. The plan runner restores frozen injects in the task's
-actual workspace before every task, including isolated worktrees.
+actual workspace before every task, including worktrees.
 
 A logical `session` is serial state, so every pair of tasks sharing one must have a dependency
-path between them. A session task cannot use disposable worktree isolation. The private ledger keeps
+path between them. A session task cannot run in a disposable worktree. The private ledger keeps
 only an opaque harness cursor and completed-turn count; neither that cursor nor Claude's native
 transcript is copied into the plan or public session log. Normal streamed harness events retain
 their existing visibility. Claude Code's native transcript remains in its private local store or a
@@ -103,9 +103,12 @@ A task's output is JSON and becomes its dependents' input.
 - `command`: the last non-empty stdout line. Nonzero exit is a measured failure; a spawn
   failure is a transport failure. Upstream outputs arrive as `CRUCIBLE_INPUTS` (a JSON object
   keyed by task name), plus `CRUCIBLE_TASK`.
-- `agent` under `--manifest`: the turn writes a single JSON object to `PLAN_TASK_RESULT.json`
-  in the workspace root. A missing file after a normal turn is a measured failure; an explicit
-  spawn, harness, or stream error is a transport failure and follows the retry policy.
+- `agent` under `--manifest`: the turn writes a single JSON object to its own result file in the
+  workspace root, `PLAN_TASK_RESULT.<digest>.json`, where the digest is of the task's name. The
+  prompt names the file and so does `CRUCIBLE_TASK_RESULT`, so a prompt or skill should point at
+  one of those rather than spell a filename. A missing file after a normal turn is a measured
+  failure; an explicit spawn, harness, or stream error is a transport failure and follows the
+  retry policy.
 - `agent` under `--agent-cmd`: the stand-in receives `CRUCIBLE_PROMPT`, `CRUCIBLE_HARNESS`,
   `CRUCIBLE_MODEL`, `CRUCIBLE_EFFORT`, and returns JSON on its last stdout line.
 - `evaluate`: requires a JSON object. `pass = false` fails and malformed `pass` fails closed.
@@ -151,18 +154,38 @@ The substrate capability a task requires. `"any"` runs everywhere. Anything else
 declared with `--cap`, otherwise the task is unrunnable, and `plan show` reports the truncation
 verdict before you spend anything.
 
-### `isolation`
+### `workspace`
 
-`isolation = "worktree"` gives the task a private clone of the workspace, including its
-uncommitted state. Two effects:
+What a task needs of the workspace. The author says what is true of the task; the executor
+decides what can run at once from it. Authored in `workflow.star` as
+`workspace = "shared" | "readonly" | "worktree"`; the TOML IR spells it `isolation`, absent for
+`shared`.
 
-- Tasks isolated this way and ready at the same time run **concurrently**. Without isolation
-  they would collide on the single `PLAN_TASK_RESULT.json` in the shared workspace.
-- The task's edits are **discarded**. What leaves is its declared output, so this is for
-  review and analysis work, not for a task whose diff has to survive.
+| Value | The task | Runs |
+| --- | --- | --- |
+| `shared` (default) | writes the shared workspace; a passing task's changes are committed | alone, in topo position |
+| `readonly` | reads the shared workspace and writes nothing | beside every other ready task that is not `shared` |
+| `worktree` | writes a private clone, including the workspace's uncommitted state; its edits are discarded | beside every other ready task that is not `shared` |
 
-A runner that cannot isolate refuses the task rather than silently running it in the shared
-workspace.
+- A `readonly` task is held to its word. The engine reads the workspace's tree before and after
+  the batch it ran in (tracked and untracked files, ignored ones excluded), and where HEAD
+  points, so a commit counts as a change. A change fails every
+  readonly task in the batch, since they ran at once in one tree and which of them wrote is not
+  knowable, and the change is put back before anything else runs. It cannot declare
+  `emits_files`: return the content in its JSON output, or make it a `worktree`.
+- Readonly peers share one `inputs/`, so the executor only batches readonly tasks staged with the
+  same producers' files. One staged differently waits for a later batch.
+- A `worktree` task's edits are **discarded**. What leaves is its declared output, so this is for
+  review and analysis work that writes scratch files, not for a task whose diff has to survive.
+- A mapped node's instances run as one concurrent batch when the node is `readonly` or
+  `worktree`, and one at a time when it is `shared`.
+- On the `openshell` backend a batch holding a readonly agent task runs one task at a time,
+  each readonly task checked alone. An openshell turn names its sandbox for the workspace and
+  ends by replacing the workspace directory with the sandbox's copy, so two turns cannot share
+  one tree yet. The local and command backends run the batch at once.
+
+A runner that cannot provide a clone, or cannot check a readonly task, refuses the task rather
+than silently running it in the shared workspace.
 
 ### `join`
 
@@ -286,7 +309,7 @@ rounds, so a turn that overruns the cap is still measured and decided.
 ### Authored measurement subgraphs
 
 The compatible `measure()` path remains available. For visible measurement, use `evaluate()` and
-`grade()`: dependencies define rungs, isolated peers can run concurrently, and `grade()` selects
+`grade()`: dependencies define rungs, readonly and worktree peers run concurrently, and `grade()` selects
 the score source for `decide()`.
 
 ```python
@@ -305,7 +328,7 @@ diff = evaluate(
     threshold = 0.001,
     direction = "lower",
     needs = "gpu",
-    isolated = True,
+    workspace = "worktree",
 )
 latency = evaluate(
     name = "latency",
@@ -313,14 +336,14 @@ latency = evaluate(
     depends_on = [diff],
     direction = "lower",
     threshold = 12.5,
-    isolated = True,
+    workspace = "worktree",
 )
 racecheck = evaluate(
     name = "racecheck",
     run = "./racecheck.sh",
     depends_on = [diff],
     required = False,
-    isolated = True,
+    workspace = "worktree",
 )
 measurement = grade(
     name = "final-grade",
@@ -374,6 +397,6 @@ the draft written without a verdict in hand, and the revision written with it pa
 model-free `claude` image, and checks the rounds, the resumed session, and the commits.
 
 `examples/adversarial-review` puts a review task between a code node and the gate below it, in
-single-reviewer and two-reviewer panel shapes. The panel runs isolated reviewers concurrently
+single-reviewer and two-reviewer panel shapes. The panel runs worktree reviewers concurrently
 and joins them on a policy gate: correctness blocks, copy-edit is advisory. It runs free
 against a stand-in manifest or against real models with the live one.

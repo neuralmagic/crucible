@@ -52,6 +52,7 @@ changed = [
     "compilation must be bounded in depth and size and must not abort the process on an author-supplied source",
     "workflow type may be playbook",
     "a task's declared files continue through the graph alongside its JSON output, isolation notwithstanding",
+    "isolated is replaced by workspace = shared | readonly | worktree, from which the engine derives concurrency; a readonly task that changes the workspace fails and the change is discarded; each task writes its own result file",
     "a required task may not depend on an advisory one through all-join edges",
     "param joins the enumerated constructors",
     "shutdown outcome gains complete for a run a task ended with no work left",

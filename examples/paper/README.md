@@ -40,7 +40,7 @@ evaluating a line of it.
 `skills/analyze-paper/SKILL.md` is the upstream skill from the speculators fork with one change.
 Its last step was *"Present to User… ask for approval to proceed"*, written for an interactive
 slash command. A playbook turn has nobody to ask and nothing reads what it prints, so that step
-is replaced by an output contract: write `SPEC.md`, write `PLAN_TASK_RESULT.json`, do not stop to
+is replaced by an output contract: write `SPEC.md`, write the result file, do not stop to
 confirm anything.
 
 That edit is what porting a hand-rolled skill pipeline into a playbook actually consists of, and

@@ -2,8 +2,8 @@
 #   implement┤                                  ├─> gate ─> measure
 #            └─> review-copy       (advisory) ──┘
 #
-# Both reviewers are isolated, so they run concurrently without colliding on
-# PLAN_TASK_RESULT.json. `gate` uses join = "passed" so an advisory reviewer failing does
+# Both reviewers run in worktrees, so they run concurrently. `gate` uses join = "passed" so
+# an advisory reviewer failing does
 # not block the run; it stays fail-closed on the blocking reviewer.
 #
 # Plants the subtle defect: trial division wrong for any composite whose smallest factor
@@ -37,7 +37,7 @@ Review adversarially. Assume the implementation may satisfy verify.sh without be
 correct in general. Judge behavior only, someone else is reviewing the prose, so ignore
 typos, comments, and docstring wording entirely.
 
-Write a single JSON object to PLAN_TASK_RESULT.json:
+Write a single JSON object to the result file the Result contract below names:
   approved       true only if is_prime is correct for ALL n, not merely the cases verify.sh
                  happens to test
   finding        one or two sentences naming the defect, or "" if approved
@@ -63,7 +63,7 @@ what the code does (a docstring promising behavior the function does not have, o
 documenting a parameter it does not take, is a copy defect). Say nothing about the
 algorithm's correctness, a different reviewer owns that.
 
-Write a single JSON object to PLAN_TASK_RESULT.json:
+Write a single JSON object to the result file the Result contract below names:
   findings  array of strings, one per prose defect, each quoting the text at fault.
             Empty array if the prose is clean.
   summary   one sentence on the overall state of the documentation

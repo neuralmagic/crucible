@@ -9,7 +9,7 @@ cluster and no LLM. If `crucible` can run this, the engine↔domain boundary
 - **Proposer (`bump.nu`):** the deterministic `command` agent backend, `value.txt += 1` per
   turn (stands in for an LLM, so the run is free, fast, and reproducible, a real e2e, not a mock).
 - **World:** GitWorld (no `[world]` block), kept iterations commit, discards `reset --hard`.
-- **Measurement graph:** isolated `shape` and `score` checks run in parallel; `grade` selects
+- **Measurement graph:** `shape` and `score` checks run in parallel worktrees; `grade` selects
   `score` for the decision.
 
 ## Run (once the engine exists)

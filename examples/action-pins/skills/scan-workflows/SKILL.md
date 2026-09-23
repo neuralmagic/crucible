@@ -53,7 +53,7 @@ You are running unattended. Write these files in the workspace root:
    The list is sorted by path. An empty repository of workflows is valid.
 2. `SCAN.md`, naming the repository and ref, listing every captured path, and stating if
    the API tree was truncated.
-3. `PLAN_TASK_RESULT.json`, exactly:
+3. The result file the Result contract below names, exactly:
 
    ```json
    {"workflows": [".github/workflows/ci.yml"]}

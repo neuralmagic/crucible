@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::plan::ir::{
     EngineOp, Join, KEPT_INPUT, Plan, PlanBudget, PlanError, Stage, Task, TaskKind, TaskName,
+    Workspace,
 };
 
 /// Names used only by the compatibility template.
@@ -122,8 +123,14 @@ pub enum WorkflowError {
     MissingCapability { capability: &'static str },
     #[error("engine task {task:?} must be required")]
     EngineTaskOptional { task: String },
-    #[error("engine task {task:?} cannot run in an isolated worktree")]
-    EngineTaskIsolated { task: String },
+    #[error(
+        "engine task {task:?} runs in the shared workspace; it cannot declare workspace = \
+         {workspace:?}"
+    )]
+    EngineTaskNotShared {
+        task: String,
+        workspace: &'static str,
+    },
     #[error("engine task {task:?} must use join = \"all\"")]
     EngineTaskJoin { task: String },
     #[error(
@@ -333,8 +340,11 @@ impl WorkflowCfg {
                 if !task.required {
                     return Err(WorkflowError::EngineTaskOptional { task: name() });
                 }
-                if task.isolation.is_some() {
-                    return Err(WorkflowError::EngineTaskIsolated { task: name() });
+                if task.workspace != Workspace::Shared {
+                    return Err(WorkflowError::EngineTaskNotShared {
+                        task: name(),
+                        workspace: task.workspace.as_str(),
+                    });
                 }
                 if task.join != Join::All && *op != EngineOp::Grade {
                     return Err(WorkflowError::EngineTaskJoin { task: name() });

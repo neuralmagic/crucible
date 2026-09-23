@@ -36,12 +36,12 @@ nothing you print is read. Two files are your entire output:
 
 1. `ISSUES.md` in the workspace root — one table row per issue: number, title, labels,
    created date. A heading naming the repository and the filter, nothing else.
-2. `PLAN_TASK_RESULT.json` in the workspace root — exactly:
+2. The result file the Result contract below names, in the workspace root — exactly:
 
    {"issues": ["<number>", "<number>", ...]}
 
    Issue numbers as strings, newest first, at most `limit` of them. Each string becomes
-   one isolated triage instance, so a wrong entry burns a real turn.
+   one triage instance, so a wrong entry burns a real turn.
 
 Write both before you finish. Do not ask for approval and do not stop to confirm
 anything.

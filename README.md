@@ -249,8 +249,8 @@ task back for another round and `when` decides at runtime whether a branch runs 
 configuration. If `workflow.star` is absent, the loop uses the built-in
 propose → apply → measure → decide workflow.
 
-This example adds two isolated evaluation tasks and combines their results before the keep
-or discard decision:
+This example adds two evaluation tasks, each in a disposable worktree so they run concurrently,
+and combines their results before the keep or discard decision:
 
 ```python
 candidate = propose(name = "propose", session = "solver")
@@ -260,13 +260,13 @@ shape = evaluate(
     name = "shape",
     run = "test -s value.txt && echo '{\"pass\": true, \"score\": 1}'",
     depends_on = [applied],
-    isolated = True,
+    workspace = "worktree",
 )
 score = evaluate(
     name = "score",
     run = "./measure.sh",
     depends_on = [applied],
-    isolated = True,
+    workspace = "worktree",
 )
 measurement = grade(
     name = "grade",

@@ -4362,7 +4362,7 @@ async fn direct_pack_launch_freezes_an_approved_autoresearch_scope(pool: PgPool)
             "solver = session(name = \"solver\")\n",
             "candidate = propose(name = \"propose\", session = solver)\n",
             "applied = apply(name = \"apply\", depends_on = [candidate])\n",
-            "score = evaluate(name = \"score\", run = \"./measure.sh\", depends_on = [applied], isolated = True, emits = [\"score\", \"pass\"])\n",
+            "score = evaluate(name = \"score\", run = \"./measure.sh\", depends_on = [applied], workspace = \"worktree\", emits = [\"score\", \"pass\"])\n",
             "measurement = grade(name = \"grade\", evidence = [score], score = score)\n",
             "decision = decide(name = \"decide\", measurement = measurement)\n",
             "workflow(type = \"autoresearch\", tasks = [candidate, applied, score, measurement, decision], result = decision)\n",

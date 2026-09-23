@@ -2,7 +2,7 @@
 
 Workflow automation in the playbook lane: point it at a GitHub repository and it triages
 the newest open issues. A `scan` agent discovers the issues, `over = scan.issues` fans
-out one **isolated triage instance per issue** inside a real sandbox image, and a free
+out one **triage instance per issue, each in its own worktree,** inside a real sandbox image, and a free
 deterministic command assembles `REPORT.md` from what the passing instances captured.
 
 ```sh
@@ -28,8 +28,8 @@ Everything the lane has, on one small graph:
 - **Only passing instances feed the join**: an issue whose fetch fails is a failed
   instance and a missing row, not an invented one. `required = False` keeps a partial
   sweep alive.
-- **Declared files through isolation**: each instance's `TRIAGE.md` is captured from its
-  isolated workspace and staged read-only under `inputs/triage[<n>]/` for the roundup.
+- **Declared files out of a worktree**: each instance's `TRIAGE.md` is captured from its
+  worktree and staged read-only under `inputs/triage[<n>]/` for the roundup.
 - **A verdict no agent grades**: `roundup` is python over captured files and
   `CRUCIBLE_INPUTS`; the report is assembled from evidence, not from an agent's summary
   of its own work.

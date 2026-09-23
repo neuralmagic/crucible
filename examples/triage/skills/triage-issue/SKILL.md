@@ -58,7 +58,7 @@ nothing you print is read. Two files are your entire output:
    ...
    ```
 
-2. `PLAN_TASK_RESULT.json` in the workspace root — exactly:
+2. The result file the Result contract below names, in the workspace root — exactly:
 
    {"classification": "<bug|feature|question|duplicate|needs-info>",
     "severity": "<critical|high|medium|low>",

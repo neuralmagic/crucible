@@ -25,8 +25,8 @@ use crate::crucible::Direction;
 use crate::errors::FileError;
 use crate::plan::diag;
 use crate::plan::ir::{
-    Decider, EngineOp, Isolation, Join, MAX_FANOUT_CEILING, MAX_ROUNDS_CEILING, OutputField,
-    OutputRef, ReportDestination, Revise, SlackDestination, Stage, Task, TaskKind, TaskName, When,
+    Decider, EngineOp, Join, MAX_FANOUT_CEILING, MAX_ROUNDS_CEILING, OutputField, OutputRef,
+    ReportDestination, Revise, SlackDestination, Stage, Task, TaskKind, TaskName, When, Workspace,
 };
 use crate::plan::starlark::error::{
     CompileError, MAX_CALLSTACK, MAX_CONSTRUCTED_TASKS, MAX_EVAL_HEAP_BYTES, MAX_EVAL_TICKS,
@@ -522,7 +522,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "depends_on",
             "needs",
             "required",
-            "isolated",
+            "workspace",
             "join",
             "stage",
             "over",
@@ -546,7 +546,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "depends_on",
             "needs",
             "required",
-            "isolated",
+            "workspace",
             "join",
             "stage",
             "over",
@@ -565,7 +565,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "depends_on",
             "needs",
             "required",
-            "isolated",
+            "workspace",
             "join",
             "stage",
             "over",
@@ -586,7 +586,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "depends_on",
             "needs",
             "required",
-            "isolated",
+            "workspace",
             "join",
             "stage",
             "over",
@@ -790,7 +790,7 @@ fn constructor(
             session: None,
             needs: "any".to_owned(),
             required: take_bool_default(&mut named, "required", true)?,
-            isolation: None,
+            workspace: Workspace::Shared,
             join: Join::All,
             stage: Stage::Epilogue,
             emits: Vec::new(),
@@ -828,7 +828,7 @@ fn constructor(
                 session: None,
                 needs: "any".to_owned(),
                 required: take_bool_default(&mut named, "required", true)?,
-                isolation: None,
+                workspace: Workspace::Shared,
                 join: Join::Passed,
                 stage: Stage::Iteration,
                 emits: Vec::new(),
@@ -858,7 +858,7 @@ fn constructor(
                 session: None,
                 needs: needs.to_owned(),
                 required: take_bool_default(&mut named, "required", true)?,
-                isolation: None,
+                workspace: Workspace::Shared,
                 join: parse_join(&take_string_default(&mut named, "join", "all")?)?,
                 stage: parse_stage(&take_string_default(&mut named, "stage", "iteration")?)?,
                 emits: Vec::new(),
@@ -1105,7 +1105,7 @@ fn dsl_task(
         session,
         needs: take_string_default(named, "needs", "any")?,
         required: take_bool_default(named, "required", true)?,
-        isolation: isolation(take_bool_default(named, "isolated", false)?),
+        workspace: take_workspace(named)?,
         join: parse_join(&take_string_default(named, "join", "all")?)?,
         stage: parse_stage(&take_string_default(named, "stage", "iteration")?)?,
         emits: take_output_fields(named)?,
@@ -1449,7 +1449,7 @@ fn engine(name: &str, op: EngineOp, source: Option<TaskName>, depends_on: Vec<Ta
         session: None,
         needs: "any".to_owned(),
         required: true,
-        isolation: None,
+        workspace: Workspace::Shared,
         join: Join::All,
         stage: Stage::Iteration,
         emits: Vec::new(),
@@ -1830,8 +1830,23 @@ fn task_names(argument: &str, value: Value) -> Result<Vec<TaskName>> {
         .collect()
 }
 
-fn isolation(isolated: bool) -> Option<Isolation> {
-    isolated.then_some(Isolation::Worktree)
+/// `workspace = "shared" | "readonly" | "worktree"`, shared when absent. The bool it replaced is
+/// refused with the spelling to use instead, since it named a mechanism and the author has to
+/// say which of two things they meant by it.
+fn take_workspace(named: &mut BTreeMap<String, Value>) -> Result<Workspace> {
+    if let Some(isolated) = named.remove("isolated") {
+        return Err(CompileError::IsolatedReplaced {
+            isolated: matches!(isolated, Value::Bool(true)),
+        });
+    }
+    match take_string_default(named, "workspace", "shared")?.as_str() {
+        "shared" => Ok(Workspace::Shared),
+        "readonly" => Ok(Workspace::Readonly),
+        "worktree" => Ok(Workspace::Worktree),
+        other => Err(CompileError::UnknownWorkspace {
+            got: other.to_owned(),
+        }),
+    }
 }
 
 fn parse_join(join: &str) -> Result<Join> {
@@ -2358,14 +2373,14 @@ reviews = [
         prompt = prompt_file("prompts/correctness.md"),
         model = "claude-opus-4-6",
         effort = "high",
-        isolated = True,
+        workspace = "worktree",
     ),
     agent(
         name = "review-copy",
         prompt = "Review prose.",
         model = "claude-sonnet-5",
         required = False,
-        isolated = True,
+        workspace = "worktree",
     ),
 ]
 workflow(reviews + [
@@ -2570,7 +2585,7 @@ correctness = evaluate(
     depends_on = [live],
     threshold = 1,
     direction = "higher",
-    isolated = True,
+    workspace = "worktree",
 )
 latency = evaluate(
     name = "latency",
@@ -2578,14 +2593,14 @@ latency = evaluate(
     depends_on = [correctness],
     threshold = 12.5,
     direction = "lower",
-    isolated = True,
+    workspace = "worktree",
 )
 racecheck = evaluate(
     name = "racecheck",
     run = "./racecheck.sh",
     depends_on = [correctness],
     required = False,
-    isolated = True,
+    workspace = "worktree",
 )
 measurement = grade(
     name = "final-grade",
@@ -2808,6 +2823,106 @@ workflow(type = "custom", tasks = [score, strict, lossy], result = strict)
         assert!(
             error.contains("workflow.star:9:5"),
             "the second call's argument, not the first call's: {error}"
+        );
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// `workspace` compiles to the requirement it names, and leaving it out is `shared`.
+    #[test]
+    fn workspace_compiles_to_the_requirement_it_names() {
+        let pack = temp_pack("workspace-values");
+        let source = "\
+shared = command(name = \"shared\", run = \"true\")
+plain = command(name = \"plain\", run = \"true\", workspace = \"shared\")
+reader = agent(name = \"reader\", prompt = \"p\", workspace = \"readonly\")
+clone = evaluate(name = \"clone\", run = \"true\", workspace = \"worktree\")
+fetch = skill(name = \"fetch\", skill = \"skills/demo\", workspace = \"readonly\")
+workflow(type = \"playbook\", tasks = [shared, plain, reader, clone, fetch])
+";
+        std::fs::create_dir_all(pack.join("skills/demo")).unwrap();
+        std::fs::write(pack.join("skills/demo/SKILL.md"), "demo\n").unwrap();
+        let compiled = compile_source(source, &pack.join("workflow.star"), &pack)
+            .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
+        let spaces: Vec<(&str, Workspace)> = compiled
+            .workflow
+            .tasks
+            .iter()
+            .map(|t| (t.name.0.as_str(), t.workspace))
+            .collect();
+        assert_eq!(
+            spaces,
+            [
+                ("shared", Workspace::Shared),
+                ("plain", Workspace::Shared),
+                ("reader", Workspace::Readonly),
+                ("clone", Workspace::Worktree),
+                ("fetch", Workspace::Readonly),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// The bool `workspace` replaced is refused where it is written, with the spelling that
+    /// says what the author meant, and an unknown value is refused at its argument.
+    #[test]
+    fn isolated_and_an_unknown_workspace_are_refused_at_the_argument() {
+        let pack = temp_pack("workspace-refusals");
+        let at = |value: &str| {
+            let source = format!(
+                "\nreview = agent(\n    name = \"review\",\n    prompt = \"p\",\n    {value},\n)\n\
+                 workflow(type = \"playbook\", tasks = [review])\n"
+            );
+            crate::errors::report(
+                &compile_source(&source, &pack.join("workflow.star"), &pack).unwrap_err(),
+            )
+        };
+        let error = at("isolated = True");
+        assert!(error.contains("workflow.star:5:5"), "{error}");
+        assert!(
+            error.contains("\"isolated\" was replaced by \"workspace\"")
+                && error.contains("workspace = \"readonly\"")
+                && error.contains("workspace = \"worktree\""),
+            "{error}"
+        );
+        let error = at("isolated = False");
+        assert!(error.contains("workflow.star:5:5"), "{error}");
+        assert!(error.contains("drop the argument"), "{error}");
+
+        let error = at("workspace = \"read-only\"");
+        assert!(error.contains("workflow.star:5:5"), "{error}");
+        assert!(
+            error.contains(
+                "workspace must be `shared`, `readonly`, or `worktree`, got \"read-only\""
+            ),
+            "{error}"
+        );
+        let error = at("workspace = True");
+        assert!(error.contains("\"workspace\""), "{error}");
+
+        // An engine fold never takes the argument at all.
+        let source = "u = command(name = \"u\", run = \"true\", emits = [\"score\"])\n\
+                      p = top_k(name = \"p\", k = 1, direction = \"lower\", depends_on = [u], \
+                      workspace = \"readonly\")\nworkflow([u, p])\n";
+        let error = crate::errors::report(
+            &compile_source(source, &pack.join("workflow.star"), &pack).unwrap_err(),
+        );
+        assert!(error.contains("unknown argument \"workspace\""), "{error}");
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// A readonly task does not write, so it has no files to declare, and the compiler says so
+    /// before anything runs.
+    #[test]
+    fn a_readonly_task_declaring_files_does_not_compile() {
+        let pack = temp_pack("readonly-files");
+        let source = "a = agent(name = \"a\", prompt = \"p\", workspace = \"readonly\", \
+                      emits_files = [\"REVIEW.md\"])\nworkflow(type = \"playbook\", tasks = [a])\n";
+        let error = crate::errors::report(
+            &compile_source(source, &pack.join("workflow.star"), &pack).unwrap_err(),
+        );
+        assert!(
+            error.contains("readonly") && error.contains("emits_files"),
+            "{error}"
         );
         let _ = std::fs::remove_dir_all(&pack);
     }
@@ -3492,27 +3607,27 @@ workflow(type = "custom", tasks = [e], result = e)
         let cases: &[(&str, &str)] = &[
             (
                 "agent",
-                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = agent(name = \"a\", prompt = \"p\", harness = \"claude\", model = \"m\", effort = \"high\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = agent(name = \"a\", prompt = \"p\", harness = \"claude\", model = \"m\", effort = \"high\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, workspace = \"worktree\", join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
             ),
             (
                 "agent",
-                "s = session(name = \"sess\")\nu = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = agent(name = \"a\", prompt = \"p\", harness = \"claude\", model = \"m\", effort = \"high\", session = s, emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", revise = u, max_rounds = 2{extra})\nworkflow(type = \"playbook\", tasks = [u, a])\n",
+                "s = session(name = \"sess\")\nu = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = agent(name = \"a\", prompt = \"p\", harness = \"claude\", model = \"m\", effort = \"high\", session = s, emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, workspace = \"shared\", join = \"all\", stage = \"iteration\", revise = u, max_rounds = 2{extra})\nworkflow(type = \"playbook\", tasks = [u, a])\n",
             ),
             (
                 "command",
-                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\nc = command(name = \"c\", run = \"true\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4{extra})\nworkflow(type = \"custom\", tasks = [u, c], result = c)\n",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\nc = command(name = \"c\", run = \"true\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, workspace = \"worktree\", join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4{extra})\nworkflow(type = \"custom\", tasks = [u, c], result = c)\n",
             ),
             (
                 "evaluate",
-                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\ne = evaluate(name = \"e\", run = \"true\", threshold = 1, direction = \"higher\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4{extra})\nworkflow(type = \"custom\", tasks = [u, e], result = e)\n",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\ne = evaluate(name = \"e\", run = \"true\", threshold = 1, direction = \"higher\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, workspace = \"shared\", join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4{extra})\nworkflow(type = \"custom\", tasks = [u, e], result = e)\n",
             ),
             (
                 "skill",
-                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = skill(name = \"a\", skill = \"skills/demo\", args = {\"k\": 1}, harness = \"claude\", model = \"m\", effort = \"high\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = skill(name = \"a\", skill = \"skills/demo\", args = {\"k\": 1}, harness = \"claude\", model = \"m\", effort = \"high\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, workspace = \"worktree\", join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
             ),
             (
                 "skill",
-                "s = session(name = \"sess\")\nu = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = skill(name = \"a\", skill = \"skills/demo\", args = {\"k\": 1}, harness = \"claude\", model = \"m\", effort = \"high\", session = s, emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", revise = u, max_rounds = 2{extra})\nworkflow(type = \"playbook\", tasks = [u, a])\n",
+                "s = session(name = \"sess\")\nu = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = skill(name = \"a\", skill = \"skills/demo\", args = {\"k\": 1}, harness = \"claude\", model = \"m\", effort = \"high\", session = s, emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, workspace = \"shared\", join = \"all\", stage = \"iteration\", revise = u, max_rounds = 2{extra})\nworkflow(type = \"playbook\", tasks = [u, a])\n",
             ),
             (
                 "command",
@@ -3647,7 +3762,7 @@ def critic(topic):
     review = agent(
         name = "review-" + topic,
         prompt = "Review the " + topic + ".",
-        isolated = True,
+        workspace = "worktree",
         required = False,
     )
     gate = command(
@@ -3690,7 +3805,7 @@ for treatment in ["surreal", "minimal", "documentary"]:
     branches.append(agent(
         name = "draft-" + treatment,
         prompt = "Draft in the " + treatment + " register.",
-        isolated = True,
+        workspace = "worktree",
     ))
 curate = command(
     name = "curate",
@@ -3705,7 +3820,7 @@ branches = [
     agent(
         name = "draft-" + treatment,
         prompt = "Draft in the " + treatment + " register.",
-        isolated = True,
+        workspace = "worktree",
     )
     for treatment in ["surreal", "minimal", "documentary"]
 ]
@@ -3719,12 +3834,12 @@ workflow(branches + [curate])
 "#;
         let literal = r#"
 branches = [
-    agent(name = "draft-surreal", prompt = "Draft in the surreal register.", isolated = True),
-    agent(name = "draft-minimal", prompt = "Draft in the minimal register.", isolated = True),
+    agent(name = "draft-surreal", prompt = "Draft in the surreal register.", workspace = "worktree"),
+    agent(name = "draft-minimal", prompt = "Draft in the minimal register.", workspace = "worktree"),
     agent(
         name = "draft-documentary",
         prompt = "Draft in the documentary register.",
-        isolated = True,
+        workspace = "worktree",
     ),
 ]
 curate = command(
@@ -3942,7 +4057,7 @@ audit = agent(
     depends_on = [discover],
     over = discover.targets,
     max_fanout = 16,
-    isolated = True,
+    workspace = "worktree",
 )
 workflow(type = "playbook", tasks = [discover, audit])
 "#;
@@ -4053,7 +4168,7 @@ workflow(type = "playbook", tasks = [discover, audit])
         let compiles = [
             "over = discover.t,\n    max_fanout = 4",
             "over = discover.t,\n    max_fanout = 4,\n    emits_files = [\"a.md\"]",
-            "over = discover.t,\n    max_fanout = 4,\n    isolated = True,\n    emits_files = [\"a.md\"]",
+            "over = discover.t,\n    max_fanout = 4,\n    workspace = \"worktree\",\n    emits_files = [\"a.md\"]",
         ];
         for clause in compiles {
             let source = format!(
@@ -4970,11 +5085,11 @@ workflow(type = "playbook", tasks = [a])
 thorough = True
 if thorough:
     panel = [
-        agent(name = "review-correctness", prompt = "Correctness.", isolated = True),
-        agent(name = "review-copy", prompt = "Copy.", isolated = True),
+        agent(name = "review-correctness", prompt = "Correctness.", workspace = "worktree"),
+        agent(name = "review-copy", prompt = "Copy.", workspace = "worktree"),
     ]
 else:
-    panel = [agent(name = "review-correctness", prompt = "Correctness.", isolated = True)]
+    panel = [agent(name = "review-correctness", prompt = "Correctness.", workspace = "worktree")]
 workflow(panel)
 "#;
         let compiled = compile_source(source, &pack.join("workflow.star"), &pack).unwrap();
@@ -4990,7 +5105,7 @@ workflow(panel)
         let source = r#"
 if False:
     extra = command(name = "never", run = "false")
-panel = [agent(name = "review", prompt = "Review.", isolated = True)]
+panel = [agent(name = "review", prompt = "Review.", workspace = "worktree")]
 workflow(panel)
 "#;
         let compiled = compile_source(source, &pack.join("workflow.star"), &pack).unwrap();
@@ -5024,7 +5139,7 @@ workflow([])
         .unwrap();
         std::fs::write(
             pack.join("panel.star"),
-            "load(\"lib/gate.star\", \"gate\")\n\ndef panel(topics):\n    return [\n        agent(name = \"review-\" + topic, prompt = \"Review \" + topic, isolated = True)\n        for topic in topics\n    ]\n",
+            "load(\"lib/gate.star\", \"gate\")\n\ndef panel(topics):\n    return [\n        agent(name = \"review-\" + topic, prompt = \"Review \" + topic, workspace = \"worktree\")\n        for topic in topics\n    ]\n",
         )
         .unwrap();
         let source = r#"
@@ -5061,7 +5176,7 @@ workflow(reviews + [gate("gate", reviews)])
         std::fs::write(pack.join("prompts/review.md"), "Review it.\n").unwrap();
         std::fs::write(
             pack.join("lib.star"),
-            "reviewer = agent(\n    name = \"review\",\n    prompt = prompt_file(\"prompts/review.md\"),\n    isolated = True,\n)\n",
+            "reviewer = agent(\n    name = \"review\",\n    prompt = prompt_file(\"prompts/review.md\"),\n    workspace = \"worktree\",\n)\n",
         )
         .unwrap();
         let source = "load(\"lib.star\", \"reviewer\")\nworkflow([reviewer])\n";
