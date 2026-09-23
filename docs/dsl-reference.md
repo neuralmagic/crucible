@@ -39,6 +39,7 @@ An agent turn driven by a prompt.
 | `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
 | `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice. |
 | `otherwise` | `bool` | In place of `answers`: every answer no other task lists and the question does not `drop`, `"uncertain"` included. Expanded at compile time. An unreachable `otherwise` is an error. |
+| `asks` | `list[str]` | Workflows this task may name in the asks it returns under `asks`. The run records them and never dispatches one; a receiving orchestrator decides what becomes a run. Playbooks only; not in a revise loop. |
 
 ### `skill()`
 
@@ -68,6 +69,7 @@ An agent turn whose prompt is a skill's instructions plus its arguments.
 | `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
 | `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice. |
 | `otherwise` | `bool` | In place of `answers`: every answer no other task lists and the question does not `drop`, `"uncertain"` included. Expanded at compile time. An unreachable `otherwise` is an error. |
+| `asks` | `list[str]` | Workflows this task may name in the asks it returns under `asks`. The run records them and never dispatches one; a receiving orchestrator decides what becomes a run. Playbooks only; not in a revise loop. |
 
 ### `command()`
 
@@ -92,6 +94,7 @@ A deterministic shell task in the candidate workspace.
 | `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
 | `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice. |
 | `otherwise` | `bool` | In place of `answers`: every answer no other task lists and the question does not `drop`, `"uncertain"` included. Expanded at compile time. An unreachable `otherwise` is an error. |
+| `asks` | `list[str]` | Workflows this task may name in the asks it returns under `asks`. The run records them and never dispatches one; a receiving orchestrator decides what becomes a run. Playbooks only; not in a revise loop. |
 
 ### `evaluate()`
 
@@ -118,6 +121,7 @@ A measurement command. Its last non-empty stdout line is a JSON object; `pass = 
 | `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
 | `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice. |
 | `otherwise` | `bool` | In place of `answers`: every answer no other task lists and the question does not `drop`, `"uncertain"` included. Expanded at compile time. An unreachable `otherwise` is an error. |
+| `asks` | `list[str]` | Workflows this task may name in the asks it returns under `asks`. The run records them and never dispatches one; a receiving orchestrator decides what becomes a run. Playbooks only; not in a revise loop. |
 
 ### `report()`
 
@@ -290,6 +294,7 @@ Read out of the object the task returns.
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `status` | `"pass" \| "fail" \| "skipped"` | Settles the task, overriding an exit code or `pass`. Any other value is ignored. |
+| `asks` | `list[{key, workflow, params}]` | Work for another run, recorded on the session log when the task passes and never dispatched by this one. `key` is the item's stable identity, `workflow` one the task lists in `asks`, `params` that workflow's parameter values (strings, numbers, booleans, lists of strings; at most 4096 bytes). A malformed ask, a repeated workflow and key, or more asks than the run's bound (`--max-asks`, default 16) fails the task. |
 
 ### Inputs the engine writes
 
