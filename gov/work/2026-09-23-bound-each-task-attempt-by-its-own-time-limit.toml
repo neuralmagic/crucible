@@ -1,0 +1,67 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-09-23-001"
+title = "Bound each task attempt by its own time limit"
+status = "active"
+created = "2026-09-23"
+started = "2026-09-23"
+refs = [
+    "RFC-0002:C-PLAYBOOK-BUDGET",
+    "RFC-0002:C-PLAYBOOK-LANE",
+    "RFC-0002:C-REVISE-LOOP",
+    "ADR-0050",
+]
+
+[content]
+description = """
+Only run-wide ceilings existed (--max-time, --max-cost), and the wall-clock ceiling was only checked between dispatches: one hung agent turn or command held the whole run until the operator killed it. [[RFC-0002:C-PLAYBOOK-BUDGET]] already required every task to run under a bounded deadline and required the run's wall-clock ceiling to terminate attempts in flight, and neither was implemented.
+
+`timeout = "10m"` on agent(), skill(), command(), and evaluate() declares a per-task limit, parsed with the --max-time rules, carried in the plan IR, the generated TOML, and plan_admitted. The executor hands every attempt a deadline: the task's own limit from the attempt's start, or the run's wall-clock ceiling when that falls first. The shell runner spawns the command in its own process group and kills the group at the deadline; the agent harness does the same for a local turn and trips the openshell turn's cancellation. A timed-out attempt settles as a measured failure whose note names the limit, and is never retried. An attempt ended by the run's ceiling halts the run on that ceiling rather than short-circuiting it.
+
+The clause asked for an operator default deadline and maximum without naming where they come from. The run's wall-clock ceiling now serves as both: an undeclared task is bounded by it, and a declared timeout longer than --max-time is refused before any dispatch."""
+
+[[content.acceptance_criteria]]
+text = "agent, skill, command, and evaluate accept timeout as a positive duration string; it compiles into the IR, round-trips through TOML and JSON, and is refused on kinds the runner does not execute"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "a command that outlives its timeout is killed with its whole process group and settles failed with a note naming the limit; a task under its limit is unaffected"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "a timed-out attempt is never retried, and a timed-out required task short-circuits the run"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "in a concurrent batch each attempt runs under its own task's limit and a member timing out does not stall its peers"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "a local agent turn is killed at its deadline and settles failed rather than as a transport failure"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "the run's wall-clock ceiling terminates an attempt in flight and the run exits on that ceiling"
+status = "done"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "a playbook whose task declares a timeout longer than --max-time is refused before dispatch"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "plan_admitted carries each task's timeout, and the contract version moves to 1.8.0"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "[[RFC-0002:C-PLAYBOOK-BUDGET]] states the per-attempt rule and the operator bound; the DSL reference and workflow docs document timeout"
+status = "done"
+category = "chore"
