@@ -1,0 +1,47 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-09-22-005"
+title = "Model-check the plan executor's settlement rules in Veil"
+status = "queue"
+created = "2026-09-22"
+refs = [
+    "RFC-0002:C-PLAYBOOK-LANE",
+    "RFC-0002:C-PLAYBOOK-CAPS",
+    "RFC-0002:C-SETTLED-JOIN",
+    "RFC-0002:C-REVISE-LOOP",
+]
+
+[content]
+description = """
+The executor's task and plan tables (crucible/src/plan/machine.rs) and the verdict rule in plan::exec are the part of the engine where a wrong edge silently changes what a run means. A Veil (verse-lab/veil, Lean 4) model of that executor, under formal/, states the [[RFC-0002]] obligations as invariants: a truncated plan dispatches nothing, a not-taken branch never dispatches, an all-join reads only passing dependencies, an epilogue observes the settled main graph and never changes the verdict, only a required main-graph task short-circuits, and nothing but a short-circuit report runs after a halt. The graph is state fixed at init, so #model_check explores every well-formed graph of the instance size, and #check_invariants proves the same invariants inductive for every size. The first model is the serial executor; fan-out, revise rounds, transport retries and concurrent isolated batches come after it holds."""
+
+[[content.acceptance_criteria]]
+text = "formal/ is a Lake project pinned to a Veil commit and Lean toolchain, built by a just recipe"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "the serial executor model passes #model_check over every well-formed graph of three tasks"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "#check_invariants proves the model's invariants inductive for graphs of any size"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "revise rounds, fan-out, transport retries and concurrent isolated batches are modelled with their [[RFC-0002]] obligations"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "CI builds formal/ and fails on a violated invariant"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "a conformance check replays model traces against plan::exec so the model cannot drift from the Rust tables"
+status = "pending"
+category = "added"
