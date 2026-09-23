@@ -1,0 +1,42 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-09-23-001"
+title = "Run readonly agent turns concurrently on the openshell backend"
+status = "queue"
+created = "2026-09-23"
+refs = [
+    "RFC-0001:C-WORKFLOW",
+    "ADR-0050",
+    "WI-2026-08-22-003",
+]
+
+[content]
+description = """
+`workspace = "readonly"` batches run at once on the local and command backends. On openshell the harness takes a batch holding a readonly agent task one task at a time (`plan/harness.rs`, `one_at_a_time`), because an openshell turn cannot share the shared tree: `openshell::sandbox::name_for` names the sandbox for the workspace path, so two turns in one tree delete each other's sandbox, and `retrieve_workspace` ends every turn by replacing the whole workspace directory with the sandbox's copy, which drops a peer's result file and races any concurrent reader or worktree clone.
+
+A readonly turn has nothing to bring back but its result file. Name its sandbox for the task (the result file name is already unique per task), and download only that file into the shared workspace instead of retrieving the tree. That also turns the readonly check from detection into prevention on this backend: an edit made in the sandbox never reaches the host. The broker's sandbox name (`cli/setup.rs`) is per workspace, so a readonly turn's provisioning reaches a different sandbox, as a worktree turn's already does; decide whether that matters before shipping.
+
+Out of the same change, not this item's: packs outside this repository (the domains repository's) that spell `PLAN_TASK_RESULT.json` or use `isolated` need migrating before they run on this engine; the controller UI labels the IR's `isolation` value as "in readonly"/"isolation"; the Veil model in formal/ (PR #147) models isolated batches and needs readonly and the staged-alike rule."""
+
+[[content.acceptance_criteria]]
+text = "an openshell readonly agent turn runs in a sandbox named for its task and brings back only its result file"
+status = "pending"
+category = "changed"
+
+[[content.acceptance_criteria]]
+text = "one_at_a_time no longer applies to openshell, and two readonly openshell turns run at once against one gateway with both results read back"
+status = "pending"
+category = "changed"
+
+[[content.acceptance_criteria]]
+text = "an edit a readonly openshell turn makes in its sandbox never reaches the shared workspace"
+status = "pending"
+category = "chore"
+
+[verification]
+required_guards = [
+    "GUARD-CARGO-FMT",
+    "GUARD-CARGO-CLIPPY",
+    "GUARD-CARGO-TEST",
+]

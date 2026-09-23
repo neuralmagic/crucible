@@ -1,0 +1,99 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0050"
+title = "A task declares what it needs of the workspace; the engine derives concurrency"
+status = "proposed"
+date = "2026-09-23"
+refs = [
+    "RFC-0001:C-WORKFLOW",
+    "RFC-0002:C-TASK-FILES",
+]
+
+[content]
+context = """
+`isolated = True` was the only way an author could get two tasks to run at once, and it said something else: that the task runs in a disposable clone. Concurrency was a side effect, bought because peers in the shared workspace would race on the single `PLAN_TASK_RESULT.json` the harness drained after every turn. The common concurrent shape is read-only (a review panel, a context-gathering sweep), and it paid for a clone per task it did not need, while an author who wanted concurrency had to claim an isolation they did not care about. The rest of the DSL states facts about a task and lets the engine decide scheduling; this one argument made the author schedule by proxy.
+
+Three things constrain a replacement. The generated TOML is the hashed artifact, and run identity hashes the serialized graph for a manifest naming `[workflow].file`, so any change to how an existing graph serializes moves the comparability key of every such run, the scored lane's included. Readonly peers in one tree share the tree's `inputs/`, which the harness lays down per dispatch from the task's own ancestors, so peers with different ancestors cannot share it without one reading another's files. And a readonly declaration nobody checks is a comment: an agent told not to write will sometimes write a scratch file anyway."""
+decision = """
+A task declares `workspace = "shared" | "readonly" | "worktree"` and the executor derives concurrency: a shared task runs alone, readonly and worktree tasks that are ready together run as one batch. `shared` is the default. The Rust type is a three-valued enum (`ir::Workspace`), so no code asks a bool what it meant.
+
+The IR keeps the key it had. `isolation` is absent for `shared` and `"worktree"` as before, and gains `"readonly"`. A graph with no readonly task therefore serializes byte for byte as it did, frozen manifests load unchanged, and no run's identity digest moves. The price is a key whose name is narrower than its meaning; the DSL, where authors read and write it, says `workspace`.
+
+`isolated` is refused, not aliased. The compiler rejects it at the argument with the two spellings that replace it, because the author has to say which of two things they meant, and an alias would keep the word that caused the problem. Frozen packs are unaffected, since they carry IR, not source; a source recompiled after the upgrade fails once, with the fix in the message. Every pack in this repository moves to `workspace = "worktree"`, which compiles to identical IR, except the playbook example's auditors, which only ever read and move to `readonly` to show the point of the change.
+
+A readonly task is enforced, after the fact and per batch. The harness arranges the shared tree once for the batch (staged inputs, frozen injects, each harness's toolbox), reads the tree as git memory would record it (`git add -A` and `write-tree`, so ignored files such as `inputs/` and the toolbox are out of it), runs the batch, and reads it again. A difference fails every readonly task in the batch with the changed paths named, and is put back with `read-tree -u --reset` before the executor dispatches anything else. The engine cannot tell which of several tasks in one tree wrote, so it fails all of them rather than guess; a task alone is named alone. A readonly task cannot declare `emits_files`, since declaring a file is declaring a write. The prompt tells the agent the task is readonly.
+
+Readonly peers are batched only when their staged producers match. The executor computes each readonly candidate's file producers during the readiness scan and skips one staged differently, leaving it for a later batch, rather than stopping the scan.
+
+Each task writes its own result file, `PLAN_TASK_RESULT.<16 hex of sha256(task name)>.json`, named in the prompt and in `CRUCIBLE_TASK_RESULT`. A hash rather than the name because an instance name carries whatever item the producer emitted. The name is uniform across all three workspaces, so an agent's contract does not depend on where it runs."""
+consequences = """
+Read-only fan-out stops paying for clones, and an author states what is true of a task instead of choosing a mechanism for its side effect. Mapped readonly nodes run their instances concurrently in the shared tree, which a shared node cannot.
+
+The result file is no longer a fixed name, so a prompt or skill that spells `PLAN_TASK_RESULT.json` now contradicts the contract the harness appends. Every pack in this repository was rewritten to refer to the result file the contract names; packs outside it, the domains repository's included, have to be rewritten the same way before they run on this engine, and any shell stand-in has to write to `$CRUCIBLE_TASK_RESULT`.
+
+Enforcement is detection, not prevention: a readonly agent can write, and the write is undone and the batch failed after the fact. A peer that did nothing wrong fails with the writer. Ignored files are outside the check, so a write to an ignored path is neither caught nor undone; it is also outside what git memory commits, so it never reaches another task's commit. The check runs git in the shared workspace, so a readonly task needs a git workspace, which is what `--manifest` provides; the bare shell runner refuses readonly tasks as it refuses worktrees.
+
+The openshell backend cannot run readonly agent turns at once yet: it names a sandbox for the workspace, and ends a turn by replacing the whole workspace directory with the sandbox's copy. Until a readonly turn there downloads only its result file under a sandbox named for the task, the harness takes a batch holding a readonly agent task one task at a time on that backend. The declaration and its check hold there; only the concurrency waits.
+
+The executor's scan gains a staged-producer comparison per readonly candidate, and the exhaustive three-task test gains the workspace dimension and the invariant that readonly peers are staged alike. Serialization keeps an old key, so a reader of the TOML sees `isolation = "readonly"`; the reference and the RFC clause say why. The formal model of batching (the Veil model, not on main) models isolated batches and needs the same change."""
+
+[[content.alternatives]]
+text = "A workspace kwarg naming what the task needs, concurrency derived, readonly enforced by a before/after tree check"
+status = "accepted"
+pros = [
+    "The author states a fact about the task; scheduling is the engine's",
+    "Read-only fan-out runs concurrently without clones",
+    "The IR key and values are unchanged for every existing graph, so run identity holds",
+    "A readonly declaration is checked, and a violation cannot reach a commit",
+]
+cons = [
+    "A violation fails every readonly peer in the batch, since the writer cannot be told apart",
+    "The IR key is named for one of its three values",
+    "Packs outside this repository that spell the result file must be rewritten",
+]
+
+[[content.alternatives]]
+text = "Keep isolated and add a separate read_only flag"
+status = "rejected"
+pros = [
+    "No migration of existing sources",
+]
+cons = [
+    "A sixth scalar in a set authors already find hard to hold, with a combination (isolated and read_only) that means nothing",
+    "Leaves the author declaring concurrency by proxy",
+]
+
+[[content.alternatives]]
+text = "Rename the IR key to workspace as well"
+status = "rejected"
+pros = [
+    "The TOML reads the same as the DSL",
+]
+cons = [
+    "Every serialized graph changes, so every run identity digest for a workflow-file manifest moves, scored lane included",
+    "Frozen manifests need a read alias, which is the dual spelling the DSL refuses",
+]
+
+[[content.alternatives]]
+text = "Accept isolated as a deprecated alias for worktree"
+status = "rejected"
+pros = [
+    "Existing sources keep compiling",
+]
+cons = [
+    "Guesses worktree for tasks that only read, which is the mistake the change exists to fix",
+    "Keeps two spellings in the DSL indefinitely",
+]
+
+[[content.alternatives]]
+text = "Prevent readonly writes (read-only mount or permissions) instead of detecting them"
+status = "rejected"
+pros = [
+    "A write fails at the syscall, attributable to the task that made it",
+]
+cons = [
+    "Depends on the backend: a local agent, openshell, and the command stand-in would each need their own mechanism",
+    "The agent's result file and harness state live in the same tree and must stay writable",
+    "Detection is backend-independent and already needed to undo a write",
+]
