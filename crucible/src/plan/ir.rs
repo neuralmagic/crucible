@@ -1198,21 +1198,23 @@ impl Plan {
             }
             if let TaskKind::Engine {
                 op: EngineOp::Grade,
-                source: Some(source),
-                ..
+                source,
+                tiebreak,
             } = &t.task
             {
-                match score(source) {
-                    Declared::Omitted => {
-                        return Err(PlanError::GradeSourceOmitsScore {
-                            task: task(),
-                            from: source.0.clone(),
-                        });
+                for source in source.iter().chain(tiebreak) {
+                    match score(source) {
+                        Declared::Omitted => {
+                            return Err(PlanError::GradeSourceOmitsScore {
+                                task: task(),
+                                from: source.0.clone(),
+                            });
+                        }
+                        Declared::Typed(declared) if !declared.is_numeric() => {
+                            return Err(not_numeric(source, declared));
+                        }
+                        _ => {}
                     }
-                    Declared::Typed(declared) if !declared.is_numeric() => {
-                        return Err(not_numeric(source, declared));
-                    }
-                    _ => {}
                 }
             }
             if let TaskKind::Evaluate {
@@ -2540,6 +2542,55 @@ emits = ["lines"]
         );
         thresholded.emits = typed(&[("score", FieldType::Number)]);
         plan(vec![thresholded]).validate().unwrap();
+    }
+
+    #[test]
+    fn a_grade_tiebreak_that_declares_emits_must_declare_a_numeric_score() {
+        let evaluate = |name: &str, emits: Emits| {
+            let mut e = agent(name, &[]);
+            e.task = TaskKind::Evaluate {
+                command: "./x.sh".into(),
+                threshold: None,
+                direction: None,
+            };
+            e.emits = emits;
+            e
+        };
+        let mut grade = agent("grade", &["e", "tb"]);
+        grade.task = TaskKind::Engine {
+            op: EngineOp::Grade,
+            source: Some("e".into()),
+            tiebreak: Some("tb".into()),
+        };
+        let with = |tiebreak: Emits| {
+            plan(vec![
+                evaluate("e", typed(&[("score", FieldType::Number)])),
+                evaluate("tb", tiebreak),
+                grade.clone(),
+            ])
+            .validate()
+        };
+        with(Emits::default()).unwrap();
+        with(fields(&["score"])).unwrap();
+        with(typed(&[("score", FieldType::Integer)])).unwrap();
+        with(typed(&[("score", FieldType::Number)])).unwrap();
+        assert_eq!(
+            with(typed(&[("score", FieldType::String)])).unwrap_err(),
+            PlanError::ScoreNotNumeric {
+                task: "grade".into(),
+                source_task: "tb".into(),
+                declared: FieldType::String,
+            }
+        );
+        for omitted in [fields(&["pass"]), typed(&[("pass", FieldType::Boolean)])] {
+            assert_eq!(
+                with(omitted).unwrap_err(),
+                PlanError::GradeSourceOmitsScore {
+                    task: "grade".into(),
+                    from: "tb".into(),
+                }
+            );
+        }
     }
 
     fn noul_route(name: &str, source: &str) -> Task {
