@@ -76,8 +76,8 @@ ghost relation branch_not_taken (t : task) :=
 
 ghost relation route_passed (t : task) := ∃ r, route_of t r ∧ status r = t_pass
 
--- A pair member with a runnable reviewer only runs inside the loop.
-ghost relation paired (t : task) := (∃ r, revises r t ∧ runnable r) ∨ (∃ x, revises t x)
+-- A target with a runnable reviewer only runs inside the loop.
+ghost relation paired (t : task) := ∃ r, revises r t ∧ runnable r
 
 -- The reviewer's join against this round's target result.
 ghost relation review_allowed (r t : task) :=
@@ -91,9 +91,13 @@ ghost relation deps_allow (t : task) :=
 after_init {
   dep T D := *
   require ∀ t d, dep t d → (le d t ∧ d ≠ t)
+  join T := *
+  require ∀ t, join t ≠ j_all → ∃ d, dep t d
   runnable T := *
+  require ∀ t, runnable t →
+    (join t = j_all → ∀ d, dep t d → runnable d) ∧ (join t = j_passed → ∃ d, dep t d ∧ runnable d)
   epilogue T := *
-  require (∀ t d, runnable t ∧ dep t d → runnable d) ∧ (∀ t d, dep t d → (epilogue t ↔ epilogue d))
+  require ∀ t d, dep t d → (epilogue t ↔ epilogue d)
   route_of T R := *
   require (∀ t r, route_of t r → dep t r) ∧ (∀ t r1 r2, route_of t r1 ∧ route_of t r2 → r1 = r2)
   reach A B := *
@@ -105,8 +109,6 @@ after_init {
     (∀ r t x, revises r t → ¬ revises t x ∧ ¬ revises x r) ∧
     (∀ r t d, revises r t ∧ dep r d ∧ d ≠ t → ¬ reach d t)
   required T := *
-  join T := *
-  require ∀ t, join t ≠ j_all → ∃ d, dep t d
   status T := t_pending
   plan := p_admitted
   halt := h_none
@@ -298,7 +300,9 @@ action finish_halted {
 
 -- The graph never changes after init.
 invariant [acyclic] dep T D → (le D T ∧ D ≠ T)
-invariant [runnable_closed] runnable T ∧ dep T D → runnable D
+-- `runnable_set`: an all join needs every dependency runnable, a passed join one, a settled join none.
+invariant [runnable_by_join]
+  runnable T → (join T = j_all → ∀ d, dep T d → runnable d) ∧ (join T = j_passed → ∃ d, dep T d ∧ runnable d)
 invariant [stages_do_not_cross] dep T D → (epilogue T ↔ epilogue D)
 invariant [route_is_dep] route_of T R → dep T R
 invariant [lossy_join_has_deps] join T ≠ j_all → ∃ d, dep T d
@@ -352,7 +356,9 @@ invariant [revising_has_phase] status T = t_revising ∧ revises R T → phase T
 invariant [reviewer_revising] status R = t_revising ∧ revises R T → status T = t_revising
 invariant [revising_is_paired] status T = t_revising → (∃ r, revises r T) ∨ (∃ t, revises T t)
 invariant [loop_only_while_dispatching] phase T ≠ rp_none → plan = p_dispatching
-invariant [reviewer_not_dispatched] revises R T → ¬ dispatched R
+invariant [reviewer_alone_means_no_loop] revises R T ∧ dispatched R → ¬ dispatched T
+invariant [pending_reviewer_means_no_loop]
+  revises R T ∧ runnable R ∧ status R = t_pending → ¬ dispatched T ∧ ¬ review_ran R
 invariant [rounds_start_at_one] phase T ≠ rp_none → 1 ≤ rounds T
 invariant [one_loop] phase T ≠ rp_none ∧ phase U ≠ rp_none → T = U
 invariant [nothing_runs_in_a_loop] phase T ≠ rp_none → status U ≠ t_running
@@ -360,7 +366,7 @@ invariant [loop_target_ready] phase T ≠ rp_none → (∀ d, dep T d → settle
 invariant [target_round_result]
   (phase T = rp_review ∨ phase T = rp_between) →
     last T = t_pass ∨ last T = t_fail ∨ last T = t_skipped ∨ last T = t_transport
-invariant [reviewer_never_runs_alone] revises R T → status R ≠ t_running
+invariant [reviewer_runs_alone_only_without_a_loop] revises R T ∧ status R = t_running → ¬ dispatched T ∧ ¬ review_ran R
 invariant [reviewer_waits_for_target]
   status T = t_pending ∧ revises R T →
     ¬ review_ran R ∧
@@ -383,7 +389,7 @@ safety [dependent_waits_for_the_pair] dispatched X ∧ dep X T ∧ revises R T �
 
 -- A failing reviewer row ends the loop only at the bound, or when a ceiling stopped it.
 safety [failing_review_ends_at_the_bound]
-  revises R T ∧ status R = t_fail → rounds T = max_rounds ∨ halt = h_ceiling
+  revises R T ∧ review_ran R ∧ status R = t_fail → rounds T = max_rounds ∨ halt = h_ceiling
 
 safety [halt_matches_plan]
   (plan = p_dispatching ∨ plan = p_completed ∨ plan = p_admitted ∨ plan = p_truncated) ↔ halt = h_none

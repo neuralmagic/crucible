@@ -11,3 +11,7 @@ not modelled yet.
 
 `just formal-mutants` breaks one executor rule per copy of the model and fails unless the model
 checker finds a violation in every copy.
+
+`every_three_task_graph_keeps_the_model_invariants` in `crucible/src/plan/exec.rs` runs `execute`
+itself on every three-task graph and checks the same invariants, so a gap between the model and
+the Rust shows up as a failing unit test.
