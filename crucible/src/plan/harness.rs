@@ -1030,7 +1030,7 @@ mod tests {
         let mut manifest = crate::manifest::Manifest::load(&dir.join("crucible.toml")).unwrap();
         manifest.resolve_workflow(dir).unwrap();
         let workflow = manifest.workflow.as_ref().unwrap();
-        let plan = crate::runloop::graph::iteration_template(
+        let plan = crate::plan::template::iteration_template(
             Some(workflow),
             &crate::plan::workflow::WorkflowCaps::for_lane(workflow.workflow_type),
         )
@@ -1609,7 +1609,7 @@ workflow(type = "playbook", tasks = [draft, shape, polish, audit_a, audit_b, rou
         );
         assert!(manifest.is_task(), "a playbook carries no judge");
 
-        let plan = crate::runloop::graph::iteration_template(
+        let plan = crate::plan::template::iteration_template(
             Some(workflow),
             &crate::plan::workflow::WorkflowCaps::for_lane(workflow.workflow_type)
                 .with_persistent_sessions(),
@@ -1751,7 +1751,7 @@ workflow(type = "playbook", tasks = [discover, audit, roundup])
         let mut manifest = crate::manifest::Manifest::load(&dir.join("crucible.toml")).unwrap();
         manifest.resolve_workflow(&dir).unwrap();
         let workflow = manifest.workflow.as_ref().expect("workflow");
-        let plan = crate::runloop::graph::iteration_template(
+        let plan = crate::plan::template::iteration_template(
             Some(workflow),
             &crate::plan::workflow::WorkflowCaps::for_lane(workflow.workflow_type),
         )
@@ -1827,7 +1827,7 @@ workflow(type = "playbook", tasks = [discover, audit, roundup])
         .unwrap();
         let mut narrow = crate::manifest::Manifest::load(&dir.join("crucible.toml")).unwrap();
         narrow.resolve_workflow(&dir).unwrap();
-        let plan = crate::runloop::graph::iteration_template(
+        let plan = crate::plan::template::iteration_template(
             Some(narrow.workflow.as_ref().unwrap()),
             &crate::plan::workflow::WorkflowCaps::for_lane(
                 crate::plan::workflow::WorkflowType::Playbook,
@@ -1921,7 +1921,7 @@ workflow(type = "playbook", tasks = [good, bad, after])
         let mut manifest = crate::manifest::Manifest::load(&dir.join("crucible.toml")).unwrap();
         manifest.resolve_workflow(&dir).unwrap();
         let workflow = manifest.workflow.as_ref().unwrap();
-        let plan = crate::runloop::graph::iteration_template(
+        let plan = crate::plan::template::iteration_template(
             Some(workflow),
             &crate::plan::workflow::WorkflowCaps::for_lane(workflow.workflow_type),
         )
@@ -2789,7 +2789,7 @@ workflow(type = "playbook", tasks = [discover, audit, roundup])
         let mut manifest = crate::manifest::Manifest::load(&dir.join("crucible.toml")).unwrap();
         manifest.resolve_workflow(dir).unwrap();
         let workflow = manifest.workflow.as_ref().expect("workflow");
-        crate::runloop::graph::iteration_template(
+        crate::plan::template::iteration_template(
             Some(workflow),
             &crate::plan::workflow::WorkflowCaps::for_lane(workflow.workflow_type),
         )
@@ -3646,7 +3646,7 @@ workflow(type = "playbook", tasks = [author, repro])
         let mut manifest = crate::manifest::Manifest::load(&dir.join("crucible.toml")).unwrap();
         manifest.resolve_workflow(&dir).unwrap();
         let workflow = manifest.workflow.as_ref().unwrap();
-        let plan = crate::runloop::graph::iteration_template(
+        let plan = crate::plan::template::iteration_template(
             Some(workflow),
             &crate::plan::workflow::WorkflowCaps::for_lane(workflow.workflow_type)
                 .with_persistent_sessions(),
