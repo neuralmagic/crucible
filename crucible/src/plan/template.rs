@@ -4,7 +4,7 @@
 use anyhow::{Context, Result};
 
 use crate::plan::ir::{
-    EngineOp, Join, Plan, PlanBudget, Stage, Task, TaskKind, TaskName, ValidPlan,
+    EngineOp, Join, Plan, PlanBudget, Stage, Task, TaskKind, TaskName, ValidPlan, Workspace,
 };
 use crate::plan::workflow::{WorkflowCaps, WorkflowCfg, WorkflowType};
 
@@ -40,7 +40,7 @@ pub(crate) fn iteration_template(
                 session: None,
                 needs: "any".to_string(),
                 required: true,
-                isolation: None,
+                workspace: Workspace::Shared,
                 join: Join::default(),
                 stage: Stage::Iteration,
                 emits: Vec::new(),

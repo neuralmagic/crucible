@@ -162,11 +162,11 @@ nothing you print is read. Two files are your entire output:
 
 1. `SPEC.md` in the workspace root — the specification from Step 5, verbatim, in
    full. A later phase implements from this file alone.
-2. `PLAN_TASK_RESULT.json` in the workspace root — exactly:
+2. The result file the Result contract below names, in the workspace root — exactly:
 
    {"algo_name": "<short-slug>", "closest_model": "<existing model you would start from>",
     "confidence": "<high|medium|low>"}
 
-Write both before you finish. A turn that ends without `PLAN_TASK_RESULT.json`
+Write both before you finish. A turn that ends without that result file
 is a failed turn, and a turn without `SPEC.md` fails the task that promised it.
 Do not ask for approval and do not stop to confirm anything.

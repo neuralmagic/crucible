@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use crate::crucible::Direction;
 use crate::plan::exec::{Attempt, AttemptOutcome, TaskRunner};
-use crate::plan::ir::{Decider, Task, TaskKind, TaskName};
+use crate::plan::ir::{Decider, Task, TaskKind, TaskName, Workspace};
 use crucible_contract::TransportCause;
 use crucible_contract::inference::{ENV_INFERENCE, InferenceRole};
 
@@ -27,15 +27,17 @@ pub struct ShellRunner {
 
 impl TaskRunner for ShellRunner {
     fn run(&mut self, task: &Task, _attempt: u32, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
-        if task.isolation.is_some() {
-            // Fail loud: a runner that quietly ran an isolation-marked task in the shared
-            // workdir would hand back a result the plan's author has no reason to trust.
+        if task.workspace != Workspace::Shared {
+            // Fail loud: a runner that quietly ran a worktree task in the shared workdir, or a
+            // readonly one without checking that it left the tree alone, would hand back a
+            // result the plan's author has no reason to trust.
             return Attempt::failed(
                 0.0,
                 format!(
-                    "task {} requests isolation, which this runner cannot provide (run the plan \
-                 with --manifest so tasks get a real workspace to clone)",
-                    task.name
+                    "task {} requests workspace = {:?}, which this runner cannot provide (run the \
+                     plan with --manifest so tasks get a real workspace to clone and check)",
+                    task.name,
+                    task.workspace.as_str()
                 ),
             );
         }
@@ -44,16 +46,16 @@ impl TaskRunner for ShellRunner {
 }
 
 impl ShellRunner {
-    /// Run in a worktree prepared by the outer runner without clearing its isolation marker.
-    pub fn run_in_prepared_worktree(
-        &mut self,
-        task: &Task,
-        inputs: &BTreeMap<TaskName, Value>,
-    ) -> Attempt {
-        if task.isolation != Some(crate::plan::ir::Isolation::Worktree) {
+    /// Run a task whose workspace requirement the outer runner has already arranged: a
+    /// worktree it cloned, or a shared tree it checks afterwards for a readonly task.
+    pub fn run_arranged(&mut self, task: &Task, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
+        if task.workspace == Workspace::Shared {
             return Attempt::failed(
                 0.0,
-                format!("task {} was not declared for worktree isolation", task.name),
+                format!(
+                    "task {} runs in the shared workspace; there is nothing to arrange",
+                    task.name
+                ),
             );
         }
         self.run_in_workdir(task, inputs)
@@ -376,7 +378,7 @@ mod tests {
             session: None,
             needs: "any".into(),
             required: true,
-            isolation: None,
+            workspace: Workspace::Shared,
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
@@ -398,7 +400,7 @@ mod tests {
             session: None,
             needs: "any".into(),
             required: true,
-            isolation: None,
+            workspace: Workspace::Shared,
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
@@ -568,7 +570,7 @@ mod tests {
             session: None,
             needs: "any".into(),
             required: true,
-            isolation: None,
+            workspace: Workspace::Shared,
             join: Join::All,
             stage: Stage::Iteration,
             emits: Vec::new(),
@@ -601,7 +603,7 @@ mod tests {
             session: None,
             needs: "any".into(),
             required: false,
-            isolation: None,
+            workspace: Workspace::Shared,
             join: Join::All,
             stage: Stage::Iteration,
             emits: Vec::new(),
@@ -641,7 +643,7 @@ mod tests {
             session: None,
             needs: "any".into(),
             required: false,
-            isolation: None,
+            workspace: Workspace::Shared,
             join: Join::All,
             stage: Stage::Iteration,
             emits: Vec::new(),
@@ -670,7 +672,7 @@ mod tests {
             session: None,
             needs: "any".into(),
             required: false,
-            isolation: None,
+            workspace: Workspace::Shared,
             join: Join::All,
             stage: Stage::Iteration,
             emits: Vec::new(),
@@ -707,7 +709,7 @@ mod tests {
             session: None,
             needs: "any".into(),
             required: true,
-            isolation: None,
+            workspace: Workspace::Shared,
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
@@ -736,7 +738,7 @@ mod tests {
             session: None,
             needs: "any".into(),
             required: true,
-            isolation: None,
+            workspace: Workspace::Shared,
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
@@ -759,20 +761,50 @@ mod tests {
         assert_eq!(v["model"], "codex");
     }
 
-    /// A runner that cannot isolate must say so, not quietly run the task in the shared
-    /// workdir and hand back a result the plan's author has no reason to trust.
+    /// A runner that cannot clone or check the workspace must say so, not quietly run the task
+    /// in the shared workdir and hand back a result the plan's author has no reason to trust.
     #[test]
-    fn isolation_request_is_refused_loudly_by_the_shell_runner() {
-        let mut t = command("iso", "echo '{}'", &[]);
-        t.isolation = Some(crate::plan::ir::Isolation::Worktree);
-        let out = run_plan(vec![t], None);
-        let r = &out.results[&"iso".into()];
-        assert_eq!(r.status, TaskStatus::Fail);
-        assert!(
-            r.note.as_ref().unwrap().contains("cannot provide"),
-            "the refusal names the problem: {:?}",
-            r.note
-        );
+    fn a_workspace_requirement_is_refused_loudly_by_the_shell_runner() {
+        for workspace in [Workspace::Readonly, Workspace::Worktree] {
+            let dir = std::env::temp_dir().join(format!(
+                "shell-runner-refusal-{}-{workspace}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut t = command("iso", "touch ran; echo '{}'", &[]);
+            t.workspace = workspace;
+            let mut runner = ShellRunner {
+                workdir: dir.clone(),
+                agent_cmd: None,
+            };
+            let a = runner.run(&t, 1, &BTreeMap::new());
+            let AttemptOutcome::Fail { note, .. } = a.outcome else {
+                panic!("{workspace}: {:?}", a.outcome);
+            };
+            assert!(
+                note.contains("cannot provide") && note.contains(workspace.as_str()),
+                "the refusal names the problem: {note}"
+            );
+            assert!(!dir.join("ran").exists(), "{workspace}: nothing ran");
+
+            let arranged = runner.run_arranged(&t, &BTreeMap::new());
+            assert!(
+                matches!(arranged.outcome, AttemptOutcome::Pass(_)),
+                "{workspace}: {:?}",
+                arranged.outcome
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        let shared = command("shared", "echo '{}'", &[]);
+        let mut runner = ShellRunner {
+            workdir: std::env::temp_dir(),
+            agent_cmd: None,
+        };
+        assert!(matches!(
+            runner.run_arranged(&shared, &BTreeMap::new()).outcome,
+            AttemptOutcome::Fail { .. }
+        ));
     }
 
     #[test]
@@ -791,7 +823,7 @@ mod tests {
             session: None,
             needs: "any".into(),
             required: true,
-            isolation: None,
+            workspace: Workspace::Shared,
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
@@ -819,7 +851,7 @@ mod tests {
             session: None,
             needs: "any".into(),
             required: true,
-            isolation: None,
+            workspace: Workspace::Shared,
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),

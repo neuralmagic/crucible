@@ -49,7 +49,7 @@
     {
       "name": "audit-headings",
       "kind": "agent",
-      "prompt": "AUDIT NOTES\n\nYou hold a private copy of the workspace. Read `NOTES.md` and report on the single topic\nnamed below. Do not edit any file; only your result leaves this task.\n\nResult: `{\"topic\": <topic>, \"findings\": [<one string per defect, empty when clean>]}`.\n\nAUDIT: HEADINGS\n",
+      "prompt": "AUDIT NOTES\n\nYou share the workspace with the other auditors. Read `NOTES.md` and report on the single topic\nnamed below. Do not edit any file; only your result leaves this task.\n\nResult: `{\"topic\": <topic>, \"findings\": [<one string per defect, empty when clean>]}`.\n\nAUDIT: HEADINGS\n",
       "harness": null,
       "model": null,
       "effort": null,
@@ -58,7 +58,7 @@
       ],
       "needs": "any",
       "required": true,
-      "isolation": "worktree",
+      "isolation": "readonly",
       "join": "all",
       "emits": [
         "findings"
@@ -67,7 +67,7 @@
     {
       "name": "audit-bullets",
       "kind": "agent",
-      "prompt": "AUDIT NOTES\n\nYou hold a private copy of the workspace. Read `NOTES.md` and report on the single topic\nnamed below. Do not edit any file; only your result leaves this task.\n\nResult: `{\"topic\": <topic>, \"findings\": [<one string per defect, empty when clean>]}`.\n\nAUDIT: BULLETS\n",
+      "prompt": "AUDIT NOTES\n\nYou share the workspace with the other auditors. Read `NOTES.md` and report on the single topic\nnamed below. Do not edit any file; only your result leaves this task.\n\nResult: `{\"topic\": <topic>, \"findings\": [<one string per defect, empty when clean>]}`.\n\nAUDIT: BULLETS\n",
       "harness": null,
       "model": null,
       "effort": null,
@@ -76,7 +76,7 @@
       ],
       "needs": "any",
       "required": true,
-      "isolation": "worktree",
+      "isolation": "readonly",
       "join": "all",
       "emits": [
         "findings"
@@ -85,7 +85,7 @@
     {
       "name": "audit-freshness",
       "kind": "agent",
-      "prompt": "AUDIT NOTES\n\nYou hold a private copy of the workspace. Read `NOTES.md` and report on the single topic\nnamed below. Do not edit any file; only your result leaves this task.\n\nResult: `{\"topic\": <topic>, \"findings\": [<one string per defect, empty when clean>]}`.\n\nAUDIT: FRESHNESS\n",
+      "prompt": "AUDIT NOTES\n\nYou share the workspace with the other auditors. Read `NOTES.md` and report on the single topic\nnamed below. Do not edit any file; only your result leaves this task.\n\nResult: `{\"topic\": <topic>, \"findings\": [<one string per defect, empty when clean>]}`.\n\nAUDIT: FRESHNESS\n",
       "harness": null,
       "model": null,
       "effort": null,
@@ -94,7 +94,7 @@
       ],
       "needs": "any",
       "required": false,
-      "isolation": "worktree",
+      "isolation": "readonly",
       "join": "all",
       "emits": [
         "findings"

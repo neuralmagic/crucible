@@ -8,7 +8,7 @@ reviewers = [
         prompt = prompt_file("prompts/correctness.md"),
         model = "claude-opus-4-6",
         effort = "high",
-        isolated = True,
+        workspace = "worktree",
         depends_on = [candidate],
     ),
     agent(
@@ -16,7 +16,7 @@ reviewers = [
         prompt = prompt_file("prompts/copy.md"),
         model = "claude-sonnet-5",
         required = False,
-        isolated = True,
+        workspace = "worktree",
         depends_on = [candidate],
     ),
 ]

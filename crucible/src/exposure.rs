@@ -61,6 +61,7 @@ pub fn builtin_agent_credentials() -> Vec<&'static str> {
     let mut out = crate::openshell::policy::VERTEX_RELAY_KEYS.to_vec();
     out.extend_from_slice(crate::openshell::policy::IDENTITY_RELAY_KEYS);
     out.push(crate::plan::TASK_NAME_ENV);
+    out.push(crate::plan::TASK_RESULT_ENV);
     out
 }
 
@@ -637,9 +638,15 @@ mod tests {
     }
 
     #[test]
-    fn the_engines_own_task_name_value_does_not_refuse_a_playbook_turn() {
+    fn the_engines_own_task_values_do_not_refuse_a_playbook_turn() {
         let m = manifest(OPENSHELL);
-        let grants = vec![(crate::plan::TASK_NAME_ENV.to_string(), "audit".to_string())];
+        let grants = vec![
+            (crate::plan::TASK_NAME_ENV.to_string(), "audit".to_string()),
+            (
+                crate::plan::TASK_RESULT_ENV.to_string(),
+                "PLAN_TASK_RESULT.0123456789abcdef.json".to_string(),
+            ),
+        ];
         assert!(refuse_uncovered(&covered(&m), &grants, &m.agent.relay).is_ok());
     }
 

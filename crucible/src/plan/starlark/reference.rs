@@ -87,9 +87,14 @@ fn task_knobs() -> Vec<Kwarg> {
             "False makes the task advisory: it blocks dependents but cannot invalidate the run.",
         ),
         Kwarg::new(
-            "isolated",
-            "bool",
-            "Run in a disposable worktree. File changes are discarded; only JSON output continues.",
+            "workspace",
+            "\"shared\" | \"readonly\" | \"worktree\"",
+            "What the task needs of the workspace; the engine runs tasks at once when none of \
+             them writes the shared tree. `shared` (the default) writes it and runs alone. \
+             `readonly` does not write it and runs beside its peers; a change it leaves fails it \
+             and is discarded, and it cannot declare `emits_files`. `worktree` writes a \
+             disposable clone and runs beside its peers; its changes are discarded and only its \
+             declared output continues.",
         ),
         Kwarg::new(
             "emits",
@@ -183,7 +188,7 @@ fn agent_knobs() -> Vec<Kwarg> {
         Kwarg::new(
             "session",
             "session | str",
-            "Join a durable conversation. A task in a session cannot be isolated.",
+            "Join a durable conversation. A task in a session cannot run in a worktree.",
         ),
     ]
 }

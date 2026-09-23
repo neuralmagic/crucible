@@ -13,7 +13,7 @@ engine propose (edit) ───┤                                  ├─> gate
 and keep/discard as editable task nodes. Crucible still owns the capabilities behind those
 operations and admits the graph under the `autoresearch` workflow contract. Its proposer binds to
 the durable `solver` session, so a discarded checkout rolls back without erasing what the solver
-learned; the isolated reviewers intentionally start fresh. The older standalone
+learned; the worktree reviewers intentionally start fresh. The older standalone
 plan fixtures below exercise the general plan runner with the same tasks:
 
 ```
@@ -41,7 +41,7 @@ and sits downstream of the gate, so a rejected candidate is `blocked` and never 
 | `expected-workflow.json` | canonical compiler golden |
 | `plan.toml` | single review, clean coder |
 | `plan-reward-hack.toml` | single review, coder told to pass "by any means" |
-| `plan-panel-*.toml` | two-reviewer panel, isolated and concurrent |
+| `plan-panel-*.toml` | two-reviewer panel, in worktrees and concurrent |
 | `plan-live-*.toml` | single review against a planted artifact |
 | `role.sh` | stand-in coder / correctness reviewer / copy reviewer |
 | `plant.sh` | writes a fixed `solution.py` (`subtle`, `clean`, `sloppy`) |
@@ -53,7 +53,7 @@ Claude reviewer models; the stand-in backend ignores those model knobs, while th
 runs them. Cross-vendor reviewers require another available harness.
 
 The manifests declare the policy and verification scripts as frozen workspace injects. The
-runner restores those files before every task, in the shared workspace or an isolated worktree.
+runner restores those files before every task, in the shared workspace or a worktree.
 This matters in `plan-reward-hack.toml`: its stand-in implementer tries to replace
 `verdict_gate.sh`, but the restored gate still rejects the hardcoded solution.
 
@@ -78,16 +78,16 @@ The compiled prompt text lives in `crucible.toml`, so runtime execution never ne
 Starlark or read the prompt files. During scoping, editing `workflow.star` or a referenced prompt
 causes validation to regenerate that manifest block before checking and freezing the pack.
 
-For a more creative loop, put a non-isolated `synthesize` agent after the parallel reviewers. It
+For a more creative loop, put a shared-workspace `synthesize` agent after the parallel reviewers. It
 receives their JSON results, edits the shared candidate, and writes its own result; a deterministic
 smoke command then gates the expensive measurement node. See contract §1.3 for that recipe.
 
 ## Task semantics used here
 
-- `isolation = "worktree"` on both reviewers. Each gets a private clone of the workspace,
-  which lets them run concurrently: two agent turns in the shared workspace would collide
-  on the single `PLAN_TASK_RESULT.json`. An isolated task's edits are discarded, so this is
-  for read-only work.
+- `workspace = "worktree"` on both reviewers. Each gets a private clone of the workspace and
+  they run concurrently. A reviewer hunting a counterexample may write a scratch script, which
+  a worktree absorbs and discards; a reviewer that only reads could be `workspace = "readonly"`
+  and skip the clone.
 - `join = "passed"` on the gate. It dispatches once every dependency is terminal, folding
   only the ones that passed, so an advisory reviewer failing does not block the run.
 - `required = false` on `review-copy`. Its findings never invalidate a candidate.
@@ -122,8 +122,8 @@ Two reviewers concurrently: 25.5s wall, against 36s for a single review.
 
 ## Limits
 
-- Isolated plan tasks discard workspace edits. Carrying edits out of an isolated task is
-  the wide tournament's path, not this one.
+- Worktree plan tasks discard workspace edits. Carrying edits out of one is the wide
+  tournament's path, not this one.
 - `plan run` reports cost per task but no token counts (`TaskResult.metric`/`secs` are unset).
 - `harness` and `model` are per-task, but the shipped harnesses (`claude`, `hermes`) both
   serve Anthropic models over Vertex. Cross-vendor panels need a harness that does not exist.

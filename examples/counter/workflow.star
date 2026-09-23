@@ -6,19 +6,19 @@ solver = session(name = "solver")
 candidate = propose(name = "propose", session = solver)
 applied = apply(name = "apply", depends_on = [candidate])
 
-# Parallel isolated checks; `score` is the primary reading and declares its output contract:
+# Parallel checks in worktrees; `score` is the primary reading and declares its output contract:
 # a passing run missing a declared field is a measured failure at the source.
 shape = evaluate(
     name = "shape",
     run = "test -s value.txt && echo '{\"pass\": true, \"score\": 1}'",
     depends_on = [applied],
-    isolated = True,
+    workspace = "worktree",
 )
 score = evaluate(
     name = "score",
     run = "./measure.nu",
     depends_on = [applied],
-    isolated = True,
+    workspace = "worktree",
     emits = ["score", "pass"],
 )
 measurement = grade(

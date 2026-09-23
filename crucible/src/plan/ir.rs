@@ -85,19 +85,80 @@ pub enum EngineOp {
     Decide,
     /// The wide tournament's scoring stage: apply an upstream candidate diff to the main
     /// workspace, `World::apply`, measure with the frozen judge, restore. Serialized by
-    /// construction (never isolation-marked), because candidates share one deployment.
+    /// construction (always `shared`), because candidates share one deployment.
     MeasureDiff,
 }
 
-/// Where a task executes. Authorable (`isolation = "worktree"`); a runner that cannot
-/// honor it must refuse the task loudly rather than silently ignore it: see
-/// [`crate::plan::runner::ShellRunner`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Isolation {
-    /// A private clone of the workspace; the task's edits travel out as a captured diff
-    /// in its output, never as workspace state.
+/// What a task needs of the workspace. The author says what is true of the task; the executor
+/// derives from it what may run at once. A runner that cannot honor a requirement must refuse
+/// the task loudly rather than silently ignore it: see [`crate::plan::runner::ShellRunner`].
+///
+/// Authored as `workspace = "shared" | "readonly" | "worktree"`. The IR spells the field
+/// `isolation`, absent for `shared`, because run identity hashes the serialized graph and
+/// renaming the key would move the digest of every run that predates the other two values.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Workspace {
+    /// Writes the shared tree, so it runs alone.
+    #[default]
+    Shared,
+    /// Reads the shared tree without writing it, so it runs beside other tasks that do not
+    /// write it either. A change it leaves behind fails it and is discarded.
+    Readonly,
+    /// Writes a private clone of the shared tree, discarded when it settles, so it runs beside
+    /// other tasks that do not write the shared tree. Only its declared output continues.
     Worktree,
+}
+
+impl Workspace {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Workspace::Shared => "shared",
+            Workspace::Readonly => "readonly",
+            Workspace::Worktree => "worktree",
+        }
+    }
+
+    /// Whether the task leaves the shared tree as it found it, which is what lets it run beside
+    /// another task.
+    pub fn concurrent(self) -> bool {
+        self != Workspace::Shared
+    }
+}
+
+impl fmt::Display for Workspace {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// [`Workspace`] on the wire: `shared` is the absent value, the others their names.
+mod workspace_wire {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use crate::plan::ir::Workspace;
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum Wire {
+        Readonly,
+        Worktree,
+    }
+
+    pub fn serialize<S: Serializer>(workspace: &Workspace, s: S) -> Result<S::Ok, S::Error> {
+        match workspace {
+            Workspace::Shared => None::<Wire>.serialize(s),
+            Workspace::Readonly => Some(Wire::Readonly).serialize(s),
+            Workspace::Worktree => Some(Wire::Worktree).serialize(s),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Workspace, D::Error> {
+        Ok(match Option::<Wire>::deserialize(d)? {
+            None => Workspace::Shared,
+            Some(Wire::Readonly) => Workspace::Readonly,
+            Some(Wire::Worktree) => Workspace::Worktree,
+        })
+    }
 }
 
 /// When the loop schedules a workflow task (`stage = "iteration" | "epilogue"`). Only the
@@ -314,9 +375,9 @@ pub struct Task {
     /// Required tasks gate plan validity; advisory failures block dependents only.
     #[serde(default = "default_required")]
     pub required: bool,
-    /// Isolated execution (see [`Isolation`]); absent = run in the shared workspace.
-    #[serde(default)]
-    pub isolation: Option<Isolation>,
+    /// What the task needs of the workspace (see [`Workspace`]).
+    #[serde(rename = "isolation", default, with = "workspace_wire")]
+    pub workspace: Workspace,
     /// Dependency-join semantics (see [`Join`]).
     #[serde(default)]
     pub join: Join,
@@ -330,7 +391,7 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub emits: Vec<OutputField>,
     /// Workspace-relative paths this task's output includes as files. A declared file is part
-    /// of the task's output, not part of the workspace state that isolation discards, so a
+    /// of the task's output, not part of the workspace state a worktree discards, so a
     /// dependent receives it either way.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub emits_files: Vec<String>,
@@ -491,9 +552,24 @@ pub enum PlanError {
     )]
     SessionOnUnsupportedTask { task: String },
     #[error(
-        "task {task:?} sets session {session:?}, but durable sessions cannot use disposable isolation"
+        "task {task:?} sets session {session:?}, but a durable session cannot run in a disposable \
+         worktree"
     )]
-    SessionWithIsolation { task: String, session: String },
+    SessionInWorktree { task: String, session: String },
+    #[error(
+        "task {task:?} is workspace = \"readonly\" but declares emits_files; a readonly task \
+         does not write, so return the content in its JSON output, or make it a worktree"
+    )]
+    ReadonlyEmitsFiles { task: String },
+    #[error(
+        "task {task:?} is a {kind} the engine computes itself; it never touches the workspace, \
+         so it cannot declare workspace = {workspace:?}"
+    )]
+    WorkspaceOnEngineFold {
+        task: String,
+        kind: &'static str,
+        workspace: &'static str,
+    },
     #[error(
         "task {task:?} contains `[` or `]`; those are reserved for a mapped node's instance \
          names, which are synthesized as `node[item]`"
@@ -1002,6 +1078,25 @@ impl Plan {
             {
                 return Err(PlanError::ThresholdedEvaluateOmitsScore { task: task() });
             }
+            if t.workspace == Workspace::Readonly && !t.emits_files.is_empty() {
+                return Err(PlanError::ReadonlyEmitsFiles { task: task() });
+            }
+            if t.workspace != Workspace::Shared
+                && matches!(
+                    t.task,
+                    TaskKind::TopK { .. }
+                        | TaskKind::Route {
+                            decider: Decider::Output { .. },
+                            ..
+                        }
+                )
+            {
+                return Err(PlanError::WorkspaceOnEngineFold {
+                    task: task(),
+                    kind: t.task.label(),
+                    workspace: t.workspace.as_str(),
+                });
+            }
             if let Some(session) = &t.session {
                 if session.is_empty()
                     || session.len() > 64
@@ -1024,8 +1119,8 @@ impl Plan {
                 ) {
                     return Err(PlanError::SessionOnUnsupportedTask { task: task() });
                 }
-                if t.isolation.is_some() {
-                    return Err(PlanError::SessionWithIsolation {
+                if t.workspace == Workspace::Worktree {
+                    return Err(PlanError::SessionInWorktree {
                         task: task(),
                         session: session.clone(),
                     });
@@ -1277,7 +1372,7 @@ mod tests {
             session: None,
             needs: "any".into(),
             required: true,
-            isolation: None,
+            workspace: Workspace::Shared,
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
@@ -1764,7 +1859,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_sessions_must_be_serial_and_nonisolated() {
+    fn shared_sessions_must_be_serial_and_out_of_worktrees() {
         let mut first = agent("first", &[]);
         first.session = Some("solver".into());
         let mut next = agent("next", &["first"]);
@@ -1783,15 +1878,106 @@ mod tests {
             }
         );
 
-        first.isolation = Some(Isolation::Worktree);
+        first.workspace = Workspace::Readonly;
+        assert!(
+            plan(vec![first.clone()]).validate().is_ok(),
+            "a readonly task keeps its session: the conversation lives in run state, not the tree"
+        );
+        first.workspace = Workspace::Worktree;
         let err = plan(vec![first]).validate().unwrap_err();
         assert_eq!(
             err,
-            PlanError::SessionWithIsolation {
+            PlanError::SessionInWorktree {
                 task: "first".to_owned(),
                 session: "solver".to_owned(),
             }
         );
+    }
+
+    /// The wire keeps the key and values the IR had before `readonly` existed, so a graph with
+    /// no readonly task serializes byte for byte as it always has and run identity holds still.
+    #[test]
+    fn workspace_rides_the_isolation_key_and_shared_is_its_absence() {
+        let mut a = agent("a", &[]);
+        let json = |t: &Task| serde_json::to_value(t).unwrap()["isolation"].clone();
+        assert_eq!(json(&a), serde_json::Value::Null);
+        a.workspace = Workspace::Readonly;
+        assert_eq!(json(&a), serde_json::json!("readonly"));
+        a.workspace = Workspace::Worktree;
+        assert_eq!(json(&a), serde_json::json!("worktree"));
+
+        let toml_of = |workspace: Workspace| {
+            let mut t = agent("a", &[]);
+            t.workspace = workspace;
+            toml::to_string(&plan(vec![t])).unwrap()
+        };
+        assert!(!toml_of(Workspace::Shared).contains("isolation"));
+        assert!(toml_of(Workspace::Readonly).contains("isolation = \"readonly\""));
+        assert!(toml_of(Workspace::Worktree).contains("isolation = \"worktree\""));
+
+        for (text, want) in [
+            ("", Workspace::Shared),
+            ("isolation = \"readonly\"\n", Workspace::Readonly),
+            ("isolation = \"worktree\"\n", Workspace::Worktree),
+        ] {
+            let parsed: Plan = toml::from_str(&format!(
+                "version = 1\n[budget]\nusd = 1.0\n[[task]]\nname = \"a\"\nkind = \"command\"\n\
+                 command = \"true\"\n{text}"
+            ))
+            .unwrap();
+            assert_eq!(parsed.tasks[0].workspace, want, "{text:?}");
+        }
+        let refused = toml::from_str::<Plan>(
+            "version = 1\n[budget]\nusd = 1.0\n[[task]]\nname = \"a\"\nkind = \"command\"\n\
+             command = \"true\"\nisolation = \"shared\"\n",
+        );
+        assert!(
+            refused.is_err(),
+            "shared is spelled by absence, so the wire has one form for it"
+        );
+    }
+
+    #[test]
+    fn a_readonly_task_cannot_declare_files() {
+        let mut reader = agent("reader", &[]);
+        reader.workspace = Workspace::Readonly;
+        reader.emits_files = vec!["REVIEW.md".into()];
+        assert_eq!(
+            plan(vec![reader.clone()]).validate().unwrap_err(),
+            PlanError::ReadonlyEmitsFiles {
+                task: "reader".into()
+            }
+        );
+        reader.workspace = Workspace::Worktree;
+        assert!(plan(vec![reader]).validate().is_ok());
+    }
+
+    #[test]
+    fn an_engine_fold_stays_in_the_shared_workspace() {
+        for workspace in [Workspace::Readonly, Workspace::Worktree] {
+            let mut pick = agent("pick", &["a"]);
+            pick.task = TaskKind::TopK {
+                k: 1,
+                direction: Direction::Higher,
+            };
+            pick.workspace = workspace;
+            let mut a = agent("a", &[]);
+            a.emits = vec![OutputField("score".into())];
+            assert_eq!(
+                plan(vec![a, pick]).validate().unwrap_err(),
+                PlanError::WorkspaceOnEngineFold {
+                    task: "pick".into(),
+                    kind: "top_k",
+                    workspace: workspace.as_str(),
+                }
+            );
+        }
+        let mut gate = output_route("gate", "scan", &[]);
+        gate.workspace = Workspace::Readonly;
+        assert!(matches!(
+            plan(vec![agent("scan", &[]), gate]).validate().unwrap_err(),
+            PlanError::WorkspaceOnEngineFold { kind: "route", .. }
+        ));
     }
 
     #[test]
@@ -1815,7 +2001,7 @@ mod tests {
             session: None,
             needs: "any".into(),
             required: true,
-            isolation: None,
+            workspace: Workspace::Shared,
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
@@ -1944,7 +2130,7 @@ mod tests {
             session: None,
             needs: "any".into(),
             required: true,
-            isolation: None,
+            workspace: Workspace::Shared,
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),

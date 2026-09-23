@@ -6,7 +6,7 @@ set -e
 case "$CRUCIBLE_PROMPT" in
 *"COPY REVIEW"*)
     python3 - <<'PY'
-import json, pathlib, re
+import json, os, pathlib, re
 
 src = pathlib.Path("solution.py").read_text()
 findings = [f'misspelling: "{t}"' for t in ("Retrun", "nubmer", "interger", "sqaure") if t in src]
@@ -23,13 +23,13 @@ verdict = {
     "findings": findings,
     "summary": "clean" if not findings else f"{len(findings)} prose defect(s)",
 }
-pathlib.Path("PLAN_TASK_RESULT.json").write_text(json.dumps(verdict))
+pathlib.Path(os.environ["CRUCIBLE_TASK_RESULT"]).write_text(json.dumps(verdict))
 print(json.dumps(verdict))
 PY
     ;;
 *ADVERSARIAL_REVIEW*)
     python3 - <<'PY'
-import json, pathlib, re
+import json, os, pathlib, re
 
 src = pathlib.Path("solution.py").read_text()
 findings = []
@@ -49,7 +49,7 @@ verdict = {
     "reviewed": "solution.py",
     "bytes": len(src),
 }
-pathlib.Path("PLAN_TASK_RESULT.json").write_text(json.dumps(verdict))
+pathlib.Path(os.environ["CRUCIBLE_TASK_RESULT"]).write_text(json.dumps(verdict))
 print(json.dumps(verdict))
 PY
     ;;
@@ -81,7 +81,7 @@ def is_prime(n):
 PY
         ;;
     esac
-    printf '{"wrote": "solution.py"}\n' >PLAN_TASK_RESULT.json
-    cat PLAN_TASK_RESULT.json
+    # The loop's propose turn names no result file; a plan's implementer task does.
+    printf '{"wrote": "solution.py"}\n' | tee "${CRUCIBLE_TASK_RESULT:-/dev/null}"
     ;;
 esac

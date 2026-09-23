@@ -10,7 +10,7 @@ score = evaluate(
     name = "score",
     run = "./measure.sh",
     depends_on = [applied],
-    isolated = True,
+    workspace = "worktree",
     emits = ["score", "pass"],
 )
 measurement = grade(

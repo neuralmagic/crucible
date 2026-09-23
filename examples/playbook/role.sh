@@ -6,18 +6,18 @@ set -e
 case "$CRUCIBLE_PROMPT" in
 *"AUDIT: HEADINGS"*)
     python3 - <<'PY'
-import json, pathlib
+import json, os, pathlib
 
 body = pathlib.Path("NOTES.md").read_text()
 findings = [] if body.startswith("# ") else ["NOTES.md has no title heading"]
 result = {"topic": "headings", "findings": findings}
-pathlib.Path("PLAN_TASK_RESULT.json").write_text(json.dumps(result))
+pathlib.Path(os.environ["CRUCIBLE_TASK_RESULT"]).write_text(json.dumps(result))
 print(json.dumps(result))
 PY
     ;;
 *"AUDIT: BULLETS"*)
     python3 - <<'PY'
-import json, pathlib
+import json, os, pathlib
 
 findings = [
     f"line {n} is neither blank, a heading, nor a bullet: {line!r}"
@@ -25,7 +25,7 @@ findings = [
     if line.strip() and not line.startswith(("# ", "- "))
 ]
 result = {"topic": "bullets", "findings": findings}
-pathlib.Path("PLAN_TASK_RESULT.json").write_text(json.dumps(result))
+pathlib.Path(os.environ["CRUCIBLE_TASK_RESULT"]).write_text(json.dumps(result))
 print(json.dumps(result))
 PY
     ;;
@@ -54,7 +54,7 @@ result = {
     "continued": len(drafted) > 1 and drafted[1] == mine,
     "titled": True,
 }
-pathlib.Path("PLAN_TASK_RESULT.json").write_text(json.dumps(result))
+pathlib.Path(os.environ["CRUCIBLE_TASK_RESULT"]).write_text(json.dumps(result))
 print(json.dumps(result))
 PY
     ;;
@@ -69,7 +69,7 @@ pathlib.Path("TURNS.txt").write_text(
     f"draft {os.environ.get('CRUCIBLE_AGENT_SESSION_ID', '')}\n"
 )
 result = {"entries": len(entries)}
-pathlib.Path("PLAN_TASK_RESULT.json").write_text(json.dumps(result))
+pathlib.Path(os.environ["CRUCIBLE_TASK_RESULT"]).write_text(json.dumps(result))
 print(json.dumps(result))
 PY
     ;;

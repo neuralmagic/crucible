@@ -27,7 +27,7 @@ scan = skill(
     emits_files = ["ISSUES.md"],
 )
 
-# One isolated instance per discovered issue, keyed by issue number.
+# One instance per discovered issue, keyed by issue number, each in its own worktree.
 triage = skill(
     name = "triage",
     skill = "skills/triage-issue",
@@ -35,7 +35,7 @@ triage = skill(
     depends_on = [scan],
     over = scan.issues,
     max_fanout = 12,
-    isolated = True,
+    workspace = "worktree",
     required = False,
     emits = ["classification", "severity", "confidence"],
     emits_files = ["TRIAGE.md"],

@@ -35,7 +35,7 @@ def auditor(topic, blocking):
         name = "audit-" + topic,
         prompt = prompt_file("prompts/audit.md") + "\nAUDIT: " + topic.upper() + "\n",
         depends_on = [polish],
-        isolated = True,
+        workspace = "readonly",
         required = blocking,
         emits = ["findings"],
     )

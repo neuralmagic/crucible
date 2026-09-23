@@ -145,6 +145,8 @@ pub(crate) fn narrow(error: CompileError, idents: &Idents) -> CompileError {
             (None, "session")
         }
         CompileError::WhenNotAnAnswer => (None, "when"),
+        CompileError::UnknownWorkspace { .. } => (None, "workspace"),
+        CompileError::IsolatedReplaced { .. } => (None, "isolated"),
         CompileError::UnknownAnswer { .. }
         | CompileError::AnswersWithoutWhen
         | CompileError::EmptyAnswers => (None, "answers"),

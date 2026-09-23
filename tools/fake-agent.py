@@ -3,8 +3,8 @@
 
 Point a manifest's `[agent] backend = "command"` / `agent_cmd` at this script and set
 FAKE_AGENT_SCRIPT to a JSON file describing what each task does. The engine spawns a real
-process, reads a real PLAN_TASK_RESULT.json, and sees a real exit code, so nothing about the
-task boundary is simulated: only the model is absent.
+process, reads a real result file (the one CRUCIBLE_TASK_RESULT names), and sees a real exit
+code, so nothing about the task boundary is simulated: only the model is absent.
 
 Tasks are addressed by CRUCIBLE_TASK, the task's own name, not by matching prompt prose.
 
@@ -25,10 +25,10 @@ Directives, all optional:
   fail_attempts fail this many times before passing; the count is kept beside the workspace
   stderr        text to emit on stderr
   exit          exit code (default 0); a nonzero code skips the result file
-  result        object written to PLAN_TASK_RESULT.json and echoed to stdout
+  result        object written to the file CRUCIBLE_TASK_RESULT names and echoed to stdout
 
 Env the engine supplies, all readable from a template in `writes`/`result` as {ENV:NAME}:
-  CRUCIBLE_TASK, CRUCIBLE_PROMPT, CRUCIBLE_INPUTS, CRUCIBLE_AGENT_SESSION,
+  CRUCIBLE_TASK, CRUCIBLE_TASK_RESULT, CRUCIBLE_PROMPT, CRUCIBLE_INPUTS, CRUCIBLE_AGENT_SESSION,
   CRUCIBLE_AGENT_SESSION_ID, CRUCIBLE_AGENT_SESSION_ACTION
 """
 
@@ -40,7 +40,6 @@ import sys
 import time
 from typing import Any, NoReturn
 
-RESULT_FILE = "PLAN_TASK_RESULT.json"
 ATTEMPTS_DIR = ".fake-agent"
 
 
@@ -80,6 +79,10 @@ def main() -> int:
     task = os.environ.get("CRUCIBLE_TASK", "")
     if not task:
         die("CRUCIBLE_TASK is unset: the engine did not name the task")
+
+    result_file = os.environ.get("CRUCIBLE_TASK_RESULT", "")
+    if not result_file:
+        die("CRUCIBLE_TASK_RESULT is unset: the engine did not name the result file")
 
     script_path = os.environ.get("FAKE_AGENT_SCRIPT", "")
     if not script_path:
@@ -134,7 +137,7 @@ def main() -> int:
 
     if "result" in spec:
         payload = json.dumps(expand(spec["result"]), sort_keys=True)
-        pathlib.Path(RESULT_FILE).write_text(payload)
+        pathlib.Path(result_file).write_text(payload)
         print(payload)
     return 0
 

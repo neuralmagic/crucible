@@ -308,6 +308,18 @@ pub enum CompileError {
     UnknownStage { got: String },
     #[error("join must be `all`, `passed`, or `settled`, got {got:?}")]
     UnknownJoin { got: String },
+    #[error("workspace must be `shared`, `readonly`, or `worktree`, got {got:?}")]
+    UnknownWorkspace { got: String },
+    #[error(
+        "\"isolated\" was replaced by \"workspace\"{}",
+        if *.isolated {
+            ": write workspace = \"readonly\" if the task only reads, or workspace = \
+             \"worktree\" if it writes files that should be discarded"
+        } else {
+            ", and a task in the shared workspace says nothing: drop the argument"
+        }
+    )]
+    IsolatedReplaced { isolated: bool },
     #[error(
         "grade() folds the evidence that passed, so it does not accept join = \"settled\"; use \
          join = \"passed\", or read the failed evidence from a command or evaluate task that \

@@ -1,6 +1,6 @@
 # Issue triage against a real repository, in a real sandbox. Discovery fans out into one
-# isolated triage instance per open issue, and a free command assembles the report from
-# what the passing instances captured.
+# triage instance per open issue, each in its own worktree, and a free command assembles the
+# report from what the passing instances captured.
 [workspace]
 inject = ["roundup.py"]
 

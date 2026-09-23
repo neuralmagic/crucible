@@ -3,11 +3,13 @@
 //! with the task's harness/model/effort overriding the manifest's `[agent]` defaults.
 //! `Command` tasks run in the workspace via the shell runner.
 //!
-//! Result contract: the turn writes its structured output to `PLAN_TASK_RESULT.json` in the
-//! workspace root; the runner drains it (read + remove) after the turn, like the loop drains
-//! its sentinel files. No file, no pass.
+//! Result contract: the turn writes its structured output to its own result file in the root it
+//! runs in, `PLAN_TASK_RESULT.<digest of the task name>.json`, named to it in the prompt and in
+//! `CRUCIBLE_TASK_RESULT`; the runner drains it (read + remove) after the turn, like the loop
+//! drains its sentinel files. No file, no pass. The name is per task because readonly peers run
+//! in one tree at once.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use clap::ValueEnum;
 
@@ -16,7 +18,7 @@ use serde_json::Value;
 use crate::agent::event::{AgentEvent, RawStream};
 use crate::agent::harness::HarnessRuntime;
 use crate::plan::exec::{Attempt, AttemptOutcome, BatchItem, TaskRunner, TransportFailure};
-use crate::plan::ir::{Isolation, Task, TaskKind, TaskName};
+use crate::plan::ir::{Task, TaskKind, TaskName, Workspace};
 use crate::plan::runner::ShellRunner;
 use crucible_contract::TransportCause;
 use std::path::{Path, PathBuf};
@@ -24,8 +26,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::args::{Args, Paths};
-
-const RESULT_FILE: &str = "PLAN_TASK_RESULT.json";
 
 use crate::plan::STAGED_INPUTS;
 
@@ -190,26 +190,15 @@ pub struct HarnessRunner {
 
 impl TaskRunner for HarnessRunner {
     fn run(&mut self, task: &Task, attempt: u32, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
-        run_task(
-            &Dispatch {
-                args: &self.args,
-                paths: &self.paths,
-                captured_bytes: &self.captured_bytes,
-                staged: self.staged.get(&task.name).map(Vec::as_slice),
-            },
-            task,
-            attempt,
-            inputs,
-            None,
-        )
+        run_task(self, task, attempt, inputs)
     }
 
     /// Record what this task's ancestors declared, for [`run_task`] to lay down under
     /// `inputs/<producer>/` in whichever root the task runs in.
     ///
-    /// It is recorded rather than copied because the root is not known yet: an isolated task's
-    /// worktree does not exist until it is dispatched, and a batch of isolated tasks has one
-    /// root each with a different ancestor set, so a single shared `inputs/` cannot serve them.
+    /// It is recorded rather than copied because the root is not known yet: a worktree task's
+    /// clone does not exist until it is dispatched, and a batch of worktree tasks has one root
+    /// each with a different ancestor set, so a single shared `inputs/` cannot serve them.
     fn stage(&mut self, task: &Task, producers: &[&Task]) -> Result<(), String> {
         let files = producers
             .iter()
@@ -255,10 +244,11 @@ impl TaskRunner for HarnessRunner {
     /// commit, so the failed task contributes after all. Discarding at the point of failure is
     /// what keeps that from happening.
     ///
-    /// An isolated task contributes nothing either way. Its worktree is discarded by contract
-    /// and only its declared output continues, so there is no workspace change to record.
+    /// A readonly or worktree task contributes nothing either way. A worktree is discarded by
+    /// contract and a readonly task's changes were already put back when its batch ended, so
+    /// only declared output continues and there is no workspace change to record.
     fn settled(&mut self, task: &Task, passed: bool) {
-        if !self.commit_per_task || task.isolation.is_some() {
+        if !self.commit_per_task || task.workspace != Workspace::Shared {
             return;
         }
         let workspace = &self.paths.workspace;
@@ -280,59 +270,75 @@ impl TaskRunner for HarnessRunner {
         }
     }
 
-    /// Isolated tasks that are ready together run concurrently, each in its own worktree.
-    /// Concurrency is what isolation buys: two reviewers reading the same artifact would
-    /// otherwise race on the single `PLAN_TASK_RESULT.json` in the shared workspace.
+    /// Tasks that leave the shared tree alone and are ready together run concurrently: a
+    /// worktree task in its own clone, a readonly task in the shared tree beside its peers, each
+    /// writing its own result file.
+    ///
+    /// The readonly tasks are arranged once for the whole batch, since they share a root: their
+    /// staged inputs, the frozen injects, and each harness's toolbox are laid down before any of
+    /// them starts, and the tree is read before and after. A change the batch left behind fails
+    /// every readonly task in it and is put back: the tasks ran at once in one tree, so the
+    /// engine cannot tell which of them wrote.
     fn run_many(&mut self, batch: &[BatchItem<'_>]) -> Vec<Attempt> {
-        if batch.len() == 1 {
-            let b = &batch[0];
-            return vec![run_task(
-                &Dispatch {
-                    args: &self.args,
-                    paths: &self.paths,
-                    captured_bytes: &self.captured_bytes,
-                    staged: self.staged.get(&b.task.name).map(Vec::as_slice),
-                },
-                b.task,
-                b.attempt,
-                &b.inputs,
-                None,
-            )];
+        if batch.len() > 1 && one_at_a_time(&self.args, batch) {
+            return batch
+                .iter()
+                .flat_map(|b| self.run_many(std::slice::from_ref(b)))
+                .collect();
         }
-        // Every item clones the same workspace, so its pending state is captured once here:
-        // concurrent `git add -A` in one repo races on `.git/index.lock`.
-        let pending = match crate::plan::worktree::capture_diff(&self.paths.workspace) {
-            Ok(p) => p,
-            Err(e) => {
-                let note = format!("capturing the workspace's uncommitted state failed: {e:#}");
-                return batch
-                    .iter()
-                    .map(|_| Attempt::failed(0.0, note.clone()))
-                    .collect();
-            }
+        let cx = Dispatch {
+            args: &self.args,
+            paths: &self.paths,
+            captured_bytes: &self.captured_bytes,
+            staged: None,
         };
-        let captured = &self.captured_bytes;
+        let readonly: Vec<&Task> = batch
+            .iter()
+            .map(|b| b.task)
+            .filter(|t| t.workspace == Workspace::Readonly)
+            .collect();
+        let arranged = if readonly.is_empty() {
+            Ok(None)
+        } else {
+            arrange_readonly(&cx, &self.staged, &readonly).map(Some)
+        };
+        // Every worktree clones the same workspace, so its pending state is captured once here:
+        // concurrent `git add -A` in one repo races on `.git/index.lock`.
+        let pending = if batch
+            .iter()
+            .any(|b| b.task.workspace == Workspace::Worktree)
+        {
+            crate::plan::worktree::capture_diff(&self.paths.workspace)
+                .map(Some)
+                .map_err(|e| format!("capturing the workspace's uncommitted state failed: {e:#}"))
+        } else {
+            Ok(None)
+        };
         let staged = &self.staged;
-        std::thread::scope(|scope| {
+        let attempts: Vec<Attempt> = std::thread::scope(|scope| {
             let handles: Vec<_> = batch
                 .iter()
                 .map(|b| {
-                    let args = self.args.clone();
-                    let paths = self.paths.clone();
-                    let pending = pending.as_str();
-                    scope.spawn(move || {
-                        run_task(
-                            &Dispatch {
-                                args: &args,
-                                paths: &paths,
-                                captured_bytes: captured,
-                                staged: staged.get(&b.task.name).map(Vec::as_slice),
-                            },
+                    let cx = Dispatch {
+                        staged: staged.get(&b.task.name).map(Vec::as_slice),
+                        ..cx
+                    };
+                    let arranged = &arranged;
+                    let pending = &pending;
+                    scope.spawn(move || match (b.task.workspace, arranged, pending) {
+                        (Workspace::Readonly, Err(why), _) => {
+                            Attempt::transport(TransportCause::Workspace, why.clone())
+                        }
+                        (Workspace::Readonly, Ok(_), _) => run_readonly(&cx, b),
+                        (Workspace::Worktree, _, Err(why)) => Attempt::failed(0.0, why.clone()),
+                        (Workspace::Worktree, _, Ok(pending)) => run_in_worktree(
+                            &cx,
                             b.task,
                             b.attempt,
                             &b.inputs,
-                            Some(pending),
-                        )
+                            pending.as_deref().unwrap_or_default(),
+                        ),
+                        (Workspace::Shared, ..) => run_shared(&cx, b.task, b.attempt, &b.inputs),
                     })
                 })
                 .collect();
@@ -344,12 +350,53 @@ impl TaskRunner for HarnessRunner {
                     })
                 })
                 .collect()
-        })
+        });
+        let Ok(Some(before)) = arranged else {
+            return attempts;
+        };
+        match readonly_changes(&self.paths.workspace, &before) {
+            Ok(None) => attempts,
+            Ok(Some(why)) | Err(why) => batch
+                .iter()
+                .zip(attempts)
+                .map(|(b, attempt)| {
+                    if b.task.workspace != Workspace::Readonly {
+                        return attempt;
+                    }
+                    let peers: Vec<&str> = readonly
+                        .iter()
+                        .filter(|t| t.name != b.task.name)
+                        .map(|t| t.name.0.as_str())
+                        .collect();
+                    let note = if peers.is_empty() {
+                        why.clone()
+                    } else {
+                        format!(
+                            "{why}; it ran beside readonly {}, and which of them wrote is not \
+                             knowable",
+                            peers.join(", ")
+                        )
+                    };
+                    wrote_readonly(attempt, note)
+                })
+                .collect(),
+        }
     }
+}
+
+/// Whether this runner has to take a batch one task at a time. An openshell turn names its
+/// sandbox for the workspace and ends by replacing the whole workspace directory with the
+/// sandbox's copy, so a readonly agent turn on it cannot share the shared tree with anything.
+fn one_at_a_time(args: &Args, batch: &[BatchItem<'_>]) -> bool {
+    args.agent_backend == crate::manifest::AgentBackend::Openshell
+        && batch.iter().any(|b| {
+            b.task.workspace == Workspace::Readonly && matches!(b.task.task, TaskKind::Agent { .. })
+        })
 }
 
 /// What one dispatch needs besides the task: the run's configuration and paths, the run's
 /// captured-byte total, and the files this task's ancestors declared.
+#[derive(Clone, Copy)]
 struct Dispatch<'a> {
     args: &'a Args,
     paths: &'a Paths,
@@ -357,15 +404,49 @@ struct Dispatch<'a> {
     staged: Option<&'a [StagedInput]>,
 }
 
-/// Dispatch one task, in the shared workspace or in a private worktree. `pending` is the
-/// shared workspace's uncommitted patch when a concurrent caller already captured it for
-/// the whole batch; `None` means capture it here.
+/// Dispatch one task by itself, where its workspace says. A readonly task alone is a batch of
+/// one: it is arranged and checked exactly as it would be beside peers.
 fn run_task(
+    runner: &mut HarnessRunner,
+    task: &Task,
+    attempt: u32,
+    inputs: &BTreeMap<TaskName, Value>,
+) -> Attempt {
+    let cx = Dispatch {
+        args: &runner.args,
+        paths: &runner.paths,
+        captured_bytes: &runner.captured_bytes,
+        staged: runner.staged.get(&task.name).map(Vec::as_slice),
+    };
+    match task.workspace {
+        Workspace::Shared => run_shared(&cx, task, attempt, inputs),
+        Workspace::Worktree => match crate::plan::worktree::capture_diff(&runner.paths.workspace) {
+            Ok(pending) => run_in_worktree(&cx, task, attempt, inputs, &pending),
+            Err(e) => Attempt::failed(
+                0.0,
+                format!("capturing the workspace's uncommitted state failed: {e:#}"),
+            ),
+        },
+        Workspace::Readonly => {
+            let mut attempts = runner.run_many(&[BatchItem {
+                task,
+                attempt,
+                inputs: inputs.clone(),
+            }]);
+            attempts
+                .pop()
+                .unwrap_or_else(|| Attempt::failed(0.0, "the batch returned nothing".to_string()))
+        }
+    }
+}
+
+/// A shared-workspace task: it runs alone, in the workspace itself, and its declared files are
+/// taken from there.
+fn run_shared(
     cx: &Dispatch<'_>,
     task: &Task,
     attempt: u32,
     inputs: &BTreeMap<TaskName, Value>,
-    pending: Option<&str>,
 ) -> Attempt {
     let Dispatch {
         args,
@@ -373,48 +454,155 @@ fn run_task(
         captured_bytes,
         staged,
     } = *cx;
-    let Some(Isolation::Worktree) = task.isolation else {
-        if let Err(e) = materialize_inputs(&paths.state, &paths.workspace, staged) {
-            return Attempt::transport(TransportCause::Workspace, e);
-        }
-        let before = PriorContents::of(&paths.workspace, &task.emits_files);
-        let attempt_out = prepare_and_run(args, paths, task, attempt, inputs);
-        return capture_declared(
-            paths,
-            &paths.workspace,
-            task,
-            attempt_out,
-            captured_bytes,
-            &before,
+    if let Err(e) = materialize_inputs(&paths.state, &paths.workspace, staged) {
+        return Attempt::transport(TransportCause::Workspace, e);
+    }
+    let before = PriorContents::of(&paths.workspace, &task.emits_files);
+    let attempt_out = prepare_and_run(args, paths, task, attempt, inputs);
+    capture_declared(
+        paths,
+        &paths.workspace,
+        task,
+        attempt_out,
+        captured_bytes,
+        &before,
+    )
+}
+
+/// Lay down what a batch of readonly tasks shares in the shared tree, then read the tree. Their
+/// staged sets are one set, because the executor only batches readonly tasks staged alike; a
+/// batch that says otherwise is refused rather than handed one task's files as another's.
+fn arrange_readonly(
+    cx: &Dispatch<'_>,
+    staged: &BTreeMap<TaskName, Vec<StagedInput>>,
+    readonly: &[&Task],
+) -> Result<String, String> {
+    let sets: Vec<Option<&[StagedInput]>> = readonly
+        .iter()
+        .map(|t| staged.get(&t.name).map(Vec::as_slice))
+        .collect();
+    let first = sets.first().copied().flatten();
+    if sets.iter().any(|set| !same_staged(*set, first)) {
+        return Err(
+            "readonly tasks staged with different files were batched into one shared tree"
+                .to_string(),
         );
+    }
+    materialize_inputs(&cx.paths.state, &cx.paths.workspace, first)?;
+    apply_frozen_injects(cx.args, cx.paths)?;
+    let mut installed: BTreeSet<&'static str> = BTreeSet::new();
+    for task in readonly {
+        if !matches!(task.task, TaskKind::Agent { .. }) {
+            continue;
+        }
+        // A task naming a harness the engine does not know fails at its own dispatch.
+        let Ok(args) = turn_args(cx.args, task) else {
+            continue;
+        };
+        let skills_dir = args.harness().spec().skills_dir;
+        if installed.insert(skills_dir) {
+            install_toolbox(&args, cx.paths)?;
+        }
+    }
+    crate::plan::worktree::tree(&cx.paths.workspace)
+        .map_err(|e| format!("reading the shared workspace before a readonly batch: {e:#}"))
+}
+
+fn same_staged(a: Option<&[StagedInput]>, b: Option<&[StagedInput]>) -> bool {
+    let key = |set: Option<&[StagedInput]>| -> Vec<(String, String)> {
+        set.unwrap_or_default()
+            .iter()
+            .map(|s| (s.producer.clone(), s.declared.clone()))
+            .collect()
     };
-    // A private clone of the workspace. Its edits are discarded on cleanup: what leaves an
-    // isolated task is its declared output, so this is for review/analysis work, not for
-    // coding tasks whose diff has to survive (the wide tournament carries those out itself).
+    key(a) == key(b)
+}
+
+/// One readonly task in a tree its batch already arranged.
+fn run_readonly(cx: &Dispatch<'_>, b: &BatchItem<'_>) -> Attempt {
+    let out = run_in(cx.args, cx.paths, b.task, b.attempt, &b.inputs, false);
+    Attempt {
+        outcome: out.outcome.settle_declared(),
+        cost_usd: out.cost_usd,
+    }
+}
+
+/// Whether the shared tree still reads as it did before a readonly batch, and if not, which
+/// paths changed. A change is put back before this returns, so nothing a readonly task wrote
+/// reaches the next task's commit.
+fn readonly_changes(workspace: &Path, before: &str) -> Result<Option<String>, String> {
+    let after = crate::plan::worktree::tree(workspace)
+        .map_err(|e| format!("reading the shared workspace after a readonly batch: {e:#}"))?;
+    if after == before {
+        return Ok(None);
+    }
+    let changed = crate::plan::worktree::changed_paths(workspace, before, &after)
+        .map_err(|e| format!("listing what a readonly batch changed: {e:#}"))?;
+    const SHOWN: usize = 8;
+    let mut listed = changed
+        .iter()
+        .take(SHOWN)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if changed.len() > SHOWN {
+        listed.push_str(&format!(" and {} more", changed.len() - SHOWN));
+    }
+    let restored = match crate::plan::worktree::reset_to_tree(workspace, before) {
+        Ok(()) => "the changes were discarded".to_string(),
+        Err(e) => format!("putting the workspace back failed: {e:#}"),
+    };
+    Ok(Some(format!(
+        "workspace = \"readonly\", but the shared workspace changed while it ran ({listed}); \
+         {restored}"
+    )))
+}
+
+/// A readonly task whose batch changed the tree. It fails whatever it reported, keeping its
+/// reading, because the declaration it ran under was not true of the batch.
+fn wrote_readonly(attempt: Attempt, why: String) -> Attempt {
+    let outcome = match attempt.outcome {
+        AttemptOutcome::Pass(output) => AttemptOutcome::Fail {
+            note: why,
+            output: Some(output),
+        },
+        AttemptOutcome::Fail { note, output } => AttemptOutcome::Fail {
+            note: format!("{note}; {why}"),
+            output,
+        },
+        AttemptOutcome::Skipped(..) | AttemptOutcome::Transport(_) => AttemptOutcome::fail(why),
+    };
+    Attempt {
+        outcome,
+        cost_usd: attempt.cost_usd,
+    }
+}
+
+/// A worktree task: a private clone of the workspace carrying `pending`, the shared workspace's
+/// uncommitted patch. Its edits are discarded on cleanup: what leaves it is its declared output,
+/// so this is for review and analysis work, not for coding tasks whose diff has to survive (the
+/// wide tournament carries those out itself).
+fn run_in_worktree(
+    cx: &Dispatch<'_>,
+    task: &Task,
+    attempt: u32,
+    inputs: &BTreeMap<TaskName, Value>,
+    pending: &str,
+) -> Attempt {
+    let Dispatch {
+        args,
+        paths,
+        captured_bytes,
+        staged,
+    } = *cx;
     let root = paths.state.join("plan-iso");
     if let Err(e) = std::fs::create_dir_all(&root) {
         return Attempt::transport(
             TransportCause::Workspace,
-            format!("creating the isolation root failed: {e}"),
+            format!("creating the worktree root failed: {e}"),
         );
     }
     let worktree = root.join(task_worktree_name(&task.name));
-    let captured;
-    let pending = match pending {
-        Some(p) => p,
-        None => match crate::plan::worktree::capture_diff(&paths.workspace) {
-            Ok(p) => {
-                captured = p;
-                &captured
-            }
-            Err(e) => {
-                return Attempt::failed(
-                    0.0,
-                    format!("capturing the workspace's uncommitted state failed: {e:#}"),
-                );
-            }
-        },
-    };
     if let Err(e) = crate::plan::worktree::setup(&paths.workspace, &worktree, pending) {
         return Attempt::transport(
             TransportCause::Workspace,
@@ -422,7 +610,7 @@ fn run_task(
         );
     }
     // `inputs/` is excluded from the workspace's git memory, so neither the clone nor the
-    // pending patch carries it. Lay this task's own staged set down here, or an isolated
+    // pending patch carries it. Lay this task's own staged set down here, or a worktree
     // consumer never sees what its ancestors declared.
     if let Err(e) = materialize_inputs(&paths.state, &worktree, staged) {
         return Attempt::transport(TransportCause::Workspace, e);
@@ -432,7 +620,7 @@ fn run_task(
     let before = PriorContents::of(&iso.workspace, &task.emits_files);
     let attempt_out = prepare_and_run(args, &iso, task, attempt, inputs);
     // Before the worktree goes: a declared file is part of the task's output, not part of the
-    // workspace state isolation discards, so it has to be taken while the tree is still there.
+    // workspace state a worktree discards, so it has to be taken while the tree is still there.
     let attempt_out = capture_declared(
         paths,
         &iso.workspace,
@@ -602,41 +790,100 @@ fn prepare_and_run(
     attempt: u32,
     inputs: &BTreeMap<TaskName, Value>,
 ) -> Attempt {
-    for (src, dst) in &args.workflow_frozen_injects {
-        if let Err(e) = crate::manifest::apply_inject(src, &paths.workspace.join(dst)) {
-            return Attempt::transport(
-                TransportCause::Workspace,
-                format!(
-                    "restoring frozen inject {} -> {} failed: {e:#}",
-                    src.display(),
-                    dst.display()
-                ),
-            );
-        }
+    if let Err(e) = apply_frozen_injects(args, paths) {
+        return Attempt::transport(TransportCause::Workspace, e);
     }
-    let out = run_in(args, paths, task, attempt, inputs);
+    let out = run_in(args, paths, task, attempt, inputs, true);
     Attempt {
         outcome: out.outcome.settle_declared(),
         cost_usd: out.cost_usd,
     }
 }
 
+fn apply_frozen_injects(args: &Args, paths: &Paths) -> Result<(), String> {
+    for (src, dst) in &args.workflow_frozen_injects {
+        crate::manifest::apply_inject(src, &paths.workspace.join(dst)).map_err(|e| {
+            format!(
+                "restoring frozen inject {} -> {} failed: {e:#}",
+                src.display(),
+                dst.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn install_toolbox(args: &Args, paths: &Paths) -> Result<(), String> {
+    crate::cli::workspace::install_toolbox(
+        paths,
+        &args.workflow_toolbox_exclude,
+        args.harness().spec().skills_dir,
+    )
+    .map_err(|e| format!("installing the task toolbox failed: {e:#}"))
+}
+
+/// The run's agent configuration with the task's own knobs laid over it, and the task named to
+/// the turn. Unknown values are a measured failure: a plan naming a harness the engine cannot
+/// parse is wrong, not unlucky.
+fn turn_args(args: &Args, task: &Task) -> Result<Args, String> {
+    let TaskKind::Agent {
+        harness,
+        model,
+        effort,
+        ..
+    } = &task.task
+    else {
+        return Ok(args.clone());
+    };
+    let mut args = args.clone();
+    // A deterministic stand-in needs to know which task it is without matching prompt prose,
+    // and a real harness gets it for free in its transcript.
+    args.env
+        .push((crate::plan::TASK_NAME_ENV.to_string(), task.name.0.clone()));
+    args.env.push((
+        crate::plan::TASK_RESULT_ENV.to_string(),
+        result_file(&task.name),
+    ));
+    if let Some(h) = harness {
+        args.harness = Some(
+            crate::manifest::Harness::from_str(h, true)
+                .map_err(|e| format!("task names unknown harness {h:?}: {e}"))?,
+        );
+    }
+    if let Some(m) = model {
+        args.model = Some(m.clone());
+    }
+    if let Some(e) = effort {
+        args.reasoning_effort = Some(
+            crate::manifest::ReasoningEffort::from_str(e, true)
+                .map_err(|err| format!("task names unknown effort {e:?}: {err}"))?,
+        );
+    }
+    Ok(args)
+}
+
+/// The file a task's turn writes its result to, relative to the root it runs in. Named for the
+/// task so readonly peers sharing one tree each have their own, and hashed so an instance name
+/// (`node[item]`, where the item is whatever the producer emitted) is always one plain filename.
+pub fn result_file(task: &TaskName) -> String {
+    let digest = crucible_contract::artifact::content_digest(task.0.as_bytes());
+    let hex = digest.trim_start_matches("sha256:");
+    format!("PLAN_TASK_RESULT.{}.json", &hex[..hex.len().min(16)])
+}
+
 /// One task against a specific workspace. `Command` tasks go to the shell runner; `Agent`
 /// tasks run through the real [`crate::agent::run_turn`] with the task's knob overrides.
+/// `toolbox` is false where the caller already installed it for a batch sharing this root.
 fn run_in(
     args: &Args,
     paths: &Paths,
     task: &Task,
     attempt: u32,
     inputs: &BTreeMap<TaskName, Value>,
+    toolbox: bool,
 ) -> Attempt {
-    let (prompt, harness, model, effort) = match &task.task {
-        TaskKind::Agent {
-            prompt,
-            harness,
-            model,
-            effort,
-        } => (prompt, harness, model, effort),
+    let prompt = match &task.task {
+        TaskKind::Agent { prompt, .. } => prompt,
         TaskKind::Command { .. }
         | TaskKind::Evaluate { .. }
         | TaskKind::Route { .. }
@@ -645,10 +892,9 @@ fn run_in(
                 workdir: paths.workspace.clone(),
                 agent_cmd: None,
             };
-            return if task.isolation == Some(Isolation::Worktree) {
-                shell.run_in_prepared_worktree(task, inputs)
-            } else {
-                shell.run(task, attempt, inputs)
+            return match task.workspace {
+                Workspace::Shared => shell.run(task, attempt, inputs),
+                Workspace::Readonly | Workspace::Worktree => shell.run_arranged(task, inputs),
             };
         }
         TaskKind::TopK { .. } => {
@@ -659,55 +905,38 @@ fn run_in(
         }
     };
 
-    // Per-task knob overrides on a cloned Args: the heterogeneity axis. Unknown values
-    // are a measured failure: a plan naming a harness we can't parse is wrong, not
-    // unlucky.
-    let mut args = args.clone();
-    // Name the task to the turn. A deterministic stand-in needs to know which task it is
-    // without matching prompt prose, and a real harness gets it for free in its transcript.
-    args.env
-        .push((crate::plan::TASK_NAME_ENV.to_string(), task.name.0.clone()));
-    if let Some(h) = harness {
-        match crate::manifest::Harness::from_str(h, true) {
-            Ok(h) => args.harness = Some(h),
-            Err(e) => {
-                return Attempt::failed(0.0, format!("task names unknown harness {h:?}: {e}"));
-            }
-        }
-    }
-    if let Some(m) = model {
-        args.model = Some(m.clone());
-    }
-    if let Some(e) = effort {
-        match crate::manifest::ReasoningEffort::from_str(e, true) {
-            Ok(e) => args.reasoning_effort = Some(e),
-            Err(err) => {
-                return Attempt::failed(0.0, format!("task names unknown effort {e:?}: {err}"));
-            }
-        }
-    }
-    if let Err(e) = crate::cli::workspace::install_toolbox(
-        paths,
-        &args.workflow_toolbox_exclude,
-        args.harness().spec().skills_dir,
-    ) {
-        return Attempt::transport(
-            TransportCause::Workspace,
-            format!("installing the task toolbox failed: {e:#}"),
-        );
+    // Per-task knob overrides on a cloned Args: the heterogeneity axis.
+    let args = match turn_args(args, task) {
+        Ok(args) => args,
+        Err(note) => return Attempt::failed(0.0, note),
+    };
+    if toolbox && let Err(e) = install_toolbox(&args, paths) {
+        return Attempt::transport(TransportCause::Workspace, e);
     }
 
     let inputs_json = match serde_json::to_string_pretty(inputs) {
         Ok(j) => j,
         Err(e) => return Attempt::failed(0.0, format!("inputs not serializable: {e}")),
     };
+    let result_file = result_file(&task.name);
+    let readonly = if task.workspace == Workspace::Readonly {
+        format!(
+            "## Workspace\n\nThis task is readonly: other tasks read this workspace while it \
+             runs. Do not create, edit, or delete any file except `{result_file}`; a change left \
+             in the workspace fails the task and is discarded.\n\n"
+        )
+    } else {
+        String::new()
+    };
     let full_prompt = format!(
         "{prompt}\n\n## Task inputs\n\nUpstream task results, as JSON:\n\n{inputs_json}\n\n\
-         ## Result contract\n\nWhen done, write your final result as a single JSON object \
-         to `{RESULT_FILE}` in the workspace root. The run is graded on that file."
+         {readonly}## Result contract\n\nWhen done, write your final result as a single JSON \
+         object to `{result_file}` in the workspace root (its name is also in \
+         `${TASK_RESULT_ENV}`). The run is graded on that file.",
+        TASK_RESULT_ENV = crate::plan::TASK_RESULT_ENV,
     );
 
-    let result_path = paths.workspace.join(RESULT_FILE);
+    let result_path = paths.workspace.join(&result_file);
     // Drain any stale result so a pass can only come from THIS turn.
     let _ = std::fs::remove_file(&result_path);
 
@@ -756,7 +985,7 @@ fn run_in(
                     outcome: AttemptOutcome::Pass(v),
                     cost_usd: cost,
                 },
-                Err(e) => Attempt::failed(cost, format!("{RESULT_FILE} is not valid JSON: {e}")),
+                Err(e) => Attempt::failed(cost, format!("{result_file} is not valid JSON: {e}")),
             }
         }
         Err(_) => match transport_error {
@@ -766,7 +995,7 @@ fn run_in(
             },
             None => Attempt::failed(
                 cost,
-                format!("turn ended without writing {RESULT_FILE} — nothing to grade"),
+                format!("turn ended without writing {result_file}: nothing to grade"),
             ),
         },
     }
@@ -840,7 +1069,7 @@ mod tests {
             session: None,
             needs: "any".into(),
             required: true,
-            isolation: None,
+            workspace: Workspace::Shared,
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
@@ -1116,12 +1345,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A serial producer's declared file has to reach an isolated consumer, whose worktree is a
+    /// A serial producer's declared file has to reach a worktree consumer, whose worktree is a
     /// clone that cannot carry `inputs/` (it is excluded from the workspace's git memory on
     /// purpose), and the whole pack has to stay runnable: the middle task's declared output is a
     /// copy of a staged input, so it carries the staged copy's read-only mode.
     #[test]
-    fn a_capturing_pack_runs_three_times_and_reaches_an_isolated_consumer() {
+    fn a_capturing_pack_runs_three_times_and_reaches_a_worktree_consumer() {
         let dir = std::env::temp_dir().join(format!("crucible-recapture-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1135,7 +1364,7 @@ mod tests {
         )
         .unwrap();
         // `copy` reads what a serial ancestor declared and declares the result, so its own
-        // captured file inherits the staged input's mode. `review` is isolated, so it can only
+        // captured file inherits the staged input's mode. `review` runs in a worktree, so it can only
         // see either file if staged inputs are carried into the worktree directly.
         std::fs::write(
             dir.join("workflow.star"),
@@ -1147,7 +1376,7 @@ copy = command(
     depends_on = [write],
     emits_files = ["B.md"],
 )
-review = agent(name = "review", prompt = "review", depends_on = [copy], isolated = True)
+review = agent(name = "review", prompt = "review", depends_on = [copy], workspace = "worktree")
 workflow(type = "playbook", tasks = [write, copy, review])
 "#,
         )
@@ -1160,7 +1389,7 @@ workflow(type = "playbook", tasks = [write, copy, review])
             assert_eq!(
                 out.results[&"review".into()].output.as_ref().unwrap()["saw_both"],
                 true,
-                "round {round}: an isolated consumer missed a serial producer's file"
+                "round {round}: a worktree consumer missed a serial producer's file"
             );
             assert!(
                 dir.join("state/files/copy/B.md").exists(),
@@ -1245,10 +1474,12 @@ workflow(type = "playbook", tasks = [seed, produce, check])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Isolated tasks that are ready together run as one batch, and they do not share an
-    /// ancestor set: each one is owed exactly what its own ancestors declared.
+    /// Tasks that are ready together run as one batch, and they do not share an ancestor set:
+    /// each one is owed exactly what its own ancestors declared. Worktree consumers each get
+    /// their own root; readonly consumers share the one tree, so the executor only batches
+    /// readonly peers staged alike.
     #[test]
-    fn batched_isolated_consumers_each_get_their_own_ancestors_files() {
+    fn batched_worktree_consumers_each_get_their_own_ancestors_files() {
         let dir =
             std::env::temp_dir().join(format!("crucible-batch-inputs-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1272,15 +1503,27 @@ con_a = command(
     name = "con_a",
     run = "test -e inputs/prod_a/a.md && test ! -e inputs/prod_b/b.md && printf '{\"ok\": true}\n'",
     depends_on = [prod_a],
-    isolated = True,
+    workspace = "worktree",
 )
 con_b = command(
     name = "con_b",
     run = "test -e inputs/prod_a/a.md && test -e inputs/prod_b/b.md && printf '{\"ok\": true}\n'",
     depends_on = [prod_b],
-    isolated = True,
+    workspace = "worktree",
 )
-workflow(type = "playbook", tasks = [prod_a, prod_b, con_a, con_b])
+read_a = command(
+    name = "read_a",
+    run = "test -e inputs/prod_a/a.md && test ! -e inputs/prod_b/b.md && printf '{\"ok\": true}\n'",
+    depends_on = [prod_a],
+    workspace = "readonly",
+)
+read_b = command(
+    name = "read_b",
+    run = "test -e inputs/prod_a/a.md && test -e inputs/prod_b/b.md && printf '{\"ok\": true}\n'",
+    depends_on = [prod_b],
+    workspace = "readonly",
+)
+workflow(type = "playbook", tasks = [prod_a, prod_b, con_a, con_b, read_a, read_b])
 "#,
         )
         .unwrap();
@@ -1293,12 +1536,14 @@ workflow(type = "playbook", tasks = [prod_a, prod_b, con_a, con_b])
             "a batched consumer missed its own ancestor's file: {:?}",
             out.results[&"con_b".into()].note
         );
-        assert_eq!(
-            out.results[&"con_a".into()].status,
-            TaskStatus::Pass,
-            "a batched consumer was handed a file no ancestor of its declared: {:?}",
-            out.results[&"con_a".into()].note
-        );
+        for consumer in ["con_a", "read_a", "read_b"] {
+            assert_eq!(
+                out.results[&consumer.into()].status,
+                TaskStatus::Pass,
+                "{consumer} was handed the wrong files: {:?}",
+                out.results[&consumer.into()].note
+            );
+        }
         assert!(out.valid, "{:?}", out.results);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1329,12 +1574,20 @@ serial_stranger = command(
     name = "serial_stranger",
     run = "test ! -e inputs/prod/a.md && printf '{\"ok\": true}\n'",
 )
-isolated_stranger = command(
-    name = "isolated_stranger",
+worktree_stranger = command(
+    name = "worktree_stranger",
     run = "test ! -e inputs/prod/a.md && printf '{\"ok\": true}\n'",
-    isolated = True,
+    workspace = "worktree",
 )
-workflow(type = "playbook", tasks = [prod, cons, serial_stranger, isolated_stranger])
+readonly_stranger = command(
+    name = "readonly_stranger",
+    run = "test ! -e inputs/prod/a.md && printf '{\"ok\": true}\n'",
+    workspace = "readonly",
+)
+workflow(
+    type = "playbook",
+    tasks = [prod, cons, serial_stranger, worktree_stranger, readonly_stranger],
+)
 "#,
         )
         .unwrap();
@@ -1347,7 +1600,7 @@ workflow(type = "playbook", tasks = [prod, cons, serial_stranger, isolated_stran
             "a descendant missed what its ancestor declared: {:?}",
             out.results[&"cons".into()].note
         );
-        for stranger in ["serial_stranger", "isolated_stranger"] {
+        for stranger in ["serial_stranger", "worktree_stranger", "readonly_stranger"] {
             assert_eq!(
                 out.results[&stranger.into()].status,
                 TaskStatus::Pass,
@@ -1359,8 +1612,97 @@ workflow(type = "playbook", tasks = [prod, cons, serial_stranger, isolated_stran
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Every result file a turn left in `root`, which after a settled run is none of them.
+    fn result_files(root: &std::path::Path) -> Vec<String> {
+        let mut found: Vec<String> = std::fs::read_dir(root)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|e| e.file_name().to_str().map(str::to_string))
+                    .filter(|name| name.starts_with("PLAN_TASK_RESULT"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        found.sort();
+        found
+    }
+
+    /// One plain filename per task, instance names included, and never the same one twice.
     #[test]
-    fn isolation_worktree_names_do_not_collide_after_display_sanitization() {
+    fn result_files_are_per_task_and_plain() {
+        let names = [
+            "review",
+            "review-a",
+            "review/a",
+            "audit[src/lib.rs]",
+            "audit[../../etc]",
+            "audit[a b]",
+        ];
+        let files: BTreeSet<String> = names.iter().map(|n| result_file(&(*n).into())).collect();
+        assert_eq!(files.len(), names.len(), "{files:?}");
+        for file in &files {
+            assert!(file.starts_with("PLAN_TASK_RESULT.") && file.ends_with(".json"));
+            assert!(
+                file.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_')),
+                "{file}"
+            );
+        }
+        assert_eq!(
+            result_file(&"review".into()),
+            result_file(&"review".into()),
+            "a retry and a revise round find the file where the first attempt was told to write it"
+        );
+    }
+
+    /// Only a readonly agent turn on openshell forces a batch apart; every other mix of backend
+    /// and task runs together.
+    #[test]
+    fn only_a_readonly_openshell_agent_turn_takes_a_batch_one_at_a_time() {
+        let agent = |name: &str, workspace: Workspace| crate::plan::ir::Task {
+            task: TaskKind::Agent {
+                prompt: "p".into(),
+                harness: None,
+                model: None,
+                effort: None,
+            },
+            workspace,
+            ..emitting(name, &[])
+        };
+        let command = |name: &str, workspace: Workspace| crate::plan::ir::Task {
+            workspace,
+            ..emitting(name, &[])
+        };
+        let item = |task| BatchItem {
+            task,
+            attempt: 1,
+            inputs: BTreeMap::new(),
+        };
+        let reader = agent("reader", Workspace::Readonly);
+        let clone = agent("clone", Workspace::Worktree);
+        let check = command("check", Workspace::Readonly);
+        let mut args = crate::args::Args::defaults().unwrap();
+        for backend in [
+            crate::manifest::AgentBackend::Local,
+            crate::manifest::AgentBackend::Command,
+            crate::manifest::AgentBackend::Openshell,
+        ] {
+            args.agent_backend = backend;
+            let openshell = backend == crate::manifest::AgentBackend::Openshell;
+            assert_eq!(
+                one_at_a_time(&args, &[item(&reader), item(&clone)]),
+                openshell,
+                "{backend:?}"
+            );
+            assert!(
+                !one_at_a_time(&args, &[item(&clone), item(&check)]),
+                "{backend:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn worktree_names_do_not_collide_after_display_sanitization() {
         let slash = task_worktree_name(&"review/a".into());
         let dash = task_worktree_name(&"review-a".into());
         assert_ne!(slash, dash);
@@ -1417,7 +1759,7 @@ workflow(type = "playbook", tasks = [prod, cons, serial_stranger, isolated_stran
              *) test -f .claude/skills/demo/SKILL.md ;;\n\
              esac\n\
              v=$(cat value.txt); v=$((v + 1)); echo \"$v\" > value.txt\n\
-             printf '{\"new_value\": %s}\\n' \"$v\" > PLAN_TASK_RESULT.json\n",
+             printf '{\"new_value\": %s}\\n' \"$v\" > \"$CRUCIBLE_TASK_RESULT\"\n",
         )
         .unwrap();
         #[cfg(unix)]
@@ -1492,7 +1834,7 @@ workflow(type = "playbook", tasks = [prod, cons, serial_stranger, isolated_stran
             3
         );
         // The result file is drained per turn: a stale pass can't leak into the next task.
-        assert!(!dir.join("workspace").join(RESULT_FILE).exists());
+        assert_eq!(result_files(&dir.join("workspace")), Vec::<String>::new());
         assert_eq!(
             std::fs::read_to_string(dir.join("workspace/value.txt"))
                 .unwrap()
@@ -1551,14 +1893,14 @@ audit_a = agent(
     name = "audit-a",
     prompt = "audit headings",
     depends_on = [polish],
-    isolated = True,
+    workspace = "worktree",
     emits = ["findings"],
 )
 audit_b = agent(
     name = "audit-b",
     prompt = "audit freshness",
     depends_on = [polish],
-    isolated = True,
+    workspace = "worktree",
     required = False,
 )
 
@@ -1665,7 +2007,7 @@ workflow(type = "playbook", tasks = [draft, shape, polish, audit_a, audit_b, rou
         );
 
         // `audit-a` declared `reads` on a file it never wrote, in a disposable worktree. It
-        // passed, so isolation staged the workspace rather than starting from nothing.
+        // passed, so the worktree staged the workspace rather than starting from nothing.
         assert_eq!(out.results[&"audit-a".into()].status, TaskStatus::Pass);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1674,6 +2016,8 @@ workflow(type = "playbook", tasks = [draft, shape, polish, audit_a, audit_b, rou
     /// A fan-out over items nobody knew about when the graph was written, run end to end with
     /// no model. The graph has three nodes whatever `discover` returns; only the instance count
     /// is decided at run time, and each instance is named by its item rather than its position.
+    /// The instances are readonly, so they run at once in the shared tree, each writing the
+    /// result file its own name gives it.
     #[test]
     fn a_fanout_runs_one_instance_per_discovered_item() {
         let dir = std::env::temp_dir().join(format!("crucible-fanout-e2e-{}", std::process::id()));
@@ -1708,7 +2052,7 @@ audit = agent(
     depends_on = [discover],
     over = discover.targets,
     max_fanout = 8,
-    isolated = True,
+    workspace = "readonly",
     required = False,
     emits = ["findings"],
 )
@@ -1816,6 +2160,7 @@ workflow(type = "playbook", tasks = [discover, audit, roundup])
             out.exit
         );
         assert_eq!(out.results[&"roundup".into()].status, TaskStatus::Pass);
+        assert_eq!(result_files(&dir.join("workspace")), Vec::<String>::new());
 
         // A wider result than declared is refused rather than run.
         std::fs::write(
@@ -2114,14 +2459,14 @@ workflow(type = "playbook", tasks = [good, bad, after])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A declared file is part of a task's output, not part of the workspace state isolation
+    /// A declared file is part of a task's output, not part of the workspace state a worktree
     /// discards, and it reaches every descendant rather than only the next one.
     ///
-    /// Three things are proven here that nothing else covers: an isolated task's file survives
+    /// Three things are proven here that nothing else covers: a worktree task's file survives
     /// the deletion of its worktree, a task two hops downstream still receives it, and a task
     /// that passes without writing what it promised fails where it promised it.
     #[test]
-    fn a_declared_file_outlives_isolation_and_reaches_every_descendant() {
+    fn a_declared_file_outlives_its_worktree_and_reaches_every_descendant() {
         let dir = std::env::temp_dir().join(format!("crucible-emits-files-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -2138,7 +2483,7 @@ workflow(type = "playbook", tasks = [good, bad, after])
         )
         .unwrap();
 
-        // `analyze` is isolated: its worktree is deleted the moment it settles, so SPEC.md can
+        // `analyze` runs in a worktree: it is deleted the moment it settles, so SPEC.md can
         // only reach anyone if a declared file is captured rather than left in a tree.
         std::fs::write(
             dir.join("workflow.star"),
@@ -2146,7 +2491,7 @@ workflow(type = "playbook", tasks = [good, bad, after])
 analyze = agent(
     name = "analyze",
     prompt = "analyze",
-    isolated = True,
+    workspace = "worktree",
     emits_files = ["SPEC.md"],
 )
 implement = agent(
@@ -2188,11 +2533,11 @@ workflow(type = "playbook", tasks = [analyze, implement, report])
         // The captured copy is kept beside the run, not in the workspace it came from.
         assert!(
             dir.join("state/files/analyze/SPEC.md").exists(),
-            "an isolated task's declared file was not captured"
+            "a worktree task's declared file was not captured"
         );
         assert!(
             !dir.join("workspace/SPEC.md").exists(),
-            "an isolated task's file leaked into the shared workspace"
+            "a worktree task's file leaked into the shared workspace"
         );
 
         // A task that passes without writing what it promised fails where it promised it.
@@ -2295,7 +2640,7 @@ workflow(type = "playbook", tasks = [analyze, implement, report])
                 .note
                 .as_deref()
                 .unwrap_or_default()
-                .contains(RESULT_FILE),
+                .contains(&result_file(&"quiet".into())),
             "the failure names the missing result file: {result:?}"
         );
         let next = crate::agent::agent_session::prepare(&state, "solver").unwrap();
@@ -2438,12 +2783,12 @@ workflow(type = "playbook", tasks = [analyze, implement, report])
         let _ = std::fs::remove_dir_all(&hacked);
     }
 
-    /// One code node splitting into two isolated reviewers, rejoined by a policy gate.
+    /// One code node splitting into two worktree reviewers, rejoined by a policy gate.
     /// Runs the shipped panel plan against the stand-in manifest. Correct code with sloppy
     /// prose: the advisory reviewer reports defects and the run still reaches `measure`,
     /// which is what makes the join a policy rather than an AND.
     #[test]
-    fn panel_splits_into_two_isolated_reviewers_joined_by_policy() {
+    fn panel_splits_into_two_worktree_reviewers_joined_by_policy() {
         let dir = stage_review_example("panel");
         let out = run_review_plan(&dir, "plan-panel-sloppy.toml");
         assert!(
@@ -2486,20 +2831,20 @@ workflow(type = "playbook", tasks = [analyze, implement, report])
             "an advisory-only finding must not stop the expensive step"
         );
 
-        // Isolation did its job: neither reviewer's result file leaked into the shared
-        // workspace (that collision is exactly what would make two concurrent reviewers
-        // read each other's verdict), and the worktrees were cleaned up.
+        // The worktrees did their job: neither reviewer's result file leaked into the shared
+        // workspace, and the worktrees were cleaned up.
         let ws = dir.join("workspace");
-        assert!(
-            !ws.join(RESULT_FILE).exists(),
-            "an isolated task must not write its result into the shared workspace"
+        assert_eq!(
+            result_files(&ws),
+            Vec::<String>::new(),
+            "a worktree task must not write its result into the shared workspace"
         );
         let iso_root = dir.join("state/plan-iso");
         if iso_root.exists() {
             let leftovers: Vec<_> = std::fs::read_dir(&iso_root).unwrap().flatten().collect();
             assert!(
                 leftovers.is_empty(),
-                "isolation worktrees should be cleaned up, found {} left",
+                "worktrees should be cleaned up, found {} left",
                 leftovers.len()
             );
         }
@@ -2521,7 +2866,7 @@ workflow(type = "playbook", tasks = [analyze, implement, report])
             session: None,
             needs: "any".into(),
             required: true,
-            isolation: None,
+            workspace: Workspace::Shared,
             join: Join::default(),
             stage: Stage::Iteration,
             emits: Vec::new(),
@@ -2813,6 +3158,240 @@ workflow(type = "playbook", tasks = [discover, audit, roundup])
         command.arg("-C").arg(workspace);
         let out = command.args(args).output().expect("git");
         String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// A pack whose agent is `reader.sh`: every agent turn waits at a barrier until `peers` agent
+    /// turns have arrived, then reports what it read. A serial runner never gets past the barrier,
+    /// so a pass is proof the turns ran at once. A prompt naming SCRIBBLE makes the turn write the
+    /// tree instead of only reading it.
+    fn reader_pack(tag: &str, peers: usize, workflow: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("crucible-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let barrier = dir.join("barrier");
+        std::fs::write(
+            dir.join("reader.sh"),
+            format!(
+                r#"#!/bin/sh
+set -e
+barrier="{barrier}"
+mkdir -p "$barrier"
+: > "$barrier/$CRUCIBLE_TASK"
+waited=0
+while [ "$(ls "$barrier" | wc -l)" -lt {peers} ]; do
+    waited=$((waited + 1))
+    if [ "$waited" -gt 400 ]; then
+        echo "$CRUCIBLE_TASK: no peer arrived; the turns ran one at a time" >&2
+        exit 1
+    fi
+    sleep 0.05
+done
+case "$CRUCIBLE_PROMPT" in
+*SCRIBBLE*)
+    printf 'scribbled\n' > NOTES.md
+    printf 'stray\n' > STRAY.md
+    ;;
+esac
+told=false
+case "$CRUCIBLE_PROMPT" in
+*"This task is readonly"*) told=true ;;
+esac
+printf '{{"task": "%s", "read": "%s", "told": %s}}\n' "$CRUCIBLE_TASK" "$(cat NOTES.md)" "$told" \
+    > "$CRUCIBLE_TASK_RESULT"
+"#,
+                barrier = barrier.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("crucible.toml"),
+            format!(
+                r#"
+                [repo]
+                path = "."
+                [workspace]
+                dir = "workspace"
+                setup_cmd = "mkdir -p workspace && git -C workspace init -q && git -C workspace -c user.email=c@l -c user.name=c -c commit.gpgsign=false commit -q --allow-empty -m baseline"
+                [agent]
+                backend = "command"
+                agent_cmd = "sh {}"
+                goal = "read"
+                [workflow]
+                type = "playbook"
+                file = "workflow.star"
+                "#,
+                dir.join("reader.sh").display(),
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.join("workflow.star"), workflow).unwrap();
+        dir
+    }
+
+    /// Two readonly agents run at once in the shared workspace, each writes its own result file,
+    /// and both results are read back: neither reads the other's, none is left behind, and
+    /// neither commits anything.
+    #[test]
+    fn readonly_peers_run_at_once_in_the_shared_tree_and_each_result_is_read_back() {
+        let dir = reader_pack(
+            "readonly-peers",
+            2,
+            r#"
+write = command(name = "write", run = "printf 'draft' > NOTES.md && echo '{}'")
+a = agent(name = "read-a", prompt = "read", depends_on = [write], workspace = "readonly")
+b = agent(name = "read-b", prompt = "read", depends_on = [write], workspace = "readonly")
+count = command(
+    name = "count",
+    run = "printf '{\"bytes\": %s}\\n' \"$(wc -c < NOTES.md)\"",
+    depends_on = [write],
+    workspace = "readonly",
+)
+after = command(name = "after", run = "echo '{}'", depends_on = [a, b, count])
+workflow(type = "playbook", tasks = [write, a, b, count, after])
+"#,
+        );
+        let out = run_playbook(&dir);
+        assert!(out.valid, "{:?}", out.results);
+        for name in ["read-a", "read-b"] {
+            let output = out.results[&name.into()].output.clone().unwrap();
+            assert_eq!(
+                output,
+                serde_json::json!({"task": name, "read": "draft", "told": true}),
+                "{name} read back its own result"
+            );
+        }
+        assert_eq!(
+            out.results[&"count".into()].output.as_ref().unwrap()["bytes"],
+            5
+        );
+        let ws = dir.join("workspace");
+        assert_eq!(result_files(&ws), Vec::<String>::new());
+        assert_eq!(
+            git_output(&ws, &["log", "--format=%s"])
+                .lines()
+                .collect::<Vec<_>>(),
+            ["task write", "baseline"],
+            "a readonly task commits nothing"
+        );
+        assert_eq!(git_output(&ws, &["status", "--porcelain"]), "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A readonly batch that changed the tree fails every readonly task in it, the honest peer
+    /// included, because the tasks ran at once in one tree and the engine cannot say which of
+    /// them wrote. The change is put back before anything downstream runs, so it is never
+    /// committed. A readonly task alone is held to the same rule and named alone.
+    #[test]
+    fn a_readonly_batch_that_writes_fails_its_readonly_tasks_and_is_put_back() {
+        let dir = reader_pack(
+            "readonly-scribble",
+            2,
+            r#"
+write = command(name = "write", run = "printf 'draft' > NOTES.md && echo '{}'")
+rogue = agent(
+    name = "rogue",
+    prompt = "SCRIBBLE",
+    depends_on = [write],
+    workspace = "readonly",
+    required = False,
+)
+honest = agent(
+    name = "honest",
+    prompt = "read",
+    depends_on = [write],
+    workspace = "readonly",
+    required = False,
+)
+clone = command(
+    name = "clone",
+    run = "printf 'in a clone' > NOTES.md && echo '{\"cloned\": true}'",
+    depends_on = [write],
+    workspace = "worktree",
+)
+after = command(
+    name = "after",
+    run = "printf '{\"notes\": \"%s\", \"stray\": %s}\\n' \"$(cat NOTES.md)\" \"$(test -e STRAY.md && echo true || echo false)\"",
+    depends_on = [rogue, honest, clone],
+    join = "settled",
+)
+workflow(type = "playbook", tasks = [write, rogue, honest, clone, after])
+"#,
+        );
+        let out = run_playbook(&dir);
+        for (name, peer) in [("rogue", "honest"), ("honest", "rogue")] {
+            let result = &out.results[&name.into()];
+            assert_eq!(result.status, TaskStatus::Fail, "{name}: {result:?}");
+            assert_eq!(result.attempts, 1, "a write is not retried");
+            let note = result.note.as_deref().unwrap_or_default();
+            assert!(
+                note.contains("workspace = \"readonly\"")
+                    && note.contains("NOTES.md")
+                    && note.contains("STRAY.md")
+                    && note.contains("discarded")
+                    && note.contains(&format!("beside readonly {peer}")),
+                "{name}: {note}"
+            );
+            assert_eq!(
+                result.output.as_ref().unwrap()["task"],
+                name,
+                "{name} keeps its own reading"
+            );
+        }
+        assert_eq!(
+            out.results[&"clone".into()].status,
+            TaskStatus::Pass,
+            "a worktree peer wrote its own clone, not the shared tree"
+        );
+        assert_eq!(
+            out.results[&"after".into()].output.as_ref().unwrap(),
+            &serde_json::json!({"notes": "draft", "stray": false}),
+            "the next task reads the tree as the readonly batch found it"
+        );
+        let ws = dir.join("workspace");
+        assert_eq!(
+            std::fs::read_to_string(ws.join("NOTES.md")).unwrap(),
+            "draft"
+        );
+        assert!(!ws.join("STRAY.md").exists());
+        assert!(
+            !git_output(&ws, &["log", "--all", "-p"]).contains("scribbled"),
+            "the discarded write was never committed"
+        );
+
+        std::fs::write(
+            dir.join("workflow.star"),
+            r#"
+write = command(name = "write", run = "printf 'draft' > NOTES.md && echo '{}'")
+alone = agent(name = "alone", prompt = "SCRIBBLE", depends_on = [write], workspace = "readonly")
+workflow(type = "playbook", tasks = [write, alone])
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("reader.sh"),
+            std::fs::read_to_string(dir.join("reader.sh"))
+                .unwrap()
+                .replace("-lt 2 ]", "-lt 1 ]"),
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(dir.join("workspace"));
+        let _ = std::fs::remove_dir_all(dir.join("state"));
+        let _ = std::fs::remove_dir_all(dir.join("barrier"));
+        let out = run_playbook(&dir);
+        assert!(!out.valid);
+        let alone = &out.results[&"alone".into()];
+        assert_eq!(alone.status, TaskStatus::Fail, "{alone:?}");
+        let note = alone.note.as_deref().unwrap_or_default();
+        assert!(
+            note.contains("NOTES.md") && !note.contains("beside"),
+            "{note}"
+        );
+        let ws = dir.join("workspace");
+        assert_eq!(
+            std::fs::read_to_string(ws.join("NOTES.md")).unwrap(),
+            "draft"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The whole failure path in one run: the declared file is captured before the workspace is

@@ -11,8 +11,8 @@ patch and open a pull request.
 | `ref` | `main` | branch or tag to inspect |
 | `propose` | `no` | `yes` pushes a branch and opens a pull request; anything else stops at the patch |
 
-The first agent turn captures the workflow files exactly. Each workflow is checked in an
-isolated deterministic task, so findings carry the path, line, original `uses:` value, and
+The first agent turn captures the workflow files exactly. Each workflow is checked in a
+deterministic task in its own worktree, so findings carry the path, line, original `uses:` value, and
 the ref that needs pinning. The final agent resolves explicit refs through GitHub, edits only
 those located lines, and leaves expressions or refs it cannot resolve for a human.
 

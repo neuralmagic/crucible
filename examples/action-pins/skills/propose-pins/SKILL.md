@@ -63,7 +63,7 @@ workflow refs pinned, a table of every edit (workflow, line, before, after), and
 every finding left alone with the reason it needs a person. If the credential or a remote
 operation later fails, add that fact to the proposal. Do not include process narration.
 
-Write `PLAN_TASK_RESULT.json` exactly:
+Write the result file the Result contract below names, exactly:
 
 ```json
 {"proposed": "<pull request URL, or `patch only`, or `nothing to fix`>", "fixed": "<N>"}

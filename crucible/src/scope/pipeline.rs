@@ -2017,8 +2017,8 @@ workflow([agent(name = "review", prompt = prompt_file("prompts/review.md") + par
             r#"
 candidate = propose(name = "invent", session = "solver")
 live = apply(name = "apply", depends_on = [candidate])
-score = evaluate(name = "score", run = "echo '{\"score\": 2}'", depends_on = [live], isolated = True)
-trace = evaluate(name = "trace", run = "echo '{\"pass\": true}'", depends_on = [live], required = False, isolated = True)
+score = evaluate(name = "score", run = "echo '{\"score\": 2}'", depends_on = [live], workspace = "worktree")
+trace = evaluate(name = "trace", run = "echo '{\"pass\": true}'", depends_on = [live], required = False, workspace = "worktree")
 measurement = grade(name = "grade", evidence = [score, trace], score = score)
 decision = decide(name = "choose", measurement = measurement)
 workflow(type = "autoresearch", tasks = [candidate, live, score, trace, measurement, decision], result = decision)

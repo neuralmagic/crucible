@@ -15,7 +15,7 @@ the fork that inherits this code on the next sync; the tracking issues are filed
 
 ## The shape
 
-`scan` reads the declared variant matrix. `probe` fans out one isolated instance per variant and
+`scan` reads the declared variant matrix. `probe` fans out one worktree instance per variant and
 decides clean or dirty from `cargo tree -e normal` — free, no model. `select` emits only the dirty
 ones, so a clean sweep spends nothing. `triage` is the single agent, and only for a dirty variant:
 it names the dependency edge that carries the blocker, proposes the smallest fix, and drafts a
