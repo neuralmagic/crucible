@@ -107,19 +107,7 @@ fn classify_line(line: &str) -> TurnEvent {
             return TurnEvent::Activity(payload.to_string());
         }
     }
-    TurnEvent::Log(cap_line(trimmed, LOG_LINE_CAP))
-}
-
-/// Truncate to at most `cap` bytes on a char boundary, marking the cut.
-pub(crate) fn cap_line(s: &str, cap: usize) -> String {
-    if s.len() <= cap {
-        return s.to_string();
-    }
-    let mut end = cap;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…[truncated]", &s[..end])
+    TurnEvent::Log(crate::runs::live::cap_line(trimmed, LOG_LINE_CAP))
 }
 
 /// Map one [`TurnEvent`] to its SSE frame.

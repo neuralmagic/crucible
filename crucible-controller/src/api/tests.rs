@@ -1,12 +1,19 @@
 use super::*;
+#[cfg(feature = "autoresearch")]
 use crate::api::dto::*;
+#[cfg(feature = "autoresearch")]
 use crate::builds::model::NewBuild;
+#[cfg(feature = "autoresearch")]
 use crate::builds::model::{BuildBackendKind, BuildState};
 use crate::client::Db;
+#[cfg(feature = "autoresearch")]
 use crate::daemon::queue::OverrideKind;
 use crate::daemon::queue::{Override, OverrideSink};
+#[cfg(feature = "autoresearch")]
 use crate::issues::model::IssueQuery;
+#[cfg(feature = "autoresearch")]
 use crate::issues::model::{InputKind, NewIssue};
+#[cfg(feature = "autoresearch")]
 use crate::model::Status;
 use crate::runs::model::{NewCandidate, NewRun};
 use anyhow::Result;
@@ -39,6 +46,7 @@ fn db_with(pool: PgPool) -> (Db, tempfile::TempDir) {
     (db, dir)
 }
 
+#[cfg(feature = "autoresearch")]
 fn sample_issue(key: &str) -> NewIssue {
     NewIssue {
         key: key.to_string(),
@@ -86,6 +94,7 @@ fn app_with_contracts(
 }
 
 /// One configured contract, `deepgemm`, with a body small enough to assert on verbatim.
+#[cfg(feature = "autoresearch")]
 fn test_contracts() -> crate::config::BrokerContracts {
     crate::config::BrokerContracts::from_map(std::collections::BTreeMap::from([(
         "deepgemm".to_string(),
@@ -107,6 +116,7 @@ fn app_with_admins_and_jira(
 
 /// Spawn a one-shot local HTTP listener that answers any request with a canned
 /// `/rest/api/2/issue/{KEY}` payload — the real reqwest path, no mocked client. Returns its base URL.
+#[cfg(feature = "autoresearch")]
 async fn spawn_mock_jira(
     summary: &str,
     description: &str,
@@ -148,6 +158,7 @@ fn app_with_roles(
 /// The repo-watch-set (Lane O3) test rig: an admin (and, optionally, an operator) plus an
 /// explicit whitelist, so `POST /api/repos` tests control both the org whitelist and the
 /// caller's role independently.
+#[cfg(feature = "autoresearch")]
 fn app_with_repo_whitelist(
     db: Db,
     admins: Vec<String>,
@@ -183,6 +194,7 @@ async fn healthz_reports_ok(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn issue_facets_count_each_axis_without_its_own_filter(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -230,6 +242,7 @@ async fn issue_facets_count_each_axis_without_its_own_filter(pool: PgPool) -> Re
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn list_issues_filters_by_status(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -258,6 +271,7 @@ async fn list_issues_filters_by_status(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn list_issues_upstream_filters_validate_and_apply(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -311,6 +325,7 @@ async fn list_issues_upstream_filters_validate_and_apply(pool: PgPool) -> Result
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn get_issue_detail_carries_body_and_comments(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -348,6 +363,7 @@ async fn get_issue_detail_carries_body_and_comments(pool: PgPool) -> Result<()> 
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn get_issue_returns_full_provenance_or_404(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -531,6 +547,7 @@ async fn list_runs_returns_most_recent_with_default_and_explicit_limit(pool: PgP
 }
 
 /// Seed a run under a repo (issue → scope → run), so the leaderboard join resolves issue_key + repo.
+#[cfg(feature = "autoresearch")]
 async fn seed_scoped_run(
     db: &Db,
     repo: &str,
@@ -629,6 +646,7 @@ async fn get_json_object(app: &Router, uri: &str) -> (StatusCode, serde_json::Va
     (status, v)
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn list_runs_page_sorts_filters_and_pages(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -742,6 +760,7 @@ async fn list_runs_page_sorts_filters_and_pages(pool: PgPool) -> Result<()> {
 }
 
 /// Seed a build under a fresh issue+scope, returning the build id (so the caller can pin it).
+#[cfg(feature = "autoresearch")]
 async fn seed_scoped_build(
     db: &Db,
     repo: &str,
@@ -788,6 +807,7 @@ async fn seed_scoped_build(
     .await
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn list_builds_filters_and_pages_and_per_issue(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -860,6 +880,7 @@ async fn list_builds_filters_and_pages_and_per_issue(pool: PgPool) -> Result<()>
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn rebuild_build_requires_admin(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -898,6 +919,7 @@ async fn rebuild_build_404_on_unknown_id(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn rebuild_build_409_when_in_flight(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -927,6 +949,7 @@ async fn rebuild_build_409_when_in_flight(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn rebuild_build_resets_row_and_unparks_the_issue_it_had_parked(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -992,6 +1015,7 @@ async fn rebuild_build_resets_row_and_unparks_the_issue_it_had_parked(pool: PgPo
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn rebuild_build_leaves_a_still_building_issue_alone(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -1025,6 +1049,7 @@ async fn rebuild_build_leaves_a_still_building_issue_alone(pool: PgPool) -> Resu
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn rebuild_build_409_when_issue_has_moved_past_building(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -1059,6 +1084,7 @@ async fn rebuild_build_409_when_issue_has_moved_past_building(pool: PgPool) -> R
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn rebuild_build_409_when_issue_parked_for_another_reason(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -1096,6 +1122,7 @@ async fn rebuild_build_409_when_issue_parked_for_another_reason(pool: PgPool) ->
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn rebuild_build_409_when_no_scope(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -1236,6 +1263,7 @@ async fn run_graph_returns_newest_plan_or_404(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn get_run_returns_candidates_or_404(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -1289,6 +1317,7 @@ async fn get_run_returns_candidates_or_404(pool: PgPool) -> Result<()> {
 
 /// A run detail echoes the pair its issue pinned, in that order, so the run page says which
 /// provider and model the work was committed to rather than leaving a reader to guess.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn get_run_echoes_the_issues_pinned_pair(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -1429,6 +1458,7 @@ async fn ledger_by_tag_without_caps_has_null_ceiling(pool: PgPool) -> Result<()>
 
 /// Seed one `work_pods` row in `state` (routed through the insert + a state advance, exactly
 /// as dispatch does), carrying `error` when failed.
+#[cfg(feature = "autoresearch")]
 async fn seed_work_pod(
     db: &Db,
     pod_name: &str,
@@ -1455,6 +1485,7 @@ async fn seed_work_pod(
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn list_turns_filters_orders_and_limits(pool: PgPool) -> Result<()> {
     use crate::runs::workpod::WorkPodState as S;
@@ -1519,6 +1550,7 @@ async fn list_turns_filters_orders_and_limits(pool: PgPool) -> Result<()> {
 
 /// The list/detail split for long free text: `GET /api/turns` serves a flagged preview, and the
 /// row expansion's `GET /api/turns/{pod_name}` serves the whole thing.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn turns_list_previews_the_error_and_the_detail_serves_it_whole(pool: PgPool) -> Result<()> {
     use crate::runs::workpod::WorkPodState as S;
@@ -1555,6 +1587,7 @@ async fn turns_list_previews_the_error_and_the_detail_serves_it_whole(pool: PgPo
 
 /// The same split for `GET /api/issues`: a parked reason embeds a pod log tail, and the whole
 /// backlog ships on one unpaginated response. The list previews it; the detail keeps it whole.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn issues_list_previews_the_parked_reason_and_the_detail_serves_it_whole(
     pool: PgPool,
@@ -1594,6 +1627,7 @@ async fn issues_list_previews_the_parked_reason_and_the_detail_serves_it_whole(
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn list_events_returns_the_tail_newest_first_with_keys(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -1641,6 +1675,7 @@ async fn list_events_returns_the_tail_newest_first_with_keys(pool: PgPool) -> Re
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn events_stream_emits_a_transition_as_sse_json(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -1698,6 +1733,7 @@ async fn events_stream_emits_a_transition_as_sse_json(pool: PgPool) -> Result<()
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn park_json_enqueues_override_without_touching_the_db(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -1740,6 +1776,7 @@ async fn park_json_enqueues_override_without_touching_the_db(pool: PgPool) -> Re
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn park_carries_the_proxy_identity_as_the_actor(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -1765,6 +1802,7 @@ async fn park_carries_the_proxy_identity_as_the_actor(pool: PgPool) -> Result<()
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn park_form_redirects_and_enqueues(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -1800,6 +1838,7 @@ async fn park_form_redirects_and_enqueues(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn unpark_and_bump_enqueue_without_a_body(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -1836,6 +1875,7 @@ async fn unpark_and_bump_enqueue_without_a_body(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn overview_returns_counts_without_caps(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -1862,6 +1902,7 @@ async fn overview_returns_counts_without_caps(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn overview_includes_caps_when_present(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -1888,6 +1929,7 @@ async fn overview_includes_caps_when_present(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn funnel_returns_a_stage_for_every_pipeline_bucket(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -2035,6 +2077,7 @@ async fn the_static_token_is_whoami_as_the_configured_identity(pool: PgPool) -> 
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn get_approvals_returns_awaiting_approval_and_kept_prs(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -2106,20 +2149,70 @@ async fn get_approvals_returns_awaiting_approval_and_kept_prs(pool: PgPool) -> R
     )
     .await?;
 
-    let app = app(db, Arc::new(Recorder::default()));
-    let res = app
-        .oneshot(HttpRequest::get("/api/approvals").body(Body::empty())?)
-        .await?;
-    assert_eq!(res.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await?;
-    let v: serde_json::Value = serde_json::from_slice(&body)?;
+    let on = app(db.clone(), Arc::new(Recorder::default()));
+    let (status, v) = get_json_object(&on, "/api/approvals").await;
+    assert_eq!(status, StatusCode::OK);
     assert_eq!(v["awaiting_approval"].as_array().unwrap().len(), 1);
     assert_eq!(v["kept_prs"].as_array().unwrap().len(), 1);
     assert_eq!(v["awaiting_approval"][0]["key"], "owner/repo#1");
     assert_eq!(v["kept_prs"][0]["issue"], "owner/repo#2");
+
+    let off = router(ApiState {
+        autoresearch: false,
+        ..ApiState::test(db, Arc::new(Recorder::default()))
+    });
+    let (status, v) = get_json_object(&off, "/api/approvals").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["awaiting_approval"], serde_json::json!([]));
+    assert_eq!(v["kept_prs"], serde_json::json!([]));
     Ok(())
 }
 
+/// With the lane off, its routes are not served and the version says so; the playbook surface
+/// is untouched.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn the_autoresearch_routes_are_served_only_with_the_lane_on(pool: PgPool) -> Result<()> {
+    let (db, _d) = db_with(pool);
+    let state = ApiState::test(db.clone(), Arc::new(Recorder::default()));
+    #[cfg(feature = "autoresearch")]
+    let state = ApiState {
+        autoresearch: false,
+        ..state
+    };
+    let off = router(state);
+    for uri in [
+        "/api/issues",
+        "/api/autopilot",
+        "/api/turns",
+        "/api/repos",
+        "/api/builds",
+    ] {
+        let (status, _) = get_json_object(&off, uri).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+    }
+    let (status, version) = get_json_object(&off, "/api/version").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(version["autoresearch"], false);
+    let (_, spec) = get_json_object(&off, "/api/openapi.json").await;
+    assert!(spec["paths"].get("/api/issues").is_none());
+    assert!(spec["paths"].get("/api/playbooks").is_some());
+    let (status, _) = get_json_object(&off, "/api/playbooks").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let on = app(db, Arc::new(Recorder::default()));
+    let (_, version) = get_json_object(&on, "/api/version").await;
+    assert_eq!(version["autoresearch"], cfg!(feature = "autoresearch"));
+    let (status, _) = get_json_object(&on, "/api/issues").await;
+    let expected = if cfg!(feature = "autoresearch") {
+        StatusCode::OK
+    } else {
+        StatusCode::NOT_FOUND
+    };
+    assert_eq!(status, expected);
+    Ok(())
+}
+
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn issue_surfaces_carry_the_latest_kept_pr_url(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -2220,6 +2313,7 @@ async fn issue_surfaces_carry_the_latest_kept_pr_url(pool: PgPool) -> Result<()>
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn get_scope_evidence_parses_the_refine_trail_off_the_stored_pack(
     pool: PgPool,
@@ -2264,6 +2358,7 @@ async fn get_scope_evidence_parses_the_refine_trail_off_the_stored_pack(
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn get_scope_evidence_is_empty_trail_for_a_pack_with_no_refine_section(
     pool: PgPool,
@@ -2313,6 +2408,7 @@ async fn get_scope_evidence_404s_an_unknown_scope(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn get_scope_report_serves_the_latest_structured_report(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -2367,6 +2463,7 @@ async fn get_scope_report_serves_the_latest_structured_report(pool: PgPool) -> R
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn get_scope_report_404s_an_issue_with_no_report(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -2379,6 +2476,7 @@ async fn get_scope_report_404s_an_issue_with_no_report(pool: PgPool) -> Result<(
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn get_scope_transcript_serves_the_stored_ndjson_decompressed(pool: PgPool) -> Result<()> {
     use std::io::Write as _;
@@ -2425,6 +2523,7 @@ async fn get_scope_transcript_serves_the_stored_ndjson_decompressed(pool: PgPool
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn get_scope_transcript_404s_an_issue_with_no_transcript(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -2439,6 +2538,7 @@ async fn get_scope_transcript_404s_an_issue_with_no_transcript(pool: PgPool) -> 
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn get_repos_returns_repo_health(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -2468,6 +2568,7 @@ async fn get_repos_returns_repo_health(pool: PgPool) -> Result<()> {
 
 /// Points `GITHUB_API_URL` at `server` for the body of `f`, holding the crate-wide env lock
 /// (the same discipline `triage`/`reconcile` tests use for this shared global).
+#[cfg(feature = "autoresearch")]
 async fn with_github_env<F, Fut, T>(server_uri: &str, f: F) -> T
 where
     F: FnOnce() -> Fut,
@@ -2484,6 +2585,7 @@ where
     out
 }
 
+#[cfg(feature = "autoresearch")]
 async fn mount_repo_exists(server: &wiremock::MockServer, repo: &str) {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, ResponseTemplate};
@@ -2494,6 +2596,7 @@ async fn mount_repo_exists(server: &wiremock::MockServer, repo: &str) {
         .await;
 }
 
+#[cfg(feature = "autoresearch")]
 async fn mount_repo_missing(server: &wiremock::MockServer, repo: &str) {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, ResponseTemplate};
@@ -2504,6 +2607,7 @@ async fn mount_repo_missing(server: &wiremock::MockServer, repo: &str) {
         .await;
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn add_repo_requires_admin(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -2527,6 +2631,7 @@ async fn add_repo_requires_admin(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn add_repo_rejects_malformed_repo_with_422(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -2556,6 +2661,7 @@ async fn add_repo_rejects_malformed_repo_with_422(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn add_repo_rejects_org_not_on_the_whitelist_with_422(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -2585,6 +2691,7 @@ async fn add_repo_rejects_org_not_on_the_whitelist_with_422(pool: PgPool) -> Res
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn add_repo_rejects_a_repo_that_does_not_exist_on_github(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -2614,6 +2721,7 @@ async fn add_repo_rejects_a_repo_that_does_not_exist_on_github(pool: PgPool) -> 
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn add_repo_requires_a_non_empty_justification(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -2635,6 +2743,7 @@ async fn add_repo_requires_a_non_empty_justification(pool: PgPool) -> Result<()>
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn add_repo_succeeds_and_audits_then_conflicts_on_a_repeat(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -2681,6 +2790,7 @@ async fn add_repo_succeeds_and_audits_then_conflicts_on_a_repeat(pool: PgPool) -
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn add_repo_is_exempt_from_the_whitelist_when_env_seeded(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -2708,6 +2818,7 @@ async fn add_repo_is_exempt_from_the_whitelist_when_env_seeded(pool: PgPool) -> 
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn pause_resume_unwatch_require_admin_and_transition_correctly(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -2816,6 +2927,7 @@ async fn pause_resume_unwatch_require_admin_and_transition_correctly(pool: PgPoo
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn scope_now_post_enqueues_override_with_justification(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -2870,6 +2982,7 @@ async fn scope_now_post_enqueues_override_with_justification(pool: PgPool) -> Re
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn redispatch_post_enqueues_override_and_is_admin_gated(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -3048,7 +3161,8 @@ async fn openapi_spec_contains_all_api_routes(pool: PgPool) -> Result<()> {
     let spec: serde_json::Value = serde_json::from_slice(&body)?;
 
     let paths = spec["paths"].as_object().expect("paths object");
-    let expected_paths = [
+    #[allow(unused_mut)]
+    let mut expected_paths = vec![
         "/healthz",
         "/api/whoami",
         "/api/teams",
@@ -3079,15 +3193,8 @@ async fn openapi_spec_contains_all_api_routes(pool: PgPool) -> Result<()> {
         "/api/prefs/pickers",
         "/api/overview",
         "/api/funnel",
-        "/api/issues",
-        "/api/issues/facets",
-        "/api/issues/{key}",
-        "/api/issues/{key}/journey",
-        "/api/issues/{key}/builds",
         "/api/runs",
-        "/api/builds",
         "/api/clusters",
-        "/api/builds/{id}/rebuild",
         "/api/runs/{run_id}",
         "/api/runs/{run_id}/iterations",
         "/api/runs/{run_id}/graph",
@@ -3101,33 +3208,14 @@ async fn openapi_spec_contains_all_api_routes(pool: PgPool) -> Result<()> {
         "/api/export/runs.parquet",
         "/api/export/iterations.parquet",
         "/api/runs/{run_id}/live",
-        "/api/turns/{pod_name}/live",
         "/api/ledger/summary",
         "/api/ledger/by-tag",
-        "/api/turns",
-        "/api/turns/{pod_name}",
         "/api/events",
         "/api/events/stream",
         "/api/approvals",
-        "/api/approvals/{scope_id}/evidence",
-        "/api/issues/{key}/scope-report",
-        "/api/issues/{key}/scope-transcript",
-        "/api/repos",
-        "/api/repos/{repo}/pause",
-        "/api/repos/{repo}/resume",
-        "/api/repos/{repo}",
         "/api/issues/{key}/park",
         "/api/issues/{key}/unpark",
-        "/api/issues/{key}/bump",
-        "/api/issues/{key}/redispatch",
-        "/api/issues/{key}/rerank",
-        "/api/issues/rerank",
         "/api/reconcile",
-        "/api/autopilot",
-        "/api/issues/{key}/scope",
-        "/api/scenarios",
-        "/api/scenarios/{key}/approve",
-        "/api/jira",
         "/api/emissions/run",
         "/api/runs/{run_id}/session",
         "/api/config",
@@ -3147,7 +3235,6 @@ async fn openapi_spec_contains_all_api_routes(pool: PgPool) -> Result<()> {
         "/api/playbooks/{id}",
         "/api/playbooks/{id}/schema",
         "/api/playbooks/{id}/launch",
-        "/api/packs/launch",
         "/api/playbook-drafts",
         "/api/playbook-drafts/from-git",
         "/api/playbook-drafts/{id}",
@@ -3191,6 +3278,36 @@ async fn openapi_spec_contains_all_api_routes(pool: PgPool) -> Result<()> {
         "/api/images/refresh",
         "/api/images/rank",
     ];
+    #[cfg(feature = "autoresearch")]
+    expected_paths.extend([
+        "/api/issues",
+        "/api/issues/facets",
+        "/api/issues/{key}",
+        "/api/issues/{key}/journey",
+        "/api/issues/{key}/builds",
+        "/api/builds",
+        "/api/builds/{id}/rebuild",
+        "/api/turns/{pod_name}/live",
+        "/api/turns",
+        "/api/turns/{pod_name}",
+        "/api/approvals/{scope_id}/evidence",
+        "/api/issues/{key}/scope-report",
+        "/api/issues/{key}/scope-transcript",
+        "/api/repos",
+        "/api/repos/{repo}/pause",
+        "/api/repos/{repo}/resume",
+        "/api/repos/{repo}",
+        "/api/issues/{key}/bump",
+        "/api/issues/{key}/redispatch",
+        "/api/issues/{key}/rerank",
+        "/api/issues/rerank",
+        "/api/autopilot",
+        "/api/issues/{key}/scope",
+        "/api/scenarios",
+        "/api/scenarios/{key}/approve",
+        "/api/jira",
+        "/api/packs/launch",
+    ]);
 
     for path in &expected_paths {
         assert!(
@@ -3208,6 +3325,7 @@ async fn openapi_spec_contains_all_api_routes(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn admin_guard_403s_non_admin_on_autopilot_set(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -3228,6 +3346,7 @@ async fn admin_guard_403s_non_admin_on_autopilot_set(pool: PgPool) -> Result<()>
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn admin_guard_allows_whitelisted_user(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -3249,6 +3368,7 @@ async fn admin_guard_allows_whitelisted_user(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn rerank_endpoints_are_admin_only(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -3283,6 +3403,7 @@ async fn rerank_endpoints_are_admin_only(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn rerank_single_clears_the_cache_keeps_the_tier_and_events(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -3338,6 +3459,7 @@ async fn rerank_single_clears_the_cache_keeps_the_tier_and_events(pool: PgPool) 
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn rerank_bulk_filters_count_affected_rows_and_logs_one_summary_event(
     pool: PgPool,
@@ -3493,6 +3615,7 @@ async fn trigger_reconcile_acks_fires_the_notify_and_audits(pool: PgPool) -> Res
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn admin_guard_403s_anonymous(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -3509,6 +3632,7 @@ async fn admin_guard_403s_anonymous(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn empty_admin_list_locks_closed(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -3526,6 +3650,7 @@ async fn empty_admin_list_locks_closed(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn get_autopilot_returns_default_enabled(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -3542,6 +3667,7 @@ async fn get_autopilot_returns_default_enabled(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn set_autopilot_appends_audit_event(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -3635,6 +3761,7 @@ async fn whoami_reports_role_for_admin_operator_and_viewer(pool: PgPool) -> Resu
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn get_access_lists_admins_operators_and_allowed_orgs(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -3661,6 +3788,7 @@ async fn get_access_lists_admins_operators_and_allowed_orgs(pool: PgPool) -> Res
 
 /// The complete 403 matrix for every operator-gated route (park/unpark/bump): a viewer is
 /// refused, an operator passes, and an admin passes too (admin implies operator).
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn operator_guard_covers_park_unpark_bump_for_every_tier(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -3729,6 +3857,7 @@ async fn operator_guard_covers_park_unpark_bump_for_every_tier(pool: PgPool) -> 
 
 /// Empty operator + admin lists lock every operator-gated route closed, even for a caller
 /// with a plausible-looking identity.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn empty_operator_list_locks_closed(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -3749,6 +3878,7 @@ async fn empty_operator_list_locks_closed(pool: PgPool) -> Result<()> {
 
 /// ScopeNow and the autopilot kill switch stay admin-only: an operator who isn't an admin
 /// still gets 403.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn operator_alone_cannot_scope_now_or_set_autopilot(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -4072,6 +4202,7 @@ async fn put_config_overrides_writes_and_audits(pool: PgPool) -> Result<()> {
 
 // --- scenario adopt + approve (Phase 4) ---------------------------------------
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn adopt_scenario_requires_admin(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -4091,6 +4222,7 @@ async fn adopt_scenario_requires_admin(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn adopt_scenario_rejects_blank_fields(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -4110,6 +4242,7 @@ async fn adopt_scenario_rejects_blank_fields(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn adopt_scenario_rejects_empty_repo_list(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -4129,6 +4262,7 @@ async fn adopt_scenario_rejects_empty_repo_list(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn adopt_scenario_rejects_blank_repo_entry(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -4151,6 +4285,7 @@ async fn adopt_scenario_rejects_blank_repo_entry(pool: PgPool) -> Result<()> {
 /// The happy path: an admin's adopt POST mints an `issues` row (`input_kind='scenario'`, `new`,
 /// a preset tier) plus its `scenarios` sidecar in one transaction, and a ledger event names the
 /// actor + justification.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn adopt_scenario_creates_issue_scenario_row_and_ledger_event(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -4210,6 +4345,7 @@ async fn adopt_scenario_creates_issue_scenario_row_and_ledger_event(pool: PgPool
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn direct_pack_launch_freezes_an_approved_autoresearch_scope(pool: PgPool) -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -4287,6 +4423,7 @@ async fn direct_pack_launch_freezes_an_approved_autoresearch_scope(pool: PgPool)
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn adopt_authoritative_scenario_persists_the_flag(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -4329,6 +4466,7 @@ async fn adopt_authoritative_scenario_persists_the_flag(pool: PgPool) -> Result<
 /// A valid `git_ref` lands on the issue row (where the turn dispatch reads it) and is echoed on the
 /// ack. The `scenarios` sidecar does NOT carry it: the ref pins the CLONE, and the clone target is
 /// an `issues` column.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn adopt_scenario_persists_a_valid_git_ref(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -4379,6 +4517,7 @@ async fn adopt_scenario_persists_a_valid_git_ref(pool: PgPool) -> Result<()> {
 }
 
 /// An omitted `git_ref` leaves the column NULL — the default branch, exactly as before this existed.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn adopt_scenario_without_a_git_ref_leaves_it_null(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -4410,6 +4549,7 @@ async fn adopt_scenario_without_a_git_ref_leaves_it_null(pool: PgPool) -> Result
 /// The ref ends up in a turn pod's argv, so the grammar is deliberately narrow: flag injection, git
 /// rev-range/traversal syntax, shell metacharacters, whitespace, and a present-but-blank value are
 /// all 422s, not sanitized-and-accepted.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn adopt_scenario_rejects_a_malformed_git_ref(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -4460,6 +4600,7 @@ async fn adopt_scenario_rejects_a_malformed_git_ref(pool: PgPool) -> Result<()> 
 
 /// A configured contract name lands on the issue row (where both dispatches read it) and is echoed
 /// on the ack. The NAME is what persists — the JSON is resolved from config at each dispatch.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn adopt_scenario_persists_a_configured_codegen_contract(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -4492,6 +4633,7 @@ async fn adopt_scenario_persists_a_configured_codegen_contract(pool: PgPool) -> 
 }
 
 /// An omitted contract leaves the column NULL — local measure, exactly as before this existed.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn adopt_scenario_without_a_codegen_contract_leaves_it_null(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -4521,6 +4663,7 @@ async fn adopt_scenario_without_a_codegen_contract_leaves_it_null(pool: PgPool) 
 
 /// A name the deploy does not configure is a 422 at adoption, not a row that parks hours later at
 /// its first run dispatch. Present-but-blank is a caller mistake, not "local measure".
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn adopt_scenario_rejects_an_unconfigured_codegen_contract(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -4597,6 +4740,7 @@ async fn broker_contracts_endpoint_lists_the_configured_names(pool: PgPool) -> R
 }
 
 /// Unconfigured Jira: the adopt endpoint answers a clean 503 instead of issuing a broken fetch.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn adopt_jira_unconfigured_returns_503(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -4617,6 +4761,7 @@ async fn adopt_jira_unconfigured_returns_503(pool: PgPool) -> Result<()> {
 }
 
 /// Non-admins can't adopt a Jira issue even when Jira is configured.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn adopt_jira_requires_admin(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -4642,6 +4787,7 @@ async fn adopt_jira_requires_admin(pool: PgPool) -> Result<()> {
 }
 
 /// A malformed issue key is a 422 (request error), never a silent `Unknown` row.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn adopt_jira_rejects_malformed_key(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -4669,6 +4815,7 @@ async fn adopt_jira_rejects_malformed_key(pool: PgPool) -> Result<()> {
 /// The happy path: an admin adopts a Jira issue by key; the controller fetches its title/body from
 /// (a mock) Jira Cloud and mints an `issues` row (`input_kind='jira'`, key `jira:{site}:{PROJ-N}`,
 /// `new`, preset tier) plus its body sidecar, with a ledger event naming the actor + justification.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn adopt_jira_fetches_and_creates_issue_row_and_ledger_event(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -4735,6 +4882,7 @@ async fn adopt_jira_fetches_and_creates_issue_row_and_ledger_event(pool: PgPool)
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn approve_scenario_requires_admin(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -4751,6 +4899,7 @@ async fn approve_scenario_requires_admin(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn approve_scenario_404s_with_no_pending_scope(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -4774,6 +4923,7 @@ async fn approve_scenario_404s_with_no_pending_scope(pool: PgPool) -> Result<()>
 
 /// The approve endpoint stamps `approved_at` on the scenario's latest scope — the same
 /// `is_approved()` signal the draft-PR poll flips for a GitHub issue — fed from the UI instead.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn approve_scenario_stamps_approved_at(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -4821,6 +4971,7 @@ async fn approve_scenario_stamps_approved_at(pool: PgPool) -> Result<()> {
 
 /// A second approve on an already-approved scope must not overwrite the ledgered stamp or emit a
 /// second audit event; it reports the stamp that actually landed with a 409.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn approve_scenario_conflicts_on_already_approved_scope(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -6778,7 +6929,7 @@ async fn launching_with_bad_values_is_422_naming_each_field(pool: PgPool) -> Res
 const OPENSHELL_MANIFEST: &str = "[repo]\npath = \".\"\n\n[workflow]\ntype = \"playbook\"\nfile = \"workflow.star\"\n\n\
      [agent]\nbackend = \"openshell\"\nsandbox_image = \"quay.io/x/sandbox:dev\"\n";
 
-/// A deployment that runs playbooks locally cannot give an OpenShell pack its sandbox, and says so
+/// A pod deployment with no deploy profile cannot give an OpenShell pack its sandbox, and says so
 /// at launch — where a person is watching — instead of at the bottom of a failed reconcile.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn launching_a_backend_this_deployment_cannot_dispatch_is_refused(
@@ -6788,7 +6939,7 @@ async fn launching_a_backend_this_deployment_cannot_dispatch_is_refused(
     let app = router(ApiState {
         roles: crate::identity::auth::Roles::new(vec!["wren".to_string()], vec![], vec![]),
         dispatch: crate::playbooks::dispatch::DispatchCapability::new(
-            crate::config::PlaybookExecutor::Local,
+            crate::config::PlaybookExecutor::Pod,
             false,
         ),
         ..ApiState::test(db.clone(), Arc::new(Recorder::default()))
@@ -6813,7 +6964,7 @@ async fn launching_a_backend_this_deployment_cannot_dispatch_is_refused(
         "quay.io/x/sandbox:dev"
     );
     assert_eq!(listed[0]["dispatch"]["dispatchable"], false);
-    assert_eq!(listed[0]["dispatch"]["local_mode"], true);
+    assert_eq!(listed[0]["dispatch"]["local_mode"], false);
 
     let (status, body) = post_launch(
         &app,
@@ -6828,7 +6979,7 @@ async fn launching_a_backend_this_deployment_cannot_dispatch_is_refused(
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     let message = body["fields"][0]["message"].as_str().unwrap_or_default();
-    assert!(message.contains("openshell"), "{body}");
+    assert!(message.contains("CONTROLLER_DEPLOY_PROFILE"), "{body}");
     assert_eq!(
         body["error"], "this deployment cannot dispatch the pack's agent backend",
         "the headline names the refusal; the parameters were fine"
@@ -10156,6 +10307,7 @@ async fn an_admin_sets_and_clears_a_dispatch_default(pool: PgPool) -> Result<()>
 
 /// A launch that picks a provider pins the pair on its issue row, where every later dispatch reads
 /// it, and echoes what it pinned.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn adopt_scenario_pins_the_provider_it_picked(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -10210,6 +10362,7 @@ async fn adopt_scenario_pins_the_provider_it_picked(pool: PgPool) -> Result<()> 
 /// Every launch surface that renders a picker pins the pair the same way: a playbook-class
 /// launch stores it on its row exactly as an autoresearch one does, and the run reaches the pod as
 /// `crucible plan run --harness/--model` replacing the pack manifest's `[agent]` table.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn every_launch_surface_agrees_on_what_a_provider_pin_means(pool: PgPool) -> Result<()> {
     let (db, dir) = db_with(pool);
@@ -10352,6 +10505,7 @@ async fn every_launch_surface_agrees_on_what_a_provider_pin_means(pool: PgPool) 
 /// The same refusals on the playbook surfaces: a registered launch and a draft test-fire each
 /// refuse a disabled or unregistered provider, a model with no provider, a blank field, and a
 /// model name a shell would read, and each refusal adopts nothing.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn a_playbook_launch_refuses_a_pin_it_may_not_pick(pool: PgPool) -> Result<()> {
     let (db, dir) = db_with(pool);
@@ -10472,6 +10626,7 @@ async fn a_playbook_launch_refuses_a_pin_it_may_not_pick(pool: PgPool) -> Result
 
 /// A model name is one argv word in the loop pod's `/bin/sh -c` wrapper, so the launch refuses
 /// anything a shell would read as syntax rather than as a model.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn a_launch_refuses_a_model_name_a_shell_would_read(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -10515,6 +10670,7 @@ async fn a_launch_refuses_a_model_name_a_shell_would_read(pool: PgPool) -> Resul
 
 /// A provider work still names cannot be deregistered: the pin would outlive the registration and
 /// every dispatch reading it would fail with no API left to clear it. Disabling is the retirement.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn deregistering_a_pinned_provider_is_refused(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -10580,6 +10736,7 @@ async fn deregistering_a_pinned_provider_is_refused(pool: PgPool) -> Result<()> 
 
 /// An adoption that picks nothing leaves both columns null, which is what keeps a deployment with
 /// no registry dispatching exactly as it did before one existed.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn adopt_scenario_without_a_provider_pins_nothing(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -10612,6 +10769,7 @@ async fn adopt_scenario_without_a_provider_pins_nothing(pool: PgPool) -> Result<
 /// The ways a launch's provider choice is wrong: a provider nobody may pick, one that was never
 /// registered, a model with no provider to serve it, and a field sent blank. Each is refused at
 /// the launch, and nothing is adopted.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn a_launch_refuses_a_provider_it_may_not_pick(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);

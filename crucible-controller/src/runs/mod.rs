@@ -11,6 +11,7 @@ pub mod clusters;
 pub mod completion;
 pub mod contract;
 pub mod dispatch_target;
+pub mod engine;
 pub mod export;
 pub(crate) mod flow_enriched;
 pub mod ingest;
@@ -26,6 +27,7 @@ pub mod run_files;
 pub mod store;
 pub mod task_evidence;
 pub mod task_results;
+#[cfg(feature = "autoresearch")]
 pub(crate) mod turn_live;
 pub mod work_pods;
 pub mod workpod;

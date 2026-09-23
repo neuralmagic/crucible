@@ -173,6 +173,7 @@ pub(crate) async fn unpark_issue(
     )
 }
 
+#[cfg(feature = "autoresearch")]
 #[derive(Debug, Deserialize, ToSchema)]
 pub(crate) struct ScopeNowBody {
     justification: String,
@@ -193,6 +194,7 @@ pub(crate) struct ScopeNowBody {
         (status = 403, description = "Caller is not in the admin whitelist", body = ErrorBody)
     )
 )]
+#[cfg(feature = "autoresearch")]
 pub(crate) async fn scope_now(
     State(state): State<ApiState>,
     Path(key): Path<String>,
@@ -219,6 +221,7 @@ pub(crate) async fn scope_now(
     )
 }
 
+#[cfg(feature = "autoresearch")]
 #[derive(Debug, Deserialize, ToSchema)]
 pub(crate) struct RedispatchBody {
     justification: String,
@@ -237,6 +240,7 @@ pub(crate) struct RedispatchBody {
         (status = 403, description = "Caller is not in the admin whitelist", body = ErrorBody)
     )
 )]
+#[cfg(feature = "autoresearch")]
 pub(crate) async fn redispatch_issue(
     State(state): State<ApiState>,
     Path(key): Path<String>,
@@ -262,6 +266,7 @@ pub(crate) async fn redispatch_issue(
     )
 }
 
+#[cfg(feature = "autoresearch")]
 #[derive(Debug, Deserialize, ToSchema)]
 pub(crate) struct BumpBody {
     priority: i64,
@@ -282,6 +287,7 @@ pub(crate) struct BumpBody {
         (status = 403, description = "Caller is not an operator", body = ErrorBody)
     )
 )]
+#[cfg(feature = "autoresearch")]
 pub(crate) async fn bump_issue(
     State(state): State<ApiState>,
     Path(key): Path<String>,

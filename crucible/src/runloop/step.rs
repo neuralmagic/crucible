@@ -5,8 +5,8 @@ use crate::args::{Args, Paths};
 use crate::control;
 use crate::control::escalation;
 use crate::control::provisioning;
+use crate::report::reporter::{AgentTurn, Reporter, Stop};
 use crate::report::session::Row;
-use crate::report::{AgentTurn, Reporter, Stop};
 use anyhow::Result;
 use crucible::crucible::{Judge, World};
 
@@ -114,7 +114,7 @@ fn is_transport_turn_error(why: &str) -> bool {
 pub(crate) fn drain_turn_markers<R: Reporter>(
     r: &mut R,
     p: &Paths,
-    control: Option<&control::ControlState>,
+    control: Option<&control::bridge::ControlState>,
     it: u32,
     turn: &AgentTurn,
     rows: &[Row],
@@ -275,9 +275,9 @@ pub(crate) fn decide_row(
 /// True when a cost/time cap is set and reached; notes it on `r`. `parked_total` is idle time
 /// spent waiting on a human approval, excluded from the wall-clock the time cap measures.
 /// The effective cost cap: a live control override wins over the CLI arg.
-pub(crate) fn live_max_cost(args: &Args, control: Option<&control::ControlState>) -> f64 {
+pub(crate) fn live_max_cost(args: &Args, control: Option<&control::bridge::ControlState>) -> f64 {
     control
-        .and_then(control::ControlState::live_max_cost)
+        .and_then(control::bridge::ControlState::live_max_cost)
         .unwrap_or(args.max_cost)
 }
 

@@ -107,7 +107,9 @@ pub(crate) fn cfg_with(state_dir: &std::path::Path) -> crate::config::Controller
         operators: vec![],
         operator_groups: vec![],
         session_secure_cookies: true,
+        #[cfg(feature = "autoresearch")]
         autopilot: None,
+        autoresearch: cfg!(feature = "autoresearch"),
         overrides_configmap: "crucible-controller-overrides".to_string(),
         overrides_namespace: None,
         overrides: None,

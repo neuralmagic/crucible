@@ -68,7 +68,7 @@ pub struct RegisterPlaybook {
     /// The principal the registration is owned to; unchanged when the id is re-registered.
     pub owner: crate::authz::model::Principal,
     pub description: String,
-    /// `owner/repo` slug or a clone URL ([`crate::issues::engine::repo_clone_url`] resolves it).
+    /// `owner/repo` slug or a clone URL ([`crate::runs::engine::repo_clone_url`] resolves it).
     pub repo: String,
     /// Branch or tag; `None` = the repo's default branch.
     pub git_ref: Option<String>,
@@ -258,12 +258,12 @@ impl PackGit {
     pub(crate) async fn resolve(
         app: Option<&crate::secrets::github_app::GithubAppTokenSource>,
     ) -> Result<Self> {
-        let token = crate::issues::engine::resolve_pack_pr_token_for(app).await?;
+        let token = crate::runs::engine::resolve_pack_pr_token_for(app).await?;
         Ok(PackGit { token })
     }
 
     fn clone_url(&self, repo: &str) -> String {
-        let url = crate::issues::engine::repo_clone_url(repo);
+        let url = crate::runs::engine::repo_clone_url(repo);
         match &self.token {
             Some(t) if url.starts_with("https://github.com/") => {
                 url.replacen("https://", &format!("https://x-access-token:{t}@"), 1)
@@ -431,6 +431,7 @@ struct WorkflowTable {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PackWorkflowKind {
     Playbook,
+    #[cfg(feature = "autoresearch")]
     Autoresearch,
 }
 
@@ -438,6 +439,7 @@ impl PackWorkflowKind {
     fn declared_type(self) -> &'static str {
         match self {
             Self::Playbook => PLAYBOOK_WORKFLOW_TYPE,
+            #[cfg(feature = "autoresearch")]
             Self::Autoresearch => "autoresearch",
         }
     }

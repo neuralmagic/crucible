@@ -17,6 +17,7 @@
 //! - [`AgentSource::Command`]: run a deterministic shell command in the workspace for
 //!   examples/tests; native `AgentEvent` JSON lines are decoded, everything else is raw.
 
+#[cfg(feature = "autoresearch")]
 pub(crate) mod activity;
 pub(crate) mod agent_session;
 pub(crate) mod engine;
@@ -30,6 +31,7 @@ pub(crate) mod turn;
 use crate::agent::event::{AgentEvent, RawStream, Tokens, estimate_cost};
 use crate::agent::harness::{HarnessRuntime, StreamDecoder};
 use crate::args::{Args, Paths};
+#[cfg(feature = "autoresearch")]
 use crate::manifest::AgentBackend;
 use crucible_harness::OtelCollector;
 use std::io::{BufRead, BufReader, Read};
@@ -59,10 +61,12 @@ pub enum AgentSource {
     Command(String),
 }
 
+#[cfg(feature = "autoresearch")]
 pub(crate) fn supports_persistent_sessions(args: &Args) -> bool {
     backend_supports_persistent_sessions(args.agent_backend, args.harness())
 }
 
+#[cfg(feature = "autoresearch")]
 /// Capability predicate used by runtime admission and scope preview.
 pub(crate) fn backend_supports_persistent_sessions(
     backend: AgentBackend,
@@ -216,6 +220,7 @@ fn spawn_local(
     })
 }
 
+#[cfg(feature = "autoresearch")]
 /// Run one agent turn against the source resolved from `args`. `sink(raw_line, stream,
 /// event)` is called per output line; returns the turn's [`TurnOutcome`]: the highest cost the
 /// agent reported (0 if none) plus the transport failure that stopped it, if any.

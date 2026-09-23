@@ -40,7 +40,10 @@
 use crate::client::Db;
 use crate::config::ControllerCfg;
 use crate::event_log::{Event, EventLog};
-use crate::issues::model::{Issue, NewIssue};
+use crate::issues::model::Issue;
+#[cfg(feature = "autoresearch")]
+use crate::issues::model::NewIssue;
+#[cfg(feature = "autoresearch")]
 use crate::issues::triage;
 use crate::model::{ParkReason, ParkedBy, Status};
 use crate::runs::ingest;
@@ -154,79 +157,82 @@ pub async fn rebuild(into: &Db, cfg: &ControllerCfg) -> Result<RebuildReport> {
 async fn rebuild_mode(into: &Db, cfg: &ControllerCfg, mode: RebuildMode) -> Result<RebuildReport> {
     let mut report = RebuildReport::default();
 
-    // Which repos to rebuild: the live ledger's watch-set (Lane O3 — the same DB the "scopes +
-    // runs" pass below reads its evidence pointers from), so a repo added via `POST /api/repos`
-    // since the last boot is still rebuilt. Only a from-nothing disaster (the live database itself
-    // gone) falls back to `cfg.repos`, the boot-seed list — the sole surviving hint of which repos
-    // mattered.
-    //
-    // Triage never ingests a closed-and-untracked issue, so rebuild mustn't either — otherwise
-    // every rebuilt DB grows the repo's closed history back and the drift check cries wolf. The
-    // live ledger's key set is the "tracked" side of that rule; a from-nothing disaster (no live
-    // DB) skips closed issues wholesale, losing only their retired-park rows.
-    let (repos, live_keys): (Vec<String>, Option<BTreeSet<String>>) =
-        if crate::client::ledger_exists(cfg.db_url()).await? {
-            let live_pool = crate::client::connect(cfg.db_url())
-                .await
-                .context("rebuild: opening the live ledger to read its watch-set and issue keys")?;
-            let repos = crate::issues::repo_watch::watched_repos(&live_pool).await?;
-            let keys = crate::daemon::store::list_all_issues(&live_pool)
-                .await?
-                .into_iter()
-                .map(|i| i.key)
-                .collect();
-            live_pool.close().await;
-            (repos, Some(keys))
-        } else {
-            (cfg.repos.clone(), None)
-        };
+    #[cfg(feature = "autoresearch")]
+    {
+        // Which repos to rebuild: the live ledger's watch-set (Lane O3 — the same DB the "scopes +
+        // runs" pass below reads its evidence pointers from), so a repo added via `POST /api/repos`
+        // since the last boot is still rebuilt. Only a from-nothing disaster (the live database itself
+        // gone) falls back to `cfg.repos`, the boot-seed list — the sole surviving hint of which repos
+        // mattered.
+        //
+        // Triage never ingests a closed-and-untracked issue, so rebuild mustn't either — otherwise
+        // every rebuilt DB grows the repo's closed history back and the drift check cries wolf. The
+        // live ledger's key set is the "tracked" side of that rule; a from-nothing disaster (no live
+        // DB) skips closed issues wholesale, losing only their retired-park rows.
+        let (repos, live_keys): (Vec<String>, Option<BTreeSet<String>>) =
+            if crate::client::ledger_exists(cfg.db_url()).await? {
+                let live_pool = crate::client::connect(cfg.db_url()).await.context(
+                    "rebuild: opening the live ledger to read its watch-set and issue keys",
+                )?;
+                let repos = crate::issues::repo_watch::watched_repos(&live_pool).await?;
+                let keys = crate::daemon::store::list_all_issues(&live_pool)
+                    .await?
+                    .into_iter()
+                    .map(|i| i.key)
+                    .collect();
+                live_pool.close().await;
+                (repos, Some(keys))
+            } else {
+                (cfg.repos.clone(), None)
+            };
 
-    // --- GitHub issue state -------------------------------------------------------------------
-    for repo in &repos {
-        let issues = triage::list_changed_issues(repo, None)
-            .await
-            .with_context(|| format!("rebuild: fetching {repo}'s issues from GitHub"))?;
-        let mut newest: Option<String> =
-            crate::issues::store::get_watermark(into.pool(), repo).await?;
-        for issue in &issues {
-            let key = format!("{repo}#{}", issue.number);
-            if !issue.state.eq_ignore_ascii_case("open")
-                && !live_keys.as_ref().is_some_and(|k| k.contains(&key))
-            {
-                // The watermark still advances past skipped issues, same as triage.
+        // --- GitHub issue state -------------------------------------------------------------------
+        for repo in &repos {
+            let issues = triage::list_changed_issues(repo, None)
+                .await
+                .with_context(|| format!("rebuild: fetching {repo}'s issues from GitHub"))?;
+            let mut newest: Option<String> =
+                crate::issues::store::get_watermark(into.pool(), repo).await?;
+            for issue in &issues {
+                let key = format!("{repo}#{}", issue.number);
+                if !issue.state.eq_ignore_ascii_case("open")
+                    && !live_keys.as_ref().is_some_and(|k| k.contains(&key))
+                {
+                    // The watermark still advances past skipped issues, same as triage.
+                    if newest
+                        .as_deref()
+                        .is_none_or(|n| issue.updated_at.as_str() > n)
+                    {
+                        newest = Some(issue.updated_at.clone());
+                    }
+                    continue;
+                }
+                crate::issues::store::upsert_issue(
+                    into.pool(),
+                    &NewIssue {
+                        key,
+                        repo: repo.clone(),
+                        priority: 0,
+                        evidence_url: Some(issue.html_url.clone()),
+                        title: Some(issue.title.clone()),
+                        author: issue.author.clone(),
+                        body: issue.body.clone(),
+                        labels: issue.labels.clone(),
+                        upstream_updated_at: Some(issue.updated_at.clone()),
+                    },
+                )
+                .await?;
+                report.issues_upserted += 1;
                 if newest
                     .as_deref()
                     .is_none_or(|n| issue.updated_at.as_str() > n)
                 {
                     newest = Some(issue.updated_at.clone());
                 }
-                continue;
             }
-            crate::issues::store::upsert_issue(
-                into.pool(),
-                &NewIssue {
-                    key,
-                    repo: repo.clone(),
-                    priority: 0,
-                    evidence_url: Some(issue.html_url.clone()),
-                    title: Some(issue.title.clone()),
-                    author: issue.author.clone(),
-                    body: issue.body.clone(),
-                    labels: issue.labels.clone(),
-                    upstream_updated_at: Some(issue.updated_at.clone()),
-                },
-            )
-            .await?;
-            report.issues_upserted += 1;
-            if newest
-                .as_deref()
-                .is_none_or(|n| issue.updated_at.as_str() > n)
-            {
-                newest = Some(issue.updated_at.clone());
+            if let Some(w) = newest {
+                crate::issues::store::set_watermark(into.pool(), repo, &w).await?;
             }
-        }
-        if let Some(w) = newest {
-            crate::issues::store::set_watermark(into.pool(), repo, &w).await?;
         }
     }
 
@@ -838,6 +844,7 @@ mod tests {
         })
     }
 
+    #[cfg(feature = "autoresearch")]
     fn sample_log() -> String {
         [
             r#"{"v":1,"kind":"row","row":{"iter":0,"decision":"baseline","score":200.0}}"#,
@@ -851,6 +858,7 @@ mod tests {
 
     // --- 1. Rebuild reproduces rows -------------------------------------------------------------
 
+    #[cfg(feature = "autoresearch")]
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn rebuild_reproduces_issue_and_run_rows(pool: PgPool) -> Result<()> {
         let _guard = crate::ENV_LOCK.lock().await;
@@ -927,6 +935,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "autoresearch")]
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn rebuild_replays_the_event_log_to_advance_status(pool: PgPool) -> Result<()> {
         let _guard = crate::ENV_LOCK.lock().await;
@@ -1002,6 +1011,7 @@ mod tests {
 
     /// The verify-mode rebuild reconstructs the rows the drift diff reads (statuses via replay)
     /// without copying the artifact payloads or the verbatim event history into the throwaway.
+    #[cfg(feature = "autoresearch")]
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn verify_mode_rebuild_applies_history_without_copying_payloads(
         pool: PgPool,
@@ -1071,6 +1081,7 @@ mod tests {
 
     // --- 2. Drift test -----------------------------------------------------------------------
 
+    #[cfg(feature = "autoresearch")]
     // No `#[sqlx::test]` pool here: `verify` needs `live` at a real path (`rebuild` re-opens
     // `cfg.db_path()` internally), the same reason `client::tests::connect_creates_and_migrates_a_fresh_db`
     // uses a plain `#[tokio::test]`.

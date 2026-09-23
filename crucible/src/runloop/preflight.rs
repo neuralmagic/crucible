@@ -16,7 +16,7 @@ use serde_json::Value;
 
 use crate::manifest::{MODE_PLACEHOLDER, PreflightCfg};
 use crate::process::STOP;
-use crate::report::Reporter;
+use crate::report::reporter::Reporter;
 
 /// The `{digest}` placeholder, filled from the most recent `digest` a rung emitted.
 const DIGEST_PLACEHOLDER: &str = "{digest}";
@@ -263,8 +263,8 @@ fn stderr_tail(stderr: &str) -> String {
 mod tests {
     use super::*;
     use crate::args::{Args, Paths};
+    use crate::report::reporter::{AgentTurn, Stop, TurnBudget};
     use crate::report::session::Row;
-    use crate::report::{AgentTurn, Stop, TurnBudget};
 
     /// Collects notes; every other `Reporter` call is inert. Preflight only ever notes.
     #[derive(Default)]

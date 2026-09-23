@@ -201,7 +201,7 @@ impl crate::daemon::queue::DiscoverySource for ApprovalPoll {
             // `GITHUB_TOKEN` is the upstream-discovery PAT and may not see the pack repo at all
             // (live failure: 403 on /reviews while the approval sat unread). Fall back to it only
             // when the App mint itself fails, so a mis-keyed App degrades loudly but not fatally.
-            let token = match crate::issues::engine::resolve_pack_pr_token(&this.cfg).await {
+            let token = match crate::runs::engine::resolve_pack_pr_token(&this.cfg).await {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::warn!(

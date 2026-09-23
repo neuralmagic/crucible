@@ -459,8 +459,18 @@ pub struct ControllerCfg {
     pub overrides_namespace: Option<String>,
     /// The runtime autopilot flag, loaded from its ledger row after parsing. `None` in tests
     /// (treated as enabled). Set by the daemon before handing the cfg to the reconcile wiring.
+    #[cfg(feature = "autoresearch")]
     #[arg(skip)]
     pub autopilot: Option<crate::daemon::autopilot_flag::AutopilotFlag>,
+    /// Run the autoresearch lane: GitHub discovery, ranking, scoping, the approval gate, builds and
+    /// scored loop runs, with their routes. Off, the controller runs playbooks only. Needs a build
+    /// with the `autoresearch` feature.
+    #[arg(
+        long = "autoresearch",
+        env = "CONTROLLER_AUTORESEARCH",
+        default_value_t = false
+    )]
+    pub autoresearch: bool,
     /// The runtime override store (Lane O2), threaded in after parsing — the same `#[arg(skip)]`
     /// handle shape as `autopilot`. `None` in tests + `--once` (the effective config is then exactly
     /// the parsed defaults/env). Cloneable (an `Arc` inside), so every `cfg.clone()` shares the one
@@ -840,6 +850,7 @@ impl ControllerCfg {
 
     /// The `POST /api/repos` org whitelist + env-seeded-repo exemption built off this parsed
     /// config — see [`crate::issues::repo_ref::RepoWhitelist`].
+    #[cfg(feature = "autoresearch")]
     pub fn repo_whitelist(&self) -> crate::issues::repo_ref::RepoWhitelist {
         crate::issues::repo_ref::RepoWhitelist::new(self.allowed_orgs.clone(), self.repos.clone())
     }
@@ -857,8 +868,24 @@ impl ControllerCfg {
     /// Whether machine-initiated spend is allowed: `true` when the autopilot flag is absent
     /// (tests, no flag loaded) or explicitly enabled; `false` when an admin disabled it via
     /// `POST /api/autopilot`.
+    #[cfg(feature = "autoresearch")]
     pub(crate) fn autopilot_enabled(&self) -> bool {
         self.autopilot.as_ref().is_none_or(|f| f.is_enabled())
+    }
+
+    /// Whether the autoresearch lane runs: built with the feature and switched on.
+    pub fn autoresearch_enabled(&self) -> bool {
+        cfg!(feature = "autoresearch") && self.autoresearch
+    }
+
+    /// Refuse `CONTROLLER_AUTORESEARCH=true` on a build without the feature.
+    pub fn validate_autoresearch(&self) -> Result<()> {
+        if self.autoresearch && !cfg!(feature = "autoresearch") {
+            bail!(
+                "CONTROLLER_AUTORESEARCH is on, but this crucible-controller was built without the autoresearch feature"
+            );
+        }
+        Ok(())
     }
 
     /// Fail loudly at startup if the chosen [`GroundedExecutor`] is missing a prerequisite, so a
@@ -1198,6 +1225,21 @@ mod tests {
                 .unwrap_err()
                 .to_string();
         assert!(err.contains("CONTROLLER_TURN_SERVICE_ACCOUNT"), "{err}");
+    }
+
+    #[test]
+    fn autoresearch_is_off_by_default_and_on_only_where_it_is_built() {
+        let c = crate::testing::cfg_from_args(["ctl"]);
+        assert!(!c.autoresearch_enabled());
+        c.validate_autoresearch()
+            .expect("off validates on every build");
+        let c = crate::testing::cfg_from_args(["ctl", "--autoresearch"]);
+        assert_eq!(c.autoresearch_enabled(), cfg!(feature = "autoresearch"));
+        assert_eq!(
+            c.validate_autoresearch().is_ok(),
+            cfg!(feature = "autoresearch"),
+            "switching the lane on needs a build that carries it"
+        );
     }
 
     #[test]

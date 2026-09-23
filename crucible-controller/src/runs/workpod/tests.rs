@@ -2,9 +2,11 @@
 
 use crate::client::Db;
 use crate::config::ControllerCfg;
+#[cfg(feature = "autoresearch")]
 use crate::issues::engine;
 use crate::playbooks::providers::AgentSelection;
 use anyhow::Result;
+#[cfg(feature = "autoresearch")]
 use crucible_contract::{ArtifactKind, ArtifactRef, Envelope, EnvelopeKind, content_digest};
 use k8s_openapi::api::core::v1::{ConfigMap, Container, EnvVar, Pod};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
@@ -13,6 +15,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(feature = "autoresearch")]
 #[test]
 fn turn_specs_convert_bare_repo_slugs_to_clone_urls() {
     let scope = crate::runs::workpod::WorkPodSpec::scope(
@@ -40,8 +43,11 @@ fn turn_specs_convert_bare_repo_slugs_to_clone_urls() {
     );
 }
 use super::*;
+#[cfg(feature = "autoresearch")]
 use crate::runs::workpod::spec::TurnSpec as _;
+#[cfg(feature = "autoresearch")]
 use crucible::deploy::ProposeTier;
+#[cfg(feature = "autoresearch")]
 use crucible_contract::{Disposition, Tier};
 use std::sync::Mutex;
 
@@ -77,6 +83,7 @@ fn work_pod_state_round_trips_and_flags_terminal() {
     assert!(WorkPodState::parse("nope").is_err());
 }
 
+#[cfg(feature = "autoresearch")]
 #[test]
 fn admit_respects_both_cap_and_daily_budget() {
     // Under both → spawn.
@@ -91,6 +98,7 @@ fn admit_respects_both_cap_and_daily_budget() {
     assert_eq!(admit(0, 4, 0, 0), Admission::Queue);
 }
 
+#[cfg(feature = "autoresearch")]
 #[test]
 fn pod_name_is_dns_safe_unique_and_bounded() {
     let n = grounded_rank_pod_name("owner/repo#42");
@@ -107,6 +115,7 @@ fn pod_name_is_dns_safe_unique_and_bounded() {
     assert!(long.len() <= 63, "{long} ({})", long.len());
 }
 
+#[cfg(feature = "autoresearch")]
 #[test]
 fn turn_opts_is_the_render_turn_contract() {
     let spec = WorkPodSpec::grounded_rank(
@@ -138,6 +147,7 @@ fn turn_opts_is_the_render_turn_contract() {
 
 /// A scope turn renders the harness and model the issue's dispatch resolved; an issue that
 /// resolved none renders neither flag, which is the pre-registry turn pod.
+#[cfg(feature = "autoresearch")]
 #[test]
 fn turn_opts_scope_carries_the_resolved_harness_and_model() {
     let scope_with = |agent: AgentSelection| {
@@ -170,6 +180,7 @@ fn turn_opts_scope_carries_the_resolved_harness_and_model() {
     assert_eq!(resolved.model.as_deref(), Some("gpt-5.6-luna"));
 }
 
+#[cfg(feature = "autoresearch")]
 #[test]
 fn turn_opts_scope_carries_kind_tier_and_the_gaming_bound() {
     let spec = WorkPodSpec::scope(
@@ -236,6 +247,7 @@ fn turn_opts_scope_carries_kind_tier_and_the_gaming_bound() {
     );
 }
 
+#[cfg(feature = "autoresearch")]
 #[test]
 fn turn_opts_scope_skip_gaming_review_rides_the_flag() {
     let spec = WorkPodSpec::scope(
@@ -259,6 +271,7 @@ fn turn_opts_scope_skip_gaming_review_rides_the_flag() {
     );
 }
 
+#[cfg(feature = "autoresearch")]
 #[test]
 fn turn_opts_scope_forwards_the_goal_text_and_authoritative() {
     let spec = WorkPodSpec::scope(
@@ -283,6 +296,7 @@ fn turn_opts_scope_forwards_the_goal_text_and_authoritative() {
 /// `repo_ref` is the whole point of `issues.git_ref`: it rides the render for BOTH turn kinds when
 /// the issue pinned a ref, and is absent entirely when it did not (the clone then takes the repo's
 /// default branch, which is what every github/jira row does).
+#[cfg(feature = "autoresearch")]
 #[test]
 fn turn_opts_forwards_repo_ref_only_when_the_issue_pinned_one() {
     let scope = WorkPodSpec::scope(
@@ -352,6 +366,7 @@ fn turn_opts_forwards_repo_ref_only_when_the_issue_pinned_one() {
 /// `TurnOpts` cannot express: the dispatch refuses by name rather than dropping the contract, a
 /// scope turn without one renders, and a rank turn ignores the field entirely (it measures
 /// nothing, so a broker contract is meaningless to it).
+#[cfg(feature = "autoresearch")]
 #[test]
 fn turn_opts_refuses_a_scope_turn_under_a_codegen_contract() {
     let scope_with = WorkPodSpec::scope(
@@ -407,6 +422,7 @@ fn turn_opts_refuses_a_scope_turn_under_a_codegen_contract() {
     assert!(rank.turn_opts(None).is_ok());
 }
 
+#[cfg(feature = "autoresearch")]
 #[test]
 fn stamp_pod_adds_issue_annotation_selector_and_owner() {
     let spec = WorkPodSpec::grounded_rank(
@@ -456,6 +472,7 @@ fn stamp_pod_adds_issue_annotation_selector_and_owner() {
     assert_eq!(owners[0].controller, Some(true));
 }
 
+#[cfg(feature = "autoresearch")]
 #[test]
 fn parse_verdict_logs_scrapes_the_marker_past_noise() {
     let logs = "\
@@ -470,6 +487,7 @@ CRUCIBLE_VERDICT: {\"tier\":\"T1\",\"rationale\":\"needs a new bench in bench/\"
     assert!((v.cost_usd - 0.42).abs() < 1e-9);
 }
 
+#[cfg(feature = "autoresearch")]
 #[test]
 fn parse_verdict_logs_takes_the_last_marker_and_surfaces_error_objects() {
     // Two markers (a retried turn): the LAST wins.
@@ -489,6 +507,7 @@ fn parse_verdict_logs_takes_the_last_marker_and_surfaces_error_objects() {
 /// Round-trip a verdict through a Tier 1 envelope the way a terminated container's message
 /// carries it: the engine's self-capped `to_capped_json` on one side, `collect_verdict` on the
 /// other, no logs at all (the message is authoritative).
+#[cfg(feature = "autoresearch")]
 #[test]
 fn verdict_rides_the_termination_message_envelope() {
     let payload = serde_json::json!({
@@ -519,6 +538,7 @@ fn verdict_rides_the_termination_message_envelope() {
 
 /// The phase-1 compat fallback: an absent, foreign, or wrong-kind termination message drops
 /// through to the marker log scrape (an old engine image emits only the marker).
+#[cfg(feature = "autoresearch")]
 #[test]
 fn verdict_falls_back_to_the_marker_when_the_message_is_not_our_envelope() {
     let logs =
@@ -547,6 +567,7 @@ fn verdict_falls_back_to_the_marker_when_the_message_is_not_our_envelope() {
 /// A scope report rides the termination message while its pack + transcript still ride their log
 /// markers: the report core comes from the envelope, the two blobs attach from the logs exactly
 /// as the pure marker path does.
+#[cfg(feature = "autoresearch")]
 #[test]
 fn scope_report_rides_the_message_with_pack_and_transcript_from_logs() {
     use base64::Engine as _;
@@ -585,6 +606,7 @@ fn scope_report_rides_the_message_with_pack_and_transcript_from_logs() {
 }
 
 /// Wrong-kind / absent message on the scope path also falls back to the marker scrape.
+#[cfg(feature = "autoresearch")]
 #[test]
 fn scope_report_falls_back_to_the_marker_when_the_message_is_not_our_envelope() {
     let logs = format!(
@@ -606,6 +628,7 @@ fn scope_report_falls_back_to_the_marker_when_the_message_is_not_our_envelope() 
 
 /// Build a minimal surviving ScopeReport (digest frozen, one passed stage) for the drop-box
 /// fold tests.
+#[cfg(feature = "autoresearch")]
 fn survived_report() -> engine::ScopeReport {
     let env = Envelope::new(
         EnvelopeKind::ScopeReport,
@@ -620,6 +643,7 @@ fn survived_report() -> engine::ScopeReport {
     collect_scope_report(Some(&env), "").expect("report")
 }
 
+#[cfg(feature = "autoresearch")]
 async fn drop_artifact(pool: &sqlx::PgPool, pod: &str, kind: ArtifactKind, bytes: &[u8]) {
     crate::runs::blob_store::put_artifact_bytes(
         pool,
@@ -634,6 +658,7 @@ async fn drop_artifact(pool: &sqlx::PgPool, pod: &str, kind: ArtifactKind, bytes
     .expect("store artifact");
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn dropbox_pack_is_preferred_and_digest_validated(pool: sqlx::PgPool) {
     let pack = b"the-real-gzipped-pack";
@@ -652,6 +677,7 @@ async fn dropbox_pack_is_preferred_and_digest_validated(pool: sqlx::PgPool) {
     assert!(report.pack_error.is_none());
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn survived_scope_with_a_missing_delivered_pack_fails_loudly(pool: sqlx::PgPool) {
     // Manifest claims delivered:true but nothing is stored.
@@ -668,6 +694,7 @@ async fn survived_scope_with_a_missing_delivered_pack_fails_loudly(pool: sqlx::P
     assert!(err.contains("scope pack not recovered"), "{err}");
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn a_digest_mismatch_fails_loudly(pool: sqlx::PgPool) {
     drop_artifact(&pool, "pod-x", ArtifactKind::ScopePack, b"actual-bytes").await;
@@ -684,6 +711,7 @@ async fn a_digest_mismatch_fails_loudly(pool: sqlx::PgPool) {
     assert!(err.contains("integrity mismatch"), "{err}");
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn an_undelivered_pack_on_a_survival_fails_loudly(pool: sqlx::PgPool) {
     let manifest = vec![ArtifactRef {
@@ -699,6 +727,7 @@ async fn an_undelivered_pack_on_a_survival_fails_loudly(pool: sqlx::PgPool) {
     assert!(err.contains("delivered:false"), "{err}");
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn a_transcript_problem_is_best_effort_not_fatal(pool: sqlx::PgPool) {
     // A valid pack so the survival requirement is met; the transcript is not stored.
@@ -730,6 +759,7 @@ async fn a_transcript_problem_is_best_effort_not_fatal(pool: sqlx::PgPool) {
     );
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn an_empty_manifest_leaves_the_report_untouched(pool: sqlx::PgPool) {
     let mut report = survived_report();
@@ -742,6 +772,7 @@ async fn an_empty_manifest_leaves_the_report_untouched(pool: sqlx::PgPool) {
 /// End to end over the dispatcher boundary: a terminated pod whose `state.terminated.message`
 /// carries the envelope is adopted into a Report/Verdict without any marker in its logs — the
 /// same read path startup adoption and the completion watch both drive.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn adoption_reads_the_result_from_pod_status(pool: sqlx::PgPool) -> Result<()> {
     let created = Arc::new(Mutex::new(Vec::new()));
@@ -808,6 +839,7 @@ async fn adoption_reads_the_result_from_pod_status(pool: sqlx::PgPool) -> Result
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[test]
 fn parse_scope_report_logs_attaches_the_transcript_marker() {
     use base64::Engine as _;
@@ -824,6 +856,7 @@ fn parse_scope_report_logs_attaches_the_transcript_marker() {
     assert_eq!(report.transcript_gz.as_deref(), Some(gz.as_slice()));
 }
 
+#[cfg(feature = "autoresearch")]
 #[test]
 fn parse_scope_report_logs_tolerates_a_missing_or_garbled_transcript() {
     let logs = format!("{SCOPE_REPORT_MARKER} {{\"stages\":[],\"digest\":null,\"cost\":0.1}}\n");
@@ -857,6 +890,7 @@ fn sample_pack_tgz() -> Vec<u8> {
     enc.finish().unwrap()
 }
 
+#[cfg(feature = "autoresearch")]
 #[test]
 fn parse_scope_report_logs_attaches_the_pack_marker() {
     use base64::Engine as _;
@@ -870,6 +904,7 @@ fn parse_scope_report_logs_attaches_the_pack_marker() {
     assert!(report.pack_error.is_none());
 }
 
+#[cfg(feature = "autoresearch")]
 #[test]
 fn parse_scope_pack_logs_distinguishes_absent_error_and_garbled() {
     // No marker at all (a dead proposal, a pre-feature engine): absent, no error.
@@ -1240,6 +1275,7 @@ async fn the_dispatch_cluster_prefers_the_pin_then_the_contract_then_the_default
 /// Two-phase, non-blocking: dispatch LAUNCHES a pod and returns without awaiting (nothing
 /// booked, the row `running`); a later re-drive (the completion watch's edge, modelled by a
 /// second dispatch call) peeks the now-terminal pod, adopts it, and books the verdict once.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn dispatch_launches_then_a_redrive_collects_and_ledgers_a_verdict(
     pool: sqlx::PgPool,
@@ -1328,6 +1364,7 @@ async fn dispatch_launches_then_a_redrive_collects_and_ledgers_a_verdict(
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn dispatch_queues_when_over_the_daily_budget(pool: sqlx::PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -1370,6 +1407,7 @@ async fn dispatch_queues_when_over_the_daily_budget(pool: sqlx::PgPool) -> Resul
 /// queued row, and the first admitted dispatch consumes that row — promoting it to running under
 /// its reserved pod name — so nothing stays `queued` once its turn actually ran and no duplicate
 /// rows accumulate.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn queued_turn_dedupes_and_drains_on_a_free_slot(pool: sqlx::PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -1445,6 +1483,7 @@ async fn queued_turn_dedupes_and_drains_on_a_free_slot(pool: sqlx::PgPool) -> Re
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn dispatch_records_the_error_when_the_turn_produces_no_verdict(
     pool: sqlx::PgPool,
@@ -1522,6 +1561,7 @@ async fn seed_running_turn(db: &Db, kind: WorkKind, issue_key: &str, pod_name: &
 /// Shared assertion tail for "adopt a running turn, never double-launch": adoption never renders
 /// a second pod, exactly one row exists (promoted in place, not inserted twice), it lands
 /// `collected`, the succeeded pod is GC'd, and its cost books exactly once.
+#[cfg(feature = "autoresearch")]
 async fn assert_adopted_not_relaunched(
     db: &Db,
     pod_name: &str,
@@ -1556,6 +1596,7 @@ async fn assert_adopted_not_relaunched(
 /// Slice 1: a grounded dispatch that finds a `running` turn for the issue ADOPTS it — collects
 /// the existing pod on the shared tail — instead of launching a second (and double-spending).
 /// Adoption must never render a second pod.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn grounded_dispatch_adopts_a_running_turn_never_double_launches(
     pool: sqlx::PgPool,
@@ -1588,6 +1629,7 @@ async fn grounded_dispatch_adopts_a_running_turn_never_double_launches(
 }
 
 /// Slice 1 for scope: the costliest kind ($5-11) must adopt a running scope turn, not relaunch.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn scope_dispatch_adopts_a_running_turn_never_double_launches(
     pool: sqlx::PgPool,
@@ -1635,6 +1677,7 @@ async fn scope_dispatch_adopts_a_running_turn_never_double_launches(
 /// one winner out of `running`, so the in-band collector and a pod-watch re-drive can both reach
 /// the terminal pod and the cost still books once — kind-agnostic, parameterized over both turn
 /// kinds.
+#[cfg(feature = "autoresearch")]
 async fn conformance_try_finish_running_work_pod_is_an_exclusive_cas(
     db: &Db,
     kind: WorkKind,
@@ -1675,6 +1718,7 @@ async fn conformance_try_finish_running_work_pod_is_an_exclusive_cas(
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn try_finish_running_work_pod_is_an_exclusive_cas_grounded(
     pool: sqlx::PgPool,
@@ -1687,6 +1731,7 @@ async fn try_finish_running_work_pod_is_an_exclusive_cas_grounded(
     .await
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn try_finish_running_work_pod_is_an_exclusive_cas_scope(pool: sqlx::PgPool) -> Result<()> {
     let db = Db::new(pool);
@@ -1700,11 +1745,13 @@ async fn try_finish_running_work_pod_is_an_exclusive_cas_scope(pool: sqlx::PgPoo
 /// A dispatcher that injects the collection race: right as the dispatch-under-test reads the
 /// verdict logs, a concurrent collector wins the row's terminal CAS. The dispatch must then LOSE
 /// its own CAS and book nothing — the single-booking guarantee under a real race.
+#[cfg(feature = "autoresearch")]
 struct RacingDispatcher {
     pool: sqlx::PgPool,
     pod_name: String,
 }
 
+#[cfg(feature = "autoresearch")]
 #[async_trait::async_trait]
 impl PodDispatcher for RacingDispatcher {
     async fn create(&self, _cluster: &str, _ns: &str, pod: Pod) -> Result<Pod> {
@@ -1739,6 +1786,7 @@ impl PodDispatcher for RacingDispatcher {
 
 /// Kind-agnostic: races a concurrent collector against a fresh dispatch's own CAS via the shared
 /// [`crate::runs::workpod::spec::dispatch_turn`] machine, for both turn kinds.
+#[cfg(feature = "autoresearch")]
 async fn conformance_adopting_collector_that_loses_the_cas_books_nothing<
     S: crate::runs::workpod::spec::TurnSpec,
 >(
@@ -1747,6 +1795,7 @@ async fn conformance_adopting_collector_that_loses_the_cas_books_nothing<
     repo_url: &str,
     max_cost: f64,
 ) -> Result<()> {
+    #[cfg(feature = "autoresearch")]
     use crate::runs::workpod::spec::{TurnCollected, TurnDispatch, dispatch_turn};
 
     let _g = crate::ENV_LOCK.lock().await;
@@ -1787,6 +1836,7 @@ async fn conformance_adopting_collector_that_loses_the_cas_books_nothing<
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[tokio::test]
 async fn adopting_collector_that_loses_the_cas_books_nothing_grounded() -> Result<()> {
     conformance_adopting_collector_that_loses_the_cas_books_nothing(
@@ -1798,6 +1848,7 @@ async fn adopting_collector_that_loses_the_cas_books_nothing_grounded() -> Resul
     .await
 }
 
+#[cfg(feature = "autoresearch")]
 #[tokio::test]
 async fn adopting_collector_that_loses_the_cas_books_nothing_scope() -> Result<()> {
     conformance_adopting_collector_that_loses_the_cas_books_nothing(
@@ -2107,6 +2158,7 @@ fn the_git_identity_is_a_default_that_an_explicit_one_beats() {
     );
 }
 
+#[cfg(feature = "autoresearch")]
 #[test]
 fn apply_build_digests_pins_matching_container_images() {
     // A rendered pod whose main + init containers reference a built image's repo (by tag) get
@@ -2157,6 +2209,7 @@ fn apply_build_digests_pins_matching_container_images() {
     );
 }
 
+#[cfg(feature = "autoresearch")]
 #[test]
 fn apply_build_digests_is_a_noop_on_an_empty_map() {
     let mut pod = Pod {
@@ -2236,6 +2289,7 @@ async fn contract_events(db: &Db, key: &str) -> Vec<crate::event_log::EventRecor
         .collect()
 }
 
+#[cfg(feature = "autoresearch")]
 async fn parked_event(db: &Db, key: &str) -> Option<crate::event_log::EventRecord> {
     db.events()
         .read_for_key(key)
@@ -2248,10 +2302,12 @@ async fn parked_event(db: &Db, key: &str) -> Option<crate::event_log::EventRecor
 /// A turn whose loop image carries another contract version is refused before any row, pod, or
 /// spend: the ledger gets a named contract-rejection event with both versions, the issue parks so
 /// nothing retries it, and the image is read once (the answer is cached).
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn a_mismatched_loop_image_refuses_the_turn_and_parks_the_issue(
     pool: sqlx::PgPool,
 ) -> Result<()> {
+    #[cfg(feature = "autoresearch")]
     use crate::runs::contract::{CONTROLLER_CONTRACT_VERSION, ContractRegistry, TableReader};
     let _g = crate::ENV_LOCK.lock().await;
     let tmp = tempfile::tempdir()?;
@@ -2367,6 +2423,7 @@ async fn a_mismatched_loop_image_refuses_the_turn_and_parks_the_issue(
 
 /// A registry read failure is a transport failure, not a verdict: the dispatch errors so the next
 /// reconcile pass retries it, and nothing is ledgered as a rejection or parked.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn an_unreadable_loop_image_fails_the_turn_without_parking(pool: sqlx::PgPool) -> Result<()> {
     use crate::runs::contract::{ContractReadError, ContractRegistry, TableReader};
@@ -2757,7 +2814,7 @@ async fn a_loop_run_exports_its_item_and_a_playbook_launch_exports_none(
         matches!(out, RunAdmission::Launched { .. }),
         "expected a launch, got {out:?}"
     );
-    let item = only_pod_env(&pods, crate::issues::engine::ITEM_ENV);
+    let item = only_pod_env(&pods, crate::runs::engine::ITEM_ENV);
     assert!(!item.is_empty());
     assert!(
         item.iter().all(|v| v.as_deref() == Some("owner/repo#7")),
@@ -2794,7 +2851,7 @@ async fn a_loop_run_exports_its_item_and_a_playbook_launch_exports_none(
         "expected a launch, got {out:?}"
     );
     assert!(
-        only_pod_env(&pods, crate::issues::engine::ITEM_ENV)
+        only_pod_env(&pods, crate::runs::engine::ITEM_ENV)
             .iter()
             .all(Option::is_none),
         "a launch with no upstream item addresses no tracker item"
@@ -3691,6 +3748,7 @@ async fn time_sweep_still_fires_under_the_count_cap(pool: sqlx::PgPool) -> Resul
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn a_new_retained_failure_triggers_the_count_cap_inline(pool: sqlx::PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -3746,6 +3804,7 @@ async fn a_new_retained_failure_triggers_the_count_cap_inline(pool: sqlx::PgPool
 /// The whole point of non-blocking dispatch: distinct issues fan out to CONCURRENT turn pods up
 /// to the per-kind cap, and the issue over the cap queues (never blocks the others). Under the
 /// old in-band await only one turn could ever run.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn dispatch_fans_out_to_the_cap_then_queues(pool: sqlx::PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -3794,6 +3853,7 @@ async fn dispatch_fans_out_to_the_cap_then_queues(pool: sqlx::PgPool) -> Result<
 /// The scope deadline scales with the gaming-refine allowance: skip-review is the flat base,
 /// each cycle adds headroom, and a 6-cycle grant clears 2h comfortably (the live 3-cycle turn
 /// ran ~82 min, and 6 cycles cannot fit in the old flat 90 min).
+#[cfg(feature = "autoresearch")]
 #[test]
 fn scope_deadline_scales_with_the_gaming_allowance() {
     assert_eq!(scope_deadline(0), SCOPE_TIMEOUT, "skip-review is the base");
@@ -3814,6 +3874,7 @@ fn scope_deadline_scales_with_the_gaming_allowance() {
 
 /// Seed a `running` turn row backdated to `created_at` — a turn dispatched in the past, so the
 /// timeout sweep can decide whether it overran.
+#[cfg(feature = "autoresearch")]
 async fn seed_running_turn_at(
     db: &Db,
     kind: WorkKind,
@@ -3844,6 +3905,7 @@ async fn seed_running_turn_at(
 /// The out-of-band deadline enforcement, kind-agnostic: a `running` turn older than its deadline
 /// is reaped — pod deleted, row CAS-failed with the timeout on it, issue key returned for
 /// re-drive — while a fresh turn of the same kind is left alone.
+#[cfg(feature = "autoresearch")]
 async fn conformance_timeout_sweep_reaps_a_hung_turn_and_frees_its_row(
     db: &Db,
     cfg: &ControllerCfg,
@@ -3887,6 +3949,7 @@ async fn conformance_timeout_sweep_reaps_a_hung_turn_and_frees_its_row(
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn timeout_sweep_reaps_a_hung_grounded_turn_and_frees_its_row(
     pool: sqlx::PgPool,
@@ -3904,6 +3967,7 @@ async fn timeout_sweep_reaps_a_hung_grounded_turn_and_frees_its_row(
     .await
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn timeout_sweep_reaps_a_hung_scope_turn_and_frees_its_row(pool: sqlx::PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -3921,6 +3985,7 @@ async fn timeout_sweep_reaps_a_hung_scope_turn_and_frees_its_row(pool: sqlx::PgP
 
 /// A hung SCOPE turn's deadline scales with the gaming allowance: at a 6-cycle grant a turn ~2h
 /// old is still within budget (not reaped), where the flat old timeout would have abandoned it.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn timeout_sweep_honors_the_scaled_scope_deadline(pool: sqlx::PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -3958,10 +4023,12 @@ async fn timeout_sweep_honors_the_scaled_scope_deadline(pool: sqlx::PgPool) -> R
 // --- queue drain: collection re-drives the backlog, park purges it -----------------------------
 
 /// A test [`crate::daemon::queue::Enqueue`] that records the issue keys the drain re-drives.
+#[cfg(feature = "autoresearch")]
 #[derive(Default)]
 struct RecordingEnqueue {
     keys: Arc<Mutex<Vec<String>>>,
 }
+#[cfg(feature = "autoresearch")]
 impl crate::daemon::queue::Enqueue for RecordingEnqueue {
     fn enqueue(&self, key: crate::daemon::queue::IssueKey) {
         self.keys.lock().expect("lock").push(key.0);
@@ -4025,6 +4092,7 @@ async fn seed_issue_status(db: &Db, key: &str, status: &str) -> Result<()> {
 /// Collecting a turn frees a slot, so its tail re-drives the eldest queued row's ISSUE back through
 /// the reconcile queue (it never dispatches the pod itself). The queued row stays `queued` — the
 /// promotion is the reconcile pass's job, not the drain's.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn collection_drains_the_eldest_queued_rows_issue(pool: sqlx::PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -4145,6 +4213,7 @@ async fn park_purges_queued_rows(pool: sqlx::PgPool) -> Result<()> {
 
 /// A queued row whose issue is ALREADY parked (a stale pre-purge row) can never promote, so the
 /// drain skips + purges it and re-drives the next drainable row instead of wedging.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn drain_skips_and_purges_a_parked_issue_queued_row(pool: sqlx::PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -4207,6 +4276,7 @@ async fn drain_skips_and_purges_a_parked_issue_queued_row(pool: sqlx::PgPool) ->
 
 /// The timeout sweep backstops the collection drain: it returns the eldest queued keys up to the
 /// grounded free-slot count (FIFO), so a missed completion edge can't strand the backlog.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn timeout_sweep_returns_queued_keys_up_to_free_slots(pool: sqlx::PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -4258,6 +4328,7 @@ async fn timeout_sweep_returns_queued_keys_up_to_free_slots(pool: sqlx::PgPool) 
 
 /// The queue-wait metric fires when a queued row is PROMOTED (the drain's downstream effect): a
 /// backdated queued row dispatched onto a free slot records how long it waited.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn promote_observes_the_queue_wait_metric(pool: sqlx::PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;

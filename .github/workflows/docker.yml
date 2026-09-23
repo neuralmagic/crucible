@@ -72,7 +72,8 @@ jobs:
       # the loop pod runs) + forge (engine-side build/deploy bins).
       - name: Build release binaries
         run: |
-          cargo build --release --locked -p crucible -p crucible-broker -p forge --bins
+          cargo build --release --locked -p crucible -p crucible-broker -p forge --bins \
+            --features crucible/autoresearch
           mkdir -p prebuilt/bin
           find target/release -maxdepth 1 -type f -executable -exec cp {} prebuilt/bin/ \;
           echo "staged binaries:" && ls -la prebuilt/bin/
@@ -205,7 +206,7 @@ jobs:
           CRUCIBLE_GIT_SHA: ${{ github.sha }}
           SQLX_OFFLINE: "true"
         run: |
-          cargo build --release --locked -p crucible-controller -p crux --bins
+          cargo build --release --locked -p crucible-controller -p crux --bins --features crucible-controller/autoresearch
           mkdir -p prebuilt/bin
           cp target/release/crucible-controller target/release/crux prebuilt/bin/
           ls -la prebuilt/bin/

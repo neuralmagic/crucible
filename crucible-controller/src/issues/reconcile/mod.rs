@@ -13,9 +13,12 @@
 //! subprocesses to the `crucible` binary ([`crate::issues::engine`]) run under `spawn_blocking`, because
 //! this library is a *dependency* of that binary and can't call back into it as a library.
 
+#[cfg(feature = "autoresearch")]
 mod grounded;
 mod lifecycle;
+#[cfg(feature = "autoresearch")]
 mod scope;
+#[cfg(feature = "autoresearch")]
 mod tier;
 
 #[cfg(test)]
@@ -25,19 +28,28 @@ mod tests;
 
 use crate::client::Db;
 use crate::config::ControllerCfg;
+#[cfg(feature = "autoresearch")]
 use crate::event_log::Event;
+#[cfg(feature = "autoresearch")]
 use crate::issues::model::Issue;
-use crate::issues::ranker;
-use crate::issues::triage;
-use crate::model::Status;
-use anyhow::{Context, Result};
-
+#[cfg(feature = "autoresearch")]
 use crate::issues::model::split_issue_key;
+#[cfg(feature = "autoresearch")]
+use crate::issues::{ranker, triage};
+use crate::model::Status;
+#[cfg(feature = "autoresearch")]
+use anyhow::Context;
+use anyhow::Result;
+#[cfg(feature = "autoresearch")]
 use grounded::apply_grounded_disposition;
-use lifecycle::{reconcile_awaiting, reconcile_building, reconcile_parked, reconcile_running};
+use lifecycle::reconcile_running;
+#[cfg(feature = "autoresearch")]
+use lifecycle::{reconcile_awaiting, reconcile_building, reconcile_parked};
+#[cfg(feature = "autoresearch")]
 use scope::{apply_pod_scope_outcome, reconcile_new, reconcile_scoped};
 
 /// Append a same-status event on `key`: a note on the log without a transition.
+#[cfg(feature = "autoresearch")]
 pub(crate) async fn annotate(
     db: &Db,
     key: &str,
@@ -90,11 +102,34 @@ async fn reconcile_step(db: &Db, cfg: &ControllerCfg, key: &str) -> Result<()> {
     // scrapes the result. Collection is not spend: the money is already gone, and every one of those
     // gates can (correctly) decline the path that would otherwise re-reach dispatch — a re-driven
     // ScopeNow, its stash deliberately cleared pre-dispatch, never re-reaches it at all.
-    if adopt_orphaned_turns(db, cfg, &issue).await? {
+    #[cfg(feature = "autoresearch")]
+    if cfg.autoresearch_enabled() && adopt_orphaned_turns(db, cfg, &issue).await? {
         // The adoption's outcome drove the issue transition (scoped/parked/tier stamped); this
         // pass's `issue` snapshot is stale now, so stop here — the next enqueue continues.
         return Ok(());
     }
+    match issue.status {
+        // A playbook launch has no scope turn ahead of it: the pack is registered and pinned, and
+        // the validated POST that wrote its launch row is the authorization.
+        Status::New if matches!(issue.kind, crate::issues::model::InputKind::Playbook { .. }) => {
+            crate::runs::launch::launch(db, cfg, &issue).await
+        }
+        Status::Running => reconcile_running(db, cfg, &issue).await,
+        // `pr-open` waits on a human merge, `done` is terminal — record only, no action.
+        Status::PrOpen | Status::Done => Ok(()),
+        #[cfg(feature = "autoresearch")]
+        _ if cfg.autoresearch_enabled() => autoresearch_step(db, cfg, &issue).await,
+        _ => {
+            tracing::debug!(issue_key = %key, status = %issue.status.as_str(), "autoresearch off, leaving the row");
+            Ok(())
+        }
+    }
+}
+
+/// The scored lane's arms of [`reconcile_step`].
+#[cfg(feature = "autoresearch")]
+async fn autoresearch_step(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
+    let key = issue.key.as_str();
     match issue.status {
         // Machine-initiated spend: rank/scope cascade, draft-PR approval, pod launch. Gated on the
         // autopilot flag so an admin can pause all new spend without stopping in-flight work.
@@ -112,16 +147,14 @@ async fn reconcile_step(db: &Db, cfg: &ControllerCfg, key: &str) -> Result<()> {
             tracing::debug!(issue_key = %key, status = %issue.status.as_str(), "autopilot disabled, skipping machine-initiated reconcile");
             Ok(())
         }
-        Status::New => reconcile_new(db, cfg, &issue).await,
-        Status::Scoped => reconcile_scoped(db, cfg, &issue).await,
-        Status::AwaitingApproval => reconcile_awaiting(db, cfg, &issue).await,
+        Status::New => reconcile_new(db, cfg, issue).await,
+        Status::Scoped => reconcile_scoped(db, cfg, issue).await,
+        Status::AwaitingApproval => reconcile_awaiting(db, cfg, issue).await,
         // In-flight build work — like a `running` run, not new machine spend, so it proceeds even
         // when the autopilot pause holds the machine-initiated states above.
-        Status::Building => reconcile_building(db, cfg, &issue).await,
-        Status::Running => reconcile_running(db, cfg, &issue).await,
-        Status::Parked => reconcile_parked(db, cfg, &issue).await,
-        // `pr-open` waits on a human merge, `done` is terminal — record only, no action.
-        Status::PrOpen | Status::Done => Ok(()),
+        Status::Building => reconcile_building(db, cfg, issue).await,
+        Status::Parked => reconcile_parked(db, cfg, issue).await,
+        Status::Running | Status::PrOpen | Status::Done => Ok(()),
     }
 }
 
@@ -139,6 +172,7 @@ async fn reconcile_step(db: &Db, cfg: &ControllerCfg, key: &str) -> Result<()> {
 /// terminal, so the single queue worker never parks itself on a 40-90 minute turn here. Returns
 /// whether a turn was adopted — the caller then ends the pass, the collection outcome having
 /// driven the issue's transition.
+#[cfg(feature = "autoresearch")]
 async fn adopt_orphaned_turns(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<bool> {
     use crate::runs::workpod::{DispatchOutcome, TurnKind, WorkKind};
     let dispatcher = crate::runs::workpod::active_dispatcher();

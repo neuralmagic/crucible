@@ -382,6 +382,7 @@ impl ParkReason {
 
     /// Gates `reconcile_parked`'s ONLY auto-unpark path. Replaces the
     /// `starts_with("stale: no upstream activity")` match.
+    #[cfg(feature = "autoresearch")]
     pub(crate) fn auto_unparkable_on_activity(&self) -> bool {
         matches!(self, Self::StaleRankHorizon { .. })
     }
@@ -397,11 +398,13 @@ impl ParkReason {
     }
 
     /// The SPA's "closable upstream" signal (`IssueDto::stale_closable`).
+    #[cfg(feature = "autoresearch")]
     pub(crate) fn is_stale_closable(&self) -> bool {
         matches!(self, Self::StaleAlreadyImplemented { .. })
     }
 
     /// Replaces `api/builds.rs`'s `starts_with("image build failed:")`.
+    #[cfg(feature = "autoresearch")]
     pub(crate) fn is_image_build_failure(&self) -> bool {
         matches!(self, Self::ImageBuildFailed { .. })
     }

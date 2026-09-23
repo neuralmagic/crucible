@@ -10,6 +10,7 @@
 
 pub(crate) mod api;
 pub mod autopilot;
+#[cfg(feature = "autoresearch")]
 pub mod autopilot_flag;
 pub mod import_sqlite;
 pub mod leader;
@@ -133,13 +134,6 @@ pub fn assemble(
         })
     });
 
-    // The approvals: the upstream watermark poll re-drives changed rows through reconcile (so
-    // the staleness + upstream-close edges fire), the `upstream_updated_at` backfill stamps
-    // pre-migration-0007 rows (self-quiescing — zero GitHub calls once none are NULL), the
-    // closed-upstream repair retires contaminated rows (self-quiescing per repo via
-    // `closed_repaired_at`), the approval poll flips `awaiting-approval` rows on the approval
-    // signal, and the review-comment poll reseeds the next run. All no-op without their config
-    // (repos / `CONTROLLER_PACK_REPO` / `CONTROLLER_APPROVERS` / GitHub creds).
     // The fire-time group refresh's credential. A deployment with no issuer or no mounted key runs
     // the sweep exactly as it did before: on the schedule-row snapshot alone.
     let owner_refresh =
@@ -150,28 +144,8 @@ pub fn assemble(
                 None
             }
         };
-    let authz = crate::issues::github::Authz::from_env();
-    let bot_user = std::env::var("CONTROLLER_BOT_USER").unwrap_or_default();
-    let discovery: Arc<dyn DiscoverySource> = Arc::new(MultiDiscovery::new(vec![
-        Arc::new(crate::issues::approvals::UpstreamPoll::new(db.clone())),
-        Arc::new(crate::issues::approvals::BackfillPoll::new(db.clone())),
-        Arc::new(crate::issues::approvals::ClosedRepairPoll::new(db.clone())),
-        Arc::new(crate::issues::approvals::ApprovalPoll::new(
-            db.clone(),
-            cfg.clone(),
-            authz.clone(),
-        )),
-        Arc::new(crate::issues::approvals::ReviewCommentPoll::new(
-            db.clone(),
-            authz,
-            bot_user,
-        )),
-        // Out-of-band turn-deadline enforcement: non-blocking dispatch no longer awaits a turn, so a
-        // hung pod is reaped here (and its issue re-driven) instead of wedging its row forever.
-        Arc::new(crate::runs::workpod::TurnTimeoutPoll::new(
-            db.clone(),
-            cfg.clone(),
-        )),
+    #[allow(unused_mut)]
+    let mut sources: Vec<Arc<dyn DiscoverySource>> = vec![
         // The only source that writes: every launch trigger (a due one-shot, a due schedule, a
         // watch hit) claims its row and mints the launch in one transaction, then enqueues the key.
         Arc::new(crate::launches::standing::TriggerSweep::new(
@@ -191,7 +165,42 @@ pub fn assemble(
             owner_refresh,
             Some(policy),
         )),
-    ]));
+    ];
+    #[cfg(feature = "autoresearch")]
+    if cfg.autoresearch_enabled() {
+        // The approvals: the upstream watermark poll re-drives changed rows through reconcile (so
+        // the staleness + upstream-close edges fire), the `upstream_updated_at` backfill stamps
+        // pre-migration-0007 rows (self-quiescing — zero GitHub calls once none are NULL), the
+        // closed-upstream repair retires contaminated rows (self-quiescing per repo via
+        // `closed_repaired_at`), the approval poll flips `awaiting-approval` rows on the approval
+        // signal, and the review-comment poll reseeds the next run. All no-op without their config
+        // (repos / `CONTROLLER_PACK_REPO` / `CONTROLLER_APPROVERS` / GitHub creds).
+        let authz = crate::issues::github::Authz::from_env();
+        let bot_user = std::env::var("CONTROLLER_BOT_USER").unwrap_or_default();
+        let autoresearch: [Arc<dyn DiscoverySource>; 6] = [
+            Arc::new(crate::issues::approvals::UpstreamPoll::new(db.clone())),
+            Arc::new(crate::issues::approvals::BackfillPoll::new(db.clone())),
+            Arc::new(crate::issues::approvals::ClosedRepairPoll::new(db.clone())),
+            Arc::new(crate::issues::approvals::ApprovalPoll::new(
+                db.clone(),
+                cfg.clone(),
+                authz.clone(),
+            )),
+            Arc::new(crate::issues::approvals::ReviewCommentPoll::new(
+                db.clone(),
+                authz,
+                bot_user,
+            )),
+            // Out-of-band turn-deadline enforcement: non-blocking dispatch no longer awaits a turn, so a
+            // hung pod is reaped here (and its issue re-driven) instead of wedging its row forever.
+            Arc::new(crate::runs::workpod::TurnTimeoutPoll::new(
+                db.clone(),
+                cfg.clone(),
+            )),
+        ];
+        sources.extend(autoresearch);
+    }
+    let discovery: Arc<dyn DiscoverySource> = Arc::new(MultiDiscovery::new(sources));
 
     // The periodic drift check: rebuild into a temp DB and diff against the live one.
     // Best-effort; a divergence is reported, never fatal.
@@ -698,7 +707,7 @@ mod tests {
             annotations.insert(ISSUE_KEY_ANNOTATION.to_string(), k.to_string());
             labels.insert(
                 ISSUE_KEY_LABEL.to_string(),
-                crate::issues::engine::issue_key_label_value(k),
+                crate::runs::engine::issue_key_label_value(k),
             );
         }
         Pod {
