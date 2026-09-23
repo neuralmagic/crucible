@@ -1,3 +1,4 @@
+#[cfg(feature = "autoresearch")]
 use crate::client::Db;
 use crate::runs::workpod::*;
 use std::sync::Arc;
@@ -78,6 +79,7 @@ pub(crate) async fn admit_contract(
 
 /// The engine version the installed registry last recorded for `target`, or `None` when no
 /// registry is installed. Names an engine in a refusal; the gate itself is [`admit_contract`].
+#[cfg(feature = "autoresearch")]
 pub(crate) async fn recorded_engine_version(
     target: &crate::runs::contract::DispatchTarget,
 ) -> Option<String> {
@@ -114,6 +116,7 @@ pub fn reset_enqueue() {
 }
 
 /// The installed reconcile-queue handle, or `None` when no queue is wired (drain is then a no-op).
+#[cfg(feature = "autoresearch")]
 fn active_enqueue() -> Option<Arc<dyn crate::daemon::queue::Enqueue>> {
     ACTIVE_ENQUEUE
         .read()
@@ -126,6 +129,7 @@ fn active_enqueue() -> Option<Arc<dyn crate::daemon::queue::Enqueue>> {
 /// stale parked rows at the FIFO head is purged as the scan skips past them. A backlog of parked
 /// rows deeper than this drains over successive collections and the timeout-sweep backstop, so the
 /// bound just keeps one collection's scan cheap.
+#[cfg(feature = "autoresearch")]
 pub(crate) const QUEUE_DRAIN_SCAN: i64 = 256;
 
 /// Collect up to `limit` DRAINABLE queued issue keys for `kind`, eldest-first: scan the FIFO head
@@ -133,6 +137,7 @@ pub(crate) const QUEUE_DRAIN_SCAN: i64 = 256;
 /// spend the park rejected, and purging backfills stale rows whose issue parked before the
 /// park-purge existed — and return the live ones. Best-effort: a DB hiccup is logged and yields the
 /// keys gathered so far (a scan failure yields none) rather than failing the caller.
+#[cfg(feature = "autoresearch")]
 pub(crate) async fn drain_queued(db: &Db, kind: WorkKind, limit: usize) -> Vec<String> {
     let mut keys = Vec::new();
     if limit == 0 {
@@ -185,6 +190,7 @@ pub(crate) async fn drain_queued(db: &Db, kind: WorkKind, limit: usize) -> Vec<S
 /// promotes the row onto the slot this collection just freed. The tail never dispatches a pod itself
 /// — the reconcile pass owns the spend gates and issue context; this only re-drives the key.
 /// Best-effort: a DB hiccup or an unwired queue is logged and the collection it rides never fails.
+#[cfg(feature = "autoresearch")]
 pub(crate) async fn drain_freed_slot(db: &Db, kind: WorkKind) {
     if let Some(key) = drain_queued(db, kind, 1).await.into_iter().next()
         && let Some(enqueue) = active_enqueue()

@@ -1254,7 +1254,7 @@ pub async fn graduate(
             scratch.path().join(&branch_path)
         };
         copy_tree(pack.path(), &out).map_err(DraftError::Internal)?;
-        crate::issues::engine::open_draft_pr(
+        crate::runs::engine::open_draft_pr(
             &branch_repo,
             &branch_key,
             scratch.path(),

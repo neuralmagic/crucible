@@ -992,7 +992,7 @@ mod tests {
             "--scope-sandbox-image",
             "quay.io/x/sandbox:s",
         ]);
-        let targets = configured_targets(&cfg, crate::issues::engine::resolve_bin());
+        let targets = configured_targets(&cfg, crate::runs::engine::resolve_bin());
         let loop_image = loop_image(&profile).expect("profile loads");
         assert!(targets.contains(&DispatchTarget::Image(loop_image)));
         assert!(

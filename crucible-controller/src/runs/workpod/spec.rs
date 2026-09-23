@@ -419,11 +419,7 @@ pub(crate) async fn spawn_turn_pod(
             let mut pod = render_turn_pod(&spec_cl, &profile, digests)?;
             stamp_pod(&mut pod, &spec_cl, owner);
             crate::secrets::deliver::stamp(&mut pod, &stamp_name, &for_stamp);
-            set_container_env(
-                &mut pod,
-                crate::issues::engine::ITEM_ENV,
-                &spec_cl.issue_key,
-            );
+            set_container_env(&mut pod, crate::runs::engine::ITEM_ENV, &spec_cl.issue_key);
             Ok(pod)
         })
         .await
@@ -662,8 +658,10 @@ pub(crate) async fn dispatch_turn<S: TurnSpec>(
 }
 
 /// A code-grounded triage-ranking turn.
+#[cfg(feature = "autoresearch")]
 pub(crate) struct GroundedRankSpec;
 
+#[cfg(feature = "autoresearch")]
 impl TurnSpec for GroundedRankSpec {
     type Result = engine::GroundedVerdict;
 
@@ -733,8 +731,10 @@ impl TurnSpec for GroundedRankSpec {
 }
 
 /// A scope-propose turn.
+#[cfg(feature = "autoresearch")]
 pub(crate) struct ScopeSpec;
 
+#[cfg(feature = "autoresearch")]
 impl TurnSpec for ScopeSpec {
     type Result = engine::ScopeReport;
 
@@ -1551,7 +1551,7 @@ mod tests {
                 c.env
                     .iter()
                     .flatten()
-                    .find(|v| v.name == crate::issues::engine::ITEM_ENV)
+                    .find(|v| v.name == crate::runs::engine::ITEM_ENV)
                     .and_then(|v| v.value.as_deref()),
                 Some("o/r#33")
             );

@@ -25,6 +25,7 @@ pub struct RepoRef {
 impl RepoRef {
     /// The `owner/repo` wire form the rest of the controller (the `repos`/`issues` tables, the
     /// GitHub API paths) already speaks.
+    #[cfg(feature = "autoresearch")]
     pub(crate) fn as_repo_string(&self) -> String {
         format!("{}/{}", self.org, self.name)
     }
@@ -119,12 +120,14 @@ impl std::error::Error for WhitelistError {}
 /// repos were operator-provisioned at deploy time, not added live through the API. An empty
 /// whitelist locks new-repo addition closed by default (matching [`crate::identity::auth::Roles`]'s
 /// empty-list-locks-closed convention), while env-seeded repos keep working untouched.
+#[cfg(feature = "autoresearch")]
 #[derive(Debug, Clone, Default)]
 pub struct RepoWhitelist {
     allowed_orgs: Vec<String>,
     env_repos: Vec<String>,
 }
 
+#[cfg(feature = "autoresearch")]
 fn normalize(items: Vec<String>) -> Vec<String> {
     items
         .into_iter()
@@ -133,6 +136,7 @@ fn normalize(items: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+#[cfg(feature = "autoresearch")]
 impl RepoWhitelist {
     /// Build from the raw config lists (arbitrary case/whitespace; normalized once here).
     pub(crate) fn new(allowed_orgs: Vec<String>, env_repos: Vec<String>) -> Self {
@@ -175,6 +179,7 @@ impl RepoWhitelist {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "autoresearch")]
     #[test]
     fn parses_a_well_formed_repo() {
         let r: RepoRef = "owner/repo".parse().expect("parses");
@@ -269,6 +274,7 @@ mod tests {
         assert_eq!(r.name, "repo.name_v2");
     }
 
+    #[cfg(feature = "autoresearch")]
     #[test]
     fn whitelist_matches_org_case_insensitively() {
         let wl = RepoWhitelist::new(vec!["NeuralMagic".to_string()], vec![]);
@@ -278,6 +284,7 @@ mod tests {
         assert!(wl.check(&r2).is_ok());
     }
 
+    #[cfg(feature = "autoresearch")]
     #[test]
     fn whitelist_rejects_org_not_on_the_list() {
         let wl = RepoWhitelist::new(vec!["neuralmagic".to_string()], vec![]);
@@ -285,6 +292,7 @@ mod tests {
         assert_eq!(wl.check(&r).unwrap_err(), WhitelistError::OrgNotAllowed);
     }
 
+    #[cfg(feature = "autoresearch")]
     #[test]
     fn empty_whitelist_locks_closed() {
         let wl = RepoWhitelist::new(vec![], vec![]);
@@ -292,6 +300,7 @@ mod tests {
         assert_eq!(wl.check(&r).unwrap_err(), WhitelistError::OrgNotAllowed);
     }
 
+    #[cfg(feature = "autoresearch")]
     #[test]
     fn env_seeded_repo_is_exempt_from_the_whitelist() {
         let wl = RepoWhitelist::new(vec![], vec!["owner/repo".to_string()]);
@@ -305,6 +314,7 @@ mod tests {
         assert_eq!(wl.check(&r2).unwrap_err(), WhitelistError::OrgNotAllowed);
     }
 
+    #[cfg(feature = "autoresearch")]
     #[test]
     fn env_seeded_match_is_case_insensitive() {
         let wl = RepoWhitelist::new(vec![], vec!["Owner/Repo".to_string()]);

@@ -99,8 +99,8 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked --no-deps -- -D warnings
 
-      - name: Clippy (engine, default features)
-        run: cargo clippy -p crucible --all-targets --locked --no-deps -- -D warnings
+      - name: Clippy (default features)
+        run: cargo clippy -p crucible -p crucible-controller -p crux --all-targets --locked --no-deps -- -D warnings
 
       # The controller's `#[sqlx::test]` suite needs a live Postgres at DATABASE_URL; each test
       # creates (and drops) its own database on it. An ephemeral host port so concurrent jobs on
@@ -194,8 +194,8 @@ jobs:
       - name: Test
         run: cargo nextest run --workspace --all-features --locked
 
-      - name: Test (engine, default features)
-        run: cargo nextest run -p crucible --locked
+      - name: Test (default features)
+        run: cargo nextest run -p crucible -p crucible-controller -p crux --locked
 
       # Nextest deliberately excludes ignored tests; this one proves an idle controller tick
       # opens no span while an ingest still traces.
@@ -220,7 +220,7 @@ jobs:
           SQLX_OFFLINE: "false"
         run: |
           sqlx migrate run --source crucible-controller/migrations
-          cargo sqlx prepare --check --workspace -- --all-targets
+          cargo sqlx prepare --check --workspace -- --all-targets --all-features
 
       - name: Stop Keycloak
         if: always() && env.KEYCLOAK_CONTAINER != ''

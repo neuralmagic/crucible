@@ -1,5 +1,7 @@
+#[cfg(feature = "autoresearch")]
 use crate::issues::engine::{self, GroundedVerdict};
 use crate::runs::workpod::*;
+#[cfg(feature = "autoresearch")]
 use anyhow::{Context, Result};
 use k8s_openapi::api::core::v1::PodStatus;
 
@@ -7,6 +9,7 @@ use k8s_openapi::api::core::v1::PodStatus;
 /// podman/git chatter ahead of it. The marker's payload is the same verdict JSON the local
 /// subprocess arm parses, so an `{"error":…}` object surfaces as `Err` (the caller keeps the text
 /// tier) via the shared [`engine::verdict_from_json_line`] decoder.
+#[cfg(feature = "autoresearch")]
 pub(crate) fn parse_verdict_logs(logs: &str) -> Result<GroundedVerdict> {
     let line = logs
         .lines()
@@ -20,6 +23,7 @@ pub(crate) fn parse_verdict_logs(logs: &str) -> Result<GroundedVerdict> {
 /// line, carrying the ScopeReport JSON. The turn's preserved agent transcript rides its own
 /// `CRUCIBLE_SCOPE_TRANSCRIPT:` line (gzip+base64) just before it — attached when present, and
 /// strictly best-effort: a missing or garbled transcript never fails the report.
+#[cfg(feature = "autoresearch")]
 pub(crate) fn parse_scope_report_logs(logs: &str) -> Result<engine::ScopeReport> {
     let line = logs
         .lines()
@@ -40,6 +44,7 @@ pub(crate) fn parse_scope_report_logs(logs: &str) -> Result<engine::ScopeReport>
 /// `(None, Some)` = the marker was there but carried an `{"error":…}` payload (an oversize pack)
 /// or garbled base64. Unlike the transcript this is never best-effort: a survival whose pack
 /// can't be recovered must fail the scope loudly.
+#[cfg(feature = "autoresearch")]
 pub(crate) fn parse_scope_pack_logs(logs: &str) -> (Option<Vec<u8>>, Option<String>) {
     use base64::Engine as _;
     let Some(payload) = logs
@@ -72,6 +77,7 @@ pub(crate) fn parse_scope_pack_logs(logs: &str) -> (Option<Vec<u8>>, Option<Stri
 
 /// The transcript marker's decoded payload (gzipped session NDJSON), or `None` when the line is
 /// absent (a pre-feature engine, a hand-written pack path) or doesn't base64-decode.
+#[cfg(feature = "autoresearch")]
 pub(crate) fn parse_scope_transcript_logs(logs: &str) -> Option<Vec<u8>> {
     use base64::Engine as _;
     let payload = logs
@@ -230,6 +236,7 @@ pub struct TerminalState {
 
 impl TerminalState {
     /// The kubelet termination envelope, available only for a terminal pod.
+    #[cfg(feature = "autoresearch")]
     pub(crate) fn termination_message(&self) -> Option<&str> {
         match self.phase {
             TurnPhase::TimedOut => None,

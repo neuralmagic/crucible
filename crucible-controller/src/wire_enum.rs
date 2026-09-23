@@ -125,25 +125,40 @@ pub(crate) fn parse_or_default<T: WireEnum + Default>(s: Option<&str>) -> Result
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "autoresearch")]
     use super::{ParseError, WireEnum};
+    #[cfg(feature = "autoresearch")]
     use crate::builds::model::{BuildBackendKind, BuildState};
+    #[cfg(feature = "autoresearch")]
     use crate::issues::model::{SortKey, UpstreamState};
+    #[cfg(feature = "autoresearch")]
     use crate::issues::ranker::{Affinity, Confidence};
+    #[cfg(feature = "autoresearch")]
     use crate::launches::model::OneShotStatus;
+    #[cfg(feature = "autoresearch")]
     use crate::model::LaunchOrigin;
+    #[cfg(feature = "autoresearch")]
     use crate::model::SortDir;
+    #[cfg(feature = "autoresearch")]
     use crate::model::{ParkedBy, Status, Trigger};
+    #[cfg(feature = "autoresearch")]
     use crate::playbooks::imports::ImportStatus;
+    #[cfg(feature = "autoresearch")]
     use crate::playbooks::providers::{DefaultScope, ProviderKind, WorkloadClass};
+    #[cfg(feature = "autoresearch")]
     use crate::runs::model::{RunKindFilter, RunSort};
+    #[cfg(feature = "autoresearch")]
     use crate::runs::workpod::WorkPodState;
+    #[cfg(feature = "autoresearch")]
     use crate::secrets::{
         AuditAction, ConsumerClass, ProjectionKind, ScopeKind, SecretKind, SecretMode, Visibility,
     };
+    #[cfg(feature = "autoresearch")]
     use strum::IntoEnumIterator;
 
     /// `parse_wire(as_wire(v)) == v` for every variant (enumerated via `EnumIter`, so a new variant
     /// is covered automatically), and an unknown literal is a typed error naming the vocabulary.
+    #[cfg(feature = "autoresearch")]
     fn assert_round_trip<T>()
     where
         T: WireEnum + IntoEnumIterator + PartialEq + std::fmt::Debug,
@@ -158,6 +173,7 @@ mod tests {
         assert_eq!(value, "__definitely_not_a_variant__");
     }
 
+    #[cfg(feature = "autoresearch")]
     #[test]
     fn every_wire_enum_round_trips() {
         assert_round_trip::<Status>();

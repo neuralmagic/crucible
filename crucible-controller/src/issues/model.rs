@@ -1,6 +1,8 @@
 //! The issue slice's row and query types.
 
-use crate::model::{ParkReason, ParkedBy, SortDir, Status};
+#[cfg(feature = "autoresearch")]
+use crate::model::ParkReason;
+use crate::model::{ParkedBy, SortDir, Status};
 use crate::wire_enum::wire_enum;
 
 use anyhow::{Context, Result};
@@ -38,6 +40,7 @@ pub enum InputKind {
 }
 
 impl InputKind {
+    #[cfg(any(test, feature = "autoresearch"))]
     /// The DB discriminant vocabulary. Stable strings, never renamed — the tests pin these
     /// spellings against the serialized DTO `type` field.
     pub(crate) fn tag(&self) -> &str {
@@ -97,15 +100,18 @@ impl InputKind {
     ///
     /// Filters that read `upstream_updated_at` need this: only these rows ever get the stamp, so a
     /// filter that requires one has to spare the rest instead of silently emptying them out.
+    #[cfg(feature = "autoresearch")]
     pub(crate) const UPSTREAM_TAGS: &'static [&'static str] = &["github"];
 
     /// Whether this kind has a live upstream (fetchable title/body/labels, staleness/close
     /// detection). `false` routes the row past reconcile's autopilot gates.
+    #[cfg(feature = "autoresearch")]
     pub(crate) fn has_upstream(&self) -> bool {
         matches!(self, InputKind::GitHub { .. })
     }
 
     /// Can receive a published PR link back on the source item, and gets a draft-PR approval gate.
+    #[cfg(feature = "autoresearch")]
     pub(crate) fn accepts_pr_backlink(&self) -> bool {
         matches!(self, InputKind::GitHub { .. })
     }
@@ -175,6 +181,7 @@ pub enum RerankScope {
 
 impl RerankScope {
     /// The human spelling for the audit event and the ack body.
+    #[cfg(feature = "autoresearch")]
     pub(crate) fn describe(self) -> String {
         match self {
             RerankScope::All => "all".to_string(),
@@ -258,6 +265,7 @@ pub struct Issue {
 impl Issue {
     /// Parse `parked_reason` (if any) into its typed [`ParkReason`] — the boundary callers use to
     /// branch on WHICH reason a row carries instead of matching its stored text.
+    #[cfg(feature = "autoresearch")]
     pub(crate) fn park_reason(&self) -> Option<ParkReason> {
         self.parked_reason.as_deref().map(ParkReason::parse)
     }
@@ -366,6 +374,7 @@ pub struct NewScope {
 
 /// Immutable provenance for an administrator-supplied autoresearch pack entering at the
 /// approved-scope boundary.
+#[cfg(feature = "autoresearch")]
 #[derive(Debug, Clone)]
 pub(crate) struct NewDirectPack<'a> {
     pub key: &'a str,
@@ -381,6 +390,7 @@ pub(crate) struct NewDirectPack<'a> {
 /// `crucible scope --json` object, verbatim, plus the dispatch context the UI links back to
 /// (which pod ran it, did the pack survive). Written on every turn that produced a report —
 /// success or failure — so a parked issue keeps its evidence.
+#[cfg(feature = "autoresearch")]
 #[derive(Debug, Clone)]
 pub struct NewScopeReport {
     pub(crate) issue_key: String,
@@ -405,6 +415,7 @@ pub struct ScopeReportRow {
 /// A scope turn's preserved agent transcript to persist (`scope_transcripts`): the session NDJSON
 /// the propose/refine/adversary turns streamed, gzipped exactly as the engine delivered it (over
 /// the pod-log marker line or the local `--transcript-out` file).
+#[cfg(feature = "autoresearch")]
 #[derive(Debug, Clone)]
 pub struct NewScopeTranscript {
     pub(crate) scope_report_id: i64,
@@ -456,6 +467,7 @@ pub enum IssueKind {
 
 impl IssueKind {
     /// The stored `input_kind` tag this filter matches — kept in lockstep with [`InputKind::tag`].
+    #[cfg(feature = "autoresearch")]
     pub(crate) fn tag(self) -> &'static str {
         match self {
             IssueKind::GitHub => "github",
@@ -570,6 +582,7 @@ mod tests {
     /// `operations::core::funnel_counts`'s `parked_reason LIKE 'stale%'` aggregate counts exactly
     /// these two variants' renderings without parsing every row in Rust — this guards that the SQL
     /// literal and the enum's `Display` can't silently drift apart.
+    #[cfg(feature = "autoresearch")]
     #[test]
     fn stale_variants_render_with_the_sql_likes_stale_prefix() {
         assert!(
@@ -586,6 +599,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "autoresearch")]
     #[test]
     fn park_reason_round_trips_the_recognized_variants() {
         for (reason, rendered) in [
@@ -639,6 +653,7 @@ mod tests {
 
     /// The launch page's secrets call-out reads `secrets_refusal`, so a persisted or replayed
     /// reason has to come back as the variant that carries one, not as `Legacy`.
+    #[cfg(feature = "autoresearch")]
     #[test]
     fn a_secrets_park_round_trips_and_yields_its_refusal() {
         let reason = ParkReason::SecretsUnresolved {
@@ -658,6 +673,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "autoresearch")]
     #[test]
     fn an_unowned_secret_refusal_names_the_secret_and_its_owner() {
         let text = ParkReason::SecretsUnresolved {
@@ -677,12 +693,14 @@ mod tests {
 
     /// Only an unresolved-secrets park is the launcher's binding to fix, so nothing else may light
     /// the bind-it-here call-out.
+    #[cfg(feature = "autoresearch")]
     #[test]
     fn only_an_unresolved_secrets_park_carries_a_refusal() {
         assert_eq!(ParkReason::parse("no repro").secrets_refusal(), None);
         assert_eq!(ParkReason::UpstreamClosed.secrets_refusal(), None);
     }
 
+    #[cfg(feature = "autoresearch")]
     #[test]
     fn park_reason_unrecognized_text_falls_back_to_legacy() {
         assert_eq!(
@@ -694,6 +712,7 @@ mod tests {
         assert!(!ParkReason::parse("no repro").is_stale_closable());
     }
 
+    #[cfg(feature = "autoresearch")]
     #[test]
     fn input_kind_github_round_trips_and_has_upstream() {
         let kind = InputKind::from_parts("github", "neuralmagic/crucible#42");
@@ -710,6 +729,7 @@ mod tests {
         assert!(kind.accepts_pr_backlink());
     }
 
+    #[cfg(feature = "autoresearch")]
     #[test]
     fn input_kind_scenario_round_trips_and_has_no_upstream() {
         let kind = InputKind::from_parts("scenario", "scenario:01hz3q3q3q3q3q3q3q3q3q3q3q");
@@ -726,6 +746,7 @@ mod tests {
 
     /// `UPSTREAM_TAGS` drives a SQL clause, so it can drift from `has_upstream` silently. Pin it
     /// against a sample of every filterable kind.
+    #[cfg(feature = "autoresearch")]
     #[test]
     fn input_kind_upstream_tags_match_has_upstream() {
         let samples = [
@@ -744,6 +765,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "autoresearch")]
     #[test]
     fn input_kind_jira_round_trips_and_has_no_upstream() {
         let kind = InputKind::from_parts("jira", "jira:example:ACME-1234");
@@ -764,6 +786,7 @@ mod tests {
 
     /// A launch key round-trips through the stored tag + key, and stays outside every
     /// upstream-shaped gate: there is nothing to re-fetch and nothing to link a PR back to.
+    #[cfg(feature = "autoresearch")]
     #[test]
     fn input_kind_playbook_round_trips_and_has_no_upstream() {
         let kind = InputKind::from_parts("playbook", "playbook:survey:0199c0de-7c2c-71a5-8000-1");
@@ -799,6 +822,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "autoresearch")]
     #[test]
     fn input_kind_unrecognized_tag_falls_back_to_unknown() {
         let kind = InputKind::from_parts("gitlab", "gitlab:group/proj!7");
@@ -836,6 +860,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "autoresearch")]
     #[test]
     fn input_kind_unparseable_github_key_falls_back_to_unknown_not_error() {
         for bad_key in ["no-hash", "owner/repo#not-a-number", "no-slash#1"] {

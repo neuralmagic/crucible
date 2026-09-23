@@ -21,9 +21,12 @@ pub async fn run_once(cfg: &ControllerCfg) -> Result<()> {
     cfg.validate_scope()
         .context("validating the scope executor configuration")?;
     let db = Db::open(cfg.db_url()).await.context("opening ledger")?;
-    crate::issues::repo_watch::seed_watched_repos(db.pool(), &cfg.repos)
-        .await
-        .context("seeding the watched-repo set from CONTROLLER_WATCHED_REPOS")?;
+    #[cfg(feature = "autoresearch")]
+    if cfg.autoresearch_enabled() {
+        crate::issues::repo_watch::seed_watched_repos(db.pool(), &cfg.repos)
+            .await
+            .context("seeding the watched-repo set from CONTROLLER_WATCHED_REPOS")?;
+    }
     run_once_with(&db, cfg).await?;
     Ok(())
 }
@@ -51,15 +54,22 @@ pub async fn run_once_with(db: &Db, cfg: &ControllerCfg) -> Result<usize> {
 // The crate-wide `ENV_LOCK` (an async mutex) is held across the async drain on purpose — see the
 // note in `reconcile::tests`.
 mod tests {
+    #[cfg(feature = "autoresearch")]
     use super::*;
+    #[cfg(feature = "autoresearch")]
     use crate::Db;
+    #[cfg(feature = "autoresearch")]
     use crate::issues::model::NewIssue;
+    #[cfg(feature = "autoresearch")]
     use crate::model::Status;
+    #[cfg(feature = "autoresearch")]
     use sqlx::PgPool;
+    #[cfg(feature = "autoresearch")]
     use std::path::{Path, PathBuf};
 
     /// A stand-in `crucible` binary that survives scope with a canned report + records `--out` (so
     /// the test can prove the pack dir was addressed) and asserts the pipeline flags are present.
+    #[cfg(feature = "autoresearch")]
     fn fake_crucible(dir: &Path, argfile: &Path) -> PathBuf {
         let json = r#"{"stages":[{"name":"validate","passed":true,"detail":"ok"}],"digest":"v1:beef","cost":0.33}"#;
         let path = dir.join("crucible");
@@ -79,6 +89,7 @@ mod tests {
 
     /// An OpenAI-chat-completions-shaped ranking response that confirms whatever tier it's told —
     /// `reconcile_new`'s first step runs for every drained `new` row.
+    #[cfg(feature = "autoresearch")]
     async fn mount_ranker_confirms(server: &wiremock::MockServer, tier: &str) {
         use wiremock::matchers::method;
         use wiremock::{Mock, ResponseTemplate};
@@ -95,6 +106,7 @@ mod tests {
     }
 
     /// Mount a single-issue GET response — the GET `confirm_tier` makes per drained issue.
+    #[cfg(feature = "autoresearch")]
     async fn mount_issue(server: &wiremock::MockServer, repo: &str, number: u64) {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
@@ -113,6 +125,7 @@ mod tests {
             .await;
     }
 
+    #[cfg(feature = "autoresearch")]
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn once_drains_new_rows_to_scoped_end_to_end(pool: PgPool) -> Result<()> {
         let _g = crate::ENV_LOCK.lock().await;

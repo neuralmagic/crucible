@@ -55,13 +55,16 @@ modgraph *ARGS:
 # the checked-in `.sqlx/` cache rather than whatever the dev database was last migrated to.
 build-controller:
     SQLX_OFFLINE=true cargo build -p crucible-controller
+    SQLX_OFFLINE=true cargo build -p crucible-controller --features autoresearch
 
 test-controller:
     SQLX_OFFLINE=true cargo test -p crucible-controller
-    SQLX_OFFLINE=true cargo test -p crucible-controller --lib -- --ignored an_idle_tick_creates_no_span_but_an_ingest_still_traces
+    SQLX_OFFLINE=true cargo test -p crucible-controller --features autoresearch
+    SQLX_OFFLINE=true cargo test -p crucible-controller --features autoresearch --lib -- --ignored an_idle_tick_creates_no_span_but_an_ingest_still_traces
 
 lint-controller:
     cargo fmt --check && SQLX_OFFLINE=true cargo clippy -p crucible-controller -p crux --all-targets --all-features -- -D warnings
+    SQLX_OFFLINE=true cargo clippy -p crucible-controller -p crux --all-targets -- -D warnings
 
 # A throwaway Postgres for the controller's sqlx tests (DATABASE_URL=postgres://postgres:ci@localhost:55432/crucible).
 dev-pg:
@@ -75,6 +78,45 @@ dev-pg:
         docker start crucible-test-pg >/dev/null
     fi
     echo "DATABASE_URL=postgres://postgres:ci@localhost:55432/crucible"
+
+# See docs/controller-local.md.
+# Run the controller on this machine: Postgres in podman, no auth, no Vault, no cluster.
+controller-local port="8787" user=env_var("USER"):
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! podman container exists crucible-local-pg; then
+        podman run -d --name crucible-local-pg -e POSTGRES_PASSWORD=local -e POSTGRES_DB=crucible \
+            -v crucible-local-pg:/var/lib/postgresql/data -p 127.0.0.1:55434:5432 postgres:16 >/dev/null
+        echo "created crucible-local-pg"
+    else
+        podman start crucible-local-pg >/dev/null
+    fi
+    until podman exec crucible-local-pg pg_isready -U postgres -q; do sleep 1; done
+    (cd crucible-controller/ui && bun install --frozen-lockfile && bun run build)
+    SQLX_OFFLINE=true cargo build -p crucible -p crucible-controller -p crux --bins
+    bin="${CARGO_TARGET_DIR:-$PWD/target}/debug"
+    state="${XDG_STATE_HOME:-$HOME/.local/state}/crucible-controller"
+    mkdir -p "$state"
+    if [ -z "${OPENSHELL_PODMAN_SOCKET:-}" ] && podman machine inspect >/dev/null 2>&1; then
+        export OPENSHELL_PODMAN_SOCKET=$(podman machine inspect --format '{{"{{"}}.ConnectionInfo.PodmanSocket.Path{{"}}"}}')
+    fi
+    echo "UI  http://127.0.0.1:{{port}} as {{user}}"
+    echo "CLI CONTROLLER_URL=http://127.0.0.1:{{port}} $bin/crux whoami"
+    exec env -u CONTROLLER_API_TOKEN -u CONTROLLER_PROXY_TOKEN -u CONTROLLER_OIDC_ISSUER -u VAULT_ADDR \
+        KUBECONFIG=/dev/null \
+        DATABASE_URL=postgres://postgres:local@127.0.0.1:55434/crucible \
+        CONTROLLER_API_ADDR=127.0.0.1:{{port}} \
+        CONTROLLER_PUBLIC_URL=http://127.0.0.1:{{port}} \
+        CONTROLLER_DEV_IDENTITY={{user}} \
+        CONTROLLER_ADMINS={{user}} \
+        CONTROLLER_AUTH_MODE=proxy \
+        CONTROLLER_SESSION_SECURE=false \
+        CONTROLLER_PLAYBOOK_EXECUTOR=local \
+        CONTROLLER_SCOPE_EXECUTOR=disabled \
+        CONTROLLER_SCRATCH_DIR="$state" \
+        CRUCIBLE_BIN="$bin/crucible" \
+        RUST_LOG="${RUST_LOG:-info}" \
+        "$bin/crucible-controller" autopilot
 
 # Regenerate the controller UI's OpenAPI spec + typed client (build artifacts, not committed):
 # `cargo run -p crucible-controller --bin openapi-spec` -> openapi.json -> openapi-typescript.

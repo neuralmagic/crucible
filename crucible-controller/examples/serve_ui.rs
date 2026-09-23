@@ -43,7 +43,6 @@ async fn main() -> anyhow::Result<()> {
     let mut cfg = ViewerCfg::parse_from(["serve_ui"]).cfg;
     cfg.state_dir = state_dir.clone();
 
-    let autopilot = crucible_controller::AutopilotFlag::load(db.pool()).await?;
     let clusters = Arc::new(crucible_controller::runs::clusters::ClusterClients::new(
         None,
     ));
@@ -53,7 +52,6 @@ async fn main() -> anyhow::Result<()> {
         db,
         Arc::new(LogOnly),
         Arc::new(queue),
-        autopilot,
         clusters,
         None,
         reconcile_now,

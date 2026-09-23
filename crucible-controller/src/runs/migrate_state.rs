@@ -1112,6 +1112,7 @@ mod tests {
         assert!(err.to_string().contains("does not exist"), "{err:#}");
     }
 
+    #[cfg(feature = "autoresearch")]
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn an_unsplittable_steer_md_tars_as_is_with_no_rows(pool: PgPool) {
         let state = tempfile::tempdir().expect("tempdir");

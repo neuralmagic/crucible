@@ -64,7 +64,7 @@ async fn run_grounded(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<Gro
     Ok(match cfg.grounded_executor {
         GroundedExecutor::Disabled => Grounded::Skipped,
         GroundedExecutor::Local => {
-            let bin = engine::resolve_bin();
+            let bin = crate::runs::engine::resolve_bin();
             if let Err(failure) = crate::runs::workpod::admit_contract(
                 crate::runs::contract::RequestKind::LocalGroundedRank,
                 &[crate::runs::contract::DispatchTarget::Binary(bin.clone())],
@@ -86,7 +86,7 @@ async fn run_grounded(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<Gro
             }
         }
         GroundedExecutor::Pod => {
-            let repo_url = engine::repo_clone_url(repo);
+            let repo_url = crate::runs::engine::repo_clone_url(repo);
             match crate::runs::workpod::dispatch_grounded_rank(
                 db,
                 cfg,
@@ -129,7 +129,7 @@ async fn run_grounded_local(
     bin: std::path::PathBuf,
 ) -> Result<engine::GroundedVerdict> {
     let workspace = engine::checkout_dir(cfg.scratch_root(), repo);
-    let repo_url = engine::repo_clone_url(repo);
+    let repo_url = crate::runs::engine::repo_clone_url(repo);
     let max_cost = cfg.effective().per_reconcile_cost;
     let key = key.to_string();
     let verdict = tokio::task::spawn_blocking(move || -> Result<engine::GroundedVerdict> {

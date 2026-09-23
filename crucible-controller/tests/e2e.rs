@@ -18,18 +18,24 @@
 #![allow(clippy::disallowed_macros)]
 
 use anyhow::Result;
+#[cfg(feature = "autoresearch")]
 use crucible_controller::daemon::autopilot;
 use crucible_controller::daemon::{self, CompletionStream, DaemonConfig};
 use crucible_controller::{
     ControllerCfg, Db, IssueKey, OverrideStore, PodDispatcher, QueueConfig, Status, WorkQueue,
 };
 use k8s_openapi::api::core::v1::Pod;
+#[cfg(feature = "autoresearch")]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use wiremock::matchers::{method, path, path_regex};
-use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+#[cfg(feature = "autoresearch")]
+use wiremock::Request;
+#[cfg(feature = "autoresearch")]
+use wiremock::matchers::path_regex;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Serializes the tests in this binary: they mutate process-global env vars and the process-wide
 /// launcher seam. (The crate's own ENV_LOCK is `cfg(test)`-internal; integration tests need their
@@ -38,6 +44,7 @@ static E2E_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 // --- the in-memory GitHub World -----------------------------------------------------------------
 
+#[cfg(feature = "autoresearch")]
 #[derive(Debug, Clone)]
 struct WorldPr {
     number: u64,
@@ -52,6 +59,7 @@ struct WorldPr {
 /// The one in-memory model every fake edge reads and writes: the upstream issues the pollers see,
 /// the PRs the (shimmed) `gh` opens, the branch pushes the (shimmed) `git` records, and any `gh`
 /// invocation the shim didn't recognize — the leak-check's "nothing unasserted happened" set.
+#[cfg(feature = "autoresearch")]
 #[derive(Debug, Default)]
 struct World {
     issues: Vec<serde_json::Value>,
@@ -61,12 +69,14 @@ struct World {
     next_pr_number: u64,
 }
 
+#[cfg(feature = "autoresearch")]
 impl World {
     fn pr_url(number: u64) -> String {
         format!("https://github.com/testorg/widget/pull/{number}")
     }
 }
 
+#[cfg(feature = "autoresearch")]
 fn upstream_issue(number: u64, title: &str, body: &str, labels: &[&str]) -> serde_json::Value {
     serde_json::json!({
         "number": number,
@@ -81,6 +91,7 @@ fn upstream_issue(number: u64, title: &str, body: &str, labels: &[&str]) -> serd
 
 /// Mount every World-backed route on `server`. The GitHub REST reads serve the model; the
 /// `/fake-gh/*` + `/fake-git/*` routes are the shimmed subprocesses' way into the same model.
+#[cfg(feature = "autoresearch")]
 async fn mount_world(server: &MockServer, world: Arc<Mutex<World>>) {
     // Upstream issue list (triage's watermark poll). Matched on the path regardless of query.
     let w = world.clone();
@@ -221,6 +232,7 @@ async fn mount_world(server: &MockServer, world: Arc<Mutex<World>>) {
         .await;
 }
 
+#[cfg(feature = "autoresearch")]
 fn nth_path_number(req: &Request, idx: usize) -> u64 {
     req.url
         .path_segments()
@@ -229,6 +241,7 @@ fn nth_path_number(req: &Request, idx: usize) -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg(feature = "autoresearch")]
 fn query_param(req: &Request, name: &str) -> Option<String> {
     req.url
         .query_pairs()
@@ -238,6 +251,7 @@ fn query_param(req: &Request, name: &str) -> Option<String> {
 
 // --- the shimmed subprocess edges ----------------------------------------------------------------
 
+#[cfg(feature = "autoresearch")]
 fn write_exec(path: &Path, body: &str) {
     std::fs::write(path, body).expect("write script");
     let mut p = std::fs::metadata(path).expect("metadata").permissions();
@@ -247,6 +261,7 @@ fn write_exec(path: &Path, body: &str) {
 
 /// The command-backend scope agent: `crucible scope --propose` materializes the pack dir (SCOPE.md
 /// + crucible.toml, what the approval pushes and the PR body embeds) and prints a surviving report.
+#[cfg(feature = "autoresearch")]
 fn write_fake_crucible(dir: &Path, argfile: &Path) -> PathBuf {
     let report = r#"{"stages":[{"name":"ingest","passed":true,"detail":"goal"},{"name":"propose","passed":true,"detail":"drafted"},{"name":"validate","passed":true,"detail":"crucible check: OK"},{"name":"freeze","passed":true,"detail":"wrote SCOPE.md"}],"digest":"v1:e2e-digest","cost":0.42}"#;
     let bin = dir.join("crucible");
@@ -278,6 +293,7 @@ exit 0
 
 /// The `gh` shim: `pr list`/`pr create` curl the World; anything else is recorded as an unknown
 /// invocation (the leak check asserts none happened) and fails loudly.
+#[cfg(feature = "autoresearch")]
 fn write_fake_gh(dir: &Path, base: &str) {
     write_exec(
         &dir.join("gh"),
@@ -300,6 +316,7 @@ exit 1
 
 /// The `git` shim: intercepts `push` (records the refspec in the World, no network) and delegates
 /// every local operation (init/config/checkout/commit/rev-parse) to the real git.
+#[cfg(feature = "autoresearch")]
 fn write_fake_git(dir: &Path, base: &str, real_git: &str) {
     write_exec(
         &dir.join("git"),
@@ -318,6 +335,7 @@ exec {real_git} "$@"
     );
 }
 
+#[cfg(feature = "autoresearch")]
 fn real_git_path() -> String {
     let out = std::process::Command::new("which")
         .arg("git")
@@ -347,6 +365,7 @@ struct FakePodDispatcher {
     deleted: Mutex<Vec<String>>,
 }
 
+#[cfg(feature = "autoresearch")]
 const SESSION_LOG: &str = r#"{"v":1,"kind":"identity","identity":{"digest":"v1:e2e-digest"}}
 {"v":1,"kind":"row","row":{"iter":0,"decision":"baseline","score":200.0}}
 {"v":1,"kind":"row","row":{"iter":1,"decision":"keep","score":260.0}}
@@ -425,6 +444,7 @@ fn channel_completions() -> (
 
 // --- harness plumbing -----------------------------------------------------------------------------
 
+#[cfg(feature = "autoresearch")]
 const KEY: &str = "testorg/widget#1";
 
 /// A unique ledger URL on the test server, so parallel e2e tests never share a database. The
@@ -440,6 +460,7 @@ fn test_ledger_url() -> String {
 
 /// The smallest single-domain loop manifest the loop-run render accepts: what the scope fake
 /// freezes and what a seeded approval stores.
+#[cfg(feature = "autoresearch")]
 const LOOP_PACK_MANIFEST: &str = concat!(
     "[repo]\n",
     "url = \"https://github.com/testorg/widget.git\"\n",
@@ -506,7 +527,9 @@ fn test_cfg(state_dir: &Path, repos: Vec<String>) -> ControllerCfg {
         operators: vec![],
         operator_groups: vec![],
         session_secure_cookies: true,
+        #[cfg(feature = "autoresearch")]
         autopilot: None,
+        autoresearch: cfg!(feature = "autoresearch"),
         overrides_configmap: "crucible-controller-overrides".to_string(),
         overrides_namespace: None,
         overrides: None,
@@ -599,6 +622,7 @@ async fn event_ndjson(db: &Db) -> Result<String> {
     Ok(String::from_utf8(buf)?)
 }
 
+#[cfg(feature = "autoresearch")]
 async fn event_trace(db: &Db) -> Vec<(String, String)> {
     let body = event_ndjson(db).await.unwrap_or_default();
     body.lines()
@@ -613,11 +637,13 @@ async fn event_trace(db: &Db) -> Vec<(String, String)> {
 }
 
 /// Set an env var for the test's duration; restores (or removes) on drop even on panic.
+#[cfg(feature = "autoresearch")]
 struct EnvGuard {
     name: &'static str,
     prior: Option<std::ffi::OsString>,
 }
 
+#[cfg(feature = "autoresearch")]
 impl EnvGuard {
     fn set(name: &'static str, value: &str) -> Self {
         let prior = std::env::var_os(name);
@@ -636,6 +662,8 @@ impl EnvGuard {
     }
 }
 
+#[cfg(feature = "autoresearch")]
+#[cfg(feature = "autoresearch")]
 impl Drop for EnvGuard {
     fn drop(&mut self) {
         match &self.prior {
@@ -661,6 +689,7 @@ impl Drop for DispatcherGuard {
 /// triage discovers → ranker confirms → scope survives → approval PR opens → (the World grants
 /// approval) → launch fires → completion ingested → per-candidate rows + ledger + event log all
 /// correct → done. Then `--once` idempotence over the settled state, then the leak check.
+#[cfg(feature = "autoresearch")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn full_chain_new_to_done_with_once_idempotence() -> Result<()> {
     let _g = E2E_LOCK.lock().await;
@@ -913,6 +942,7 @@ async fn full_chain_new_to_done_with_once_idempotence() -> Result<()> {
 /// The crash-recovery case: the daemon dies after launch, before the completion is delivered.
 /// A fresh daemon over the same DB re-enqueues the still-`running` row at startup and reconciles
 /// the missed completion from evidence (the stored session artifact) — and nothing double-spends.
+#[cfg(feature = "autoresearch")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn crash_recovery_reconciles_a_missed_completion() -> Result<()> {
     let _g = E2E_LOCK.lock().await;
@@ -1088,6 +1118,7 @@ async fn crash_recovery_reconciles_a_missed_completion() -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 async fn rank_calls(server: &MockServer) -> usize {
     server
         .received_requests()
@@ -1326,7 +1357,6 @@ async fn standing_launches_fire_through_one_sweep() -> Result<()> {
             queue.clone(),
         )),
         Arc::new(queue),
-        crucible_controller::AutopilotFlag::load(db.pool()).await?,
         Arc::new(crucible_controller::runs::clusters::ClusterClients::new(
             None,
         )),

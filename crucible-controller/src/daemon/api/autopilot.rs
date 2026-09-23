@@ -1,6 +1,9 @@
 use crate::api::dto::*;
 use crate::api::state::*;
 use axum::extract::State;
+use axum::response::{IntoResponse, Response};
+
+const NO_FLAG: &str = "no autopilot flag is loaded on this controller";
 
 // --- autopilot flag -----------------------------------------------------------
 
@@ -11,11 +14,14 @@ use axum::extract::State;
         (status = 200, description = "Autopilot flag state: enabled/disabled plus audit trail", body = AutopilotDto)
     )
 )]
-pub(crate) async fn get_autopilot(
-    State(state): State<ApiState>,
-) -> Result<Json<AutopilotDto>, AppError> {
-    let s = state.autopilot.read().await?;
-    Ok(Json(s.into()))
+pub(crate) async fn get_autopilot(State(state): State<ApiState>) -> Response {
+    let Some(flag) = state.autopilot.as_ref() else {
+        return unavailable(NO_FLAG);
+    };
+    match flag.read().await {
+        Ok(s) => Json(AutopilotDto::from(s)).into_response(),
+        Err(e) => AppError(e).into_response(),
+    }
 }
 
 #[utoipa::path(
@@ -32,13 +38,24 @@ pub(crate) async fn set_autopilot(
     identity: crate::identity::session::Identity,
     _admin: crate::identity::auth::AdminGuard,
     Json(body): Json<AutopilotSetBody>,
-) -> Result<Json<AutopilotDto>, AppError> {
-    let actor = identity.as_deref();
-    let prev = state.autopilot.read().await?;
-    let next = state
-        .autopilot
-        .set(body.enabled, actor, &body.reason)
-        .await?;
+) -> Response {
+    let Some(flag) = state.autopilot.as_ref() else {
+        return unavailable(NO_FLAG);
+    };
+    match set(&state, flag, identity.as_deref(), &body).await {
+        Ok(dto) => Json(dto).into_response(),
+        Err(e) => AppError(e).into_response(),
+    }
+}
+
+async fn set(
+    state: &ApiState,
+    flag: &crate::daemon::autopilot_flag::AutopilotFlag,
+    actor: Option<&str>,
+    body: &AutopilotSetBody,
+) -> anyhow::Result<AutopilotDto> {
+    let prev = flag.read().await?;
+    let next = flag.set(body.enabled, actor, &body.reason).await?;
     let from_str = if prev.enabled { "enabled" } else { "disabled" };
     let to_str = if next.enabled { "enabled" } else { "disabled" };
     state
@@ -49,5 +66,5 @@ pub(crate) async fn set_autopilot(
                 .by(actor),
         )
         .await?;
-    Ok(Json(next.into()))
+    Ok(next.into())
 }

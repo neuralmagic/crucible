@@ -17,6 +17,9 @@ use utoipa_axum::routes;
 pub mod state;
 use state::*;
 
+#[cfg(feature = "autoresearch")]
+mod autoresearch;
+
 pub(crate) mod dto;
 pub(crate) mod events;
 pub(crate) mod metrics;
@@ -46,19 +49,12 @@ pub(crate) mod tests;
         crate::identity::api::prefs::put_picker_prefs,
         system::overview,
         dto::funnel,
-        crate::issues::api::issues::list_issues,
-        crate::issues::api::issues::issue_facets,
-        crate::issues::api::issues::get_issue,
-        crate::issues::api::issues::get_issue_journey,
         crate::runs::api::runs::list_runs,
-        crate::builds::api::list_builds,
         crate::images::api::list_images,
         crate::images::api::refresh_images,
         crate::playbooks::api::images::rank_images,
         crate::runs::api::cluster_view::list_clusters,
         crate::runs::api::cluster_view::list_dispatch_targets,
-        crate::builds::api::list_issue_builds,
-        crate::builds::api::rebuild_build,
         crate::runs::api::runs::get_run,
         crate::runs::api::runs::get_run_iterations,
         crate::runs::api::runs::get_run_graph,
@@ -72,36 +68,14 @@ pub(crate) mod tests;
         crate::runs::api::runs::export_runs,
         crate::runs::api::runs::export_iterations,
         crate::runs::api::runs::live_run,
-        crate::runs::api::runs::live_turn,
         system::ledger_summary,
         system::ledger_by_tag,
-        crate::runs::api::turns::list_turns,
-        crate::runs::api::turns::get_turn,
         events::list_events,
         events::events_stream,
         crate::issues::api::approvals::get_approvals,
-        crate::issues::api::approvals::get_scope_evidence,
-        crate::issues::api::approvals::get_scope_report,
-        crate::issues::api::approvals::get_scope_transcript,
-        crate::issues::api::repos::get_repos,
-        crate::issues::api::repos::add_repo,
-        crate::issues::api::repos::pause_repo,
-        crate::issues::api::repos::resume_repo,
-        crate::issues::api::repos::unwatch_repo,
         crate::issues::api::overrides::park_issue,
         crate::issues::api::overrides::unpark_issue,
-        crate::issues::api::overrides::bump_issue,
-        crate::issues::api::overrides::redispatch_issue,
-        crate::issues::api::rerank::rerank_issue,
-        crate::issues::api::rerank::rerank_issues,
         crate::issues::api::reconcile_manual::trigger_reconcile,
-        crate::daemon::api::autopilot::get_autopilot,
-        crate::daemon::api::autopilot::set_autopilot,
-        crate::issues::api::overrides::scope_now,
-        crate::issues::api::scenarios::launch_pack,
-        crate::issues::api::scenarios::adopt_scenario,
-        crate::issues::api::scenarios::approve_scenario,
-        crate::issues::api::scenarios::adopt_jira,
         crate::playbooks::api::registry::register_playbook,
         crate::playbooks::api::import::import_candidates,
         crate::playbooks::api::import::propose_pack_import,
@@ -218,12 +192,9 @@ pub(crate) mod tests;
         dto::CostMetric,
         dto::LongText,
         dto::IssueDto,
-        crate::issues::api::issues::IssueFacetsDto,
-        crate::issues::api::issues::FacetCount,
         dto::ScopeDto,
         dto::RunDto,
         crate::runs::api::runs::RunRowDto,
-        crate::builds::api::BuildDto,
         crate::images::api::CatalogDto,
         crate::images::api::CatalogImageDto,
         crate::images::api::CatalogRepositoryDto,
@@ -234,7 +205,6 @@ pub(crate) mod tests;
         crate::playbooks::preflight::RankedImage,
         crate::playbooks::preflight::ExcludedImage,
         crate::playbooks::api::images::RankImagesBody,
-        crate::builds::api::RebuildAck,
         dto::CandidateDto,
         dto::RunDetail,
         dto::PlanTaskDto,
@@ -248,47 +218,16 @@ pub(crate) mod tests;
         crate::runs::artifacts::ArtifactEntry,
         dto::ScopeDetail,
         dto::EventDto,
-        dto::IssueDetail,
-        dto::IssueCommentDto,
-        crate::issues::journey::JourneyDto,
-        crate::issues::journey::JourneyStep,
         dto::LedgerSummaryDto,
         dto::LedgerDayDto,
         system::LedgerByTagDto,
         system::LedgerTagDto,
-        crate::runs::api::turns::WorkPodDto,
         dto::ApprovalsDto,
         dto::PendingImportDto,
         dto::AwaitingApprovalDto,
         dto::KeptPrDto,
-        crate::issues::refine_trail::ScopeEvidenceDto,
-        crate::issues::refine_trail::ScopeReportDto,
-        crate::issues::refine_trail::ScopeStage,
-        crate::issues::refine_trail::RoundRecord,
-        crate::issues::refine_trail::RoundKind,
-        crate::issues::refine_trail::RoundOutcome,
-        crate::issues::refine_trail::FailureEvidence,
-        crate::issues::refine_trail::Attack,
-        crate::issues::refine_trail::AttackKind,
-        crate::issues::refine_trail::SelftestEvidence,
-        crate::issues::refine_trail::ControlEvidence,
-        crate::issues::refine_trail::ReadingEvidence,
         dto::RepoHealthDto,
-        crate::issues::api::repos::AddRepoBody,
-        crate::issues::api::repos::RepoActionAck,
         crate::issues::api::overrides::OverrideAck,
-        crate::issues::api::rerank::RerankFilter,
-        crate::issues::api::rerank::RerankAck,
-        crate::issues::api::rerank::BulkRerankAck,
-        dto::AutopilotDto,
-        dto::AutopilotSetBody,
-        crate::issues::api::overrides::ScopeNowBody,
-        crate::issues::api::overrides::RedispatchBody,
-        crate::issues::api::scenarios::AdoptScenarioBody,
-        crate::issues::api::scenarios::ScenarioAck,
-        crate::issues::api::scenarios::ScenarioApproveAck,
-        crate::issues::api::scenarios::AdoptJiraBody,
-        crate::issues::api::scenarios::JiraAck,
         crate::playbooks::api::registry::RegisterPlaybookBody,
         crate::playbooks::api::registry::RegisterAck,
         crate::playbooks::api::import::ImportCandidatesBody,
@@ -416,14 +355,18 @@ struct ApiDoc;
 
 /// Return the OpenAPI spec as JSON. Can be called without a running server for typegen workflows.
 pub(crate) fn openapi_spec() -> anyhow::Result<String> {
-    Ok(ApiDoc::openapi().to_json()?)
+    #[allow(unused_mut)]
+    let mut doc = ApiDoc::openapi();
+    #[cfg(feature = "autoresearch")]
+    doc.merge(autoresearch::AutoresearchDoc::openapi());
+    Ok(doc.to_json()?)
 }
 
 /// Build the API router alone (used by tests that only exercise `/api/*` + `/healthz`; `spa`
 /// merges its pages onto the same state). Uses utoipa-axum's OpenApiRouter so every route is
 /// type-checked against the spec at compile time — a handler can't be routed without its schema.
 pub fn router(state: ApiState) -> Router {
-    let (router, api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
+    let router = OpenApiRouter::with_openapi(ApiDoc::openapi())
         .routes(routes!(system::healthz))
         .routes(routes!(system::version))
         .routes(routes!(system::whoami))
@@ -439,12 +382,7 @@ pub fn router(state: ApiState) -> Router {
         .routes(routes!(system::get_access))
         .routes(routes!(system::overview))
         .routes(routes!(dto::funnel))
-        .routes(routes!(crate::issues::api::issues::list_issues))
-        .routes(routes!(crate::issues::api::issues::issue_facets))
-        .routes(routes!(crate::issues::api::issues::get_issue))
-        .routes(routes!(crate::issues::api::issues::get_issue_journey))
         .routes(routes!(crate::runs::api::runs::list_runs))
-        .routes(routes!(crate::builds::api::list_builds))
         .routes(routes!(crate::images::api::list_images))
         .routes(routes!(crate::images::api::refresh_images))
         .routes(routes!(crate::playbooks::api::images::rank_images))
@@ -452,8 +390,6 @@ pub fn router(state: ApiState) -> Router {
         .routes(routes!(
             crate::runs::api::cluster_view::list_dispatch_targets
         ))
-        .routes(routes!(crate::builds::api::list_issue_builds))
-        .routes(routes!(crate::builds::api::rebuild_build))
         .routes(routes!(crate::runs::api::runs::get_run))
         .routes(routes!(crate::runs::api::runs::get_run_iterations))
         .routes(routes!(crate::runs::api::runs::get_run_graph))
@@ -465,38 +401,16 @@ pub fn router(state: ApiState) -> Router {
         .routes(routes!(crate::runs::api::runs::export_runs))
         .routes(routes!(crate::runs::api::runs::export_iterations))
         .routes(routes!(crate::runs::api::runs::live_run))
-        .routes(routes!(crate::runs::api::runs::live_turn))
         .routes(routes!(system::ledger_summary))
         .routes(routes!(system::ledger_by_tag))
-        .routes(routes!(crate::runs::api::turns::list_turns))
-        .routes(routes!(crate::runs::api::turns::get_turn))
         .routes(routes!(events::list_events))
         .routes(routes!(events::events_stream))
         .routes(routes!(crate::issues::api::approvals::get_approvals))
-        .routes(routes!(crate::issues::api::approvals::get_scope_evidence))
-        .routes(routes!(crate::issues::api::approvals::get_scope_report))
-        .routes(routes!(crate::issues::api::approvals::get_scope_transcript))
-        .routes(routes!(crate::issues::api::repos::get_repos))
-        .routes(routes!(crate::issues::api::repos::add_repo))
-        .routes(routes!(crate::issues::api::repos::pause_repo))
-        .routes(routes!(crate::issues::api::repos::resume_repo))
-        .routes(routes!(crate::issues::api::repos::unwatch_repo))
         .routes(routes!(crate::issues::api::overrides::park_issue))
         .routes(routes!(crate::issues::api::overrides::unpark_issue))
-        .routes(routes!(crate::issues::api::overrides::bump_issue))
-        .routes(routes!(crate::issues::api::overrides::redispatch_issue))
-        .routes(routes!(crate::issues::api::rerank::rerank_issue))
-        .routes(routes!(crate::issues::api::rerank::rerank_issues))
         .routes(routes!(
             crate::issues::api::reconcile_manual::trigger_reconcile
         ))
-        .routes(routes!(crate::daemon::api::autopilot::get_autopilot))
-        .routes(routes!(crate::daemon::api::autopilot::set_autopilot))
-        .routes(routes!(crate::issues::api::overrides::scope_now))
-        .routes(routes!(crate::issues::api::scenarios::launch_pack))
-        .routes(routes!(crate::issues::api::scenarios::adopt_scenario))
-        .routes(routes!(crate::issues::api::scenarios::approve_scenario))
-        .routes(routes!(crate::issues::api::scenarios::adopt_jira))
         .routes(routes!(crate::playbooks::api::registry::register_playbook))
         .routes(routes!(crate::playbooks::api::import::import_candidates))
         .routes(routes!(crate::playbooks::api::import::propose_pack_import))
@@ -660,8 +574,14 @@ pub fn router(state: ApiState) -> Router {
         .routes(routes!(
             crate::authz::shares::grant_provider_share,
             crate::authz::shares::revoke_provider_share
-        ))
-        .split_for_parts();
+        ));
+    #[cfg(feature = "autoresearch")]
+    let router = if state.autoresearch {
+        autoresearch::routes(router)
+    } else {
+        router
+    };
+    let (router, api) = router.split_for_parts();
 
     router
         // The artifact proxy is a catch-all (`{*path}` captures `diffs/<file>`, which carries a

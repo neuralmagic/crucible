@@ -101,8 +101,6 @@ pub static BINDINGS: &[Binding] = &[
         V::Update,
         Platform,
     ),
-    bind("GET", "/api/autopilot", R::Platform, V::Read, Route),
-    bind("POST", "/api/autopilot", R::Platform, V::Update, Platform),
     bind("POST", "/api/reconcile", R::Platform, V::Update, Platform),
     bind(
         "POST",
@@ -166,26 +164,6 @@ pub static BINDINGS: &[Binding] = &[
         V::Activate,
         Platform,
     ),
-    bind("GET", "/api/issues", R::Issue, V::Read, Route),
-    bind("GET", "/api/issues/facets", R::Issue, V::Read, Route),
-    bind("POST", "/api/issues/rerank", R::Issue, V::Launch, Platform),
-    bind("GET", "/api/issues/{key}", R::Issue, V::Read, Route),
-    bind("GET", "/api/issues/{key}/journey", R::Issue, V::Read, Route),
-    bind("GET", "/api/issues/{key}/builds", R::Build, V::Read, Route),
-    bind(
-        "GET",
-        "/api/issues/{key}/scope-report",
-        R::Issue,
-        V::Read,
-        Route,
-    ),
-    bind(
-        "GET",
-        "/api/issues/{key}/scope-transcript",
-        R::Issue,
-        V::Read,
-        Route,
-    ),
     bind(
         "POST",
         "/api/issues/{key}/park",
@@ -200,85 +178,7 @@ pub static BINDINGS: &[Binding] = &[
         V::Update,
         Platform,
     ),
-    bind(
-        "POST",
-        "/api/issues/{key}/bump",
-        R::Issue,
-        V::Update,
-        Platform,
-    ),
-    bind(
-        "POST",
-        "/api/issues/{key}/redispatch",
-        R::Issue,
-        V::Launch,
-        Platform,
-    ),
-    bind(
-        "POST",
-        "/api/issues/{key}/rerank",
-        R::Issue,
-        V::Launch,
-        Platform,
-    ),
-    bind(
-        "POST",
-        "/api/issues/{key}/scope",
-        R::Issue,
-        V::Launch,
-        Platform,
-    ),
     bind("GET", "/api/approvals", R::Issue, V::Read, Route),
-    bind(
-        "GET",
-        "/api/approvals/{scope_id}/evidence",
-        R::Issue,
-        V::Read,
-        Route,
-    ),
-    bind("POST", "/api/jira", R::Issue, V::Create, Platform),
-    bind("POST", "/api/scenarios", R::Issue, V::Create, Platform),
-    bind(
-        "POST",
-        "/api/scenarios/{key}/approve",
-        R::Issue,
-        V::Approve,
-        Platform,
-    ),
-    bind("GET", "/api/turns", R::Issue, V::Read, Route),
-    bind("GET", "/api/turns/{pod_name}", R::Issue, V::Read, Route),
-    bind(
-        "GET",
-        "/api/turns/{pod_name}/live",
-        R::Issue,
-        V::Read,
-        Route,
-    ),
-    bind("GET", "/api/repos", R::Repo, V::Read, Route),
-    bind("POST", "/api/repos", R::Repo, V::Create, Platform),
-    bind("DELETE", "/api/repos/{repo}", R::Repo, V::Delete, Platform),
-    bind(
-        "POST",
-        "/api/repos/{repo}/pause",
-        R::Repo,
-        V::Update,
-        Platform,
-    ),
-    bind(
-        "POST",
-        "/api/repos/{repo}/resume",
-        R::Repo,
-        V::Update,
-        Platform,
-    ),
-    bind("GET", "/api/builds", R::Build, V::Read, Route),
-    bind(
-        "POST",
-        "/api/builds/{id}/rebuild",
-        R::Build,
-        V::Update,
-        Platform,
-    ),
     bind("GET", "/api/runs", R::Run, V::Read, Route),
     bind("GET", "/api/runs/{run_id}", R::Run, V::Read, Route),
     bind(
@@ -358,7 +258,6 @@ pub static BINDINGS: &[Binding] = &[
         V::Transfer,
         Route,
     ),
-    bind("POST", "/api/packs/launch", R::Playbook, V::Launch, Route),
     bind(
         "GET",
         "/api/playbooks/{id}/shares",
@@ -791,11 +690,123 @@ pub static BINDINGS: &[Binding] = &[
     bind("GET", "/api/teams/{slug}/audit", R::Team, V::Read, Route),
 ];
 
+/// The autoresearch lane's bindings, served only when that lane is built.
+#[cfg(feature = "autoresearch")]
+static AUTORESEARCH_BINDINGS: &[Binding] = &[
+    bind("GET", "/api/autopilot", R::Platform, V::Read, Route),
+    bind("POST", "/api/autopilot", R::Platform, V::Update, Platform),
+    bind("GET", "/api/issues", R::Issue, V::Read, Route),
+    bind("GET", "/api/issues/facets", R::Issue, V::Read, Route),
+    bind("POST", "/api/issues/rerank", R::Issue, V::Launch, Platform),
+    bind("GET", "/api/issues/{key}", R::Issue, V::Read, Route),
+    bind("GET", "/api/issues/{key}/journey", R::Issue, V::Read, Route),
+    bind("GET", "/api/issues/{key}/builds", R::Build, V::Read, Route),
+    bind(
+        "GET",
+        "/api/issues/{key}/scope-report",
+        R::Issue,
+        V::Read,
+        Route,
+    ),
+    bind(
+        "GET",
+        "/api/issues/{key}/scope-transcript",
+        R::Issue,
+        V::Read,
+        Route,
+    ),
+    bind(
+        "POST",
+        "/api/issues/{key}/bump",
+        R::Issue,
+        V::Update,
+        Platform,
+    ),
+    bind(
+        "POST",
+        "/api/issues/{key}/redispatch",
+        R::Issue,
+        V::Launch,
+        Platform,
+    ),
+    bind(
+        "POST",
+        "/api/issues/{key}/rerank",
+        R::Issue,
+        V::Launch,
+        Platform,
+    ),
+    bind(
+        "POST",
+        "/api/issues/{key}/scope",
+        R::Issue,
+        V::Launch,
+        Platform,
+    ),
+    bind(
+        "GET",
+        "/api/approvals/{scope_id}/evidence",
+        R::Issue,
+        V::Read,
+        Route,
+    ),
+    bind("POST", "/api/jira", R::Issue, V::Create, Platform),
+    bind("POST", "/api/scenarios", R::Issue, V::Create, Platform),
+    bind(
+        "POST",
+        "/api/scenarios/{key}/approve",
+        R::Issue,
+        V::Approve,
+        Platform,
+    ),
+    bind("GET", "/api/turns", R::Issue, V::Read, Route),
+    bind("GET", "/api/turns/{pod_name}", R::Issue, V::Read, Route),
+    bind(
+        "GET",
+        "/api/turns/{pod_name}/live",
+        R::Issue,
+        V::Read,
+        Route,
+    ),
+    bind("GET", "/api/repos", R::Repo, V::Read, Route),
+    bind("POST", "/api/repos", R::Repo, V::Create, Platform),
+    bind("DELETE", "/api/repos/{repo}", R::Repo, V::Delete, Platform),
+    bind(
+        "POST",
+        "/api/repos/{repo}/pause",
+        R::Repo,
+        V::Update,
+        Platform,
+    ),
+    bind(
+        "POST",
+        "/api/repos/{repo}/resume",
+        R::Repo,
+        V::Update,
+        Platform,
+    ),
+    bind("GET", "/api/builds", R::Build, V::Read, Route),
+    bind(
+        "POST",
+        "/api/builds/{id}/rebuild",
+        R::Build,
+        V::Update,
+        Platform,
+    ),
+    bind("POST", "/api/packs/launch", R::Playbook, V::Launch, Route),
+];
+
+/// Every binding this build serves.
+pub fn bindings() -> impl Iterator<Item = &'static Binding> {
+    let core = BINDINGS.iter();
+    #[cfg(feature = "autoresearch")]
+    let core = core.chain(AUTORESEARCH_BINDINGS.iter());
+    core
+}
+
 /// The binding for a served method and matched path template.
 pub fn lookup(method: &Method, path: &str) -> Option<&'static Binding> {
-    BINDINGS
-        .iter()
-        .find(|b| b.method == method.as_str() && b.path == path)
+    bindings().find(|b| b.method == method.as_str() && b.path == path)
 }
 
 /// The binding middleware: refuse an unbound route, decide a platform route, pass the rest.
@@ -844,7 +855,7 @@ mod tests {
     #[test]
     fn every_binding_names_a_defined_action_and_no_pair_repeats() {
         let mut seen = BTreeSet::new();
-        for b in BINDINGS {
+        for b in bindings() {
             assert!(
                 b.action.resource.defines(b.action.verb),
                 "{} {} binds {} which the type does not define",
@@ -880,8 +891,7 @@ mod tests {
             }
         }
         served.insert(("GET".to_string(), "/api/openapi.json".to_string()));
-        let bound: BTreeSet<(String, String)> = BINDINGS
-            .iter()
+        let bound: BTreeSet<(String, String)> = bindings()
             .map(|b| {
                 (
                     b.method.to_string(),

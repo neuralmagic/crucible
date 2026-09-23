@@ -12,7 +12,7 @@
     "check": "tsc --noEmit && eslint . --max-warnings 0",
     "preview": "vite preview",
     "generate": "bun run generate:spec && bun run generate:types",
-    "generate:spec": "cargo run -q -p crucible-controller --bin openapi-spec > openapi.json",
+    "generate:spec": "cargo run -q -p crucible-controller --features autoresearch --bin openapi-spec > openapi.json",
     "generate:types": "openapi-typescript openapi.json -o src/api/schema.d.ts",
     "pretest": "bun run generate",
     "test": "vitest run",
