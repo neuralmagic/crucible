@@ -198,6 +198,35 @@ mod tests {
     }
 
     #[test]
+    fn a_pack_with_typed_emits_previews_its_graph() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = write_playbook_pack(
+            dir.path(),
+            concat!(
+                "scan = command(name = \"scan\", run = \"true\", ",
+                "emits = {\"targets\": \"list\", \"tier\": [\"high\", \"low\"]})\n",
+                "audit = command(name = \"audit\", run = \"true\", depends_on = [scan], ",
+                "over = scan.targets, max_fanout = 4, emits = [\"note\"])\n",
+                "workflow(type = \"playbook\", tasks = [scan, audit], result = audit)\n",
+            ),
+        );
+
+        let preview = preview_pack(&root, &BTreeMap::new(), Unvalued::Refuse).expect("previews");
+        assert!(preview.diagnostics.is_empty(), "{:?}", preview.diagnostics);
+        let graph = preview.graph.expect("the graph rides the preview");
+        let emits = |name: &str| {
+            graph
+                .nodes
+                .iter()
+                .find(|n| n.name == name)
+                .map(|n| n.emits.clone())
+                .expect("the node")
+        };
+        assert_eq!(emits("scan"), ["targets", "tier"]);
+        assert_eq!(emits("audit"), ["note"]);
+    }
+
+    #[test]
     fn a_refused_compile_keeps_the_schema_and_carries_the_engine_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = write_playbook_pack(dir.path(), WORKFLOW_BROKEN);
