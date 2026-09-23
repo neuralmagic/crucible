@@ -24,6 +24,7 @@ use crate::openshell::grpc::Gateway;
 use crate::openshell::{gateway, grpc, policy, provider, sandbox};
 use anyhow::{Context, Result};
 use crucible_contract::TransportCause;
+use std::time::Instant;
 
 /// Which step of the turn an orchestration error came from, read off the typed errors in its
 /// chain. The gateway is checked first: a sandbox call that failed because the gateway was down
@@ -99,6 +100,7 @@ pub fn turn(
     prompt: &str,
     json: bool,
     session: Option<&crate::agent::agent_session::SessionTurn>,
+    deadline: Option<crucible::deadline::Deadline>,
     mut sink: impl FnMut(&str, RawStream, Option<&AgentEvent>),
 ) -> TurnOutcome {
     // The whole turn is async; the engine runtime drives it. The one `block_on` in the openshell
@@ -124,7 +126,17 @@ pub fn turn(
         }
     };
     let spent = CostMeter::default();
-    match handle.block_on(try_turn(args, p, prompt, json, session, &spent, &mut sink)) {
+    let at = deadline.map(|d| d.at);
+    let outcome = handle.block_on(try_turn(
+        args, p, prompt, json, session, at, &spent, &mut sink,
+    ));
+    if outcome.is_err()
+        && let Some(deadline) = deadline
+        && Instant::now() >= deadline.at
+    {
+        return TurnOutcome::failed(spent.get(), TurnFailure::DeadlineExceeded(deadline));
+    }
+    match outcome {
         Ok(cost) => TurnOutcome::completed(cost),
         Err(e) => {
             let cause = transport_cause(&e);
@@ -166,12 +178,15 @@ impl Drop for AbortOnDrop {
 }
 
 /// Spawn the per-turn Ctrl-C bridge: poll [`crate::process::STOP`] every 50ms and trip `cancel` when it is
-/// set, so the exec stream (and the cancellable upload/download children) unwind promptly. STOP
-/// stays the single source of truth the loop driver already owns; this only translates it into the
-/// token the async I/O `select!`s on. The returned guard aborts the task at turn end.
-fn spawn_stop_bridge(cancel: CancellationToken) -> AbortOnDrop {
+/// set, or when the turn's deadline passes, so the exec stream (and the cancellable upload/download
+/// children) unwind promptly. STOP stays the single source of truth the loop driver already owns;
+/// this only translates it into the token the async I/O `select!`s on. The returned guard aborts
+/// the task at turn end.
+fn spawn_stop_bridge(cancel: CancellationToken, deadline: Option<Instant>) -> AbortOnDrop {
     AbortOnDrop(tokio::spawn(async move {
-        while !crate::process::STOP.load(Ordering::SeqCst) {
+        while !crate::process::STOP.load(Ordering::SeqCst)
+            && deadline.is_none_or(|at| Instant::now() < at)
+        {
             if cancel.is_cancelled() {
                 return;
             }
@@ -249,6 +264,7 @@ fn selected_codex_api_key(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
     name = "openshell_turn",
     skip_all,
@@ -269,6 +285,7 @@ async fn try_turn(
     prompt: &str,
     json: bool,
     session: Option<&crate::agent::agent_session::SessionTurn>,
+    deadline: Option<Instant>,
     spent: &CostMeter,
     sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
 ) -> Result<f64> {
@@ -276,7 +293,7 @@ async fn try_turn(
     // stream and the upload/download children `select!` it. The guard aborts the bridge at turn
     // end (including any `?` bail below).
     let cancel = CancellationToken::new();
-    let _bridge = spawn_stop_bridge(cancel.clone());
+    let _bridge = spawn_stop_bridge(cancel.clone(), deadline);
 
     // Env values and relay files are provisioned below, so the disclosure gate runs here, before
     // the sandbox exists (RFC-0001:C-CAPABILITY-DISCLOSURE).

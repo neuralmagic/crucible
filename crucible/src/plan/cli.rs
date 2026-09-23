@@ -147,6 +147,9 @@ pub fn render(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
         if let Some(when) = &t.when {
             detail.push_str(&format!(" when={when}"));
         }
+        if let Some(timeout) = &t.timeout {
+            detail.push_str(&format!(" timeout={timeout}"));
+        }
         out.push_str(&format!(
             "  {:<20} {:<28} needs={:<8} {} deps: {}{}\n",
             t.name.0,
@@ -529,6 +532,36 @@ struct BadDuration {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[error(
+    "task {task:?} declares timeout {timeout}, longer than this run's --max-time {ceiling}. The \
+     run's ceiling is the longest any task may declare; shorten the timeout or raise --max-time"
+)]
+struct TimeoutPastCeiling {
+    task: String,
+    timeout: crucible::duration::TaskTimeout,
+    ceiling: String,
+}
+
+/// Refuse a plan whose task declares a limit the operator's wall-clock ceiling does not allow.
+fn check_timeouts(plan: &ValidPlan, ceiling: Option<std::time::Duration>) -> Result<()> {
+    let Some(ceiling) = ceiling else {
+        return Ok(());
+    };
+    match plan
+        .tasks_topo()
+        .find_map(|t| Some((t, t.timeout?)).filter(|(_, limit)| limit.get() > ceiling))
+    {
+        Some((task, timeout)) => Err(TimeoutPastCeiling {
+            task: task.name.0.clone(),
+            timeout,
+            ceiling: crucible::duration::Shown(ceiling).to_string(),
+        }
+        .into()),
+        None => Ok(()),
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
 #[error("{manifest} declares no [workflow]; pass --file, or give the manifest a graph to compile")]
 struct NoGraph {
     manifest: String,
@@ -654,6 +687,13 @@ pub fn run(
             }
             (None, None) => unreachable!("clap requires --file without --manifest"),
         };
+    check_timeouts(&plan, ceilings.wall_clock)?;
+    // A task under a deadline runs in a process group of its own, where the terminal's SIGINT
+    // does not reach it.
+    let _ = ctrlc::set_handler(|| {
+        crucible::deadline::terminate_live_groups();
+        std::process::exit(130);
+    });
     // Manifest runs append plan wire events to the run's session log so tailers (and the
     // controller's ingest) see the graph and its live progress; shell runs have no state dir.
     let substrate = Substrate::detecting(caps.clone(), &crucible::inference::from_process_env()?);
@@ -925,6 +965,16 @@ mod tests {
         let out = render(&plan, &BTreeSet::new());
         assert!(out.contains("[UNRUNNABLE]"));
         assert!(out.contains("verdict: TRUNCATED"));
+    }
+
+    #[test]
+    fn render_states_each_tasks_own_time_limit() {
+        let mut plan = Plan::from_toml_str(SRC).unwrap();
+        plan.tasks[0].timeout = Some("90m".parse().unwrap());
+        let out = render(&plan.validate().unwrap(), &BTreeSet::new());
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[1].contains(" timeout=90m"), "{out}");
+        assert!(!lines[2].contains("timeout="), "{out}");
     }
 
     #[test]

@@ -130,6 +130,14 @@ fn task_knobs() -> Vec<Kwarg> {
             ),
         ),
         Kwarg::new(
+            "timeout",
+            "str",
+            "How long one attempt may run, as `90s`, `10m`, or `2h`. At the limit the attempt's \
+             whole process group is killed and the task settles failed with a note naming the \
+             limit; it is not retried. The run's `--max-time` bounds every attempt as well, and a \
+             playbook refuses a timeout longer than it before dispatching anything.",
+        ),
+        Kwarg::new(
             "stage",
             "\"iteration\" | \"epilogue\"",
             "`epilogue` runs once after the loop concludes, and only if the run kept a candidate.",

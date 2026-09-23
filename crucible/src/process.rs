@@ -38,6 +38,7 @@ pub(crate) mod pid_registry {
                 crate::process::kill_pid(pid);
             }
         }
+        crucible::deadline::terminate_live_groups();
     }
 
     #[cfg(test)]

@@ -381,6 +381,10 @@ pub enum CompileError {
     FanoutWithoutOver { task: String },
     #[error("\"max_rounds\" must be an integer")]
     RoundsNotInteger,
+    #[error("\"timeout\" must be a duration string (try \"90s\", \"10m\", \"2h\")")]
+    TimeoutNotString,
+    #[error(transparent)]
+    InvalidTimeout(#[from] crate::duration::BadTimeout),
     #[error("max_rounds = {got} is outside 2..={MAX_ROUNDS_CEILING}")]
     RoundsOutOfRange { got: i32 },
     #[error(

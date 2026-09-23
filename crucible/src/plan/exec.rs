@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::crucible::Direction;
+use crate::deadline::{Bound, Deadline, RunCeiling};
 use crate::diagram::IllegalTransition;
 use crate::plan::ir::{
     Decider, ITEM_INPUT, Join, OUTCOME_INPUT, REVISION_INPUT, Stage, Task, TaskKind, TaskName,
@@ -65,6 +66,9 @@ pub enum AttemptOutcome {
     Skipped(Value, String),
     /// Transport failure (infra, not the work). Retried, bounded, every attempt visible.
     Transport(TransportFailure),
+    /// The runner killed the attempt at its deadline. Settles as a measured failure naming the
+    /// limit and is never retried: a rerun would spend the same time again.
+    TimedOut(Deadline),
 }
 
 /// What an attempt died on before the task could be judged, and the engine's account of it.
@@ -143,6 +147,13 @@ impl Attempt {
             cost_usd: 0.0,
         }
     }
+
+    pub fn timed_out(cost_usd: f64, deadline: Deadline) -> Self {
+        Self {
+            outcome: AttemptOutcome::TimedOut(deadline),
+            cost_usd,
+        }
+    }
 }
 
 /// One task of a concurrent dispatch batch (see [`TaskRunner::run_many`]).
@@ -150,13 +161,25 @@ pub struct BatchItem<'a> {
     pub task: &'a Task,
     pub attempt: u32,
     pub inputs: BTreeMap<TaskName, Value>,
+    /// This item's own deadline: items of one batch do not share one.
+    pub deadline: Option<Deadline>,
 }
 
 /// Runs one attempt of an `Agent` or `Command` task. The engine implements this against the
 /// harness and broker; tests program it directly. `TopK` never reaches the runner: reducers
 /// are engine-owned.
+///
+/// A runner that executes work ends it at `deadline` and returns a measured failure carrying
+/// [`Deadline::note`], never a transport failure: rerunning an attempt that exceeded its limit
+/// would repeat the cost.
 pub trait TaskRunner {
-    fn run(&mut self, task: &Task, attempt: u32, inputs: &BTreeMap<TaskName, Value>) -> Attempt;
+    fn run(
+        &mut self,
+        task: &Task,
+        attempt: u32,
+        inputs: &BTreeMap<TaskName, Value>,
+        deadline: Option<Deadline>,
+    ) -> Attempt;
 
     /// Run several isolation-marked tasks, possibly concurrently. The executor only
     /// batches tasks that are simultaneously ready, so items never depend on each other.
@@ -187,7 +210,7 @@ pub trait TaskRunner {
     fn run_many(&mut self, batch: &[BatchItem<'_>]) -> Vec<Attempt> {
         batch
             .iter()
-            .map(|b| self.run(b.task, b.attempt, &b.inputs))
+            .map(|b| self.run(b.task, b.attempt, &b.inputs, b.deadline))
             .collect()
     }
 }
@@ -515,6 +538,9 @@ pub fn execute(
         .filter_map(|t| Some((&t.revise.as_ref()?.task, t)))
         .collect();
     let started = Instant::now();
+    let run_ceiling = cfg
+        .wall_clock
+        .and_then(|ceiling| RunCeiling::starting(started, ceiling));
     let mut results: BTreeMap<TaskName, TaskResult> = BTreeMap::new();
     let mut spent = 0.0f64;
     let budget = plan.plan().budget.usd;
@@ -852,6 +878,7 @@ pub fn execute(
                                 task,
                                 attempt: 1,
                                 inputs: item_inputs(key),
+                                deadline: None,
                             })
                             .collect();
                         for instance in &instances {
@@ -860,11 +887,15 @@ pub fn execute(
                                 .or_default()
                                 .advance(TaskEvent::Dispatched)?;
                         }
-                        let (batch_results, budget_exceeded) =
-                            run_batch_with_retries(batch, cfg, runner, &mut spent, budget);
-                        if budget_exceeded {
-                            halt(&mut halted, &mut plan_machine, Halt::Budget)?;
-                        }
+                        let (batch_results, overrun) = run_batch_with_retries(
+                            batch,
+                            cfg,
+                            run_ceiling,
+                            runner,
+                            &mut spent,
+                            budget,
+                        );
+                        overrun.halt(node.stage, &mut halted, &mut plan_machine)?;
                         for ((task, result, event), key) in batch_results.into_iter().zip(&keys) {
                             runner.settled(task, result.status == TaskStatus::Pass);
                             settled.push((key.clone(), result.clone()));
@@ -914,17 +945,16 @@ pub fn execute(
                                 .entry(instance.name.clone())
                                 .or_default()
                                 .advance(TaskEvent::Dispatched)?;
-                            let (result, event, budget_exceeded) = run_with_retries(
+                            let (result, event, overrun) = run_with_retries(
                                 instance,
                                 &item_inputs(key),
                                 cfg,
+                                run_ceiling,
                                 runner,
                                 &mut spent,
                                 budget,
                             );
-                            if budget_exceeded {
-                                halt(&mut halted, &mut plan_machine, Halt::Budget)?;
-                            }
+                            overrun.halt(node.stage, &mut halted, &mut plan_machine)?;
                             runner.settled(instance, result.status == TaskStatus::Pass);
                             settled.push((key.clone(), result.clone()));
                             record(
@@ -1036,11 +1066,16 @@ pub fn execute(
                     .entry(proposed.name.clone())
                     .or_default()
                     .advance(TaskEvent::Dispatched)?;
-                let (result, event, budget_exceeded) =
-                    run_with_retries(proposer, &proposer_inputs, cfg, runner, &mut spent, budget);
-                if budget_exceeded {
-                    halt(&mut halted, &mut plan_machine, Halt::Budget)?;
-                }
+                let (result, event, overrun) = run_with_retries(
+                    proposer,
+                    &proposer_inputs,
+                    cfg,
+                    run_ceiling,
+                    runner,
+                    &mut spent,
+                    budget,
+                );
+                overrun.halt(proposer.stage, &mut halted, &mut plan_machine)?;
                 runner.settled(proposer, result.status == TaskStatus::Pass);
                 record(
                     &mut *runner,
@@ -1104,11 +1139,16 @@ pub fn execute(
                     .entry(reviewed.name.clone())
                     .or_default()
                     .advance(TaskEvent::Dispatched)?;
-                let (verdict, event, budget_exceeded) =
-                    run_with_retries(reviewer, &reviewer_inputs, cfg, runner, &mut spent, budget);
-                if budget_exceeded {
-                    halt(&mut halted, &mut plan_machine, Halt::Budget)?;
-                }
+                let (verdict, event, overrun) = run_with_retries(
+                    reviewer,
+                    &reviewer_inputs,
+                    cfg,
+                    run_ceiling,
+                    runner,
+                    &mut spent,
+                    budget,
+                );
+                overrun.halt(reviewer.stage, &mut halted, &mut plan_machine)?;
                 runner.settled(reviewer, verdict.status == TaskStatus::Pass);
                 record(
                     &mut *runner,
@@ -1149,7 +1189,7 @@ pub fn execute(
                 .entry(t.name.clone())
                 .or_default()
                 .advance(TaskEvent::Dispatched)?;
-            let (result, event, budget_exceeded) = match &t.task {
+            let (result, event, overrun) = match &t.task {
                 TaskKind::TopK { k, direction } => {
                     let reduced = reduce_top_k(&inputs, *k, *direction);
                     let event = if reduced.status == TaskStatus::Pass {
@@ -1157,7 +1197,7 @@ pub fn execute(
                     } else {
                         TaskEvent::Failed
                     };
-                    (reduced, event, false)
+                    (reduced, event, Overrun::default())
                 }
                 TaskKind::Route {
                     questions,
@@ -1169,7 +1209,7 @@ pub fn execute(
                     } else {
                         TaskEvent::Failed
                     };
-                    (decided, event, false)
+                    (decided, event, Overrun::default())
                 }
                 TaskKind::Route {
                     decider: Decider::Model { .. },
@@ -1180,12 +1220,10 @@ pub fn execute(
                 | TaskKind::Evaluate { .. }
                 | TaskKind::Report { .. }
                 | TaskKind::Engine { .. } => {
-                    run_with_retries(t, &inputs, cfg, runner, &mut spent, budget)
+                    run_with_retries(t, &inputs, cfg, run_ceiling, runner, &mut spent, budget)
                 }
             };
-            if budget_exceeded {
-                halt(&mut halted, &mut plan_machine, Halt::Budget)?;
-            }
+            overrun.halt(t.stage, &mut halted, &mut plan_machine)?;
             runner.settled(t, result.status == TaskStatus::Pass);
             record(
                 &mut *runner,
@@ -1208,6 +1246,7 @@ pub fn execute(
                     task: t,
                     attempt: 1,
                     inputs: inputs_for_dispatch.remove(&t.name).unwrap_or_default(),
+                    deadline: None,
                 })
                 .collect();
             for t in &dispatch {
@@ -1216,11 +1255,9 @@ pub fn execute(
                     .or_default()
                     .advance(TaskEvent::Dispatched)?;
             }
-            let (batch_results, budget_exceeded) =
-                run_batch_with_retries(batch, cfg, runner, &mut spent, budget);
-            if budget_exceeded {
-                halt(&mut halted, &mut plan_machine, Halt::Budget)?;
-            }
+            let (batch_results, overrun) =
+                run_batch_with_retries(batch, cfg, run_ceiling, runner, &mut spent, budget);
+            overrun.halt(first.stage, &mut halted, &mut plan_machine)?;
             for (t, result, event) in batch_results {
                 runner.settled(t, result.status == TaskStatus::Pass);
                 record(
@@ -1259,6 +1296,45 @@ pub fn execute(
         spent_usd: spent,
         results,
     })
+}
+
+/// The run ceilings one dispatch ran past: spend beyond the budget, or an attempt the runner
+/// killed at the run's wall-clock ceiling rather than at its own limit. A killed epilogue attempt
+/// does not halt the run: the main graph already settled how it ended.
+#[derive(Clone, Copy, Debug, Default)]
+struct Overrun {
+    budget: bool,
+    time: bool,
+}
+
+impl Overrun {
+    fn of(outcome: &AttemptOutcome) -> Self {
+        Overrun {
+            budget: false,
+            time: matches!(
+                outcome,
+                AttemptOutcome::TimedOut(Deadline {
+                    bound: Bound::Run(_),
+                    ..
+                })
+            ),
+        }
+    }
+
+    fn halt(
+        self,
+        stage: Stage,
+        halted: &mut Option<Halt>,
+        plan_machine: &mut PlanMachine,
+    ) -> Result<(), IllegalTransition> {
+        if self.budget {
+            halt(halted, plan_machine, Halt::Budget)?;
+        }
+        if self.time && stage == Stage::Iteration {
+            halt(halted, plan_machine, Halt::Time)?;
+        }
+        Ok(())
+    }
 }
 
 /// Fix the plan's exit on its first halt; later ceilings do not change how it ended.
@@ -1733,6 +1809,12 @@ fn settle_attempt(
         AttemptOutcome::Fail { note, output } => {
             (TaskStatus::Fail, output, Some(note), TaskEvent::Failed)
         }
+        AttemptOutcome::TimedOut(deadline) => (
+            TaskStatus::Fail,
+            None,
+            Some(deadline.note()),
+            TaskEvent::Failed,
+        ),
         AttemptOutcome::Transport(failure) => return Err(failure),
     };
     Ok((
@@ -1786,63 +1868,77 @@ fn transport_result(
 }
 
 /// Run one task, retrying transport-class failures up to `cfg.transport_retries` times while
-/// the budget allows. The flag says whether this task's spend crossed the budget.
+/// the budget allows. Every attempt runs under its own deadline.
 fn run_with_retries(
     t: &Task,
     inputs: &BTreeMap<TaskName, Value>,
     cfg: ExecCfg,
+    run_ceiling: Option<RunCeiling>,
     runner: &mut dyn TaskRunner,
     spent: &mut f64,
     budget: f64,
-) -> (TaskResult, TaskEvent, bool) {
+) -> (TaskResult, TaskEvent, Overrun) {
     let max_attempts = 1 + cfg.transport_retries;
     let mut attempts = 0;
     let mut cost = 0.0;
     let mut last_transport = TransportFailure::new(TransportCause::Other, String::new());
     while attempts < max_attempts {
         attempts += 1;
-        let a = runner.run(t, attempts, inputs);
+        let deadline = Deadline::for_attempt(Instant::now(), t.timeout, run_ceiling);
+        let a = runner.run(t, attempts, inputs, deadline);
         cost += a.cost_usd;
         *spent += a.cost_usd;
-        match settle_attempt(enforce_emits(t, a.outcome), attempts, cost) {
-            Ok((result, event)) => return (result, event, *spent > budget),
+        let outcome = enforce_emits(t, a.outcome);
+        let mut overrun = Overrun::of(&outcome);
+        overrun.budget = *spent > budget;
+        match settle_attempt(outcome, attempts, cost) {
+            Ok((result, event)) => return (result, event, overrun),
             Err(failure) => {
                 if *spent > budget || (*spent >= budget && attempts < max_attempts) {
                     let (result, event) =
                         transport_result(attempts, max_attempts, cost, &failure, true);
-                    return (result, event, true);
+                    overrun.budget = true;
+                    return (result, event, overrun);
                 }
                 last_transport = failure;
             }
         }
     }
     let (result, event) = transport_result(attempts, max_attempts, cost, &last_transport, false);
-    (result, event, *spent > budget)
+    let overrun = Overrun {
+        budget: *spent > budget,
+        time: false,
+    };
+    (result, event, overrun)
 }
 
 /// Run a batch of isolated tasks through the runner's parallel path, retrying the transport
-/// failures as a smaller wave until every task has a result or retries run out.
+/// failures as a smaller wave until every task has a result or retries run out. Each wave stamps
+/// every item with its own deadline as it starts.
 fn run_batch_with_retries<'a>(
     batch: Vec<BatchItem<'a>>,
     cfg: ExecCfg,
+    run_ceiling: Option<RunCeiling>,
     runner: &mut dyn TaskRunner,
     spent: &mut f64,
     budget: f64,
-) -> (Vec<(&'a Task, TaskResult, TaskEvent)>, bool) {
+) -> (Vec<(&'a Task, TaskResult, TaskEvent)>, Overrun) {
     let max_attempts = 1 + cfg.transport_retries;
     let mut done: BTreeMap<usize, (TaskResult, TaskEvent)> = BTreeMap::new();
     let mut cost_so_far: Vec<f64> = vec![0.0; batch.len()];
     let order: Vec<&'a Task> = batch.iter().map(|b| b.task).collect();
     let mut wave: Vec<(usize, BatchItem<'a>)> = batch.into_iter().enumerate().collect();
-    let mut budget_exceeded = false;
+    let mut overrun = Overrun::default();
 
     while !wave.is_empty() {
+        let now = Instant::now();
         let items: Vec<BatchItem<'_>> = wave
             .iter()
             .map(|(_, b)| BatchItem {
                 task: b.task,
                 attempt: b.attempt,
                 inputs: b.inputs.clone(),
+                deadline: Deadline::for_attempt(now, b.task.timeout, run_ceiling),
             })
             .collect();
         let attempts = runner.run_many(&items);
@@ -1851,10 +1947,11 @@ fn run_batch_with_retries<'a>(
             *spent += a.cost_usd;
             cost_so_far[idx] += a.cost_usd;
             let outcome = enforce_emits(item.task, a.outcome);
+            overrun.time |= Overrun::of(&outcome).time;
             attempted.push((idx, item, outcome));
         }
         let retry_budget_blocked = *spent >= budget;
-        budget_exceeded |= *spent > budget;
+        overrun.budget |= *spent > budget;
         let mut next: Vec<(usize, BatchItem<'a>)> = Vec::new();
         for (idx, item, outcome) in attempted {
             match settle_attempt(outcome, item.attempt, cost_so_far[idx]) {
@@ -1869,11 +1966,12 @@ fn run_batch_with_retries<'a>(
                                 task: item.task,
                                 attempt: item.attempt + 1,
                                 inputs: item.inputs,
+                                deadline: None,
                             },
                         ));
                     } else {
                         let cut_by_budget = item.attempt < max_attempts;
-                        budget_exceeded |= cut_by_budget;
+                        overrun.budget |= cut_by_budget;
                         done.insert(
                             idx,
                             transport_result(
@@ -1894,7 +1992,7 @@ fn run_batch_with_retries<'a>(
         done.into_iter()
             .map(|(idx, (r, event))| (order[idx], r, event))
             .collect(),
-        budget_exceeded,
+        overrun,
     )
 }
 
@@ -2123,6 +2221,8 @@ mod tests {
         rounds: BTreeMap<String, std::collections::VecDeque<fn() -> AttemptOutcome>>,
         /// Every dispatch's inputs, in order; `seen_values` keeps only the last per task.
         runs: Vec<(String, BTreeMap<TaskName, Value>)>,
+        /// The deadline every dispatch was handed, in order.
+        deadlines: Vec<(String, Option<Deadline>)>,
     }
 
     impl ScriptRunner {
@@ -2138,6 +2238,7 @@ mod tests {
                 dropped: Vec::new(),
                 rounds: BTreeMap::new(),
                 runs: Vec::new(),
+                deadlines: Vec::new(),
             }
         }
         fn rounds(&mut self, task: &str, outcomes: &[fn() -> AttemptOutcome]) {
@@ -2175,8 +2276,10 @@ mod tests {
             task: &Task,
             attempt: u32,
             inputs: &BTreeMap<TaskName, Value>,
+            deadline: Option<Deadline>,
         ) -> Attempt {
             self.dispatched.push((task.name.0.clone(), attempt));
+            self.deadlines.push((task.name.0.clone(), deadline));
             self.seen_inputs.insert(
                 task.name.0.clone(),
                 inputs.keys().map(|k| k.0.clone()).collect(),
@@ -2225,6 +2328,7 @@ mod tests {
             max_fanout: None,
             when: None,
             revise: None,
+            timeout: None,
         }
     }
 
@@ -2309,6 +2413,260 @@ mod tests {
             assert!(out.valid, "{wall_clock:?}");
             assert_eq!(out.exit, PlanExit::Completed, "{wall_clock:?}");
         }
+    }
+
+    /// Takes each task's scripted time, or stops at the deadline it was handed, whichever is
+    /// first: a runner that honors deadlines the way the shell runner does.
+    struct Sleeper {
+        takes: BTreeMap<String, Duration>,
+        dispatched: Vec<String>,
+    }
+
+    impl Sleeper {
+        fn new(takes: &[(&str, Duration)]) -> Self {
+            Sleeper {
+                takes: takes
+                    .iter()
+                    .map(|(task, took)| ((*task).to_string(), *took))
+                    .collect(),
+                dispatched: Vec::new(),
+            }
+        }
+    }
+
+    impl TaskRunner for Sleeper {
+        fn run(
+            &mut self,
+            task: &Task,
+            _: u32,
+            _: &BTreeMap<TaskName, Value>,
+            deadline: Option<Deadline>,
+        ) -> Attempt {
+            self.dispatched.push(task.name.0.clone());
+            let takes = self.takes.get(&task.name.0).copied().unwrap_or_default();
+            let done = Instant::now() + takes;
+            match deadline.filter(|d| d.at < done) {
+                Some(deadline) => {
+                    std::thread::sleep(deadline.at.saturating_duration_since(Instant::now()));
+                    Attempt::timed_out(0.02, deadline)
+                }
+                None => {
+                    std::thread::sleep(takes);
+                    Attempt {
+                        outcome: AttemptOutcome::Pass(serde_json::json!({})),
+                        cost_usd: 0.02,
+                    }
+                }
+            }
+        }
+    }
+
+    fn limited(mut task: Task, limit: &str) -> Task {
+        task.timeout = Some(limit.parse().expect("a timeout"));
+        task
+    }
+
+    #[test]
+    fn a_task_that_outlives_its_limit_fails_on_it_once_and_short_circuits() {
+        let plan = valid(
+            vec![
+                limited(task("hang", &[], "any", true), "0.1s"),
+                task("after", &["hang"], "any", true),
+            ],
+            10.0,
+        );
+        let mut r = Sleeper::new(&[("hang", Duration::from_secs(30))]);
+        let started = Instant::now();
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let hang = &out.results[&"hang".into()];
+        assert_eq!(hang.status, TaskStatus::Fail);
+        assert_eq!(hang.attempts, 1, "a timed-out attempt was retried");
+        assert_eq!(hang.transport, None);
+        assert_eq!(
+            hang.note.as_deref(),
+            Some("timed out: the task ran past its 0.1s limit")
+        );
+        assert_eq!(hang.cost_usd, 0.02, "the killed attempt's spend is kept");
+        assert_eq!(
+            out.exit,
+            PlanExit::ShortCircuit {
+                task: "hang".into()
+            }
+        );
+        assert_eq!(out.results[&"after".into()].status, TaskStatus::Blocked);
+        assert_eq!(r.dispatched, ["hang"]);
+        assert!(!out.valid);
+    }
+
+    #[test]
+    fn an_advisory_task_that_times_out_blocks_its_dependents_only() {
+        let plan = valid(
+            vec![
+                limited(task("probe", &[], "any", false), "0.1s"),
+                task("reader", &["probe"], "any", false),
+                task("other", &[], "any", true),
+            ],
+            10.0,
+        );
+        let mut r = Sleeper::new(&[("probe", Duration::from_secs(30))]);
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        assert_eq!(out.results[&"probe".into()].status, TaskStatus::Fail);
+        assert_eq!(out.results[&"reader".into()].status, TaskStatus::Blocked);
+        assert_eq!(out.results[&"other".into()].status, TaskStatus::Pass);
+        assert_eq!(out.exit, PlanExit::Completed);
+        assert!(out.valid);
+    }
+
+    #[test]
+    fn a_task_under_its_limit_is_unaffected() {
+        let plan = valid(vec![limited(task("quick", &[], "any", true), "30s")], 10.0);
+        let mut r = Sleeper::new(&[("quick", Duration::from_millis(20))]);
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        assert_eq!(out.results[&"quick".into()].status, TaskStatus::Pass);
+        assert_eq!(out.results[&"quick".into()].note, None);
+        assert!(out.valid);
+    }
+
+    /// The ceiling is the operator's bound on the run, so a run it cut short ends on it, not on
+    /// whichever task happened to be in flight.
+    #[test]
+    fn the_run_ceiling_ends_an_attempt_in_flight_and_the_run_on_that_ceiling() {
+        let plan = valid(
+            vec![
+                limited(task("long", &[], "any", true), "10m"),
+                task("after", &["long"], "any", true),
+            ],
+            10.0,
+        );
+        let mut r = Sleeper::new(&[("long", Duration::from_secs(30))]);
+        let cfg = ExecCfg {
+            wall_clock: Some(Duration::from_millis(150)),
+            ..ExecCfg::default()
+        };
+        let started = Instant::now();
+        let out = execute(&plan, &any_substrate(), cfg, &mut r, |_, _| {});
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let long = &out.results[&"long".into()];
+        assert_eq!(long.status, TaskStatus::Fail);
+        assert_eq!(long.attempts, 1);
+        assert_eq!(
+            long.note.as_deref(),
+            Some("timed out: the run reached its 0.15s wall-clock ceiling")
+        );
+        assert_eq!(out.exit, PlanExit::TimeExceeded);
+        let after = &out.results[&"after".into()];
+        assert_eq!(after.status, TaskStatus::Blocked);
+        assert_eq!(after.blocked, Some(BlockedReason::WallClockCeiling));
+        assert_eq!(r.dispatched, ["long"]);
+    }
+
+    #[test]
+    fn the_run_ceiling_ends_an_epilogue_in_flight_without_relabelling_a_completed_run() {
+        let plan = valid(
+            vec![
+                task("probe", &[], "any", true),
+                epilogue("report", &[], true),
+            ],
+            10.0,
+        );
+        let mut r = Sleeper::new(&[("report", Duration::from_secs(30))]);
+        let cfg = ExecCfg {
+            wall_clock: Some(Duration::from_millis(150)),
+            ..ExecCfg::default()
+        };
+        let started = Instant::now();
+        let out = execute(&plan, &any_substrate(), cfg, &mut r, |_, _| {});
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let report = &out.results[&"report".into()];
+        assert_eq!(report.status, TaskStatus::Fail);
+        assert_eq!(
+            report.note.as_deref(),
+            Some("timed out: the run reached its 0.15s wall-clock ceiling")
+        );
+        assert_eq!(out.exit, PlanExit::Completed);
+        assert!(out.valid);
+    }
+
+    #[test]
+    fn every_attempt_is_handed_the_earlier_of_its_own_limit_and_the_run_ceiling() {
+        let plan = valid(
+            vec![
+                limited(task("own", &[], "any", true), "10m"),
+                task("undeclared", &["own"], "any", true),
+                limited(task("longer", &["undeclared"], "any", true), "2h"),
+                limited(task("flaky", &["longer"], "any", true), "5m"),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.on(
+            "flaky",
+            1,
+            || AttemptOutcome::Transport(TransportFailure::new(TransportCause::Other, "blip")),
+            0.0,
+        );
+        let cfg = ExecCfg {
+            wall_clock: Some(Duration::from_secs(3600)),
+            ..ExecCfg::default()
+        };
+        let out = execute(&plan, &any_substrate(), cfg, &mut r, |_, _| {});
+        assert!(out.valid);
+        let bounds: Vec<(&str, Option<Bound>)> = r
+            .deadlines
+            .iter()
+            .map(|(task, d)| (task.as_str(), d.map(|d| d.bound)))
+            .collect();
+        let task_limit = |s: &str| Some(Bound::Task(s.parse().unwrap()));
+        let run = Some(Bound::Run(Duration::from_secs(3600)));
+        assert_eq!(
+            bounds,
+            [
+                ("own", task_limit("10m")),
+                ("undeclared", run),
+                ("longer", run),
+                ("flaky", task_limit("5m")),
+                ("flaky", task_limit("5m")),
+            ]
+        );
+        let flaky: Vec<Instant> = r
+            .deadlines
+            .iter()
+            .filter(|(task, _)| task == "flaky")
+            .filter_map(|(_, d)| d.map(|d| d.at))
+            .collect();
+        assert!(
+            flaky[1] > flaky[0],
+            "a retry reused the first attempt's deadline"
+        );
+
+        let mut r = ScriptRunner::new();
+        execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        assert_eq!(r.deadlines[1], ("undeclared".to_string(), None));
     }
 
     #[test]
@@ -2740,6 +3098,7 @@ mod tests {
             max_fanout: None,
             when: None,
             revise: None,
+            timeout: None,
         });
         let plan = valid(tasks, 10.0);
         let mut r = ScriptRunner::new();
@@ -2800,6 +3159,7 @@ mod tests {
             max_fanout: None,
             when: None,
             revise: None,
+            timeout: None,
         });
         let plan = valid(tasks, 10.0);
         let mut r = ScriptRunner::new();
@@ -2873,7 +3233,13 @@ mod tests {
             batches: Vec<Vec<String>>,
         }
         impl TaskRunner for BatchRecorder {
-            fn run(&mut self, task: &Task, _: u32, _: &BTreeMap<TaskName, Value>) -> Attempt {
+            fn run(
+                &mut self,
+                task: &Task,
+                _: u32,
+                _: &BTreeMap<TaskName, Value>,
+                _: Option<Deadline>,
+            ) -> Attempt {
                 self.batches.push(vec![task.name.0.clone()]);
                 Attempt {
                     outcome: AttemptOutcome::Pass(serde_json::json!({})),
@@ -2993,6 +3359,7 @@ mod tests {
             max_fanout: None,
             when: None,
             revise: None,
+            timeout: None,
         };
         tasks.push(pick);
         let plan = valid(tasks, 10.0);
@@ -3140,7 +3507,13 @@ mod tests {
             waves: Vec<Vec<(String, u32)>>,
         }
         impl TaskRunner for FlakyBatch {
-            fn run(&mut self, _: &Task, _: u32, _: &BTreeMap<TaskName, Value>) -> Attempt {
+            fn run(
+                &mut self,
+                _: &Task,
+                _: u32,
+                _: &BTreeMap<TaskName, Value>,
+                _: Option<Deadline>,
+            ) -> Attempt {
                 unreachable!("batchable plan must go through run_many");
             }
             fn run_many(&mut self, batch: &[BatchItem<'_>]) -> Vec<Attempt> {
@@ -3788,6 +4161,7 @@ mod tests {
             task: &Task,
             _attempt: u32,
             inputs: &BTreeMap<TaskName, Value>,
+            _deadline: Option<Deadline>,
         ) -> Attempt {
             self.log.push(format!("run {}", task.name));
             self.seen_inputs.insert(task.name.0.clone(), inputs.clone());
@@ -3819,7 +4193,7 @@ mod tests {
             self.log.push(format!("batch of {}", batch.len()));
             batch
                 .iter()
-                .map(|b| self.run(b.task, b.attempt, &b.inputs))
+                .map(|b| self.run(b.task, b.attempt, &b.inputs, b.deadline))
                 .collect()
         }
 
@@ -5852,7 +6226,14 @@ mod tests {
             task: &Task,
             _attempt: u32,
             _inputs: &BTreeMap<TaskName, Value>,
+            deadline: Option<Deadline>,
         ) -> Attempt {
+            assert_eq!(
+                deadline.map(|d| d.bound),
+                task.timeout.map(Bound::Task),
+                "{} ran under the wrong deadline",
+                task.name
+            );
             self.log
                 .borrow_mut()
                 .push(GraphEvent::Run(vec![task.name.0.clone()]));
@@ -5868,9 +6249,17 @@ mod tests {
             ));
             batch
                 .iter()
-                .map(|b| Attempt {
-                    outcome: self.outcomes[&b.task.name.0](),
-                    cost_usd: 0.1,
+                .map(|b| {
+                    assert_eq!(
+                        b.deadline.map(|d| d.bound),
+                        b.task.timeout.map(Bound::Task),
+                        "{} ran under another item's deadline",
+                        b.task.name
+                    );
+                    Attempt {
+                        outcome: self.outcomes[&b.task.name.0](),
+                        cost_usd: 0.1,
+                    }
                 })
                 .collect()
         }
@@ -5883,7 +6272,7 @@ mod tests {
     fn every_three_task_graph_keeps_the_model_invariants() {
         const N: usize = 3;
         const EDGES: [(usize, usize); 3] = [(1, 0), (2, 0), (2, 1)];
-        let outcomes: [fn() -> AttemptOutcome; 4] = [
+        let outcomes: [fn() -> AttemptOutcome; 5] = [
             || AttemptOutcome::Pass(serde_json::json!({})),
             || AttemptOutcome::Fail {
                 note: "measured".into(),
@@ -5891,6 +6280,12 @@ mod tests {
             },
             || AttemptOutcome::Skipped(serde_json::json!({}), "inapplicable".into()),
             || AttemptOutcome::Transport(TransportFailure::new(TransportCause::Other, "blip")),
+            || {
+                AttemptOutcome::TimedOut(Deadline {
+                    at: Instant::now(),
+                    bound: Bound::Task(own_limit()),
+                })
+            },
         ];
         let joins = [Join::All, Join::Passed, Join::Settled];
         let name = |i: usize| format!("t{i}");
@@ -5939,6 +6334,9 @@ mod tests {
                                             if is_epilogue(t) {
                                                 task.stage = Stage::Epilogue;
                                             }
+                                            if t % 2 == 1 {
+                                                task.timeout = Some(own_limit());
+                                            }
                                             task
                                         })
                                         .collect();
@@ -5955,7 +6353,9 @@ mod tests {
                                     let mut runner = GraphRunner {
                                         outcomes: (0..N)
                                             .map(|t| {
-                                                let pick = outcome_pick / 4usize.pow(t as u32) % 4;
+                                                let pick = outcome_pick
+                                                    / outcomes.len().pow(t as u32)
+                                                    % outcomes.len();
                                                 (name(t), outcomes[pick])
                                             })
                                             .collect(),
@@ -5984,6 +6384,10 @@ mod tests {
             }
         }
         assert!(runs > 100_000, "the enumeration shrank to {runs} runs");
+    }
+
+    fn own_limit() -> crate::duration::TaskTimeout {
+        "1h".parse().expect("1h is a timeout")
     }
 
     fn check_graph(tasks: &[Task], out: &PlanOutcome, log: &[GraphEvent], budget: f64) {

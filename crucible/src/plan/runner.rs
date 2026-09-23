@@ -4,15 +4,18 @@
 //! full harness/broker runners replace this one; the executor contract is identical.
 //!
 //! Output contract, mirroring `measure_cmd`: the last non-empty stdout line is the task's
-//! JSON result. Nonzero exit is a measured failure; failure to spawn is transport.
+//! JSON result. Nonzero exit is a measured failure; failure to spawn is transport. A command
+//! still running at its deadline is killed with its whole process group and fails measured.
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use serde_json::Value;
 
 use crate::crucible::Direction;
+use crate::deadline::{Deadline, Supervised};
 use crate::plan::exec::{Attempt, AttemptOutcome, TaskRunner};
 use crate::plan::ir::{Decider, Task, TaskKind, TaskName};
 use crucible_contract::TransportCause;
@@ -26,7 +29,13 @@ pub struct ShellRunner {
 }
 
 impl TaskRunner for ShellRunner {
-    fn run(&mut self, task: &Task, _attempt: u32, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
+    fn run(
+        &mut self,
+        task: &Task,
+        _attempt: u32,
+        inputs: &BTreeMap<TaskName, Value>,
+        deadline: Option<Deadline>,
+    ) -> Attempt {
         if task.isolation.is_some() {
             // Fail loud: a runner that quietly ran an isolation-marked task in the shared
             // workdir would hand back a result the plan's author has no reason to trust.
@@ -39,7 +48,7 @@ impl TaskRunner for ShellRunner {
                 ),
             );
         }
-        self.run_in_workdir(task, inputs)
+        self.run_in_workdir(task, inputs, deadline)
     }
 }
 
@@ -49,6 +58,7 @@ impl ShellRunner {
         &mut self,
         task: &Task,
         inputs: &BTreeMap<TaskName, Value>,
+        deadline: Option<Deadline>,
     ) -> Attempt {
         if task.isolation != Some(crate::plan::ir::Isolation::Worktree) {
             return Attempt::failed(
@@ -56,10 +66,15 @@ impl ShellRunner {
                 format!("task {} was not declared for worktree isolation", task.name),
             );
         }
-        self.run_in_workdir(task, inputs)
+        self.run_in_workdir(task, inputs, deadline)
     }
 
-    fn run_in_workdir(&mut self, task: &Task, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
+    fn run_in_workdir(
+        &mut self,
+        task: &Task,
+        inputs: &BTreeMap<TaskName, Value>,
+        deadline: Option<Deadline>,
+    ) -> Attempt {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").current_dir(&self.workdir);
         cmd.env(crate::plan::TASK_NAME_ENV, &task.name.0);
@@ -164,8 +179,9 @@ impl ShellRunner {
                 return Attempt::failed(0.0, "engine task reached a non-loop runner".to_string());
             }
         }
-        let out = match cmd.output() {
-            Ok(out) => out,
+        let out = match run_to_completion(&mut cmd, deadline) {
+            Ok(Finished::Exited(out)) => out,
+            Ok(Finished::Killed(deadline)) => return Attempt::timed_out(0.0, deadline),
             Err(e) => {
                 return Attempt::transport(TransportCause::Command, format!("spawn failed: {e}"));
             }
@@ -199,6 +215,43 @@ impl ShellRunner {
             ),
         }
     }
+}
+
+/// How a command ended: on its own, or killed at its deadline.
+enum Finished {
+    Exited(std::process::Output),
+    Killed(Deadline),
+}
+
+/// `Command::output` under a deadline. Stdin is closed, as `output` leaves it; stderr drains on
+/// its own thread so a command filling one pipe cannot wedge the other.
+fn run_to_completion(cmd: &mut Command, deadline: Option<Deadline>) -> std::io::Result<Finished> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = Supervised::spawn(cmd, deadline)?;
+    let stdout = child.child().stdout.take();
+    let stderr = child.child().stderr.take();
+    let stderr_thread = std::thread::spawn(move || drain(stderr));
+    let stdout = drain(stdout);
+    let stderr = stderr_thread.join().unwrap_or_default();
+    let reaped = child.wait()?;
+    if let Some(deadline) = reaped.killed_at {
+        return Ok(Finished::Killed(deadline));
+    }
+    Ok(Finished::Exited(std::process::Output {
+        status: reaped.status,
+        stdout,
+        stderr,
+    }))
+}
+
+fn drain(pipe: Option<impl Read>) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    if let Some(mut pipe) = pipe {
+        let _ = pipe.read_to_end(&mut bytes);
+    }
+    bytes
 }
 
 /// The task's JSON result, where the last non-empty stdout line carries one.
@@ -385,6 +438,7 @@ mod tests {
             max_fanout: None,
             when: None,
             revise: None,
+            timeout: None,
         }
     }
 
@@ -407,6 +461,7 @@ mod tests {
             max_fanout: None,
             when: None,
             revise: None,
+            timeout: None,
         }
     }
 
@@ -577,6 +632,7 @@ mod tests {
             max_fanout: None,
             when: None,
             revise: None,
+            timeout: None,
         };
         let passed = run_plan(vec![evaluate("latency", 9.5)], None);
         assert_eq!(passed.results[&"latency".into()].status, TaskStatus::Pass);
@@ -610,6 +666,7 @@ mod tests {
             max_fanout: None,
             when: None,
             revise: None,
+            timeout: None,
         };
         let over = run_plan(
             vec![evaluate("over", r#"{"score": 100, "pass": true}"#)],
@@ -650,6 +707,7 @@ mod tests {
             max_fanout: None,
             when: None,
             revise: None,
+            timeout: None,
         };
         let green = run_plan(vec![evaluate("green", r#"{"pass": true}"#)], None);
         assert_eq!(green.results[&"green".into()].status, TaskStatus::Pass);
@@ -679,6 +737,7 @@ mod tests {
             max_fanout: None,
             when: None,
             revise: None,
+            timeout: None,
         };
         let out = run_plan(vec![task], None);
         let result = &out.results[&"malformed".into()];
@@ -716,6 +775,7 @@ mod tests {
             max_fanout: None,
             when: None,
             revise: None,
+            timeout: None,
         };
         let out = run_plan(vec![t], None);
         assert_eq!(out.results[&"a".into()].status, TaskStatus::Fail);
@@ -745,6 +805,7 @@ mod tests {
             max_fanout: None,
             when: None,
             revise: None,
+            timeout: None,
         };
         let out = run_plan(
             vec![t],
@@ -800,6 +861,7 @@ mod tests {
             max_fanout: None,
             when: None,
             revise: None,
+            timeout: None,
         };
         let measure = |name: &str, dep: &str| {
             command(
@@ -828,6 +890,7 @@ mod tests {
             max_fanout: None,
             when: None,
             revise: None,
+            timeout: None,
         };
         let out = run_plan(
             vec![
@@ -886,6 +949,113 @@ mod tests {
     #[test]
     fn stderr_tail_escapes_pipes() {
         assert_eq!(stderr_tail("a | b\n"), "a \\| b");
+    }
+
+    fn limited(mut task: Task, limit: &str) -> Task {
+        task.timeout = Some(limit.parse().unwrap());
+        task
+    }
+
+    fn alive(pid: i32) -> bool {
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+    }
+
+    /// The command forks a sleeper that holds stdout open, so the task ends at its limit only if
+    /// the whole process group is killed, and the sleeper must not outlive the task.
+    #[test]
+    fn a_command_that_outlives_its_timeout_is_killed_with_its_group_and_fails_on_the_limit() {
+        let dir = std::env::temp_dir().join(format!("crucible-timeout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("sleeper.pid");
+        let started = std::time::Instant::now();
+        let out = run_plan(
+            vec![
+                limited(
+                    command(
+                        "hang",
+                        &format!("sleep 30 & echo $! > {}; wait", pidfile.display()),
+                        &[],
+                    ),
+                    "0.5s",
+                ),
+                command("after", "echo '{}'", &["hang"]),
+            ],
+            None,
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the run waited out the command"
+        );
+        let hang = &out.results[&"hang".into()];
+        assert_eq!(hang.status, TaskStatus::Fail);
+        assert_eq!(hang.attempts, 1, "a timed-out attempt was retried");
+        assert_eq!(
+            hang.note.as_deref(),
+            Some("timed out: the task ran past its 0.5s limit")
+        );
+        assert_eq!(
+            out.exit,
+            PlanExit::ShortCircuit {
+                task: "hang".into()
+            }
+        );
+        assert_eq!(out.results[&"after".into()].status, TaskStatus::Blocked);
+        let sleeper: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let settle = std::time::Instant::now();
+        while alive(sleeper) && settle.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            !alive(sleeper),
+            "the forked sleeper {sleeper} outlived its task"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_command_under_its_timeout_runs_as_it_would_without_one() {
+        let out = run_plan(
+            vec![
+                limited(
+                    command("quick", r#"sleep 0.1; echo '{"score": 3}'"#, &[]),
+                    "30s",
+                ),
+                limited(
+                    command("boom", "echo doomed >&2; exit 3", &["quick"]),
+                    "30s",
+                ),
+            ],
+            None,
+        );
+        let quick = &out.results[&"quick".into()];
+        assert_eq!(quick.status, TaskStatus::Pass);
+        assert_eq!(quick.output.as_ref().unwrap()["score"], 3);
+        let boom = &out.results[&"boom".into()];
+        assert_eq!(boom.status, TaskStatus::Fail);
+        assert_eq!(boom.note.as_deref(), Some("exit 3: doomed"));
+    }
+
+    #[test]
+    fn an_evaluate_past_its_timeout_fails_on_the_limit_not_its_grade() {
+        let out = run_plan(
+            vec![limited(
+                evaluate("slow", r#"sleep 30; echo '{"score": 1}'"#, Some(10.0)),
+                "0.3s",
+            )],
+            None,
+        );
+        let slow = &out.results[&"slow".into()];
+        assert_eq!(slow.status, TaskStatus::Fail);
+        assert_eq!(slow.output, None);
+        assert_eq!(
+            slow.note.as_deref(),
+            Some("timed out: the task ran past its 0.3s limit")
+        );
     }
 
     #[test]
