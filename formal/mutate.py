@@ -14,8 +14,8 @@ MUTANTS = {
         "  if required t ∧ (plan = p_dispatching ∨ plan = p_draining) then",
     ),
     "dispatch_ignores_join": (
-        "  require deps_allow t\n  require ¬ paired t\n  status t := t_running",
-        "  require ¬ paired t\n  status t := t_running",
+        "  require deps_allow t\n  require ¬ paired t\n",
+        "  require ¬ paired t\n",
     ),
     "required_failure_does_not_halt": (
         "  if s ≠ t_pass then\n    short_circuit t",
@@ -45,11 +45,17 @@ MUTANTS = {
         "  last t := s\n  dispatched t := true\n  phase t := rp_review",
         "  last t := s\n  status t := s\n  dispatched t := true\n  phase t := rp_review",
     ),
+    "serial_task_joins_a_batch": (
+        "  require isolated t ∧ batch_open ∧ (∀ u, status u = t_running → isolated u) ∨ idle",
+        "  require batch_open ∨ idle",
+    ),
 }
+
+for name, (old, _) in MUTANTS.items():
+    assert src.count(old) == 1, f"{name}: the pattern matches {src.count(old)} times"
 
 failed = False
 for name, (old, new) in MUTANTS.items():
-    assert src.count(old) == 1, name
     body = src.replace(old, new).replace("veil module PlanExec", f"veil module M_{name}").replace(
         "end PlanExec", f"end M_{name}"
     )

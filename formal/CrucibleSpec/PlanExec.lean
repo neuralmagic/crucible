@@ -4,8 +4,8 @@ public import Veil
 
 /-! # crucible plan executor, serial
 
-`crucible::plan::exec::execute` over the tables in `crucible/src/plan/machine.rs`: one task or
-revise loop in flight, no fan-out or transport retries. The graph is state that `after_init`
+`crucible::plan::exec::execute` over the tables in `crucible/src/plan/machine.rs`: a serial task,
+a revise loop, or a batch of isolated tasks in flight; no fan-out or transport retries. The graph is state that `after_init`
 chooses and no action writes, so `#model_check` covers every well-formed graph of the instance.
 -/
 
@@ -32,6 +32,7 @@ relation epilogue : task → Bool
 relation runnable : task → Bool
 relation route_of : task → task → Bool
 function join : task → jkind
+relation isolated : task → Bool
 -- `revises r t`: reviewer r sends t back (C-REVISE-LOOP).
 relation revises : task → task → Bool
 relation reach : task → task → Bool
@@ -46,6 +47,7 @@ function phase : task → rphase
 function rounds : task → Nat
 function last : task → tstate
 relation review_ran : task → Bool
+individual batch_open : Bool
 
 #gen_state
 
@@ -109,6 +111,7 @@ after_init {
     (∀ r t x, revises r t → ¬ revises t x ∧ ¬ revises x r) ∧
     (∀ r t d, revises r t ∧ dep r d ∧ d ≠ t → ¬ reach d t)
   required T := *
+  isolated T := *
   status T := t_pending
   plan := p_admitted
   halt := h_none
@@ -118,6 +121,7 @@ after_init {
   rounds T := 0
   last T := t_pending
   review_ran T := false
+  batch_open := false
 }
 
 -- C-PLAYBOOK-CAPS: a required main-graph task the substrate cannot run truncates the plan.
@@ -185,15 +189,16 @@ action block_on_dependency (t : task) {
 
 action dispatch (t : task) {
   require open_for t
-  require idle
   require status t = t_pending
   require runnable t
   require deps_settled t
   require ¬ route_not_taken t ∧ ¬ route_undecided t ∧ ¬ branch_not_taken t
   require deps_allow t
   require ¬ paired t
+  require isolated t ∧ batch_open ∧ (∀ u, status u = t_running → isolated u) ∨ idle
   status t := t_running
   dispatched t := true
+  batch_open := isolated t
   if plan = p_draining then
     dispatched_while_halted t := true
 }
@@ -202,6 +207,7 @@ action settle (t : task) {
   require status t = t_running
   let s :| s = t_pass ∨ s = t_fail ∨ s = t_skipped ∨ s = t_transport
   status t := s
+  batch_open := false
   if s ≠ t_pass then
     short_circuit t
 }
@@ -345,7 +351,12 @@ safety [short_circuit_has_a_cause]
 safety [nothing_runs_after_a_ceiling]
   dispatched_while_halted T → epilogue T ∧ halt = h_short
 
-safety [one_in_flight] status T = t_running ∧ status U = t_running → T = U
+-- A serial task runs alone; tasks in flight together are isolated and independent.
+safety [serial_runs_alone] status T = t_running ∧ ¬ isolated T ∧ status U = t_running → T = U
+safety [batch_is_isolated] status T = t_running ∧ status U = t_running ∧ T ≠ U → isolated T ∧ isolated U
+safety [batch_is_independent] status T = t_running ∧ status U = t_running → ¬ dep T U
+invariant [running_was_dispatched] status T = t_running → dispatched T
+invariant [batch_open_means_isolated_running] batch_open → ∃ t, status t = t_running ∧ isolated t
 
 invariant [revise_well_formed] revises R T → dep R T ∧ ¬ epilogue R ∧ ¬ revises T X ∧ ¬ revises X R
 invariant [one_reviewer] revises R T ∧ revises Q T → R = Q
