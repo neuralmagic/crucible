@@ -5,5 +5,4 @@ pub(crate) mod graph;
 pub(crate) mod machine;
 pub(crate) mod preflight;
 pub(crate) mod publish;
-pub(crate) mod selftest;
 pub(crate) mod step;

@@ -1,11 +1,14 @@
 //! The shared vocabulary of a run: its CLI options ([`Args`]), the paths everything anchors
 //! off ([`Paths`]), and the inputs resolved once before the loop starts ([`Prepared`]).
 
+#[cfg(feature = "autoresearch")]
 use crate::duration::parse_duration;
+#[cfg(feature = "autoresearch")]
 use crate::identity;
 use crate::manifest;
 use crate::openshell;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "autoresearch")]
 use std::time::Duration;
 
 /// Which front-end to drive the loop with.
@@ -166,16 +169,20 @@ pub(crate) struct Args {
     /// Publish-on-keep (composite only): per-component `(name, owner/repo)` fork map, populated from the
     /// composite manifest's `[[component]].pr_repo`, not a CLI flag. Each touched component opens one
     /// cross-linked draft PR against its fork.
+    #[cfg_attr(not(feature = "autoresearch"), allow(dead_code))]
     #[arg(skip)]
     pub component_pr_repos: Vec<(String, String)>,
     /// Declared pipeline artifacts (from `[[workspace.artifact]]`), for the publish layer:
     /// each `embed` match lands in the PR body and the S3 run record. No CLI flag.
+    #[cfg_attr(not(feature = "autoresearch"), allow(dead_code))]
     #[arg(skip)]
     pub artifacts: Vec<manifest::Artifact>,
     /// Wide-round search config (from `[search]`). No CLI flag, set by `run_from_manifest`.
+    #[cfg_attr(not(feature = "autoresearch"), allow(dead_code))]
     #[arg(skip)]
     pub search: Option<manifest::SearchCfg>,
     /// Manifest-only authored workflow.
+    #[cfg_attr(not(feature = "autoresearch"), allow(dead_code))]
     #[arg(skip)]
     pub workflow: Option<crate::plan::workflow::WorkflowCfg>,
     /// Manifest injects restored in each task workspace.
@@ -203,11 +210,13 @@ impl Args {
         <Flagless as clap::Parser>::try_parse_from(["crucible"]).map(|f| f.run)
     }
 
+    #[cfg(feature = "autoresearch")]
     /// Parse `--max-time` (e.g. `30m`) into a duration; None when unset/invalid.
     pub(crate) fn max_time(&self) -> Option<Duration> {
         parse_duration(&self.max_time)
     }
 
+    #[cfg(feature = "autoresearch")]
     /// Parse `--max-park` into a duration; None = wait on an approval indefinitely.
     pub(crate) fn max_park(&self) -> Option<Duration> {
         parse_duration(&self.max_park)
@@ -238,21 +247,26 @@ pub(crate) struct Paths {
     /// Toolbox source dir (`[agent].toolbox_dir`, manifest-relative); its subdirs are copied
     /// into `<workspace>/.claude/skills` each run. `None` when the manifest sets no toolbox.
     pub skills: Option<PathBuf>,
+    #[cfg_attr(not(feature = "autoresearch"), allow(dead_code))]
     pub steer: PathBuf,
     /// Cross-process state dir (gitignored): the session log + control file live here.
     pub state: PathBuf,
     /// Append-only NDJSON event log the headless loop emits for external tailers.
     pub session_log: PathBuf,
     /// Cross-process stop signal written by the `stop` tool.
+    #[cfg_attr(not(feature = "autoresearch"), allow(dead_code))]
     pub control: PathBuf,
     /// Escalation marker the agent's `escalate` tool writes in its workspace; the loop detects it
     /// after a turn, restores the world, and halts for human review.
+    #[cfg_attr(not(feature = "autoresearch"), allow(dead_code))]
     pub escalation: PathBuf,
     /// Pending-provisioning marker the agent writes when it has an open approval to wait on; the loop
     /// detects it after a turn and parks or continues per its `mode`.
+    #[cfg_attr(not(feature = "autoresearch"), allow(dead_code))]
     pub provisioning: PathBuf,
     /// Append-only NDJSON record of every external input, authoritative over the session
     /// log for what an operator asked for; a resume replays it.
+    #[cfg_attr(not(feature = "autoresearch"), allow(dead_code))]
     pub admissions: PathBuf,
 }
 
@@ -298,6 +312,7 @@ impl Paths {
 }
 
 /// Inputs resolved once before the loop (and before any UI takes the screen).
+#[cfg(feature = "autoresearch")]
 #[derive(Clone)]
 pub(crate) struct Prepared {
     pub goal: String,

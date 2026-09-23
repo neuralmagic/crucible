@@ -1058,7 +1058,7 @@ fn render_workflow_preview(manifest_path: &Path, pack: &Path) -> Result<(u32, u3
             }
             .validate()?
         }
-        workflow => crate::runloop::graph::iteration_template(workflow, &workflow_caps)?,
+        workflow => crate::plan::template::iteration_template(workflow, &workflow_caps)?,
     };
     // Preview authored capabilities; execution still admits against the real substrate.
     let caps = plan
