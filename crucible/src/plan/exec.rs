@@ -712,6 +712,10 @@ pub fn execute(
                 break;
             }
         }
+        if let Some(halt) = &halted {
+            let reports = matches!(halt, Halt::ShortCircuit(_));
+            dispatch.retain(|t| reports && t.stage == Stage::Epilogue);
+        }
         let Some(first) = dispatch.first() else {
             if results.len() > settled_before {
                 continue;
@@ -2098,7 +2102,7 @@ mod tests {
         crate::plan::exec::execute(plan, substrate, cfg, runner, on_result)
             .expect("an executor transition its table does not list")
     }
-    use crate::plan::ir::{Join, Plan, PlanBudget, Stage};
+    use crate::plan::ir::{Isolation, Join, Plan, PlanBudget, Stage};
 
     type Script = BTreeMap<(String, u32), (fn() -> AttemptOutcome, f64)>;
 
@@ -5780,6 +5784,44 @@ mod tests {
         assert!(r.dispatched.contains(&("report".to_string(), 1)));
     }
 
+    /// A required task that settles blocked later in the same scan pass stops the isolated batch
+    /// the pass had already collected: nothing undispatched runs after a short circuit.
+    #[test]
+    fn a_short_circuit_later_in_the_scan_stops_the_collected_batch() {
+        let mut a = task("a", &[], "any", false);
+        a.isolation = None;
+        let mut b = task("b", &[], "any", false);
+        b.isolation = Some(Isolation::Worktree);
+        let mut c = task("c", &["a"], "any", true);
+        c.isolation = Some(Isolation::Worktree);
+        c.join = Join::Passed;
+        let plan = valid(vec![a, b, c], 10.0);
+        let mut r = ScriptRunner::new();
+        r.on(
+            "a",
+            1,
+            || AttemptOutcome::Fail {
+                note: "measured".into(),
+                output: None,
+            },
+            0.1,
+        );
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        assert_eq!(out.exit, PlanExit::ShortCircuit { task: "c".into() });
+        assert_eq!(out.results[&"b".into()].status, TaskStatus::Blocked);
+        assert!(
+            !r.dispatched.iter().any(|(t, _)| t == "b"),
+            "{:?}",
+            r.dispatched
+        );
+    }
+
     /// The runner for the exhaustive graph test: one scripted outcome per task, and one shared
     /// log of every dispatch and every settlement in the order the executor made them.
     struct GraphRunner {
@@ -5787,9 +5829,10 @@ mod tests {
         log: std::rc::Rc<std::cell::RefCell<Vec<GraphEvent>>>,
     }
 
+    /// `Run` is one call into the runner: a serial attempt, or a whole concurrent wave.
     #[derive(Clone, Debug)]
     enum GraphEvent {
-        Run(String),
+        Run(Vec<String>),
         Settled(String, TaskStatus),
     }
 
@@ -5812,17 +5855,30 @@ mod tests {
         ) -> Attempt {
             self.log
                 .borrow_mut()
-                .push(GraphEvent::Run(task.name.0.clone()));
+                .push(GraphEvent::Run(vec![task.name.0.clone()]));
             Attempt {
                 outcome: self.outcomes[&task.name.0](),
                 cost_usd: 0.1,
             }
         }
+
+        fn run_many(&mut self, batch: &[BatchItem<'_>]) -> Vec<Attempt> {
+            self.log.borrow_mut().push(GraphEvent::Run(
+                batch.iter().map(|b| b.task.name.0.clone()).collect(),
+            ));
+            batch
+                .iter()
+                .map(|b| Attempt {
+                    outcome: self.outcomes[&b.task.name.0](),
+                    cost_usd: 0.1,
+                })
+                .collect()
+        }
     }
 
     /// The invariants formal/CrucibleSpec/PlanExec.lean proves for the model, checked against
     /// `execute` on every three-task graph: every edge set, stage split, required set, substrate
-    /// fit, join, per-task outcome, and a budget that does and does not run out.
+    /// fit, join, isolation split, per-task outcome, and a budget that does and does not run out.
     #[test]
     fn every_three_task_graph_keeps_the_model_invariants() {
         const N: usize = 3;
@@ -5853,7 +5909,9 @@ mod tests {
                 if (0..N).any(|t| deps(t).iter().any(|&d| is_epilogue(t) != is_epilogue(d))) {
                     continue;
                 }
-                for required in 0..(1u32 << N) {
+                for (required, isolated) in
+                    (0..(1u32 << N)).flat_map(|r| [0u32, 0b011, 0b110, 0b111].map(|i| (r, i)))
+                {
                     for gpu in [None, Some(0), Some(1), Some(2)] {
                         for join_pick in 0..(joins.len().pow(N as u32)) {
                             let join = |t: usize| joins[join_pick / joins.len().pow(t as u32) % 3];
@@ -5875,6 +5933,9 @@ mod tests {
                                                 required & (1 << t) != 0,
                                             );
                                             task.join = join(t);
+                                            if isolated & (1 << t) != 0 {
+                                                task.isolation = Some(Isolation::Worktree);
+                                            }
                                             if is_epilogue(t) {
                                                 task.stage = Stage::Epilogue;
                                             }
@@ -5987,19 +6048,43 @@ mod tests {
             return;
         }
 
+        let find = |n: &str| tasks.iter().find(|t| t.name.0 == n).expect("a known task");
         let mut settled: BTreeMap<&str, TaskStatus> = BTreeMap::new();
         let mut runs: BTreeMap<&str, u32> = BTreeMap::new();
+        let mut in_flight: BTreeSet<&str> = BTreeSet::new();
         let mut spent = 0.0;
         let mut halted_at_short_circuit = false;
         for e in log {
             match e {
-                GraphEvent::Run(n) => {
-                    let t = tasks.iter().find(|t| &t.name.0 == n).expect("a known task");
-                    let first = !runs.contains_key(n.as_str());
-                    *runs.entry(n.as_str()).or_default() += 1;
-                    // nothing_runs_after_a_ceiling.
-                    assert!(spent <= budget, "dispatched past the budget: {}", ctx());
-                    if first {
+                GraphEvent::Run(wave) => {
+                    // nothing_runs_after_a_ceiling: every dispatch and retry is decided under it.
+                    assert!(spent < budget, "dispatched at the budget: {}", ctx());
+                    let fresh: Vec<&str> = wave
+                        .iter()
+                        .map(String::as_str)
+                        .filter(|n| !in_flight.contains(n))
+                        .collect();
+                    if !fresh.is_empty() {
+                        // A new dispatch starts only once everything before it has settled.
+                        assert!(
+                            in_flight.is_empty(),
+                            "{fresh:?} joined {in_flight:?}: {}",
+                            ctx()
+                        );
+                        assert_eq!(fresh.len(), wave.len(), "{}", ctx());
+                    }
+                    if wave.len() > 1 {
+                        // batch_is_isolated and batch_is_independent.
+                        for a in wave {
+                            let t = find(a);
+                            assert!(t.isolation.is_some(), "{a} ran in a batch: {}", ctx());
+                            for b in wave {
+                                assert!(!t.depends_on.iter().any(|d| &d.0 == b), "{}", ctx());
+                            }
+                        }
+                    }
+                    for n in &fresh {
+                        let t = find(n);
                         // dispatch_after_dependencies and all_join_reads_passing.
                         for d in &t.depends_on {
                             let s = settled.get(d.0.as_str());
@@ -6020,11 +6105,16 @@ mod tests {
                             "{}",
                             ctx()
                         );
+                        in_flight.insert(n);
                     }
-                    spent += 0.1;
+                    for n in wave {
+                        *runs.entry(n.as_str()).or_default() += 1;
+                    }
+                    spent += 0.1 * wave.len() as f64;
                 }
                 GraphEvent::Settled(n, s) => {
-                    let t = tasks.iter().find(|t| &t.name.0 == n).expect("a known task");
+                    let t = find(n);
+                    in_flight.remove(n.as_str());
                     settled.insert(n.as_str(), *s);
                     if t.required
                         && t.stage == Stage::Iteration
