@@ -2102,7 +2102,7 @@ mod tests {
         crate::plan::exec::execute(plan, substrate, cfg, runner, on_result)
             .expect("an executor transition its table does not list")
     }
-    use crate::plan::ir::{Isolation, Join, Plan, PlanBudget, Stage};
+    use crate::plan::ir::{Isolation, Join, Plan, PlanBudget, Revise, Stage};
 
     type Script = BTreeMap<(String, u32), (fn() -> AttemptOutcome, f64)>;
 
@@ -5826,7 +5826,35 @@ mod tests {
     /// log of every dispatch and every settlement in the order the executor made them.
     struct GraphRunner {
         outcomes: BTreeMap<String, fn() -> AttemptOutcome>,
+        /// Outcomes by revise round, for the tasks of a revise pair.
+        rounds: BTreeMap<String, Vec<fn() -> AttemptOutcome>>,
         log: std::rc::Rc<std::cell::RefCell<Vec<GraphEvent>>>,
+        /// Every dispatch and the round its `revision` input named, if any.
+        revisions: Vec<(String, Option<u64>)>,
+    }
+
+    impl GraphRunner {
+        fn outcome(&mut self, task: &Task, inputs: &BTreeMap<TaskName, Value>) -> AttemptOutcome {
+            let revision = inputs
+                .get(&TaskName(REVISION_INPUT.to_string()))
+                .and_then(|r| r["round"].as_u64());
+            self.revisions.push((task.name.0.clone(), revision));
+            match self.rounds.get(&task.name.0) {
+                Some(rounds) => {
+                    let round = self
+                        .log
+                        .borrow()
+                        .iter()
+                        .filter(|e| {
+                            matches!(e, GraphEvent::Settled(n, _)
+                                if n.starts_with(&format!("{}[round-", task.name.0)))
+                        })
+                        .count();
+                    rounds[round.min(rounds.len() - 1)]()
+                }
+                None => self.outcomes[&task.name.0](),
+            }
+        }
     }
 
     /// `Run` is one call into the runner: a serial attempt, or a whole concurrent wave.
@@ -5851,13 +5879,13 @@ mod tests {
             &mut self,
             task: &Task,
             _attempt: u32,
-            _inputs: &BTreeMap<TaskName, Value>,
+            inputs: &BTreeMap<TaskName, Value>,
         ) -> Attempt {
             self.log
                 .borrow_mut()
                 .push(GraphEvent::Run(vec![task.name.0.clone()]));
             Attempt {
-                outcome: self.outcomes[&task.name.0](),
+                outcome: self.outcome(task, inputs),
                 cost_usd: 0.1,
             }
         }
@@ -5869,7 +5897,7 @@ mod tests {
             batch
                 .iter()
                 .map(|b| Attempt {
-                    outcome: self.outcomes[&b.task.name.0](),
+                    outcome: self.outcome(b.task, &b.inputs),
                     cost_usd: 0.1,
                 })
                 .collect()
@@ -5959,7 +5987,9 @@ mod tests {
                                                 (name(t), outcomes[pick])
                                             })
                                             .collect(),
+                                        rounds: BTreeMap::new(),
                                         log: log.clone(),
+                                        revisions: Vec::new(),
                                     };
                                     let settled_log = log.clone();
                                     let out = execute(
@@ -5986,6 +6016,194 @@ mod tests {
         assert!(runs > 100_000, "the enumeration shrank to {runs} runs");
     }
 
+    /// C-REVISE-LOOP against `execute`: t1 reviews t0 for two rounds under every reviewer join,
+    /// every per-round outcome of both, and every shape of a third task hanging off the pair.
+    #[test]
+    fn every_revise_pair_keeps_the_loop_invariants() {
+        let target: [fn() -> AttemptOutcome; 3] = [
+            || AttemptOutcome::Pass(serde_json::json!({})),
+            || AttemptOutcome::Fail {
+                note: "measured".into(),
+                output: None,
+            },
+            || AttemptOutcome::Transport(TransportFailure::new(TransportCause::Other, "blip")),
+        ];
+        let review: [fn() -> AttemptOutcome; 3] = [
+            || AttemptOutcome::Pass(serde_json::json!({})),
+            || AttemptOutcome::Fail {
+                note: "rejected".into(),
+                output: None,
+            },
+            || AttemptOutcome::Skipped(serde_json::json!({}), "inapplicable".into()),
+        ];
+        let joins = [Join::All, Join::Passed, Join::Settled];
+        let mut runs = 0usize;
+        let mut second_rounds = 0usize;
+        for review_join in joins {
+            for dependent_deps in [vec![], vec!["t0"], vec!["t1"], vec!["t0", "t1"]] {
+                for dependent_join in joins {
+                    if dependent_join != Join::All && dependent_deps.is_empty() {
+                        continue;
+                    }
+                    for required in 0..8u32 {
+                        for gpu in [None, Some(1)] {
+                            for picks in 0..(9 * 9) {
+                                for budget in [0.35, 10.0] {
+                                    let mut t0 = task("t0", &[], "any", required & 1 != 0);
+                                    t0.session = None;
+                                    let mut t1 = task(
+                                        "t1",
+                                        &["t0"],
+                                        if gpu == Some(1) { "gpu" } else { "any" },
+                                        required & 2 != 0,
+                                    );
+                                    t1.join = review_join;
+                                    t1.revise = Some(Revise {
+                                        task: "t0".into(),
+                                        max_rounds: 2,
+                                    });
+                                    let mut t2 =
+                                        task("t2", &dependent_deps, "any", required & 4 != 0);
+                                    t2.join = dependent_join;
+                                    let tasks = vec![t0, t1, t2];
+                                    let Ok(plan) = (Plan {
+                                        version: 1,
+                                        reason: None,
+                                        budget: PlanBudget { usd: budget },
+                                        tasks: tasks.clone(),
+                                    })
+                                    .validate() else {
+                                        continue;
+                                    };
+                                    let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+                                    let (a, b) = (picks % 9, picks / 9);
+                                    let mut runner = GraphRunner {
+                                        outcomes: [(
+                                            "t2".to_string(),
+                                            target[0] as fn() -> AttemptOutcome,
+                                        )]
+                                        .into(),
+                                        rounds: [
+                                            ("t0".to_string(), vec![target[a % 3], target[a / 3]]),
+                                            ("t1".to_string(), vec![review[b % 3], review[b / 3]]),
+                                        ]
+                                        .into(),
+                                        log: log.clone(),
+                                        revisions: Vec::new(),
+                                    };
+                                    let settled_log = log.clone();
+                                    let out = execute(
+                                        &plan,
+                                        &any_substrate(),
+                                        ExecCfg::default(),
+                                        &mut runner,
+                                        |t, r| {
+                                            settled_log.borrow_mut().push(GraphEvent::Settled(
+                                                t.name.0.clone(),
+                                                r.status,
+                                            ))
+                                        },
+                                    );
+                                    check_graph(&tasks, &out, &log.borrow(), budget);
+                                    if check_rounds(&tasks, &out, &log.borrow(), &runner.revisions)
+                                        == 2
+                                    {
+                                        second_rounds += 1;
+                                    }
+                                    runs += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(runs > 10_000, "the enumeration shrank to {runs} runs");
+        assert!(
+            second_rounds > 1_000,
+            "only {second_rounds} runs reached a second round"
+        );
+    }
+
+    fn check_rounds(
+        tasks: &[Task],
+        out: &PlanOutcome,
+        log: &[GraphEvent],
+        revisions: &[(String, Option<u64>)],
+    ) -> usize {
+        let ctx = || format!("{tasks:#?}\n{log:?}\n{revisions:?}\n{:?}", out.exit);
+        let rows = |task: &str| -> Vec<TaskStatus> {
+            (1..)
+                .map_while(|k| {
+                    log.iter().find_map(|e| match e {
+                        GraphEvent::Settled(n, s) if n == &format!("{task}[round-{k}]") => Some(*s),
+                        _ => None,
+                    })
+                })
+                .collect()
+        };
+        let (target, reviews) = (rows("t0"), rows("t1"));
+        if target.is_empty() {
+            return 0;
+        }
+        // rounds_bounded.
+        assert!(
+            target.len() <= 2 && reviews.len() <= target.len(),
+            "{}",
+            ctx()
+        );
+        // another_round_needs_a_failing_review.
+        for k in 1..target.len() {
+            assert_eq!(reviews.get(k - 1), Some(&TaskStatus::Fail), "{}", ctx());
+        }
+        // A reviewer joining all never reviews a failed round.
+        let reviewer = &tasks[1];
+        for (k, t) in target.iter().enumerate() {
+            if reviewer.join == Join::All && *t != TaskStatus::Pass {
+                assert_eq!(reviews.get(k), Some(&TaskStatus::Blocked), "{}", ctx());
+            }
+        }
+        // The pair's own rows are its last round's.
+        assert_eq!(
+            out.results[&"t0".into()].status,
+            *target.last().expect("a round"),
+            "{}",
+            ctx()
+        );
+        if let Some(last) = reviews.last() {
+            assert_eq!(out.results[&"t1".into()].status, *last, "{}", ctx());
+        }
+        // No revision in the first round; the right one in the second.
+        let target_rounds: Vec<Option<u64>> = revisions
+            .iter()
+            .filter(|(n, _)| n == "t0")
+            .map(|(_, r)| *r)
+            .collect();
+        assert!(
+            target_rounds.iter().take_while(|r| r.is_none()).count() >= 1,
+            "{}",
+            ctx()
+        );
+        assert!(
+            target_rounds.iter().all(|r| r.is_none() || *r == Some(2)),
+            "{}",
+            ctx()
+        );
+        // dependent_waits_for_the_pair.
+        let reviewer_row = log
+            .iter()
+            .position(|e| matches!(e, GraphEvent::Settled(n, _) if n == "t1"));
+        let dependent_run = log
+            .iter()
+            .position(|e| matches!(e, GraphEvent::Run(w) if w.iter().any(|n| n == "t2")));
+        if let (Some(run), Some(row)) = (dependent_run, reviewer_row)
+            && !tasks[2].depends_on.is_empty()
+        {
+            assert!(row < run, "t2 ran before t1 settled: {}", ctx());
+        }
+        target.len()
+    }
+
     fn check_graph(tasks: &[Task], out: &PlanOutcome, log: &[GraphEvent], budget: f64) {
         let ctx = || format!("{tasks:#?}\n{log:?}\n{:?}", out.exit);
         let status = |t: &Task| out.results[&t.name].status;
@@ -5994,12 +6212,22 @@ mod tests {
             .iter()
             .filter(|t| t.required && t.stage == Stage::Iteration)
             .collect();
-        assert_eq!(
-            out.results.len(),
-            tasks.len(),
-            "every task settles: {}",
-            ctx()
-        );
+        for t in tasks {
+            assert!(
+                out.results.contains_key(&t.name),
+                "{} never settled: {}",
+                t.name,
+                ctx()
+            );
+        }
+        for n in out.results.keys() {
+            let base = n.0.split('[').next().unwrap_or(&n.0);
+            assert!(
+                tasks.iter().any(|t| t.name.0 == base),
+                "stray row {n}: {}",
+                ctx()
+            );
+        }
 
         // completed_means_valid: exit == Completed alone implies every required task held.
         if out.exit == PlanExit::Completed {
@@ -6112,11 +6340,13 @@ mod tests {
                     }
                     spent += 0.1 * wave.len() as f64;
                 }
-                GraphEvent::Settled(n, s) => {
+                GraphEvent::Settled(row, s) => {
+                    let n = row.split('[').next().unwrap_or(row);
                     let t = find(n);
-                    in_flight.remove(n.as_str());
-                    settled.insert(n.as_str(), *s);
-                    if t.required
+                    in_flight.remove(n);
+                    settled.insert(n, *s);
+                    if n == row
+                        && t.required
                         && t.stage == Stage::Iteration
                         && !matches!(s, TaskStatus::Pass | TaskStatus::NotTaken)
                     {
@@ -6127,9 +6357,18 @@ mod tests {
         }
         for t in tasks {
             let n = runs.get(t.name.0.as_str()).copied().unwrap_or(0);
+            let rounds = tasks
+                .iter()
+                .find_map(|r| {
+                    r.revise
+                        .as_ref()
+                        .filter(|v| v.task == t.name || r.name == t.name)
+                        .map(|v| v.max_rounds)
+                })
+                .unwrap_or(1);
             // Retry is not recheck: only a transport failure runs again, and only twice more.
-            assert!(n <= 3, "{} ran {n} times: {}", t.name, ctx());
-            if n > 1 {
+            assert!(n <= 3 * rounds, "{} ran {n} times: {}", t.name, ctx());
+            if n > 1 && rounds == 1 {
                 assert_eq!(status(t), TaskStatus::Transport, "{}", ctx());
             }
             // not_taken_never_dispatched.
