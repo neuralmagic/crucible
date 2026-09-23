@@ -1245,6 +1245,9 @@ pub fn whoami(endpoint: &Endpoint, credential: &Credential, w: &dto::Whoami) -> 
 
 fn endpoint_line(endpoint: &Endpoint) -> String {
     match endpoint {
+        Endpoint::Configured { url } if url == crate::config::DEFAULT_URL => {
+            format!("{url} (the default: a controller on this machine)")
+        }
         Endpoint::Configured { url } => format!("{url} (configured CONTROLLER_URL)"),
         Endpoint::InProcess { links } => {
             format!("this controller, in process (links are built against {links})")
@@ -1399,6 +1402,21 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("credential: api key\n"), "{text}");
+    }
+
+    #[test]
+    fn whoami_says_when_the_url_is_the_local_default() {
+        let text = whoami(
+            &Endpoint::Configured {
+                url: crate::config::DEFAULT_URL.into(),
+            },
+            &Credential::Wire(Auth::None),
+            &wynn(),
+        );
+        assert!(
+            text.contains("(the default: a controller on this machine)"),
+            "{text}"
+        );
     }
 
     /// The bug this fixes: the in-process wire carries no per-request credential, and reporting
