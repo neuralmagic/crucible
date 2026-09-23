@@ -12,6 +12,9 @@ use crucible_contract::elicit::{
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The least time one request gets, however close the run's ceiling is.
+const MIN_TIMEOUT: Duration = Duration::from_secs(1);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Endpoint {
     pub url: String,
@@ -105,12 +108,18 @@ fn exchange(
     task: &str,
     method: Method,
     request: &ElicitRequest,
+    ceiling: Option<Instant>,
 ) -> Result<ElicitStatus, ElicitError> {
     let url = endpoint.question_url(task);
+    let timeout = ceiling.map_or(TIMEOUT, |c| {
+        c.saturating_duration_since(Instant::now())
+            .clamp(MIN_TIMEOUT, TIMEOUT)
+    });
     let mut call = match method {
         Method::Put => client.put(&url).json(request),
         Method::Get => client.get(&url),
-    };
+    }
+    .timeout(timeout);
     if let Some(token) = endpoint.token()? {
         call = call.bearer_auth(token);
     }
@@ -151,10 +160,16 @@ pub fn wait(
     bounds: Bounds,
 ) -> Result<Waited, ElicitError> {
     let client = reqwest::blocking::Client::builder()
-        .timeout(TIMEOUT)
         .build()
         .map_err(|e| ElicitError::Invalid(format!("building the elicitation client: {e}")))?;
-    let mut status = exchange(&client, endpoint, task, Method::Put, request)?;
+    let mut status = exchange(
+        &client,
+        endpoint,
+        task,
+        Method::Put,
+        request,
+        bounds.ceiling,
+    )?;
     let deadline_after = |status: &ElicitStatus| {
         let left = Duration::from_secs(status.expires_in_secs.min(request.deadline_secs));
         let now = Instant::now();
@@ -172,7 +187,14 @@ pub fn wait(
         }
         let bound = bounds.ceiling.map_or(deadline, |c| c.min(deadline));
         std::thread::sleep(bound.saturating_duration_since(now).min(bounds.poll));
-        match exchange(&client, endpoint, task, Method::Get, request) {
+        match exchange(
+            &client,
+            endpoint,
+            task,
+            Method::Get,
+            request,
+            bounds.ceiling,
+        ) {
             Ok(fresh) => {
                 deadline = deadline_after(&fresh);
                 status = fresh;
@@ -446,6 +468,60 @@ mod tests {
         .unwrap();
         assert_eq!(got, Waited::Cut(answers(&[("owner", "kernels")])));
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_poll_that_hangs_at_the_ceiling_is_cut_at_the_ceiling() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/e", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for (served, stream) in listener.incoming().enumerate() {
+                let mut stream = stream.unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = v.trim().parse().unwrap();
+                    }
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let mut payload = vec![0u8; length];
+                reader.read_exact(&mut payload).unwrap();
+                if served == 0 {
+                    let (_, body) = ok(3600, &[]);
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .unwrap();
+                } else {
+                    held.push(stream);
+                }
+            }
+        });
+        let started = Instant::now();
+        let got = wait(
+            &endpoint(url),
+            "gate",
+            &request(),
+            Bounds {
+                poll: Duration::from_millis(10),
+                ceiling: Some(started + Duration::from_millis(500)),
+            },
+        )
+        .unwrap();
+        assert_eq!(got, Waited::Cut(BTreeMap::new()));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a hung poll held the wait {:?} past a 500ms ceiling",
+            started.elapsed()
+        );
     }
 
     #[test]
