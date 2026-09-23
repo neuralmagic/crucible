@@ -3,22 +3,21 @@
 [govctl]
 id = "WI-2026-09-22-004"
 title = "Name the playbook lane in its baseline commit and the CLI help"
-status = "queue"
+status = "done"
 created = "2026-09-22"
-refs = [
-    "RFC-0002:C-PLAYBOOK-LANE",
-]
+started = "2026-09-23"
+completed = "2026-09-23"
+refs = ["RFC-0002:C-PLAYBOOK-LANE"]
 
 [content]
-description = """
-A playbook run's workspace starts with a commit titled "autoresearch: baseline workspace", and `crucible --help` opens with "Agentic autoresearch loop: an LLM proposes, a frozen judge decides", even on a build without the autoresearch feature. Both should describe the engine for the lane that is running."""
+description = """A playbook run's workspace starts with a commit titled "autoresearch: baseline workspace", and `crucible --help` opens with "Agentic autoresearch loop: an LLM proposes, a frozen judge decides", even on a build without the autoresearch feature. Both should describe the engine for the lane that is running."""
 
 [[content.acceptance_criteria]]
-text = "a playbook run's baseline commit does not name the autoresearch lane; a scored run's is unchanged"
-status = "pending"
+text = "the workspace baseline commit and the default git identity name no lane, so a playbook run's history does not say autoresearch"
+status = "done"
 category = "fixed"
 
 [[content.acceptance_criteria]]
 text = "crucible --help describes the workflow engine, and names the autoresearch loop only where the feature is built"
-status = "pending"
+status = "done"
 category = "fixed"

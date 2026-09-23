@@ -36,11 +36,13 @@ Expected, exactly:
   audit-bullets        pass       attempts=1 cost=$0.0000  out={"findings":[],"topic":"bullets"}
   audit-freshness      fail       attempts=1 cost=$0.0000  (turn ended without writing PLAN_TASK_RESULT.json — nothing to grade)
   roundup              pass       attempts=1 cost=$0.0000  out={"findings":[],"reporting":["audit-bullets","audit-headings"],"silent":["audit-freshness"]}
+  publish-report       fail       attempts=1 cost=$0.0000  (reading /var/lib/forge/report.json: No such file or directory (os error 2))
 plan v1: completed — spent $0.0000 of $1
 verdict: valid
 ```
 
-Exit 0. Re-running without deleting `workspace/` and `state/` prints the same rows: every
+Exit 0. `publish-report` fails because outside the controller there is no report destination to
+read; it is an epilogue, so the verdict stays valid. Re-running without deleting `workspace/` and `state/` prints the same rows: every
 stand-in rewrites what it owns.
 
 The graph in its authoring syntax, and its checked-in compiler golden:

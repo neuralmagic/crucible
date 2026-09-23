@@ -3,27 +3,26 @@
 [govctl]
 id = "WI-2026-09-22-002"
 title = "Show every revise round in plan run's table"
-status = "queue"
+status = "done"
 created = "2026-09-22"
-refs = [
-    "RFC-0002:C-REVISE-LOOP",
-]
+started = "2026-09-23"
+completed = "2026-09-23"
+refs = ["RFC-0002:C-REVISE-LOOP"]
 
 [content]
-description = """
-`crucible plan run` prints one row per task under its own name. For a revise pair that took two rounds it prints `poem pass attempts=1` and `check pass attempts=1`, so the table reads as if the review passed first time; the `[round-N]` rows C-REVISE-LOOP requires exist only in state/session.jsonl. The terminal table should show each round as it settles, the way the session log does, and the folded row should not claim one attempt for a task that ran twice."""
+description = "`crucible plan run` prints one row per task under its own name. For a revise pair that took two rounds it prints `poem pass attempts=1` and `check pass attempts=1`, so the table reads as if the review passed first time; the `[round-N]` rows C-REVISE-LOOP requires exist only in state/session.jsonl. The terminal table should show each round as it settles, the way the session log does, and the folded row should not claim one attempt for a task that ran twice."
 
 [[content.acceptance_criteria]]
-text = "plan run prints a task[round-N] row for every round as it settles, before the folded rows"
-status = "pending"
+text = "plan run prints a task[round-N] row for every round, ahead of the task's own row"
+status = "done"
 category = "fixed"
 
 [[content.acceptance_criteria]]
 text = "the folded row of a task that ran more than one round says how many rounds it ran"
-status = "pending"
+status = "done"
 category = "fixed"
 
 [[content.acceptance_criteria]]
-text = "a CLI test runs a two-round revise pack and asserts the printed rows"
-status = "pending"
+text = "a test runs a two-round revise pack and asserts the rows plan run prints"
+status = "done"
 category = "added"

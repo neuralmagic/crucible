@@ -23,11 +23,11 @@ pub fn ensure_repo(ws: &Path) -> Result<()> {
     {
         let mut cfg = repo.config().context("open repo config")?;
         if cfg.get_string("user.name").is_err() {
-            cfg.set_str("user.name", "autoresearch")
+            cfg.set_str("user.name", "crucible")
                 .context("set user.name")?;
         }
         if cfg.get_string("user.email").is_err() {
-            cfg.set_str("user.email", "autoresearch@crucible.local")
+            cfg.set_str("user.email", "crucible@crucible.local")
                 .context("set user.email")?;
         }
     }
@@ -46,7 +46,7 @@ pub fn ensure_repo(ws: &Path) -> Result<()> {
         Some("HEAD"),
         &sig,
         &sig,
-        "autoresearch: baseline workspace",
+        "crucible: baseline workspace",
         &tree,
         &[],
     )
@@ -306,6 +306,20 @@ mod tests {
         );
         assert!(!ws.join("out/junk.txt").exists(), "sibling file removed");
         assert!(!ws.join("out/build").exists(), "sibling dir removed");
+    }
+
+    #[test]
+    fn the_baseline_commit_names_no_lane() {
+        let tmp = tempdir();
+        let ws = tmp.as_path();
+        fs::write(ws.join("seed.txt"), "x").expect("seed");
+        ensure_repo(ws).expect("ensure_repo");
+        let repo = Repository::open(ws).expect("open");
+        let head = repo.head().expect("head").peel_to_commit().expect("commit");
+        assert_eq!(
+            head.summary().expect("summary"),
+            Some("crucible: baseline workspace")
+        );
     }
 
     #[test]

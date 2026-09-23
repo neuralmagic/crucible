@@ -291,7 +291,11 @@ pub fn functions() -> Vec<Function> {
                     "task",
                     "The task whose result the template renders.",
                 ),
-                Kwarg::new("required", "bool", "False makes the report advisory."),
+                Kwarg::new(
+                    "required",
+                    "bool",
+                    "Recorded on the task. A report is an epilogue, so a failed delivery settles it failing and never changes the verdict.",
+                ),
             ],
         },
         Function {

@@ -557,6 +557,7 @@ pub fn execute(
         Ok(())
     };
     loop {
+        let settled_before = results.len();
         let mut dispatch: Vec<&Task> = Vec::new();
         for t in plan.tasks_topo() {
             if results.contains_key(&t.name) {
@@ -711,7 +712,14 @@ pub fn execute(
                 break;
             }
         }
+        if let Some(halt) = &halted {
+            let reports = matches!(halt, Halt::ShortCircuit(_));
+            dispatch.retain(|t| reports && t.stage == Stage::Epilogue);
+        }
         let Some(first) = dispatch.first() else {
+            if results.len() > settled_before {
+                continue;
+            }
             // Nothing dispatchable and nothing left to settle: done.
             break;
         };
@@ -2058,7 +2066,7 @@ fn reduce_top_k(inputs: &BTreeMap<TaskName, Value>, k: u32, direction: Direction
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::plan::exec::*;
 
     #[test]
     fn every_task_status_is_a_settled_state_the_table_reaches() {
@@ -2094,7 +2102,9 @@ mod tests {
         crate::plan::exec::execute(plan, substrate, cfg, runner, on_result)
             .expect("an executor transition its table does not list")
     }
-    use crate::plan::ir::{Join, Plan, PlanBudget, Stage};
+    use crate::plan::ir::{
+        Isolation, Join, Plan, PlanBudget, ReportDestination, SlackDestination, Stage,
+    };
 
     type Script = BTreeMap<(String, u32), (fn() -> AttemptOutcome, f64)>;
 
@@ -4199,6 +4209,28 @@ mod tests {
         assert!(out.valid, "an epilogue is advisory by contract");
     }
 
+    /// A report is an epilogue: a failed delivery settles it failing, required or not, and the
+    /// verdict is the main graph's.
+    #[test]
+    fn a_failed_required_report_settles_failing_and_leaves_the_verdict() {
+        let mut report = epilogue("publish-report", &[], true);
+        report.task = TaskKind::Report {
+            destination: ReportDestination::Slack(SlackDestination::default()),
+            template: "reports/slack.md.j2".into(),
+            result: Some("a".into()),
+        };
+        let plan = valid(vec![task("a", &[], "any", true), report], 10.0);
+        let mut r = ScriptRunner::new();
+        r.on("publish-report", 1, || AttemptOutcome::fail("no sink"), 0.1);
+        let out = run_plan(&plan, &mut r);
+        assert_eq!(
+            out.results[&"publish-report".into()].status,
+            TaskStatus::Fail
+        );
+        assert_eq!(out.exit, PlanExit::Completed);
+        assert!(out.valid);
+    }
+
     /// A failed epilogue task must not gate a second one either: the short-circuit is a
     /// main-graph device, and the epilogue has no verdict to protect.
     #[test]
@@ -5737,5 +5769,397 @@ mod tests {
                 row("repro", TaskStatus::Skipped)
             ]
         );
+    }
+
+    /// An epilogue declared ahead of the main graph still reports a short circuit whose last
+    /// blocked task settles after the epilogue's own place in the scan.
+    #[test]
+    fn an_epilogue_declared_first_still_reports_a_short_circuit() {
+        let mut report = task("report", &[], "any", true);
+        report.stage = Stage::Epilogue;
+        let plan = valid(
+            vec![
+                report,
+                task("a", &[], "any", true),
+                task("b", &["a"], "any", true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.on(
+            "a",
+            1,
+            || AttemptOutcome::Fail {
+                note: "measured".into(),
+                output: None,
+            },
+            0.1,
+        );
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        assert_eq!(out.exit, PlanExit::ShortCircuit { task: "a".into() });
+        assert_eq!(out.results[&"b".into()].status, TaskStatus::Blocked);
+        assert_eq!(out.results[&"report".into()].status, TaskStatus::Pass);
+        assert!(r.dispatched.contains(&("report".to_string(), 1)));
+    }
+
+    /// A required task that settles blocked later in the same scan pass stops the isolated batch
+    /// the pass had already collected: nothing undispatched runs after a short circuit.
+    #[test]
+    fn a_short_circuit_later_in_the_scan_stops_the_collected_batch() {
+        let mut a = task("a", &[], "any", false);
+        a.isolation = None;
+        let mut b = task("b", &[], "any", false);
+        b.isolation = Some(Isolation::Worktree);
+        let mut c = task("c", &["a"], "any", true);
+        c.isolation = Some(Isolation::Worktree);
+        c.join = Join::Passed;
+        let plan = valid(vec![a, b, c], 10.0);
+        let mut r = ScriptRunner::new();
+        r.on(
+            "a",
+            1,
+            || AttemptOutcome::Fail {
+                note: "measured".into(),
+                output: None,
+            },
+            0.1,
+        );
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        assert_eq!(out.exit, PlanExit::ShortCircuit { task: "c".into() });
+        assert_eq!(out.results[&"b".into()].status, TaskStatus::Blocked);
+        assert!(
+            !r.dispatched.iter().any(|(t, _)| t == "b"),
+            "{:?}",
+            r.dispatched
+        );
+    }
+
+    /// The runner for the exhaustive graph test: one scripted outcome per task, and one shared
+    /// log of every dispatch and every settlement in the order the executor made them.
+    struct GraphRunner {
+        outcomes: BTreeMap<String, fn() -> AttemptOutcome>,
+        log: std::rc::Rc<std::cell::RefCell<Vec<GraphEvent>>>,
+    }
+
+    /// `Run` is one call into the runner: a serial attempt, or a whole concurrent wave.
+    #[derive(Clone, Debug)]
+    enum GraphEvent {
+        Run(Vec<String>),
+        Settled(String, TaskStatus),
+    }
+
+    impl TaskRunner for GraphRunner {
+        fn stage(&mut self, _task: &Task, _producers: &[&Task]) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn has_captured_files(&self, _task: &Task) -> bool {
+            false
+        }
+
+        fn drop_captured(&mut self, _task: &Task) {}
+
+        fn run(
+            &mut self,
+            task: &Task,
+            _attempt: u32,
+            _inputs: &BTreeMap<TaskName, Value>,
+        ) -> Attempt {
+            self.log
+                .borrow_mut()
+                .push(GraphEvent::Run(vec![task.name.0.clone()]));
+            Attempt {
+                outcome: self.outcomes[&task.name.0](),
+                cost_usd: 0.1,
+            }
+        }
+
+        fn run_many(&mut self, batch: &[BatchItem<'_>]) -> Vec<Attempt> {
+            self.log.borrow_mut().push(GraphEvent::Run(
+                batch.iter().map(|b| b.task.name.0.clone()).collect(),
+            ));
+            batch
+                .iter()
+                .map(|b| Attempt {
+                    outcome: self.outcomes[&b.task.name.0](),
+                    cost_usd: 0.1,
+                })
+                .collect()
+        }
+    }
+
+    /// The invariants formal/CrucibleSpec/PlanExec.lean proves for the model, checked against
+    /// `execute` on every three-task graph: every edge set, stage split, required set, substrate
+    /// fit, join, isolation split, per-task outcome, and a budget that does and does not run out.
+    #[test]
+    fn every_three_task_graph_keeps_the_model_invariants() {
+        const N: usize = 3;
+        const EDGES: [(usize, usize); 3] = [(1, 0), (2, 0), (2, 1)];
+        let outcomes: [fn() -> AttemptOutcome; 4] = [
+            || AttemptOutcome::Pass(serde_json::json!({})),
+            || AttemptOutcome::Fail {
+                note: "measured".into(),
+                output: None,
+            },
+            || AttemptOutcome::Skipped(serde_json::json!({}), "inapplicable".into()),
+            || AttemptOutcome::Transport(TransportFailure::new(TransportCause::Other, "blip")),
+        ];
+        let joins = [Join::All, Join::Passed, Join::Settled];
+        let name = |i: usize| format!("t{i}");
+        let mut runs = 0usize;
+        for edges in 0..(1u32 << EDGES.len()) {
+            let deps = |t: usize| -> Vec<usize> {
+                EDGES
+                    .iter()
+                    .enumerate()
+                    .filter(|(bit, (from, _))| edges & (1 << bit) != 0 && *from == t)
+                    .map(|(_, (_, to))| *to)
+                    .collect()
+            };
+            for epilogue in 0..(1u32 << N) {
+                let is_epilogue = |t: usize| epilogue & (1 << t) != 0;
+                if (0..N).any(|t| deps(t).iter().any(|&d| is_epilogue(t) != is_epilogue(d))) {
+                    continue;
+                }
+                for (required, isolated) in
+                    (0..(1u32 << N)).flat_map(|r| [0u32, 0b011, 0b110, 0b111].map(|i| (r, i)))
+                {
+                    for gpu in [None, Some(0), Some(1), Some(2)] {
+                        for join_pick in 0..(joins.len().pow(N as u32)) {
+                            let join = |t: usize| joins[join_pick / joins.len().pow(t as u32) % 3];
+                            if (0..N).any(|t| join(t) != Join::All && deps(t).is_empty()) {
+                                continue;
+                            }
+                            for outcome_pick in 0..(outcomes.len().pow(N as u32)) {
+                                for budget in [0.25, 10.0] {
+                                    let tasks: Vec<Task> = (0..N)
+                                        .map(|t| {
+                                            let dep_names: Vec<String> =
+                                                deps(t).into_iter().map(name).collect();
+                                            let dep_refs: Vec<&str> =
+                                                dep_names.iter().map(String::as_str).collect();
+                                            let mut task = task(
+                                                &name(t),
+                                                &dep_refs,
+                                                if gpu == Some(t) { "gpu" } else { "any" },
+                                                required & (1 << t) != 0,
+                                            );
+                                            task.join = join(t);
+                                            if isolated & (1 << t) != 0 {
+                                                task.isolation = Some(Isolation::Worktree);
+                                            }
+                                            if is_epilogue(t) {
+                                                task.stage = Stage::Epilogue;
+                                            }
+                                            task
+                                        })
+                                        .collect();
+                                    let Ok(plan) = (Plan {
+                                        version: 1,
+                                        reason: None,
+                                        budget: PlanBudget { usd: budget },
+                                        tasks: tasks.clone(),
+                                    })
+                                    .validate() else {
+                                        continue;
+                                    };
+                                    let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+                                    let mut runner = GraphRunner {
+                                        outcomes: (0..N)
+                                            .map(|t| {
+                                                let pick = outcome_pick / 4usize.pow(t as u32) % 4;
+                                                (name(t), outcomes[pick])
+                                            })
+                                            .collect(),
+                                        log: log.clone(),
+                                    };
+                                    let settled_log = log.clone();
+                                    let out = execute(
+                                        &plan,
+                                        &any_substrate(),
+                                        ExecCfg::default(),
+                                        &mut runner,
+                                        |t, r| {
+                                            settled_log.borrow_mut().push(GraphEvent::Settled(
+                                                t.name.0.clone(),
+                                                r.status,
+                                            ))
+                                        },
+                                    );
+                                    check_graph(&tasks, &out, &log.borrow(), budget);
+                                    runs += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(runs > 100_000, "the enumeration shrank to {runs} runs");
+    }
+
+    fn check_graph(tasks: &[Task], out: &PlanOutcome, log: &[GraphEvent], budget: f64) {
+        let ctx = || format!("{tasks:#?}\n{log:?}\n{:?}", out.exit);
+        let status = |t: &Task| out.results[&t.name].status;
+        let held = |t: &Task| matches!(status(t), TaskStatus::Pass | TaskStatus::NotTaken);
+        let main_required: Vec<&Task> = tasks
+            .iter()
+            .filter(|t| t.required && t.stage == Stage::Iteration)
+            .collect();
+        assert_eq!(
+            out.results.len(),
+            tasks.len(),
+            "every task settles: {}",
+            ctx()
+        );
+
+        // completed_means_valid: exit == Completed alone implies every required task held.
+        if out.exit == PlanExit::Completed {
+            assert!(main_required.iter().all(|t| held(t)), "{}", ctx());
+        }
+        assert_eq!(
+            out.valid,
+            out.exit == PlanExit::Completed && main_required.iter().all(|t| held(t)),
+            "{}",
+            ctx()
+        );
+
+        // short_circuit_has_a_cause: only a required main-graph task short-circuits.
+        if let PlanExit::ShortCircuit { task } = &out.exit {
+            let t = tasks
+                .iter()
+                .find(|t| &t.name == task)
+                .expect("a known task");
+            assert!(
+                t.required && t.stage == Stage::Iteration && !held(t),
+                "{}",
+                ctx()
+            );
+        }
+
+        let mut runnable: BTreeSet<&TaskName> = BTreeSet::new();
+        for t in tasks {
+            let deps = match t.join {
+                Join::All => t.depends_on.iter().all(|d| runnable.contains(d)),
+                Join::Passed => t.depends_on.iter().any(|d| runnable.contains(d)),
+                Join::Settled => true,
+            };
+            if t.needs == "any" && deps {
+                runnable.insert(&t.name);
+            }
+        }
+        let unrunnable = |t: &Task| !runnable.contains(&t.name);
+        // unrunnable_required_truncates and truncation_dispatches_nothing.
+        if main_required.iter().any(|t| unrunnable(t)) {
+            assert!(matches!(out.exit, PlanExit::Truncated { .. }), "{}", ctx());
+            assert!(
+                !log.iter().any(|e| matches!(e, GraphEvent::Run(_))),
+                "{}",
+                ctx()
+            );
+            return;
+        }
+
+        let find = |n: &str| tasks.iter().find(|t| t.name.0 == n).expect("a known task");
+        let mut settled: BTreeMap<&str, TaskStatus> = BTreeMap::new();
+        let mut runs: BTreeMap<&str, u32> = BTreeMap::new();
+        let mut in_flight: BTreeSet<&str> = BTreeSet::new();
+        let mut spent = 0.0;
+        let mut halted_at_short_circuit = false;
+        for e in log {
+            match e {
+                GraphEvent::Run(wave) => {
+                    // nothing_runs_after_a_ceiling: every dispatch and retry is decided under it.
+                    assert!(spent < budget, "dispatched at the budget: {}", ctx());
+                    let fresh: Vec<&str> = wave
+                        .iter()
+                        .map(String::as_str)
+                        .filter(|n| !in_flight.contains(n))
+                        .collect();
+                    if !fresh.is_empty() {
+                        // A new dispatch starts only once everything before it has settled.
+                        assert!(
+                            in_flight.is_empty(),
+                            "{fresh:?} joined {in_flight:?}: {}",
+                            ctx()
+                        );
+                        assert_eq!(fresh.len(), wave.len(), "{}", ctx());
+                    }
+                    if wave.len() > 1 {
+                        // batch_is_isolated and batch_is_independent.
+                        for a in wave {
+                            let t = find(a);
+                            assert!(t.isolation.is_some(), "{a} ran in a batch: {}", ctx());
+                            for b in wave {
+                                assert!(!t.depends_on.iter().any(|d| &d.0 == b), "{}", ctx());
+                            }
+                        }
+                    }
+                    for n in &fresh {
+                        let t = find(n);
+                        // dispatch_after_dependencies and all_join_reads_passing.
+                        for d in &t.depends_on {
+                            let s = settled.get(d.0.as_str());
+                            assert!(s.is_some(), "{n} ran before {d} settled: {}", ctx());
+                            if t.join == Join::All {
+                                assert_eq!(s, Some(&TaskStatus::Pass), "{}", ctx());
+                            }
+                        }
+                        // epilogue_after_main.
+                        if t.stage == Stage::Epilogue {
+                            for m in tasks.iter().filter(|m| m.stage == Stage::Iteration) {
+                                assert!(settled.contains_key(m.name.0.as_str()), "{}", ctx());
+                            }
+                        }
+                        // After a short circuit only an epilogue reports it.
+                        assert!(
+                            !halted_at_short_circuit || t.stage == Stage::Epilogue,
+                            "{}",
+                            ctx()
+                        );
+                        in_flight.insert(n);
+                    }
+                    for n in wave {
+                        *runs.entry(n.as_str()).or_default() += 1;
+                    }
+                    spent += 0.1 * wave.len() as f64;
+                }
+                GraphEvent::Settled(n, s) => {
+                    let t = find(n);
+                    in_flight.remove(n.as_str());
+                    settled.insert(n.as_str(), *s);
+                    if t.required
+                        && t.stage == Stage::Iteration
+                        && !matches!(s, TaskStatus::Pass | TaskStatus::NotTaken)
+                    {
+                        halted_at_short_circuit = true;
+                    }
+                }
+            }
+        }
+        for t in tasks {
+            let n = runs.get(t.name.0.as_str()).copied().unwrap_or(0);
+            // Retry is not recheck: only a transport failure runs again, and only twice more.
+            assert!(n <= 3, "{} ran {n} times: {}", t.name, ctx());
+            if n > 1 {
+                assert_eq!(status(t), TaskStatus::Transport, "{}", ctx());
+            }
+            // not_taken_never_dispatched.
+            if status(t) == TaskStatus::NotTaken {
+                assert_eq!(n, 0, "{}", ctx());
+            }
+        }
     }
 }

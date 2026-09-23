@@ -6,32 +6,68 @@
       {
         "ordinal": 0,
         "name": "key!",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "issues",
+            "name": "key"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "repo!",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "issues",
+            "name": "repo"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "scope_id!",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "scopes",
+            "name": "id"
+          }
+        }
       },
       {
         "ordinal": 3,
         "name": "approval_pr!",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "scopes",
+            "name": "approval_pr"
+          }
+        }
       },
       {
         "ordinal": 4,
         "name": "stale!",
-        "type_info": "Bool"
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "scopes",
+            "name": "stale"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "exposure_digest",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "scopes",
+            "name": "exposure_digest"
+          }
+        }
       }
     ],
     "parameters": {
