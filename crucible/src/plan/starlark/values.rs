@@ -1,6 +1,6 @@
 //! The opaque starlark values the DSL constructors hand back. Each wraps owned, immutable
-//! compiler data, and nothing here mutates or reaches into the compiler: a workflow can only
-//! pass these along to another constructor.
+//! compiler data, and nothing here reaches into the compiler except to refuse a call: a workflow
+//! can only pass these along to another constructor.
 //!
 //! A task has exactly one attribute shape, `task.field`, which names one of the fields that task
 //! declared it emits and yields another opaque value. It exists because `over = discover.targets`
@@ -10,6 +10,7 @@
 use std::fmt::{self, Display};
 
 use allocative::Allocative;
+use starlark::eval::{Arguments, Evaluator};
 use starlark::starlark_simple_value;
 use starlark::values::{
     Heap, NoSerialize, ProvidesStaticType, StarlarkValue, Value, starlark_value,
@@ -20,6 +21,7 @@ use crucible_contract::decision::{Question, QuestionId};
 
 use crate::plan::ir::{OutputField, OutputRef, Task, TaskKind, TaskName};
 use crate::plan::starlark::error::CompileError;
+use crate::plan::starlark::globals;
 use crate::plan::workflow::WorkflowCfg;
 
 /// A `session(...)` declaration: a durable conversation name plus optional agent
@@ -203,21 +205,32 @@ impl ExternalText {
     }
 }
 
+/// The character that stands in for external text turned into a plain string.
+///
+/// `str()`, `repr()`, `%` and `.format()` all reach [`Display`], and starlark gives none of them
+/// a way to fail. So the conversion yields this placeholder instead of the value, and a
+/// constructor handed a string carrying it refuses the string. A noncharacter survives case
+/// changes and is never in text a pack author wrote.
+pub(crate) const CONVERTED: char = '\u{FDD0}';
+
 starlark_simple_value!(ExternalText);
 
 impl Display for ExternalText {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for segment in &self.0 {
-            f.write_str(&segment.text)?;
-        }
-        Ok(())
+        write!(f, "{CONVERTED}external text{CONVERTED}")
     }
 }
 
 #[starlark_value(type = "external")]
 impl<'v> StarlarkValue<'v> for ExternalText {
-    /// `external + "text"`. Nothing else is offered: a string method on external text would
-    /// hand back a plain string and quietly lose the fact that it came from outside.
+    /// Every attribute is a method that refuses when called. A string method on external text
+    /// would hand back a plain string and quietly lose the fact that it came from outside, and
+    /// starlark's own missing-attribute error would not say what to write instead.
+    fn get_attr(&self, attribute: &str, heap: Heap<'v>) -> Option<Value<'v>> {
+        Some(heap.alloc(ExternalMethod(attribute.to_owned())))
+    }
+
+    /// `external + "text"`.
     fn add(&self, rhs: Value<'v>, heap: Heap<'v>) -> Option<starlark::Result<Value<'v>>> {
         let after = match rhs.unpack_str() {
             Some(text) => ExternalText::plain(text),
@@ -230,6 +243,35 @@ impl<'v> StarlarkValue<'v> for ExternalText {
     fn radd(&self, lhs: Value<'v>, heap: Heap<'v>) -> Option<starlark::Result<Value<'v>>> {
         let before = ExternalText::plain(lhs.unpack_str()?);
         Some(Ok(heap.alloc(ExternalText::joined(&before, &self.0))))
+    }
+}
+
+/// `external.method`, which exists only to refuse being called.
+#[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
+pub(crate) struct ExternalMethod(String);
+
+starlark_simple_value!(ExternalMethod);
+
+impl Display for ExternalMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "external.{}", self.0)
+    }
+}
+
+#[starlark_value(type = "external_method")]
+impl<'v> StarlarkValue<'v> for ExternalMethod {
+    fn invoke(
+        &self,
+        _me: Value<'v>,
+        _args: &Arguments<'v, '_>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        Err(globals::refuse(
+            eval,
+            CompileError::ExternalMethod {
+                method: self.0.clone(),
+            },
+        ))
     }
 }
 

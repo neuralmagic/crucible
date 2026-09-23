@@ -144,7 +144,7 @@ Declare a durable agent conversation. Tasks that share one run serially under on
 
 ### `param()`
 
-Read a launch parameter. The `params` block must be the source's first statement, and a source that declares one compiles per run.
+Read a launch parameter. The `params` block must be the source's first statement, and a source that declares one compiles per run. A supplied string reaches a prompt with `+`, inside a region marked as external input; `str()`, `%`, `.format()`, and string methods on it are refused, as is a value carrying the marker text.
 
 Takes one positional argument, `name`.
 

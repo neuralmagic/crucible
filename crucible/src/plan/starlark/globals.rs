@@ -18,8 +18,8 @@ use starlark_syntax::codemap::FileSpan;
 
 use crate::plan::starlark as dsl;
 use crate::plan::starlark::values::{
-    AnswerRefValue, ExternalText, OutputRefValue, QuestionValue, SessionValue, TaskValue,
-    WorkflowValue,
+    AnswerRefValue, CONVERTED, ExternalText, OutputRefValue, QuestionValue, SessionValue,
+    TaskValue, WorkflowValue,
 };
 use crate::plan::workflow::{WorkflowCfg, WorkflowType};
 
@@ -197,6 +197,17 @@ fn dispatch<'v>(
     kwargs: SmallMap<String, Value<'v>>,
     eval: &mut Evaluator<'v, '_, '_>,
 ) -> starlark::Result<Value<'v>> {
+    let (state, at) = compile_site(eval)?;
+    match call(function, args, kwargs, state, &at) {
+        Ok(value) => Ok(alloc(eval.heap(), value)),
+        Err(error) => Err(state.throw(error)),
+    }
+}
+
+/// The compile state on the evaluator, and the call being evaluated.
+fn compile_site<'a>(
+    eval: &'a Evaluator<'_, '_, '_>,
+) -> starlark::Result<(&'a dsl::CompileState, FileSpan)> {
     let Some(state) = eval
         .extra
         .and_then(|extra| extra.downcast_ref::<dsl::CompileState>())
@@ -208,9 +219,14 @@ fn dispatch<'v>(
     let at = eval
         .call_stack_top_location()
         .unwrap_or_else(|| state.site());
-    match call(function, args, kwargs, state, &at) {
-        Ok(value) => Ok(alloc(eval.heap(), value)),
-        Err(error) => Err(state.throw(error)),
+    Ok((state, at))
+}
+
+/// Fail the call being evaluated with `error`, located at that call.
+pub(crate) fn refuse(eval: &Evaluator<'_, '_, '_>, error: dsl::CompileError) -> starlark::Error {
+    match compile_site(eval) {
+        Ok((state, at)) => state.throw(located(&at, error)),
+        Err(missing) => missing,
     }
 }
 
@@ -324,7 +340,7 @@ fn convert_at(value: Value<'_>, depth: usize) -> dsl::Result<dsl::Value> {
         return Ok(dsl::Value::Float(float.0));
     }
     if let Some(text) = value.unpack_str() {
-        return Ok(dsl::Value::String(text.to_owned()));
+        return plain(text).map(dsl::Value::String);
     }
     if let Some(list) = ListRef::from_value(value) {
         return list
@@ -346,13 +362,16 @@ fn convert_at(value: Value<'_>, depth: usize) -> dsl::Result<dsl::Value> {
         return dict
             .iter()
             .map(|(key, value)| match key.unpack_str() {
-                Some(key) => Ok((key.to_owned(), convert_at(value, depth + 1)?)),
+                Some(key) => Ok((plain(key)?, convert_at(value, depth + 1)?)),
                 None => Err(dsl::CompileError::DictKeyNotString),
             })
             .collect::<dsl::Result<BTreeMap<String, dsl::Value>>>()
             .map(dsl::Value::Map);
     }
     if let Some(external) = ExternalText::from_value(value) {
+        for segment in external.0.iter().filter(|segment| !segment.external) {
+            plain(&segment.text)?;
+        }
         return Ok(dsl::Value::External(external.0.clone()));
     }
     if let Some(task) = TaskValue::from_value(value) {
@@ -374,6 +393,15 @@ fn convert_at(value: Value<'_>, depth: usize) -> dsl::Result<dsl::Value> {
         return Ok(dsl::Value::Workflow(workflow.0.clone()));
     }
     Ok(dsl::Value::Opaque)
+}
+
+/// A string the source built, refused if it holds external text that a conversion turned
+/// into [`CONVERTED`] placeholders.
+fn plain(text: &str) -> dsl::Result<String> {
+    if text.contains(CONVERTED) {
+        return Err(dsl::CompileError::ExternalConverted);
+    }
+    Ok(text.to_owned())
 }
 
 fn alloc<'v>(heap: Heap<'v>, value: dsl::Value) -> Value<'v> {

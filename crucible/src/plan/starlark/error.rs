@@ -335,6 +335,25 @@ pub enum CompileError {
          to the task as a file or an environment variable instead of building it into {argument:?}."
     )]
     ExternalOutsidePrompt { argument: String },
+    #[error(
+        "a value supplied from outside the pack was turned into a plain string by str(), repr(), \
+         % or .format(). That drops the marking a prompt needs to tell it from an instruction, \
+         so the value is withheld. Join it into the prompt unchanged with + instead, as in \
+         `prompt = \"Read \" + param(\"url\")`."
+    )]
+    ExternalConverted,
+    #[error(
+        "a value supplied from outside the pack has no method {method:?}: its result would be a \
+         plain string that lost the marking a prompt needs to tell it from an instruction. Join \
+         the value into the prompt unchanged with +."
+    )]
+    ExternalMethod { method: String },
+    #[error(
+        "a value supplied from outside the pack carries the external-input marker {marker:?}. A \
+         value that opens or closes a marked region of its own is an attempt to have its text \
+         read as an instruction, so the prompt is refused rather than rewritten."
+    )]
+    ExternalCarriesMarker { marker: &'static str },
     #[error("task {task:?} argument \"args\" must be a dictionary")]
     SkillArgsNotDict { task: String },
     #[error("task {task:?} argument {key:?} is not something a prompt can render")]
