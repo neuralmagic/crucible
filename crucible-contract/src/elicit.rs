@@ -305,7 +305,11 @@ pub fn slack_message(
         }));
     }
     json!({
-        "text": format!("Crucible needs an answer: {} {}", ctx.run, ctx.task),
+        "text": format!(
+            "Crucible needs an answer: {} {}",
+            slack_escape(ctx.run),
+            slack_escape(ctx.task)
+        ),
         "blocks": blocks,
     })
 }
@@ -593,6 +597,10 @@ mod tests {
             "{encoded}"
         );
         assert!(!encoded.contains("<@here>"), "{encoded}");
+        assert!(
+            !encoded.contains("nightly<1>"),
+            "the fallback text is escaped too: {encoded}"
+        );
     }
 
     #[test]
