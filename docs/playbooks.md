@@ -51,7 +51,7 @@ the difference, which is what makes a pack testable in CI.
 ```python
 poem = agent(
     name = "poem",
-    prompt = "Write a haiku about molten metal to HAIKU.md.",
+    prompt = "Write a haiku about molten metal to HAIKU.md. Report its line count as `lines`.",
     emits = ["lines"],
     emits_files = ["HAIKU.md"],
 )
@@ -98,8 +98,8 @@ echo "{\"lines\": $(grep -c . HAIKU.md)}" > PLAN_TASK_RESULT.json
 ```
 
 An agent turn reports by writing `PLAN_TASK_RESULT.json` in the workspace root. The engine
-appends that instruction to every agent prompt, and names the fields the task's `emits`
-promises.
+appends that instruction to every agent prompt; name the fields `emits` promises in the prompt
+itself, as `poem` does with `lines`.
 
 </li>
 </ol>
@@ -185,7 +185,7 @@ params = {
 
 poem = agent(
     name = "poem",
-    prompt = "Write a haiku about " + param("topic") + " to HAIKU.md.",
+    prompt = "Write a haiku about " + param("topic") + " to HAIKU.md. Report its line count as `lines`.",
     emits = ["lines"],
     emits_files = ["HAIKU.md"],
 )
