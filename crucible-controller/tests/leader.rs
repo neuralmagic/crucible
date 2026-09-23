@@ -18,7 +18,7 @@ async fn test_pool(name: &str) -> Result<sqlx::PgPool> {
         .await?;
     // Advisory locks are per-database: a sibling database isolates this test's fence from every
     // other test binary sharing the server.
-    let _ = sqlx::query(&format!(r#"CREATE DATABASE "{name}""#))
+    let _ = sqlx::query(sqlx::AssertSqlSafe(format!(r#"CREATE DATABASE "{name}""#)))
         .execute(&admin)
         .await;
     Ok(PgPoolOptions::new()

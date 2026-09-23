@@ -9,37 +9,15 @@ use sqlx::{PgExecutor, Row};
 // Declarative image builds: the `builds` ledger that gates the `building` state.
 // ---------------------------------------------------------------------------------------------
 
-/// The `builds` column list, in decode order. Every read builds its SELECT from this via
-/// [`build_cols`] so a new column is a one-line edit here.
-const BUILD_COLS: &[&str] = &[
-    "id",
-    "scope",
-    "name",
-    "image",
-    "tag",
-    "context_digest",
-    "backend",
-    "state",
-    "dispatch_id",
-    "digest_ref",
-    "evidence_url",
-    "dispatch_attempts",
-    "timeout_secs",
-    "created_at",
-    "dispatched_at",
-    "finished_at",
-];
-
-/// [`BUILD_COLS`] joined with `prefix` — `"b."` for a join query (disambiguates from the joined
-/// `scopes`/`issues`), `""` for a bare `FROM builds`. Result column names stay unprefixed, so
-/// the `FromRow` derive reads them by bare name either way.
-fn build_cols(prefix: &str) -> String {
-    BUILD_COLS
-        .iter()
-        .map(|c| format!("{prefix}{c}"))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
+/// The `builds` columns, in decode order, bare for a `FROM builds` and `b.`-qualified for a
+/// join (disambiguates from the joined `scopes`/`issues`). Result column names stay unprefixed
+/// either way, so the `FromRow` derive reads them by bare name.
+const BUILD_COLS: &str = "id, scope, name, image, tag, context_digest, backend, state, dispatch_id, digest_ref, \
+    evidence_url, dispatch_attempts, timeout_secs, created_at, dispatched_at, \
+    finished_at";
+const BUILD_COLS_B: &str = "b.id, b.scope, b.name, b.image, b.tag, b.context_digest, b.backend, b.state, \
+    b.dispatch_id, b.digest_ref, b.evidence_url, b.dispatch_attempts, b.timeout_secs, \
+    b.created_at, b.dispatched_at, b.finished_at";
 
 /// Insert a `builds` row (a freshly declared build entering `pending`); returns its autoincrement
 /// id (reconcile keys the dispatch/poll transitions on it).
@@ -72,11 +50,12 @@ pub(crate) async fn insert_build(ex: impl PgExecutor<'_>, b: &NewBuild) -> Resul
 /// run launches only when every row is `succeeded` with a `digest_ref`).
 #[tracing::instrument(name = "db.builds_for_scope", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", scope = scope), err)]
 pub(crate) async fn builds_for_scope(ex: impl PgExecutor<'_>, scope: i64) -> Result<Vec<BuildRow>> {
-    let sql = format!(
-        "SELECT {} FROM builds WHERE scope = $1 ORDER BY id ASC",
-        build_cols("")
+    let sql = const_format::concatcp!(
+        "SELECT ",
+        BUILD_COLS,
+        " FROM builds WHERE scope = $1 ORDER BY id ASC"
     );
-    sqlx::query_as::<_, BuildRow>(&sql)
+    sqlx::query_as::<_, BuildRow>(sql)
         .bind(scope)
         .fetch_all(ex)
         .await
@@ -90,12 +69,13 @@ pub(crate) async fn builds_for_issue(
     ex: impl PgExecutor<'_>,
     issue: &str,
 ) -> Result<Vec<BuildRow>> {
-    let sql = format!(
-        "SELECT {} FROM builds b JOIN scopes s ON b.scope = s.id \
-         WHERE s.issue = $1 ORDER BY b.id ASC",
-        build_cols("b.")
+    let sql = const_format::concatcp!(
+        "SELECT ",
+        BUILD_COLS_B,
+        " FROM builds b JOIN scopes s ON b.scope = s.id \
+         WHERE s.issue = $1 ORDER BY b.id ASC"
     );
-    sqlx::query_as::<_, BuildRow>(&sql)
+    sqlx::query_as::<_, BuildRow>(sql)
         .bind(issue)
         .fetch_all(ex)
         .await
@@ -113,18 +93,19 @@ pub(crate) async fn list_builds_page(
 ) -> Result<Vec<crate::builds::model::BuildListRow>> {
     let state = q.state.map(|s| s.as_str());
     let backend = q.backend.map(|b| b.as_str());
-    let sql = format!(
-        "SELECT {}, s.issue AS issue_key, i.repo AS repo \
+    let sql = const_format::concatcp!(
+        "SELECT ",
+        BUILD_COLS_B,
+        ", s.issue AS issue_key, i.repo AS repo \
          FROM builds b \
          LEFT JOIN scopes s ON b.scope = s.id \
          LEFT JOIN issues i ON s.issue = i.key \
          WHERE ($1 IS NULL OR b.state = $2) \
            AND ($3 IS NULL OR b.backend = $4) \
            AND ($5 IS NULL OR s.issue = $6) \
-         ORDER BY b.id DESC LIMIT $7 OFFSET $8",
-        build_cols("b.")
+         ORDER BY b.id DESC LIMIT $7 OFFSET $8"
     );
-    let rows = sqlx::query(&sql)
+    let rows = sqlx::query(sql)
         .bind(state)
         .bind(state)
         .bind(backend)
@@ -242,8 +223,8 @@ pub(crate) async fn set_build_failed(
 /// check.
 #[tracing::instrument(name = "db.get_build", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", id = id), err)]
 pub(crate) async fn get_build(ex: impl PgExecutor<'_>, id: i64) -> Result<Option<BuildRow>> {
-    let sql = format!("SELECT {} FROM builds WHERE id = $1", build_cols(""));
-    sqlx::query_as::<_, BuildRow>(&sql)
+    let sql = const_format::concatcp!("SELECT ", BUILD_COLS, " FROM builds WHERE id = $1");
+    sqlx::query_as::<_, BuildRow>(sql)
         .bind(id)
         .fetch_optional(ex)
         .await
@@ -295,17 +276,26 @@ pub(crate) async fn builds_in_states(
     if states.is_empty() {
         return Ok(Vec::new());
     }
-    let list = states
-        .iter()
-        .map(|s| format!("'{}'", s.as_str()))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT {} FROM builds WHERE state IN ({list}) ORDER BY id ASC",
-        build_cols("")
+    let states: Vec<&str> = states.iter().map(|s| s.as_str()).collect();
+    let sql = const_format::concatcp!(
+        "SELECT ",
+        BUILD_COLS,
+        " FROM builds WHERE state = ANY($1) ORDER BY id ASC"
     );
-    sqlx::query_as::<_, BuildRow>(&sql)
+    sqlx::query_as::<_, BuildRow>(sql)
+        .bind(states)
         .fetch_all(ex)
         .await
         .context("builds_in_states")
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::builds::store::{BUILD_COLS, BUILD_COLS_B};
+
+    #[test]
+    fn the_qualified_columns_are_the_bare_ones_prefixed() {
+        let prefixed: Vec<String> = BUILD_COLS.split(", ").map(|c| format!("b.{c}")).collect();
+        assert_eq!(BUILD_COLS_B, prefixed.join(", "));
+    }
 }

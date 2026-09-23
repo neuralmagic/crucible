@@ -651,23 +651,27 @@ const PROVIDER_INSERT: &str = "INSERT INTO model_providers (id, display_name, ki
      secret_owner, endpoint, protocol, enabled, created_by, created_at, updated_at, owner, harness) \
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12, $13, $14)";
 
-const PROVIDER_ON_CONFLICT_IGNORE: &str = "ON CONFLICT (id) DO NOTHING";
+const PROVIDER_INSERT_OR_IGNORE: &str =
+    const_format::concatcp!(PROVIDER_INSERT, " ON CONFLICT (id) DO NOTHING");
 
-const PROVIDER_ON_CONFLICT_UPDATE: &str = "ON CONFLICT (id) DO UPDATE SET display_name = EXCLUDED.display_name, \
+const PROVIDER_UPSERT: &str = const_format::concatcp!(
+    PROVIDER_INSERT,
+    " ON CONFLICT (id) DO UPDATE SET display_name = EXCLUDED.display_name, \
          kind = EXCLUDED.kind, models = EXCLUDED.models, \
          default_model = EXCLUDED.default_model, secret_name = EXCLUDED.secret_name, \
          secret_owner = EXCLUDED.secret_owner, endpoint = EXCLUDED.endpoint, \
          protocol = EXCLUDED.protocol, harness = EXCLUDED.harness, \
-         enabled = EXCLUDED.enabled, updated_at = EXCLUDED.updated_at";
+         enabled = EXCLUDED.enabled, updated_at = EXCLUDED.updated_at"
+);
 
 async fn write_provider(
     ex: impl PgExecutor<'_>,
     new: &NewProvider<'_>,
-    on_conflict: &str,
+    sql: &'static str,
     context: &'static str,
 ) -> Result<u64> {
     let binds = provider_binds(new)?;
-    let written = sqlx::query(&format!("{PROVIDER_INSERT} {on_conflict}"))
+    let written = sqlx::query(sql)
         .bind(new.id)
         .bind(new.display_name)
         .bind(new.kind.as_str())
@@ -693,13 +697,13 @@ async fn write_provider(
 /// created the row.
 #[tracing::instrument(name = "db.insert_provider", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", provider = %new.id), err)]
 pub async fn insert(ex: impl PgExecutor<'_>, new: &NewProvider<'_>) -> Result<bool> {
-    Ok(write_provider(ex, new, PROVIDER_ON_CONFLICT_IGNORE, "insert_provider").await? > 0)
+    Ok(write_provider(ex, new, PROVIDER_INSERT_OR_IGNORE, "insert_provider").await? > 0)
 }
 
 /// Register a provider, or replace the registration under that id.
 #[tracing::instrument(name = "db.upsert_provider", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", provider = %new.id), err)]
 pub async fn upsert(ex: impl PgExecutor<'_>, new: &NewProvider<'_>) -> Result<()> {
-    write_provider(ex, new, PROVIDER_ON_CONFLICT_UPDATE, "upsert_provider")
+    write_provider(ex, new, PROVIDER_UPSERT, "upsert_provider")
         .await
         .map(|_| ())
 }
@@ -707,8 +711,8 @@ pub async fn upsert(ex: impl PgExecutor<'_>, new: &NewProvider<'_>) -> Result<()
 /// One provider by id, enabled or not.
 #[tracing::instrument(name = "db.get_provider", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", provider = %id), err)]
 pub async fn get(ex: impl PgExecutor<'_>, id: &str) -> Result<Option<ModelProvider>> {
-    let sql = format!("SELECT {PROVIDER_COLS} FROM model_providers WHERE id = $1");
-    let row = sqlx::query(&sql)
+    let sql = const_format::formatcp!("SELECT {PROVIDER_COLS} FROM model_providers WHERE id = $1");
+    let row = sqlx::query(sql)
         .bind(id)
         .fetch_optional(ex)
         .await
@@ -719,10 +723,10 @@ pub async fn get(ex: impl PgExecutor<'_>, id: &str) -> Result<Option<ModelProvid
 /// Every registered provider, id order. `enabled_only` is what the launch pickers ask for.
 #[tracing::instrument(name = "db.list_providers", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql"), err)]
 pub async fn list(ex: impl PgExecutor<'_>, enabled_only: bool) -> Result<Vec<ModelProvider>> {
-    let sql = format!(
+    let sql = const_format::formatcp!(
         "SELECT {PROVIDER_COLS} FROM model_providers WHERE ($1 = FALSE OR enabled) ORDER BY id"
     );
-    let rows = sqlx::query(&sql)
+    let rows = sqlx::query(sql)
         .bind(enabled_only)
         .fetch_all(ex)
         .await
@@ -856,11 +860,11 @@ const DEFAULT_COLS: &str = "scope_kind, scope_ref, workload_class, provider_id, 
 /// Every default, so the launch pickers can preselect the one that would apply.
 #[tracing::instrument(name = "db.list_dispatch_defaults", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql"), err)]
 pub async fn list_defaults(ex: impl PgExecutor<'_>) -> Result<Vec<DispatchDefault>> {
-    let sql = format!(
+    let sql = const_format::formatcp!(
         "SELECT {DEFAULT_COLS} FROM dispatch_defaults ORDER BY scope_kind, scope_ref, \
          workload_class"
     );
-    let rows = sqlx::query(&sql)
+    let rows = sqlx::query(sql)
         .fetch_all(ex)
         .await
         .context("list_dispatch_defaults")?;
@@ -873,11 +877,11 @@ async fn get_default(
     scope_ref: &str,
     class: WorkloadClass,
 ) -> Result<Option<DispatchDefault>> {
-    let sql = format!(
+    let sql = const_format::formatcp!(
         "SELECT {DEFAULT_COLS} FROM dispatch_defaults \
          WHERE scope_kind = $1 AND scope_ref = $2 AND workload_class = $3"
     );
-    let row = sqlx::query(&sql)
+    let row = sqlx::query(sql)
         .bind(scope_kind.as_str())
         .bind(scope_ref)
         .bind(class.as_str())

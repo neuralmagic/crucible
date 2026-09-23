@@ -279,9 +279,9 @@ pub async fn backfill_pack_agents(pool: &sqlx::PgPool) -> Result<usize> {
     use sqlx::Row as _;
     let mut filled = 0usize;
     for (table, key) in AGENT_TABLES {
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT {key}, tar_gz FROM {table} WHERE agent_backend IS NULL OR agent_requirements IS NULL"
-        ))
+        )))
         .fetch_all(pool)
         .await
         .with_context(|| format!("listing {table} rows with no recorded agent"))?;
@@ -304,7 +304,7 @@ pub async fn backfill_pack_agents(pool: &sqlx::PgPool) -> Result<usize> {
                     "id = $4"
                 }
             );
-            let update = sqlx::query(&sql)
+            let update = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
                 .bind(&agent.backend)
                 .bind(agent.sandbox_image.as_deref())
                 .bind(agent.requirements_json());

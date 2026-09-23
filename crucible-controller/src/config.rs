@@ -226,6 +226,9 @@ impl Profile {
     }
 }
 
+/// The `DATABASE_URL` value that asks the daemon to run its own Postgres.
+pub const EMBEDDED_DATABASE_URL: &str = "embedded";
+
 /// The controller's full config: where scratch lives + which repos to watch + the [`Profile`].
 ///
 /// The deploy render injects everything as env vars — `CONTROLLER_SCRATCH_DIR` and friends.
@@ -878,6 +881,21 @@ impl ControllerCfg {
         cfg!(feature = "autoresearch") && self.autoresearch
     }
 
+    /// Whether `DATABASE_URL` asks the daemon to run its own Postgres.
+    pub fn wants_embedded_db(&self) -> bool {
+        self.db == EMBEDDED_DATABASE_URL
+    }
+
+    /// Refuse `DATABASE_URL=embedded` on a build without the feature.
+    pub fn validate_database(&self) -> Result<()> {
+        if self.wants_embedded_db() && !cfg!(feature = "embedded-db") {
+            bail!(
+                "DATABASE_URL=embedded, but this crucible-controller was built without the embedded-db feature"
+            );
+        }
+        Ok(())
+    }
+
     /// Refuse `CONTROLLER_AUTORESEARCH=true` on a build without the feature.
     pub fn validate_autoresearch(&self) -> Result<()> {
         if self.autoresearch && !cfg!(feature = "autoresearch") {
@@ -1225,6 +1243,17 @@ mod tests {
                 .unwrap_err()
                 .to_string();
         assert!(err.contains("CONTROLLER_TURN_SERVICE_ACCOUNT"), "{err}");
+    }
+
+    #[test]
+    fn an_embedded_database_is_asked_for_by_name_and_needs_the_feature() {
+        let c = crate::testing::cfg_from_args(["ctl", "--db", "postgres://localhost/crucible"]);
+        assert!(!c.wants_embedded_db());
+        c.validate_database()
+            .expect("a real URL validates on every build");
+        let c = crate::testing::cfg_from_args(["ctl", "--db", "embedded"]);
+        assert!(c.wants_embedded_db());
+        assert_eq!(c.validate_database().is_ok(), cfg!(feature = "embedded-db"));
     }
 
     #[test]

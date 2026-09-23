@@ -684,7 +684,7 @@ pub async fn register(
 
 /// Every registered playbook, newest registration first.
 pub async fn list(pool: &PgPool) -> Result<Vec<PlaybookRow>> {
-    let rows = sqlx::query(&format!(
+    let rows = sqlx::query(const_format::formatcp!(
         "SELECT {PLAYBOOK_COLS} FROM playbooks ORDER BY created_at DESC, id"
     ))
     .fetch_all(pool)
@@ -695,7 +695,7 @@ pub async fn list(pool: &PgPool) -> Result<Vec<PlaybookRow>> {
 
 /// One registered playbook's row, or `None` when the id is unknown.
 pub async fn get(pool: &PgPool, id: &str) -> Result<Option<PlaybookRow>> {
-    let row = sqlx::query(&format!(
+    let row = sqlx::query(const_format::formatcp!(
         "SELECT {PLAYBOOK_COLS} FROM playbooks WHERE id = $1"
     ))
     .bind(id)
