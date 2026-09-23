@@ -3676,6 +3676,29 @@ workflow(type = "playbook", tasks = [author, repro])
                 ("repro".to_string(), "pass"),
             ]
         );
+        let printed: Vec<(String, String, bool)> = crate::plan::cli::result_rows(&plan, &out)
+            .iter()
+            .map(|row| {
+                let mut fields = row.split_whitespace();
+                (
+                    fields.next().unwrap().to_string(),
+                    fields.next().unwrap().to_string(),
+                    row.contains(" rounds=2 "),
+                )
+            })
+            .collect();
+        assert_eq!(
+            printed,
+            [
+                ("author[round-1]".to_string(), "pass".to_string(), false),
+                ("author[round-2]".to_string(), "pass".to_string(), false),
+                ("author".to_string(), "pass".to_string(), true),
+                ("repro[round-1]".to_string(), "fail".to_string(), false),
+                ("repro[round-2]".to_string(), "pass".to_string(), false),
+                ("repro".to_string(), "pass".to_string(), true),
+            ],
+            "plan run prints every round ahead of the folded row"
+        );
         let workspace = dir.join("workspace");
         assert_eq!(
             std::fs::read_to_string(workspace.join("SESSION.log")).unwrap(),

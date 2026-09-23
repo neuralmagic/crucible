@@ -7,7 +7,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::plan::exec::{Substrate, TaskResult, TaskStatus, runnable_set};
-use crate::plan::ir::{Plan, Task, TaskKind, ValidPlan};
+use crate::plan::ir::{Plan, Task, TaskKind, TaskName, ValidPlan};
 use crucible::crucible::Direction;
 use xai_grok_mermaid::{MermaidTheme, RenderLimits, RenderParams, default_engine, render_checked};
 
@@ -740,24 +740,8 @@ pub fn run(
             }
         },
     )?;
-    for t in plan.tasks_topo() {
-        if let Some(r) = out.results.get(&t.name) {
-            println!(
-                "  {:<20} {:<10} attempts={} cost=${:.4}{}{}",
-                t.name.0,
-                r.status.as_str(),
-                r.attempts,
-                r.cost_usd,
-                r.output
-                    .as_ref()
-                    .map(|v| format!("  out={v}"))
-                    .unwrap_or_default(),
-                r.note
-                    .as_ref()
-                    .map(|n| format!("  ({n})"))
-                    .unwrap_or_default(),
-            );
-        }
+    for row in result_rows(&plan, &out) {
+        println!("{row}");
     }
     let exit = match &out.exit {
         PlanExit::Completed => "completed".to_string(),
@@ -793,6 +777,48 @@ pub fn run(
     }
     println!("verdict: valid");
     Ok(())
+}
+
+/// The rows `plan run` prints: each task under its own name, preceded by one row per revise
+/// round it ran.
+pub(crate) fn result_rows(plan: &ValidPlan, out: &crate::plan::exec::PlanOutcome) -> Vec<String> {
+    let row = |name: &str, r: &TaskResult, rounds: usize| {
+        format!(
+            "  {:<20} {:<10} attempts={}{} cost=${:.4}{}{}",
+            name,
+            r.status.as_str(),
+            r.attempts,
+            if rounds > 1 {
+                format!(" rounds={rounds}")
+            } else {
+                String::new()
+            },
+            r.cost_usd,
+            r.output
+                .as_ref()
+                .map(|v| format!("  out={v}"))
+                .unwrap_or_default(),
+            r.note
+                .as_ref()
+                .map(|n| format!("  ({n})"))
+                .unwrap_or_default(),
+        )
+    };
+    let mut rows = Vec::new();
+    for t in plan.tasks_topo() {
+        let Some(r) = out.results.get(&t.name) else {
+            continue;
+        };
+        let rounds: Vec<(String, &TaskResult)> = (1..)
+            .map(|k| format!("{}[round-{k}]", t.name.0))
+            .map_while(|n| out.results.get(&TaskName(n.clone())).map(|r| (n, r)))
+            .collect();
+        for (n, round) in &rounds {
+            rows.push(row(n, round, 1));
+        }
+        rows.push(row(&t.name.0, r, rounds.len()));
+    }
+    rows
 }
 
 #[cfg(test)]
