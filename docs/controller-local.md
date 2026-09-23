@@ -68,6 +68,10 @@ disclose it as an agent credential before a run is handed it.
 
 ## What is off
 
+- The autoresearch lane is not built by default (see
+  [Deploying the controller](./controller-deploy.md#the-autoresearch-lane)), so the UI shows
+  playbooks only.
+
 - The secrets registry answers 503 on its write routes without Vault. A pack that binds no
   secrets launches normally; one that binds some is refused.
 - Runtime overrides (the admin page's live caps) need the overrides ConfigMap, so the parsed

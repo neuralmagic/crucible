@@ -141,7 +141,7 @@ pub(crate) async fn launch(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Resul
         }
         PlaybookExecutor::Local => {
             let engine =
-                crate::runs::contract::DispatchTarget::Binary(crate::issues::engine::resolve_bin());
+                crate::runs::contract::DispatchTarget::Binary(crate::runs::engine::resolve_bin());
             match crate::runs::workpod::admit_contract(
                 crate::runs::contract::RequestKind::LocalRun,
                 &[engine],

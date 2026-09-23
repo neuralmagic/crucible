@@ -145,9 +145,9 @@ pub async fn run_compare(
 
     // Maintain the shared per-repo checkout once for the whole batch (each grounded turn runs in its
     // own throwaway worktree of it).
-    let bin = engine::resolve_bin();
+    let bin = crate::runs::engine::resolve_bin();
     let workspace = engine::checkout_dir(cfg.scratch_root(), &opts.repo);
-    let repo_url = engine::repo_clone_url(&opts.repo);
+    let repo_url = crate::runs::engine::repo_clone_url(&opts.repo);
 
     let mut newly = 0usize;
     for iss in &targets {

@@ -126,6 +126,7 @@ pub(crate) async fn set_work_pod_state(
 }
 
 /// Count the active (running) work pods of one kind — the per-kind concurrency cap query.
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.count_active_work_pods", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", kind = %kind), err)]
 pub(crate) async fn count_active_work_pods(ex: impl PgExecutor<'_>, kind: &str) -> Result<u32> {
     let row = sqlx::query!(
@@ -140,6 +141,7 @@ pub(crate) async fn count_active_work_pods(ex: impl PgExecutor<'_>, kind: &str) 
 
 /// Count the turns of one kind dispatched on a UTC day (`YYYY-MM-DD`) — the per-kind daily turn
 /// budget query. A still-`queued` row hasn't spent a turn, so it's excluded; every other state has.
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.count_work_pod_turns_on_day", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", kind = %kind, day = %day), err)]
 pub(crate) async fn count_work_pod_turns_on_day(
     ex: impl PgExecutor<'_>,
@@ -163,6 +165,7 @@ pub(crate) async fn count_work_pod_turns_on_day(
 /// The queued work pod for one kind + issue, or `None` — the dedupe check before queueing, and the
 /// row a spawn consumes (its reserved pod name is reused). At most one row per (kind, issue) is ever
 /// `queued`, enforced by this lookup at the only insert site.
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.find_queued_work_pod", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", kind = %kind, issue_key = %issue_key), err)]
 pub(crate) async fn find_queued_work_pod(
     ex: impl PgExecutor<'_>,
@@ -187,6 +190,7 @@ pub(crate) async fn find_queued_work_pod(
 /// Consume a queued row by promoting it to `running` in place (the spawn that drains it). Resets
 /// `created_at` to now: for a spent turn that column means "when the turn dispatched" (the daily
 /// budget's clock), not "when it entered the queue". A no-op on a row that isn't `queued`.
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.promote_queued_work_pod", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", pod_name = %pod_name), err)]
 pub(crate) async fn promote_queued_work_pod(ex: impl PgExecutor<'_>, pod_name: &str) -> Result<()> {
     let now = crate::clock::now_rfc3339();
@@ -209,6 +213,7 @@ pub(crate) async fn promote_queued_work_pod(ex: impl PgExecutor<'_>, pod_name: &
 /// on its existing pod, never relaunched: relaunching would spend the turn's money twice and orphan
 /// the first pod's verdict. At most one row per (kind, issue) is ever `running` (a spawn
 /// promotes/inserts exactly one), so this `LIMIT 1` is exact. Mirrors [`find_queued_work_pod`].
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.find_running_work_pod", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", kind = %kind, issue_key = %issue_key), err)]
 pub(crate) async fn find_running_work_pod(
     ex: impl PgExecutor<'_>,
@@ -237,6 +242,7 @@ pub(crate) async fn find_running_work_pod(
 /// winner. A read-then-write couldn't close that race — the `WHERE state = 'running'` does, atomically.
 /// `terminal_at` is stamped on the first observation (COALESCE keeps an earlier one), the retention
 /// clock a `failed` pod's sweep counts from.
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.try_finish_running_work_pod", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", pod_name = %pod_name), err)]
 pub(crate) async fn try_finish_running_work_pod(
     ex: impl PgExecutor<'_>,
@@ -272,6 +278,7 @@ pub(crate) async fn try_finish_running_work_pod(
 }
 
 /// The oldest still-queued work pod of one kind (FIFO backpressure drain), or `None`.
+#[cfg(feature = "autoresearch")]
 #[cfg(test)]
 #[tracing::instrument(name = "db.next_queued_work_pod", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", kind = %kind), err)]
 pub(crate) async fn next_queued_work_pod(
@@ -309,6 +316,7 @@ pub struct QueuedCandidate {
 /// the caller needn't re-query per row (the sweep backstop's "one query per kind" budget). FIFO by
 /// `created_at` then `pod_name`, identical to [`next_queued_work_pod`], so the drain honors queue
 /// order.
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.queued_candidates", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", kind = %kind), err)]
 pub(crate) async fn queued_candidates(
     ex: impl PgExecutor<'_>,
@@ -367,6 +375,7 @@ pub(crate) async fn purge_queued_work_pods(
 /// skipped past. The `state = 'queued'` guard makes it a no-op if the row was meanwhile promoted, so
 /// it can never race a spawn. Same rationale as [`purge_queued_work_pods`]: a queued row created no
 /// pod, so deleting it leaks nothing and keeps it out of the turn budget.
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.delete_queued_work_pod", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", pod_name = %pod_name), err)]
 pub(crate) async fn delete_queued_work_pod(ex: impl PgExecutor<'_>, pod_name: &str) -> Result<u64> {
     let affected = sqlx::query!(
@@ -427,6 +436,7 @@ pub(crate) async fn get_work_pod(
 /// [`WorkPodState`]/[`crate::runs::workpod::WorkKind`] by the API layer, then spelled back), never raw
 /// caller input. Ties on `created_at` (second-resolution stamps) break on `pod_name` for a
 /// stable page.
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.list_work_pods", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql"), err)]
 pub(crate) async fn list_work_pods(
     ex: impl PgExecutor<'_>,
@@ -472,6 +482,7 @@ pub(crate) async fn set_scope_now(
 }
 
 /// Clear the ScopeNow override after the scope dispatch completes (or is declined).
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.clear_scope_now", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", key = %key), err)]
 pub(crate) async fn clear_scope_now(ex: impl PgExecutor<'_>, key: &str) -> Result<()> {
     sqlx::query!(
@@ -693,6 +704,7 @@ pub(crate) async fn set_redispatch(
 }
 
 /// Clear the redispatch stash once the re-dispatched run launches.
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.clear_redispatch", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", key = %key), err)]
 pub(crate) async fn clear_redispatch(ex: impl PgExecutor<'_>, key: &str) -> Result<()> {
     sqlx::query!(

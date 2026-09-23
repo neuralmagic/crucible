@@ -30,6 +30,8 @@ pub(crate) struct Version {
     git_sha: &'static str,
     /// The controller crate's version.
     version: &'static str,
+    /// Whether the autoresearch lane is running: built in and switched on.
+    autoresearch: bool,
 }
 
 /// `GET /api/version` — the commit this controller is running.
@@ -42,10 +44,16 @@ pub(crate) struct Version {
     path = "/api/version",
     responses((status = 200, description = "The running build", body = Version))
 )]
-pub(crate) async fn version() -> Json<Version> {
+pub(crate) async fn version(
+    #[cfg(feature = "autoresearch")] State(state): State<ApiState>,
+) -> Json<Version> {
     Json(Version {
         git_sha: env!("CRUCIBLE_GIT_SHA"),
         version: env!("CARGO_PKG_VERSION"),
+        #[cfg(feature = "autoresearch")]
+        autoresearch: state.autoresearch,
+        #[cfg(not(feature = "autoresearch"))]
+        autoresearch: false,
     })
 }
 
@@ -142,7 +150,10 @@ pub(crate) async fn get_access(State(state): State<ApiState>) -> Json<AccessDto>
     Json(AccessDto {
         admins: state.roles.admins().to_vec(),
         operators: state.roles.operators().to_vec(),
+        #[cfg(feature = "autoresearch")]
         allowed_orgs: state.repo_whitelist.allowed_orgs().to_vec(),
+        #[cfg(not(feature = "autoresearch"))]
+        allowed_orgs: Vec::new(),
     })
 }
 

@@ -36,6 +36,7 @@ mod markers;
 pub(crate) mod retry;
 mod run;
 mod scrape;
+#[cfg(feature = "autoresearch")]
 mod spec;
 mod sweep;
 #[cfg(test)]
@@ -64,9 +65,11 @@ pub(crate) async fn issue_dispatch_cluster(
 }
 
 pub(crate) use core::*;
+#[cfg(feature = "autoresearch")]
 pub(crate) use dispatcher::*;
 pub(crate) use globals::*;
 pub(crate) use markers::*;
+#[cfg(feature = "autoresearch")]
 pub(crate) use run::*;
 pub(crate) use scrape::*;
 pub(crate) use sweep::*;
@@ -79,7 +82,9 @@ pub use globals::{
 };
 pub use kube_dispatcher::{KubePodDispatcher, reconcile_on_startup};
 pub use run::{
-    LaunchSecrets, RunAdmission, RunDisposition, RunRenderOpts, ScopeOutcome, collect_run_pod,
-    dispatch_run, dispatch_scope, render_run_docs, run_pod_name, stamp_run_pod,
+    LaunchSecrets, RunAdmission, RunDisposition, RunRenderOpts, collect_run_pod, dispatch_run,
+    render_run_docs, run_pod_name, stamp_run_pod,
 };
+#[cfg(feature = "autoresearch")]
+pub use run::{ScopeOutcome, dispatch_scope};
 pub use scrape::TerminalState;

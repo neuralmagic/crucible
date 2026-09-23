@@ -467,7 +467,7 @@ async fn fetch_s3(
     let full_uri = format!("{prefix}{rel}");
     let dir = tempfile::tempdir().map_err(|e| FetchError::Fetch(format!("temp dir: {e}")))?;
     let out = dir.path().join("artifact");
-    let bin = crate::issues::engine::resolve_bin();
+    let bin = crate::runs::engine::resolve_bin();
     crate::runs::workpod::admit_contract(
         crate::runs::contract::RequestKind::Fetch,
         &[crate::runs::contract::DispatchTarget::Binary(bin.clone())],

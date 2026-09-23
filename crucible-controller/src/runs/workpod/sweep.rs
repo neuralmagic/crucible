@@ -1,7 +1,9 @@
 use crate::client::Db;
+#[cfg(feature = "autoresearch")]
 use crate::config::ControllerCfg;
 use crate::runs::workpod::*;
 use anyhow::{Context, Result};
+#[cfg(feature = "autoresearch")]
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -140,6 +142,7 @@ pub(crate) async fn sweep_failed_pod_overflow(
 /// count, purging any whose issue has since parked), so a missed completion edge can't strand the
 /// queue forever. Only grounded-rank carries a queue (`dispatch_scope` has no admission/queue step),
 /// so the backstop is one extra query per tick. Those drained keys ride the same returned vec.
+#[cfg(feature = "autoresearch")]
 pub(crate) async fn sweep_timed_out_turns(
     db: &Db,
     dispatcher: &dyn PodDispatcher,
@@ -235,6 +238,7 @@ pub(crate) async fn sweep_timed_out_turns(
 /// [`QUEUE_DRAIN_SCAN`] so a run of parked head rows can't hide the live rows behind it. A DB error
 /// yields no keys rather than failing the whole sweep. Grounded-rank is the only queuing kind, so
 /// this is the whole backstop.
+#[cfg(feature = "autoresearch")]
 async fn drain_free_slots_backstop(db: &Db, cfg: &ControllerCfg) -> Vec<String> {
     let kind = WorkKind::AgentTurn(TurnKind::GroundedRank);
     let cap = cfg.effective().grounded_rank_pod_cap;
@@ -257,6 +261,7 @@ async fn drain_free_slots_backstop(db: &Db, cfg: &ControllerCfg) -> Vec<String> 
 /// Whether a `running` turn row has outlived `deadline`, from its `created_at` dispatch stamp. An
 /// unparseable stamp counts as overran — a row with no usable clock can't be trusted to still be
 /// live, and the pod delete + CAS-fail are both safe if it wasn't.
+#[cfg(feature = "autoresearch")]
 fn turn_row_overran(created_at: &str, deadline: Duration) -> bool {
     match elapsed_secs_since(created_at) {
         Ok(secs) => secs >= deadline.as_secs_f64(),
@@ -267,17 +272,20 @@ fn turn_row_overran(created_at: &str, deadline: Duration) -> bool {
 /// A [`crate::daemon::queue::DiscoverySource`] that runs [`sweep_timed_out_turns`] on the daemon's discovery
 /// tick — out-of-band deadline enforcement for non-blocking turn dispatch. Enqueues each issue whose
 /// row it reaped so it re-dispatches on the freed slot.
+#[cfg(feature = "autoresearch")]
 pub struct TurnTimeoutPoll {
     db: Db,
     cfg: ControllerCfg,
 }
 
+#[cfg(feature = "autoresearch")]
 impl TurnTimeoutPoll {
     pub(crate) fn new(db: Db, cfg: ControllerCfg) -> Self {
         TurnTimeoutPoll { db, cfg }
     }
 }
 
+#[cfg(feature = "autoresearch")]
 impl crate::daemon::queue::DiscoverySource for TurnTimeoutPoll {
     fn poll(
         &self,

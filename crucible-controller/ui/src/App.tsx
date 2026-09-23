@@ -1,6 +1,7 @@
-import { lazy, Suspense, useCallback, useEffect } from 'react';
-import { Route, Routes, Link, NavLink } from 'react-router-dom';
+import { lazy, Suspense, useCallback, useEffect, type ReactNode } from 'react';
+import { Route, Routes, Link, NavLink, Navigate } from 'react-router-dom';
 import { $api } from './api/client';
+import { useAutoresearch } from './api/lanes';
 import { cn, Spinner, Status, Tooltip } from './ui';
 import { useDeviceFlag } from './useDeviceFlag';
 import { relativeTime } from './pages/journeyView';
@@ -86,6 +87,7 @@ interface StripItem {
 }
 
 function DatasheetStrip() {
+  const autoresearch = useAutoresearch() === true;
   const overview = $api.useQuery('get', '/api/overview', {}, POLL);
   const approvals = $api.useQuery('get', '/api/approvals', {}, POLL);
   const events = $api.useQuery('get', '/api/events', { params: { query: { limit: 1 } } }, POLL);
@@ -94,14 +96,14 @@ function DatasheetStrip() {
 
   if (overview.isSuccess) {
     const { statuses, running } = overview.data;
-    items.push({ label: 'Open issues', value: String(openIssueCount(statuses)) });
+    if (autoresearch) items.push({ label: 'Open issues', value: String(openIssueCount(statuses)) });
     items.push({
       label: 'Runs active',
       value: running.cap === null || running.cap === undefined ? String(running.current) : `${running.current} / ${running.cap}`,
     });
   }
 
-  if (approvals.isSuccess) {
+  if (autoresearch && approvals.isSuccess) {
     items.push({ label: 'Awaiting approval', value: String(approvals.data.awaiting_approval.length) });
   }
 
@@ -146,6 +148,8 @@ interface RailItem {
   /// The two-letter mark the collapsed rail shows in place of the label.
   icon: string;
   count?: number;
+  /// Shown only where the autoresearch lane runs.
+  autoresearch?: boolean;
 }
 
 interface RailSection {
@@ -153,7 +157,7 @@ interface RailSection {
   items: RailItem[];
 }
 
-function RailLink({ to, label, count }: RailItem) {
+function RailLink({ to, label, count }: Omit<RailItem, 'icon' | 'autoresearch'>) {
   return (
     <NavLink
       to={to}
@@ -176,7 +180,7 @@ function RailLink({ to, label, count }: RailItem) {
   );
 }
 
-function RailIcon({ to, label, icon, count }: RailItem) {
+function RailIcon({ to, label, icon, count }: Omit<RailItem, 'autoresearch'>) {
   return (
     <Tooltip side="right" delay={120} content={count === undefined ? label : `${label} · ${count}`}>
       <NavLink
@@ -227,19 +231,20 @@ interface CategoryRailProps {
 }
 
 function CategoryRail({ collapsed, onToggle }: CategoryRailProps) {
+  const autoresearch = useAutoresearch() === true;
   const overview = $api.useQuery('get', '/api/overview', {}, POLL);
   const approvals = $api.useQuery('get', '/api/approvals', {}, POLL);
-  const repos = $api.useQuery('get', '/api/repos');
+  const repos = $api.useQuery('get', '/api/repos', {}, { enabled: autoresearch });
   const whoami = $api.useQuery('get', '/api/whoami');
 
   const statuses = overview.isSuccess ? overview.data.statuses : [];
   const teams = [...(whoami.data?.teams ?? [])].sort((a, b) => a.team.localeCompare(b.team));
-  const sections: RailSection[] = [
+  const allSections: RailSection[] = [
     {
       heading: 'Queue',
       items: [
-        { to: '/issues', label: 'Issues', icon: 'IS', count: overview.isSuccess ? openIssueCount(statuses) : undefined },
-        { to: '/inbox', label: 'Inbox', icon: 'IN', count: overview.isSuccess ? countOf(statuses, 'parked') : undefined },
+        { to: '/issues', label: 'Issues', icon: 'IS', autoresearch: true, count: overview.isSuccess ? openIssueCount(statuses) : undefined },
+        { to: '/inbox', label: 'Inbox', icon: 'IN', autoresearch: true, count: overview.isSuccess ? countOf(statuses, 'parked') : undefined },
         {
           to: '/approvals',
           label: 'Approvals',
@@ -254,23 +259,23 @@ function CategoryRail({ collapsed, onToggle }: CategoryRailProps) {
     {
       heading: 'Runs',
       items: [
-        { to: '/runs', label: 'Autoresearch', icon: 'AR', count: overview.isSuccess ? overview.data.running.current : undefined },
+        { to: '/runs', label: 'Autoresearch', icon: 'AR', autoresearch: true, count: overview.isSuccess ? overview.data.running.current : undefined },
         { to: '/playbook-runs', label: 'Playbooks', icon: 'PR' },
       ],
     },
     {
       heading: 'Execution',
       items: [
-        { to: '/builds', label: 'Builds', icon: 'BD' },
-        { to: '/turns', label: 'Turns', icon: 'TN' },
+        { to: '/builds', label: 'Builds', icon: 'BD', autoresearch: true },
+        { to: '/turns', label: 'Turns', icon: 'TN', autoresearch: true },
       ],
     },
     {
       heading: 'Records',
       items: [
         { to: '/activity', label: 'Activity', icon: 'AC' },
-        { to: '/repos', label: 'Repos', icon: 'RP', count: repos.isSuccess ? repos.data.length : undefined },
-        { to: '/explore', label: 'Explore', icon: 'EX' },
+        { to: '/repos', label: 'Repos', icon: 'RP', autoresearch: true, count: repos.isSuccess ? repos.data.length : undefined },
+        { to: '/explore', label: 'Explore', icon: 'EX', autoresearch: true },
       ],
     },
     {
@@ -294,6 +299,9 @@ function CategoryRail({ collapsed, onToggle }: CategoryRailProps) {
       ],
     },
   ];
+  const sections = allSections
+    .map((section) => ({ ...section, items: section.items.filter((item) => autoresearch || !item.autoresearch) }))
+    .filter((section) => section.items.length > 0);
 
   return (
     <nav
@@ -334,8 +342,22 @@ function CategoryRail({ collapsed, onToggle }: CategoryRailProps) {
   );
 }
 
+/// An autoresearch page where that lane runs; the playbooks otherwise.
+function Lane({ page }: { page: ReactNode }) {
+  const autoresearch = useAutoresearch();
+  if (autoresearch === undefined) {
+    return (
+      <div className="p-4">
+        <Spinner label="LOADING" />
+      </div>
+    );
+  }
+  return autoresearch ? page : <Navigate to="/playbooks" replace />;
+}
+
 export function App() {
   const [collapsed, toggleRail] = useRailCollapsed();
+  const autoresearch = useAutoresearch() === true;
 
   return (
     <div className="flex h-screen min-h-0 flex-col">
@@ -354,7 +376,7 @@ export function App() {
         </Link>
         <div className="flex-1" />
         <div className="flex items-stretch">
-          <AutopilotIndicator />
+          {autoresearch ? <AutopilotIndicator /> : null}
           <OwnerSwitcher />
           <IdentityBadge />
           <DisplayPrefs />
@@ -362,26 +384,26 @@ export function App() {
       </header>
 
       <DatasheetStrip />
-      <AutopilotBanner />
+      {autoresearch ? <AutopilotBanner /> : null}
 
       <div className="flex min-h-0 flex-1">
         <CategoryRail collapsed={collapsed} onToggle={toggleRail} />
         <main className="min-h-0 min-w-0 flex-1 overflow-y-auto">
           <Routes>
-            <Route path="/" element={<DashboardPage />} />
-            <Route path="/issues" element={<IssuesPage />} />
-            <Route path="/scenarios/new" element={<NewScenarioPage />} />
-            <Route path="/jira/new" element={<NewJiraPage />} />
-            <Route path="/issues/:key" element={<IssueDetailPage />} />
-            <Route path="/issues/:key/scope" element={<ScopeFormPage />} />
-            <Route path="/issues/:key/scope/progress" element={<ScopeProgressPage />} />
-            <Route path="/inbox" element={<InboxPage />} />
+            <Route path="/" element={<Lane page={<DashboardPage />} />} />
+            <Route path="/issues" element={<Lane page={<IssuesPage />} />} />
+            <Route path="/scenarios/new" element={<Lane page={<NewScenarioPage />} />} />
+            <Route path="/jira/new" element={<Lane page={<NewJiraPage />} />} />
+            <Route path="/issues/:key" element={<Lane page={<IssueDetailPage />} />} />
+            <Route path="/issues/:key/scope" element={<Lane page={<ScopeFormPage />} />} />
+            <Route path="/issues/:key/scope/progress" element={<Lane page={<ScopeProgressPage />} />} />
+            <Route path="/inbox" element={<Lane page={<InboxPage />} />} />
             <Route path="/approvals" element={<ApprovalsPage />} />
-            <Route path="/repos" element={<ReposPage />} />
-            <Route path="/runs" element={<RunsPage />} />
+            <Route path="/repos" element={<Lane page={<ReposPage />} />} />
+            <Route path="/runs" element={<Lane page={<RunsPage />} />} />
             <Route path="/runs/:runId" element={<RunDetailPage />} />
             <Route path="/runs/:runId/files/*" element={<RunDetailPage />} />
-            <Route path="/builds" element={<BuildsPage />} />
+            <Route path="/builds" element={<Lane page={<BuildsPage />} />} />
             <Route path="/playbooks" element={<PlaybooksPage />} />
             <Route path="/playbooks/:id" element={<PlaybookDetailPage />} />
             <Route path="/playbooks/import" element={<PlaybookImportPage />} />
@@ -394,9 +416,9 @@ export function App() {
             <Route path="/playbook-runs/:key" element={<PlaybookLaunchDetailPage />} />
             <Route path="/playbook-runs/:key/runs/:runId" element={<RunDetailPage />} />
             <Route path="/playbook-runs/:key/runs/:runId/files/*" element={<RunDetailPage />} />
-            <Route path="/turns" element={<TurnsPage />} />
-            <Route path="/turns/:pod/live" element={<TurnLivePage />} />
-            <Route path="/live" element={<LivePage />} />
+            <Route path="/turns" element={<Lane page={<TurnsPage />} />} />
+            <Route path="/turns/:pod/live" element={<Lane page={<TurnLivePage />} />} />
+            <Route path="/live" element={<Lane page={<LivePage />} />} />
             <Route path="/activity" element={<ActivityPage />} />
             <Route path="/secrets" element={<SecretsPage />} />
             <Route path="/providers" element={<ProvidersPage />} />
@@ -407,15 +429,19 @@ export function App() {
             <Route
               path="/explore"
               element={
-                <Suspense
-                  fallback={
-                    <div className="p-4">
-                      <Spinner label="LOADING EXPLORE" />
-                    </div>
+                <Lane
+                  page={
+                    <Suspense
+                      fallback={
+                        <div className="p-4">
+                          <Spinner label="LOADING EXPLORE" />
+                        </div>
+                      }
+                    >
+                      <ExplorePage />
+                    </Suspense>
                   }
-                >
-                  <ExplorePage />
-                </Suspense>
+                />
               }
             />
           </Routes>

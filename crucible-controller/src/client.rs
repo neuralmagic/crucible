@@ -467,6 +467,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "autoresearch")]
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn upsert_never_overwrites_a_ranked_tier(pool: PgPool) -> Result<()> {
         let db = Db::new(pool);
@@ -537,6 +538,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "autoresearch")]
     fn comment(id: i64, key: &str, body: &str) -> crate::issues::model::IssueComment {
         crate::issues::model::IssueComment {
             id,
@@ -548,6 +550,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "autoresearch")]
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn issue_comments_upsert_edit_and_delete_vanished(pool: PgPool) -> Result<()> {
         let db = Db::new(pool);
@@ -597,6 +600,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "autoresearch")]
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn issue_comments_are_scoped_per_issue(pool: PgPool) -> Result<()> {
         let db = Db::new(pool);

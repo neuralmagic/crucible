@@ -158,6 +158,7 @@ pub struct IssueDto {
 impl IssueDto {
     /// Build the DTO from an issue row plus its kept PR resolved through
     /// [`crate::issues::store::latest_kept_pr_urls`]'s issue → pr_url map.
+    #[cfg(feature = "autoresearch")]
     pub(crate) fn from_parts(i: Issue, pr_url: Option<String>) -> Self {
         let stale_closable = i.park_reason().is_some_and(|r| r.is_stale_closable());
         IssueDto {
@@ -189,6 +190,7 @@ impl IssueDto {
     /// the engine's stage detail or ten raw pod log lines ([`crate::model::ParkReason`]'s
     /// `Display`), and `GET /api/issues` is unpaginated, so the full text is multi-KB per row
     /// across the whole backlog for a tooltip nobody opens.
+    #[cfg(feature = "autoresearch")]
     pub(crate) fn truncated_for_list(mut self) -> Self {
         self.parked_reason = self.parked_reason.map(LongText::truncate);
         self
@@ -757,6 +759,7 @@ pub(crate) async fn funnel(State(state): State<ApiState>) -> Result<Json<FunnelD
 /// one assembly. `body` and `comments` live here rather than on [`IssueDto`] so the list endpoint
 /// stays lean — full markdown bodies belong on the one detail fetch, not on every row of
 /// `GET /api/issues`.
+#[cfg(feature = "autoresearch")]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct IssueDetail {
     pub issue: IssueDto,
@@ -772,6 +775,7 @@ pub struct IssueDetail {
     pub scenario: Option<ScenarioDetailDto>,
 }
 
+#[cfg(feature = "autoresearch")]
 dto! {
     /// The free-text goal a human adopted, plus who adopted it and when. Distinct from
     /// [`InputKindDto::Scenario`]'s bare `id` — that's identity, this is content.
@@ -787,6 +791,7 @@ dto! {
     }
 }
 
+#[cfg(feature = "autoresearch")]
 dto! {
     /// One mirrored GitHub comment on the issue-detail surface.
     pub struct IssueCommentDto: From<c: crate::issues::model::IssueComment> {
@@ -803,6 +808,7 @@ dto! {
 
 /// Assemble the full provenance graph for one issue: issue row → scopes → runs → candidates,
 /// plus the event-log history. `None` if the issue is untracked.
+#[cfg(feature = "autoresearch")]
 pub async fn issue_detail(db: &Db, key: &str) -> anyhow::Result<Option<IssueDetail>> {
     let Some(issue) = crate::issues::store::get_issue(db.pool(), key).await? else {
         return Ok(None);
@@ -970,6 +976,7 @@ pub(crate) fn bad_request(msg: impl Into<String>) -> Response {
         .into_response()
 }
 
+#[cfg(feature = "autoresearch")]
 dto! {
     /// The autopilot flag state (runtime-flippable kill switch for machine-initiated spend).
     pub struct AutopilotDto: From<s: crate::daemon::autopilot_flag::AutopilotState> {
@@ -980,6 +987,7 @@ dto! {
     }
 }
 
+#[cfg(feature = "autoresearch")]
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct AutopilotSetBody {
     pub enabled: bool,
@@ -997,7 +1005,7 @@ pub(crate) fn unprocessable(msg: impl Into<String>) -> Response {
 /// Reduce a pasted GitHub URL to the `owner/repo` slug the rest of the controller keys on
 /// (`CONTROLLER_PR_REPO_MAP` lookups, per-repo checkouts, the issues table's repo grouping all
 /// assume slugs). Anything that isn't a GitHub URL passes through untouched — non-GitHub remotes
-/// stay full URLs on purpose ([`crate::issues::engine::repo_clone_url`] passes them through).
+/// stay full URLs on purpose ([`crate::runs::engine::repo_clone_url`] passes them through).
 pub(crate) fn normalize_repo(repo: &str) -> &str {
     let Some(path) = repo
         .strip_prefix("https://github.com/")
@@ -1412,6 +1420,7 @@ mod tests {
     /// A realistic parked backlog: `NoSessionEmpty` renders ten raw pod log lines into
     /// `parked_reason`, and `GET /api/issues` is unpaginated. Pin the list payload's per-row cost
     /// so nobody re-inlines the full text.
+    #[cfg(feature = "autoresearch")]
     #[test]
     fn list_dto_truncation_bounds_the_issues_payload() {
         let reason = crate::model::ParkReason::NoSessionEmpty {

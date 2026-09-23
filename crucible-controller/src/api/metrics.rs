@@ -67,6 +67,31 @@ pub(crate) async fn gauge_state(
             .len(),
     )
     .unwrap_or(i64::MAX);
+    #[cfg(feature = "autoresearch")]
+    let builds = build_gauges(db).await?;
+    #[cfg(not(feature = "autoresearch"))]
+    let builds = std::collections::BTreeMap::new();
+    Ok(crate::metrics::GaugeState {
+        daily_spend_usd,
+        daily_ceiling_usd: ceiling,
+        workpods: workpods.into_iter().map(|((k, s), n)| (k, s, n)).collect(),
+        approvals_pending,
+        builds: builds.into_iter().map(|((b, s), n)| (b, s, n)).collect(),
+    })
+}
+
+/// The unauthenticated `/metrics` router, merged onto the served app outside the bearer guard.
+pub(crate) fn router(state: crate::api::state::ApiState) -> axum::Router {
+    axum::Router::new()
+        .route("/metrics", axum::routing::get(metrics_handler))
+        .with_state(state)
+}
+
+/// Build pods by backend and state, for the build gauges.
+#[cfg(feature = "autoresearch")]
+async fn build_gauges(
+    db: &crate::client::Db,
+) -> anyhow::Result<std::collections::BTreeMap<(&'static str, &'static str), i64>> {
     let build_rows = crate::builds::store::builds_in_states(
         db.pool(),
         &[
@@ -85,18 +110,5 @@ pub(crate) async fn gauge_state(
             .entry((row.backend.as_str(), row.state.as_str()))
             .or_insert(0) += 1;
     }
-    Ok(crate::metrics::GaugeState {
-        daily_spend_usd,
-        daily_ceiling_usd: ceiling,
-        workpods: workpods.into_iter().map(|((k, s), n)| (k, s, n)).collect(),
-        approvals_pending,
-        builds: builds.into_iter().map(|((b, s), n)| (b, s, n)).collect(),
-    })
-}
-
-/// The unauthenticated `/metrics` router, merged onto the served app outside the bearer guard.
-pub(crate) fn router(state: crate::api::state::ApiState) -> axum::Router {
-    axum::Router::new()
-        .route("/metrics", axum::routing::get(metrics_handler))
-        .with_state(state)
+    Ok(builds)
 }

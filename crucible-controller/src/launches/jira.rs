@@ -13,8 +13,10 @@
 #![allow(clippy::disallowed_macros)]
 
 use crate::daemon::queue::BoxFuture;
+#[cfg(feature = "autoresearch")]
+use crate::launches::tracker::TrackerIssue;
 use crate::launches::tracker::{
-    EmittedKind, IssueEmitter, NewTrackerIssue, TrackerHit, TrackerIssue, TrackerQueryError,
+    EmittedKind, IssueEmitter, NewTrackerIssue, TrackerHit, TrackerQueryError,
 };
 use anyhow::{Context, Result, bail};
 use std::time::Duration;
@@ -62,6 +64,7 @@ impl JiraConfig {
     /// the first DNS label of `example.atlassian.net` is `example`. Falls back to the whole host, then
     /// to `jira`, so the key is always well-formed even for an unusual base URL. Callers may override
     /// this with an explicit site on the adopt request.
+    #[cfg(feature = "autoresearch")]
     pub(crate) fn site_label(&self) -> String {
         let after_scheme = self
             .base_url
@@ -100,6 +103,7 @@ impl JiraRef {
     /// Parse from a site label and a raw `PROJ-N` issue key (case preserved). `Err` on a blank site
     /// or a key that isn't `PROJECT-<number>` — the caller turns that into a 422, not an `Unknown`
     /// row (adoption is human-driven, so a malformed key is a request error worth reporting).
+    #[cfg(feature = "autoresearch")]
     pub(crate) fn parse(site: &str, issue_key: &str) -> Result<Self> {
         let site = site.trim();
         if site.is_empty() {
@@ -126,12 +130,14 @@ impl JiraRef {
     }
 
     /// The `PROJ-N` issue key as Jira's REST API and `/browse/` URLs expect it.
+    #[cfg(feature = "autoresearch")]
     pub(crate) fn issue_key(&self) -> String {
         format!("{}-{}", self.project, self.number)
     }
 
     /// The stored `issues.key` for this ref — the `jira:{site}:{PROJ-N}` form
     /// [`crate::issues::model::InputKind::from_parts`] decodes back into `InputKind::Jira`.
+    #[cfg(feature = "autoresearch")]
     pub(crate) fn storage_key(&self) -> String {
         format!("jira:{}:{}", self.site, self.issue_key())
     }
@@ -147,6 +153,7 @@ pub struct JiraIssue {
 /// Fetch one Jira issue's title + body by key. Takes the creds explicitly (no env reads), so a test
 /// can point `cfg.base_url` at a local listener without racing process-global env. The issue key is
 /// logged (it's not sensitive); the body never is.
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "jira.fetch_issue", skip(cfg), fields(otel.kind = "client", peer.service = "jira", issue = %jira_ref.issue_key()), err)]
 pub(crate) async fn fetch_jira_issue(cfg: &JiraConfig, jira_ref: &JiraRef) -> Result<JiraIssue> {
     let tracker = JiraTracker::new(cfg.clone())?;
@@ -176,6 +183,7 @@ pub struct JiraTracker {
 
 /// The full api/2 issue payload: known fields are pulled out by name, the rest becomes
 /// [`TrackerIssue::extra_fields`].
+#[cfg(feature = "autoresearch")]
 #[derive(serde::Deserialize)]
 struct RawFullIssue {
     fields: serde_json::Map<String, serde_json::Value>,
@@ -272,6 +280,7 @@ impl JiraTracker {
             .header(reqwest::header::ACCEPT, "application/json")
     }
 
+    #[cfg(feature = "autoresearch")]
     async fn fetch(&self, id: &str) -> Result<TrackerIssue> {
         let url = format!("{}/rest/api/2/issue/{id}", self.cfg.base_url);
         let resp = self
@@ -572,6 +581,7 @@ pub fn trackers(jira: Option<JiraConfig>) -> crate::launches::tracker::Trackers 
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "autoresearch")]
     use crate::issues::model::InputKind;
     use crate::launches::jira::*;
     use crate::launches::tracker::{TrackerQueryError, TrackerSearch};
@@ -646,6 +656,7 @@ mod tests {
         .expect("client builds")
     }
 
+    #[cfg(feature = "autoresearch")]
     #[tokio::test]
     async fn tracker_fetch_maps_common_fields_and_keeps_extras() {
         let payload = serde_json::json!({
@@ -848,6 +859,7 @@ mod tests {
     /// Live smoke against a real Jira Cloud instance — run explicitly with
     /// `JIRA_LIVE_BASE_URL/EMAIL/TOKEN/ISSUE set` + `cargo test ... live_smoke -- --ignored`.
     /// Read-only (fetch + search); comment posting is covered by the listener tests.
+    #[cfg(feature = "autoresearch")]
     #[tokio::test]
     #[ignore = "hits a live Jira instance; needs JIRA_LIVE_* env"]
     async fn live_smoke_fetch_and_search() {
@@ -884,6 +896,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "autoresearch")]
     #[test]
     fn jira_ref_parses_and_round_trips_through_input_kind() {
         let r = JiraRef::parse("example", "ACME-1234").expect("valid key");
@@ -899,6 +912,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "autoresearch")]
     #[test]
     fn jira_ref_trims_and_preserves_project_case() {
         let r = JiraRef::parse("  example ", "  Infra-7 ").expect("valid key");
@@ -906,6 +920,7 @@ mod tests {
         assert_eq!(r.storage_key(), "jira:example:Infra-7");
     }
 
+    #[cfg(feature = "autoresearch")]
     #[test]
     fn jira_ref_rejects_malformed_keys() {
         for (site, key) in [
@@ -941,6 +956,7 @@ mod tests {
         assert_eq!(cfg.base_url, "https://x", "trailing slash trimmed");
     }
 
+    #[cfg(feature = "autoresearch")]
     #[test]
     fn site_label_derives_from_base_url_host() {
         let cfg = |u: &str| JiraConfig {
@@ -955,6 +971,7 @@ mod tests {
 
     /// A real HTTP round-trip against a one-shot local listener returning a canonical
     /// `/rest/api/2/issue/{KEY}` payload — no mock client, the actual reqwest path.
+    #[cfg(feature = "autoresearch")]
     #[tokio::test]
     async fn fetch_jira_issue_pulls_summary_and_description() -> Result<()> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -990,6 +1007,7 @@ mod tests {
     }
 
     /// A null description (Jira's empty-body shape) decodes to an empty string, not an error.
+    #[cfg(feature = "autoresearch")]
     #[tokio::test]
     async fn fetch_jira_issue_tolerates_null_description() -> Result<()> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
