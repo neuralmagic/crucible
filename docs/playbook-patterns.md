@@ -59,7 +59,7 @@ nothing, and does not affect the verdict. Anything that depends on it with the d
 | | Answered by | Cost |
 | --- | --- | --- |
 | `source = read` | A dependency's own output: `read` emits `{"bucket": "billing"}`. | Free and deterministic. |
-| `min_confidence = 0.8` | A decision model, through the broker's `systemone` capability. An answer below the threshold is recorded as `"uncertain"`. | One model call per question. |
+| `min_confidence = 0.8` | A decision model, through the broker's `systemone` capability. An answer below the threshold is recorded as `"uncertain"`. | One model call per route, for all its questions. |
 
 A source that emits a label the question does not declare fails the route, and the run
 short-circuits there. A model-backed route with no decision binding truncates the plan
@@ -80,6 +80,92 @@ or say an answer deliberately leads nowhere with `drop`:
 Adding an option to a question can therefore never strand a ticket silently: `otherwise`
 catches it, or the pack stops compiling until the new label has a home. `examples/route` is
 the full pack, with a model-backed gate and a serving recipe for the decision model.
+
+## Let a decision model answer
+
+A decision model reads the route's inputs and returns a probability for each label of each
+question, instead of text an agent would have to be trusted to format. Any server that speaks
+the System One decision API (`POST /v1/systemone`) works: the hosted Jev API, or vLLM's
+DiffusionGemma structured-reads server. The route declares the questions and the confidence it
+needs:
+
+```python
+read = command(name = "read", run = "./read.sh", emits = ["ticket"])
+
+gate = route(
+    name = "gate",
+    depends_on = [read],
+    min_confidence = 0.8,
+    questions = {
+        "bucket": choice(
+            ask = "Which queue owns this ticket?",
+            options = {
+                "outage": "the product is down or unusable",
+                "billing": "charges, invoices, refunds",
+                "feature": "a request for something new",
+            },
+        ),
+        "urgent": noul(
+            ask = "Does the customer need a reply within the hour?",
+            drop = ["no", "uncertain"],
+        ),
+    },
+)
+```
+
+The workflow never names the endpoint. Whoever launches the run binds one in
+`CRUCIBLE_INFERENCE`:
+
+```sh
+export CRUCIBLE_INFERENCE='{"version":1,"bindings":[{"role":"decision","protocol":"system_one",
+  "url":"https://api.example.com/v1/systemone","model":"jev-1","key_env":"JEV_API_KEY"}]}'
+crucible plan run --manifest crucible.toml --max-cost 1 --max-time 5m
+```
+
+`key_env` names the variable that holds the bearer key; the document never holds the key
+itself. With no `decision` binding the route cannot run, so the plan truncates before
+anything spends.
+
+**What the model sees.** One request per route: the outputs of the route's dependencies as
+`state`, and each question with its instructions and the description of each label:
+
+```json
+{
+  "model": "jev-1",
+  "state": {"read": {"ticket": "I was charged twice for the March invoice. No rush, but please refund the duplicate."}},
+  "questions": {
+    "bucket": {"type": "choice", "instructions": "Which queue owns this ticket?",
+               "criteria": {"outage": "the product is down or unusable",
+                            "billing": "charges, invoices, refunds",
+                            "feature": "a request for something new"}},
+    "urgent": {"type": "noul", "instructions": "Does the customer need a reply within the hour?"}
+  }
+}
+```
+
+The label descriptions are the model's only definition of each queue, so write them the way
+you would brief a person.
+
+**What the run records.** The route's output is the decision: for each question the label, its
+confidence, and the whole distribution the model returned.
+
+```json
+{"bucket": {"label": "billing", "confidence": 0.9,
+            "probabilities": {"billing": 0.9, "feature": 0.05, "outage": 0.05}},
+ "urgent": {"label": "no", "confidence": 0.9, "probabilities": {"no": 0.9, "yes": 0.1}}}
+```
+
+A label whose probability is under `min_confidence` is recorded as `"uncertain"`, which
+`otherwise` or `drop` has to cover.
+
+**From the control plane.** A controller started with `just controller-local` passes its own
+`CRUCIBLE_*` variables to the runs it launches, so exporting `CRUCIBLE_INFERENCE` before starting
+it gives every playbook launch the decision model. Name the key variable with the same prefix
+(`"key_env":"CRUCIBLE_JEV_API_KEY"`) and it passes through too. A deployed controller does not
+build a decision binding yet.
+
+`examples/route` is the runnable pack, with five sample tickets and a recipe for serving
+DiffusionGemma yourself.
 
 ## Send work back
 
