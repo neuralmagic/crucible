@@ -4,7 +4,7 @@ This is the spec for the interface between the engine (`crucible`) and a
 domain. The engine implements it, a domain satisfies it, and a minimal fake domain
 (`examples/counter/`) tests it end-to-end with no EPP and no cluster.
 
-Concept: [What crucible is](./crucible.md).
+Concept: [The loop in one read](./crucible.md).
 Trust line (engine hands the agent a World, never a Judge): [ADR 0001](./adr/0001-adaptive-harness.md).
 
 > **Contract status: NORMATIVE.** Words like *must* / *exactly one* are binding. The engine
