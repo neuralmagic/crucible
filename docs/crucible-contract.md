@@ -167,14 +167,14 @@ critics = [
         prompt = prompt_file("prompts/correctness.md"),
         model = "claude-opus-4-6",
         effort = "high",
-        isolated = True,
+        workspace = "readonly",
         depends_on = [candidate],
     ),
     agent(
         name = "novelty",
         prompt = prompt_file("prompts/novelty.md"),
         required = False,
-        isolated = True,
+        workspace = "readonly",
         depends_on = [candidate],
     ),
 ]
@@ -211,7 +211,7 @@ correctness = evaluate(
     name = "correctness",
     run = "./correctness.sh",
     depends_on = [live],
-    isolated = True,
+    workspace = "worktree",
 )
 latency = evaluate(
     name = "latency",
@@ -219,14 +219,14 @@ latency = evaluate(
     depends_on = [correctness],
     threshold = 12.5,
     direction = "lower",
-    isolated = True,
+    workspace = "worktree",
 )
 racecheck = evaluate(
     name = "racecheck",
     run = "./racecheck.sh",
     depends_on = [correctness],
     required = False,
-    isolated = True,
+    workspace = "worktree",
 )
 measurement = grade(
     name = "grade",
@@ -236,7 +236,8 @@ measurement = grade(
 decision = decide(name = "choose", measurement = measurement)
 ```
 
-Dependencies define measurement rungs; ready isolated siblings run concurrently. `evaluate()`
+Dependencies define measurement rungs; ready siblings that leave the shared workspace alone
+(`readonly` or `worktree`) run concurrently. `evaluate()`
 expects a JSON object on its last stdout line. `pass = false` vetoes a result, malformed `pass`
 fails closed, and paired `threshold`/`direction` fields grade numeric `score`. Without a threshold,
 omitted `pass` means success. `grade()` selects a passing score evaluator and folds passing
@@ -245,7 +246,7 @@ workflow are unchanged.
 
 `session = "solver"` binds agent-producing tasks to a durable logical conversation. The checkout
 may roll back after a discarded candidate while the solver session continues forward and retains
-what it learned. Tasks sharing a session must be dependency-ordered and cannot be isolated;
+what it learned. Tasks sharing a session must be dependency-ordered and cannot run in a worktree;
 parallel critics should stay fresh or use distinct sessions. Admission requires
 `agent.session.persist`. A missing `session` preserves the historical fresh-turn behavior.
 
@@ -303,9 +304,9 @@ studio that fans out three treatments, curates them, and publishes a contact she
 
 ```python
 treatments = [
-    agent(name = "surreal", prompt = prompt_file("prompts/surreal.md"), isolated = True),
-    agent(name = "minimal", prompt = prompt_file("prompts/minimal.md"), isolated = True),
-    agent(name = "documentary", prompt = prompt_file("prompts/documentary.md"), isolated = True),
+    agent(name = "surreal", prompt = prompt_file("prompts/surreal.md"), workspace = "worktree"),
+    agent(name = "minimal", prompt = prompt_file("prompts/minimal.md"), workspace = "worktree"),
+    agent(name = "documentary", prompt = prompt_file("prompts/documentary.md"), workspace = "worktree"),
 ]
 curate = agent(
     name = "curate",
@@ -335,8 +336,9 @@ one is an unknown-name error where it was written, and a did-you-mean never offe
 - `propose(...)`, `apply(...)`, `measure(...)`, `grade(...)`, and `decide(...)` create
   capability-owned engine tasks. `decide(measurement = score)` selects its measurement.
   Scored lanes only.
-- `agent(...)` creates an agent task. `isolated = True` gives it a disposable worktree, ideal for
-  concurrent read-only critics; leave it false for a synthesizer whose edits must survive.
+- `agent(...)` creates an agent task. `workspace = "readonly"` suits concurrent critics that only
+  read; `workspace = "worktree"` gives a task that writes scratch files a disposable clone. Leave
+  a synthesizer whose edits must survive in the shared workspace, the default.
   `session = "name"` opts into an engine-managed durable conversation.
 - `session(name = ..., harness = ?, model = ?, effort = ?)` declares a durable conversation with
   optional agent defaults, bindable as the `session =` value on `agent()` and `propose()`.
@@ -366,7 +368,7 @@ is the whole of it:
 | --- | --- | --- |
 | `required` | `True` (default), `False` | whether this task's failure invalidates the run. An advisory task's failure blocks only its dependents. |
 | `join` | `"all"` (default), `"passed"` | what this task needs of its dependencies. `"all"` needs every one to have passed; `"passed"` runs on whatever survived. |
-| `isolated` | `False` (default), `True` | whether the task gets a disposable worktree. Today this is also what buys concurrency, because non-isolated peers would race on the shared result file. |
+| `workspace` | `"shared"` (default), `"readonly"`, `"worktree"` | what the task needs of the workspace: to write it, to only read it, or to write a disposable clone. The engine derives concurrency from it: a `shared` task runs alone, the other two run beside each other. A readonly task that leaves a change fails, and the change is discarded. |
 | `needs` | `"any"` (default), a capability name | a capability the run must have before this task is dispatched. |
 | `stage` | `"iteration"` (default), `"epilogue"` | whether the task is in the main graph, or runs once after it settles. |
 
@@ -376,8 +378,9 @@ disqualifying, and no run of it yields an honest verdict. Validation rejects it 
 naming both tasks. `join = "passed"` is the exemption, because it declares up front that the task
 runs on whatever survived.
 
-Agent tasks receive upstream results in their prompt and write one JSON object to
-`PLAN_TASK_RESULT.json`. Required failures discard the candidate; advisory tasks use
+Agent tasks receive upstream results in their prompt and write one JSON object to the result
+file the prompt names (also in `CRUCIBLE_TASK_RESULT`), one per task so concurrent readonly peers
+never share one. Required failures discard the candidate; advisory tasks use
 `required = False`. `join = "passed"` waits for all dependencies, then receives their non-empty set
 of successful results. No passing input blocks the task.
 
