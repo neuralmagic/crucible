@@ -701,7 +701,7 @@ fn run_in(
         Ok(j) => j,
         Err(e) => return Attempt::failed(0.0, format!("inputs not serializable: {e}")),
     };
-    let full_prompt = task_prompt(&prompt, &inputs_json, &task.emits);
+    let full_prompt = task_prompt(prompt, &inputs_json, &task.emits);
 
     let result_path = paths.workspace.join(RESULT_FILE);
     // Drain any stale result so a pass can only come from THIS turn.
