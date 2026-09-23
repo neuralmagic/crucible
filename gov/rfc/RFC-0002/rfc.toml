@@ -36,4 +36,7 @@ clauses = [
 version = "0.1.0"
 date = "2026-08-21"
 notes = "Initial draft"
-changed = ["a settled join forwards a dependency that settled not taken"]
+changed = [
+    "a settled join forwards a dependency that settled not taken",
+    "C-ASKS states how a task declares and emits asks, the reserved output field, the run bound, and where asks land on the session log",
+]

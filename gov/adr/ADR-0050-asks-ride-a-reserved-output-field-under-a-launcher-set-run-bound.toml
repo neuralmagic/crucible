@@ -1,0 +1,56 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0050"
+title = "Asks ride a reserved output field under a launcher-set run bound"
+status = "accepted"
+date = "2026-09-23"
+refs = [
+    "RFC-0002:C-ASKS",
+    "RFC-0002:C-PLAYBOOK-SHAPE",
+    "RFC-0002:C-REVISE-LOOP",
+    "ADR-0027",
+    "ADR-0033",
+]
+
+[content]
+context = """
+[[RFC-0002:C-ASKS]] specified asks (work a playbook proposes for another run) and the contract crate already carried an ask key type and an asks_emitted session event, but no pack could emit one: the DSL had no surface, the executor ignored the field, and nothing bounded a run's asks. [[RFC-0002:C-PLAYBOOK-SHAPE]] names asks as the only way a run hands a discovered item set to runs of its own, so the triage pack's natural follow-up (one fix run per triaged bug) had nowhere to go.
+
+Forces: the graph must stay static and renderable before any spend; the emitting run must never dispatch what it asks for; the bound must be the operator's, not the pack's; a failure has to land at the task that caused it; and whatever carries an ask must not become a channel for file content."""
+decision = """
+A task declares the workflows it may ask for (`asks = ["issue-fix"]` in workflow.star, `asks` on the IR task and on the admitted-plan wire task). It emits asks by returning them in its JSON output under the reserved field `asks`: a list of `{key, workflow, params}` objects, decoded through the contract's `Ask`, which refuses unknown fields, a key or workflow name that cannot form the orchestrator's `ask:{workflow}:{key}` queue key, parameter values outside the declared parameter types, and parameters over 4096 encoded bytes.
+
+The executor checks asks when a task settles passing, before its git-memory commit, in the same place the declared-output check already converts a pass into a measured failure. A run-scoped ledger holds the bound and every (workflow, key) emitted so far. A task whose asks are malformed, name an undeclared workflow, repeat an emitted pair, or would take the run past its bound settles failing with its output kept and emits nothing. Batched isolated tasks are counted in declaration order after the batch returns. Emitted asks travel on the task result and reach the session log as one asks_emitted event written before that task's task_result row.
+
+The bound is `plan run --max-asks` (default 16), carried as `max_asks` on plan_admitted. The scored loop runs with a bound of zero and rejects the declaration at workflow admission. Revise-loop members may not declare asks: their rounds produce drafts the loop may replace, and a dependent of the reviewer sees the settled draft."""
+consequences = """
+- Asks are part of a task's result, so every executor path that already settles a result (serial, batch, fan-out instance) carries them without a new dispatch mode; a mapped node's instances each ask about their own item and the folded node asks nothing.
+- The field name `asks` is reserved in every task's output. A pack whose output already carried an `asks` field for its own purposes now fails that task until it declares asks or renames the field.
+- The engine checks shape, not meaning: whether `params` satisfy the named workflow's schema, whether the workflow exists, dedup across runs, and rate limits stay with the receiving orchestrator, which is the only party holding the registry.
+- Playbook resume is not implemented, so a resumed run does not yet fold earlier asks into its ledger; whoever builds [[RFC-0002:C-PLAYBOOK-RESUME]] must count folded asks against the bound.
+- CONTRACT_VERSION moves to 1.8.0: `Ask`'s fields become private behind a checking constructor, `params` becomes a JSON object, and plan_admitted gains `max_asks` and per-task `asks`."""
+
+[[content.alternatives]]
+text = "A reserved output field checked at settle time, with a declared workflow list per task and a launcher-set run bound"
+status = "accepted"
+
+[[content.alternatives]]
+text = "A dedicated ask() constructor: an engine-owned task that turns a dependency's list into asks"
+status = "rejected"
+rejection_reason = "Adds a node whose only job is reshaping another task's output, and still needs that task to produce the list in some reserved shape. The item set is discovered at run time, so the task that discovers it is the one that knows the key; a second node would only re-derive it."
+
+[[content.alternatives]]
+text = "Asks written to a declared file (emits_files) that the engine reads after the task settles"
+status = "rejected"
+rejection_reason = "[[RFC-0002:C-TASK-FILES]] forbids emits_files as a channel between runs, and a file is exactly the content C-ASKS keeps out of an ask. The JSON output is already bounded, parsed, and on the session log."
+
+[[content.alternatives]]
+text = "Drop asks past the bound and emit the rest"
+status = "rejected"
+rejection_reason = "[[RFC-0002:C-ASKS]] requires the emitting task to fail rather than silently drop the remainder, and a partial emission would leave which items were asked for dependent on list order."
+
+[[content.alternatives]]
+text = "Let the pack declare its own bound, as max_fanout does"
+status = "rejected"
+rejection_reason = "An ask widens work beyond the run, so the bound protects the operator from the pack; a bound a pack can raise is not a bound. max_fanout bounds width inside the run's own ceilings, which the operator already controls."

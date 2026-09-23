@@ -61,6 +61,7 @@ changed = [
     "the declared lane scopes the constructor namespace, so a playbook cannot name or be offered a scored constructor",
     "session log gains asks_emitted, so what a run proposed is auditable apart from what an orchestrator admitted",
     "skill joins the enumerated constructors: an agent task whose prompt is assembled from a shipped SKILL.md and the invocation's arguments",
+    "plan_admitted carries the run's ask bound and each task's askable workflows, and asks_emitted precedes the emitting task's row",
 ]
 
 [[changelog]]

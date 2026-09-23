@@ -722,7 +722,7 @@ pub(crate) fn resume_approval(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::control::recovery::*;
     use crate::report::session::{PlanTaskWire, RowWire, encode};
 
     fn write_log(name: &str, events: &[SessionEvent]) -> std::path::PathBuf {
@@ -931,6 +931,7 @@ mod tests {
                     when: String::new(),
                     revise: String::new(),
                     max_rounds: 0,
+                    asks: Vec::new(),
                 },
                 PlanTaskWire {
                     name: "measure".into(),
@@ -946,8 +947,10 @@ mod tests {
                     when: String::new(),
                     revise: String::new(),
                     max_rounds: 0,
+                    asks: Vec::new(),
                 },
             ],
+            max_asks: 0,
         });
         let got = classify("plan-task", &events);
         match &got.classification {
@@ -970,6 +973,7 @@ mod tests {
             reason: String::new(),
             budget_usd: 5.0,
             tasks: vec![],
+            max_asks: 0,
         });
         events.push(row(1, "discard", 260.0));
         let got = classify("plan-closed", &events);
@@ -997,6 +1001,7 @@ mod tests {
                 reason: String::new(),
                 budget_usd: 5.0,
                 tasks: vec![],
+                max_asks: 0,
             },
         ];
         let got = classify("wide-phased", &events);
@@ -1019,6 +1024,7 @@ mod tests {
                 reason: String::new(),
                 budget_usd: 5.0,
                 tasks: vec![],
+                max_asks: 0,
             },
         ];
         let got = classify("wide", &events);
@@ -1164,6 +1170,7 @@ mod tests {
             reason: String::new(),
             budget_usd: 5.0,
             tasks: vec![],
+            max_asks: 0,
         });
         events.push(SessionEvent::ApprovalWait {
             handle: "h".into(),

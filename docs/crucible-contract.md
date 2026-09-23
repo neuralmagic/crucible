@@ -747,6 +747,15 @@ that does, its key replaces `[agent.codex]`'s own, and the ambient `ANTHROPIC_AP
 Each replacement is logged. With no `agent` binding those ambient variables and the manifest
 decide, which is how a run from an operator's shell works.
 
+A playbook task that asks for work (contract 1.8.0) produces an `asks_emitted` event,
+`{ task, asks: [{ key, workflow, params }] }`, written before that task's `task_result` and only
+when it passed. Each ask decodes through `crucible_contract::ask::Ask`, which refuses any other
+field, a key or workflow name that cannot form the queue key `ask:<workflow>:<key>`, a parameter
+value that is not a string, number, boolean, or list of strings, and parameters over 4096 encoded
+bytes. `plan_admitted` carries the run's bound as `max_asks` (0 where the lane admits no asks) and
+each task's declared workflows as an additive `asks` list. The run never dispatches an ask; see
+[Work graphs](./work-graphs.md#asks).
+
 Additive event kinds beyond the compat set include:
 
 - **`identity`**: the run's `RunIdentity` (below), emitted once at setup and again on
