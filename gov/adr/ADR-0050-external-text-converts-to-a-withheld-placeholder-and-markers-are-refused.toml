@@ -1,0 +1,49 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0050"
+title = "External text converts to a withheld placeholder and markers are refused"
+status = "accepted"
+date = "2026-09-23"
+refs = ["RFC-0002:C-PLAYBOOK-PARAMS"]
+
+[content]
+context = """
+[[RFC-0002:C-PLAYBOOK-PARAMS]] requires a supplied parameter value to reach an agent prompt only inside a marked external-input region. The compiler carries such a value as ExternalText, whose segments remember their provenance through `+`. But starlark renders any value as a string through Display: str(), repr(), %-formatting, .format(), and the repr of a list or dict holding the value all call collect_repr or collect_str, and those hooks return nothing and cannot fail. ExternalText's Display wrote the raw value, so any of these produced a plain string the prompt renderer could not mark, and a hostile value carried a forged close marker and instructions straight into the prompt.
+
+Separately, the renderer stripped marker text out of a supplied value to a fixpoint. That kept the region intact but silently: a launcher that tried an injection got a working run and no signal."""
+decision = """
+ExternalText's Display yields a placeholder, U+FDD0 + "external text" + U+FDD0, and never the value. Every string that crosses into a DSL constructor (arguments, list and dict items, dict keys, and the plain spans joined to external text with `+`) is refused with ExternalConverted when it contains U+FDD0. The value's text is therefore absent from any conversion, and the conversion is a compile error at the constructor that receives it.
+
+Attribute access on ExternalText yields a method object whose call throws ExternalMethod at the call site, so `v.upper()` and friends fail with a message that says to join the value with `+`, instead of starlark's missing-attribute error.
+
+The renderer refuses, with ExternalCarriesMarker, an external span that contains either marker's text, checked after `+` has joined adjacent external values. It no longer strips."""
+consequences = """
+The security property does not depend on the check: a conversion never holds the value, so even a conversion whose placeholder is sliced beyond recognition (`str(v)[1:-1]`) yields no hostile text. The compile error is best effort over that and catches every conversion a pack author writes by accident, including after case changes and most string methods, because a noncharacter survives them.
+
+A refused conversion is reported at the constructor that received the string, not at the str() or % that made it, since those hooks cannot raise. Method calls are reported at the call.
+
+`hasattr(v, name)` is true for every name on external text. `v == "x"` stays identity comparison and is always false for a supplied value; that is a separate footgun, not a leak.
+
+A pack literal containing U+FDD0 is refused. Noncharacters do not occur in authored text.
+
+A launch whose value carries a marker now fails to compile with the marker named, so the operator sees the attempt; before, it ran with the marker removed."""
+
+[[content.alternatives]]
+text = "Display yields a withheld placeholder; constructors refuse strings carrying it; markers are refused at render"
+status = "accepted"
+
+[[content.alternatives]]
+text = "Shadow the str and repr builtins with versions that refuse external text"
+status = "rejected"
+rejection_reason = "Covers two of the paths. %-formatting and .format() are string internals that call collect_repr directly, and shadowing str breaks it as a type in annotations."
+
+[[content.alternatives]]
+text = "Keep Display writing the value and rely on a placeholder-free check downstream"
+status = "rejected"
+rejection_reason = "There is nothing downstream to check: once Display has written the value, the result is an ordinary starlark string indistinguishable from one the author typed."
+
+[[content.alternatives]]
+text = "Keep stripping marker text from a supplied value and log a warning"
+status = "rejected"
+rejection_reason = "The compiler has no warnings channel to the launcher, and a rewritten value still runs. Refusing names the marker to whoever launched the run and costs nothing legitimate, since no real value contains the marker text."

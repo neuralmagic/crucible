@@ -36,4 +36,7 @@ clauses = [
 version = "0.1.0"
 date = "2026-08-21"
 notes = "Initial draft"
-changed = ["a settled join forwards a dependency that settled not taken"]
+changed = [
+    "a settled join forwards a dependency that settled not taken",
+    "converting external text to a plain string, and a supplied value carrying a marker, are compile errors",
+]
