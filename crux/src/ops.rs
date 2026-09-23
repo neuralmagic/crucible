@@ -654,6 +654,20 @@ pub async fn draft_delete(c: &Client, draft_id: &str) -> Result<String> {
     Ok(format!("deleted draft {draft_id}\n"))
 }
 
+/// Register a draft's newest compiling version as a playbook, with no review.
+pub async fn draft_publish(
+    c: &Client,
+    draft_id: &str,
+    playbook: Option<&str>,
+    as_json: bool,
+) -> Result<String> {
+    if as_json {
+        return json(&c.publish_draft::<Value>(draft_id, playbook).await?);
+    }
+    let ack: dto::PublishAck = c.publish_draft(draft_id, playbook).await?;
+    Ok(render::draft_published(draft_id, &ack))
+}
+
 /// Export a draft as a PR against `repo`. Already graduated comes back as the controller's own
 /// refusal, which carries the open PR.
 pub async fn draft_graduate(

@@ -1,6 +1,7 @@
 import { Mono, Section, SectionBody, SectionHeader } from '../ui';
 import { MetaRow, Notice } from './formControls';
 import type { components } from '../api/schema';
+import { resourcesLabel } from './sandboxResources';
 
 type PackDispatchDto = components['schemas']['PackDispatchDto'];
 
@@ -16,6 +17,7 @@ export function PackDispatchNotice({ dispatch }: PackDispatchNoticeProps) {
   const backend = dispatch.backend ?? 'unknown';
   const image = dispatch.image;
   const imageBad = image.refusals.length > 0;
+  const resources = resourcesLabel(dispatch.resources);
   return (
     <Section>
       <SectionHeader
@@ -48,6 +50,7 @@ export function PackDispatchNotice({ dispatch }: PackDispatchNoticeProps) {
           {dispatch.sandbox_image === null || dispatch.sandbox_image === undefined ? null : (
             <MetaRow label="sandbox image">{dispatch.sandbox_image}</MetaRow>
           )}
+          {resources === null ? null : <MetaRow label="resources">{resources}</MetaRow>}
           {image.tags.length === 0 ? null : <MetaRow label="channel">{image.tags.join(', ')}</MetaRow>}
           {image.digest === null || image.digest === undefined ? null : (
             <MetaRow label="resolved digest">

@@ -107,6 +107,8 @@ pub struct PlaybookDraftDto {
     pub graduation_repo: Option<String>,
     pub graduation_path: Option<String>,
     pub graduation_pr_url: Option<String>,
+    /// The playbook this draft was last published into, without review.
+    pub published_playbook: Option<String>,
     /// Set once the graduated pack was imported: the draft is read-only from then on.
     pub retired_at: Option<String>,
     /// The newest save; 0 when nothing is saved yet.
@@ -132,6 +134,7 @@ impl PlaybookDraftDto {
             graduation_repo,
             graduation_path,
             graduation_pr_url,
+            published_playbook,
             retired_at,
             owner,
             created_by,
@@ -145,6 +148,7 @@ impl PlaybookDraftDto {
             graduation_repo,
             graduation_path,
             graduation_pr_url,
+            published_playbook,
             retired_at,
             latest_version: s.latest_version,
             compiles: s.compiles,
@@ -871,7 +875,10 @@ pub(crate) async fn launch_playbook_draft(
     let title = format!("draft {id}: {}", draft.description);
     let launch = crate::launches::model::NewPlaybookLaunch {
         playbook: &id,
-        repo: draft.graduation_repo.as_deref().unwrap_or("(draft)"),
+        repo: draft
+            .graduation_repo
+            .as_deref()
+            .unwrap_or(crate::playbooks::registry::DRAFT_LAUNCH_REPO),
         title: &title,
         params: &params,
         schema_digest: &schema_digest,
@@ -994,7 +1001,7 @@ pub struct GraduateAck {
     request_body = GraduateDraftBody,
     responses(
         (status = 200, description = "The export PR", body = GraduateAck),
-        (status = 403, description = "Caller is not in the admin whitelist", body = ErrorBody),
+        (status = 403, description = "The active policy denies the caller this action", body = ErrorBody),
         (status = 404, description = "No draft with that id", body = ErrorBody),
         (status = 409, description = "Already graduated; the body carries the open PR", body = ErrorBody),
         (status = 422, description = "Bad repo/path, or nothing that compiled to export", body = ErrorBody),
@@ -1004,7 +1011,6 @@ pub struct GraduateAck {
 pub(crate) async fn graduate_playbook_draft(
     State(state): State<ApiState>,
     identity: crate::identity::session::Identity,
-    _admin: crate::identity::auth::AdminGuard,
     caller: crate::authz::Caller,
     Path(id): Path<String>,
     Json(body): Json<GraduateDraftBody>,
@@ -1046,6 +1052,116 @@ pub(crate) async fn graduate_playbook_draft(
         )
         .await;
     Json(GraduateAck { pr_url: url }).into_response()
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct PublishDraftBody {
+    /// The playbook to publish into; omitted ⇒ the one this draft last published into, else the
+    /// registered pack it was seeded from.
+    #[serde(default)]
+    playbook: Option<String>,
+    /// The exposure digest the caller reviewed. Re-publishing a playbook whose declared exposure
+    /// changes is refused (409, naming both digests) unless this quotes the new one back.
+    #[serde(default)]
+    accept_exposure_digest: Option<String>,
+}
+
+/// `POST /api/playbook-drafts/{id}/publish` — register the newest compiling version straight into
+/// the registry, with no pull request and no review. The draft stays live; publishing it again
+/// re-pins the same playbook. Re-pinning an existing playbook also takes `playbook:update` on it.
+#[utoipa::path(
+    post,
+    path = "/api/playbook-drafts/{id}/publish",
+    params(("id" = String, Path, description = "Draft id")),
+    request_body = PublishDraftBody,
+    responses(
+        (status = 201, description = "The playbook the draft now serves as", body = crate::playbooks::api::registry::RegisterAck),
+        (status = 403, description = "The active policy denies the caller this action", body = ErrorBody),
+        (status = 404, description = "No draft with that id, or a target playbook the caller may not read", body = ErrorBody),
+        (status = 409, description = "The draft retired, a live draft holds the target id, the target appeared or vanished mid-publish, or its exposure changed unaccepted", body = ErrorBody),
+        (status = 422, description = "No target named, a bad id, or nothing that compiled to publish", body = ErrorBody)
+    )
+)]
+pub(crate) async fn publish_playbook_draft(
+    State(state): State<ApiState>,
+    identity: crate::identity::session::Identity,
+    caller: crate::authz::Caller,
+    Path(id): Path<String>,
+    Json(body): Json<PublishDraftBody>,
+) -> Response {
+    let draft =
+        match readable_draft(&state, &caller, &id, crate::authz::action::Verb::Publish).await {
+            Ok(draft) => draft,
+            Err(refused) => return refused,
+        };
+    let target = match crate::playbooks::drafts::publish_target(&draft, body.playbook.as_deref()) {
+        Ok(target) => target,
+        Err(e) => return draft_refusal(e),
+    };
+    let replaces = match crate::playbooks::registry::get(state.db.pool(), &target).await {
+        Ok(existing) => existing.is_some(),
+        Err(e) => return AppError::from(e).into_response(),
+    };
+    if replaces
+        && let Err(refused) = crate::playbooks::api::registry::readable_playbook(
+            &state,
+            &caller,
+            &target,
+            crate::authz::action::Verb::Update,
+        )
+        .await
+    {
+        return refused;
+    }
+    let (version, tar_gz) =
+        match crate::playbooks::drafts::newest_compiling(state.db.pool(), &id).await {
+            Ok(newest) => newest,
+            Err(e) => return draft_refusal(e),
+        };
+
+    let actor = identity.as_deref();
+    let req = crate::playbooks::registry::PublishDraft {
+        id: target,
+        owner: draft.owner,
+        description: draft.description,
+        draft: id.clone(),
+        version,
+        tar_gz,
+        replaces,
+        accept_exposure_digest: body
+            .accept_exposure_digest
+            .map(|d| d.trim().to_string())
+            .filter(|d| !d.is_empty()),
+    };
+    let registered =
+        match crate::playbooks::registry::publish_draft(state.db.pool(), req, actor).await {
+            Ok(r) => r,
+            Err(e) => return crate::playbooks::api::registry::register_refusal(e),
+        };
+
+    state
+        .audit(
+            crate::event_log::Event::now(
+                &format!("playbook:{}", registered.id),
+                "published",
+                "published",
+                Some(&format!(
+                    "draft {id} v{version} published without review ({})",
+                    registered.schema_digest
+                )),
+                None,
+            )
+            .by(actor),
+            "publish_playbook_draft",
+        )
+        .await;
+    (
+        StatusCode::CREATED,
+        Json(crate::playbooks::api::registry::RegisterAck::from(
+            registered,
+        )),
+    )
+        .into_response()
 }
 
 // --- co-drafting with a local agent ------------------------------------------

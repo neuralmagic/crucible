@@ -12,6 +12,7 @@ mod openshell;
 pub mod outputs;
 mod preflight;
 mod relay;
+mod resources;
 mod search;
 mod secret;
 mod selftest;
@@ -29,6 +30,7 @@ pub use openshell::OpenshellCfg;
 pub use outputs::OutputsCfg;
 pub use preflight::{MODE_PLACEHOLDER, PreflightCfg};
 pub use relay::RelayFile;
+pub use resources::{Quantity, QuantityError, SandboxResources};
 pub use search::SearchCfg;
 pub use secret::{SecretDecl, SecretError, SecretKind};
 pub use selftest::SelftestCfg;
@@ -718,6 +720,9 @@ pub struct AgentCfg {
     /// the `local` / `command` backends.
     #[serde(default)]
     pub openshell: OpenshellCfg,
+    /// GPUs, CPU and memory for the `openshell` backend's sandbox.
+    #[serde(default)]
+    pub resources: SandboxResources,
     /// The loop-pod provisioning broker. Off unless a domain opts in.
     #[serde(default)]
     pub broker: BrokerCfg,

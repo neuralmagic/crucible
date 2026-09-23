@@ -25,6 +25,7 @@ const DISPATCH = {
   requires: {},
   prefers: {},
   allow_unverified_image: false,
+  resources: { gpus: 0, cpu: null, memory: null, node_selector: {} },
   image: {
     reference: null,
     digest: null,
@@ -98,10 +99,8 @@ function playbook(overrides: Partial<PlaybookDto> = {}): PlaybookDto {
     description: 'reads a paper',
     owner: 'user:alice',
     actions: ['read', 'launch'],
-    repo: 'owner/packs',
-    git_ref: 'main',
+    source: { kind: 'git', repo: 'owner/packs', git_ref: 'main', path: 'packs/survey' },
     rev: 'a'.repeat(40),
-    path: 'packs/survey',
     tar_digest: 'sha256:tar',
     schema_digest: 'sha256:old',
     core_rev: 'c'.repeat(40),
@@ -212,12 +211,23 @@ describe('what the gate renders', () => {
 
 describe('matchExistingPlaybook', () => {
   it('matches on repo and pack directory together', () => {
-    const rows = [playbook(), playbook({ id: 'audit', path: 'packs/audit' })];
+    const rows = [
+      playbook(),
+      playbook({
+        id: 'audit',
+        source: { kind: 'git', repo: 'owner/packs', git_ref: 'main', path: 'packs/audit' },
+      }),
+      playbook({ id: 'published', source: { kind: 'draft', draft: 'survey', version: 2 } }),
+    ];
     expect(matchExistingPlaybook(rows, 'owner/packs', 'packs/survey')?.id).toBe('survey');
     expect(matchExistingPlaybook(rows, ' owner/packs ', 'packs/audit')?.id).toBe('audit');
     expect(matchExistingPlaybook(rows, 'owner/packs', 'packs/other')).toBeNull();
     expect(matchExistingPlaybook(rows, 'someone/else', 'packs/survey')).toBeNull();
     expect(matchExistingPlaybook([], 'owner/packs', 'packs/survey')).toBeNull();
+    expect(
+      matchExistingPlaybook(rows.slice(2), 'owner/packs', 'packs/survey'),
+      'a published draft is never an import target'
+    ).toBeNull();
   });
 });
 

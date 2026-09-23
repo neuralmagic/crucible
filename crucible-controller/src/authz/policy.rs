@@ -393,7 +393,8 @@ mod tests {
         assert!(ids.contains(&"platform-admin-all".to_string()));
         assert!(ids.contains(&"team-owner-all".to_string()));
         assert!(ids.contains(&"everyone-read-platform-providers".to_string()));
-        assert_eq!(ids.len(), 16);
+        assert!(ids.contains(&"playbook-publishers-publish".to_string()));
+        assert_eq!(ids.len(), 17);
     }
 
     #[test]
@@ -452,6 +453,108 @@ mod tests {
             assert!(!d.allowed, "{verb:?}");
             assert_eq!(d.reason(), "no-rule");
         }
+    }
+
+    /// Owning a draft is not a licence to register it unreviewed: every owner rule leaves
+    /// `playbook_draft:publish` out, and a rule naming the principal is what grants it.
+    #[test]
+    fn publishing_a_draft_takes_a_rule_that_names_the_principal() {
+        let engine = Engine::load(DEFAULT_POLICY).expect("default");
+        let publish = act(ResourceType::PlaybookDraft, Verb::Publish);
+        let approve = act(ResourceType::PlaybookDraft, Verb::Approve);
+        let owned_by = |owner: Principal| Resource::new(ResourceType::PlaybookDraft, "d", owner);
+        let user_draft = owned_by(Principal::User("alice".into()));
+        let team_draft = owned_by(Principal::Team(slug("mlr")));
+        let group_draft = owned_by(Principal::Group("/groups/mlr".into()));
+        let tagged = |tags: &[(&str, &str)]| {
+            Subject::user(
+                "alice",
+                false,
+                true,
+                tags.iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            )
+        };
+        let team_owner = tagged(&[("team:mlr", "owner")]);
+        let group_owner = tagged(&[("group:/groups/mlr", "owner")]);
+
+        for (who, subject, draft) in [
+            ("user owner", &user("alice"), &user_draft),
+            ("team owner", &team_owner, &team_draft),
+            ("group owner", &group_owner, &group_draft),
+        ] {
+            assert!(
+                engine.authorize(subject, approve, draft, 0).allowed,
+                "a {who} still graduates through review"
+            );
+            let d = engine.authorize(subject, publish, draft, 0);
+            assert!(!d.allowed, "a {who} does not publish: {}", d.reason());
+        }
+        let admin = Subject::user("root", true, true, BTreeMap::new());
+        let d = engine.authorize(&admin, publish, &team_draft, 0);
+        assert!(d.allowed);
+        assert_eq!(d.rules, vec!["platform-admin-all"]);
+
+        let publisher = |tags: &[(&str, &str)]| {
+            let mut tags = tags.to_vec();
+            tags.push(("team:playbook-publishers", "member"));
+            tagged(&tags)
+        };
+        let d = engine.authorize(&publisher(&[]), publish, &user_draft, 0);
+        assert!(
+            d.allowed,
+            "a publisher publishes a draft it owns: {}",
+            d.reason()
+        );
+        assert_eq!(d.rules, vec!["playbook-publishers-publish"]);
+        let d = engine.authorize(
+            &publisher(&[("team:mlr", "owner")]),
+            publish,
+            &team_draft,
+            0,
+        );
+        assert!(d.allowed, "and one its team owns: {}", d.reason());
+        let d = engine.authorize(
+            &publisher(&[("team:mlr", "member")]),
+            publish,
+            &team_draft,
+            0,
+        );
+        assert!(
+            !d.allowed,
+            "a publisher below owner on the draft does not publish"
+        );
+        let d = engine.authorize(
+            &publisher(&[]),
+            publish,
+            &owned_by(Principal::User("bob".into())),
+            0,
+        );
+        assert!(
+            !d.allowed,
+            "a publisher does not publish someone else's draft"
+        );
+
+        let granted = Engine::load(&format!(
+            "{DEFAULT_POLICY}\n@id(\"mlr-publish\") permit(principal, action == Action::\"playbook_draft:publish\", resource) when {{ principal.hasTag(\"team:mlr\") && resource has owner_role }};"
+        ))
+        .expect("a publish grant loads");
+        let d = granted.authorize(&team_owner, publish, &team_draft, 0);
+        assert!(d.allowed, "{}", d.reason());
+        assert_eq!(d.rules, vec!["mlr-publish"]);
+        let d = granted.authorize(
+            &team_owner,
+            publish,
+            &owned_by(Principal::User("bob".into())),
+            0,
+        );
+        assert!(
+            !d.allowed,
+            "the grant reaches only drafts the principal holds a role on"
+        );
+        let d = granted.authorize(&user("carol"), publish, &team_draft, 0);
+        assert!(!d.allowed, "a principal outside the rule does not publish");
     }
 
     #[test]

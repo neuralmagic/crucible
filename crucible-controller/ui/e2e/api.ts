@@ -261,6 +261,7 @@ const UNDISPATCHABLE = {
   requires: {},
   prefers: {},
   allow_unverified_image: false,
+  resources: { gpus: 0, cpu: null, memory: null, node_selector: {} },
   image: {
     reference: 'ghcr.io/example/sandbox:latest',
     digest: null,
@@ -288,6 +289,7 @@ const DISPATCHABLE = {
   requires: {},
   prefers: {},
   allow_unverified_image: false,
+  resources: { gpus: 0, cpu: null, memory: null, node_selector: {} },
   image: {
     reference: null,
     digest: null,
@@ -357,7 +359,7 @@ const RANKED_IMAGES = {
   unverified: [CUSTOM_IMAGE],
 };
 
-const PACK_IMPORT = {
+export const PACK_IMPORT = {
   id: IMPORT_ID,
   repo: 'neuralmagic/other-packs',
   git_ref: null,
@@ -545,10 +547,8 @@ export const ROUTES: Record<string, Json> = {
     {
       id: 'survey',
       description: 'Survey a topic across the tracked repos and file what it finds.',
-      repo: 'neuralmagic/crucible-packs',
-      git_ref: null,
+      source: { kind: 'git', repo: 'neuralmagic/crucible-packs', git_ref: null, path: 'packs/survey' },
       rev: '9f2c1a4c0b3d5e6f7a8b9c0d1e2f3a4b5c6d7e8f',
-      path: 'packs/survey',
       tar_digest: 'sha256:1111',
       schema_digest: 'sha256:2222',
       core_rev: '7c2c1a5',
@@ -562,10 +562,8 @@ export const ROUTES: Record<string, Json> = {
     {
       id: 'triage',
       description: 'Triage the inbox and park what cannot move.',
-      repo: 'neuralmagic/crucible-packs',
-      git_ref: null,
+      source: { kind: 'git', repo: 'neuralmagic/crucible-packs', git_ref: null, path: 'packs/triage' },
       rev: '0a1b2c3d4e5f60718293a4b5c6d7e8f901234567',
-      path: 'packs/triage',
       tar_digest: 'sha256:3333',
       schema_digest: 'sha256:4444',
       core_rev: '7c2c1a5',
@@ -615,6 +613,7 @@ export const ROUTES: Record<string, Json> = {
       graduation_repo: null,
       graduation_path: null,
       graduation_pr_url: null,
+      published_playbook: null,
       retired_at: null,
       latest_version: 1,
       compiles: true,
@@ -633,6 +632,7 @@ export const ROUTES: Record<string, Json> = {
     graduation_repo: null,
     graduation_path: null,
     graduation_pr_url: null,
+    published_playbook: null,
     retired_at: null,
     latest_version: 1,
     compiles: true,

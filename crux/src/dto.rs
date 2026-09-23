@@ -640,6 +640,45 @@ pub struct DraftCompile {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+/// Where a registered pack came from.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PlaybookSource {
+    Git {
+        repo: String,
+        #[serde(default)]
+        git_ref: Option<String>,
+        #[serde(default)]
+        path: String,
+    },
+    Draft {
+        draft: String,
+        version: i64,
+    },
+}
+
+impl PlaybookSource {
+    /// `repo/path`, or the draft version the pack was published from.
+    pub fn label(&self) -> String {
+        match self {
+            PlaybookSource::Git { repo, path, .. } if path.is_empty() => repo.clone(),
+            PlaybookSource::Git { repo, path, .. } => format!("{repo}/{path}"),
+            PlaybookSource::Draft { draft, version } => format!("draft {draft} v{version}"),
+        }
+    }
+}
+
+/// `POST /api/playbook-drafts/{id}/publish`: the playbook the draft now serves as.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PublishAck {
+    pub id: String,
+    pub rev: String,
+    #[serde(default)]
+    pub schema_changed: bool,
+    #[serde(default)]
+    pub exposure_changed: bool,
+}
+
 /// `POST /api/playbook-drafts/{id}/graduate`: the export PR the draft was pushed to.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GraduateAck {
@@ -702,8 +741,7 @@ pub struct Playbook {
     pub id: String,
     #[serde(default)]
     pub description: String,
-    #[serde(default)]
-    pub repo: String,
+    pub source: PlaybookSource,
     #[serde(default)]
     pub rev: String,
     #[serde(default)]

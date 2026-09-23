@@ -6,6 +6,7 @@
 //! Module map:
 //! - [`grpc`]: the tonic channel, mTLS setup, and the typed per-turn gateway client.
 //! - `provider`: mint the Vertex token from ADC (`gcp_auth`) per turn (constants + minting).
+//! - [`placement`]: where a sandbox that asks for GPUs is scheduled.
 //! - `policy`: resolve the egress allowlist (endpoints + binaries) from the manifest.
 //! - `sandbox`: the per-workspace sandbox name + the surviving CLI upload/download argv.
 //! - `gateway`: boot/teardown the local gateway + rootless podman socket (still subprocess).
@@ -13,4 +14,5 @@
 
 pub mod gateway;
 pub mod grpc;
+pub mod placement;
 pub mod policy;

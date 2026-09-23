@@ -10,11 +10,12 @@ Three kinds of caller reach the controller, each on its own credential:
 
 Authorization is separate from all three: who may do what is decided by teams, ownership and
 the policy set ([RFC-0003](./rfc/RFC-0003.md)), from the login and groups the credential
-carries. Three lists bootstrap that on a fresh deployment: `CONTROLLER_ADMINS` (logins that
-administer the platform), `CONTROLLER_OPERATORS` (logins that may operate) and
-`CONTROLLER_OPERATOR_GROUPS` (IdP groups whose members may operate). They seed the platform
-teams while those teams reach nobody; after that, membership is managed in the UI and the
-lists are inert.
+carries. Four lists bootstrap that on a fresh deployment: `CONTROLLER_ADMINS` (logins that
+administer the platform), `CONTROLLER_OPERATORS` (logins that may operate),
+`CONTROLLER_OPERATOR_GROUPS` (IdP groups whose members may operate) and `CONTROLLER_PUBLISHERS`
+(logins that may publish drafts they own without review). They seed the `platform-administrators`,
+`platform-operators` and `playbook-publishers` teams while those teams reach nobody; after that,
+membership is managed in the UI and the lists are inert.
 
 ## The controller as the OIDC relying party
 

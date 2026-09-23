@@ -3005,6 +3005,7 @@ mod tests {
             env: Vec::new(),
             relay: Vec::new(),
             openshell: Default::default(),
+            sandbox_resources: Default::default(),
             broker: Default::default(),
             broker_token: None,
             model: Some("test-model".into()),

@@ -112,7 +112,7 @@ impl ResourceType {
         let extra: &[Verb] = match self {
             ResourceType::Issue => &[Verb::Launch, Verb::Approve],
             ResourceType::Playbook | ResourceType::StandingLaunch => &[Verb::Launch],
-            ResourceType::PlaybookDraft => &[Verb::Launch, Verb::Approve],
+            ResourceType::PlaybookDraft => &[Verb::Launch, Verb::Approve, Verb::Publish],
             ResourceType::PackImport | ResourceType::Scope => &[Verb::Approve],
             ResourceType::Secret => &[Verb::Bind, Verb::Rotate],
             ResourceType::DispatchTarget => &[Verb::Dispatch],
@@ -291,7 +291,7 @@ mod tests {
             Err(ActionError::Malformed { .. })
         ));
         let all = Action::all();
-        assert_eq!(all.len(), 18 * 6 + 14);
+        assert_eq!(all.len(), 18 * 6 + 15);
         let mut sorted = all.clone();
         sorted.dedup();
         assert_eq!(sorted.len(), all.len());
