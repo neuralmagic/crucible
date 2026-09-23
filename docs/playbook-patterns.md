@@ -248,15 +248,15 @@ payload.
 
 <div class="cru-grid">
   <a class="cru-card" href="./dsl-reference.html">
-    <h3>DSL reference <span class="arrow">→</span></h3>
+    <p class="cru-card-title">DSL reference <span class="arrow">→</span></p>
     <p>Every constructor, its lane, and its arguments.</p>
   </a>
   <a class="cru-card" href="./work-graphs.html">
-    <h3>Work graphs <span class="arrow">→</span></h3>
+    <p class="cru-card-title">Work graphs <span class="arrow">→</span></p>
     <p>Readiness, retries, budget, isolation and the plan file format.</p>
   </a>
   <a class="cru-card" href="./plan-states.html">
-    <h3>Plan states <span class="arrow">→</span></h3>
+    <p class="cru-card-title">Plan states <span class="arrow">→</span></p>
     <p>The state machine every task and plan moves through.</p>
   </a>
 </div>

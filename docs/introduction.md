@@ -6,9 +6,9 @@
     <canvas data-molten width="480" height="480" aria-label="The crucible mark, molten: lava sloshing in the vessel. Click to slosh."></canvas>
   </span>
   <div>
-    <p class="eyebrow">A workflow engine for agent work</p>
-    <p class="headline">Write the graph. Crucible runs it and tells you whether it held.</p>
-    <p class="lead">Agent turns, shell commands and checks, declared in Starlark, compiled to a static plan, and run in one Git workspace under a cost ceiling you set.</p>
+    <p class="eyebrow">Deterministic agent orchestration</p>
+    <p class="headline">Agents do the work. The engine decides what runs.</p>
+    <p class="lead">Crucible is a deterministic orchestrator for agent workflows, with sandboxing built in. Declare the graph; the engine schedules it, contains it, and accounts for it.</p>
     <div class="cru-actions">
       <a class="cru-button primary" href="./playbooks.html">Write a playbook →</a>
       <a class="cru-button" href="./controller-local.html">Run the control plane</a>
@@ -17,40 +17,46 @@
   </div>
 </div>
 
-A crucible workflow is a graph of tasks: an agent turn that drafts a fix, a command that runs
-the tests, a reviewer that sends the draft back, a route that picks a branch. You write the
-graph once. The engine owns everything after that: what runs next, what a failure means,
-what gets retried, and what the run cost.
-
-## Two lanes
+A workflow is a graph of agent turns, commands and checks. An agent never picks what runs
+next: the executor does, by rules you can read before the run starts.
 
 <div class="cru-lanes">
   <div class="cru-lane">
-    <h3>Playbooks</h3>
-    <p class="tag">Run once, ship the result</p>
-    <p>The graph runs to completion and hands back what it produced, with a verdict that says whether every required task held.</p>
+    <h3>Deterministic</h3>
+    <p class="tag">The plan you review is the plan that runs</p>
     <ul>
-      <li>Branch on typed answers with <code>route()</code></li>
-      <li>Send a draft back to its author with <code>revise</code></li>
-      <li>Fan out one isolated instance per item with <code>over</code></li>
+      <li>Workflows compile to a static plan. Loops and functions unroll at compile time.</li>
+      <li>The executor owns advancement. Dispatch order is stable and the event stream is reproducible.</li>
+      <li>Outcomes follow fixed rules: transport failures retry, measured failures never do, and a plan that cannot run in full dispatches nothing.</li>
+      <li>Cost and time ceilings are inputs to every run.</li>
     </ul>
-    <p>Triage, reviews, release notes, anything with an end.</p>
   </div>
   <div class="cru-lane scored">
-    <h3>Autoresearch</h3>
-    <p class="tag">Loop until the number moves</p>
-    <p>The graph runs inside a keep-or-discard loop. An agent proposes a change, a frozen judge measures it, and the engine keeps it only if it beats the best so far.</p>
+    <h3>Sandboxed</h3>
+    <p class="tag">The host holds the keys</p>
     <ul>
-      <li>Latency, throughput, a failing test suite</li>
-      <li>Git is the memory: kept candidates are commits</li>
-      <li>Wide rounds, portfolios, composite domains</li>
+      <li>Agent turns run in OpenShell sandboxes with deny-by-default egress.</li>
+      <li>Privileged operations go through a mediated broker: the agent asks over MCP, the host acts.</li>
+      <li>A pack declares its egress and credentials, and <code>crucible check</code> lists them before anything runs.</li>
+      <li>Launch parameters reach prompts, never a command line.</li>
     </ul>
-    <p>Anything you can score with one command.</p>
   </div>
 </div>
 
-Both lanes share the DSL, the executor and the control plane. A playbook is the graph; an
-autoresearch run is the same graph with a loop around it.
+## Two lanes
+
+The same engine runs two kinds of workflow.
+
+<div class="cru-grid">
+  <a class="cru-card" href="./playbooks.html">
+    <p class="cru-card-title">Playbooks <span class="arrow">→</span></p>
+    <p>Run the graph once and ship what it produced, with a verdict on whether every required task held. Branches, review rounds and fan-out are decided at runtime, each bounded.</p>
+  </a>
+  <a class="cru-card" href="./how-it-works.html">
+    <p class="cru-card-title">Autoresearch <span class="arrow">→</span></p>
+    <p>Run the graph inside a keep-or-discard loop against a frozen judge. A change is kept only if it scores better than the best so far, and Git is the memory.</p>
+  </a>
+</div>
 
 ## A playbook, end to end
 
@@ -106,47 +112,31 @@ with low-confidence answers recorded as `uncertain`, which `otherwise` catches.
   <figcaption>A playbook run in the control plane: a fanned-out build and measure, one failed instance, an advisory profile, and each task's cost.</figcaption>
 </figure>
 
-## What the engine holds for you
-
-- **One workspace.** Tasks share a Git checkout. A task's declared files are staged for its
-  dependents, and each passing task is a commit, so the run's history is `git log`.
-- **Failures mean something.** Transport failures retry; measured failures never do. A task
-  that cannot run on this substrate truncates the plan before anything spends. An advisory
-  task can fail without invalidating the run.
-- **Cost is an input.** A playbook does not start without `--max-cost` and `--max-time`, and
-  spend is counted per attempt.
-- **Agents run in a sandbox.** With the `openshell` backend each turn runs in a
-  deny-by-default sandbox; the host keeps the credentials and the agent asks for what it
-  needs over MCP.
-- **The graph is static.** Starlark loops and functions unroll at compile time, so the plan
-  you review is the plan that runs. Only `route`, `revise` and `over` decide anything at
-  runtime, and each is bounded.
-
 ## Where to go next
 
 <div class="cru-grid">
   <a class="cru-card" href="./playbooks.html">
-    <h3>Your first playbook <span class="arrow">→</span></h3>
+    <p class="cru-card-title">Your first playbook <span class="arrow">→</span></p>
     <p>Write a pack, run it with no model, then point it at a real agent.</p>
   </a>
   <a class="cru-card" href="./playbook-patterns.html">
-    <h3>Branching and review <span class="arrow">→</span></h3>
+    <p class="cru-card-title">Branching and review <span class="arrow">→</span></p>
     <p>Routes, revise loops, fan-out, sessions, joins and advisory tasks.</p>
   </a>
   <a class="cru-card" href="./dsl-reference.html">
-    <h3>DSL reference <span class="arrow">→</span></h3>
+    <p class="cru-card-title">DSL reference <span class="arrow">→</span></p>
     <p>Every constructor and argument, generated from the compiler.</p>
   </a>
   <a class="cru-card" href="./how-it-works.html">
-    <h3>The autoresearch loop <span class="arrow">→</span></h3>
+    <p class="cru-card-title">The autoresearch loop <span class="arrow">→</span></p>
     <p>Propose, apply, measure, keep or discard, against a frozen judge.</p>
   </a>
   <a class="cru-card" href="./controller-local.html">
-    <h3>The control plane <span class="arrow">→</span></h3>
+    <p class="cru-card-title">The control plane <span class="arrow">→</span></p>
     <p>A UI, API and CLI for launching and watching runs. Starts on a laptop with one command.</p>
   </a>
   <a class="cru-card" href="./crucible-contract.html">
-    <h3>The contract <span class="arrow">→</span></h3>
+    <p class="cru-card-title">The contract <span class="arrow">→</span></p>
     <p>The frozen interface between the engine and a domain.</p>
   </a>
 </div>

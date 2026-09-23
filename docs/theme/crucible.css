@@ -515,12 +515,14 @@ a.cru-card:hover {
   transform: translateY(-1px);
 }
 
-.cru-card h3 {
+.cru-card .cru-card-title {
   margin-block: 0 0.35rem;
+  color: var(--fg);
   font-size: 1.65rem;
+  font-weight: 700;
 }
 
-.cru-card p {
+.cru-card p:not(.cru-card-title) {
   margin-block: 0;
   color: var(--cru-muted);
   font-size: 1.42rem;

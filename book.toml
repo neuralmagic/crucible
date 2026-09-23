@@ -1,6 +1,6 @@
 [book]
 title = "crucible"
-description = "A workflow engine for agent work: playbooks that run once and ship, and autoresearch loops that keep only what a frozen judge scores better."
+description = "A deterministic agent orchestrator with native sandboxing."
 authors = ["crucible contributors"]
 src = "docs"
 language = "en"
