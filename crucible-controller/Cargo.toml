@@ -195,10 +195,19 @@ regex = "1"
 regex-syntax = "0.8"
 cedar-policy = "4.12.0"
 
+# A Postgres the controller runs itself, for `DATABASE_URL=embedded`.
+postgresql_embedded = { version = "0.21", default-features = false, features = [
+    "theseus",
+    "tokio",
+    "tls-rustls-aws-lc-rs",
+], optional = true }
+
 [features]
 # The machine-initiated scored lane: GitHub discovery and triage, ranking, scope proposal and its
 # approval gate, image builds, and scored loop runs. Off, the controller is the playbook engine.
 autoresearch = ["dep:genai", "dep:gcp_auth"]
+# `DATABASE_URL=embedded`: the daemon runs its own Postgres under the state dir.
+embedded-db = ["dep:postgresql_embedded"]
 
 [dev-dependencies]
 tempfile = "3"
