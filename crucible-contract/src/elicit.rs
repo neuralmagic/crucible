@@ -24,6 +24,9 @@ pub const MAX_BUTTONS: usize = 25;
 /// descriptions.
 pub const MAX_TEXT_LEN: usize = 3000;
 
+/// The most blocks Slack accepts in one message, which bounds how many questions one route asks.
+pub const MAX_BLOCKS: usize = 50;
+
 /// What the engine PUTs to open a question. Opening an open question changes nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ElicitRequest {
@@ -203,6 +206,7 @@ fn descriptions_text(question: &Question) -> Option<String> {
 pub enum SlackLimit {
     TooManyLabels { got: usize },
     TextTooLong { got: usize },
+    TooManyBlocks { got: usize },
 }
 
 impl std::fmt::Display for SlackLimit {
@@ -215,6 +219,10 @@ impl std::fmt::Display for SlackLimit {
             SlackLimit::TextTooLong { got } => write!(
                 f,
                 "its text renders to {got} characters, over Slack's {MAX_TEXT_LEN}"
+            ),
+            SlackLimit::TooManyBlocks { got } => write!(
+                f,
+                "its questions render to {got} Slack blocks, over Slack's {MAX_BLOCKS} per message"
             ),
         }
     }
@@ -233,6 +241,24 @@ pub fn fits_slack(question: &Question) -> Result<(), SlackLimit> {
         if got > MAX_TEXT_LEN {
             return Err(SlackLimit::TextTooLong { got });
         }
+    }
+    Ok(())
+}
+
+/// Whether Slack accepts [`slack_message`] for `questions` at its largest: every question open
+/// and the run link present.
+pub fn message_fits_slack(questions: &BTreeMap<QuestionId, Question>) -> Result<(), SlackLimit> {
+    let largest = MessageContext {
+        run: "",
+        task: "",
+        run_url: Some(""),
+        deadline_unix: 0,
+    };
+    let got = slack_message(&largest, questions, &BTreeMap::new(), false)["blocks"]
+        .as_array()
+        .map_or(0, Vec::len);
+    if got > MAX_BLOCKS {
+        return Err(SlackLimit::TooManyBlocks { got });
     }
     Ok(())
 }
@@ -726,6 +752,51 @@ mod tests {
             fits_slack(&described),
             Err(SlackLimit::TextTooLong { .. })
         ));
+    }
+
+    #[test]
+    fn a_message_fits_slack_up_to_its_block_limit_counted_at_its_largest() {
+        let asked = |n: usize, described: bool| -> BTreeMap<QuestionId, Question> {
+            (0..n)
+                .map(|i| {
+                    let question = Question {
+                        instructions: format!("question {i}?"),
+                        kind: QuestionKind::Choice {
+                            options: ["a", "b"]
+                                .into_iter()
+                                .map(|l| ChoiceOption {
+                                    label: label(l),
+                                    description: described.then(|| format!("option {l}")),
+                                })
+                                .collect(),
+                        },
+                        drop: vec![],
+                    };
+                    (qid(&format!("q{i}")), question)
+                })
+                .collect()
+        };
+        let blocks = |questions: &BTreeMap<QuestionId, Question>| {
+            slack_message(&ctx(), questions, &BTreeMap::new(), false)["blocks"]
+                .as_array()
+                .unwrap()
+                .len()
+        };
+        for described in [false, true] {
+            let per_question = if described { 4 } else { 3 };
+            let most = (MAX_BLOCKS - 3) / per_question;
+            let fits = asked(most, described);
+            assert!(blocks(&fits) <= MAX_BLOCKS);
+            assert_eq!(message_fits_slack(&fits), Ok(()), "{most} questions");
+            let over = asked(most + 1, described);
+            assert_eq!(
+                message_fits_slack(&over),
+                Err(SlackLimit::TooManyBlocks { got: blocks(&over) }),
+                "{} questions",
+                most + 1
+            );
+            assert!(blocks(&over) > MAX_BLOCKS);
+        }
     }
 
     #[test]

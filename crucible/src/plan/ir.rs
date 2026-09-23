@@ -615,6 +615,11 @@ pub enum PlanError {
         question: String,
         error: crucible_contract::elicit::SlackLimit,
     },
+    #[error("human-decided route task {task:?}: {error}")]
+    RouteUnfitForSlack {
+        task: String,
+        error: crucible_contract::elicit::SlackLimit,
+    },
     #[error(
         "route task {task:?} decides from {source_task:?}, which is not one of its dependencies"
     )]
@@ -936,6 +941,12 @@ impl Plan {
                                 }
                             })?;
                         }
+                        crucible_contract::elicit::message_fits_slack(questions).map_err(
+                            |error| PlanError::RouteUnfitForSlack {
+                                task: task(),
+                                error,
+                            },
+                        )?;
                     }
                     Decider::Output { task: source } => {
                         if !t.depends_on.contains(source) {
@@ -1733,6 +1744,42 @@ mod tests {
                 },
             }
         );
+        if let TaskKind::Route { decider, .. } = &mut gate.task {
+            *decider = Decider::Model {
+                min_confidence: 0.5,
+            };
+        }
+        gate.needs = NEEDS_SYSTEMONE.into();
+        plan(vec![gate]).validate().unwrap();
+    }
+
+    #[test]
+    fn a_human_route_rejects_more_questions_than_one_slack_message_holds() {
+        use crucible_contract::elicit::{MAX_BLOCKS, SlackLimit};
+        let asking = |n: usize| {
+            let mut gate = human_route("gate", &[], 600);
+            if let TaskKind::Route { questions, .. } = &mut gate.task {
+                *questions = (0..n)
+                    .map(|i| (qid(&format!("q{i}")), area_question(&["uncertain"])))
+                    .collect();
+            }
+            gate
+        };
+        let per_question = 3;
+        let most = (MAX_BLOCKS - 3) / per_question;
+        plan(vec![asking(most)]).validate().unwrap();
+        let err = plan(vec![asking(most + 1)]).validate().unwrap_err();
+        assert_eq!(
+            err,
+            PlanError::RouteUnfitForSlack {
+                task: "gate".into(),
+                error: SlackLimit::TooManyBlocks {
+                    got: 3 + per_question * (most + 1)
+                },
+            }
+        );
+        assert!(err.to_string().contains("per message"), "{err}");
+        let mut gate = asking(most + 1);
         if let TaskKind::Route { decider, .. } = &mut gate.task {
             *decider = Decider::Model {
                 min_confidence: 0.5,
