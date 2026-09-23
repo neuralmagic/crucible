@@ -1,0 +1,30 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-09-22-003"
+title = "Tell an agent turn which fields its result must carry"
+status = "queue"
+created = "2026-09-22"
+refs = [
+    "RFC-0001:C-OUTPUTS",
+    "RFC-0001:C-WORKFLOW",
+]
+
+[content]
+description = """
+The result contract the engine appends to an agent prompt says to write one JSON object to PLAN_TASK_RESULT.json and nothing about its fields. A task with `emits = ["lines"]` fails as a measured failure when the object lacks `lines`, but the turn was never told it owed one, so every pack has to repeat its emits in prose. When a task declares emits, the appended contract should name the fields."""
+
+[[content.acceptance_criteria]]
+text = "the result contract appended to an agent or skill prompt lists the task's declared emits fields when there are any"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "a task with no emits gets the contract as it is today"
+status = "pending"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "a prompt-rendering test pins both forms"
+status = "pending"
+category = "added"
