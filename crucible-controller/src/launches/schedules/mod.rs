@@ -51,10 +51,6 @@ impl ScheduleStore {
         Self { db }
     }
 
-    fn select(&self) -> String {
-        SELECT.replace("{COLUMNS}", standing::COLUMNS)
-    }
-
     /// When a schedule in this state fires next: nothing while disabled, otherwise the first
     /// occurrence after `now`.
     fn due_after(&self, spec: &CronSpec, enabled: bool, now: Timestamp) -> Option<String> {
@@ -359,9 +355,13 @@ impl From<ScheduleRow> for Schedule {
     }
 }
 
-const SELECT: &str = "SELECT {COLUMNS}, s.cron_expr, s.tz, s.cursor_from, s.cursor_param, \
+const SELECT: &str = const_format::concatcp!(
+    "SELECT ",
+    standing::COLUMNS,
+    ", s.cron_expr, s.tz, s.cursor_from, s.cursor_param, \
     s.cursor_path, s.cursor_value, s.cursor_updated_at, s.next_due_at, s.last_fired_at \
-    FROM playbook_standing_launches c JOIN playbook_schedules s USING (id)";
+    FROM playbook_standing_launches c JOIN playbook_schedules s USING (id)"
+);
 
 impl ScheduleStore {
     /// Store a schedule. The values were validated against the pack's stored schema and the
@@ -461,11 +461,11 @@ impl ScheduleStore {
 
     /// Every schedule, soonest-due first among the enabled ones.
     pub(crate) async fn list(&self, limit: i64) -> Result<Vec<Schedule>> {
-        let sql = format!(
-            "{} ORDER BY c.enabled DESC, s.next_due_at NULLS LAST, c.id LIMIT $1",
-            self.select()
+        let sql = const_format::concatcp!(
+            SELECT,
+            " ORDER BY c.enabled DESC, s.next_due_at NULLS LAST, c.id LIMIT $1"
         );
-        let rows = sqlx::query_as::<_, ScheduleRow>(&sql)
+        let rows = sqlx::query_as::<_, ScheduleRow>(sql)
             .bind(limit)
             .fetch_all(self.db.pool())
             .await
@@ -475,8 +475,8 @@ impl ScheduleStore {
 
     /// One schedule by id, or `None`.
     pub(crate) async fn get(&self, id: &str) -> Result<Option<Schedule>> {
-        let sql = format!("{} WHERE c.id = $1", self.select());
-        let row = sqlx::query_as::<_, ScheduleRow>(&sql)
+        let sql = const_format::concatcp!(SELECT, " WHERE c.id = $1");
+        let row = sqlx::query_as::<_, ScheduleRow>(sql)
             .bind(id)
             .fetch_optional(self.db.pool())
             .await

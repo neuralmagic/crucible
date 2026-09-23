@@ -52,7 +52,7 @@ tokio = { workspace = true, features = ["sync", "process"] }
 # offline mode (checked-in `.sqlx/`). The controller is the workspace's only sqlx user.
 # The `sqlite` driver exists ONLY for `db import-sqlite` (the one-shot cutover reader of a
 # pre-Postgres ledger file, runtime queries only) — never write new sqlite-facing code.
-sqlx = { version = "0.8", default-features = false, features = [
+sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "postgres",
     "sqlite",
@@ -62,6 +62,8 @@ sqlx = { version = "0.8", default-features = false, features = [
     "json",
 ] }
 uuid.workspace = true
+# Compile-time SQL assembly: a query spliced from `const` column lists stays `&'static str`.
+const_format = "0.2"
 jsonschema.workspace = true
 # Scratch-database URL derivation for `db verify`/`db rebuild` (swap the database name in the
 # ledger URL); already in the tree via reqwest.
@@ -106,10 +108,10 @@ openidconnect = { version = "4", default-features = false }
 # The HTTP API (lane F): default features give the Json/Form extractors the frozen routes need
 # (API clients POST JSON, the ingest drop-box POSTs urlencoded).
 axum = "0.8"
-# Server-side HTTP sessions (cookie id -> Postgres row) on the human surface. Held at 0.14: the
-# sqlx store below pins tower-sessions-core 0.14 — bump both together.
-tower-sessions = { version = "0.14", default-features = false, features = ["axum-core"] }
-tower-sessions-sqlx-store = { version = "0.15", default-features = false, features = ["postgres"] }
+# Server-side HTTP sessions (cookie id -> Postgres row) on the human surface. The store is pinned
+# to its sqlx 0.9 main by git until a release carries it; bump tower-sessions with it.
+tower-sessions = { version = "0.15", default-features = false, features = ["axum-core"] }
+tower-sessions-sqlx-store = { git = "https://github.com/wseaton/tower-sessions-stores", rev = "d18c9bf76f1d4fb73130dbe5aa643197f14b5d2d", default-features = false, features = ["postgres"] }
 # The tier-ranking cache key (stage 2, lane J): sha256 of an issue's title+body+labels, and the
 # digest an api key's secret half is stored as.
 sha2 = "0.10"

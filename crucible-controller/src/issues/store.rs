@@ -135,8 +135,8 @@ pub(crate) async fn park_issue(
 /// Fetch one issue by key, decoded into strong types, or `None` if untracked.
 #[tracing::instrument(name = "db.get_issue", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", key = %key), err)]
 pub async fn get_issue(ex: impl PgExecutor<'_>, key: &str) -> Result<Option<Issue>> {
-    let sql = format!("SELECT {ISSUE_COLS} FROM issues WHERE key = $1");
-    sqlx::query(&sql)
+    let sql = const_format::formatcp!("SELECT {ISSUE_COLS} FROM issues WHERE key = $1");
+    sqlx::query(sql)
         .bind(key)
         .fetch_optional(ex)
         .await
@@ -219,7 +219,7 @@ pub(crate) async fn list_issues_filtered(
     );
     let status = q.status.map(|s| s.as_str());
     let label_pattern = q.label.as_ref().map(|l| format!("%\"{l}\"%"));
-    let mut query = sqlx::query(&sql)
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(status)
         .bind(&q.tier)
         .bind(&q.repo)
@@ -434,8 +434,9 @@ pub(crate) async fn list_scopes_for_issue(
     ex: impl PgExecutor<'_>,
     issue: &str,
 ) -> Result<Vec<Scope>> {
-    let sql = format!("SELECT {SCOPE_COLS} FROM scopes WHERE issue = $1 ORDER BY id");
-    let rows = sqlx::query(&sql)
+    let sql =
+        const_format::formatcp!("SELECT {SCOPE_COLS} FROM scopes WHERE issue = $1 ORDER BY id");
+    let rows = sqlx::query(sql)
         .bind(issue)
         .fetch_all(ex)
         .await
@@ -477,8 +478,8 @@ fn decode_scope(r: &sqlx::postgres::PgRow) -> Result<Scope> {
 /// (`GET /api/approvals/{scope_id}/evidence`) needs the owning issue key to reconstruct the pack path.
 #[tracing::instrument(name = "db.get_scope_by_id", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", id = id), err)]
 pub(crate) async fn get_scope_by_id(ex: impl PgExecutor<'_>, id: i64) -> Result<Option<Scope>> {
-    let sql = format!("SELECT {SCOPE_COLS} FROM scopes WHERE id = $1");
-    sqlx::query(&sql)
+    let sql = const_format::formatcp!("SELECT {SCOPE_COLS} FROM scopes WHERE id = $1");
+    sqlx::query(sql)
         .bind(id)
         .fetch_optional(ex)
         .await
@@ -846,8 +847,10 @@ pub(crate) async fn set_scope_exposure(
 /// issue was never scoped.
 #[tracing::instrument(name = "db.latest_scope_for_issue", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", issue = %issue), err)]
 pub async fn latest_scope_for_issue(ex: impl PgExecutor<'_>, issue: &str) -> Result<Option<Scope>> {
-    let sql = format!("SELECT {SCOPE_COLS} FROM scopes WHERE issue = $1 ORDER BY id DESC LIMIT 1");
-    sqlx::query(&sql)
+    let sql = const_format::formatcp!(
+        "SELECT {SCOPE_COLS} FROM scopes WHERE issue = $1 ORDER BY id DESC LIMIT 1"
+    );
+    sqlx::query(sql)
         .bind(issue)
         .fetch_optional(ex)
         .await

@@ -81,4 +81,6 @@ allow-git = [
     "https://github.com/wseaton/OpenShell",
     # The broker's pinned jira-mcp dep.
     "https://github.com/wseaton/jira-mcp",
+    # tower-sessions-sqlx-store on sqlx 0.9, pinned by rev until a release carries it.
+    "https://github.com/wseaton/tower-sessions-stores",
 ]

@@ -6,12 +6,24 @@
       {
         "ordinal": 0,
         "name": "issue_key?",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "runs",
+            "name": "issue"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "repo?",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "issues",
+            "name": "repo"
+          }
+        }
       }
     ],
     "parameters": {
@@ -21,7 +33,7 @@
     },
     "nullable": [
       true,
-      false
+      true
     ]
   },
   "hash": "4a798669769ca506721fa4e93a45976aa03f723a916bdd19cc76e83387316ecd"
