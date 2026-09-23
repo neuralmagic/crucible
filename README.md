@@ -123,9 +123,14 @@ Build and install from source:
 ```bash
 git clone https://github.com/neuralmagic/crucible.git
 cd crucible
-cargo build --release -p crucible
+cargo build --release -p crucible --features autoresearch
 install -m 755 target/release/crucible ~/.local/bin/crucible
 ```
+
+Without `--features autoresearch` the binary is the playbook workflow engine alone: `plan`,
+`check`, `deploy`, `build`, `flow` and `fetch` work, and the optimization loop, `scope`,
+`rank-grounded`, `watch-pr` and `loop-states` are not built. Release binaries and images carry
+the feature.
 
 Place the destination directory on `PATH`. Published binaries, when available for a
 platform, are listed on the [GitHub releases page](https://github.com/neuralmagic/crucible/releases).
@@ -139,7 +144,7 @@ and Git history without a model or cluster. Its `command` backend increments the
 From a source checkout:
 
 ```bash
-cargo run -p crucible -- \
+cargo run -p crucible --features autoresearch -- \
   --manifest examples/counter/crucible.toml \
   --iterations 6
 ```
@@ -405,7 +410,8 @@ intended for deterministic tests and integrations that provide their own propose
 ## CLI reference
 
 Running `crucible` without a subcommand starts an optimization loop and requires
-`--manifest`. The principal subcommands are:
+`--manifest`. The loop, `scope`, `watch-pr`, `rank-grounded` and `loop-states` need a build with
+`--features autoresearch`. The principal subcommands are:
 
 | Command | Function |
 | --- | --- |

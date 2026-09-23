@@ -1,8 +1,11 @@
 #![allow(clippy::disallowed_macros)]
 
+#[cfg(feature = "autoresearch")]
 use super::grounded::TierGate;
+#[cfg(feature = "autoresearch")]
 use super::grounded::*;
 use super::lifecycle::*;
+#[cfg(feature = "autoresearch")]
 use super::scope::*;
 use super::*;
 use crate::Db;
@@ -21,6 +24,7 @@ fn db_with(pool: PgPool) -> (Db, tempfile::TempDir) {
 }
 
 /// Store `files` as `key`'s durable pack tarball — what the reconcile readers materialize.
+#[cfg(feature = "autoresearch")]
 async fn seed_stored_pack(db: &Db, key: &str, files: &[(&str, &str)]) {
     let dir = tempfile::tempdir().expect("tempdir");
     for (name, body) in files {
@@ -46,6 +50,7 @@ fn db_with_metrics(pool: PgPool) -> (Db, crate::metrics::Metrics, tempfile::Temp
 
 /// Applying a plain text-tier verdict moves `crucible_rank_verdicts_total` with the verdict's
 /// tier/disposition/confidence/grounded labels — the reconcile choke point, driven directly.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn apply_verdict_moves_the_rank_verdict_counter(pool: PgPool) -> Result<()> {
     let (db, metrics, dir) = db_with_metrics(pool);
@@ -333,6 +338,7 @@ fn cfg_with(state_dir: &Path, profile: Profile) -> ControllerCfg {
 /// A stand-in `crucible` binary: on `scope`, print a `ScopeReport` JSON to stdout — a surviving
 /// pack (a digest, all stages passed) or a dead one (a failing validate stage, no digest). The
 /// same command-backend seam the engine's real proposer uses one level up.
+#[cfg(feature = "autoresearch")]
 fn fake_crucible(dir: &Path, survive: bool) -> PathBuf {
     let json = if survive {
         r#"{"stages":[{"name":"ingest","passed":true,"detail":"goal"},{"name":"propose","passed":true,"detail":"drafted (turn cost $0.4200)"},{"name":"validate","passed":true,"detail":"crucible check: OK"},{"name":"freeze","passed":true,"detail":"wrote SCOPE.md"}],"digest":"v1:deadbeefcafef00d","cost":0.42}"#
@@ -377,6 +383,7 @@ async fn mark_scenario(pool: &sqlx::PgPool, key: &str) -> Result<()> {
 /// Insert a `scenarios` sidecar row (plus its single-entry `scenario_repos` hint) — no adopt
 /// endpoint exists yet (Phase 4), so tests stamp it directly, the same way [`mark_scenario`]
 /// stamps `input_kind`.
+#[cfg(feature = "autoresearch")]
 async fn insert_scenario_body(pool: &sqlx::PgPool, key: &str, body: &str) -> Result<()> {
     sqlx::query("INSERT INTO scenarios (key, title, body, created_by) VALUES ($1, $2, $3, $4)")
         .bind(key)
@@ -395,6 +402,7 @@ async fn insert_scenario_body(pool: &sqlx::PgPool, key: &str, body: &str) -> Res
 
 /// Like [`fake_crucible`], but also dumps every `scope` invocation's argv (one arg per line) to
 /// `argv_path` — for tests asserting exactly which flags the controller passed.
+#[cfg(feature = "autoresearch")]
 fn fake_crucible_capturing_argv(dir: &Path, argv_path: &Path) -> PathBuf {
     let json = r#"{"stages":[{"name":"ingest","passed":true,"detail":"goal"},{"name":"propose","passed":true,"detail":"drafted (turn cost $0.4200)"},{"name":"validate","passed":true,"detail":"crucible check: OK"},{"name":"freeze","passed":true,"detail":"wrote SCOPE.md"}],"digest":"v1:deadbeefcafef00d","cost":0.42}"#;
     let path = dir.join("crucible-argv-capture");
@@ -498,6 +506,7 @@ async fn mount_ranker_confirms(server: &wiremock::MockServer, tier: &str) {
 
 /// A ranking response whose affinity is `unrelated`: whatever the tier says, the verdict must
 /// park the issue off-rubric before any grounding or scope spend.
+#[cfg(feature = "autoresearch")]
 async fn mount_ranker_unrelated(server: &wiremock::MockServer, tier: &str) {
     mount_ranker_verdict(
         server,
@@ -509,12 +518,14 @@ async fn mount_ranker_unrelated(server: &wiremock::MockServer, tier: &str) {
 }
 
 /// A ranking response that never parses — the malformed-output path.
+#[cfg(feature = "autoresearch")]
 async fn mount_ranker_malformed(server: &wiremock::MockServer) {
     mount_ranker_verdict(server, "not json").await;
 }
 
 /// How many ranking calls `server` has received so far (the cache-hit test's proof, counting
 /// real HTTP requests instead of inferring from a counter file or ledger cost).
+#[cfg(feature = "autoresearch")]
 async fn rank_calls(server: &wiremock::MockServer) -> usize {
     server
         .received_requests()
@@ -525,6 +536,7 @@ async fn rank_calls(server: &wiremock::MockServer) -> usize {
         .count()
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn new_with_a_surviving_pack_goes_scoped_with_ledger_and_event(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -611,6 +623,7 @@ async fn new_with_a_surviving_pack_goes_scoped_with_ledger_and_event(pool: PgPoo
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn new_with_a_dead_proposal_parks_machine_with_the_reason(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -676,6 +689,7 @@ async fn new_with_a_dead_proposal_parks_machine_with_the_reason(pool: PgPool) ->
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn daily_ceiling_declines_a_new_scope_and_records_capped(pool: PgPool) -> Result<()> {
     let (db, dir) = db_with(pool);
@@ -715,6 +729,7 @@ async fn daily_ceiling_declines_a_new_scope_and_records_capped(pool: PgPool) -> 
 /// A non-upstream (scenario) `new` row with a NULL `upstream_updated_at` and every
 /// autopilot gate already blown (rank horizon, daily ceiling, scopes/day) still reaches the
 /// scope turn — the human adoption is the authorization, not the ranker or the caps.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn scenario_kind_bypasses_rank_horizon_tier_and_caps(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -771,6 +786,7 @@ async fn scenario_kind_bypasses_rank_horizon_tier_and_caps(pool: PgPool) -> Resu
 /// stamps the other scenario tests use) still reaches the scope turn with the daily ceiling and
 /// scopes/day cap already blown — R2's caps-bypass claim, proven against the actual adopt path
 /// rather than a synthetic row.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn adopted_scenario_bypasses_caps_end_to_end(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -885,6 +901,7 @@ async fn scenario_bypass_is_idempotent_across_pod_redrives(pool: PgPool) -> Resu
 
 /// A scenario row's scope turn is framed by its ledgered free text, not a GitHub fetch: the
 /// argv the controller passes `crucible scope --propose` carries `--goal-file`, never `--issue`.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn scope_propose_uses_goal_file_not_issue_for_a_scenario(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -925,6 +942,7 @@ async fn scope_propose_uses_goal_file_not_issue_for_a_scenario(pool: PgPool) -> 
 /// The scope freeze extracts the exposure with the same publish target a loop run of the pack is
 /// rendered with, so the disclosure an approver signs names the fork the run would open against
 /// rather than an incomplete engine default.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn the_frozen_exposure_carries_the_publish_target_a_run_would_use(
     pool: PgPool,
@@ -966,6 +984,7 @@ async fn the_frozen_exposure_carries_the_publish_target_a_run_would_use(
 
 /// A kind with no PR backlink (a scenario) never calls `open_pack_pr`: `reconcile_scoped` skips
 /// straight to `awaiting-approval` with no `approval_pr`, for the Phase 4 UI-approve endpoint.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn reconcile_scoped_never_opens_a_pack_pr_for_a_scenario(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -1006,6 +1025,7 @@ async fn reconcile_scoped_never_opens_a_pack_pr_for_a_scenario(pool: PgPool) -> 
 /// (the same `operations::record_approval` the API handler calls) → the run launches — one
 /// scenario row driven through every reconcile stage with no synthetic status jumps. Proves the
 /// full adopt-to-run wire, not just each stage in isolation.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn scenario_adopt_to_run_end_to_end(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -1148,6 +1168,7 @@ async fn scopes_per_day_cap_declines_a_new_scope(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn concurrent_pod_cap_declines_an_approved_launch(pool: PgPool) -> Result<()> {
     let (db, dir) = db_with(pool);
@@ -1209,6 +1230,7 @@ async fn concurrent_pod_cap_declines_an_approved_launch(pool: PgPool) -> Result<
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn dispatch_failure_surfaces_the_error_chain_on_the_event_log(pool: PgPool) -> Result<()> {
     // An approved run whose dispatch dies in render (here: no deploy profile configured) must
@@ -1276,6 +1298,7 @@ async fn dispatch_failure_surfaces_the_error_chain_on_the_event_log(pool: PgPool
 /// mints a FRESH run id, re-launches the SAME stored pack through `dispatch_run`, and clears the
 /// one-shot stash — all while autopilot is PAUSED (the human is the authorization). The prior run
 /// row is untouched immutable history. This is the relay-testbed re-run driver's happy path.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn redispatch_relaunches_the_stored_pack_with_a_fresh_run_id(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -1406,6 +1429,7 @@ async fn redispatch_relaunches_the_stored_pack_with_a_fresh_run_id(pool: PgPool)
 
 /// The exemption is real: WITHOUT a redispatch stash, an approved issue at the approval stays paused
 /// while autopilot is disabled — the pack alone never re-launches, only the human's re-run does.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn approved_approval_stays_paused_without_a_redispatch(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -1463,8 +1487,10 @@ async fn approved_approval_stays_paused_without_a_redispatch(pool: PgPool) -> Re
 /// A fake build backend for the `building`-state reconcile tests: dispatch records a job name,
 /// poll reports still-running, resolve returns a pinned digest. The cluster boundary's hermetic
 /// double (the WorkPod tests' fake-dispatcher discipline), never an internal collaborator.
+#[cfg(feature = "autoresearch")]
 struct FakeBuildBackend;
 
+#[cfg(feature = "autoresearch")]
 #[async_trait::async_trait]
 impl crate::builds::lifecycle::BuildBackend for FakeBuildBackend {
     async fn dispatch(
@@ -1492,6 +1518,7 @@ impl crate::builds::lifecycle::BuildBackend for FakeBuildBackend {
 
 /// Store a frozen pack tarball declaring one cluster `[build]` block (what
 /// [`crate::builds::lifecycle::plan_builds`] reads off the materialized tree).
+#[cfg(feature = "autoresearch")]
 async fn write_build_pack(db: &Db, key: &str) {
     seed_stored_pack(
         db,
@@ -1507,6 +1534,7 @@ async fn write_build_pack(db: &Db, key: &str) {
     .await;
 }
 
+#[cfg(feature = "autoresearch")]
 async fn approve_scope(db: &Db, key: &str) -> Result<i64> {
     let scope_id = crate::issues::store::insert_scope(
         db.pool(),
@@ -1529,6 +1557,7 @@ async fn approve_scope(db: &Db, key: &str) -> Result<i64> {
 /// A malformed `[build]` table (a self-referencing `needs` — a `forge::spec::SpecError`) can never
 /// plan. The reconcile driver parks the issue (machine) with the spec error as the reason rather than
 /// returning `Err` and letting the queue retry a deterministic failure `park_after` times.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn a_malformed_build_table_parks_instead_of_erroring(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -1578,6 +1607,7 @@ async fn a_malformed_build_table_parks_instead_of_erroring(pool: PgPool) -> Resu
 /// The block: an approved pack that declares a `[build]` block enters `building` (not
 /// `running`) and dispatches its builds; the run is NEVER launched while a build is still in
 /// flight (no `runs` row, no digest yet).
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn approved_pack_with_a_build_blocks_the_run_at_building(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -1639,6 +1669,7 @@ async fn approved_pack_with_a_build_blocks_the_run_at_building(pool: PgPool) -> 
 
 /// Unblock-on-success: a `building` issue whose builds all carry a pinned digest launches the
 /// loop run (`building` → `running`) — the same launch path a build-free pack takes.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn building_launches_the_run_once_every_build_pins(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -1705,6 +1736,7 @@ async fn building_launches_the_run_once_every_build_pins(pool: PgPool) -> Result
 
 /// Park-on-failure: a `building` issue with a failed build parks (machine) with the build-log
 /// pointer carried in the park reason — the evidence the next person reads.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn building_parks_on_a_failed_build_with_the_log_pointer(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -1761,6 +1793,7 @@ async fn building_parks_on_a_failed_build_with_the_log_pointer(pool: PgPool) -> 
 /// The deterministic wedge repro at the reconcile level: an approved pack that declares a
 /// `[build]` with NO real backend installed must PARK with a clear "backend not installed"
 /// reason on the first building pass — never wedge at `building` forever.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn building_with_no_backend_parks_not_wedges(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -1798,6 +1831,7 @@ async fn building_with_no_backend_parks_not_wedges(pool: PgPool) -> Result<()> {
 /// A scope whose fixed build demand exceeds `build_pod_cap` can never be admitted (the run
 /// needs every image at once), so it parks with a clear reason instead of re-driving a
 /// forever-capped dispatch.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn building_parks_when_demand_exceeds_the_cap(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -1889,6 +1923,7 @@ async fn awaiting_without_approval_is_a_noop_approval_wait(pool: PgPool) -> Resu
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn losing_the_claim_is_a_clean_noop(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -2162,6 +2197,7 @@ async fn complete_run_ingests_and_advances_running_to_done(pool: PgPool) -> Resu
 
 /// The P1 fix: a run whose session log carries a `pr_links` event lands `pr-open` (not `done`),
 /// the kept candidate row carries the PR url, and the transition's event records it as evidence.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn complete_run_lands_pr_open_when_a_pr_opened(pool: PgPool) -> Result<()> {
     let (db, _dir) = db_with(pool);
@@ -2521,6 +2557,7 @@ async fn ingest_completion_prefers_the_dropbox_run_session(pool: PgPool) -> Resu
 /// no-session park) self-heals back to `awaiting-approval`, where a standing approval
 /// re-dispatches. The live failure: an operator unpark restored `running` and nothing ever
 /// converged it.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn runless_running_self_heals_to_the_approval_approval(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -2953,6 +2990,7 @@ async fn ingest_completion_parks_a_truncated_session_without_shutdown(pool: PgPo
 /// A fresh (never-ranked) issue's first reconcile assigns its tier from the ranking call: the
 /// row's `tier` moves from `NULL` to the verdict, the rationale lands as event-log evidence,
 /// and the call's cost ledgers under `kind = "rank"`.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn ranker_assigns_the_first_tier(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -3024,6 +3062,7 @@ async fn ranker_assigns_the_first_tier(pool: PgPool) -> Result<()> {
 /// A changed issue content hash re-ranks: the row's `tier` moves to the new verdict, not the
 /// stale one — proof `apply_rank_result`'s cache guard keys off the hash, not off "already
 /// ranked."
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn rank_changes_tier_when_content_hash_changes(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -3075,6 +3114,7 @@ async fn rank_changes_tier_when_content_hash_changes(pool: PgPool) -> Result<()>
 
 /// An `N` verdict parks the issue (machine, "unscopeable per ranker") and never reaches the
 /// scope turn — no `CRUCIBLE_BIN` override is even set, so a stray call would be a hard error.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn n_verdict_parks_the_issue_as_unscopeable(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -3124,6 +3164,7 @@ async fn n_verdict_parks_the_issue_as_unscopeable(pool: PgPool) -> Result<()> {
 /// An `unrelated`-affinity verdict parks the issue no matter how measurable its tier says it is —
 /// a T0 docs chore must not sit in the table as scopeable work. The tier still stamps (with the
 /// content hash), so the rank cache holds and a later sweep never re-spends on the same content.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn unrelated_affinity_parks_the_issue_despite_a_scopeable_tier(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -3177,6 +3218,7 @@ async fn unrelated_affinity_parks_the_issue_despite_a_scopeable_tier(pool: PgPoo
 /// is settled by the issue text, so a code-grounded turn has nothing to add and must not spend.
 /// `CRUCIBLE_BIN` points at a nonexistent binary — if the escalation (or a scope turn) were
 /// wrongly reached, the spawn would fail and this test would error.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn unrelated_affinity_parks_without_a_grounded_escalation(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -3232,6 +3274,7 @@ async fn unrelated_affinity_parks_without_a_grounded_escalation(pool: PgPool) ->
 /// heuristic to fall back to — logs the failure, does NOT park the issue, and (the ranker
 /// being the sole gate to the scope turn) DEFERS the scope: no verdict, no spend. The issue
 /// stays `new` for a later sweep to retry.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn malformed_verdict_defers_the_scope_turn_and_leaves_tier_null(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -3300,6 +3343,7 @@ async fn malformed_verdict_defers_the_scope_turn_and_leaves_tier_null(pool: PgPo
 
 /// Same content hash on a second reconcile means the ranker is never invoked again — proven
 /// by counting the ranking endpoint's received requests, not by inference from cost alone.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn unchanged_content_hash_skips_a_second_rank_call(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -3354,6 +3398,7 @@ async fn unchanged_content_hash_skips_a_second_rank_call(pool: PgPool) -> Result
 
 /// A force re-rank ([`crate::client::Db::clear_rank`]) invalidates the cache for real: after
 /// clearing, a sweep over the same unchanged content ranks again instead of cache-hitting.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn a_cleared_rank_cache_reranks_on_the_next_sweep(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -3422,6 +3467,7 @@ async fn a_cleared_rank_cache_reranks_on_the_next_sweep(pool: PgPool) -> Result<
 /// When the daily ceiling is already crossed, `confirm_tier` must not invoke the ranker at
 /// all (no spend), the tier stands untouched (`NULL` — never ranked), and a `capped` event is
 /// recorded.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn capped_before_the_rank_call_skips_the_ranker(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -3473,6 +3519,7 @@ async fn capped_before_the_rank_call_skips_the_ranker(pool: PgPool) -> Result<()
 
 /// The baseline schema carries no `tier_source` (dropped back in the SQLite era's migration
 /// 0005) while `ranked_content_hash` (the rank cache) is present and round-trips.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn baseline_has_no_tier_source_and_keeps_ranked_content_hash(pool: PgPool) -> Result<()> {
     let (db, _dir) = db_with(pool);
@@ -3504,6 +3551,7 @@ async fn baseline_has_no_tier_source_and_keeps_ranked_content_hash(pool: PgPool)
 /// A T3 verdict records the tier + rationale + cost like any other verdict, but — with
 /// `allow_t3` off (the default) — the row stays `new` instead of proceeding to a scope turn,
 /// and a `tier-deferred` line lands in the event log exactly once.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn t3_verdict_defers_instead_of_scoping(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -3569,6 +3617,7 @@ async fn t3_verdict_defers_instead_of_scoping(pool: PgPool) -> Result<()> {
 
 /// The same T3 verdict, with `CONTROLLER_ALLOW_T3`/`allow_t3` on, proceeds to the scope turn
 /// like any other tier — no deferral, no `tier-deferred` line.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn allow_t3_lets_a_t3_row_proceed_to_scope(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -3620,6 +3669,7 @@ async fn allow_t3_lets_a_t3_row_proceed_to_scope(pool: PgPool) -> Result<()> {
 /// A T3 row's exclusion holds on a cache-hit sweep too (unchanged content, already ranked
 /// T3): `reconcile_new` must not run the scope turn a second time either, and — critically —
 /// `tier-deferred` is not re-logged on the repeat sweep.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn t3_exclusion_holds_on_a_cache_hit_and_logs_once(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -3672,6 +3722,7 @@ async fn t3_exclusion_holds_on_a_cache_hit_and_logs_once(pool: PgPool) -> Result
 
 /// `allowed_tiers = [t0]` (an operator narrowing the default) defers a T1 verdict exactly like
 /// the old `allow_t3`-only gate deferred T3: the row stays `new`, `tier-deferred` names T1.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn allowed_tiers_t0_only_defers_a_t1_verdict(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -3716,6 +3767,7 @@ async fn allowed_tiers_t0_only_defers_a_t1_verdict(pool: PgPool) -> Result<()> {
 
 /// `allowed_tiers = [t0, t1]` (the shipped default) admits a T1 verdict straight through to a
 /// scope turn.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn allowed_tiers_t0_t1_admits_a_t1_verdict_to_scope(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -3797,6 +3849,7 @@ fn allow_t3_alias_unions_t3_without_dropping_the_rest() {
 
 /// A stand-in `crucible` binary that handles both subcommands the escalation path touches:
 /// `scope` prints a surviving pack, `rank-grounded` prints a grounded verdict of `grounded_tier`.
+#[cfg(feature = "autoresearch")]
 fn fake_crucible_grounded(dir: &Path, grounded_tier: &str) -> PathBuf {
     let scope_json = r#"{"stages":[{"name":"validate","passed":true,"detail":"ok"}],"digest":"v1:deadbeefcafef00d","cost":0.42}"#;
     let grounded_json = format!(
@@ -3832,6 +3885,7 @@ fn seed_checkout(state_dir: &Path, repo: &str) {
 }
 
 /// A low-confidence text verdict of `tier` — what triggers the grounded escalation.
+#[cfg(feature = "autoresearch")]
 async fn mount_ranker_low(server: &wiremock::MockServer, tier: &str) {
     mount_ranker_verdict(
         server,
@@ -3846,6 +3900,7 @@ async fn mount_ranker_low(server: &wiremock::MockServer, tier: &str) {
 /// one: the row lands on the *grounded* tier (T0), not the low-confidence API tier (T2), the
 /// grounded rationale is the recorded evidence, and the grounded turn's cost ledgers separately
 /// under `rank-grounded`.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn low_confidence_verdict_escalates_to_the_grounded_ranker(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -3914,11 +3969,13 @@ async fn low_confidence_verdict_escalates_to_the_grounded_ranker(pool: PgPool) -
 
 /// A canned [`crate::runs::workpod::PodDispatcher`] for the pod-arm reconcile tests: every turn pod
 /// "succeeds" with the given logs, and `create` keeps the rendered pod for the test to read.
+#[cfg(feature = "autoresearch")]
 struct PodArmDispatcher {
     logs: String,
     created: CreatedPods,
 }
 
+#[cfg(feature = "autoresearch")]
 #[async_trait::async_trait]
 impl crate::runs::workpod::PodDispatcher for PodArmDispatcher {
     async fn create(
@@ -3951,6 +4008,7 @@ impl crate::runs::workpod::PodDispatcher for PodArmDispatcher {
 }
 
 /// A stand-in bin for the pod arm's local scope executor: `scope` prints a surviving pack report.
+#[cfg(feature = "autoresearch")]
 fn fake_crucible_pod_arm(dir: &Path) -> PathBuf {
     let scope_json = r#"{"stages":[{"name":"validate","passed":true,"detail":"ok"}],"digest":"v1:beef","cost":0.42}"#;
     let path = dir.join("crucible-pod-arm");
@@ -3993,6 +4051,7 @@ fn pod_arm_cfg(state_dir: &Path) -> ControllerCfg {
 /// collects it — the pod-arm dispatchers' fake pods are instantly terminal. Stops when the
 /// issue's observable state (status + tier + the two content-hash caches) stops changing, so a
 /// two-phase launch→collect settles without the test hard-coding a pass count.
+#[cfg(feature = "autoresearch")]
 async fn reconcile_to_fixpoint(
     db: &Db,
     cfg: &ControllerCfg,
@@ -4024,6 +4083,7 @@ async fn reconcile_to_fixpoint(
 /// SINGLE-BOOKING INVARIANT, end to end: a pod-arm grounded escalation drives reconcile through
 /// dispatch (which books the cost at collection) AND `apply_verdict` (which must NOT book it
 /// again) — exactly ONE `rank-grounded` ledger row lands, carrying the turn's own cost.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn pod_arm_verdict_ledgers_exactly_once_end_to_end(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -4093,6 +4153,7 @@ async fn pod_arm_verdict_ledgers_exactly_once_end_to_end(pool: PgPool) -> Result
 /// verdict: the tier is NOT finalized, nothing ledgers, and the queued row waits. When the
 /// budget frees, the next reconcile pass drains the queued turn and the grounded tier lands —
 /// with exactly one rank-grounded ledger row for the whole episode.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn queued_grounded_turn_defers_the_rank_then_drains(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -4192,6 +4253,7 @@ async fn queued_grounded_turn_defers_the_rank_then_drains(pool: PgPool) -> Resul
 
 /// A gzip'd tar of a tiny frozen pack, the blob a surviving pod scope turn emits on its
 /// `CRUCIBLE_SCOPE_PACK:` marker line.
+#[cfg(feature = "autoresearch")]
 fn sample_pack_tgz() -> Vec<u8> {
     use std::io::Write as _;
     let dir = tempfile::tempdir().expect("tempdir");
@@ -4219,6 +4281,7 @@ fn pod_scope_cfg(state_dir: &Path) -> ControllerCfg {
 /// The loop-run half of the reconcile-time chain: an approved issue pinned to a provider is
 /// dispatched with that provider's flags on the wrapper the pod runs. `dispatch_target`-style
 /// plumbing is only correct end to end, so this drives the real `reconcile`, not `for_loop`.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn a_pinned_issue_dispatches_its_loop_run_with_the_pair(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -4306,11 +4369,13 @@ async fn a_pinned_issue_dispatches_its_loop_run_with_the_pair(pool: PgPool) -> R
 
 /// A scope-turn dispatcher that keeps the pod AND the Secret it was handed, so a test can read
 /// both halves of a provider-backed turn.
+#[cfg(feature = "autoresearch")]
 struct ScopeTurnDispatcher {
     created: CreatedPods,
     created_secrets: std::sync::Arc<std::sync::Mutex<Vec<k8s_openapi::api::core::v1::Secret>>>,
 }
 
+#[cfg(feature = "autoresearch")]
 #[async_trait::async_trait]
 impl crate::runs::workpod::PodDispatcher for ScopeTurnDispatcher {
     async fn create(
@@ -4356,6 +4421,7 @@ impl crate::runs::workpod::PodDispatcher for ScopeTurnDispatcher {
 /// turn pod as `--harness`/`--model`, and the provider's registered key rides along as the
 /// environment variable that harness reads. A turn rendered against a provider it cannot pay for
 /// is the failure this covers.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn a_pinned_scope_turn_renders_its_provider_and_carries_its_key(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -4470,6 +4536,7 @@ async fn a_pinned_scope_turn_renders_its_provider_and_carries_its_key(pool: PgPo
 /// The pack handoff, happy path: a surviving pod scope turn's pack blob is scraped off the
 /// logs, stored as the durable pack tarball (what `reconcile_scoped` and `dispatch_run`
 /// materialize), and only then does the row transition to `scoped`.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn pod_scope_survival_lands_the_pack_then_transitions(pool: PgPool) -> Result<()> {
     use base64::Engine as _;
@@ -4533,6 +4600,7 @@ async fn pod_scope_survival_lands_the_pack_then_transitions(pool: PgPool) -> Res
 /// The loud-failure invariant: a survival WITHOUT a recoverable pack blob (a pre-feature
 /// engine image, an oversize pack's error payload) never transitions to `scoped` over a
 /// missing pack — the row stays put and the failure is evented on the issue.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn pod_scope_survival_without_a_pack_blob_fails_loudly(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -4589,6 +4657,7 @@ async fn pod_scope_survival_without_a_pack_blob_fails_loudly(pool: PgPool) -> Re
 /// GitHub fetch — same invariant as `scope_propose_uses_goal_file_not_issue_for_a_scenario`, but for
 /// `scope_executor = pod`: the `deploy render-turn` argv the controller shells carries `--goal-file`,
 /// never `--issue`, so the in-pod `crucible scope --propose` never routes into the GitHub Ingest arm.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn pod_scope_uses_goal_file_not_issue_for_a_scenario(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -4628,6 +4697,7 @@ async fn pod_scope_uses_goal_file_not_issue_for_a_scenario(pool: PgPool) -> Resu
 /// The goal framing the pack agent reads: a pinned ref must appear in the text, not only in the
 /// pod's own `--repo-ref`. `--repo-ref` decides what the SCOPE pod clones; the manifest the agent
 /// writes decides what every later RUN clones, and nothing else in the pipeline puts the ref there.
+#[cfg(feature = "autoresearch")]
 #[test]
 fn goal_framing_states_the_ref_the_manifest_must_pin() {
     let repos = vec!["owner/repo".to_string()];
@@ -4659,6 +4729,7 @@ fn goal_framing_states_the_ref_the_manifest_must_pin() {
 /// End to end on the pod executor: a scenario adopted with a `git_ref` produces a `deploy
 /// render-turn` argv carrying `--repo-ref <ref>`, so the turn pod clones the named branch instead
 /// of the repo default.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn pod_scope_forwards_the_adopted_git_ref(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -4706,6 +4777,7 @@ async fn pod_scope_forwards_the_adopted_git_ref(pool: PgPool) -> Result<()> {
 /// A scenario adopted against a pack the repo already carries validates that pack instead of
 /// drafting one: no propose, no agent, no sandbox — which is the whole point of importing a pack
 /// that is already scored.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn pod_scope_validates_an_adopted_pack_instead_of_proposing(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -4753,6 +4825,7 @@ async fn pod_scope_validates_an_adopted_pack_instead_of_proposing(pool: PgPool) 
 
 /// The complement: an adoption that named no ref renders no `--repo-ref` flag at all, so the clone
 /// keeps taking the repo's default branch.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn pod_scope_omits_repo_ref_when_the_scenario_pinned_none(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -4794,6 +4867,7 @@ async fn pod_scope_omits_repo_ref_when_the_scenario_pinned_none(pool: PgPool) ->
 /// authors is what the broker reads at run time, and the controller projects the same string as
 /// `BROKER_CODEGEN_TOOLS_OVERLAY` — paraphrasing it here would let the two describe different
 /// measurements.
+#[cfg(feature = "autoresearch")]
 #[test]
 fn goal_framing_embeds_the_codegen_contract_verbatim() {
     let repos = vec!["owner/repo".to_string()];
@@ -4836,6 +4910,7 @@ fn goal_framing_embeds_the_codegen_contract_verbatim() {
 /// broker-measured scope render, which the linked engine cannot express. That is a deterministic
 /// boundary refusal: it is ledgered as a contract rejection naming the contract and the missing
 /// option, the issue parks so no sweep re-renders it, and nothing reaches the cluster.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn pod_scope_forwards_broker_measure_for_a_contracted_scenario(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -4920,6 +4995,7 @@ async fn pod_scope_forwards_broker_measure_for_a_contracted_scenario(pool: PgPoo
 
 /// The complement: an adoption that named no contract renders and launches as before, so the
 /// pack keeps measuring locally on the loop pod.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn pod_scope_omits_broker_measure_when_the_scenario_named_no_contract(
     pool: PgPool,
@@ -4961,6 +5037,7 @@ async fn pod_scope_omits_broker_measure_when_the_scenario_named_no_contract(
 /// A contract name the deploy no longer configures fails the scope dispatch loudly. Falling back to
 /// local measure would scope a GPU problem into a pack that cannot measure it, and nothing would say
 /// so until the run.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn pod_scope_fails_when_the_named_contract_is_not_configured(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -5022,6 +5099,7 @@ async fn seed_running_turn_row(db: &Db, kind: &str, issue_key: &str, pod_name: &
 /// stamps a recorded rank hash between the two), reconcile once, and assert the adopt-first
 /// pre-pass collected the row regardless of the (now-declining) spend gates. The per-kind
 /// fold-tail (issue transition/tier stamp, ledger kind) stays in each caller.
+#[cfg(feature = "autoresearch")]
 async fn adopt_past_an_exhausted_ceiling(
     db: &Db,
     cfg: &ControllerCfg,
@@ -5047,6 +5125,7 @@ async fn adopt_past_an_exhausted_ceiling(
 /// so the re-driven issue takes the normal path and every spend gate declines before
 /// `dispatch_scope`. Collection is not spend: the adopt-first pre-pass must collect the finished
 /// pod anyway, land the pack, and transition the issue — the $5-11 report is never orphaned.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn orphaned_scope_turn_is_adopted_past_an_exhausted_ceiling(pool: PgPool) -> Result<()> {
     use base64::Engine as _;
@@ -5105,6 +5184,7 @@ async fn orphaned_scope_turn_is_adopted_past_an_exhausted_ceiling(pool: PgPool) 
 /// The grounded analogue: an orphaned rank turn behind an exhausted ceiling is collected by the
 /// adopt-first pre-pass — verdict applied on the recorded rank hash, cost booked once — instead
 /// of waiting for budget to free (which could be the next UTC day).
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn orphaned_grounded_turn_is_adopted_past_an_exhausted_ceiling(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -5236,6 +5316,7 @@ async fn adopt_first_leaves_a_still_running_turn_alone(pool: PgPool) -> Result<(
 /// A `high`-confidence API verdict does NOT escalate: no grounded turn runs (the stand-in bin
 /// here has no `rank-grounded` handler at all, so a stray call would parse-fail and be logged,
 /// never changing the tier), and the row lands on the API tier directly.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn high_confidence_verdict_does_not_escalate(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -5294,6 +5375,7 @@ async fn high_confidence_verdict_does_not_escalate(pool: PgPool) -> Result<()> {
 /// A stand-in bin for the pre-scope gate tests: `rank-grounded` returns the given disposition
 /// (a tier or `stale`); `scope` prints unparseable output, so a test asserting the gate must
 /// never reach the scope turn fails loudly (a parse error) instead of silently passing.
+#[cfg(feature = "autoresearch")]
 fn fake_crucible_gate(dir: &Path, disposition: &str, rationale: &str) -> PathBuf {
     let grounded_json = format!(
         r#"{{"tier":"{disposition}","rationale":"{rationale}","confidence":"high","cost_usd":0.15,"over_budget":false}}"#
@@ -5311,6 +5393,7 @@ fn fake_crucible_gate(dir: &Path, disposition: &str, rationale: &str) -> PathBuf
 /// A `stale` low-confidence escalation verdict (the [`apply_verdict`] arm, exercised
 /// independent of the pre-scope gate) parks the issue with the grounded rationale attached,
 /// and never touches `issues.tier` — `stale` is not a tier.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn stale_verdict_parks_with_the_rationale_attached(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -5373,6 +5456,7 @@ async fn stale_verdict_parks_with_the_rationale_attached(pool: PgPool) -> Result
 /// With the pre-scope gate on, a grounded verdict that demotes a T1 API tier to `N` parks the
 /// issue instead of ever reaching the scope turn (the stand-in bin's `scope` handler would
 /// fail the test if it ran).
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn prescope_gate_demotion_to_n_parks_instead_of_scoping(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -5447,6 +5531,7 @@ async fn prescope_gate_demotion_to_n_parks_instead_of_scoping(pool: PgPool) -> R
 /// A local grounded turn whose engine binary carries another contract version is a deterministic
 /// boundary refusal, not a missing verdict: it is ledgered as a contract rejection and the issue
 /// parks, so no sweep re-attempts it and no text-only verdict is finalized behind its back.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn a_mismatched_engine_binary_parks_the_local_grounded_turn(pool: PgPool) -> Result<()> {
     use crucible_controller::runs::contract::{ContractRegistry, TableReader};
@@ -5533,6 +5618,7 @@ async fn a_mismatched_engine_binary_parks_the_local_grounded_turn(pool: PgPool) 
 
 /// The same setup but the grounded verdict confirms T1 (matches the API tier): the pre-scope
 /// gate proceeds and the scope turn actually runs.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn prescope_gate_confirms_and_proceeds_to_scope(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -5586,6 +5672,7 @@ async fn prescope_gate_confirms_and_proceeds_to_scope(pool: PgPool) -> Result<()
 
 /// A hash the pre-scope gate already grounded-confirmed is never re-spent on: a second
 /// reconcile of the same (unchanged) issue makes no second `rank-grounded` call.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn prescope_gate_skips_a_hash_already_grounded_confirmed(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -5722,6 +5809,7 @@ async fn prescope_gate_failure_defers_the_scope_turn(pool: PgPool) -> Result<()>
 /// (high-confidence, non-escalating) API tier to the scope turn without ever invoking
 /// `rank-grounded` — the stand-in bin here has no handler for it at all, so a stray call would
 /// be a hard parse failure, never a silent pass.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn prescope_grounded_off_preserves_old_behavior(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -5775,6 +5863,7 @@ async fn prescope_grounded_off_preserves_old_behavior(pool: PgPool) -> Result<()
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn rank_horizon_parks_old_and_null_rows_with_exact_reason(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -5826,6 +5915,7 @@ async fn rank_horizon_parks_old_and_null_rows_with_exact_reason(pool: PgPool) ->
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn rank_horizon_disabled_when_zero(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -5880,6 +5970,7 @@ async fn rank_horizon_disabled_when_zero(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn rank_horizon_fresh_row_proceeds(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -5961,6 +6052,7 @@ async fn rank_horizon_fresh_row_proceeds(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn rank_horizon_auto_unpark_on_fresh_activity(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -6080,6 +6172,7 @@ async fn config_env_parse_rank_horizon_days() {
     assert_eq!(cfg_default.rank_horizon_days, 0);
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn autopilot_disabled_skips_new_issue_reconcile(pool: PgPool) -> Result<()> {
     let (db, dir) = db_with(pool);
@@ -6122,6 +6215,7 @@ async fn autopilot_disabled_skips_new_issue_reconcile(pool: PgPool) -> Result<()
 /// The autopilot pause holds machine-initiated GitHub discovery, but a scenario's `!has_upstream()`
 /// is a standing exemption alongside `scope_now_justification`/`redispatch_justification` — the
 /// human adoption already authorized it, so it must reach the scope turn even while paused.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn autopilot_disabled_does_not_hold_an_adopted_scenario(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -6171,6 +6265,7 @@ async fn autopilot_disabled_does_not_hold_an_adopted_scenario(pool: PgPool) -> R
 /// ScopeNow bypasses ALL gates: daily ceiling, rank horizon, unranked tier, scopes/day cap.
 /// An issue with `scope_now_justification` set goes straight to the scope turn even when the
 /// autopilot would park/decline it.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn scope_now_bypasses_ceiling_and_unranked_gates(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -6233,6 +6328,7 @@ async fn scope_now_bypasses_ceiling_and_unranked_gates(pool: PgPool) -> Result<(
 /// adopt-first pre-pass collects the terminal pod, lands the pack, and transitions to `scoped`.
 /// The stash is gone by then (cleared pre-dispatch), so the collection rides the pre-pass — the
 /// exact hole PR #131 closed — with an event trail that reads sensibly.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn scope_now_pod_executor_launches_then_a_redrive_scopes(pool: PgPool) -> Result<()> {
     use base64::Engine as _;
@@ -6319,6 +6415,7 @@ async fn scope_now_pod_executor_launches_then_a_redrive_scopes(pool: PgPool) -> 
 
 /// The flag pauses the machine, never the humans: a stashed ScopeNow executes even while
 /// autopilot is disabled (the disabled guard exempts it).
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn scope_now_executes_when_autopilot_disabled(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -6366,6 +6463,7 @@ async fn scope_now_executes_when_autopilot_disabled(pool: PgPool) -> Result<()> 
 
 /// A ScopeNow-scoped issue must not re-scope on the next reconcile: the stash is cleared
 /// after dispatch, so a second reconcile goes through the normal (now-gateable) path.
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn scope_now_no_double_dispatch(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -6419,8 +6517,10 @@ async fn scope_now_no_double_dispatch(pool: PgPool) -> Result<()> {
 // sweep, but the tight runtime-override cap (PR #85) still throttles ranking one issue at a
 // time, exactly as it would for a slow trickle. No burst-sized backlog may bypass the cap.
 
+#[cfg(feature = "autoresearch")]
 const BURST_SIZE: u64 = 10;
 
+#[cfg(feature = "autoresearch")]
 fn burst_issue(number: u64) -> serde_json::Value {
     serde_json::json!({
         "number": number,
@@ -6433,6 +6533,7 @@ fn burst_issue(number: u64) -> serde_json::Value {
     })
 }
 
+#[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn burst_backlog_respects_the_tight_rank_cap_no_bypass(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -6862,6 +6963,47 @@ async fn a_dequeued_playbook_key_dispatches_from_its_stored_row(pool: PgPool) ->
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].status, "running");
     assert!(runs[0].scope.is_none(), "a launch has no scope to point at");
+    Ok(())
+}
+
+/// With the lane built but switched off, a GitHub row stays where it is while a playbook launch
+/// still dispatches through the same reconcile.
+#[cfg(feature = "autoresearch")]
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn with_autoresearch_off_only_playbook_launches_move(pool: PgPool) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let profile = crate::testing::fixtures::write_deploy_profile(dir.path());
+    let cfg = ControllerCfg {
+        deploy_profile: Some(profile),
+        autoresearch: false,
+        ..cfg_with(dir.path(), Profile::default())
+    };
+
+    crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#1")).await?;
+    reconcile(&db, &cfg, "owner/repo#1").await?;
+    let issue = crate::issues::store::get_issue(db.pool(), "owner/repo#1")
+        .await?
+        .expect("issue");
+    assert_eq!(issue.status, Status::New);
+    assert!(issue.tier.is_none(), "no ranking ran");
+    assert!(db.events().read_for_key("owner/repo#1").await?.is_empty());
+
+    let key = "playbook:survey:0199c0de-7c2c-71a5-8000-9";
+    seed_registered_playbook(&db, "survey").await;
+    adopt_launch(&db, key, 3.5).await;
+    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(RunPodDispatcher {
+        phase: crate::runs::workpod::TurnPhase::Succeeded,
+        logs: String::new(),
+        created: CreatedPods::default(),
+    }));
+    let res = reconcile(&db, &cfg, key).await;
+    crate::runs::workpod::reset_dispatcher();
+    res?;
+    let issue = crate::issues::store::get_issue(db.pool(), key)
+        .await?
+        .expect("issue");
+    assert_eq!(issue.status, Status::Running);
     Ok(())
 }
 

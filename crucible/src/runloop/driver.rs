@@ -10,9 +10,9 @@ use crate::args::{Args, Paths, Prepared};
 use crate::control;
 use crate::control::provisioning;
 use crate::process::STOP;
+use crate::report::reporter::{Outcome, Reporter, Stop};
 use crate::report::session;
 use crate::report::session::Row;
-use crate::report::{Outcome, Reporter, Stop};
 use crate::runloop::publish;
 use anyhow::{Context, Result};
 use crucible::crucible::{Judge, World};
@@ -40,7 +40,7 @@ struct BaselineInvalid {
 /// one argument so the core loop boundary stays small as front-ends evolve.
 #[derive(Default)]
 pub(crate) struct LoopRuntime {
-    pub control: Option<Arc<control::ControlState>>,
+    pub control: Option<Arc<control::bridge::ControlState>>,
     pub resume: Option<ResumeState>,
     /// How this resume classified the previous shutdown; present only with `resume`.
     pub recovery: Option<crate::control::recovery::ResumeRecovery>,
@@ -1232,7 +1232,7 @@ fn restore_kept_best(
     }
 }
 
-fn wait_if_paused<R: Reporter>(control: Option<&control::ControlState>, r: &mut R) {
+fn wait_if_paused<R: Reporter>(control: Option<&control::bridge::ControlState>, r: &mut R) {
     let Some(control) = control else {
         return;
     };
@@ -1257,7 +1257,7 @@ fn beat_position(heartbeat: Option<&crate::control::heartbeat::Heartbeat>, iter:
 }
 
 fn update_control_progress(
-    control: Option<&control::ControlState>,
+    control: Option<&control::bridge::ControlState>,
     iter: u32,
     best_score: f64,
     spend: f64,
@@ -1269,7 +1269,7 @@ fn update_control_progress(
 
 fn over_budget<R: Reporter>(
     args: &Args,
-    control: Option<&control::ControlState>,
+    control: Option<&control::bridge::ControlState>,
     spent: f64,
     started: Instant,
     parked_total: Duration,
@@ -1315,7 +1315,7 @@ enum ParkOutcome {
 /// broker drives the approval+capture and sends the terminal `rescope`/`deny` over the control
 /// bridge. With no control bridge nothing could deliver an outcome, so we note and proceed.
 fn park_for_approval<R: Reporter>(
-    control: Option<&control::ControlState>,
+    control: Option<&control::bridge::ControlState>,
     ledger: Option<&crate::control::admission::AdmissionLedger>,
     r: &mut R,
     parked_total: &mut Duration,
@@ -1595,7 +1595,7 @@ fn fingerprint(goal: &str, objective: &str, regime: &str) -> String {
 /// stops and un-granted approves are closed out.
 fn replay_admissions<R: Reporter>(
     ledger: &crate::control::admission::AdmissionLedger,
-    control: Option<&control::ControlState>,
+    control: Option<&control::bridge::ControlState>,
     replay: crate::control::admission::ResumeReplay,
     r: &mut R,
 ) {
@@ -1683,7 +1683,7 @@ fn write_results(p: &Paths, goal: &str, prior: &str, rows: &[Row]) -> Result<()>
                 detail.push(' ');
             }
             detail.push_str("evidence: ");
-            detail.push_str(&crate::report::evidence_line(&r.evidence));
+            detail.push_str(&crate::report::reporter::evidence_line(&r.evidence));
         }
         s.push_str(&format!(
             "| {} | {} | {} | {} |\n",
@@ -1700,8 +1700,8 @@ fn write_results(p: &Paths, goal: &str, prior: &str, rows: &[Row]) -> Result<()>
 mod tests {
     use super::*;
     use crate::control::recovery::{ResumeFold, resume_finished};
+    use crate::report::reporter::{AgentTurn, Stop, TurnBudget};
     use crate::report::session::Row;
-    use crate::report::{AgentTurn, Stop, TurnBudget};
     use crate::runloop::step::{TurnVerdict, drain_turn_markers};
     use crucible_contract::LoopPhase;
     use crucible_contract::admission::AdmissionKey;
@@ -2273,7 +2273,7 @@ mod tests {
         // The broker would deliver a rescope over the control bridge when the human approves; here
         // a thread plays that role. The park must wake, accrue the idle time, and leave the rescope
         // for the iteration-head drain to consume (the single re-baseline site).
-        let control = std::sync::Arc::new(control::ControlState::default());
+        let control = std::sync::Arc::new(control::bridge::ControlState::default());
         let deliver = control.clone();
         let h = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(60));
@@ -2315,7 +2315,7 @@ mod tests {
     fn park_returns_denied_on_a_deny_signal() {
         // The broker (or an operator) rejects the ask; the park must wake with a Denied outcome so
         // the caller can escalate (block had no fallback).
-        let control = std::sync::Arc::new(control::ControlState::default());
+        let control = std::sync::Arc::new(control::bridge::ControlState::default());
         let deliver = control.clone();
         let h = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(60));
@@ -2342,7 +2342,7 @@ mod tests {
     #[test]
     fn park_times_out_into_denied() {
         // No signal ever arrives; a short --max-park bounds the wait and resolves to Denied.
-        let control = std::sync::Arc::new(control::ControlState::default());
+        let control = std::sync::Arc::new(control::bridge::ControlState::default());
         let mut r = NoteCapture::default();
         let mut parked = Duration::ZERO;
         let outcome = park_for_approval(
@@ -3895,7 +3895,7 @@ mod tests {
             solved: false,
             fail_baseline: false,
         });
-        let control = Arc::new(control::ControlState::default());
+        let control = Arc::new(control::bridge::ControlState::default());
         let r = RecordingReporter::default();
         let recovery = crate::control::recovery::ResumeRecovery {
             class: crate::report::session::RecoveryClass::DiedBetweenIterations,
@@ -4070,7 +4070,7 @@ mod tests {
             .admit(Some(AdmissionKey::new("s1")), AdmittedInput::Stop)
             .expect("stop");
 
-        let control = Arc::new(control::ControlState::default());
+        let control = Arc::new(control::bridge::ControlState::default());
         let mut r = NoteCapture::default();
         replay_admissions(&ledger, Some(&control), ledger.replay_for_resume(), &mut r);
 
@@ -4237,7 +4237,7 @@ mod tests {
             &[r#"echo '{"pass":true}'"#],
             Some(r#"echo '{"score":88.0,"note":"seeded"}'"#),
         ));
-        let control = std::sync::Arc::new(control::ControlState::default());
+        let control = std::sync::Arc::new(control::bridge::ControlState::default());
         control.set_rescope(AdmissionKey::new("g1"), "concurrency=48".into());
         let world = world_of(FakeWorld);
         let judge = judge_of(FakeJudge {

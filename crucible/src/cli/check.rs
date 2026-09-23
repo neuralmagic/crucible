@@ -4,10 +4,10 @@
 //! (docs/crucible-contract.md §3), and warn when the gate is reachable by the agent's own edits (frozen-
 //! judge wall, applied here as a lint rather than a block).
 
+use crate::cli::selftest::{self, SelftestReport};
 use crate::manifest::{self, AgentCfg, CompositeManifest, Manifest, WorldCfg};
 use crate::openshell;
 use crate::plan::ir::TaskKind;
-use crate::runloop::selftest::{self, SelftestReport};
 use anyhow::Result;
 use crucible::crucible::Direction;
 use std::collections::BTreeSet;

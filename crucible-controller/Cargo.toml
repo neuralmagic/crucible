@@ -126,10 +126,10 @@ aws-lc-rs = "1.18"
 # in-process here since ranking never shells out to a `claude` CLI the loop image doesn't carry).
 # genai's vertex adapter expects a pre-minted OAuth2 bearer (it does no ADC itself), so the mint
 # stays here and is injected through genai's ServiceTargetResolver.
-gcp_auth = "0.12"
+gcp_auth = { version = "0.12", optional = true }
 # The ranker's multi-provider LLM client (lane J2): Claude-on-Vertex and the OpenAI-compatible
 # custom-endpoint arm (vLLM/llm-d, wiremock in tests) behind one `exec_chat` interface.
-genai = "0.6.5"
+genai = { version = "0.6.5", optional = true }
 # The Prometheus client (the de-facto tikv crate, not the `metrics` facade): the controller
 # re-exports what it already ingests at `/metrics`. `default-features = false` drops the protobuf
 # exposition path — we serve only the text format the shared kube-prometheus-stack scrapes.
@@ -193,8 +193,15 @@ regex = "1"
 regex-syntax = "0.8"
 cedar-policy = "4.12.0"
 
+[features]
+# The machine-initiated scored lane: GitHub discovery and triage, ranking, scope proposal and its
+# approval gate, image builds, and scored loop runs. Off, the controller is the playbook engine.
+autoresearch = ["dep:genai", "dep:gcp_auth"]
+
 [dev-dependencies]
 tempfile = "3"
+# `Builder::start_paused` for the virtual-clock tests.
+tokio = { workspace = true, features = ["test-util"] }
 # Fake-GitHub HTTP server for the triage fetch tests (work plan sanctions it).
 wiremock = "0.6"
 # UI-page and JSON-payload golden snapshots. "filters" redacts the rendered-at timestamps that

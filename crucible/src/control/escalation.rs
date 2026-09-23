@@ -9,7 +9,7 @@
 //! The engine is deliberately incurious about *why*: `category`/`reason`/`evidence` are
 //! free-form and never branched on here. Routing the report to a human is the whole point,
 //! an escalation is a stop-for-review, not a success (it gets its own exit code, see
-//! [`crate::report::Outcome`]).
+//! [`crate::report::reporter::Outcome`]).
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;

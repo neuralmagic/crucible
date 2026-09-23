@@ -3,6 +3,7 @@
 
 use crate::client::Db;
 use crate::daemon::queue::{Enqueue, OverrideSink};
+#[cfg(feature = "autoresearch")]
 use crate::issues::repo_ref::RepoWhitelist;
 use axum::extract::{FromRequest, Request};
 use axum::http::StatusCode;
@@ -56,7 +57,13 @@ pub struct ApiState {
     pub(crate) queue: Arc<dyn Enqueue>,
     pub(crate) caps: Option<Caps>,
     pub(crate) roles: crate::identity::auth::Roles,
-    pub(crate) autopilot: crate::daemon::autopilot_flag::AutopilotFlag,
+    /// The daemon's autopilot flag; `None` where no daemon loaded one.
+    #[cfg(feature = "autoresearch")]
+    pub(crate) autopilot: Option<crate::daemon::autopilot_flag::AutopilotFlag>,
+    /// Whether the autoresearch routes are mounted: the feature is built and
+    /// `CONTROLLER_AUTORESEARCH` is on.
+    #[cfg(feature = "autoresearch")]
+    pub(crate) autoresearch: bool,
     /// The namespace loop pods run in — the read-only live relay (`GET /api/runs/:id/live`) resolves
     /// a running run's pod IP here, the same namespace the pod dispatch uses.
     pub(crate) pod_namespace: String,
@@ -74,6 +81,7 @@ pub struct ApiState {
     /// The `POST /api/repos` org whitelist + env-seeded-repo exemption (Lane O3), built once off
     /// the parsed `ControllerCfg` at startup (`cfg.repo_whitelist()`). Deploy-pinned — never part
     /// of the Lane O2 runtime-override set.
+    #[cfg(feature = "autoresearch")]
     pub(crate) repo_whitelist: Arc<RepoWhitelist>,
     /// `ControllerCfg::scratch_root()` — the flow-cache root (`GET /api/runs/{id}/flow`).
     pub(crate) scratch_dir: std::path::PathBuf,
@@ -154,7 +162,6 @@ impl ApiState {
         db: Db,
         sink: Arc<dyn OverrideSink>,
         queue: Arc<dyn Enqueue>,
-        autopilot: crate::daemon::autopilot_flag::AutopilotFlag,
         clusters: Arc<crate::runs::clusters::ClusterClients>,
         config: Option<crate::daemon::overrides_store::ConfigStore>,
         reconcile_now: Arc<tokio::sync::Notify>,
@@ -178,7 +185,10 @@ impl ApiState {
                 cfg.operators.clone(),
                 cfg.operator_groups.clone(),
             ),
-            autopilot,
+            #[cfg(feature = "autoresearch")]
+            autopilot: cfg.autopilot.clone(),
+            #[cfg(feature = "autoresearch")]
+            autoresearch: cfg.autoresearch_enabled(),
             pod_namespace: cfg.pod_namespace.clone(),
             cluster_stats: Arc::new(crate::runs::cluster_stats::ClusterStats::new(
                 clusters.clone(),
@@ -186,6 +196,7 @@ impl ApiState {
             clusters,
             control_port: cfg.control_port,
             config,
+            #[cfg(feature = "autoresearch")]
             repo_whitelist: Arc::new(cfg.repo_whitelist()),
             scratch_dir: cfg.scratch_root().to_path_buf(),
             reconcile_now,
@@ -267,9 +278,10 @@ impl ApiState {
     /// Baseline router state for tests: guards off, stores absent, loopback defaults. Override the
     /// few fields a test cares about with `..ApiState::test(db, sink)` struct-update syntax.
     pub(crate) fn test(db: Db, sink: Arc<dyn OverrideSink>) -> Self {
+        let schedules = crate::launches::schedules::ScheduleStore::new(db.clone());
+        #[cfg(feature = "autoresearch")]
         let autopilot =
             crate::daemon::autopilot_flag::AutopilotFlag::seeded(db.pool().clone(), true);
-        let schedules = crate::launches::schedules::ScheduleStore::new(db.clone());
         let clusters = Arc::new(crate::runs::clusters::ClusterClients::new(None));
         Self {
             db,
@@ -278,7 +290,10 @@ impl ApiState {
             queue: Arc::new(crate::daemon::queue::WorkQueue::new()),
             caps: None,
             roles: crate::identity::auth::Roles::new(vec![], vec![], vec![]),
-            autopilot,
+            #[cfg(feature = "autoresearch")]
+            autopilot: Some(autopilot),
+            #[cfg(feature = "autoresearch")]
+            autoresearch: true,
             pod_namespace: "autoresearch".to_string(),
             cluster_stats: Arc::new(crate::runs::cluster_stats::ClusterStats::new(
                 clusters.clone(),
@@ -286,6 +301,7 @@ impl ApiState {
             clusters,
             control_port: 7777,
             config: None,
+            #[cfg(feature = "autoresearch")]
             repo_whitelist: Arc::new(RepoWhitelist::default()),
             scratch_dir: std::path::PathBuf::new(),
             reconcile_now: Arc::new(tokio::sync::Notify::new()),

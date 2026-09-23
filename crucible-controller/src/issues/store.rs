@@ -1,18 +1,23 @@
 //! Raw SQL over the issue, scope, comment and adoption tables.
 
-use crate::issues::model::{
-    AwaitingApproval, InputKind, Issue, IssueComment, IssueQuery, NewIssue, NewScope, RerankScope,
-    Scope, SortKey, UpstreamState,
-};
+use crate::issues::model::{AwaitingApproval, InputKind, Issue, NewIssue, NewScope, Scope};
+#[cfg(feature = "autoresearch")]
+use crate::issues::model::{IssueComment, IssueQuery, RerankScope, SortKey, UpstreamState};
 
-use crate::model::{ParkReason, ParkedBy, SortDir, Status};
+#[cfg(feature = "autoresearch")]
+use crate::model::{ParkReason, SortDir};
+use crate::model::{ParkedBy, Status};
 
 use anyhow::{Context, Result};
 
+#[cfg(feature = "autoresearch")]
 use crucible_contract::Tier;
 
-use sqlx::{PgExecutor, PgPool, Row};
+#[cfg(feature = "autoresearch")]
+use sqlx::PgPool;
+use sqlx::{PgExecutor, Row};
 
+#[cfg(feature = "autoresearch")]
 use std::collections::HashMap;
 
 /// Serialize a label set for the `issues.labels` TEXT column: a serde_json array string, or NULL
@@ -147,6 +152,7 @@ pub async fn get_issue(ex: impl PgExecutor<'_>, key: &str) -> Result<Option<Issu
 /// drift). The sort column comes from a [`SortKey`] match, never string-interpolated, so this
 /// stays injection-safe however the query params are threaded through; every filter value is a
 /// bound `?` parameter.
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.list_issues_filtered", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql"), err)]
 pub(crate) async fn list_issues_filtered(
     ex: impl PgExecutor<'_>,
@@ -341,6 +347,7 @@ pub(crate) struct DispatchRouting {
 /// Mirror one issue's upstream comment set: upsert each comment by GitHub id and delete rows
 /// whose comment vanished upstream, in one transaction (a reader never sees a half-replaced
 /// set). Takes the pool (not a generic executor) because it owns the transaction.
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.replace_issue_comments", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", issue_key = %issue_key), err)]
 pub(crate) async fn replace_issue_comments(
     pool: &sqlx::PgPool,
@@ -390,6 +397,7 @@ pub(crate) async fn replace_issue_comments(
 
 /// One issue's mirrored comments, oldest first (GitHub creation order; id breaks the rare
 /// same-second tie).
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.list_issue_comments", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", issue_key = %issue_key), err)]
 pub(crate) async fn list_issue_comments(
     ex: impl PgExecutor<'_>,
@@ -420,6 +428,7 @@ pub(crate) async fn list_issue_comments(
 
 /// Every scope proposed for one issue, oldest first (the provenance chain the issue-detail view
 /// walks: issue → scopes → runs → candidates).
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.list_scopes_for_issue", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", issue = %issue), err)]
 pub(crate) async fn list_scopes_for_issue(
     ex: impl PgExecutor<'_>,
@@ -484,6 +493,7 @@ pub(crate) async fn get_scope_by_id(ex: impl PgExecutor<'_>, id: i64) -> Result<
 /// row's cached hash is stale relative to `ranked_content_hash` (never-ranked, or content
 /// changed since the last verdict). Returns rows changed (0/1): only the winner should log the
 /// rationale as evidence and ledger the call's cost.
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.apply_rank_result", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", key = %key, tier = %tier), err)]
 pub(crate) async fn apply_rank_result(
     ex: impl PgExecutor<'_>,
@@ -514,6 +524,7 @@ pub(crate) async fn apply_rank_result(
 /// Stamp the tier/ranking-cache columns unconditionally. The follow-up half of an N-verdict park
 /// ([`crate::issues::reconcile`]): the caller already won the `status` CAS via `claim_park`, so nothing
 /// else can be racing this row's tier fields at this point.
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.set_ranked_tier", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", key = %key, tier = %tier), err)]
 pub(crate) async fn set_ranked_tier(
     ex: impl PgExecutor<'_>,
@@ -541,6 +552,7 @@ pub(crate) async fn set_ranked_tier(
 /// `confirm_tier` misses it and re-ranks. The standing `tier` is deliberately left in place — the
 /// tier gate keeps working off the old verdict until the fresh one lands. Returns rows changed
 /// (0 = unknown key).
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.clear_rank", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", key = %key), err)]
 pub(crate) async fn clear_rank(ex: impl PgExecutor<'_>, key: &str) -> Result<bool> {
     let updated_at = crate::clock::now_rfc3339();
@@ -560,6 +572,7 @@ pub(crate) async fn clear_rank(ex: impl PgExecutor<'_>, key: &str) -> Result<boo
 /// how many rows will rank fresh on the next sweep — for [`RerankScope::Unranked`] that's rows
 /// that were already due (their cache is NULL after a rank failure), so the count is a match
 /// count, not a cache-invalidation count.
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.clear_rank_bulk", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql"), err)]
 pub(crate) async fn clear_rank_bulk(ex: impl PgExecutor<'_>, scope: RerankScope) -> Result<u64> {
     let updated_at = crate::clock::now_rfc3339();
@@ -611,6 +624,7 @@ pub(crate) async fn clear_rank_bulk(ex: impl PgExecutor<'_>, scope: RerankScope)
 /// NULL on the next sweep, re-rank, and re-escalate a fresh (paid) grounded turn every pass. In the
 /// pre-scope path `ranked_content_hash` already equals this hash (confirm_tier set it), so the extra
 /// column write is a harmless idempotent no-op.
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.apply_grounded_result", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", key = %key), err)]
 pub(crate) async fn apply_grounded_result(
     ex: impl PgExecutor<'_>,
@@ -654,6 +668,7 @@ pub async fn non_terminal_keys(ex: impl PgExecutor<'_>) -> Result<Vec<String>> {
 
 /// The upstream-poll watermark for `repo`: the `updated_at` of the most-recently-seen
 /// issue, or `None` if the repo has never been triaged.
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.get_watermark", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", repo = %repo), err)]
 pub(crate) async fn get_watermark(ex: impl PgExecutor<'_>, repo: &str) -> Result<Option<String>> {
     let row = sqlx::query!(
@@ -667,6 +682,7 @@ pub(crate) async fn get_watermark(ex: impl PgExecutor<'_>, repo: &str) -> Result
 }
 
 /// Advance (or create) `repo`'s watermark to `updated_at`.
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.set_watermark", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", repo = %repo), err)]
 pub(crate) async fn set_watermark(
     ex: impl PgExecutor<'_>,
@@ -688,6 +704,7 @@ pub(crate) async fn set_watermark(
 }
 
 /// Count issues in `repo` currently at `status` — the triage summary's `parked` column.
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.count_issues_by_status", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", repo = %repo), err)]
 pub(crate) async fn count_issues_by_status(
     ex: impl PgExecutor<'_>,
@@ -708,6 +725,7 @@ pub(crate) async fn count_issues_by_status(
 
 /// Count issues in `repo` whose `upstream_updated_at` was never stamped (rows ingested before
 /// migration 0007) — the backfill pass's gate: zero means the pass makes no GitHub calls at all.
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.count_null_upstream_updated_at", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", repo = %repo), err)]
 pub(crate) async fn count_null_upstream_updated_at(
     ex: impl PgExecutor<'_>,
@@ -728,6 +746,7 @@ pub(crate) async fn count_null_upstream_updated_at(
 /// is skipped, not an error. Returns how many rows took a stamp. Deliberately leaves `updated_at`
 /// alone — this is metadata repair, not row activity. Takes the pool (not a generic executor)
 /// because it owns the transaction.
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.stamp_null_upstream_updated_at", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql"), err)]
 pub(crate) async fn stamp_null_upstream_updated_at(
     pool: &sqlx::PgPool,
@@ -803,6 +822,7 @@ pub async fn insert_scope(ex: impl PgExecutor<'_>, s: &NewScope) -> Result<i64> 
 }
 
 /// Record the exposure the engine computed from a frozen scope pack.
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.set_scope_exposure", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql"), err)]
 pub(crate) async fn set_scope_exposure(
     ex: impl PgExecutor<'_>,
@@ -840,6 +860,7 @@ pub async fn latest_scope_for_issue(ex: impl PgExecutor<'_>, issue: &str) -> Res
 /// The full `scenarios` sidecar row for the SPA's detail panel (title/body/affected_repos/adopter,
 /// none of which live on `issues` — the GitHub-flavored `title`/`body` columns keep their upstream
 /// semantics and are never repurposed for a scenario). `None` for a key with no sidecar row.
+#[cfg(feature = "autoresearch")]
 pub(crate) struct ScenarioRow {
     pub(crate) title: String,
     pub(crate) body: String,
@@ -854,6 +875,7 @@ pub(crate) struct ScenarioRow {
     pub(crate) created_at: String,
 }
 
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.get_scenario", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", key = %key), err)]
 pub(crate) async fn get_scenario(pool: &PgPool, key: &str) -> Result<Option<ScenarioRow>> {
     let row = sqlx::query!(
@@ -881,6 +903,7 @@ pub(crate) async fn get_scenario(pool: &PgPool, key: &str) -> Result<Option<Scen
 /// The ordered affected-repos hint list for a scenario (position 0 first). `issues.repo` — seeded
 /// from position 0 at adoption — is the actual clone target; this list is the human's problem
 /// framing, not a binding constraint.
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.get_scenario_repos", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", key = %key), err)]
 async fn get_scenario_repos(ex: impl PgExecutor<'_>, key: &str) -> Result<Vec<String>> {
     let rows = sqlx::query!(
@@ -906,6 +929,7 @@ async fn get_scenario_repos(ex: impl PgExecutor<'_>, key: &str) -> Result<Vec<St
 /// `authoritative` marks a measurement-derived brief that reaches the scope agent verbatim,
 /// prescriptions intact, instead of being de-prescribed. `pins` carries the clone ref and the
 /// codegen-contract name; the API layer has already validated both.
+#[cfg(feature = "autoresearch")]
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(name = "db.adopt_scenario", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql"), err)]
 pub(crate) async fn adopt_scenario(
@@ -937,6 +961,7 @@ pub(crate) async fn adopt_scenario(
 /// POST itself is both authorship and approval, so the row starts at `awaiting-approval` with an
 /// already-approved scope. Reconcile can therefore reuse the ordinary build + loop-run pipeline
 /// without spending on, or pretending to have performed, a scope turn.
+#[cfg(feature = "autoresearch")]
 pub(crate) async fn adopt_direct_pack(
     pool: &PgPool,
     launch: &crate::issues::model::NewDirectPack<'_>,
@@ -992,6 +1017,7 @@ pub(crate) async fn adopt_direct_pack(
 /// The per-adoption pins a scenario may set on its own `issues` row. Grouped rather than passed as
 /// two adjacent `Option<&str>`: a transposed pair would compile fine and silently clone a branch
 /// named after a contract.
+#[cfg(feature = "autoresearch")]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct AdoptPins<'a> {
     /// Branch or tag to clone the target repo at; `None` = the repo's default branch.
@@ -1009,6 +1035,7 @@ pub(crate) struct AdoptPins<'a> {
 /// flows the same non-upstream scope path (the stored body IS the goal, no live re-fetch), and the
 /// human adopt is the tier/priority authorization. `key` is a pre-validated `jira:{site}:{PROJ-N}`
 /// ([`crate::launches::jira::JiraRef::storage_key`]); the caller has already fetched `title`/`body`.
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.adopt_jira", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", key = %key), err)]
 pub(crate) async fn adopt_jira(
     pool: &PgPool,
@@ -1045,6 +1072,7 @@ pub(crate) async fn adopt_jira(
 /// the full list rides the scope pod's goal framing as a hint the pack agent may override. `pins`
 /// pins that clone to a branch/tag and/or names the broker codegen contract the item is measured
 /// under; only scenario adoption ever sets either.
+#[cfg(feature = "autoresearch")]
 #[allow(clippy::too_many_arguments)]
 async fn adopt_body_issue(
     pool: &PgPool,
@@ -1109,6 +1137,7 @@ async fn adopt_body_issue(
 }
 
 /// Persist a scope turn's structured report verbatim (`scope_reports`), success or failure.
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.insert_scope_report", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql"), err)]
 pub(crate) async fn insert_scope_report(
     ex: impl PgExecutor<'_>,
@@ -1135,6 +1164,7 @@ pub(crate) async fn insert_scope_report(
 
 /// The most recent structured scope report for an issue, or `None` if no scope turn ever
 /// finished with a report (dispatch failures and timeouts leave nothing here).
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.latest_scope_report", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", issue_key = %issue_key), err)]
 pub(crate) async fn latest_scope_report(
     ex: impl PgExecutor<'_>,
@@ -1163,11 +1193,13 @@ pub(crate) async fn latest_scope_report(
 
 /// Transcripts are the biggest rows in the DB, so retention is enforced on every insert: only the
 /// newest N per issue survive ([`insert_scope_transcript`] prunes past this).
+#[cfg(feature = "autoresearch")]
 const SCOPE_TRANSCRIPT_KEEP: i64 = 3;
 
 /// Persist a scope turn's preserved agent transcript (`scope_transcripts`), then prune the
 /// issue's older attempts past [`SCOPE_TRANSCRIPT_KEEP`] — the structured `scope_reports` rows
 /// keep the full history, the heavyweight transcripts keep only the recent tail.
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.insert_scope_transcript", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql"), err)]
 pub(crate) async fn insert_scope_transcript(
     pool: &PgPool,
@@ -1208,6 +1240,7 @@ pub(crate) async fn insert_scope_transcript(
 
 /// The most recent preserved transcript for an issue, or `None` if no scope turn ever delivered
 /// one (pre-feature turns, dispatch failures, timeouts).
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.latest_scope_transcript", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", issue_key = %issue_key), err)]
 pub(crate) async fn latest_scope_transcript(
     ex: impl PgExecutor<'_>,
@@ -1236,6 +1269,7 @@ pub(crate) async fn latest_scope_transcript(
 /// Record a human approval on a scope — the signal that flips its approval gate open. Only the
 /// FIRST approval takes — `WHERE approved_at IS NULL` — so a re-poll seeing the same approval is an
 /// idempotent no-op. Returns whether this poll was the one that flipped the approval open.
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.record_approval", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql"), err)]
 pub(crate) async fn record_approval(
     ex: impl PgExecutor<'_>,
@@ -1259,6 +1293,7 @@ pub(crate) async fn record_approval(
 
 /// Baseline (or update) the frozen upstream-content hash on a scope — the reference a later approval
 /// reconcile compares against to detect goal drift.
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.set_scope_frozen_hash", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql"), err)]
 pub(crate) async fn set_scope_frozen_hash(
     ex: impl PgExecutor<'_>,
@@ -1278,6 +1313,7 @@ pub(crate) async fn set_scope_frozen_hash(
 
 /// Mark a scope stale and record the id of the "upstream changed" comment on the approval PR,
 /// updating the comment in place. Set together so a stale row always carries its comment id.
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.set_scope_stale", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql"), err)]
 pub(crate) async fn set_scope_stale(
     ex: impl PgExecutor<'_>,
@@ -1335,6 +1371,7 @@ pub(crate) async fn awaiting_approval_scopes(
 /// The latest kept-candidate PR per issue (issue key → pr_url), for the issue surfaces' PR chips.
 /// Rows come back ordered by run_id ascending (lexical = chronological, the run-id stamp), so the
 /// map fold leaves each issue holding the PR from its newest run.
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.latest_kept_pr_urls", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql"), err)]
 pub(crate) async fn latest_kept_pr_urls(
     ex: impl PgExecutor<'_>,
@@ -1405,6 +1442,7 @@ pub(crate) async fn set_priority(
 
 /// The pod name of the most recent run launched for `issue` (via its scopes), or `None`. The
 /// upstream-close path uses it to stop a live run. Newest by insertion order (`rowid`).
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.latest_run_pod_for_issue", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", issue = %issue), err)]
 pub(crate) async fn latest_run_pod_for_issue(
     ex: impl PgExecutor<'_>,
@@ -1498,6 +1536,7 @@ pub(crate) async fn tier_counts(ex: impl PgExecutor<'_>) -> Result<Vec<(String, 
 /// with tracked issues always shows, even if its `repos` row hasn't landed yet) UNIONed with
 /// `repos.repo` (so a freshly-watched repo with zero issues yet still shows; every issue-count
 /// column is simply 0 until the first triage sweep lands one).
+#[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.repo_health", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql"), err)]
 pub(crate) async fn repo_health(
     ex: impl PgExecutor<'_>,
@@ -1620,7 +1659,9 @@ pub(crate) mod tests {
     use crate::launches::model::NewPlaybookLaunch;
     use crate::launches::store::{AdoptPlaybookOutcome, adopt_playbook_launch};
 
+    #[cfg(feature = "autoresearch")]
     use crate::issues::model::IssueKind;
+    #[cfg(feature = "autoresearch")]
     use crate::issues::repo_watch::*;
 
     use anyhow::Result;
@@ -1688,6 +1729,7 @@ pub(crate) mod tests {
     /// so the sort/upstream-filter tests that need distinct, deterministic values pin `updated_at`
     /// directly with a raw UPDATE after seeding — same effect as a caller-supplied stamp, without
     /// reintroducing a timestamp parameter every production call site would have to thread through.
+    #[cfg(feature = "autoresearch")]
     async fn pin_updated_at(pool: &PgPool, key: &str, updated_at: &str) -> Result<()> {
         sqlx::query!(
             "UPDATE issues SET updated_at = $1 WHERE key = $2",
@@ -1699,6 +1741,7 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "autoresearch")]
     pub(crate) async fn seed_rows(pool: &PgPool) -> Result<()> {
         // Tier is never part of an upsert (triage is pure discovery) — seed it separately via
         // `set_ranked_tier`, the way the ranker actually sets it.
@@ -1762,6 +1805,7 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "autoresearch")]
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn preexisting_row_decodes_as_github_via_default_backfill(pool: PgPool) -> Result<()> {
         let iss = seed("neuralmagic/crucible#7", "neuralmagic/crucible", 3);
@@ -1782,6 +1826,7 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "autoresearch")]
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn insert_scope_transcript_prunes_past_the_per_issue_keep(pool: PgPool) -> Result<()> {
         // One report row per attempt; each carries a transcript. Another issue's transcript must
@@ -1850,6 +1895,7 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "autoresearch")]
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn list_issues_filtered_sorts_by_priority_desc(pool: PgPool) -> Result<()> {
         seed_rows(&pool).await?;
@@ -1866,6 +1912,7 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "autoresearch")]
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn list_issues_filtered_sorts_by_updated_asc(pool: PgPool) -> Result<()> {
         seed_rows(&pool).await?;
@@ -1882,6 +1929,7 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "autoresearch")]
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn list_issues_filtered_combines_repo_and_tier_filters(pool: PgPool) -> Result<()> {
         seed_rows(&pool).await?;
@@ -1899,6 +1947,7 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "autoresearch")]
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn list_issues_filtered_with_no_filters_returns_everything(pool: PgPool) -> Result<()> {
         seed_rows(&pool).await?;
@@ -1907,6 +1956,7 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "autoresearch")]
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn list_issues_filtered_by_label_matches_the_whole_label_only(
         pool: PgPool,
@@ -1998,6 +2048,7 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "autoresearch")]
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn list_issues_filtered_by_kind_matches_the_input_kind_tag(pool: PgPool) -> Result<()> {
         // Three github rows from the shared seed plus one adopted scenario row and one adopted jira row.
@@ -2124,6 +2175,7 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "autoresearch")]
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn label_filter_combines_with_repo(pool: PgPool) -> Result<()> {
         seed_rows(&pool).await?;
@@ -2143,6 +2195,7 @@ pub(crate) mod tests {
     /// The approval queue carries each revision's exposure digest, so an approver sees which rows
     /// disclose one before opening any of them. A revision frozen by an engine with no extraction
     /// reads NULL, not an empty disclosure.
+    #[cfg(feature = "autoresearch")]
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn the_approval_queue_carries_each_revisions_exposure_digest(pool: PgPool) -> Result<()> {
         let disclosed = crate::playbooks::exposure::Extraction::Declared(
@@ -2185,6 +2238,7 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "autoresearch")]
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn direct_pack_adoption_lands_as_an_approved_frozen_scope(pool: PgPool) -> Result<()> {
         let key = "scenario:direct-pack-test";
@@ -2216,6 +2270,7 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "autoresearch")]
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn list_issues_filtered_by_upstream_since_excludes_older_and_null(
         pool: PgPool,
@@ -2243,6 +2298,7 @@ pub(crate) mod tests {
     /// The issues page ships `recency=1y` by default, so `kind=scenario` arrives with an
     /// `upstream_since` attached. Adopted rows never carry an `upstream_updated_at`, and the
     /// cutoff used to drop them — the filter matched nothing, whatever the window.
+    #[cfg(feature = "autoresearch")]
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn upstream_since_spares_kinds_with_no_upstream(pool: PgPool) -> Result<()> {
         seed_rows(&pool).await?;
@@ -2307,6 +2363,7 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "autoresearch")]
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn list_issues_filtered_by_upstream_state(pool: PgPool) -> Result<()> {
         seed_rows(&pool).await?;
@@ -2354,6 +2411,7 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "autoresearch")]
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn list_issues_filtered_sorts_by_upstream_desc_nulls_last(pool: PgPool) -> Result<()> {
         seed_rows(&pool).await?;
@@ -2378,6 +2436,7 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "autoresearch")]
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn funnel_counts_buckets_every_stage(pool: PgPool) -> Result<()> {
         // discovered: fresh triage, no tier yet.
@@ -2461,6 +2520,7 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "autoresearch")]
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn clear_rank_nulls_only_the_cache_and_reports_a_miss(pool: PgPool) -> Result<()> {
         seed_rows(&pool).await?;
@@ -2486,6 +2546,7 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "autoresearch")]
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn clear_rank_bulk_filters_by_scope_and_only_touches_new_rows(
         pool: PgPool,
@@ -2521,6 +2582,7 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "autoresearch")]
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn repo_health_includes_zero_issue_watched_repos_and_unwatched_issue_repos(
         pool: PgPool,

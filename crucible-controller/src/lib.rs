@@ -20,6 +20,7 @@ extern crate self as crucible_controller;
 
 pub mod api;
 pub mod authz;
+#[cfg(feature = "autoresearch")]
 pub mod builds;
 pub mod client;
 pub(crate) mod clock;
@@ -49,6 +50,7 @@ pub use client::{
     Db, MAINTENANCE_ADVISORY_LOCK, connect, db_name, sibling_db_url, try_maintenance_lock,
 };
 pub use config::{ControllerCfg, GroundedExecutor, PlaybookExecutor, Profile, ScopeExecutor};
+#[cfg(feature = "autoresearch")]
 pub use daemon::autopilot_flag::AutopilotFlag;
 pub use daemon::overrides::{OverrideStore, QueueOverrideSink};
 pub use daemon::overrides_store::{ConfigStore, KubeConfigMapApi};
@@ -56,6 +58,7 @@ pub use daemon::queue::{IssueKey, Override, OverrideSink, QueueConfig, WorkQueue
 pub use daemon::rebuild::{Drift, DriftReport, rebuild, verify};
 pub use event_log::Event;
 pub use issues::model::{NewIssue, NewScope};
+#[cfg(feature = "autoresearch")]
 pub use issues::triage::{TriageSummary, triage_repo};
 pub use metrics::Metrics;
 pub use model::{ParkedBy, Status};

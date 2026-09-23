@@ -77,6 +77,7 @@ fn openai_prices(m: &str) -> Option<(f64, f64)> {
     }
 }
 
+#[cfg(feature = "autoresearch")]
 /// The turn's provisional cost from one mid-turn token sample: the OTEL number when
 /// telemetry stamped one, otherwise the pricing-table estimate. Reconciled by the
 /// authoritative turn-end cost, so streaming this keeps the budget line moving
@@ -173,6 +174,7 @@ mod tests {
         assert_eq!(openai_prices("gpt-5.2-codex"), Some((1.75, 14.0)));
     }
 
+    #[cfg(feature = "autoresearch")]
     #[test]
     fn provisional_prefers_the_authoritative_sample_cost() {
         let mut t = sample();

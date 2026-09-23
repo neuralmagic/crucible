@@ -9,8 +9,8 @@ use crate::agent;
 use crate::agent::event::{AgentEvent, RawStream};
 use crate::args::{Args, Paths};
 use crate::process::STOP;
+use crate::report::reporter::{AgentTurn, Reporter, Stop, TurnBudget};
 use crate::report::session::Row;
-use crate::report::{AgentTurn, Reporter, Stop, TurnBudget};
 use crucible_contract::LoopPhase;
 use std::io::{IsTerminal, Write};
 use std::sync::atomic::Ordering;
@@ -47,7 +47,7 @@ impl Reporter for ConsoleReporter {
         if !row.evidence.is_empty() {
             println!(
                 "  evidence: {}",
-                crate::report::evidence_line(&row.evidence)
+                crate::report::reporter::evidence_line(&row.evidence)
             );
         }
         if solved {
@@ -226,7 +226,7 @@ fn print_rows(rows: &[Row]) {
         } else {
             format!(
                 "  [evidence: {}]",
-                crate::report::evidence_line(&r.evidence)
+                crate::report::reporter::evidence_line(&r.evidence)
             )
         };
         println!(

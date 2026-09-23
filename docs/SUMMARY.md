@@ -16,6 +16,7 @@
 # The control plane
 
 - [Deploying the controller](./controller-deploy.md)
+- [Running the controller locally](./controller-local.md)
 - [Authentication](./controller-auth.md)
 - [Vault and the secrets registry](./controller-vault.md)
 

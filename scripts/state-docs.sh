@@ -9,7 +9,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-crucible=(cargo run --quiet --manifest-path "$root/Cargo.toml" -p crucible --)
+crucible=(cargo run --quiet --manifest-path "$root/Cargo.toml" -p crucible --features autoresearch --)
 
 # page-or-dot path, then the command that produces it.
 outputs=(
