@@ -1,192 +1,581 @@
 :root {
-  --content-max-width: 920px;
+  --content-max-width: 860px;
   --page-padding: 28px;
-  --cru-accent: #b45309;
-  --cru-accent-2: #2563eb;
-  --cru-border: color-mix(in srgb, var(--fg) 16%, transparent);
-  --cru-muted: color-mix(in srgb, var(--fg) 68%, var(--bg));
-  --cru-surface: color-mix(in srgb, var(--bg) 94%, var(--fg));
-  --cru-code-bg: color-mix(in srgb, var(--bg) 88%, var(--fg));
+  --mono-font: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --cru-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --cru-radius: 10px;
 }
 
 .light,
 .rust,
 html:not(.js) {
-  --links: #b04a08;
-  --sidebar-active: #b45309;
-  --table-header-bg: #f6eee4;
-  --table-alternate-bg: #fbf7f1;
-  --quote-bg: #fbf4ea;
-  --quote-border: #e6cba6;
+  --bg: #fcfbf8;
+  --fg: #1f1b16;
+  --sidebar-bg: #f4f0e9;
+  --sidebar-fg: #4a4238;
+  --sidebar-non-existant: #a8a095;
+  --sidebar-active: #c2410c;
+  --sidebar-spacer: #e6dfd4;
+  --scrollbar: #cfc6b8;
+  --icons: #8a8073;
+  --icons-hover: #1f1b16;
+  --links: #b93c0a;
+  --inline-code-color: #8c2f0b;
+  --theme-popup-bg: #fcfbf8;
+  --theme-popup-border: #e6dfd4;
+  --theme-hover: #f1ebe2;
+  --quote-bg: #fbf3e8;
+  --quote-border: #f0c89a;
+  --table-border-color: #e9e2d7;
+  --table-header-bg: #f4eee5;
+  --table-alternate-bg: #faf7f2;
+  --searchbar-border-color: #d9d0c3;
+  --searchbar-bg: #ffffff;
+  --searchbar-fg: #1f1b16;
+  --searchresults-header-fg: #6b6155;
+  --searchresults-border-color: #e6dfd4;
+  --searchresults-li-bg: #f4eee5;
+  --search-mark-bg: #fcd9b1;
+
+  --cru-accent: #c2410c;
+  --cru-accent-soft: color-mix(in srgb, #ea580c 12%, transparent);
+  --cru-accent-2: #1d4ed8;
+  --cru-heat: linear-gradient(135deg, #f59e0b, #ea580c 45%, #b91c1c);
+  --cru-border: #e6dfd4;
+  --cru-muted: #6b6155;
+  --cru-surface: #ffffff;
+  --cru-code-bg: #f6f2eb;
+  --cru-shadow: 0 1px 2px rgb(60 40 20 / 6%), 0 8px 24px rgb(60 40 20 / 6%);
 }
 
 .ayu,
 .coal,
 .navy {
-  --cru-border: color-mix(in srgb, var(--fg) 22%, transparent);
-  --cru-surface: color-mix(in srgb, var(--bg) 86%, var(--fg));
-  --cru-code-bg: color-mix(in srgb, var(--bg) 80%, var(--fg));
+  --bg: #14110e;
+  --fg: #e9e3da;
+  --sidebar-bg: #0f0d0b;
+  --sidebar-fg: #b9b0a3;
+  --sidebar-non-existant: #6b6258;
+  --sidebar-active: #fb923c;
+  --sidebar-spacer: #2a241e;
+  --scrollbar: #3a332b;
+  --icons: #8f8578;
+  --icons-hover: #f4efe8;
+  --links: #fb923c;
+  --inline-code-color: #fdba74;
+  --theme-popup-bg: #1c1814;
+  --theme-popup-border: #2f2821;
+  --theme-hover: #26211b;
+  --quote-bg: #1d1814;
+  --quote-border: #7c3a12;
+  --table-border-color: #2f2821;
+  --table-header-bg: #1f1a15;
+  --table-alternate-bg: #18140f;
+  --searchbar-border-color: #3a332b;
+  --searchbar-bg: #1c1814;
+  --searchbar-fg: #e9e3da;
+  --searchresults-header-fg: #a39a8d;
+  --searchresults-border-color: #2f2821;
+  --searchresults-li-bg: #1f1a15;
+  --search-mark-bg: #9a3412;
+
+  --cru-accent: #fb923c;
+  --cru-accent-soft: color-mix(in srgb, #fb923c 12%, transparent);
+  --cru-accent-2: #7aa2f7;
+  --cru-heat: linear-gradient(135deg, #f59e0b, #ea580c 45%, #b91c1c);
+  --cru-border: #2f2821;
+  --cru-muted: #a39a8d;
+  --cru-surface: #1a1612;
+  --cru-code-bg: #1d1915;
+  --cru-shadow: 0 1px 2px rgb(0 0 0 / 30%), 0 10px 30px rgb(0 0 0 / 25%);
+}
+
+html {
+  font-family: var(--cru-sans);
+  font-feature-settings: "cv11", "ss01";
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  font-size: 1.6rem;
+}
+
+#menu-bar {
+  border-block-end: 1px solid var(--cru-border);
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter: saturate(1.4) blur(8px);
+}
+
+#menu-bar.bordered {
+  border-block-end-color: var(--cru-border);
+}
+
+.menu-title {
+  font-size: 1.8rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.sidebar {
+  border-inline-end: 1px solid var(--cru-border);
+  font-size: 1.45rem;
+}
+
+.sidebar-scrollbox {
+  padding: 1rem 1.2rem 2rem;
+}
+
+.chapter li {
+  margin-block: 0.1rem;
+}
+
+.chapter li.chapter-item {
+  line-height: 1.45;
+}
+
+.chapter li a {
+  padding: 0.32rem 0.6rem;
+  border-radius: 6px;
+}
+
+.chapter li a:hover {
+  background: var(--theme-hover);
+  color: var(--fg);
+  text-decoration: none;
+}
+
+.chapter li a.active {
+  background: var(--cru-accent-soft);
+  color: var(--sidebar-active);
+  font-weight: 600;
+}
+
+.chapter li.part-title {
+  font-family: var(--mono-font);
+  margin-block: 1.6rem 0.35rem;
+  padding-inline-start: 0.6rem;
+  color: var(--cru-muted);
+  font-size: 1.1rem;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+.chapter li.spacer {
+  margin-block: 1rem;
 }
 
 .content main {
-  padding-block-start: 22px;
+  padding-block: 12px 48px;
 }
 
 .content p,
 .content li {
-  line-height: 1.62;
+  line-height: 1.7;
 }
 
 .content h1,
 .content h2,
-.content h3 {
-  letter-spacing: 0;
+.content h3,
+.content h4 {
+  font-weight: 700;
+  letter-spacing: -0.015em;
+  line-height: 1.25;
 }
 
 .content h1 {
-  margin-block: 0.55em 0.65em;
-  font-size: 3.4rem;
-  line-height: 1.12;
+  margin-block: 0.6em 0.5em;
+  font-size: 3.6rem;
+  letter-spacing: -0.025em;
 }
 
 .content h2 {
-  margin-block-start: 2.25em;
-  padding-block-start: 0.35em;
-  border-block-start: 1px solid var(--cru-border);
-  font-size: 2.35rem;
+  margin-block: 2.4em 0.7em;
+  font-size: 2.5rem;
 }
 
 .content h3 {
-  font-size: 1.78rem;
+  margin-block: 1.8em 0.5em;
+  font-size: 1.95rem;
+}
+
+.content h4 {
+  font-size: 1.7rem;
+}
+
+.content h1 a.header,
+.content h2 a.header,
+.content h3 a.header {
+  color: var(--fg);
 }
 
 .content a {
-  text-underline-offset: 0.18em;
+  text-decoration: none;
 }
 
-.content a:hover {
-  text-decoration-thickness: 0.08em;
+.content main a:not(.header):not(.cru-button):not(.cru-card) {
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, var(--links) 35%, transparent);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.2em;
 }
 
-.content code {
-  padding: 0.08em 0.28em;
-  border-radius: 4px;
+.content main a:not(.header):not(.cru-button):not(.cru-card):hover {
+  text-decoration-color: var(--links);
+}
+
+.content hr {
+  margin-block: 3rem;
+  border: 0;
+  border-block-start: 1px solid var(--cru-border);
+}
+
+.content img {
+  border-radius: var(--cru-radius);
+}
+
+code {
+  font-family: var(--mono-font);
+  font-size: 0.875em;
+}
+
+.content :not(pre) > code {
+  padding: 0.12em 0.36em;
+  border: 1px solid var(--cru-border);
+  border-radius: 5px;
   background: var(--cru-code-bg);
+  color: var(--inline-code-color);
 }
 
-.content pre code {
-  padding: 0;
-  background: transparent;
+.content a > code {
+  color: inherit;
 }
 
 .content pre {
+  margin-block: 1.4em;
   border: 1px solid var(--cru-border);
-  border-radius: 8px;
-  box-shadow: 0 8px 24px color-mix(in srgb, #000 8%, transparent);
+  border-radius: var(--cru-radius);
+  background: var(--cru-code-bg);
+}
+
+.content pre > code,
+.content pre > code.hljs {
+  padding: 1.1em 1.25em;
+  background: var(--cru-code-bg);
+  font-size: 1.36rem;
+  line-height: 1.6;
+}
+
+.content pre > .buttons {
+  top: 0.6rem;
+  right: 0.6rem;
 }
 
 .table-wrapper {
-  margin-block: 1.25em;
-  border: 1px solid var(--cru-border);
-  border-radius: 8px;
+  margin-block: 1.4em;
+  border: 1px solid var(--table-border-color);
+  border-radius: var(--cru-radius);
 }
 
 table {
   width: 100%;
+  border-collapse: collapse;
+  font-size: 0.95em;
+}
+
+table thead {
+  background: var(--table-header-bg);
+}
+
+table th {
+  font-weight: 600;
+  text-align: start;
 }
 
 table th,
 table td {
-  padding: 0.68em 0.9em;
+  padding: 0.7em 0.95em;
+  border: 0;
+  border-block-end: 1px solid var(--table-border-color);
   vertical-align: top;
 }
 
+table tbody tr:last-child td {
+  border-block-end: 0;
+}
+
+table thead tr:first-child th {
+  border-block-start: 0;
+}
+
 blockquote {
-  border-block: 0;
-  border-inline-start: 4px solid var(--quote-border);
-  border-radius: 0 8px 8px 0;
+  margin-inline: 0;
+  padding: 0.9rem 1.2rem;
+  border: 0;
+  border-inline-start: 3px solid var(--quote-border);
+  border-radius: 0 var(--cru-radius) var(--cru-radius) 0;
+  background: var(--quote-bg);
 }
 
-.sidebar-scrollbox {
-  padding-block-start: 0.65rem;
+blockquote p {
+  margin-block: 0.4em;
 }
 
-.chapter li {
-  margin-block: 0.18rem;
+.cru-callout {
+  margin-block: 1.6rem;
+  padding: 1rem 1.2rem;
+  border: 1px solid var(--cru-border);
+  border-inline-start: 3px solid var(--cru-accent-2);
+  border-radius: var(--cru-radius);
+  background: var(--cru-surface);
 }
 
-.chapter li.part-title {
-  margin-block-start: 1.25rem;
-  color: var(--cru-muted);
-  font-size: 1.15rem;
-  font-weight: 700;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
+.cru-callout.warn {
+  border-inline-start-color: var(--cru-accent);
 }
 
-.menu-title {
-  font-weight: 700;
+.cru-callout p {
+  margin-block: 0.3em;
 }
 
 .cru-hero {
-  margin-block: 0 2rem;
-  padding: 1.45rem 1.6rem;
+  position: relative;
+  display: grid;
+  grid-template-columns: 132px 1fr;
+  gap: 2.4rem;
+  align-items: center;
+  margin-block: 1.2rem 3rem;
+  padding: 2.6rem 2.6rem 2.4rem;
+  overflow: hidden;
   border: 1px solid var(--cru-border);
-  border-radius: 8px;
+  border-radius: 14px;
   background:
-    linear-gradient(135deg, color-mix(in srgb, var(--cru-accent) 14%, transparent), transparent 52%),
+    radial-gradient(120% 90% at 0% 0%, color-mix(in srgb, #f97316 16%, transparent), transparent 60%),
+    radial-gradient(80% 80% at 100% 100%, color-mix(in srgb, #b91c1c 8%, transparent), transparent 60%),
     var(--cru-surface);
+  box-shadow: var(--cru-shadow);
 }
 
 .cru-hero .eyebrow {
-  margin: 0 0 0.45rem;
+  font-family: var(--mono-font);
+  margin: 0 0 0.6rem;
   color: var(--cru-accent);
   font-size: 1.2rem;
-  font-weight: 800;
-  letter-spacing: 0.08em;
+  font-weight: 700;
+  letter-spacing: 0.1em;
   text-transform: uppercase;
+}
+
+.cru-hero .headline {
+  margin: 0 0 0.8rem;
+  font-size: 3rem;
+  font-weight: 750;
+  letter-spacing: -0.025em;
+  line-height: 1.15;
 }
 
 .cru-hero .lead {
   margin: 0;
-  max-width: 72ch;
-  font-size: 1.82rem;
-  line-height: 1.5;
+  max-width: 60ch;
+  color: var(--cru-muted);
+  font-size: 1.75rem;
+  line-height: 1.55;
+}
+
+.cru-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.8rem;
+  margin-block-start: 1.8rem;
+}
+
+.cru-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.7rem 1.3rem;
+  border: 1px solid var(--cru-border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--fg) !important;
+  font-size: 1.45rem;
+  font-weight: 600;
+  transition: border-color 0.15s ease, transform 0.15s ease;
+}
+
+.cru-button:hover {
+  border-color: var(--cru-accent);
+  transform: translateY(-1px);
+}
+
+.cru-button.primary {
+  border-color: transparent;
+  background: var(--cru-heat, var(--cru-accent));
+  color: #fff !important;
+}
+
+/* The molten mark on the introduction hero: the still image holds the box until (and unless)
+   WebGPU takes over, so the layout never jumps. */
+.cru-mark {
+  position: relative;
+  display: block;
+  width: 132px;
+  height: 132px;
+}
+
+.cru-mark img,
+.cru-mark canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border-radius: 0;
+  image-rendering: pixelated;
+}
+
+.cru-mark canvas {
+  opacity: 0;
+  cursor: crosshair;
+  transition: opacity 240ms ease;
+}
+
+.cru-lanes {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 1.2rem;
+  margin-block: 1.6rem 2rem;
+}
+
+.cru-lane {
+  position: relative;
+  padding: 1.6rem 1.7rem 1.4rem;
+  overflow: hidden;
+  border: 1px solid var(--cru-border);
+  border-radius: var(--cru-radius);
+  background: var(--cru-surface);
+}
+
+.cru-lane::before {
+  position: absolute;
+  inset: 0 0 auto;
+  height: 3px;
+  background: var(--cru-heat, var(--cru-accent));
+  content: "";
+}
+
+.cru-lane.scored::before {
+  background: linear-gradient(90deg, var(--cru-accent-2), #7c3aed);
+}
+
+.cru-lane h3 {
+  margin-block: 0 0.4rem;
+  font-size: 1.9rem;
+}
+
+.cru-lane .tag {
+  font-family: var(--mono-font);
+  margin: 0 0 0.9rem;
+  color: var(--cru-muted);
+  font-size: 1.3rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.cru-lane p,
+.cru-lane li {
+  font-size: 1.5rem;
+}
+
+.cru-lane ul {
+  margin-block: 0.6rem 0;
+  padding-inline-start: 1.2em;
 }
 
 .cru-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   gap: 1rem;
-  margin-block: 1.25rem;
+  margin-block: 1.4rem;
 }
 
+a.cru-card,
 .cru-card {
-  padding: 1rem 1.1rem;
+  display: block;
+  padding: 1.2rem 1.3rem;
   border: 1px solid var(--cru-border);
-  border-radius: 8px;
+  border-radius: var(--cru-radius);
   background: var(--cru-surface);
+  color: var(--fg);
+  transition: border-color 0.15s ease, transform 0.15s ease;
+}
+
+a.cru-card:hover {
+  border-color: var(--cru-accent);
+  transform: translateY(-1px);
 }
 
 .cru-card h3 {
   margin-block: 0 0.35rem;
+  font-size: 1.65rem;
 }
 
 .cru-card p {
   margin-block: 0;
   color: var(--cru-muted);
+  font-size: 1.42rem;
+  line-height: 1.55;
 }
 
-.cru-callout {
-  margin-block: 1.2rem;
-  padding: 0.95rem 1.1rem;
-  border-inline-start: 4px solid var(--cru-accent-2);
-  border-radius: 0 8px 8px 0;
-  background: var(--cru-surface);
+.cru-card .arrow {
+  color: var(--cru-accent);
 }
 
-.cru-callout p {
-  margin-block: 0;
+ol.cru-steps {
+  padding-inline-start: 0;
+  list-style: none;
+  counter-reset: cru-step;
+}
+
+ol.cru-steps > li {
+  position: relative;
+  margin-block: 0.9rem;
+  padding-inline-start: 3.2rem;
+  counter-increment: cru-step;
+}
+
+ol.cru-steps > li::before {
+  position: absolute;
+  inset-inline-start: 0;
+  top: 0.1rem;
+  display: grid;
+  place-items: center;
+  width: 2.2rem;
+  height: 2.2rem;
+  border-radius: 50%;
+  background: var(--cru-accent-soft);
+  color: var(--cru-accent);
+  font-size: 1.25rem;
+  font-weight: 700;
+  content: counter(cru-step);
+}
+
+figure.cru-figure {
+  margin: 2rem 0;
+}
+
+figure.cru-figure img {
+  display: block;
+  width: 100%;
+  border: 1px solid var(--cru-border);
+  box-shadow: var(--cru-shadow);
+}
+
+figure.cru-figure figcaption {
+  margin-block-start: 0.7rem;
+  color: var(--cru-muted);
+  font-size: 1.35rem;
+  text-align: center;
 }
 
 /* Mermaid diagrams: a bordered viewport that svg-pan-zoom drives. Fixed height +
@@ -194,10 +583,10 @@ blockquote {
    blowing past the content column. */
 .mermaid {
   border: 1px solid var(--cru-border, rgba(128, 128, 128, 0.3));
-  border-radius: 8px;
+  border-radius: var(--cru-radius);
   background: var(--cru-surface, rgba(128, 128, 128, 0.04));
   overflow: hidden;
-  margin-block: 1.2rem;
+  margin-block: 1.4rem;
 }
 
 .mermaid > svg {
@@ -216,37 +605,26 @@ blockquote {
 
 @media (max-width: 700px) {
   :root {
-    --page-padding: 18px;
+    --page-padding: 16px;
   }
 
   .content h1 {
-    font-size: 2.7rem;
+    font-size: 2.8rem;
   }
 
   .cru-hero {
-    padding: 1.1rem 1.2rem;
+    grid-template-columns: 1fr;
+    gap: 1.2rem;
+    padding: 1.6rem 1.4rem;
+    text-align: start;
   }
-}
 
-/* The molten mark on the introduction hero: the still image holds the box until (and unless)
-   WebGPU takes over, so the layout never jumps. */
-.cru-mark {
-  position: relative;
-  display: block;
-  width: 120px;
-  height: 120px;
-  margin: 0 auto 18px;
-}
-.cru-mark img,
-.cru-mark canvas {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  image-rendering: pixelated;
-}
-.cru-mark canvas {
-  opacity: 0;
-  cursor: crosshair;
-  transition: opacity 240ms ease;
+  .cru-hero .headline {
+    font-size: 2.4rem;
+  }
+
+  .cru-mark {
+    width: 88px;
+    height: 88px;
+  }
 }

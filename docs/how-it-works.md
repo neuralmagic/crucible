@@ -1,6 +1,6 @@
-# How it works
+# How the loop works
 
-The whole system in one diagram: a goal goes in, an agent proposes a change, the change is
+The autoresearch lane in one diagram: a goal goes in, an agent proposes a change, the change is
 applied to a reversible **world**, a **frozen judge** measures it once, and the loop keeps it
 only if it strictly beats the best so far. Git is the memory; the operator can steer; the
 privileged operations live host-side behind a mediated broker the agent can only *ask*.
@@ -65,7 +65,7 @@ its own generated diagram: [Loop control states](./loop-states.md).
 | --- | --- | --- |
 | **Goal** | A GitHub issue or Jira ticket becomes a frozen run objective. The objective never moves once the run starts. | [ADR 0001](./adr/0001-adaptive-harness.md) |
 | **wide round** | Optional: `--wide N` fans out N independent propose turns (one per `[search].approaches` entry) in parallel, ranks them by the gate, and the winner seeds the deep loop below. 0 (default) skips straight to propose. | [ADR 0010](./adr/0010-candidate-portfolios-and-search.md) |
-| **propose** | The agent reads the history and edits the world toward the goal. The proposal policy is a pluggable backend (`local` / `openshell` / `command`), not the engine. | [What crucible is](./crucible.md) |
+| **propose** | The agent reads the history and edits the world toward the goal. The proposal policy is a pluggable backend (`local` / `openshell` / `command`), not the engine. | [The loop in one read](./crucible.md) |
 | **apply** | Make the candidate live. For a code repo the edits *are* the apply; for a deploy domain it builds + sets the image. | [ADR 0005](./adr/0005-engine-side-builds.md), [ADR 0012](./adr/0012-rendered-deployments.md) |
 | **measure** | The frozen judge scores the candidate once. The agent is handed a `World`, never the `Judge`, so it can't tune the test it's graded on. | [ADR 0001](./adr/0001-adaptive-harness.md) |
 | **accept?** | Keep iff `valid` and the score strictly beats the best per `direction`; otherwise restore the last good state. | [Contract](./crucible-contract.md) |
@@ -96,4 +96,4 @@ and **Judge**: they're the trust boundary, and they mean something specific here
 | **forge** | The builder. | Engine-side image build + deploy: `buildah` for real source builds, native-OCI `derive_layer` for "base image + an edited file." |
 | **publish-on-keep** | Ship a winner. | On a kept candidate, push the run record to S3 and open/update a draft PR per fork. |
 
-For the prose version of the same model, see [What crucible is](./crucible.md).
+For the prose version of the same model, see [The loop in one read](./crucible.md).

@@ -22,7 +22,8 @@ for every agent turn, so the whole graph runs in under two seconds with no model
 
 ```sh
 crucible plan run --file examples/playbook/plan.toml \
-                  --manifest examples/playbook/crucible.toml
+                  --manifest examples/playbook/crucible.toml \
+                  --max-cost 1 --max-time 5m
 ```
 
 Expected, exactly:
