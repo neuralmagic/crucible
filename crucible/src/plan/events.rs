@@ -32,6 +32,15 @@ pub(crate) fn plan_admitted_event(plan: &ValidPlan) -> crate::report::session::S
                     .map(|r| r.task.0.clone())
                     .unwrap_or_default(),
                 max_rounds: t.revise.as_ref().map_or(0, |r| r.max_rounds),
+                emits: t
+                    .emits
+                    .fields()
+                    .into_iter()
+                    .map(|(field, ty)| crucible_contract::emits::EmitWire {
+                        field: field.0.clone(),
+                        ty: ty.cloned(),
+                    })
+                    .collect(),
             })
             .collect(),
     }
@@ -116,6 +125,75 @@ mod tests {
         assert_eq!(
             (tasks[1].revise.as_str(), tasks[1].max_rounds),
             ("author", 3)
+        );
+    }
+
+    #[test]
+    fn the_admitted_plan_carries_each_declared_field_and_its_type() {
+        use crucible_contract::decision::Label;
+        use crucible_contract::emits::{EmitWire, FieldType};
+        let plan = Plan::from_toml_str(
+            r#"
+            version = 1
+            [budget]
+            usd = 1.0
+            [[task]]
+            name = "classify"
+            kind = "command"
+            command = "true"
+            emits = { tier = ["high", "low"], score = "number" }
+            [[task]]
+            name = "legacy"
+            kind = "command"
+            command = "true"
+            emits = ["lines"]
+            [[task]]
+            name = "bare"
+            kind = "command"
+            command = "true"
+            "#,
+        )
+        .unwrap()
+        .validate()
+        .unwrap();
+        let SessionEvent::PlanAdmitted { tasks, .. } =
+            crate::plan::events::plan_admitted_event(&plan)
+        else {
+            panic!("not a plan_admitted event");
+        };
+        let emits = |name: &str| {
+            tasks
+                .iter()
+                .find(|t| t.name == name)
+                .map(|t| t.emits.clone())
+                .unwrap()
+        };
+        let label = |l: &str| Label::new(l).unwrap();
+        assert_eq!(
+            emits("classify"),
+            [
+                EmitWire {
+                    field: "score".into(),
+                    ty: Some(FieldType::Number),
+                },
+                EmitWire {
+                    field: "tier".into(),
+                    ty: Some(FieldType::OneOf(vec![label("high"), label("low")])),
+                },
+            ]
+        );
+        assert_eq!(
+            emits("legacy"),
+            [EmitWire {
+                field: "lines".into(),
+                ty: None,
+            }]
+        );
+        assert!(emits("bare").is_empty());
+        let line = crucible_contract::encode(&crate::plan::events::plan_admitted_event(&plan));
+        assert!(
+            line.contains(r#""emits":[{"field":"score","type":"number"},{"field":"tier","type":["high","low"]}]"#),
+            "{line}"
         );
     }
 }

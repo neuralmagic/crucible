@@ -3,7 +3,10 @@ use std::fmt;
 
 use crate::crucible::Direction;
 use anyhow::{Context, Result};
-use crucible_contract::decision::{Label, Question, QuestionError, QuestionId, UNCERTAIN};
+use crucible_contract::decision::{
+    Label, Question, QuestionError, QuestionId, QuestionKind, UNCERTAIN,
+};
+use crucible_contract::emits::{FieldType, FieldTypeError};
 use serde::{Deserialize, Serialize};
 
 /// The reserved input a mapped instance receives its own item under. Reserved like the
@@ -42,6 +45,117 @@ impl From<&str> for TaskName {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct OutputField(pub String);
+
+/// The fields a task's JSON output promises: names alone (`emits = ["a"]`), or names with the
+/// type each holds (`emits = {"a": "string"}`). Empty in either form declares nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Emits {
+    Fields(Vec<OutputField>),
+    Typed(BTreeMap<OutputField, FieldType>),
+}
+
+/// What a task's emits say about one field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Declared<'a> {
+    /// The task declares no emits, so nothing is promised or checked.
+    Unchecked,
+    /// The task declares emits without this field.
+    Omitted,
+    /// The field is promised present, of any type.
+    Untyped,
+    /// The field is promised present and of this type.
+    Typed(&'a FieldType),
+}
+
+impl Default for Emits {
+    fn default() -> Self {
+        Emits::Fields(Vec::new())
+    }
+}
+
+impl Emits {
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Emits::Fields(fields) => fields.is_empty(),
+            Emits::Typed(fields) => fields.is_empty(),
+        }
+    }
+
+    /// Every declared field in declaration order (key order for the typed form), with its type.
+    pub fn fields(&self) -> Vec<(&OutputField, Option<&FieldType>)> {
+        match self {
+            Emits::Fields(fields) => fields.iter().map(|f| (f, None)).collect(),
+            Emits::Typed(fields) => fields.iter().map(|(f, ty)| (f, Some(ty))).collect(),
+        }
+    }
+
+    pub fn names(&self) -> Vec<String> {
+        self.fields()
+            .into_iter()
+            .map(|(f, _)| f.0.clone())
+            .collect()
+    }
+
+    pub fn field(&self, name: &str) -> Declared<'_> {
+        if self.is_empty() {
+            return Declared::Unchecked;
+        }
+        match self.fields().into_iter().find(|(f, _)| f.0 == name) {
+            None => Declared::Omitted,
+            Some((_, None)) => Declared::Untyped,
+            Some((_, Some(ty))) => Declared::Typed(ty),
+        }
+    }
+}
+
+impl Serialize for Emits {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Emits::Fields(fields) => fields.serialize(serializer),
+            Emits::Typed(fields) => fields.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Emits {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::{Error, MapAccess, SeqAccess, Visitor};
+
+        struct EmitsVisitor;
+
+        impl<'de> Visitor<'de> for EmitsVisitor {
+            type Value = Emits;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a list of field names, or a table from field name to field type")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Emits, A::Error> {
+                let mut fields = Vec::new();
+                while let Some(field) = seq.next_element::<OutputField>()? {
+                    fields.push(field);
+                }
+                Ok(Emits::Fields(fields))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Emits, A::Error> {
+                let mut fields = BTreeMap::new();
+                while let Some((field, ty)) = map.next_entry::<OutputField, FieldType>()? {
+                    if fields.contains_key(&field) {
+                        return Err(A::Error::custom(format!(
+                            "output field {:?} is declared twice",
+                            field.0
+                        )));
+                    }
+                    fields.insert(field, ty);
+                }
+                Ok(Emits::Typed(fields))
+            }
+        }
+
+        deserializer.deserialize_any(EmitsVisitor)
+    }
+}
 
 /// One declared output field of one task: what a mapped task fans out over.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -324,11 +438,11 @@ pub struct Task {
     /// run once post-loop against the kept best.
     #[serde(default, skip_serializing_if = "Stage::is_iteration")]
     pub stage: Stage,
-    /// Fields the task's JSON output promises to include. Presence is checked at
-    /// runtime; consumer contracts (`top_k`, grade sources) at validation. Empty =
-    /// undeclared.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub emits: Vec<OutputField>,
+    /// Fields the task's JSON output promises to include, optionally typed. Presence and type
+    /// are checked at runtime; consumer contracts (`top_k`, grade sources, output-decided
+    /// routes, `over`) at validation. Empty = undeclared.
+    #[serde(default, skip_serializing_if = "Emits::is_empty")]
+    pub emits: Emits,
     /// Workspace-relative paths this task's output includes as files. A declared file is part
     /// of the task's output, not part of the workspace state that isolation discards, so a
     /// dependent receives it either way.
@@ -482,6 +596,21 @@ pub enum PlanError {
     GradeSourceOmitsScore { task: String, from: String },
     #[error("task {task:?}: a thresholded evaluate grades `score`, but its emits omits it")]
     ThresholdedEvaluateOmitsScore { task: String },
+    #[error("task {task:?} declares output field {field:?} with an invalid type: {error}")]
+    InvalidFieldType {
+        task: String,
+        field: String,
+        error: FieldTypeError,
+    },
+    #[error(
+        "task {task:?} reads a numeric `score` from {source_task:?}, which declares it {declared}; \
+         declare it \"number\""
+    )]
+    ScoreNotNumeric {
+        task: String,
+        source_task: String,
+        declared: FieldType,
+    },
     #[error(
         "task {task:?} has invalid session {session:?}; use 1-64 ASCII letters, digits, `.`, `_`, or `-`"
     )]
@@ -566,6 +695,36 @@ pub enum PlanError {
         task: String,
         source_task: String,
         question: String,
+    },
+    #[error(
+        "route task {task:?} reads question {question:?} from {source_task:?}, which declares it \
+         {declared}; {question:?} answers {expected}"
+    )]
+    RouteSourceUnanswerable {
+        task: String,
+        source_task: String,
+        question: String,
+        declared: Box<FieldType>,
+        expected: String,
+    },
+    #[error(
+        "task {task:?} maps over {reference}, but {producer:?} declares emits without {field:?}"
+    )]
+    OverFieldOmitted {
+        task: String,
+        reference: String,
+        producer: String,
+        field: String,
+    },
+    #[error(
+        "task {task:?} maps over {reference}, which {producer:?} declares {declared}; `over` \
+         needs a list"
+    )]
+    OverNotAList {
+        task: String,
+        reference: String,
+        producer: String,
+        declared: FieldType,
     },
     #[error("route task {task:?} declares `over`; routing each element of a list is not supported")]
     RouteWithOver { task: String },
@@ -678,6 +837,30 @@ pub enum PlanError {
         right: String,
         session: String,
     },
+}
+
+/// Whether every value of `declared` is an answer an output-decided route accepts for
+/// `question`: one of its labels or `uncertain`, or, for a noul, a boolean.
+fn answers(question: &Question, declared: &FieldType) -> bool {
+    match (declared, &question.kind) {
+        (FieldType::Boolean, QuestionKind::Noul) => true,
+        (FieldType::OneOf(labels), _) => labels.iter().all(|l| question.resolves_to(l)),
+        _ => false,
+    }
+}
+
+fn answerable_types(question: &Question) -> String {
+    let labels: Vec<String> = question
+        .labels()
+        .iter()
+        .map(ToString::to_string)
+        .chain([UNCERTAIN.to_owned()])
+        .collect();
+    let labels = format!("labels from {}", labels.join("|"));
+    match question.kind {
+        QuestionKind::Noul => format!("\"boolean\" or {labels}"),
+        QuestionKind::Choice { .. } => labels,
+    }
 }
 
 impl Plan {
@@ -859,14 +1042,27 @@ impl Plan {
                             });
                         }
                         let emits = &self.tasks[index[source]].emits;
-                        if let Some(missing) = questions.keys().find(|id| {
-                            !emits.is_empty() && !emits.iter().any(|f| f.0 == id.as_str())
-                        }) {
-                            return Err(PlanError::RouteSourceOmitsQuestion {
-                                task: task(),
-                                source_task: source.0.clone(),
-                                question: missing.to_string(),
-                            });
+                        for (id, question) in questions {
+                            match emits.field(id.as_str()) {
+                                Declared::Unchecked | Declared::Untyped => {}
+                                Declared::Omitted => {
+                                    return Err(PlanError::RouteSourceOmitsQuestion {
+                                        task: task(),
+                                        source_task: source.0.clone(),
+                                        question: id.to_string(),
+                                    });
+                                }
+                                Declared::Typed(declared) if answers(question, declared) => {}
+                                Declared::Typed(declared) => {
+                                    return Err(PlanError::RouteSourceUnanswerable {
+                                        task: task(),
+                                        source_task: source.0.clone(),
+                                        question: id.to_string(),
+                                        declared: Box::new(declared.clone()),
+                                        expected: answerable_types(question),
+                                    });
+                                }
+                            }
                         }
                     }
                 }
@@ -943,7 +1139,7 @@ impl Plan {
                     });
                 }
                 let mut fields = BTreeSet::new();
-                for field in &t.emits {
+                for (field, ty) in t.emits.fields() {
                     if field.0.is_empty()
                         || field.0.len() > 64
                         || !field
@@ -962,23 +1158,41 @@ impl Plan {
                             field: field.0.clone(),
                         });
                     }
+                    if let Some(ty) = ty {
+                        ty.validate().map_err(|error| PlanError::InvalidFieldType {
+                            task: task(),
+                            field: field.0.clone(),
+                            error,
+                        })?;
+                    }
                 }
             }
-            // Consumer contracts are presence-only: a declared emits that omits `score`
+            // A declared emits that omits `score`, or types it as something other than a number,
             // where a score is read is a wiring bug worth failing before any spend.
-            let score_declared = |name: &TaskName| {
-                index.get(name).is_none_or(|&i| {
-                    let emits = &self.tasks[i].emits;
-                    emits.is_empty() || emits.iter().any(|f| f.0 == "score")
-                })
+            let score = |name: &TaskName| {
+                index
+                    .get(name)
+                    .map_or(Declared::Unchecked, |&i| self.tasks[i].emits.field("score"))
             };
+            let not_numeric =
+                |source: &TaskName, declared: &FieldType| PlanError::ScoreNotNumeric {
+                    task: task(),
+                    source_task: source.0.clone(),
+                    declared: declared.clone(),
+                };
             if matches!(t.task, TaskKind::TopK { .. }) {
                 for d in &t.depends_on {
-                    if !score_declared(d) {
-                        return Err(PlanError::TopKSourceOmitsScore {
-                            task: task(),
-                            dependency: d.0.clone(),
-                        });
+                    match score(d) {
+                        Declared::Omitted => {
+                            return Err(PlanError::TopKSourceOmitsScore {
+                                task: task(),
+                                dependency: d.0.clone(),
+                            });
+                        }
+                        Declared::Typed(declared) if !declared.is_numeric() => {
+                            return Err(not_numeric(d, declared));
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -987,20 +1201,33 @@ impl Plan {
                 source: Some(source),
                 ..
             } = &t.task
-                && !score_declared(source)
             {
-                return Err(PlanError::GradeSourceOmitsScore {
-                    task: task(),
-                    from: source.0.clone(),
-                });
+                match score(source) {
+                    Declared::Omitted => {
+                        return Err(PlanError::GradeSourceOmitsScore {
+                            task: task(),
+                            from: source.0.clone(),
+                        });
+                    }
+                    Declared::Typed(declared) if !declared.is_numeric() => {
+                        return Err(not_numeric(source, declared));
+                    }
+                    _ => {}
+                }
             }
             if let TaskKind::Evaluate {
                 threshold: Some(_), ..
             } = &t.task
-                && !t.emits.is_empty()
-                && !t.emits.iter().any(|f| f.0 == "score")
             {
-                return Err(PlanError::ThresholdedEvaluateOmitsScore { task: task() });
+                match t.emits.field("score") {
+                    Declared::Omitted => {
+                        return Err(PlanError::ThresholdedEvaluateOmitsScore { task: task() });
+                    }
+                    Declared::Typed(declared) if !declared.is_numeric() => {
+                        return Err(not_numeric(&t.name, declared));
+                    }
+                    _ => {}
+                }
             }
             if let Some(session) = &t.session {
                 if session.is_empty()
@@ -1047,6 +1274,28 @@ impl Plan {
                             reference: reference.to_string(),
                             producer: reference.task.0.clone(),
                         });
+                    }
+                    let producer = &self.tasks[index[&reference.task]];
+                    match producer.emits.field(&reference.field.0) {
+                        Declared::Unchecked
+                        | Declared::Untyped
+                        | Declared::Typed(FieldType::List) => {}
+                        Declared::Omitted => {
+                            return Err(PlanError::OverFieldOmitted {
+                                task: task(),
+                                reference: reference.to_string(),
+                                producer: reference.task.0.clone(),
+                                field: reference.field.0.clone(),
+                            });
+                        }
+                        Declared::Typed(declared) => {
+                            return Err(PlanError::OverNotAList {
+                                task: task(),
+                                reference: reference.to_string(),
+                                producer: reference.task.0.clone(),
+                                declared: declared.clone(),
+                            });
+                        }
                     }
                     if width == 0 || width > MAX_FANOUT_CEILING {
                         return Err(PlanError::FanoutOutOfRange {
@@ -1280,7 +1529,7 @@ mod tests {
             isolation: None,
             join: Join::default(),
             stage: Stage::Iteration,
-            emits: Vec::new(),
+            emits: crate::plan::ir::Emits::default(),
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
@@ -1527,7 +1776,7 @@ mod tests {
             }
         );
         let mut gate = model_route("gate", &[], &[]);
-        gate.emits = vec![OutputField("area".into())];
+        gate.emits = fields(&["area"]);
         assert_eq!(
             plan(vec![gate]).validate().unwrap_err(),
             PlanError::EmitsOnEngineTask {
@@ -1551,7 +1800,7 @@ mod tests {
             }
         );
         let mut classify = agent("classify", &[]);
-        classify.emits = vec![OutputField("severity".into())];
+        classify.emits = fields(&["severity"]);
         assert_eq!(
             plan(vec![
                 classify.clone(),
@@ -1565,7 +1814,7 @@ mod tests {
                 question: "area".into()
             }
         );
-        classify.emits.push(OutputField("area".into()));
+        classify.emits = fields(&["severity", "area"]);
         plan(vec![classify, output_route("gate", "classify", &[])])
             .validate()
             .unwrap();
@@ -1818,7 +2067,7 @@ mod tests {
             isolation: None,
             join: Join::default(),
             stage: Stage::Iteration,
-            emits: Vec::new(),
+            emits: crate::plan::ir::Emits::default(),
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
@@ -1926,11 +2175,30 @@ mod tests {
 
     fn emitting(name: &str, deps: &[&str], emits: &[&str]) -> Task {
         let mut t = agent(name, deps);
-        t.emits = emits
-            .iter()
-            .map(|f| OutputField((*f).to_string()))
-            .collect();
+        t.emits = fields(emits);
         t
+    }
+
+    fn fields(names: &[&str]) -> Emits {
+        Emits::Fields(
+            names
+                .iter()
+                .map(|f| OutputField((*f).to_string()))
+                .collect(),
+        )
+    }
+
+    fn typed(pairs: &[(&str, FieldType)]) -> Emits {
+        Emits::Typed(
+            pairs
+                .iter()
+                .map(|(f, ty)| (OutputField((*f).to_string()), ty.clone()))
+                .collect(),
+        )
+    }
+
+    fn one_of(labels: &[&str]) -> FieldType {
+        FieldType::OneOf(labels.iter().map(|l| Label::new(*l).unwrap()).collect())
     }
 
     fn top_k(name: &str, deps: &[&str]) -> Task {
@@ -1947,7 +2215,7 @@ mod tests {
             isolation: None,
             join: Join::default(),
             stage: Stage::Iteration,
-            emits: Vec::new(),
+            emits: crate::plan::ir::Emits::default(),
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
@@ -1987,7 +2255,7 @@ mod tests {
     #[test]
     fn emits_is_rejected_on_top_k_and_engine_tasks() {
         let mut pick = top_k("pick", &["a"]);
-        pick.emits = vec![OutputField("kept".into())];
+        pick.emits = fields(&["kept"]);
         let err = plan(vec![agent("a", &[]), pick]).validate().unwrap_err();
         assert_eq!(
             err,
@@ -2003,7 +2271,7 @@ mod tests {
             source: None,
             tiebreak: None,
         };
-        measure.emits = vec![OutputField("score".into())];
+        measure.emits = fields(&["score"]);
         let err = plan(vec![measure]).validate().unwrap_err();
         assert!(matches!(err, PlanError::EmitsOnEngineTask { .. }), "{err}");
     }
@@ -2077,8 +2345,372 @@ mod tests {
             }
         );
 
-        t.emits.push(OutputField("score".into()));
+        t.emits = fields(&["latency_ms", "score"]);
         assert!(plan(vec![t]).validate().is_ok());
+    }
+
+    #[test]
+    fn typed_emits_parse_from_toml_and_json_and_keep_their_form() {
+        let toml = r#"
+version = 1
+[budget]
+usd = 1.0
+[[task]]
+name = "classify"
+kind = "command"
+command = "./c.sh"
+emits = { score = "number", tier = ["high", "low"], notes = "list" }
+[[task]]
+name = "legacy"
+kind = "command"
+command = "./l.sh"
+emits = ["lines"]
+"#;
+        let plan = Plan::from_toml_str(toml).unwrap().validate().unwrap();
+        let tasks = &plan.plan().tasks;
+        assert_eq!(
+            tasks[0].emits,
+            typed(&[
+                ("score", FieldType::Number),
+                ("tier", one_of(&["high", "low"])),
+                ("notes", FieldType::List),
+            ])
+        );
+        assert_eq!(tasks[1].emits, fields(&["lines"]));
+
+        let json = serde_json::to_value(&tasks[0]).unwrap();
+        assert_eq!(
+            json["emits"],
+            serde_json::json!({"notes": "list", "score": "number", "tier": ["high", "low"]})
+        );
+        let back: Task = serde_json::from_value(json).unwrap();
+        assert_eq!(back.emits, tasks[0].emits);
+        let legacy = serde_json::to_value(&tasks[1]).unwrap();
+        assert_eq!(legacy["emits"], serde_json::json!(["lines"]));
+
+        let text = toml::to_string(plan.plan()).unwrap();
+        let again = Plan::from_toml_str(&text).unwrap();
+        assert_eq!(again.tasks[0].emits, tasks[0].emits);
+        assert_eq!(again.tasks[1].emits, tasks[1].emits);
+    }
+
+    #[test]
+    fn a_malformed_typed_emits_does_not_parse_or_validate() {
+        let parse = |emits: &str| {
+            let toml = format!(
+                "version = 1\n[budget]\nusd = 1.0\n[[task]]\nname = \"a\"\nkind = \"command\"\ncommand = \"x\"\nemits = {emits}\n"
+            );
+            format!("{:#}", Plan::from_toml_str(&toml).unwrap_err())
+        };
+        for (emits, needle) in [
+            (r#"{ score = "float" }"#, "a field type"),
+            (r#"{ score = 3 }"#, "a field type"),
+            (r#"{ tier = ["hi-gh"] }"#, "not an identifier"),
+            (r#"{ tier = [] }"#, "names no labels"),
+            (r#"{ tier = ["a", "a"] }"#, "listed twice"),
+            (r#""score""#, "a list of field names, or a table"),
+        ] {
+            let err = parse(emits);
+            assert!(err.contains(needle), "{emits}: {err}");
+        }
+        let duplicate = serde_json::from_str::<Emits>(r#"{"a": "string", "a": "list"}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(duplicate.contains("declared twice"), "{duplicate}");
+
+        let mut t = agent("a", &[]);
+        t.emits = typed(&[("tier", FieldType::OneOf(Vec::new()))]);
+        assert_eq!(
+            plan(vec![t]).validate().unwrap_err(),
+            PlanError::InvalidFieldType {
+                task: "a".into(),
+                field: "tier".into(),
+                error: FieldTypeError::NoLabels,
+            }
+        );
+        let mut t = agent("a", &[]);
+        t.emits = typed(&[("bad-name", FieldType::String)]);
+        assert!(matches!(
+            plan(vec![t]).validate().unwrap_err(),
+            PlanError::InvalidOutputField { .. }
+        ));
+    }
+
+    #[test]
+    fn a_score_source_that_types_its_score_must_type_it_numeric() {
+        for ty in [FieldType::Number, FieldType::Integer] {
+            let mut m = agent("m", &[]);
+            m.emits = typed(&[("score", ty)]);
+            plan(vec![m, top_k("pick", &["m"])]).validate().unwrap();
+        }
+        for ty in [
+            FieldType::String,
+            FieldType::Boolean,
+            FieldType::List,
+            FieldType::Object,
+            one_of(&["high"]),
+        ] {
+            let mut m = agent("m", &[]);
+            m.emits = typed(&[("score", ty.clone())]);
+            assert_eq!(
+                plan(vec![m, top_k("pick", &["m"])]).validate().unwrap_err(),
+                PlanError::ScoreNotNumeric {
+                    task: "pick".into(),
+                    source_task: "m".into(),
+                    declared: ty,
+                }
+            );
+        }
+        let mut m = agent("m", &[]);
+        m.emits = typed(&[("latency_ms", FieldType::Number)]);
+        assert_eq!(
+            plan(vec![m, top_k("pick", &["m"])]).validate().unwrap_err(),
+            PlanError::TopKSourceOmitsScore {
+                task: "pick".into(),
+                dependency: "m".into(),
+            }
+        );
+
+        let evaluate = |emits: Emits| {
+            let mut e = agent("e", &[]);
+            e.task = TaskKind::Evaluate {
+                command: "./x.sh".into(),
+                threshold: None,
+                direction: None,
+            };
+            e.emits = emits;
+            e
+        };
+        let mut grade = agent("grade", &["e"]);
+        grade.task = TaskKind::Engine {
+            op: EngineOp::Grade,
+            source: Some("e".into()),
+            tiebreak: None,
+        };
+        assert_eq!(
+            plan(vec![
+                evaluate(typed(&[("score", FieldType::Boolean)])),
+                grade.clone()
+            ])
+            .validate()
+            .unwrap_err(),
+            PlanError::ScoreNotNumeric {
+                task: "grade".into(),
+                source_task: "e".into(),
+                declared: FieldType::Boolean,
+            }
+        );
+        assert_eq!(
+            plan(vec![
+                evaluate(typed(&[("pass", FieldType::Boolean)])),
+                grade.clone()
+            ])
+            .validate()
+            .unwrap_err(),
+            PlanError::GradeSourceOmitsScore {
+                task: "grade".into(),
+                from: "e".into(),
+            }
+        );
+        plan(vec![
+            evaluate(typed(&[("score", FieldType::Integer)])),
+            grade,
+        ])
+        .validate()
+        .unwrap();
+
+        let mut thresholded = evaluate(typed(&[("score", FieldType::String)]));
+        thresholded.task = TaskKind::Evaluate {
+            command: "./x.sh".into(),
+            threshold: Some(1.0),
+            direction: Some(Direction::Lower),
+        };
+        assert_eq!(
+            plan(vec![thresholded.clone()]).validate().unwrap_err(),
+            PlanError::ScoreNotNumeric {
+                task: "e".into(),
+                source_task: "e".into(),
+                declared: FieldType::String,
+            }
+        );
+        thresholded.emits = typed(&[("pass", FieldType::Boolean)]);
+        assert_eq!(
+            plan(vec![thresholded.clone()]).validate().unwrap_err(),
+            PlanError::ThresholdedEvaluateOmitsScore { task: "e".into() }
+        );
+        thresholded.emits = typed(&[("score", FieldType::Number)]);
+        plan(vec![thresholded]).validate().unwrap();
+    }
+
+    fn noul_route(name: &str, source: &str) -> Task {
+        Task {
+            task: TaskKind::Route {
+                questions: BTreeMap::from([(
+                    qid("urgent"),
+                    Question {
+                        instructions: "Urgent?".into(),
+                        kind: QuestionKind::Noul,
+                        drop: Vec::new(),
+                    },
+                )]),
+                decider: Decider::Output {
+                    task: source.into(),
+                },
+            },
+            ..agent(name, &[source])
+        }
+    }
+
+    #[test]
+    fn an_output_route_question_must_be_answerable_by_the_declared_type() {
+        let check = |question: &str, ty: FieldType| {
+            let mut classify = agent("classify", &[]);
+            classify.emits = typed(&[(question, ty)]);
+            let gate = if question == "area" {
+                output_route("gate", "classify", &[])
+            } else {
+                noul_route("gate", "classify")
+            };
+            plan(vec![classify, gate]).validate()
+        };
+        for ok in [
+            one_of(&["scheduler", "frontend"]),
+            one_of(&["frontend"]),
+            one_of(&["scheduler", "uncertain"]),
+        ] {
+            check("area", ok).unwrap();
+        }
+        for (bad, expected) in [
+            (
+                FieldType::String,
+                "labels from scheduler|frontend|uncertain",
+            ),
+            (
+                FieldType::Boolean,
+                "labels from scheduler|frontend|uncertain",
+            ),
+            (
+                one_of(&["scheduler", "backend"]),
+                "labels from scheduler|frontend|uncertain",
+            ),
+        ] {
+            assert_eq!(
+                check("area", bad.clone()).unwrap_err(),
+                PlanError::RouteSourceUnanswerable {
+                    task: "gate".into(),
+                    source_task: "classify".into(),
+                    question: "area".into(),
+                    declared: Box::new(bad),
+                    expected: expected.into(),
+                }
+            );
+        }
+        for ok in [
+            FieldType::Boolean,
+            one_of(&["yes", "no"]),
+            one_of(&["no", "uncertain"]),
+        ] {
+            check("urgent", ok).unwrap();
+        }
+        for bad in [
+            FieldType::String,
+            FieldType::Integer,
+            one_of(&["yes", "maybe"]),
+        ] {
+            let err = check("urgent", bad.clone()).unwrap_err();
+            assert_eq!(
+                err,
+                PlanError::RouteSourceUnanswerable {
+                    task: "gate".into(),
+                    source_task: "classify".into(),
+                    question: "urgent".into(),
+                    declared: Box::new(bad),
+                    expected: "\"boolean\" or labels from yes|no|uncertain".into(),
+                }
+            );
+        }
+        let mut classify = agent("classify", &[]);
+        classify.emits = typed(&[("severity", one_of(&["high"]))]);
+        assert_eq!(
+            plan(vec![classify, output_route("gate", "classify", &[])])
+                .validate()
+                .unwrap_err(),
+            PlanError::RouteSourceOmitsQuestion {
+                task: "gate".into(),
+                source_task: "classify".into(),
+                question: "area".into(),
+            }
+        );
+        let message = check("area", FieldType::String).unwrap_err().to_string();
+        assert!(
+            message.contains("which declares it string; \"area\" answers labels from"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn over_must_name_a_declared_list() {
+        let targets = OutputRef {
+            task: "discover".into(),
+            field: OutputField("targets".into()),
+        };
+        let audit = || {
+            let mut t = agent("audit", &["discover"]);
+            t.over = Some(targets.clone());
+            t.max_fanout = Some(4);
+            t
+        };
+        let with = |emits: Emits| {
+            let mut discover = agent("discover", &[]);
+            discover.emits = emits;
+            plan(vec![discover, audit()]).validate()
+        };
+        with(Emits::default()).unwrap();
+        with(fields(&["targets"])).unwrap();
+        with(typed(&[("targets", FieldType::List)])).unwrap();
+        for bad in [FieldType::Object, FieldType::String, one_of(&["a"])] {
+            assert_eq!(
+                with(typed(&[("targets", bad.clone())])).unwrap_err(),
+                PlanError::OverNotAList {
+                    task: "audit".into(),
+                    reference: "discover.targets".into(),
+                    producer: "discover".into(),
+                    declared: bad,
+                }
+            );
+        }
+        for omitted in [fields(&["other"]), typed(&[("other", FieldType::List)])] {
+            assert_eq!(
+                with(omitted).unwrap_err(),
+                PlanError::OverFieldOmitted {
+                    task: "audit".into(),
+                    reference: "discover.targets".into(),
+                    producer: "discover".into(),
+                    field: "targets".into(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn declared_names_the_field_in_either_form() {
+        assert_eq!(Emits::default().field("a"), Declared::Unchecked);
+        assert_eq!(typed(&[]).field("a"), Declared::Unchecked);
+        assert_eq!(fields(&["a"]).field("a"), Declared::Untyped);
+        assert_eq!(fields(&["a"]).field("b"), Declared::Omitted);
+        assert_eq!(
+            typed(&[("a", FieldType::List)]).field("a"),
+            Declared::Typed(&FieldType::List)
+        );
+        assert_eq!(
+            typed(&[("a", FieldType::List)]).field("b"),
+            Declared::Omitted
+        );
+        assert_eq!(
+            typed(&[("b", FieldType::List), ("a", FieldType::String)]).names(),
+            ["a", "b"]
+        );
+        assert_eq!(fields(&["b", "a"]).names(), ["b", "a"]);
     }
 
     fn advisory(name: &str, deps: &[&str]) -> Task {
@@ -2236,10 +2868,7 @@ mod tests {
         let declared = emitting("a", &[], &["score"]);
         let json = serde_json::to_string(&plan(vec![declared])).unwrap();
         let back = Plan::from_json_str(&json).unwrap().validate().unwrap();
-        assert_eq!(
-            back.plan().tasks[0].emits,
-            vec![OutputField("score".into())]
-        );
+        assert_eq!(back.plan().tasks[0].emits, fields(&["score"]));
     }
     /// A plan that arrives as JSON never passes through the starlark front end, so the
     /// structural facts about a mapped node are checked here or nowhere.

@@ -93,8 +93,13 @@ fn task_knobs() -> Vec<Kwarg> {
         ),
         Kwarg::new(
             "emits",
-            "list[str]",
-            "Result fields the task promises in its JSON output.",
+            "list[str] | dict[str, type]",
+            "Result fields the task promises in its JSON output. The dict form also promises each \
+             field's type: `\"string\"`, `\"integer\"`, `\"number\"`, `\"boolean\"`, \
+             `\"list\"`, `\"object\"`, or a list of labels the value is one of. A passing \
+             output missing a field, or holding one of the wrong type, fails the task. Types are \
+             checked where the graph reads them: `over` needs a list, a `top_k` or grade score a \
+             number, and a `route(source = ...)` question labels it can answer.",
         ),
         Kwarg::new(
             "emits_files",
@@ -470,7 +475,9 @@ pub fn functions() -> Vec<Function> {
                     "task",
                     "A dependency's output answers instead: it emits one declared label (or a \
                      boolean, for a noul) under each question id. Deterministic, free, and \
-                     needs no capability. Any other value fails the route.",
+                     needs no capability. Any other value fails the route. When the dependency \
+                     types its emits, each question's field must be typed with labels the \
+                     question answers, or `\"boolean\"` for a noul.",
                 ),
                 Kwarg::new(
                     "depends_on",

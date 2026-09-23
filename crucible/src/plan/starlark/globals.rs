@@ -404,9 +404,15 @@ fn alloc_at<'v>(heap: Heap<'v>, value: dsl::Value, depth: usize) -> Value<'v> {
         // A dictionary never travels back out: the constructors consume it.
         dsl::Value::Map(_) => Value::new_none(),
         dsl::Value::Task(task) => heap.alloc(TaskValue(*task)),
-        dsl::Value::Output(reference) => heap.alloc(OutputRefValue {
-            declared: vec![reference.field.0.clone()],
-            reference,
+        dsl::Value::Output(output) => heap.alloc(OutputRefValue {
+            declared: match output.ty {
+                None => crate::plan::ir::Emits::Fields(vec![output.reference.field.clone()]),
+                Some(ty) => crate::plan::ir::Emits::Typed(BTreeMap::from([(
+                    output.reference.field.clone(),
+                    ty,
+                )])),
+            },
+            reference: output.reference,
         }),
         dsl::Value::Session(session) => heap.alloc(SessionValue(session)),
         dsl::Value::Question(question) => heap.alloc(QuestionValue(question)),

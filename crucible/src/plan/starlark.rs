@@ -25,7 +25,7 @@ use crate::crucible::Direction;
 use crate::errors::FileError;
 use crate::plan::diag;
 use crate::plan::ir::{
-    Decider, EngineOp, Isolation, Join, MAX_FANOUT_CEILING, MAX_ROUNDS_CEILING, OutputField,
+    Decider, Emits, EngineOp, Isolation, Join, MAX_FANOUT_CEILING, MAX_ROUNDS_CEILING, OutputField,
     OutputRef, ReportDestination, Revise, SlackDestination, Stage, Task, TaskKind, TaskName, When,
 };
 use crate::plan::starlark::error::{
@@ -38,6 +38,7 @@ use crate::plan::workflow::{WorkflowCfg, WorkflowType};
 use crucible_contract::decision::{
     ChoiceOption, IdentError, Label, NOUL_YES, Question, QuestionId, QuestionKind, UNCERTAIN,
 };
+use crucible_contract::emits::FieldType;
 
 type Result<T> = std::result::Result<T, CompileError>;
 
@@ -385,7 +386,7 @@ enum Value {
     List(Vec<Value>),
     Task(Box<Task>),
     /// `producer.field`, already checked against the producer's declared emits.
-    Output(OutputRef),
+    Output(values::DeclaredOutput),
     Session(SessionDecl),
     Workflow(WorkflowCfg),
     /// A `noul(...)` or `choice(...)` declaration.
@@ -793,7 +794,7 @@ fn constructor(
             isolation: None,
             join: Join::All,
             stage: Stage::Epilogue,
-            emits: Vec::new(),
+            emits: crate::plan::ir::Emits::default(),
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
@@ -831,7 +832,7 @@ fn constructor(
                 isolation: None,
                 join: Join::Passed,
                 stage: Stage::Iteration,
-                emits: Vec::new(),
+                emits: crate::plan::ir::Emits::default(),
                 emits_files: Vec::new(),
                 over: None,
                 max_fanout: None,
@@ -861,7 +862,7 @@ fn constructor(
                 isolation: None,
                 join: parse_join(&take_string_default(&mut named, "join", "all")?)?,
                 stage: parse_stage(&take_string_default(&mut named, "stage", "iteration")?)?,
-                emits: Vec::new(),
+                emits: crate::plan::ir::Emits::default(),
                 emits_files: Vec::new(),
                 over: None,
                 max_fanout: None,
@@ -1393,7 +1394,13 @@ fn expand_otherwise(tasks: &mut [Task], state: &CompileState) -> Result<()> {
 fn take_over(named: &mut BTreeMap<String, Value>) -> Result<Option<OutputRef>> {
     match named.remove("over") {
         None | Some(Value::None) => Ok(None),
-        Some(Value::Output(reference)) => Ok(Some(reference)),
+        Some(Value::Output(output)) => match output.ty {
+            None | Some(FieldType::List) => Ok(Some(output.reference)),
+            Some(declared) => Err(CompileError::OverNotAList {
+                reference: output.reference.to_string(),
+                declared,
+            }),
+        },
         Some(_) => Err(CompileError::OverNotOutputField),
     }
 }
@@ -1452,7 +1459,7 @@ fn engine(name: &str, op: EngineOp, source: Option<TaskName>, depends_on: Vec<Ta
         isolation: None,
         join: Join::All,
         stage: Stage::Iteration,
-        emits: Vec::new(),
+        emits: crate::plan::ir::Emits::default(),
         emits_files: Vec::new(),
         over: None,
         max_fanout: None,
@@ -1461,18 +1468,68 @@ fn engine(name: &str, op: EngineOp, source: Option<TaskName>, depends_on: Vec<Ta
     }
 }
 
-fn take_output_fields(named: &mut BTreeMap<String, Value>) -> Result<Vec<OutputField>> {
+fn take_output_fields(named: &mut BTreeMap<String, Value>) -> Result<Emits> {
     match named.remove("emits").unwrap_or(Value::None) {
-        Value::None => Ok(Vec::new()),
+        Value::None => Ok(Emits::default()),
         Value::List(fields) => fields
             .into_iter()
             .map(|field| match field {
                 Value::String(field) => Ok(OutputField(field)),
                 _ => Err(CompileError::EmitsEntryNotString),
             })
-            .collect(),
+            .collect::<Result<Vec<_>>>()
+            .map(Emits::Fields),
+        Value::Map(fields) => fields
+            .into_iter()
+            .map(|(field, ty)| {
+                let ty = field_type(&field, ty)?;
+                Ok((OutputField(field), ty))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()
+            .map(Emits::Typed),
         _ => Err(CompileError::EmitsNotList),
     }
+}
+
+/// One value of a typed `emits`: a type token, or a list of labels.
+fn field_type(field: &str, value: Value) -> Result<FieldType> {
+    let ty = match value {
+        Value::String(token) => {
+            FieldType::scalar(&token).ok_or_else(|| CompileError::UnknownFieldType {
+                field: field.to_owned(),
+                suggestion: diag::suggest(&token, FieldType::SCALARS.iter().map(|(name, _)| *name))
+                    .map(str::to_owned),
+                got: token,
+            })?
+        }
+        Value::List(labels) => FieldType::OneOf(
+            labels
+                .into_iter()
+                .map(|label| match label {
+                    Value::String(label) => {
+                        Label::new(label).map_err(|error| CompileError::InvalidFieldLabel {
+                            field: field.to_owned(),
+                            error,
+                        })
+                    }
+                    _ => Err(CompileError::FieldTypeWrongShape {
+                        field: field.to_owned(),
+                    }),
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        _ => {
+            return Err(CompileError::FieldTypeWrongShape {
+                field: field.to_owned(),
+            });
+        }
+    };
+    ty.validate()
+        .map_err(|error| CompileError::InvalidFieldType {
+            field: field.to_owned(),
+            error,
+        })?;
+    Ok(ty)
 }
 
 /// Mirrors the session charset rule enforced by plan validation, so the error lands at
@@ -3462,12 +3519,10 @@ e = evaluate(name = "e", run = "true", emits = ["score", "pass"])
 workflow(type = "custom", tasks = [e], result = e)
 "#;
         let compiled = compile_source(source, &pack.join("workflow.star"), &pack).unwrap();
+        assert_eq!(compiled.workflow.tasks[0].emits.names(), ["score", "pass"]);
         assert_eq!(
-            compiled.workflow.tasks[0].emits,
-            vec![
-                crate::plan::ir::OutputField("score".into()),
-                crate::plan::ir::OutputField("pass".into()),
-            ]
+            compiled.workflow.tasks[0].emits.field("score"),
+            crate::plan::ir::Declared::Untyped
         );
 
         for source in [
@@ -3479,6 +3534,273 @@ workflow(type = "custom", tasks = [e], result = e)
             assert!(err.contains("unknown argument \"emits\""), "{err}");
         }
         let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    const TYPED: &str = r#"scan = command(
+    name = "scan",
+    run = "./scan.sh",
+    emits = {"targets": "list", "count": "integer", "severity": ["high", "low"], "urgent": "boolean"},
+)
+audit = command(name = "audit", run = "./audit.sh", depends_on = [scan], over = scan.targets, max_fanout = 4)
+workflow(type = "playbook", tasks = [scan, audit])
+"#;
+
+    fn typed_error(tag: &str, source: &str) -> String {
+        let pack = temp_pack(tag);
+        let err = crate::errors::report(
+            &compile_source(source, &pack.join("workflow.star"), &pack).unwrap_err(),
+        );
+        let _ = std::fs::remove_dir_all(&pack);
+        err
+    }
+
+    fn column_of(source: &str, line_prefix: &str, needle: &str) -> String {
+        let line = source
+            .lines()
+            .position(|l| l.contains(line_prefix))
+            .expect("the line");
+        let column = source
+            .lines()
+            .nth(line)
+            .and_then(|l| l.find(needle))
+            .expect("the argument")
+            + 1;
+        format!("workflow.star:{}:{column}", line + 1)
+    }
+
+    #[test]
+    fn a_dict_emits_compiles_to_typed_fields_and_survives_the_generated_toml() {
+        let pack = temp_pack("typed-emits");
+        let compiled = compile_source(TYPED, &pack.join("workflow.star"), &pack)
+            .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
+        let scan = &compiled.workflow.tasks[0];
+        let label = |l: &str| Label::new(l).unwrap();
+        assert_eq!(
+            scan.emits,
+            Emits::Typed(BTreeMap::from([
+                (OutputField("count".into()), FieldType::Integer),
+                (
+                    OutputField("severity".into()),
+                    FieldType::OneOf(vec![label("high"), label("low")])
+                ),
+                (OutputField("targets".into()), FieldType::List),
+                (OutputField("urgent".into()), FieldType::Boolean),
+            ]))
+        );
+        let text = toml::to_string(&compiled.workflow).unwrap();
+        let back: WorkflowCfg = toml::from_str(&text).unwrap();
+        back.validate().unwrap();
+        assert_eq!(back.tasks[0].emits, scan.emits);
+        assert_eq!(toml::to_string(&back).unwrap(), text);
+        let json: serde_json::Value = serde_json::from_str(&compiled.canonical_json).unwrap();
+        let task = json
+            .pointer("/tasks/0")
+            .or_else(|| json.pointer("/task/0"))
+            .unwrap_or_else(|| panic!("{json:#}"));
+        assert_eq!(
+            task["emits"],
+            serde_json::json!({
+                "count": "integer",
+                "severity": ["high", "low"],
+                "targets": "list",
+                "urgent": "boolean",
+            }),
+            "{json:#}"
+        );
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn a_malformed_dict_emits_is_an_error_at_the_emits_argument() {
+        for (replacement, needle) in [
+            (
+                r#""count": "integr""#,
+                "emits field \"count\" has unknown type \"integr\"; did you mean \"integer\"?",
+            ),
+            (
+                r#""count": 3"#,
+                "emits field \"count\" must map to a type name or a list of label strings",
+            ),
+            (
+                r#""count": ["high", 1]"#,
+                "emits field \"count\" must map to a type name or a list",
+            ),
+            (
+                r#""count": ["hi-gh"]"#,
+                "emits field \"count\": \"hi-gh\" is not an identifier",
+            ),
+            (
+                r#""count": []"#,
+                "emits field \"count\": a label list names no labels",
+            ),
+            (
+                r#""count": ["a", "a"]"#,
+                "emits field \"count\": label \"a\" is listed twice",
+            ),
+        ] {
+            let source = TYPED.replace(r#""count": "integer""#, replacement);
+            let err = typed_error("typed-bad", &source);
+            assert!(err.contains(needle), "{replacement}: {err}");
+            assert!(
+                err.contains(&column_of(&source, "emits = {", "emits")),
+                "{replacement}: {err}"
+            );
+        }
+        let source = TYPED.replace(
+            r#"emits = {"targets": "list", "count": "integer", "severity": ["high", "low"], "urgent": "boolean"}"#,
+            r#"emits = "targets""#,
+        );
+        let err = typed_error("typed-shape", &source);
+        assert!(
+            err.contains("must be a list of field names, or a dict from field name to type"),
+            "{err}"
+        );
+        let err = typed_error(
+            "typed-name",
+            &TYPED.replace(r#""count": "integer""#, r#""co-unt": "integer""#),
+        );
+        assert!(err.contains("invalid output field \"co-unt\""), "{err}");
+    }
+
+    #[test]
+    fn over_a_typed_field_that_is_not_a_list_is_an_error_at_the_over_argument() {
+        for (field, declared) in [
+            ("count", "integer"),
+            ("severity", "one of high|low"),
+            ("urgent", "boolean"),
+        ] {
+            let source = TYPED.replace("over = scan.targets", &format!("over = scan.{field}"));
+            let err = typed_error("typed-over", &source);
+            assert!(
+                err.contains(&format!(
+                    "argument \"over\" maps over scan.{field}, which is declared {declared}; `over` needs a list"
+                )),
+                "{err}"
+            );
+            assert!(
+                err.contains(&column_of(&source, "audit = ", "over")),
+                "{err}"
+            );
+        }
+        let err = typed_error(
+            "typed-over-missing",
+            &TYPED.replace("over = scan.targets", "over = scan.target"),
+        );
+        assert!(
+            err.contains("declares no output field \"target\"; did you mean \"targets\"?"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_route_reading_a_typed_source_must_be_able_to_answer_from_it() {
+        let routed = |emits: &str| {
+            format!(
+                r#"classify = command(name = "classify", run = "./c.sh", emits = {emits})
+gate = route(
+    name = "gate",
+    depends_on = [classify],
+    source = classify,
+    questions = {{
+        "area": choice(ask = "Which?", options = {{"scheduler": None, "frontend": None}}),
+        "urgent": noul(ask = "Now?"),
+    }},
+)
+fix = command(name = "fix", run = "./f.sh", depends_on = [gate], when = gate.area, answers = "scheduler")
+rest = command(name = "rest", run = "./r.sh", depends_on = [gate], when = gate.area, otherwise = True)
+workflow(type = "playbook", tasks = [classify, gate, fix, rest])
+"#
+            )
+        };
+        for ok in [
+            r#"{"area": ["scheduler", "frontend"], "urgent": "boolean"}"#,
+            r#"{"area": ["frontend", "uncertain"], "urgent": ["yes", "no"]}"#,
+            r#"["area", "urgent"]"#,
+        ] {
+            let pack = temp_pack("typed-route-ok");
+            compile_source(&routed(ok), &pack.join("workflow.star"), &pack)
+                .unwrap_or_else(|error| panic!("{ok}: {}", crate::errors::report(&error)));
+            let _ = std::fs::remove_dir_all(&pack);
+        }
+        for (bad, needle) in [
+            (
+                r#"{"area": ["scheduler", "backend"], "urgent": "boolean"}"#,
+                "reads question \"area\" from \"classify\", which declares it one of scheduler|backend; \"area\" answers labels from frontend|scheduler|uncertain",
+            ),
+            (
+                r#"{"area": "string", "urgent": "boolean"}"#,
+                "which declares it string; \"area\" answers labels from",
+            ),
+            (
+                r#"{"area": ["scheduler"], "urgent": "string"}"#,
+                "which declares it string; \"urgent\" answers \"boolean\" or labels from yes|no|uncertain",
+            ),
+            (
+                r#"{"area": ["scheduler"]}"#,
+                "reads question \"urgent\" from \"classify\", which declares emits without it",
+            ),
+        ] {
+            let err = typed_error("typed-route-bad", &routed(bad));
+            assert!(err.contains(needle), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_top_k_over_a_typed_score_needs_a_number() {
+        let source = |ty: &str| {
+            format!(
+                "m = command(name = \"m\", run = \"true\", emits = {{\"score\": {ty}}})\n\
+                 p = top_k(name = \"p\", k = 1, direction = \"lower\", depends_on = [m])\n\
+                 workflow(type = \"custom\", tasks = [m, p], result = p)\n"
+            )
+        };
+        for ok in ["\"number\"", "\"integer\""] {
+            let pack = temp_pack("typed-topk-ok");
+            compile_source(&source(ok), &pack.join("workflow.star"), &pack)
+                .unwrap_or_else(|error| panic!("{ok}: {}", crate::errors::report(&error)));
+            let _ = std::fs::remove_dir_all(&pack);
+        }
+        let err = typed_error("typed-topk-bad", &source("\"string\""));
+        assert!(
+            err.contains("task \"p\" reads a numeric `score` from \"m\", which declares it string"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_fips_watch_example_types_its_emits() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root")
+            .to_path_buf();
+        let pack = root.join("examples/fips-watch");
+        let compiled = compile_file(&pack.join("workflow.star"), &pack)
+            .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
+        let emits = |name: &str| {
+            compiled
+                .workflow
+                .tasks
+                .iter()
+                .find(|t| t.name.0 == name)
+                .map(|t| t.emits.clone())
+                .expect("the task")
+        };
+        assert_eq!(
+            emits("scan").field("variants"),
+            crate::plan::ir::Declared::Typed(&FieldType::List)
+        );
+        assert_eq!(
+            emits("roundup").field("clean"),
+            crate::plan::ir::Declared::Typed(&FieldType::Integer)
+        );
+        assert!(
+            compiled
+                .workflow
+                .tasks
+                .iter()
+                .all(|t| !matches!(t.emits, Emits::Fields(ref f) if !f.is_empty())),
+            "every declared emits in the example is typed"
+        );
     }
 
     /// The drift guard for [`known_kwargs`]: per constructor, a call carrying every

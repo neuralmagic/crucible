@@ -17,8 +17,9 @@ use starlark::values::{
 
 use crate::plan::diag;
 use crucible_contract::decision::{Question, QuestionId};
+use crucible_contract::emits::FieldType;
 
-use crate::plan::ir::{OutputField, OutputRef, Task, TaskKind, TaskName};
+use crate::plan::ir::{Declared, Emits, OutputField, OutputRef, Task, TaskKind, TaskName};
 use crate::plan::starlark::error::CompileError;
 use crate::plan::workflow::WorkflowCfg;
 
@@ -65,7 +66,12 @@ impl<'v> StarlarkValue<'v> for TaskValue {
                         task: self.0.name.clone(),
                         field: OutputField(attribute.to_owned()),
                     },
-                    declared: questions.keys().map(ToString::to_string).collect(),
+                    declared: Emits::Fields(
+                        questions
+                            .keys()
+                            .map(|id| OutputField(id.to_string()))
+                            .collect(),
+                    ),
                 }),
             });
         }
@@ -74,9 +80,17 @@ impl<'v> StarlarkValue<'v> for TaskValue {
                 task: self.0.name.clone(),
                 field: OutputField(attribute.to_owned()),
             },
-            declared: self.0.emits.iter().map(|field| field.0.clone()).collect(),
+            declared: self.0.emits.clone(),
         }))
     }
+}
+
+/// `producer.field` once checked against what the producer declares, with the type it declares
+/// for the field when it gave one.
+#[derive(Clone, Debug)]
+pub(crate) struct DeclaredOutput {
+    pub(crate) reference: OutputRef,
+    pub(crate) ty: Option<FieldType>,
 }
 
 /// One task's output field, as `over = producer.field` yields it. `declared` travels with it so
@@ -85,23 +99,32 @@ impl<'v> StarlarkValue<'v> for TaskValue {
 pub(crate) struct OutputRefValue {
     #[allocative(skip)]
     pub(crate) reference: OutputRef,
-    pub(crate) declared: Vec<String>,
+    #[allocative(skip)]
+    pub(crate) declared: Emits,
 }
 
 impl OutputRefValue {
-    pub(crate) fn resolve(&self) -> Result<OutputRef, CompileError> {
-        if self.declared.contains(&self.reference.field.0) {
-            return Ok(self.reference.clone());
-        }
-        Err(CompileError::UndeclaredOutputField {
-            task: self.reference.task.0.clone(),
-            field: self.reference.field.0.clone(),
-            suggestion: diag::suggest(
-                &self.reference.field.0,
-                self.declared.iter().map(String::as_str),
-            )
-            .map(str::to_owned),
-            declared: self.declared.join(", "),
+    pub(crate) fn resolve(&self) -> Result<DeclaredOutput, CompileError> {
+        let ty = match self.declared.field(&self.reference.field.0) {
+            Declared::Untyped => None,
+            Declared::Typed(ty) => Some(ty.clone()),
+            Declared::Unchecked | Declared::Omitted => {
+                let declared = self.declared.names();
+                return Err(CompileError::UndeclaredOutputField {
+                    task: self.reference.task.0.clone(),
+                    field: self.reference.field.0.clone(),
+                    suggestion: diag::suggest(
+                        &self.reference.field.0,
+                        declared.iter().map(String::as_str),
+                    )
+                    .map(str::to_owned),
+                    declared: declared.join(", "),
+                });
+            }
+        };
+        Ok(DeclaredOutput {
+            reference: self.reference.clone(),
+            ty,
         })
     }
 }

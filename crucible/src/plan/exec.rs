@@ -1703,17 +1703,34 @@ fn enforce_emits(task: &Task, outcome: AttemptOutcome) -> AttemptOutcome {
         AttemptOutcome::Pass(value) => value,
         other => return other,
     };
-    match task
-        .emits
-        .iter()
-        .find(|field| value.get(&field.0).is_none())
-    {
+    match emits_violation(&task.emits, &value) {
         None => AttemptOutcome::Pass(value),
-        Some(missing) => AttemptOutcome::Fail {
-            note: format!("output missing declared field {:?}", missing.0),
+        Some(note) => AttemptOutcome::Fail {
+            note,
             output: Some(value),
         },
     }
+}
+
+/// The first way a passing output breaks its declared emits: a missing field, or a field whose
+/// value is not of its declared type.
+fn emits_violation(emits: &crate::plan::ir::Emits, value: &Value) -> Option<String> {
+    emits.fields().into_iter().find_map(|(field, ty)| {
+        let Some(found) = value.get(&field.0) else {
+            return Some(format!("output missing declared field {:?}", field.0));
+        };
+        let ty = ty.filter(|ty| !ty.admits(found))?;
+        Some(match (ty, found) {
+            (crucible_contract::emits::FieldType::OneOf(_), Value::String(label)) => {
+                format!("output field {:?} is {label:?}, declared {ty}", field.0)
+            }
+            _ => format!(
+                "output field {:?} is {}, declared {ty}",
+                field.0,
+                crucible_contract::emits::value_type(found)
+            ),
+        })
+    })
 }
 
 /// A finished attempt as the task's result, or the transport note when it should be retried.
@@ -2103,6 +2120,8 @@ mod tests {
             .expect("an executor transition its table does not list")
     }
     use crate::plan::ir::{Isolation, Join, Plan, PlanBudget, Stage};
+    use crucible_contract::emits::FieldType;
+    use serde_json::json;
 
     type Script = BTreeMap<(String, u32), (fn() -> AttemptOutcome, f64)>;
 
@@ -2123,6 +2142,8 @@ mod tests {
         rounds: BTreeMap<String, std::collections::VecDeque<fn() -> AttemptOutcome>>,
         /// Every dispatch's inputs, in order; `seen_values` keeps only the last per task.
         runs: Vec<(String, BTreeMap<TaskName, Value>)>,
+        /// A passing output per task, for a task no `script` or `rounds` entry covers.
+        outputs: BTreeMap<String, Value>,
     }
 
     impl ScriptRunner {
@@ -2138,6 +2159,7 @@ mod tests {
                 dropped: Vec::new(),
                 rounds: BTreeMap::new(),
                 runs: Vec::new(),
+                outputs: BTreeMap::new(),
             }
         }
         fn rounds(&mut self, task: &str, outcomes: &[fn() -> AttemptOutcome]) {
@@ -2199,7 +2221,12 @@ mod tests {
                     cost_usd: *cost,
                 },
                 None => Attempt {
-                    outcome: AttemptOutcome::Pass(serde_json::json!({"score": 1.0})),
+                    outcome: AttemptOutcome::Pass(
+                        self.outputs
+                            .get(&task.name.0)
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!({"score": 1.0})),
+                    ),
                     cost_usd: self.default_cost,
                 },
             }
@@ -2219,7 +2246,7 @@ mod tests {
             isolation: None,
             join: Join::default(),
             stage: Stage::Iteration,
-            emits: Vec::new(),
+            emits: crate::plan::ir::Emits::default(),
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
@@ -2734,7 +2761,7 @@ mod tests {
             isolation: None,
             join: Join::default(),
             stage: Stage::Iteration,
-            emits: Vec::new(),
+            emits: crate::plan::ir::Emits::default(),
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
@@ -2794,7 +2821,7 @@ mod tests {
             isolation: None,
             join: Join::default(),
             stage: Stage::Iteration,
-            emits: Vec::new(),
+            emits: crate::plan::ir::Emits::default(),
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
@@ -2987,7 +3014,7 @@ mod tests {
             isolation: None,
             join: Join::Passed,
             stage: Stage::Iteration,
-            emits: Vec::new(),
+            emits: crate::plan::ir::Emits::default(),
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
@@ -3192,11 +3219,208 @@ mod tests {
 
     fn emitting(name: &str, deps: &[&str], required: bool, emits: &[&str]) -> Task {
         let mut t = task(name, deps, "any", required);
-        t.emits = emits
-            .iter()
-            .map(|f| crate::plan::ir::OutputField((*f).to_string()))
-            .collect();
+        t.emits = crate::plan::ir::Emits::Fields(
+            emits
+                .iter()
+                .map(|f| crate::plan::ir::OutputField((*f).to_string()))
+                .collect(),
+        );
         t
+    }
+
+    fn typed(name: &str, deps: &[&str], required: bool, emits: &[(&str, FieldType)]) -> Task {
+        let mut t = task(name, deps, "any", required);
+        t.emits = crate::plan::ir::Emits::Typed(
+            emits
+                .iter()
+                .map(|(f, ty)| (crate::plan::ir::OutputField((*f).to_string()), ty.clone()))
+                .collect(),
+        );
+        t
+    }
+
+    fn one_of(labels: &[&str]) -> FieldType {
+        FieldType::OneOf(labels.iter().map(|l| label(l)).collect())
+    }
+
+    /// Each declared type against a value of it and a value not of it, one task each, so every
+    /// arm of the runtime check is exercised through the executor rather than beside it.
+    #[test]
+    fn a_passing_output_of_the_wrong_type_is_a_measured_failure_at_its_producer() {
+        let cases: Vec<(FieldType, Value, Value, &str)> = vec![
+            (
+                FieldType::String,
+                json!("x"),
+                json!(1),
+                "is integer, declared string",
+            ),
+            (
+                FieldType::Integer,
+                json!(3),
+                json!(3.5),
+                "is number, declared integer",
+            ),
+            (
+                FieldType::Number,
+                json!(0.5),
+                json!("0.5"),
+                "is string, declared number",
+            ),
+            (
+                FieldType::Boolean,
+                json!(false),
+                json!("false"),
+                "is string, declared boolean",
+            ),
+            (
+                FieldType::List,
+                json!([]),
+                json!({}),
+                "is object, declared list",
+            ),
+            (
+                FieldType::Object,
+                json!({}),
+                json!(null),
+                "is null, declared object",
+            ),
+            (
+                one_of(&["high", "low"]),
+                json!("low"),
+                json!("urgent"),
+                "is \"urgent\", declared one of high|low",
+            ),
+            (
+                one_of(&["high", "low"]),
+                json!("high"),
+                json!(true),
+                "is boolean, declared one of high|low",
+            ),
+        ];
+        for (ty, good, bad, note) in cases {
+            let plan = valid(
+                vec![
+                    typed("good", &[], false, &[("f", ty.clone())]),
+                    typed("bad", &[], false, &[("f", ty.clone())]),
+                    task("child", &["bad"], "any", false),
+                ],
+                10.0,
+            );
+            let mut r = ScriptRunner::new();
+            let good_value = json!({ "f": good });
+            let bad_value = json!({ "f": bad });
+            r.outputs.insert("good".into(), good_value.clone());
+            r.outputs.insert("bad".into(), bad_value.clone());
+            let out = execute(
+                &plan,
+                &any_substrate(),
+                ExecCfg::default(),
+                &mut r,
+                |_, _| {},
+            );
+            let ctx = format!("{ty}: {good_value} / {bad_value}");
+            assert_eq!(
+                out.results[&"good".into()].status,
+                TaskStatus::Pass,
+                "{ctx}"
+            );
+            let bad = &out.results[&"bad".into()];
+            assert_eq!(bad.status, TaskStatus::Fail, "{ctx}");
+            assert_eq!(bad.attempts, 1, "a measured failure never retries: {ctx}");
+            assert_eq!(bad.output.as_ref(), Some(&bad_value), "{ctx}");
+            let got = bad.note.as_deref().unwrap_or_default();
+            assert!(
+                got.contains(&format!("output field \"f\" {note}")),
+                "{ctx}: {got}"
+            );
+            assert_eq!(
+                out.results[&"child".into()].status,
+                TaskStatus::Blocked,
+                "{ctx}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_typed_field_that_is_missing_names_the_missing_field() {
+        let plan = valid(
+            vec![typed(
+                "t",
+                &[],
+                false,
+                &[("score", FieldType::Number), ("tier", FieldType::String)],
+            )],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.outputs.insert("t".into(), json!({"score": 1}));
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        let t = &out.results[&"t".into()];
+        assert_eq!(t.status, TaskStatus::Fail);
+        assert_eq!(
+            t.note.as_deref(),
+            Some("output missing declared field \"tier\"")
+        );
+    }
+
+    /// A task that settles itself owes nothing, typed or not: its own verdict stands.
+    #[test]
+    fn a_declared_skip_or_fail_owes_no_typed_emits() {
+        for (status, settled) in [("skipped", TaskStatus::Skipped), ("fail", TaskStatus::Fail)] {
+            let plan = valid(
+                vec![typed("t", &[], false, &[("score", FieldType::Number)])],
+                10.0,
+            );
+            let mut r = ScriptRunner::new();
+            r.outputs.insert(
+                "t".into(),
+                json!({"status": status, "score": "n/a", "note": "own"}),
+            );
+            let out = execute(
+                &plan,
+                &any_substrate(),
+                ExecCfg::default(),
+                &mut r,
+                |_, _| {},
+            );
+            let t = &out.results[&"t".into()];
+            assert_eq!(t.status, settled);
+            assert_eq!(t.note.as_deref(), Some("own"));
+        }
+    }
+
+    #[test]
+    fn a_required_task_of_the_wrong_type_short_circuits_the_plan() {
+        let plan = valid(
+            vec![
+                typed("gate", &[], true, &[("ok", FieldType::Boolean)]),
+                task("after", &["gate"], "any", true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.outputs.insert("gate".into(), json!({"ok": "yes"}));
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        assert_eq!(
+            out.exit,
+            PlanExit::ShortCircuit {
+                task: "gate".into()
+            }
+        );
+        assert!(!out.valid);
+        assert!(!r.dispatched.iter().any(|(t, _)| t == "after"));
     }
 
     #[test]
@@ -4892,7 +5116,9 @@ mod tests {
     #[test]
     fn a_task_declaring_status_fail_settles_failing_with_its_object_kept() {
         let mut veto = task("veto", &[], "any", false);
-        veto.emits = vec![crate::plan::ir::OutputField("separates".to_string())];
+        veto.emits = crate::plan::ir::Emits::Fields(vec![crate::plan::ir::OutputField(
+            "separates".to_string(),
+        )]);
         let plan = valid(vec![veto, settled_task("report", &["veto"], true)], 10.0);
         let mut r = ScriptRunner::new();
         r.on(
@@ -5107,7 +5333,9 @@ mod tests {
     #[test]
     fn a_settled_consumer_of_a_node_that_never_expanded_reads_the_refusal() {
         let mut source = task("discover", &[], "any", false);
-        source.emits = vec![crate::plan::ir::OutputField("targets".to_string())];
+        source.emits = crate::plan::ir::Emits::Fields(vec![crate::plan::ir::OutputField(
+            "targets".to_string(),
+        )]);
         let mut node = mapped_node("audit", "discover", "targets", false);
         node.join = Join::Settled;
         let plan = valid(
@@ -5879,19 +6107,26 @@ mod tests {
     /// The invariants formal/CrucibleSpec/PlanExec.lean proves for the model, checked against
     /// `execute` on every three-task graph: every edge set, stage split, required set, substrate
     /// fit, join, isolation split, per-task outcome, and a budget that does and does not run out.
+    /// Every task declares a typed `score`, and the last outcome is a pass whose `score` is not a
+    /// number: output drift must settle as a measured failure wherever it lands in the graph.
     #[test]
     fn every_three_task_graph_keeps_the_model_invariants() {
         const N: usize = 3;
         const EDGES: [(usize, usize); 3] = [(1, 0), (2, 0), (2, 1)];
-        let outcomes: [fn() -> AttemptOutcome; 4] = [
-            || AttemptOutcome::Pass(serde_json::json!({})),
+        const DRIFTED: usize = 4;
+        let outcomes: [fn() -> AttemptOutcome; 5] = [
+            || AttemptOutcome::Pass(serde_json::json!({"score": 1})),
             || AttemptOutcome::Fail {
                 note: "measured".into(),
                 output: None,
             },
             || AttemptOutcome::Skipped(serde_json::json!({}), "inapplicable".into()),
             || AttemptOutcome::Transport(TransportFailure::new(TransportCause::Other, "blip")),
+            || AttemptOutcome::Pass(serde_json::json!({"score": "high"})),
         ];
+        let pick = |outcome_pick: usize, t: usize| {
+            outcome_pick / outcomes.len().pow(t as u32) % outcomes.len()
+        };
         let joins = [Join::All, Join::Passed, Join::Settled];
         let name = |i: usize| format!("t{i}");
         let mut runs = 0usize;
@@ -5939,6 +6174,13 @@ mod tests {
                                             if is_epilogue(t) {
                                                 task.stage = Stage::Epilogue;
                                             }
+                                            task.emits = crate::plan::ir::Emits::Typed(
+                                                [(
+                                                    crate::plan::ir::OutputField("score".into()),
+                                                    FieldType::Number,
+                                                )]
+                                                .into(),
+                                            );
                                             task
                                         })
                                         .collect();
@@ -5954,10 +6196,7 @@ mod tests {
                                     let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
                                     let mut runner = GraphRunner {
                                         outcomes: (0..N)
-                                            .map(|t| {
-                                                let pick = outcome_pick / 4usize.pow(t as u32) % 4;
-                                                (name(t), outcomes[pick])
-                                            })
+                                            .map(|t| (name(t), outcomes[pick(outcome_pick, t)]))
                                             .collect(),
                                         log: log.clone(),
                                     };
@@ -5974,7 +6213,11 @@ mod tests {
                                             ))
                                         },
                                     );
-                                    check_graph(&tasks, &out, &log.borrow(), budget);
+                                    let drifted: BTreeSet<String> = (0..N)
+                                        .filter(|&t| pick(outcome_pick, t) == DRIFTED)
+                                        .map(name)
+                                        .collect();
+                                    check_graph(&tasks, &out, &log.borrow(), budget, &drifted);
                                     runs += 1;
                                 }
                             }
@@ -5986,7 +6229,13 @@ mod tests {
         assert!(runs > 100_000, "the enumeration shrank to {runs} runs");
     }
 
-    fn check_graph(tasks: &[Task], out: &PlanOutcome, log: &[GraphEvent], budget: f64) {
+    fn check_graph(
+        tasks: &[Task],
+        out: &PlanOutcome,
+        log: &[GraphEvent],
+        budget: f64,
+        drifted: &BTreeSet<String>,
+    ) {
         let ctx = || format!("{tasks:#?}\n{log:?}\n{:?}", out.exit);
         let status = |t: &Task| out.results[&t.name].status;
         let held = |t: &Task| matches!(status(t), TaskStatus::Pass | TaskStatus::NotTaken);
@@ -6135,6 +6384,13 @@ mod tests {
             // not_taken_never_dispatched.
             if status(t) == TaskStatus::NotTaken {
                 assert_eq!(n, 0, "{}", ctx());
+            }
+            // Output drift is a measured failure at the producer: it never passes, never retries.
+            if drifted.contains(&t.name.0) {
+                assert_ne!(status(t), TaskStatus::Pass, "{}", ctx());
+                if n > 0 {
+                    assert_eq!((n, status(t)), (1, TaskStatus::Fail), "{}", ctx());
+                }
             }
         }
     }

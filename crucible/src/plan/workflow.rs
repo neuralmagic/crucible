@@ -1193,7 +1193,7 @@ mod tests {
         let toml = toml::to_string(&workflow).unwrap();
         assert!(toml.contains("emits = [\"score\", \"pass\"]"), "{toml}");
         let back: WorkflowCfg = toml::from_str(&toml).unwrap();
-        assert_eq!(back.tasks[0].emits.len(), 2);
+        assert_eq!(back.tasks[0].emits.names(), ["score", "pass"]);
 
         // Undeclared emits stays off the wire, keeping existing manifests byte-identical.
         let bare = parse(
@@ -1201,6 +1201,29 @@ mod tests {
              [[task]]\nname = \"c\"\nkind = \"command\"\ncommand = \"true\"\n",
         );
         assert!(!toml::to_string(&bare).unwrap().contains("emits"));
+    }
+
+    #[test]
+    fn typed_emits_round_trip_the_generated_toml() {
+        let workflow = parse(
+            "type = \"custom\"\nresult = \"check\"\n\
+             [[task]]\nname = \"check\"\nkind = \"evaluate\"\ncommand = \"true\"\n\
+             emits = { score = \"number\", pass = \"boolean\", tier = [\"high\", \"low\"] }\n",
+        );
+        workflow.validate().unwrap();
+        let toml = toml::to_string(&workflow).unwrap();
+        let back: WorkflowCfg = toml::from_str(&toml).unwrap();
+        back.validate().unwrap();
+        assert_eq!(back.tasks[0].emits, workflow.tasks[0].emits);
+        assert_eq!(toml::to_string(&back).unwrap(), toml);
+        assert!(
+            matches!(
+                back.tasks[0].emits.field("tier"),
+                crate::plan::ir::Declared::Typed(crucible_contract::emits::FieldType::OneOf(labels))
+                    if labels.len() == 2
+            ),
+            "{toml}"
+        );
     }
 
     fn full_autoresearch() -> WorkflowCfg {

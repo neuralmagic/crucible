@@ -396,8 +396,37 @@ pub enum CompileError {
     ReviseNotADependency { task: String, target: String },
     #[error("emits entries must be strings")]
     EmitsEntryNotString,
-    #[error("argument \"emits\" must be a list of field-name strings")]
+    #[error("argument \"emits\" must be a list of field names, or a dict from field name to type")]
     EmitsNotList,
+    #[error(
+        "emits field {field:?} has unknown type {got:?}{}; use \"string\", \"integer\", \
+         \"number\", \"boolean\", \"list\", \"object\", or a list of labels",
+        diag::hint(.suggestion.as_deref())
+    )]
+    UnknownFieldType {
+        field: String,
+        got: String,
+        suggestion: Option<String>,
+    },
+    #[error("emits field {field:?} must map to a type name or a list of label strings")]
+    FieldTypeWrongShape { field: String },
+    #[error("emits field {field:?}: {error}")]
+    InvalidFieldLabel {
+        field: String,
+        error: crucible_contract::decision::IdentError,
+    },
+    #[error("emits field {field:?}: {error}")]
+    InvalidFieldType {
+        field: String,
+        error: crucible_contract::emits::FieldTypeError,
+    },
+    #[error(
+        "argument \"over\" maps over {reference}, which is declared {declared}; `over` needs a list"
+    )]
+    OverNotAList {
+        reference: String,
+        declared: crucible_contract::emits::FieldType,
+    },
 
     #[error("argument {argument:?}: {error}")]
     InvalidIdentifier {
