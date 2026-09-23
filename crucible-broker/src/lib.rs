@@ -30,6 +30,7 @@ pub mod deploy;
 pub mod describe;
 pub mod distress;
 pub mod draft_pr;
+pub mod elicit;
 pub(crate) mod gateway;
 pub mod gpu_check;
 pub mod jira;

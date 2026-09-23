@@ -9,6 +9,7 @@ pub mod admission;
 pub mod artifact;
 pub mod ask;
 pub mod decision;
+pub mod elicit;
 pub mod envelope;
 pub mod event;
 pub mod identity;
@@ -29,7 +30,7 @@ pub mod verdict;
 /// `crucible --contract-version` and the runtime image carries it as the
 /// `io.crucible.contract-version` OCI label, so a deployed image can be matched against the
 /// controller it talks to without a probe.
-pub const CONTRACT_VERSION: &str = "1.7.0";
+pub const CONTRACT_VERSION: &str = "1.8.0";
 
 pub use admission::{
     ADMISSION_WIRE_VERSION, AdmissionEvent, AdmissionKey, AdmissionOutcome, AdmittedInput,

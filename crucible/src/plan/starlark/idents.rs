@@ -152,6 +152,12 @@ pub(crate) fn narrow(error: CompileError, idents: &Idents) -> CompileError {
         | CompileError::OtherwiseWithAnswers
         | CompileError::UnreachableOtherwise { .. } => (None, "otherwise"),
         CompileError::RouteDecider { .. } => (Some("route"), "name"),
+        CompileError::HumanNotObject
+        | CompileError::HumanParameter { .. }
+        | CompileError::UnknownHumanChannel { .. }
+        | CompileError::UnknownHumanParameter { .. }
+        | CompileError::BadHumanDeadline { .. }
+        | CompileError::HumanDeadlineOutOfRange { .. } => (Some("route"), "human"),
         _ => {
             return CompileError::At { at, inner };
         }

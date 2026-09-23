@@ -1,0 +1,57 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-09-23-002"
+title = "Human-decided route: controller elicitation endpoint and Slack interactivity"
+status = "queue"
+created = "2026-09-23"
+refs = [
+    "RFC-0001:C-ROUTE",
+    "ADR-0050",
+    "WI-2026-09-23-001",
+]
+
+[content]
+description = "The controller half of [[ADR-0050]]. Serve the elicitation endpoint the engine opens and polls (PUT and GET of crucible_contract::elicit::{ElicitRequest, ElicitStatus} at a pod-scoped path authenticated by the ingest TokenReview), store each question keyed by (run, route task) with its fixed deadline and first answer per question, post and edit the Slack message rendered by crucible_contract::elicit::slack_message with a bot token to one configured channel, and receive Slack block_actions at an interactivity route that verifies the signing secret, decodes the click with crucible_contract::elicit::decode_click, and accepts it only from a member of the configured channel. Loop pods get CRUCIBLE_ELICIT_URL and CRUCIBLE_ELICIT_TOKEN_PATH only when the Slack app is configured."
+
+[[content.acceptance_criteria]]
+text = "a migration stores elicitations keyed by (run, task) with questions, deadline, Slack channel and message ts, and per-question answer, responder and time"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "PUT creates the question and posts one Slack message; a repeated PUT with the same questions returns the stored answers and the time left without posting, and one with different questions is refused with 409"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "GET returns ElicitStatus for the pod's run only; a token bound to another run's pod cannot read or answer it"
+status = "pending"
+category = "security"
+
+[[content.acceptance_criteria]]
+text = "the interactivity route rejects a bad or stale Slack signature, a click from another channel, a non-member, and a value the stored question does not declare; the first accepted answer per question is final"
+status = "pending"
+category = "security"
+
+[[content.acceptance_criteria]]
+text = "the Slack message is edited to show each answer and its responder, and marked expired once the deadline passes"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "the loop-pod render sets CRUCIBLE_ELICIT_URL and CRUCIBLE_ELICIT_TOKEN_PATH only when the controller has a Slack bot token, signing secret and channel configured"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "sqlx tests against real Postgres and an end-to-end test against a local Slack stand-in cover each path above"
+status = "pending"
+category = "chore"
+
+[verification]
+required_guards = [
+    "GUARD-CARGO-FMT",
+    "GUARD-CARGO-TEST",
+    "GUARD-GOVCTL-CHECK",
+]

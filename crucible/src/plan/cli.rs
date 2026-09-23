@@ -136,6 +136,8 @@ pub fn render(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
                     crate::plan::ir::Decider::Model { min_confidence } =>
                         format!("model >= {min_confidence}"),
                     crate::plan::ir::Decider::Output { task } => format!("from {task}"),
+                    crate::plan::ir::Decider::Human { via, deadline_secs } =>
+                        format!("person via {via} within {deadline_secs}s"),
                 }
             ),
             TaskKind::Report { .. } => "report".to_string(),
@@ -656,7 +658,11 @@ pub fn run(
         };
     // Manifest runs append plan wire events to the run's session log so tailers (and the
     // controller's ingest) see the graph and its live progress; shell runs have no state dir.
-    let substrate = Substrate::detecting(caps.clone(), &crucible::inference::from_process_env()?);
+    let substrate = Substrate::detecting(
+        caps.clone(),
+        &crucible::inference::from_process_env()?,
+        crucible_broker::elicit::Endpoint::from_env(|name| std::env::var(name).ok()).as_ref(),
+    );
     let append = |f: &std::fs::File, ev: &crate::report::session::SessionEvent| {
         use std::io::Write;
         let mut w = f;

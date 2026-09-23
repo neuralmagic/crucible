@@ -747,6 +747,18 @@ that does, its key replaces `[agent.codex]`'s own, and the ambient `ANTHROPIC_AP
 Each replacement is logged. With no `agent` binding those ambient variables and the manifest
 decide, which is how a run from an operator's shell works.
 
+A human-decided route (contract 1.8.0) asks a person through an elicitation endpoint the
+controller names in `CRUCIBLE_ELICIT_URL`; its presence is the `human` capability, so a run
+without it truncates such a route before any spend. `CRUCIBLE_ELICIT_TOKEN_PATH`, when set, names a
+file whose contents are sent as the bearer, re-read on every request. The engine PUTs
+`crucible_contract::elicit::ElicitRequest` (`{"questions", "deadline_secs"}`) to
+`<url>/<task>` and then GETs the same URL; both answer `ElicitStatus`
+(`{"expires_in_secs", "answers": {question: label}}`). A PUT for a question that is already open
+returns its stored answers and the time left before its original deadline. An answer naming an
+undeclared question, a label the question does not declare, or `uncertain` fails the route; a 5xx,
+a 429, or an unreachable endpoint is transport. The controller posts and edits the Slack message
+from `elicit::slack_message` and decodes clicks with `elicit::decode_click`; see ADR-0050.
+
 Additive event kinds beyond the compat set include:
 
 - **`identity`**: the run's `RunIdentity` (below), emitted once at setup and again on

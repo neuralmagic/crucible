@@ -25,8 +25,9 @@ use crate::crucible::Direction;
 use crate::errors::FileError;
 use crate::plan::diag;
 use crate::plan::ir::{
-    Decider, EngineOp, Isolation, Join, MAX_FANOUT_CEILING, MAX_ROUNDS_CEILING, OutputField,
-    OutputRef, ReportDestination, Revise, SlackDestination, Stage, Task, TaskKind, TaskName, When,
+    Decider, EngineOp, HumanChannel, Isolation, Join, MAX_FANOUT_CEILING, MAX_HUMAN_DEADLINE_SECS,
+    MAX_ROUNDS_CEILING, MIN_HUMAN_DEADLINE_SECS, OutputField, OutputRef, ReportDestination, Revise,
+    SlackDestination, Stage, Task, TaskKind, TaskName, When,
 };
 use crate::plan::starlark::error::{
     CompileError, MAX_CALLSTACK, MAX_CONSTRUCTED_TASKS, MAX_EVAL_HEAP_BYTES, MAX_EVAL_TICKS,
@@ -604,6 +605,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "questions",
             "min_confidence",
             "source",
+            "human",
             "depends_on",
             "required",
             "join",
@@ -844,14 +846,14 @@ fn constructor(
             let questions = take_questions(&mut named)?;
             let min_confidence = take_optional_number(&mut named, "min_confidence")?;
             let source = take_optional_task_name(&mut named, "source")?;
-            let (decider, needs) = match (min_confidence, source) {
-                (Some(min_confidence), None) => (
-                    Decider::Model { min_confidence },
-                    crate::plan::ir::NEEDS_SYSTEMONE,
-                ),
-                (None, Some(task)) => (Decider::Output { task }, "any"),
+            let human = take_optional_human(&mut named)?;
+            let decider = match (min_confidence, source, human) {
+                (Some(min_confidence), None, None) => Decider::Model { min_confidence },
+                (None, Some(task), None) => Decider::Output { task },
+                (None, None, Some(human)) => human,
                 _ => return Err(CompileError::RouteDecider { task: name.0 }),
             };
+            let needs = decider.needs().unwrap_or("any");
             Task {
                 task: TaskKind::Route { questions, decider },
                 depends_on: take_task_names(&mut named)?,
@@ -1520,6 +1522,49 @@ fn take_string(named: &mut BTreeMap<String, Value>, name: &str) -> Result<String
         }),
         _ => Err(wrong_type(name, "a string")),
     }
+}
+
+/// `human = {"kind": "slack", "deadline": "4h"}`: who answers a route, and how long they have.
+fn take_optional_human(named: &mut BTreeMap<String, Value>) -> Result<Option<Decider>> {
+    let mut object = match named.remove("human").unwrap_or(Value::None) {
+        Value::None => return Ok(None),
+        Value::Map(object) => object,
+        _ => return Err(CompileError::HumanNotObject),
+    };
+    let kind = match object.remove("kind") {
+        Some(Value::String(kind)) => kind,
+        _ => return Err(CompileError::HumanParameter { parameter: "kind" }),
+    };
+    let via = match kind.as_str() {
+        "slack" => HumanChannel::Slack,
+        other => {
+            return Err(CompileError::UnknownHumanChannel {
+                got: other.to_owned(),
+            });
+        }
+    };
+    let raw = match object.remove("deadline") {
+        Some(Value::String(raw)) => raw,
+        _ => {
+            return Err(CompileError::HumanParameter {
+                parameter: "deadline",
+            });
+        }
+    };
+    if let Some(parameter) = object.keys().next() {
+        return Err(CompileError::UnknownHumanParameter {
+            parameter: parameter.clone(),
+        });
+    }
+    let deadline = crate::duration::parse_duration(&raw)
+        .ok_or_else(|| CompileError::BadHumanDeadline { raw: raw.clone() })?;
+    let deadline_secs = deadline.as_secs();
+    if !(MIN_HUMAN_DEADLINE_SECS..=MAX_HUMAN_DEADLINE_SECS).contains(&deadline_secs)
+        || deadline.subsec_nanos() != 0
+    {
+        return Err(CompileError::HumanDeadlineOutOfRange { raw });
+    }
+    Ok(Some(Decider::Human { via, deadline_secs }))
 }
 
 fn take_report_destination(named: &mut BTreeMap<String, Value>) -> Result<ReportDestination> {
@@ -2944,6 +2989,103 @@ workflow(type = "playbook", tasks = [classify, gate, fix, punt, page, wrap], res
     }
 
     #[test]
+    fn a_human_decided_route_compiles_and_survives_the_generated_toml() {
+        let pack = temp_pack("routed-human");
+        let source = ROUTED.replace(
+            "min_confidence = 0.8",
+            "human = {\"kind\": \"slack\", \"deadline\": \"4h\"}",
+        );
+        let compiled = compile_source(&source, &pack.join("workflow.star"), &pack).unwrap();
+        let gate = compiled
+            .workflow
+            .tasks
+            .iter()
+            .find(|t| t.name.0 == "gate")
+            .unwrap();
+        assert_eq!(gate.needs, "human");
+        assert!(matches!(
+            &gate.task,
+            TaskKind::Route {
+                decider: Decider::Human {
+                    via: HumanChannel::Slack,
+                    deadline_secs: 14400
+                },
+                ..
+            }
+        ));
+        let text = toml::to_string(&compiled.workflow).unwrap();
+        let back: WorkflowCfg = toml::from_str(&text).unwrap();
+        back.validate().unwrap();
+        assert_eq!(toml::to_string(&back).unwrap(), text);
+        assert!(
+            text.contains(
+                "[task.decider]\nkind = \"human\"\nvia = \"slack\"\ndeadline_secs = 14400\n"
+            ),
+            "{text}"
+        );
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn a_bad_human_argument_is_located_at_the_argument() {
+        for (human, needle) in [
+            ("\"slack\"", "must be an object"),
+            (
+                "{\"kind\": \"email\", \"deadline\": \"4h\"}",
+                "kind must be `slack`, got \"email\"",
+            ),
+            ("{\"deadline\": \"4h\"}", "human needs kind as a string"),
+            ("{\"kind\": \"slack\"}", "human needs deadline as a string"),
+            (
+                "{\"kind\": \"slack\", \"deadline\": 3600}",
+                "human needs deadline as a string",
+            ),
+            (
+                "{\"kind\": \"slack\", \"deadline\": \"4h\", \"channel\": \"#ops\"}",
+                "unknown parameter \"channel\"",
+            ),
+            (
+                "{\"kind\": \"slack\", \"deadline\": \"soon\"}",
+                "\"soon\" is not a duration",
+            ),
+            (
+                "{\"kind\": \"slack\", \"deadline\": \"30s\"}",
+                "from 60 to 604800",
+            ),
+            (
+                "{\"kind\": \"slack\", \"deadline\": \"169h\"}",
+                "from 60 to 604800",
+            ),
+            (
+                "{\"kind\": \"slack\", \"deadline\": \"90.5s\"}",
+                "whole number of seconds",
+            ),
+        ] {
+            let source = ROUTED.replace(
+                "    min_confidence = 0.8,\n",
+                &format!("    min_confidence = None,\n    human = {human},\n"),
+            );
+            let err = routed_error("routed-human-bad", &source);
+            assert!(err.contains(needle), "{human}: {err}");
+            assert!(err.contains("workflow.star:6:"), "{human}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_route_with_a_person_and_another_decider_is_refused() {
+        for other in ["min_confidence = 0.8", "source = classify"] {
+            let source = ROUTED.replace(
+                "    min_confidence = 0.8,\n",
+                &format!(
+                    "    {other},\n    human = {{\"kind\": \"slack\", \"deadline\": \"1h\"}},\n"
+                ),
+            );
+            let err = routed_error("routed-human-two", &source);
+            assert!(err.contains("or human (a person answers)"), "{err}");
+        }
+    }
+
+    #[test]
     fn a_route_takes_exactly_one_decider() {
         for source in [
             ROUTED.replace("    min_confidence = 0.8,\n", ""),
@@ -3541,6 +3683,10 @@ workflow(type = "custom", tasks = [e], result = e)
             (
                 "route",
                 "u = command(name = \"u\", run = \"true\", emits = [\"q\", \"r\"])\ng = route(name = \"g\", source = u, min_confidence = None, depends_on = [u], required = True, join = \"all\", stage = \"iteration\", questions = {\"q\": noul(ask = \"q?\", drop = [\"no\", \"uncertain\"])})\nh = route(name = \"h\", source = u, depends_on = [u, g], when = g.q, answers = \"yes\", otherwise = False, questions = {\"r\": noul(ask = \"r?\")}{extra})\nw = command(name = \"w\", run = \"true\", depends_on = [h], join = \"settled\")\nworkflow(type = \"custom\", tasks = [u, g, h, w], result = w)\n",
+            ),
+            (
+                "route",
+                "g = route(name = \"g\", human = {\"kind\": \"slack\", \"deadline\": \"1h\"}, questions = {\"q\": noul(ask = \"q?\", drop = [\"no\", \"uncertain\"])}{extra})\nworkflow(type = \"custom\", tasks = [g], result = g)\n",
             ),
             (
                 "noul",

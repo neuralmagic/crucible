@@ -270,7 +270,51 @@ pub enum Decider {
     },
     /// A dependency's output, which carries one declared label per question id.
     Output { task: TaskName },
+    /// A person, reached over `via`; a question unanswered after `deadline_secs` is uncertain.
+    Human {
+        via: HumanChannel,
+        deadline_secs: u64,
+    },
 }
+
+impl Decider {
+    /// The capability a route decided this way must declare, when it needs one.
+    pub fn needs(&self) -> Option<&'static str> {
+        match self {
+            Decider::Model { .. } => Some(NEEDS_SYSTEMONE),
+            Decider::Human { .. } => Some(NEEDS_HUMAN),
+            Decider::Output { .. } => None,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Decider::Model { .. } => "model",
+            Decider::Output { .. } => "output",
+            Decider::Human { .. } => "human",
+        }
+    }
+}
+
+/// How a human-decided route reaches a person.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanChannel {
+    Slack,
+}
+
+impl fmt::Display for HumanChannel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HumanChannel::Slack => f.write_str("slack"),
+        }
+    }
+}
+
+/// The shortest deadline a human-decided route may give a person.
+pub const MIN_HUMAN_DEADLINE_SECS: u64 = 60;
+/// The longest deadline a human-decided route may give a person.
+pub const MAX_HUMAN_DEADLINE_SECS: u64 = 7 * 24 * 3600;
 
 /// Run a task only when one question of a route it depends on resolved to a listed label.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -289,6 +333,8 @@ impl fmt::Display for When {
 
 /// The capability a model-decided route task needs.
 pub const NEEDS_SYSTEMONE: &str = "systemone";
+/// The capability a human-decided route task needs.
+pub const NEEDS_HUMAN: &str = "human";
 
 fn default_needs() -> String {
     "any".to_string()
@@ -551,10 +597,29 @@ pub enum PlanError {
     },
     #[error("route task {task:?}: min_confidence must be in (0, 1], got {got}")]
     MinConfidenceOutOfRange { task: String, got: f64 },
+    #[error("{decider}-decided route task {task:?} must declare needs = {want:?}, got {got:?}")]
+    RouteNeeds {
+        task: String,
+        decider: &'static str,
+        want: &'static str,
+        got: String,
+    },
     #[error(
-        "model-decided route task {task:?} must declare needs = \"{NEEDS_SYSTEMONE}\", got {got:?}"
+        "human-decided route task {task:?}: deadline_secs = {got} is outside \
+         {MIN_HUMAN_DEADLINE_SECS}..={MAX_HUMAN_DEADLINE_SECS}"
     )]
-    RouteNeeds { task: String, got: String },
+    HumanDeadlineOutOfRange { task: String, got: u64 },
+    #[error("human-decided route task {task:?}, question {question:?}: {error}")]
+    QuestionUnfitForSlack {
+        task: String,
+        question: String,
+        error: crucible_contract::elicit::SlackLimit,
+    },
+    #[error("human-decided route task {task:?}: {error}")]
+    RouteUnfitForSlack {
+        task: String,
+        error: crucible_contract::elicit::SlackLimit,
+    },
     #[error(
         "route task {task:?} decides from {source_task:?}, which is not one of its dependencies"
     )]
@@ -836,6 +901,16 @@ impl Plan {
                             error,
                         })?;
                 }
+                if let Some(want) = decider.needs()
+                    && t.needs != want
+                {
+                    return Err(PlanError::RouteNeeds {
+                        task: task(),
+                        decider: decider.label(),
+                        want,
+                        got: t.needs.clone(),
+                    });
+                }
                 match decider {
                     Decider::Model { min_confidence } => {
                         if !(*min_confidence > 0.0 && *min_confidence <= 1.0) {
@@ -844,12 +919,34 @@ impl Plan {
                                 got: *min_confidence,
                             });
                         }
-                        if t.needs != NEEDS_SYSTEMONE {
-                            return Err(PlanError::RouteNeeds {
+                    }
+                    Decider::Human {
+                        via: HumanChannel::Slack,
+                        deadline_secs,
+                    } => {
+                        if !(MIN_HUMAN_DEADLINE_SECS..=MAX_HUMAN_DEADLINE_SECS)
+                            .contains(deadline_secs)
+                        {
+                            return Err(PlanError::HumanDeadlineOutOfRange {
                                 task: task(),
-                                got: t.needs.clone(),
+                                got: *deadline_secs,
                             });
                         }
+                        for (id, question) in questions {
+                            crucible_contract::elicit::fits_slack(question).map_err(|error| {
+                                PlanError::QuestionUnfitForSlack {
+                                    task: task(),
+                                    question: id.to_string(),
+                                    error,
+                                }
+                            })?;
+                        }
+                        crucible_contract::elicit::message_fits_slack(questions).map_err(
+                            |error| PlanError::RouteUnfitForSlack {
+                                task: task(),
+                                error,
+                            },
+                        )?;
                     }
                     Decider::Output { task: source } => {
                         if !t.depends_on.contains(source) {
@@ -1501,6 +1598,8 @@ mod tests {
             plan(vec![gate]).validate().unwrap_err(),
             PlanError::RouteNeeds {
                 task: "gate".into(),
+                decider: "model",
+                want: NEEDS_SYSTEMONE,
                 got: "any".into()
             }
         );
@@ -1510,6 +1609,184 @@ mod tests {
         ])
         .validate()
         .unwrap();
+    }
+
+    fn human_route(name: &str, deps: &[&str], deadline_secs: u64) -> Task {
+        Task {
+            task: TaskKind::Route {
+                questions: BTreeMap::from([(qid("area"), area_question(&["uncertain"]))]),
+                decider: Decider::Human {
+                    via: HumanChannel::Slack,
+                    deadline_secs,
+                },
+            },
+            needs: NEEDS_HUMAN.into(),
+            ..agent(name, deps)
+        }
+    }
+
+    #[test]
+    fn a_human_route_round_trips_through_toml_and_json() {
+        let original = plan(vec![
+            agent("scan", &[]),
+            human_route("gate", &["scan"], 3600),
+            on(
+                agent("fix", &["gate"]),
+                "gate",
+                "area",
+                &["scheduler", "frontend"],
+            ),
+        ]);
+        let text = toml::to_string(&original).unwrap();
+        assert!(
+            text.contains(
+                "[task.decider]\nkind = \"human\"\nvia = \"slack\"\ndeadline_secs = 3600\n"
+            ),
+            "{text}"
+        );
+        let from_toml = Plan::from_toml_str(&text).unwrap();
+        let from_json = Plan::from_json_str(&serde_json::to_string(&original).unwrap()).unwrap();
+        for back in [from_toml, from_json] {
+            let TaskKind::Route { questions, decider } = &back.tasks[1].task else {
+                panic!("gate is not a route");
+            };
+            assert_eq!(questions[&qid("area")], area_question(&["uncertain"]));
+            assert_eq!(
+                *decider,
+                Decider::Human {
+                    via: HumanChannel::Slack,
+                    deadline_secs: 3600
+                }
+            );
+            assert_eq!(back.tasks[1].needs, NEEDS_HUMAN);
+            back.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_human_route_deadline_lies_between_a_minute_and_a_week() {
+        for (deadline, ok) in [
+            (0, false),
+            (MIN_HUMAN_DEADLINE_SECS - 1, false),
+            (MIN_HUMAN_DEADLINE_SECS, true),
+            (MAX_HUMAN_DEADLINE_SECS, true),
+            (MAX_HUMAN_DEADLINE_SECS + 1, false),
+            (u64::MAX, false),
+        ] {
+            let got = plan(vec![human_route("gate", &[], deadline)]).validate();
+            if ok {
+                got.unwrap();
+            } else {
+                assert_eq!(
+                    got.unwrap_err(),
+                    PlanError::HumanDeadlineOutOfRange {
+                        task: "gate".into(),
+                        got: deadline
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_human_route_must_need_human() {
+        for needs in ["any", NEEDS_SYSTEMONE] {
+            let mut gate = human_route("gate", &[], 600);
+            gate.needs = needs.into();
+            let err = plan(vec![gate]).validate().unwrap_err();
+            assert_eq!(
+                err,
+                PlanError::RouteNeeds {
+                    task: "gate".into(),
+                    decider: "human",
+                    want: NEEDS_HUMAN,
+                    got: needs.into()
+                }
+            );
+            assert!(
+                err.to_string().starts_with(
+                    "human-decided route task \"gate\" must declare needs = \"human\""
+                ),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_human_route_rejects_a_question_slack_cannot_render() {
+        use crucible_contract::decision::{ChoiceOption, QuestionKind};
+        use crucible_contract::elicit::{MAX_BUTTONS, SlackLimit};
+        let mut gate = human_route("gate", &[], 600);
+        if let TaskKind::Route { questions, .. } = &mut gate.task {
+            questions.insert(
+                qid("many"),
+                Question {
+                    instructions: "which?".into(),
+                    kind: QuestionKind::Choice {
+                        options: (0..=MAX_BUTTONS)
+                            .map(|i| ChoiceOption {
+                                label: label(&format!("l{i}")),
+                                description: None,
+                            })
+                            .collect(),
+                    },
+                    drop: vec![],
+                },
+            );
+        }
+        assert_eq!(
+            plan(vec![gate.clone()]).validate().unwrap_err(),
+            PlanError::QuestionUnfitForSlack {
+                task: "gate".into(),
+                question: "many".into(),
+                error: SlackLimit::TooManyLabels {
+                    got: MAX_BUTTONS + 1
+                },
+            }
+        );
+        if let TaskKind::Route { decider, .. } = &mut gate.task {
+            *decider = Decider::Model {
+                min_confidence: 0.5,
+            };
+        }
+        gate.needs = NEEDS_SYSTEMONE.into();
+        plan(vec![gate]).validate().unwrap();
+    }
+
+    #[test]
+    fn a_human_route_rejects_more_questions_than_one_slack_message_holds() {
+        use crucible_contract::elicit::{MAX_BLOCKS, SlackLimit};
+        let asking = |n: usize| {
+            let mut gate = human_route("gate", &[], 600);
+            if let TaskKind::Route { questions, .. } = &mut gate.task {
+                *questions = (0..n)
+                    .map(|i| (qid(&format!("q{i}")), area_question(&["uncertain"])))
+                    .collect();
+            }
+            gate
+        };
+        let per_question = 3;
+        let most = (MAX_BLOCKS - 3) / per_question;
+        plan(vec![asking(most)]).validate().unwrap();
+        let err = plan(vec![asking(most + 1)]).validate().unwrap_err();
+        assert_eq!(
+            err,
+            PlanError::RouteUnfitForSlack {
+                task: "gate".into(),
+                error: SlackLimit::TooManyBlocks {
+                    got: 3 + per_question * (most + 1)
+                },
+            }
+        );
+        assert!(err.to_string().contains("per message"), "{err}");
+        let mut gate = asking(most + 1);
+        if let TaskKind::Route { decider, .. } = &mut gate.task {
+            *decider = Decider::Model {
+                min_confidence: 0.5,
+            };
+        }
+        gate.needs = NEEDS_SYSTEMONE.into();
+        plan(vec![gate]).validate().unwrap();
     }
 
     #[test]
