@@ -14,7 +14,7 @@ To try it on a laptop first, see [Running the controller locally](./controller-l
 
 | Need | How it is given | Notes |
 | --- | --- | --- |
-| Postgres | `DATABASE_URL` | The daemon migrates the schema on open; there is no separate migrate step. `crucible-controller db verify` proves the migration set against a scratch database. |
+| Postgres | `DATABASE_URL` | The daemon migrates the schema on open; there is no separate migrate step. `crucible-controller db verify` proves the migration set against a scratch database. `embedded` runs a Postgres of its own, for [local use](./controller-local.md#the-embedded-database). |
 | A bind address | `CONTROLLER_API_ADDR` | Without `CONTROLLER_API_TOKEN` the API binds loopback only, whatever address you give it. |
 | A static bearer | `CONTROLLER_API_TOKEN` | The deployment's machine credential, for CD and the cluster-internal Service. Required for any routable bind. |
 | A GitHub token | `GITHUB_TOKEN` | Discovery and triage read the watched repos with it; public repos need only public read. |

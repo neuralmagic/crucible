@@ -760,6 +760,7 @@ fn dispatch_autopilot(mut cfg: crucible_controller::ControllerCfg, once: bool) -
             // Install the tracing subscriber inside the runtime (an OTLP layer, if enabled, wants
             // one); the guard flushes any batched spans on drop.
             let _telemetry = crucible_controller::telemetry::init(cfg.db_url());
+            let _embedded = embedded_database(&mut cfg).await?;
             let pool = crucible_controller::connect(cfg.db_url()).await?;
             let lock = crucible_controller::try_maintenance_lock(&pool)
                 .await?
@@ -780,10 +781,31 @@ fn dispatch_autopilot(mut cfg: crucible_controller::ControllerCfg, once: bool) -
     rt.block_on(run_autopilot_daemon(cfg))
 }
 
+/// Start the embedded Postgres when `DATABASE_URL=embedded` and point `cfg` at it. The returned
+/// guard stops the server when the daemon lets go of it.
+#[cfg(feature = "embedded-db")]
+async fn embedded_database(
+    cfg: &mut crucible_controller::ControllerCfg,
+) -> Result<Option<crucible_controller::embedded_db::EmbeddedDb>> {
+    if !cfg.wants_embedded_db() {
+        return Ok(None);
+    }
+    let (server, url) = crucible_controller::embedded_db::EmbeddedDb::start(&cfg.state_dir).await?;
+    cfg.db = url;
+    Ok(Some(server))
+}
+
+#[cfg(not(feature = "embedded-db"))]
+async fn embedded_database(cfg: &mut crucible_controller::ControllerCfg) -> Result<Option<()>> {
+    cfg.validate_database()?;
+    Ok(None)
+}
+
 async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Result<()> {
     // Structured logging for the daemon: RUST_LOG-driven (default info), stderr, plus an OTLP trace
     // layer only when OTEL_EXPORTER_OTLP_ENDPOINT is set. The guard flushes batched spans on exit.
     let _telemetry = crucible_controller::telemetry::init(cfg.db_url());
+    let _embedded = embedded_database(&mut cfg).await?;
 
     // Fail loud at startup if the grounded executor is misconfigured (a missing profile/sandbox for
     // `pod` mode), never silently per verdict — the exact failure the old env gate had.
