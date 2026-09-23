@@ -16,7 +16,7 @@ use serde_json::Value;
 use crate::agent::event::{AgentEvent, RawStream};
 use crate::agent::harness::HarnessRuntime;
 use crate::plan::exec::{Attempt, AttemptOutcome, BatchItem, TaskRunner, TransportFailure};
-use crate::plan::ir::{Isolation, Task, TaskKind, TaskName};
+use crate::plan::ir::{Isolation, OutputField, Task, TaskKind, TaskName};
 use crate::plan::runner::ShellRunner;
 use crucible_contract::TransportCause;
 use std::path::{Path, PathBuf};
@@ -701,11 +701,7 @@ fn run_in(
         Ok(j) => j,
         Err(e) => return Attempt::failed(0.0, format!("inputs not serializable: {e}")),
     };
-    let full_prompt = format!(
-        "{prompt}\n\n## Task inputs\n\nUpstream task results, as JSON:\n\n{inputs_json}\n\n\
-         ## Result contract\n\nWhen done, write your final result as a single JSON object \
-         to `{RESULT_FILE}` in the workspace root. The run is graded on that file."
-    );
+    let full_prompt = task_prompt(&prompt, &inputs_json, &task.emits);
 
     let result_path = paths.workspace.join(RESULT_FILE);
     // Drain any stale result so a pass can only come from THIS turn.
@@ -802,9 +798,50 @@ fn task_worktree_name(name: &TaskName) -> String {
     format!("task-{}", digest.trim_start_matches("sha256:"))
 }
 
+/// An agent task's prompt: the author's text, its inputs, and the result contract, which names
+/// the fields the task's `emits` promises.
+fn task_prompt(prompt: &str, inputs_json: &str, emits: &[OutputField]) -> String {
+    let fields = if emits.is_empty() {
+        String::new()
+    } else {
+        let names: Vec<String> = emits.iter().map(|f| format!("`{}`", f.0)).collect();
+        format!(" The object must carry these fields: {}.", names.join(", "))
+    };
+    format!(
+        "{prompt}\n\n## Task inputs\n\nUpstream task results, as JSON:\n\n{inputs_json}\n\n\
+         ## Result contract\n\nWhen done, write your final result as a single JSON object \
+         to `{RESULT_FILE}` in the workspace root.{fields} The run is graded on that file."
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_result_contract_names_the_fields_a_task_emits() {
+        let plain = task_prompt("Write a haiku.", "{}", &[]);
+        assert!(
+            plain.ends_with(
+                "## Result contract\n\nWhen done, write your final result as a single JSON \
+                 object to `PLAN_TASK_RESULT.json` in the workspace root. The run is graded on \
+                 that file."
+            ),
+            "{plain}"
+        );
+        let promised = task_prompt(
+            "Write a haiku.",
+            "{}",
+            &[OutputField("lines".into()), OutputField("title".into())],
+        );
+        assert!(
+            promised.ends_with(
+                "in the workspace root. The object must carry these fields: `lines`, `title`. \
+                 The run is graded on that file."
+            ),
+            "{promised}"
+        );
+    }
     use crate::plan::exec::{ExecCfg, PlanExit, Substrate, TaskStatus};
 
     /// The executor's own transitions are in its table; a test that trips one fails here.
