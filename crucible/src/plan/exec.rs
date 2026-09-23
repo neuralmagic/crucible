@@ -37,10 +37,17 @@ pub struct Substrate {
 }
 
 impl Substrate {
-    /// `caps` plus the capabilities the run's inference bindings provide.
-    pub fn detecting(mut caps: BTreeSet<String>, inference: &ResolvedInference) -> Self {
+    /// `caps` plus the capabilities the run's inference bindings and elicitation endpoint provide.
+    pub fn detecting(
+        mut caps: BTreeSet<String>,
+        inference: &ResolvedInference,
+        elicit: Option<&crucible_broker::elicit::Endpoint>,
+    ) -> Self {
         if inference.binding(InferenceRole::Decision).is_some() {
             caps.insert(crate::plan::ir::NEEDS_SYSTEMONE.to_owned());
+        }
+        if elicit.is_some() {
+            caps.insert(crate::plan::ir::NEEDS_HUMAN.to_owned());
         }
         Substrate { caps }
     }
@@ -145,6 +152,21 @@ impl Attempt {
     }
 }
 
+/// How a human-decided route's wait ended, as the runner reports it. Each map holds the labels
+/// read by then, one per answered question.
+#[derive(Debug)]
+pub enum Elicited {
+    /// Every question has an answer.
+    Answered(BTreeMap<QuestionId, Label>),
+    /// The question's own deadline passed first.
+    Expired(BTreeMap<QuestionId, Label>),
+    /// The run's wall-clock ceiling arrived before the deadline.
+    Cut(BTreeMap<QuestionId, Label>),
+    /// The question or its answer is wrong; asking again would repeat it.
+    Failed(String),
+    Transport(TransportFailure),
+}
+
 /// One task of a concurrent dispatch batch (see [`TaskRunner::run_many`]).
 pub struct BatchItem<'a> {
     pub task: &'a Task,
@@ -189,6 +211,16 @@ pub trait TaskRunner {
             .iter()
             .map(|b| self.run(b.task, b.attempt, &b.inputs))
             .collect()
+    }
+
+    /// Put a human-decided route's questions to a person and wait until each is answered, the
+    /// route's deadline passes, or `ceiling` arrives. A runner that cannot reach a person fails
+    /// the route.
+    fn elicit(&mut self, task: &Task, _ceiling: Option<Instant>) -> Elicited {
+        Elicited::Failed(format!(
+            "task {} is decided by a person, and this runner cannot reach one",
+            task.name
+        ))
     }
 }
 
@@ -1172,6 +1204,18 @@ pub fn execute(
                     (decided, event, false)
                 }
                 TaskKind::Route {
+                    questions,
+                    decider: Decider::Human { .. },
+                } => {
+                    let ceiling = cfg.wall_clock.and_then(|limit| started.checked_add(limit));
+                    let (decided, event, cut) =
+                        decide_by_person(t, questions, ceiling, cfg, runner);
+                    if cut {
+                        halt(&mut halted, &mut plan_machine, Halt::Time)?;
+                    }
+                    (decided, event, false)
+                }
+                TaskKind::Route {
                     decider: Decider::Model { .. },
                     ..
                 }
@@ -1959,16 +2003,7 @@ fn decide_from_output(
     questions: &BTreeMap<QuestionId, Question>,
     source: &TaskName,
 ) -> TaskResult {
-    let fail = |note: String| TaskResult {
-        status: TaskStatus::Fail,
-        attempts: 1,
-        cost_usd: 0.0,
-        output: None,
-        note: Some(note),
-        fanout: None,
-        blocked: None,
-        transport: None,
-    };
+    let fail = |note: String| route_failed(1, note);
     let Some(output) = inputs.get(source) else {
         return fail(format!("source {source} contributed no output"));
     };
@@ -1994,25 +2029,44 @@ fn decide_from_output(
             }
             Err(e) => return fail(format!("{source}.{id}: {e}")),
         };
-        let probabilities = if label.is_uncertain() {
-            BTreeMap::new()
-        } else {
-            BTreeMap::from([(label.clone(), 1.0)])
-        };
-        let confidence = if label.is_uncertain() { 0.0 } else { 1.0 };
-        decision.insert(
-            id.clone(),
-            Answer {
-                label,
-                confidence,
-                probabilities,
-            },
-        );
+        decision.insert(id.clone(), certain(label));
     }
-    match serde_json::to_value(Decision(decision)) {
+    decided(Decision(decision), 1)
+}
+
+/// An answer read rather than inferred: probability 1 for the label, or an empty distribution
+/// with confidence 0 for `uncertain`.
+fn certain(label: Label) -> Answer {
+    let (confidence, probabilities) = if label.is_uncertain() {
+        (0.0, BTreeMap::new())
+    } else {
+        (1.0, BTreeMap::from([(label.clone(), 1.0)]))
+    };
+    Answer {
+        label,
+        confidence,
+        probabilities,
+    }
+}
+
+fn route_failed(attempts: u32, note: String) -> TaskResult {
+    TaskResult {
+        status: TaskStatus::Fail,
+        attempts,
+        cost_usd: 0.0,
+        output: None,
+        note: Some(note),
+        fanout: None,
+        blocked: None,
+        transport: None,
+    }
+}
+
+fn decided(decision: Decision, attempts: u32) -> TaskResult {
+    match serde_json::to_value(decision) {
         Ok(output) => TaskResult {
             status: TaskStatus::Pass,
-            attempts: 1,
+            attempts,
             cost_usd: 0.0,
             output: Some(output),
             note: None,
@@ -2020,8 +2074,82 @@ fn decide_from_output(
             blocked: None,
             transport: None,
         },
-        Err(e) => fail(format!("encoding the decision: {e}")),
+        Err(e) => route_failed(attempts, format!("encoding the decision: {e}")),
     }
+}
+
+/// Settle a human-decided route: ask through the runner, retrying transport failures, and record
+/// each answer as read. The flag is whether the run's wall-clock ceiling ended the wait.
+fn decide_by_person(
+    t: &Task,
+    questions: &BTreeMap<QuestionId, Question>,
+    ceiling: Option<Instant>,
+    cfg: ExecCfg,
+    runner: &mut dyn TaskRunner,
+) -> (TaskResult, TaskEvent, bool) {
+    let max_attempts = 1 + cfg.transport_retries;
+    let mut attempts = 0;
+    let mut last = TransportFailure::new(TransportCause::Other, String::new());
+    let past_ceiling = || ceiling.is_some_and(|c| Instant::now() >= c);
+    while attempts < max_attempts {
+        attempts += 1;
+        let (answers, expired) = match runner.elicit(t, ceiling) {
+            Elicited::Answered(answers) => (answers, false),
+            Elicited::Expired(answers) => (answers, true),
+            Elicited::Cut(answers) => {
+                let open: Vec<&str> = questions
+                    .keys()
+                    .filter(|id| !answers.contains_key(*id))
+                    .map(QuestionId::as_str)
+                    .collect();
+                let note = format!(
+                    "wall-clock ceiling reached before {} was answered",
+                    open.join(", ")
+                );
+                return (route_failed(attempts, note), TaskEvent::Failed, true);
+            }
+            Elicited::Failed(note) => {
+                return (route_failed(attempts, note), TaskEvent::Failed, false);
+            }
+            Elicited::Transport(failure) => {
+                last = failure;
+                if past_ceiling() {
+                    break;
+                }
+                continue;
+            }
+        };
+        if let Some(error) = answers.iter().find_map(|(id, label)| {
+            crucible_contract::elicit::check_answer(questions, id, label).err()
+        }) {
+            return (
+                route_failed(attempts, error.to_string()),
+                TaskEvent::Failed,
+                false,
+            );
+        }
+        let mut decision = BTreeMap::new();
+        for id in questions.keys() {
+            let label = match answers.get(id) {
+                Some(label) => label.clone(),
+                None if expired => Label::uncertain(),
+                None => {
+                    let note = format!("the runner reported every question answered, but not {id}");
+                    return (route_failed(attempts, note), TaskEvent::Failed, false);
+                }
+            };
+            decision.insert(id.clone(), certain(label));
+        }
+        let result = decided(Decision(decision), attempts);
+        let event = if result.status == TaskStatus::Pass {
+            TaskEvent::Passed
+        } else {
+            TaskEvent::Failed
+        };
+        return (result, event, false);
+    }
+    let (result, event) = transport_result(attempts, max_attempts, 0.0, &last, false);
+    (result, event, past_ceiling())
 }
 
 fn reduce_top_k(inputs: &BTreeMap<TaskName, Value>, k: u32, direction: Direction) -> TaskResult {
@@ -6137,5 +6265,489 @@ mod tests {
                 assert_eq!(n, 0, "{}", ctx());
             }
         }
+    }
+
+    /// A runner whose person answers from a script, one entry per elicit call, and whose other
+    /// tasks pass. Every call into it lands in one log, in order.
+    struct PersonRunner {
+        answers: std::collections::VecDeque<fn() -> Elicited>,
+        log: Vec<String>,
+        ceilings: Vec<Option<Instant>>,
+    }
+
+    impl PersonRunner {
+        fn new(answers: &[fn() -> Elicited]) -> Self {
+            PersonRunner {
+                answers: answers.iter().copied().collect(),
+                log: Vec::new(),
+                ceilings: Vec::new(),
+            }
+        }
+
+        fn asked(&self) -> usize {
+            self.log.iter().filter(|e| e.starts_with("ask ")).count()
+        }
+    }
+
+    impl TaskRunner for PersonRunner {
+        fn run(
+            &mut self,
+            task: &Task,
+            _attempt: u32,
+            _inputs: &BTreeMap<TaskName, Value>,
+        ) -> Attempt {
+            self.log.push(format!("run {}", task.name));
+            Attempt {
+                outcome: AttemptOutcome::Pass(serde_json::json!({})),
+                cost_usd: 0.1,
+            }
+        }
+
+        fn elicit(&mut self, task: &Task, ceiling: Option<Instant>) -> Elicited {
+            self.log.push(format!("ask {}", task.name));
+            self.ceilings.push(ceiling);
+            match self.answers.pop_front() {
+                Some(answer) => answer(),
+                None => Elicited::Failed("the script ran out".into()),
+            }
+        }
+    }
+
+    fn person_gate(questions: &[(&str, Question)], required: bool) -> Task {
+        Task {
+            task: TaskKind::Route {
+                questions: questions
+                    .iter()
+                    .map(|(id, q)| (QuestionId::new(*id).unwrap(), q.clone()))
+                    .collect(),
+                decider: Decider::Human {
+                    via: crate::plan::ir::HumanChannel::Slack,
+                    deadline_secs: 3600,
+                },
+            },
+            ..task(
+                "gate",
+                &["classify"],
+                crate::plan::ir::NEEDS_HUMAN,
+                required,
+            )
+        }
+    }
+
+    /// classify -> gate(area, by a person) -> fix [scheduler]
+    ///                                     -> punt [frontend, uncertain]
+    ///             side (independent), fix, punt -> wrap (settled)
+    fn asked(required: bool) -> ValidPlan {
+        valid(
+            vec![
+                task("classify", &[], "any", true),
+                person_gate(&[("area", area(&[]))], required),
+                when(task("fix", &["gate"], "any", false), "area", &["scheduler"]),
+                when(
+                    task("punt", &["gate"], "any", false),
+                    "area",
+                    &["frontend", "uncertain"],
+                ),
+                task("side", &[], "any", false),
+                joining(
+                    task("wrap", &["fix", "punt", "side"], "any", true),
+                    Join::Settled,
+                ),
+            ],
+            10.0,
+        )
+    }
+
+    fn human_substrate() -> Substrate {
+        Substrate {
+            caps: BTreeSet::from([crate::plan::ir::NEEDS_HUMAN.to_owned()]),
+        }
+    }
+
+    fn run_asked(
+        plan: &ValidPlan,
+        r: &mut PersonRunner,
+        wall_clock: Option<Duration>,
+    ) -> PlanOutcome {
+        execute(
+            plan,
+            &human_substrate(),
+            ExecCfg {
+                wall_clock,
+                ..ExecCfg::default()
+            },
+            r,
+            |_, _| {},
+        )
+    }
+
+    fn labels(pairs: &[(&str, &str)]) -> BTreeMap<QuestionId, Label> {
+        pairs
+            .iter()
+            .map(|(q, l)| (QuestionId::new(*q).unwrap(), label(l)))
+            .collect()
+    }
+
+    fn answers_frontend() -> Elicited {
+        Elicited::Answered(labels(&[("area", "frontend")]))
+    }
+    fn answers_scheduler() -> Elicited {
+        Elicited::Answered(labels(&[("area", "scheduler")]))
+    }
+    fn nobody_answers() -> Elicited {
+        Elicited::Expired(BTreeMap::new())
+    }
+    fn ceiling_arrives() -> Elicited {
+        Elicited::Cut(BTreeMap::new())
+    }
+    fn endpoint_blips() -> Elicited {
+        Elicited::Transport(TransportFailure::new(TransportCause::Provider, "503"))
+    }
+    fn endpoint_refuses() -> Elicited {
+        Elicited::Failed("409: opened with other questions".into())
+    }
+
+    fn settled_as(out: &PlanOutcome, name: &str) -> TaskStatus {
+        out.results[&TaskName(name.into())].status
+    }
+
+    #[test]
+    fn a_persons_answer_takes_its_branch_and_is_recorded_with_certainty() {
+        let mut r = PersonRunner::new(&[answers_frontend]);
+        let out = run_asked(&asked(true), &mut r, None);
+        assert!(out.valid);
+        assert_eq!(out.exit, PlanExit::Completed);
+        assert_eq!(
+            r.log,
+            [
+                "run classify",
+                "ask gate",
+                "run punt",
+                "run side",
+                "run wrap"
+            ]
+        );
+        assert_eq!(settled_as(&out, "fix"), TaskStatus::NotTaken);
+        let gate = &out.results[&TaskName("gate".into())];
+        assert_eq!(gate.cost_usd, 0.0);
+        assert_eq!(
+            gate.output.as_ref().unwrap()["area"],
+            serde_json::json!({"label": "frontend", "confidence": 1.0, "probabilities": {"frontend": 1.0}})
+        );
+    }
+
+    #[test]
+    fn a_deadline_nobody_met_records_uncertain_and_takes_the_uncertain_branch() {
+        let mut r = PersonRunner::new(&[nobody_answers]);
+        let out = run_asked(&asked(true), &mut r, None);
+        assert!(out.valid);
+        assert_eq!(settled_as(&out, "gate"), TaskStatus::Pass);
+        assert_eq!(settled_as(&out, "punt"), TaskStatus::Pass);
+        assert_eq!(settled_as(&out, "fix"), TaskStatus::NotTaken);
+        assert_eq!(
+            out.results[&TaskName("gate".into())]
+                .output
+                .as_ref()
+                .unwrap()["area"],
+            serde_json::json!({"label": "uncertain", "confidence": 0.0, "probabilities": {}})
+        );
+    }
+
+    #[test]
+    fn an_expired_question_keeps_the_answers_given_before_the_deadline() {
+        use crucible_contract::decision::QuestionKind;
+        let plan = valid(
+            vec![
+                task("classify", &[], "any", true),
+                person_gate(
+                    &[
+                        ("area", area(&["uncertain", "frontend", "scheduler"])),
+                        ("urgent", question(QuestionKind::Noul, &["no", "uncertain"])),
+                    ],
+                    true,
+                ),
+                when(task("page", &["gate"], "any", false), "urgent", &["yes"]),
+            ],
+            10.0,
+        );
+        let mut r = PersonRunner::new(&[|| Elicited::Expired(labels(&[("urgent", "yes")]))]);
+        let out = run_asked(&plan, &mut r, None);
+        assert!(out.valid);
+        let decision = out.results[&TaskName("gate".into())]
+            .output
+            .clone()
+            .unwrap();
+        assert_eq!(decision["urgent"]["label"], "yes");
+        assert_eq!(decision["area"]["label"], "uncertain");
+        assert_eq!(settled_as(&out, "page"), TaskStatus::Pass);
+    }
+
+    #[test]
+    fn the_run_ceiling_during_the_wait_fails_the_route_and_ends_the_run_on_the_ceiling() {
+        for required in [true, false] {
+            let mut r = PersonRunner::new(&[ceiling_arrives]);
+            let out = run_asked(&asked(required), &mut r, Some(Duration::from_secs(3600)));
+            assert_eq!(out.exit, PlanExit::TimeExceeded, "required = {required}");
+            assert!(!out.valid);
+            assert_eq!(
+                r.log,
+                ["run classify", "ask gate"],
+                "nothing runs after the cut"
+            );
+            let gate = &out.results[&TaskName("gate".into())];
+            assert_eq!(gate.status, TaskStatus::Fail);
+            assert!(
+                gate.note
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("before area was answered"),
+                "{:?}",
+                gate.note
+            );
+            for blocked in ["fix", "punt", "side", "wrap"] {
+                let r = &out.results[&TaskName(blocked.into())];
+                assert_eq!(r.status, TaskStatus::Blocked, "{blocked}");
+                assert_eq!(
+                    r.blocked,
+                    Some(BlockedReason::WallClockCeiling),
+                    "{blocked}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_runner_is_handed_the_runs_ceiling_and_none_without_one() {
+        let mut r = PersonRunner::new(&[answers_scheduler]);
+        let before = Instant::now();
+        run_asked(&asked(true), &mut r, Some(Duration::from_secs(3600)));
+        let ceiling = r.ceilings[0].expect("a ceiling");
+        assert!(ceiling >= before + Duration::from_secs(3599));
+        assert!(ceiling <= Instant::now() + Duration::from_secs(3600));
+
+        let mut r = PersonRunner::new(&[answers_scheduler]);
+        run_asked(&asked(true), &mut r, None);
+        assert_eq!(r.ceilings, [None]);
+    }
+
+    #[test]
+    fn an_unreachable_endpoint_is_retried_and_its_answer_still_counts() {
+        let mut r = PersonRunner::new(&[endpoint_blips, endpoint_blips, answers_scheduler]);
+        let out = run_asked(&asked(true), &mut r, None);
+        assert!(out.valid);
+        let gate = &out.results[&TaskName("gate".into())];
+        assert_eq!((gate.status, gate.attempts), (TaskStatus::Pass, 3));
+        assert_eq!(settled_as(&out, "fix"), TaskStatus::Pass);
+    }
+
+    #[test]
+    fn an_endpoint_that_stays_unreachable_settles_transport_after_three_asks() {
+        let mut r = PersonRunner::new(&[endpoint_blips, endpoint_blips, endpoint_blips]);
+        let out = run_asked(&asked(true), &mut r, None);
+        assert_eq!(r.asked(), 3);
+        let gate = &out.results[&TaskName("gate".into())];
+        assert_eq!(gate.status, TaskStatus::Transport);
+        assert_eq!(gate.transport, Some(TransportCause::Provider));
+        assert_eq!(
+            out.exit,
+            PlanExit::ShortCircuit {
+                task: "gate".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_refused_question_fails_the_route_without_asking_again() {
+        let mut r = PersonRunner::new(&[endpoint_refuses, answers_scheduler]);
+        let out = run_asked(&asked(true), &mut r, None);
+        assert_eq!(r.asked(), 1);
+        assert_eq!(settled_as(&out, "gate"), TaskStatus::Fail);
+        assert_eq!(
+            out.exit,
+            PlanExit::ShortCircuit {
+                task: "gate".into()
+            }
+        );
+    }
+
+    #[test]
+    fn the_executor_refuses_a_label_the_question_does_not_declare_whatever_the_runner_says() {
+        for (answer, needle) in [
+            (
+                (|| Elicited::Answered(labels(&[("area", "kv_cache")]))) as fn() -> Elicited,
+                "undeclared label \"kv_cache\"",
+            ),
+            (
+                || Elicited::Answered(labels(&[("area", "uncertain")])),
+                "only the engine records",
+            ),
+            (
+                || Elicited::Expired(labels(&[("ghost", "yes")])),
+                "undeclared question \"ghost\"",
+            ),
+            (|| Elicited::Answered(BTreeMap::new()), "but not area"),
+        ] {
+            let mut r = PersonRunner::new(&[answer]);
+            let out = run_asked(&asked(true), &mut r, None);
+            let gate = &out.results[&TaskName("gate".into())];
+            assert_eq!(gate.status, TaskStatus::Fail, "{needle}");
+            assert!(
+                gate.note.as_deref().unwrap_or("").contains(needle),
+                "{:?} lacks {needle}",
+                gate.note
+            );
+            assert_eq!(r.asked(), 1);
+        }
+    }
+
+    #[test]
+    fn a_runner_that_cannot_reach_a_person_fails_the_route() {
+        let mut r = ScriptRunner::new();
+        let out = execute(
+            &asked(true),
+            &human_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        let gate = &out.results[&TaskName("gate".into())];
+        assert_eq!(gate.status, TaskStatus::Fail);
+        assert!(
+            gate.note
+                .as_deref()
+                .unwrap_or("")
+                .contains("cannot reach one")
+        );
+    }
+
+    #[test]
+    fn a_human_route_on_a_run_that_cannot_reach_a_person_truncates_before_any_dispatch() {
+        let mut r = PersonRunner::new(&[answers_scheduler]);
+        let out = execute(
+            &asked(true),
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        assert_eq!(
+            out.exit,
+            PlanExit::Truncated {
+                task: "gate".into()
+            }
+        );
+        assert!(r.log.is_empty(), "{:?}", r.log);
+    }
+
+    /// Every script of up to three asks, over a required and an advisory route, with and without a
+    /// ceiling, rejoining under either lossy join: the route settles as its first non-transport
+    /// answer says, the branch taken is the label recorded, and a ceiling cut ends the run there.
+    #[test]
+    fn every_human_route_outcome_keeps_the_model_invariants() {
+        let choices: [fn() -> Elicited; 6] = [
+            answers_scheduler,
+            answers_frontend,
+            nobody_answers,
+            ceiling_arrives,
+            endpoint_refuses,
+            endpoint_blips,
+        ];
+        let mut runs = 0usize;
+        for pick in 0..choices.len().pow(3) {
+            let script: Vec<fn() -> Elicited> = (0..3)
+                .map(|i| choices[pick / choices.len().pow(i) % choices.len()])
+                .collect();
+            let picks: Vec<usize> = (0..3)
+                .map(|i| pick / choices.len().pow(i) % choices.len())
+                .collect();
+            for required in [true, false] {
+                for wall_clock in [None, Some(Duration::from_secs(3600))] {
+                    for rejoin in [Join::Passed, Join::Settled] {
+                        let mut tasks = asked(required).plan().tasks.clone();
+                        if let Some(wrap) = tasks.iter_mut().find(|t| t.name.0 == "wrap") {
+                            wrap.join = rejoin;
+                        }
+                        let plan = valid(tasks, 10.0);
+                        let mut r = PersonRunner::new(&script);
+                        let out = run_asked(&plan, &mut r, wall_clock);
+                        check_asked(&picks, required, &out, &r);
+                        runs += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(runs, 216 * 8);
+    }
+
+    fn check_asked(picks: &[usize], required: bool, out: &PlanOutcome, r: &PersonRunner) {
+        let ctx = || {
+            format!(
+                "picks {picks:?} required {required}: {:?} {:?}",
+                r.log, out.exit
+            )
+        };
+        let blips = picks.iter().take_while(|&&p| p == 5).count();
+        let asks = (blips + 1).min(3);
+        assert_eq!(r.asked(), asks, "{}", ctx());
+        let gate = &out.results[&TaskName("gate".into())];
+        assert_eq!(gate.attempts as usize, asks, "{}", ctx());
+        assert_eq!(gate.cost_usd, 0.0, "{}", ctx());
+        let settled_by = picks.get(blips).copied();
+        let expected = match settled_by {
+            Some(0..=2) => TaskStatus::Pass,
+            Some(3 | 4) => TaskStatus::Fail,
+            _ => TaskStatus::Transport,
+        };
+        assert_eq!(gate.status, expected, "{}", ctx());
+        let cut = settled_by == Some(3);
+        assert_eq!(out.exit == PlanExit::TimeExceeded, cut, "{}", ctx());
+        if cut {
+            assert_eq!(
+                r.log.last().map(String::as_str),
+                Some("ask gate"),
+                "{}",
+                ctx()
+            );
+            assert!(!out.valid, "{}", ctx());
+        }
+        if gate.status == TaskStatus::Pass {
+            let recorded = &gate.output.as_ref().expect("a decision")["area"];
+            let want = ["scheduler", "frontend", "uncertain"][settled_by.unwrap_or(0)];
+            assert_eq!(recorded["label"], want, "{}", ctx());
+            let certain = want != "uncertain";
+            assert_eq!(
+                recorded["confidence"],
+                if certain { 1.0 } else { 0.0 },
+                "{}",
+                ctx()
+            );
+            let (taken, untaken) = if want == "scheduler" {
+                ("fix", "punt")
+            } else {
+                ("punt", "fix")
+            };
+            assert_eq!(settled_as(out, taken), TaskStatus::Pass, "{}", ctx());
+            assert_eq!(settled_as(out, untaken), TaskStatus::NotTaken, "{}", ctx());
+            assert!(!r.log.contains(&format!("run {untaken}")), "{}", ctx());
+            assert!(out.valid, "{}", ctx());
+        } else {
+            for branch in ["fix", "punt"] {
+                assert!(!r.log.contains(&format!("run {branch}")), "{}", ctx());
+            }
+            if !required && !cut {
+                assert_eq!(out.exit, PlanExit::Completed, "{}", ctx());
+            }
+            if required && !cut {
+                assert_eq!(
+                    out.exit,
+                    PlanExit::ShortCircuit {
+                        task: "gate".into()
+                    },
+                    "{}",
+                    ctx()
+                );
+            }
+        }
+        assert_eq!(out.results.len(), 6, "every task settles: {}", ctx());
     }
 }

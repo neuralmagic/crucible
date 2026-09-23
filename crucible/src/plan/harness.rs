@@ -15,7 +15,9 @@ use serde_json::Value;
 
 use crate::agent::event::{AgentEvent, RawStream};
 use crate::agent::harness::HarnessRuntime;
-use crate::plan::exec::{Attempt, AttemptOutcome, BatchItem, TaskRunner, TransportFailure};
+use crate::plan::exec::{
+    Attempt, AttemptOutcome, BatchItem, Elicited, TaskRunner, TransportFailure,
+};
 use crate::plan::ir::{Isolation, Task, TaskKind, TaskName};
 use crate::plan::runner::ShellRunner;
 use crucible_contract::TransportCause;
@@ -189,6 +191,10 @@ pub struct HarnessRunner {
 }
 
 impl TaskRunner for HarnessRunner {
+    fn elicit(&mut self, task: &Task, ceiling: Option<std::time::Instant>) -> Elicited {
+        crate::plan::route::human_elicit(task, ceiling)
+    }
+
     fn run(&mut self, task: &Task, attempt: u32, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
         run_task(
             &Dispatch {

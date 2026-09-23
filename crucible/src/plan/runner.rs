@@ -13,7 +13,7 @@ use std::process::Command;
 use serde_json::Value;
 
 use crate::crucible::Direction;
-use crate::plan::exec::{Attempt, AttemptOutcome, TaskRunner};
+use crate::plan::exec::{Attempt, AttemptOutcome, Elicited, TaskRunner};
 use crate::plan::ir::{Decider, Task, TaskKind, TaskName};
 use crucible_contract::TransportCause;
 use crucible_contract::inference::{ENV_INFERENCE, InferenceRole};
@@ -26,6 +26,10 @@ pub struct ShellRunner {
 }
 
 impl TaskRunner for ShellRunner {
+    fn elicit(&mut self, task: &Task, ceiling: Option<std::time::Instant>) -> Elicited {
+        crate::plan::route::human_elicit(task, ceiling)
+    }
+
     fn run(&mut self, task: &Task, _attempt: u32, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
         if task.isolation.is_some() {
             // Fail loud: a runner that quietly ran an isolation-marked task in the shared
@@ -149,10 +153,13 @@ impl ShellRunner {
                 );
             }
             TaskKind::Route {
-                decider: Decider::Output { .. },
+                decider: Decider::Output { .. } | Decider::Human { .. },
                 ..
             } => {
-                return Attempt::failed(0.0, "output-decided route reached the runner".to_string());
+                return Attempt::failed(
+                    0.0,
+                    "an executor-settled route reached the runner".to_string(),
+                );
             }
             TaskKind::TopK { .. } => {
                 // The executor owns reducers; reaching the runner is an executor bug.
