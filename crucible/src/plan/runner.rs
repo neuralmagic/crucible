@@ -340,9 +340,9 @@ fn evaluation_attempt(task: &Task, mut value: Value) -> Attempt {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::crucible::Direction;
     use crate::plan::exec::{ExecCfg, PlanExit, Substrate, TaskStatus};
+    use crate::plan::runner::*;
 
     /// The executor's own transitions are in its table; a test that trips one fails here.
     fn execute(
@@ -385,6 +385,7 @@ mod tests {
             max_fanout: None,
             when: None,
             revise: None,
+            asks: Vec::new(),
         }
     }
 
@@ -407,6 +408,7 @@ mod tests {
             max_fanout: None,
             when: None,
             revise: None,
+            asks: Vec::new(),
         }
     }
 
@@ -577,6 +579,7 @@ mod tests {
             max_fanout: None,
             when: None,
             revise: None,
+            asks: Vec::new(),
         };
         let passed = run_plan(vec![evaluate("latency", 9.5)], None);
         assert_eq!(passed.results[&"latency".into()].status, TaskStatus::Pass);
@@ -610,6 +613,7 @@ mod tests {
             max_fanout: None,
             when: None,
             revise: None,
+            asks: Vec::new(),
         };
         let over = run_plan(
             vec![evaluate("over", r#"{"score": 100, "pass": true}"#)],
@@ -650,6 +654,7 @@ mod tests {
             max_fanout: None,
             when: None,
             revise: None,
+            asks: Vec::new(),
         };
         let green = run_plan(vec![evaluate("green", r#"{"pass": true}"#)], None);
         assert_eq!(green.results[&"green".into()].status, TaskStatus::Pass);
@@ -679,6 +684,7 @@ mod tests {
             max_fanout: None,
             when: None,
             revise: None,
+            asks: Vec::new(),
         };
         let out = run_plan(vec![task], None);
         let result = &out.results[&"malformed".into()];
@@ -716,6 +722,7 @@ mod tests {
             max_fanout: None,
             when: None,
             revise: None,
+            asks: Vec::new(),
         };
         let out = run_plan(vec![t], None);
         assert_eq!(out.results[&"a".into()].status, TaskStatus::Fail);
@@ -745,6 +752,7 @@ mod tests {
             max_fanout: None,
             when: None,
             revise: None,
+            asks: Vec::new(),
         };
         let out = run_plan(
             vec![t],
@@ -800,6 +808,7 @@ mod tests {
             max_fanout: None,
             when: None,
             revise: None,
+            asks: Vec::new(),
         };
         let measure = |name: &str, dep: &str| {
             command(
@@ -828,6 +837,7 @@ mod tests {
             max_fanout: None,
             when: None,
             revise: None,
+            asks: Vec::new(),
         };
         let out = run_plan(
             vec![

@@ -804,8 +804,8 @@ fn task_worktree_name(name: &TaskName) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::plan::exec::{ExecCfg, PlanExit, Substrate, TaskStatus};
+    use crate::plan::harness::*;
 
     /// The executor's own transitions are in its table; a test that trips one fails here.
     fn execute(
@@ -849,6 +849,7 @@ mod tests {
             max_fanout: None,
             when: None,
             revise: None,
+            asks: Vec::new(),
         }
     }
 
@@ -2061,6 +2062,7 @@ workflow(type = "playbook", tasks = [good, bad, after])
                     usd: Some(1.0),
                     wall_clock: None,
                     wall_clock_raw: Some("later".into()),
+                    asks: None,
                 },
                 "is not a duration",
             ),
@@ -2095,6 +2097,7 @@ workflow(type = "playbook", tasks = [good, bad, after])
                     usd: Some(1.0),
                     wall_clock: Some(std::time::Duration::from_secs(600)),
                     wall_clock_raw: Some("10m".into()),
+                    asks: None,
                 },
                 ..Default::default()
             },
@@ -2530,6 +2533,7 @@ workflow(type = "playbook", tasks = [analyze, implement, report])
             max_fanout: None,
             when: None,
             revise: None,
+            asks: Vec::new(),
         };
         let mut runner = HarnessRunner {
             args: <crate::cli::Cli as clap::Parser>::try_parse_from(["crucible"])

@@ -147,6 +147,10 @@ pub fn render(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
         if let Some(when) = &t.when {
             detail.push_str(&format!(" when={when}"));
         }
+        if !t.asks.is_empty() {
+            let asks: Vec<&str> = t.asks.iter().map(|w| w.as_str()).collect();
+            detail.push_str(&format!(" asks={}", asks.join(",")));
+        }
         out.push_str(&format!(
             "  {:<20} {:<28} needs={:<8} {} deps: {}{}\n",
             t.name.0,
@@ -280,6 +284,10 @@ fn render_mermaid_styled(
         };
         if let Some(session) = &t.session {
             detail.push_str(&format!("<br/>session: {}", mermaid_label(session)));
+        }
+        if !t.asks.is_empty() {
+            let asks: Vec<&str> = t.asks.iter().map(|w| w.as_str()).collect();
+            detail.push_str(&format!("<br/>asks: {}", mermaid_label(&asks.join(", "))));
         }
         let marks = format!(
             "{}{}",
@@ -503,6 +511,14 @@ pub struct Ceilings {
     pub wall_clock: Option<std::time::Duration>,
     /// What the operator typed, so a rejection can quote it back rather than say "invalid".
     pub wall_clock_raw: Option<String>,
+    /// The most asks the run may emit; `None` is [`crate::plan::ir::DEFAULT_MAX_ASKS`].
+    pub asks: Option<u32>,
+}
+
+impl Ceilings {
+    fn max_asks(&self) -> u32 {
+        self.asks.unwrap_or(crate::plan::ir::DEFAULT_MAX_ASKS)
+    }
 }
 
 /// What a launch supplies beyond the graph and its parameters.
@@ -662,8 +678,12 @@ pub fn run(
         let mut w = f;
         let _ = writeln!(w, "{}", crate::report::session::encode(ev));
     };
+    let max_asks = ceilings.max_asks();
     if let Some(f) = &events {
-        append(f, &crate::plan::events::plan_admitted_event(&plan));
+        append(
+            f,
+            &crate::plan::events::plan_admitted_event(&plan, max_asks),
+        );
     }
     let selected_results: std::collections::BTreeSet<_> = plan
         .tasks_topo()
@@ -713,6 +733,7 @@ pub fn run(
         &substrate,
         ExecCfg {
             wall_clock: ceilings.wall_clock,
+            max_asks,
             ..ExecCfg::default()
         },
         runner.as_mut(),
@@ -733,6 +754,15 @@ pub fn run(
             }
             write_report(&report);
             if let Some(f) = &events {
+                if !result.asks.is_empty() {
+                    append(
+                        f,
+                        &crate::report::session::SessionEvent::AsksEmitted {
+                            task: task.name.0.clone(),
+                            asks: result.asks.clone(),
+                        },
+                    );
+                }
                 append(
                     f,
                     &crate::plan::events::task_result_event(plan.plan().version, 0, task, result),
@@ -758,6 +788,10 @@ pub fn run(
                     .unwrap_or_default(),
             );
         }
+    }
+    let emitted: usize = out.results.values().map(|r| r.asks.len()).sum();
+    if emitted > 0 {
+        println!("asks: {emitted} emitted of at most {max_asks}, none dispatched by this run");
     }
     let exit = match &out.exit {
         PlanExit::Completed => "completed".to_string(),
@@ -797,7 +831,7 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::plan::cli::*;
 
     const SRC: &str = r#"
         version = 1
@@ -841,6 +875,7 @@ mod tests {
                         usd: Some(1.0),
                         wall_clock: Some(std::time::Duration::from_secs(60)),
                         wall_clock_raw: Some("60s".to_string()),
+                        asks: None,
                     },
                     ..Default::default()
                 },
@@ -1111,7 +1146,7 @@ mod tests {
     #[test]
     fn wire_events_round_trip_through_the_contract_codec() {
         let plan = Plan::from_toml_str(SRC).unwrap().validate().unwrap();
-        let admitted = crate::plan::events::plan_admitted_event(&plan);
+        let admitted = crate::plan::events::plan_admitted_event(&plan, 0);
         let back =
             crate::report::session::decode(&crate::report::session::encode(&admitted)).unwrap();
         match back {
@@ -1137,6 +1172,7 @@ mod tests {
             fanout: None,
             blocked: None,
             transport: None,
+            asks: Vec::new(),
         };
         let back = crate::report::session::decode(&crate::report::session::encode(
             &crate::plan::events::task_result_event(1, 0, t, &r),
@@ -1192,6 +1228,7 @@ emits = ["verdict", "dirty"]
             fanout: None,
             blocked: None,
             transport: None,
+            asks: Vec::new(),
         };
 
         assert_eq!(
@@ -1346,6 +1383,7 @@ emits = ["verdict", "dirty"]
             usd: Some(1.0),
             wall_clock: Some(std::time::Duration::from_secs(60)),
             wall_clock_raw: Some("60s".to_string()),
+            asks: None,
         };
         run(
             None,
@@ -1395,6 +1433,141 @@ emits = ["verdict", "dirty"]
                 other => panic!("the session must end in a shutdown, got {other:?}: {text}"),
             }
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A playbook's asks reach its session log as the emitting task settles, ahead of that task's
+    /// row, under the bound the admitted plan states; a task past the bound emits nothing and the
+    /// run has no valid verdict. The real `plan run` path end to end: manifest, compiled
+    /// workflow.star, a shell command's JSON, the session log on disk.
+    #[test]
+    fn a_manifest_playbook_records_its_asks_on_the_session_log() {
+        let _guard = crucible::test_support::env_lock();
+        let dir = std::env::temp_dir().join(format!("crucible-asks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let pack = |name: &str| {
+            let pack = dir.join(name);
+            std::fs::create_dir_all(&pack).expect("mkdir pack");
+            std::fs::write(
+                pack.join("roundup.sh"),
+                r#"echo '{"triaged": 2, "asks": [{"key": "o/r#1", "workflow": "issue-fix", "params": {"repo": "o/r", "issue": "1"}}, {"key": "o/r#2", "workflow": "issue-fix", "params": {"repo": "o/r", "issue": "2"}}]}'"#,
+            )
+            .expect("script");
+            std::fs::write(
+                pack.join("workflow.star"),
+                format!(
+                    "roundup = command(name = \"roundup\", run = \"sh {}\", asks = [\"issue-fix\"])\n\
+                     workflow(type = \"playbook\", tasks = [roundup])\n",
+                    pack.join("roundup.sh").display()
+                ),
+            )
+            .expect("workflow");
+            std::fs::write(
+                pack.join("crucible.toml"),
+                r#"
+                [repo]
+                path = "."
+                [workspace]
+                dir = "workspace"
+                setup_cmd = "mkdir -p workspace && git -C workspace init -q && git -C workspace -c user.email=c@l -c user.name=c -c commit.gpgsign=false commit -q --allow-empty -m baseline"
+                [agent]
+                backend = "command"
+                agent_cmd = "true"
+                goal = "ask for fixes"
+                [workflow]
+                type = "playbook"
+                file = "workflow.star"
+                "#,
+            )
+            .expect("manifest");
+            pack
+        };
+        let launch = |pack: &std::path::Path, asks: Option<u32>| {
+            run(
+                None,
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                None,
+                Some(&pack.join("crucible.toml")),
+                RunOpts {
+                    ceilings: Ceilings {
+                        usd: Some(1.0),
+                        wall_clock: Some(std::time::Duration::from_secs(60)),
+                        wall_clock_raw: Some("60s".to_string()),
+                        asks,
+                    },
+                    ..Default::default()
+                },
+            )
+        };
+        let events = |pack: &std::path::Path| -> Vec<crate::report::session::SessionEvent> {
+            std::fs::read_to_string(pack.join("state/session.jsonl"))
+                .expect("a session log")
+                .lines()
+                .filter_map(crate::report::session::decode)
+                .collect()
+        };
+        use crate::report::session::SessionEvent;
+
+        let within = pack("within");
+        launch(&within, None).expect("a run within the default bound is valid");
+        let log = events(&within);
+        let admitted = log
+            .iter()
+            .find_map(|e| match e {
+                SessionEvent::PlanAdmitted {
+                    tasks, max_asks, ..
+                } => Some((tasks.clone(), *max_asks)),
+                _ => None,
+            })
+            .expect("an admitted plan");
+        assert_eq!(admitted.1, crate::plan::ir::DEFAULT_MAX_ASKS);
+        assert_eq!(
+            admitted.0[0]
+                .asks
+                .iter()
+                .map(|w| w.as_str())
+                .collect::<Vec<_>>(),
+            ["issue-fix"]
+        );
+        let asked = log
+            .iter()
+            .position(|e| matches!(e, SessionEvent::AsksEmitted { .. }))
+            .expect("the asks reach the log");
+        let row = log
+            .iter()
+            .position(|e| matches!(e, SessionEvent::TaskResult { task, .. } if task == "roundup"))
+            .expect("the task's row");
+        assert!(asked < row, "the asks precede the row that settles them");
+        let SessionEvent::AsksEmitted { task, asks } = &log[asked] else {
+            unreachable!("matched above");
+        };
+        assert_eq!(task, "roundup");
+        assert_eq!(
+            asks.iter().map(|a| a.input_key()).collect::<Vec<_>>(),
+            ["ask:issue-fix:o/r#1", "ask:issue-fix:o/r#2"]
+        );
+        assert_eq!(asks[1].params()["issue"], "2");
+
+        let past = pack("past");
+        launch(&past, Some(1)).expect_err("a task past the bound fails the run");
+        let log = events(&past);
+        assert!(
+            log.iter()
+                .any(|e| matches!(e, SessionEvent::PlanAdmitted { max_asks: 1, .. })),
+            "the admitted plan states the bound in force"
+        );
+        assert!(
+            !log.iter()
+                .any(|e| matches!(e, SessionEvent::AsksEmitted { .. })),
+            "a refused task emits nothing"
+        );
+        assert!(log.iter().any(|e| matches!(
+            e,
+            SessionEvent::TaskResult { task, status, note, .. }
+                if task == "roundup" && status == "fail" && note.contains("past its bound of 1")
+        )));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

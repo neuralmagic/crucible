@@ -29,7 +29,7 @@ pub mod verdict;
 /// `crucible --contract-version` and the runtime image carries it as the
 /// `io.crucible.contract-version` OCI label, so a deployed image can be matched against the
 /// controller it talks to without a probe.
-pub const CONTRACT_VERSION: &str = "1.7.0";
+pub const CONTRACT_VERSION: &str = "1.8.0";
 
 pub use admission::{
     ADMISSION_WIRE_VERSION, AdmissionEvent, AdmissionKey, AdmissionOutcome, AdmittedInput,
@@ -38,7 +38,9 @@ pub use admission::{
 pub use artifact::{
     ArtifactKind, ArtifactRef, IngestError, IngestPath, IngestResponse, content_digest,
 };
-pub use ask::{Ask, AskKey, AskKeyError};
+pub use ask::{
+    Ask, AskKey, AskKeyError, AskParamsError, MAX_ASK_PARAMS_BYTES, WorkflowName, WorkflowNameError,
+};
 pub use envelope::{Envelope, EnvelopeKind, SCHEMA_VERSION, TERMINATION_MESSAGE_CAP, Usage};
 pub use event::{AgentEvent, ModelUsage, RawStream, Tokens};
 pub use identity::{

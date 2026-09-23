@@ -3,6 +3,7 @@ use std::fmt;
 
 use crate::crucible::Direction;
 use anyhow::{Context, Result};
+use crucible_contract::ask::WorkflowName;
 use crucible_contract::decision::{Label, Question, QuestionError, QuestionId, UNCERTAIN};
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +21,14 @@ pub const REVISION_INPUT: &str = "revision";
 /// Every key the engine writes into a task's inputs itself. A dependency named after one of
 /// them would have its entry overwritten, so [`crate::plan::ir::Plan::validate`] refuses it.
 pub const RESERVED_INPUTS: [&str; 4] = [ITEM_INPUT, KEPT_INPUT, OUTCOME_INPUT, REVISION_INPUT];
+
+/// The output field a task's asks travel in. Reserved in every task's output: a task may not
+/// declare it in `emits`, and a task that declares no `asks` fails when its output carries it.
+pub const ASKS_FIELD: &str = "asks";
+
+/// The most asks one run may emit when its launcher sets no other bound. The launcher's, never
+/// the pack's: a bound a pack could raise is not a bound.
+pub const DEFAULT_MAX_ASKS: u32 = 16;
 
 /// Task identity: cache key component, wire label, UI label. Unique within a plan.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -350,6 +359,10 @@ pub struct Task {
     /// Sends a failing verdict back to a dependency (see [`Revise`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revise: Option<Revise>,
+    /// The workflows this task may name in an ask it emits under [`ASKS_FIELD`]. The run never
+    /// dispatches an ask; a receiving orchestrator decides what becomes a run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub asks: Vec<WorkflowName>,
 }
 
 /// A reviewer's bounded send-back: when the reviewer settles failing, `task` runs again with the
@@ -668,6 +681,23 @@ pub enum PlanError {
         target: String,
         dependency: String,
     },
+    #[error(
+        "task {task:?}: asks is not accepted on {kind} tasks; only agent, command, and evaluate \
+         tasks emit asks"
+    )]
+    AsksOnEngineTask { task: String, kind: &'static str },
+    #[error("task {task:?} lists workflow {workflow:?} in asks twice")]
+    RepeatedAskWorkflow { task: String, workflow: String },
+    #[error(
+        "task {task:?} declares asks and takes part in a revise loop; a round's output is a draft \
+         the loop may replace, so emit the asks from a task that depends on the reviewer"
+    )]
+    AsksInReviseLoop { task: String },
+    #[error(
+        "task {task:?} declares output field {field:?}, which the engine reserves; declare the \
+         workflows it may ask for with asks instead"
+    )]
+    ReservedOutputField { task: String, field: String },
     #[error("plan has a dependency cycle involving: {}", .tasks.join(", "))]
     DependencyCycle { tasks: Vec<String> },
     #[error(
@@ -931,6 +961,40 @@ impl Plan {
                         });
                     }
                 }
+            }
+            if !t.asks.is_empty() {
+                if !matches!(
+                    t.task,
+                    TaskKind::Agent { .. } | TaskKind::Command { .. } | TaskKind::Evaluate { .. }
+                ) {
+                    return Err(PlanError::AsksOnEngineTask {
+                        task: task(),
+                        kind: t.task.label(),
+                    });
+                }
+                let mut listed = BTreeSet::new();
+                for workflow in &t.asks {
+                    if !listed.insert(workflow) {
+                        return Err(PlanError::RepeatedAskWorkflow {
+                            task: task(),
+                            workflow: workflow.to_string(),
+                        });
+                    }
+                }
+                let in_revise_loop = t.revise.is_some()
+                    || self
+                        .tasks
+                        .iter()
+                        .any(|other| other.revise.as_ref().is_some_and(|r| r.task == t.name));
+                if in_revise_loop {
+                    return Err(PlanError::AsksInReviseLoop { task: task() });
+                }
+            }
+            if let Some(field) = t.emits.iter().find(|f| f.0 == ASKS_FIELD) {
+                return Err(PlanError::ReservedOutputField {
+                    task: task(),
+                    field: field.0.clone(),
+                });
             }
             if !t.emits.is_empty() {
                 if matches!(
@@ -1262,7 +1326,7 @@ impl Plan {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::plan::ir::*;
 
     fn agent(name: &str, deps: &[&str]) -> Task {
         Task {
@@ -1286,6 +1350,7 @@ mod tests {
             max_fanout: None,
             when: None,
             revise: None,
+            asks: Vec::new(),
         }
     }
 
@@ -1824,6 +1889,7 @@ mod tests {
             max_fanout: None,
             when: None,
             revise: None,
+            asks: Vec::new(),
         };
         let err = plan(vec![t]).validate().unwrap_err();
         assert_eq!(
@@ -1953,6 +2019,7 @@ mod tests {
             max_fanout: None,
             when: None,
             revise: None,
+            asks: Vec::new(),
         }
     }
 
@@ -2603,6 +2670,126 @@ mod tests {
             PlanError::ReservedDependencyName {
                 task: "author".into(),
                 dependency: "revision".into()
+            }
+        );
+    }
+
+    fn asking(name: &str, deps: &[&str], workflows: &[&str]) -> Task {
+        let mut t = agent(name, deps);
+        t.asks = workflows
+            .iter()
+            .map(|w| WorkflowName::new(*w).expect("valid workflow name"))
+            .collect();
+        t
+    }
+
+    #[test]
+    fn asks_round_trip_through_toml_and_json() {
+        let parsed = Plan::from_toml_str(
+            r#"
+            version = 1
+            [budget]
+            usd = 1.0
+            [[task]]
+            name = "roundup"
+            kind = "command"
+            command = "true"
+            asks = ["issue-fix", "docs"]
+            "#,
+        )
+        .expect("parses")
+        .validate()
+        .expect("valid");
+        let roundup = parsed.get(&"roundup".into()).expect("declared");
+        assert_eq!(
+            roundup
+                .asks
+                .iter()
+                .map(WorkflowName::as_str)
+                .collect::<Vec<_>>(),
+            ["issue-fix", "docs"]
+        );
+        let json = serde_json::to_string(parsed.plan()).expect("encodes");
+        let back = Plan::from_json_str(&json).expect("decodes");
+        assert_eq!(back.tasks[0].asks, roundup.asks);
+        // A task that asks for nothing keeps the canonical JSON it had before asks existed.
+        let quiet = serde_json::to_value(agent("quiet", &[])).expect("encodes");
+        assert!(quiet.get("asks").is_none(), "{quiet}");
+    }
+
+    #[test]
+    fn a_workflow_name_that_cannot_name_a_queued_key_does_not_parse() {
+        for bad in ["\"a:b\"", "\"\"", "\"two words\""] {
+            let src = format!(
+                "version = 1\n[budget]\nusd = 1.0\n[[task]]\nname = \"t\"\nkind = \"command\"\ncommand = \"true\"\nasks = [{bad}]\n"
+            );
+            assert!(Plan::from_toml_str(&src).is_err(), "{bad} parsed");
+        }
+    }
+
+    #[test]
+    fn only_agent_command_and_evaluate_tasks_ask() {
+        let mut fold = top_k("pick", &["author"]);
+        fold.asks = vec![WorkflowName::new("w").expect("valid")];
+        assert_eq!(
+            refused(vec![emitting("author", &[], &["score"]), fold]),
+            PlanError::AsksOnEngineTask {
+                task: "pick".into(),
+                kind: "top_k"
+            }
+        );
+    }
+
+    #[test]
+    fn a_task_lists_a_workflow_in_asks_once() {
+        assert_eq!(
+            refused(vec![asking("roundup", &[], &["w", "x", "w"])]),
+            PlanError::RepeatedAskWorkflow {
+                task: "roundup".into(),
+                workflow: "w".into()
+            }
+        );
+    }
+
+    /// Either side of a revise loop produces drafts the loop may replace, so neither side asks.
+    #[test]
+    fn neither_side_of_a_revise_loop_asks() {
+        let mut author = asking("author", &[], &["w"]);
+        assert_eq!(
+            refused(vec![
+                author.clone(),
+                reviewer("repro", &["author"], "author", 2)
+            ]),
+            PlanError::AsksInReviseLoop {
+                task: "author".into()
+            }
+        );
+        author.asks.clear();
+        let mut repro = reviewer("repro", &["author"], "author", 2);
+        repro.asks = vec![WorkflowName::new("w").expect("valid")];
+        assert_eq!(
+            refused(vec![author.clone(), repro]),
+            PlanError::AsksInReviseLoop {
+                task: "repro".into()
+            }
+        );
+        // A dependent of the reviewer reads the settled draft and may ask.
+        plan(vec![
+            author,
+            reviewer("repro", &["author"], "author", 2),
+            asking("file", &["repro"], &["w"]),
+        ])
+        .validate()
+        .expect("a task downstream of the loop asks");
+    }
+
+    #[test]
+    fn asks_is_a_reserved_output_field() {
+        assert_eq!(
+            refused(vec![emitting("roundup", &[], &["triaged", ASKS_FIELD])]),
+            PlanError::ReservedOutputField {
+                task: "roundup".into(),
+                field: ASKS_FIELD.into()
             }
         );
     }
