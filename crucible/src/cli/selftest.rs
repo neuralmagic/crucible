@@ -7,6 +7,7 @@ use crate::manifest::SelftestCfg;
 use anyhow::{Context, Result};
 use crucible::crucible::Direction;
 use crucible::crucible::{Judge, MeasureCtx, World};
+use crucible_contract::refine::{ControlEvidence, ReadingEvidence, SelftestEvidence};
 use std::path::Path;
 
 #[derive(Debug, thiserror::Error)]
@@ -142,9 +143,42 @@ fn stage(workspace: &Path, cmd: &str) -> Result<()> {
     Ok(())
 }
 
+impl From<&SelftestReport> for SelftestEvidence {
+    fn from(r: &SelftestReport) -> Self {
+        let direction = match r.direction {
+            crucible::crucible::Direction::Higher => "higher",
+            crucible::crucible::Direction::Lower => "lower",
+        }
+        .to_string();
+        SelftestEvidence {
+            direction,
+            runs: r.runs,
+            good: control_evidence(&r.good),
+            bad: control_evidence(&r.bad),
+        }
+    }
+}
+
+fn control_evidence(c: &ControlResult) -> ControlEvidence {
+    ControlEvidence {
+        cmd: c.cmd.clone(),
+        mean: c.mean_score,
+        all_valid: c.all_valid,
+        readings: c
+            .readings
+            .iter()
+            .map(|r| ReadingEvidence {
+                valid: r.valid,
+                score: r.score,
+                note: r.note.clone(),
+            })
+            .collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::cli::selftest::*;
     use crate::manifest::SelftestCfg;
     use crucible::command_world::GitWorld;
     use std::fs;

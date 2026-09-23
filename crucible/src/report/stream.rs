@@ -12,8 +12,8 @@ use crate::agent;
 use crate::agent::event::AgentEvent;
 use crate::args::{Args, Paths};
 use crate::process::STOP;
+use crate::report::reporter::{AgentTurn, Reporter, RunMeta, Stop, TurnBudget};
 use crate::report::session::{self, Row, RowWire, SessionEvent};
-use crate::report::{AgentTurn, Reporter, RunMeta, Stop, TurnBudget};
 use anyhow::{Context, Result};
 use crucible_contract::LoopPhase;
 use std::fs::{File, OpenOptions};
@@ -256,7 +256,7 @@ impl Reporter for SessionReporter {
             return Stop::Quit;
         }
         if let Some(control) = &self.control
-            && crate::control::stop_file_says_stop(control)
+            && crate::control::bridge::stop_file_says_stop(control)
         {
             crate::process::pid_registry::kill_all();
             return Stop::Quit;

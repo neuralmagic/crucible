@@ -32,9 +32,9 @@ install-tools:
     for f in tools/*.nu; do [ -e "$f" ] && ln -sf "$PWD/$f" "{{cargo_bin}}/$(basename "$f" .nu)"; done
     @echo "linked tools -> {{cargo_bin}}"
 
-# Build the whole Rust workspace.
+# Build the whole Rust workspace, the scored loop included.
 build-loop:
-    cargo build --release
+    cargo build --release --features crucible/autoresearch
 
 # Score the agent-stream decoder (examples/selfhost's gate): ns/line over the synthetic corpus.
 bench-stream:
@@ -42,7 +42,7 @@ bench-stream:
 
 # Lint + test the Rust workspace.
 lint:
-    cargo fmt --check && cargo clippy --workspace --all-targets && cargo test --workspace
+    cargo fmt --check && cargo clippy --workspace --all-targets --all-features && cargo clippy -p crucible --all-targets && cargo test --workspace --all-features && cargo test -p crucible
 
 # Module dependency graph of one crate (crucible by default; `--root crucible-controller/src`
 # for the controller): cycles, fan-in/out, duplicate item names. `just modgraph --check` fails

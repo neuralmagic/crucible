@@ -13,6 +13,7 @@ use nix::fcntl::{Flock, FlockArg};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[cfg(feature = "autoresearch")]
 use crate::report::session::SessionAction;
 
 const LEDGER_FILE: &str = "agent-sessions.json";
@@ -42,6 +43,7 @@ impl SessionTurn {
         self.completed_turns > 0
     }
 
+    #[cfg(feature = "autoresearch")]
     pub(crate) fn action(&self) -> SessionAction {
         if self.is_resume() {
             SessionAction::Resumed
@@ -155,6 +157,7 @@ pub(crate) fn commit_if_ok(
         .map(|e| format!("committing agent session failed: {e:#}"))
 }
 
+#[cfg(feature = "autoresearch")]
 /// A resumed turn gets the follow-up prompt when the caller has one.
 pub(crate) fn effective_prompt<'a>(
     prepared: Option<&SessionTurn>,

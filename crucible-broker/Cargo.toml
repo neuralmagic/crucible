@@ -36,10 +36,10 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time",
 openshell-core.workspace = true
 tonic.workspace = true
 thiserror.workspace = true
-# JIRA Cloud client + token-frugal renderers, shared with the standalone `jira-mcp` server so there
+# JIRA Cloud client + token-frugal renderers, shared with the standalone `ujira` server so there
 # is ONE curation/field map instead of a fork of it here. We keep our OWN three-tool surface: that
-# crate's nine tools include create/transition/link, which the sandboxed agent must never reach.
-jira-mcp = { git = "https://github.com/wseaton/jira-mcp", tag = "v0.4.0" }
+# crate's sixteen tools include create/transition/link, which the sandboxed agent must never reach.
+ujira = { git = "https://github.com/wseaton/ujira", tag = "v0.7.0" }
 # The distress tool's one outbound call: a Slack incoming-webhook POST. Blocking client (the tool
 # body already runs on `telemetry::spawn_blocking`), and the same default-features-off + rustls
 # feature set the engine and forge already build, so this adds no second HTTP/TLS stack.

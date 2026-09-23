@@ -87,6 +87,7 @@ pub(crate) fn handle() -> Result<&'static Handle> {
     )
 }
 
+#[cfg(feature = "autoresearch")]
 /// Best-effort span flush, for the run paths that end in `std::process::exit` (which skips
 /// [`EngineCtx`]'s `Drop`). Bounded on a scratch thread so a hung collector cannot wedge exit;
 /// a no-op when no exporter is installed.
@@ -109,6 +110,7 @@ pub(crate) fn flush() {
     let _ = rx.recv_timeout(Duration::from_secs(3));
 }
 
+#[cfg(feature = "autoresearch")]
 /// Why the run is being torn down, and the exit code that reports it. `128 + signo`, the shell
 /// convention, so a killed loop is distinguishable from one that chose its own exit code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,6 +121,7 @@ pub(crate) enum Termination {
     Interrupted,
 }
 
+#[cfg(feature = "autoresearch")]
 impl Termination {
     fn exit_code(self) -> i32 {
         match self {
@@ -135,6 +138,7 @@ impl Termination {
     }
 }
 
+#[cfg(feature = "autoresearch")]
 /// Resolves on SIGTERM or ctrl-c, naming which arrived. Mirrors `crucible-broker`'s
 /// `telemetry::shutdown_signal`; the broker feeds it to axum's graceful shutdown, the engine has no
 /// server to drain so it acts on it directly in [`abort_on_signal`].
@@ -161,6 +165,7 @@ async fn termination_signal() -> Termination {
     }
 }
 
+#[cfg(feature = "autoresearch")]
 /// End `span` as aborted: mark it, then close the OTel side explicitly.
 ///
 /// Dropping the `tracing::Span` is not enough here. The signal handler holds a CLONE while the run
@@ -183,6 +188,7 @@ fn end_span_aborted(span: &tracing::Span, reason: &str) {
     otel.end();
 }
 
+#[cfg(feature = "autoresearch")]
 /// Close the run out on SIGTERM/ctrl-c instead of dying mid-batch.
 ///
 /// The engine has no graceful-shutdown path of its own: `run` ends in `std::process::exit`, so a
@@ -215,12 +221,15 @@ pub(crate) fn abort_on_signal(run_span: Option<tracing::Span>) {
     });
 }
 
+#[cfg(feature = "autoresearch")]
 /// The W3C env vars the controller's dispatches (loop run, scope turn, rank turn) inject; the
 /// engine adopts them as its trace parent. Distinct from the `OTEL_*` exporter config, so they
 /// never collide with it.
 const TRACEPARENT_ENV: &str = "TRACEPARENT";
+#[cfg(feature = "autoresearch")]
 const TRACESTATE_ENV: &str = "TRACESTATE";
 
+#[cfg(feature = "autoresearch")]
 /// The controller-injected W3C parent from the process env, or `None` when `TRACEPARENT` is absent
 /// (the normal local/uninstrumented invocation). A present-but-unparseable value is a
 /// warn-and-ignore (never fail the work); the adopting span just roots itself.
@@ -237,6 +246,7 @@ fn dispatch_parent() -> Option<opentelemetry::Context> {
     parent
 }
 
+#[cfg(feature = "autoresearch")]
 /// The long-lived `run` root span for a loop. When the controller dispatched this pod the span is
 /// parented to that dispatch, so the backend shows one tree (controller → run → turn → RPCs); a
 /// standalone run (no controller, so no `TRACEPARENT`) gets the same span self-rooted. Returns
@@ -278,6 +288,7 @@ pub(crate) fn run_span(workspace: &str, run_id: &str) -> Option<tracing::Span> {
     Some(span)
 }
 
+#[cfg(feature = "autoresearch")]
 /// Which controller-dispatched agent turn is adopting the dispatch as its trace parent.
 pub(crate) enum TurnSpanKind {
     /// `crucible scope --propose`, pairs with the controller's `dispatch_scope` PRODUCER.
@@ -286,6 +297,7 @@ pub(crate) enum TurnSpanKind {
     RankGrounded,
 }
 
+#[cfg(feature = "autoresearch")]
 /// The CONSUMER root span for one controller-dispatched agent turn (scope-propose / grounded-rank),
 /// parented to the controller's PRODUCER dispatch span exactly like [`run_span`], so the turn's
 /// `openshell_turn` span nests under the dispatch instead of floating as an orphaned trace. Same
@@ -593,6 +605,7 @@ fn trace_env_from_context(cx: &opentelemetry::Context) -> Option<(String, Option
     Some((traceparent, tracestate))
 }
 
+#[cfg(feature = "autoresearch")]
 /// Extract the controller's remote parent context from the W3C carrier values, or `None` when
 /// `traceparent` is absent/blank or serializes to an invalid (all-zeros) span context. A local
 /// `TraceContextPropagator` mirrors the controller's injection side.
@@ -823,6 +836,7 @@ mod tests {
         assert_eq!(resolve_logs_endpoint(Some("  ".into()), None), None);
     }
 
+    #[cfg(feature = "autoresearch")]
     #[test]
     fn extract_parent_round_trips_the_controller_traceparent() {
         use opentelemetry::trace::TraceContextExt as _;
@@ -843,6 +857,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "autoresearch")]
     #[test]
     fn extract_parent_ignores_absent_or_garbage_traceparent() {
         // Absent: the normal local run (turn spans root themselves).
@@ -861,6 +876,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "autoresearch")]
     #[test]
     fn trace_env_formats_and_round_trips_through_extract() {
         use opentelemetry::trace::{
@@ -1060,6 +1076,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "autoresearch")]
     #[test]
     fn termination_reports_the_shell_signal_codes() {
         // 128 + signo, so a killed loop is distinguishable from a chosen exit code. 143 is the one
@@ -1070,12 +1087,14 @@ mod tests {
         assert_eq!(Termination::Interrupted.reason(), "SIGINT");
     }
 
+    #[cfg(feature = "autoresearch")]
     #[test]
     fn abort_on_signal_without_a_span_is_a_noop() {
         // Telemetry off means no run span, and installing a handler must not require a runtime.
         abort_on_signal(None);
     }
 
+    #[cfg(feature = "autoresearch")]
     #[test]
     fn end_span_aborted_ignores_an_unsampled_span() {
         // No exporter installed in the test process, so the span carries an invalid SpanContext and

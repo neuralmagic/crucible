@@ -1,17 +1,23 @@
-//! The command line: the default (no subcommand) runs the loop.
+//! The command line: the default (no subcommand) runs the scored loop, when it is built.
 
 pub(crate) mod build;
 pub(crate) mod check;
 pub(crate) mod init;
 pub(crate) mod ps;
 pub(crate) mod run;
+#[cfg(feature = "autoresearch")]
+pub(crate) mod scored;
+pub(crate) mod selftest;
 pub(crate) mod setup;
 pub(crate) mod workspace;
 
 use crate::args::Args;
+#[cfg(feature = "autoresearch")]
 use crate::control::pr_watch;
 use crate::openshell;
+#[cfg(feature = "autoresearch")]
 use crate::scope;
+#[cfg(feature = "autoresearch")]
 use crate::scope::rank_grounded;
 use clap::Parser;
 use std::path::PathBuf;
@@ -68,6 +74,7 @@ pub(crate) enum Cmd {
     /// recording the goal source, the check outcome, and the pack's `RunIdentity` digest. No
     /// isolation preflight (S3), no draft-PR approval (S4), the freeze report names those as
     /// pending.
+    #[cfg(feature = "autoresearch")]
     Scope(scope::ScopeArgs),
     /// List every crucible loop pod in the cluster (kube-native): NAME, NAMESPACE, PHASE, AGE,
     /// RESTARTS, and a best-effort ITER (ships as `-` for now, see `ps.rs`'s module doc). Selects
@@ -96,6 +103,7 @@ pub(crate) enum Cmd {
     /// Print the loop's control states: the transition table the driver runs on, as the
     /// reference page (`docs/loop-states.md` is generated from it), as Graphviz dot (the
     /// page's diagram), or as mermaid.
+    #[cfg(feature = "autoresearch")]
     LoopStates {
         #[arg(long, default_value = "markdown")]
         format: StatesFormat,
@@ -105,6 +113,7 @@ pub(crate) enum Cmd {
     /// or appended to a reseed file that the next run's first turn reads, exactly one of
     /// `--control-addr`/`--reseed` is required. A kept composite candidate is a SET of linked PRs
     /// (one per component fork); pass `--pr` more than once to watch them all in one process.
+    #[cfg(feature = "autoresearch")]
     WatchPr {
         /// The PR to watch, e.g. `https://github.com/owner/repo/pull/42` (repeatable, a composite
         /// candidate opens one linked PR per component).
@@ -151,6 +160,7 @@ pub(crate) enum Cmd {
     /// cheap text-only ranker escalates to this when it is unsure; the turn is read-only (a
     /// throwaway worktree contains any write). The caller owns `--workspace`, this command never
     /// clones or mutates it.
+    #[cfg(feature = "autoresearch")]
     RankGrounded(rank_grounded::RankGroundedArgs),
     /// Dispatch a named `[build.<name>]` from the domain manifest, wait for it, and print the
     /// digest-pinned ref. The cluster backend renders a detached rootless-buildah Job; the

@@ -477,6 +477,7 @@ config:
     })
 }
 
+#[cfg(any(feature = "autoresearch", test))]
 /// Render a validated graph to PNG.
 pub fn render_png_to(
     plan: &ValidPlan,
@@ -622,7 +623,7 @@ pub fn run(
                             .validate()
                             .context("building one-pass playbook")?
                         } else {
-                            crate::runloop::graph::iteration_template(Some(workflow), &caps)?
+                            crate::plan::template::iteration_template(Some(workflow), &caps)?
                         }
                     }
                 };

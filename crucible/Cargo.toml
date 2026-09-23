@@ -19,6 +19,9 @@ default = ["publish"]
 # manifests, plans, flow) needs none of it, and the SDK carries its own hyper/rustls generation,
 # so a linked consumer turns this off.
 publish = ["dep:aws-config", "dep:aws-sdk-s3"]
+# The scored optimization loop (keep/discard over a judge), scoping, grounded ranking and PR
+# watching. Off by default: without it the binary is the playbook workflow engine.
+autoresearch = ["publish"]
 
 [dependencies]
 anyhow.workspace = true
