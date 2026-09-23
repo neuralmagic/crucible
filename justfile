@@ -40,6 +40,14 @@ build-loop:
 bench-stream:
     cargo bench -p crucible-harness --bench stream_json -q
 
+# Check the Veil models under formal/: model checking and the SMT invariant proofs run in the build.
+formal:
+    cd formal && lake build
+
+# Break each executor rule in a copy of the model and require a violation for every one.
+formal-mutants:
+    python3 formal/mutate.py
+
 # Lint + test the Rust workspace.
 lint:
     cargo fmt --check && cargo clippy --workspace --all-targets --all-features && cargo clippy -p crucible --all-targets && cargo test --workspace --all-features && cargo test -p crucible
