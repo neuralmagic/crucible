@@ -168,7 +168,8 @@ decides what can run at once from it. Authored in `workflow.star` as
 | `worktree` | writes a private clone, including the workspace's uncommitted state; its edits are discarded | beside every other ready task that is not `shared` |
 
 - A `readonly` task is held to its word. The engine reads the workspace's tree before and after
-  the batch it ran in (tracked and untracked files, ignored ones excluded). A change fails every
+  the batch it ran in (tracked and untracked files, ignored ones excluded), and where HEAD
+  points, so a commit counts as a change. A change fails every
   readonly task in the batch, since they ran at once in one tree and which of them wrote is not
   knowable, and the change is put back before anything else runs. It cannot declare
   `emits_files`: return the content in its JSON output, or make it a `worktree`.

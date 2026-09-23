@@ -276,7 +276,7 @@ impl TaskRunner for HarnessRunner {
     ///
     /// The readonly tasks are arranged once for the whole batch, since they share a root: their
     /// staged inputs, the frozen injects, and each harness's toolbox are laid down before any of
-    /// them starts, and the tree is read before and after. A change the batch left behind fails
+    /// them starts, and the tree and HEAD are read before and after. A change the batch left behind fails
     /// every readonly task in it and is put back: the tasks ran at once in one tree, so the
     /// engine cannot tell which of them wrote.
     fn run_many(&mut self, batch: &[BatchItem<'_>]) -> Vec<Attempt> {
@@ -476,7 +476,7 @@ fn arrange_readonly(
     cx: &Dispatch<'_>,
     staged: &BTreeMap<TaskName, Vec<StagedInput>>,
     readonly: &[&Task],
-) -> Result<String, String> {
+) -> Result<crate::plan::worktree::Snapshot, String> {
     let sets: Vec<Option<&[StagedInput]>> = readonly
         .iter()
         .map(|t| staged.get(&t.name).map(Vec::as_slice))
@@ -504,7 +504,7 @@ fn arrange_readonly(
             install_toolbox(&args, cx.paths)?;
         }
     }
-    crate::plan::worktree::tree(&cx.paths.workspace)
+    crate::plan::worktree::snapshot(&cx.paths.workspace)
         .map_err(|e| format!("reading the shared workspace before a readonly batch: {e:#}"))
 }
 
@@ -527,16 +527,19 @@ fn run_readonly(cx: &Dispatch<'_>, b: &BatchItem<'_>) -> Attempt {
     }
 }
 
-/// Whether the shared tree still reads as it did before a readonly batch, and if not, which
-/// paths changed. A change is put back before this returns, so nothing a readonly task wrote
-/// reaches the next task's commit.
-fn readonly_changes(workspace: &Path, before: &str) -> Result<Option<String>, String> {
-    let after = crate::plan::worktree::tree(workspace)
+/// Whether the shared workspace still reads as it did before a readonly batch, and if not, which
+/// paths changed and whether HEAD moved. A change is put back before this returns, so nothing a
+/// readonly task wrote or committed reaches the next task's commit.
+fn readonly_changes(
+    workspace: &Path,
+    before: &crate::plan::worktree::Snapshot,
+) -> Result<Option<String>, String> {
+    let after = crate::plan::worktree::snapshot(workspace)
         .map_err(|e| format!("reading the shared workspace after a readonly batch: {e:#}"))?;
-    if after == before {
+    if after == *before {
         return Ok(None);
     }
-    let changed = crate::plan::worktree::changed_paths(workspace, before, &after)
+    let changed = crate::plan::worktree::changes(workspace, before, &after)
         .map_err(|e| format!("listing what a readonly batch changed: {e:#}"))?;
     const SHOWN: usize = 8;
     let mut listed = changed
@@ -548,7 +551,7 @@ fn readonly_changes(workspace: &Path, before: &str) -> Result<Option<String>, St
     if changed.len() > SHOWN {
         listed.push_str(&format!(" and {} more", changed.len() - SHOWN));
     }
-    let restored = match crate::plan::worktree::reset_to_tree(workspace, before) {
+    let restored = match crate::plan::worktree::restore(workspace, before) {
         Ok(()) => "the changes were discarded".to_string(),
         Err(e) => format!("putting the workspace back failed: {e:#}"),
     };
@@ -3163,7 +3166,7 @@ workflow(type = "playbook", tasks = [discover, audit, roundup])
     /// A pack whose agent is `reader.sh`: every agent turn waits at a barrier until `peers` agent
     /// turns have arrived, then reports what it read. A serial runner never gets past the barrier,
     /// so a pass is proof the turns ran at once. A prompt naming SCRIBBLE makes the turn write the
-    /// tree instead of only reading it.
+    /// tree instead of only reading it, and one naming COMMIT makes it commit what it wrote.
     fn reader_pack(tag: &str, peers: usize, workflow: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("crucible-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -3190,6 +3193,11 @@ case "$CRUCIBLE_PROMPT" in
 *SCRIBBLE*)
     printf 'scribbled\n' > NOTES.md
     printf 'stray\n' > STRAY.md
+    ;;
+*COMMIT*)
+    printf 'committed\n' > COMMITTED.md
+    git add COMMITTED.md
+    git -c user.email=r@o -c user.name=rogue -c commit.gpgsign=false commit -qm rogue
     ;;
 esac
 told=false
@@ -3391,6 +3399,55 @@ workflow(type = "playbook", tasks = [write, alone])
             std::fs::read_to_string(ws.join("NOTES.md")).unwrap(),
             "draft"
         );
+
+        // A commit is a write too: HEAD is put back where the batch found it, so the commit never
+        // reaches the branch a later task commits onto.
+        std::fs::write(
+            dir.join("workflow.star"),
+            r#"
+write = command(name = "write", run = "printf 'draft' > NOTES.md && echo '{}'")
+committer = agent(
+    name = "committer",
+    prompt = "COMMIT",
+    depends_on = [write],
+    workspace = "readonly",
+    required = False,
+)
+after = command(
+    name = "after",
+    run = "printf 'next' > NEXT.md && echo '{}'",
+    depends_on = [committer],
+    join = "settled",
+)
+workflow(type = "playbook", tasks = [write, committer, after])
+"#,
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(dir.join("workspace"));
+        let _ = std::fs::remove_dir_all(dir.join("state"));
+        let _ = std::fs::remove_dir_all(dir.join("barrier"));
+        let out = run_playbook(&dir);
+        let committer = &out.results[&"committer".into()];
+        assert_eq!(committer.status, TaskStatus::Fail, "{committer:?}");
+        let note = committer.note.as_deref().unwrap_or_default();
+        assert!(
+            note.contains("COMMITTED.md") && note.contains("HEAD") && note.contains("discarded"),
+            "{note}"
+        );
+        let ws = dir.join("workspace");
+        assert!(!ws.join("COMMITTED.md").exists());
+        assert_eq!(
+            git_output(&ws, &["log", "--format=%s"])
+                .lines()
+                .collect::<Vec<_>>(),
+            ["task after", "task write", "baseline"],
+            "the readonly task's commit is not on the branch"
+        );
+        assert!(
+            !git_output(&ws, &["log", "--all", "-p"]).contains("committed"),
+            "the discarded commit is reachable"
+        );
+        assert_eq!(git_output(&ws, &["status", "--porcelain"]), "");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
