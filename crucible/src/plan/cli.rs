@@ -539,6 +539,15 @@ struct MissingCeiling {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[error(
+    "task {task:?} declares asks, but only a playbook run records them; run it with --manifest \
+     naming a playbook workflow"
+)]
+struct AsksWithoutPlaybook {
+    task: String,
+}
+
+#[derive(Debug, thiserror::Error)]
 #[error("--max-time {raw:?} is not a duration (try `90s`, `30m`, `2h`)")]
 struct BadDuration {
     raw: String,
@@ -589,87 +598,88 @@ pub fn run(
 
     // Either the plan was handed to us, or the manifest names the graph and we compile it.
     let mut evidence: Option<crate::args::Paths> = None;
-    let (plan, mut runner, events): (ValidPlan, Box<dyn TaskRunner>, Option<std::fs::File>) =
-        match (path, manifest) {
-            (_, Some(m)) => {
-                let (prepared, loaded) = crate::cli::setup::prep_plan_runner_with_params(
-                    m,
-                    params,
-                    compute_driver,
-                    agent,
-                )?;
-                let session_log = prepared.paths.session_log.clone();
-                evidence = Some(prepared.paths.clone());
-                let playbook = loaded.workflow.as_ref().is_some_and(|w| {
-                    w.workflow_type == crate::plan::workflow::WorkflowType::Playbook
-                });
-                if playbook {
-                    let missing = match (ceilings.usd, ceilings.wall_clock) {
-                        (None, None) => Some("--max-cost and --max-time"),
-                        (None, Some(_)) => Some("--max-cost"),
-                        (Some(_), None) => Some("--max-time"),
-                        (Some(_), Some(_)) => None,
-                    };
-                    if let Some(missing) = missing {
-                        return Err(MissingCeiling {
-                            missing: missing.to_string(),
-                        }
-                        .into());
-                    }
-                }
-                let mut plan = match path {
-                    Some(p) => load(p)?,
-                    None => {
-                        let workflow = loaded.workflow.as_ref().ok_or_else(|| NoGraph {
-                            manifest: m.display().to_string(),
-                        })?;
-                        let caps =
-                            crate::plan::workflow::WorkflowCaps::for_lane(workflow.workflow_type)
-                                .with_persistent_sessions();
-                        if workflow.workflow_type == crate::plan::workflow::WorkflowType::Playbook {
-                            workflow
-                                .admit(&caps)
-                                .context("admitting one-pass playbook")?;
-                            Plan {
-                                version: 1,
-                                reason: None,
-                                budget: crate::plan::ir::PlanBudget { usd: f64::MAX },
-                                tasks: workflow.tasks.clone(),
-                            }
-                            .validate()
-                            .context("building one-pass playbook")?
-                        } else {
-                            crate::plan::template::iteration_template(Some(workflow), &caps)?
-                        }
-                    }
+    let (plan, mut runner, events, playbook): (
+        ValidPlan,
+        Box<dyn TaskRunner>,
+        Option<std::fs::File>,
+        bool,
+    ) = match (path, manifest) {
+        (_, Some(m)) => {
+            let (prepared, loaded) =
+                crate::cli::setup::prep_plan_runner_with_params(m, params, compute_driver, agent)?;
+            let session_log = prepared.paths.session_log.clone();
+            evidence = Some(prepared.paths.clone());
+            let playbook = loaded
+                .workflow
+                .as_ref()
+                .is_some_and(|w| w.workflow_type == crate::plan::workflow::WorkflowType::Playbook);
+            if playbook {
+                let missing = match (ceilings.usd, ceilings.wall_clock) {
+                    (None, None) => Some("--max-cost and --max-time"),
+                    (None, Some(_)) => Some("--max-cost"),
+                    (Some(_), None) => Some("--max-time"),
+                    (Some(_), Some(_)) => None,
                 };
-                if let Some(usd) = ceilings.usd {
-                    plan = plan.with_budget(usd)?;
+                if let Some(missing) = missing {
+                    return Err(MissingCeiling {
+                        missing: missing.to_string(),
+                    }
+                    .into());
                 }
-                let f = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&session_log)
-                    .with_context(|| format!("opening {}", session_log.display()))?;
-                (plan, Box::new(prepared), Some(f))
             }
-            (Some(p), None) => {
-                let mut plan = load(p)?;
-                if let Some(usd) = ceilings.usd {
-                    plan = plan.with_budget(usd)?;
+            let mut plan = match path {
+                Some(p) => load(p)?,
+                None => {
+                    let workflow = loaded.workflow.as_ref().ok_or_else(|| NoGraph {
+                        manifest: m.display().to_string(),
+                    })?;
+                    let caps =
+                        crate::plan::workflow::WorkflowCaps::for_lane(workflow.workflow_type)
+                            .with_persistent_sessions();
+                    if workflow.workflow_type == crate::plan::workflow::WorkflowType::Playbook {
+                        workflow
+                            .admit(&caps)
+                            .context("admitting one-pass playbook")?;
+                        Plan {
+                            version: 1,
+                            reason: None,
+                            budget: crate::plan::ir::PlanBudget { usd: f64::MAX },
+                            tasks: workflow.tasks.clone(),
+                        }
+                        .validate()
+                        .context("building one-pass playbook")?
+                    } else {
+                        crate::plan::template::iteration_template(Some(workflow), &caps)?
+                    }
                 }
-                (
-                    plan,
-                    Box::new(ShellRunner {
-                        workdir: std::env::current_dir()
-                            .context("resolving the working directory")?,
-                        agent_cmd,
-                    }),
-                    None,
-                )
+            };
+            if let Some(usd) = ceilings.usd {
+                plan = plan.with_budget(usd)?;
             }
-            (None, None) => unreachable!("clap requires --file without --manifest"),
-        };
+            let f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&session_log)
+                .with_context(|| format!("opening {}", session_log.display()))?;
+            (plan, Box::new(prepared), Some(f), playbook)
+        }
+        (Some(p), None) => {
+            let mut plan = load(p)?;
+            if let Some(usd) = ceilings.usd {
+                plan = plan.with_budget(usd)?;
+            }
+            (
+                plan,
+                Box::new(ShellRunner {
+                    workdir: std::env::current_dir().context("resolving the working directory")?,
+                    agent_cmd,
+                }),
+                None,
+                false,
+            )
+        }
+        (None, None) => unreachable!("clap requires --file without --manifest"),
+    };
     // Manifest runs append plan wire events to the run's session log so tailers (and the
     // controller's ingest) see the graph and its live progress; shell runs have no state dir.
     let substrate = Substrate::detecting(caps.clone(), &crucible::inference::from_process_env()?);
@@ -678,7 +688,13 @@ pub fn run(
         let mut w = f;
         let _ = writeln!(w, "{}", crate::report::session::encode(ev));
     };
-    let max_asks = ceilings.max_asks();
+    if !playbook && let Some(task) = plan.tasks_topo().find(|t| !t.asks.is_empty()) {
+        return Err(AsksWithoutPlaybook {
+            task: task.name.0.clone(),
+        }
+        .into());
+    }
+    let max_asks = if playbook { ceilings.max_asks() } else { 0 };
     if let Some(f) = &events {
         append(
             f,
@@ -1568,6 +1584,42 @@ emits = ["verdict", "dirty"]
             SessionEvent::TaskResult { task, status, note, .. }
                 if task == "roundup" && status == "fail" && note.contains("past its bound of 1")
         )));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A plan run outside a playbook has no session log to record asks on and no launcher bound
+    /// to count them against, so a graph that declares them is refused before anything runs.
+    #[test]
+    fn a_plan_file_that_declares_asks_is_refused_outside_a_playbook() {
+        let dir = std::env::temp_dir().join(format!("crucible-asks-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let marker = dir.join("ran");
+        let plan = dir.join("plan.toml");
+        std::fs::write(
+            &plan,
+            format!(
+                "version = 1\n[budget]\nusd = 1.0\n[[task]]\nname = \"roundup\"\nkind = \"command\"\ncommand = \"touch {}\"\nasks = [\"issue-fix\"]\n",
+                marker.display()
+            ),
+        )
+        .expect("plan");
+        let error = run(
+            Some(&plan),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            None,
+            RunOpts::default(),
+        )
+        .expect_err("a plan file may not declare asks");
+        assert!(
+            error
+                .to_string()
+                .contains("task \"roundup\" declares asks, but only a playbook run records them"),
+            "{error:#}"
+        );
+        assert!(!marker.exists(), "the asking task was dispatched");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
