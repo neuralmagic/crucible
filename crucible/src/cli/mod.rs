@@ -24,8 +24,15 @@ use std::path::PathBuf;
 
 /// Top-level CLI: the default (no subcommand) runs the loop.
 #[derive(Parser)]
-#[command(
-    about = "Agentic autoresearch loop: an LLM proposes, a frozen judge decides. Domain = crucible.toml"
+#[cfg_attr(
+    feature = "autoresearch",
+    command(
+        about = "A deterministic orchestrator for agent workflows. With no subcommand, runs the autoresearch loop: an LLM proposes, a frozen judge decides. Domain = crucible.toml"
+    )
+)]
+#[cfg_attr(
+    not(feature = "autoresearch"),
+    command(about = "A deterministic orchestrator for agent workflows. Domain = crucible.toml")
 )]
 #[command(args_conflicts_with_subcommands = true)]
 pub(crate) struct Cli {
@@ -499,6 +506,24 @@ pub(crate) struct DeployArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_help_names_the_autoresearch_loop_only_where_it_is_built() {
+        use clap::CommandFactory;
+        let about = Cli::command()
+            .get_about()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        assert!(
+            about.starts_with("A deterministic orchestrator for agent workflows."),
+            "{about}"
+        );
+        assert_eq!(
+            about.contains("autoresearch"),
+            cfg!(feature = "autoresearch"),
+            "{about}"
+        );
+    }
 
     fn deploy_render(extra: &[&str]) -> Result<Cli, clap::Error> {
         let mut argv = vec![
