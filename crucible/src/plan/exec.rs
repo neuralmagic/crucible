@@ -2102,7 +2102,9 @@ mod tests {
         crate::plan::exec::execute(plan, substrate, cfg, runner, on_result)
             .expect("an executor transition its table does not list")
     }
-    use crate::plan::ir::{Isolation, Join, Plan, PlanBudget, Stage};
+    use crate::plan::ir::{
+        Isolation, Join, Plan, PlanBudget, ReportDestination, SlackDestination, Stage,
+    };
 
     type Script = BTreeMap<(String, u32), (fn() -> AttemptOutcome, f64)>;
 
@@ -4205,6 +4207,28 @@ mod tests {
         assert_eq!(out.results[&"report".into()].status, TaskStatus::Fail);
         assert_eq!(out.exit, PlanExit::Completed);
         assert!(out.valid, "an epilogue is advisory by contract");
+    }
+
+    /// A report is an epilogue: a failed delivery settles it failing, required or not, and the
+    /// verdict is the main graph's.
+    #[test]
+    fn a_failed_required_report_settles_failing_and_leaves_the_verdict() {
+        let mut report = epilogue("publish-report", &[], true);
+        report.task = TaskKind::Report {
+            destination: ReportDestination::Slack(SlackDestination::default()),
+            template: "reports/slack.md.j2".into(),
+            result: Some("a".into()),
+        };
+        let plan = valid(vec![task("a", &[], "any", true), report], 10.0);
+        let mut r = ScriptRunner::new();
+        r.on("publish-report", 1, || AttemptOutcome::fail("no sink"), 0.1);
+        let out = run_plan(&plan, &mut r);
+        assert_eq!(
+            out.results[&"publish-report".into()].status,
+            TaskStatus::Fail
+        );
+        assert_eq!(out.exit, PlanExit::Completed);
+        assert!(out.valid);
     }
 
     /// A failed epilogue task must not gate a second one either: the short-circuit is a

@@ -363,8 +363,9 @@ The optional `result` selector projects only that main-graph task's declared JSO
 engine-built Block Kit card. It does not expose prompts, stdout, workspaces, undeclared fields, raw
 Slack blocks, channels, or credentials. Selected output defaults to a 16 KiB encoded limit; an
 operator may lower or raise it up to 64 KiB with `CRUCIBLE_REPORT_RESULT_MAX_BYTES`. Oversize data
-fails without truncation. A required report makes rendering or delivery failure fail the workflow;
-it does not rely on an agent remembering to call a tool.
+fails without truncation. A rendering or delivery failure settles the report task failing, where the
+session log shows it; like every epilogue task it never changes the run's verdict. The engine makes
+the call, so a report does not rely on an agent remembering to call a tool.
 
 ## Worked example
 

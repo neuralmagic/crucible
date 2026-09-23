@@ -129,7 +129,7 @@ Publish a rendered template to a controller-configured destination. The workflow
 | `destination` | `str` | The configured sink to publish to. |
 | `template` | `str` | The template rendered into the message. |
 | `result` | `task` | The task whose result the template renders. |
-| `required` | `bool` | False makes the report advisory. |
+| `required` | `bool` | Recorded on the task. A report is an epilogue, so a failed delivery settles it failing and never changes the verdict. |
 
 ### `session()`
 
