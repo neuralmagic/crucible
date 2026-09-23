@@ -9,6 +9,7 @@ pub mod admission;
 pub mod artifact;
 pub mod ask;
 pub mod decision;
+pub mod emits;
 pub mod envelope;
 pub mod event;
 pub mod identity;
