@@ -6,10 +6,6 @@ formal = pathlib.Path(__file__).resolve().parent
 out = formal / ".lake" / "mutants"
 out.mkdir(parents=True, exist_ok=True)
 src = (formal / "CrucibleSpec/PlanExec.lean").read_text()
-src = src.replace("#model_check compiled { task := Fin 3 }", "#model_check compiled { task := Fin 2 }")
-i = src.index("sat trace [can_complete]")
-j = src.index("}\n", i) + 2
-src = src[:i] + src[j:]
 src = src.replace("#check_invariants\n", "")
 
 MUTANTS = {
@@ -18,8 +14,8 @@ MUTANTS = {
         "  if required t ∧ (plan = p_dispatching ∨ plan = p_draining) then",
     ),
     "dispatch_ignores_join": (
-        "  require deps_allow t\n  status t := t_running",
-        "  status t := t_running",
+        "  require deps_allow t\n  require ¬ paired t\n  status t := t_running",
+        "  require ¬ paired t\n  status t := t_running",
     ),
     "required_failure_does_not_halt": (
         "  if s ≠ t_pass then\n    short_circuit t",
@@ -36,6 +32,18 @@ MUTANTS = {
     "start_ignores_unrunnable": (
         "  require ∀ t, required t ∧ ¬ epilogue t → runnable t\n  plan := p_dispatching",
         "  plan := p_dispatching",
+    ),
+    "another_round_after_a_passing_review": (
+        "    if s = t_fail ∧ rounds t < max_rounds then",
+        "    if rounds t < max_rounds then",
+    ),
+    "rounds_unbounded": (
+        "    if s = t_fail ∧ rounds t < max_rounds then",
+        "    if s = t_fail then",
+    ),
+    "target_row_lands_before_the_review": (
+        "  last t := s\n  dispatched t := true\n  phase t := rp_review",
+        "  last t := s\n  status t := s\n  dispatched t := true\n  phase t := rp_review",
     ),
 }
 
