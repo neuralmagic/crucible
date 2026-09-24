@@ -849,6 +849,27 @@ pub fn draft_graduated(id: &str, ack: &dto::GraduateAck) -> String {
     )
 }
 
+/// A publish that landed: the playbook is registered already, and the draft stays the place to
+/// edit it.
+pub fn draft_published(id: &str, ack: &dto::PublishAck) -> String {
+    let mut out = format!(
+        "published draft {id} as playbook {} @ {}\n",
+        ack.id,
+        ack.rev.chars().take(19).collect::<String>()
+    );
+    if ack.schema_changed {
+        out.push_str("the launch form changed.\n");
+    }
+    if ack.exposure_changed {
+        out.push_str("the declared exposure changed.\n");
+    }
+    out.push_str(&format!(
+        "the draft stays live; publishing it again re-pins {}.\n",
+        ack.id
+    ));
+    out
+}
+
 fn saved_by(saved: &dto::DraftCompile) -> String {
     format!(
         "saved_by: {} at {}\n",
@@ -1005,7 +1026,7 @@ pub fn playbooks(list: &[dto::Playbook]) -> String {
         .map(|p| {
             vec![
                 p.id.clone(),
-                p.repo.clone(),
+                p.source.label(),
                 p.rev.chars().take(8).collect(),
                 or_dash(p.created_by.as_deref()),
                 truncate(&p.description, TITLE_MAX),
@@ -2489,6 +2510,47 @@ mod tests {
         );
         assert!(
             out.contains("imported from the same repo and path"),
+            "{out}"
+        );
+    }
+
+    /// The registry lists where each pack came from: a git pin by repo and directory, a published
+    /// draft by the version it was published from.
+    #[test]
+    fn the_registry_names_a_git_pin_and_a_published_draft_by_their_sources() {
+        let list: Vec<dto::Playbook> = serde_json::from_str(
+            r#"[{"id":"survey","description":"reads a paper","rev":"7c2c1a563813ce95",
+                 "source":{"kind":"git","repo":"owner/packs","git_ref":null,"path":"packs/survey"},
+                 "created_by":"wren"},
+                {"id":"mlr-pack","description":"mlr sweep","rev":"sha256:beefcafe",
+                 "source":{"kind":"draft","draft":"studio","version":3},
+                 "created_by":"reed"}]"#,
+        )
+        .expect("the registry fixture parses");
+        let out = playbooks(&list);
+        assert!(out.contains("owner/packs/packs/survey"), "{out}");
+        assert!(out.contains("draft studio v3"), "{out}");
+    }
+
+    /// A publish lands a playbook at once; what the agent needs back is its id, its pin, and that
+    /// the draft is still where edits go.
+    #[test]
+    fn a_publish_names_the_playbook_and_keeps_the_draft_live() {
+        let ack: dto::PublishAck = serde_json::from_str(
+            r#"{"id":"mlr-pack","rev":"sha256:0123456789abcdef0123","tar_digest":"sha256:0123",
+               "schema_digest":"sha256:form","schema_changed":true,"exposure_digest":null,
+               "exposure_changed":false}"#,
+        )
+        .expect("the publish fixture parses");
+        let out = draft_published("studio", &ack);
+        assert!(
+            out.starts_with("published draft studio as playbook mlr-pack @ sha256:0123456789ab\n"),
+            "{out}"
+        );
+        assert!(out.contains("the launch form changed.\n"), "{out}");
+        assert!(!out.contains("exposure"), "{out}");
+        assert!(
+            out.ends_with("publishing it again re-pins mlr-pack.\n"),
             "{out}"
         );
     }

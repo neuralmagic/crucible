@@ -8,11 +8,13 @@ when { principal.platform_admin };
 
 @id("user-owner-all")
 permit(principal, action, resource)
-when { resource.owner_kind == "user" && resource has owner_role && resource.owner_role == "owner" };
+when { resource.owner_kind == "user" && resource has owner_role && resource.owner_role == "owner" }
+unless { action == Action::"playbook_draft:publish" };
 
 @id("group-owner-all")
 permit(principal, action, resource)
-when { resource.owner_kind == "group" && resource has owner_role };
+when { resource.owner_kind == "group" && resource has owner_role }
+unless { action == Action::"playbook_draft:publish" };
 
 @id("team-member-read-launch")
 permit(principal, action in [Action::"read", Action::"launch", Action::"dispatch"], resource)
@@ -27,7 +29,8 @@ when {
 
 @id("team-owner-all")
 permit(principal, action, resource)
-when { resource.owner_kind == "team" && resource has owner_role && resource.owner_role == "owner" };
+when { resource.owner_kind == "team" && resource has owner_role && resource.owner_role == "owner" }
+unless { action == Action::"playbook_draft:publish" };
 
 @id("everyone-read-platform")
 permit(principal is UserPrincipal, action in [Action::"platform:read", Action::"policy_set:read", Action::"team:read"], resource)
@@ -43,6 +46,13 @@ when { resource.owner == "team:platform-administrators" };
 
 @id("user-create-team")
 permit(principal is UserPrincipal, action == Action::"team:create", resource);
+
+@id("playbook-publishers-publish")
+permit(principal is UserPrincipal, action == Action::"playbook_draft:publish", resource)
+when {
+    principal.hasTag("team:playbook-publishers")
+    && resource has owner_role && resource.owner_role == "owner"
+};
 
 @id("platform-operator-curation")
 permit(principal is UserPrincipal, action == Action::"issue:update", resource)

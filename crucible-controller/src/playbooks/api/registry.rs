@@ -1,7 +1,7 @@
 use crate::api::dto::*;
 use crate::api::state::*;
 use crate::daemon::queue::IssueKey;
-use crate::playbooks::registry::{PlaybookRow, RegisterError, RegisterPlaybook};
+use crate::playbooks::registry::{PlaybookRow, PlaybookSource, RegisterError, RegisterPlaybook};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -39,7 +39,7 @@ pub(crate) struct RegisterPlaybookBody {
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct RegisterAck {
     pub(crate) id: String,
-    /// The commit the pack is pinned at.
+    /// The commit the pack is pinned at, or the tarball digest of a draft-sourced pack.
     pub(crate) rev: String,
     pub(crate) tar_digest: String,
     pub(crate) schema_digest: String,
@@ -49,6 +49,44 @@ pub(crate) struct RegisterAck {
     pub(crate) exposure_digest: Option<String>,
     /// True when re-registering an existing id changed the declared exposure.
     pub(crate) exposure_changed: bool,
+}
+
+impl From<crate::playbooks::registry::Registered> for RegisterAck {
+    fn from(r: crate::playbooks::registry::Registered) -> Self {
+        RegisterAck {
+            id: r.id,
+            rev: r.rev,
+            tar_digest: r.tar_digest,
+            schema_digest: r.schema_digest,
+            schema_changed: r.schema_changed,
+            exposure_digest: r.exposure_digest,
+            exposure_changed: r.exposure_changed,
+        }
+    }
+}
+
+/// The response a refused registration earns.
+pub(crate) fn register_refusal(err: RegisterError) -> Response {
+    match err {
+        RegisterError::Invalid(msg) | RegisterError::Compile(msg) => unprocessable(msg),
+        RegisterError::Conflict(msg) => {
+            (StatusCode::CONFLICT, Json(ErrorBody::new(msg))).into_response()
+        }
+        RegisterError::Fetch(msg) => {
+            (StatusCode::BAD_GATEWAY, Json(ErrorBody::new(msg))).into_response()
+        }
+        RegisterError::RevMoved(current) => (
+            StatusCode::CONFLICT,
+            Json(ErrorBody::new(format!(
+                "the ref moved to {current} since the preview; preview again before registering"
+            ))),
+        )
+            .into_response(),
+        e @ RegisterError::ExposureChanged { .. } => {
+            (StatusCode::CONFLICT, Json(ErrorBody::new(e.to_string()))).into_response()
+        }
+        RegisterError::Internal(e) => AppError::from(e).into_response(),
+    }
 }
 
 /// The substrate a pack's agent asks for, and whether this deployment can give it. Rides every
@@ -69,6 +107,8 @@ pub struct PackDispatchDto {
     /// `[agent] allow_unverified_image`: the pack opts into launching on an image the catalog
     /// cannot vouch for.
     pub allow_unverified_image: bool,
+    /// `[agent.resources]`: what the sandbox is scheduled with.
+    pub resources: SandboxResourcesDto,
     /// The capability preflight of the declared image against the catalog, with the manifest's
     /// own harness standing in for the one a launch will pin.
     pub image: crate::playbooks::preflight::ImagePreflight,
@@ -79,6 +119,27 @@ pub struct PackDispatchDto {
     /// True when a launch here runs as a supervised subprocess on the controller's machine rather
     /// than a work pod.
     pub local_mode: bool,
+}
+
+/// `[agent.resources]` as the sandbox is scheduled with it; zero and nulls are no request.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SandboxResourcesDto {
+    pub gpus: u32,
+    pub cpu: Option<String>,
+    pub memory: Option<String>,
+    /// Node labels the sandbox must land on, as the pack wrote them.
+    pub node_selector: std::collections::BTreeMap<String, String>,
+}
+
+impl From<&crucible::manifest::SandboxResources> for SandboxResourcesDto {
+    fn from(r: &crucible::manifest::SandboxResources) -> Self {
+        SandboxResourcesDto {
+            gpus: r.gpus,
+            cpu: r.cpu.as_ref().map(|q| q.as_str().to_string()),
+            memory: r.memory.as_ref().map(|q| q.as_str().to_string()),
+            node_selector: r.node_selector.clone(),
+        }
+    }
 }
 
 impl PackDispatchDto {
@@ -95,6 +156,9 @@ impl PackDispatchDto {
                 requires: Default::default(),
                 prefers: Default::default(),
                 allow_unverified_image: false,
+                resources: SandboxResourcesDto::from(
+                    &crucible::manifest::SandboxResources::default(),
+                ),
                 image: Default::default(),
                 dispatchable: false,
                 refusal: Some(UNREADABLE_MANIFEST.to_string()),
@@ -109,6 +173,7 @@ impl PackDispatchDto {
             requires: agent.requires.clone(),
             prefers: agent.prefers.clone(),
             allow_unverified_image: agent.allow_unverified_image,
+            resources: SandboxResourcesDto::from(&agent.resources),
             image: crate::playbooks::preflight::preflight(agent, None, catalog),
             dispatchable: refusal.is_none(),
             refusal,
@@ -190,12 +255,9 @@ pub(crate) async fn authorize_image(
 pub struct PlaybookDto {
     pub id: String,
     pub description: String,
-    pub repo: String,
-    /// The branch/tag the pack was fetched at; null = the repo's default branch.
-    pub git_ref: Option<String>,
+    pub source: PlaybookSourceDto,
+    /// The git commit, or the tarball digest of a draft-sourced pack.
     pub rev: String,
-    /// The pack directory inside the repo; empty = the repo root.
-    pub path: String,
     pub tar_digest: String,
     pub schema_digest: String,
     /// The engine pin the stored schema was extracted with.
@@ -213,6 +275,38 @@ pub struct PlaybookDto {
     pub updated_at: String,
 }
 
+/// Where a registered pack came from.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PlaybookSourceDto {
+    Git {
+        repo: String,
+        /// The branch/tag the pack was fetched at; null = the repo's default branch.
+        git_ref: Option<String>,
+        /// The pack directory inside the repo; empty = the repo root.
+        path: String,
+    },
+    /// Published straight from a draft version.
+    Draft { draft: String, version: i64 },
+}
+
+impl From<PlaybookSource> for PlaybookSourceDto {
+    fn from(source: PlaybookSource) -> Self {
+        match source {
+            PlaybookSource::Git {
+                repo,
+                git_ref,
+                path,
+            } => PlaybookSourceDto::Git {
+                repo,
+                git_ref,
+                path,
+            },
+            PlaybookSource::Draft { draft, version } => PlaybookSourceDto::Draft { draft, version },
+        }
+    }
+}
+
 impl PlaybookDto {
     pub(crate) fn from_row(
         r: PlaybookRow,
@@ -224,10 +318,8 @@ impl PlaybookDto {
         PlaybookDto {
             id: r.id,
             description: r.description,
-            repo: r.repo,
-            git_ref: r.git_ref,
+            source: r.source.into(),
             rev: r.rev,
-            path: r.path,
             tar_digest: r.tar_digest,
             exposure_digest: r.exposure_digest,
             schema_digest: r.schema_digest,
@@ -323,28 +415,7 @@ pub(crate) async fn register_playbook(
     let registered =
         match crate::playbooks::registry::register(state.db.pool(), &git, req, actor).await {
             Ok(r) => r,
-            Err(RegisterError::Invalid(msg)) | Err(RegisterError::Compile(msg)) => {
-                return unprocessable(msg);
-            }
-            Err(RegisterError::Conflict(msg)) => {
-                return (StatusCode::CONFLICT, Json(ErrorBody::new(msg))).into_response();
-            }
-            Err(RegisterError::Fetch(msg)) => {
-                return (StatusCode::BAD_GATEWAY, Json(ErrorBody::new(msg))).into_response();
-            }
-            Err(RegisterError::RevMoved(current)) => {
-                return (
-                StatusCode::CONFLICT,
-                Json(ErrorBody::new(format!(
-                    "the ref moved to {current} since the preview; preview again before registering"
-                ))),
-            )
-                .into_response();
-            }
-            Err(e @ RegisterError::ExposureChanged { .. }) => {
-                return (StatusCode::CONFLICT, Json(ErrorBody::new(e.to_string()))).into_response();
-            }
-            Err(RegisterError::Internal(e)) => return AppError::from(e).into_response(),
+            Err(e) => return register_refusal(e),
         };
 
     state
@@ -364,25 +435,13 @@ pub(crate) async fn register_playbook(
         )
         .await;
 
-    (
-        StatusCode::CREATED,
-        Json(RegisterAck {
-            id: registered.id,
-            rev: registered.rev,
-            tar_digest: registered.tar_digest,
-            schema_digest: registered.schema_digest,
-            schema_changed: registered.schema_changed,
-            exposure_digest: registered.exposure_digest,
-            exposure_changed: registered.exposure_changed,
-        }),
-    )
-        .into_response()
+    (StatusCode::CREATED, Json(RegisterAck::from(registered))).into_response()
 }
 
 /// The registered playbook `id` names, decided for `verb` against its owner; a caller who may not
 /// read it is told it does not exist.
 #[allow(clippy::result_large_err)]
-async fn readable_playbook(
+pub(crate) async fn readable_playbook(
     state: &ApiState,
     caller: &crate::authz::Caller,
     id: &str,
@@ -698,7 +757,7 @@ pub(crate) async fn launch_playbook(
         &state,
         pack.agent.as_ref(),
         saver.provider.as_deref(),
-        Some(&pack.repo),
+        pack.source.repo(),
     )
     .await
     {
@@ -710,7 +769,7 @@ pub(crate) async fn launch_playbook(
     let key = format!("playbook:{id}:{}", uuid::Uuid::now_v7());
     let launch = crate::launches::model::NewPlaybookLaunch {
         playbook: &pack.id,
-        repo: &pack.repo,
+        repo: pack.source.launch_repo(),
         title: &pack.description,
         params: &authorized.params,
         schema_digest: &pack.schema_digest,

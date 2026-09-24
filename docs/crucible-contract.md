@@ -62,6 +62,12 @@ allow_unverified_image = false            # launch on an image the controller's 
 
 [agent.prefers]                           # ranks compatible images in the controller's picker
 "toolchain.go" = ">=1.26"
+
+[agent.resources]                         # openshell backend only: what the sandbox is scheduled with
+gpus   = 1                                # nvidia.com/gpu; the deploy profile's [cluster.gpu_sandbox] says where
+cpu    = "8"                              # Kubernetes quantities, requested and limited alike
+memory = "32Gi"
+node_selector = { "nvidia.com/gpu.product" = "NVIDIA-H100-80GB-HBM3" }  # node labels, passed to the pod as written
 agent_cmd     = "..."                          # command backend only (§6)
 [agent.env]                                   # injected into the agent process (creds, Vertex, etc.)
 ANTHROPIC_VERTEX_PROJECT_ID = "my-gcp-project"
@@ -634,7 +640,13 @@ hands it + the workspace to an agent that edits the workspace, and never hands i
 - **`local`**: direct `claude --output-format stream-json` with `[agent].env`
   (real Claude/Vertex turn).
 - **`openshell`**: sandboxed pod turn driven by the in-Rust OpenShell driver
-  (`backend = "openshell"`, `sandbox_image`).
+  (`backend = "openshell"`, `sandbox_image`). `[agent.resources]` sets the sandbox's GPUs, CPU and
+  memory, and `node_selector` picks the nodes by label. It takes effect only where sandboxes are
+  Kubernetes pods (deploy profile
+  `[cluster] sandbox_driver = "kubernetes"`); the controller refuses a launch anywhere else, and
+  the engine refuses the table on any other backend. The deployment's `[cluster.gpu_sandbox]`
+  (node selector, tolerations, runtime class) is added to every GPU sandbox, and a selector key it
+  sets keeps its value over the pack's.
 - **`command`**: run `[agent].agent_cmd` via `sh -c` in the workspace as the proposal. A
   *deterministic, free* proposer (no LLM). This is a real transport, not a mock: it makes the
   minimal example a fast, deterministic e2e (e.g. `agent_cmd = "./bump.nu"` increments a
