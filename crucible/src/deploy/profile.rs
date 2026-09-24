@@ -169,6 +169,12 @@ pub struct Cluster {
     pub rig_namespace: String,
     /// The service account the loop pod runs as (its projected token is what kubectl authenticates with).
     pub service_account: String,
+    /// The service account sandbox pods run as, when it differs from `service_account`. Sandbox
+    /// pods mount no token, so this account needs no RBAC, only whatever admits the sandbox pod
+    /// (an OpenShift SCC, a PSA exemption); keeping that grant off the loop SA keeps it off every
+    /// pod the loop SA's token creates.
+    #[serde(default)]
+    pub sandbox_service_account: Option<String>,
     /// The in-cluster kubeconfig configmap mounted at `/etc/kube` (points kubectl at the API server +
     /// the projected token).
     #[serde(default = "default_kubeconfig_configmap")]
@@ -235,6 +241,15 @@ pub struct Cluster {
     /// only to GPU sandboxes. Takes effect under `sandbox_driver = "kubernetes"`.
     #[serde(default)]
     pub gpu_sandbox: crate::openshell::placement::GpuPlacement,
+}
+
+impl Cluster {
+    /// The service account sandbox pods run as: `sandbox_service_account`, else the loop's.
+    pub fn sandbox_service_account(&self) -> &str {
+        self.sandbox_service_account
+            .as_deref()
+            .unwrap_or(&self.service_account)
+    }
 }
 
 /// `state_pvc = "name"` (existing claim) or a `[cluster.state_pvc]` template.

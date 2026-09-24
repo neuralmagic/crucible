@@ -85,7 +85,7 @@ pub fn run_parse_only(manifest_path: &Path) -> Result<CheckOutcome> {
 /// Validate a deploy profile's spoke-cluster wiring: the named `[measure].cluster` resolves
 /// against the merged fleet file, its secret name is non-empty, and no bastion block is selected
 /// (schema-accepted, not implemented yet). With `live`, also assert the deployment's isolation
-/// claim: the sandbox SA (sandbox pods run as the loop SA, see `kubernetes_sandbox_env`) must NOT
+/// claim: the sandbox SA (`[cluster].sandbox_service_account`, else the loop SA) must NOT
 /// be able to read the spoke kubeconfig Secret in the loop namespace; an unreachable API server
 /// degrades that probe to a warning, an "allowed" verdict is a finding.
 pub fn check_profile(
@@ -116,7 +116,7 @@ pub fn check_profile(
         return out;
     }
     let ns = &profile.cluster.loop_namespace;
-    let sa = &profile.cluster.service_account;
+    let sa = profile.cluster.sandbox_service_account();
     let secret = &entry.kubeconfig_secret;
     // The probe uses the ambient client; name what that points at, so a laptop run can't silently
     // validate the wrong cluster.
