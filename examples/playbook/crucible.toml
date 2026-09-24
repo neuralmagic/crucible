@@ -3,7 +3,8 @@
 # in for every agent turn, so the whole pack runs in milliseconds with no model and no cost.
 #
 #   crucible plan run --file examples/playbook/plan.toml \
-#                     --manifest examples/playbook/crucible.toml
+#                     --manifest examples/playbook/crucible.toml \
+#                     --max-cost 1 --max-time 5m
 #
 # type = "playbook" is the one workflow table a judge-free manifest takes. The graph is named,
 # not carried: it compiles per run, which is what a parameterised playbook needs.

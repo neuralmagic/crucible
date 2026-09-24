@@ -1,13 +1,14 @@
 # Getting started: zero to a running loop
 
-This is the hands-on path from nothing to a crucible loop. It's deliberately
-end-to-end, two acts:
+This is the hands-on path from nothing to an autoresearch loop. For a graph that runs once,
+start with [Your first playbook](./playbooks.md) instead. This page is end to end, in two
+acts:
 
 1. **Run a loop locally** — the hello-world domain, no cluster, no LLM, runs in milliseconds.
 2. **Onboard your own domain** — the manifest + the `measure` contract, the only two things you have to write.
 
-For the *why* behind any of this, read [How it works](./how-it-works.md) (the diagram +
-glossary) and [What crucible is](./crucible.md) first. The manifest and command shapes
+For the *why* behind any of this, read [How the loop works](./how-it-works.md) (the diagram +
+glossary) and [The autoresearch loop, in one read](./crucible.md) first. The manifest and command shapes
 below are the hands-on expansion of [the contract](./crucible-contract.md), which is the
 normative reference. When this page and the contract disagree, the contract wins.
 
@@ -174,7 +175,7 @@ both components, and per-component deploy targets if the domains rebuild images.
 
 ## Where to go next
 
-- [How it works](./how-it-works.md) — the full diagram + glossary.
-- [What crucible is](./crucible.md) — the conceptual deep-dive and the contract table.
+- [How the loop works](./how-it-works.md) — the full diagram + glossary.
+- [The loop in one read](./crucible.md) — the conceptual deep-dive and the contract table.
 - [Implementation contract](./crucible-contract.md) — the normative manifest + command spec.
 - [JIRA tools (mediated)](./jira-proxy.md) — grounding a goal in an issue.
