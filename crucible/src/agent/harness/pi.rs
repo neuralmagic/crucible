@@ -120,7 +120,7 @@ pub(crate) const MCP_ADAPTER: &str = "/usr/local/lib/node_modules/pi-mcp-adapter
 pub(crate) const MCP_CONFIG: &str = "/sandbox/.pi/agent/mcp.json";
 
 fn mcp_json(broker: &Broker<'_>) -> String {
-    let mut server = json!({ "url": broker.url });
+    let mut server = json!({ "url": broker.url, "protocolVersion": "auto" });
     if let Some(token) = broker.token {
         server["headers"] = json!({ "Authorization": format!("Bearer {token}") });
     }
@@ -656,6 +656,7 @@ mod tests {
         let m: Value = serde_json::from_str(&seeds[1].content).expect("valid json");
         let server = &m["mcpServers"][a.broker.name.as_str()];
         assert_eq!(server["url"], "http://10.0.0.1:8000/mcp");
+        assert_eq!(server["protocolVersion"], "auto");
         assert_eq!(server["headers"]["Authorization"], "Bearer tok");
         assert_eq!(seeds[1].content.matches("Bearer").count(), 1);
 
@@ -667,6 +668,10 @@ mod tests {
             &custom_endpoint(),
         );
         let m: Value = serde_json::from_str(&tokenless[1].content).expect("valid json");
+        assert_eq!(
+            m["mcpServers"][a.broker.name.as_str()]["protocolVersion"],
+            "auto"
+        );
         assert!(
             m["mcpServers"][a.broker.name.as_str()]
                 .get("headers")
