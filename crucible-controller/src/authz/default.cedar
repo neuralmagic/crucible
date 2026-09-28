@@ -58,6 +58,10 @@ when {
     && resource has owner_role && resource.owner_role == "owner"
 };
 
+@id("operators-access-autoresearch")
+permit(principal is UserPrincipal, action == Action::"autoresearch:access", resource)
+when { principal.hasTag("team:platform-operators") };
+
 @id("platform-operator-curation")
 permit(principal is UserPrincipal, action == Action::"issue:update", resource)
 when { principal.hasTag("team:platform-operators") && resource.owner == "team:platform-administrators" };
