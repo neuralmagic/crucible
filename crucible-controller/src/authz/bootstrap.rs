@@ -44,6 +44,18 @@ pub async fn seed_playbook_publishers(pool: &PgPool, publishers: &[String]) -> R
     .await
 }
 
+/// Seed the autoresearch team while it reaches nobody, with the platform operators nested as
+/// members. Its members hold the autoresearch lane through the default policy set.
+pub async fn seed_autoresearch(pool: &PgPool) -> Result<SeedOutcome> {
+    seed_team(pool, &TeamSlug::autoresearch(), "Autoresearch", || {
+        vec![Member {
+            member: MemberRef::Team(TeamSlug::platform_operators()),
+            role: TeamRole::Member,
+        }]
+    })
+    .await
+}
+
 /// Each configured login as a member at `role`; an entry that is not a login is skipped with a
 /// warning naming the `knob` it came from.
 fn login_members(logins: &[String], role: TeamRole, knob: &str) -> Vec<Member> {

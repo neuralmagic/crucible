@@ -1533,3 +1533,145 @@ async fn a_share_confers_its_role_until_it_expires_and_survives_transfer(pool: P
         ]
     );
 }
+
+async fn signed_in(pool: &PgPool, sub: &str, login: &str, groups: &[&str]) {
+    let now = jiff::Timestamp::now();
+    crate::identity::oidc::users::record_login(pool, sub, login, None, now)
+        .await
+        .expect("login");
+    let groups: Vec<String> = groups.iter().map(|g| g.to_string()).collect();
+    let mut conn = pool.acquire().await.expect("conn");
+    crate::identity::oidc::users::record_groups_on(&mut conn, sub, &groups, now)
+        .await
+        .expect("groups");
+}
+
+/// A view-as snapshot is the target's subject and the groups their last sign-in stamped; nobody
+/// who never signed in, and never the caller's own login.
+#[sqlx::test(migrator = "crate::MIGRATOR")]
+async fn a_view_as_snapshot_is_the_targets_last_stamped_sign_in(pool: PgPool) {
+    signed_in(&pool, "sub-reed", "reed", &["neuralmagic:nm_mlr"]).await;
+
+    let view = crate::authz::impersonation::snapshot(&pool, "root", "  Reed ")
+        .await
+        .expect("a signed-in user");
+    assert_eq!(view.login, "reed");
+    assert_eq!(view.sub, "sub-reed");
+    assert_eq!(view.groups, ["neuralmagic:nm_mlr"]);
+    assert!(view.groups_at.is_some());
+    assert_eq!(view.by, "root");
+
+    let refused = crate::authz::impersonation::snapshot(&pool, "root", "ghost")
+        .await
+        .expect_err("never signed in");
+    assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+    let refused = crate::authz::impersonation::snapshot(&pool, "root", "root")
+        .await
+        .expect_err("own login");
+    assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+/// Starting a view is `platform:impersonate`, decided before the handler; an administrator on a
+/// credential that is not a browser session gets past the decision and is refused by the handler.
+#[sqlx::test(migrator = "crate::MIGRATOR")]
+async fn only_a_platform_administrator_in_a_browser_may_start_viewing_as(pool: PgPool) {
+    let app = app_with_roles(pool.clone(), &["root"], &["op"]);
+    seed_admin(&pool, "root").await;
+    signed_in(&pool, "sub-reed", "reed", &[]).await;
+    let start = |user: &str| {
+        as_user(
+            "POST",
+            "/api/impersonation",
+            Some(user),
+            &[],
+            Some(json!({"login": "reed"})),
+        )
+    };
+    for refused in ["op", "zed"] {
+        let (status, body) = call(&app, start(refused)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{refused}: {body}");
+    }
+    let (status, body) = call(&app, start("root")).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .expect("error")
+            .contains("browser session"),
+        "{body}"
+    );
+    let (status, _) = call(
+        &app,
+        as_user("DELETE", "/api/impersonation", Some("zed"), &[], None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "stopping is anyone's");
+}
+
+/// The autoresearch lane is its team's: platform administrators, the team's members, and the
+/// platform operators nested in it see it; every other signed-in caller gets no such route and no
+/// entitlement.
+#[cfg(feature = "autoresearch")]
+#[sqlx::test(migrator = "crate::MIGRATOR")]
+async fn the_autoresearch_lane_is_its_teams_and_hidden_from_everyone_else(pool: PgPool) {
+    let app = app_with_roles(pool.clone(), &["root"], &["op"]);
+    seed_admin(&pool, "root").await;
+    crate::authz::bootstrap::seed_platform_operators(&pool, &["op".to_string()], &[])
+        .await
+        .expect("seed operators");
+    crate::authz::bootstrap::seed_autoresearch(&pool)
+        .await
+        .expect("seed autoresearch");
+    let signed_in = |path: &str, who: &str| {
+        let mut req = as_user("GET", path, Some(who), &[], None);
+        req.extensions_mut()
+            .insert(crate::identity::auth::AuthPath::Edge);
+        req
+    };
+    let entitled = |who: &'static str| {
+        let app = app.clone();
+        async move {
+            let (status, whoami) = call(&app, signed_in("/api/whoami", who)).await;
+            assert_eq!(status, StatusCode::OK);
+            let (issues, _) = call(&app, signed_in("/api/issues", who)).await;
+            (whoami["entitlements"].clone(), issues)
+        }
+    };
+
+    for who in ["root", "op"] {
+        assert_eq!(
+            entitled(who).await,
+            (json!(["autoresearch"]), StatusCode::OK),
+            "{who}"
+        );
+    }
+    assert_eq!(entitled("bob").await, (json!([]), StatusCode::NOT_FOUND));
+    let (_, open) = call(&app, as_user("GET", "/api/whoami", None, &[], None)).await;
+    assert_eq!(
+        open["entitlements"],
+        json!(["autoresearch"]),
+        "a controller with its guard off hides nothing from its loopback caller"
+    );
+
+    let (status, body) = call(
+        &app,
+        as_user(
+            "PUT",
+            "/api/teams/autoresearch/members",
+            Some("root"),
+            &[],
+            Some(json!({"members": [
+                member("team", PLATFORM_OPERATORS, "member"),
+                member("user", "root", "owner"),
+                member("user", "bob", "member"),
+            ]})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        entitled("bob").await,
+        (json!(["autoresearch"]), StatusCode::OK)
+    );
+    assert_eq!(entitled("zed").await, (json!([]), StatusCode::NOT_FOUND));
+}

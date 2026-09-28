@@ -146,6 +146,8 @@ pub(crate) mod tests;
         crate::secrets::api::bind_secret,
         crate::secrets::api::unbind_secret,
         crate::secrets::api::list_secret_audit,
+        crate::authz::impersonation::start,
+        crate::authz::impersonation::stop,
         crate::authz::api::list_teams,
         crate::authz::api::create_team,
         crate::authz::api::get_team,
@@ -325,6 +327,9 @@ pub(crate) mod tests;
         crate::secrets::ScopeKind,
         crate::secrets::ProjectionKind,
         crate::secrets::AuditAction,
+        crate::authz::impersonation::StartImpersonationBody,
+        crate::identity::session::Impersonation,
+        crate::authz::entitlement::Entitlement,
         crate::authz::api::TeamDto,
         crate::authz::api::MemberDto,
         crate::authz::api::MemberBody,
@@ -374,6 +379,10 @@ pub fn router(state: ApiState) -> Router {
         .routes(routes!(system::healthz))
         .routes(routes!(system::version))
         .routes(routes!(system::whoami))
+        .routes(routes!(
+            crate::authz::impersonation::start,
+            crate::authz::impersonation::stop
+        ))
         .routes(routes!(
             crate::identity::api::credentials::get_credential,
             crate::identity::api::credentials::revoke_credential

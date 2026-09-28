@@ -41,6 +41,24 @@ provider spends its key on every dispatch, so whoever may pick it spends that ke
 provider to a team only when the whole team should. `email-domain:<domain>` rules match only in
 native mode, where the controller records each login's email.
 
+### The autoresearch lane
+
+On a deployment that runs autoresearch (`CONTROLLER_AUTORESEARCH=true`), the lane's pages and
+routes (issues, inbox, turns, builds, repos, explore, the autopilot switch) are shown only to
+callers entitled to it; everyone else gets a 404 and a navigation without them. The entitlement is
+`read` on the lane, which the `autoresearch` team owns: its members hold it, platform
+administrators hold everything, and a policy set may grant it to anyone else. The controller
+seeds the team with `platform-operators` nested in it; add a group rule or a person to the team to
+give them the lane. `/api/whoami` reports what the caller holds under `entitlements`.
+
+### Viewing as another user
+
+A platform administrator (`platform:impersonate`) can view the controller as any user who has
+signed in, from the user's row on a team page. The browser session then resolves as that user,
+with the groups their last sign-in stamped, for an hour or until stopped. It is read-only: every
+write except `DELETE /api/impersonation` is refused. Starting and stopping land in the event log
+under the administrator's login. API keys and bearer tokens never carry a view.
+
 ## The controller as the OIDC relying party
 
 With `CONTROLLER_AUTH_MODE=native` the controller owns `/auth/login`, `/auth/callback` and

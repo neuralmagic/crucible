@@ -30,6 +30,8 @@ pub enum ResourceType {
     UserPrefs,
     PolicySet,
     Team,
+    /// The autoresearch lane as a whole: holding `read` on it is the entitlement to see and use it.
+    Autoresearch,
 }
 
 wire_enum!(ResourceType, "resource type", both, {
@@ -51,10 +53,11 @@ wire_enum!(ResourceType, "resource type", both, {
     ResourceType::UserPrefs => "user_prefs",
     ResourceType::PolicySet => "policy_set",
     ResourceType::Team => "team",
+    ResourceType::Autoresearch => "autoresearch",
 });
 
 impl ResourceType {
-    pub const ALL: [ResourceType; 18] = [
+    pub const ALL: [ResourceType; 19] = [
         ResourceType::Platform,
         ResourceType::Issue,
         ResourceType::Repo,
@@ -73,6 +76,7 @@ impl ResourceType {
         ResourceType::UserPrefs,
         ResourceType::PolicySet,
         ResourceType::Team,
+        ResourceType::Autoresearch,
     ];
 
     /// The Cedar entity type name for the resource.
@@ -96,6 +100,7 @@ impl ResourceType {
             ResourceType::UserPrefs => "UserPrefs",
             ResourceType::PolicySet => "PolicySet",
             ResourceType::Team => "Team",
+            ResourceType::Autoresearch => "Autoresearch",
         }
     }
 
@@ -119,6 +124,7 @@ impl ResourceType {
             ResourceType::Run => &[Verb::Publish],
             ResourceType::PolicySet => &[Verb::Activate],
             ResourceType::Team => &[Verb::ManageMembers],
+            ResourceType::Platform => &[Verb::Impersonate],
             _ => &[],
         };
         verbs.extend_from_slice(extra);
@@ -149,6 +155,7 @@ pub enum Verb {
     Publish,
     Activate,
     ManageMembers,
+    Impersonate,
 }
 
 wire_enum!(Verb, "action verb", both, {
@@ -166,6 +173,7 @@ wire_enum!(Verb, "action verb", both, {
     Verb::Publish => "publish",
     Verb::Activate => "activate",
     Verb::ManageMembers => "manage-members",
+    Verb::Impersonate => "impersonate",
 });
 
 /// One entry of the vocabulary: a verb the resource type defines.
@@ -266,6 +274,8 @@ mod tests {
         assert!(ResourceType::Run.defines(Verb::Publish));
         assert!(ResourceType::PolicySet.defines(Verb::Activate));
         assert!(ResourceType::Team.defines(Verb::ManageMembers));
+        assert!(ResourceType::Platform.defines(Verb::Impersonate));
+        assert!(!ResourceType::Team.defines(Verb::Impersonate));
         assert!(!ResourceType::Secret.defines(Verb::Launch));
     }
 
@@ -291,7 +301,7 @@ mod tests {
             Err(ActionError::Malformed { .. })
         ));
         let all = Action::all();
-        assert_eq!(all.len(), 18 * 6 + 15);
+        assert_eq!(all.len(), 19 * 6 + 16);
         let mut sorted = all.clone();
         sorted.dedup();
         assert_eq!(sorted.len(), all.len());

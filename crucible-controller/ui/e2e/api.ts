@@ -829,6 +829,7 @@ export const ROUTES: Record<string, Json> = {
     mode: 'native',
     downgraded: false,
     proves_groups: true,
+    entitlements: ['autoresearch'],
     teams: [
       { team: 'llm-d', role: 'maintainer', via: [{ kind: 'group', group: '/groups/platform', role: 'maintainer' }] },
       { team: 'platform-administrators', role: 'owner', via: [{ kind: 'rule', rule: 'configured-admins', role: 'owner' }] },

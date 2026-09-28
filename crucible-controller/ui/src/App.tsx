@@ -9,6 +9,7 @@ import { DisplayPrefs } from './DisplayPrefs';
 import { IdentityBadge } from './IdentityBadge';
 import { OwnerSwitcher } from './OwnerSwitcher';
 import { AutopilotBanner } from './AutopilotBanner';
+import { ViewAsBanner } from './ViewAsBanner';
 import { DashboardPage } from './pages/DashboardPage';
 import { IssuesPage } from './pages/IssuesPage';
 import { IssueDetailPage } from './pages/IssueDetailPage';
@@ -383,6 +384,7 @@ export function App() {
         </div>
       </header>
 
+      <ViewAsBanner />
       <DatasheetStrip />
       {autoresearch ? <AutopilotBanner /> : null}
 

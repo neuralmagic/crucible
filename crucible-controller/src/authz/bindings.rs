@@ -57,6 +57,14 @@ pub static BINDINGS: &[Binding] = &[
     bind("GET", "/api/openapi.json", R::Platform, V::Read, Route),
     bind("GET", "/api/version", R::Platform, V::Read, Route),
     bind("GET", "/api/whoami", R::Platform, V::Read, Route),
+    bind(
+        "POST",
+        "/api/impersonation",
+        R::Platform,
+        V::Impersonate,
+        Platform,
+    ),
+    bind("DELETE", "/api/impersonation", R::Platform, V::Read, Route),
     bind("GET", "/api/access", R::Platform, V::Read, Route),
     bind("GET", "/api/overview", R::Platform, V::Read, Route),
     bind("GET", "/api/funnel", R::Platform, V::Read, Route),
@@ -811,6 +819,21 @@ pub fn bindings() -> impl Iterator<Item = &'static Binding> {
     core
 }
 
+/// Whether `binding` belongs to the autoresearch lane, which only an entitled caller may reach.
+fn in_autoresearch_lane(binding: &Binding) -> bool {
+    #[cfg(feature = "autoresearch")]
+    {
+        AUTORESEARCH_BINDINGS
+            .as_ptr_range()
+            .contains(&std::ptr::from_ref(binding))
+    }
+    #[cfg(not(feature = "autoresearch"))]
+    {
+        let _ = binding;
+        false
+    }
+}
+
 /// The binding for a served method and matched path template.
 pub fn lookup(method: &Method, path: &str) -> Option<&'static Binding> {
     bindings().find(|b| b.method == method.as_str() && b.path == path)
@@ -835,7 +858,8 @@ pub async fn enforce(State(state): State<ApiState>, req: Request, next: Next) ->
         )
             .into_response();
     };
-    if binding.resolver == Resolver::Route {
+    let lane = in_autoresearch_lane(binding);
+    if binding.resolver == Resolver::Route && !lane {
         return next.run(req).await;
     }
     let (mut parts, body) = req.into_parts();
@@ -843,6 +867,16 @@ pub async fn enforce(State(state): State<ApiState>, req: Request, next: Next) ->
         Ok(caller) => caller,
         Err(refusal) => return refusal,
     };
+    if lane && !crate::authz::entitlement::autoresearch(&state, &caller) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorBody::new(format!("no route {method} {matched}"))),
+        )
+            .into_response();
+    }
+    if binding.resolver == Resolver::Route {
+        return next.run(Request::from_parts(parts, body)).await;
+    }
     let resource = Resource::platform(binding.action.resource, parts.uri.path());
     let decision =
         match crate::authz::owner::decide(&state, &caller, binding.action, &resource).await {

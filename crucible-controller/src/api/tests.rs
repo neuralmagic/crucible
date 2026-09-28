@@ -3165,6 +3165,7 @@ async fn openapi_spec_contains_all_api_routes(pool: PgPool) -> Result<()> {
     let mut expected_paths = vec![
         "/healthz",
         "/api/whoami",
+        "/api/impersonation",
         "/api/teams",
         "/api/teams/{slug}",
         "/api/teams/{slug}/members",
