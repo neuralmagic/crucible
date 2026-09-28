@@ -178,6 +178,7 @@ impl Reporter for SessionReporter {
             crate::agent::agent_session::effective_prompt(prepared.as_ref(), prompt, resume_prompt),
             true,
             prepared.as_ref(),
+            None,
             |_raw, _stream, ev| {
                 if let Some(ev) = ev {
                     if let AgentEvent::Result {

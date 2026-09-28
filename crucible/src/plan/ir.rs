@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::crucible::Direction;
+use crate::duration::TaskTimeout;
+use crate::plan::starlark::params::ParamValue;
 use anyhow::{Context, Result};
 use crucible_contract::decision::{Label, Question, QuestionError, QuestionId, UNCERTAIN};
 use serde::{Deserialize, Serialize};
@@ -14,12 +16,21 @@ pub const ITEM_INPUT: &str = "item";
 pub const KEPT_INPUT: &str = "kept";
 /// The reserved input every epilogue task receives the main graph's outcome under.
 pub const OUTCOME_INPUT: &str = "outcome";
+/// The reserved input every command and evaluate task receives the plan's bound parameter values
+/// under.
+pub const PARAMS_INPUT: &str = "params";
 /// The reserved input a revised task receives its reviewer's last verdict under, from its second
 /// round on.
 pub const REVISION_INPUT: &str = "revision";
 /// Every key the engine writes into a task's inputs itself. A dependency named after one of
 /// them would have its entry overwritten, so [`crate::plan::ir::Plan::validate`] refuses it.
-pub const RESERVED_INPUTS: [&str; 4] = [ITEM_INPUT, KEPT_INPUT, OUTCOME_INPUT, REVISION_INPUT];
+pub const RESERVED_INPUTS: [&str; 5] = [
+    ITEM_INPUT,
+    KEPT_INPUT,
+    OUTCOME_INPUT,
+    PARAMS_INPUT,
+    REVISION_INPUT,
+];
 
 /// Task identity: cache key component, wire label, UI label. Unique within a plan.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -353,6 +364,9 @@ pub struct Task {
     /// Sends a failing verdict back to a dependency (see [`Revise`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revise: Option<Revise>,
+    /// How long one attempt may run before its runner kills it and it settles failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<TaskTimeout>,
 }
 
 /// A reviewer's bounded send-back: when the reviewer settles failing, `task` runs again with the
@@ -379,6 +393,9 @@ pub struct Plan {
     #[serde(default)]
     pub reason: Option<String>,
     pub budget: PlanBudget,
+    /// Every declared parameter's value as compilation bound it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, ParamValue>,
     #[serde(rename = "task", default)]
     pub tasks: Vec<Task>,
 }
@@ -682,6 +699,11 @@ pub enum PlanError {
         target: String,
         dependency: String,
     },
+    #[error(
+        "task {task:?} declares a timeout, but {kind} tasks are engine work the runner does not \
+         time; only agent, command, and evaluate tasks take one"
+    )]
+    TimeoutOnUntimedTask { task: String, kind: &'static str },
     #[error("plan has a dependency cycle involving: {}", .tasks.join(", "))]
     DependencyCycle { tasks: Vec<String> },
     #[error(
@@ -797,6 +819,17 @@ impl Plan {
                         });
                     }
                 }
+            }
+            if t.timeout.is_some()
+                && !matches!(
+                    t.task,
+                    TaskKind::Agent { .. } | TaskKind::Command { .. } | TaskKind::Evaluate { .. }
+                )
+            {
+                return Err(PlanError::TimeoutOnUntimedTask {
+                    task: task(),
+                    kind: t.task.label(),
+                });
             }
             if let TaskKind::TopK { k, .. } = &t.task {
                 if *k == 0 {
@@ -1323,6 +1356,7 @@ mod tests {
             max_fanout: None,
             when: None,
             revise: None,
+            timeout: None,
         }
     }
 
@@ -1331,6 +1365,7 @@ mod tests {
             version: 1,
             reason: None,
             budget: PlanBudget { usd: 5.0 },
+            params: BTreeMap::new(),
             tasks,
         }
     }
@@ -1451,6 +1486,35 @@ mod tests {
             .unwrap()
             .replace("min_confidence = 0.8", "min_confidence = 1");
         Plan::from_toml_str(&text).unwrap().validate().unwrap();
+    }
+
+    /// A frozen plan carries its bound values, so whatever loads it back gives every command
+    /// the same ones, each in the type it was bound with.
+    #[test]
+    fn bound_params_round_trip_through_toml_and_json_in_their_types() {
+        let mut original = plan(vec![agent("a", &[])]);
+        original.params = BTreeMap::from([
+            (
+                "url".to_string(),
+                ParamValue::String("https://x.test".into()),
+            ),
+            ("steps".to_string(), ParamValue::Int(3)),
+            ("ratio".to_string(), ParamValue::Number(2.0)),
+            ("dry_run".to_string(), ParamValue::Bool(false)),
+            (
+                "labels".to_string(),
+                ParamValue::StringList(vec!["ci".into()]),
+            ),
+        ]);
+        let text = toml::to_string(&original).unwrap();
+        let from_toml = Plan::from_toml_str(&text).unwrap();
+        let from_json = Plan::from_json_str(&serde_json::to_string(&original).unwrap()).unwrap();
+        for back in [from_toml, from_json] {
+            assert_eq!(back.params, original.params);
+        }
+
+        let bare = toml::to_string(&plan(vec![agent("a", &[])])).unwrap();
+        assert!(!bare.contains("params"), "{bare}");
     }
 
     #[test]
@@ -1861,6 +1925,7 @@ mod tests {
             max_fanout: None,
             when: None,
             revise: None,
+            timeout: None,
         };
         let err = plan(vec![t]).validate().unwrap_err();
         assert_eq!(
@@ -1990,6 +2055,7 @@ mod tests {
             max_fanout: None,
             when: None,
             revise: None,
+            timeout: None,
         }
     }
 
@@ -2630,6 +2696,48 @@ mod tests {
                 task: "repro".into(),
                 target: "author".into(),
                 dependency: "build".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_timeout_round_trips_and_is_refused_where_nothing_would_enforce_it() {
+        let parsed = Plan::from_toml_str(
+            r#"
+            version = 1
+            [budget]
+            usd = 1.0
+            [[task]]
+            name = "build"
+            kind = "command"
+            command = "make"
+            timeout = "90m"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.tasks[0].timeout.map(|t| t.get()),
+            Some(std::time::Duration::from_secs(5400))
+        );
+        let json = serde_json::to_string(&parsed).unwrap();
+        assert!(json.contains("\"timeout\":\"90m\""), "{json}");
+        let back = Plan::from_json_str(&json).unwrap();
+        assert_eq!(back.tasks[0].timeout, parsed.tasks[0].timeout);
+        back.validate().unwrap();
+
+        let zero = Plan::from_toml_str(
+            "version = 1\n[budget]\nusd = 1.0\n[[task]]\nname = \"a\"\nkind = \"command\"\ncommand = \"true\"\ntimeout = \"0s\"\n",
+        )
+        .unwrap_err();
+        assert!(format!("{zero:#}").contains("positive"), "{zero:#}");
+
+        let mut fold = top_k("fold", &["a"]);
+        fold.timeout = Some("1m".parse().unwrap());
+        assert_eq!(
+            refused(vec![agent("a", &[]), fold]),
+            PlanError::TimeoutOnUntimedTask {
+                task: "fold".into(),
+                kind: "top_k",
             }
         );
     }

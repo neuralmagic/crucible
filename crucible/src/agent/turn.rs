@@ -18,6 +18,9 @@ pub enum TurnFailure {
         cause: TransportCause,
         message: String,
     },
+    /// The turn was killed at its deadline. The agent ran; it ran out of time.
+    #[error("{}", .0.note())]
+    DeadlineExceeded(crucible::deadline::Deadline),
 }
 
 impl TurnFailure {
@@ -26,6 +29,7 @@ impl TurnFailure {
         match self {
             TurnFailure::Spawn(_) => TransportCause::Agent,
             TurnFailure::Orchestration { cause, .. } => *cause,
+            TurnFailure::DeadlineExceeded(_) => TransportCause::Agent,
         }
     }
 }
