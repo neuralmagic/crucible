@@ -463,7 +463,7 @@ pub fn functions() -> Vec<Function> {
                     "number",
                     "A decision model answers, through the broker's `systemone` capability. An \
                      answer whose probability is below this, in (0, 1], is recorded as \
-                     `\"uncertain\"`. Exactly one of `min_confidence` and `source`.",
+                     `\"uncertain\"`. Exactly one of `min_confidence`, `source`, and `human`.",
                 ),
                 Kwarg::new(
                     "source",
@@ -473,9 +473,19 @@ pub fn functions() -> Vec<Function> {
                      needs no capability. Any other value fails the route.",
                 ),
                 Kwarg::new(
+                    "human",
+                    "{\"kind\": \"slack\", \"deadline\": duration}",
+                    "A person answers instead, choosing one button per question in the Slack \
+                     channel the controller configures; needs the `human` capability. A \
+                     question nobody answers within `deadline` (1m to 168h) is recorded as \
+                     `\"uncertain\"`. The run's wall-clock ceiling still applies: reached first, \
+                     it fails the route and ends the run.",
+                ),
+                Kwarg::new(
                     "depends_on",
                     "list[task]",
-                    "Dependencies. Their outputs are the state the questions are asked about.",
+                    "Dependencies. Their outputs are the state a model is asked about; a person \
+                     is shown only the questions and a link to the run.",
                 ),
                 Kwarg::new("required", "bool", "False makes the route advisory."),
                 Kwarg::new(

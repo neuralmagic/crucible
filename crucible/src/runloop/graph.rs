@@ -107,6 +107,7 @@ pub(crate) fn run_iteration<R: Reporter>(
         &Substrate::detecting(
             Default::default(),
             &crucible::inference::from_process_env()?,
+            None,
         ),
         ExecCfg::default(),
         &mut *runner,
@@ -261,6 +262,7 @@ pub(crate) fn run_epilogue<R: Reporter>(
         &Substrate::detecting(
             Default::default(),
             &crucible::inference::from_process_env()?,
+            None,
         ),
         ExecCfg::default(),
         &mut runner,
@@ -895,6 +897,7 @@ pub(crate) fn run_wide_tournament<R: Reporter>(
         &Substrate::detecting(
             Default::default(),
             &crucible::inference::from_process_env()?,
+            None,
         ),
         ExecCfg::default(),
         &mut runner,

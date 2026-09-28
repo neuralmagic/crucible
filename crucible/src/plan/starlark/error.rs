@@ -409,10 +409,29 @@ pub enum CompileError {
         error: crucible_contract::decision::QuestionError,
     },
     #[error(
-        "route {task:?} needs exactly one of min_confidence (a decision model answers) or \
-         source (a dependency's output answers)"
+        "route {task:?} needs exactly one of min_confidence (a decision model answers), \
+         source (a dependency's output answers), or human (a person answers)"
     )]
     RouteDecider { task: String },
+    #[error(
+        "argument \"human\" must be an object such as {{\"kind\": \"slack\", \"deadline\": \"4h\"}}"
+    )]
+    HumanNotObject,
+    #[error("human needs {parameter} as a string")]
+    HumanParameter { parameter: &'static str },
+    #[error("human kind must be `slack`, got {got:?}")]
+    UnknownHumanChannel { got: String },
+    #[error("human has unknown parameter {parameter:?}; it takes kind and deadline")]
+    UnknownHumanParameter { parameter: String },
+    #[error("human deadline {raw:?} is not a duration (try `90s`, `30m`, `4h`)")]
+    BadHumanDeadline { raw: String },
+    #[error(
+        "human deadline {raw:?} must be a whole number of seconds from {} to {} ({}h)",
+        crate::plan::ir::MIN_HUMAN_DEADLINE_SECS,
+        crate::plan::ir::MAX_HUMAN_DEADLINE_SECS,
+        crate::plan::ir::MAX_HUMAN_DEADLINE_SECS / 3600
+    )]
+    HumanDeadlineOutOfRange { raw: String },
     #[error("argument \"when\" must be one question of a route task, like `gate.area`")]
     WhenNotAnAnswer,
     #[error("argument \"answers\" has no meaning without \"when\"")]

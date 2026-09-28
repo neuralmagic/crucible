@@ -19,7 +19,10 @@
 # "key_env":"SOME_VAR" to the binding for an endpoint that needs a bearer key, and put the key in
 # SOME_VAR. With no decision binding the run truncates at `gate` before spending anything.
 # Swap `min_confidence = 0.8` for `source = read` in workflow.star to decide from read.sh's own
-# output instead, with no model at all.
+# output instead, with no model at all, or for `human = {"kind": "slack", "deadline": "4h"}` to
+# have a person answer with one button per label in the controller's Slack channel. A person who
+# does not answer by the deadline is recorded as "uncertain". That needs CRUCIBLE_ELICIT_URL,
+# which only a controller with Slack configured sets; without it the run truncates at `gate`.
 
 [workspace]
 inject = ["read.sh", "act.sh", "tickets"]

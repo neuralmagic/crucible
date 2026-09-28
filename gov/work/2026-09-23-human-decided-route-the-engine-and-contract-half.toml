@@ -1,0 +1,69 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-09-23-001"
+title = "Human-decided route: the engine and contract half"
+status = "active"
+created = "2026-09-23"
+started = "2026-09-23"
+refs = [
+    "RFC-0001:C-ROUTE",
+    "RFC-0002:C-PLAYBOOK-BUDGET",
+    "RFC-0002:C-PLAYBOOK-CAPS",
+    "ADR-0050",
+]
+
+[content]
+description = "A route gains a third decider in which a person answers its typed questions over Slack, per [[ADR-0050]]. This item ships the DSL surface, the IR and its validation, the contract types the engine and controller share (the elicitation request and status, the Slack message and click decoding), the broker client that opens and polls a question, and the executor that waits on it under the run's wall-clock ceiling and records the answers exactly as an output-decided route does. The controller endpoint and Slack interactivity are [[WI-2026-09-23-002]]."
+
+[[content.acceptance_criteria]]
+text = 'workflow.star compiles route(human = {"kind": "slack", "deadline": ...}) into a human decider with needs = "human", and rejects a second decider, an unknown kind or parameter, and an unparseable deadline at the argument'
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "plan validation rejects a human-decided route whose deadline is outside one minute to seven days or whose needs is not human"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "the human capability is present exactly when CRUCIBLE_ELICIT_URL is set, so a human route with no endpoint truncates the run before dispatch"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "answered questions record their label with confidence 1, questions unanswered at the deadline record uncertain with confidence 0, and the route passes"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "a wall-clock ceiling reached during the wait fails the route and ends the run as TimeExceeded, not ShortCircuit"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "an endpoint answer naming an undeclared question, an undeclared label, or uncertain fails the route without retry; an unreachable endpoint is a transport failure that retries and never reads as expired"
+status = "done"
+category = "security"
+
+[[content.acceptance_criteria]]
+text = "the Slack message carries only compile-time question text, run and task names, deadline and run link, with one button per declared label and no input element; click decoding rejects anything the stored question does not declare"
+status = "done"
+category = "security"
+
+[[content.acceptance_criteria]]
+text = "end-to-end crucible plan run tests against a local HTTP endpoint cover an answer, a poll, an expired deadline, a ceiling cut, an invalid answer, and a missing endpoint"
+status = "done"
+category = "chore"
+
+[[content.acceptance_criteria]]
+text = "C-ROUTE carries the human decider's normative rules and the DSL reference is regenerated"
+status = "done"
+category = "chore"
+
+[verification]
+required_guards = [
+    "GUARD-CARGO-FMT",
+    "GUARD-CARGO-TEST",
+    "GUARD-GOVCTL-CHECK",
+]

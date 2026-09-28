@@ -250,9 +250,10 @@ Engine-owned decision: answers typed questions about its dependencies' outputs a
 | --- | --- | --- |
 | `name` | `str` | Task identity, unique within the workflow. |
 | `questions` | `dict[str, question]` | Question id to `noul()` or `choice()`. `gate.<id>` names one for `when`. |
-| `min_confidence` | `number` | A decision model answers, through the broker's `systemone` capability. An answer whose probability is below this, in (0, 1], is recorded as `"uncertain"`. Exactly one of `min_confidence` and `source`. |
+| `min_confidence` | `number` | A decision model answers, through the broker's `systemone` capability. An answer whose probability is below this, in (0, 1], is recorded as `"uncertain"`. Exactly one of `min_confidence`, `source`, and `human`. |
 | `source` | `task` | A dependency's output answers instead: it emits one declared label (or a boolean, for a noul) under each question id. Deterministic, free, and needs no capability. Any other value fails the route. |
-| `depends_on` | `list[task]` | Dependencies. Their outputs are the state the questions are asked about. |
+| `human` | `{"kind": "slack", "deadline": duration}` | A person answers instead, choosing one button per question in the Slack channel the controller configures; needs the `human` capability. A question nobody answers within `deadline` (1m to 168h) is recorded as `"uncertain"`. The run's wall-clock ceiling still applies: reached first, it fails the route and ends the run. |
+| `depends_on` | `list[task]` | Dependencies. Their outputs are the state a model is asked about; a person is shown only the questions and a link to the run. |
 | `required` | `bool` | False makes the route advisory. |
 | `join` | `"all" \| "passed" \| "settled"` | Which dependency outputs form the state, as on any task. |
 | `stage` | `"iteration" \| "epilogue"` | As on any task. |
