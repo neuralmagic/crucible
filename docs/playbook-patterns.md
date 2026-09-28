@@ -334,9 +334,9 @@ The template is a Jinja file in the pack, rendered into the card body. It reads:
 
 | Name | Value |
 | --- | --- |
-| `verdict` | `"pass"` when every settled task passed, otherwise `"fail"` |
+| `verdict` | the run's verdict: `"pass"` when every required main-graph task passed or was not taken, otherwise `"fail"`. Advisory tasks and branches not taken never change it |
 | `spent_usd` | total task cost |
-| `passed`, `failed` | settled task counts |
+| `passed`, `failed` | counts of settled tasks that passed and that did not, advisory and not-taken tasks included |
 | `tasks` | the first 20 settled tasks, each with `name`, `status`, `cost_usd` |
 | `run`, `run_url` | the run name and its Crucible link |
 | `result.name`, `result.status` | the selected task and its terminal status |

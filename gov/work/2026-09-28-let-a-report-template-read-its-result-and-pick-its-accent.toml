@@ -48,7 +48,7 @@ status = "done"
 category = "chore"
 
 [[content.acceptance_criteria]]
-text = "a template reads the run's verdict, its cost, and the bounded task status context the card carries"
+text = "a template reads the run's verdict as the engine records it (a run whose required tasks held reads pass though branches were not taken or advisory tasks failed or skipped), its cost, and the bounded task status context the card carries"
 status = "done"
 category = "added"
 

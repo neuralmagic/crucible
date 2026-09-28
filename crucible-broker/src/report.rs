@@ -91,42 +91,19 @@ fn limit_from_env(name: &'static str, default: usize, max: usize) -> Result<usiz
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-enum Verdict {
-    Pass,
-    Fail,
-}
-
-impl Verdict {
-    fn as_str(self) -> &'static str {
-        match self {
-            Verdict::Pass => "pass",
-            Verdict::Fail => "fail",
-        }
-    }
-}
-
 struct Totals {
     passed: usize,
     failed: usize,
     spent_usd: f64,
-    verdict: Verdict,
 }
 
 impl Totals {
     fn of(report: &crucible_contract::RunReport) -> Self {
         let passed = report.tasks.iter().filter(|t| t.status == "pass").count();
-        let failed = report.tasks.len() - passed;
         Self {
             passed,
-            failed,
+            failed: report.tasks.len() - passed,
             spent_usd: report.tasks.iter().map(|t| t.cost_usd).sum(),
-            verdict: if failed == 0 {
-                Verdict::Pass
-            } else {
-                Verdict::Fail
-            },
         }
     }
 }
@@ -218,7 +195,7 @@ struct TemplateResult<'a> {
 struct TemplateContext<'a> {
     run: &'a str,
     run_url: Option<&'a str>,
-    verdict: Verdict,
+    verdict: crucible_contract::RunVerdict,
     tasks: Vec<TemplateTask<'a>>,
     passed: usize,
     failed: usize,
@@ -280,7 +257,7 @@ fn render(
     let context = TemplateContext {
         run: &report.run,
         run_url: report.run_url.as_deref(),
-        verdict: totals.verdict,
+        verdict: report.verdict,
         tasks: report
             .tasks
             .iter()
@@ -348,7 +325,7 @@ fn payload(
             "type": "context",
             "elements": [{"type": "mrkdwn", "text": format!(
                 "*Verdict* {} · {} passed, {} non-passing · ${:.4}",
-                totals.verdict.as_str(),
+                report.verdict.as_str(),
                 totals.passed,
                 totals.failed,
                 totals.spent_usd
@@ -394,15 +371,20 @@ fn payload(
     }
 
     if let Some(url) = &report.run_url {
-        blocks.push(serde_json::json!({
-            "type": "actions",
-            "elements": [{
-                "type": "button",
-                "text": {"type": "plain_text", "text": "Open run in Crucible"},
-                "url": url,
-                "style": if totals.verdict == Verdict::Pass { "primary" } else { "danger" }
-            }]
-        }));
+        let mut button = serde_json::json!({
+            "type": "button",
+            "text": {"type": "plain_text", "text": "Open run in Crucible"},
+            "url": url
+        });
+        let style = match report.verdict {
+            crucible_contract::RunVerdict::Pass => Some("primary"),
+            crucible_contract::RunVerdict::Fail => Some("danger"),
+            crucible_contract::RunVerdict::Pending => None,
+        };
+        if let (Some(style), Some(object)) = (style, button.as_object_mut()) {
+            object.insert("style".to_owned(), serde_json::Value::from(style));
+        }
+        blocks.push(serde_json::json!({"type": "actions", "elements": [button]}));
     }
     let text = format!("Crucible workflow: {}", slack_escape(&report.run));
     let accent = selection
@@ -486,6 +468,7 @@ mod tests {
             run: "watch".into(),
             run_url: None,
             tasks: vec![task("card", status)],
+            verdict: crucible_contract::RunVerdict::Pass,
             results: BTreeMap::from([(
                 "card".into(),
                 crucible_contract::ReportResult {
@@ -539,6 +522,7 @@ mod tests {
                 blocked: None,
                 transport: None,
             }],
+            verdict: crucible_contract::RunVerdict::Pass,
             results: Default::default(),
         };
         let encoded = payload(&report, None, None, LIMITS).unwrap().to_string();
@@ -558,6 +542,7 @@ mod tests {
             run: "run<&".into(),
             run_url: Some("https://example.test/runs/7?a=1&b=2".into()),
             tasks: vec![task("task<@everyone>", "pass")],
+            verdict: crucible_contract::RunVerdict::Pending,
             results: Default::default(),
         };
         let text = render(
@@ -666,6 +651,7 @@ mod tests {
                 )
             })
             .collect();
+        report.verdict = crucible_contract::RunVerdict::Fail;
         let text = render(
             &report,
             &Totals::of(&report),
@@ -675,6 +661,44 @@ mod tests {
         )
         .unwrap();
         assert_eq!(text, "fail 12.50 24/1 20 fail");
+    }
+
+    #[test]
+    fn the_verdict_is_the_engines_not_a_count_of_non_passing_tasks() {
+        let mut report = selected_report("pass", None);
+        report.run_url = Some("https://crucible.example/runs/watch".into());
+        report.tasks.extend([
+            task("other_route", "not_taken"),
+            task("optional", "skipped"),
+            task("advisory_lint", "fail"),
+        ]);
+        let body = payload(&report, Some("{{ verdict }}"), None, LIMITS).unwrap();
+        assert_eq!(body["blocks"][3]["text"]["text"], "pass");
+        let encoded = body.to_string();
+        assert!(
+            encoded.contains("*Verdict* pass · 1 passed, 3 non-passing"),
+            "{encoded}"
+        );
+        assert!(encoded.contains("\"style\":\"primary\""), "{encoded}");
+    }
+
+    #[test]
+    fn a_report_written_before_the_main_graph_settled_reads_pending() {
+        let mut report: crucible_contract::RunReport = serde_json::from_value(serde_json::json!({
+            "run": "watch",
+            "run_url": "https://crucible.example/runs/watch",
+            "tasks": [{"name": "card", "status": "fail", "cost_usd": 0.0}]
+        }))
+        .unwrap();
+        assert_eq!(report.verdict, crucible_contract::RunVerdict::Pending);
+        let body = payload(&report, Some("{{ verdict }}"), None, LIMITS).unwrap();
+        assert_eq!(body["blocks"][3]["text"]["text"], "pending");
+        let encoded = body.to_string();
+        assert!(encoded.contains("*Verdict* pending"), "{encoded}");
+        assert!(!encoded.contains("\"style\""), "{encoded}");
+        report.verdict = crucible_contract::RunVerdict::Fail;
+        let encoded = payload(&report, None, None, LIMITS).unwrap().to_string();
+        assert!(encoded.contains("\"style\":\"danger\""), "{encoded}");
     }
 
     #[test]
@@ -759,6 +783,7 @@ mod tests {
     fn severity_field_selects_the_accent_whatever_the_run_verdict() {
         let mut report = selected_report("pass", Some(serde_json::json!({"severity": "good"})));
         report.tasks.push(task("lint", "fail"));
+        report.verdict = crucible_contract::RunVerdict::Fail;
         report.run_url = Some("https://crucible.example/runs/watch".into());
         let body = payload(
             &report,
@@ -836,6 +861,7 @@ mod tests {
             run: "fips-watch".into(),
             run_url: Some("https://crucible.example/runs/fips-watch".into()),
             tasks: vec![task("card", "pass")],
+            verdict: crucible_contract::RunVerdict::Pass,
             results: BTreeMap::from([(
                 "card".into(),
                 crucible_contract::ReportResult {
@@ -902,6 +928,7 @@ mod tests {
                 run: "run-9".into(),
                 run_url: Some("https://crucible.example/runs/run-9".into()),
                 tasks: vec![task("roundup", "pass")],
+                verdict: crucible_contract::RunVerdict::Pass,
                 results: Default::default(),
             })
             .unwrap(),
