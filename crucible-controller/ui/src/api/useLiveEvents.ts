@@ -11,6 +11,8 @@ const LIVE_PATHS = [
   '/api/approvals',
   '/api/repos',
   '/api/runs',
+  '/api/playbook-runs',
+  '/api/schedules',
   '/api/ledger/summary',
 ] as const;
 

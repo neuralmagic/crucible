@@ -1,14 +1,17 @@
 import { useQueryClient } from '@tanstack/react-query';
-import { Link } from 'react-router-dom';
+import { useMemo } from 'react';
+import { Link, useSearchParams } from 'react-router-dom';
 import { $api } from '../api/client';
 import type { components } from '../api/schema';
 import { narrow } from '../ownerContext';
 import { useOwnerContext } from '../useOwnerContext';
 import {
+  Applied,
   Button,
   createDataColumnHelper,
   DataTable,
   Empty,
+  Facets,
   formatStamp,
   Identifier,
   Mono,
@@ -21,15 +24,25 @@ import {
   statusTone,
   useDataTable,
 } from '../ui';
+import type { AppliedFilter, FacetRow } from '../ui';
 import { issueStatusColor } from './issueStatus';
 import { launchPath, relaunchPath } from './launchView';
 import { formatCost, transportLossLabel } from './runReport';
+import {
+  DEFAULT_FILTERS,
+  parseRunFilters,
+  runFilterParams,
+  runInContext,
+  runsView,
+  type RunFilters,
+} from './playbookRunsView';
 
 type PlaybookRunDto = components['schemas']['PlaybookRunDto'];
 type OneShotDto = components['schemas']['OneShotView'];
 
 const EMPTY_RUNS: PlaybookRunDto[] = [];
 const EMPTY_ONE_SHOTS: OneShotDto[] = [];
+const EMPTY_OWNED: { id: string; owner: string }[] = [];
 
 const ONE_SHOT_COLOR: Record<string, string> = {
   pending: 'blue',
@@ -140,10 +153,76 @@ const runColumns = runHelper.columns([
 export function PlaybookRunsPage() {
   const runs = $api.useQuery('get', '/api/playbook-runs');
   const oneShots = $api.useQuery('get', '/api/one-shots');
+  const playbooks = $api.useQuery('get', '/api/playbooks');
+  const drafts = $api.useQuery('get', '/api/playbook-drafts');
   const owner = useOwnerContext();
   const oneShotRows = narrow(oneShots.data ?? EMPTY_ONE_SHOTS, owner.context, (row) => row.owner_principal);
 
-  const runRows = runs.data ?? EMPTY_RUNS;
+  const [searchParams, setSearchParams] = useSearchParams();
+  const filters = parseRunFilters(searchParams);
+  const patch = (next: Partial<RunFilters>) => {
+    setSearchParams(runFilterParams({ ...filters, ...next }), { replace: true });
+  };
+
+  const owners = useMemo(
+    () => new Map([...(playbooks.data ?? EMPTY_OWNED), ...(drafts.data ?? EMPTY_OWNED)].map((p) => [p.id, p.owner])),
+    [playbooks.data, drafts.data],
+  );
+  const inContext = useMemo(
+    () => (runs.data ?? EMPTY_RUNS).filter((run) => runInContext(run, owner.context, (id) => owners.get(id))),
+    [runs.data, owner.context, owners],
+  );
+  const view = runsView(inContext, filters);
+
+  const facetRows: FacetRow[] = [
+    {
+      label: 'Status',
+      options: view.status,
+      value: filters.status,
+      onChange: (status) => {
+        patch({ status });
+      },
+    },
+    {
+      label: 'Playbook',
+      options: view.playbook,
+      value: filters.playbook,
+      onChange: (playbook) => {
+        patch({ playbook });
+      },
+      maxVisible: 8,
+    },
+    {
+      label: 'Origin',
+      options: view.origin,
+      value: filters.origin,
+      onChange: (origin) => {
+        patch({ origin });
+      },
+    },
+  ];
+
+  const applied: AppliedFilter[] = [];
+  for (const axis of ['status', 'playbook', 'origin'] as const) {
+    if (filters[axis]) {
+      applied.push({
+        label: `${axis}: ${filters[axis]}`,
+        onClear: () => {
+          patch({ [axis]: '' });
+        },
+      });
+    }
+  }
+  if (view.hiddenDrafts > 0) {
+    applied.push({
+      label: `${view.hiddenDrafts} draft run${view.hiddenDrafts === 1 ? '' : 's'} hidden`,
+      onClear: () => {
+        patch({ drafts: true });
+      },
+    });
+  }
+
+  const runRows = view.rows;
   const table = useDataTable({
     columns: runColumns,
     data: runRows,
@@ -158,11 +237,39 @@ export function PlaybookRunsPage() {
         description="Ad-hoc playbook launches with the values they froze, what they cost, and the deferred ones still waiting."
       />
 
+      <Facets rows={facetRows} />
+      <Applied
+        shown={runRows.length}
+        total={inContext.length}
+        noun="runs"
+        filters={applied}
+        onClearAll={() => {
+          setSearchParams(runFilterParams(DEFAULT_FILTERS), { replace: true });
+        }}
+      />
       <QueryState query={runs} noun="RUNS">
         <DataTable
           table={table}
-          empty={<Empty title="NO PLAYBOOK RUNS" />}
-          footer={<>Showing {runRows.length}</>}
+          empty={<Empty title={inContext.length === 0 ? 'NO PLAYBOOK RUNS' : 'NO RUNS MATCH THESE FILTERS'} />}
+          footer={
+            <>
+              Showing {runRows.length} of {inContext.length}
+              {filters.drafts ? (
+                <>
+                  {' · '}
+                  <button
+                    type="button"
+                    className="cursor-pointer border-0 bg-transparent p-0 font-mono text-ink-3 underline hover:text-ink"
+                    onClick={() => {
+                      patch({ drafts: false });
+                    }}
+                  >
+                    hide draft runs
+                  </button>
+                </>
+              ) : null}
+            </>
+          }
         />
       </QueryState>
 
