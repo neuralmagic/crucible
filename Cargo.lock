@@ -9724,6 +9724,7 @@ dependencies = [
  "sha2 0.10.9",
  "syn 2.0.118",
  "tempfile",
+ "thiserror 2.0.18",
  "toml 0.8.23",
 ]
 

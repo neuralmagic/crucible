@@ -93,7 +93,13 @@ fn containerfile(image: &ResolvedImage, intro: &str) -> Result<String> {
         if !steps.is_empty() {
             // Heredoc RUN (dockerfile 1.4+, buildah >= 1.33): one script block per
             // feature layer instead of an &&-chain.
-            let _ = writeln!(out, "RUN <<EOF");
+            let mounts: String = feature
+                .spec
+                .secrets
+                .iter()
+                .map(|s| format!("--mount=type=secret,id={},required=true ", s.as_str()))
+                .collect();
+            let _ = writeln!(out, "RUN {mounts}<<EOF");
             let _ = writeln!(out, "#!/bin/bash");
             let _ = writeln!(out, "set -euo pipefail");
             for step in &steps {
@@ -208,6 +214,33 @@ mod tests {
         )));
         assert!(cf.contains("RUN <<EOF\n#!/bin/bash\nset -euo pipefail\n"));
         assert_eq!(files, crate::generate::render(&fs_).unwrap());
+    }
+
+    #[test]
+    fn a_feature_with_build_secrets_mounts_them_on_its_own_run_only() {
+        let dir = tempfile::tempdir().unwrap();
+        feedstock(dir.path(), MATRIX);
+        let go = dir.path().join("features/go/feature.toml");
+        let spec = fs::read_to_string(&go).unwrap();
+        fs::write(
+            &go,
+            spec.replace(
+                "layer = 20\n",
+                "layer = 20\nsecrets = [\"github_token\", \"b\"]\n",
+            ),
+        )
+        .unwrap();
+        let fs_ = Feedstock::load(dir.path()).unwrap();
+        let files = crate::generate::render(&fs_).unwrap();
+        let cf = &files[std::path::Path::new("sandbox-go-cc/Containerfile")];
+        let mounted = "RUN --mount=type=secret,id=github_token,required=true \
+                       --mount=type=secret,id=b,required=true <<EOF\n";
+        assert_eq!(cf.matches(mounted).count(), 1, "{cf}");
+        let go_at = cf.find("# feature: go").unwrap();
+        let cc_at = cf.find("# feature: claude-code").unwrap();
+        let run_at = cf.find(mounted).unwrap();
+        assert!(go_at < run_at && run_at < cc_at, "{cf}");
+        assert_eq!(cf.matches("--mount=type=secret").count(), 2, "{cf}");
     }
 
     #[test]
