@@ -1,0 +1,80 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0051"
+title = "Refresh minted GitHub tokens in place for runs that outlive them"
+status = "proposed"
+date = "2026-09-28"
+refs = ["ADR-0028", "ADR-0036", "RFC-0002:C-PLAYBOOK-BUDGET"]
+
+[content]
+context = """
+A `mint://github-app` secret is a GitHub App installation token, and GitHub caps those at one hour. The controller mints one per dispatch, and [[ADR-0036]] delivers it in the run's owner-referenced Secret, projected into the pod as an environment variable or as a file mounted with `subPath`. Neither projection changes after the pod starts: the environment is fixed at exec, and the kubelet does not update a `subPath` mount when the Secret changes.
+
+An agent reaches a secret only by relay, and the relay is narrower still. The engine reads the env projections that `CRUCIBLE_AGENT_VISIBLE_ENV` names out of its own environment once, at startup, and hands those values to every sandbox it later creates. A file projection never reaches a sandbox at all. An agent's token therefore dies an hour after the pod started, however many turns later it is used.
+
+A playbook that waits on an external system runs far past an hour. A playbook that watches a CI run for up to ten hours, then fixes and rebuilds, holds one pod for many hours, so every token it was given is dead long before it pushes a branch or dispatches the rebuild. [[RFC-0002:C-PLAYBOOK-BUDGET]] lets a run's wall-clock ceiling be as long as its launcher allows, so nothing stops a launch from asking for a run that its own credentials cannot finish.
+
+The app key stays in the controller's custody under [[ADR-0028]]. Whatever refreshes the token either holds the key or asks the controller."""
+decision = """
+The hub controller re-mints every minted secret of a live run once the current token has less than 30 minutes left, and writes the new bytes into that run's Secret. It finds live runs by sweeping the `work_pods` rows that are `Running`, and it writes through the per-cluster dispatcher that created the Secret, merge-patching only the minted keys so that co-delivered Vault values are not re-read. The sweep runs in every build, not only under the `autoresearch` feature that gates today's work-pod sweep. The run never asks for a token.
+
+A minted secret projected as a file is mounted by directory, not by `subPath`, so the kubelet carries each rewrite into the running pod. Its declared path therefore names a file in a directory the projection owns alone, and registration refuses one that does not. A command reads the file when it needs the token, through a git credential helper and a `gh` wrapper the runtime image ships.
+
+A file projection can be agent-visible, and the engine relays it by reading the file each time it creates a sandbox, not once at startup. The file holds between 30 and 60 minutes of validity, less the kubelet's propagation delay of a minute or two, so an agent turn starts with roughly half an hour or more.
+
+A minted secret projected into the environment keeps working as it does today and is not refreshed. The controller warns at launch when a run projects one into the environment and asks for a wall-clock ceiling longer than the token's lifetime."""
+consequences = """
+A run can hold GitHub credentials for as long as its ceiling allows, without the key ever leaving the controller and without a new endpoint the run can call. A pack that reads the file through the helper or the wrapper sees no difference.
+
+The engine's relay and the agent-visibility list both change. Today visibility names environment variables; it must also name a file projection, and the engine must read that file per sandbox create. That touches the controller/engine boundary [[RFC-0004]] inventories.
+
+The hub has per-run work for as long as a run is live, on every spoke it dispatches to. A hub that is down lets tokens lapse once the file's remaining validity runs out, which is 30 minutes in the worst case and 60 in the best. [[ADR-0049]]'s leader election covers a single replica failing.
+
+A single agent turn longer than its relayed token's remaining validity loses GitHub access partway through, because the sandbox holds a copy and not the file. Agent rounds today run 10 to 20 minutes, so this is the exception. The egress rewrite alternative below removes the limit and is the intended successor.
+
+A pack that consumes the env projection, as `examples/fips-watch` does, keeps the one-hour limit. The launch warning makes that visible before the run rather than an hour into it."""
+
+[[content.alternatives]]
+text = "Re-mint on a timer into the run's Secret, mounted by directory; commands read it per use; the engine relays the file at each sandbox create"
+status = "accepted"
+pros = [
+    "The app key stays with the controller and the run gets no new way to ask for credentials",
+    "Reuses the Secret, projection, owner reference, and per-cluster dispatcher [[ADR-0036]] already built",
+    "Invisible to a pack that reads through the helper or wrapper",
+]
+cons = [
+    "The hub does per-run work for the run's whole life, on every spoke",
+    "The relay and agent-visibility list change across the controller/engine boundary",
+    "An agent turn longer than the relayed token's remaining validity loses access",
+    "Environment projections are not covered",
+]
+
+[[content.alternatives]]
+text = "The OpenShell egress proxy substitutes a freshly minted token for a placeholder, as the fork's AWS provider does. Deferred as the successor to the accepted option."
+status = "considered"
+pros = [
+    "The token never enters the sandbox, so it cannot leak or go stale there",
+    "Covers agent turns of any length",
+]
+cons = [
+    "Needs a GitHub provider in the OpenShell fork and a way for the gateway to mint without holding the app key",
+    "Covers the sandbox only; commands run in the pod, not behind the proxy",
+]
+
+[[content.alternatives]]
+text = "The run asks the broker for a token when it needs one"
+status = "rejected"
+pros = ["Fresh on demand, no timer"]
+cons = [
+    "The broker does not hold the app key, so it needs a new authenticated call back to the hub controller",
+    "Adds a credential-issuing tool to the surface a run can call",
+]
+rejection_reason = "It moves credential issuance into the run's reach to solve a lifetime problem the controller can solve without the run asking."
+
+[[content.alternatives]]
+text = "Deliver the app key and let the pack mint its own tokens"
+status = "rejected"
+pros = ["No controller work after dispatch"]
+cons = ["Puts the app key in every pod that binds the secret, against the custody rule of [[ADR-0028]]"]
+rejection_reason = "Key custody is the point of minting."
