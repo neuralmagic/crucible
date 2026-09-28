@@ -44,6 +44,10 @@ when { resource.owner == "team:platform-administrators" };
 permit(principal is UserPrincipal, action == Action::"model_provider:read", resource)
 when { resource.owner == "team:platform-administrators" };
 
+@id("everyone-launch-platform-playbooks")
+permit(principal is UserPrincipal, action in [Action::"playbook:read", Action::"playbook:launch"], resource)
+when { resource.owner == "team:platform-administrators" };
+
 @id("user-create-team")
 permit(principal is UserPrincipal, action == Action::"team:create", resource);
 

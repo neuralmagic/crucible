@@ -70,7 +70,7 @@ pub(crate) async fn get_config(State(state): State<ApiState>) -> Response {
 pub(crate) async fn put_config_overrides(
     State(state): State<ApiState>,
     identity: crate::identity::session::Identity,
-    _admin: crate::identity::auth::AdminGuard,
+    _admin: crate::authz::guard::AdminGuard,
     Json(body): Json<ConfigOverridesBody>,
 ) -> Response {
     let Some(store) = state.config.clone() else {

@@ -14,8 +14,32 @@ carries. Four lists bootstrap that on a fresh deployment: `CONTROLLER_ADMINS` (l
 administer the platform), `CONTROLLER_OPERATORS` (logins that may operate),
 `CONTROLLER_OPERATOR_GROUPS` (IdP groups whose members may operate) and `CONTROLLER_PUBLISHERS`
 (logins that may publish drafts they own without review). They seed the `platform-administrators`,
-`platform-operators` and `playbook-publishers` teams while those teams reach nobody; after that,
-membership is managed in the UI and the lists are inert.
+`platform-operators` and `playbook-publishers` teams while those teams reach nobody, and a login on
+the admin or operator list holds that team membership on every request whether or not the team
+lists it. Membership added in the UI counts the same: an owner of `platform-administrators` is an
+admin and any other member of it or of `platform-operators` an operator, for the admin- and
+operator-gated routes and for the `role` that `/api/whoami` reports.
+
+### Opening a deployment to an organization
+
+A signed-in user who is in no team reads and launches playbooks and providers owned by
+`team:platform-administrators`, dispatches to its targets, and owns whatever they create. To give
+one organization more than that without opening it to every login the issuer accepts, make a team
+whose members come from a rule, then give that team the shared resources (the Teams page does
+the first call):
+
+```text
+POST /api/teams {"slug": "my-org", "display_name": "My org",
+  "members": [{"kind": "rule", "member": "group-suffix:my-org-group", "role": "member"},
+              {"kind": "user", "member": "<you>", "role": "owner"}]}
+PUT /api/playbooks/<id>/owner {"owner": "team:my-org"}
+PUT /api/providers/<id>/owner {"owner": "team:my-org"}
+```
+
+Members read, launch and dispatch what the team owns; maintainers and owners also edit it. A
+provider spends its key on every dispatch, so whoever may pick it spends that key: move a
+provider to a team only when the whole team should. `email-domain:<domain>` rules match only in
+native mode, where the controller records each login's email.
 
 ## The controller as the OIDC relying party
 

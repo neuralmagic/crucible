@@ -11,6 +11,7 @@ pub mod bootstrap;
 pub mod decision;
 pub mod firing;
 pub mod granted;
+pub mod guard;
 pub mod model;
 pub mod owner;
 pub mod policy;
@@ -45,6 +46,31 @@ impl Caller {
     /// loopback caller asserted, exactly as the role guards read it.
     pub fn proves_groups(&self) -> bool {
         self.path == AuthPath::Open || self.path.carries_groups()
+    }
+
+    /// The coarse role the admin- and operator-gated routes and `whoami` read: an owner of the
+    /// platform administrators team is an admin, any other member of it or of the platform
+    /// operators team an operator. A downgraded session holds no role.
+    pub fn role(&self) -> crate::identity::auth::Role {
+        use crate::identity::auth::Role;
+        if !self.path.holds_roles() {
+            return Role::Viewer;
+        }
+        if self.principals.is_platform_admin() {
+            Role::Admin
+        } else if self
+            .principals
+            .team_role(&model::TeamSlug::platform_administrators())
+            .or_else(|| {
+                self.principals
+                    .team_role(&model::TeamSlug::platform_operators())
+            })
+            .is_some()
+        {
+            Role::Operator
+        } else {
+            Role::Viewer
+        }
     }
 
     /// The actor spelled for an audit row: the caller's principal, or `anonymous`.
@@ -95,11 +121,14 @@ impl FromRequestParts<ApiState> for Caller {
         parts: &mut Parts,
         state: &ApiState,
     ) -> Result<Self, Self::Rejection> {
+        if let Some(caller) = parts.extensions.get::<Caller>() {
+            return Ok(caller.clone());
+        }
         let Ok(identity) =
             crate::identity::session::Identity::from_request_parts(parts, state).await;
         let Ok(groups) = crate::identity::auth::Groups::from_request_parts(parts, state).await;
         let Ok(path) = AuthPath::from_request_parts(parts, state).await;
-        resolve_caller(
+        let caller = resolve_caller(
             state.db.pool(),
             &state.roles,
             identity.as_deref(),
@@ -107,7 +136,9 @@ impl FromRequestParts<ApiState> for Caller {
             path,
         )
         .await
-        .map_err(|e| crate::api::state::AppError::from(e).into_response())
+        .map_err(|e| crate::api::state::AppError::from(e).into_response())?;
+        parts.extensions.insert(caller.clone());
+        Ok(caller)
     }
 }
 
@@ -156,4 +187,73 @@ pub async fn resolve_caller(
     }
     let principals = Principals::new(login.as_deref(), groups).with_teams(teams);
     Ok(Caller { principals, path })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::authz::Caller;
+    use crate::authz::model::{Membership, Principals, TeamRole, TeamSlug, Via};
+    use crate::identity::auth::{AuthPath, Role};
+    use std::collections::BTreeMap;
+
+    fn caller(teams: &[(TeamSlug, TeamRole)], path: AuthPath) -> Caller {
+        let teams: BTreeMap<TeamSlug, Membership> = teams
+            .iter()
+            .map(|(slug, role)| {
+                (
+                    slug.clone(),
+                    Membership {
+                        role: *role,
+                        via: [Via::Direct { role: *role }].into(),
+                    },
+                )
+            })
+            .collect();
+        Caller {
+            principals: Principals::new(Some("reed"), &[]).with_teams(teams),
+            path,
+        }
+    }
+
+    #[test]
+    fn a_platform_administrators_owner_is_an_admin_however_the_membership_was_granted() {
+        let admins = [(TeamSlug::platform_administrators(), TeamRole::Owner)];
+        assert_eq!(caller(&admins, AuthPath::Session).role(), Role::Admin);
+        assert_eq!(caller(&admins, AuthPath::ApiKey).role(), Role::Admin);
+    }
+
+    #[test]
+    fn any_lesser_platform_membership_is_an_operator() {
+        for (team, role) in [
+            (TeamSlug::platform_administrators(), TeamRole::Maintainer),
+            (TeamSlug::platform_administrators(), TeamRole::Member),
+            (TeamSlug::platform_operators(), TeamRole::Member),
+            (TeamSlug::platform_operators(), TeamRole::Owner),
+        ] {
+            assert_eq!(
+                caller(&[(team.clone(), role)], AuthPath::Session).role(),
+                Role::Operator,
+                "{team} at {role:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn membership_in_other_teams_holds_no_role() {
+        let team = TeamSlug::parse("nm-mlr").unwrap();
+        assert_eq!(
+            caller(&[(team, TeamRole::Owner)], AuthPath::Session).role(),
+            Role::Viewer
+        );
+        assert_eq!(caller(&[], AuthPath::Session).role(), Role::Viewer);
+    }
+
+    #[test]
+    fn a_downgraded_session_holds_no_role_even_as_a_platform_owner() {
+        let admins = [(TeamSlug::platform_administrators(), TeamRole::Owner)];
+        assert_eq!(
+            caller(&admins, AuthPath::DowngradedSession).role(),
+            Role::Viewer
+        );
+    }
 }

@@ -32,6 +32,7 @@ const ONPREM: ProviderDetailDto = {
   created_by: 'alice',
   created_at: '2026-09-02T00:00:00Z',
   updated_at: '2026-09-02T00:00:00Z',
+  actions: ['read', 'update', 'delete'],
 };
 
 describe('providerBody', () => {
