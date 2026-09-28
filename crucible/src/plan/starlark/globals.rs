@@ -248,6 +248,7 @@ fn call<'v>(
                     tasks,
                     file: None,
                     resolved_from: None,
+                    params: BTreeMap::new(),
                     history_record: None,
                 };
                 workflow.validate()?;

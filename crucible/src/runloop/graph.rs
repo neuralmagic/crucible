@@ -33,6 +33,7 @@ use crate::report::session::{EvidenceDisposition, EvidenceEntry};
 use crate::runloop::step::{Decided, IterStep, Measured, TurnVerdict};
 use crucible::crucible::Direction;
 use crucible::crucible::{Judge, MeasureCtx, Reading, World};
+use crucible::deadline::Deadline;
 use crucible_contract::TransportCause;
 
 #[derive(Debug, thiserror::Error)]
@@ -193,6 +194,7 @@ pub(crate) fn epilogue_template(workflow: &WorkflowCfg) -> Result<Option<ValidPl
         version: 1,
         reason: None,
         budget: PlanBudget { usd: f64::MAX },
+        params: workflow.params.clone(),
         tasks,
     }
     .validate()
@@ -339,9 +341,15 @@ impl EpilogueRunner {
 }
 
 impl TaskRunner for EpilogueRunner {
-    fn run(&mut self, task: &Task, attempt: u32, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
+    fn run(
+        &mut self,
+        task: &Task,
+        attempt: u32,
+        inputs: &BTreeMap<TaskName, Value>,
+        deadline: Option<Deadline>,
+    ) -> Attempt {
         let inputs = self.with_kept(inputs);
-        self.inner.run(task, attempt, &inputs)
+        self.inner.run(task, attempt, &inputs, deadline)
     }
 
     fn run_many(&mut self, batch: &[BatchItem<'_>]) -> Vec<Attempt> {
@@ -351,6 +359,7 @@ impl TaskRunner for EpilogueRunner {
                 task: b.task,
                 attempt: b.attempt,
                 inputs: self.with_kept(&b.inputs),
+                deadline: b.deadline,
             })
             .collect();
         self.inner.run_many(&batch)
@@ -705,13 +714,19 @@ impl<R: Reporter> LoopTaskRunner<R> {
 }
 
 impl<R: Reporter> TaskRunner for LoopTaskRunner<R> {
-    fn run(&mut self, task: &Task, attempt: u32, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
+    fn run(
+        &mut self,
+        task: &Task,
+        attempt: u32,
+        inputs: &BTreeMap<TaskName, Value>,
+        deadline: Option<Deadline>,
+    ) -> Attempt {
         match &task.task {
             TaskKind::Agent { .. }
             | TaskKind::Command { .. }
             | TaskKind::Evaluate { .. }
             | TaskKind::Route { .. }
-            | TaskKind::Report { .. } => self.workflow_runner.run(task, attempt, inputs),
+            | TaskKind::Report { .. } => self.workflow_runner.run(task, attempt, inputs, deadline),
             TaskKind::Engine {
                 op: EngineOp::Propose,
                 ..
@@ -995,6 +1010,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
             max_fanout: None,
             when: None,
             revise: None,
+            timeout: None,
             history: None,
         });
     }
@@ -1019,6 +1035,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
             max_fanout: None,
             when: None,
             revise: None,
+            timeout: None,
             history: None,
         });
     }
@@ -1043,12 +1060,14 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
         max_fanout: None,
         when: None,
         revise: None,
+        timeout: None,
         history: None,
     });
     Plan {
         version: 1,
         reason: None,
         budget: PlanBudget { usd: f64::MAX },
+        params: std::collections::BTreeMap::new(),
         tasks,
     }
     .validate()
@@ -1209,7 +1228,13 @@ impl<R: Reporter> WideRunner<'_, R> {
 }
 
 impl<R: Reporter> TaskRunner for WideRunner<'_, R> {
-    fn run(&mut self, task: &Task, _attempt: u32, inputs: &BTreeMap<TaskName, Value>) -> Attempt {
+    fn run(
+        &mut self,
+        task: &Task,
+        _attempt: u32,
+        inputs: &BTreeMap<TaskName, Value>,
+        _deadline: Option<Deadline>,
+    ) -> Attempt {
         match &task.task {
             TaskKind::Agent { prompt, .. } => {
                 // A batch of one (wide n=1) lands here instead of run_many.

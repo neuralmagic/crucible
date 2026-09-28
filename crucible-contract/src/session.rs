@@ -152,6 +152,10 @@ pub struct PlanTaskWire {
     /// The most rounds `revise` may run, the first included; 0 when the task revises nothing.
     #[serde(default)]
     pub max_rounds: u32,
+    /// How long one attempt may run (`90s`, `10m`, `2h`), empty when the task declares no limit
+    /// and only the run's wall-clock ceiling bounds it.
+    #[serde(default)]
+    pub timeout: String,
     /// How many earlier runs of its series the task reads under `history`; 0 when it reads none.
     #[serde(default)]
     pub history_depth: u32,
@@ -838,6 +842,7 @@ mod tests {
                 when: String::new(),
                 revise: "draft".into(),
                 max_rounds: 3,
+                timeout: "10m".into(),
                 history_depth: 5,
             }],
             history_record: "propose-a".into(),

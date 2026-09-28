@@ -40,6 +40,9 @@ version = 1                 # the only format version accepted today
 [budget]
 usd = 5.0                   # required, positive; execution fails closed on overrun
 
+[params]                    # optional; command and evaluate tasks read it as inputs["params"]
+topic = "slag"
+
 [[task]]
 name = "propose"            # unique within the plan
 kind = "agent"
@@ -59,6 +62,7 @@ required = true             # default true
 isolation = "worktree"      # optional
 join = "all"                # default "all"
 emits = ["score"]           # optional declared output fields; absent = undeclared
+timeout = "20m"             # optional per-attempt limit; agent, command, and evaluate only
 
 [[task]]
 name = "pick"
@@ -144,6 +148,17 @@ never reruns: a task that failed, failed.
 **Budget.** Cost is known only after an attempt completes, so an in-flight attempt may report a
 total above `budget.usd`. Any overrun invalidates the plan and blocks all further dispatch and
 retries. Reaching the budget exactly is valid only when no further retry or task is needed.
+
+**Time.** Elapsed time is known continuously, so it bounds every attempt while it runs. Each
+attempt gets a deadline: its task's `timeout` counted from when the attempt starts, or the run's
+`--max-time` ceiling if that falls first. A task with no `timeout` runs under the ceiling alone.
+At the deadline the runner kills the attempt's whole process group (a command and everything it
+started, or the agent turn) and the task settles as a measured failure with a note naming the
+limit, `timed out: the task ran past its 20m limit`. It is not retried: a rerun would spend the
+same time again. A required task that times out short-circuits like any other failure. An
+attempt the run's ceiling ends instead ends the run on that ceiling, and everything undispatched
+settles blocked on it. A playbook refuses a `timeout` longer than `--max-time` before it
+dispatches anything. In a concurrent batch each task runs under its own deadline.
 
 ### `needs`
 
@@ -362,8 +377,9 @@ engine-known keys, not URLs or secret names; `slack` is the only destination in 
 The optional `result` selector projects only that main-graph task's declared JSON fields into an
 engine-built Block Kit card. It does not expose prompts, stdout, workspaces, undeclared fields, raw
 Slack blocks, channels, or credentials. Selected output defaults to a 16 KiB encoded limit; an
-operator may lower or raise it up to 64 KiB with `CRUCIBLE_REPORT_RESULT_MAX_BYTES`. Oversize data
-fails without truncation. A required report makes rendering or delivery failure fail the workflow;
+operator may lower or raise it up to 64 KiB with `CRUCIBLE_REPORT_RESULT_MAX_BYTES`. The rendered
+template body is bounded by `CRUCIBLE_REPORT_BODY_MAX_BYTES` (default and maximum 3000, Slack's
+section limit). Oversize data fails without truncation. A required report makes rendering or delivery failure fail the workflow;
 it does not rely on an agent remembering to call a tool.
 
 ## Worked example

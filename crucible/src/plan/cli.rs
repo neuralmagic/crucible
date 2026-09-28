@@ -6,9 +6,9 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::plan::exec::{Substrate, runnable_set};
+use crate::plan::exec::{Substrate, TaskStatus, required_tasks_held, runnable_set};
 use crate::plan::history::{SeriesHistory, declared_output};
-use crate::plan::ir::{Plan, TaskKind, TaskName, ValidPlan};
+use crate::plan::ir::{Plan, Stage, TaskKind, TaskName, ValidPlan};
 use crucible::crucible::Direction;
 use xai_grok_mermaid::{MermaidTheme, RenderLimits, RenderParams, default_engine, render_checked};
 
@@ -129,6 +129,9 @@ pub fn render(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
         }
         if let Some(when) = &t.when {
             detail.push_str(&format!(" when={when}"));
+        }
+        if let Some(timeout) = &t.timeout {
+            detail.push_str(&format!(" timeout={timeout}"));
         }
         out.push_str(&format!(
             "  {:<20} {:<28} needs={:<8} {} deps: {}{}\n",
@@ -512,6 +515,36 @@ struct BadDuration {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[error(
+    "task {task:?} declares timeout {timeout}, longer than this run's --max-time {ceiling}. The \
+     run's ceiling is the longest any task may declare; shorten the timeout or raise --max-time"
+)]
+struct TimeoutPastCeiling {
+    task: String,
+    timeout: crucible::duration::TaskTimeout,
+    ceiling: String,
+}
+
+/// Refuse a plan whose task declares a limit the operator's wall-clock ceiling does not allow.
+fn check_timeouts(plan: &ValidPlan, ceiling: Option<std::time::Duration>) -> Result<()> {
+    let Some(ceiling) = ceiling else {
+        return Ok(());
+    };
+    match plan
+        .tasks_topo()
+        .find_map(|t| Some((t, t.timeout?)).filter(|(_, limit)| limit.get() > ceiling))
+    {
+        Some((task, timeout)) => Err(TimeoutPastCeiling {
+            task: task.name.0.clone(),
+            timeout,
+            ceiling: crucible::duration::Shown(ceiling).to_string(),
+        }
+        .into()),
+        None => Ok(()),
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
 #[error("{manifest} declares no [workflow]; pass --file, or give the manifest a graph to compile")]
 struct NoGraph {
     manifest: String,
@@ -607,6 +640,7 @@ pub fn run(
                                 version: 1,
                                 reason: None,
                                 budget: crate::plan::ir::PlanBudget { usd: f64::MAX },
+                                params: workflow.params.clone(),
                                 tasks: workflow.tasks.clone(),
                             }
                             .validate()
@@ -643,6 +677,13 @@ pub fn run(
             }
             (None, None) => unreachable!("clap requires --file without --manifest"),
         };
+    check_timeouts(&plan, ceilings.wall_clock)?;
+    // A task under a deadline runs in a process group of its own, where the terminal's SIGINT
+    // does not reach it.
+    let _ = ctrlc::set_handler(|| {
+        crucible::deadline::terminate_live_groups();
+        std::process::exit(130);
+    });
     // Manifest runs append plan wire events to the run's session log so tailers (and the
     // controller's ingest) see the graph and its live progress; shell runs have no state dir.
     let substrate = Substrate::detecting(caps.clone(), &crucible::inference::from_process_env()?);
@@ -680,6 +721,7 @@ pub fn run(
             _ => None,
         },
         tasks: Vec::new(),
+        verdict: crucible_contract::RunVerdict::Pending,
         results: selected_results
             .iter()
             .map(|name| {
@@ -703,6 +745,7 @@ pub fn run(
         }
     };
     write_report(&report);
+    let mut statuses: BTreeMap<TaskName, TaskStatus> = BTreeMap::new();
     let out = execute(
         &plan,
         &substrate,
@@ -727,6 +770,17 @@ pub fn run(
                 selected.status = result.status.as_str().to_string();
                 selected.output = declared_output(task, result);
             }
+            statuses.insert(task.name.clone(), result.status);
+            if plan
+                .tasks_topo()
+                .filter(|t| t.stage == Stage::Iteration)
+                .all(|t| statuses.contains_key(&t.name))
+            {
+                report.verdict =
+                    crucible_contract::RunVerdict::of(required_tasks_held(&plan, |name| {
+                        statuses.get(name).copied()
+                    }));
+            }
             write_report(&report);
             if let Some(f) = &events {
                 append(
@@ -736,6 +790,8 @@ pub fn run(
             }
         },
     )?;
+    report.verdict = crucible_contract::RunVerdict::of(out.valid);
+    write_report(&report);
     for t in plan.tasks_topo() {
         if let Some(r) = out.results.get(&t.name) {
             println!(
@@ -929,6 +985,16 @@ mod tests {
         let out = render(&plan, &BTreeSet::new());
         assert!(out.contains("[UNRUNNABLE]"));
         assert!(out.contains("verdict: TRUNCATED"));
+    }
+
+    #[test]
+    fn render_states_each_tasks_own_time_limit() {
+        let mut plan = Plan::from_toml_str(SRC).unwrap();
+        plan.tasks[0].timeout = Some("90m".parse().unwrap());
+        let out = render(&plan.validate().unwrap(), &BTreeSet::new());
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[1].contains(" timeout=90m"), "{out}");
+        assert!(!lines[2].contains("timeout="), "{out}");
     }
 
     #[test]
@@ -1355,6 +1421,111 @@ mod tests {
                 other => panic!("the session must end in a shutdown, got {other:?}: {text}"),
             }
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A run whose required tasks held reports `pass`, though a branch was not taken and advisory
+    /// tasks failed and skipped. The report reads the engine's verdict, not a status count.
+    #[test]
+    fn a_report_carries_the_engines_verdict_past_untaken_and_advisory_tasks() {
+        let _guard = crucible::test_support::env_lock();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let receiver = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().expect("accept");
+            read_one_post(&mut s)
+        });
+
+        let dir = std::env::temp_dir().join(format!("crucible-verdict-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("reports")).expect("mkdir");
+        std::fs::write(
+            dir.join("reports/card.j2"),
+            "template verdict {{ verdict }}",
+        )
+        .expect("template");
+        std::fs::write(
+            dir.join("workflow.star"),
+            r#"
+pick = command(name = "pick", run = "echo '{\"lane\": \"a\"}'", emits = ["lane"])
+gate = route(
+    name = "gate",
+    depends_on = [pick],
+    source = pick,
+    questions = {"lane": choice(ask = "Which lane?", options = ["a", "b"])},
+)
+a = command(name = "a", run = "echo '{}'", depends_on = [gate], when = gate.lane, answers = "a")
+b = command(name = "b", run = "echo '{}'", depends_on = [gate], when = gate.lane, otherwise = True)
+lint = command(name = "lint", run = "exit 1", required = False)
+optional = command(name = "optional", run = "echo '{\"status\": \"skipped\"}'", required = False)
+publish = report(name = "publish", destination = {"kind": "slack"}, template = "reports/card.j2")
+workflow(type = "playbook", tasks = [pick, gate, a, b, lint, optional, publish])
+"#,
+        )
+        .expect("workflow");
+        std::fs::write(
+            dir.join("crucible.toml"),
+            r#"
+            [repo]
+            path = "."
+            [workspace]
+            dir = "workspace"
+            setup_cmd = "mkdir -p workspace && git -C workspace init -q && git -C workspace -c user.email=c@l -c user.name=c -c commit.gpgsign=false commit -q --allow-empty -m baseline"
+            [agent]
+            backend = "command"
+            agent_cmd = "true"
+            goal = "report the verdict"
+            [workflow]
+            type = "playbook"
+            file = "workflow.star"
+            "#,
+        )
+        .expect("manifest");
+
+        let storage = dir.join("storage");
+        let _env = ScopedEnv::set(&[
+            ("FORGE_STORAGE_ROOT", storage.display().to_string()),
+            ("SLACK_WEBHOOK_URL", format!("http://127.0.0.1:{port}/hook")),
+        ]);
+        run(
+            None,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            Some(&dir.join("crucible.toml")),
+            RunOpts {
+                ceilings: Ceilings {
+                    usd: Some(1.0),
+                    wall_clock: Some(std::time::Duration::from_secs(60)),
+                    wall_clock_raw: Some("60s".to_string()),
+                },
+                ..Default::default()
+            },
+        )
+        .expect("the required tasks held");
+        drop(_env);
+
+        let (_, body) = receiver.join().expect("receiver");
+        let card = String::from_utf8(body).expect("utf-8");
+        assert!(card.contains("template verdict pass"), "{card}");
+        assert!(card.contains("*Verdict* pass"), "{card}");
+
+        let report: crucible_contract::RunReport = serde_json::from_slice(
+            &std::fs::read(storage.join(crucible_contract::REPORT_FILE)).expect("report"),
+        )
+        .expect("decode");
+        assert_eq!(report.verdict, crucible_contract::RunVerdict::Pass);
+        let status = |name: &str| {
+            report
+                .tasks
+                .iter()
+                .find(|t| t.name == name)
+                .map(|t| t.status.clone())
+        };
+        assert_eq!(status("b").as_deref(), Some("not_taken"));
+        assert_eq!(status("lint").as_deref(), Some("fail"));
+        assert_eq!(status("optional").as_deref(), Some("skipped"));
+        assert_eq!(status("publish").as_deref(), Some("pass"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

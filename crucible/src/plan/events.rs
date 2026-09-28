@@ -37,6 +37,11 @@ pub(crate) fn plan_admitted_event(
                     .map(|r| r.task.0.clone())
                     .unwrap_or_default(),
                 max_rounds: t.revise.as_ref().map_or(0, |r| r.max_rounds),
+                timeout: t
+                    .timeout
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
                 history_depth: t.history.unwrap_or_default(),
             })
             .collect(),
@@ -124,5 +129,36 @@ mod tests {
             (tasks[1].revise.as_str(), tasks[1].max_rounds),
             ("author", 3)
         );
+    }
+
+    #[test]
+    fn the_admitted_plan_states_each_tasks_own_time_limit() {
+        let plan = Plan::from_toml_str(
+            r#"
+            version = 1
+            [budget]
+            usd = 1.0
+            [[task]]
+            name = "build"
+            kind = "command"
+            command = "true"
+            timeout = "90m"
+            [[task]]
+            name = "check"
+            kind = "command"
+            command = "true"
+            depends_on = ["build"]
+            "#,
+        )
+        .unwrap()
+        .validate()
+        .unwrap();
+        let SessionEvent::PlanAdmitted { tasks, .. } =
+            crate::plan::events::plan_admitted_event(&plan, None)
+        else {
+            panic!("not a plan_admitted event");
+        };
+        assert_eq!(tasks[0].timeout, "90m");
+        assert_eq!(tasks[1].timeout, "");
     }
 }

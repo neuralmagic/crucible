@@ -28,6 +28,33 @@ pub struct RunReport {
     pub tasks: Vec<TaskReport>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub results: BTreeMap<String, ReportResult>,
+    #[serde(default)]
+    pub verdict: RunVerdict,
+}
+
+/// The engine's run verdict: `pass` when every required main-graph task held and dispatch
+/// ended on its own, `fail` otherwise, `pending` until the main graph settles.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RunVerdict {
+    #[default]
+    Pending,
+    Pass,
+    Fail,
+}
+
+impl RunVerdict {
+    pub fn of(valid: bool) -> Self {
+        if valid { Self::Pass } else { Self::Fail }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

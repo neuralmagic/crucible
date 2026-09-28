@@ -35,6 +35,7 @@ An agent turn driven by a prompt.
 | `max_fanout` | `int` | Instance cap for `over`, within the engine's ceiling of 256. |
 | `revise` | `task` | A direct dependency this task sends back when it settles failing. The dependency runs again with the verdict under `revision`, then this task does, until this task stops failing or `max_rounds` is spent. Playbooks only; not with `over`. |
 | `max_rounds` | `int` | Round cap for `revise`, counting the first, from 2 to the engine's ceiling of 5. |
+| `timeout` | `str` | How long one attempt may run, as `90s`, `10m`, or `2h`. At the limit the attempt's whole process group is killed and the task settles failed with a note naming the limit; it is not retried. The run's `--max-time` bounds every attempt as well, and a playbook refuses a timeout longer than it before dispatching anything. |
 | `stage` | `"iteration" \| "epilogue"` | `epilogue` runs once after the loop concludes, and only if the run kept a candidate. |
 | `history` | `int` | Read this many earlier runs of the launch series, from 1 to the engine's ceiling of 30, under `history`. A run launched outside a series gets an empty list. Playbooks only. |
 | `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
@@ -65,6 +66,7 @@ An agent turn whose prompt is a skill's instructions plus its arguments.
 | `max_fanout` | `int` | Instance cap for `over`, within the engine's ceiling of 256. |
 | `revise` | `task` | A direct dependency this task sends back when it settles failing. The dependency runs again with the verdict under `revision`, then this task does, until this task stops failing or `max_rounds` is spent. Playbooks only; not with `over`. |
 | `max_rounds` | `int` | Round cap for `revise`, counting the first, from 2 to the engine's ceiling of 5. |
+| `timeout` | `str` | How long one attempt may run, as `90s`, `10m`, or `2h`. At the limit the attempt's whole process group is killed and the task settles failed with a note naming the limit; it is not retried. The run's `--max-time` bounds every attempt as well, and a playbook refuses a timeout longer than it before dispatching anything. |
 | `stage` | `"iteration" \| "epilogue"` | `epilogue` runs once after the loop concludes, and only if the run kept a candidate. |
 | `history` | `int` | Read this many earlier runs of the launch series, from 1 to the engine's ceiling of 30, under `history`. A run launched outside a series gets an empty list. Playbooks only. |
 | `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
@@ -90,6 +92,7 @@ A deterministic shell task in the candidate workspace.
 | `max_fanout` | `int` | Instance cap for `over`, within the engine's ceiling of 256. |
 | `revise` | `task` | A direct dependency this task sends back when it settles failing. The dependency runs again with the verdict under `revision`, then this task does, until this task stops failing or `max_rounds` is spent. Playbooks only; not with `over`. |
 | `max_rounds` | `int` | Round cap for `revise`, counting the first, from 2 to the engine's ceiling of 5. |
+| `timeout` | `str` | How long one attempt may run, as `90s`, `10m`, or `2h`. At the limit the attempt's whole process group is killed and the task settles failed with a note naming the limit; it is not retried. The run's `--max-time` bounds every attempt as well, and a playbook refuses a timeout longer than it before dispatching anything. |
 | `stage` | `"iteration" \| "epilogue"` | `epilogue` runs once after the loop concludes, and only if the run kept a candidate. |
 | `history` | `int` | Read this many earlier runs of the launch series, from 1 to the engine's ceiling of 30, under `history`. A run launched outside a series gets an empty list. Playbooks only. |
 | `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
@@ -117,6 +120,7 @@ A measurement command. Its last non-empty stdout line is a JSON object; `pass = 
 | `max_fanout` | `int` | Instance cap for `over`, within the engine's ceiling of 256. |
 | `revise` | `task` | A direct dependency this task sends back when it settles failing. The dependency runs again with the verdict under `revision`, then this task does, until this task stops failing or `max_rounds` is spent. Playbooks only; not with `over`. |
 | `max_rounds` | `int` | Round cap for `revise`, counting the first, from 2 to the engine's ceiling of 5. |
+| `timeout` | `str` | How long one attempt may run, as `90s`, `10m`, or `2h`. At the limit the attempt's whole process group is killed and the task settles failed with a note naming the limit; it is not retried. The run's `--max-time` bounds every attempt as well, and a playbook refuses a timeout longer than it before dispatching anything. |
 | `stage` | `"iteration" \| "epilogue"` | `epilogue` runs once after the loop concludes, and only if the run kept a candidate. |
 | `history` | `int` | Read this many earlier runs of the launch series, from 1 to the engine's ceiling of 30, under `history`. A run launched outside a series gets an empty list. Playbooks only. |
 | `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
@@ -131,8 +135,9 @@ Publish a rendered template to a controller-configured destination. The workflow
 | --- | --- | --- |
 | `name` | `str` | Task identity, unique within the workflow. |
 | `destination` | `str` | The configured sink to publish to. |
-| `template` | `str` | The template rendered into the message. |
-| `result` | `task` | The task whose result the template renders. |
+| `template` | `str` | Pack file rendered into the card body. Reads `verdict`, `spent_usd`, `passed`, `failed`, `tasks` (first 20), `run`, `run_url`, and `result`. Every inserted value is escaped for Slack. |
+| `result` | `task` | The task whose declared fields the card and `result.output` carry; `result.status` alone when it did not pass. |
+| `severity_field` | `str` | A declared field of `result` whose value ("good", "warning", "danger") picks the card accent; any other value is neutral. |
 | `required` | `bool` | False makes the report advisory. |
 
 ### `session()`
@@ -148,7 +153,7 @@ Declare a durable agent conversation. Tasks that share one run serially under on
 
 ### `param()`
 
-Read a launch parameter. The `params` block must be the source's first statement, and a source that declares one compiles per run.
+Read a launch parameter. The `params` block must be the source's first statement, and a source that declares one compiles per run. A supplied value may reach a prompt or a skill argument; a command or evaluate task reads it from `params` in `CRUCIBLE_INPUTS` instead of its command line.
 
 Takes one positional argument, `name`.
 
@@ -306,4 +311,5 @@ Present alongside the dependency entries, never wrapped in one.
 | `item` | `str` | This mapped instance's key, one per item of the list `over` names. |
 | `kept` | `object` | The kept candidate, in an epilogue task only. |
 | `outcome` | `object` | How the main graph ended and what each of its tasks settled as, as `{"exit": str, "tasks": {name: {"status", "note"}}}`, in an epilogue task only. |
+| `params` | `object` | Every declared parameter's bound value under its name, in its declared type, and `{}` where the source declares none, in a command or evaluate task only. |
 | `revision` | `object` | The verdict that sent this task back, as `{"round": int, "max_rounds": int, "reviewer": str, "review": {"status", "note", "output", "files"}}`, from the second round of a revise loop on. |
