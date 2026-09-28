@@ -3,9 +3,10 @@
 [govctl]
 id = "WI-2026-09-28-003"
 title = "Deliver a launch series' history to the tasks that read it"
-status = "active"
+status = "done"
 created = "2026-09-28"
 started = "2026-09-28"
+completed = "2026-09-28"
 refs = [
     "RFC-0002:C-RUN-HISTORY",
     "ADR-0052",
