@@ -26,6 +26,7 @@ import {
 } from '../ui';
 import type { AppliedFilter, FacetRow } from '../ui';
 import { issueStatusColor } from './issueStatus';
+import { relativeTime } from './journeyView';
 import { launchPath, relaunchPath } from './launchView';
 import { formatCost, transportLossLabel } from './runReport';
 import {
@@ -51,58 +52,19 @@ const ONE_SHOT_COLOR: Record<string, string> = {
   failed: 'red',
 };
 
-/// The frozen param snapshot, collapsed. It is what a relaunch re-renders the form from, so the
-/// exact values a run was authorized with stay readable next to its outcome.
-function ParamSnapshot({ params }: { params: PlaybookRunDto['params'] }) {
-  const entries = Object.entries(params);
-  if (entries.length === 0) return <Mono tone="ink-3">no params</Mono>;
-  return (
-    <details>
-      <summary className="cursor-pointer font-mono text-data text-ink-2">
-        {entries.length} param{entries.length === 1 ? '' : 's'}
-      </summary>
-      <dl className="mt-1 grid grid-cols-[auto_1fr] gap-x-3 font-mono text-data">
-        {entries.map(([name, value]) => (
-          <div key={name} className="contents">
-            <dt className="text-ink-3">{name}</dt>
-            <dd className="m-0 break-all text-ink-2">{String(value)}</dd>
-          </div>
-        ))}
-      </dl>
-    </details>
-  );
-}
-
 const runHelper = createDataColumnHelper<PlaybookRunDto>();
 
 const runColumns = runHelper.columns([
-  runHelper.accessor('key', {
-    header: 'Launch',
-    enableSorting: false,
-    meta: { pad: 'tight', shrink: true },
-    cell: ({ getValue }) => (
-      <Identifier to={launchPath(getValue())}>{getValue()}</Identifier>
-    ),
-  }),
-  runHelper.accessor('playbook', {
-    header: 'Playbook',
-    enableSorting: false,
-    meta: { className: 'font-mono text-data text-ink-2' },
-  }),
-  runHelper.accessor('origin', {
-    header: 'Origin',
-    enableSorting: false,
-    meta: { className: 'font-mono text-data text-ink-2' },
-  }),
   runHelper.accessor('status', {
-    header: 'Outcome',
+    header: 'Status',
     enableSorting: false,
+    meta: { shrink: true },
     cell: ({ row }) => {
       const lost = transportLossLabel(row.original.transport_losses);
       return (
         <span className="flex flex-wrap items-center gap-2">
           <Status
-            status={row.original.parked_reason ?? row.original.status}
+            status={row.original.status}
             tone={statusTone(issueStatusColor(row.original.status))}
             pulse={row.original.status === 'running'}
           />
@@ -111,34 +73,45 @@ const runColumns = runHelper.columns([
       );
     },
   }),
-  runHelper.display({
-    id: 'params',
-    header: 'Snapshot',
-    cell: ({ row }) => <ParamSnapshot params={row.original.params} />,
+  runHelper.accessor('playbook', {
+    header: 'Playbook',
+    enableSorting: false,
+    cell: ({ row }) => {
+      const { key, playbook, draft_version, parked_reason } = row.original;
+      return (
+        <div className="min-w-0 max-w-[60ch]">
+          <Link to={launchPath(key)} className="font-mono text-data font-semibold text-ink hover:underline">
+            {playbook}
+            {draft_version === null || draft_version === undefined ? null : (
+              <span className="ml-1.5 font-normal text-ink-3">draft v{draft_version}</span>
+            )}
+          </Link>
+          {parked_reason ? (
+            <p className="m-0 mt-0.5 truncate text-ink-3" title={parked_reason}>
+              {parked_reason}
+            </p>
+          ) : null}
+        </div>
+      );
+    },
   }),
-  runHelper.display({
-    id: 'ceilings',
-    header: 'Ceilings',
-    meta: { className: 'font-mono text-data text-ink-2' },
-    cell: ({ row }) => `$${row.original.max_cost.toFixed(2)} / ${row.original.max_time}`,
+  runHelper.accessor('created_by', {
+    header: 'Launched by',
+    enableSorting: false,
+    meta: { shrink: true, className: 'font-mono text-data text-ink-2' },
+    cell: ({ getValue }) => getValue() ?? '—',
+  }),
+  runHelper.accessor('created_at', {
+    header: 'When',
+    enableSorting: false,
+    meta: { shrink: true, className: 'font-mono text-data text-ink-2' },
+    cell: ({ getValue }) => <span title={formatStamp(getValue())}>{relativeTime(getValue()) ?? '—'}</span>,
   }),
   runHelper.display({
     id: 'cost',
     header: 'Cost',
-    meta: { align: 'end', className: 'font-mono text-data text-ink-2' },
+    meta: { align: 'end', shrink: true, className: 'font-mono text-data text-ink-2' },
     cell: ({ row }) => formatCost(row.original.cost_usd),
-  }),
-  runHelper.accessor('advance_dedupe', {
-    header: 'Dedupe',
-    enableSorting: false,
-    meta: { className: 'font-mono text-data text-ink-3' },
-    cell: ({ getValue }) => (getValue() ? 'advances' : 'untouched'),
-  }),
-  runHelper.accessor('created_at', {
-    header: 'Launched',
-    enableSorting: false,
-    meta: { className: 'font-mono text-data text-ink-2' },
-    cell: ({ getValue }) => formatStamp(getValue()),
   }),
   runHelper.display({
     id: 'relaunch',
@@ -273,20 +246,21 @@ export function PlaybookRunsPage() {
         />
       </QueryState>
 
-      <Section>
-        <SectionHeader title="Deferred one-shots" />
-        <SectionBody>
-          <QueryState query={oneShots} noun="ONE-SHOTS">
-            <OneShotList rows={oneShotRows} />
-          </QueryState>
-        </SectionBody>
-      </Section>
+      {oneShots.isSuccess && oneShotRows.length === 0 ? null : (
+        <Section>
+          <SectionHeader title="Deferred one-shots" />
+          <SectionBody>
+            <QueryState query={oneShots} noun="ONE-SHOTS">
+              <OneShotList rows={oneShotRows} />
+            </QueryState>
+          </SectionBody>
+        </Section>
+      )}
     </>
   );
 }
 
 function OneShotList({ rows }: { rows: OneShotDto[] }) {
-  if (rows.length === 0) return <Empty title="NOTHING DEFERRED" />;
   return (
     <ul className="m-0 list-none p-0">
       {rows.map((row) => (
