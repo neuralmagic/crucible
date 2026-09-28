@@ -618,6 +618,7 @@ pub fn run(
                                 version: 1,
                                 reason: None,
                                 budget: crate::plan::ir::PlanBudget { usd: f64::MAX },
+                                params: workflow.params.clone(),
                                 tasks: workflow.tasks.clone(),
                             }
                             .validate()

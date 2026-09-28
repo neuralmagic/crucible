@@ -661,6 +661,7 @@ fn constructor(
             tasks,
             file: None,
             resolved_from: None,
+            params: BTreeMap::new(),
         };
         workflow.validate()?;
         return Ok(Value::Workflow(workflow));
@@ -1072,6 +1073,7 @@ fn default_autoresearch(mut extras: Vec<Task>) -> Result<WorkflowCfg> {
         tasks,
         file: None,
         resolved_from: None,
+        params: BTreeMap::new(),
     };
     workflow.validate()?;
     Ok(workflow)
@@ -2109,7 +2111,7 @@ fn compile_source_here(
         context.supplied = supplied.keys().cloned().collect();
     }
     let loader = loader::resolve(&ast, &state, &globals, source.len(), lane)?;
-    let workflow = catching_panics(|| {
+    let mut workflow = catching_panics(|| {
         Module::with_temp_heap(|module| -> Result<WorkflowCfg> {
             let mut eval = Evaluator::new(&module);
             eval.extra = Some(&state);
@@ -2155,6 +2157,7 @@ fn compile_source_here(
     if !unbound.is_empty() {
         return Err(CompileError::UnboundSessions { sites: unbound });
     }
+    workflow.params = context.params;
     let canonical_json = serde_json::to_string_pretty(&workflow)? + "\n";
     Ok(CompiledWorkflow {
         workflow,
@@ -4766,7 +4769,67 @@ workflow(type = "playbook", tasks = [a])
                 error.contains("supplied from outside the pack"),
                 "{what}: {error}"
             );
+            assert!(
+                error.contains("\"params\" entry of $CRUCIBLE_INPUTS"),
+                "{what}: the refusal does not say where a command reads the value: {error}"
+            );
         }
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// The compiled graph carries the values it was bound with, typed, so whatever runs it later
+    /// hands every command the same ones without recompiling or rereading a launcher.
+    #[test]
+    fn the_compiled_workflow_carries_every_bound_parameter_in_its_declared_type() {
+        use crate::plan::starlark::params::ParamValue;
+        let pack = temp_pack("params-carried");
+        let source = r#"
+params = {
+    "url": {"type": "string", "required": True},
+    "steps": {"type": "int", "default": 3},
+    "ratio": {"type": "number", "default": 0.5},
+    "dry_run": {"type": "bool", "default": False},
+    "labels": {"type": "list<string>", "default": ["ci"]},
+}
+workflow(type = "playbook", tasks = [command(name = "a", run = "./go.sh")])
+"#;
+        let supplied = BTreeMap::from([
+            ("url".to_string(), "https://x.test/p".to_string()),
+            ("dry_run".to_string(), "true".to_string()),
+        ]);
+        let compiled =
+            compile_source_with(source, &pack.join("workflow.star"), &pack, &supplied).unwrap();
+        assert_eq!(
+            compiled.workflow.params,
+            BTreeMap::from([
+                (
+                    "url".to_string(),
+                    ParamValue::String("https://x.test/p".into())
+                ),
+                ("steps".to_string(), ParamValue::Int(3)),
+                ("ratio".to_string(), ParamValue::Number(0.5)),
+                ("dry_run".to_string(), ParamValue::Bool(true)),
+                (
+                    "labels".to_string(),
+                    ParamValue::StringList(vec!["ci".into()])
+                ),
+            ])
+        );
+        let json: serde_json::Value = serde_json::from_str(&compiled.canonical_json).unwrap();
+        assert_eq!(json["params"]["steps"], serde_json::json!(3));
+
+        let bare = compile_source(
+            "workflow(type = \"playbook\", tasks = [command(name = \"a\", run = \"true\")])\n",
+            &pack.join("workflow.star"),
+            &pack,
+        )
+        .unwrap();
+        assert!(bare.workflow.params.is_empty());
+        assert!(
+            !bare.canonical_json.contains("\"params\""),
+            "{}",
+            bare.canonical_json
+        );
         let _ = std::fs::remove_dir_all(&pack);
     }
 

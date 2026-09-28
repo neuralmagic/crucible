@@ -40,6 +40,9 @@ version = 1                 # the only format version accepted today
 [budget]
 usd = 5.0                   # required, positive; execution fails closed on overrun
 
+[params]                    # optional; command and evaluate tasks read it as inputs["params"]
+topic = "slag"
+
 [[task]]
 name = "propose"            # unique within the plan
 kind = "agent"

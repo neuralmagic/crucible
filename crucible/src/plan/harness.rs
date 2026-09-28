@@ -3429,6 +3429,64 @@ workflow(type = "playbook", tasks = [probe, deliver, report])
         assert_eq!(seen["deliver"]["files"], false);
         let _ = std::fs::remove_dir_all(&dir);
     }
+    /// A launch parameter reaches a script as data, never through its command line: the
+    /// compiler binds it, the plan carries it, and the command reads it out of its inputs.
+    #[test]
+    fn a_command_reads_its_launch_params_out_of_its_inputs() {
+        let dir = playbook_pack(
+            "params-input",
+            r#"
+params = {
+    "url": {"type": "string", "required": True},
+    "steps": {"type": "int", "default": 3},
+    "labels": {"type": "list<string>", "default": ["ci", "flaky"]},
+}
+echo = command(
+    name = "echo",
+    run = "python3 -c 'import json, os; print(json.dumps({\"seen\": json.loads(os.environ[\"CRUCIBLE_INPUTS\"])[\"params\"]}))'",
+)
+workflow(type = "playbook", tasks = [echo])
+"#,
+        );
+        let supplied = BTreeMap::from([("url".to_string(), "https://x.test/$(id)".to_string())]);
+        let manifest_path = dir.join("crucible.toml");
+        let mut manifest = crate::manifest::Manifest::load(&manifest_path).unwrap();
+        manifest.resolve_workflow_with(&dir, &supplied).unwrap();
+        let workflow = manifest.workflow.as_ref().unwrap();
+        let plan = crate::plan::template::iteration_template(
+            Some(workflow),
+            &crate::plan::workflow::WorkflowCaps::for_lane(workflow.workflow_type),
+        )
+        .unwrap();
+        let mut runner = crate::cli::setup::prep_plan_runner_with_params(
+            &manifest_path,
+            &supplied,
+            crate::openshell::gateway::ComputeDriver::Podman,
+            crate::args::AgentOverride::default(),
+        )
+        .unwrap()
+        .0;
+        let out = execute(
+            &plan,
+            &Substrate::default(),
+            ExecCfg::default(),
+            &mut runner,
+            |_, _| {},
+        );
+
+        let echo = &out.results[&"echo".into()];
+        assert_eq!(echo.status, TaskStatus::Pass, "{:?}", echo.note);
+        assert_eq!(
+            echo.output.as_ref().map(|o| &o["seen"]),
+            Some(&serde_json::json!({
+                "url": "https://x.test/$(id)",
+                "steps": 3,
+                "labels": ["ci", "flaky"],
+            }))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Provenance cannot rest on git's opinion of the workspace: a declared path an earlier
     /// passing task wrote is still there when a later task fails without writing it, and a
     /// `.gitignore` covering that path makes it invisible to every cleanliness test.

@@ -7,7 +7,7 @@
 
 use crate::plan::exec::DeclaredStatus;
 use crate::plan::ir::KEPT_INPUT;
-use crate::plan::ir::{ITEM_INPUT, OUTCOME_INPUT, REVISION_INPUT};
+use crate::plan::ir::{ITEM_INPUT, OUTCOME_INPUT, PARAMS_INPUT, REVISION_INPUT};
 use crate::plan::ir::{MAX_FANOUT_CEILING, MAX_ROUNDS_CEILING};
 #[cfg(test)]
 use crate::plan::workflow::WorkflowType;
@@ -319,7 +319,9 @@ pub fn functions() -> Vec<Function> {
             name: "param",
             lane: Lane::Common,
             purpose: "Read a launch parameter. The `params` block must be the source's first \
-                      statement, and a source that declares one compiles per run.",
+                      statement, and a source that declares one compiles per run. A supplied \
+                      value may reach a prompt or a skill argument; a command or evaluate task \
+                      reads it from `params` in `CRUCIBLE_INPUTS` instead of its command line.",
             positional: Some("name"),
             kwargs: vec![],
         },
@@ -589,6 +591,12 @@ pub fn reserved_inputs() -> Vec<Reserved> {
             "How the main graph ended and what each of its tasks settled as, as \
              `{\"exit\": str, \"tasks\": {name: {\"status\", \"note\"}}}`, in an epilogue \
              task only.",
+        ),
+        Reserved::new(
+            PARAMS_INPUT,
+            "object",
+            "Every declared parameter's bound value under its name, in its declared type, and \
+             `{}` where the source declares none, in a command or evaluate task only.",
         ),
         Reserved::new(
             REVISION_INPUT,

@@ -415,6 +415,7 @@ mod tests {
             version: 1,
             reason: None,
             budget: PlanBudget { usd: 1.0 },
+            params: std::collections::BTreeMap::new(),
             tasks,
         }
         .validate()
@@ -805,7 +806,9 @@ mod tests {
             command(
                 name,
                 // Real work: score = byte length of the upstream approach string.
-                r#"python3 -c 'import json,os; v=json.loads(os.environ["CRUCIBLE_INPUTS"]); a=list(v.values())[0]["approach"]; print(json.dumps({"score": len(a)}))'"#,
+                &format!(
+                    r#"python3 -c 'import json,os; v=json.loads(os.environ["CRUCIBLE_INPUTS"]); a=v["{dep}"]["approach"]; print(json.dumps({{"score": len(a)}}))'"#
+                ),
                 &[dep],
             )
         };

@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::crucible::Direction;
+use crate::plan::starlark::params::ParamValue;
 use anyhow::{Context, Result};
 use crucible_contract::decision::{Label, Question, QuestionError, QuestionId, UNCERTAIN};
 use serde::{Deserialize, Serialize};
@@ -14,12 +15,21 @@ pub const ITEM_INPUT: &str = "item";
 pub const KEPT_INPUT: &str = "kept";
 /// The reserved input every epilogue task receives the main graph's outcome under.
 pub const OUTCOME_INPUT: &str = "outcome";
+/// The reserved input every command and evaluate task receives the plan's bound parameter values
+/// under.
+pub const PARAMS_INPUT: &str = "params";
 /// The reserved input a revised task receives its reviewer's last verdict under, from its second
 /// round on.
 pub const REVISION_INPUT: &str = "revision";
 /// Every key the engine writes into a task's inputs itself. A dependency named after one of
 /// them would have its entry overwritten, so [`crate::plan::ir::Plan::validate`] refuses it.
-pub const RESERVED_INPUTS: [&str; 4] = [ITEM_INPUT, KEPT_INPUT, OUTCOME_INPUT, REVISION_INPUT];
+pub const RESERVED_INPUTS: [&str; 5] = [
+    ITEM_INPUT,
+    KEPT_INPUT,
+    OUTCOME_INPUT,
+    PARAMS_INPUT,
+    REVISION_INPUT,
+];
 
 /// Task identity: cache key component, wire label, UI label. Unique within a plan.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -376,6 +386,9 @@ pub struct Plan {
     #[serde(default)]
     pub reason: Option<String>,
     pub budget: PlanBudget,
+    /// Every declared parameter's value as compilation bound it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, ParamValue>,
     #[serde(rename = "task", default)]
     pub tasks: Vec<Task>,
 }
@@ -1294,6 +1307,7 @@ mod tests {
             version: 1,
             reason: None,
             budget: PlanBudget { usd: 5.0 },
+            params: BTreeMap::new(),
             tasks,
         }
     }
@@ -1414,6 +1428,35 @@ mod tests {
             .unwrap()
             .replace("min_confidence = 0.8", "min_confidence = 1");
         Plan::from_toml_str(&text).unwrap().validate().unwrap();
+    }
+
+    /// A frozen plan carries its bound values, so whatever loads it back gives every command
+    /// the same ones, each in the type it was bound with.
+    #[test]
+    fn bound_params_round_trip_through_toml_and_json_in_their_types() {
+        let mut original = plan(vec![agent("a", &[])]);
+        original.params = BTreeMap::from([
+            (
+                "url".to_string(),
+                ParamValue::String("https://x.test".into()),
+            ),
+            ("steps".to_string(), ParamValue::Int(3)),
+            ("ratio".to_string(), ParamValue::Number(2.0)),
+            ("dry_run".to_string(), ParamValue::Bool(false)),
+            (
+                "labels".to_string(),
+                ParamValue::StringList(vec!["ci".into()]),
+            ),
+        ]);
+        let text = toml::to_string(&original).unwrap();
+        let from_toml = Plan::from_toml_str(&text).unwrap();
+        let from_json = Plan::from_json_str(&serde_json::to_string(&original).unwrap()).unwrap();
+        for back in [from_toml, from_json] {
+            assert_eq!(back.params, original.params);
+        }
+
+        let bare = toml::to_string(&plan(vec![agent("a", &[])])).unwrap();
+        assert!(!bare.contains("params"), "{bare}");
     }
 
     #[test]

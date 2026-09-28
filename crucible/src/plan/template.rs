@@ -21,6 +21,7 @@ pub(crate) fn iteration_template(
             version: 1,
             reason: None,
             budget: PlanBudget { usd: f64::MAX },
+            params: workflow.params.clone(),
             tasks: workflow.iteration_tasks(),
         }
         .validate()
@@ -88,6 +89,7 @@ pub(crate) fn iteration_template(
         tasks,
         file: None,
         resolved_from: None,
+        params: std::collections::BTreeMap::new(),
     };
     workflow
         .admit(caps)
@@ -96,6 +98,7 @@ pub(crate) fn iteration_template(
         version: 1,
         reason: None,
         budget: PlanBudget { usd: f64::MAX },
+        params: std::collections::BTreeMap::new(),
         tasks: workflow.tasks,
     }
     .validate()

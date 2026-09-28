@@ -18,8 +18,8 @@ use serde_json::Value;
 use crate::crucible::Direction;
 use crate::diagram::IllegalTransition;
 use crate::plan::ir::{
-    Decider, ITEM_INPUT, Join, OUTCOME_INPUT, REVISION_INPUT, Stage, Task, TaskKind, TaskName,
-    ValidPlan,
+    Decider, ITEM_INPUT, Join, OUTCOME_INPUT, PARAMS_INPUT, REVISION_INPUT, Stage, Task, TaskKind,
+    TaskName, ValidPlan,
 };
 use crate::plan::machine::{
     BlockedReason, PlanEvent, PlanMachine, TaskEvent, TaskMachine, TaskState,
@@ -1375,6 +1375,27 @@ fn file_producers(
     producers
 }
 
+/// What a dispatched task reads, as JSON: its dependencies' contributions and, for a command or
+/// evaluate task, the plan's bound parameters under [`PARAMS_INPUT`].
+fn inputs_for(
+    plan: &ValidPlan,
+    t: &Task,
+    results: &BTreeMap<TaskName, TaskResult>,
+    staged: &[Task],
+) -> BTreeMap<TaskName, Value> {
+    let mut inputs = dependency_inputs(plan, t, results, staged);
+    if matches!(t.task, TaskKind::Command { .. } | TaskKind::Evaluate { .. }) {
+        let params = plan
+            .plan()
+            .params
+            .iter()
+            .map(|(name, value)| (name.clone(), value.json()))
+            .collect();
+        inputs.insert(TaskName(PARAMS_INPUT.to_string()), Value::Object(params));
+    }
+    inputs
+}
+
 /// What a dispatched task reads from its dependencies, as JSON.
 ///
 /// Under `all` and `passed` a dependency contributes its output directly, under its own name. A
@@ -1385,7 +1406,7 @@ fn file_producers(
 /// output and staged-file flag, whatever it settled as. `staged` is the producer list this
 /// dispatch is about to hand the runner, which is what makes the `files` flag mean "staged for
 /// this consumer, in this run".
-fn inputs_for(
+fn dependency_inputs(
     plan: &ValidPlan,
     t: &Task,
     results: &BTreeMap<TaskName, TaskResult>,
@@ -2233,6 +2254,7 @@ mod tests {
             version: 1,
             reason: None,
             budget: PlanBudget { usd },
+            params: std::collections::BTreeMap::new(),
             tasks,
         }
         .validate()
@@ -2260,7 +2282,7 @@ mod tests {
         assert!(out.valid);
         assert_eq!(out.exit, PlanExit::Completed);
         assert_eq!(out.results[&"b".into()].status, TaskStatus::Pass);
-        assert_eq!(r.seen_inputs["b"], vec!["a".to_string()]);
+        assert_eq!(r.seen_inputs["b"], ["a", "params"]);
     }
 
     /// The wall-clock ceiling blocks every task not yet dispatched and invalidates the run.
@@ -2391,7 +2413,7 @@ mod tests {
         assert!(out.valid, "lossy grade remains runnable: {:?}", out.exit);
         assert_eq!(out.results[&"racecheck".into()].status, TaskStatus::Skipped);
         assert_eq!(out.results[&"grade".into()].status, TaskStatus::Pass);
-        assert_eq!(runner.seen_inputs["grade"], vec!["score".to_string()]);
+        assert_eq!(runner.seen_inputs["grade"], ["params", "score"]);
     }
 
     #[test]
@@ -3059,7 +3081,7 @@ mod tests {
         assert_eq!(bad.status, TaskStatus::Fail);
         assert_eq!(bad.output.as_ref().unwrap()["score"], 12.0);
         assert_eq!(out.results[&"grade".into()].status, TaskStatus::Pass);
-        assert_eq!(r.seen_inputs["grade"], vec!["ok".to_string()]);
+        assert_eq!(r.seen_inputs["grade"], ["ok", "params"]);
     }
 
     /// The other side of the status filter: a self-declared skip is a reading the task stands
@@ -3100,10 +3122,7 @@ mod tests {
             TaskStatus::Skipped
         );
         assert_eq!(out.results[&"grade".into()].status, TaskStatus::Pass);
-        assert_eq!(
-            r.seen_inputs["grade"],
-            vec!["ok".to_string(), "unmeasured".to_string()]
-        );
+        assert_eq!(r.seen_inputs["grade"], ["ok", "params", "unmeasured"]);
     }
 
     #[test]
@@ -4688,7 +4707,7 @@ mod tests {
         let out = run_plan(&plan, &mut r);
 
         assert_eq!(out.results[&"roundup".into()].status, TaskStatus::Pass);
-        assert_eq!(r.seen_inputs["roundup"], vec!["good".to_string()]);
+        assert_eq!(r.seen_inputs["roundup"], ["good", "params"]);
     }
 
     /// A settled dependent of a mapped node waits for the fold and then reads each instance,
@@ -5077,7 +5096,7 @@ mod tests {
             "a lossy join was staged a failed dependency's evidence: {:?}",
             r.staged["roundup"]
         );
-        assert_eq!(r.seen_inputs["roundup"], vec!["other".to_string()]);
+        assert_eq!(r.seen_inputs["roundup"], ["other", "params"]);
     }
 
     /// "Nothing" has one spelling in the entry: a dependency the engine recorded no note for
@@ -5946,6 +5965,7 @@ mod tests {
                                         version: 1,
                                         reason: None,
                                         budget: PlanBudget { usd: budget },
+                                        params: std::collections::BTreeMap::new(),
                                         tasks: tasks.clone(),
                                     })
                                     .validate() else {
@@ -6136,6 +6156,185 @@ mod tests {
             if status(t) == TaskStatus::NotTaken {
                 assert_eq!(n, 0, "{}", ctx());
             }
+        }
+    }
+
+    fn with_params(tasks: Vec<Task>) -> ValidPlan {
+        use crate::plan::starlark::params::ParamValue;
+        Plan {
+            version: 1,
+            reason: None,
+            budget: PlanBudget { usd: 10.0 },
+            params: [
+                ("url", ParamValue::String("https://example.test/a b".into())),
+                ("steps", ParamValue::Int(3)),
+                ("ratio", ParamValue::Number(0.5)),
+                ("dry_run", ParamValue::Bool(true)),
+                (
+                    "labels",
+                    ParamValue::StringList(vec!["ci".into(), "flaky".into()]),
+                ),
+            ]
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value))
+            .collect(),
+            tasks,
+        }
+        .validate()
+        .unwrap()
+    }
+
+    fn params_of(inputs: &BTreeMap<TaskName, Value>) -> Option<&Value> {
+        inputs.get(&TaskName(PARAMS_INPUT.to_string()))
+    }
+
+    fn agent_task(name: &str, deps: &[&str]) -> Task {
+        Task {
+            task: TaskKind::Agent {
+                prompt: "summarize".into(),
+                harness: None,
+                model: None,
+                effort: None,
+            },
+            ..task(name, deps, "any", true)
+        }
+    }
+
+    fn evaluate_task(name: &str, deps: &[&str]) -> Task {
+        Task {
+            task: TaskKind::Evaluate {
+                command: "true".into(),
+                threshold: None,
+                direction: None,
+            },
+            ..task(name, deps, "any", true)
+        }
+    }
+
+    /// A command reads a launch parameter as data, each value in the type its declaration gave
+    /// it, beside its dependencies' outputs rather than in place of them.
+    #[test]
+    fn command_and_evaluate_tasks_read_every_bound_parameter_in_its_declared_type() {
+        let plan = with_params(vec![
+            task("fetch", &[], "any", true),
+            evaluate_task("check", &["fetch"]),
+            agent_task("summarize", &["fetch"]),
+        ]);
+        let mut r = ScriptRunner::new();
+        let out = run_plan(&plan, &mut r);
+
+        assert!(out.valid);
+        let expected = serde_json::json!({
+            "url": "https://example.test/a b",
+            "steps": 3,
+            "ratio": 0.5,
+            "dry_run": true,
+            "labels": ["ci", "flaky"],
+        });
+        for consumer in ["fetch", "check"] {
+            let params = params_of(&r.seen_values[consumer]);
+            assert_eq!(params, Some(&expected), "{consumer}");
+            let params = params.unwrap();
+            assert!(params["steps"].is_i64(), "an int widened: {params}");
+            assert!(params["ratio"].is_f64(), "a number narrowed: {params}");
+        }
+        assert_eq!(
+            r.seen_inputs["check"],
+            vec!["fetch".to_string(), PARAMS_INPUT.to_string()],
+            "params sits beside the dependency's output"
+        );
+    }
+
+    #[test]
+    fn a_plan_without_parameters_gives_a_command_an_empty_params_object() {
+        let plan = valid(
+            vec![task("a", &[], "any", true), evaluate_task("b", &["a"])],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        run_plan(&plan, &mut r);
+
+        for consumer in ["a", "b"] {
+            assert_eq!(
+                params_of(&r.seen_values[consumer]),
+                Some(&serde_json::json!({})),
+                "{consumer}"
+            );
+        }
+    }
+
+    /// An agent's parameter values reach it only through the prompt regions that mark them as
+    /// outside text, so its inputs never carry them unmarked.
+    #[test]
+    fn an_agent_task_receives_no_params_input() {
+        let plan = with_params(vec![
+            task("fetch", &[], "any", true),
+            agent_task("summarize", &["fetch"]),
+        ]);
+        let mut r = ScriptRunner::new();
+        run_plan(&plan, &mut r);
+
+        assert_eq!(params_of(&r.seen_values["summarize"]), None);
+        assert_eq!(r.seen_inputs["summarize"], vec!["fetch".to_string()]);
+    }
+
+    /// A settled consumer's params is the reserved input, not a dependency entry wrapping it.
+    #[test]
+    fn a_settled_joins_params_is_not_wrapped_in_a_dependency_entry() {
+        let plan = with_params(vec![
+            task("probe", &[], "any", false),
+            joining(evaluate_task("verdict", &["probe"]), Join::Settled),
+        ]);
+        let mut r = ScriptRunner::new();
+        r.on("probe", 1, || AttemptOutcome::fail("no signal"), 0.1);
+        run_plan(&plan, &mut r);
+
+        let params = params_of(&r.seen_values["verdict"]);
+        assert_eq!(params.map(|p| &p["steps"]), Some(&serde_json::json!(3)));
+        assert!(
+            params.is_some_and(|p| p.get("status").is_none()),
+            "{params:?}"
+        );
+    }
+
+    #[test]
+    fn every_round_of_a_revise_loop_and_every_mapped_instance_reads_the_parameters() {
+        let plan = with_params(vec![
+            task("author", &[], "any", true),
+            reviewing("repro", &["author"], "author", 3),
+        ]);
+        let mut r = ScriptRunner::new();
+        r.rounds("author", &[drafted, drafted]);
+        r.rounds("repro", &[rejected, approved]);
+        run_plan(&plan, &mut r);
+
+        assert_eq!(r.runs.len(), 4, "{:?}", r.runs);
+        for (name, inputs) in &r.runs {
+            assert_eq!(
+                params_of(inputs).map(|p| &p["url"]),
+                Some(&serde_json::json!("https://example.test/a b")),
+                "{name}"
+            );
+        }
+
+        let plan = with_params(vec![
+            task("discover", &[], "any", true),
+            mapped_node("audit", "discover", "targets", true),
+        ]);
+        let mut runner = FanoutRunner::new(&["alpha", "beta"]);
+        execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut runner,
+            |_, _| {},
+        );
+        for instance in ["audit[alpha]", "audit[beta]"] {
+            assert_eq!(
+                params_of(&runner.seen_inputs[instance]).map(|p| &p["labels"]),
+                Some(&serde_json::json!(["ci", "flaky"])),
+                "{instance}"
+            );
         }
     }
 }

@@ -193,6 +193,7 @@ pub(crate) fn epilogue_template(workflow: &WorkflowCfg) -> Result<Option<ValidPl
         version: 1,
         reason: None,
         budget: PlanBudget { usd: f64::MAX },
+        params: workflow.params.clone(),
         tasks,
     }
     .validate()
@@ -1046,6 +1047,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
         version: 1,
         reason: None,
         budget: PlanBudget { usd: f64::MAX },
+        params: std::collections::BTreeMap::new(),
         tasks,
     }
     .validate()
