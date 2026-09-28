@@ -41,6 +41,42 @@ pub struct FeatureSpec {
     /// INTRO.md. `{pin.<name>}` resolves to the pin's effective version.
     #[serde(default)]
     pub intro: Option<String>,
+    /// BuildKit secrets the feature's install step reads at `/run/secrets/<id>`. The
+    /// build must supply each one (`--secret id=<id>,...`); none reaches a layer.
+    #[serde(default)]
+    pub secrets: Vec<BuildSecret>,
+}
+
+/// A BuildKit secret id: lowercase letters, digits, `-` and `_`, so it sits
+/// unquoted in a `RUN --mount` flag and a `/run/secrets` path.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub struct BuildSecret(String);
+
+#[derive(Debug, thiserror::Error)]
+#[error("build secret id {0:?} must be non-empty lowercase letters, digits, '-' or '_'")]
+pub struct BadBuildSecret(String);
+
+impl TryFrom<String> for BuildSecret {
+    type Error = BadBuildSecret;
+
+    fn try_from(id: String) -> Result<Self, Self::Error> {
+        let valid = !id.is_empty()
+            && id
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
+        if valid {
+            Ok(Self(id))
+        } else {
+            Err(BadBuildSecret(id))
+        }
+    }
+}
+
+impl BuildSecret {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -148,6 +184,9 @@ impl Feedstock {
                 }
             }
             let install = dir.join("install.sh").is_file();
+            if !install && !spec.secrets.is_empty() {
+                bail!("feature {name}: secrets are mounted for install.sh, which it does not have");
+            }
             features.insert(
                 name.clone(),
                 Feature {
@@ -553,6 +592,65 @@ mod tests {
     fn minor_truncates_to_two_components() {
         assert_eq!(minor("0.28.0"), "0.28");
         assert_eq!(minor("1.25"), "1.25");
+    }
+
+    fn secret_feedstock(
+        dir: &std::path::Path,
+        secrets: &str,
+        install: bool,
+    ) -> anyhow::Result<Feedstock> {
+        write_feature(dir, "base", "summary = \"s\"\nlayer = 0\n");
+        write_feature(
+            dir,
+            "private",
+            &format!("summary = \"p\"\nlayer = 40\nsecrets = {secrets}\n"),
+        );
+        if install {
+            fs::write(dir.join("features/private/install.sh"), "true\n").unwrap();
+        }
+        fs::write(
+            dir.join("matrix.toml"),
+            "schema = 1\n\n[[image]]\nname = \"p\"\nfeatures = [\"private\"]\n",
+        )
+        .unwrap();
+        Feedstock::load(dir)
+    }
+
+    #[test]
+    fn build_secret_ids_load_when_well_formed() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs_ = secret_feedstock(dir.path(), "[\"github_token\", \"a-1\"]", true).unwrap();
+        let ids: Vec<&str> = fs_.features["private"]
+            .spec
+            .secrets
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        assert_eq!(ids, ["github_token", "a-1"]);
+    }
+
+    #[test]
+    fn build_secret_ids_that_a_shell_or_flag_would_read_are_refused() {
+        for bad in [
+            "\"\"",
+            "\"GITHUB_TOKEN\"",
+            "\"a,src=/etc/passwd\"",
+            "\"a b\"",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let err = secret_feedstock(dir.path(), &format!("[{bad}]"), true).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("build secret id"),
+                "{bad}: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn secrets_on_a_feature_without_install_sh_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = secret_feedstock(dir.path(), "[\"github_token\"]", false).unwrap_err();
+        assert!(err.to_string().contains("does not have"), "{err:#}");
     }
 }
 
