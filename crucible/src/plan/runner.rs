@@ -101,11 +101,19 @@ impl ShellRunner {
                 }
             }
             TaskKind::Report {
-                template, result, ..
+                template,
+                result,
+                severity_field,
+                ..
             } => {
                 return match crucible_broker::report::deliver(
                     Some(template),
-                    result.as_ref().map(|name| name.0.as_str()),
+                    result
+                        .as_ref()
+                        .map(|name| crucible_broker::report::Selection {
+                            task: &name.0,
+                            severity_field: severity_field.as_ref().map(|field| field.0.as_str()),
+                        }),
                 ) {
                     Ok(output) => Attempt {
                         outcome: AttemptOutcome::Pass(
@@ -117,7 +125,7 @@ impl ShellRunner {
                         ),
                         cost_usd: 0.0,
                     },
-                    Err(error) => Attempt::failed(0.0, error),
+                    Err(error) => Attempt::failed(0.0, error.to_string()),
                 };
             }
             TaskKind::Route {

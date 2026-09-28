@@ -330,6 +330,45 @@ The workflow names a destination key, never a URL, channel or credential. `resul
 only that task's declared fields into the message. No agent can skip the call or write the
 payload.
 
+The template is a Jinja file in the pack, rendered into the card body. It reads:
+
+| Name | Value |
+| --- | --- |
+| `verdict` | `"pass"` when every settled task passed, otherwise `"fail"` |
+| `spent_usd` | total task cost |
+| `passed`, `failed` | settled task counts |
+| `tasks` | the first 20 settled tasks, each with `name`, `status`, `cost_usd` |
+| `run`, `run_url` | the run name and its Crucible link |
+| `result.name`, `result.status` | the selected task and its terminal status |
+| `result.output` | the selected task's declared fields, with their JSON types; defined only when it passed |
+
+A field the selected task did not declare is never defined, so guard optional reads with
+`is defined`. Every value the template inserts is escaped for Slack, `|safe` included: a result
+holding `<!channel>` renders as that literal text. A body over
+`CRUCIBLE_REPORT_BODY_MAX_BYTES` (default and maximum 3000) fails the report task.
+
+```jinja
+{% if result.output is defined %}{{ result.output.summary }}{% else %}roundup {{ result.status }}{% endif %}
+```
+
+`severity_field` names one declared field of `result` whose value picks the card's accent:
+
+```python
+publish = report(
+    name = "publish-report",
+    destination = {"kind": "slack"},
+    template = "reports/slack.md.j2",
+    result = roundup,
+    severity_field = "severity",
+)
+```
+
+`"good"`, `"warning"` and `"danger"` set that accent whatever the run's verdict; the card shows
+the verdict on its own line. Any other value is neutral, as is a selected task that was skipped
+or not taken. A selected task that failed, transport-failed or was blocked renders `"danger"`.
+The field only picks an accent, never a payload fragment. Naming it without `result`, or naming
+a field `result` does not declare in `emits`, is a compile error.
+
 ## Where to look next
 
 <div class="cru-grid">

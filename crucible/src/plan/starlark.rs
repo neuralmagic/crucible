@@ -614,7 +614,14 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
         ],
         "noul" => &["ask", "drop"],
         "choice" => &["ask", "options", "drop"],
-        "report" => &["name", "destination", "template", "result", "required"],
+        "report" => &[
+            "name",
+            "destination",
+            "template",
+            "result",
+            "severity_field",
+            "required",
+        ],
         "propose" => &["name", "session", "depends_on"],
         "apply" | "measure" => &["name", "depends_on"],
         "grade" => &["name", "score", "tiebreak", "evidence", "join"],
@@ -785,6 +792,8 @@ fn constructor(
                     state.context_mut().prompt_file(&path)?
                 },
                 result: take_optional_task_name(&mut named, "result")?,
+                severity_field: take_optional_string(&mut named, "severity_field")?
+                    .map(OutputField),
             },
             depends_on: Vec::new(),
             session: None,
@@ -2526,6 +2535,69 @@ workflow(type = "playbook", tasks = [work, publish])
         assert_eq!(publish.stage, Stage::Epilogue);
         assert!(publish.required);
         assert!(publish.depends_on.is_empty());
+        let _ = std::fs::remove_dir_all(pack);
+    }
+
+    #[test]
+    fn report_severity_field_must_name_a_declared_field_of_its_selected_result() {
+        let pack = temp_pack("report-severity");
+        std::fs::create_dir_all(pack.join("reports")).unwrap();
+        std::fs::write(pack.join("reports/slack.md.j2"), "{{ verdict }}").unwrap();
+        let workflow = |report_args: &str| {
+            format!(
+                r#"
+work = command(name = "work", run = "true", emits = ["severity", "summary"])
+publish = report(name = "publish-report", destination = {{"kind": "slack"}}, template = "reports/slack.md.j2", {report_args})
+workflow(type = "playbook", tasks = [work, publish])
+"#
+            )
+        };
+
+        let compiled = compile_source(
+            &workflow(r#"result = work, severity_field = "severity""#),
+            &pack.join("workflow.star"),
+            &pack,
+        )
+        .unwrap();
+        assert!(matches!(
+            &compiled.workflow.tasks[1].task,
+            TaskKind::Report {
+                severity_field: Some(field),
+                ..
+            } if field.0 == "severity"
+        ));
+
+        let error = crate::errors::report(
+            &compile_source(
+                &workflow(r#"severity_field = "severity""#),
+                &pack.join("workflow.star"),
+                &pack,
+            )
+            .unwrap_err(),
+        );
+        assert!(error.contains("selects no result task"), "{error}");
+
+        let error = crate::errors::report(
+            &compile_source(
+                &workflow(r#"result = work, severity_field = "colour""#),
+                &pack.join("workflow.star"),
+                &pack,
+            )
+            .unwrap_err(),
+        );
+        assert!(error.contains("\"colour\""), "{error}");
+        assert!(error.contains("does not declare"), "{error}");
+        assert!(error.contains("\"severity\""), "{error}");
+
+        let error = crate::errors::report(
+            &compile_source(
+                &workflow(r#"result = work, severity_field = 3"#),
+                &pack.join("workflow.star"),
+                &pack,
+            )
+            .unwrap_err(),
+        );
+        assert!(error.contains("severity_field"), "{error}");
         let _ = std::fs::remove_dir_all(pack);
     }
 

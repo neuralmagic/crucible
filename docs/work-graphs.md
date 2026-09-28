@@ -362,8 +362,9 @@ engine-known keys, not URLs or secret names; `slack` is the only destination in 
 The optional `result` selector projects only that main-graph task's declared JSON fields into an
 engine-built Block Kit card. It does not expose prompts, stdout, workspaces, undeclared fields, raw
 Slack blocks, channels, or credentials. Selected output defaults to a 16 KiB encoded limit; an
-operator may lower or raise it up to 64 KiB with `CRUCIBLE_REPORT_RESULT_MAX_BYTES`. Oversize data
-fails without truncation. A required report makes rendering or delivery failure fail the workflow;
+operator may lower or raise it up to 64 KiB with `CRUCIBLE_REPORT_RESULT_MAX_BYTES`. The rendered
+template body is bounded by `CRUCIBLE_REPORT_BODY_MAX_BYTES` (default and maximum 3000, Slack's
+section limit). Oversize data fails without truncation. A required report makes rendering or delivery failure fail the workflow;
 it does not rely on an agent remembering to call a tool.
 
 ## Worked example

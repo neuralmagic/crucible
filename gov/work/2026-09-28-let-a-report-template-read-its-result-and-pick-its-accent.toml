@@ -3,8 +3,10 @@
 [govctl]
 id = "WI-2026-09-28-002"
 title = "Let a report template read its result and pick its accent"
-status = "queue"
+status = "done"
 created = "2026-09-28"
+started = "2026-09-28"
+completed = "2026-09-28"
 refs = ["RFC-0002:C-REPORTS"]
 
 [content]
@@ -12,50 +14,50 @@ description = "`report()` templates see only run totals and task statuses, and e
 
 [[content.acceptance_criteria]]
 text = "a template renders fields of the selected task's declared output when it passed, and only its terminal status when it did not"
-status = "pending"
+status = "done"
 category = "added"
 
 [[content.acceptance_criteria]]
 text = "a template gets no value for a field the selected task did not declare"
-status = "pending"
+status = "done"
 category = "added"
 
 [[content.acceptance_criteria]]
 text = "every value a template inserts is escaped for Slack mrkdwn, so a result containing `<!channel>` or `<https://x|y>` renders as literal text"
-status = "pending"
+status = "done"
 category = "security"
 
 [[content.acceptance_criteria]]
 text = "a rendered body over the operator-configured size fails the report task with a note naming the limit, without truncation"
-status = "pending"
+status = "done"
 category = "added"
 
 [[content.acceptance_criteria]]
 text = '`severity_field` sets the card accent for "good", "warning", and "danger"; any other value, and a selected task that skipped or was not taken, renders neutral; a selected task that failed, transport-failed, or was blocked renders danger'
-status = "pending"
+status = "done"
 category = "added"
 
 [[content.acceptance_criteria]]
 text = "`severity_field` on a report with no `result`, or naming a field the selected task does not declare, is refused at compile time"
-status = "pending"
+status = "done"
 category = "added"
 
 [[content.acceptance_criteria]]
 text = "the DSL reference and the report section of playbook-patterns document the template context and `severity_field`"
-status = "pending"
+status = "done"
 category = "chore"
 
 [[content.acceptance_criteria]]
 text = "a template reads the run's verdict, its cost, and the bounded task status context the card carries"
-status = "pending"
+status = "done"
 category = "added"
 
 [[content.acceptance_criteria]]
 text = "`severity_field` selects the accent whatever the run's verdict"
-status = "pending"
+status = "done"
 category = "added"
 
 [[content.acceptance_criteria]]
 text = "a severity value such as `danger<!channel>` renders the card neutral and never reaches the payload"
-status = "pending"
+status = "done"
 category = "security"
