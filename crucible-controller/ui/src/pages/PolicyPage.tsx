@@ -1,9 +1,11 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { $api } from '../api/client';
 import { formatError } from '../api/errors';
 import { CodeDiff } from '../editor/CodeDiff';
-import { CodeSurface } from '../editor/CodeSurface';
+import { CodeSurface, type CodeMarker } from '../editor/CodeSurface';
+import { cedarCompletionSource, cedarVocabulary } from '../editor/cedarComplete';
+import type { CedarValidator } from '../editor/cedarWasm';
 import { viaLabel } from '../ownerContext';
 import {
   BareTextInput,
@@ -41,6 +43,7 @@ import {
   type PolicyRule,
   type PolicySetDto,
 } from './policyView';
+import { policyMarkers } from './policyCheck';
 
 function useActivate() {
   const qc = useQueryClient();
@@ -202,14 +205,53 @@ function ActiveSet({ active, rules, highlighted }: ActiveSetProps) {
   );
 }
 
+/// Early feedback only; the server validates every save, so a missing schema or validator yields no
+/// markers.
+function usePolicyCheck(text: string, schema: string | undefined): CodeMarker[] {
+  const [validator, setValidator] = useState<CedarValidator | null>(null);
+  const [markers, setMarkers] = useState<CodeMarker[]>([]);
+
+  useEffect(() => {
+    let live = true;
+    import('../editor/cedarWasm')
+      .then((module) => module.loadCedar())
+      .then((loaded) => {
+        if (live) setValidator(loaded);
+      })
+      .catch(() => undefined);
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (validator === null || schema === undefined) return;
+    const timer = setTimeout(() => {
+      setMarkers(policyMarkers(validator.validate(text, schema), text));
+    }, 250);
+    return () => {
+      clearTimeout(timer);
+    };
+  }, [validator, schema, text]);
+
+  return markers;
+}
+
 function Editor({ active }: { active: PolicySetDto }) {
   const qc = useQueryClient();
+  const schema = $api.useQuery('get', '/api/authz/schema', { parseAs: 'text' }, { staleTime: Infinity });
+  const actions = $api.useQuery('get', '/api/authz/actions');
   const create = $api.useMutation('post', '/api/authz/policy-sets');
   const [draft, setDraft] = useState<string | null>(null);
   const [saved, setSaved] = useState<PolicySetDto | null>(null);
   const [error, setError] = useState<string | null>(null);
   const text = draft ?? active.text;
   const dirty = text !== active.text;
+  const markers = usePolicyCheck(text, schema.data);
+  const completions = useMemo(
+    () => cedarCompletionSource(cedarVocabulary(actions.data ?? [], schema.data ?? '')),
+    [actions.data, schema.data],
+  );
 
   const save = async () => {
     setError(null);
@@ -247,6 +289,8 @@ function Editor({ active }: { active: PolicySetDto }) {
             path="policy/edit.cedar"
             value={text}
             onChange={setDraft}
+            markers={markers}
+            completions={completions}
             onSave={() => {
               if (dirty && !create.isPending) void save();
             }}
@@ -270,6 +314,11 @@ function Editor({ active }: { active: PolicySetDto }) {
           >
             {create.isPending ? 'SAVING…' : 'SAVE VERSION'}
           </Button>
+          {markers.length === 0 ? null : (
+            <span data-testid="policy-errors">
+              <Status status={`${markers.length} ${markers.length === 1 ? 'error' : 'errors'}`} tone="red" />
+            </span>
+          )}
         </FormActions>
       </Section>
       {saved === null ? null : (

@@ -453,6 +453,17 @@ permit(principal is UserPrincipal, action == Action::"autoresearch:access", reso
 when { principal.hasTag("team:platform-operators") };
 `;
 
+const POLICY_SCHEMA = `entity UserPrincipal { id: String, platform_admin: Bool, proves_groups: Bool } tags String;
+entity TeamPrincipal { id: String, platform_admin: Bool, proves_groups: Bool } tags String;
+entity RunPrincipal { id: String, platform_admin: Bool, proves_groups: Bool } tags String;
+entity Playbook { id: String, owner: String, owner_kind: String, owner_role?: String, share?: String, run?: String };
+entity Autoresearch { id: String, owner: String, owner_kind: String, owner_role?: String, share?: String, run?: String };
+action "access";
+action "launch";
+action "autoresearch:access" in [Action::"access"] appliesTo { principal: [UserPrincipal, TeamPrincipal, RunPrincipal], resource: [Autoresearch], context: { now: Long } };
+action "playbook:launch" in [Action::"launch"] appliesTo { principal: [UserPrincipal, TeamPrincipal, RunPrincipal], resource: [Playbook], context: { now: Long } };
+`;
+
 const POLICY_SETS = [
   {
     digest: 'a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0a1b2',
@@ -1023,6 +1034,9 @@ export async function stubApi(page: Page): Promise<void> {
       }
       if (path === '/api/teams/llm-d') {
         return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(team) });
+      }
+      if (path === '/api/authz/schema') {
+        return route.fulfill({ status: 200, contentType: 'text/plain; charset=utf-8', body: POLICY_SCHEMA });
       }
       if (path === '/api/authz/policy-sets' && route.request().method() === 'POST') {
         const sent: unknown = JSON.parse(route.request().postData() ?? '{}');
