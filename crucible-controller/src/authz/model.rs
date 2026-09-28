@@ -19,9 +19,6 @@ pub const PLATFORM_OPERATORS: &str = "platform-operators";
 /// The slug of the team whose members may publish drafts they own without review.
 pub const PLAYBOOK_PUBLISHERS: &str = "playbook-publishers";
 
-/// The slug of the team that owns the autoresearch lane: its members are entitled to it.
-pub const AUTORESEARCH: &str = "autoresearch";
-
 /// Who may own or act. Every spelling derives from something the controller verified: a login the
 /// bearer guard proved, a group in validated claims, a team in the controller's own membership
 /// records, or a run credential the controller minted.
@@ -201,10 +198,6 @@ impl TeamSlug {
 
     pub fn playbook_publishers() -> TeamSlug {
         TeamSlug(PLAYBOOK_PUBLISHERS.to_string())
-    }
-
-    pub fn autoresearch() -> TeamSlug {
-        TeamSlug(AUTORESEARCH.to_string())
     }
 }
 

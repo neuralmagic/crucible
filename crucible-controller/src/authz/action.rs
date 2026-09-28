@@ -30,7 +30,7 @@ pub enum ResourceType {
     UserPrefs,
     PolicySet,
     Team,
-    /// The autoresearch lane as a whole: holding `read` on it is the entitlement to see and use it.
+    /// The autoresearch lane as a whole: `autoresearch:access` is the entitlement to see and use it.
     Autoresearch,
 }
 
@@ -104,8 +104,12 @@ impl ResourceType {
         }
     }
 
-    /// The verbs the type defines: the six every type has, then the RFC's per-type additions.
+    /// The verbs the type defines: the six every type has, then the RFC's per-type additions. A
+    /// lane is not a record anyone creates or edits; its only verb is `access`.
     pub fn verbs(self) -> Vec<Verb> {
+        if self == ResourceType::Autoresearch {
+            return vec![Verb::Access];
+        }
         let mut verbs = vec![
             Verb::Read,
             Verb::Create,
@@ -156,6 +160,7 @@ pub enum Verb {
     Activate,
     ManageMembers,
     Impersonate,
+    Access,
 }
 
 wire_enum!(Verb, "action verb", both, {
@@ -174,6 +179,7 @@ wire_enum!(Verb, "action verb", both, {
     Verb::Activate => "activate",
     Verb::ManageMembers => "manage-members",
     Verb::Impersonate => "impersonate",
+    Verb::Access => "access",
 });
 
 /// One entry of the vocabulary: a verb the resource type defines.
@@ -246,11 +252,14 @@ impl serde::Serialize for Action {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::authz::action::*;
 
     #[test]
     fn every_type_defines_the_six_base_verbs_and_the_rfc_extras() {
-        for resource in ResourceType::ALL {
+        for resource in ResourceType::ALL
+            .into_iter()
+            .filter(|r| *r != ResourceType::Autoresearch)
+        {
             for verb in [
                 Verb::Read,
                 Verb::Create,
@@ -277,6 +286,8 @@ mod tests {
         assert!(ResourceType::Platform.defines(Verb::Impersonate));
         assert!(!ResourceType::Team.defines(Verb::Impersonate));
         assert!(!ResourceType::Secret.defines(Verb::Launch));
+        assert_eq!(ResourceType::Autoresearch.verbs(), vec![Verb::Access]);
+        assert!(!ResourceType::Playbook.defines(Verb::Access));
     }
 
     #[test]
@@ -301,7 +312,7 @@ mod tests {
             Err(ActionError::Malformed { .. })
         ));
         let all = Action::all();
-        assert_eq!(all.len(), 19 * 6 + 16);
+        assert_eq!(all.len(), 18 * 6 + 16 + 1);
         let mut sorted = all.clone();
         sorted.dedup();
         assert_eq!(sorted.len(), all.len());

@@ -10,6 +10,7 @@ pub mod bindings;
 pub mod bootstrap;
 pub mod decision;
 pub mod entitlement;
+pub mod explain;
 pub mod firing;
 pub mod granted;
 pub mod guard;

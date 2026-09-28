@@ -1066,17 +1066,6 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
             )
         }
     }
-    if cfg.autoresearch_enabled()
-        && let crucible_controller::authz::bootstrap::SeedOutcome::Seeded { added } =
-            crucible_controller::authz::bootstrap::seed_autoresearch(db.pool())
-                .await
-                .context("seeding the autoresearch team")?
-    {
-        tracing::info!(
-            added,
-            "autoresearch team seeded with the platform operators"
-        );
-    }
     match crucible_controller::authz::bootstrap::migrate_group_owners(db.pool()).await {
         Ok(0) => {}
         Ok(n) => tracing::info!(count = n, "group-owned resources moved to their teams"),

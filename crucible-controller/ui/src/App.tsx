@@ -39,6 +39,7 @@ import { TurnLivePage } from './pages/TurnLivePage';
 import { ActivityPage } from './pages/ActivityPage';
 import { LivePage } from './pages/LivePage';
 import { AdminPage } from './pages/AdminPage';
+import { PolicyPage } from './pages/PolicyPage';
 import { SecretsPage } from './pages/SecretsPage';
 import { ProvidersPage } from './pages/ProvidersPage';
 import { SettingsPage } from './pages/SettingsPage';
@@ -151,6 +152,8 @@ interface RailItem {
   count?: number;
   /// Shown only where the autoresearch lane runs.
   autoresearch?: boolean;
+  /// Shown only to platform administrators.
+  admin?: boolean;
 }
 
 interface RailSection {
@@ -158,7 +161,7 @@ interface RailSection {
   items: RailItem[];
 }
 
-function RailLink({ to, label, count }: Omit<RailItem, 'icon' | 'autoresearch'>) {
+function RailLink({ to, label, count }: Omit<RailItem, 'icon' | 'autoresearch' | 'admin'>) {
   return (
     <NavLink
       to={to}
@@ -181,7 +184,7 @@ function RailLink({ to, label, count }: Omit<RailItem, 'icon' | 'autoresearch'>)
   );
 }
 
-function RailIcon({ to, label, icon, count }: Omit<RailItem, 'autoresearch'>) {
+function RailIcon({ to, label, icon, count }: Omit<RailItem, 'autoresearch' | 'admin'>) {
   return (
     <Tooltip side="right" delay={120} content={count === undefined ? label : `${label} · ${count}`}>
       <NavLink
@@ -297,11 +300,16 @@ function CategoryRail({ collapsed, onToggle }: CategoryRailProps) {
         { to: '/providers', label: 'Providers', icon: 'PV' },
         { to: '/settings', label: 'Settings', icon: 'ST' },
         { to: '/admin', label: 'Admin', icon: 'AD' },
+        { to: '/policy', label: 'Policy', icon: 'PO', admin: true },
       ],
     },
   ];
+  const admin = whoami.data?.role === 'admin';
   const sections = allSections
-    .map((section) => ({ ...section, items: section.items.filter((item) => autoresearch || !item.autoresearch) }))
+    .map((section) => ({
+      ...section,
+      items: section.items.filter((item) => (autoresearch || !item.autoresearch) && (admin || !item.admin)),
+    }))
     .filter((section) => section.items.length > 0);
 
   return (
@@ -428,6 +436,7 @@ export function App() {
             <Route path="/teams" element={<TeamsPage />} />
             <Route path="/teams/:slug" element={<TeamDetailPage />} />
             <Route path="/admin" element={<AdminPage />} />
+            <Route path="/policy" element={<PolicyPage />} />
             <Route
               path="/explore"
               element={

@@ -1,12 +1,12 @@
-//! Lanes a caller is entitled to see and use. A lane is one resource owned by its team, so the
-//! policy decides the entitlement like any other read: the team's members hold it, platform
-//! administrators hold everything, and a policy set may grant it to anyone else.
+//! Lanes a caller is entitled to see and use. Each lane is one platform resource and holding it is
+//! one action, `<lane>:access`, so who holds a lane is whatever the active policy set says: the
+//! shipped default grants platform administrators and operators, and a rule over `group:`,
+//! `user:` or `team:` tags grants anyone else.
 
 use crate::api::state::ApiState;
 use crate::authz::Caller;
 use crate::authz::action::ResourceType;
 use crate::authz::decision::Resource;
-use crate::authz::model::{Principal, TeamSlug};
 
 /// A lane the caller may use, as `/api/whoami` reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
@@ -15,16 +15,12 @@ pub enum Entitlement {
     Autoresearch,
 }
 
-/// The autoresearch lane, owned by the `autoresearch` team.
+/// The autoresearch lane, as the policy decides on it.
 pub fn autoresearch_lane() -> Resource {
-    Resource::new(
-        ResourceType::Autoresearch,
-        "autoresearch",
-        Principal::team(&TeamSlug::autoresearch()),
-    )
+    Resource::platform(ResourceType::Autoresearch, "autoresearch")
 }
 
-/// Whether the deployment runs the autoresearch lane and `caller` may read it. A controller with
+/// Whether the deployment runs the autoresearch lane and `caller` may access it. A controller with
 /// its guard off has no one to tell apart, so its loopback caller holds every lane.
 #[cfg(feature = "autoresearch")]
 pub fn autoresearch(state: &ApiState, caller: &Caller) -> bool {
@@ -33,7 +29,7 @@ pub fn autoresearch(state: &ApiState, caller: &Caller) -> bool {
             || crate::authz::owner::may(
                 state,
                 caller,
-                crate::authz::action::Verb::Read,
+                crate::authz::action::Verb::Access,
                 &autoresearch_lane(),
             ))
 }

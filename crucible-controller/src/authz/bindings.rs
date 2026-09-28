@@ -65,6 +65,13 @@ pub static BINDINGS: &[Binding] = &[
         Platform,
     ),
     bind("DELETE", "/api/impersonation", R::Platform, V::Read, Route),
+    bind(
+        "GET",
+        "/api/authz/explain",
+        R::Platform,
+        V::Impersonate,
+        Platform,
+    ),
     bind("GET", "/api/access", R::Platform, V::Read, Route),
     bind("GET", "/api/overview", R::Platform, V::Read, Route),
     bind("GET", "/api/funnel", R::Platform, V::Read, Route),
