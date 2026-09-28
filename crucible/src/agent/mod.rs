@@ -148,6 +148,7 @@ fn command_backend(
         // local backend uses. Without these a `command` pack's declared env silently vanished.
         .envs(args.env.iter().map(|(k, v)| (k, v)))
         .envs(extra_env.iter().map(|(k, v)| (k, v)))
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(session) = session {
@@ -192,6 +193,7 @@ fn local_command(
     let mut cmd = Command::new(program);
     cmd.args(rest)
         .current_dir(&p.workspace)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // This local child inherits the engine's process env wholesale (Command's default), which under
@@ -570,6 +572,57 @@ mod tests {
             lines.iter().any(|l| l == "started"),
             "output before the kill is kept"
         );
+    }
+
+    /// Under a deadline the turn runs in its own, background process group, where a read from
+    /// the terminal would stop it until the deadline. Its stdin is /dev/null instead. The probe
+    /// reruns in a test process whose own stdin is a pipe, so an inherited stdin cannot pass.
+    #[test]
+    fn a_turn_reads_stdin_from_dev_null() {
+        let exe = std::env::current_exe().expect("the test binary");
+        let mut probe = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "agent::tests::stdin_probe",
+                "--ignored",
+                "--nocapture",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn the probe");
+        let status = probe.wait().expect("the probe ran");
+        assert!(status.success(), "the turn saw an inherited stdin");
+    }
+
+    #[test]
+    #[ignore = "run by a_turn_reads_stdin_from_dev_null with a pipe as stdin"]
+    fn stdin_probe() {
+        let a = args(&[]);
+        let p = workspace("stdin");
+        let deadline = crucible::deadline::Deadline::for_attempt(
+            std::time::Instant::now(),
+            Some("30s".parse().unwrap()),
+            None,
+        );
+        let mut lines = Vec::new();
+        let outcome = run_turn_with(
+            &AgentSource::Command(
+                r#"python3 -c 'import os; print("null" if os.fstat(0).st_rdev == os.stat("/dev/null").st_rdev else "other")'"#
+                    .to_string(),
+            ),
+            &a,
+            &p,
+            "prompt",
+            false,
+            None,
+            deadline,
+            |line, _s, _ev| lines.push(line.to_string()),
+        );
+        let _ = std::fs::remove_dir_all(&p.workspace);
+        assert_eq!(outcome.failure(), None);
+        assert!(lines.iter().any(|l| l == "null"), "{lines:?}");
     }
 
     #[test]
