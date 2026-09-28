@@ -3,9 +3,13 @@
 [govctl]
 id = "ADR-0052"
 title = "Run history is a controller-supplied view of a launch series"
-status = "proposed"
+status = "accepted"
 date = "2026-09-28"
-refs = ["RFC-0002:C-RUN-HISTORY", "ADR-0027", "ADR-0037"]
+refs = [
+    "RFC-0002:C-RUN-HISTORY",
+    "ADR-0027",
+    "ADR-0037",
+]
 
 [content]
 context = """

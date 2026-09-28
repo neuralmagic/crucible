@@ -3,9 +3,13 @@
 [govctl]
 id = "ADR-0051"
 title = "Refresh minted GitHub tokens in place for runs that outlive them"
-status = "proposed"
+status = "accepted"
 date = "2026-09-28"
-refs = ["ADR-0028", "ADR-0036", "RFC-0002:C-PLAYBOOK-BUDGET"]
+refs = [
+    "ADR-0028",
+    "ADR-0036",
+    "RFC-0002:C-PLAYBOOK-BUDGET",
+]
 
 [content]
 context = """
