@@ -99,11 +99,7 @@ pub(crate) async fn whoami(
     auth_path: crate::identity::auth::AuthPath,
     caller: crate::authz::Caller,
 ) -> Json<Whoami> {
-    let role = if auth_path.holds_roles() {
-        state.roles.role(&identity, &groups)
-    } else {
-        crate::identity::auth::Role::Viewer
-    };
+    let role = caller.role();
     let teams = caller
         .principals
         .teams()

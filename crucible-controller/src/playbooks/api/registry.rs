@@ -353,7 +353,7 @@ pub struct PlaybookDetailDto {
     request_body = RegisterPlaybookBody,
     responses(
         (status = 201, description = "Playbook registered (or re-pinned)", body = RegisterAck),
-        (status = 403, description = "Caller is not in the admin whitelist", body = ErrorBody),
+        (status = 403, description = "Caller is not a platform administrator", body = ErrorBody),
         (status = 409, description = "The ref moved since the preview this registration quotes, or a live draft holds the id", body = ErrorBody),
         (status = 422, description = "Bad id/description/ref/path, or the pack's workflow source did not compile", body = ErrorBody),
         (status = 502, description = "Cloning the pack repo failed", body = ErrorBody)
@@ -362,7 +362,7 @@ pub struct PlaybookDetailDto {
 pub(crate) async fn register_playbook(
     State(state): State<ApiState>,
     identity: crate::identity::session::Identity,
-    _admin: crate::identity::auth::AdminGuard,
+    _admin: crate::authz::guard::AdminGuard,
     caller: crate::authz::Caller,
     Json(body): Json<RegisterPlaybookBody>,
 ) -> Response {

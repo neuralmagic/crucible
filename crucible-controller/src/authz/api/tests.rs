@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::api::router;
-use crate::authz::model::PLATFORM_ADMINISTRATORS;
+use crate::authz::model::{PLATFORM_ADMINISTRATORS, PLATFORM_OPERATORS};
 use crate::client::Db;
 use crate::daemon::queue::{Override, OverrideSink};
 use crate::testing::call;
@@ -659,12 +659,20 @@ async fn a_platform_mutation_is_decided_before_the_handler_and_a_denial_is_audit
     assert_eq!(trail.len(), 3, "one row per denied mutation");
 }
 
-/// Team membership alone reaches the decision but not the guard it still sits beside: both must
-/// allow during the migration (RFC-0003 C-COMPATIBILITY).
+/// The admin role is read from the platform administrators team, so an owner added through the
+/// teams API holds it exactly like one named in `CONTROLLER_ADMINS`.
 #[sqlx::test(migrator = "crate::MIGRATOR")]
-async fn a_team_administrator_passes_the_decision_but_not_the_legacy_guard(pool: PgPool) {
+async fn a_platform_administrators_owner_added_through_the_teams_api_holds_the_admin_role(
+    pool: PgPool,
+) {
     let app = app_with_roles(pool.clone(), &["root"], &[]);
     seed_admin(&pool, "root").await;
+    let (status, body) = call(
+        &app,
+        as_user("POST", "/api/reconcile", Some("alice"), &[], None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     let (status, body) = call(
         &app,
         as_user(
@@ -685,26 +693,75 @@ async fn a_team_administrator_passes_the_decision_but_not_the_legacy_guard(pool:
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["teams"][0]["team"], PLATFORM_ADMINISTRATORS);
     assert_eq!(body["teams"][0]["role"], "owner");
-    assert_eq!(
-        body["role"], "viewer",
-        "the legacy role ladder does not read the team"
-    );
+    assert_eq!(body["role"], "admin");
+    assert_eq!(body["admin"], true);
     let (status, body) = call(
         &app,
         as_user("POST", "/api/reconcile", Some("alice"), &[], None),
     )
     .await;
+    assert_ne!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+/// A platform operators member holds the operator role without being on an env list, and it
+/// still is not admin.
+#[sqlx::test(migrator = "crate::MIGRATOR")]
+async fn a_platform_operators_member_added_through_the_teams_api_holds_the_operator_role(
+    pool: PgPool,
+) {
+    let app = app_with_roles(pool.clone(), &["root"], &[]);
+    seed_admin(&pool, "root").await;
+    crate::authz::bootstrap::seed_platform_operators(&pool, &["root".to_string()], &[])
+        .await
+        .expect("seed");
+    let (status, body) = call(
+        &app,
+        as_user(
+            "PUT",
+            &format!("/api/teams/{PLATFORM_OPERATORS}/members"),
+            Some("root"),
+            &[],
+            Some(json!({"members": [member("user", "root", "owner"), member("user", "bob", "member")]})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, body) = call(&app, as_user("GET", "/api/whoami", Some("bob"), &[], None)).await;
+    assert_eq!(body["role"], "operator");
+    let (status, body) = call(
+        &app,
+        as_user(
+            "POST",
+            "/api/playbooks/import/candidates",
+            Some("bob"),
+            &[],
+            Some(json!({})),
+        ),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the operator guard admits bob: {body}"
+    );
+    let (status, body) = call(
+        &app,
+        as_user(
+            "POST",
+            "/api/playbooks",
+            Some("bob"),
+            &[],
+            Some(json!({"id": "x", "repo": "o/r", "path": "p"})),
+        ),
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert!(
-        body["error"].as_str().expect("error").contains("whitelist"),
-        "the guard refused, not the decision: {body}"
-    );
-    assert!(
-        crate::authz::store::audit_for(&pool, "platform", "/api/reconcile", 10)
-            .await
-            .expect("trail")
-            .is_empty(),
-        "the decision allowed, so nothing was audited"
+        body["error"]
+            .as_str()
+            .expect("error")
+            .contains("is not a platform administrator"),
+        "{body}"
     );
 }
 
@@ -853,8 +910,8 @@ async fn a_policy_set_is_validated_stored_and_activated_with_an_audit_row(pool: 
     );
     assert_eq!(trail[0].result.as_ref().expect("result")["digest"], digest);
 
-    // The new set decides from now on: zed's platform:update passes the decision, and only the
-    // legacy guard still refuses (both must allow).
+    // The new set decides from now on: zed's platform:update passes the decision, and the guard
+    // still refuses because zed is not a platform administrator (both must allow).
     let (status, body) = call(
         &app,
         as_user("POST", "/api/reconcile", Some("zed"), &[], None),
@@ -862,7 +919,10 @@ async fn a_policy_set_is_validated_stored_and_activated_with_an_audit_row(pool: 
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert!(
-        body["error"].as_str().expect("error").contains("whitelist"),
+        body["error"]
+            .as_str()
+            .expect("error")
+            .contains("is not a platform administrator"),
         "{body}"
     );
     let (status, body) = call(

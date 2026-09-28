@@ -23,7 +23,7 @@ pub(crate) struct ReconcileAck {
 pub(crate) async fn trigger_reconcile(
     State(state): State<ApiState>,
     identity: crate::identity::session::Identity,
-    _admin: crate::identity::auth::AdminGuard,
+    _admin: crate::authz::guard::AdminGuard,
 ) -> Result<Response, AppError> {
     state.reconcile_now.notify_one();
     // One line on the synthetic `reconcile` key (the `rerank`/`autopilot` keys' precedent).

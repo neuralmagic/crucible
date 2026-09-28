@@ -340,6 +340,8 @@ function DetailSection({ provider, onClose }: { provider: ProviderDetailDto; onC
   const [form, setForm] = useState<ProviderForm>(() => formOf(provider));
   const [error, setError] = useState<string | null>(null);
   const errors = providerErrors(form, true);
+  const mayUpdate = provider.actions.includes('update');
+  const mayDelete = provider.actions.includes('delete');
 
   const refresh = async () => {
     await qc.invalidateQueries({ queryKey: PROVIDERS_KEY });
@@ -378,34 +380,40 @@ function DetailSection({ provider, onClose }: { provider: ProviderDetailDto; onC
         note={`registered by ${provider.created_by} · updated ${provider.updated_at}`}
         actions={<Button onClick={onClose}>CLOSE</Button>}
       />
-      <SectionBody>
-        <ProviderFormFields idPrefix={`edit-${provider.id}`} form={form} editing onChange={setForm} />
-      </SectionBody>
+      {mayUpdate ? (
+        <SectionBody>
+          <ProviderFormFields idPrefix={`edit-${provider.id}`} form={form} editing onChange={setForm} />
+        </SectionBody>
+      ) : null}
       {error === null ? null : (
         <SectionBody>
           <FormError>{error}</FormError>
         </SectionBody>
       )}
-      <FormActions>
-        <Button
-          variant="filled"
-          disabled={errors.size > 0 || update.isPending}
-          onClick={() => { void save(); }}
-        >
-          {update.isPending ? 'SAVING…' : 'SAVE'}
-        </Button>
-        <Button disabled={remove.isPending} onClick={() => { void deregister(); }}>
-          {remove.isPending ? 'DEREGISTERING…' : 'DEREGISTER'}
-        </Button>
-      </FormActions>
+      {mayUpdate || mayDelete ? (
+        <FormActions>
+          {mayUpdate ? (
+            <Button
+              variant="filled"
+              disabled={errors.size > 0 || update.isPending}
+              onClick={() => { void save(); }}
+            >
+              {update.isPending ? 'SAVING…' : 'SAVE'}
+            </Button>
+          ) : null}
+          {mayDelete ? (
+            <Button disabled={remove.isPending} onClick={() => { void deregister(); }}>
+              {remove.isPending ? 'DEREGISTERING…' : 'DEREGISTER'}
+            </Button>
+          ) : null}
+        </FormActions>
+      ) : null}
     </Section>
   );
 }
 
 export function ProvidersPage() {
-  const whoami = $api.useQuery('get', '/api/whoami');
-  const admin = whoami.data?.role === 'admin';
-  const providers = $api.useQuery('get', '/api/providers', undefined, { enabled: admin });
+  const providers = $api.useQuery('get', '/api/providers');
   const ownerContext = useOwnerContext();
   const [open, setOpen] = useState<string | null>(null);
   const rows = narrow(providers.data ?? [], ownerContext.context, (p) => p.owner);
@@ -414,16 +422,7 @@ export function ProvidersPage() {
   return (
     <div className="grid gap-3">
       <PageHeader eyebrow="System" title="Providers" />
-      {!admin ? (
-        <Section>
-          <SectionBody>
-            <Empty
-              title="ADMINS ONLY"
-              description="The provider registry decides where every launch can send work and which key pays for it."
-            />
-          </SectionBody>
-        </Section>
-      ) : providers.isLoading ? (
+      {providers.isLoading ? (
         <LoadingBlock />
       ) : (
         <>
@@ -437,7 +436,9 @@ export function ProvidersPage() {
           {selected === null ? null : (
             <>
               <DetailSection key={selected.id} provider={selected} onClose={() => { setOpen(null); }} />
-              <SharesSection path="/api/providers/{id}" id={selected.id} />
+              {selected.actions.includes('share') ? (
+                <SharesSection path="/api/providers/{id}" id={selected.id} />
+              ) : null}
             </>
           )}
           <RegisterSection />

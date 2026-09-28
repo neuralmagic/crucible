@@ -87,6 +87,47 @@ async fn readable_providers(
     .await
 }
 
+/// A registration spends its secret on every dispatch, so naming one needs `bind` on it.
+#[allow(clippy::result_large_err)]
+async fn may_spend(
+    state: &ApiState,
+    caller: &crate::authz::Caller,
+    secret: &crate::playbooks::providers::ProviderSecretRef,
+) -> Result<(), Response> {
+    let name = crate::secrets::SecretName::parse(&secret.name).map_err(|e| {
+        unprocessable(format!(
+            "secret_name {:?} is not a secret name: {e}",
+            secret.name
+        ))
+    })?;
+    let row = crate::secrets::store::find_owned(state.db.pool(), &secret.owner, &name)
+        .await
+        .map_err(|e| AppError::from(e).into_response())?
+        .ok_or_else(|| {
+            unprocessable(format!(
+                "secret_name {name} names no secret owned by {}",
+                secret.owner
+            ))
+        })?;
+    let resource = crate::authz::decision::Resource::new(
+        crate::authz::action::ResourceType::Secret,
+        &row.id,
+        row.owner.clone(),
+    );
+    crate::authz::owner::decide(
+        state,
+        caller,
+        crate::authz::action::Action {
+            resource: crate::authz::action::ResourceType::Secret,
+            verb: crate::authz::action::Verb::Bind,
+        },
+        &resource,
+    )
+    .await
+    .map(|_| ())
+    .map_err(IntoResponse::into_response)
+}
+
 /// The enabled providers `caller` may read: what a launch form offers and what a launch may pin.
 async fn launchable(
     state: &ApiState,
@@ -150,7 +191,36 @@ dto! {
         pub created_by: String,
         pub created_at: String,
         pub updated_at: String,
+        /// The verbs the caller holds on this registration.
+        pub actions: Vec<crate::authz::action::Verb> = Vec::new(),
     }
+}
+
+impl ProviderDetailDto {
+    fn with_actions(provider: ModelProvider, actions: Vec<crate::authz::action::Verb>) -> Self {
+        ProviderDetailDto {
+            actions,
+            ..ProviderDetailDto::from(provider)
+        }
+    }
+}
+
+/// [`ProviderDetailDto`] for a registration the caller just wrote.
+#[allow(clippy::result_large_err)]
+async fn detail_for(
+    state: &ApiState,
+    caller: &crate::authz::Caller,
+    provider: ModelProvider,
+) -> Result<ProviderDetailDto, Response> {
+    let resource = crate::authz::decision::Resource::new(
+        crate::authz::action::ResourceType::ModelProvider,
+        &provider.id,
+        provider.owner.clone(),
+    );
+    crate::authz::owner::actions_on(state, caller, resource)
+        .await
+        .map(|actions| ProviderDetailDto::with_actions(provider, actions))
+        .map_err(|e| AppError::from(e).into_response())
 }
 
 /// Everything about a registration except its id, which a POST carries in the body and a PUT in
@@ -544,23 +614,35 @@ async fn readable_provider(
     get,
     path = "/api/providers",
     responses(
-        (status = 200, description = "Every registration, disabled ones included", body = Vec<ProviderDetailDto>),
-        (status = 403, description = "Caller is not an admin", body = ErrorBody)
+        (status = 200, description = "Every registration the caller may read, disabled ones included", body = Vec<ProviderDetailDto>)
     )
 )]
 pub(crate) async fn list_providers(
     State(state): State<ApiState>,
-    _admin: crate::identity::auth::AdminGuard,
     caller: crate::authz::Caller,
 ) -> Response {
     let rows = match crate::playbooks::providers::list(state.db.pool(), false).await {
         Ok(rows) => rows,
         Err(e) => return AppError::from(e).into_response(),
     };
-    match readable_providers(&state, &caller, rows).await {
+    let rows = crate::authz::owner::readable_with_actions(
+        &state,
+        &caller,
+        crate::authz::action::ResourceType::ModelProvider,
+        rows,
+        |r| {
+            crate::authz::decision::Resource::new(
+                crate::authz::action::ResourceType::ModelProvider,
+                &r.id,
+                r.owner.clone(),
+            )
+        },
+    )
+    .await;
+    match rows {
         Ok(rows) => Json(
             rows.into_iter()
-                .map(ProviderDetailDto::from)
+                .map(|(row, actions)| ProviderDetailDto::with_actions(row, actions))
                 .collect::<Vec<_>>(),
         )
         .into_response(),
@@ -574,7 +656,7 @@ pub(crate) async fn list_providers(
     request_body = RegisterProviderBody,
     responses(
         (status = 201, description = "Provider registered", body = ProviderDetailDto),
-        (status = 403, description = "Caller is not an admin", body = ErrorBody),
+        (status = 403, description = "The caller may not create a provider for that owner, or may not bind the named secret", body = ErrorBody),
         (status = 409, description = "A provider is already registered under that id", body = ErrorBody),
         (status = 422, description = "The id, the model list, or the named secret was refused", body = ErrorBody)
     )
@@ -582,7 +664,6 @@ pub(crate) async fn list_providers(
 pub(crate) async fn register_provider(
     State(state): State<ApiState>,
     identity: crate::identity::session::Identity,
-    _admin: crate::identity::auth::AdminGuard,
     caller: crate::authz::Caller,
     Json(body): Json<RegisterProviderBody>,
 ) -> Response {
@@ -595,6 +676,11 @@ pub(crate) async fn register_provider(
         Ok(Err(msg)) => return unprocessable(msg),
         Err(e) => return e.into_response(),
     };
+    if let Some(secret) = &checked.secret
+        && let Err(refused) = may_spend(&state, &caller, secret).await
+    {
+        return refused;
+    }
     let actor = identity.as_deref().unwrap_or("unknown");
     let owner = match crate::authz::owner::owner_for_create(
         &state,
@@ -647,7 +733,10 @@ pub(crate) async fn register_provider(
             "register_provider",
         )
         .await;
-    (StatusCode::CREATED, Json(ProviderDetailDto::from(stored))).into_response()
+    match detail_for(&state, &caller, stored).await {
+        Ok(dto) => (StatusCode::CREATED, Json(dto)).into_response(),
+        Err(refused) => refused,
+    }
 }
 
 #[utoipa::path(
@@ -657,7 +746,7 @@ pub(crate) async fn register_provider(
     request_body = ProviderBody,
     responses(
         (status = 200, description = "Registration replaced", body = ProviderDetailDto),
-        (status = 403, description = "Caller is not an admin", body = ErrorBody),
+        (status = 403, description = "The caller may not update this provider, or may not bind the named secret", body = ErrorBody),
         (status = 404, description = "No provider with that id", body = ErrorBody),
         (status = 422, description = "The model list or the named secret was refused", body = ErrorBody)
     )
@@ -666,7 +755,6 @@ pub(crate) async fn update_provider(
     State(state): State<ApiState>,
     Path(id): Path<String>,
     identity: crate::identity::session::Identity,
-    _admin: crate::identity::auth::AdminGuard,
     caller: crate::authz::Caller,
     Json(body): Json<ProviderBody>,
 ) -> Response {
@@ -680,6 +768,12 @@ pub(crate) async fn update_provider(
         Ok(Err(msg)) => return unprocessable(msg),
         Err(e) => return e.into_response(),
     };
+    if let Some(secret) = &checked.secret
+        && existing.secret.as_ref() != Some(secret)
+        && let Err(refused) = may_spend(&state, &caller, secret).await
+    {
+        return refused;
+    }
     let actor = identity.as_deref().unwrap_or("unknown");
     // The registration keeps whoever created it: an edit is not a change of authorship.
     let stored = match store_provider(
@@ -714,7 +808,10 @@ pub(crate) async fn update_provider(
             "update_provider",
         )
         .await;
-    Json(ProviderDetailDto::from(stored)).into_response()
+    match detail_for(&state, &caller, stored).await {
+        Ok(dto) => Json(dto).into_response(),
+        Err(refused) => refused,
+    }
 }
 
 #[utoipa::path(
@@ -723,7 +820,7 @@ pub(crate) async fn update_provider(
     params(("id" = String, Path, description = "Provider slug")),
     responses(
         (status = 204, description = "Deregistered, along with every default naming it"),
-        (status = 403, description = "Caller is not an admin", body = ErrorBody),
+        (status = 403, description = "The caller may not delete this provider", body = ErrorBody),
         (status = 404, description = "No provider with that id", body = ErrorBody),
         (status = 409, description = "Issues or schedules still pin it", body = ErrorBody)
     )
@@ -732,7 +829,6 @@ pub(crate) async fn delete_provider(
     State(state): State<ApiState>,
     Path(id): Path<String>,
     identity: crate::identity::session::Identity,
-    _admin: crate::identity::auth::AdminGuard,
     caller: crate::authz::Caller,
 ) -> Response {
     if let Err(refused) =
@@ -876,7 +972,7 @@ fn require_scope_ref(scope_kind: DefaultScope, scope_ref: Option<&str>) -> Resul
 pub(crate) async fn put_dispatch_default(
     State(state): State<ApiState>,
     identity: crate::identity::session::Identity,
-    _admin: crate::identity::auth::AdminGuard,
+    _admin: crate::authz::guard::AdminGuard,
     Json(body): Json<DispatchDefaultBody>,
 ) -> Response {
     let scope_ref = match require_scope_ref(body.scope_kind, body.scope_ref.as_deref()) {
@@ -957,7 +1053,7 @@ pub(crate) async fn put_dispatch_default(
 pub(crate) async fn delete_dispatch_default(
     State(state): State<ApiState>,
     identity: crate::identity::session::Identity,
-    _admin: crate::identity::auth::AdminGuard,
+    _admin: crate::authz::guard::AdminGuard,
     Query(q): Query<DispatchDefaultQuery>,
 ) -> Response {
     let scope_kind = match DefaultScope::parse(&q.scope_kind) {

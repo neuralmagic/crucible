@@ -26,7 +26,7 @@
 
 #![allow(clippy::disallowed_macros)]
 
-use axum::extract::{FromRef, FromRequestParts, Request, State};
+use axum::extract::{FromRequestParts, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header, request::Parts};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
@@ -1011,13 +1011,9 @@ impl Roles {
             .any(|cfg| cfg == asserted || cfg == tail)
     }
 
-    fn is_admin(&self, identity: &Identity) -> bool {
-        // Admin never comes from a group, so no Groups needed on this path.
-        self.role(identity, &Groups(Vec::new())) == Role::Admin
-    }
-
     /// The admin login whitelist (normalized: trimmed, lowercased, de-blanked). Read-only view for
-    /// the `/admin` access panel (`GET /api/access`) — the guards decide with `is_admin`, not this.
+    /// the `/admin` access panel (`GET /api/access`); the guards decide from platform team
+    /// membership, not this.
     pub(crate) fn admins(&self) -> &[String] {
         &self.admins
     }
@@ -1025,70 +1021,6 @@ impl Roles {
     /// The operator login whitelist (normalized). Same read-only-projection role as [`Roles::admins`].
     pub(crate) fn operators(&self) -> &[String] {
         &self.operators
-    }
-
-    fn is_operator(&self, identity: &Identity, groups: &Groups) -> bool {
-        matches!(self.role(identity, groups), Role::Admin | Role::Operator)
-    }
-}
-
-fn forbidden(who: &str, tier: &str) -> Response {
-    let body = serde_json::json!({
-        "error": format!("{who} is not in the {tier} whitelist")
-    });
-    (
-        StatusCode::FORBIDDEN,
-        [(header::CONTENT_TYPE, "application/json")],
-        serde_json::to_string(&body).unwrap_or_default(),
-    )
-        .into_response()
-}
-
-/// An axum extractor that asserts the caller is an admin. 403 with JSON body when not. Pair with
-/// `Roles` in state; any route that extracts `AdminGuard` is admin-gated. Money + config routes
-/// (ScopeNow, the autopilot kill switch) stay admin-only.
-pub struct AdminGuard;
-
-impl<S: Send + Sync> FromRequestParts<S> for AdminGuard
-where
-    Roles: FromRef<S>,
-{
-    type Rejection = Response;
-
-    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let Ok(identity) = Identity::from_request_parts(parts, state).await;
-        let Ok(path) = AuthPath::from_request_parts(parts, state).await;
-        let roles = Roles::from_ref(state);
-        if path.holds_roles() && roles.is_admin(&identity) {
-            Ok(AdminGuard)
-        } else {
-            let who = identity.as_deref().unwrap_or("anonymous");
-            Err(forbidden(who, "admin"))
-        }
-    }
-}
-
-/// An axum extractor that asserts the caller is an operator or an admin. 403 with JSON body when
-/// not. Pair with `Roles` in state; curation routes (park/unpark/bump) are operator-gated.
-pub struct OperatorGuard;
-
-impl<S: Send + Sync> FromRequestParts<S> for OperatorGuard
-where
-    Roles: FromRef<S>,
-{
-    type Rejection = Response;
-
-    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let Ok(identity) = Identity::from_request_parts(parts, state).await;
-        let Ok(groups) = Groups::from_request_parts(parts, state).await;
-        let Ok(path) = AuthPath::from_request_parts(parts, state).await;
-        let roles = Roles::from_ref(state);
-        if path.holds_roles() && roles.is_operator(&identity, &groups) {
-            Ok(OperatorGuard)
-        } else {
-            let who = identity.as_deref().unwrap_or("anonymous");
-            Err(forbidden(who, "operator"))
-        }
     }
 }
 
@@ -1202,21 +1134,12 @@ mod tests {
     }
 
     #[test]
-    fn admin_implies_operator() {
-        let roles = Roles::new(vec!["alice".to_string()], vec![], vec![]);
-        assert!(roles.is_operator(&identity("alice"), &Groups(Vec::new())));
-        assert!(roles.is_admin(&identity("alice")));
-    }
-
-    #[test]
     fn operator_is_not_admin() {
         let roles = Roles::new(vec![], vec!["bob".to_string()], vec![]);
         assert_eq!(
             roles.role(&identity("bob"), &Groups(Vec::new())),
             Role::Operator
         );
-        assert!(roles.is_operator(&identity("bob"), &Groups(Vec::new())));
-        assert!(!roles.is_admin(&identity("bob")));
     }
 
     #[test]
@@ -1239,8 +1162,6 @@ mod tests {
             roles.role(&identity("alice"), &Groups(Vec::new())),
             Role::Viewer
         );
-        assert!(!roles.is_admin(&identity("alice")));
-        assert!(!roles.is_operator(&identity("alice"), &Groups(Vec::new())));
     }
 
     #[test]
