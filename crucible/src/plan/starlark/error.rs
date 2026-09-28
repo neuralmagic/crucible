@@ -381,6 +381,13 @@ pub enum CompileError {
     FanoutWithoutOver { task: String },
     #[error("\"max_rounds\" must be an integer")]
     RoundsNotInteger,
+    #[error("\"history\" must be an integer")]
+    HistoryNotInteger,
+    #[error(
+        "history = {got} is outside 1..={}",
+        crucible_contract::history::MAX_HISTORY_DEPTH
+    )]
+    HistoryOutOfRange { got: i32 },
     #[error("max_rounds = {got} is outside 2..={MAX_ROUNDS_CEILING}")]
     RoundsOutOfRange { got: i32 },
     #[error(

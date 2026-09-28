@@ -248,6 +248,7 @@ fn call<'v>(
                     tasks,
                     file: None,
                     resolved_from: None,
+                    history_record: None,
                 };
                 workflow.validate()?;
                 Ok(dsl::Value::Workflow(workflow))

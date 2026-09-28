@@ -49,6 +49,7 @@ pub(crate) fn iteration_template(
                 max_fanout: None,
                 when: None,
                 revise: None,
+                history: None,
             }
         };
     let mut tasks = vec![engine("propose", EngineOp::Propose, None, vec![])];
@@ -88,6 +89,7 @@ pub(crate) fn iteration_template(
         tasks,
         file: None,
         resolved_from: None,
+        history_record: None,
     };
     workflow
         .admit(caps)

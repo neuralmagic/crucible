@@ -7,7 +7,9 @@
 use crate::cli::selftest::{self, SelftestReport};
 use crate::manifest::{self, AgentCfg, CompositeManifest, Manifest, WorldCfg};
 use crate::openshell;
+use crate::plan::history::HistoryLimit;
 use crate::plan::ir::TaskKind;
+use crate::plan::workflow::WorkflowType;
 use anyhow::Result;
 use crucible::crucible::Direction;
 use std::collections::BTreeSet;
@@ -70,8 +72,12 @@ pub fn run_parse_only(manifest_path: &Path) -> Result<CheckOutcome> {
             .map_err(|e| format!("composite manifest parse failed: {e:#}"))
     } else {
         Manifest::load(manifest_path)
-            .map(|m| crate::exposure::render(&crate::exposure::compute(&m, None)))
             .map_err(|e| format!("manifest parse failed: {e:#}"))
+            .and_then(|m| {
+                let mut exposure = crate::exposure::render(&crate::exposure::compute(&m, None));
+                exposure.extend(history_limit_line(&m, operator_history_limit().as_deref())?);
+                Ok(exposure)
+            })
     };
     Ok(match result {
         Ok(exposure) => CheckOutcome {
@@ -160,6 +166,25 @@ fn undeclared_credential_warnings(m: &Manifest) -> Vec<String> {
     )]
 }
 
+/// The bound a playbook's run puts on the history one task receives, as the operator set it for
+/// this environment. A malformed bound is a finding: the run would refuse it before dispatch.
+fn history_limit_line(m: &Manifest, raw: Option<&str>) -> Result<Option<String>, String> {
+    let playbook = m
+        .workflow
+        .as_ref()
+        .is_some_and(|w| w.workflow_type == WorkflowType::Playbook);
+    if !playbook {
+        return Ok(None);
+    }
+    HistoryLimit::parse(raw)
+        .map(|limit| Some(limit.describe()))
+        .map_err(|e| e.to_string())
+}
+
+fn operator_history_limit() -> Option<String> {
+    std::env::var(crucible_contract::history::ENV_HISTORY_MAX_BYTES).ok()
+}
+
 fn check_single(manifest_path: &Path) -> Result<CheckOutcome> {
     let mut m = match Manifest::load_frozen(manifest_path) {
         Ok(m) => m,
@@ -172,6 +197,10 @@ fn check_single(manifest_path: &Path) -> Result<CheckOutcome> {
         exposure: crate::exposure::render(&crate::exposure::compute(&m, None)),
         ..CheckOutcome::default()
     };
+    match history_limit_line(&m, operator_history_limit().as_deref()) {
+        Ok(line) => out.exposure.extend(line),
+        Err(finding) => out.findings.push(finding),
+    }
     out.warnings.extend(undeclared_credential_warnings(&m));
     out.warnings.extend(shadowed_deny_warnings(&m.agent));
     check_referenced_files(&m, &manifest_dir, &mut out);
@@ -773,6 +802,43 @@ mod tests {
             !dir.join("workspace").exists(),
             "parse-only must not set up the workspace"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Whoever launches a playbook can see the history bound its tasks will get before any run.
+    #[test]
+    fn a_playbook_check_shows_the_history_size_limit() {
+        let dir = tempdir("history-limit");
+        let playbook = "[agent]\nbackend=\"command\"\nagent_cmd=\"true\"\ngoal=\"g\"\n[workflow]\ntype = \"playbook\"\n[[workflow.task]]\nname = \"a\"\nkind = \"command\"\ncommand = \"true\"\n";
+        fs::write(dir.join(MANIFEST), playbook).unwrap();
+        let outcome = run_parse_only(&dir.join(MANIFEST)).expect("check runs");
+        assert!(outcome.ok(), "findings: {:?}", outcome.findings);
+        assert!(
+            outcome
+                .exposure
+                .iter()
+                .any(|line| line.starts_with("history size limit: ")),
+            "{:?}",
+            outcome.exposure
+        );
+
+        let m = Manifest::load(&dir.join(MANIFEST)).unwrap();
+        let var = crucible_contract::history::ENV_HISTORY_MAX_BYTES;
+        assert_eq!(
+            history_limit_line(&m, None),
+            Ok(Some(format!(
+                "history size limit: {} bytes per task (engine default)",
+                crucible_contract::history::DEFAULT_HISTORY_MAX_BYTES
+            )))
+        );
+        assert_eq!(
+            history_limit_line(&m, Some("4096")),
+            Ok(Some(format!(
+                "history size limit: 4096 bytes per task ({var})"
+            )))
+        );
+        let refused = history_limit_line(&m, Some("lots")).unwrap_err();
+        assert!(refused.contains(var), "{refused}");
         let _ = fs::remove_dir_all(&dir);
     }
 

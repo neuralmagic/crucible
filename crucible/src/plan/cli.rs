@@ -6,8 +6,9 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::plan::exec::{Substrate, TaskResult, TaskStatus, runnable_set};
-use crate::plan::ir::{Plan, Task, TaskKind, ValidPlan};
+use crate::plan::exec::{Substrate, runnable_set};
+use crate::plan::history::{SeriesHistory, declared_output};
+use crate::plan::ir::{Plan, TaskKind, TaskName, ValidPlan};
 use crucible::crucible::Direction;
 use xai_grok_mermaid::{MermaidTheme, RenderLimits, RenderParams, default_engine, render_checked};
 
@@ -24,24 +25,6 @@ struct NoValidVerdict {
 }
 
 const MERMAID_COMMAND_PREVIEW_CHARS: usize = 72;
-
-fn declared_report_output(task: &Task, result: &TaskResult) -> Option<serde_json::Value> {
-    if result.status != TaskStatus::Pass {
-        return None;
-    }
-    let object = result.output.as_ref()?.as_object()?;
-    Some(serde_json::Value::Object(
-        task.emits
-            .iter()
-            .filter_map(|field| {
-                object
-                    .get(&field.0)
-                    .cloned()
-                    .map(|value| (field.0.clone(), value))
-            })
-            .collect(),
-    ))
-}
 
 /// Compile scope-time workflow authoring syntax. JSON on stdout is stable enough for a
 /// checked-in golden; `--manifest` additionally materializes the runtime TOML authority. A
@@ -570,9 +553,13 @@ pub fn run(
     if let (None, Some(raw)) = (ceilings.wall_clock, ceilings.wall_clock_raw.as_ref()) {
         return Err(BadDuration { raw: raw.clone() }.into());
     }
+    let history = SeriesHistory::from_env()?;
 
     // Either the plan was handed to us, or the manifest names the graph and we compile it.
     let mut evidence: Option<crate::args::Paths> = None;
+    // A playbook run records an entry for its launch series: under the record task its workflow
+    // names, or an empty one for a precompiled plan, which names none.
+    let mut series_entry: Option<Option<TaskName>> = None;
     let (plan, mut runner, events): (ValidPlan, Box<dyn TaskRunner>, Option<std::fs::File>) =
         match (path, manifest) {
             (_, Some(m)) => {
@@ -588,6 +575,7 @@ pub fn run(
                     w.workflow_type == crate::plan::workflow::WorkflowType::Playbook
                 });
                 if playbook {
+                    series_entry = Some(None);
                     let missing = match (ceilings.usd, ceilings.wall_clock) {
                         (None, None) => Some("--max-cost and --max-time"),
                         (None, Some(_)) => Some("--max-cost"),
@@ -614,6 +602,7 @@ pub fn run(
                             workflow
                                 .admit(&caps)
                                 .context("admitting one-pass playbook")?;
+                            series_entry = Some(workflow.history_record.clone());
                             Plan {
                                 version: 1,
                                 reason: None,
@@ -663,7 +652,13 @@ pub fn run(
         let _ = writeln!(w, "{}", crate::report::session::encode(ev));
     };
     if let Some(f) = &events {
-        append(f, &crate::plan::events::plan_admitted_event(&plan));
+        append(
+            f,
+            &crate::plan::events::plan_admitted_event(
+                &plan,
+                series_entry.as_ref().and_then(Option::as_ref),
+            ),
+        );
     }
     let selected_results: std::collections::BTreeSet<_> = plan
         .tasks_topo()
@@ -713,6 +708,7 @@ pub fn run(
         &substrate,
         ExecCfg {
             wall_clock: ceilings.wall_clock,
+            history: Some(&history),
             ..ExecCfg::default()
         },
         runner.as_mut(),
@@ -729,7 +725,7 @@ pub fn run(
             });
             if let Some(selected) = report.results.get_mut(&task.name.0) {
                 selected.status = result.status.as_str().to_string();
-                selected.output = declared_report_output(task, result);
+                selected.output = declared_output(task, result);
             }
             write_report(&report);
             if let Some(f) = &events {
@@ -766,6 +762,14 @@ pub fn run(
         PlanExit::BudgetExceeded => "budget exceeded".to_string(),
         PlanExit::TimeExceeded => "wall-clock ceiling reached".to_string(),
     };
+    if let (Some(f), Some(record)) = (&events, &series_entry) {
+        append(
+            f,
+            &crate::report::session::SessionEvent::HistoryEntry {
+                entry: crate::plan::history::run_entry(&plan, record.as_ref(), &out.results),
+            },
+        );
+    }
     if let Some(f) = &events {
         append(
             f,
@@ -1111,7 +1115,7 @@ mod tests {
     #[test]
     fn wire_events_round_trip_through_the_contract_codec() {
         let plan = Plan::from_toml_str(SRC).unwrap().validate().unwrap();
-        let admitted = crate::plan::events::plan_admitted_event(&plan);
+        let admitted = crate::plan::events::plan_admitted_event(&plan, None);
         let back =
             crate::report::session::decode(&crate::report::session::encode(&admitted)).unwrap();
         match back {
@@ -1159,50 +1163,6 @@ mod tests {
             }
             other => panic!("wrong variant: {other:?}"),
         }
-    }
-
-    #[test]
-    fn report_projection_keeps_only_declared_fields_from_a_passing_task() {
-        let plan = Plan::from_toml_str(
-            r#"
-version = 1
-[budget]
-usd = 1
-[[task]]
-name = "card"
-kind = "command"
-command = "true"
-emits = ["verdict", "dirty"]
-"#,
-        )
-        .unwrap()
-        .validate()
-        .unwrap();
-        let task = plan.get(&"card".into()).unwrap();
-        let result = TaskResult {
-            status: TaskStatus::Pass,
-            attempts: 1,
-            cost_usd: 0.0,
-            output: Some(serde_json::json!({
-                "verdict": "ACTION REQUIRED",
-                "dirty": 3,
-                "undeclared_secret": "must not cross"
-            })),
-            note: None,
-            fanout: None,
-            blocked: None,
-            transport: None,
-        };
-
-        assert_eq!(
-            declared_report_output(task, &result),
-            Some(serde_json::json!({"verdict": "ACTION REQUIRED", "dirty": 3}))
-        );
-        let failed = TaskResult {
-            status: TaskStatus::Fail,
-            ..result
-        };
-        assert_eq!(declared_report_output(task, &failed), None);
     }
 
     #[test]

@@ -36,6 +36,7 @@ An agent turn driven by a prompt.
 | `revise` | `task` | A direct dependency this task sends back when it settles failing. The dependency runs again with the verdict under `revision`, then this task does, until this task stops failing or `max_rounds` is spent. Playbooks only; not with `over`. |
 | `max_rounds` | `int` | Round cap for `revise`, counting the first, from 2 to the engine's ceiling of 5. |
 | `stage` | `"iteration" \| "epilogue"` | `epilogue` runs once after the loop concludes, and only if the run kept a candidate. |
+| `history` | `int` | Read this many earlier runs of the launch series, from 1 to the engine's ceiling of 30, under `history`. A run launched outside a series gets an empty list. Playbooks only. |
 | `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
 | `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice. |
 | `otherwise` | `bool` | In place of `answers`: every answer no other task lists and the question does not `drop`, `"uncertain"` included. Expanded at compile time. An unreachable `otherwise` is an error. |
@@ -65,6 +66,7 @@ An agent turn whose prompt is a skill's instructions plus its arguments.
 | `revise` | `task` | A direct dependency this task sends back when it settles failing. The dependency runs again with the verdict under `revision`, then this task does, until this task stops failing or `max_rounds` is spent. Playbooks only; not with `over`. |
 | `max_rounds` | `int` | Round cap for `revise`, counting the first, from 2 to the engine's ceiling of 5. |
 | `stage` | `"iteration" \| "epilogue"` | `epilogue` runs once after the loop concludes, and only if the run kept a candidate. |
+| `history` | `int` | Read this many earlier runs of the launch series, from 1 to the engine's ceiling of 30, under `history`. A run launched outside a series gets an empty list. Playbooks only. |
 | `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
 | `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice. |
 | `otherwise` | `bool` | In place of `answers`: every answer no other task lists and the question does not `drop`, `"uncertain"` included. Expanded at compile time. An unreachable `otherwise` is an error. |
@@ -89,6 +91,7 @@ A deterministic shell task in the candidate workspace.
 | `revise` | `task` | A direct dependency this task sends back when it settles failing. The dependency runs again with the verdict under `revision`, then this task does, until this task stops failing or `max_rounds` is spent. Playbooks only; not with `over`. |
 | `max_rounds` | `int` | Round cap for `revise`, counting the first, from 2 to the engine's ceiling of 5. |
 | `stage` | `"iteration" \| "epilogue"` | `epilogue` runs once after the loop concludes, and only if the run kept a candidate. |
+| `history` | `int` | Read this many earlier runs of the launch series, from 1 to the engine's ceiling of 30, under `history`. A run launched outside a series gets an empty list. Playbooks only. |
 | `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
 | `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice. |
 | `otherwise` | `bool` | In place of `answers`: every answer no other task lists and the question does not `drop`, `"uncertain"` included. Expanded at compile time. An unreachable `otherwise` is an error. |
@@ -115,6 +118,7 @@ A measurement command. Its last non-empty stdout line is a JSON object; `pass = 
 | `revise` | `task` | A direct dependency this task sends back when it settles failing. The dependency runs again with the verdict under `revision`, then this task does, until this task stops failing or `max_rounds` is spent. Playbooks only; not with `over`. |
 | `max_rounds` | `int` | Round cap for `revise`, counting the first, from 2 to the engine's ceiling of 5. |
 | `stage` | `"iteration" \| "epilogue"` | `epilogue` runs once after the loop concludes, and only if the run kept a candidate. |
+| `history` | `int` | Read this many earlier runs of the launch series, from 1 to the engine's ceiling of 30, under `history`. A run launched outside a series gets an empty list. Playbooks only. |
 | `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
 | `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice. |
 | `otherwise` | `bool` | In place of `answers`: every answer no other task lists and the question does not `drop`, `"uncertain"` included. Expanded at compile time. An unreachable `otherwise` is an error. |
@@ -165,6 +169,7 @@ Takes one positional argument, `tasks`.
 | `type` | `"autoresearch" \| "custom" \| "playbook"` | The lane, which decides which constructors exist. |
 | `tasks` | `list[task]` | Every task that ships. |
 | `result` | `task` | The task whose output is the workflow's result. |
+| `history_record` | `task` | The task each run records for the later runs of its launch series: its status, and the fields it declares in `emits` when it passed. Not a mapped task; an epilogue task records even when the main graph failed. Playbooks only. |
 
 ## Scored lanes only
 
@@ -297,6 +302,7 @@ Present alongside the dependency entries, never wrapped in one.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
+| `history` | `object` | Earlier terminal runs of the launch series, as `{"records": [record], "dropped": int}`, oldest first by end time, at most the task's `history` depth. Each record is `{"run", "started_at", "ended_at", "outcome", "verdict", "revision", "link", "entry": {"task", "status", "output"}}`. `dropped` counts records the operator's size limit removed from the oldest end. In a task that declares `history` only; an agent reads it as marked external input. |
 | `item` | `str` | This mapped instance's key, one per item of the list `over` names. |
 | `kept` | `object` | The kept candidate, in an epilogue task only. |
 | `outcome` | `object` | How the main graph ended and what each of its tasks settled as, as `{"exit": str, "tasks": {name: {"status", "note"}}}`, in an epilogue task only. |

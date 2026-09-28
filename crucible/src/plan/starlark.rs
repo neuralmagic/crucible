@@ -530,6 +530,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "revise",
             "max_rounds",
             "emits_files",
+            "history",
             "when",
             "answers",
             "otherwise",
@@ -554,6 +555,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "revise",
             "max_rounds",
             "emits_files",
+            "history",
             "when",
             "answers",
             "otherwise",
@@ -573,6 +575,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "revise",
             "max_rounds",
             "emits_files",
+            "history",
             "when",
             "answers",
             "otherwise",
@@ -594,6 +597,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "revise",
             "max_rounds",
             "emits_files",
+            "history",
             "when",
             "answers",
             "otherwise",
@@ -620,7 +624,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
         "grade" => &["name", "score", "tiebreak", "evidence", "join"],
         "decide" => &["name", "measurement", "depends_on"],
         "session" => &["name", "harness", "model", "effort"],
-        "workflow" => &["type", "tasks", "result"],
+        "workflow" => &["type", "tasks", "result", "history_record"],
         _ => &[],
     }
 }
@@ -654,6 +658,7 @@ fn constructor(
             _ => return Err(CompileError::TasksNotList),
         };
         let result = take_optional_task_name(&mut named, "result")?;
+        let history_record = take_optional_task_name(&mut named, "history_record")?;
         no_unknown_kwargs(function, &named)?;
         let workflow = WorkflowCfg {
             workflow_type,
@@ -661,6 +666,7 @@ fn constructor(
             tasks,
             file: None,
             resolved_from: None,
+            history_record,
         };
         workflow.validate()?;
         return Ok(Value::Workflow(workflow));
@@ -799,6 +805,7 @@ fn constructor(
             max_fanout: None,
             when: None,
             revise: None,
+            history: None,
         },
         "top_k" => {
             let k = take_int(&mut named, "k")?;
@@ -837,6 +844,7 @@ fn constructor(
                 max_fanout: None,
                 revise: None,
                 when: None,
+                history: None,
             }
         }
         "route" => {
@@ -868,6 +876,7 @@ fn constructor(
                 revise: None,
                 when: take_when(&mut named, state, &name)?,
                 name,
+                history: None,
             }
         }
         "propose" => {
@@ -1072,6 +1081,7 @@ fn default_autoresearch(mut extras: Vec<Task>) -> Result<WorkflowCfg> {
         tasks,
         file: None,
         resolved_from: None,
+        history_record: None,
     };
     workflow.validate()?;
     Ok(workflow)
@@ -1114,6 +1124,7 @@ fn dsl_task(
         max_fanout: take_optional_fanout(named)?,
         when,
         revise: take_revise(named)?,
+        history: take_optional_history(named)?,
     };
     check_fanout(&task)?;
     if let Some(revise) = &task.revise
@@ -1407,6 +1418,19 @@ fn take_optional_fanout(named: &mut BTreeMap<String, Value>) -> Result<Option<u3
     }
 }
 
+fn take_optional_history(named: &mut BTreeMap<String, Value>) -> Result<Option<u32>> {
+    match named.remove("history") {
+        None | Some(Value::None) => Ok(None),
+        Some(Value::Int(n)) => match u32::try_from(n) {
+            Ok(depth) if (1..=crucible_contract::history::MAX_HISTORY_DEPTH).contains(&depth) => {
+                Ok(Some(depth))
+            }
+            _ => Err(CompileError::HistoryOutOfRange { got: n }),
+        },
+        Some(_) => Err(CompileError::HistoryNotInteger),
+    }
+}
+
 /// `revise` and `max_rounds` are one declaration written as two kwargs: a send-back states how
 /// many rounds it may take before it runs.
 fn take_revise(named: &mut BTreeMap<String, Value>) -> Result<Option<Revise>> {
@@ -1458,6 +1482,7 @@ fn engine(name: &str, op: EngineOp, source: Option<TaskName>, depends_on: Vec<Ta
         max_fanout: None,
         when: None,
         revise: None,
+        history: None,
     }
 }
 
@@ -1588,14 +1613,18 @@ fn strip_markers(text: &str) -> String {
     text
 }
 
+/// Wrap text that did not originate inside the pack in the external-input markers, after
+/// removing any marker it carries itself.
+pub fn mark_external(text: &str) -> String {
+    format!("{EXTERNAL_OPEN}{}{EXTERNAL_CLOSE}", strip_markers(text))
+}
+
 /// Assemble a prompt, marking every span that came from outside the pack.
 fn render_prompt(segments: &[values::Segment]) -> String {
     let mut prompt = String::new();
     for segment in segments {
         if segment.external {
-            prompt.push_str(EXTERNAL_OPEN);
-            prompt.push_str(&strip_markers(&segment.text));
-            prompt.push_str(EXTERNAL_CLOSE);
+            prompt.push_str(&mark_external(&segment.text));
         } else {
             prompt.push_str(&segment.text);
         }
@@ -3496,7 +3525,7 @@ workflow(type = "custom", tasks = [e], result = e)
             ),
             (
                 "agent",
-                "s = session(name = \"sess\")\nu = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = agent(name = \"a\", prompt = \"p\", harness = \"claude\", model = \"m\", effort = \"high\", session = s, emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", revise = u, max_rounds = 2{extra})\nworkflow(type = \"playbook\", tasks = [u, a])\n",
+                "s = session(name = \"sess\")\nu = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = agent(name = \"a\", prompt = \"p\", harness = \"claude\", model = \"m\", effort = \"high\", session = s, emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", revise = u, max_rounds = 2, history = 3{extra})\nworkflow(type = \"playbook\", tasks = [u, a])\n",
             ),
             (
                 "command",
@@ -3512,15 +3541,15 @@ workflow(type = "custom", tasks = [e], result = e)
             ),
             (
                 "skill",
-                "s = session(name = \"sess\")\nu = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = skill(name = \"a\", skill = \"skills/demo\", args = {\"k\": 1}, harness = \"claude\", model = \"m\", effort = \"high\", session = s, emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", revise = u, max_rounds = 2{extra})\nworkflow(type = \"playbook\", tasks = [u, a])\n",
+                "s = session(name = \"sess\")\nu = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = skill(name = \"a\", skill = \"skills/demo\", args = {\"k\": 1}, harness = \"claude\", model = \"m\", effort = \"high\", session = s, emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", revise = u, max_rounds = 2, history = 3{extra})\nworkflow(type = \"playbook\", tasks = [u, a])\n",
             ),
             (
                 "command",
-                "u = command(name = \"u\", run = \"true\")\nc = command(name = \"c\", run = \"true\", depends_on = [u], revise = u, max_rounds = 3{extra})\nworkflow(type = \"playbook\", tasks = [u, c])\n",
+                "u = command(name = \"u\", run = \"true\")\nc = command(name = \"c\", run = \"true\", depends_on = [u], revise = u, max_rounds = 3, history = 30{extra})\nworkflow(type = \"playbook\", tasks = [u, c])\n",
             ),
             (
                 "evaluate",
-                "u = command(name = \"u\", run = \"true\")\ne = evaluate(name = \"e\", run = \"true\", depends_on = [u], revise = u, max_rounds = 3{extra})\nworkflow(type = \"playbook\", tasks = [u, e])\n",
+                "u = command(name = \"u\", run = \"true\")\ne = evaluate(name = \"e\", run = \"true\", depends_on = [u], revise = u, max_rounds = 3, history = 1{extra})\nworkflow(type = \"playbook\", tasks = [u, e])\n",
             ),
             (
                 "agent",
@@ -3581,6 +3610,10 @@ workflow(type = "custom", tasks = [e], result = e)
             (
                 "workflow",
                 "c = command(name = \"c\", run = \"true\")\nworkflow(type = \"custom\", tasks = [c], result = c{extra})\n",
+            ),
+            (
+                "workflow",
+                "c = command(name = \"c\", run = \"true\")\nworkflow(type = \"playbook\", tasks = [c], history_record = c{extra})\n",
             ),
         ];
         // `over` excludes `session` and `revise`, so a constructor taking both needs two
@@ -4183,6 +4216,93 @@ workflow(type = "playbook", tasks = [author, repro])
             );
             assert!(error.contains(expected), "{clause}: {error}");
         }
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn a_playbook_names_its_record_task_and_each_tasks_history_depth() {
+        let pack = temp_pack("history");
+        let source = r#"
+look = agent(name = "look", prompt = "what did the last runs find?", history = 5)
+fix = command(name = "fix", run = "true", depends_on = [look], history = 30, emits = ["fixed"])
+note = command(name = "note", run = "true", stage = "epilogue")
+workflow(type = "playbook", tasks = [look, fix, note], history_record = fix)
+"#;
+        let compiled = compile_source(source, &pack.join("workflow.star"), &pack).unwrap();
+        assert_eq!(compiled.workflow.history_record, Some("fix".into()));
+        let depths: Vec<Option<u32>> = compiled.workflow.tasks.iter().map(|t| t.history).collect();
+        assert_eq!(depths, [Some(5), Some(30), None]);
+        let canonical: serde_json::Value = serde_json::from_str(&compiled.canonical_json).unwrap();
+        assert_eq!(canonical["history_record"], "fix");
+        assert_eq!(canonical["task"][0]["history"], 5);
+        assert!(canonical["task"][2].get("history").is_none());
+
+        let epilogue = source.replace("history_record = fix", "history_record = \"note\"");
+        let compiled = compile_source(&epilogue, &pack.join("workflow.star"), &pack).unwrap();
+        assert_eq!(compiled.workflow.history_record, Some("note".into()));
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn history_is_refused_where_the_rfc_forbids_it() {
+        let pack = temp_pack("history-refused");
+        let cases = [
+            (
+                "a = command(name = \"a\", run = \"true\", history = 0)\nworkflow(type = \"playbook\", tasks = [a])\n",
+                "history = 0 is outside 1..=30",
+            ),
+            (
+                "a = command(name = \"a\", run = \"true\", history = 31)\nworkflow(type = \"playbook\", tasks = [a])\n",
+                "history = 31 is outside 1..=30",
+            ),
+            (
+                "a = command(name = \"a\", run = \"true\", history = -1)\nworkflow(type = \"playbook\", tasks = [a])\n",
+                "history = -1 is outside 1..=30",
+            ),
+            (
+                "a = command(name = \"a\", run = \"true\", history = \"3\")\nworkflow(type = \"playbook\", tasks = [a])\n",
+                "\"history\" must be an integer",
+            ),
+            (
+                "a = agent(name = \"a\", prompt = \"p\", history = 2)\nworkflow(type = \"custom\", tasks = [a], result = a)\n",
+                "only a playbook launched in a series receives",
+            ),
+            (
+                "a = command(name = \"a\", run = \"true\")\nworkflow(type = \"custom\", tasks = [a], result = a, history_record = a)\n",
+                "only a playbook records history",
+            ),
+            (
+                "a = command(name = \"a\", run = \"true\")\nworkflow(type = \"playbook\", tasks = [a], history_record = \"b\")\n",
+                "history record \"b\" names an unknown task",
+            ),
+            (
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\nm = command(name = \"m\", run = \"true\", depends_on = [u], over = u.items, max_fanout = 2)\nworkflow(type = \"playbook\", tasks = [u, m], history_record = m)\n",
+                "maps over a list",
+            ),
+            (
+                "history = command(name = \"history\", run = \"true\")\na = command(name = \"a\", run = \"true\", depends_on = [history])\nworkflow(type = \"playbook\", tasks = [history, a])\n",
+                "history",
+            ),
+            (
+                "g = route(name = \"g\", min_confidence = 0.5, questions = {\"q\": noul(ask = \"q?\")}, history = 2)\nworkflow(type = \"playbook\", tasks = [g])\n",
+                "unknown argument \"history\"",
+            ),
+        ];
+        for (source, expected) in cases {
+            let error = crate::errors::report(
+                &compile_source(source, &pack.join("workflow.star"), &pack)
+                    .err()
+                    .unwrap_or_else(|| panic!("compiled: {source}")),
+            );
+            assert!(error.contains(expected), "{source}: {error}");
+        }
+        let reserved = crate::errors::report(
+            &compile_source(cases[8].0, &pack.join("workflow.star"), &pack).unwrap_err(),
+        );
+        assert!(
+            reserved.contains("depends on \"history\""),
+            "a dependency named after the reserved input: {reserved}"
+        );
         let _ = std::fs::remove_dir_all(&pack);
     }
 

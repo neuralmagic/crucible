@@ -96,7 +96,7 @@ pub(crate) fn run_iteration<R: Reporter>(
         .unwrap_or_else(|| "decide".into());
     runner
         .r
-        .plan_event(&crate::plan::events::plan_admitted_event(&plan));
+        .plan_event(&crate::plan::events::plan_admitted_event(&plan, None));
     runner.arm(&cx);
     let task_states = Arc::clone(&runner.task_states);
     // The runner and the on_result hook both need the reporter; collect the wire lines
@@ -243,7 +243,7 @@ pub(crate) fn run_epilogue<R: Reporter>(
         plan.plan().tasks.len(),
         kept.iter
     ));
-    r.plan_event(&crate::plan::events::plan_admitted_event(&plan));
+    r.plan_event(&crate::plan::events::plan_admitted_event(&plan, None));
 
     let mut runner = EpilogueRunner {
         inner: crate::plan::harness::HarnessRunner {
@@ -867,7 +867,7 @@ pub(crate) fn run_wide_tournament<R: Reporter>(
 
     let direction = judge.direction();
     let plan = wide_template(cfg, prep, direction)?;
-    r.plan_event(&crate::plan::events::plan_admitted_event(&plan));
+    r.plan_event(&crate::plan::events::plan_admitted_event(&plan, None));
     r.note("wide: starting parallel PROPOSE turns");
     let snap = world
         .snapshot("wide-pre-measure")
@@ -995,6 +995,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
             max_fanout: None,
             when: None,
             revise: None,
+            history: None,
         });
     }
     for id in 0..cfg.n {
@@ -1018,6 +1019,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
             max_fanout: None,
             when: None,
             revise: None,
+            history: None,
         });
     }
     tasks.push(Task {
@@ -1041,6 +1043,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
         max_fanout: None,
         when: None,
         revise: None,
+        history: None,
     });
     Plan {
         version: 1,
