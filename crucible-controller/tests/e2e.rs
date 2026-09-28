@@ -526,6 +526,7 @@ fn test_cfg(state_dir: &Path, repos: Vec<String>) -> ControllerCfg {
         admins: vec![],
         operators: vec![],
         operator_groups: vec![],
+        publishers: vec![],
         session_secure_cookies: true,
         #[cfg(feature = "autoresearch")]
         autopilot: None,

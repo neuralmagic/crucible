@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useReducer, useState } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
+import { Link, useNavigate, useParams } from 'react-router-dom';
 import { $api, apiClient } from '../api/client';
 import { formatError } from '../api/errors';
 import type { components } from '../api/schema';
@@ -88,7 +88,6 @@ export function DraftStudioPage() {
   const { id = '' } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const wide = useMediaQuery(WIDE);
-  const whoami = $api.useQuery('get', '/api/whoami');
   const draft = $api.useQuery('get', '/api/playbook-drafts/{id}', { params: { path: { id } } });
   const files = $api.useQuery('get', '/api/playbook-drafts/{id}/files', {
     params: { path: { id } },
@@ -110,6 +109,7 @@ export function DraftStudioPage() {
   const drop = $api.useMutation('delete', '/api/playbook-drafts/{id}');
   const launch = $api.useMutation('post', '/api/playbook-drafts/{id}/launch');
   const graduate = $api.useMutation('post', '/api/playbook-drafts/{id}/graduate');
+  const publish = $api.useMutation('post', '/api/playbook-drafts/{id}/publish');
 
   const [state, dispatch] = useReducer(studioReducer, EMPTY_STUDIO);
   const [preview, setPreview] = useState<CompileDto | null>(null);
@@ -132,6 +132,10 @@ export function DraftStudioPage() {
   const [gradError, setGradError] = useState<string | null>(null);
   const [prUrl, setPrUrl] = useState<string | null>(null);
 
+  const [publishTo, setPublishTo] = useState('');
+  const [publishError, setPublishError] = useState<string | null>(null);
+  const [publishedRev, setPublishedRev] = useState<string | null>(null);
+
   const loaded = files.data;
   useEffect(() => {
     if (loaded === undefined) return;
@@ -145,6 +149,12 @@ export function DraftStudioPage() {
     setGradRepo((previous) => (previous.length === 0 ? target : previous));
     setGradPath((previous) => (previous.length === 0 ? (targetPath ?? '') : previous));
   }, [target, targetPath]);
+
+  const publishTarget = draft.data?.published_playbook ?? origin?.playbook ?? null;
+  useEffect(() => {
+    if (publishTarget === null) return;
+    setPublishTo((previous) => (previous.length === 0 ? publishTarget : previous));
+  }, [publishTarget]);
 
   const first = stored.data;
   useEffect(() => {
@@ -179,7 +189,6 @@ export function DraftStudioPage() {
   );
   const flagged = useMemo(() => flaggedFiles(diagnostics, paths), [diagnostics, paths]);
   const retired = draft.data?.retired_at !== null && draft.data?.retired_at !== undefined;
-  const admin = whoami.data?.role === 'admin';
   const actions = draft.data?.actions ?? [];
   const author = actions.includes('update');
   const writable = author && !retired;
@@ -274,6 +283,20 @@ export function DraftStudioPage() {
       void draft.refetch();
     } catch (err: unknown) {
       setGradError(formatError(err));
+    }
+  };
+
+  const handlePublish = async () => {
+    setPublishError(null);
+    try {
+      const ack = await publish.mutateAsync({
+        params: { path: { id } },
+        body: { playbook: publishTo.trim() },
+      });
+      setPublishedRev(ack.rev);
+      void draft.refetch();
+    } catch (err: unknown) {
+      setPublishError(formatError(err));
     }
   };
 
@@ -663,7 +686,12 @@ export function DraftStudioPage() {
             <FormActions>
               <Button
                 variant="filled"
-                disabled={!admin || retired || gradRepo.trim().length === 0 || graduate.isPending}
+                disabled={
+                  !actions.includes('approve') ||
+                  retired ||
+                  gradRepo.trim().length === 0 ||
+                  graduate.isPending
+                }
                 onClick={() => {
                   void handleGraduate();
                 }}
@@ -680,6 +708,53 @@ export function DraftStudioPage() {
           </SectionBody>
         )}
       </Section>
+
+      {actions.includes('publish') ? (
+        <Section>
+          <SectionHeader title="Publish" note="no review" />
+          <SectionBody>
+            <FormGrid>
+              <TextField
+                id="studio-publish-playbook"
+                label="Playbook"
+                mono
+                required
+                value={publishTo}
+                onChange={setPublishTo}
+              />
+            </FormGrid>
+          </SectionBody>
+          {publishError === null ? null : (
+            <SectionBody>
+              <FormError>{publishError}</FormError>
+            </SectionBody>
+          )}
+          <FormActions>
+            <Button
+              variant="filled"
+              disabled={
+                retired || isDirty(state) || publishTo.trim().length === 0 || publish.isPending
+              }
+              onClick={() => {
+                void handlePublish();
+              }}
+            >
+              {publish.isPending ? 'PUBLISHING…' : 'PUBLISH'}
+            </Button>
+            {draft.data?.published_playbook === null ||
+            draft.data?.published_playbook === undefined ? null : (
+              <Link
+                to={`/playbooks/${draft.data.published_playbook}`}
+                className="font-mono text-data"
+              >
+                {publishedRev === null
+                  ? draft.data.published_playbook
+                  : `${draft.data.published_playbook} @ ${publishedRev.slice(0, 19)}`}
+              </Link>
+            )}
+          </FormActions>
+        </Section>
+      ) : null}
     </div>
   );
 

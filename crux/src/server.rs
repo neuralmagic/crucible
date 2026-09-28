@@ -375,6 +375,17 @@ pub struct DraftGraduateArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DraftPublishArgs {
+    pub draft_id: String,
+    /// The playbook id to publish into. Omit to re-pin the one this draft last published into,
+    /// else the registered pack it was seeded from.
+    #[serde(default)]
+    pub playbook: Option<String>,
+    #[serde(default)]
+    pub json: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DraftCreateArgs {
     /// Lowercase slug; the studio page and every launch of the draft are keyed by it.
     pub draft_id: String,
@@ -778,6 +789,16 @@ impl CrucibleMcp {
     }
 
     #[tool(
+        description = "Publish a draft with no review: register its newest compiling version \
+        as a registered playbook. The draft stays live and publishing it again re-pins the same \
+        playbook. Only principals the active policy grants playbook_draft:publish may; everyone \
+        else graduates through crucible_draft_graduate."
+    )]
+    async fn crucible_draft_publish(&self, Parameters(a): Parameters<DraftPublishArgs>) -> String {
+        flatten(ops::draft_publish(&self.client, &a.draft_id, a.playbook.as_deref(), a.json).await)
+    }
+
+    #[tool(
         description = "List registered playbooks: ID REPO REV BY DESCRIPTION. These are what \
         crucible_launch can start."
     )]
@@ -953,7 +974,7 @@ mod tests {
             .into_iter()
             .map(|t| t.name.to_string())
             .collect();
-        assert_eq!(names.len(), 40, "tools: {names:?}");
+        assert_eq!(names.len(), 41, "tools: {names:?}");
         for required in [
             "crucible_issues",
             "crucible_draft_delete",
@@ -984,6 +1005,7 @@ mod tests {
             "crucible_draft_preview",
             "crucible_draft_launch",
             "crucible_draft_graduate",
+            "crucible_draft_publish",
             "crucible_playbooks",
             "crucible_playbook_schema",
             "crucible_launch",
@@ -1088,6 +1110,10 @@ mod tests {
         let (graduate_schema, _) = tool_of("crucible_draft_graduate");
         assert!(graduate_schema.contains("repo"), "{graduate_schema}");
         assert!(graduate_schema.contains("path"), "{graduate_schema}");
+
+        let (publish_schema, publish) = tool_of("crucible_draft_publish");
+        assert!(publish_schema.contains("playbook"), "{publish_schema}");
+        assert!(publish.contains("playbook_draft:publish"), "{publish}");
     }
 
     /// An error must arrive as readable text, not as an MCP fault the model can't see into.

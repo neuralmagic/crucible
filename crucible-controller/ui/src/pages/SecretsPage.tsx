@@ -320,7 +320,6 @@ function RegisterSection({ owners }: { owners: readonly PickOption[] }) {
                 value={form.owner}
                 onChange={(owner) => { setForm({ ...form, owner }); }}
                 options={owners}
-                hint="You, or a group in your validated claims. Every member of the owner can rotate and delete it; binding it also needs the operator role."
               />
               <SelectField
                 id="secret-kind"

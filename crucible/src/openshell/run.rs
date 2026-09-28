@@ -430,6 +430,7 @@ async fn try_turn(
         &providers,
         &labels,
         &args.openshell.read_only_paths,
+        &args.sandbox_resources,
     )
     .await
     .context("creating the openshell sandbox")?;

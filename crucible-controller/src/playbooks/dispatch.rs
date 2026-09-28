@@ -30,6 +30,8 @@ pub struct PackAgent {
     /// `[agent] allow_unverified_image = true`: launch on an image the catalog does not know or
     /// that carries no capability document, instead of being refused.
     pub allow_unverified_image: bool,
+    /// `[agent.resources]`: GPUs, CPU and memory for the sandbox.
+    pub resources: crucible::manifest::SandboxResources,
 }
 
 /// The `[agent]` fields beyond backend and image, as the `agent_requirements` column stores them.
@@ -43,6 +45,11 @@ pub struct AgentRequirements {
     pub prefers: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub allow_unverified_image: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "crucible::manifest::SandboxResources::is_empty"
+    )]
+    pub resources: crucible::manifest::SandboxResources,
 }
 
 impl PackAgent {
@@ -66,6 +73,7 @@ impl PackAgent {
             requires: r.requires,
             prefers: r.prefers,
             allow_unverified_image: r.allow_unverified_image,
+            resources: r.resources,
         }
     }
 
@@ -76,6 +84,7 @@ impl PackAgent {
             requires: self.requires.clone(),
             prefers: self.prefers.clone(),
             allow_unverified_image: self.allow_unverified_image,
+            resources: self.resources.clone(),
         }
     }
 
@@ -134,6 +143,8 @@ struct AgentTable {
     prefers: BTreeMap<String, String>,
     #[serde(default)]
     allow_unverified_image: bool,
+    #[serde(default)]
+    resources: crucible::manifest::SandboxResources,
 }
 
 /// Read a pack tree's `[agent]` backend and sandbox image. `Err` is a manifest that is not there or
@@ -162,6 +173,7 @@ pub fn pack_agent(pack_root: &Path) -> Result<PackAgent> {
         requires: agent.requires,
         prefers: agent.prefers,
         allow_unverified_image: agent.allow_unverified_image,
+        resources: agent.resources,
     })
 }
 
@@ -172,20 +184,48 @@ pub struct DispatchCapability {
     /// Whether a work-pod render has the deploy profile it needs — the controller's own answer to
     /// "can we reach a cluster", since a dispatch without one fails at render.
     cluster: bool,
+    /// Whether launches create sandboxes as Kubernetes pods, the only driver that schedules a
+    /// sandbox with the resources a pack asks for.
+    pod_sandboxes: bool,
 }
 
 impl DispatchCapability {
     /// The capability spelled directly: `cluster` is whether a work-pod render has its deploy
     /// profile.
     pub fn new(executor: PlaybookExecutor, cluster: bool) -> Self {
-        DispatchCapability { executor, cluster }
+        DispatchCapability {
+            executor,
+            cluster,
+            pod_sandboxes: false,
+        }
+    }
+
+    /// The same capability where launches do (or do not) create sandboxes as Kubernetes pods.
+    pub fn with_pod_sandboxes(self, pod_sandboxes: bool) -> Self {
+        DispatchCapability {
+            pod_sandboxes,
+            ..self
+        }
     }
 
     pub fn from_cfg(cfg: &ControllerCfg) -> Self {
-        DispatchCapability {
-            executor: cfg.playbook_executor,
-            cluster: cfg.deploy_profile.is_some(),
-        }
+        let kubernetes_driver = cfg.deploy_profile.as_deref().is_some_and(|path| {
+            match crucible::deploy::DeployProfile::load(path) {
+                Ok(profile) => {
+                    profile.cluster.sandbox_driver
+                        == crucible::openshell::gateway::ComputeDriver::Kubernetes
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %format!("{e:#}"),
+                        "the deploy profile did not load; sandbox resources are refused"
+                    );
+                    false
+                }
+            }
+        });
+        DispatchCapability::new(cfg.playbook_executor, cfg.deploy_profile.is_some())
+            .with_pod_sandboxes(kubernetes_driver && cfg.playbook_executor == PlaybookExecutor::Pod)
     }
 
     /// Whether launches run as a supervised subprocess on this machine.
@@ -203,6 +243,20 @@ impl DispatchCapability {
                 "the pack declares [agent] backend {backend:?}, which the engine does not take \
                  (local, openshell or command)"
             ));
+        }
+        if !agent.resources.is_empty() && backend != SANDBOX_BACKEND {
+            return Some(format!(
+                "the pack declares [agent.resources] on the {backend} backend, which runs no \
+                 sandbox to schedule them (use backend = \"openshell\")"
+            ));
+        }
+        if !agent.resources.is_empty() && !self.pod_sandboxes {
+            return Some(
+                "the pack declares [agent.resources] and this deployment does not schedule \
+                 sandboxes as pods, so the request would be dropped (its deploy profile needs \
+                 [cluster] sandbox_driver = \"kubernetes\" and pod dispatch)"
+                    .to_string(),
+            );
         }
         match self.executor {
             PlaybookExecutor::Local => None,
@@ -462,6 +516,141 @@ mod tests {
         let legacy = PackAgent::from_columns("local".into(), None, None);
         assert_eq!(legacy, PackAgent::new("local", None));
         assert_eq!(legacy.requirements_json(), serde_json::json!({}));
+    }
+
+    fn resourced(backend: &str, toml: &str) -> PackAgent {
+        let mut agent = PackAgent::new(backend.to_string(), Some("sandbox:dev".to_string()));
+        agent.resources = toml::from_str(toml).expect("resources");
+        agent
+    }
+
+    /// The sandbox's resources are read off the manifest with the engine's own type, so a quantity
+    /// the engine would refuse at run time is refused where the pack is read, and they ride the
+    /// requirements column only when declared.
+    #[test]
+    fn sandbox_resources_are_read_typed_and_round_trip_the_column() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("crucible.toml"),
+            "[agent]\nbackend = \"openshell\"\nsandbox_image = \"s:1\"\n\n\
+             [agent.resources]\ngpus = 2\nmemory = \"32Gi\"\n\
+             node_selector = { \"nvidia.com/gpu.product\" = \"NVIDIA-H100-80GB-HBM3\" }\n",
+        )
+        .expect("manifest");
+        let agent = pack_agent(dir.path()).expect("parses");
+        assert_eq!(agent.resources.gpus, 2);
+        let json = agent.requirements_json();
+        assert_eq!(
+            json["resources"],
+            serde_json::json!({
+                "gpus": 2,
+                "memory": "32Gi",
+                "node_selector": {"nvidia.com/gpu.product": "NVIDIA-H100-80GB-HBM3"},
+            })
+        );
+        let back: AgentRequirements = serde_json::from_value(json).expect("decodes");
+        assert_eq!(
+            PackAgent::from_columns(
+                agent.backend.clone(),
+                agent.sandbox_image.clone(),
+                Some(back)
+            ),
+            agent
+        );
+        assert!(
+            PackAgent::new("openshell", None)
+                .requirements_json()
+                .get("resources")
+                .is_none(),
+            "a pack asking for nothing stores nothing"
+        );
+
+        std::fs::write(
+            dir.path().join("crucible.toml"),
+            "[agent]\nbackend = \"openshell\"\n\n[agent.resources]\nmemory = \"32GB\"\n",
+        )
+        .expect("manifest");
+        assert!(pack_agent(dir.path()).is_err());
+    }
+
+    /// A resource request needs a sandbox the scheduler places: the openshell backend, on a
+    /// deployment whose sandboxes are pods. Anywhere else it would be dropped, so it is refused.
+    #[test]
+    fn sandbox_resources_launch_only_where_a_pod_sandbox_schedules_them() {
+        let pods = capability(PlaybookExecutor::Pod, true).with_pod_sandboxes(true);
+        let nested = capability(PlaybookExecutor::Pod, true);
+        let local = capability(PlaybookExecutor::Local, false);
+
+        let gpu = resourced("openshell", "gpus = 1");
+        assert_eq!(pods.refusal(&gpu), None);
+        for cap in [nested, local] {
+            let refusal = cap.refusal(&gpu).expect("refused");
+            assert!(
+                refusal.contains("sandbox_driver = \"kubernetes\""),
+                "{refusal}"
+            );
+        }
+        assert!(
+            nested
+                .refusal(&resourced(
+                    "openshell",
+                    "node_selector = { \"nvidia.com/gpu.product\" = \"NVIDIA-H100-80GB-HBM3\" }"
+                ))
+                .is_some(),
+            "a node selector needs a pod to place, like any other request"
+        );
+        let memory = resourced("openshell", "memory = \"8Gi\"");
+        assert!(
+            nested.refusal(&memory).is_some(),
+            "memory is dropped off the pod driver just like GPUs"
+        );
+        assert_eq!(pods.refusal(&memory), None);
+
+        let refusal = pods
+            .refusal(&resourced("command", "gpus = 1"))
+            .expect("refused");
+        assert!(refusal.contains("runs no sandbox"), "{refusal}");
+        assert_eq!(
+            nested.refusal(&agent("openshell")),
+            None,
+            "a pack asking for nothing launches as before"
+        );
+    }
+
+    /// What decides whether a launch can schedule sandbox resources is the deploy profile's
+    /// sandbox driver under pod dispatch, read once from the file the controller is configured with.
+    #[test]
+    fn the_deploy_profiles_sandbox_driver_decides_whether_resources_launch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let gpu = resourced("openshell", "gpus = 1");
+        let mut cfg = crate::testing::cfg_with(dir.path());
+        cfg.playbook_executor = PlaybookExecutor::Pod;
+        cfg.deploy_profile = Some(crate::testing::fixtures::write_deploy_profile(dir.path()));
+        assert!(
+            DispatchCapability::from_cfg(&cfg).refusal(&gpu).is_some(),
+            "the default podman driver nests the sandbox in the loop pod"
+        );
+
+        let kubernetes = dir.path().join("kubernetes.toml");
+        std::fs::write(
+            &kubernetes,
+            crate::testing::fixtures::DEPLOY_PROFILE.replace(
+                "[cluster]\n",
+                "[cluster]\nsandbox_driver = \"kubernetes\"\n",
+            ),
+        )
+        .expect("profile");
+        cfg.deploy_profile = Some(kubernetes);
+        assert_eq!(DispatchCapability::from_cfg(&cfg).refusal(&gpu), None);
+
+        cfg.playbook_executor = PlaybookExecutor::Local;
+        assert!(
+            DispatchCapability::from_cfg(&cfg).refusal(&gpu).is_some(),
+            "a local launch runs the engine here, with no pod sandbox"
+        );
+        cfg.playbook_executor = PlaybookExecutor::Pod;
+        cfg.deploy_profile = Some(dir.path().join("missing.toml"));
+        assert!(DispatchCapability::from_cfg(&cfg).refusal(&gpu).is_some());
     }
 
     #[test]

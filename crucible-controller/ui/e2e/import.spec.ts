@@ -1,5 +1,5 @@
 import { expect, test, type Page, type Route } from '@playwright/test';
-import { IMPORT_ID, stubApi } from './api';
+import { IMPORT_ID, PACK_IMPORT, stubApi } from './api';
 
 const IMPORT = '/playbooks/import';
 
@@ -12,10 +12,13 @@ async function ready(page: Page, path: string): Promise<void> {
   await expect(page.locator('main')).toBeVisible();
 }
 
-/// Serve one import row for both the proposal and the link it lands on.
+/// Serve one import row for both the proposal and the link it lands on. The row's shares stay
+/// with the fixture stubs.
 async function importWith(page: Page, body: Record<string, unknown>): Promise<void> {
   await page.route('**/api/playbooks/imports**', (route: Route) =>
-    route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) }),
+    new URL(route.request().url()).pathname.endsWith('/shares')
+      ? route.fallback()
+      : route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) }),
   );
 }
 
@@ -30,6 +33,18 @@ async function toReview(page: Page): Promise<void> {
 }
 
 test.describe('pack import wizard', () => {
+  /// A pack that asks for GPUs says so where it is reviewed, before anyone registers it.
+  test('the substrate names the sandbox resources the pack asks for', async ({ page }) => {
+    await stubApi(page);
+    await importWith(page, {
+      ...PACK_IMPORT,
+      dispatch: { ...PACK_IMPORT.dispatch, resources: { gpus: 1, cpu: null, memory: '32Gi', node_selector: {} } },
+    });
+    await toReview(page);
+
+    await expect(page.getByText('1 GPU · memory 32Gi')).toBeVisible();
+  });
+
   test('lists the candidate packs at a ref', async ({ page }) => {
     await stubApi(page);
     await ready(page, IMPORT);
@@ -178,6 +193,7 @@ test.describe('pack import wizard', () => {
         requires: {},
         prefers: {},
         allow_unverified_image: false,
+        resources: { gpus: 0, cpu: null, memory: null, node_selector: {} },
         image: {
           reference: null,
           digest: null,
@@ -235,6 +251,7 @@ test.describe('pack import wizard', () => {
         requires: {},
         prefers: {},
         allow_unverified_image: false,
+        resources: { gpus: 0, cpu: null, memory: null, node_selector: {} },
         image: {
           reference: null,
           digest: null,

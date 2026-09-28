@@ -14,6 +14,7 @@ import {
   QueryState,
   useDataTable,
 } from '../ui';
+import { sourceLabel } from './playbookSource';
 
 type PlaybookDto = components['schemas']['PlaybookDto'];
 
@@ -43,7 +44,7 @@ const columns = helper.columns([
     header: 'Pinned at',
     meta: { className: 'font-mono text-data text-ink-2' },
     cell: ({ row }) =>
-      `${row.original.repo}${row.original.path === '' ? '' : `/${row.original.path}`} @ ${row.original.rev.slice(0, 7)}`,
+      `${sourceLabel(row.original.source)} @ ${row.original.rev.slice(0, 7)}`,
   }),
   helper.accessor('schema_digest', {
     header: 'Form',

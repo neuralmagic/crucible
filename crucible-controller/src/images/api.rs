@@ -79,7 +79,7 @@ pub(crate) async fn list_images(State(state): State<ApiState>) -> Result<Respons
 )]
 pub(crate) async fn refresh_images(
     State(state): State<ApiState>,
-    _admin: crate::identity::auth::AdminGuard,
+    _admin: crate::authz::guard::AdminGuard,
 ) -> Response {
     state.images_refresh.notify_one();
     StatusCode::ACCEPTED.into_response()

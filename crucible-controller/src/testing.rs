@@ -106,6 +106,7 @@ pub(crate) fn cfg_with(state_dir: &std::path::Path) -> crate::config::Controller
         admins: vec![],
         operators: vec![],
         operator_groups: vec![],
+        publishers: vec![],
         session_secure_cookies: true,
         #[cfg(feature = "autoresearch")]
         autopilot: None,

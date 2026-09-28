@@ -3245,6 +3245,7 @@ async fn openapi_spec_contains_all_api_routes(pool: PgPool) -> Result<()> {
         "/api/playbook-drafts/{id}/versions",
         "/api/playbook-drafts/{id}/launch",
         "/api/playbook-drafts/{id}/graduate",
+        "/api/playbook-drafts/{id}/publish",
         "/api/playbook-runs",
         "/api/playbook-runs/{key}",
         "/api/one-shots",
@@ -6197,7 +6198,7 @@ async fn an_operator_proposes_an_import_and_an_admin_registers_it(pool: PgPool) 
     let (status, rows) = get_json(&app, "/api/playbooks").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0]["path"], "packs/survey");
+    assert_eq!(rows[0]["source"]["path"], "packs/survey");
     assert_eq!(rows[0]["rev"], serde_json::Value::String(rev));
 
     let (status, approvals) = get_json_object(&app, "/api/approvals").await;
@@ -7057,7 +7058,8 @@ async fn a_valid_launch_adopts_the_issue_the_row_and_the_pack(pool: PgPool) -> R
         .await?
         .expect("registry row");
     assert_eq!(
-        issue.repo, registered.repo,
+        Some(issue.repo.as_str()),
+        registered.source.repo(),
         "a launch groups under the pack's source repo"
     );
 
@@ -8481,6 +8483,74 @@ async fn a_stale_base_is_refused_with_the_version_that_overtook_it(pool: PgPool)
     Ok(())
 }
 
+/// A draft copies its template's files, so seeding one takes `read` on the template: a playbook
+/// the caller cannot see is a template that does not exist. Once the platform team owns it,
+/// every signed-in user reads, launches, and copies it.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_template_is_what_the_caller_may_read_and_a_platform_playbook_is_everyones(
+    pool: PgPool,
+) -> Result<()> {
+    let (db, dir) = db_with(pool);
+    let app = app_with_admins(db, vec!["wren".to_string()]);
+    register_survey(&app, dir.path(), LAUNCH_WORKFLOW).await;
+    let fork = |id: &str| {
+        json_as(
+            "mallory",
+            "POST",
+            "/api/playbook-drafts",
+            serde_json::json!({"id": id, "description": "forked", "template": "survey"}),
+        )
+    };
+
+    let res = app.clone().oneshot(fork("peek")?).await?;
+    assert_eq!(
+        res.status(),
+        StatusCode::NOT_FOUND,
+        "wren's playbook is private"
+    );
+    let res = app
+        .clone()
+        .oneshot(
+            HttpRequest::get("/api/playbooks")
+                .header("x-auth-request-user", "mallory")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(json_of(res).await?, serde_json::json!([]));
+
+    let res = app
+        .clone()
+        .oneshot(admin_json(
+            "PUT",
+            "/api/playbooks/survey/owner",
+            serde_json::json!({"owner": "team:platform-administrators"}),
+        )?)
+        .await?;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let res = app
+        .clone()
+        .oneshot(
+            HttpRequest::get("/api/playbooks")
+                .header("x-auth-request-user", "mallory")
+                .body(Body::empty())?,
+        )
+        .await?;
+    let listed = json_of(res).await?;
+    assert_eq!(listed[0]["id"], "survey", "{listed}");
+    let actions: Vec<&str> = listed[0]["actions"]
+        .as_array()
+        .expect("actions")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert_eq!(actions, ["read", "launch"]);
+
+    let res = app.oneshot(fork("studio")?).await?;
+    assert_eq!(res.status(), StatusCode::CREATED);
+    Ok(())
+}
+
 /// New-from-template: version 1 is the registered pack's files, and an unknown template is a 404.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn a_draft_seeds_from_a_registered_pack(pool: PgPool) -> Result<()> {
@@ -8819,14 +8889,18 @@ async fn graduation_opens_a_pr_and_the_import_retires_the_draft(pool: PgPool) ->
         let registered = crate::playbooks::registry::get(db.pool(), "studio-pack")
             .await?
             .expect("row");
+        let crate::playbooks::registry::PlaybookSource::Git { repo, path, .. } = registered.source
+        else {
+            panic!("a git registration has a git source");
+        };
         sqlx::query!(
             "UPDATE playbook_drafts SET graduation_repo = $1, graduation_path = $2 WHERE id = 'studio'",
-            registered.repo,
-            registered.path,
+            repo,
+            path,
         )
         .execute(db.pool())
         .await?;
-        registered.repo
+        repo
     };
     assert!(
         crate::playbooks::drafts::get(db.pool(), "studio")
@@ -8874,10 +8948,11 @@ async fn graduation_opens_a_pr_and_the_import_retires_the_draft(pool: PgPool) ->
 }
 
 /// A team holding no platform role runs its own draft: a maintainer authors it, a member launches
-/// it, only the owner deletes it, and a caller outside the team is told it does not exist.
+/// it, only the owner graduates or deletes it, and a caller outside the team is told it does not
+/// exist.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn a_team_with_no_platform_role_authors_and_launches_its_draft(pool: PgPool) -> Result<()> {
-    let (db, _d) = db_with(pool);
+    let (db, dir) = db_with(pool);
     let app = app_with_playbook_caps(
         db.clone(),
         vec![],
@@ -8986,6 +9061,45 @@ async fn a_team_with_no_platform_role_authors_and_launches_its_draft(pool: PgPoo
             .await?;
     assert_eq!(created_by.as_deref(), Some("kim"));
 
+    let graduate_uri = "/api/playbook-drafts/studio/graduate";
+    let target = serde_json::json!({"repo": "owner/packs", "path": "packs/studio"});
+    let (refusals, log) = with_forge_stubs(dir.path(), || async {
+        let mut refusals = Vec::new();
+        for user in ["kim", "dana", "mallory"] {
+            refusals.push((
+                user,
+                send_as(&app, "POST", graduate_uri, user, target.clone()).await,
+            ));
+        }
+        refusals
+    })
+    .await;
+    for (user, (status, body)) in refusals {
+        let expected = if user == "mallory" {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::FORBIDDEN
+        };
+        assert_eq!(status, expected, "{user}: {body}");
+        if user != "mallory" {
+            assert!(
+                body["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("playbook_draft:approve"),
+                "{user}: {body}"
+            );
+        }
+    }
+    assert!(log.is_empty(), "a refused graduation pushes nothing: {log}");
+    let ((status, body), log) = with_forge_stubs(dir.path(), || {
+        send_as(&app, "POST", graduate_uri, "reed", target.clone())
+    })
+    .await;
+    assert_eq!(status, StatusCode::OK, "the owner graduates: {body}");
+    assert_eq!(body["pr_url"], "https://github.com/owner/packs/pull/7");
+    assert!(log.contains("crucible-pack/draft_studio"), "{log}");
+
     let uri = "/api/playbook-drafts/studio";
     for user in ["kim", "dana"] {
         let (status, body) = send_as(&app, "DELETE", uri, user, serde_json::Value::Null).await;
@@ -9002,6 +9116,362 @@ async fn a_team_with_no_platform_role_authors_and_launches_its_draft(pool: PgPoo
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     let (status, body) = send_as(&app, "DELETE", uri, "reed", serde_json::Value::Null).await;
     assert!(status.is_success(), "the owner deletes: {status} {body}");
+    Ok(())
+}
+
+/// Publishing a draft skips review, so owning it is not enough: the default policy refuses the
+/// team's owner until a rule names the team, and from then on the draft stays live and each publish
+/// re-pins the same playbook, which launches and schedules like any other.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_draft_publishes_straight_to_the_registry_only_under_a_rule_naming_its_owner(
+    pool: PgPool,
+) -> Result<()> {
+    let (db, _d) = db_with(pool);
+    let app = app_with_playbook_caps(
+        db.clone(),
+        vec!["root".to_string()],
+        crate::config::PlaybookCaps {
+            max_cost: 10.0,
+            max_time: crate::model::MaxTime::parse("2h").expect("cap"),
+        },
+    );
+    let (status, body) = send_as(
+        &app,
+        "POST",
+        "/api/teams",
+        "reed",
+        serde_json::json!({
+            "slug": "mlr",
+            "display_name": "MLR",
+            "members": [
+                {"kind": "user", "member": "reed", "role": "owner"},
+                {"kind": "user", "member": "kim", "role": "member"},
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let draft =
+        serde_json::json!({"id": "studio", "description": "mlr sweep", "owner": "team:mlr"});
+    let (status, body) = send_as(&app, "POST", "/api/playbook-drafts", "reed", draft).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let mut files = draft_files();
+    files["workflow.star"] = serde_json::json!(LAUNCH_WORKFLOW);
+    let versions = "/api/playbook-drafts/studio/versions";
+    let (status, body) = send_as(
+        &app,
+        "POST",
+        versions,
+        "reed",
+        serde_json::json!({"files": files.clone()}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let publish = "/api/playbook-drafts/studio/publish";
+    let into = |playbook: &str| serde_json::json!({"playbook": playbook});
+    let (status, body) = send_as(&app, "POST", publish, "reed", into("mlr-pack")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("playbook_draft:publish"),
+        "{body}"
+    );
+    let actions = |user: &'static str| {
+        let app = app.clone();
+        async move {
+            let (status, detail) = send_as(
+                &app,
+                "GET",
+                "/api/playbook-drafts/studio",
+                user,
+                serde_json::Value::Null,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{user}: {detail}");
+            detail
+        }
+    };
+    let detail = actions("reed").await;
+    assert!(
+        !detail["actions"]
+            .as_array()
+            .expect("actions")
+            .contains(&serde_json::json!("publish")),
+        "{detail}"
+    );
+
+    let granted = format!(
+        "{}\n@id(\"mlr-owners-publish\") permit(principal, action == Action::\"playbook_draft:publish\", resource) when {{ principal.hasTag(\"team:mlr\") && resource has owner_role && resource.owner_role == \"owner\" }};",
+        crate::authz::policy::DEFAULT_POLICY
+    );
+    let (status, set) = send_as(
+        &app,
+        "POST",
+        "/api/authz/policy-sets",
+        "root",
+        serde_json::json!({"text": granted}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{set}");
+    let activate = format!(
+        "/api/authz/policy-sets/{}/activate",
+        set["digest"].as_str().expect("digest")
+    );
+    let (status, body) = send_as(&app, "POST", &activate, "root", serde_json::Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let detail = actions("reed").await;
+    assert!(
+        detail["actions"]
+            .as_array()
+            .expect("actions")
+            .contains(&serde_json::json!("publish")),
+        "{detail}"
+    );
+
+    let (status, body) = send_as(&app, "POST", publish, "kim", into("mlr-pack")).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a member is outside the rule: {body}"
+    );
+    let (status, body) = send_as(&app, "POST", publish, "mallory", into("mlr-pack")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let (status, body) = send_as(&app, "POST", publish, "reed", serde_json::json!({})).await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "no target yet: {body}"
+    );
+    let (status, body) = send_as(&app, "POST", publish, "reed", into("studio")).await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "the draft keeps its own id: {body}"
+    );
+
+    let (status, first) = send_as(&app, "POST", publish, "reed", into("mlr-pack")).await;
+    assert_eq!(status, StatusCode::CREATED, "{first}");
+    assert_eq!(first["id"], "mlr-pack");
+    assert_eq!(
+        first["rev"], first["tar_digest"],
+        "a draft-sourced pack pins its bytes"
+    );
+    let (status, pack) = send_as(
+        &app,
+        "GET",
+        "/api/playbooks/mlr-pack",
+        "kim",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{pack}");
+    assert_eq!(
+        pack["source"],
+        serde_json::json!({"kind": "draft", "draft": "studio", "version": 2})
+    );
+    assert_eq!(pack["owner"], "team:mlr");
+    let detail = actions("reed").await;
+    assert_eq!(detail["published_playbook"], "mlr-pack");
+    assert!(detail["retired_at"].is_null(), "the draft stays live");
+
+    files["workflow.star"] = serde_json::json!(format!("{LAUNCH_WORKFLOW}\n# second pass\n"));
+    let (status, body) = send_as(
+        &app,
+        "POST",
+        versions,
+        "reed",
+        serde_json::json!({"files": files}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a published draft still saves: {body}"
+    );
+    let (status, second) = send_as(&app, "POST", publish, "reed", serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{second}");
+    assert_eq!(
+        second["id"], "mlr-pack",
+        "a re-publish re-pins the same playbook"
+    );
+    assert_ne!(second["rev"], first["rev"]);
+    let (_, pack) = send_as(
+        &app,
+        "GET",
+        "/api/playbooks/mlr-pack",
+        "reed",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(pack["source"]["version"], 3);
+    let rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM playbooks WHERE source_draft = 'studio'")
+            .fetch_one(db.pool())
+            .await?;
+    assert_eq!(rows, 1);
+
+    let launch = serde_json::json!({
+        "params": {"topic": "attention", "depth": "deep"},
+        "max_cost": 1.0,
+        "max_time": "30m",
+    });
+    let (status, ack) = send_as(
+        &app,
+        "POST",
+        "/api/playbooks/mlr-pack/launch",
+        "kim",
+        launch,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "a member launches the published pack: {ack}"
+    );
+    let launched_repo: String = sqlx::query_scalar("SELECT repo FROM issues WHERE key = $1")
+        .bind(ack["key"].as_str().expect("key"))
+        .fetch_one(db.pool())
+        .await?;
+    assert_eq!(launched_repo, crate::playbooks::registry::DRAFT_LAUNCH_REPO);
+    let mut schedule = schedule_body("0 6 * * *", "UTC");
+    schedule["playbook"] = serde_json::json!("mlr-pack");
+    schedule["params"] = serde_json::json!({"topic": "attention", "depth": "deep"});
+    let (status, body) = send_as(&app, "POST", "/api/schedules", "reed", schedule).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "a schedule adopts the published pack: {body}"
+    );
+
+    let (status, body) = send_as(
+        &app,
+        "POST",
+        "/api/playbook-drafts",
+        "root",
+        serde_json::json!({"id": "roots", "description": "root's"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = send_as(
+        &app,
+        "POST",
+        "/api/playbook-drafts/roots/versions",
+        "root",
+        serde_json::json!({"files": draft_files()}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = send_as(
+        &app,
+        "POST",
+        "/api/playbook-drafts/roots/publish",
+        "root",
+        into("root-pack"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "an admin publishes: {body}");
+    let (status, body) = send_as(&app, "POST", publish, "reed", into("root-pack")).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "re-pinning takes playbook:update on the target: {body}"
+    );
+    let (status, body) = send_as(&app, "POST", publish, "reed", into("roots")).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a live draft holds the launch key: {body}"
+    );
+    Ok(())
+}
+
+/// Turning publishing on for someone is a teams-page edit: an administrator lists them in the
+/// seeded publishers team, and from then on they publish the drafts they own, and only those.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_member_of_the_publishers_team_publishes_the_drafts_it_owns(pool: PgPool) -> Result<()> {
+    let (db, _d) = db_with(pool);
+    crate::authz::bootstrap::seed_playbook_publishers(db.pool(), &[]).await?;
+    let app = app_with_admins(db.clone(), vec!["root".to_string()]);
+    let (status, body) = send_as(
+        &app,
+        "POST",
+        "/api/teams",
+        "reed",
+        serde_json::json!({
+            "slug": "mlr",
+            "display_name": "MLR",
+            "members": [
+                {"kind": "user", "member": "reed", "role": "owner"},
+                {"kind": "user", "member": "kim", "role": "member"},
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let draft =
+        serde_json::json!({"id": "studio", "description": "mlr sweep", "owner": "team:mlr"});
+    let (status, body) = send_as(&app, "POST", "/api/playbook-drafts", "reed", draft).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let mut files = draft_files();
+    files["workflow.star"] = serde_json::json!(LAUNCH_WORKFLOW);
+    let (status, body) = send_as(
+        &app,
+        "POST",
+        "/api/playbook-drafts/studio/versions",
+        "reed",
+        serde_json::json!({"files": files}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let publish = "/api/playbook-drafts/studio/publish";
+    let into = serde_json::json!({"playbook": "mlr-pack"});
+    let (status, body) = send_as(&app, "POST", publish, "reed", into.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "not yet a publisher: {body}");
+
+    let members = serde_json::json!({"members": [
+        {"kind": "user", "member": "root", "role": "owner"},
+        {"kind": "user", "member": "reed", "role": "member"},
+        {"kind": "user", "member": "kim", "role": "member"},
+    ]});
+    let uri = "/api/teams/playbook-publishers/members";
+    let (status, body) = send_as(&app, "PUT", uri, "reed", members.clone()).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "only its owners manage it: {body}"
+    );
+    let (status, body) = send_as(&app, "PUT", uri, "root", members).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = send_as(&app, "POST", publish, "kim", into.clone()).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a publisher who is only a member of the owning team does not publish: {body}"
+    );
+    let (status, detail) = send_as(
+        &app,
+        "GET",
+        "/api/playbook-drafts/studio",
+        "reed",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{detail}");
+    assert!(
+        detail["actions"]
+            .as_array()
+            .expect("actions")
+            .contains(&serde_json::json!("publish")),
+        "{detail}"
+    );
+    let (status, ack) = send_as(&app, "POST", publish, "reed", into).await;
+    assert_eq!(status, StatusCode::CREATED, "{ack}");
+    assert_eq!(ack["id"], "mlr-pack");
     Ok(())
 }
 
@@ -10020,9 +10490,24 @@ async fn an_admin_registers_edits_and_deregisters_a_provider(pool: PgPool) -> Re
     Ok(())
 }
 
-/// Every write to the registry is an administrator's, and a caller who is not one changes nothing.
+fn json_as(
+    user: &str,
+    method: &str,
+    path: &str,
+    body: serde_json::Value,
+) -> Result<HttpRequest<Body>> {
+    Ok(HttpRequest::builder()
+        .method(method)
+        .uri(path)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-auth-request-user", user)
+        .body(Body::from(serde_json::to_vec(&body)?))?)
+}
+
+/// A caller who is no administrator reads the platform's providers and registers their own, but
+/// may not edit or remove the platform's, nor set a dispatch default.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-async fn a_non_admin_may_not_touch_the_registry(pool: PgPool) -> Result<()> {
+async fn a_non_admin_owns_what_they_register_and_changes_nothing_else(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
     seed_provider(
         db.pool(),
@@ -10033,38 +10518,87 @@ async fn a_non_admin_may_not_touch_the_registry(pool: PgPool) -> Result<()> {
     .await;
     let app = app_with_admins(db.clone(), vec!["wren".to_string()]);
 
-    let body = serde_json::json!({"id": "sneaky", "display_name": "Mine", "kind": "openai"});
+    let res = app
+        .clone()
+        .oneshot(json_as(
+            "mallory",
+            "POST",
+            "/api/providers",
+            serde_json::json!({"id": "mine", "display_name": "Mine", "kind": "openai"}),
+        )?)
+        .await?;
+    assert_eq!(res.status(), StatusCode::CREATED);
+    assert_eq!(json_of(res).await?["owner"], "user:mallory");
+
+    let res = app
+        .clone()
+        .oneshot(
+            HttpRequest::get("/api/providers")
+                .header("x-auth-request-user", "mallory")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(res.status(), StatusCode::OK);
+    let listed = json_of(res).await?;
+    let mut held: Vec<(String, serde_json::Value)> = listed
+        .as_array()
+        .expect("list")
+        .iter()
+        .map(|p| {
+            (
+                p["id"].as_str().unwrap_or_default().to_string(),
+                p["actions"].clone(),
+            )
+        })
+        .collect();
+    held.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        held,
+        [
+            (
+                "mine".to_string(),
+                serde_json::json!(["read", "create", "update", "delete", "transfer", "share"])
+            ),
+            ("plat-openai".to_string(), serde_json::json!(["read"])),
+        ],
+        "{listed}"
+    );
+
+    let res = app
+        .clone()
+        .oneshot(
+            HttpRequest::get("/api/providers")
+                .header("x-auth-request-user", "zed")
+                .body(Body::empty())?,
+        )
+        .await?;
+    let ids: Vec<serde_json::Value> = json_of(res).await?.as_array().expect("list").clone();
+    assert_eq!(
+        ids.iter().map(|p| p["id"].clone()).collect::<Vec<_>>(),
+        [serde_json::json!("plat-openai")],
+        "another caller's provider is not listed"
+    );
+
     let requests: Vec<HttpRequest<Body>> = vec![
-        HttpRequest::get("/api/providers")
-            .header("x-auth-request-user", "mallory")
-            .body(Body::empty())?,
-        HttpRequest::builder()
-            .method("POST")
-            .uri("/api/providers")
-            .header(header::CONTENT_TYPE, "application/json")
-            .header("x-auth-request-user", "mallory")
-            .body(Body::from(serde_json::to_vec(&body)?))?,
-        HttpRequest::builder()
-            .method("PUT")
-            .uri("/api/providers/plat-openai")
-            .header(header::CONTENT_TYPE, "application/json")
-            .header("x-auth-request-user", "mallory")
-            .body(Body::from(serde_json::to_vec(
-                &serde_json::json!({"display_name": "Mine", "kind": "openai"}),
-            )?))?,
+        json_as(
+            "mallory",
+            "PUT",
+            "/api/providers/plat-openai",
+            serde_json::json!({"display_name": "Mine", "kind": "openai"}),
+        )?,
         HttpRequest::delete("/api/providers/plat-openai")
             .header("x-auth-request-user", "mallory")
             .body(Body::empty())?,
-        HttpRequest::builder()
-            .method("PUT")
-            .uri("/api/config/dispatch-defaults")
-            .header(header::CONTENT_TYPE, "application/json")
-            .header("x-auth-request-user", "mallory")
-            .body(Body::from(serde_json::to_vec(&serde_json::json!({
+        json_as(
+            "mallory",
+            "PUT",
+            "/api/config/dispatch-defaults",
+            serde_json::json!({
                 "scope_kind": "platform",
                 "workload_class": "playbook",
                 "provider": "plat-openai",
-            }))?))?,
+            }),
+        )?,
         HttpRequest::delete(
             "/api/config/dispatch-defaults?scope_kind=platform&workload_class=playbook",
         )
@@ -10076,16 +10610,95 @@ async fn a_non_admin_may_not_touch_the_registry(pool: PgPool) -> Result<()> {
         let res = app.clone().oneshot(req).await?;
         assert_eq!(res.status(), StatusCode::FORBIDDEN, "{method} {uri}");
     }
-    assert_eq!(
-        crate::playbooks::providers::list(db.pool(), false)
-            .await?
-            .len(),
-        1
-    );
+    let plat = crate::playbooks::providers::get(db.pool(), "plat-openai")
+        .await?
+        .expect("still registered");
+    assert_eq!(plat.display_name, "Platform OpenAI");
     assert!(
         crate::playbooks::providers::list_defaults(db.pool())
             .await?
             .is_empty()
+    );
+    Ok(())
+}
+
+/// A provider spends its key on every dispatch, so registering or editing one to name a secret
+/// takes `bind` on that secret: a caller cannot point a provider of their own at someone else's.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn naming_a_provider_key_takes_bind_on_the_secret(pool: PgPool) -> Result<()> {
+    let (db, _d) = db_with(pool);
+    seed_secret(
+        db.pool(),
+        "sec-1",
+        "openai-key",
+        crate::secrets::SecretKind::InferenceApiKey,
+    )
+    .await;
+    let app = app_with_admins(db.clone(), vec!["wren".to_string()]);
+    let register = |user: &str, id: &str| {
+        json_as(
+            user,
+            "POST",
+            "/api/providers",
+            serde_json::json!({
+                "id": id,
+                "display_name": "Keyed",
+                "kind": "openai",
+                "secret_name": "openai-key",
+            }),
+        )
+    };
+
+    let res = app.clone().oneshot(register("mallory", "stolen")?).await?;
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    assert!(
+        crate::playbooks::providers::get(db.pool(), "stolen")
+            .await?
+            .is_none()
+    );
+
+    let res = app
+        .clone()
+        .oneshot(json_as(
+            "mallory",
+            "POST",
+            "/api/providers",
+            serde_json::json!({"id": "keyless", "display_name": "Keyless", "kind": "openai"}),
+        )?)
+        .await?;
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let res = app
+        .clone()
+        .oneshot(json_as(
+            "mallory",
+            "PUT",
+            "/api/providers/keyless",
+            serde_json::json!({"display_name": "Keyless", "kind": "openai", "secret_name": "openai-key"}),
+        )?)
+        .await?;
+    assert_eq!(
+        res.status(),
+        StatusCode::FORBIDDEN,
+        "an edit cannot attach the key either"
+    );
+
+    let res = app.clone().oneshot(register("alice", "alices")?).await?;
+    assert_eq!(res.status(), StatusCode::CREATED, "the secret's owner may");
+    let res = app
+        .clone()
+        .oneshot(json_as(
+            "alice",
+            "PUT",
+            "/api/providers/alices",
+            serde_json::json!({"display_name": "Renamed", "kind": "openai", "secret_name": "openai-key"}),
+        )?)
+        .await?;
+    assert_eq!(res.status(), StatusCode::OK);
+    let res = app.oneshot(register("wren", "platform")?).await?;
+    assert_eq!(
+        res.status(),
+        StatusCode::CREATED,
+        "a platform administrator holds bind on every secret"
     );
     Ok(())
 }

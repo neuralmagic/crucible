@@ -55,7 +55,7 @@ pub(crate) struct EmitAck {
     request_body = EmitRunBody,
     responses(
         (status = 201, description = "Review trail filed (idempotent — replays create nothing new)", body = EmitAck),
-        (status = 403, description = "Caller is not in the admin whitelist", body = ErrorBody),
+        (status = 403, description = "Caller is not a platform administrator", body = ErrorBody),
         (status = 422, description = "issue_key/pack_digest/run_id/justification must be non-empty; prs must be non-empty with non-blank url+repo", body = ErrorBody),
         (status = 502, description = "The tracker rejected a create call", body = ErrorBody),
         (status = 503, description = "Emission is not configured on this controller", body = ErrorBody)
@@ -64,7 +64,7 @@ pub(crate) struct EmitAck {
 pub(crate) async fn emit_run(
     State(state): State<ApiState>,
     identity: crate::identity::session::Identity,
-    _admin: crate::identity::auth::AdminGuard,
+    _admin: crate::authz::guard::AdminGuard,
     Json(body): Json<EmitRunBody>,
 ) -> Response {
     let Some(ctx) = state.emission.clone() else {

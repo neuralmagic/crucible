@@ -57,7 +57,7 @@ fn validate_repo_ref(raw: &str, whitelist: &RepoWhitelist) -> Result<RepoRef, St
 pub(crate) async fn add_repo(
     State(state): State<ApiState>,
     identity: crate::identity::session::Identity,
-    _admin: crate::identity::auth::AdminGuard,
+    _admin: crate::authz::guard::AdminGuard,
     Json(body): Json<AddRepoBody>,
 ) -> Response {
     let justification = body.justification.trim().to_string();
@@ -170,7 +170,7 @@ pub(crate) async fn pause_repo(
     State(state): State<ApiState>,
     Path(repo): Path<String>,
     identity: crate::identity::session::Identity,
-    _admin: crate::identity::auth::AdminGuard,
+    _admin: crate::authz::guard::AdminGuard,
 ) -> Response {
     repo_transition(
         &state,
@@ -198,7 +198,7 @@ pub(crate) async fn resume_repo(
     State(state): State<ApiState>,
     Path(repo): Path<String>,
     identity: crate::identity::session::Identity,
-    _admin: crate::identity::auth::AdminGuard,
+    _admin: crate::authz::guard::AdminGuard,
 ) -> Response {
     repo_transition(
         &state,
@@ -226,7 +226,7 @@ pub(crate) async fn unwatch_repo(
     State(state): State<ApiState>,
     Path(repo): Path<String>,
     identity: crate::identity::session::Identity,
-    _admin: crate::identity::auth::AdminGuard,
+    _admin: crate::authz::guard::AdminGuard,
 ) -> Response {
     repo_transition(
         &state,

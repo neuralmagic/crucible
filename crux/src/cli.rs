@@ -486,6 +486,17 @@ enum Command {
     /// Delete a draft and every version of it. Admin only; the id is free to create again.
     DraftDelete { draft_id: String },
 
+    /// Publish a draft: register its newest compiling version as a playbook, with no review.
+    DraftPublish {
+        draft_id: String,
+        /// The playbook to publish into. Omit to re-pin the one this draft last published into,
+        /// else the one it was seeded from.
+        #[arg(long)]
+        playbook: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Graduate a draft: push its newest compiling version and open the export PR.
     DraftGraduate {
         draft_id: String,
@@ -801,6 +812,11 @@ pub async fn run() -> Result<()> {
             path,
             json,
         } => ops::draft_graduate(&client, &draft_id, &repo, path.as_deref(), json).await?,
+        Command::DraftPublish {
+            draft_id,
+            playbook,
+            json,
+        } => ops::draft_publish(&client, &draft_id, playbook.as_deref(), json).await?,
     };
     println!("{}", out.trim_end());
     Ok(())

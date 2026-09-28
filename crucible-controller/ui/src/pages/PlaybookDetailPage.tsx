@@ -16,6 +16,7 @@ import {
   SectionHeader,
 } from '../ui';
 import { FormActions, FormError, FormGrid, TextField } from './formControls';
+import { sourceLabel } from './playbookSource';
 import { SharesSection } from './SharesSection';
 
 export function PlaybookDetailPage() {
@@ -80,7 +81,7 @@ export function PlaybookDetailPage() {
         <SectionHeader title="Source" note="read only" />
         <SectionBody>
           <div className="mb-3 flex flex-wrap gap-x-6 gap-y-1 font-mono text-data text-ink-2">
-            <span>{playbook.repo}{playbook.path === '' ? '' : `/${playbook.path}`}</span>
+            <span>{sourceLabel(playbook.source)}</span>
             <span>@ {playbook.rev}</span>
             <span>{playbook.tar_digest}</span>
           </div>

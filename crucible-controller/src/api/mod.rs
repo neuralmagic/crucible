@@ -96,6 +96,7 @@ pub(crate) mod tests;
         crate::playbooks::api::drafts::delete_playbook_draft,
         crate::playbooks::api::drafts::launch_playbook_draft,
         crate::playbooks::api::drafts::graduate_playbook_draft,
+        crate::playbooks::api::drafts::publish_playbook_draft,
         crate::playbooks::api::registry::list_playbooks,
         crate::playbooks::api::registry::get_playbook,
         crate::playbooks::api::registry::get_playbook_schema,
@@ -244,6 +245,7 @@ pub(crate) mod tests;
         crate::playbooks::api::drafts::LaunchDraftBody,
         crate::playbooks::api::drafts::GraduateDraftBody,
         crate::playbooks::api::drafts::GraduateAck,
+        crate::playbooks::api::drafts::PublishDraftBody,
         crate::playbooks::api::drafts::PlaybookDraftDto,
         crate::playbooks::api::drafts::PlaybookDraftDetail,
         crate::playbooks::api::drafts::DraftVersionDto,
@@ -262,6 +264,8 @@ pub(crate) mod tests;
         crate::playbooks::plan_graph::Needs,
         crate::playbooks::plan_graph::Join,
         crate::playbooks::api::registry::PlaybookDto,
+        crate::playbooks::api::registry::PlaybookSourceDto,
+        crate::playbooks::api::registry::SandboxResourcesDto,
         crate::playbooks::api::registry::PlaybookDetailDto,
         crate::playbooks::api::registry::LaunchPlaybookBody,
         crate::playbooks::api::registry::PlaybookLaunchAck,
@@ -450,6 +454,9 @@ pub fn router(state: ApiState) -> Router {
         ))
         .routes(routes!(
             crate::playbooks::api::drafts::graduate_playbook_draft
+        ))
+        .routes(routes!(
+            crate::playbooks::api::drafts::publish_playbook_draft
         ))
         .routes(routes!(crate::playbooks::api::drafts::get_co_draft_skill))
         .routes(routes!(crate::playbooks::api::drafts::get_co_draft))

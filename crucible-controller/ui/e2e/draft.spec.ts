@@ -509,6 +509,85 @@ test.describe('draft authoring studio', () => {
     await expect(page.getByRole('button', { name: 'SAVE', exact: true })).toBeDisabled();
     await expect(page.getByRole('button', { name: 'DELETE DRAFT' })).toBeDisabled();
     await expect(page.getByRole('button', { name: 'LAUNCH DRAFT' })).toBeEnabled();
+    await page.getByLabel('Repo').fill('owner/packs');
+    await expect(page.getByRole('button', { name: 'GRADUATE' })).toBeDisabled();
+  });
+
+  /// Graduating is the draft owner's call: a platform viewer who owns the draft exports it.
+  test('a draft owner with no platform role graduates it', async ({ page }) => {
+    await stubApi(page);
+    const whoami = ROUTES['/api/whoami'];
+    if (typeof whoami !== 'object' || whoami === null || Array.isArray(whoami)) {
+      throw new Error('the whoami fixture is an object');
+    }
+    await page.route('**/api/whoami', (route: Route) =>
+      route.fulfill({ json: { ...whoami, role: 'viewer' } }),
+    );
+    const graduations: unknown[] = [];
+    await page.route('**/api/playbook-drafts/studio/graduate', (route: Route) => {
+      graduations.push(route.request().postDataJSON());
+      return route.fulfill({ json: { pr_url: 'https://github.com/owner/packs/pull/7' } });
+    });
+    await ready(page, STUDIO);
+
+    const graduate = page.getByRole('button', { name: 'GRADUATE' });
+    await page.getByLabel('Repo').fill('');
+    await expect(graduate).toBeDisabled();
+    await page.getByLabel('Repo').fill('owner/packs');
+    await page.getByLabel('Path').fill('packs/studio');
+    await graduate.click();
+    await expect(
+      page.getByRole('link', { name: 'https://github.com/owner/packs/pull/7' }),
+    ).toBeVisible();
+    expect(graduations).toEqual([{ repo: 'owner/packs', path: 'packs/studio' }]);
+  });
+
+  /// Publishing skips review, so the studio offers it only where the policy grants it, and a
+  /// draft that published before re-pins the same playbook.
+  test('publishing is offered only under a grant and re-pins the published playbook', async ({
+    page,
+  }) => {
+    await stubApi(page);
+    await ready(page, STUDIO);
+    await expect(page.getByRole('button', { name: 'PUBLISH', exact: true })).toHaveCount(0);
+
+    const studio = ROUTES['/api/playbook-drafts/studio'];
+    if (typeof studio !== 'object' || studio === null || Array.isArray(studio)) {
+      throw new Error('the studio fixture is an object');
+    }
+    const actions: unknown = studio.actions;
+    if (!Array.isArray(actions)) throw new Error('the studio fixture lists its actions');
+    await page.route('**/api/playbook-drafts/studio', (route: Route) => {
+      if (route.request().method() !== 'GET') return route.fallback();
+      return route.fulfill({
+        json: { ...studio, actions: [...actions, 'publish'], published_playbook: 'mlr-pack' },
+      });
+    });
+    const published: unknown[] = [];
+    await page.route('**/api/playbook-drafts/studio/publish', (route: Route) => {
+      published.push(route.request().postDataJSON());
+      return route.fulfill({
+        status: 201,
+        json: {
+          id: 'mlr-pack',
+          rev: 'sha256:0123456789abcdef0123',
+          tar_digest: 'sha256:0123456789abcdef0123',
+          schema_digest: 'sha256:form',
+          schema_changed: false,
+          exposure_digest: null,
+          exposure_changed: false,
+        },
+      });
+    });
+    await ready(page, STUDIO);
+
+    await expect(page.getByLabel('Playbook')).toHaveValue('mlr-pack');
+    await page.getByRole('button', { name: 'PUBLISH', exact: true }).click();
+    await expect(page.getByRole('link', { name: 'mlr-pack @ sha256:0123456789ab' })).toHaveAttribute(
+      'href',
+      '/playbooks/mlr-pack',
+    );
+    expect(published).toEqual([{ playbook: 'mlr-pack' }]);
   });
 
   /// Deleting takes every version with it, so it asks first and names what it is about to drop.
