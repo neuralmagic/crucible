@@ -3,9 +3,10 @@
 [govctl]
 id = "WI-2026-09-23-001"
 title = "Bound each task attempt by its own time limit"
-status = "active"
+status = "done"
 created = "2026-09-23"
 started = "2026-09-23"
+completed = "2026-09-28"
 refs = [
     "RFC-0002:C-PLAYBOOK-BUDGET",
     "RFC-0002:C-PLAYBOOK-LANE",
