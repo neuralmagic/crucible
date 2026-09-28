@@ -2,7 +2,11 @@
 
 use crate::plan::ir::ValidPlan;
 
-pub(crate) fn plan_admitted_event(plan: &ValidPlan) -> crate::report::session::SessionEvent {
+/// `max_asks` is the run's bound on asks as the launcher set it; 0 where the lane admits none.
+pub(crate) fn plan_admitted_event(
+    plan: &ValidPlan,
+    max_asks: u32,
+) -> crate::report::session::SessionEvent {
     let p = plan.plan();
     crate::report::session::SessionEvent::PlanAdmitted {
         plan_version: p.version,
@@ -32,8 +36,10 @@ pub(crate) fn plan_admitted_event(plan: &ValidPlan) -> crate::report::session::S
                     .map(|r| r.task.0.clone())
                     .unwrap_or_default(),
                 max_rounds: t.revise.as_ref().map_or(0, |r| r.max_rounds),
+                asks: t.asks.clone(),
             })
             .collect(),
+        max_asks,
     }
 }
 
@@ -108,7 +114,7 @@ mod tests {
         .validate()
         .unwrap();
         let SessionEvent::PlanAdmitted { tasks, .. } =
-            crate::plan::events::plan_admitted_event(&plan)
+            crate::plan::events::plan_admitted_event(&plan, 0)
         else {
             panic!("not a plan_admitted event");
         };
@@ -117,5 +123,45 @@ mod tests {
             (tasks[1].revise.as_str(), tasks[1].max_rounds),
             ("author", 3)
         );
+    }
+
+    #[test]
+    fn the_admitted_plan_carries_each_tasks_asks_and_the_runs_bound() {
+        let plan = Plan::from_toml_str(
+            r#"
+            version = 1
+            [budget]
+            usd = 1.0
+            [[task]]
+            name = "scan"
+            kind = "command"
+            command = "true"
+            [[task]]
+            name = "roundup"
+            kind = "command"
+            command = "true"
+            depends_on = ["scan"]
+            asks = ["issue-fix"]
+            "#,
+        )
+        .unwrap()
+        .validate()
+        .unwrap();
+        let event = crate::plan::events::plan_admitted_event(&plan, 7);
+        let SessionEvent::PlanAdmitted {
+            tasks, max_asks, ..
+        } = &event
+        else {
+            panic!("not a plan_admitted event");
+        };
+        assert_eq!(*max_asks, 7);
+        assert!(tasks[0].asks.is_empty());
+        assert_eq!(
+            tasks[1].asks.iter().map(|w| w.as_str()).collect::<Vec<_>>(),
+            ["issue-fix"]
+        );
+        let line = crate::report::session::encode(&event);
+        assert!(line.contains("\"max_asks\":7"), "{line}");
+        assert!(line.contains("\"asks\":[\"issue-fix\"]"), "{line}");
     }
 }

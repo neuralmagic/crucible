@@ -96,7 +96,7 @@ pub(crate) fn run_iteration<R: Reporter>(
         .unwrap_or_else(|| "decide".into());
     runner
         .r
-        .plan_event(&crate::plan::events::plan_admitted_event(&plan));
+        .plan_event(&crate::plan::events::plan_admitted_event(&plan, 0));
     runner.arm(&cx);
     let task_states = Arc::clone(&runner.task_states);
     // The runner and the on_result hook both need the reporter; collect the wire lines
@@ -108,7 +108,10 @@ pub(crate) fn run_iteration<R: Reporter>(
             Default::default(),
             &crucible::inference::from_process_env()?,
         ),
-        ExecCfg::default(),
+        ExecCfg {
+            max_asks: 0,
+            ..ExecCfg::default()
+        },
         &mut *runner,
         |task, result| {
             states_of(&task_states).insert(task.name.clone(), (result.status, result.note.clone()));
@@ -243,7 +246,7 @@ pub(crate) fn run_epilogue<R: Reporter>(
         plan.plan().tasks.len(),
         kept.iter
     ));
-    r.plan_event(&crate::plan::events::plan_admitted_event(&plan));
+    r.plan_event(&crate::plan::events::plan_admitted_event(&plan, 0));
 
     let mut runner = EpilogueRunner {
         inner: crate::plan::harness::HarnessRunner {
@@ -262,7 +265,10 @@ pub(crate) fn run_epilogue<R: Reporter>(
             Default::default(),
             &crucible::inference::from_process_env()?,
         ),
-        ExecCfg::default(),
+        ExecCfg {
+            max_asks: 0,
+            ..ExecCfg::default()
+        },
         &mut runner,
         |task, result| {
             task_events.push(crate::plan::events::task_result_event(
@@ -867,7 +873,7 @@ pub(crate) fn run_wide_tournament<R: Reporter>(
 
     let direction = judge.direction();
     let plan = wide_template(cfg, prep, direction)?;
-    r.plan_event(&crate::plan::events::plan_admitted_event(&plan));
+    r.plan_event(&crate::plan::events::plan_admitted_event(&plan, 0));
     r.note("wide: starting parallel PROPOSE turns");
     let snap = world
         .snapshot("wide-pre-measure")
@@ -896,7 +902,10 @@ pub(crate) fn run_wide_tournament<R: Reporter>(
             Default::default(),
             &crucible::inference::from_process_env()?,
         ),
-        ExecCfg::default(),
+        ExecCfg {
+            max_asks: 0,
+            ..ExecCfg::default()
+        },
         &mut runner,
         |task, result| {
             task_events.push(crate::plan::events::task_result_event(
@@ -995,6 +1004,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
             max_fanout: None,
             when: None,
             revise: None,
+            asks: Vec::new(),
         });
     }
     for id in 0..cfg.n {
@@ -1018,6 +1028,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
             max_fanout: None,
             when: None,
             revise: None,
+            asks: Vec::new(),
         });
     }
     tasks.push(Task {
@@ -1041,6 +1052,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
         max_fanout: None,
         when: None,
         revise: None,
+        asks: Vec::new(),
     });
     Plan {
         version: 1,
@@ -1357,12 +1369,12 @@ fn render_wide_prompt(template: &str, goal: &str, approach: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::args::Prepared;
     use crate::manifest;
     use crate::report;
     use crate::report::stream;
     use crate::runloop::driver::{LoopRuntime, run_loop};
+    use crate::runloop::graph::*;
     use clap::Parser;
     use std::path::Path;
 

@@ -295,6 +295,10 @@ pub(crate) enum PlanAction {
         /// one, for the same reason.
         #[arg(long)]
         max_time: Option<String>,
+        /// The most asks the run may emit across all of its tasks. A task whose asks would take
+        /// the run past it fails; the run never dispatches an ask either way.
+        #[arg(long, default_value_t = crate::plan::ir::DEFAULT_MAX_ASKS)]
+        max_asks: u32,
         /// Substrate capabilities (repeatable). `any`-needs tasks always run.
         #[arg(long = "cap")]
         caps: Vec<String>,
@@ -498,7 +502,7 @@ pub(crate) struct DeployArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::cli::*;
 
     fn deploy_render(extra: &[&str]) -> Result<Cli, clap::Error> {
         let mut argv = vec![

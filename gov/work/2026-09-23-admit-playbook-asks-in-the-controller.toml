@@ -1,0 +1,53 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-09-23-002"
+title = "Admit playbook asks in the controller"
+status = "queue"
+created = "2026-09-23"
+refs = [
+    "RFC-0002:C-ASKS",
+    "RFC-0002:C-PLAYBOOK-PARAMS",
+    "ADR-0050",
+    "ADR-0033",
+    "ADR-0037",
+]
+
+[content]
+description = """
+The engine half of [[RFC-0002:C-ASKS]] ([[WI-2026-09-23-001]]) emits asks on the session log and never dispatches them. The receiving orchestrator's half is open: the controller folds no asks_emitted event, so an ask goes nowhere.
+
+Ingest (crucible-controller runs::ingest) must fold asks_emitted into durable rows keyed by the contract's ask:{workflow}:{key} input key, resolve the workflow against the playbook registry, validate params against the registered pack's stored params schema, and refuse an ask whose workflow is unknown or whose params fail, recording why. Dedup is by input key across runs; exclusion and rate limits are the controller's to set. Admission must go through the one launch path ([[ADR-0033]], [[ADR-0037]]) rather than a second, weaker one.
+
+Decisions this item has to make, which the engine half deliberately left open:
+- Authority: whose principal an admitted ask launches under (the emitting run's launcher, the standing launch's owner, or a configured service principal) and how [[RFC-0003]] team policy scopes which workflows a run may ask for. An ask must not let a run launch what its launcher could not.
+- Ceilings: where an asked run's --max-cost and --max-time come from, bounded by the playbook caps.
+- Human in the loop: whether admission waits on approval, e.g. an elicitation in Slack naming the emitting run, the workflow, the key, and the params, before the launch row is written.
+- Parameter types: validate_params builds an all-strings instance, while an ask's params keep JSON types (numbers, booleans, lists of strings); one of the two needs to give.
+- The bound: pass plan run --max-asks from a controller knob (and through the deploy render's --playbook path) so the operator sets it per deployment, and surface it before launch.
+- Disclosure: list the workflows a pack may ask for in its exposure or preview, so an approver sees them before the pack runs."""
+
+[[content.acceptance_criteria]]
+text = "ingest folds asks_emitted into ask rows keyed by input key, idempotent across re-ingest of the same log"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "an ask naming an unregistered workflow or carrying params its schema refuses is rejected with the reason recorded, and never launched"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "an admitted ask launches or queues through the existing playbook launch path under a stated principal and ceilings, and a repeat of an input key already admitted does not launch again"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "the deployment sets the run bound passed as plan run --max-asks on both the pod and local executors"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "sqlx tests against a real Postgres cover ingest, rejection, dedup, and launch"
+status = "pending"
+category = "chore"

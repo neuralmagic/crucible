@@ -23,7 +23,7 @@ scan = skill(
     name = "scan",
     skill = "skills/scan-issues",
     args = {"repo": param("repo"), "label": param("label"), "limit": param("limit")},
-    emits = ["issues"],
+    emits = ["repo", "issues"],
     emits_files = ["ISSUES.md"],
 )
 
@@ -42,7 +42,8 @@ triage = skill(
 )
 
 # Deterministic and free: the report is assembled from what the passing instances
-# captured, not from an agent's memory of what it did.
+# captured, not from an agent's memory of what it did. Each confident, severe bug becomes
+# an ask for its own issue-fix run, which this run records and never starts itself.
 roundup = command(
     name = "roundup",
     run = "python3 roundup.py",
@@ -50,6 +51,7 @@ roundup = command(
     join = "passed",
     emits = ["triaged"],
     emits_files = ["REPORT.md"],
+    asks = ["issue-fix"],
 )
 
 workflow(type = "playbook", tasks = [scan, triage, roundup], result = roundup)

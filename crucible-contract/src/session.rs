@@ -152,6 +152,9 @@ pub struct PlanTaskWire {
     /// The most rounds `revise` may run, the first included; 0 when the task revises nothing.
     #[serde(default)]
     pub max_rounds: u32,
+    /// The workflows this task may name in an ask, empty when it may emit none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub asks: Vec<crate::ask::WorkflowName>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -394,6 +397,11 @@ pub enum SessionEvent {
         reason: String,
         budget_usd: f64,
         tasks: Vec<PlanTaskWire>,
+        /// The most asks the run may emit across all of its tasks. A task whose asks would take
+        /// the run past it fails. 0 on a log written before the field existed, and in any lane
+        /// that admits no asks.
+        #[serde(default)]
+        max_asks: u32,
     },
     /// What a task proposed for a receiving orchestrator to admit. Emitted once per task that
     /// emitted any, as it settles, so what a run proposed is auditable independently of what was
@@ -543,9 +551,9 @@ pub fn decode(line: &str) -> Option<SessionEvent> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::event::{ModelUsage, RawStream, Tokens};
     use crate::identity::{ComponentIdentity, RigIdentity};
+    use crate::session::*;
 
     /// A task run (and a skipped-baseline codegen run) has no finite best/baseline; those
     /// lines carry `null` and must still decode instead of being silently dropped.
@@ -826,7 +834,9 @@ mod tests {
                 when: String::new(),
                 revise: "draft".into(),
                 max_rounds: 3,
+                asks: vec![crate::ask::WorkflowName::new("fix-issue").expect("valid name")],
             }],
+            max_asks: 16,
         });
     }
 
@@ -839,8 +849,11 @@ mod tests {
             asks: vec![
                 crate::ask::Ask::new(
                     crate::ask::AskKey::new("arxiv.org/abs/2401.12345").expect("valid key"),
-                    "implement-paper",
-                    serde_json::json!({"paper_url": "https://arxiv.org/abs/2401.12345"}),
+                    crate::ask::WorkflowName::new("implement-paper").expect("valid name"),
+                    serde_json::Map::from_iter([(
+                        "paper_url".to_string(),
+                        serde_json::json!("https://arxiv.org/abs/2401.12345"),
+                    )]),
                 )
                 .expect("valid ask"),
             ],
@@ -851,7 +864,7 @@ mod tests {
     /// this the wire would be a way around the key rules rather than the place they are enforced.
     #[test]
     fn an_ask_with_an_unusable_key_does_not_decode() {
-        let line = r#"{"v":1,"kind":"asks_emitted","task":"classify","asks":[{"key":"with space","workflow":"w","params":null}]}"#;
+        let line = r#"{"v":1,"kind":"asks_emitted","task":"classify","asks":[{"key":"with space","workflow":"w","params":{}}]}"#;
         assert!(decode(line).is_none(), "a bad key decoded");
     }
 

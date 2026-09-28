@@ -7,10 +7,11 @@
 
 use crate::plan::exec::DeclaredStatus;
 use crate::plan::ir::KEPT_INPUT;
-use crate::plan::ir::{ITEM_INPUT, OUTCOME_INPUT, REVISION_INPUT};
+use crate::plan::ir::{ASKS_FIELD, DEFAULT_MAX_ASKS, ITEM_INPUT, OUTCOME_INPUT, REVISION_INPUT};
 use crate::plan::ir::{MAX_FANOUT_CEILING, MAX_ROUNDS_CEILING};
 #[cfg(test)]
 use crate::plan::workflow::WorkflowType;
+use crucible_contract::ask::MAX_ASK_PARAMS_BYTES;
 use crucible_contract::decision::UNCERTAIN;
 
 /// Which lanes see a constructor.
@@ -137,6 +138,15 @@ fn task_knobs() -> Vec<Kwarg> {
         when_kwarg(),
         answers_kwarg(),
         otherwise_kwarg(),
+        Kwarg::new(
+            "asks",
+            "list[str]",
+            format!(
+                "Workflows this task may name in the asks it returns under `{ASKS_FIELD}`. The run \
+                 records them and never dispatches one; a receiving orchestrator decides what \
+                 becomes a run. Playbooks only; not in a revise loop."
+            ),
+        ),
     ]
 }
 
@@ -538,15 +548,15 @@ pub fn functions() -> Vec<Function> {
 pub struct Reserved {
     pub name: &'static str,
     pub ty: String,
-    pub purpose: &'static str,
+    pub purpose: String,
 }
 
 impl Reserved {
-    fn new(name: &'static str, ty: impl Into<String>, purpose: &'static str) -> Self {
+    fn new(name: &'static str, ty: impl Into<String>, purpose: impl Into<String>) -> Self {
         Reserved {
             name,
             ty: ty.into(),
-            purpose,
+            purpose: purpose.into(),
         }
     }
 }
@@ -562,11 +572,26 @@ fn declared_status_type() -> String {
 
 /// Fields the engine reads out of a task's own JSON output.
 pub fn reserved_result_fields() -> Vec<Reserved> {
-    vec![Reserved::new(
-        "status",
-        declared_status_type(),
-        "Settles the task, overriding an exit code or `pass`. Any other value is ignored.",
-    )]
+    vec![
+        Reserved::new(
+            "status",
+            declared_status_type(),
+            "Settles the task, overriding an exit code or `pass`. Any other value is ignored."
+                .to_owned(),
+        ),
+        Reserved::new(
+            ASKS_FIELD,
+            "list[{key, workflow, params}]",
+            format!(
+                "Work for another run, recorded on the session log when the task passes and never \
+                 dispatched by this one. `key` is the item's stable identity, `workflow` one the \
+                 task lists in `asks`, `params` that workflow's parameter values (strings, \
+                 numbers, booleans, lists of strings; at most {MAX_ASK_PARAMS_BYTES} bytes). A \
+                 malformed ask, a repeated workflow and key, or more asks than the run's bound \
+                 (`--max-asks`, default {DEFAULT_MAX_ASKS}) fails the task."
+            ),
+        ),
+    ]
 }
 
 /// Keys the engine writes into a task's inputs. None of them is ever wrapped in a settled
@@ -719,7 +744,7 @@ pub fn markdown() -> String {
                 "| `{}` | `{}` | {} |\n",
                 cell(row.name),
                 cell(&row.ty),
-                cell(row.purpose)
+                cell(&row.purpose)
             ));
         }
         out.push('\n');
@@ -824,7 +849,7 @@ mod tests {
     /// the page renders has to survive as three cells regardless.
     #[test]
     fn every_rendered_table_row_has_three_cells() {
-        for line in super::markdown().lines() {
+        for line in crate::plan::starlark::reference::markdown().lines() {
             if !line.starts_with('|') {
                 continue;
             }
@@ -840,10 +865,10 @@ mod tests {
     /// tokens are the ones the engine acts on, and the input names are the constants it writes.
     #[test]
     fn the_reserved_fields_table_names_the_engines_own_constants() {
-        let results = super::reserved_result_fields();
+        let results = crate::plan::starlark::reference::reserved_result_fields();
         assert_eq!(
             results.iter().map(|row| row.name).collect::<Vec<_>>(),
-            ["status"],
+            ["status", crate::plan::ir::ASKS_FIELD],
             "the table documents a field no engine code reads"
         );
         for declared in DeclaredStatus::ALL {
@@ -863,7 +888,7 @@ mod tests {
         }
 
         assert_eq!(
-            super::reserved_inputs()
+            crate::plan::starlark::reference::reserved_inputs()
                 .iter()
                 .map(|row| row.name)
                 .collect::<Vec<_>>(),
@@ -875,10 +900,10 @@ mod tests {
     /// The page carries the tables, not just the tables' source.
     #[test]
     fn the_rendered_page_documents_every_reserved_name() {
-        let page = super::markdown();
-        for row in super::reserved_result_fields()
+        let page = crate::plan::starlark::reference::markdown();
+        for row in crate::plan::starlark::reference::reserved_result_fields()
             .iter()
-            .chain(super::reserved_inputs().iter())
+            .chain(crate::plan::starlark::reference::reserved_inputs().iter())
         {
             assert!(
                 page.contains(&format!("| `{}` |", row.name)),

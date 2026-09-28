@@ -18,13 +18,14 @@ use serde_json::Value;
 use crate::crucible::Direction;
 use crate::diagram::IllegalTransition;
 use crate::plan::ir::{
-    Decider, ITEM_INPUT, Join, OUTCOME_INPUT, REVISION_INPUT, Stage, Task, TaskKind, TaskName,
-    ValidPlan,
+    ASKS_FIELD, DEFAULT_MAX_ASKS, Decider, ITEM_INPUT, Join, OUTCOME_INPUT, REVISION_INPUT, Stage,
+    Task, TaskKind, TaskName, ValidPlan,
 };
 use crate::plan::machine::{
     BlockedReason, PlanEvent, PlanMachine, TaskEvent, TaskMachine, TaskState,
 };
 use crucible_contract::TransportCause;
+use crucible_contract::ask::{Ask, AskKey, WorkflowName};
 use crucible_contract::decision::{
     Answer, Decision, Label, NOUL_NO, NOUL_YES, Question, QuestionId,
 };
@@ -199,6 +200,8 @@ pub struct ExecCfg {
     /// How long the whole run may take. `None` means unbounded, which the scored loop
     /// tolerates because an operator is watching it; a playbook must supply one.
     pub wall_clock: Option<Duration>,
+    /// The most asks the whole run may emit. A task whose asks would take the run past it fails.
+    pub max_asks: u32,
 }
 
 impl Default for ExecCfg {
@@ -206,6 +209,7 @@ impl Default for ExecCfg {
         ExecCfg {
             transport_retries: 2,
             wall_clock: None,
+            max_asks: DEFAULT_MAX_ASKS,
         }
     }
 }
@@ -323,6 +327,10 @@ pub struct TaskResult {
     /// Present exactly when `status` is [`TaskStatus::Transport`]: what the last attempt died on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transport: Option<TransportCause>,
+    /// What this task asked for, checked and counted against the run's bound. Only a passing
+    /// task emits asks, so this is empty on every other status.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub asks: Vec<Ask>,
 }
 
 impl TaskResult {
@@ -352,6 +360,7 @@ impl TaskResult {
             fanout: None,
             blocked: None,
             transport: None,
+            asks: Vec::new(),
         }
     }
 }
@@ -519,6 +528,7 @@ pub fn execute(
     let mut spent = 0.0f64;
     let budget = plan.plan().budget.usd;
     let mut halted: Option<Halt> = None;
+    let mut asks = AskLedger::new(cfg.max_asks);
 
     // Readiness scan: repeated topo passes. Each pass settles everything decidable
     // without dispatch (halt-blocked, skipped, dep-failed, over-budget), then dispatches
@@ -781,6 +791,7 @@ pub fn execute(
                         fanout: None,
                         blocked: None,
                         transport: None,
+                        asks: Vec::new(),
                     };
                     record(
                         &mut *runner,
@@ -860,8 +871,9 @@ pub fn execute(
                                 .or_default()
                                 .advance(TaskEvent::Dispatched)?;
                         }
-                        let (batch_results, budget_exceeded) =
-                            run_batch_with_retries(batch, cfg, runner, &mut spent, budget);
+                        let (batch_results, budget_exceeded) = run_batch_with_retries(
+                            batch, cfg, runner, &mut spent, budget, &mut asks,
+                        );
                         if budget_exceeded {
                             halt(&mut halted, &mut plan_machine, Halt::Budget)?;
                         }
@@ -921,6 +933,7 @@ pub fn execute(
                                 runner,
                                 &mut spent,
                                 budget,
+                                &mut asks,
                             );
                             if budget_exceeded {
                                 halt(&mut halted, &mut plan_machine, Halt::Budget)?;
@@ -1036,8 +1049,15 @@ pub fn execute(
                     .entry(proposed.name.clone())
                     .or_default()
                     .advance(TaskEvent::Dispatched)?;
-                let (result, event, budget_exceeded) =
-                    run_with_retries(proposer, &proposer_inputs, cfg, runner, &mut spent, budget);
+                let (result, event, budget_exceeded) = run_with_retries(
+                    proposer,
+                    &proposer_inputs,
+                    cfg,
+                    runner,
+                    &mut spent,
+                    budget,
+                    &mut asks,
+                );
                 if budget_exceeded {
                     halt(&mut halted, &mut plan_machine, Halt::Budget)?;
                 }
@@ -1104,8 +1124,15 @@ pub fn execute(
                     .entry(reviewed.name.clone())
                     .or_default()
                     .advance(TaskEvent::Dispatched)?;
-                let (verdict, event, budget_exceeded) =
-                    run_with_retries(reviewer, &reviewer_inputs, cfg, runner, &mut spent, budget);
+                let (verdict, event, budget_exceeded) = run_with_retries(
+                    reviewer,
+                    &reviewer_inputs,
+                    cfg,
+                    runner,
+                    &mut spent,
+                    budget,
+                    &mut asks,
+                );
                 if budget_exceeded {
                     halt(&mut halted, &mut plan_machine, Halt::Budget)?;
                 }
@@ -1180,7 +1207,7 @@ pub fn execute(
                 | TaskKind::Evaluate { .. }
                 | TaskKind::Report { .. }
                 | TaskKind::Engine { .. } => {
-                    run_with_retries(t, &inputs, cfg, runner, &mut spent, budget)
+                    run_with_retries(t, &inputs, cfg, runner, &mut spent, budget, &mut asks)
                 }
             };
             if budget_exceeded {
@@ -1217,7 +1244,7 @@ pub fn execute(
                     .advance(TaskEvent::Dispatched)?;
             }
             let (batch_results, budget_exceeded) =
-                run_batch_with_retries(batch, cfg, runner, &mut spent, budget);
+                run_batch_with_retries(batch, cfg, runner, &mut spent, budget, &mut asks);
             if budget_exceeded {
                 halt(&mut halted, &mut plan_machine, Halt::Budget)?;
             }
@@ -1621,6 +1648,7 @@ fn fold_instances(settled: Vec<(String, TaskResult)>) -> TaskResult {
     TaskResult {
         blocked: None,
         transport: None,
+        asks: Vec::new(),
         status: if failed == 0 {
             TaskStatus::Pass
         } else {
@@ -1745,6 +1773,7 @@ fn settle_attempt(
             fanout: None,
             blocked: None,
             transport: None,
+            asks: Vec::new(),
         },
         event,
     ))
@@ -1780,6 +1809,7 @@ fn transport_result(
             fanout: None,
             blocked: None,
             transport: Some(failure.cause),
+            asks: Vec::new(),
         },
         event,
     )
@@ -1794,6 +1824,7 @@ fn run_with_retries(
     runner: &mut dyn TaskRunner,
     spent: &mut f64,
     budget: f64,
+    asks: &mut AskLedger,
 ) -> (TaskResult, TaskEvent, bool) {
     let max_attempts = 1 + cfg.transport_retries;
     let mut attempts = 0;
@@ -1805,7 +1836,10 @@ fn run_with_retries(
         cost += a.cost_usd;
         *spent += a.cost_usd;
         match settle_attempt(enforce_emits(t, a.outcome), attempts, cost) {
-            Ok((result, event)) => return (result, event, *spent > budget),
+            Ok((result, event)) => {
+                let (result, event) = asks.claim(t, result, event);
+                return (result, event, *spent > budget);
+            }
             Err(failure) => {
                 if *spent > budget || (*spent >= budget && attempts < max_attempts) {
                     let (result, event) =
@@ -1828,6 +1862,7 @@ fn run_batch_with_retries<'a>(
     runner: &mut dyn TaskRunner,
     spent: &mut f64,
     budget: f64,
+    asks: &mut AskLedger,
 ) -> (Vec<(&'a Task, TaskResult, TaskEvent)>, bool) {
     let max_attempts = 1 + cfg.transport_retries;
     let mut done: BTreeMap<usize, (TaskResult, TaskEvent)> = BTreeMap::new();
@@ -1890,12 +1925,121 @@ fn run_batch_with_retries<'a>(
         }
         wave = next;
     }
+    // Counted in declaration order, not completion order, so which task of a batch meets the
+    // bound does not depend on which finished first.
     (
         done.into_iter()
-            .map(|(idx, (r, event))| (order[idx], r, event))
+            .map(|(idx, (r, event))| {
+                let (r, event) = asks.claim(order[idx], r, event);
+                (order[idx], r, event)
+            })
             .collect(),
         budget_exceeded,
     )
+}
+
+/// The asks one run has emitted, against the launcher's bound.
+struct AskLedger {
+    bound: u32,
+    emitted: BTreeMap<(WorkflowName, AskKey), TaskName>,
+}
+
+impl AskLedger {
+    fn new(bound: u32) -> Self {
+        AskLedger {
+            bound,
+            emitted: BTreeMap::new(),
+        }
+    }
+
+    /// Admit a passing result's asks to the run, or settle the task as the measured failure its
+    /// asks earn it. Any other result passes through untouched: only a passing task emits.
+    ///
+    /// A refused task counts none of its asks, so the bound is never met by dropping the ones
+    /// past it, and the next task sees the run's count as it was.
+    fn claim(&mut self, t: &Task, result: TaskResult, event: TaskEvent) -> (TaskResult, TaskEvent) {
+        if result.status != TaskStatus::Pass {
+            return (result, event);
+        }
+        let Some(output) = &result.output else {
+            return (result, event);
+        };
+        match self.admit(t, output) {
+            Ok(asks) => (TaskResult { asks, ..result }, event),
+            Err(note) => (
+                TaskResult {
+                    status: TaskStatus::Fail,
+                    note: Some(note),
+                    asks: Vec::new(),
+                    ..result
+                },
+                TaskEvent::Failed,
+            ),
+        }
+    }
+
+    fn admit(&mut self, t: &Task, output: &Value) -> Result<Vec<Ask>, String> {
+        let Some(field) = output.get(ASKS_FIELD) else {
+            return Ok(Vec::new());
+        };
+        if t.asks.is_empty() {
+            return Err(format!(
+                "output carries {ASKS_FIELD:?}, but {} declares no workflows it may ask for; list \
+                 them in asks",
+                t.name
+            ));
+        }
+        let Some(items) = field.as_array() else {
+            return Err(format!("output field {ASKS_FIELD:?} is not a list"));
+        };
+        let mut asks: Vec<Ask> = Vec::with_capacity(items.len());
+        for (i, item) in items.iter().enumerate() {
+            let ask: Ask = serde_json::from_value(item.clone())
+                .map_err(|error| format!("{ASKS_FIELD}[{i}]: {error}"))?;
+            if !t.asks.contains(ask.workflow()) {
+                let listed: Vec<&str> = t.asks.iter().map(WorkflowName::as_str).collect();
+                return Err(format!(
+                    "{ASKS_FIELD}[{i}] names workflow {:?}, which {} does not list; it lists: {}",
+                    ask.workflow().as_str(),
+                    t.name,
+                    listed.join(", ")
+                ));
+            }
+            if asks
+                .iter()
+                .any(|a| a.workflow() == ask.workflow() && a.key() == ask.key())
+            {
+                return Err(format!(
+                    "{ASKS_FIELD}[{i}] repeats {} within one output",
+                    ask.input_key()
+                ));
+            }
+            if let Some(earlier) = self
+                .emitted
+                .get(&(ask.workflow().clone(), ask.key().clone()))
+            {
+                return Err(format!(
+                    "{ASKS_FIELD}[{i}] repeats {}, which {earlier} already asked for in this run",
+                    ask.input_key()
+                ));
+            }
+            asks.push(ask);
+        }
+        let total = self.emitted.len().saturating_add(asks.len());
+        if total > usize::try_from(self.bound).unwrap_or(usize::MAX) {
+            return Err(format!(
+                "{} asks would bring this run to {total}, past its bound of {} (--max-asks); none \
+                 of them were emitted",
+                asks.len(),
+                self.bound
+            ));
+        }
+        for ask in &asks {
+            self.emitted
+                .insert((ask.workflow().clone(), ask.key().clone()), t.name.clone());
+        }
+        Ok(asks)
+    }
 }
 
 /// Engine-built-in fold: keep the k best inputs by their `score` field.
@@ -1968,6 +2112,7 @@ fn decide_from_output(
         fanout: None,
         blocked: None,
         transport: None,
+        asks: Vec::new(),
     };
     let Some(output) = inputs.get(source) else {
         return fail(format!("source {source} contributed no output"));
@@ -2019,6 +2164,7 @@ fn decide_from_output(
             fanout: None,
             blocked: None,
             transport: None,
+            asks: Vec::new(),
         },
         Err(e) => fail(format!("encoding the decision: {e}")),
     }
@@ -2039,6 +2185,7 @@ fn reduce_top_k(inputs: &BTreeMap<TaskName, Value>, k: u32, direction: Direction
                     fanout: None,
                     blocked: None,
                     transport: None,
+                    asks: Vec::new(),
                 };
             }
         }
@@ -2061,12 +2208,14 @@ fn reduce_top_k(inputs: &BTreeMap<TaskName, Value>, k: u32, direction: Direction
         fanout: None,
         blocked: None,
         transport: None,
+        asks: Vec::new(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::plan::exec::*;
+    use crucible_contract::ask::MAX_ASK_PARAMS_BYTES;
 
     #[test]
     fn every_task_status_is_a_settled_state_the_table_reaches() {
@@ -2225,6 +2374,7 @@ mod tests {
             max_fanout: None,
             when: None,
             revise: None,
+            asks: Vec::new(),
         }
     }
 
@@ -2740,6 +2890,7 @@ mod tests {
             max_fanout: None,
             when: None,
             revise: None,
+            asks: Vec::new(),
         });
         let plan = valid(tasks, 10.0);
         let mut r = ScriptRunner::new();
@@ -2800,6 +2951,7 @@ mod tests {
             max_fanout: None,
             when: None,
             revise: None,
+            asks: Vec::new(),
         });
         let plan = valid(tasks, 10.0);
         let mut r = ScriptRunner::new();
@@ -2993,6 +3145,7 @@ mod tests {
             max_fanout: None,
             when: None,
             revise: None,
+            asks: Vec::new(),
         };
         tasks.push(pick);
         let plan = valid(tasks, 10.0);
@@ -4116,6 +4269,7 @@ mod tests {
             fanout: None,
             blocked: None,
             transport: None,
+            asks: Vec::new(),
         };
         for status in [
             TaskStatus::Fail,
@@ -5822,6 +5976,424 @@ mod tests {
         );
     }
 
+    /// A runner whose tasks return fixed JSON, and whose mapped instances each ask for a fix of
+    /// their own item. It records what it ran and how each task settled into git memory.
+    struct AskingRunner {
+        outputs: BTreeMap<String, Value>,
+        dispatched: Vec<String>,
+        settled: Vec<(String, bool)>,
+    }
+
+    impl AskingRunner {
+        fn new(outputs: &[(&str, Value)]) -> Self {
+            AskingRunner {
+                outputs: outputs
+                    .iter()
+                    .map(|(name, output)| ((*name).to_string(), output.clone()))
+                    .collect(),
+                dispatched: Vec::new(),
+                settled: Vec::new(),
+            }
+        }
+    }
+
+    impl TaskRunner for AskingRunner {
+        fn run(
+            &mut self,
+            task: &Task,
+            _attempt: u32,
+            inputs: &BTreeMap<TaskName, Value>,
+        ) -> Attempt {
+            self.dispatched.push(task.name.0.clone());
+            let output = match (
+                self.outputs.get(&task.name.0),
+                inputs.get(&TaskName(ITEM_INPUT.to_string())),
+            ) {
+                (Some(output), _) => output.clone(),
+                (None, Some(item)) => serde_json::json!({
+                    "asks": [{"key": format!("issue-{}", item.as_str().unwrap_or("?")),
+                              "workflow": "issue-fix",
+                              "params": {"issue": item}}]
+                }),
+                (None, None) => serde_json::json!({}),
+            };
+            Attempt {
+                outcome: AttemptOutcome::Pass(output),
+                cost_usd: 0.1,
+            }
+        }
+
+        fn settled(&mut self, task: &Task, passed: bool) {
+            self.settled.push((task.name.0.clone(), passed));
+        }
+    }
+
+    fn asking(name: &str, deps: &[&str], workflows: &[&str]) -> Task {
+        let mut t = task(name, deps, "any", true);
+        t.asks = workflows
+            .iter()
+            .map(|w| WorkflowName::new(*w).expect("valid workflow name"))
+            .collect();
+        t
+    }
+
+    fn one_ask(key: &str, workflow: &str) -> Value {
+        serde_json::json!({"key": key, "workflow": workflow, "params": {"issue": key}})
+    }
+
+    fn with_asks(asks: &[Value]) -> Value {
+        serde_json::json!({ "asks": asks })
+    }
+
+    fn run_asking(
+        plan: &ValidPlan,
+        r: &mut AskingRunner,
+        max_asks: u32,
+    ) -> (PlanOutcome, Vec<(String, usize)>) {
+        let mut emitted = Vec::new();
+        let out = execute(
+            plan,
+            &any_substrate(),
+            ExecCfg {
+                max_asks,
+                ..ExecCfg::default()
+            },
+            r,
+            |t, result| emitted.push((t.name.0.clone(), result.asks.len())),
+        );
+        (out, emitted)
+    }
+
+    fn keys(result: &TaskResult) -> Vec<String> {
+        result.asks.iter().map(Ask::input_key).collect()
+    }
+
+    #[test]
+    fn a_passing_task_emits_its_asks_and_nothing_dispatches_them() {
+        let plan = valid(
+            vec![
+                asking("roundup", &[], &["issue-fix"]),
+                task("after", &["roundup"], "any", true),
+            ],
+            10.0,
+        );
+        let mut r = AskingRunner::new(&[(
+            "roundup",
+            with_asks(&[one_ask("o/r#1", "issue-fix"), one_ask("o/r#2", "issue-fix")]),
+        )]);
+        let (out, emitted) = run_asking(&plan, &mut r, 16);
+
+        assert!(out.valid, "{:?}", out.results);
+        let roundup = &out.results[&"roundup".into()];
+        assert_eq!(
+            keys(roundup),
+            ["ask:issue-fix:o/r#1", "ask:issue-fix:o/r#2"]
+        );
+        assert_eq!(roundup.asks[0].params()["issue"], "o/r#1");
+        assert_eq!(emitted, [("roundup".into(), 2), ("after".into(), 0)]);
+        assert_eq!(
+            r.dispatched,
+            ["roundup", "after"],
+            "an ask is never a dispatch"
+        );
+        // A dependent reads the output the asks travelled in, unchanged.
+        assert_eq!(
+            roundup
+                .output
+                .as_ref()
+                .and_then(|o| o.get(ASKS_FIELD))
+                .map(|a| a.as_array().map(Vec::len)),
+            Some(Some(2))
+        );
+    }
+
+    #[test]
+    fn a_passing_task_with_no_asks_field_emits_none() {
+        let plan = valid(vec![asking("roundup", &[], &["issue-fix"])], 10.0);
+        let mut r = AskingRunner::new(&[("roundup", serde_json::json!({"triaged": 0}))]);
+        let (out, _) = run_asking(&plan, &mut r, 16);
+        assert!(out.valid);
+        assert!(out.results[&"roundup".into()].asks.is_empty());
+    }
+
+    /// Every way an output can get its asks wrong is a measured failure at the task that wrote
+    /// them: not retried, its output kept for the reader, its workspace not committed, and its
+    /// asks not emitted.
+    #[test]
+    fn a_malformed_ask_fails_the_task_that_wrote_it() {
+        for (declared, output, expect) in [
+            (
+                &[][..],
+                with_asks(&[one_ask("k", "issue-fix")]),
+                "declares no workflows it may ask for",
+            ),
+            (
+                &["issue-fix"][..],
+                serde_json::json!({"asks": {"key": "k"}}),
+                "is not a list",
+            ),
+            (
+                &["issue-fix"][..],
+                with_asks(&[one_ask("k", "docs")]),
+                "names workflow \"docs\", which roundup does not list; it lists: issue-fix",
+            ),
+            (
+                &["issue-fix"][..],
+                with_asks(&[one_ask("has space", "issue-fix")]),
+                "asks[0]: ",
+            ),
+            (
+                &["issue-fix"][..],
+                with_asks(&[
+                    serde_json::json!({"key": "k", "workflow": "issue-fix", "body": "a file"}),
+                ]),
+                "unknown field `body`",
+            ),
+            (
+                &["issue-fix"][..],
+                with_asks(&[
+                    serde_json::json!({"key": "k", "workflow": "issue-fix", "params": {"p": {"nested": 1}}}),
+                ]),
+                "is an object",
+            ),
+            (
+                &["issue-fix"][..],
+                with_asks(&[
+                    serde_json::json!({"key": "k", "workflow": "issue-fix", "params": {"p": "x".repeat(MAX_ASK_PARAMS_BYTES)}}),
+                ]),
+                "Pass large material by published artifact location",
+            ),
+            (
+                &["issue-fix"][..],
+                with_asks(&[
+                    one_ask("k", "issue-fix"),
+                    one_ask("ok", "issue-fix"),
+                    one_ask("k", "issue-fix"),
+                ]),
+                "asks[2] repeats ask:issue-fix:k within one output",
+            ),
+        ] {
+            let plan = valid(
+                vec![
+                    asking("roundup", &[], declared),
+                    task("after", &["roundup"], "any", true),
+                ],
+                10.0,
+            );
+            let mut r = AskingRunner::new(&[("roundup", output.clone())]);
+            let (out, emitted) = run_asking(&plan, &mut r, 16);
+
+            let roundup = &out.results[&"roundup".into()];
+            assert_eq!(roundup.status, TaskStatus::Fail, "{output}");
+            let note = roundup.note.clone().unwrap_or_default();
+            assert!(note.contains(expect), "{note:?} lacks {expect:?}");
+            assert!(roundup.asks.is_empty());
+            assert_eq!(roundup.output.as_ref(), Some(&output), "the output is kept");
+            assert_eq!(roundup.attempts, 1, "a measured failure is not retried");
+            assert_eq!(r.dispatched, ["roundup"], "{output}");
+            assert_eq!(r.settled, [("roundup".to_string(), false)]);
+            assert_eq!(
+                out.exit,
+                PlanExit::ShortCircuit {
+                    task: "roundup".into()
+                }
+            );
+            assert_eq!(emitted.iter().map(|(_, n)| n).sum::<usize>(), 0);
+        }
+    }
+
+    /// Two workflows asking about one item are two pieces of work; one workflow asked twice about
+    /// it in one run is a repeat, and the later task is the one that fails.
+    #[test]
+    fn a_repeated_workflow_and_key_fails_the_later_task_in_the_run() {
+        let plan = valid(
+            vec![
+                asking("first", &[], &["issue-fix", "docs"]),
+                asking("second", &["first"], &["issue-fix"]),
+            ],
+            10.0,
+        );
+        let mut r = AskingRunner::new(&[
+            (
+                "first",
+                with_asks(&[one_ask("k", "issue-fix"), one_ask("k", "docs")]),
+            ),
+            ("second", with_asks(&[one_ask("k", "issue-fix")])),
+        ]);
+        let (out, _) = run_asking(&plan, &mut r, 16);
+
+        assert_eq!(
+            keys(&out.results[&"first".into()]),
+            ["ask:issue-fix:k", "ask:docs:k"]
+        );
+        let second = &out.results[&"second".into()];
+        assert_eq!(second.status, TaskStatus::Fail);
+        assert!(
+            second.note.as_deref().is_some_and(
+                |n| n.contains("repeats ask:issue-fix:k, which first already asked for")
+            ),
+            "{:?}",
+            second.note
+        );
+    }
+
+    /// The bound is the run's: asks count across tasks, a task that would pass it fails whole
+    /// rather than emitting the ones that fit, and a later task still sees the count as it was.
+    #[test]
+    fn the_run_bound_fails_the_task_that_would_pass_it_and_drops_nothing() {
+        let plan = valid(
+            vec![
+                asking("a", &[], &["w"]),
+                asking("b", &["a"], &["w"]),
+                asking("c", &["b"], &["w"]),
+            ],
+            10.0,
+        );
+        let mut b = asking("b", &["a"], &["w"]);
+        b.required = false;
+        let plan_with_advisory = valid(
+            vec![asking("a", &[], &["w"]), b, asking("c", &[], &["w"])],
+            10.0,
+        );
+        let outputs = [
+            ("a", with_asks(&[one_ask("1", "w"), one_ask("2", "w")])),
+            ("b", with_asks(&[one_ask("3", "w"), one_ask("4", "w")])),
+            ("c", with_asks(&[one_ask("5", "w")])),
+        ];
+
+        let mut r = AskingRunner::new(&outputs);
+        let (out, _) = run_asking(&plan, &mut r, 3);
+        assert_eq!(keys(&out.results[&"a".into()]).len(), 2);
+        let b = &out.results[&"b".into()];
+        assert_eq!(b.status, TaskStatus::Fail);
+        assert_eq!(
+            b.note.as_deref(),
+            Some(
+                "2 asks would bring this run to 4, past its bound of 3 (--max-asks); none of them \
+                 were emitted"
+            )
+        );
+        assert!(b.asks.is_empty());
+        assert_eq!(out.results[&"c".into()].status, TaskStatus::Blocked);
+
+        // An advisory task refused at the bound leaves the count where it was, so a later task
+        // with room still emits.
+        let mut r = AskingRunner::new(&outputs);
+        let (out, _) = run_asking(&plan_with_advisory, &mut r, 3);
+        assert_eq!(out.results[&"b".into()].status, TaskStatus::Fail);
+        assert_eq!(keys(&out.results[&"c".into()]), ["ask:w:5"]);
+        assert!(out.valid, "{:?}", out.results);
+
+        // Exactly at the bound is within it.
+        let mut r = AskingRunner::new(&outputs);
+        let (out, _) = run_asking(&plan, &mut r, 5);
+        assert!(out.valid, "{:?}", out.results);
+        let total: usize = out.results.values().map(|r| r.asks.len()).sum();
+        assert_eq!(total, 5);
+    }
+
+    #[test]
+    fn a_bound_of_zero_fails_any_task_that_asks() {
+        let plan = valid(
+            vec![asking("a", &[], &["w"]), asking("b", &[], &["w"])],
+            10.0,
+        );
+        let mut r = AskingRunner::new(&[
+            ("a", with_asks(&[one_ask("1", "w")])),
+            ("b", with_asks(&[])),
+        ]);
+        let (out, _) = run_asking(&plan, &mut r, 0);
+        assert_eq!(out.results[&"a".into()].status, TaskStatus::Fail);
+        // An empty list asks for nothing, so it never meets the bound.
+        let mut r = AskingRunner::new(&[("b", with_asks(&[]))]);
+        let plan = valid(vec![asking("b", &[], &["w"])], 10.0);
+        let (out, _) = run_asking(&plan, &mut r, 0);
+        assert!(out.valid);
+    }
+
+    /// Only a passing task emits. A task that settles itself failing or skipped keeps the asks
+    /// it wrote in its output for a reader, and none of them count.
+    #[test]
+    fn a_task_that_does_not_pass_emits_none_of_its_asks() {
+        for status in ["fail", "skipped"] {
+            let plan = valid(
+                vec![
+                    {
+                        let mut a = asking("a", &[], &["w"]);
+                        a.required = false;
+                        a
+                    },
+                    asking("b", &[], &["w"]),
+                ],
+                10.0,
+            );
+            let mut r = AskingRunner::new(&[
+                (
+                    "a",
+                    serde_json::json!({"status": status, "asks": [one_ask("1", "w")]}),
+                ),
+                ("b", with_asks(&[one_ask("1", "w")])),
+            ]);
+            let (out, _) = run_asking(&plan, &mut r, 1);
+            let a = &out.results[&"a".into()];
+            assert_ne!(a.status, TaskStatus::Pass);
+            assert!(a.asks.is_empty());
+            assert_eq!(keys(&out.results[&"b".into()]), ["ask:w:1"], "{status}");
+        }
+    }
+
+    /// Concurrent isolated tasks meet the bound in declaration order, whichever finishes first.
+    #[test]
+    fn a_batch_meets_the_bound_in_declaration_order() {
+        let isolated = |name: &str| {
+            let mut t = asking(name, &[], &["w"]);
+            t.isolation = Some(Isolation::Worktree);
+            t.required = false;
+            t
+        };
+        let plan = valid(vec![isolated("x"), isolated("y"), isolated("z")], 10.0);
+        let mut r = AskingRunner::new(&[
+            ("x", with_asks(&[one_ask("x", "w")])),
+            ("y", with_asks(&[one_ask("y", "w")])),
+            ("z", with_asks(&[one_ask("z", "w")])),
+        ]);
+        let (out, emitted) = run_asking(&plan, &mut r, 2);
+        assert_eq!(emitted, [("x".into(), 1), ("y".into(), 1), ("z".into(), 0)]);
+        assert_eq!(out.results[&"z".into()].status, TaskStatus::Fail);
+    }
+
+    /// A fan-out's instances each ask about their own item, and the bound counts them all: the
+    /// node's folded result carries none of its own, so nothing is counted twice.
+    #[test]
+    fn mapped_instances_ask_per_item_under_one_run_bound() {
+        let mut node = mapped_node("triage", "scan", "issues", false);
+        node.asks = vec![WorkflowName::new("issue-fix").expect("valid")];
+        let plan = valid(vec![task("scan", &[], "any", true), node], 10.0);
+        let mut r = AskingRunner::new(&[("scan", serde_json::json!({"issues": ["1", "2", "3"]}))]);
+        let (out, emitted) = run_asking(&plan, &mut r, 2);
+
+        assert_eq!(
+            keys(&out.results[&"triage[1]".into()]),
+            ["ask:issue-fix:issue-1"]
+        );
+        assert_eq!(
+            keys(&out.results[&"triage[2]".into()]),
+            ["ask:issue-fix:issue-2"]
+        );
+        assert_eq!(out.results[&"triage[3]".into()].status, TaskStatus::Fail);
+        assert!(out.results[&"triage".into()].asks.is_empty());
+        assert_eq!(emitted.iter().map(|(_, n)| n).sum::<usize>(), 2);
+        assert_eq!(
+            r.settled,
+            [
+                ("scan".to_string(), true),
+                ("triage[1]".to_string(), true),
+                ("triage[2]".to_string(), true),
+                ("triage[3]".to_string(), false),
+            ]
+        );
+    }
+
     /// The runner for the exhaustive graph test: one scripted outcome per task, and one shared
     /// log of every dispatch and every settlement in the order the executor made them.
     struct GraphRunner {
@@ -5857,7 +6429,7 @@ mod tests {
                 .borrow_mut()
                 .push(GraphEvent::Run(vec![task.name.0.clone()]));
             Attempt {
-                outcome: self.outcomes[&task.name.0](),
+                outcome: graph_outcome(self.outcomes[&task.name.0], task),
                 cost_usd: 0.1,
             }
         }
@@ -5869,21 +6441,36 @@ mod tests {
             batch
                 .iter()
                 .map(|b| Attempt {
-                    outcome: self.outcomes[&b.task.name.0](),
+                    outcome: graph_outcome(self.outcomes[&b.task.name.0], b.task),
                     cost_usd: 0.1,
                 })
                 .collect()
         }
     }
 
+    /// The scripted outcome, with the asking outcome's marker turned into one ask keyed by the
+    /// task's own name, so every asker asks about a different item.
+    fn graph_outcome(scripted: fn() -> AttemptOutcome, task: &Task) -> AttemptOutcome {
+        match scripted() {
+            AttemptOutcome::Pass(v) if v.get("ask").is_some() => AttemptOutcome::Pass(
+                serde_json::json!({"asks": [{"key": task.name.0, "workflow": "w"}]}),
+            ),
+            other => other,
+        }
+    }
+
     /// The invariants formal/CrucibleSpec/PlanExec.lean proves for the model, checked against
     /// `execute` on every three-task graph: every edge set, stage split, required set, substrate
     /// fit, join, isolation split, per-task outcome, and a budget that does and does not run out.
+    ///
+    /// A fifth outcome passes with one ask under a run bound of one, so every placement of asking
+    /// tasks meets the bound. The model carries no asks; those invariants are checked here only.
+    /// The asking outcome runs under the ample budget alone, since it spends what a plain pass does.
     #[test]
     fn every_three_task_graph_keeps_the_model_invariants() {
         const N: usize = 3;
         const EDGES: [(usize, usize); 3] = [(1, 0), (2, 0), (2, 1)];
-        let outcomes: [fn() -> AttemptOutcome; 4] = [
+        let outcomes: [fn() -> AttemptOutcome; 5] = [
             || AttemptOutcome::Pass(serde_json::json!({})),
             || AttemptOutcome::Fail {
                 note: "measured".into(),
@@ -5891,7 +6478,9 @@ mod tests {
             },
             || AttemptOutcome::Skipped(serde_json::json!({}), "inapplicable".into()),
             || AttemptOutcome::Transport(TransportFailure::new(TransportCause::Other, "blip")),
+            || AttemptOutcome::Pass(serde_json::json!({"ask": true})),
         ];
+        const ASKING: usize = 4;
         let joins = [Join::All, Join::Passed, Join::Settled];
         let name = |i: usize| format!("t{i}");
         let mut runs = 0usize;
@@ -5919,7 +6508,15 @@ mod tests {
                                 continue;
                             }
                             for outcome_pick in 0..(outcomes.len().pow(N as u32)) {
+                                let pick = |t: usize| {
+                                    outcome_pick / outcomes.len().pow(t as u32) % outcomes.len()
+                                };
+                                let askers: BTreeSet<String> =
+                                    (0..N).filter(|&t| pick(t) == ASKING).map(name).collect();
                                 for budget in [0.25, 10.0] {
+                                    if budget < 1.0 && !askers.is_empty() {
+                                        continue;
+                                    }
                                     let tasks: Vec<Task> = (0..N)
                                         .map(|t| {
                                             let dep_names: Vec<String> =
@@ -5939,6 +6536,8 @@ mod tests {
                                             if is_epilogue(t) {
                                                 task.stage = Stage::Epilogue;
                                             }
+                                            task.asks =
+                                                vec![WorkflowName::new("w").expect("valid name")];
                                             task
                                         })
                                         .collect();
@@ -5954,10 +6553,7 @@ mod tests {
                                     let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
                                     let mut runner = GraphRunner {
                                         outcomes: (0..N)
-                                            .map(|t| {
-                                                let pick = outcome_pick / 4usize.pow(t as u32) % 4;
-                                                (name(t), outcomes[pick])
-                                            })
+                                            .map(|t| (name(t), outcomes[pick(t)]))
                                             .collect(),
                                         log: log.clone(),
                                     };
@@ -5965,7 +6561,10 @@ mod tests {
                                     let out = execute(
                                         &plan,
                                         &any_substrate(),
-                                        ExecCfg::default(),
+                                        ExecCfg {
+                                            max_asks: 1,
+                                            ..ExecCfg::default()
+                                        },
                                         &mut runner,
                                         |t, r| {
                                             settled_log.borrow_mut().push(GraphEvent::Settled(
@@ -5974,7 +6573,7 @@ mod tests {
                                             ))
                                         },
                                     );
-                                    check_graph(&tasks, &out, &log.borrow(), budget);
+                                    check_graph(&tasks, &out, &log.borrow(), budget, &askers);
                                     runs += 1;
                                 }
                             }
@@ -5986,8 +6585,14 @@ mod tests {
         assert!(runs > 100_000, "the enumeration shrank to {runs} runs");
     }
 
-    fn check_graph(tasks: &[Task], out: &PlanOutcome, log: &[GraphEvent], budget: f64) {
-        let ctx = || format!("{tasks:#?}\n{log:?}\n{:?}", out.exit);
+    fn check_graph(
+        tasks: &[Task],
+        out: &PlanOutcome,
+        log: &[GraphEvent],
+        budget: f64,
+        askers: &BTreeSet<String>,
+    ) {
+        let ctx = || format!("{tasks:#?}\n{log:?}\n{:?}\naskers {askers:?}", out.exit);
         let status = |t: &Task| out.results[&t.name].status;
         let held = |t: &Task| matches!(status(t), TaskStatus::Pass | TaskStatus::NotTaken);
         let main_required: Vec<&Task> = tasks
@@ -6000,6 +6605,17 @@ mod tests {
             "every task settles: {}",
             ctx()
         );
+
+        // asks_only_from_passing_askers and asks_within_the_bound.
+        for (name, r) in &out.results {
+            if !r.asks.is_empty() {
+                assert_eq!(r.status, TaskStatus::Pass, "{name}: {}", ctx());
+                assert!(askers.contains(&name.0), "{name}: {}", ctx());
+                assert_eq!(r.asks.len(), 1, "{}", ctx());
+            }
+        }
+        let emitted: usize = out.results.values().map(|r| r.asks.len()).sum();
+        assert!(emitted <= 1, "the run bound is one ask: {}", ctx());
 
         // completed_means_valid: exit == Completed alone implies every required task held.
         if out.exit == PlanExit::Completed {
@@ -6125,6 +6741,36 @@ mod tests {
                 }
             }
         }
+        // The first asker to settle takes the run's one ask; every later one fails on the bound.
+        let settled_askers: Vec<&str> = log
+            .iter()
+            .filter_map(|e| match e {
+                GraphEvent::Settled(n, _)
+                    if askers.contains(n) && runs.contains_key(n.as_str()) =>
+                {
+                    Some(n.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        for (i, n) in settled_askers.iter().enumerate() {
+            let r = &out.results[&TaskName(n.to_string())];
+            if i == 0 {
+                assert_eq!(r.status, TaskStatus::Pass, "{n}: {}", ctx());
+                assert_eq!(r.asks.len(), 1, "{n}: {}", ctx());
+            } else {
+                assert_eq!(r.status, TaskStatus::Fail, "{n}: {}", ctx());
+                assert!(
+                    r.note
+                        .as_deref()
+                        .is_some_and(|note| note.contains("past its bound of 1")),
+                    "{n}: {}",
+                    ctx()
+                );
+            }
+        }
+        assert_eq!(emitted, settled_askers.len().min(1), "{}", ctx());
+
         for t in tasks {
             let n = runs.get(t.name.0.as_str()).copied().unwrap_or(0);
             // Retry is not recheck: only a transport failure runs again, and only twice more.

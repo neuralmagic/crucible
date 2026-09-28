@@ -174,6 +174,11 @@ pub enum WorkflowError {
          a failed candidate back through its next iteration"
     )]
     ReviseOutsidePlaybook { task: String },
+    #[error(
+        "task {task:?} declares asks, which only a playbook emits; a scored loop's tasks advance \
+         one candidate and propose no work beyond it"
+    )]
+    AsksOutsidePlaybook { task: String },
     #[error("engine task {task:?} cannot run in the epilogue (the loop is over)")]
     EngineTaskInEpilogue { task: String },
     #[error("report task {task:?} must run in the epilogue")]
@@ -296,6 +301,13 @@ impl WorkflowCfg {
             && let Some(task) = self.tasks.iter().find(|task| task.revise.is_some())
         {
             return Err(WorkflowError::ReviseOutsidePlaybook {
+                task: task.name.0.clone(),
+            });
+        }
+        if self.workflow_type != WorkflowType::Playbook
+            && let Some(task) = self.tasks.iter().find(|task| !task.asks.is_empty())
+        {
+            return Err(WorkflowError::AsksOutsidePlaybook {
                 task: task.name.0.clone(),
             });
         }
@@ -720,7 +732,7 @@ fn is_ancestor(tasks: &BTreeMap<&TaskName, &Task>, ancestor: &TaskName, node: &T
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::plan::workflow::*;
 
     fn parse(source: &str) -> WorkflowCfg {
         toml::from_str(source).expect("parse workflow")
@@ -741,6 +753,27 @@ mod tests {
         parse(&format!("type = \"custom\"\nresult = \"wrap\"\n{ROUTED}"))
             .validate()
             .unwrap();
+    }
+
+    #[test]
+    fn only_a_playbook_asks() {
+        const ASKING: &str = "[[task]]\nname = \"roundup\"\nkind = \"command\"\ncommand = \"true\"\nasks = [\"issue-fix\"]\n";
+        parse(&format!("type = \"playbook\"\n{ASKING}"))
+            .admit(&WorkflowCaps::playbook_engine())
+            .expect("a playbook asks");
+        for lane in ["custom", "autoresearch"] {
+            assert_eq!(
+                parse(&format!(
+                    "type = \"{lane}\"\nresult = \"roundup\"\n{ASKING}"
+                ))
+                .validate()
+                .unwrap_err(),
+                WorkflowError::AsksOutsidePlaybook {
+                    task: "roundup".into()
+                },
+                "{lane}"
+            );
+        }
     }
 
     #[test]

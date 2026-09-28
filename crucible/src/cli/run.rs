@@ -207,6 +207,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                 params,
                 max_cost,
                 max_time,
+                max_asks,
                 caps,
                 agent_cmd,
                 manifest,
@@ -228,6 +229,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                                 .as_deref()
                                 .and_then(crate::duration::parse_duration),
                             wall_clock_raw: max_time.clone(),
+                            asks: Some(*max_asks),
                         },
                         compute_driver: *compute_driver,
                         agent: crate::args::AgentOverride {

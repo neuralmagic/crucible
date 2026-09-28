@@ -35,6 +35,7 @@ use crate::plan::starlark::error::{
 };
 use crate::plan::starlark::values::{SessionDecl, WorkflowValue};
 use crate::plan::workflow::{WorkflowCfg, WorkflowType};
+use crucible_contract::ask::WorkflowName;
 use crucible_contract::decision::{
     ChoiceOption, IdentError, Label, NOUL_YES, Question, QuestionId, QuestionKind, UNCERTAIN,
 };
@@ -533,6 +534,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "when",
             "answers",
             "otherwise",
+            "asks",
         ],
         "skill" => &[
             "name",
@@ -557,6 +559,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "when",
             "answers",
             "otherwise",
+            "asks",
         ],
         "command" => &[
             "name",
@@ -576,6 +579,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "when",
             "answers",
             "otherwise",
+            "asks",
         ],
         "evaluate" => &[
             "name",
@@ -597,6 +601,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "when",
             "answers",
             "otherwise",
+            "asks",
         ],
         "top_k" => &["name", "k", "direction", "depends_on", "required"],
         "route" => &[
@@ -799,6 +804,7 @@ fn constructor(
             max_fanout: None,
             when: None,
             revise: None,
+            asks: Vec::new(),
         },
         "top_k" => {
             let k = take_int(&mut named, "k")?;
@@ -836,6 +842,7 @@ fn constructor(
                 over: None,
                 max_fanout: None,
                 revise: None,
+                asks: Vec::new(),
                 when: None,
             }
         }
@@ -866,6 +873,7 @@ fn constructor(
                 over: None,
                 max_fanout: None,
                 revise: None,
+                asks: Vec::new(),
                 when: take_when(&mut named, state, &name)?,
                 name,
             }
@@ -1114,6 +1122,7 @@ fn dsl_task(
         max_fanout: take_optional_fanout(named)?,
         when,
         revise: take_revise(named)?,
+        asks: take_asks(named)?,
     };
     check_fanout(&task)?;
     if let Some(revise) = &task.revise
@@ -1458,6 +1467,24 @@ fn engine(name: &str, op: EngineOp, source: Option<TaskName>, depends_on: Vec<Ta
         max_fanout: None,
         when: None,
         revise: None,
+        asks: Vec::new(),
+    }
+}
+
+/// The workflows a task may name in its asks. Only the name's shape is checked here: whether a
+/// workflow of that name exists is the receiving orchestrator's to decide.
+fn take_asks(named: &mut BTreeMap<String, Value>) -> Result<Vec<WorkflowName>> {
+    match named.remove("asks").unwrap_or(Value::None) {
+        Value::None => Ok(Vec::new()),
+        Value::List(names) => names
+            .into_iter()
+            .map(|name| match name {
+                Value::String(name) => WorkflowName::new(name)
+                    .map_err(|error| CompileError::InvalidAskWorkflow { error }),
+                _ => Err(CompileError::AsksNotList),
+            })
+            .collect(),
+        _ => Err(CompileError::AsksNotList),
     }
 }
 
@@ -2337,7 +2364,7 @@ fn dialect() -> Dialect {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::plan::starlark::*;
 
     fn temp_pack(tag: &str) -> PathBuf {
         let dir =
@@ -3539,6 +3566,22 @@ workflow(type = "custom", tasks = [e], result = e)
                 "g = route(name = \"g\", min_confidence = 0.5, questions = {\"q\": noul(ask = \"q?\", drop = [\"no\", \"uncertain\"])})\ne = evaluate(name = \"e\", run = \"true\", depends_on = [g], when = g.q, answers = \"yes\", otherwise = False{extra})\nw = command(name = \"w\", run = \"true\", depends_on = [e], join = \"settled\")\nworkflow(type = \"custom\", tasks = [g, e, w], result = w)\n",
             ),
             (
+                "agent",
+                "a = agent(name = \"a\", prompt = \"p\", asks = [\"fix-issue\"]{extra})\nworkflow(type = \"playbook\", tasks = [a])\n",
+            ),
+            (
+                "skill",
+                "a = skill(name = \"a\", skill = \"skills/demo\", asks = [\"fix-issue\"]{extra})\nworkflow(type = \"playbook\", tasks = [a])\n",
+            ),
+            (
+                "command",
+                "c = command(name = \"c\", run = \"true\", asks = [\"fix-issue\"]{extra})\nworkflow(type = \"playbook\", tasks = [c])\n",
+            ),
+            (
+                "evaluate",
+                "e = evaluate(name = \"e\", run = \"true\", asks = [\"fix-issue\"]{extra})\nworkflow(type = \"playbook\", tasks = [e])\n",
+            ),
+            (
                 "route",
                 "u = command(name = \"u\", run = \"true\", emits = [\"q\", \"r\"])\ng = route(name = \"g\", source = u, min_confidence = None, depends_on = [u], required = True, join = \"all\", stage = \"iteration\", questions = {\"q\": noul(ask = \"q?\", drop = [\"no\", \"uncertain\"])})\nh = route(name = \"h\", source = u, depends_on = [u, g], when = g.q, answers = \"yes\", otherwise = False, questions = {\"r\": noul(ask = \"r?\")}{extra})\nw = command(name = \"w\", run = \"true\", depends_on = [h], join = \"settled\")\nworkflow(type = \"custom\", tasks = [u, g, h, w], result = w)\n",
             ),
@@ -4194,6 +4237,65 @@ workflow(type = "playbook", tasks = [author, repro])
             &compile_source(source, &pack.join("workflow.star"), &pack).unwrap_err(),
         );
         assert!(error.contains("which only a playbook runs"), "{error}");
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn asks_compile_to_the_workflows_a_task_may_name() {
+        let pack = temp_pack("asks");
+        let source = r#"
+scan = command(name = "scan", run = "true", emits = ["issues"])
+roundup = command(name = "roundup", run = "true", depends_on = [scan], asks = ["issue-fix", "docs"])
+workflow(type = "playbook", tasks = [scan, roundup])
+"#;
+        let compiled = compile_source(source, &pack.join("workflow.star"), &pack)
+            .unwrap_or_else(|e| panic!("{}", crate::errors::report(&e)));
+        let names = |t: &Task| {
+            t.asks
+                .iter()
+                .map(|w| w.as_str().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert!(names(&compiled.workflow.tasks[0]).is_empty());
+        assert_eq!(names(&compiled.workflow.tasks[1]), ["issue-fix", "docs"]);
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn asks_refuses_a_non_list_a_non_string_and_a_name_a_queued_key_cannot_carry() {
+        let pack = temp_pack("asks-shape");
+        for (asks, expect) in [
+            (
+                "\"issue-fix\"",
+                "argument \"asks\" must be a list of workflow-name strings",
+            ),
+            (
+                "[1]",
+                "argument \"asks\" must be a list of workflow-name strings",
+            ),
+            ("[\"a:b\"]", "workflow name \"a:b\" contains ':'"),
+            ("[\"\"]", "a workflow name is empty"),
+            ("[\"w\", \"w\"]", "lists workflow \"w\" in asks twice"),
+        ] {
+            let source = format!(
+                "c = command(name = \"c\", run = \"true\", asks = {asks})\nworkflow(type = \"playbook\", tasks = [c])\n"
+            );
+            let error = crate::errors::report(
+                &compile_source(&source, &pack.join("workflow.star"), &pack).unwrap_err(),
+            );
+            assert!(error.contains(expect), "{asks}: {error}");
+        }
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn a_scored_workflow_refuses_asks() {
+        let pack = temp_pack("asks-lane");
+        let source = "c = command(name = \"c\", run = \"true\", asks = [\"w\"])\nworkflow(type = \"custom\", tasks = [c], result = c)\n";
+        let error = crate::errors::report(
+            &compile_source(source, &pack.join("workflow.star"), &pack).unwrap_err(),
+        );
+        assert!(error.contains("which only a playbook emits"), "{error}");
         let _ = std::fs::remove_dir_all(&pack);
     }
 

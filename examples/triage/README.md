@@ -33,6 +33,12 @@ Everything the lane has, on one small graph:
 - **A verdict no agent grades**: `roundup` is python over captured files and
   `CRUCIBLE_INPUTS`; the report is assembled from evidence, not from an agent's summary
   of its own work.
+- **Asks, not fan-out into new runs**: `roundup` declares `asks = ["issue-fix"]` and returns
+  one ask per bug a triage instance called `critical` or `high` with `high` confidence, keyed
+  `owner/name#N` so next week's sweep asks about the same bug under the same key. The run
+  writes them to its session log as `asks_emitted` and starts nothing; whatever orchestrator
+  reads the log decides which become `issue-fix` runs. `--max-asks` bounds how many one sweep
+  may emit (16 by default), and a roundup that would exceed it fails rather than dropping some.
 
 ## Before you run it
 
@@ -48,4 +54,6 @@ Everything the lane has, on one small graph:
 The controller adopts GitHub inputs and launches one run per adopted issue; this pack is
 the other direction, one run sweeping many issues. The parameters are the boundary: an
 orchestrator that can answer `plan params` can launch this pack with no knowledge of what
-is inside it.
+is inside it, and can validate an ask's `params` against the named workflow's schema the
+same way. No `issue-fix` pack ships here, and the controller does not admit asks yet; until
+it does, the asks are a record of what the sweep would have started.

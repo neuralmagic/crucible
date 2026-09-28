@@ -398,6 +398,12 @@ pub enum CompileError {
     EmitsEntryNotString,
     #[error("argument \"emits\" must be a list of field-name strings")]
     EmitsNotList,
+    #[error("argument \"asks\" must be a list of workflow-name strings")]
+    AsksNotList,
+    #[error("argument \"asks\": {error}")]
+    InvalidAskWorkflow {
+        error: crucible_contract::ask::WorkflowNameError,
+    },
 
     #[error("argument {argument:?}: {error}")]
     InvalidIdentifier {

@@ -219,6 +219,60 @@ dependency, a fan-out on either side, two reviewers for one target, nested or ch
 a reviewer dependency that can reach the target (it would read a draft a later round replaces).
 Anything less bounded, or a repair that re-runs more than one producer, stays inside one task.
 
+### `asks`
+
+A task proposes work for another run by asking for it. Playbooks only. An item set found at run
+time never becomes new nodes; a task either handles it itself or asks for one run per item, and
+asks are the route when each item deserves its own budget, isolation, and verdict.
+
+```python
+roundup = command(
+    name = "roundup",
+    run = "python3 roundup.py",
+    depends_on = [scan, triage],
+    join = "passed",
+    asks = ["issue-fix"],
+)
+```
+
+`asks` names the workflows the task may ask for. The task returns its asks in its JSON output
+under the reserved `asks` field:
+
+```json
+{"triaged": 6,
+ "asks": [{"key": "vllm-project/speculators#412", "workflow": "issue-fix",
+           "params": {"repo": "vllm-project/speculators", "issue": "412"}}]}
+```
+
+- `key` is the item's identity, stable across runs: the same issue gets the same key every time
+  it is found, which is what lets the receiving orchestrator recognize a repeat.
+- `workflow` is one the task lists in `asks`.
+- `params` are that workflow's parameter values: strings, numbers, booleans, or lists of
+  strings, at most 4096 encoded bytes. Anything bigger is material, and material travels by
+  published artifact location, never in an ask.
+
+The run never dispatches an ask. When the task settles passing, the engine checks its asks and
+writes them to the session log as one `asks_emitted` event ahead of the task's row; admitting
+them (validating `params` against the named workflow's schema, deduplicating on the key,
+exclusion, rate limits) is the receiving orchestrator's job. A task that fails or skips emits
+nothing, whatever its output says.
+
+The checks fail the asking task, as a measured failure with its output kept: an `asks` field on a
+task that declares no workflows, an ask that is not exactly `{key, workflow, params}`, a key or
+workflow name that cannot form the queue key `ask:<workflow>:<key>`, an undeclared workflow, a
+parameter value outside those types, and a workflow and key the run already asked for. The
+failure lands before the task's commit, like a missing `emits` field.
+
+The run's asks are bounded by its launcher, never its pack: `crucible plan run --max-asks N`,
+16 when unset. The bound counts every task's asks, mapped instances included. A task whose asks
+would take the run past it fails and emits none of them; the ones that would have fit are not
+sent either, so which items were asked for never depends on list order. Isolated tasks that ran
+together meet the bound in declaration order. `plan_admitted` carries the bound as `max_asks`
+and each task's declared workflows as `asks`, so both are on the log before any task runs.
+
+A task inside a revise loop cannot ask: its rounds produce drafts the loop may replace. A task
+that depends on the reviewer reads the settled draft and can.
+
 ## The loop as a plan
 
 Each loop iteration runs as a capability-admitted `autoresearch` workflow. With no authored
