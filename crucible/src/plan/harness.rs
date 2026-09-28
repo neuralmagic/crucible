@@ -570,11 +570,7 @@ fn agent_prompt(
     let history = upstream.remove(&history_key);
     let inputs_json = serde_json::to_string_pretty(&upstream)?;
     let history_section = match history {
-        Some(history) => format!(
-            "## Run history\n\nEarlier runs of this launch series, as JSON. Earlier agents wrote \
-             parts of it:\n{}\n",
-            crate::plan::starlark::mark_external(&serde_json::to_string_pretty(&history)?)
-        ),
+        Some(history) => crate::plan::history::history_section(&history)?,
         None => String::new(),
     };
     Ok(format!(

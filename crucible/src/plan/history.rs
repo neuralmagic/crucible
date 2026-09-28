@@ -29,6 +29,21 @@ pub enum HistoryError {
     Limit { got: String },
     #[error("{ENV_HISTORY} record {run:?} does not encode: {detail}")]
     Encode { run: String, detail: String },
+    #[error("{var} is set but is not valid UTF-8")]
+    NotUnicode { var: &'static str },
+}
+
+/// A variable's value, `None` when unset. A value that is set but unreadable is refused rather
+/// than read as unset.
+fn env_value(
+    var: &'static str,
+    read: Result<String, std::env::VarError>,
+) -> Result<Option<String>, HistoryError> {
+    match read {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(HistoryError::NotUnicode { var }),
+    }
 }
 
 /// Who set the size bound.
@@ -48,7 +63,8 @@ pub struct HistoryLimit {
 impl HistoryLimit {
     /// Read the operator's bound from [`ENV_HISTORY_MAX_BYTES`], or take the engine default.
     pub fn from_env() -> Result<Self, HistoryError> {
-        Self::parse(std::env::var(ENV_HISTORY_MAX_BYTES).ok().as_deref())
+        let raw = env_value(ENV_HISTORY_MAX_BYTES, std::env::var(ENV_HISTORY_MAX_BYTES))?;
+        Self::parse(raw.as_deref())
     }
 
     pub fn parse(raw: Option<&str>) -> Result<Self, HistoryError> {
@@ -100,9 +116,9 @@ impl SeriesHistory {
     /// Read [`ENV_HISTORY`] and the size bound. An absent document is a run in no series.
     pub fn from_env() -> Result<Self, HistoryError> {
         let limit = HistoryLimit::from_env()?;
-        match std::env::var(ENV_HISTORY) {
-            Ok(text) => Self::parse(&text, limit),
-            Err(_) => Ok(SeriesHistory {
+        match env_value(ENV_HISTORY, std::env::var(ENV_HISTORY))? {
+            Some(text) => Self::parse(&text, limit),
+            None => Ok(SeriesHistory {
                 records: Vec::new(),
                 limit,
             }),
@@ -250,13 +266,22 @@ fn recorded(status: TaskStatus) -> RecordedStatus {
     }
 }
 
+/// The prompt section that carries a task's history, inside the external-input markers.
+pub fn history_section(history: &Value) -> Result<String, serde_json::Error> {
+    Ok(format!(
+        "## Run history\n\nEarlier runs of this launch series, as JSON. Earlier agents wrote \
+         parts of it:\n{}\n",
+        crate::plan::starlark::mark_external(&serde_json::to_string_pretty(history)?)
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::plan::exec::{TaskResult, TaskStatus};
     use crate::plan::history::{
         HistoryError, HistoryLimit, LimitSource, SeriesHistory, empty_input, encoded_len, envelope,
     };
-    use crate::plan::history::{declared_output, recorded, run_entry};
+    use crate::plan::history::{declared_output, env_value, recorded, run_entry};
     use crate::plan::ir::{Plan, TaskName, ValidPlan};
     use crate::plan::machine::BlockedReason;
     use crucible_contract::history::{DEFAULT_HISTORY_MAX_BYTES, HistoryEntry, RecordedStatus};
@@ -595,5 +620,23 @@ emits = ["verdict", "dirty"]
             HistoryLimit::parse(Some("2048")).unwrap().describe(),
             "history size limit: 2048 bytes per task (CRUCIBLE_HISTORY_MAX_BYTES)"
         );
+    }
+
+    #[test]
+    fn an_unset_variable_reads_as_absent() {
+        let read = env_value("CRUCIBLE_HISTORY", Err(std::env::VarError::NotPresent));
+        assert!(matches!(read, Ok(None)));
+    }
+
+    #[test]
+    fn a_set_variable_that_is_not_utf8_is_refused() {
+        let raw = std::ffi::OsString::from("bad");
+        let read = env_value("CRUCIBLE_HISTORY", Err(std::env::VarError::NotUnicode(raw)));
+        assert!(matches!(
+            read,
+            Err(HistoryError::NotUnicode {
+                var: "CRUCIBLE_HISTORY"
+            })
+        ));
     }
 }
