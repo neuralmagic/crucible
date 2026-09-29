@@ -75,7 +75,7 @@ use crate::wire_enum::wire_enum;
 use anyhow::{Context, Result, bail};
 use crucible_contract::Tier;
 use genai::adapter::AdapterKind;
-use genai::chat::{ChatOptions, ChatRequest};
+use genai::chat::{ChatOptions, ChatRequest, ReasoningEffort};
 use genai::resolver::{AuthData, Endpoint, ServiceTargetResolver};
 use genai::{Client, ModelIden, ServiceTarget};
 use serde::Deserialize;
@@ -509,12 +509,13 @@ async fn rank_on(candidate: &Candidate, prompt: &str) -> Result<Verdict, String>
 }
 
 /// Build the ranking call's [`ChatOptions`] from the env knobs: the (raised, thinking-inclusive)
-/// max-tokens cap, raw-body capture for the self-reported cost, and an *optional* temperature that
-/// is set only when `CONTROLLER_RANKER_TEMPERATURE` is present and parseable (Sonnet 5 400s on a
-/// non-default one, so unset must stay off the request).
+/// max-tokens cap, raw-body capture for the self-reported cost, reasoning effort pinned to low,
+/// and an *optional* temperature that is set only when `CONTROLLER_RANKER_TEMPERATURE` is present
+/// and parseable (Sonnet 5 400s on a non-default one, so unset must stay off the request).
 fn build_chat_options() -> ChatOptions {
     let options = ChatOptions::default()
         .with_max_tokens(ranker_max_tokens())
+        .with_reasoning_effort(ReasoningEffort::Low)
         .with_capture_raw_body(true);
     match ranker_temperature() {
         Some(t) => options.with_temperature(t),
@@ -903,6 +904,7 @@ mod tests {
         }
         let opts = build_chat_options();
         assert_eq!(opts.max_tokens, Some(DEFAULT_MAX_TOKENS));
+        assert!(matches!(opts.reasoning_effort, Some(ReasoningEffort::Low)));
         assert_eq!(
             opts.temperature, None,
             "temperature must be absent from the request when unset (Sonnet 5 400s otherwise)"
@@ -988,7 +990,7 @@ mod tests {
     /// reached the way every reconcile test reaches it: a registered Chat Completions provider that
     /// is the platform's autoresearch default. The path and body matchers prove the call speaks the
     /// OpenAI shape at `{base}/chat/completions` (the URL-join contract `custom_base` protects) and
-    /// asks for the provider's default model.
+    /// asks for the provider's default model at low reasoning effort.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn rank_through_the_registered_provider_confirms_a_tier(
         pool: sqlx::PgPool,
@@ -999,9 +1001,10 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/chat/completions"))
-            .and(wiremock::matchers::body_partial_json(
-                serde_json::json!({"model": "test-ranker-model"}),
-            ))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "model": "test-ranker-model",
+                "reasoning_effort": "low",
+            })))
             .respond_with(chat_reply(T1_VERDICT))
             .expect(1)
             .mount(&server)
@@ -1140,7 +1143,8 @@ mod tests {
     }
 
     /// A custom Messages provider (PriceTag's gateway shape) is reached at `{endpoint}/v1/messages`
-    /// through genai's Anthropic adapter, with the key its registered secret holds.
+    /// through genai's Anthropic adapter, with the key its registered secret holds. Low effort on a
+    /// model genai does not know as effort-capable is a 1024-token thinking budget.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_messages_provider_ranks_with_its_registered_key(pool: sqlx::PgPool) -> Result<()> {
         let tmp = tempfile::tempdir()?;
@@ -1156,9 +1160,10 @@ mod tests {
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/v1/messages"))
             .and(wiremock::matchers::header("x-api-key", "sk-gateway"))
-            .and(wiremock::matchers::body_partial_json(
-                serde_json::json!({"model": "rits/zai-org/glm-5-3"}),
-            ))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "model": "rits/zai-org/glm-5-3",
+                "thinking": {"type": "enabled", "budget_tokens": 1024},
+            })))
             .respond_with(
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "id": "msg_1",
