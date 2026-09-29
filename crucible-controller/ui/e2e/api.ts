@@ -348,12 +348,28 @@ const CUSTOM_IMAGE = {
   capabilities: null,
   capability_digest: null,
 };
-const RANKED_IMAGES = {
-  compatible: [{ image: GO_CC_IMAGE, surplus: 0, preferred: 0, default: true }],
+/// Older builds tagged only by commit.
+const GO_CC_OLDER = [
+  { ...GO_CC_IMAGE, digest: `sha256:${'4'.repeat(64)}`, tags: ['0a1b2c3d4e5f60718293a4b5c6d7e8f901234567'], created_at: '2026-09-10T06:40:00Z' },
+  { ...GO_CC_IMAGE, digest: `sha256:${'5'.repeat(64)}`, tags: ['9f8e7d6c5b4a39281706f5e4d3c2b1a098765432'], created_at: '2026-09-08T06:40:00Z' },
+];
+export const RANKED_IMAGES = {
+  compatible: [
+    { image: GO_CC_IMAGE, surplus: 0, preferred: 0, default: true },
+    ...GO_CC_OLDER.map((image) => ({ image, surplus: 0, preferred: 0, default: false })),
+  ],
   excluded: [
     {
       image: RUST_CC_IMAGE,
       unsatisfied: [{ predicate: 'toolchain.go', required: '>=1.25', found: null }],
+    },
+    {
+      image: { ...RUST_CC_IMAGE, digest: `sha256:${'6'.repeat(64)}`, tags: ['0a1b2c3d4e5f60718293a4b5c6d7e8f901234567'] },
+      unsatisfied: [{ predicate: 'toolchain.go', required: '>=1.25', found: null }],
+    },
+    {
+      image: { ...GO_CC_IMAGE, digest: `sha256:${'7'.repeat(64)}`, tags: ['1122334455667788990011223344556677889900'], created_at: '2026-09-01T06:40:00Z' },
+      unsatisfied: [{ predicate: 'toolchain.go', required: '>=1.25', found: '1.24.2' }],
     },
   ],
   unverified: [CUSTOM_IMAGE],
