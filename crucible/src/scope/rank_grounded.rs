@@ -59,6 +59,9 @@ pub struct RankGroundedArgs {
     /// Override the turn's agent with a `command`-backend script (test hook).
     #[arg(long, hide = true)]
     pub agent_cmd: Option<String>,
+    /// The harness that runs the turn; the claude default when unset.
+    #[arg(long, value_enum)]
+    pub harness: Option<crate::manifest::Harness>,
     /// Override the turn's model (env fallback: `CRUCIBLE_RANK_MODEL`).
     #[arg(long)]
     pub model: Option<String>,
@@ -348,29 +351,12 @@ fn grounded_paths(scratch: &Path) -> Paths {
     }
 }
 
-/// Run the grounded turn in a throwaway worktree of `workspace` and return its outcome plus the
-/// agent's accumulated output. The worktree (detached at HEAD) is the read-only-intent mechanism:
-/// any write the agent makes lands here and is discarded on `worktree remove --force`, so the
-/// caller's checkout is never touched.
-fn run_grounded_turn(
-    workspace: &Path,
-    prompt: &str,
-    a: &RankGroundedArgs,
-) -> Result<(TurnOutcome, String)> {
-    let scratch = worktree_path();
-    git(
-        workspace,
-        &[
-            "worktree",
-            "add",
-            "--detach",
-            &scratch.to_string_lossy(),
-            "HEAD",
-        ],
-    )
-    .context("creating the read-only worktree for the grounded turn")?;
-
+/// The engine args for the grounded turn. Ranking is a one-line verdict, so reasoning effort is
+/// pinned to `low` whatever the harness or model.
+fn turn_args(a: &RankGroundedArgs) -> Result<crate::args::Args> {
     let mut args = crate::args::Args::defaults().context("constructing default args")?;
+    args.harness = a.harness;
+    args.reasoning_effort = Some(crate::manifest::ReasoningEffort::Low);
     match &a.agent_cmd {
         Some(cmd) => {
             args.agent_backend = AgentBackend::Command;
@@ -399,6 +385,32 @@ fn run_grounded_turn(
     if let Some(model) = model {
         args.model = Some(model);
     }
+    Ok(args)
+}
+
+/// Run the grounded turn in a throwaway worktree of `workspace` and return its outcome plus the
+/// agent's accumulated output. The worktree (detached at HEAD) is the read-only-intent mechanism:
+/// any write the agent makes lands here and is discarded on `worktree remove --force`, so the
+/// caller's checkout is never touched.
+fn run_grounded_turn(
+    workspace: &Path,
+    prompt: &str,
+    a: &RankGroundedArgs,
+) -> Result<(TurnOutcome, String)> {
+    let scratch = worktree_path();
+    git(
+        workspace,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            &scratch.to_string_lossy(),
+            "HEAD",
+        ],
+    )
+    .context("creating the read-only worktree for the grounded turn")?;
+
+    let args = turn_args(a)?;
     let paths = grounded_paths(&scratch);
     let _ = std::fs::create_dir_all(&paths.state);
 
@@ -833,9 +845,69 @@ mod tests {
             agent_backend: AgentBackend::Local,
             sandbox_image: None,
             agent_cmd: Some(script.display().to_string()),
+            harness: None,
             model: None,
             compute_driver: crate::openshell::gateway::ComputeDriver::Podman,
         }
+    }
+
+    #[test]
+    fn the_controllers_dispatch_argv_parses() {
+        let cli = <crate::cli::Cli as clap::Parser>::try_parse_from([
+            "crucible",
+            "rank-grounded",
+            "--issue",
+            "llm-d/llm-d-router#3088",
+            "--workspace",
+            "/checkout",
+            "--max-cost",
+            "10",
+            "--json",
+            "--marker",
+            "--agent-backend",
+            "openshell",
+            "--sandbox-image",
+            "ghcr.io/neuralmagic/sandbox-go-cc@sha256:0d25",
+            "--harness",
+            "claude",
+            "--model",
+            "rits/zai-org/glm-5-3",
+            "--compute-driver=kubernetes",
+        ])
+        .unwrap();
+        let Some(crate::cli::Cmd::RankGrounded(a)) = cli.command else {
+            panic!("rank-grounded parses as its subcommand");
+        };
+        assert_eq!(a.harness, Some(crate::manifest::Harness::Claude));
+        assert_eq!(a.model.as_deref(), Some("rits/zai-org/glm-5-3"));
+    }
+
+    #[test]
+    fn the_grounded_turn_pins_low_effort_and_takes_the_harness_and_model() {
+        let mut a = args(Path::new("/checkout"), Path::new("/agent.sh"), 1.0);
+        a.agent_cmd = None;
+        a.agent_backend = AgentBackend::Openshell;
+        a.harness = Some(crate::manifest::Harness::OpenCode);
+        a.model = Some("qwen-3-8-27b".to_string());
+        let turn = turn_args(&a).unwrap();
+        assert_eq!(
+            turn.reasoning_effort,
+            Some(crate::manifest::ReasoningEffort::Low)
+        );
+        assert_eq!(turn.harness(), crate::manifest::Harness::OpenCode);
+        assert_eq!(turn.model(), "qwen-3-8-27b");
+        assert_eq!(turn.agent_backend, AgentBackend::Openshell);
+    }
+
+    #[test]
+    fn the_grounded_turn_defaults_to_claude_at_low_effort() {
+        let turn = turn_args(&args(Path::new("/checkout"), Path::new("/agent.sh"), 1.0)).unwrap();
+        assert_eq!(turn.harness(), crate::manifest::Harness::Claude);
+        assert_eq!(
+            turn.reasoning_effort,
+            Some(crate::manifest::ReasoningEffort::Low)
+        );
+        assert_eq!(turn.agent_backend, AgentBackend::Command);
     }
 
     #[test]
@@ -1018,6 +1090,7 @@ mod tests {
             agent_backend: AgentBackend::Openshell,
             sandbox_image: Some("ghcr.io/neuralmagic/crucible-sandbox:latest".to_string()),
             agent_cmd: None,
+            harness: None,
             model: None,
             compute_driver: crate::openshell::gateway::ComputeDriver::Podman,
         };
