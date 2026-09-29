@@ -208,16 +208,18 @@ impl EventLog {
 
     /// Read every recorded event, oldest first.
     pub(crate) async fn read_all(&self) -> Result<Vec<EventRecord>> {
-        let rows = sqlx::query(&format!("SELECT {SELECT_COLUMNS} FROM events ORDER BY id"))
-            .fetch_all(&self.pool)
-            .await
-            .context("reading the events table")?;
+        let rows = sqlx::query(const_format::formatcp!(
+            "SELECT {SELECT_COLUMNS} FROM events ORDER BY id"
+        ))
+        .fetch_all(&self.pool)
+        .await
+        .context("reading the events table")?;
         Ok(rows.iter().map(record_of_row).collect())
     }
 
     /// The `limit` most recent events, newest first — the activity feed's starting tail.
     pub(crate) async fn read_recent(&self, limit: usize) -> Result<Vec<EventRecord>> {
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(const_format::formatcp!(
             "SELECT {SELECT_COLUMNS} FROM events ORDER BY id DESC LIMIT $1"
         ))
         .bind(i64::try_from(limit).unwrap_or(i64::MAX))
@@ -229,7 +231,7 @@ impl EventLog {
 
     /// Every event recorded for one issue key, oldest first.
     pub(crate) async fn read_for_key(&self, key: &str) -> Result<Vec<EventRecord>> {
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(const_format::formatcp!(
             "SELECT {SELECT_COLUMNS} FROM events WHERE key = $1 ORDER BY id"
         ))
         .bind(key)
@@ -250,7 +252,7 @@ impl EventLog {
 
     /// Events with `id > after`, oldest first, each with its id.
     async fn read_after(&self, after: i64) -> Result<Vec<(i64, EventRecord)>> {
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(const_format::formatcp!(
             "SELECT id, {SELECT_COLUMNS} FROM events WHERE id > $1 ORDER BY id"
         ))
         .bind(after)

@@ -36,7 +36,7 @@ pub(crate) async fn get_autopilot(State(state): State<ApiState>) -> Response {
 pub(crate) async fn set_autopilot(
     State(state): State<ApiState>,
     identity: crate::identity::session::Identity,
-    _admin: crate::identity::auth::AdminGuard,
+    _admin: crate::authz::guard::AdminGuard,
     Json(body): Json<AutopilotSetBody>,
 ) -> Response {
     let Some(flag) = state.autopilot.as_ref() else {

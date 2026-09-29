@@ -261,6 +261,7 @@ const UNDISPATCHABLE = {
   requires: {},
   prefers: {},
   allow_unverified_image: false,
+  resources: { gpus: 0, cpu: null, memory: null, node_selector: {} },
   image: {
     reference: 'ghcr.io/example/sandbox:latest',
     digest: null,
@@ -288,6 +289,7 @@ const DISPATCHABLE = {
   requires: {},
   prefers: {},
   allow_unverified_image: false,
+  resources: { gpus: 0, cpu: null, memory: null, node_selector: {} },
   image: {
     reference: null,
     digest: null,
@@ -357,7 +359,7 @@ const RANKED_IMAGES = {
   unverified: [CUSTOM_IMAGE],
 };
 
-const PACK_IMPORT = {
+export const PACK_IMPORT = {
   id: IMPORT_ID,
   repo: 'neuralmagic/other-packs',
   git_ref: null,
@@ -437,6 +439,53 @@ const TEAMS = [
     created_at: '2026-09-13T00:00:00Z',
     created_by: null,
     updated_at: '2026-09-13T00:00:00Z',
+  },
+];
+
+export const POLICY_ACTIVE = `// The shipped set.
+
+@id("platform-admin-all")
+permit(principal, action, resource)
+when { principal.platform_admin };
+
+@id("operators-access-autoresearch")
+permit(principal is UserPrincipal, action == Action::"autoresearch:access", resource)
+when { principal.hasTag("team:platform-operators") };
+`;
+
+const POLICY_SCHEMA = `entity UserPrincipal { id: String, platform_admin: Bool, proves_groups: Bool } tags String;
+entity TeamPrincipal { id: String, platform_admin: Bool, proves_groups: Bool } tags String;
+entity RunPrincipal { id: String, platform_admin: Bool, proves_groups: Bool } tags String;
+entity Playbook { id: String, owner: String, owner_kind: String, owner_role?: String, share?: String, run?: String };
+entity Autoresearch { id: String, owner: String, owner_kind: String, owner_role?: String, share?: String, run?: String };
+action "access";
+action "launch";
+action "autoresearch:access" in [Action::"access"] appliesTo { principal: [UserPrincipal, TeamPrincipal, RunPrincipal], resource: [Autoresearch], context: { now: Long } };
+action "playbook:launch" in [Action::"launch"] appliesTo { principal: [UserPrincipal, TeamPrincipal, RunPrincipal], resource: [Playbook], context: { now: Long } };
+`;
+
+const POLICY_SETS = [
+  {
+    digest: 'a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0a1b2',
+    text: POLICY_ACTIVE,
+    owner: 'team:platform-administrators',
+    schema_version: 1,
+    created_by: 'user:wren',
+    created_at: '2026-09-20T00:00:00Z',
+    activated_by: 'user:wren',
+    activated_at: '2026-09-20T00:05:00Z',
+    active: true,
+  },
+  {
+    digest: 'ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100',
+    text: '@id("platform-admin-all")\npermit(principal, action, resource)\nwhen { principal.platform_admin };\n',
+    owner: 'team:platform-administrators',
+    schema_version: 1,
+    created_by: null,
+    created_at: '2026-09-01T00:00:00Z',
+    activated_by: null,
+    activated_at: '2026-09-01T00:00:00Z',
+    active: false,
   },
 ];
 
@@ -545,10 +594,8 @@ export const ROUTES: Record<string, Json> = {
     {
       id: 'survey',
       description: 'Survey a topic across the tracked repos and file what it finds.',
-      repo: 'neuralmagic/crucible-packs',
-      git_ref: null,
+      source: { kind: 'git', repo: 'neuralmagic/crucible-packs', git_ref: null, path: 'packs/survey' },
       rev: '9f2c1a4c0b3d5e6f7a8b9c0d1e2f3a4b5c6d7e8f',
-      path: 'packs/survey',
       tar_digest: 'sha256:1111',
       schema_digest: 'sha256:2222',
       core_rev: '7c2c1a5',
@@ -562,10 +609,8 @@ export const ROUTES: Record<string, Json> = {
     {
       id: 'triage',
       description: 'Triage the inbox and park what cannot move.',
-      repo: 'neuralmagic/crucible-packs',
-      git_ref: null,
+      source: { kind: 'git', repo: 'neuralmagic/crucible-packs', git_ref: null, path: 'packs/triage' },
       rev: '0a1b2c3d4e5f60718293a4b5c6d7e8f901234567',
-      path: 'packs/triage',
       tar_digest: 'sha256:3333',
       schema_digest: 'sha256:4444',
       core_rev: '7c2c1a5',
@@ -615,6 +660,7 @@ export const ROUTES: Record<string, Json> = {
       graduation_repo: null,
       graduation_path: null,
       graduation_pr_url: null,
+      published_playbook: null,
       retired_at: null,
       latest_version: 1,
       compiles: true,
@@ -633,6 +679,7 @@ export const ROUTES: Record<string, Json> = {
     graduation_repo: null,
     graduation_path: null,
     graduation_pr_url: null,
+    published_playbook: null,
     retired_at: null,
     latest_version: 1,
     compiles: true,
@@ -820,6 +867,21 @@ export const ROUTES: Record<string, Json> = {
     },
     runs: [],
   },
+  '/api/playbook-runs': [
+    { ...PLAYBOOK_RUN, key: 'playbook:triage:0201', playbook: 'triage', status: 'running', cost_usd: 0.42, created_by: 'kylesayrs', created_at: '2026-08-24T11:40:00Z' },
+    {
+      ...PLAYBOOK_RUN,
+      key: 'playbook:survey:0197',
+      status: 'parked',
+      cost_usd: null,
+      runs: 0,
+      parked_reason: 'secrets: the pack declares secret pr_token, and repo neuralmagic/crucible has no binding for it',
+      created_at: '2026-08-24T09:00:00Z',
+    },
+    PLAYBOOK_RUN,
+    { ...PLAYBOOK_RUN, key: 'playbook:studio:0196', playbook: 'studio', origin: 'draft', draft_version: 3, status: 'parked', parked_reason: 'dispatch failed', cost_usd: null, runs: 0 },
+    { ...PLAYBOOK_RUN, key: 'playbook:studio:0195', playbook: 'studio', origin: 'draft', draft_version: 2, status: 'parked', parked_reason: 'dispatch failed', cost_usd: null, runs: 0 },
+  ],
   '/api/turns': [],
   '/api/whoami': {
     user: 'wren',
@@ -829,12 +891,17 @@ export const ROUTES: Record<string, Json> = {
     mode: 'native',
     downgraded: false,
     proves_groups: true,
+    entitlements: ['autoresearch'],
     teams: [
       { team: 'llm-d', role: 'maintainer', via: [{ kind: 'group', group: '/groups/platform', role: 'maintainer' }] },
       { team: 'platform-administrators', role: 'owner', via: [{ kind: 'rule', rule: 'configured-admins', role: 'owner' }] },
     ],
   },
   '/api/teams': TEAMS,
+  '/api/authz/actions': [
+    { action: 'autoresearch:access', resource: 'autoresearch', verb: 'access' },
+    { action: 'playbook:launch', resource: 'playbook', verb: 'launch' },
+  ],
   '/api/teams/llm-d': TEAMS[0],
   '/api/teams/platform-administrators': TEAMS[1],
   '/api/playbook-drafts/studio/shares': [
@@ -933,6 +1000,7 @@ export async function stubApi(page: Page): Promise<void> {
   let proposed: Record<string, unknown> = { ...PACK_IMPORT };
   let shares = [...(ROUTES['/api/playbook-drafts/studio/shares'] as Record<string, unknown>[])];
   let team = { ...TEAMS[0] };
+  let policySets = POLICY_SETS.map((set) => ({ ...set }));
   await page.route(
     (url: URL) => url.pathname.startsWith('/api/'),
     (route: Route) => {
@@ -981,6 +1049,72 @@ export async function stubApi(page: Page): Promise<void> {
       }
       if (path === '/api/teams/llm-d') {
         return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(team) });
+      }
+      if (path === '/api/authz/schema') {
+        return route.fulfill({ status: 200, contentType: 'text/plain; charset=utf-8', body: POLICY_SCHEMA });
+      }
+      if (path === '/api/authz/policy-sets' && route.request().method() === 'POST') {
+        const sent: unknown = JSON.parse(route.request().postData() ?? '{}');
+        const text = typeof sent === 'object' && sent !== null && 'text' in sent && typeof sent.text === 'string' ? sent.text : '';
+        if (text.includes('bogus')) {
+          return route.fulfill({
+            status: 422,
+            contentType: 'application/json',
+            body: JSON.stringify({ error: 'policy bogus-rule does not validate: unexpected token `bogus`' }),
+          });
+        }
+        const row = {
+          ...POLICY_SETS[0],
+          digest: `0123456789ab${String(policySets.length).padStart(52, '0')}`,
+          text,
+          created_at: '2026-09-28T00:00:00Z',
+          activated_by: null,
+          activated_at: null,
+          active: false,
+        };
+        policySets = [...policySets, row];
+        return route.fulfill({ status: 201, contentType: 'application/json', body: JSON.stringify(row) });
+      }
+      const activate = /^\/api\/authz\/policy-sets\/([0-9a-f]+)\/activate$/.exec(path);
+      if (activate !== null && route.request().method() === 'POST') {
+        const prior = policySets.find((set) => set.active)?.digest ?? null;
+        policySets = policySets.map((set) =>
+          set.digest === activate[1]
+            ? { ...set, active: true, activated_by: 'user:wren', activated_at: '2026-09-28T00:01:00Z' }
+            : { ...set, active: false },
+        );
+        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ prior, active: activate[1] }) });
+      }
+      if (path === '/api/authz/policy-sets') {
+        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(policySets) });
+      }
+      if (path === '/api/authz/explain') {
+        const query = new URL(route.request().url()).searchParams;
+        const login = query.get('login') ?? '';
+        if (login === 'ghost') {
+          return route.fulfill({
+            status: 404,
+            contentType: 'application/json',
+            body: JSON.stringify({ error: 'no one with login ghost has signed in here' }),
+          });
+        }
+        const granted = policySets.find((set) => set.active)?.text.includes('llm-d-devs-autoresearch') ?? false;
+        return route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            login,
+            action: query.get('action'),
+            resource: query.get('resource') ?? 'autoresearch',
+            owner: 'team:platform-administrators',
+            allowed: granted,
+            rules: granted ? ['llm-d-devs-autoresearch'] : [],
+            policy: policySets.find((set) => set.active)?.digest ?? '',
+            groups: ['/groups/inference-eng-llm-d-devs'],
+            groups_at: '2026-09-27T12:00:00Z',
+            teams: [{ team: 'llm-d', role: 'member', via: [{ kind: 'group', group: '/groups/inference-eng-llm-d-devs', role: 'member' }] }],
+          }),
+        });
       }
       if (path === '/api/images/rank' && route.request().method() === 'POST') {
         return route.fulfill({

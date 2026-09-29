@@ -110,6 +110,16 @@ pub(crate) fn pin_agent(args: &mut Args, agent: &manifest::AgentCfg) -> Result<m
     Ok(harness)
 }
 
+/// A pack asked for sandbox resources on a backend that runs no sandbox, so they would be dropped.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "[agent.resources] schedules the openshell backend's sandbox; the {backend} backend runs no \
+     sandbox, so the request would be dropped"
+)]
+pub(crate) struct ResourcesWithoutSandbox {
+    backend: manifest::AgentBackend,
+}
+
 /// Fold a manifest's `[agent]` config onto `Args` and, for the openshell backend, spawn the
 /// provisioning broker. Shared by the single-domain and composite run paths.
 pub(crate) fn apply_agent_cfg(
@@ -179,6 +189,13 @@ pub(crate) fn apply_agent_cfg(
     args.disclosure = frozen.disclosure.clone();
     args.output_bounds = frozen.bounds.clone();
     args.openshell = agent.openshell.clone();
+    if !agent.resources.is_empty() && args.agent_backend != manifest::AgentBackend::Openshell {
+        return Err(ResourcesWithoutSandbox {
+            backend: args.agent_backend,
+        }
+        .into());
+    }
+    args.sandbox_resources = agent.resources.clone();
     args.broker = agent.broker.clone();
 
     // The provisioning broker: a run-lifetime child crucible spawns for the openshell
@@ -355,6 +372,46 @@ mod tests {
             ),
             (Harness::Claude, "bound-model".to_string())
         );
+    }
+
+    /// Resources schedule a sandbox, so only the backend that runs one takes them; any other
+    /// backend refuses rather than dropping a GPU request on the floor.
+    #[test]
+    fn sandbox_resources_reach_the_openshell_turn_and_refuse_every_other_backend() {
+        let apply = |backend: &str, extra: &str| {
+            let text = manifest_toml(extra)
+                .replace("backend = \"command\"", &format!("backend = \"{backend}\""));
+            let m: manifest::Manifest = toml::from_str(&text).unwrap();
+            let mut a = args_from(&["crucible"]);
+            apply_agent_cfg(
+                &mut a,
+                &m.agent,
+                &m.secrets,
+                Path::new("ws"),
+                &FrozenProjection::default(),
+            )
+            .map(|()| a.sandbox_resources)
+        };
+        let resources = apply(
+            "openshell",
+            "sandbox_image = \"sandbox:dev\"\nresources = { gpus = 1, memory = \"32Gi\" }",
+        )
+        .expect("the openshell backend takes resources");
+        assert_eq!(resources.gpus, 1);
+        assert_eq!(
+            resources.memory.as_ref().map(manifest::Quantity::as_str),
+            Some("32Gi")
+        );
+
+        for backend in ["local", "command"] {
+            let err = apply(backend, "resources = { gpus = 1 }")
+                .expect_err("a backend with no sandbox refuses resources");
+            assert!(
+                err.to_string().contains("[agent.resources]"),
+                "{backend}: {err:#}"
+            );
+        }
+        assert!(apply("local", "").is_ok(), "an absent table is no request");
     }
 
     #[test]

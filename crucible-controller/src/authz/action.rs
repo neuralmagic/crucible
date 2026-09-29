@@ -30,6 +30,8 @@ pub enum ResourceType {
     UserPrefs,
     PolicySet,
     Team,
+    /// The autoresearch lane as a whole: `autoresearch:access` is the entitlement to see and use it.
+    Autoresearch,
 }
 
 wire_enum!(ResourceType, "resource type", both, {
@@ -51,10 +53,11 @@ wire_enum!(ResourceType, "resource type", both, {
     ResourceType::UserPrefs => "user_prefs",
     ResourceType::PolicySet => "policy_set",
     ResourceType::Team => "team",
+    ResourceType::Autoresearch => "autoresearch",
 });
 
 impl ResourceType {
-    pub const ALL: [ResourceType; 18] = [
+    pub const ALL: [ResourceType; 19] = [
         ResourceType::Platform,
         ResourceType::Issue,
         ResourceType::Repo,
@@ -73,6 +76,7 @@ impl ResourceType {
         ResourceType::UserPrefs,
         ResourceType::PolicySet,
         ResourceType::Team,
+        ResourceType::Autoresearch,
     ];
 
     /// The Cedar entity type name for the resource.
@@ -96,11 +100,16 @@ impl ResourceType {
             ResourceType::UserPrefs => "UserPrefs",
             ResourceType::PolicySet => "PolicySet",
             ResourceType::Team => "Team",
+            ResourceType::Autoresearch => "Autoresearch",
         }
     }
 
-    /// The verbs the type defines: the six every type has, then the RFC's per-type additions.
+    /// The verbs the type defines: the six every type has, then the RFC's per-type additions. A
+    /// lane is not a record anyone creates or edits; its only verb is `access`.
     pub fn verbs(self) -> Vec<Verb> {
+        if self == ResourceType::Autoresearch {
+            return vec![Verb::Access];
+        }
         let mut verbs = vec![
             Verb::Read,
             Verb::Create,
@@ -112,13 +121,14 @@ impl ResourceType {
         let extra: &[Verb] = match self {
             ResourceType::Issue => &[Verb::Launch, Verb::Approve],
             ResourceType::Playbook | ResourceType::StandingLaunch => &[Verb::Launch],
-            ResourceType::PlaybookDraft => &[Verb::Launch, Verb::Approve],
+            ResourceType::PlaybookDraft => &[Verb::Launch, Verb::Approve, Verb::Publish],
             ResourceType::PackImport | ResourceType::Scope => &[Verb::Approve],
             ResourceType::Secret => &[Verb::Bind, Verb::Rotate],
             ResourceType::DispatchTarget => &[Verb::Dispatch],
             ResourceType::Run => &[Verb::Publish],
             ResourceType::PolicySet => &[Verb::Activate],
             ResourceType::Team => &[Verb::ManageMembers],
+            ResourceType::Platform => &[Verb::Impersonate],
             _ => &[],
         };
         verbs.extend_from_slice(extra);
@@ -149,6 +159,8 @@ pub enum Verb {
     Publish,
     Activate,
     ManageMembers,
+    Impersonate,
+    Access,
 }
 
 wire_enum!(Verb, "action verb", both, {
@@ -166,6 +178,8 @@ wire_enum!(Verb, "action verb", both, {
     Verb::Publish => "publish",
     Verb::Activate => "activate",
     Verb::ManageMembers => "manage-members",
+    Verb::Impersonate => "impersonate",
+    Verb::Access => "access",
 });
 
 /// One entry of the vocabulary: a verb the resource type defines.
@@ -238,11 +252,14 @@ impl serde::Serialize for Action {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::authz::action::*;
 
     #[test]
     fn every_type_defines_the_six_base_verbs_and_the_rfc_extras() {
-        for resource in ResourceType::ALL {
+        for resource in ResourceType::ALL
+            .into_iter()
+            .filter(|r| *r != ResourceType::Autoresearch)
+        {
             for verb in [
                 Verb::Read,
                 Verb::Create,
@@ -266,7 +283,11 @@ mod tests {
         assert!(ResourceType::Run.defines(Verb::Publish));
         assert!(ResourceType::PolicySet.defines(Verb::Activate));
         assert!(ResourceType::Team.defines(Verb::ManageMembers));
+        assert!(ResourceType::Platform.defines(Verb::Impersonate));
+        assert!(!ResourceType::Team.defines(Verb::Impersonate));
         assert!(!ResourceType::Secret.defines(Verb::Launch));
+        assert_eq!(ResourceType::Autoresearch.verbs(), vec![Verb::Access]);
+        assert!(!ResourceType::Playbook.defines(Verb::Access));
     }
 
     #[test]
@@ -291,7 +312,7 @@ mod tests {
             Err(ActionError::Malformed { .. })
         ));
         let all = Action::all();
-        assert_eq!(all.len(), 18 * 6 + 14);
+        assert_eq!(all.len(), 18 * 6 + 16 + 1);
         let mut sorted = all.clone();
         sorted.dedup();
         assert_eq!(sorted.len(), all.len());

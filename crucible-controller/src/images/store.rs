@@ -118,9 +118,8 @@ pub(crate) async fn known_digests(
 /// Every catalogued image, newest first within a repository.
 #[tracing::instrument(name = "db.list_catalog_images", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql"), err)]
 pub(crate) async fn list_images(ex: impl PgExecutor<'_>) -> Result<Vec<CatalogImage>> {
-    let rows = sqlx::query(&format!(
-        "SELECT {IMAGE_COLS} FROM catalog_images ORDER BY repository, created_at DESC NULLS LAST, digest"
-    ))
+    let rows = sqlx::query(const_format::formatcp!(
+        "SELECT {IMAGE_COLS} FROM catalog_images ORDER BY repository, created_at DESC NULLS LAST, digest"))
     .fetch_all(ex)
     .await
     .context("list_catalog_images")?;

@@ -71,7 +71,8 @@ pub struct ConnectArgs {
     #[arg(long, env = "CONTROLLER_CONFIG", global = true)]
     pub config: Option<PathBuf>,
 
-    /// Controller base URL: the API route.
+    /// Controller base URL: the API route. Defaults to a controller on this machine,
+    /// `http://127.0.0.1:8870`.
     #[arg(long, env = "CONTROLLER_URL", global = true)]
     pub url: Option<String>,
 
@@ -128,11 +129,19 @@ impl ConnectArgs {
 
     fn resolve_over(&self, file: FileConfig) -> Config {
         Config {
-            url: normalize_url(self.url.clone().or(file.url).unwrap_or_default()),
+            url: normalize_url(
+                self.url
+                    .clone()
+                    .or(file.url)
+                    .unwrap_or_else(|| DEFAULT_URL.to_string()),
+            ),
             auth: Auth::from_token(self.api_token.clone().or(file.api_token)),
         }
     }
 }
+
+/// A controller running on this machine with its default bind.
+pub(crate) const DEFAULT_URL: &str = "http://127.0.0.1:8870";
 
 /// Strip the trailing slash so `format!("{url}{path}")` never produces a double slash — some
 /// ingress controllers 404 on `//api/issues`.
@@ -310,9 +319,9 @@ mod tests {
     }
 
     #[test]
-    fn with_nothing_at_all_the_url_is_empty_and_the_auth_is_none() {
+    fn with_nothing_at_all_the_url_is_the_local_controller_and_the_auth_is_none() {
         let cfg = args(&[]).resolve_over(FileConfig::default());
-        assert_eq!(cfg.url, "");
+        assert_eq!(cfg.url, "http://127.0.0.1:8870");
         assert_eq!(cfg.auth, Auth::None);
     }
 

@@ -1,6 +1,6 @@
 # JIRA tools (mediated)
 
-The broker embeds a native JIRA Cloud client (the shared `jira-mcp` crate) and exposes a
+The broker embeds a native JIRA Cloud client (the shared `ujira` crate) and exposes a
 **read+comment** slice of it to the sandboxed agent over the broker's existing MCP wire. It's the
 ADR-0002 mediation pattern, JIRA edition: the agent gets JIRA tools without ever holding an
 Atlassian credential. There is no upstream MCP child process; the broker calls JIRA's REST API

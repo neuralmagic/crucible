@@ -44,6 +44,10 @@ const ID_TOKEN_KEY: &str = "oidc_id_token";
 /// The session slot an in-flight authorization-code request parks its PKCE verifier, nonce, and
 /// state under, between `/auth/login` and `/auth/callback`.
 const FLOW_KEY: &str = "oidc_flow";
+/// The session slot an administrator's view-as snapshot of another user lives under.
+const IMPERSONATION_KEY: &str = "impersonation";
+/// How long a view-as lasts before the session answers as its own identity again.
+const IMPERSONATION_TTL: jiff::SignedDuration = jiff::SignedDuration::from_hours(1);
 /// How often the background sweep garbage-collects expired rows (loads already filter on
 /// `expiry_date`, so the sweep's cadence only bounds dead-row buildup).
 const SWEEP_PERIOD: std::time::Duration = std::time::Duration::from_secs(3600);
@@ -245,6 +249,51 @@ pub async fn restamp_native(
     claims: &NativeClaims,
 ) -> Result<(), tower_sessions::session::Error> {
     write_slot(session, CLAIMS_KEY, claims).await
+}
+
+/// The user an administrator is viewing as, snapshotted when the view started: their login,
+/// subject, and the groups their last sign-in stamped. Every request on the session resolves as
+/// this user, read-only, until it is stopped or [`IMPERSONATION_TTL`] passes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct Impersonation {
+    pub login: String,
+    pub sub: String,
+    pub groups: Vec<String>,
+    /// When `groups` was last the issuer's word, RFC3339; absent if the user's sign-in stamped none.
+    pub groups_at: Option<String>,
+    /// The administrator viewing.
+    pub by: String,
+    #[schema(value_type = String)]
+    pub started_at: jiff::Timestamp,
+}
+
+impl Impersonation {
+    pub fn expired(&self, now: jiff::Timestamp) -> bool {
+        self.started_at
+            .checked_add(IMPERSONATION_TTL)
+            .map_or(true, |end| end <= now)
+    }
+}
+
+/// The view-as snapshot on this session, if one is running.
+pub async fn impersonation(
+    session: &Session,
+) -> Result<Option<Impersonation>, tower_sessions::session::Error> {
+    read_slot(session, IMPERSONATION_KEY).await
+}
+
+pub async fn start_impersonation(
+    session: &Session,
+    view: &Impersonation,
+) -> Result<(), tower_sessions::session::Error> {
+    write_slot(session, IMPERSONATION_KEY, view).await
+}
+
+/// Stop a view-as, returning the snapshot it ran under.
+pub async fn stop_impersonation(
+    session: &Session,
+) -> Result<Option<Impersonation>, tower_sessions::session::Error> {
+    take_slot(session, IMPERSONATION_KEY).await
 }
 
 /// End a session: the row is deleted and the cookie is cleared.

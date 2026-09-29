@@ -172,12 +172,12 @@ pub(crate) async fn find_queued_work_pod(
     kind: &str,
     issue_key: &str,
 ) -> Result<Option<WorkPodRow>> {
-    let sql = format!(
+    let sql = const_format::formatcp!(
         "SELECT {WORK_POD_COLS} FROM work_pods \
          WHERE kind = $1 AND issue_key = $2 AND state = 'queued' \
          ORDER BY created_at ASC, pod_name ASC LIMIT 1"
     );
-    sqlx::query(&sql)
+    sqlx::query(sql)
         .bind(kind)
         .bind(issue_key)
         .fetch_optional(ex)
@@ -220,12 +220,12 @@ pub(crate) async fn find_running_work_pod(
     kind: &str,
     issue_key: &str,
 ) -> Result<Option<WorkPodRow>> {
-    let sql = format!(
+    let sql = const_format::formatcp!(
         "SELECT {WORK_POD_COLS} FROM work_pods \
          WHERE kind = $1 AND issue_key = $2 AND state = 'running' \
          ORDER BY created_at ASC, pod_name ASC LIMIT 1"
     );
-    sqlx::query(&sql)
+    sqlx::query(sql)
         .bind(kind)
         .bind(issue_key)
         .fetch_optional(ex)
@@ -285,12 +285,12 @@ pub(crate) async fn next_queued_work_pod(
     ex: impl PgExecutor<'_>,
     kind: &str,
 ) -> Result<Option<WorkPodRow>> {
-    let sql = format!(
+    let sql = const_format::formatcp!(
         "SELECT {WORK_POD_COLS} FROM work_pods \
          WHERE kind = $1 AND state = 'queued' \
          ORDER BY created_at ASC, pod_name ASC LIMIT 1"
     );
-    sqlx::query(&sql)
+    sqlx::query(sql)
         .bind(kind)
         .fetch_optional(ex)
         .await
@@ -400,15 +400,12 @@ pub async fn work_pods_in_states(
     if states.is_empty() {
         return Ok(Vec::new());
     }
-    let list = states
-        .iter()
-        .map(|s| format!("'{}'", s.as_str()))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT {WORK_POD_COLS} FROM work_pods WHERE state IN ({list}) ORDER BY created_at ASC"
+    let states: Vec<&str> = states.iter().map(|s| s.as_str()).collect();
+    let sql = const_format::formatcp!(
+        "SELECT {WORK_POD_COLS} FROM work_pods WHERE state = ANY($1) ORDER BY created_at ASC"
     );
-    let rows = sqlx::query(&sql)
+    let rows = sqlx::query(sql)
+        .bind(states)
         .fetch_all(ex)
         .await
         .context("work_pods_in_states")?;
@@ -421,8 +418,8 @@ pub(crate) async fn get_work_pod(
     ex: impl PgExecutor<'_>,
     pod_name: &str,
 ) -> Result<Option<WorkPodRow>> {
-    let sql = format!("SELECT {WORK_POD_COLS} FROM work_pods WHERE pod_name = $1");
-    sqlx::query(&sql)
+    let sql = const_format::formatcp!("SELECT {WORK_POD_COLS} FROM work_pods WHERE pod_name = $1");
+    sqlx::query(sql)
         .bind(pod_name)
         .fetch_optional(ex)
         .await
@@ -444,12 +441,12 @@ pub(crate) async fn list_work_pods(
     kind: Option<&str>,
     limit: i64,
 ) -> Result<Vec<WorkPodRow>> {
-    let sql = format!(
+    let sql = const_format::formatcp!(
         "SELECT {WORK_POD_COLS} FROM work_pods \
          WHERE ($1 IS NULL OR state = $2) AND ($3 IS NULL OR kind = $4) \
          ORDER BY created_at DESC, pod_name DESC LIMIT $5"
     );
-    let rows = sqlx::query(&sql)
+    let rows = sqlx::query(sql)
         .bind(state)
         .bind(state)
         .bind(kind)

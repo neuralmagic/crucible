@@ -1,7 +1,7 @@
 import { lazy, Suspense } from 'react';
 import type { CodeSurfaceProps } from './CodeSurfaceImpl';
 
-export type { CodeFocus, CodeMarker, CodeSurfaceProps } from './CodeSurfaceImpl';
+export type { CodeCompletion, CodeCompletions, CodeFocus, CodeMarker, CodeSurfaceProps } from './CodeSurfaceImpl';
 
 const Impl = lazy(() => import('./CodeSurfaceImpl'));
 

@@ -221,7 +221,7 @@ pub async fn propose(
         .transpose()?;
     let now = crate::clock::now_rfc3339();
 
-    let row = sqlx::query(&format!(
+    let row = sqlx::query(const_format::formatcp!(
         r#"INSERT INTO pack_imports (id, repo, git_ref, path, rev, tar_gz, tar_digest, tar_bytes,
                                      params_schema, schema_digest, graph, diagnostics,
                                      agent_backend, agent_sandbox_image, declared_secrets,
@@ -262,17 +262,19 @@ pub async fn propose(
 
 /// One import row.
 pub async fn get(pool: &PgPool, id: &str) -> Result<Option<PackImport>> {
-    let row = sqlx::query(&format!("SELECT {COLUMNS} FROM pack_imports WHERE id = $1"))
-        .bind(id)
-        .fetch_optional(pool)
-        .await
-        .context("reading a pack import")?;
+    let row = sqlx::query(const_format::formatcp!(
+        "SELECT {COLUMNS} FROM pack_imports WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .context("reading a pack import")?;
     row.as_ref().map(PackImport::from_row).transpose()
 }
 
 /// Every import that is still waiting on a human, newest first.
 pub async fn pending(pool: &PgPool) -> Result<Vec<PackImport>> {
-    let rows = sqlx::query(&format!(
+    let rows = sqlx::query(const_format::formatcp!(
         "SELECT {COLUMNS} FROM pack_imports WHERE status = 'pending' ORDER BY created_at DESC, id"
     ))
     .fetch_all(pool)
@@ -334,7 +336,7 @@ pub async fn register(
         .begin()
         .await
         .context("locking a pack import to register it")?;
-    let row = sqlx::query(&format!(
+    let row = sqlx::query(const_format::formatcp!(
         "SELECT {COLUMNS} FROM pack_imports WHERE id = $1 FOR UPDATE"
     ))
     .bind(id)
@@ -389,7 +391,7 @@ pub async fn discard(
     id: &str,
     actor: Option<&str>,
 ) -> Result<PackImport, ImportError> {
-    let row = sqlx::query(&format!(
+    let row = sqlx::query(const_format::formatcp!(
         r#"UPDATE pack_imports SET status = 'discarded', resolved_by = $2, resolved_at = $3
            WHERE id = $1 AND status = 'pending' RETURNING {COLUMNS}"#
     ))

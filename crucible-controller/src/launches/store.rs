@@ -240,8 +240,10 @@ pub(crate) async fn list_playbook_runs(
 /// Every run one launch dispatched, newest first.
 #[tracing::instrument(name = "db.list_runs_for_launch", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", key = %key), err)]
 pub(crate) async fn list_runs_for_launch(ex: impl PgExecutor<'_>, key: &str) -> Result<Vec<Run>> {
-    let sql = format!("SELECT {RUN_COLS} FROM runs WHERE issue = $1 ORDER BY run_id DESC");
-    sqlx::query_as::<_, crate::runs::model::Run>(&sql)
+    let sql = const_format::formatcp!(
+        "SELECT {RUN_COLS} FROM runs WHERE issue = $1 ORDER BY run_id DESC"
+    );
+    sqlx::query_as::<_, crate::runs::model::Run>(sql)
         .bind(key)
         .fetch_all(ex)
         .await

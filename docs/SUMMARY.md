@@ -2,31 +2,33 @@
 
 [Introduction](./introduction.md)
 
-# Concepts
+# Playbooks
 
-- [How it works](./how-it-works.md)
-- [What crucible is](./crucible.md)
+- [Your first playbook](./playbooks.md)
+- [Branching and review](./playbook-patterns.md)
+- [Workflow DSL reference](./dsl-reference.md)
+- [Work graphs](./work-graphs.md)
+- [Plan execution states](./plan-states.md)
 
-# Getting started
+# Autoresearch
 
+- [How the loop works](./how-it-works.md)
+- [The loop in one read](./crucible.md)
 - [Zero to a running loop](./getting-started.md)
-- [Tasks: general-purpose orchestration](./task-lane.md)
+- [Tasks: the no-judge lane](./task-lane.md)
+- [Loop control states](./loop-states.md)
 - [Images for a new domain](./domain-images.md)
 
 # The control plane
 
-- [Deploying the controller](./controller-deploy.md)
 - [Running the controller locally](./controller-local.md)
+- [Deploying the controller](./controller-deploy.md)
 - [Authentication](./controller-auth.md)
 - [Vault and the secrets registry](./controller-vault.md)
 
 # Reference
 
 - [Implementation contract](./crucible-contract.md)
-- [Work graphs](./work-graphs.md)
-- [Loop control states](./loop-states.md)
-- [Plan execution states](./plan-states.md)
-- [Workflow DSL reference](./dsl-reference.md)
 - [Hand-rolled codegen pipelines](./hand-rolled-pipelines.md)
 - [The codex harness](./codex-harness.md)
 - [The opencode and pi harnesses](./opencode-pi-harnesses.md)

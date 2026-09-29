@@ -125,13 +125,13 @@ impl From<WatchRow> for Watch {
     }
 }
 
-const SELECT: &str = "SELECT {COLUMNS}, w.tracker, w.query, w.key_param, w.watermark, \
+const SELECT: &str = const_format::concatcp!(
+    "SELECT ",
+    standing::COLUMNS,
+    ", w.tracker, w.query, w.key_param, w.watermark, \
     w.last_swept_at, w.last_launched_at \
-    FROM playbook_standing_launches c JOIN playbook_watches w USING (id)";
-
-fn select() -> String {
-    SELECT.replace("{COLUMNS}", standing::COLUMNS)
-}
+    FROM playbook_standing_launches c JOIN playbook_watches w USING (id)"
+);
 
 /// One item a watch launched.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
@@ -198,11 +198,11 @@ pub(crate) async fn update(pool: &PgPool, id: &str, new: &NewWatch<'_>) -> Resul
 
 /// Every watch, enabled first.
 pub(crate) async fn list(pool: &PgPool, limit: i64) -> Result<Vec<Watch>> {
-    let sql = format!(
-        "{} ORDER BY c.enabled DESC, c.created_at, c.id LIMIT $1",
-        select()
+    let sql = const_format::concatcp!(
+        SELECT,
+        " ORDER BY c.enabled DESC, c.created_at, c.id LIMIT $1"
     );
-    let rows = sqlx::query_as::<_, WatchRow>(&sql)
+    let rows = sqlx::query_as::<_, WatchRow>(sql)
         .bind(limit)
         .fetch_all(pool)
         .await
@@ -212,8 +212,8 @@ pub(crate) async fn list(pool: &PgPool, limit: i64) -> Result<Vec<Watch>> {
 
 /// One watch by id, or `None`.
 pub(crate) async fn get(pool: &PgPool, id: &str) -> Result<Option<Watch>> {
-    let sql = format!("{} WHERE c.id = $1", select());
-    let row = sqlx::query_as::<_, WatchRow>(&sql)
+    let sql = const_format::concatcp!(SELECT, " WHERE c.id = $1");
+    let row = sqlx::query_as::<_, WatchRow>(sql)
         .bind(id)
         .fetch_optional(pool)
         .await

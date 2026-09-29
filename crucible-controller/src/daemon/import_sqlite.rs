@@ -332,10 +332,11 @@ pub async fn import_sqlite(from: &Path, pg: &PgPool) -> Result<ImportReport> {
 
     // Refuse a non-empty target: the import is a cutover, not a merge.
     for probe in ["issues", "runs", "work_pods", "ledger"] {
-        let n: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {probe}"))
-            .fetch_one(pg)
-            .await
-            .with_context(|| format!("counting target rows in {probe}"))?;
+        let n: i64 =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {probe}")))
+                .fetch_one(pg)
+                .await
+                .with_context(|| format!("counting target rows in {probe}"))?;
         anyhow::ensure!(
             n == 0,
             "target ledger is not empty ({probe} has {n} row(s)); import only cuts over into a fresh database"
@@ -353,10 +354,10 @@ pub async fn import_sqlite(from: &Path, pg: &PgPool) -> Result<ImportReport> {
     for table in IDENTITY_TABLES {
         // Bump the identity sequence past the imported ids; the third setval arg keeps a fresh
         // (empty-table) sequence at its start value instead of skipping 1.
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT setval(pg_get_serial_sequence('{table}', 'id'), \
                     COALESCE(MAX(id), 1), MAX(id) IS NOT NULL) FROM {table}"
-        ))
+        )))
         .execute(&mut *tx)
         .await
         .with_context(|| format!("bumping {table}'s id sequence"))?;
@@ -390,10 +391,12 @@ async fn copy_table(
     }
     insert.push(')');
 
-    let rows = sqlx::query(&select).fetch_all(sqlite).await?;
+    let rows = sqlx::query(sqlx::AssertSqlSafe(select.as_str()))
+        .fetch_all(sqlite)
+        .await?;
     let copied = rows.len();
     for row in rows {
-        let mut q = sqlx::query(&insert);
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(insert.as_str()));
         for col in spec.cols {
             q = match col {
                 Col::Text(n) => q.bind(row.try_get::<Option<String>, _>(*n)?),

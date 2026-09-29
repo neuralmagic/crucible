@@ -27,6 +27,8 @@ pub(crate) mod clock;
 pub mod config;
 pub mod daemon;
 pub(crate) mod dto;
+#[cfg(feature = "embedded-db")]
+pub mod embedded_db;
 pub mod event_log;
 pub mod identity;
 pub mod images;

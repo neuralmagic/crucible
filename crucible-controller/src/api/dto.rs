@@ -1125,10 +1125,12 @@ mod tests {
             exposure_digest: None,
             id: "survey".to_string(),
             description: "reads a paper".to_string(),
-            repo: "neuralmagic/crucible".to_string(),
-            git_ref: None,
+            source: crate::playbooks::api::registry::PlaybookSourceDto::Git {
+                repo: "neuralmagic/crucible".to_string(),
+                git_ref: None,
+                path: "examples/paper".to_string(),
+            },
             rev: "7c2c1a563813ce952dd4039745730397cf2295c2".to_string(),
-            path: "examples/paper".to_string(),
             tar_digest: "sha256:beef".to_string(),
             schema_digest: "sha256:cafe".to_string(),
             core_rev: "7c2c1a563813ce952dd4039745730397cf2295c2".to_string(),
@@ -1150,10 +1152,16 @@ mod tests {
         let v = serde_json::to_value(&dto).expect("serialize");
         assert_eq!(v["id"], "survey");
         assert_eq!(v["description"], "reads a paper");
-        assert_eq!(v["repo"], "neuralmagic/crucible");
-        assert_eq!(v["git_ref"], serde_json::Value::Null);
+        assert_eq!(
+            v["source"],
+            serde_json::json!({
+                "kind": "git",
+                "repo": "neuralmagic/crucible",
+                "git_ref": null,
+                "path": "examples/paper",
+            })
+        );
         assert_eq!(v["rev"], "7c2c1a563813ce952dd4039745730397cf2295c2");
-        assert_eq!(v["path"], "examples/paper");
         assert_eq!(v["tar_digest"], "sha256:beef");
         assert_eq!(v["schema_digest"], "sha256:cafe");
         assert_eq!(v["core_rev"], "7c2c1a563813ce952dd4039745730397cf2295c2");
@@ -1171,6 +1179,15 @@ mod tests {
         assert_eq!(v["created_by"], "wren");
         assert_eq!(v["created_at"], "2026-08-22T00:00:00Z");
         assert_eq!(v["updated_at"], "2026-08-22T00:00:00Z");
+
+        let draft = crate::playbooks::api::registry::PlaybookSourceDto::Draft {
+            draft: "studio".to_string(),
+            version: 4,
+        };
+        assert_eq!(
+            serde_json::to_value(&draft).expect("serialize"),
+            serde_json::json!({"kind": "draft", "draft": "studio", "version": 4})
+        );
     }
 
     /// The launch ack's field spellings: the launch form reads them back, and the schedule and

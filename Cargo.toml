@@ -18,12 +18,12 @@ exclude = ["third_party/dagre_rust", "third_party/graphlib_rust", "third_party/m
 resolver = "3"
 
 [workspace.package]
-version = "0.3.0"
+version = "0.3.1"
 # Dual-licensed like the repo (LICENSE-MIT / LICENSE-APACHE); the public export's cargo-deny
 # licenses check requires every workspace crate to declare it.
 license = "MIT OR Apache-2.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.94"
 
 [workspace.dependencies]
 anyhow = "1"

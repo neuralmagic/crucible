@@ -119,12 +119,12 @@ fn decode(row: OneShotRow) -> Result<OneShot> {
     })
 }
 
-const SELECT: &str = "SELECT {COLUMNS}, o.dedupe_schedule, o.fire_at, o.status, o.fired_key, \
-    o.fired_at FROM playbook_standing_launches c JOIN playbook_one_shots o USING (id)";
-
-fn select() -> String {
-    SELECT.replace("{COLUMNS}", standing::COLUMNS)
-}
+const SELECT: &str = const_format::concatcp!(
+    "SELECT ",
+    standing::COLUMNS,
+    ", o.dedupe_schedule, o.fire_at, o.status, o.fired_key, \
+    o.fired_at FROM playbook_standing_launches c JOIN playbook_one_shots o USING (id)"
+);
 
 /// Store a deferred one-shot. The values were validated against the pack's stored schema and the
 /// ceilings bounded by the admin caps at the endpoint, exactly as for an immediate launch.
@@ -159,11 +159,11 @@ pub(crate) async fn create(pool: &PgPool, new: &NewOneShot<'_>) -> Result<Option
 
 /// Every one-shot, soonest-due first among the pending ones.
 pub(crate) async fn list(pool: &PgPool, limit: i64) -> Result<Vec<OneShot>> {
-    let sql = format!(
-        "{} ORDER BY (o.status = 'pending') DESC, o.fire_at, o.id LIMIT $1",
-        select()
+    let sql = const_format::concatcp!(
+        SELECT,
+        " ORDER BY (o.status = 'pending') DESC, o.fire_at, o.id LIMIT $1"
     );
-    let rows = sqlx::query_as::<_, OneShotRow>(&sql)
+    let rows = sqlx::query_as::<_, OneShotRow>(sql)
         .bind(limit)
         .fetch_all(pool)
         .await
@@ -173,8 +173,8 @@ pub(crate) async fn list(pool: &PgPool, limit: i64) -> Result<Vec<OneShot>> {
 
 /// One one-shot by id, or `None`.
 pub(crate) async fn get(pool: &PgPool, id: &str) -> Result<Option<OneShot>> {
-    let sql = format!("{} WHERE c.id = $1", select());
-    let row = sqlx::query_as::<_, OneShotRow>(&sql)
+    let sql = const_format::concatcp!(SELECT, " WHERE c.id = $1");
+    let row = sqlx::query_as::<_, OneShotRow>(sql)
         .bind(id)
         .fetch_optional(pool)
         .await

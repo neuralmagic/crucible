@@ -6,37 +6,79 @@
       {
         "ordinal": 0,
         "name": "iter!: i64",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "run_task_results",
+            "name": "iter"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "task!",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_task_results",
+            "name": "task"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "status!",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_task_results",
+            "name": "status"
+          }
+        }
       },
       {
         "ordinal": 3,
         "name": "note!",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_task_results",
+            "name": "note"
+          }
+        }
       },
       {
         "ordinal": 4,
         "name": "cost_usd",
-        "type_info": "Float8"
+        "type_info": "Float8",
+        "origin": {
+          "Table": {
+            "table": "run_task_results",
+            "name": "cost_usd"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "secs",
-        "type_info": "Float8"
+        "type_info": "Float8",
+        "origin": {
+          "Table": {
+            "table": "run_task_results",
+            "name": "secs"
+          }
+        }
       },
       {
         "ordinal": 6,
         "name": "blocked",
-        "type_info": "Jsonb"
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "run_task_results",
+            "name": "blocked"
+          }
+        }
       }
     ],
     "parameters": {

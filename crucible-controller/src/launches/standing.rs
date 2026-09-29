@@ -257,7 +257,7 @@ pub(crate) async fn authorized(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     id: &str,
 ) -> Result<Option<Authorized>> {
-    let sql = format!(
+    let sql = const_format::formatcp!(
         r#"
         SELECT {COLUMNS},
                COALESCE(p.repo, '(draft)') AS repo,
@@ -277,7 +277,7 @@ pub(crate) async fn authorized(
         FOR UPDATE OF c
         "#
     );
-    sqlx::query_as::<_, Authorized>(&sql)
+    sqlx::query_as::<_, Authorized>(sql)
         .bind(id)
         .fetch_optional(&mut **tx)
         .await
@@ -759,17 +759,23 @@ pub(crate) async fn expire_stale_owner_parks(
     }
     .to_string();
     let prefix = prefix.trim_end().to_string();
-    let minted = match trigger {
-        Trigger::Schedule => "SELECT key FROM playbook_launches WHERE dedupe_schedule = $2",
-        Trigger::Deferred => "SELECT fired_key FROM playbook_one_shots WHERE id = $2",
-        Trigger::Watch => "SELECT launch_key FROM playbook_watch_hits WHERE watch_id = $2",
+    const EXPIRE: &str = "UPDATE issues SET status = 'done', parked_reason = NULL, parked_by = NULL, \
+         updated_at = $3 WHERE status = 'parked' AND parked_reason LIKE $1 || '%' AND key IN";
+    let sql = match trigger {
+        Trigger::Schedule => const_format::concatcp!(
+            EXPIRE,
+            " (SELECT key FROM playbook_launches WHERE dedupe_schedule = $2) RETURNING key"
+        ),
+        Trigger::Deferred => const_format::concatcp!(
+            EXPIRE,
+            " (SELECT fired_key FROM playbook_one_shots WHERE id = $2) RETURNING key"
+        ),
+        Trigger::Watch => const_format::concatcp!(
+            EXPIRE,
+            " (SELECT launch_key FROM playbook_watch_hits WHERE watch_id = $2) RETURNING key"
+        ),
     };
-    let sql = format!(
-        "UPDATE issues SET status = 'done', parked_reason = NULL, parked_by = NULL, updated_at = $3
-         WHERE status = 'parked' AND parked_reason LIKE $1 || '%' AND key IN ({minted})
-         RETURNING key"
-    );
-    sqlx::query_scalar(&sql)
+    sqlx::query_scalar(sql)
         .bind(&prefix)
         .bind(id)
         .bind(&now)

@@ -66,10 +66,10 @@ pub async fn owner_of(
     owned: Owned,
     id: &str,
 ) -> anyhow::Result<Option<Principal>> {
-    let row = sqlx::query(&format!(
+    let row = sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT owner FROM {} WHERE {} = $1",
         owned.table, owned.id_column
-    ))
+    )))
     .bind(id)
     .fetch_optional(pool)
     .await?;
@@ -127,10 +127,10 @@ pub async fn transfer(
         Ok(tx) => tx,
         Err(e) => return AppError::from(e).into_response(),
     };
-    let done = match sqlx::query(&format!(
+    let done = match sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE {} SET owner = $2 WHERE {} = $1",
         owned.table, owned.id_column
-    ))
+    )))
     .bind(id)
     .bind(next.to_string())
     .execute(&mut *tx)

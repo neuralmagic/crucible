@@ -10,11 +10,54 @@ Three kinds of caller reach the controller, each on its own credential:
 
 Authorization is separate from all three: who may do what is decided by teams, ownership and
 the policy set ([RFC-0003](./rfc/RFC-0003.md)), from the login and groups the credential
-carries. Three lists bootstrap that on a fresh deployment: `CONTROLLER_ADMINS` (logins that
-administer the platform), `CONTROLLER_OPERATORS` (logins that may operate) and
-`CONTROLLER_OPERATOR_GROUPS` (IdP groups whose members may operate). They seed the platform
-teams while those teams reach nobody; after that, membership is managed in the UI and the
-lists are inert.
+carries. Four lists bootstrap that on a fresh deployment: `CONTROLLER_ADMINS` (logins that
+administer the platform), `CONTROLLER_OPERATORS` (logins that may operate),
+`CONTROLLER_OPERATOR_GROUPS` (IdP groups whose members may operate) and `CONTROLLER_PUBLISHERS`
+(logins that may publish drafts they own without review). They seed the `platform-administrators`,
+`platform-operators` and `playbook-publishers` teams while those teams reach nobody, and a login on
+the admin or operator list holds that team membership on every request whether or not the team
+lists it. Membership added in the UI counts the same: an owner of `platform-administrators` is an
+admin and any other member of it or of `platform-operators` an operator, for the admin- and
+operator-gated routes and for the `role` that `/api/whoami` reports.
+
+### Opening a deployment to an organization
+
+A signed-in user who is in no team reads and launches playbooks and providers owned by
+`team:platform-administrators`, dispatches to its targets, and owns whatever they create. To give
+one organization more than that without opening it to every login the issuer accepts, make a team
+whose members come from a rule, then give that team the shared resources (the Teams page does
+the first call):
+
+```text
+POST /api/teams {"slug": "my-org", "display_name": "My org",
+  "members": [{"kind": "rule", "member": "group-suffix:my-org-group", "role": "member"},
+              {"kind": "user", "member": "<you>", "role": "owner"}]}
+PUT /api/playbooks/<id>/owner {"owner": "team:my-org"}
+PUT /api/providers/<id>/owner {"owner": "team:my-org"}
+```
+
+Members read, launch and dispatch what the team owns; maintainers and owners also edit it. A
+provider spends its key on every dispatch, so whoever may pick it spends that key: move a
+provider to a team only when the whole team should. `email-domain:<domain>` rules match only in
+native mode, where the controller records each login's email.
+
+### The autoresearch lane
+
+On a deployment that runs autoresearch (`CONTROLLER_AUTORESEARCH=true`), the lane's pages and
+routes (issues, inbox, turns, builds, repos, explore, the autopilot switch) are shown only to
+callers entitled to it; everyone else gets a 404 and a navigation without them. The entitlement is
+`read` on the lane, which the `autoresearch` team owns: its members hold it, platform
+administrators hold everything, and a policy set may grant it to anyone else. The controller
+seeds the team with `platform-operators` nested in it; add a group rule or a person to the team to
+give them the lane. `/api/whoami` reports what the caller holds under `entitlements`.
+
+### Viewing as another user
+
+A platform administrator (`platform:impersonate`) can view the controller as any user who has
+signed in, from the user's row on a team page. The browser session then resolves as that user,
+with the groups their last sign-in stamped, for an hour or until stopped. It is read-only: every
+write except `DELETE /api/impersonation` is refused. Starting and stopping land in the event log
+under the administrator's login. API keys and bearer tokens never carry a view.
 
 ## The controller as the OIDC relying party
 

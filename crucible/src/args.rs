@@ -89,6 +89,10 @@ pub(crate) struct Args {
     /// `[agent.openshell]`). No CLI flag.
     #[arg(skip)]
     pub openshell: manifest::OpenshellCfg,
+    /// What the `openshell` backend's sandbox is scheduled with (from `[agent.resources]`). No
+    /// CLI flag.
+    #[arg(skip)]
+    pub sandbox_resources: manifest::SandboxResources,
     /// The loop-pod provisioning broker for the `openshell` backend (from `[agent.broker]`). The
     /// agent asks, the loop pod holds the keys. No CLI flag.
     #[arg(skip)]

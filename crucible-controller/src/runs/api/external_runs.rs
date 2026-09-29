@@ -47,7 +47,7 @@ pub(crate) struct ExternalRunAck {
     ),
     responses(
         (status = 201, description = "Run ingested (or replaced) and visible in the SPA", body = ExternalRunAck),
-        (status = 403, description = "Caller is not in the admin whitelist", body = ErrorBody),
+        (status = 403, description = "Caller is not a platform administrator", body = ErrorBody),
         (status = 409, description = "The run belongs to a scope (controller-dispatched); external replace is refused", body = ErrorBody),
         (status = 422, description = "run_id/justification/body must be non-empty", body = ErrorBody)
     )
@@ -55,7 +55,7 @@ pub(crate) struct ExternalRunAck {
 pub(crate) async fn put_external_run_session(
     State(state): State<ApiState>,
     identity: crate::identity::session::Identity,
-    _admin: crate::identity::auth::AdminGuard,
+    _admin: crate::authz::guard::AdminGuard,
     AxPath(run_id): AxPath<String>,
     Query(q): Query<ExternalRunQuery>,
     body: String,

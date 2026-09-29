@@ -141,23 +141,27 @@ const AUDIT_COLUMNS: &str = "id, at, actor, subject, auth_path, action, resource
                              resource_id, decision, rule, prior, result";
 
 pub async fn list_teams(ex: impl PgExecutor<'_>) -> Result<Vec<TeamRow>> {
-    sqlx::query_as::<_, TeamRow>(&format!("SELECT {TEAM_COLUMNS} FROM teams ORDER BY slug"))
-        .fetch_all(ex)
-        .await
-        .context("listing teams")
+    sqlx::query_as::<_, TeamRow>(const_format::formatcp!(
+        "SELECT {TEAM_COLUMNS} FROM teams ORDER BY slug"
+    ))
+    .fetch_all(ex)
+    .await
+    .context("listing teams")
 }
 
 pub async fn get_team(ex: impl PgExecutor<'_>, slug: &TeamSlug) -> Result<Option<TeamRow>> {
-    sqlx::query_as::<_, TeamRow>(&format!("SELECT {TEAM_COLUMNS} FROM teams WHERE slug = $1"))
-        .bind(slug.as_str())
-        .fetch_optional(ex)
-        .await
-        .context("reading a team")
+    sqlx::query_as::<_, TeamRow>(const_format::formatcp!(
+        "SELECT {TEAM_COLUMNS} FROM teams WHERE slug = $1"
+    ))
+    .bind(slug.as_str())
+    .fetch_optional(ex)
+    .await
+    .context("reading a team")
 }
 
 /// Every member row of every team, which is what resolution and the cycle check walk.
 pub async fn all_members(ex: impl PgExecutor<'_>) -> Result<Vec<MemberRow>> {
-    let rows = sqlx::query_as::<_, RawMemberRow>(&format!(
+    let rows = sqlx::query_as::<_, RawMemberRow>(const_format::formatcp!(
         "SELECT {MEMBER_COLUMNS} FROM team_members ORDER BY team, member_kind, member_ref"
     ))
     .fetch_all(ex)
@@ -167,7 +171,7 @@ pub async fn all_members(ex: impl PgExecutor<'_>) -> Result<Vec<MemberRow>> {
 }
 
 pub async fn members_of(ex: impl PgExecutor<'_>, slug: &TeamSlug) -> Result<Vec<MemberRow>> {
-    let rows = sqlx::query_as::<_, RawMemberRow>(&format!(
+    let rows = sqlx::query_as::<_, RawMemberRow>(const_format::formatcp!(
         "SELECT {MEMBER_COLUMNS} FROM team_members WHERE team = $1 \
          ORDER BY member_kind, member_ref"
     ))
@@ -185,7 +189,7 @@ pub async fn insert_team(
     created_by: Option<&Principal>,
     now: &str,
 ) -> Result<TeamRow, StoreError> {
-    sqlx::query_as::<_, TeamRow>(&format!(
+    sqlx::query_as::<_, TeamRow>(const_format::formatcp!(
         "INSERT INTO teams (slug, display_name, created_by, created_at, updated_at) \
          VALUES ($1, $2, $3, $4, $4) RETURNING {TEAM_COLUMNS}"
     ))
@@ -209,7 +213,7 @@ pub async fn rename_team(
     display_name: &str,
     now: &str,
 ) -> Result<Option<TeamRow>> {
-    sqlx::query_as::<_, TeamRow>(&format!(
+    sqlx::query_as::<_, TeamRow>(const_format::formatcp!(
         "UPDATE teams SET display_name = $2, updated_at = $3 WHERE slug = $1 \
          RETURNING {TEAM_COLUMNS}"
     ))
@@ -393,7 +397,7 @@ pub async fn audit_for(
     resource_id: &str,
     limit: i64,
 ) -> Result<Vec<AuditRow>> {
-    sqlx::query_as::<_, AuditRow>(&format!(
+    sqlx::query_as::<_, AuditRow>(const_format::formatcp!(
         "SELECT {AUDIT_COLUMNS} FROM authz_audit \
          WHERE resource_type = $1 AND resource_id = $2 ORDER BY id DESC LIMIT $3"
     ))
@@ -450,7 +454,7 @@ pub async fn insert_policy_set(
 }
 
 pub async fn list_policy_sets(ex: impl PgExecutor<'_>) -> Result<Vec<PolicySetRow>> {
-    sqlx::query_as::<_, PolicySetRow>(&format!(
+    sqlx::query_as::<_, PolicySetRow>(const_format::formatcp!(
         "SELECT {POLICY_COLUMNS} FROM policy_sets ORDER BY active DESC, created_at DESC"
     ))
     .fetch_all(ex)
@@ -459,7 +463,7 @@ pub async fn list_policy_sets(ex: impl PgExecutor<'_>) -> Result<Vec<PolicySetRo
 }
 
 pub async fn get_policy_set(ex: impl PgExecutor<'_>, digest: &str) -> Result<Option<PolicySetRow>> {
-    sqlx::query_as::<_, PolicySetRow>(&format!(
+    sqlx::query_as::<_, PolicySetRow>(const_format::formatcp!(
         "SELECT {POLICY_COLUMNS} FROM policy_sets WHERE digest = $1"
     ))
     .bind(digest)
@@ -469,7 +473,7 @@ pub async fn get_policy_set(ex: impl PgExecutor<'_>, digest: &str) -> Result<Opt
 }
 
 pub async fn active_policy_set(ex: impl PgExecutor<'_>) -> Result<Option<PolicySetRow>> {
-    sqlx::query_as::<_, PolicySetRow>(&format!(
+    sqlx::query_as::<_, PolicySetRow>(const_format::formatcp!(
         "SELECT {POLICY_COLUMNS} FROM policy_sets WHERE active"
     ))
     .fetch_optional(ex)
@@ -527,7 +531,7 @@ pub async fn shares_of(
     resource_type: &str,
     resource_id: &str,
 ) -> Result<Vec<ShareRow>> {
-    sqlx::query_as::<_, ShareRow>(&format!(
+    sqlx::query_as::<_, ShareRow>(const_format::formatcp!(
         "SELECT {SHARE_COLUMNS} FROM resource_shares \
          WHERE resource_type = $1 AND resource_id = $2 ORDER BY grantee"
     ))
@@ -547,7 +551,7 @@ pub async fn shares_granted_to(
     if grantees.is_empty() {
         return Ok(Vec::new());
     }
-    sqlx::query_as::<_, ShareRow>(&format!(
+    sqlx::query_as::<_, ShareRow>(const_format::formatcp!(
         "SELECT {SHARE_COLUMNS} FROM resource_shares \
          WHERE resource_type = $1 AND grantee = ANY($2) ORDER BY resource_id, grantee"
     ))
@@ -560,7 +564,7 @@ pub async fn shares_granted_to(
 
 /// Grant or change a share; the prior row, when one existed.
 pub async fn upsert_share(conn: &mut PgConnection, share: &ShareRow) -> Result<Option<ShareRow>> {
-    let prior = sqlx::query_as::<_, ShareRow>(&format!(
+    let prior = sqlx::query_as::<_, ShareRow>(const_format::formatcp!(
         "SELECT {SHARE_COLUMNS} FROM resource_shares \
          WHERE resource_type = $1 AND resource_id = $2 AND grantee = $3"
     ))
@@ -598,7 +602,7 @@ pub async fn delete_share(
     resource_id: &str,
     grantee: &str,
 ) -> Result<Option<ShareRow>> {
-    sqlx::query_as::<_, ShareRow>(&format!(
+    sqlx::query_as::<_, ShareRow>(const_format::formatcp!(
         "DELETE FROM resource_shares \
          WHERE resource_type = $1 AND resource_id = $2 AND grantee = $3 RETURNING {SHARE_COLUMNS}"
     ))

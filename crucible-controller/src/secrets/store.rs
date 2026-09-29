@@ -21,6 +21,18 @@ const SECRET_COLUMNS: &str = "id, name, owner, kind, visibility, consumer, mode,
 const BINDING_COLUMNS: &str = "id, secret_id, scope_kind, scope_id, projection_kind, projection, \
                                declared_name, pack_rev, schema_digest, created_by, created_at";
 
+/// [`BINDING_COLUMNS`] qualified by the `b` alias, for the bindings-with-secrets join.
+const BINDING_COLUMNS_B: &str = "b.id, b.secret_id, b.scope_kind, b.scope_id, b.projection_kind, b.projection, \
+    b.declared_name, b.pack_rev, b.schema_digest, b.created_by, b.created_at";
+
+/// [`SECRET_COLUMNS`] qualified by the `s` alias and renamed `sec_*`, so the join's secret half
+/// decodes apart from its binding half.
+const SECRET_COLUMNS_AS_SEC: &str = "s.id AS sec_id, s.name AS sec_name, s.owner AS sec_owner, s.kind AS sec_kind, \
+    s.visibility AS sec_visibility, s.consumer AS sec_consumer, s.mode AS sec_mode, \
+    s.vault_path AS sec_vault_path, s.current_version AS sec_current_version, \
+    s.created_by AS sec_created_by, s.created_at AS sec_created_at, \
+    s.updated_at AS sec_updated_at";
+
 /// Why a write was refused by the registry's own constraints.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -118,7 +130,7 @@ pub struct AuditRow {
 /// transaction.
 pub async fn insert(conn: &mut PgConnection, new: &NewSecret<'_>) -> Result<SecretRow, StoreError> {
     let now = crate::clock::now_rfc3339();
-    let row = sqlx::query(&format!(
+    let row = sqlx::query(const_format::formatcp!(
         r#"INSERT INTO secrets (id, name, owner, kind, visibility, consumer, mode, vault_path,
                                 current_version, created_by, created_at, updated_at)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11)
@@ -150,7 +162,7 @@ pub async fn insert(conn: &mut PgConnection, new: &NewSecret<'_>) -> Result<Secr
 
 /// One secret by id.
 pub async fn get(pool: &sqlx::PgPool, id: &str) -> Result<Option<SecretRow>> {
-    sqlx::query_as::<_, SecretRow>(&format!(
+    sqlx::query_as::<_, SecretRow>(const_format::formatcp!(
         "SELECT {SECRET_COLUMNS} FROM secrets WHERE id = $1"
     ))
     .bind(id)
@@ -162,7 +174,7 @@ pub async fn get(pool: &sqlx::PgPool, id: &str) -> Result<Option<SecretRow>> {
 /// Every secret, or every secret owned by one of `owners`. Newest first.
 pub async fn list(pool: &sqlx::PgPool, owners: Option<&[Principal]>) -> Result<Vec<SecretRow>> {
     let rows = match owners {
-        None => sqlx::query_as::<_, SecretRow>(&format!(
+        None => sqlx::query_as::<_, SecretRow>(const_format::formatcp!(
             "SELECT {SECRET_COLUMNS} FROM secrets ORDER BY created_at DESC, id"
         ))
         .fetch_all(pool)
@@ -170,7 +182,7 @@ pub async fn list(pool: &sqlx::PgPool, owners: Option<&[Principal]>) -> Result<V
         .context("listing secrets")?,
         Some(owners) => {
             let owners: Vec<String> = owners.iter().map(Principal::to_string).collect();
-            sqlx::query_as::<_, SecretRow>(&format!(
+            sqlx::query_as::<_, SecretRow>(const_format::formatcp!(
                 "SELECT {SECRET_COLUMNS} FROM secrets WHERE owner = ANY($1)
                  ORDER BY created_at DESC, id"
             ))
@@ -187,7 +199,7 @@ pub async fn list(pool: &sqlx::PgPool, owners: Option<&[Principal]>) -> Result<V
 /// has only a name (a provider registration does) gets back everything that answers to it and
 /// decides what an ambiguous answer means.
 pub async fn find_by_name(pool: &sqlx::PgPool, name: &SecretName) -> Result<Vec<SecretRow>> {
-    sqlx::query_as::<_, SecretRow>(&format!(
+    sqlx::query_as::<_, SecretRow>(const_format::formatcp!(
         "SELECT {SECRET_COLUMNS} FROM secrets WHERE name = $1 ORDER BY owner"
     ))
     .bind(name.as_str())
@@ -203,7 +215,7 @@ pub async fn find_owned(
     owner: &Principal,
     name: &SecretName,
 ) -> Result<Option<SecretRow>> {
-    sqlx::query_as::<_, SecretRow>(&format!(
+    sqlx::query_as::<_, SecretRow>(const_format::formatcp!(
         "SELECT {SECRET_COLUMNS} FROM secrets WHERE owner = $1 AND name = $2"
     ))
     .bind(owner.to_string())
@@ -239,7 +251,7 @@ pub async fn transfer(
     current_version: Option<i64>,
 ) -> Result<SecretRow, StoreError> {
     let now = crate::clock::now_rfc3339();
-    let row = sqlx::query(&format!(
+    let row = sqlx::query(const_format::formatcp!(
         r#"UPDATE secrets SET owner = $2, vault_path = $3, current_version = $4, updated_at = $5
            WHERE id = $1
            RETURNING {SECRET_COLUMNS}"#
@@ -293,7 +305,7 @@ pub async fn insert_binding(
     conn: &mut PgConnection,
     new: &NewBinding<'_>,
 ) -> Result<BindingRow, StoreError> {
-    let row = sqlx::query(&format!(
+    let row = sqlx::query(const_format::formatcp!(
         r#"INSERT INTO secret_bindings (id, secret_id, scope_kind, scope_id, projection_kind,
                                         projection, declared_name, pack_rev, schema_digest,
                                         created_by, created_at)
@@ -333,7 +345,7 @@ pub async fn insert_binding(
 
 /// One binding by id, for the unbind path's ownership check.
 pub async fn get_binding(pool: &sqlx::PgPool, id: &str) -> Result<Option<BindingRow>> {
-    sqlx::query_as::<_, BindingRow>(&format!(
+    sqlx::query_as::<_, BindingRow>(const_format::formatcp!(
         "SELECT {BINDING_COLUMNS} FROM secret_bindings WHERE id = $1"
     ))
     .bind(id)
@@ -354,7 +366,7 @@ pub async fn delete_binding(conn: &mut PgConnection, id: &str) -> Result<bool> {
 
 /// Every binding of one secret — what the delete check reads.
 pub async fn bindings_for_secret(pool: &sqlx::PgPool, secret_id: &str) -> Result<Vec<BindingRow>> {
-    sqlx::query_as::<_, BindingRow>(&format!(
+    sqlx::query_as::<_, BindingRow>(const_format::formatcp!(
         "SELECT {BINDING_COLUMNS} FROM secret_bindings WHERE secret_id = $1
          ORDER BY created_at, id"
     ))
@@ -370,18 +382,8 @@ pub async fn bindings_for_scope(
     scope_kind: ScopeKind,
     scope_id: &str,
 ) -> Result<Vec<(BindingRow, SecretRow)>> {
-    let binding_columns = BINDING_COLUMNS
-        .split(", ")
-        .map(|c| format!("b.{c}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let secret_columns = SECRET_COLUMNS
-        .split(", ")
-        .map(|c| format!("s.{c} AS sec_{c}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let rows = sqlx::query(&format!(
-        "SELECT {binding_columns}, {secret_columns}
+    let rows = sqlx::query(const_format::formatcp!(
+        "SELECT {BINDING_COLUMNS_B}, {SECRET_COLUMNS_AS_SEC}
          FROM secret_bindings b JOIN secrets s ON s.id = b.secret_id
          WHERE b.scope_kind = $1 AND b.scope_id = $2
          ORDER BY b.declared_name"
@@ -475,4 +477,25 @@ pub async fn audit_for_secret(
 
 fn is_unique_violation(e: &sqlx::Error) -> bool {
     matches!(e, sqlx::Error::Database(db) if db.is_unique_violation())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::secrets::store::{
+        BINDING_COLUMNS, BINDING_COLUMNS_B, SECRET_COLUMNS, SECRET_COLUMNS_AS_SEC,
+    };
+
+    #[test]
+    fn the_join_columns_are_the_table_columns_qualified() {
+        let bindings: Vec<String> = BINDING_COLUMNS
+            .split(", ")
+            .map(|c| format!("b.{c}"))
+            .collect();
+        assert_eq!(BINDING_COLUMNS_B, bindings.join(", "));
+        let secrets: Vec<String> = SECRET_COLUMNS
+            .split(", ")
+            .map(|c| format!("s.{c} AS sec_{c}"))
+            .collect();
+        assert_eq!(SECRET_COLUMNS_AS_SEC, secrets.join(", "));
+    }
 }

@@ -6,12 +6,24 @@
       {
         "ordinal": 0,
         "name": "key!",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "runs",
+            "name": "issue"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "run_id!",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "runs",
+            "name": "run_id"
+          }
+        }
       }
     ],
     "parameters": {

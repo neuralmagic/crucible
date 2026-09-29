@@ -57,6 +57,8 @@ allow = [
     # clipboard-win/error-code via starlark's rustyline (Windows-only clipboard). OSI-approved,
     # permissive.
     "BSL-1.0",
+    # postgresql_embedded (the controller's `embedded-db` feature). OSI-approved, permissive.
+    "PostgreSQL",
 ]
 
 # ring's license file is the historical OpenSSL/ISC/MIT aggregate; declare it so the checker
@@ -79,6 +81,8 @@ allow-git = [
     # The OpenShell fork pin: the gateway's native gRPC clients + auth interceptor, one pin
     # for every crate that talks to the gateway.
     "https://github.com/wseaton/OpenShell",
-    # The broker's pinned jira-mcp dep.
-    "https://github.com/wseaton/jira-mcp",
+    # The broker's pinned ujira dep.
+    "https://github.com/wseaton/ujira",
+    # tower-sessions-sqlx-store on sqlx 0.9, pinned by rev until a release carries it.
+    "https://github.com/wseaton/tower-sessions-stores",
 ]

@@ -10,8 +10,8 @@ use sqlx::PgExecutor;
 /// Every `issues` row, decoded into strong types — [`crate::daemon::rebuild`]'s row-by-row diff source.
 #[tracing::instrument(name = "db.list_all_issues", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql"), err)]
 pub(crate) async fn list_all_issues(ex: impl PgExecutor<'_>) -> Result<Vec<Issue>> {
-    let sql = format!("SELECT {ISSUE_COLS} FROM issues ORDER BY key");
-    let rows = sqlx::query(&sql)
+    let sql = const_format::formatcp!("SELECT {ISSUE_COLS} FROM issues ORDER BY key");
+    let rows = sqlx::query(sql)
         .fetch_all(ex)
         .await
         .context("list_all_issues")?;
@@ -21,8 +21,8 @@ pub(crate) async fn list_all_issues(ex: impl PgExecutor<'_>) -> Result<Vec<Issue
 /// Every `runs` row, in full (unlike [`insert_run`]'s write-only [`NewRun`]).
 #[tracing::instrument(name = "db.list_all_runs", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql"), err)]
 pub(crate) async fn list_all_runs(ex: impl PgExecutor<'_>) -> Result<Vec<Run>> {
-    let sql = format!("SELECT {RUN_COLS} FROM runs ORDER BY run_id");
-    sqlx::query_as::<_, Run>(&sql)
+    let sql = const_format::formatcp!("SELECT {RUN_COLS} FROM runs ORDER BY run_id");
+    sqlx::query_as::<_, Run>(sql)
         .fetch_all(ex)
         .await
         .context("list_all_runs")
@@ -32,8 +32,10 @@ pub(crate) async fn list_all_runs(ex: impl PgExecutor<'_>) -> Result<Vec<Run>> {
 /// `run_id` then `iter`/`lane` (whichever this row carries) for a deterministic diff.
 #[tracing::instrument(name = "db.list_all_candidates", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql"), err)]
 pub(crate) async fn list_all_candidates(ex: impl PgExecutor<'_>) -> Result<Vec<Candidate>> {
-    let sql = format!("SELECT {CANDIDATE_COLS} FROM candidates ORDER BY run_id, lane, iter");
-    sqlx::query_as::<_, Candidate>(&sql)
+    let sql = const_format::formatcp!(
+        "SELECT {CANDIDATE_COLS} FROM candidates ORDER BY run_id, lane, iter"
+    );
+    sqlx::query_as::<_, Candidate>(sql)
         .fetch_all(ex)
         .await
         .context("list_all_candidates")

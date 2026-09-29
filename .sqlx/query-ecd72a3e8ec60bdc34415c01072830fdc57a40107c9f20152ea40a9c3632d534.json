@@ -6,32 +6,68 @@
       {
         "ordinal": 0,
         "name": "id!",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "issue_comments",
+            "name": "id"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "issue_key!",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "issue_comments",
+            "name": "issue_key"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "author",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "issue_comments",
+            "name": "author"
+          }
+        }
       },
       {
         "ordinal": 3,
         "name": "created_at",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "issue_comments",
+            "name": "created_at"
+          }
+        }
       },
       {
         "ordinal": 4,
         "name": "updated_at",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "issue_comments",
+            "name": "updated_at"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "body",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "issue_comments",
+            "name": "body"
+          }
+        }
       }
     ],
     "parameters": {

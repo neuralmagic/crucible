@@ -6,32 +6,68 @@
       {
         "ordinal": 0,
         "name": "secret_hash!",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "api_keys",
+            "name": "secret_hash"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "expires_at",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "api_keys",
+            "name": "expires_at"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "revoked_at",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "api_keys",
+            "name": "revoked_at"
+          }
+        }
       },
       {
         "ordinal": 3,
         "name": "sub!",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "sub"
+          }
+        }
       },
       {
         "ordinal": 4,
         "name": "login!",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "login"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "groups!",
-        "type_info": "Jsonb"
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "groups"
+          }
+        }
       }
     ],
     "parameters": {

@@ -8,18 +8,19 @@ turns ask for an OpenShell sandbox gets one on the host's podman.
 just controller-local
 ```
 
-Then open <http://127.0.0.1:8787>. The recipe needs podman (a running `podman machine` on
-macOS), bun, and a Rust toolchain. It:
+Then open <http://127.0.0.1:8870>. The recipe needs bun and a Rust toolchain; podman only for
+OpenShell sandboxes. It:
 
-- starts Postgres in a `crucible-local-pg` container on `127.0.0.1:55434`, with its data in the
-  `crucible-local-pg` volume, so launches and drafts survive a restart;
-- builds the UI and the `crucible`, `crucible-controller` and `crux` binaries;
-- runs `crucible-controller autopilot` with the settings below.
+- builds the UI and the `crucible`, `crucible-controller` (with `embedded-db`) and `crux`
+  binaries;
+- runs `crucible-controller autopilot` against its own Postgres (below), with the settings
+  below.
 
-`just controller-local 9000 wren` picks another port and login. Drive it from a shell with crux:
+`just controller-local 9000 wren` picks another port and login. crux talks to
+`http://127.0.0.1:8870` when nothing else is configured, so on the default port it needs no
+setup:
 
 ```sh
-export CONTROLLER_URL=http://127.0.0.1:8787
 crux whoami
 crux draft-create notes --description "release notes"
 crux draft-push notes examples/playbook --base 1
@@ -30,6 +31,8 @@ crux draft-launch notes --max-cost 1 --max-time 5m
 
 | Variable | Value | Why |
 | --- | --- | --- |
+| `DATABASE_URL` | `embedded` | The controller runs its own Postgres. |
+| `CONTROLLER_STATE_DIR` | `$XDG_STATE_HOME/crucible-controller` | Where that database and the local runs live. |
 | `CONTROLLER_DEV_IDENTITY` | `$USER` | Every request lands as this login. |
 | `CONTROLLER_ADMINS` | `$USER` | Makes that login an admin, so the UI can launch and edit. |
 | `CONTROLLER_PLAYBOOK_EXECUTOR` | `local` | Launches run as a subprocess here instead of a work pod. |
@@ -41,6 +44,22 @@ crux draft-launch notes --max-cost 1 --max-time 5m
 
 `CONTROLLER_API_TOKEN`, `CONTROLLER_PROXY_TOKEN`, `CONTROLLER_OIDC_ISSUER` and `VAULT_ADDR` are
 unset for the process, whatever your shell exports.
+
+## The embedded database
+
+`DATABASE_URL=embedded` makes `crucible-controller autopilot` run its own Postgres 16 instead of
+connecting to one. It needs a build with the `embedded-db` feature
+(`cargo build -p crucible-controller --features embedded-db`); a build without it refuses the
+value at boot.
+
+- The binaries are downloaded once, on first start, into `~/.theseus/postgresql`, shared by every
+  embedded controller on the machine.
+- The data directory is `$CONTROLLER_STATE_DIR/postgres/data`, with its password in
+  `postgres/pgpass` beside it. It persists across restarts; delete `postgres/` to start empty.
+- The server listens on a free loopback port chosen at each start. Nothing outside the
+  controller needs it: crux and the UI talk to the controller's API.
+- The server stops when the controller exits. If the controller is killed hard, the next start
+  stops the leftover server before starting its own.
 
 ## The dev identity
 

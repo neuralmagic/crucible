@@ -6,7 +6,13 @@
       {
         "ordinal": 0,
         "name": "dispatch_attempts!: i64",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "builds",
+            "name": "dispatch_attempts"
+          }
+        }
       }
     ],
     "parameters": {

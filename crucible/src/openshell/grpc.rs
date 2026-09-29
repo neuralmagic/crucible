@@ -12,15 +12,16 @@ use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::{
     AddNetworkRule, ConfigureProviderRefreshRequest, CreateProviderRequest, CreateSandboxRequest,
     DeleteSandboxRequest, ExecSandboxRequest, FilesystemPolicy, GetProviderRequest,
-    GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest,
-    ImportProviderProfilesRequest, NetworkBinary, NetworkCredentialBinding, NetworkEndpoint,
-    NetworkPolicyRule, PolicyMergeOperation, PolicyStatus, Provider,
-    ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileImportItem,
-    RotateProviderCredentialRequest, SandboxCondition, SandboxLogLine, SandboxPhase, SandboxPolicy,
-    SandboxSpec, SandboxTemplate, ServiceStatus, UpdateConfigRequest, UpdateProviderRequest,
+    GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest,
+    GpuResourceRequirements, HealthRequest, ImportProviderProfilesRequest, NetworkBinary,
+    NetworkCredentialBinding, NetworkEndpoint, NetworkPolicyRule, PolicyMergeOperation,
+    PolicyStatus, Provider, ProviderCredentialRefreshStrategy, ProviderProfile,
+    ProviderProfileImportItem, ResourceRequirements, RotateProviderCredentialRequest,
+    SandboxCondition, SandboxLogLine, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate,
+    ServiceStatus, UpdateConfigRequest, UpdateProviderRequest,
     exec_sandbox_event::Payload as ExecPayload, policy_merge_operation::Operation as MergeOp,
 };
-use prost_types::{Struct, Value, value::Kind};
+use prost_types::Struct;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -477,8 +478,13 @@ impl Gateway {
         providers: &[String],
         labels: &[(String, String)],
         read_only_paths: &[String],
+        resources: &crate::manifest::SandboxResources,
     ) -> Result<()> {
-        let driver_config = Self::sandbox_host_aliases_driver_config()?;
+        let driver_config = sandbox_driver_config(
+            &env_json("CRUCIBLE_SANDBOX_HOST_ALIASES")?.unwrap_or_default(),
+            &env_json(crate::openshell::placement::GPU_PLACEMENT_ENV)?.unwrap_or_default(),
+            resources,
+        )?;
         let template = match (image, driver_config) {
             (Some(img), driver_config) => Some(SandboxTemplate {
                 image: img.to_string(),
@@ -502,6 +508,11 @@ impl Gateway {
                 providers: providers.to_vec(),
                 template,
                 policy,
+                resource_requirements: (resources.gpus > 0).then_some(ResourceRequirements {
+                    gpu: Some(GpuResourceRequirements {
+                        count: Some(resources.gpus),
+                    }),
+                }),
                 ..SandboxSpec::default()
             }),
             name: name.to_string(),
@@ -514,57 +525,6 @@ impl Gateway {
             .await
             .map_err(GrpcError::rpc(format!("create_sandbox({name})")))?;
         self.wait_ready(name).await
-    }
-
-    /// Carry the deployment profile's DNS-dark host aliases into the selected OpenShell
-    /// Kubernetes driver's sandbox template. The public API wraps selected-driver config
-    /// under the driver name; the driver then renders these names as pod-spec hostAliases.
-    fn sandbox_host_aliases_driver_config() -> Result<Option<Struct>> {
-        let Ok(raw) = std::env::var("CRUCIBLE_SANDBOX_HOST_ALIASES") else {
-            return Ok(None);
-        };
-        let aliases: BTreeMap<String, String> =
-            serde_json::from_str(&raw).context("parsing CRUCIBLE_SANDBOX_HOST_ALIASES")?;
-        if aliases.is_empty() {
-            return Ok(None);
-        }
-
-        let alias_fields = aliases
-            .into_iter()
-            .map(|(hostname, ip)| {
-                (
-                    hostname,
-                    Value {
-                        kind: Some(Kind::StringValue(ip)),
-                    },
-                )
-            })
-            .collect();
-        let pod = Struct {
-            fields: BTreeMap::from([(
-                "pod".to_string(),
-                Value {
-                    kind: Some(Kind::StructValue(Struct {
-                        fields: BTreeMap::from([(
-                            "host_aliases".to_string(),
-                            Value {
-                                kind: Some(Kind::StructValue(Struct {
-                                    fields: alias_fields,
-                                })),
-                            },
-                        )]),
-                    })),
-                },
-            )]),
-        };
-        Ok(Some(Struct {
-            fields: BTreeMap::from([(
-                "kubernetes".to_string(),
-                Value {
-                    kind: Some(Kind::StructValue(pod)),
-                },
-            )]),
-        }))
     }
 
     /// Poll `GetSandbox` until the sandbox is `Ready` (or `Error`/timeout). A fresh create starts
@@ -1165,6 +1125,73 @@ fn build_provider(name: &str, cred_key: &str, token: &str) -> Provider {
     }
 }
 
+/// A deployment variable holding JSON, `None` when unset.
+fn env_json<T: serde::de::DeserializeOwned>(name: &str) -> Result<Option<T>> {
+    match std::env::var(name) {
+        Ok(raw) => serde_json::from_str(&raw)
+            .map(Some)
+            .with_context(|| format!("parsing {name}")),
+        Err(_) => Ok(None),
+    }
+}
+
+/// The Kubernetes driver config one sandbox is created with, wrapped under the driver's name as
+/// the public API takes it: the deployment's DNS-dark host aliases (rendered as pod hostAliases),
+/// the pack's node selector, where the deployment schedules GPU sandboxes when this one asks for
+/// GPUs (its selector keys win over the pack's), and the pack's CPU and memory as the agent
+/// container's requests and limits. `None` when there is nothing to say.
+fn sandbox_driver_config(
+    host_aliases: &BTreeMap<String, String>,
+    gpu: &crate::openshell::placement::GpuPlacement,
+    resources: &crate::manifest::SandboxResources,
+) -> Result<Option<Struct>> {
+    let mut pod = serde_json::Map::new();
+    if !host_aliases.is_empty() {
+        pod.insert("host_aliases".into(), serde_json::to_value(host_aliases)?);
+    }
+    let mut node_selector = resources.node_selector.clone();
+    if resources.gpus > 0 {
+        node_selector.extend(gpu.node_selector.clone());
+        if !gpu.tolerations.is_empty() {
+            pod.insert(
+                "tolerations".into(),
+                serde_json::to_value(&gpu.tolerations)?,
+            );
+        }
+        if let Some(runtime_class) = &gpu.runtime_class_name {
+            pod.insert("runtime_class_name".into(), runtime_class.clone().into());
+        }
+    }
+    if !node_selector.is_empty() {
+        pod.insert("node_selector".into(), serde_json::to_value(node_selector)?);
+    }
+    let quantities: BTreeMap<&str, &str> = [("cpu", &resources.cpu), ("memory", &resources.memory)]
+        .into_iter()
+        .filter_map(|(name, q)| q.as_ref().map(|q| (name, q.as_str())))
+        .collect();
+
+    let mut kubernetes = serde_json::Map::new();
+    if !pod.is_empty() {
+        kubernetes.insert("pod".into(), serde_json::Value::Object(pod));
+    }
+    if !quantities.is_empty() {
+        kubernetes.insert(
+            "containers".into(),
+            serde_json::json!({"agent": {"resources": {"requests": quantities, "limits": quantities}}}),
+        );
+    }
+    if kubernetes.is_empty() {
+        return Ok(None);
+    }
+    let wrapped = serde_json::Map::from_iter([(
+        "kubernetes".to_string(),
+        serde_json::Value::Object(kubernetes),
+    )]);
+    Ok(Some(openshell_core::proto_struct::json_object_to_struct(
+        wrapped,
+    )?))
+}
+
 /// The domain's declared paths ADDED to openshell's restrictive default, or `None` when it declared
 /// none (the gateway then applies that same default itself).
 ///
@@ -1662,26 +1689,109 @@ pYBZ
         assert!(sandbox_filesystem_policy(&[]).is_none());
     }
 
+    fn gpu_placement() -> crate::openshell::placement::GpuPlacement {
+        serde_json::from_value(serde_json::json!({
+            "node_selector": {"nvidia.com/gpu.present": "true"},
+            "tolerations": [{"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"}],
+            "runtime_class_name": "nvidia",
+        }))
+        .expect("placement")
+    }
+
+    fn resources(toml: &str) -> crate::manifest::SandboxResources {
+        toml::from_str(toml).expect("resources")
+    }
+
     #[test]
     fn sandbox_host_aliases_are_wrapped_for_the_kubernetes_driver() {
-        let _guard = crate::test_support::env_lock();
-        unsafe {
-            std::env::set_var(
-                "CRUCIBLE_SANDBOX_HOST_ALIASES",
-                r#"{"maas.example.com":"10.0.0.8"}"#,
-            );
-        }
-        let config = Gateway::sandbox_host_aliases_driver_config()
-            .expect("host aliases should parse")
-            .expect("configured aliases should produce driver config");
-        unsafe {
-            std::env::remove_var("CRUCIBLE_SANDBOX_HOST_ALIASES");
-        }
-
+        let aliases = BTreeMap::from([("maas.example.com".to_string(), "10.0.0.8".to_string())]);
+        let config = sandbox_driver_config(&aliases, &gpu_placement(), &resources(""))
+            .expect("config")
+            .expect("configured aliases produce driver config");
         let value = openshell_core::proto_struct::struct_to_json_value(&config);
         assert_eq!(
-            value["kubernetes"]["pod"]["host_aliases"]["maas.example.com"],
-            "10.0.0.8"
+            value,
+            serde_json::json!({"kubernetes": {"pod": {"host_aliases": {"maas.example.com": "10.0.0.8"}}}}),
+            "a sandbox that asks for no GPUs is not steered onto GPU nodes"
+        );
+    }
+
+    #[test]
+    fn a_sandbox_asking_for_gpus_lands_where_the_deployment_puts_them() {
+        let aliases = BTreeMap::from([("maas.example.com".to_string(), "10.0.0.8".to_string())]);
+        let config = sandbox_driver_config(
+            &aliases,
+            &gpu_placement(),
+            &resources("gpus = 1\ncpu = \"8\"\nmemory = \"32Gi\""),
+        )
+        .expect("config")
+        .expect("a GPU sandbox has driver config");
+        let value = openshell_core::proto_struct::struct_to_json_value(&config);
+        assert_eq!(
+            value,
+            serde_json::json!({"kubernetes": {
+                "pod": {
+                    "host_aliases": {"maas.example.com": "10.0.0.8"},
+                    "node_selector": {"nvidia.com/gpu.present": "true"},
+                    "tolerations": [{"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"}],
+                    "runtime_class_name": "nvidia",
+                },
+                "containers": {"agent": {"resources": {
+                    "requests": {"cpu": "8", "memory": "32Gi"},
+                    "limits": {"cpu": "8", "memory": "32Gi"},
+                }}},
+            }})
+        );
+    }
+
+    /// A pack picks its nodes by label; on a GPU sandbox the deployment's placement is added, and
+    /// where both name the same label the deployment's value holds.
+    #[test]
+    fn a_packs_node_selector_passes_through_under_the_deployments() {
+        let h100 = "[node_selector]\n\"nvidia.com/gpu.product\" = \"NVIDIA-H100-80GB-HBM3\"\n\
+                    \"nvidia.com/gpu.present\" = \"false\"";
+        let value = |toml: &str| {
+            let config =
+                sandbox_driver_config(&BTreeMap::new(), &gpu_placement(), &resources(toml))
+                    .expect("config")
+                    .expect("a selector produces driver config");
+            openshell_core::proto_struct::struct_to_json_value(&config)
+        };
+        assert_eq!(
+            value(h100)["kubernetes"],
+            serde_json::json!({"pod": {"node_selector": {
+                "nvidia.com/gpu.product": "NVIDIA-H100-80GB-HBM3",
+                "nvidia.com/gpu.present": "false",
+            }}}),
+            "without GPUs the pack's selector is the whole placement"
+        );
+        let pod = &value(&format!("gpus = 1\n{h100}"))["kubernetes"]["pod"];
+        assert_eq!(
+            pod["node_selector"],
+            serde_json::json!({
+                "nvidia.com/gpu.product": "NVIDIA-H100-80GB-HBM3",
+                "nvidia.com/gpu.present": "true",
+            })
+        );
+        assert_eq!(pod["runtime_class_name"], "nvidia");
+    }
+
+    #[test]
+    fn nothing_declared_sends_no_driver_config() {
+        assert!(
+            sandbox_driver_config(&BTreeMap::new(), &gpu_placement(), &resources(""))
+                .expect("config")
+                .is_none()
+        );
+        let config = sandbox_driver_config(
+            &BTreeMap::new(),
+            &crate::openshell::placement::GpuPlacement::default(),
+            &resources("gpus = 2"),
+        )
+        .expect("config");
+        assert!(
+            config.is_none(),
+            "a GPU count rides the spec; with no placement there is no driver config to send"
         );
     }
 
