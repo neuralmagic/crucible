@@ -6928,6 +6928,77 @@ async fn launching_with_bad_values_is_422_naming_each_field(pool: PgPool) -> Res
     Ok(())
 }
 
+/// A pack declaring one param of every non-string type.
+const TYPED_WORKFLOW: &str = concat!(
+    "params = {\n",
+    "    \"rounds\": {\"type\": \"int\", \"required\": True, \"min\": 1, \"max\": 10},\n",
+    "    \"ratio\": {\"type\": \"number\", \"default\": 0.5},\n",
+    "    \"deep\": {\"type\": \"bool\", \"default\": False},\n",
+    "    \"topics\": {\"type\": \"list<string>\", \"default\": [\"a\"]},\n",
+    "}\n",
+    "\n",
+    "hello = command(name = \"hello\", run = \"echo hello\")\n",
+    "\n",
+    "workflow(type = \"playbook\", tasks = [hello], result = hello)\n",
+);
+
+/// Typed params launch through the registered schema the engine emitted, and the launch keeps the
+/// text the launcher sent: that text is what the run's `--param` flags carry.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn typed_params_launch_and_keep_the_launchers_text(pool: PgPool) -> Result<()> {
+    let (db, dir) = db_with(pool);
+    let app = app_with_admins(db.clone(), vec!["wren".to_string()]);
+    register_survey(&app, dir.path(), TYPED_WORKFLOW).await;
+
+    let (status, ack) = post_launch(
+        &app,
+        "survey",
+        serde_json::json!({
+            "params": {"rounds": "3", "ratio": "0.75", "deep": "true", "topics": "ci,flaky"},
+            "max_cost": 3.0,
+            "max_time": "30m",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{ack}");
+    let key = ack["key"].as_str().expect("key").to_string();
+    let launch = crate::launches::store::get_playbook_launch(db.pool(), &key)
+        .await?
+        .expect("launch row");
+    let mut stored = launch.params.clone();
+    stored.sort();
+    assert_eq!(
+        stored,
+        vec![
+            ("deep".to_string(), "true".to_string()),
+            ("ratio".to_string(), "0.75".to_string()),
+            ("rounds".to_string(), "3".to_string()),
+            ("topics".to_string(), "ci,flaky".to_string()),
+        ]
+    );
+
+    let (status, body) = post_launch(
+        &app,
+        "survey",
+        serde_json::json!({
+            "params": {"rounds": "11", "deep": "maybe"},
+            "max_cost": 3.0,
+            "max_time": "30m",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let mut fields: Vec<&str> = body["fields"]
+        .as_array()
+        .expect("fields")
+        .iter()
+        .map(|f| f["field"].as_str().unwrap_or_default())
+        .collect();
+    fields.sort_unstable();
+    assert_eq!(fields, vec!["deep", "rounds"], "{body}");
+    Ok(())
+}
+
 /// The manifest a pack that needs an OpenShell sandbox declares.
 const OPENSHELL_MANIFEST: &str = "[repo]\npath = \".\"\n\n[workflow]\ntype = \"playbook\"\nfile = \"workflow.star\"\n\n\
      [agent]\nbackend = \"openshell\"\nsandbox_image = \"quay.io/x/sandbox:dev\"\n";

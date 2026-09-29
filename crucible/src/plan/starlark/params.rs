@@ -58,6 +58,53 @@ impl ParamType {
     fn numeric(self) -> bool {
         matches!(self, ParamType::Int | ParamType::Number)
     }
+
+    /// The type a property of [`Params::json_schema`] declares; anything it does not emit reads
+    /// as a string.
+    pub fn from_schema(property: &serde_json::Value) -> Self {
+        match property.get("type").and_then(serde_json::Value::as_str) {
+            Some("integer") => ParamType::Int,
+            Some("number") => ParamType::Number,
+            Some("boolean") => ParamType::Bool,
+            Some("array") => ParamType::StringList,
+            _ => ParamType::String,
+        }
+    }
+
+    /// Turn what a launcher typed into this type. `Err` is what the value should have been.
+    pub fn read(self, raw: &str) -> std::result::Result<ParamValue, &'static str> {
+        match self {
+            ParamType::String => Ok(ParamValue::String(raw.to_owned())),
+            ParamType::Bool => match raw {
+                "true" | "True" => Ok(ParamValue::Bool(true)),
+                "false" | "False" => Ok(ParamValue::Bool(false)),
+                _ => Err("true or false"),
+            },
+            ParamType::Int => raw
+                .parse::<i32>()
+                .map(ParamValue::Int)
+                .map_err(|_| "a whole number"),
+            ParamType::Number => raw
+                .parse::<f64>()
+                .ok()
+                .filter(|n| n.is_finite())
+                .map(ParamValue::Number)
+                .ok_or("a number"),
+            // A JSON array where the items might contain commas, a comma-separated list where
+            // they do not. Both spellings are unambiguous on sight, which a bare split is not.
+            ParamType::StringList => {
+                if raw.trim_start().starts_with('[') {
+                    crucible_contract::json::from_str::<Vec<String>>(raw)
+                        .map(ParamValue::StringList)
+                        .map_err(|_| "a JSON array of strings")
+                } else {
+                    Ok(ParamValue::StringList(
+                        raw.split(',').map(|s| s.trim().to_owned()).collect(),
+                    ))
+                }
+            }
+        }
+    }
 }
 
 /// One declared parameter.
@@ -430,42 +477,13 @@ fn literal_value(ty: ParamType, expression: &Expr, param: &str) -> Result<ParamV
 
 /// Turn what a launcher typed into the declared type.
 fn parse(spec: &ParamSpec, raw: &str) -> Result<ParamValue> {
-    let wrong = |expected: &str| CompileError::ParamValueWrongType {
-        param: spec.name.clone(),
-        got: raw.to_owned(),
-        expected: expected.to_owned(),
-    };
-    match spec.ty {
-        ParamType::String => Ok(ParamValue::String(raw.to_owned())),
-        ParamType::Bool => match raw {
-            "true" | "True" => Ok(ParamValue::Bool(true)),
-            "false" | "False" => Ok(ParamValue::Bool(false)),
-            _ => Err(wrong("true or false")),
-        },
-        ParamType::Int => raw
-            .parse::<i32>()
-            .map(ParamValue::Int)
-            .map_err(|_| wrong("a whole number")),
-        ParamType::Number => raw
-            .parse::<f64>()
-            .ok()
-            .filter(|n| n.is_finite())
-            .map(ParamValue::Number)
-            .ok_or_else(|| wrong("a number")),
-        // A JSON array where the items might contain commas, a comma-separated list where they
-        // do not. Both spellings are unambiguous on sight, which a bare split is not.
-        ParamType::StringList => {
-            if raw.trim_start().starts_with('[') {
-                let items: Vec<String> = crucible_contract::json::from_str(raw)
-                    .map_err(|_| wrong("a JSON array of strings"))?;
-                Ok(ParamValue::StringList(items))
-            } else {
-                Ok(ParamValue::StringList(
-                    raw.split(',').map(|s| s.trim().to_owned()).collect(),
-                ))
-            }
-        }
-    }
+    spec.ty
+        .read(raw)
+        .map_err(|expected| CompileError::ParamValueWrongType {
+            param: spec.name.clone(),
+            got: raw.to_owned(),
+            expected: expected.to_owned(),
+        })
 }
 
 /// Enforce the declared constraint on a bound value, whether it was supplied or defaulted.
