@@ -1054,6 +1054,7 @@ fn render_workflow_preview(manifest_path: &Path, pack: &Path) -> Result<(u32, u3
                 version: 1,
                 reason: None,
                 budget: crate::plan::ir::PlanBudget { usd: f64::MAX },
+                params: workflow.params.clone(),
                 tasks: workflow.tasks.clone(),
             }
             .validate()?

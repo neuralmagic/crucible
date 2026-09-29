@@ -3,6 +3,7 @@ use std::fmt;
 
 use crate::crucible::Direction;
 use crate::duration::TaskTimeout;
+use crate::plan::param::ParamValue;
 use anyhow::{Context, Result};
 use crucible_contract::decision::{Label, Question, QuestionError, QuestionId, UNCERTAIN};
 use serde::{Deserialize, Serialize};
@@ -15,12 +16,21 @@ pub const ITEM_INPUT: &str = "item";
 pub const KEPT_INPUT: &str = "kept";
 /// The reserved input every epilogue task receives the main graph's outcome under.
 pub const OUTCOME_INPUT: &str = "outcome";
+/// The reserved input every command and evaluate task receives the plan's bound parameter values
+/// under.
+pub const PARAMS_INPUT: &str = "params";
 /// The reserved input a revised task receives its reviewer's last verdict under, from its second
 /// round on.
 pub const REVISION_INPUT: &str = "revision";
 /// Every key the engine writes into a task's inputs itself. A dependency named after one of
 /// them would have its entry overwritten, so [`crate::plan::ir::Plan::validate`] refuses it.
-pub const RESERVED_INPUTS: [&str; 4] = [ITEM_INPUT, KEPT_INPUT, OUTCOME_INPUT, REVISION_INPUT];
+pub const RESERVED_INPUTS: [&str; 5] = [
+    ITEM_INPUT,
+    KEPT_INPUT,
+    OUTCOME_INPUT,
+    PARAMS_INPUT,
+    REVISION_INPUT,
+];
 
 /// Task identity: cache key component, wire label, UI label. Unique within a plan.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -197,6 +207,9 @@ pub enum TaskKind {
         template: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         result: Option<TaskName>,
+        /// A declared field of `result` whose value picks the card accent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        severity_field: Option<OutputField>,
     },
     /// Engine-builtin deterministic fold: keep the k best upstream outputs by `score`.
     TopK { k: u32, direction: Direction },
@@ -380,6 +393,9 @@ pub struct Plan {
     #[serde(default)]
     pub reason: Option<String>,
     pub budget: PlanBudget,
+    /// Every declared parameter's value as compilation bound it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, ParamValue>,
     #[serde(rename = "task", default)]
     pub tasks: Vec<Task>,
 }
@@ -442,6 +458,17 @@ pub enum PlanError {
         "report task {task:?} selects epilogue task {result:?}; report results must come from the main graph"
     )]
     EpilogueReportResult { task: String, result: String },
+    #[error("report task {task:?} names severity_field {field:?} but selects no result task")]
+    SeverityWithoutResult { task: String, field: String },
+    #[error(
+        "report task {task:?} names severity_field {field:?}, which result task {result:?} does not declare in emits; declared: {declared:?}"
+    )]
+    UndeclaredSeverityField {
+        task: String,
+        result: String,
+        field: String,
+        declared: Vec<String>,
+    },
     #[error("task {task:?} lists dependency {dependency:?} twice")]
     RepeatedDependency { task: String, dependency: String },
     #[error("task {task:?}: join = \"passed\" needs at least one dependency")]
@@ -826,21 +853,44 @@ impl Plan {
                 }
             }
             if let TaskKind::Report {
-                result: Some(result),
+                result,
+                severity_field,
                 ..
             } = &t.task
             {
-                let Some(&result_index) = index.get(result) else {
-                    return Err(PlanError::UnknownReportResult {
-                        task: task(),
-                        result: result.0.clone(),
-                    });
-                };
-                if self.tasks[result_index].stage == Stage::Epilogue {
-                    return Err(PlanError::EpilogueReportResult {
-                        task: task(),
-                        result: result.0.clone(),
-                    });
+                match (result, severity_field) {
+                    (None, Some(field)) => {
+                        return Err(PlanError::SeverityWithoutResult {
+                            task: task(),
+                            field: field.0.clone(),
+                        });
+                    }
+                    (None, None) => {}
+                    (Some(result), severity_field) => {
+                        let Some(&result_index) = index.get(result) else {
+                            return Err(PlanError::UnknownReportResult {
+                                task: task(),
+                                result: result.0.clone(),
+                            });
+                        };
+                        let selected = &self.tasks[result_index];
+                        if selected.stage == Stage::Epilogue {
+                            return Err(PlanError::EpilogueReportResult {
+                                task: task(),
+                                result: result.0.clone(),
+                            });
+                        }
+                        if let Some(field) = severity_field
+                            && !selected.emits.contains(field)
+                        {
+                            return Err(PlanError::UndeclaredSeverityField {
+                                task: task(),
+                                result: result.0.clone(),
+                                field: field.0.clone(),
+                                declared: selected.emits.iter().map(|f| f.0.clone()).collect(),
+                            });
+                        }
+                    }
                 }
             }
             if let TaskKind::Route { questions, decider } = &t.task {
@@ -1315,6 +1365,7 @@ mod tests {
             version: 1,
             reason: None,
             budget: PlanBudget { usd: 5.0 },
+            params: BTreeMap::new(),
             tasks,
         }
     }
@@ -1435,6 +1486,35 @@ mod tests {
             .unwrap()
             .replace("min_confidence = 0.8", "min_confidence = 1");
         Plan::from_toml_str(&text).unwrap().validate().unwrap();
+    }
+
+    /// A frozen plan carries its bound values, so whatever loads it back gives every command
+    /// the same ones, each in the type it was bound with.
+    #[test]
+    fn bound_params_round_trip_through_toml_and_json_in_their_types() {
+        let mut original = plan(vec![agent("a", &[])]);
+        original.params = BTreeMap::from([
+            (
+                "url".to_string(),
+                ParamValue::String("https://x.test".into()),
+            ),
+            ("steps".to_string(), ParamValue::Int(3)),
+            ("ratio".to_string(), ParamValue::Number(2.0)),
+            ("dry_run".to_string(), ParamValue::Bool(false)),
+            (
+                "labels".to_string(),
+                ParamValue::StringList(vec!["ci".into()]),
+            ),
+        ]);
+        let text = toml::to_string(&original).unwrap();
+        let from_toml = Plan::from_toml_str(&text).unwrap();
+        let from_json = Plan::from_json_str(&serde_json::to_string(&original).unwrap()).unwrap();
+        for back in [from_toml, from_json] {
+            assert_eq!(back.params, original.params);
+        }
+
+        let bare = toml::to_string(&plan(vec![agent("a", &[])])).unwrap();
+        assert!(!bare.contains("params"), "{bare}");
     }
 
     #[test]
@@ -2209,6 +2289,7 @@ mod tests {
                     destination: ReportDestination::Slack(SlackDestination {}),
                     template: "t".into(),
                     result: None,
+                    severity_field: None,
                 },
                 "report",
             ),

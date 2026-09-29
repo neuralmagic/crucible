@@ -40,6 +40,9 @@ version = 1                 # the only format version accepted today
 [budget]
 usd = 5.0                   # required, positive; execution fails closed on overrun
 
+[params]                    # optional; command and evaluate tasks read it as inputs["params"]
+topic = "slag"
+
 [[task]]
 name = "propose"            # unique within the plan
 kind = "agent"
@@ -364,6 +367,13 @@ Each task's `CRUCIBLE_INPUTS` carries the kept candidate under the reserved `kep
 `{"iter", "score", "tiebreak", "sha", "snapshot", "note"}`. Dependencies may not cross stages,
 engine ops cannot be epilogue, and the workflow `result` must iterate.
 
+In a playbook the epilogue runs after the main graph completes or fails, and reads the reserved
+`outcome` input instead: `{"exit", "tasks": {name: {"status", "note", "output", "files"}}}`,
+each entry what a `join = "settled"` consumer receives, `per_instance` included. Every
+main-graph task's declared files are staged under `inputs/<name>/` (a mapped node's under
+`inputs/<node>[<key>]/`), from a failed task as well as a passing one, and `files` says whether
+that task's set is there. A skipped, blocked, or transport-failed task stages nothing.
+
 Epilogue results are advisory: they cannot un-keep the candidate. Rows land in the session log
 and RESULTS.md (`epilogue` / `epilogue-skip` / `epilogue-fail`), and the PR body gets an
 "Epilogue checks (advisory)" section with failures marked **FAILED**.
@@ -374,8 +384,9 @@ engine-known keys, not URLs or secret names; `slack` is the only destination in 
 The optional `result` selector projects only that main-graph task's declared JSON fields into an
 engine-built Block Kit card. It does not expose prompts, stdout, workspaces, undeclared fields, raw
 Slack blocks, channels, or credentials. Selected output defaults to a 16 KiB encoded limit; an
-operator may lower or raise it up to 64 KiB with `CRUCIBLE_REPORT_RESULT_MAX_BYTES`. Oversize data
-fails without truncation. A required report makes rendering or delivery failure fail the workflow;
+operator may lower or raise it up to 64 KiB with `CRUCIBLE_REPORT_RESULT_MAX_BYTES`. The rendered
+template body is bounded by `CRUCIBLE_REPORT_BODY_MAX_BYTES` (default and maximum 3000, Slack's
+section limit). Oversize data fails without truncation. A required report makes rendering or delivery failure fail the workflow;
 it does not rely on an agent remembering to call a tool.
 
 ## Worked example

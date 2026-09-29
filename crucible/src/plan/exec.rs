@@ -19,8 +19,8 @@ use crate::crucible::Direction;
 use crate::deadline::{Bound, Deadline, RunCeiling};
 use crate::diagram::IllegalTransition;
 use crate::plan::ir::{
-    Decider, ITEM_INPUT, Join, OUTCOME_INPUT, REVISION_INPUT, Stage, Task, TaskKind, TaskName,
-    ValidPlan,
+    Decider, ITEM_INPUT, Join, OUTCOME_INPUT, PARAMS_INPUT, REVISION_INPUT, Stage, Task, TaskKind,
+    TaskName, ValidPlan,
 };
 use crate::plan::machine::{
     BlockedReason, PlanEvent, PlanMachine, TaskEvent, TaskMachine, TaskState,
@@ -765,7 +765,7 @@ pub fn execute(
             if t.stage == Stage::Epilogue {
                 inputs.insert(
                     TaskName(OUTCOME_INPUT.to_string()),
-                    main_graph_outcome(plan, &results, halted.as_ref()),
+                    main_graph_outcome(plan, &results, halted.as_ref(), &producers),
                 );
             }
             inputs_for_dispatch.insert(t.name.clone(), inputs);
@@ -1281,21 +1281,29 @@ pub fn execute(
         .map(Halt::exit)
         .unwrap_or(PlanExit::Completed);
     let valid = exit == PlanExit::Completed
-        && plan
-            .tasks_topo()
-            .filter(|t| t.required && t.stage == Stage::Iteration)
-            .all(|t| {
-                matches!(
-                    results.get(&t.name).map(|r| r.status),
-                    Some(TaskStatus::Pass | TaskStatus::NotTaken)
-                )
-            });
+        && required_tasks_held(plan, |name| results.get(name).map(|r| r.status));
     Ok(PlanOutcome {
         valid,
         exit,
         spent_usd: spent,
         results,
     })
+}
+
+/// Whether every required main-graph task passed or was not taken. With a completed exit this is
+/// the run's verdict; advisory results, epilogue tasks, and captured failure sets do not enter it.
+pub fn required_tasks_held(
+    plan: &ValidPlan,
+    status: impl Fn(&TaskName) -> Option<TaskStatus>,
+) -> bool {
+    plan.tasks_topo()
+        .filter(|t| t.required && t.stage == Stage::Iteration)
+        .all(|t| {
+            matches!(
+                status(&t.name),
+                Some(TaskStatus::Pass | TaskStatus::NotTaken)
+            )
+        })
 }
 
 /// The run ceilings one dispatch ran past: spend beyond the budget, or an attempt the runner
@@ -1411,17 +1419,21 @@ fn file_producers(
     results: &BTreeMap<TaskName, TaskResult>,
     runner: &dyn TaskRunner,
 ) -> Vec<Task> {
+    let epilogue = t.stage == Stage::Epilogue;
     let contributes = |node: &Task, candidate: &Task, r: &TaskResult| match r.status {
         TaskStatus::Pass => true,
         TaskStatus::Fail => {
-            t.join == Join::Settled
-                && t.depends_on.contains(&node.name)
-                && runner.has_captured_files(candidate)
+            let reads_failures = (t.join == Join::Settled && t.depends_on.contains(&node.name))
+                || (epilogue && node.stage == Stage::Iteration);
+            reads_failures && runner.has_captured_files(candidate)
         }
         _ => false,
     };
+    let main_graph = plan
+        .tasks_topo()
+        .filter(|p| epilogue && p.stage == Stage::Iteration);
     let mut producers: Vec<Task> = Vec::new();
-    for p in ancestors(plan, t) {
+    for p in main_graph.chain(ancestors(plan, t)) {
         if p.emits_files.is_empty() {
             continue;
         }
@@ -1451,6 +1463,27 @@ fn file_producers(
     producers
 }
 
+/// What a dispatched task reads, as JSON: its dependencies' contributions and, for a command or
+/// evaluate task, the plan's bound parameters under [`PARAMS_INPUT`].
+fn inputs_for(
+    plan: &ValidPlan,
+    t: &Task,
+    results: &BTreeMap<TaskName, TaskResult>,
+    staged: &[Task],
+) -> BTreeMap<TaskName, Value> {
+    let mut inputs = dependency_inputs(plan, t, results, staged);
+    if matches!(t.task, TaskKind::Command { .. } | TaskKind::Evaluate { .. }) {
+        let params = plan
+            .plan()
+            .params
+            .iter()
+            .map(|(name, value)| (name.clone(), value.json()))
+            .collect();
+        inputs.insert(TaskName(PARAMS_INPUT.to_string()), Value::Object(params));
+    }
+    inputs
+}
+
 /// What a dispatched task reads from its dependencies, as JSON.
 ///
 /// Under `all` and `passed` a dependency contributes its output directly, under its own name. A
@@ -1461,7 +1494,7 @@ fn file_producers(
 /// output and staged-file flag, whatever it settled as. `staged` is the producer list this
 /// dispatch is about to hand the runner, which is what makes the `files` flag mean "staged for
 /// this consumer, in this run".
-fn inputs_for(
+fn dependency_inputs(
     plan: &ValidPlan,
     t: &Task,
     results: &BTreeMap<TaskName, TaskResult>,
@@ -1483,50 +1516,53 @@ fn inputs_for(
             })
             .collect();
     }
-    let was_staged = |name: &TaskName| staged.iter().any(|p| &p.name == name);
     t.depends_on
         .iter()
         .filter_map(|d| {
-            let r = results.get(d)?;
-            // A mapped node is staged under its instances' names, so the node's own flag is true
-            // when any of them was.
-            let any_staged = was_staged(d) || staged.iter().any(|p| is_instance_of(d, &p.name));
-            let mut entry = settled_entry(r, any_staged);
-            if plan.get(d).is_some_and(|dep| dep.over.is_some()) {
-                let per_instance: serde_json::Map<String, Value> = results
-                    .iter()
-                    .filter_map(|(name, r)| {
-                        let key = instance_key(d, name)?;
-                        Some((
-                            key.to_owned(),
-                            Value::Object(settled_entry(r, was_staged(name))),
-                        ))
-                    })
-                    .collect();
-                entry.insert("per_instance".to_string(), Value::Object(per_instance));
-            }
+            let entry = settled_node_entry(plan, d, results, staged)?;
             Some((d.clone(), Value::Object(entry)))
         })
         .collect()
 }
 
-/// What one settled task reports about itself: the settled entry with the output and the
-/// staged-file flag omitted, which is what an epilogue task receives per main-graph task.
-fn outcome_entry(r: &TaskResult) -> serde_json::Map<String, Value> {
-    let mut entry = serde_json::Map::new();
-    entry.insert("status".to_string(), Value::from(r.status.as_str()));
-    entry.insert(
-        "note".to_string(),
-        r.note.clone().map_or(Value::Null, Value::String),
-    );
-    entry
+fn settled_node_entry(
+    plan: &ValidPlan,
+    node: &TaskName,
+    results: &BTreeMap<TaskName, TaskResult>,
+    staged: &[Task],
+) -> Option<serde_json::Map<String, Value>> {
+    let r = results.get(node)?;
+    let mut entry = settled_entry(r, node_staged(staged, node));
+    if plan.get(node).is_some_and(|t| t.over.is_some()) {
+        let per_instance: serde_json::Map<String, Value> = results
+            .iter()
+            .filter_map(|(name, r)| {
+                let key = instance_key(node, name)?;
+                let files = staged.iter().any(|p| &p.name == name);
+                Some((key.to_owned(), Value::Object(settled_entry(r, files))))
+            })
+            .collect();
+        entry.insert("per_instance".to_string(), Value::Object(per_instance));
+    }
+    Some(entry)
+}
+
+fn node_staged(staged: &[Task], node: &TaskName) -> bool {
+    staged
+        .iter()
+        .any(|p| &p.name == node || is_instance_of(node, &p.name))
 }
 
 /// One dependency's entry in a settled join's inputs. The entry carries the output rather than
 /// being it, so a consumer cannot read a failed dependency's reading without stepping past its
 /// status.
 fn settled_entry(r: &TaskResult, files: bool) -> serde_json::Map<String, Value> {
-    let mut entry = outcome_entry(r);
+    let mut entry = serde_json::Map::new();
+    entry.insert("status".to_string(), Value::from(r.status.as_str()));
+    entry.insert(
+        "note".to_string(),
+        r.note.clone().map_or(Value::Null, Value::String),
+    );
     entry.insert(
         "output".to_string(),
         r.output.clone().unwrap_or(Value::Null),
@@ -1542,13 +1578,14 @@ fn main_graph_outcome(
     plan: &ValidPlan,
     results: &BTreeMap<TaskName, TaskResult>,
     halted: Option<&Halt>,
+    staged: &[Task],
 ) -> Value {
     let tasks: serde_json::Map<String, Value> = plan
         .tasks_topo()
         .filter(|t| t.stage == Stage::Iteration)
         .filter_map(|t| {
-            let r = results.get(&t.name)?;
-            Some((t.name.0.clone(), Value::Object(outcome_entry(r))))
+            let entry = settled_node_entry(plan, &t.name, results, staged)?;
+            Some((t.name.0.clone(), Value::Object(entry)))
         })
         .collect();
     serde_json::json!({
@@ -2337,6 +2374,7 @@ mod tests {
             version: 1,
             reason: None,
             budget: PlanBudget { usd },
+            params: std::collections::BTreeMap::new(),
             tasks,
         }
         .validate()
@@ -2364,7 +2402,7 @@ mod tests {
         assert!(out.valid);
         assert_eq!(out.exit, PlanExit::Completed);
         assert_eq!(out.results[&"b".into()].status, TaskStatus::Pass);
-        assert_eq!(r.seen_inputs["b"], vec!["a".to_string()]);
+        assert_eq!(r.seen_inputs["b"], ["a", "params"]);
     }
 
     /// The wall-clock ceiling blocks every task not yet dispatched and invalidates the run.
@@ -2749,7 +2787,7 @@ mod tests {
         assert!(out.valid, "lossy grade remains runnable: {:?}", out.exit);
         assert_eq!(out.results[&"racecheck".into()].status, TaskStatus::Skipped);
         assert_eq!(out.results[&"grade".into()].status, TaskStatus::Pass);
-        assert_eq!(runner.seen_inputs["grade"], vec!["score".to_string()]);
+        assert_eq!(runner.seen_inputs["grade"], ["params", "score"]);
     }
 
     #[test]
@@ -3426,7 +3464,7 @@ mod tests {
         assert_eq!(bad.status, TaskStatus::Fail);
         assert_eq!(bad.output.as_ref().unwrap()["score"], 12.0);
         assert_eq!(out.results[&"grade".into()].status, TaskStatus::Pass);
-        assert_eq!(r.seen_inputs["grade"], vec!["ok".to_string()]);
+        assert_eq!(r.seen_inputs["grade"], ["ok", "params"]);
     }
 
     /// The other side of the status filter: a self-declared skip is a reading the task stands
@@ -3467,10 +3505,7 @@ mod tests {
             TaskStatus::Skipped
         );
         assert_eq!(out.results[&"grade".into()].status, TaskStatus::Pass);
-        assert_eq!(
-            r.seen_inputs["grade"],
-            vec!["ok".to_string(), "unmeasured".to_string()]
-        );
+        assert_eq!(r.seen_inputs["grade"], ["ok", "params", "unmeasured"]);
     }
 
     #[test]
@@ -5062,7 +5097,7 @@ mod tests {
         let out = run_plan(&plan, &mut r);
 
         assert_eq!(out.results[&"roundup".into()].status, TaskStatus::Pass);
-        assert_eq!(r.seen_inputs["roundup"], vec!["good".to_string()]);
+        assert_eq!(r.seen_inputs["roundup"], ["good", "params"]);
     }
 
     /// A settled dependent of a mapped node waits for the fold and then reads each instance,
@@ -5451,7 +5486,7 @@ mod tests {
             "a lossy join was staged a failed dependency's evidence: {:?}",
             r.staged["roundup"]
         );
-        assert_eq!(r.seen_inputs["roundup"], vec!["other".to_string()]);
+        assert_eq!(r.seen_inputs["roundup"], ["other", "params"]);
     }
 
     /// "Nothing" has one spelling in the entry: a dependency the engine recorded no note for
@@ -5561,11 +5596,13 @@ mod tests {
             Some(2),
             "an epilogue task is not part of the main graph it reports on"
         );
-        assert!(
-            outcome["tasks"]["build"].get("output").is_none()
-                && outcome["tasks"]["build"].get("files").is_none(),
-            "the epilogue entry is the settled entry minus output and files"
+        assert_eq!(
+            outcome["tasks"]["build"]["output"],
+            serde_json::json!({"score": 1.0}),
+            "the epilogue entry is the settled entry, output included"
         );
+        assert_eq!(outcome["tasks"]["check"]["output"], Value::Null);
+        assert_eq!(outcome["tasks"]["build"]["files"], false);
         assert!(
             !r.seen_inputs["check"].contains(&OUTCOME_INPUT.to_string()),
             "a main-graph task was given the run's outcome"
@@ -5602,6 +5639,166 @@ mod tests {
         assert_eq!(
             outcome["tasks"]["after"]["note"],
             "required task probe failed"
+        );
+    }
+
+    #[test]
+    fn an_epilogue_is_staged_with_failed_and_passing_main_graph_evidence() {
+        let mut build = task("build", &[], "any", true);
+        build.emits_files = vec!["evidence/build.json".to_string()];
+        let mut probe = task("probe", &["build"], "any", true);
+        probe.emits_files = vec!["evidence/probe.json".to_string()];
+        let mut deliver = task("deliver", &["probe"], "any", true);
+        deliver.emits_files = vec!["DELIVER.md".to_string()];
+        let plan = valid(
+            vec![build, probe, deliver, epilogue("report", &[], true)],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.captured.insert("probe".to_string());
+        r.on(
+            "probe",
+            1,
+            || AttemptOutcome::fail("did not reproduce"),
+            0.1,
+        );
+        let out = run_plan(&plan, &mut r);
+
+        assert!(!out.valid);
+        assert_eq!(out.results[&"report".into()].status, TaskStatus::Pass);
+        assert_eq!(
+            r.staged["report"],
+            vec!["build".to_string(), "probe".to_string()],
+            "a blocked task has no set to stage"
+        );
+        let outcome = outcome_of(&r, "report");
+        assert_eq!(outcome["tasks"]["build"]["files"], true);
+        assert_eq!(outcome["tasks"]["probe"]["status"], "fail");
+        assert_eq!(outcome["tasks"]["probe"]["files"], true);
+        assert_eq!(outcome["tasks"]["deliver"]["status"], "blocked");
+        assert_eq!(outcome["tasks"]["deliver"]["files"], false);
+    }
+
+    #[test]
+    fn an_epilogue_reports_no_files_for_a_failure_without_a_captured_set() {
+        let mut probe = task("probe", &[], "any", false);
+        probe.emits_files = vec!["evidence/probe.json".to_string()];
+        let plan = valid(vec![probe, epilogue("report", &[], true)], 10.0);
+        let mut r = ScriptRunner::new();
+        r.on(
+            "probe",
+            1,
+            || AttemptOutcome::fail("did not reproduce"),
+            0.1,
+        );
+        run_plan(&plan, &mut r);
+
+        assert!(r.staged["report"].is_empty());
+        let outcome = outcome_of(&r, "report");
+        assert_eq!(outcome["tasks"]["probe"]["status"], "fail");
+        assert_eq!(outcome["tasks"]["probe"]["files"], false);
+    }
+
+    #[test]
+    fn an_epilogue_is_not_staged_with_a_skipped_or_transport_failed_set() {
+        let mut quiet = task("quiet", &[], "any", false);
+        quiet.emits_files = vec!["evidence/quiet.json".to_string()];
+        let mut flaky = task("flaky", &[], "any", false);
+        flaky.emits_files = vec!["evidence/flaky.json".to_string()];
+        let plan = valid(vec![quiet, flaky, epilogue("report", &[], true)], 10.0);
+        let mut r = ScriptRunner::new();
+        r.captured.insert("quiet".to_string());
+        r.captured.insert("flaky".to_string());
+        r.on(
+            "quiet",
+            1,
+            || AttemptOutcome::Skipped(serde_json::json!({}), "not applicable".into()),
+            0.0,
+        );
+        for attempt in 1..=3 {
+            r.on(
+                "flaky",
+                attempt,
+                || {
+                    AttemptOutcome::Transport(TransportFailure::new(
+                        TransportCause::Sandbox,
+                        "pod evicted",
+                    ))
+                },
+                0.0,
+            );
+        }
+        run_plan(&plan, &mut r);
+
+        assert!(r.staged["report"].is_empty(), "{:?}", r.staged["report"]);
+        let outcome = outcome_of(&r, "report");
+        assert_eq!(outcome["tasks"]["quiet"]["files"], false);
+        assert_eq!(outcome["tasks"]["flaky"]["status"], "transport");
+        assert_eq!(outcome["tasks"]["flaky"]["files"], false);
+    }
+
+    #[test]
+    fn an_epilogue_is_staged_with_each_mapped_instances_set() {
+        let mut node = mapped_node("audit", "discover", "targets", false);
+        node.emits_files = vec!["OUT.md".to_string()];
+        let plan = valid(
+            vec![
+                task("discover", &[], "any", true),
+                node,
+                epilogue("report", &[], true),
+            ],
+            5.0,
+        );
+        let mut runner = FanoutRunner::new(&["alpha", "beta", "gamma"]);
+        runner.fail.insert("audit[beta]".to_string());
+        runner.fail.insert("audit[gamma]".to_string());
+        runner.captured.insert("audit[beta]".to_string());
+        execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut runner,
+            |_, _| {},
+        );
+
+        assert_eq!(
+            runner.staged["report"],
+            vec!["audit[alpha]".to_string(), "audit[beta]".to_string()]
+        );
+        let outcome = &runner.seen_inputs["report"][&TaskName(OUTCOME_INPUT.to_string())];
+        assert_eq!(outcome["tasks"]["audit"]["files"], true);
+        assert_eq!(outcome["tasks"]["discover"]["files"], false);
+    }
+
+    #[test]
+    fn a_main_graph_task_is_not_staged_with_unrelated_failure_evidence() {
+        let mut probe = task("probe", &[], "any", false);
+        probe.emits_files = vec!["evidence/probe.json".to_string()];
+        let mut other = task("other", &[], "any", true);
+        other.emits_files = vec!["evidence/other.json".to_string()];
+        let plan = valid(
+            vec![
+                probe,
+                other,
+                task("tip", &["other"], "any", true),
+                epilogue("report", &[], true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.captured.insert("probe".to_string());
+        r.on(
+            "probe",
+            1,
+            || AttemptOutcome::fail("did not reproduce"),
+            0.1,
+        );
+        run_plan(&plan, &mut r);
+
+        assert_eq!(r.staged["tip"], vec!["other".to_string()]);
+        assert_eq!(
+            r.staged["report"],
+            vec!["probe".to_string(), "other".to_string()]
         );
     }
 
@@ -6265,13 +6462,52 @@ mod tests {
         }
     }
 
+    const THREE_TASK_EDGES: [(usize, usize); 3] = [(1, 0), (2, 0), (2, 1)];
+    const _: () = assert!(
+        1 << THREE_TASK_EDGES.len() == 8,
+        "one test per edge set below"
+    );
+
     /// The invariants formal/CrucibleSpec/PlanExec.lean proves for the model, checked against
     /// `execute` on every three-task graph: every edge set, stage split, required set, substrate
     /// fit, join, isolation split, per-task outcome, and a budget that does and does not run out.
+    /// One test per edge set, so nextest runs them in parallel.
     #[test]
-    fn every_three_task_graph_keeps_the_model_invariants() {
+    fn every_three_task_graph_keeps_the_model_invariants_edges_0() {
+        three_task_graphs_keep_the_model_invariants(0);
+    }
+    #[test]
+    fn every_three_task_graph_keeps_the_model_invariants_edges_1() {
+        three_task_graphs_keep_the_model_invariants(1);
+    }
+    #[test]
+    fn every_three_task_graph_keeps_the_model_invariants_edges_2() {
+        three_task_graphs_keep_the_model_invariants(2);
+    }
+    #[test]
+    fn every_three_task_graph_keeps_the_model_invariants_edges_3() {
+        three_task_graphs_keep_the_model_invariants(3);
+    }
+    #[test]
+    fn every_three_task_graph_keeps_the_model_invariants_edges_4() {
+        three_task_graphs_keep_the_model_invariants(4);
+    }
+    #[test]
+    fn every_three_task_graph_keeps_the_model_invariants_edges_5() {
+        three_task_graphs_keep_the_model_invariants(5);
+    }
+    #[test]
+    fn every_three_task_graph_keeps_the_model_invariants_edges_6() {
+        three_task_graphs_keep_the_model_invariants(6);
+    }
+    #[test]
+    fn every_three_task_graph_keeps_the_model_invariants_edges_7() {
+        three_task_graphs_keep_the_model_invariants(7);
+    }
+
+    fn three_task_graphs_keep_the_model_invariants(edges: u32) {
         const N: usize = 3;
-        const EDGES: [(usize, usize); 3] = [(1, 0), (2, 0), (2, 1)];
+        const EDGES: [(usize, usize); 3] = THREE_TASK_EDGES;
         let outcomes: [fn() -> AttemptOutcome; 5] = [
             || AttemptOutcome::Pass(serde_json::json!({})),
             || AttemptOutcome::Fail {
@@ -6290,7 +6526,7 @@ mod tests {
         let joins = [Join::All, Join::Passed, Join::Settled];
         let name = |i: usize| format!("t{i}");
         let mut runs = 0usize;
-        for edges in 0..(1u32 << EDGES.len()) {
+        {
             let deps = |t: usize| -> Vec<usize> {
                 EDGES
                     .iter()
@@ -6344,6 +6580,7 @@ mod tests {
                                         version: 1,
                                         reason: None,
                                         budget: PlanBudget { usd: budget },
+                                        params: std::collections::BTreeMap::new(),
                                         tasks: tasks.clone(),
                                     })
                                     .validate() else {
@@ -6383,7 +6620,7 @@ mod tests {
                 }
             }
         }
-        assert!(runs > 100_000, "the enumeration shrank to {runs} runs");
+        assert!(runs > 50_000, "edge set {edges} shrank to {runs} runs");
     }
 
     fn own_limit() -> crate::duration::TaskTimeout {
@@ -6540,6 +6777,185 @@ mod tests {
             if status(t) == TaskStatus::NotTaken {
                 assert_eq!(n, 0, "{}", ctx());
             }
+        }
+    }
+
+    fn with_params(tasks: Vec<Task>) -> ValidPlan {
+        use crate::plan::param::ParamValue;
+        Plan {
+            version: 1,
+            reason: None,
+            budget: PlanBudget { usd: 10.0 },
+            params: [
+                ("url", ParamValue::String("https://example.test/a b".into())),
+                ("steps", ParamValue::Int(3)),
+                ("ratio", ParamValue::Number(0.5)),
+                ("dry_run", ParamValue::Bool(true)),
+                (
+                    "labels",
+                    ParamValue::StringList(vec!["ci".into(), "flaky".into()]),
+                ),
+            ]
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value))
+            .collect(),
+            tasks,
+        }
+        .validate()
+        .unwrap()
+    }
+
+    fn params_of(inputs: &BTreeMap<TaskName, Value>) -> Option<&Value> {
+        inputs.get(&TaskName(PARAMS_INPUT.to_string()))
+    }
+
+    fn agent_task(name: &str, deps: &[&str]) -> Task {
+        Task {
+            task: TaskKind::Agent {
+                prompt: "summarize".into(),
+                harness: None,
+                model: None,
+                effort: None,
+            },
+            ..task(name, deps, "any", true)
+        }
+    }
+
+    fn evaluate_task(name: &str, deps: &[&str]) -> Task {
+        Task {
+            task: TaskKind::Evaluate {
+                command: "true".into(),
+                threshold: None,
+                direction: None,
+            },
+            ..task(name, deps, "any", true)
+        }
+    }
+
+    /// A command reads a launch parameter as data, each value in the type its declaration gave
+    /// it, beside its dependencies' outputs rather than in place of them.
+    #[test]
+    fn command_and_evaluate_tasks_read_every_bound_parameter_in_its_declared_type() {
+        let plan = with_params(vec![
+            task("fetch", &[], "any", true),
+            evaluate_task("check", &["fetch"]),
+            agent_task("summarize", &["fetch"]),
+        ]);
+        let mut r = ScriptRunner::new();
+        let out = run_plan(&plan, &mut r);
+
+        assert!(out.valid);
+        let expected = serde_json::json!({
+            "url": "https://example.test/a b",
+            "steps": 3,
+            "ratio": 0.5,
+            "dry_run": true,
+            "labels": ["ci", "flaky"],
+        });
+        for consumer in ["fetch", "check"] {
+            let params = params_of(&r.seen_values[consumer]);
+            assert_eq!(params, Some(&expected), "{consumer}");
+            let params = params.unwrap();
+            assert!(params["steps"].is_i64(), "an int widened: {params}");
+            assert!(params["ratio"].is_f64(), "a number narrowed: {params}");
+        }
+        assert_eq!(
+            r.seen_inputs["check"],
+            vec!["fetch".to_string(), PARAMS_INPUT.to_string()],
+            "params sits beside the dependency's output"
+        );
+    }
+
+    #[test]
+    fn a_plan_without_parameters_gives_a_command_an_empty_params_object() {
+        let plan = valid(
+            vec![task("a", &[], "any", true), evaluate_task("b", &["a"])],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        run_plan(&plan, &mut r);
+
+        for consumer in ["a", "b"] {
+            assert_eq!(
+                params_of(&r.seen_values[consumer]),
+                Some(&serde_json::json!({})),
+                "{consumer}"
+            );
+        }
+    }
+
+    /// An agent's parameter values reach it only through the prompt regions that mark them as
+    /// outside text, so its inputs never carry them unmarked.
+    #[test]
+    fn an_agent_task_receives_no_params_input() {
+        let plan = with_params(vec![
+            task("fetch", &[], "any", true),
+            agent_task("summarize", &["fetch"]),
+        ]);
+        let mut r = ScriptRunner::new();
+        run_plan(&plan, &mut r);
+
+        assert_eq!(params_of(&r.seen_values["summarize"]), None);
+        assert_eq!(r.seen_inputs["summarize"], vec!["fetch".to_string()]);
+    }
+
+    /// A settled consumer's params is the reserved input, not a dependency entry wrapping it.
+    #[test]
+    fn a_settled_joins_params_is_not_wrapped_in_a_dependency_entry() {
+        let plan = with_params(vec![
+            task("probe", &[], "any", false),
+            joining(evaluate_task("verdict", &["probe"]), Join::Settled),
+        ]);
+        let mut r = ScriptRunner::new();
+        r.on("probe", 1, || AttemptOutcome::fail("no signal"), 0.1);
+        run_plan(&plan, &mut r);
+
+        let params = params_of(&r.seen_values["verdict"]);
+        assert_eq!(params.map(|p| &p["steps"]), Some(&serde_json::json!(3)));
+        assert!(
+            params.is_some_and(|p| p.get("status").is_none()),
+            "{params:?}"
+        );
+    }
+
+    #[test]
+    fn every_round_of_a_revise_loop_and_every_mapped_instance_reads_the_parameters() {
+        let plan = with_params(vec![
+            task("author", &[], "any", true),
+            reviewing("repro", &["author"], "author", 3),
+        ]);
+        let mut r = ScriptRunner::new();
+        r.rounds("author", &[drafted, drafted]);
+        r.rounds("repro", &[rejected, approved]);
+        run_plan(&plan, &mut r);
+
+        assert_eq!(r.runs.len(), 4, "{:?}", r.runs);
+        for (name, inputs) in &r.runs {
+            assert_eq!(
+                params_of(inputs).map(|p| &p["url"]),
+                Some(&serde_json::json!("https://example.test/a b")),
+                "{name}"
+            );
+        }
+
+        let plan = with_params(vec![
+            task("discover", &[], "any", true),
+            mapped_node("audit", "discover", "targets", true),
+        ]);
+        let mut runner = FanoutRunner::new(&["alpha", "beta"]);
+        execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut runner,
+            |_, _| {},
+        );
+        for instance in ["audit[alpha]", "audit[beta]"] {
+            assert_eq!(
+                params_of(&runner.seen_inputs[instance]).map(|p| &p["labels"]),
+                Some(&serde_json::json!(["ci", "flaky"])),
+                "{instance}"
+            );
         }
     }
 }

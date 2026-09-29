@@ -7,7 +7,7 @@
 
 use crate::plan::exec::DeclaredStatus;
 use crate::plan::ir::KEPT_INPUT;
-use crate::plan::ir::{ITEM_INPUT, OUTCOME_INPUT, REVISION_INPUT};
+use crate::plan::ir::{ITEM_INPUT, OUTCOME_INPUT, PARAMS_INPUT, REVISION_INPUT};
 use crate::plan::ir::{MAX_FANOUT_CEILING, MAX_ROUNDS_CEILING};
 #[cfg(test)]
 use crate::plan::workflow::WorkflowType;
@@ -293,11 +293,24 @@ pub fn functions() -> Vec<Function> {
             kwargs: vec![
                 name_kwarg(),
                 Kwarg::new("destination", "str", "The configured sink to publish to."),
-                Kwarg::new("template", "str", "The template rendered into the message."),
+                Kwarg::new(
+                    "template",
+                    "str",
+                    "Pack file rendered into the card body. Reads `verdict`, `spent_usd`, \
+                     `passed`, `failed`, `tasks` (first 20), `run`, `run_url`, and `result`. \
+                     Every inserted value is escaped for Slack.",
+                ),
                 Kwarg::new(
                     "result",
                     "task",
-                    "The task whose result the template renders.",
+                    "The task whose declared fields the card and `result.output` carry; \
+                     `result.status` alone when it did not pass.",
+                ),
+                Kwarg::new(
+                    "severity_field",
+                    "str",
+                    "A declared field of `result` whose value (\"good\", \"warning\", \
+                     \"danger\") picks the card accent; any other value is neutral.",
                 ),
                 Kwarg::new("required", "bool", "False makes the report advisory."),
             ],
@@ -327,7 +340,9 @@ pub fn functions() -> Vec<Function> {
             name: "param",
             lane: Lane::Common,
             purpose: "Read a launch parameter. The `params` block must be the source's first \
-                      statement, and a source that declares one compiles per run.",
+                      statement, and a source that declares one compiles per run. A supplied \
+                      value may reach a prompt or a skill argument; a command or evaluate task \
+                      reads it from `params` in `CRUCIBLE_INPUTS` instead of its command line.",
             positional: Some("name"),
             kwargs: vec![],
         },
@@ -595,8 +610,16 @@ pub fn reserved_inputs() -> Vec<Reserved> {
             OUTCOME_INPUT,
             "object",
             "How the main graph ended and what each of its tasks settled as, as \
-             `{\"exit\": str, \"tasks\": {name: {\"status\", \"note\"}}}`, in an epilogue \
-             task only.",
+             `{\"exit\": str, \"tasks\": {name: {\"status\", \"note\", \"output\", \"files\"}}}`, \
+             in an epilogue task only: each entry is what a `settled` join receives, \
+             `per_instance` included for a mapped task. `files` says whether that task's declared \
+             files, passing or failing, are staged under `inputs/<name>/`.",
+        ),
+        Reserved::new(
+            PARAMS_INPUT,
+            "object",
+            "Every declared parameter's bound value under its name, in its declared type, and \
+             `{}` where the source declares none, in a command or evaluate task only.",
         ),
         Reserved::new(
             REVISION_INPUT,

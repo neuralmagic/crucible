@@ -1052,10 +1052,19 @@ mod tests {
         let mut manifest = crate::manifest::Manifest::load(&dir.join("crucible.toml")).unwrap();
         manifest.resolve_workflow(dir).unwrap();
         let workflow = manifest.workflow.as_ref().unwrap();
-        let plan = crate::plan::template::iteration_template(
-            Some(workflow),
-            &crate::plan::workflow::WorkflowCaps::for_lane(workflow.workflow_type),
-        )
+        workflow
+            .admit(&crate::plan::workflow::WorkflowCaps::for_lane(
+                workflow.workflow_type,
+            ))
+            .unwrap();
+        let plan = crate::plan::ir::Plan {
+            version: 1,
+            reason: None,
+            budget: crate::plan::ir::PlanBudget { usd: f64::MAX },
+            tasks: workflow.tasks.clone(),
+            params: BTreeMap::new(),
+        }
+        .validate()
         .unwrap();
         let mut runner = crate::cli::setup::prep_plan_runner(&dir.join("crucible.toml"))
             .unwrap()
@@ -3593,6 +3602,112 @@ workflow(type = "playbook", tasks = [probe, deliver, report])
         assert_eq!(seen["deliver"]["status"], "blocked");
         assert_eq!(seen["deliver"]["output"], serde_json::Value::Null);
         assert_eq!(seen["deliver"]["files"], false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// A launch parameter reaches a script as data, never through its command line: the
+    /// compiler binds it, the plan carries it, and the command reads it out of its inputs.
+    #[test]
+    fn a_command_reads_its_launch_params_out_of_its_inputs() {
+        let dir = playbook_pack(
+            "params-input",
+            r#"
+params = {
+    "url": {"type": "string", "required": True},
+    "steps": {"type": "int", "default": 3},
+    "labels": {"type": "list<string>", "default": ["ci", "flaky"]},
+}
+echo = command(
+    name = "echo",
+    run = "python3 -c 'import json, os; print(json.dumps({\"seen\": json.loads(os.environ[\"CRUCIBLE_INPUTS\"])[\"params\"]}))'",
+)
+workflow(type = "playbook", tasks = [echo])
+"#,
+        );
+        let supplied = BTreeMap::from([("url".to_string(), "https://x.test/$(id)".to_string())]);
+        let manifest_path = dir.join("crucible.toml");
+        let mut manifest = crate::manifest::Manifest::load(&manifest_path).unwrap();
+        manifest.resolve_workflow_with(&dir, &supplied).unwrap();
+        let workflow = manifest.workflow.as_ref().unwrap();
+        let plan = crate::plan::template::iteration_template(
+            Some(workflow),
+            &crate::plan::workflow::WorkflowCaps::for_lane(workflow.workflow_type),
+        )
+        .unwrap();
+        let mut runner = crate::cli::setup::prep_plan_runner_with_params(
+            &manifest_path,
+            &supplied,
+            crate::openshell::gateway::ComputeDriver::Podman,
+            crate::args::AgentOverride::default(),
+        )
+        .unwrap()
+        .0;
+        let out = execute(
+            &plan,
+            &Substrate::default(),
+            ExecCfg::default(),
+            &mut runner,
+            |_, _| {},
+        );
+
+        let echo = &out.results[&"echo".into()];
+        assert_eq!(echo.status, TaskStatus::Pass, "{:?}", echo.note);
+        assert_eq!(
+            echo.output.as_ref().map(|o| &o["seen"]),
+            Some(&serde_json::json!({
+                "url": "https://x.test/$(id)",
+                "steps": 3,
+                "labels": ["ci", "flaky"],
+            }))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_epilogue_reads_every_main_graph_tasks_evidence_after_a_required_failure() {
+        let dir = playbook_pack(
+            "epilogue-evidence",
+            r#"
+build = command(
+    name = "build",
+    run = "mkdir -p evidence && printf 'built\n' > evidence/build.json && printf '{}\n'",
+    emits_files = ["evidence/build.json"],
+)
+probe = command(
+    name = "probe",
+    run = "mkdir -p evidence && printf 'not reproduced\n' > evidence/probe.json && exit 1",
+    depends_on = [build],
+    emits_files = ["evidence/probe.json"],
+)
+deliver = command(
+    name = "deliver",
+    run = "mkdir -p out && printf 'x\n' > out/DELIVER.md && printf '{}\n'",
+    depends_on = [probe],
+    emits_files = ["out/DELIVER.md"],
+)
+report = command(
+    name = "report",
+    run = "cat inputs/build/evidence/build.json inputs/probe/evidence/probe.json > SEEN.txt && test ! -e inputs/deliver && python3 -c 'import json, os; print(json.dumps(json.loads(os.environ[\"CRUCIBLE_INPUTS\"])[\"outcome\"]))'",
+    stage = "epilogue",
+)
+workflow(type = "playbook", tasks = [build, probe, deliver, report])
+"#,
+        );
+        let out = run_playbook(&dir);
+
+        assert!(!out.valid);
+        assert_eq!(out.results[&"probe".into()].status, TaskStatus::Fail);
+        assert_eq!(out.results[&"deliver".into()].status, TaskStatus::Blocked);
+        let report = &out.results[&"report".into()];
+        assert_eq!(report.status, TaskStatus::Pass, "{:?}", report.note);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("workspace/SEEN.txt")).unwrap(),
+            "built\nnot reproduced\n"
+        );
+        let outcome = report.output.as_ref().expect("the echoed outcome");
+        assert_eq!(outcome["tasks"]["build"]["files"], true);
+        assert_eq!(outcome["tasks"]["probe"]["status"], "fail");
+        assert_eq!(outcome["tasks"]["probe"]["files"], true);
+        assert_eq!(outcome["tasks"]["deliver"]["files"], false);
         let _ = std::fs::remove_dir_all(&dir);
     }
     /// Provenance cannot rest on git's opinion of the workspace: a declared path an earlier

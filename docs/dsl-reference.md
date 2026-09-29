@@ -131,8 +131,9 @@ Publish a rendered template to a controller-configured destination. The workflow
 | --- | --- | --- |
 | `name` | `str` | Task identity, unique within the workflow. |
 | `destination` | `str` | The configured sink to publish to. |
-| `template` | `str` | The template rendered into the message. |
-| `result` | `task` | The task whose result the template renders. |
+| `template` | `str` | Pack file rendered into the card body. Reads `verdict`, `spent_usd`, `passed`, `failed`, `tasks` (first 20), `run`, `run_url`, and `result`. Every inserted value is escaped for Slack. |
+| `result` | `task` | The task whose declared fields the card and `result.output` carry; `result.status` alone when it did not pass. |
+| `severity_field` | `str` | A declared field of `result` whose value ("good", "warning", "danger") picks the card accent; any other value is neutral. |
 | `required` | `bool` | False makes the report advisory. |
 
 ### `session()`
@@ -148,7 +149,7 @@ Declare a durable agent conversation. Tasks that share one run serially under on
 
 ### `param()`
 
-Read a launch parameter. The `params` block must be the source's first statement, and a source that declares one compiles per run.
+Read a launch parameter. The `params` block must be the source's first statement, and a source that declares one compiles per run. A supplied value may reach a prompt or a skill argument; a command or evaluate task reads it from `params` in `CRUCIBLE_INPUTS` instead of its command line.
 
 Takes one positional argument, `name`.
 
@@ -303,5 +304,6 @@ Present alongside the dependency entries, never wrapped in one.
 | --- | --- | --- |
 | `item` | `str` | This mapped instance's key, one per item of the list `over` names. |
 | `kept` | `object` | The kept candidate, in an epilogue task only. |
-| `outcome` | `object` | How the main graph ended and what each of its tasks settled as, as `{"exit": str, "tasks": {name: {"status", "note"}}}`, in an epilogue task only. |
+| `outcome` | `object` | How the main graph ended and what each of its tasks settled as, as `{"exit": str, "tasks": {name: {"status", "note", "output", "files"}}}`, in an epilogue task only: each entry is what a `settled` join receives, `per_instance` included for a mapped task. `files` says whether that task's declared files, passing or failing, are staged under `inputs/<name>/`. |
+| `params` | `object` | Every declared parameter's bound value under its name, in its declared type, and `{}` where the source declares none, in a command or evaluate task only. |
 | `revision` | `object` | The verdict that sent this task back, as `{"round": int, "max_rounds": int, "reviewer": str, "review": {"status", "note", "output", "files"}}`, from the second round of a revise loop on. |

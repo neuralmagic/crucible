@@ -7,10 +7,11 @@ import json, os
 
 inputs = json.loads(os.environ.get("CRUCIBLE_INPUTS", "{}"))
 expected = ["audit-headings", "audit-bullets", "audit-freshness"]
-findings = [f for r in inputs.values() for f in r.get("findings", [])]
+reports = {name: r for name, r in inputs.items() if name in expected}
+findings = [f for r in reports.values() for f in r.get("findings", [])]
 print(json.dumps({
-    "reporting": sorted(inputs),
-    "silent": [name for name in expected if name not in inputs],
+    "reporting": sorted(reports),
+    "silent": [name for name in expected if name not in reports],
     "findings": findings,
 }))
 PY
