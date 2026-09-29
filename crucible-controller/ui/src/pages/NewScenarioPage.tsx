@@ -68,7 +68,7 @@ export function NewScenarioPage() {
       <>
         <Breadcrumb items={CRUMBS} />
         <Empty
-          title="ADMIN ACCESS REQUIRED"
+          title="Admin access required"
           description="Adopting a scenario books to your login, so it needs an admin session."
         />
       </>
@@ -219,12 +219,15 @@ export function NewScenarioPage() {
       <FormActions>
         <Button
           variant="filled"
+          className="uppercase"
           onClick={() => void handleSubmit()}
           disabled={!isValid || adoptMutation.isPending}
         >
-          {adoptMutation.isPending ? 'ADOPTING…' : 'ADOPT SCENARIO'}
+          {adoptMutation.isPending ? 'Adopting…' : 'Adopt scenario'}
         </Button>
-        <Button render={<Link to="/issues" />}>CANCEL</Button>
+        <Button className="uppercase" render={<Link to="/issues" />}>
+          Cancel
+        </Button>
       </FormActions>
     </>
   );

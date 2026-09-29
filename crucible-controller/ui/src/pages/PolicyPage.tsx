@@ -108,6 +108,7 @@ function SetDiff({ active, other, scope }: SetDiffProps) {
           <Status status="active" tone="green" />
         ) : (
           <Button
+            className="uppercase"
             variant="filled"
             disabled={pending}
             data-testid={`activate-${other.digest}`}
@@ -118,7 +119,7 @@ function SetDiff({ active, other, scope }: SetDiffProps) {
               });
             }}
           >
-            {pending ? 'ACTIVATING…' : 'ACTIVATE'}
+            {pending ? 'Activating…' : 'Activate'}
           </Button>
         )}
       </SectionBody>
@@ -200,7 +201,7 @@ function ActiveSet({ active, rules, highlighted }: ActiveSetProps) {
           </li>
         ))}
       </ol>
-      {shown.length === 0 ? <Empty title={rules.length === 0 ? 'NO RULES' : 'NO MATCHING RULES'} /> : null}
+      {shown.length === 0 ? <Empty title={rules.length === 0 ? 'No rules' : 'No matching rules'} /> : null}
     </Section>
   );
 }
@@ -273,6 +274,7 @@ function Editor({ active }: { active: PolicySetDto }) {
           note={dirty ? <Status status="modified" tone="amber" /> : undefined}
           actions={
             <Button
+              className="uppercase"
               disabled={!dirty || create.isPending}
               onClick={() => {
                 setDraft(null);
@@ -280,7 +282,7 @@ function Editor({ active }: { active: PolicySetDto }) {
                 setError(null);
               }}
             >
-              RESET
+              Reset
             </Button>
           }
         />
@@ -306,13 +308,14 @@ function Editor({ active }: { active: PolicySetDto }) {
         )}
         <FormActions>
           <Button
+            className="uppercase"
             variant="filled"
             disabled={!dirty || create.isPending}
             onClick={() => {
               void save();
             }}
           >
-            {create.isPending ? 'SAVING…' : 'SAVE VERSION'}
+            {create.isPending ? 'Saving…' : 'Save version'}
           </Button>
           {markers.length === 0 ? null : (
             <span data-testid="policy-errors">
@@ -328,11 +331,12 @@ function Editor({ active }: { active: PolicySetDto }) {
             note={<Mono size="label">{shortDigest(saved.digest)}</Mono>}
             actions={
               <Button
+                className="uppercase"
                 onClick={() => {
                   setSaved(null);
                 }}
               >
-                CLOSE
+                Close
               </Button>
             }
           />
@@ -404,7 +408,7 @@ function History({ active, sets }: { active: PolicySetDto; sets: readonly Policy
       <div data-testid="policy-history">
         <DataTable
           table={table}
-          empty={<Empty title="NO STORED SETS" />}
+          empty={<Empty title="No stored sets" />}
           renderSubRow={(row) => <SetDiff active={active} other={row.original} scope="history" />}
         />
       </div>
@@ -448,8 +452,13 @@ function Explain({ rules, onRule }: ExplainProps) {
             <TextField id="explain-login" label="Login" mono required value={login} onChange={setLogin} />
             <SelectField id="explain-action" label="Action" value={chosen} onChange={setAction} options={options} />
             <TextField id="explain-resource" label="Resource" mono value={resource} onChange={setResource} />
-            <Button type="submit" variant="filled" disabled={ready === null || answer.isFetching}>
-              {answer.isFetching ? 'DECIDING…' : 'EXPLAIN'}
+            <Button
+              className="uppercase"
+              type="submit"
+              variant="filled"
+              disabled={ready === null || answer.isFetching}
+            >
+              {answer.isFetching ? 'Deciding…' : 'Explain'}
             </Button>
           </FormGrid>
         </form>
@@ -459,7 +468,7 @@ function Explain({ rules, onRule }: ExplainProps) {
           <FormError>{formatError(answer.error)}</FormError>
         </SectionBody>
       ) : answer.isPending ? (
-        <LoadingBlock label="DECIDING" />
+        <LoadingBlock label="Deciding" />
       ) : (
         <SectionBody className="grid gap-3">
           <div className="flex flex-wrap items-center gap-4">
@@ -562,12 +571,12 @@ export function PolicyPage() {
   const rules = useMemo(() => (active === null ? [] : parsePolicies(active.text)), [active]);
 
   const header = <PageHeader eyebrow="System" title="Policy" />;
-  if (whoami.isPending) return <LoadingBlock label="LOADING" />;
+  if (whoami.isPending) return <LoadingBlock label="Loading" />;
   if (!admin) {
     return (
       <>
         {header}
-        <Empty title="PLATFORM ADMINISTRATORS ONLY" />
+        <Empty title="Platform administrators only" />
       </>
     );
   }
@@ -575,7 +584,7 @@ export function PolicyPage() {
     return (
       <>
         {header}
-        <Empty title="POLICY UNAVAILABLE" description={formatError(sets.error)} />
+        <Empty title="Policy unavailable" description={formatError(sets.error)} />
       </>
     );
   }
@@ -583,7 +592,7 @@ export function PolicyPage() {
     return (
       <>
         {header}
-        <LoadingBlock label="LOADING POLICY" />
+        <LoadingBlock label="Loading policy" />
       </>
     );
   }
@@ -591,7 +600,7 @@ export function PolicyPage() {
     return (
       <>
         {header}
-        <Empty title="NO ACTIVE SET" />
+        <Empty title="No active set" />
       </>
     );
   }

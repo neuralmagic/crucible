@@ -126,7 +126,9 @@ function Playbooks({ playbooks }: { playbooks: PlaybookDto[] }) {
               <p className="m-0 mt-1 truncate text-ink-2">{book.description}</p>
             </div>
             {book.actions.includes('launch') ? (
-              <Button render={<Link to={`${path}/launch`} />}>LAUNCH</Button>
+              <Button className="uppercase" render={<Link to={`${path}/launch`} />}>
+                Launch
+              </Button>
             ) : null}
           </li>
         );
@@ -161,13 +163,15 @@ function ComingUp({ schedules }: { schedules: ScheduleDto[] }) {
 function FirstRun() {
   return (
     <Empty
-      title="NOTHING HERE YET"
+      title="Nothing here yet"
       action={
         <>
-          <Button variant="filled" render={<Link to="/playbooks/import" />}>
-            IMPORT FROM GIT
+          <Button variant="filled" className="uppercase" render={<Link to="/playbooks/import" />}>
+            Import from git
           </Button>
-          <Button render={<Link to="/playbooks/drafts" />}>START A DRAFT</Button>
+          <Button className="uppercase" render={<Link to="/playbooks/drafts" />}>
+            Start a draft
+          </Button>
         </>
       }
     />
@@ -209,7 +213,7 @@ export function HomePage() {
     return (
       <>
         {header}
-        <LoadingBlock label="LOADING" />
+        <LoadingBlock label="Loading" />
       </>
     );
   }
@@ -231,7 +235,7 @@ export function HomePage() {
         <Section>
           <SectionHeader title="Recent runs" actions={<SeeAll to="/playbook-runs">All runs</SeeAll>} />
           <SectionBody className="py-0">
-            <QueryState query={runs} noun="RUNS">
+            <QueryState query={runs} noun="runs">
               <RecentRuns runs={realRuns.slice(0, RECENT_RUNS)} />
             </QueryState>
           </SectionBody>
@@ -239,7 +243,7 @@ export function HomePage() {
         <Section className="wide:border-l wide:border-l-rule-hard">
           <SectionHeader title="Playbooks" actions={<SeeAll to="/playbooks">All playbooks</SeeAll>} />
           <SectionBody className="py-0">
-            <QueryState query={playbooks} noun="PLAYBOOKS">
+            <QueryState query={playbooks} noun="playbooks">
               <Playbooks playbooks={playbooksByUse(books, allRuns, PLAYBOOKS_SHOWN)} />
             </QueryState>
           </SectionBody>

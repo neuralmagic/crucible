@@ -206,11 +206,11 @@ export function ActivityPage() {
       />
 
       {initialEvents.isError ? (
-        <Empty title="ACTIVITY UNAVAILABLE" description={formatError(initialEvents.error)} />
+        <Empty title="Activity unavailable" description={formatError(initialEvents.error)} />
       ) : initialEvents.isPending ? (
-        <LoadingBlock label="LOADING ACTIVITY" />
+        <LoadingBlock label="Loading activity" />
       ) : allEvents.length === 0 ? (
-        <Empty title="NO TRANSITIONS" description="Nothing has moved through the loop yet." />
+        <Empty title="No transitions" description="Nothing has moved through the loop yet." />
       ) : (
         Array.from(eventsByDay.entries()).map(([day, events]) => (
           <DayTable key={day} day={day} events={events} />

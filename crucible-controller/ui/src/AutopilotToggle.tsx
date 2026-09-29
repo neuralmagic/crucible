@@ -65,7 +65,9 @@ export function AutopilotToggle() {
           <div className="flex flex-col gap-3">
             <div className="flex items-center gap-4">
               <Status status={data.enabled ? 'enabled' : 'disabled'} tone={data.enabled ? 'green' : 'amber'} />
-              <Button onClick={handleToggleClick}>{verb.toUpperCase()}</Button>
+              <Button className="uppercase" onClick={handleToggleClick}>
+                {verb}
+              </Button>
             </div>
             {audit.length > 0 ? (
               <dl className="m-0 grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1">
@@ -125,18 +127,20 @@ export function AutopilotToggle() {
             </div>
             <div className="flex justify-end border-t border-rule">
               <Button
+                className="uppercase"
                 onClick={() => {
                   setModalOpen(false);
                 }}
               >
-                CANCEL
+                Cancel
               </Button>
               <Button
                 variant="filled"
+                className="uppercase"
                 onClick={() => void handleConfirm()}
                 disabled={!reason.trim() || mutation.isPending}
               >
-                {verb.toUpperCase()}
+                {verb}
               </Button>
             </div>
           </AlertDialog.Popup>

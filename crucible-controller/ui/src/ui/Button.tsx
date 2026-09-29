@@ -20,6 +20,8 @@ const SELECTED: Record<ButtonVariant, string> = {
 interface RenderProps {
   className?: string;
   children?: ReactNode;
+  'data-ui'?: string;
+  'data-variant'?: ButtonVariant;
 }
 
 export interface ButtonProps extends Omit<ButtonHTMLAttributes<HTMLButtonElement>, 'className'> {
@@ -45,6 +47,8 @@ export function Button({
   if (render !== undefined) {
     return cloneElement(render, {
       ...rest,
+      'data-ui': 'button',
+      'data-variant': variant,
       className: cn(cls, render.props.className),
       children,
     });
@@ -54,6 +58,8 @@ export function Button({
       {...rest}
       type={type}
       aria-pressed={selected ? true : undefined}
+      data-ui="button"
+      data-variant={variant}
       className={cls}
     >
       {children}

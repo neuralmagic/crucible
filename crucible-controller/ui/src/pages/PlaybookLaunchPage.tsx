@@ -56,8 +56,8 @@ const DEFAULT_CRON = '0 6 * * MON-FRI';
 const PREVIEW_COUNT = 5;
 
 const MODES: readonly { value: LaunchMode; label: string }[] = [
-  { value: 'now', label: 'RUN NOW' },
-  { value: 'schedule', label: 'ON A SCHEDULE' },
+  { value: 'now', label: 'Run now' },
+  { value: 'schedule', label: 'On a schedule' },
 ];
 
 function formatFiring(iso: string): string {
@@ -141,12 +141,12 @@ export function PlaybookLaunchPage() {
 
   const crumbs = [{ label: 'Playbooks', to: '/playbooks' }, { label: id || 'launch' }];
 
-  if (schema.isPending || playbooks.isPending) return <LoadingBlock label="LOADING FORM" />;
+  if (schema.isPending || playbooks.isPending) return <LoadingBlock label="Loading form" />;
   if (pack !== undefined && !pack.actions.includes('launch')) {
     return (
       <>
         <Breadcrumb items={crumbs} />
-        <Empty title="LAUNCH NOT PERMITTED" description={`Owned by ${pack.owner}`} />
+        <Empty title="Launch not permitted" description={`Owned by ${pack.owner}`} />
       </>
     );
   }
@@ -154,7 +154,7 @@ export function PlaybookLaunchPage() {
     return (
       <>
         <Breadcrumb items={crumbs} />
-        <Empty title="NO SUCH PLAYBOOK" description={formatError(schema.error)} />
+        <Empty title="No such playbook" description={formatError(schema.error)} />
       </>
     );
   }
@@ -163,7 +163,7 @@ export function PlaybookLaunchPage() {
       <>
         <Breadcrumb items={crumbs} />
         <Empty
-          title="FORM CANNOT BE RENDERED"
+          title="Form cannot be rendered"
           description={
             parsed === null
               ? 'The playbook served no schema.'
@@ -359,7 +359,7 @@ export function PlaybookLaunchPage() {
         />
         <SectionBody>
           {specs.length === 0 ? (
-            <Empty title="NO PARAMETERS" description="This pack declares none; launch it as is." />
+            <Empty title="No parameters" description="This pack declares none; launch it as is." />
           ) : (
             <PlaybookParamFields
               idPrefix="launch"
@@ -464,11 +464,11 @@ export function PlaybookLaunchPage() {
               <div className="grid gap-2">
                 <div>
                   <Button
-                    className="border border-rule-hard"
+                    className="border border-rule-hard uppercase"
                     onClick={() => void runPreview()}
                     disabled={preview.isPending}
                   >
-                    {preview.isPending ? 'PREVIEWING…' : 'PREVIEW FIRINGS'}
+                    {preview.isPending ? 'Previewing…' : 'Preview firings'}
                   </Button>
                 </div>
                 {previewed && firings !== null ? (
@@ -511,17 +511,23 @@ export function PlaybookLaunchPage() {
 
       <FormActions>
         {mode === 'now' ? (
-          <Button variant="filled" onClick={() => void handleLaunch()} disabled={launch.isPending}>
-            {launch.isPending ? 'LAUNCHING…' : 'LAUNCH'}
+          <Button
+            variant="filled"
+            className="uppercase"
+            onClick={() => void handleLaunch()}
+            disabled={launch.isPending}
+          >
+            {launch.isPending ? 'Launching…' : 'Launch'}
           </Button>
         ) : (
           <>
             <Button
               variant="filled"
+              className="uppercase"
               onClick={() => void handleSchedule()}
               disabled={schedule.isPending || !previewed}
             >
-              {schedule.isPending ? 'SCHEDULING…' : 'SCHEDULE'}
+              {schedule.isPending ? 'Scheduling…' : 'Schedule'}
             </Button>
             {!previewed && (
               <Mono size="data" tone="ink-3">
@@ -530,7 +536,9 @@ export function PlaybookLaunchPage() {
             )}
           </>
         )}
-        <Button render={<Link to="/playbooks" />}>CANCEL</Button>
+        <Button className="uppercase" render={<Link to="/playbooks" />}>
+          Cancel
+        </Button>
       </FormActions>
     </>
   );

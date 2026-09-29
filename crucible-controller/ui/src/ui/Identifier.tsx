@@ -31,20 +31,20 @@ export function Identifier({
   const cls = cn(BASE, VARIANT[variant], className);
   if (target.to !== undefined) {
     return (
-      <Link to={target.to} title={title} className={cls}>
+      <Link to={target.to} title={title} data-ui="identifier" className={cls}>
         {children}
       </Link>
     );
   }
   if (target.href !== undefined) {
     return (
-      <a href={target.href} title={title} target="_blank" rel="noreferrer" className={cls}>
+      <a href={target.href} title={title} target="_blank" rel="noreferrer" data-ui="identifier" className={cls}>
         {children}
       </a>
     );
   }
   return (
-    <span title={title} className={cls}>
+    <span title={title} data-ui="identifier" className={cls}>
       {children}
     </span>
   );

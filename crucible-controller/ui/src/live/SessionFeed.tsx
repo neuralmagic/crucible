@@ -120,8 +120,8 @@ function SessionScrollback({ rows, hidden, compact, autoFollow, emptyText }: { r
       </div>
       {autoFollow && !following && (
         <div className="absolute bottom-3 left-1/2 -translate-x-1/2">
-          <Button variant="filled" onClick={resume}>
-            ↓ RESUME FOLLOWING
+          <Button variant="filled" className="uppercase" onClick={resume}>
+            ↓ Resume following
           </Button>
         </div>
       )}

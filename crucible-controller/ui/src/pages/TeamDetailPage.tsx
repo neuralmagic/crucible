@@ -117,6 +117,7 @@ function Members({ slug, members, editable, viewer }: MembersProps) {
     cell: ({ row }) =>
       row.original.kind === 'user' && row.original.member !== viewer ? (
         <Button
+          className="uppercase"
           disabled={viewAs.pending}
           onClick={() => {
             viewAs.start(row.original.member).catch((err: unknown) => {
@@ -124,7 +125,7 @@ function Members({ slug, members, editable, viewer }: MembersProps) {
             });
           }}
         >
-          VIEW AS
+          View as
         </Button>
       ) : null,
   });
@@ -155,12 +156,13 @@ function Members({ slug, members, editable, viewer }: MembersProps) {
                   ))}
                 </select>
                 <Button
+                  className="uppercase"
                   disabled={put.isPending}
                   onClick={() => {
                     void send(withoutMember(current, row.original.kind, row.original.member));
                   }}
                 >
-                  REMOVE
+                  Remove
                 </Button>
               </span>
             ),
@@ -174,7 +176,7 @@ function Members({ slug, members, editable, viewer }: MembersProps) {
   return (
     <>
       <div data-testid="members">
-        <DataTable table={table} empty={<Empty title="NO MEMBERS" />} footer={<>Showing {rows.length}</>} />
+        <DataTable table={table} empty={<Empty title="No members" />} footer={<>Showing {rows.length}</>} />
       </div>
       {editable ? (
         <>
@@ -213,13 +215,14 @@ function Members({ slug, members, editable, viewer }: MembersProps) {
           </SectionBody>
           <FormActions>
             <Button
+              className="uppercase"
               variant="filled"
               disabled={added.member.trim().length === 0 || put.isPending}
               onClick={() => {
                 void send(withMember(current, added));
               }}
             >
-              {put.isPending ? 'SAVING…' : 'ADD MEMBER'}
+              {put.isPending ? 'Saving…' : 'Add member'}
             </Button>
           </FormActions>
         </>
@@ -246,7 +249,7 @@ export function TeamDetailPage() {
     return (
       <>
         <Breadcrumb items={crumbs} />
-        <Empty title="TEAM UNAVAILABLE" description={formatError(team.error)} />
+        <Empty title="Team unavailable" description={formatError(team.error)} />
       </>
     );
   }
@@ -254,7 +257,7 @@ export function TeamDetailPage() {
     return (
       <>
         <Breadcrumb items={crumbs} />
-        <LoadingBlock label="LOADING TEAM" />
+        <LoadingBlock label="Loading team" />
       </>
     );
   }
@@ -275,6 +278,7 @@ export function TeamDetailPage() {
         badge={
           owner.switchable.some((p) => p.value === principal) ? (
             <Button
+              className="uppercase"
               variant={acting ? 'filled' : undefined}
               aria-pressed={acting}
               data-testid="act-as-team"
@@ -282,7 +286,7 @@ export function TeamDetailPage() {
                 owner.setContext(acting ? 'all' : principal);
               }}
             >
-              {acting ? 'ACTING AS' : 'ACT AS'}
+              {acting ? 'Acting as' : 'Act as'}
             </Button>
           ) : null
         }

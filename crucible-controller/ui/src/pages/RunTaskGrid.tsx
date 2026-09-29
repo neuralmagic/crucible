@@ -95,7 +95,7 @@ function GridBody({ runId, graph }: GridBodyProps) {
     return (
       <SectionBody>
         <Empty
-          title="NOTHING REPORTED"
+          title="Nothing reported"
           description="No task of this run has reported an attempt yet."
         />
       </SectionBody>

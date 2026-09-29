@@ -118,7 +118,12 @@ const runColumns = runHelper.columns([
     header: '',
     meta: { pad: 'tight', shrink: true },
     cell: ({ row }) => (
-      <Button render={<Link to={relaunchPath(row.original.playbook, row.original.key)} />}>RELAUNCH</Button>
+      <Button
+        className="uppercase"
+        render={<Link to={relaunchPath(row.original.playbook, row.original.key)} />}
+      >
+        Relaunch
+      </Button>
     ),
   }),
 ]);
@@ -220,10 +225,10 @@ export function PlaybookRunsPage() {
           setSearchParams(runFilterParams(DEFAULT_FILTERS), { replace: true });
         }}
       />
-      <QueryState query={runs} noun="RUNS">
+      <QueryState query={runs} noun="runs">
         <DataTable
           table={table}
-          empty={<Empty title={inContext.length === 0 ? 'NO PLAYBOOK RUNS' : 'NO RUNS MATCH THESE FILTERS'} />}
+          empty={<Empty title={inContext.length === 0 ? 'No playbook runs' : 'No runs match these filters'} />}
           footer={
             <>
               Showing {runRows.length} of {inContext.length}
@@ -250,7 +255,7 @@ export function PlaybookRunsPage() {
         <Section>
           <SectionHeader title="Deferred one-shots" />
           <SectionBody>
-            <QueryState query={oneShots} noun="ONE-SHOTS">
+            <QueryState query={oneShots} noun="one-shots">
               <OneShotList rows={oneShotRows} />
             </QueryState>
           </SectionBody>
@@ -288,6 +293,7 @@ function CancelButton({ id }: { id: string }) {
   const mutation = $api.useMutation('delete', '/api/one-shots/{id}');
   return (
     <Button
+      className="uppercase"
       disabled={mutation.isPending}
       onClick={() => {
         mutation.mutate(
@@ -300,7 +306,7 @@ function CancelButton({ id }: { id: string }) {
         );
       }}
     >
-      {mutation.isPending ? 'CANCELLING…' : 'CANCEL'}
+      {mutation.isPending ? 'Cancelling…' : 'Cancel'}
     </Button>
   );
 }

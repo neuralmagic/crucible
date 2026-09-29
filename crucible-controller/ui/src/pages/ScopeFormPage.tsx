@@ -45,15 +45,15 @@ export function ScopeFormPage() {
   ];
 
   if (!issueKey) {
-    return <Empty title="NO ISSUE KEY" description="This route needs an issue key." />;
+    return <Empty title="No issue key" description="This route needs an issue key." />;
   }
 
   if (detail.isError) {
-    return <Empty title="ISSUE UNAVAILABLE" description={formatError(detail.error)} />;
+    return <Empty title="Issue unavailable" description={formatError(detail.error)} />;
   }
 
   if (detail.isPending || whoami.isPending) {
-    return <LoadingBlock label="LOADING ISSUE" />;
+    return <LoadingBlock label="Loading issue" />;
   }
 
   const isAdmin = whoami.data?.role === 'admin';
@@ -63,7 +63,7 @@ export function ScopeFormPage() {
       <>
         <Breadcrumb items={crumbs} />
         <Empty
-          title="ADMIN ACCESS REQUIRED"
+          title="Admin access required"
           description="A scope override bypasses budget caps, so it needs an admin session."
         />
       </>
@@ -138,12 +138,15 @@ export function ScopeFormPage() {
       <FormActions>
         <Button
           variant="filled"
+          className="uppercase"
           onClick={() => void handleSubmit()}
           disabled={!isValid || scopeMutation.isPending}
         >
-          {scopeMutation.isPending ? 'SUBMITTING…' : 'SUBMIT SCOPE OVERRIDE'}
+          {scopeMutation.isPending ? 'Submitting…' : 'Submit scope override'}
         </Button>
-        <Button render={<Link to={`/issues/${encodeURIComponent(issueKey)}`} />}>CANCEL</Button>
+        <Button className="uppercase" render={<Link to={`/issues/${encodeURIComponent(issueKey)}`} />}>
+          Cancel
+        </Button>
       </FormActions>
     </>
   );

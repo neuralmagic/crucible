@@ -81,10 +81,10 @@ export function ReposPage() {
         description="Every watched repository, its issue counts by status, and how far upstream polling has read."
       />
 
-      <QueryState query={repos} noun="REPOS">
+      <QueryState query={repos} noun="repos">
         <DataTable
           table={table}
-          empty={<Empty title="NO REPOSITORIES" description="No repositories tracked yet." />}
+          empty={<Empty title="No repositories" description="No repositories tracked yet." />}
           footer={
             <>
               {rows.length} repositor{rows.length === 1 ? 'y' : 'ies'}
