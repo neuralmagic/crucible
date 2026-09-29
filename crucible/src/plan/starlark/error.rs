@@ -386,6 +386,13 @@ pub enum CompileError {
     TimeoutNotString,
     #[error(transparent)]
     InvalidTimeout(#[from] crate::duration::BadTimeout),
+    #[error("\"history\" must be an integer")]
+    HistoryNotInteger,
+    #[error(
+        "history = {got} is outside 1..={}",
+        crucible_contract::history::MAX_HISTORY_DEPTH
+    )]
+    HistoryOutOfRange { got: i32 },
     #[error("max_rounds = {got} is outside 2..={MAX_ROUNDS_CEILING}")]
     RoundsOutOfRange { got: i32 },
     #[error(

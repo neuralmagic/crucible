@@ -764,11 +764,43 @@ that does, its key replaces `[agent.codex]`'s own, and the ambient `ANTHROPIC_AP
 Each replacement is logged. With no `agent` binding those ambient variables and the manifest
 decide, which is how a run from an operator's shell works.
 
+An orchestrator that starts a run of a launch series supplies the series' earlier terminal runs
+as one JSON document in `CRUCIBLE_HISTORY` (contract 1.9.0), typed as
+`crucible_contract::history::SuppliedHistory`: `{"version":1,"records":[record]}`, the most
+recent runs by end time, at most 30. A record is exactly
+`{"run","started_at","ended_at","outcome","verdict","revision","link","entry":{"task","status",
+"output"}}`: the run's identifier, its RFC 3339 start and end, its shutdown `outcome` token or
+null where it wrote none, its verdict (`valid`/`invalid`) or null, the pack revision it ran, a
+controller-owned link to it, and the history entry it recorded (below). Every field is present,
+nullable ones as null. An unknown field or token, a missing field, a version other than 1, more
+than 30 records, a repeated or empty `run`, an unparseable time, or an end before its start
+fails the run before any task. With no `CRUCIBLE_HISTORY` the run belongs to no series.
+
+The engine orders the records by end time, oldest first, and gives a task declaring
+`history = N` the reserved input `history`: `{"records": [...], "dropped": k}`, the last `N`
+records exactly as supplied, less whole records from the oldest end until the compact JSON
+encoding of that object fits `CRUCIBLE_HISTORY_MAX_BYTES` (default 65536), with `k` the number
+removed. A run outside a series gives such a task `{"records": [], "dropped": 0}`. A command or
+evaluate task reads it from `CRUCIBLE_INPUTS`; an agent task reads it in its prompt, inside the
+external-input markers, and never in its upstream-results JSON. `crucible check` prints the
+bound a playbook's run will apply, and refuses a malformed one.
+
+A `plan_admitted` event carries an additive `history_record`, the task a playbook records for
+its series or empty when it names none, and each task an additive `history_depth`, zero when it
+reads no history (contract 1.9.0).
+
 Additive event kinds beyond the compat set include:
 
 - **`identity`**: the run's `RunIdentity` (below), emitted once at setup and again on
   `--resume` (the freshly recomputed identity). A mismatch against the original run's identity is
   a hard-warning `note` event, never an abort.
+- **`history_entry`**: `{ entry: { task, status, output } }`, emitted once by a playbook run,
+  just before `shutdown` (contract 1.9.0). `task` is the playbook's `history_record`, empty when
+  it names none. `status` is that task's `task_result` status, and `output` its JSON output cut
+  down to the fields it declares in `emits`, null unless it passed. A revise target or reviewer
+  records its final result, not a round's. Both are null when the task never settled: the run
+  stopped early, or a ceiling left it undispatched. An orchestrator copies this object into the
+  `entry` of the record later runs of the series receive.
 - **`shutdown`**: `{ outcome, reason }`, emitted **exactly once**, as the **last** line of every
   run (after `finished`/`summary`). `outcome` is one of `finished`/`solved`/`budget`/`stopped`/
   `escalated`/`stalled`/`error`. Session-log consumers key a run's terminal state off this line; a
