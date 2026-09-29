@@ -6046,13 +6046,52 @@ mod tests {
         }
     }
 
+    const THREE_TASK_EDGES: [(usize, usize); 3] = [(1, 0), (2, 0), (2, 1)];
+    const _: () = assert!(
+        1 << THREE_TASK_EDGES.len() == 8,
+        "one test per edge set below"
+    );
+
     /// The invariants formal/CrucibleSpec/PlanExec.lean proves for the model, checked against
     /// `execute` on every three-task graph: every edge set, stage split, required set, substrate
     /// fit, join, isolation split, per-task outcome, and a budget that does and does not run out.
+    /// One test per edge set, so nextest runs them in parallel.
     #[test]
-    fn every_three_task_graph_keeps_the_model_invariants() {
+    fn every_three_task_graph_keeps_the_model_invariants_edges_0() {
+        three_task_graphs_keep_the_model_invariants(0);
+    }
+    #[test]
+    fn every_three_task_graph_keeps_the_model_invariants_edges_1() {
+        three_task_graphs_keep_the_model_invariants(1);
+    }
+    #[test]
+    fn every_three_task_graph_keeps_the_model_invariants_edges_2() {
+        three_task_graphs_keep_the_model_invariants(2);
+    }
+    #[test]
+    fn every_three_task_graph_keeps_the_model_invariants_edges_3() {
+        three_task_graphs_keep_the_model_invariants(3);
+    }
+    #[test]
+    fn every_three_task_graph_keeps_the_model_invariants_edges_4() {
+        three_task_graphs_keep_the_model_invariants(4);
+    }
+    #[test]
+    fn every_three_task_graph_keeps_the_model_invariants_edges_5() {
+        three_task_graphs_keep_the_model_invariants(5);
+    }
+    #[test]
+    fn every_three_task_graph_keeps_the_model_invariants_edges_6() {
+        three_task_graphs_keep_the_model_invariants(6);
+    }
+    #[test]
+    fn every_three_task_graph_keeps_the_model_invariants_edges_7() {
+        three_task_graphs_keep_the_model_invariants(7);
+    }
+
+    fn three_task_graphs_keep_the_model_invariants(edges: u32) {
         const N: usize = 3;
-        const EDGES: [(usize, usize); 3] = [(1, 0), (2, 0), (2, 1)];
+        const EDGES: [(usize, usize); 3] = THREE_TASK_EDGES;
         let outcomes: [fn() -> AttemptOutcome; 4] = [
             || AttemptOutcome::Pass(serde_json::json!({})),
             || AttemptOutcome::Fail {
@@ -6065,7 +6104,7 @@ mod tests {
         let joins = [Join::All, Join::Passed, Join::Settled];
         let name = |i: usize| format!("t{i}");
         let mut runs = 0usize;
-        for edges in 0..(1u32 << EDGES.len()) {
+        {
             let deps = |t: usize| -> Vec<usize> {
                 EDGES
                     .iter()
@@ -6153,7 +6192,7 @@ mod tests {
                 }
             }
         }
-        assert!(runs > 100_000, "the enumeration shrank to {runs} runs");
+        assert!(runs > 50_000, "edge set {edges} shrank to {runs} runs");
     }
 
     fn check_graph(tasks: &[Task], out: &PlanOutcome, log: &[GraphEvent], budget: f64) {
