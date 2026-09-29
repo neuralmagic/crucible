@@ -3,7 +3,7 @@ use std::fmt;
 
 use crate::crucible::Direction;
 use crate::duration::TaskTimeout;
-use crate::plan::starlark::params::ParamValue;
+use crate::plan::param::ParamValue;
 use anyhow::{Context, Result};
 use crucible_contract::decision::{Label, Question, QuestionError, QuestionId, UNCERTAIN};
 use serde::{Deserialize, Serialize};

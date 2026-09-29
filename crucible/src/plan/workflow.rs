@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::plan::ir::{
     EngineOp, Join, KEPT_INPUT, Plan, PlanBudget, PlanError, Stage, Task, TaskKind, TaskName,
 };
-use crate::plan::starlark::params::ParamValue;
+use crate::plan::param::ParamValue;
 
 /// Names used only by the compatibility template.
 const LEGACY_NAMES: [&str; 4] = ["propose", "apply", "measure", "decide"];
