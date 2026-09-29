@@ -7,8 +7,9 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::plan::exec::{Substrate, TaskStatus, required_tasks_held, runnable_set};
-use crate::plan::history::{SeriesHistory, declared_output};
+use crate::plan::history::SeriesHistory;
 use crate::plan::ir::{Plan, Stage, TaskKind, TaskName, ValidPlan};
+use crate::plan::record::declared_output;
 use crucible::crucible::Direction;
 use xai_grok_mermaid::{MermaidTheme, RenderLimits, RenderParams, default_engine, render_checked};
 
@@ -822,7 +823,7 @@ pub fn run(
         append(
             f,
             &crate::report::session::SessionEvent::HistoryEntry {
-                entry: crate::plan::history::run_entry(&plan, record.as_ref(), &out.results),
+                entry: crate::plan::record::run_entry(&plan, record.as_ref(), &out.results),
             },
         );
     }
