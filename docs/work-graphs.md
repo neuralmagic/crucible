@@ -40,6 +40,9 @@ version = 1                 # the only format version accepted today
 [budget]
 usd = 5.0                   # required, positive; execution fails closed on overrun
 
+[params]                    # optional; command and evaluate tasks read it as inputs["params"]
+topic = "slag"
+
 [[task]]
 name = "propose"            # unique within the plan
 kind = "agent"
@@ -59,6 +62,8 @@ required = true             # default true
 isolation = "worktree"      # optional
 join = "all"                # default "all"
 emits = ["score"]           # optional declared output fields; absent = undeclared
+                            # or typed: emits = { score = "number", tier = ["high", "low"] }
+timeout = "20m"             # optional per-attempt limit; agent, command, and evaluate only
 
 [[task]]
 name = "pick"
@@ -115,12 +120,44 @@ A task's output is JSON and becomes its dependents' input.
 `top_k` reads a finite numeric `score` from each input, so an upstream task that wants to rank
 must emit one. That contract is declarable: `emits = ["score"]` on an `agent`, `command`, or
 `evaluate` task names fields its JSON output promises to include. Validation rejects a `top_k`
-dependency, `grade` score source, or thresholded `evaluate` whose declared emits omits `score`,
-before anything runs; at runtime a passing attempt missing a declared field is converted to a
-measured failure at the producing task (never retried, blocks dependents), so output drift fails
-where it happened instead of downstream. An empty or absent `emits` declares nothing and is
+dependency, `grade` score source or tiebreak, or thresholded `evaluate` whose declared emits omits
+`score`, before anything runs; at runtime a passing attempt missing a declared field is converted
+to a measured failure at the producing task (never retried, blocks dependents), so output drift
+fails where it happened instead of downstream. An empty or absent `emits` declares nothing and is
 never checked. `top_k` and `engine` tasks cannot declare emits; their outputs are
 engine-defined.
+
+`emits` can also promise each field's type, as a dict from field name to type:
+
+```python
+scan = command(
+    name = "scan",
+    run = "./scan.sh",
+    emits = {"targets": "list", "count": "integer", "severity": ["high", "low"]},
+)
+```
+
+A type is `"string"`, `"integer"` (a number with no fractional part), `"number"`, `"boolean"`,
+`"list"`, `"object"`, or a list of labels, which declares a string equal to one of them. Labels
+are identifiers, like route labels. The list form keeps working and promises presence only.
+
+At runtime a passing attempt whose field holds the wrong type, or a string outside its labels,
+is a measured failure at the producing task, the same as a missing field, and the note names
+the field, what arrived, and what was declared. A task that settled itself skipped or failed
+owes nothing.
+
+At compile time the types are checked wherever the graph reads a field, before any spend:
+
+- `over = scan.targets` needs a field declared `"list"`, reported at the `over` argument.
+- A `top_k` dependency, a `grade` score source or tiebreak, and a thresholded `evaluate` need
+  `score` declared `"number"` or `"integer"`.
+- `route(source = scan, ...)` needs each question's field declared as labels the question
+  answers (its options, or `yes`/`no`, plus `uncertain`), or `"boolean"` for a `noul`. A
+  `"string"` is refused: it promises nothing about which label arrives.
+
+A field declared without a type (list form) or a task with no `emits` stays unchecked at compile
+time. The generated TOML carries the types as a table (`emits = { score = "number" }`) and the
+`plan_admitted` event lists each field with its type.
 
 ## Execution semantics
 
@@ -138,12 +175,31 @@ in the same position is skipped, along with its dependents, and validity is unaf
 **Failure.** A `required` task that fails short-circuits the plan; everything undispatched is
 blocked. An advisory failure blocks only its dependents.
 
+**Early completion.** In a playbook, a passing main-graph task that returns `"complete": true`
+(with an optional `"reason"` string) ends the run: nothing else in the main graph dispatches,
+undispatched tasks stay unsettled rather than blocked, and epilogue tasks still run. The run is
+valid unless a required task had already settled other than passing, and the shutdown outcome
+is `complete`, with the reason. Both fields are reserved, so `emits` cannot list them. A
+revised task that completes ends its loop without another review; a mapped instance that
+completes ends the run once its node has folded.
+
 **Retry is not recheck.** Transport failures retry, bounded (2 by default). A measured failure
 never reruns: a task that failed, failed.
 
 **Budget.** Cost is known only after an attempt completes, so an in-flight attempt may report a
 total above `budget.usd`. Any overrun invalidates the plan and blocks all further dispatch and
 retries. Reaching the budget exactly is valid only when no further retry or task is needed.
+
+**Time.** Elapsed time is known continuously, so it bounds every attempt while it runs. Each
+attempt gets a deadline: its task's `timeout` counted from when the attempt starts, or the run's
+`--max-time` ceiling if that falls first. A task with no `timeout` runs under the ceiling alone.
+At the deadline the runner kills the attempt's whole process group (a command and everything it
+started, or the agent turn) and the task settles as a measured failure with a note naming the
+limit, `timed out: the task ran past its 20m limit`. It is not retried: a rerun would spend the
+same time again. A required task that times out short-circuits like any other failure. An
+attempt the run's ceiling ends instead ends the run on that ceiling, and everything undispatched
+settles blocked on it. A playbook refuses a `timeout` longer than `--max-time` before it
+dispatches anything. In a concurrent batch each task runs under its own deadline.
 
 ### `needs`
 
@@ -171,8 +227,8 @@ dependency, then folds the non-empty passing set. It fails closed if none can ru
 
 ### `revise`
 
-A reviewer sends a failing verdict back to the one dependency it names, for a bounded number of
-rounds. Playbooks only, and the only repetition the graph itself states.
+A reviewer sends a failing verdict back to the tasks it names, for a bounded number of rounds.
+Playbooks only, and the only repetition the graph itself states.
 
 ```python
 author = agent(
@@ -197,7 +253,25 @@ remain, `author` runs again and then `review` does, until `review` stops failing
 round is spent. Any other reviewer outcome ends the loop, as does a revision that fails and
 leaves the reviewer blocked. The engine checks the ceilings before every round.
 
-From the second round the target's inputs carry the reserved `revision` key:
+`revise` also takes a list, when a fix needs more than one task to run again:
+
+```python
+confirm = evaluate(
+    name = "confirm",
+    run = "python3 tools/probe.py --rung confirm",
+    depends_on = [rig],
+    revise = [pick, build, rig],
+    max_rounds = 3,
+)
+```
+
+The targets and the reviewer are the loop's body. Each round runs the body one task at a time in
+dependency order, each under its own `join` and `when`, so a failed `build` blocks an all-join
+reviewer and ends the loop, while a reviewer joining `settled` sees the failure and can send the
+chain back. The loop starts once everything outside the body that any body task reads has
+settled, and a task outside the body that reads a body task waits for the loop to end.
+
+From the second round every target's inputs carry the reserved `revision` key:
 
 ```json
 {"round": 2, "max_rounds": 3, "reviewer": "review",
@@ -206,18 +280,20 @@ From the second round the target's inputs carry the reserved `revision` key:
 ```
 
 `files` says whether the reviewer's declared files from that failing round were staged, which
-they are under `inputs/<reviewer>/`, the same place a `join = "settled"` consumer finds them. A
-target that declares a `session` resumes it each round, so it remembers what it already tried.
+they are under `inputs/<reviewer>/`, the same place a `join = "settled"` consumer finds them. The
+reviewer itself never receives `revision`. A body task that declares a `session` resumes it each
+round, so it remembers what it already tried.
 
 Each round settles in its own right: a passing round commits, a failing one is discarded, and
 each reports as `task[round-N]`, the naming a mapped node's instances use. Once the loop ends,
 each task reports one row under its own name carrying its last round and the spend of every
 round, and those rows alone gate the verdict. A dependent reads the last round.
 
-The bound is 2 to 5 and is never defaulted. Validation refuses a target that is not a direct
-dependency, a fan-out on either side, two reviewers for one target, nested or chained loops, and
-a reviewer dependency that can reach the target (it would read a draft a later round replaces).
-Anything less bounded, or a repair that re-runs more than one producer, stays inside one task.
+The bound is 2 to 5 and is never defaulted. Validation refuses a target the reviewer does not
+depend on, directly or through other tasks; a body that leaves out a task on a path between two
+of its tasks (that task would read a result a later round replaces); a body task that is not an
+agent, command, or evaluate task, or that fans out; a task in two bodies; and a reviewer that is
+itself a target. Anything whose bound depends on what a task finds stays inside one task.
 
 ## The loop as a plan
 
@@ -352,6 +428,13 @@ Each task's `CRUCIBLE_INPUTS` carries the kept candidate under the reserved `kep
 `{"iter", "score", "tiebreak", "sha", "snapshot", "note"}`. Dependencies may not cross stages,
 engine ops cannot be epilogue, and the workflow `result` must iterate.
 
+In a playbook the epilogue runs after the main graph completes or fails, and reads the reserved
+`outcome` input instead: `{"exit", "tasks": {name: {"status", "note", "output", "files"}}}`,
+each entry what a `join = "settled"` consumer receives, `per_instance` included. Every
+main-graph task's declared files are staged under `inputs/<name>/` (a mapped node's under
+`inputs/<node>[<key>]/`), from a failed task as well as a passing one, and `files` says whether
+that task's set is there. A skipped, blocked, or transport-failed task stages nothing.
+
 Epilogue results are advisory: they cannot un-keep the candidate. Rows land in the session log
 and RESULTS.md (`epilogue` / `epilogue-skip` / `epilogue-fail`), and the PR body gets an
 "Epilogue checks (advisory)" section with failures marked **FAILED**.
@@ -362,8 +445,9 @@ engine-known keys, not URLs or secret names; `slack` is the only destination in 
 The optional `result` selector projects only that main-graph task's declared JSON fields into an
 engine-built Block Kit card. It does not expose prompts, stdout, workspaces, undeclared fields, raw
 Slack blocks, channels, or credentials. Selected output defaults to a 16 KiB encoded limit; an
-operator may lower or raise it up to 64 KiB with `CRUCIBLE_REPORT_RESULT_MAX_BYTES`. Oversize data
-fails without truncation. A required report makes rendering or delivery failure fail the workflow;
+operator may lower or raise it up to 64 KiB with `CRUCIBLE_REPORT_RESULT_MAX_BYTES`. The rendered
+template body is bounded by `CRUCIBLE_REPORT_BODY_MAX_BYTES` (default and maximum 3000, Slack's
+section limit). Oversize data fails without truncation. A required report makes rendering or delivery failure fail the workflow;
 it does not rely on an agent remembering to call a tool.
 
 ## Worked example

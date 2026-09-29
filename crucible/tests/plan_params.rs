@@ -5,7 +5,8 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crucible::plan::starlark::params::{ParamType, ParamValue, Params};
+use crucible::plan::param::ParamValue;
+use crucible::plan::starlark::params::{ParamType, Params};
 use crucible::plan::starlark::{declared_params, read_params};
 
 const SOURCE: &str = r#"

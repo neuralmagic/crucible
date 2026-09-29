@@ -1,0 +1,19 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-SERVICE-DECLARATION"
+title = "Service declaration"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+A manifest of any workflow type MAY declare services as an array of [[service]] tables, extending the schema [[RFC-0001:C-MANIFEST]] defines and validated under its rules. A manifest that declares none runs exactly as it would without this RFC.
+
+
+
+Each service MUST declare a name and a tool, and MAY declare arguments, a tool version requirement, and secrets. A name MUST match [a-z][a-z0-9_]* and MUST be unique among the manifest's services. The capability a service provides is "service." followed by its name, so no service can take a name the engine or the broker uses. Arguments MUST be a list of strings, passed to the tool's executable verbatim and never through a shell. The engine MUST reject an argument that names a path inside the pack or the workspace. A version requirement uses semantic-version requirement syntax. Each secret entry MUST name a secret and MUST state the external system it authorizes and the scope within that system.
+
+
+
+The engine MUST refuse the run, naming the service and the field, when a declaration violates this clause, before compiling the workflow."""

@@ -2,8 +2,14 @@
 // SPA build output is gitignored — make sure a Node-less checkout still compiles (spa.rs then
 // answers 503 "UI not built").
 fn main() {
-    if let Err(e) = std::fs::create_dir_all("ui/dist") {
-        println!("cargo:warning=could not create ui/dist: {e}");
+    let dist = std::path::Path::new("ui/dist");
+    if !dist.exists() {
+        let created = std::fs::create_dir_all(dist).and_then(|()| {
+            std::fs::File::open(dist)?.set_modified(std::time::SystemTime::UNIX_EPOCH)
+        });
+        if let Err(e) = created {
+            println!("cargo:warning=could not create ui/dist: {e}");
+        }
     }
     println!("cargo:rerun-if-changed=ui/dist");
 

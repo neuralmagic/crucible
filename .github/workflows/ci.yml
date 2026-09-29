@@ -31,12 +31,151 @@ env:
   CARGO_NET_RETRY: "10"
 
 jobs:
-  # One job, ordered fail-fast: fmt is instant, then the compile-heavy steps share a single
-  # warm target/. Same-repo refs get the org's beefy self-hosted runners (32-core, sccache
-  # in S3, baked toolchain); fork PRs MUST stay on hosted runners — self-hosted instances
-  # carry an IAM role, and this is a public repo.
-  build-and-test:
+  # Same-repo refs get the org's beefy self-hosted runners (32-core, sccache in S3, baked
+  # toolchain); fork PRs MUST stay on hosted runners — self-hosted instances carry an IAM role,
+  # and this is a public repo.
+  test-all-features:
     timeout-minutes: 40
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # The baked AMI already carries the toolchain and tools; hosted runners install them.
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          # The GH cache API round-trips from EC2 are slower than sccache's in-region S3.
+          cache: ${{ runner.environment == 'github-hosted' }}
+
+      - name: Install cargo-nextest (hosted only)
+        if: runner.environment == 'github-hosted'
+        uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2.82.2
+        with:
+          tool: cargo-nextest
+
+      - name: Enable sccache + mold
+        if: runner.environment == 'self-hosted'
+        run: |
+          {
+            echo "SCCACHE_BUCKET=llm-d-sccache-783952637884"
+            echo "SCCACHE_REGION=us-east-1"
+            echo "SCCACHE_S3_KEY_PREFIX=crucible"
+            echo "RUSTC_WRAPPER=sccache"
+            echo "RUSTFLAGS=-C link-arg=-fuse-ld=mold"
+          } >> "$GITHUB_ENV"
+
+      # The OIDC relying party's e2e suite (crucible-controller/src/identity/oidc/keycloak_e2e.rs)
+      # drives the real browser flow — the rendered login form included — and presents real
+      # Keycloak-minted access tokens. No mocks: this container IS the issuer, with the realm,
+      # clients, and users in crucible-controller/tests/keycloak/crucible-realm.json imported at
+      # startup. CRUCIBLE_REQUIRE_KEYCLOAK_TESTS turns the suite's "no issuer, skipping" path into
+      # a failure, so a broken step here can never pass as green.
+      # It boots while the tests compile; readiness is checked after the build.
+      - name: Start Keycloak
+        env:
+          KEYCLOAK_IMAGE: quay.io/keycloak/keycloak:26.4
+        run: |
+          set -eu
+          name="crucible-ci-keycloak-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker run -d --rm --name "$name" \
+            -e KC_BOOTSTRAP_ADMIN_USERNAME=admin -e KC_BOOTSTRAP_ADMIN_PASSWORD=admin \
+            -v "$PWD/crucible-controller/tests/keycloak:/opt/keycloak/data/import:ro" \
+            -p 127.0.0.1::8080 "$KEYCLOAK_IMAGE" start-dev --import-realm
+          port=$(docker port "$name" 8080/tcp | head -n1 | cut -d: -f2)
+          {
+            echo "KEYCLOAK_CONTAINER=$name"
+            echo "KEYCLOAK_URL=http://127.0.0.1:${port}"
+            echo "CRUCIBLE_REQUIRE_KEYCLOAK_TESTS=1"
+          } >> "$GITHUB_ENV"
+
+      # The controller's `#[sqlx::test]` suite needs a live Postgres at DATABASE_URL; each test
+      # creates (and drops) its own database on it. Compilation stays on the checked-in `.sqlx/`
+      # offline cache (SQLX_OFFLINE) — only the lint job's prepare-check talks to the server at
+      # compile time.
+      - name: Start Postgres
+        uses: ./.github/actions/postgres
+
+      # The Vault client's e2e suite (crucible-controller/tests/vault_e2e.rs) talks to a real
+      # Vault — no mocks. This container IS `vault server -dev`: in-memory, auto-unsealed, root
+      # token known. The tests provision their own KV v2 mount, AppRole/JWT roles, and policies on
+      # it, each under its own path prefix so they can share one server. CRUCIBLE_REQUIRE_VAULT_TESTS
+      # turns the suite's "no server, skipping" path into a failure, so a broken step here can
+      # never pass as green. The binary is copied out of the same image (it is statically linked)
+      # for the handful of tests that need a server they can seal.
+      - name: Start Vault
+        env:
+          VAULT_IMAGE: hashicorp/vault:2.0
+        run: |
+          set -eu
+          name="crucible-ci-vault-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker run -d --rm --name "$name" --cap-add=IPC_LOCK \
+            -e VAULT_DEV_ROOT_TOKEN_ID=ci -e VAULT_DEV_LISTEN_ADDRESS=0.0.0.0:8200 \
+            -p 127.0.0.1::8200 "$VAULT_IMAGE"
+          port=$(docker port "$name" 8200/tcp | head -n1 | cut -d: -f2)
+          mkdir -p "$HOME/.local/bin"
+          docker cp "$name:/bin/vault" "$HOME/.local/bin/vault"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          {
+            echo "VAULT_CONTAINER=$name"
+            echo "VAULT_ADDR=http://127.0.0.1:${port}"
+            echo "VAULT_TOKEN=ci"
+            echo "CRUCIBLE_REQUIRE_VAULT_TESTS=1"
+          } >> "$GITHUB_ENV"
+          for _ in $(seq 1 30); do
+            curl -fsS "http://127.0.0.1:${port}/v1/sys/health" >/dev/null && exit 0
+            sleep 1
+          done
+          echo "vault never became ready" >&2
+          exit 1
+
+      - name: Build tests
+        run: cargo nextest run --workspace --all-features --locked --no-run
+
+      - name: Wait for Keycloak
+        run: |
+          for _ in $(seq 1 120); do
+            curl -fsS "$KEYCLOAK_URL/realms/crucible/.well-known/openid-configuration" \
+              >/dev/null 2>&1 && exit 0
+            sleep 1
+          done
+          echo "keycloak never became ready" >&2
+          docker logs "$KEYCLOAK_CONTAINER" 2>&1 | tail -50 >&2
+          exit 1
+
+      # Nextest deliberately excludes ignored tests; this one proves an idle controller tick
+      # opens no span while an ingest still traces. It runs before the suite, whose tests
+      # leave the controller crate dirty for a later build.
+      - name: Test ignored tracing regression
+        run: cargo nextest run --workspace --all-features --locked --run-ignored only -E 'package(crucible-controller) & test(=issues::reconcile::tests::an_idle_tick_creates_no_span_but_an_ingest_still_traces)'
+
+      # nextest for the run (parallel, per-test isolation), cargo test for doctests,
+      # which nextest does not execute.
+      - name: Test
+        run: cargo nextest run --workspace --all-features --locked
+
+      - name: Stop Keycloak
+        if: always() && env.KEYCLOAK_CONTAINER != ''
+        run: docker rm -f "$KEYCLOAK_CONTAINER" || true
+
+      - name: Stop Postgres
+        if: always() && env.PG_CONTAINER != ''
+        run: docker rm -f "$PG_CONTAINER" || true
+
+      - name: Stop Vault
+        if: always() && env.VAULT_CONTAINER != ''
+        run: docker rm -f "$VAULT_CONTAINER" || true
+
+      - name: Doctests
+        run: cargo test --doc --workspace --all-features --locked
+
+      - name: sccache stats
+        if: runner.environment == 'self-hosted' && always()
+        run: sccache --show-stats
+
+  # Formatting, guards, clippy, and generated docs; beside the test jobs, fmt first.
+  lint:
+    timeout-minutes: 20
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -49,12 +188,6 @@ jobs:
           components: rustfmt, clippy
           # The GH cache API round-trips from EC2 are slower than sccache's in-region S3.
           cache: ${{ runner.environment == 'github-hosted' }}
-
-      - name: Install cargo-nextest (hosted only)
-        if: runner.environment == 'github-hosted'
-        uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2.82.2
-        with:
-          tool: cargo-nextest
 
       - name: Enable sccache + mold
         if: runner.environment == 'self-hosted'
@@ -102,138 +235,6 @@ jobs:
       - name: Clippy (default features)
         run: cargo clippy -p crucible -p crucible-controller -p crux --all-targets --locked --no-deps -- -D warnings
 
-      # The controller's `#[sqlx::test]` suite needs a live Postgres at DATABASE_URL; each test
-      # creates (and drops) its own database on it. An ephemeral host port so concurrent jobs on
-      # a shared self-hosted runner never collide. Compilation stays on the checked-in `.sqlx/`
-      # offline cache (SQLX_OFFLINE) — only the prepare-check below talks to the server at
-      # compile time.
-      - name: Start Postgres
-        run: |
-          name="crucible-ci-pg-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          docker run -d --rm --name "$name" -e POSTGRES_PASSWORD=ci -e POSTGRES_DB=crucible \
-            -p 127.0.0.1::5432 postgres:16 -c max_connections=400
-          port=$(docker port "$name" 5432/tcp | head -n1 | cut -d: -f2)
-          {
-            echo "PG_CONTAINER=$name"
-            echo "DATABASE_URL=postgres://postgres:ci@127.0.0.1:${port}/crucible"
-            echo "SQLX_OFFLINE=true"
-          } >> "$GITHUB_ENV"
-          for _ in $(seq 1 30); do
-            docker exec "$name" pg_isready -U postgres -d crucible && exit 0
-            sleep 1
-          done
-          echo "postgres never became ready" >&2
-          exit 1
-
-      # The Vault client's e2e suite (crucible-controller/tests/vault_e2e.rs) talks to a real
-      # Vault — no mocks. This container IS `vault server -dev`: in-memory, auto-unsealed, root
-      # token known. The tests provision their own KV v2 mount, AppRole/JWT roles, and policies on
-      # it, each under its own path prefix so they can share one server. CRUCIBLE_REQUIRE_VAULT_TESTS
-      # turns the suite's "no server, skipping" path into a failure, so a broken step here can
-      # never pass as green. The binary is copied out of the same image (it is statically linked)
-      # for the handful of tests that need a server they can seal.
-      - name: Start Vault
-        env:
-          VAULT_IMAGE: hashicorp/vault:2.0
-        run: |
-          set -eu
-          name="crucible-ci-vault-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          docker run -d --rm --name "$name" --cap-add=IPC_LOCK \
-            -e VAULT_DEV_ROOT_TOKEN_ID=ci -e VAULT_DEV_LISTEN_ADDRESS=0.0.0.0:8200 \
-            -p 127.0.0.1::8200 "$VAULT_IMAGE"
-          port=$(docker port "$name" 8200/tcp | head -n1 | cut -d: -f2)
-          mkdir -p "$HOME/.local/bin"
-          docker cp "$name:/bin/vault" "$HOME/.local/bin/vault"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          {
-            echo "VAULT_CONTAINER=$name"
-            echo "VAULT_ADDR=http://127.0.0.1:${port}"
-            echo "VAULT_TOKEN=ci"
-            echo "CRUCIBLE_REQUIRE_VAULT_TESTS=1"
-          } >> "$GITHUB_ENV"
-          for _ in $(seq 1 30); do
-            curl -fsS "http://127.0.0.1:${port}/v1/sys/health" >/dev/null && exit 0
-            sleep 1
-          done
-          echo "vault never became ready" >&2
-          exit 1
-
-      # The OIDC relying party's e2e suite (crucible-controller/src/identity/oidc/keycloak_e2e.rs)
-      # drives the real browser flow — the rendered login form included — and presents real
-      # Keycloak-minted access tokens. No mocks: this container IS the issuer, with the realm,
-      # clients, and users in crucible-controller/tests/keycloak/crucible-realm.json imported at
-      # startup. CRUCIBLE_REQUIRE_KEYCLOAK_TESTS turns the suite's "no issuer, skipping" path into
-      # a failure, so a broken step here can never pass as green.
-      - name: Start Keycloak
-        env:
-          KEYCLOAK_IMAGE: quay.io/keycloak/keycloak:26.4
-        run: |
-          set -eu
-          name="crucible-ci-keycloak-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          docker run -d --rm --name "$name" \
-            -e KC_BOOTSTRAP_ADMIN_USERNAME=admin -e KC_BOOTSTRAP_ADMIN_PASSWORD=admin \
-            -v "$PWD/crucible-controller/tests/keycloak:/opt/keycloak/data/import:ro" \
-            -p 127.0.0.1::8080 "$KEYCLOAK_IMAGE" start-dev --import-realm
-          port=$(docker port "$name" 8080/tcp | head -n1 | cut -d: -f2)
-          {
-            echo "KEYCLOAK_CONTAINER=$name"
-            echo "KEYCLOAK_URL=http://127.0.0.1:${port}"
-            echo "CRUCIBLE_REQUIRE_KEYCLOAK_TESTS=1"
-          } >> "$GITHUB_ENV"
-          for _ in $(seq 1 120); do
-            curl -fsS "http://127.0.0.1:${port}/realms/crucible/.well-known/openid-configuration" \
-              >/dev/null 2>&1 && exit 0
-            sleep 1
-          done
-          echo "keycloak never became ready" >&2
-          docker logs "$name" 2>&1 | tail -50 >&2
-          exit 1
-
-      # nextest for the run (parallel, per-test isolation), cargo test for doctests,
-      # which nextest does not execute.
-      - name: Test
-        run: cargo nextest run --workspace --all-features --locked
-
-      - name: Test (default features)
-        run: cargo nextest run -p crucible -p crucible-controller -p crux --locked
-
-      # Nextest deliberately excludes ignored tests; this one proves an idle controller tick
-      # opens no span while an ingest still traces.
-      - name: Test ignored tracing regression
-        run: cargo test -p crucible-controller --all-features --locked --lib -- --ignored an_idle_tick_creates_no_span_but_an_ingest_still_traces
-
-      # Guard the checked-in sqlx offline metadata (`.sqlx/`). `prepare --check` re-derives the
-      # query data (via the crate's own sqlx macro, so the format tracks the crate, not the CLI)
-      # and fails if it is stale. It needs a live migrated DB to analyze the queries against — the
-      # Postgres container started above.
-      - name: Cache sqlx-cli
-        id: sqlx-cli
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ env.CARGO_HOME || format('{0}/.cargo', env.HOME) }}/bin/sqlx
-          key: sqlx-cli-0.9.0-${{ runner.os }}-${{ runner.arch }}
-      - name: Install sqlx-cli
-        if: steps.sqlx-cli.outputs.cache-hit != 'true'
-        run: cargo install sqlx-cli --version 0.9.0 --no-default-features --features postgres,rustls --locked
-      - name: Check sqlx offline metadata is current
-        env:
-          SQLX_OFFLINE: "false"
-        run: |
-          sqlx migrate run --source crucible-controller/migrations
-          cargo sqlx prepare --check --workspace -- --all-targets --all-features
-
-      - name: Stop Keycloak
-        if: always() && env.KEYCLOAK_CONTAINER != ''
-        run: docker rm -f "$KEYCLOAK_CONTAINER" || true
-
-      - name: Stop Postgres
-        if: always() && env.PG_CONTAINER != ''
-        run: docker rm -f "$PG_CONTAINER" || true
-
-      - name: Stop Vault
-        if: always() && env.VAULT_CONTAINER != ''
-        run: docker rm -f "$VAULT_CONTAINER" || true
-
       - name: DSL reference is current
         run: ./scripts/dsl-docs.sh --check
 
@@ -251,12 +252,87 @@ jobs:
           govctl render rfc
           git diff --exit-code docs/rfc
 
-      - name: Doctests
-        run: cargo test --doc --workspace --all-features --locked
+      - name: Start Postgres
+        uses: ./.github/actions/postgres
+
+      # Guard the checked-in sqlx offline metadata (`.sqlx/`). `prepare --check` re-derives the
+      # query data (via the crate's own sqlx macro, so the format tracks the crate, not the CLI)
+      # and fails if it is stale. It needs a live migrated DB to analyze the queries against.
+      - name: Cache sqlx-cli
+        id: sqlx-cli
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CARGO_HOME || format('{0}/.cargo', env.HOME) }}/bin/sqlx
+          key: sqlx-cli-0.9.0-${{ runner.os }}-${{ runner.arch }}
+      - name: Install sqlx-cli
+        if: steps.sqlx-cli.outputs.cache-hit != 'true'
+        run: cargo install sqlx-cli --version 0.9.0 --no-default-features --features postgres,rustls --locked
+      - name: Check sqlx offline metadata is current
+        env:
+          SQLX_OFFLINE: "false"
+        run: |
+          sqlx migrate run --source crucible-controller/migrations
+          cargo sqlx prepare --check --workspace -- --all-targets --all-features
+
+      - name: Stop Postgres
+        if: always() && env.PG_CONTAINER != ''
+        run: docker rm -f "$PG_CONTAINER" || true
 
       - name: sccache stats
         if: runner.environment == 'self-hosted' && always()
         run: sccache --show-stats
+
+  # The default-feature build's tests. Vault and Keycloak suites skip here;
+  # test-all-features runs them.
+  test-default-features:
+    timeout-minutes: 30
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          cache: ${{ runner.environment == 'github-hosted' }}
+
+      - name: Install cargo-nextest (hosted only)
+        if: runner.environment == 'github-hosted'
+        uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2.82.2
+        with:
+          tool: cargo-nextest
+
+      - name: Enable sccache + mold
+        if: runner.environment == 'self-hosted'
+        run: |
+          {
+            echo "SCCACHE_BUCKET=llm-d-sccache-783952637884"
+            echo "SCCACHE_REGION=us-east-1"
+            echo "SCCACHE_S3_KEY_PREFIX=crucible"
+            echo "RUSTC_WRAPPER=sccache"
+            echo "RUSTFLAGS=-C link-arg=-fuse-ld=mold"
+          } >> "$GITHUB_ENV"
+
+      - name: Start Postgres
+        uses: ./.github/actions/postgres
+
+      - name: Test (default features)
+        run: cargo nextest run -p crucible -p crucible-controller -p crux --locked
+
+      - name: Stop Postgres
+        if: always() && env.PG_CONTAINER != ''
+        run: docker rm -f "$PG_CONTAINER" || true
+
+  # The required check: green only when every job above is.
+  build-and-test:
+    needs: [lint, test-all-features, test-default-features]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          [ "${{ needs.lint.result }}" = success ] &&
+            [ "${{ needs.test-all-features.result }}" = success ] &&
+            [ "${{ needs.test-default-features.result }}" = success ]
 
   # The controller SPA, independent of the Rust build. The package pre-hooks regenerate the
   # OpenAPI spec (from the controller's own bin) and the typed client before check/test/build.

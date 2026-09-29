@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::plan::ir::{
     EngineOp, Join, KEPT_INPUT, Plan, PlanBudget, PlanError, Stage, Task, TaskKind, TaskName,
 };
+use crate::plan::param::ParamValue;
 
 /// Names used only by the compatibility template.
 const LEGACY_NAMES: [&str; 4] = ["propose", "apply", "measure", "decide"];
@@ -174,6 +175,20 @@ pub enum WorkflowError {
          a failed candidate back through its next iteration"
     )]
     ReviseOutsidePlaybook { task: String },
+    #[error("task {task:?} declares history, which only a playbook launched in a series receives")]
+    HistoryOutsidePlaybook { task: String },
+    #[error(
+        "workflow names history record {record:?}, but only a playbook records history for its \
+         launch series"
+    )]
+    HistoryRecordOutsidePlaybook { record: String },
+    #[error("workflow history record {record:?} names an unknown task")]
+    UnknownHistoryRecord { record: String },
+    #[error(
+        "workflow history record {record:?} maps over a list; a run records one task's result, \
+         not a fan-out's"
+    )]
+    MappedHistoryRecord { record: String },
     #[error("engine task {task:?} cannot run in the epilogue (the loop is over)")]
     EngineTaskInEpilogue { task: String },
     #[error("report task {task:?} must run in the epilogue")]
@@ -220,6 +235,11 @@ pub enum WorkflowError {
     FileAndTasks { file: String },
     #[error("[workflow].file is empty")]
     FileEmpty,
+    #[error(
+        "[workflow] declares both file = {file:?} and history_record; name the record task in \
+         the source's workflow() instead"
+    )]
+    FileAndHistoryRecord { file: String },
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -231,6 +251,9 @@ pub struct WorkflowCfg {
     /// Result task; absent selects the compatibility splice format.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<TaskName>,
+    /// The task whose result each run records for the runs of its launch series that follow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_record: Option<TaskName>,
     /// A workflow source to compile, relative to the manifest directory, instead of inline
     /// tasks. A parameterised graph is a function of its launch arguments, so it cannot be a
     /// committed artifact and must be compiled per run.
@@ -241,6 +264,9 @@ pub struct WorkflowCfg {
     /// hash the graph itself or the hash stops discriminating between two different graphs.
     #[serde(skip)]
     pub resolved_from: Option<String>,
+    /// Every declared parameter's value as compilation bound it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, ParamValue>,
     #[serde(rename = "task", default)]
     pub tasks: Vec<Task>,
 }
@@ -277,6 +303,9 @@ impl WorkflowCfg {
             if !self.tasks.is_empty() {
                 return Err(WorkflowError::FileAndTasks { file: file.clone() });
             }
+            if self.history_record.is_some() {
+                return Err(WorkflowError::FileAndHistoryRecord { file: file.clone() });
+            }
             // Nothing to check until it is compiled; the compiled graph validates then.
             return Ok(());
         }
@@ -299,6 +328,7 @@ impl WorkflowCfg {
                 task: task.name.0.clone(),
             });
         }
+        self.validate_history()?;
         if self.is_legacy_splice() {
             self.validate_stages()?;
             return self.validate_legacy_splice();
@@ -308,6 +338,7 @@ impl WorkflowCfg {
             version: 1,
             reason: None,
             budget: PlanBudget { usd: f64::MAX },
+            params: self.params.clone(),
             tasks: self.tasks.clone(),
         };
         plan.validate()?;
@@ -441,6 +472,35 @@ impl WorkflowCfg {
             if self.may_settle_not_taken().contains(result) {
                 return Err(WorkflowError::ConditionalResult {
                     result: result.0.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// History belongs to a playbook launched in a series, and a run records one task's result.
+    fn validate_history(&self) -> Result<(), WorkflowError> {
+        if self.workflow_type != WorkflowType::Playbook {
+            if let Some(task) = self.tasks.iter().find(|task| task.history.is_some()) {
+                return Err(WorkflowError::HistoryOutsidePlaybook {
+                    task: task.name.0.clone(),
+                });
+            }
+            if let Some(record) = &self.history_record {
+                return Err(WorkflowError::HistoryRecordOutsidePlaybook {
+                    record: record.0.clone(),
+                });
+            }
+        }
+        if let Some(record) = &self.history_record {
+            let Some(task) = self.tasks.iter().find(|task| &task.name == record) else {
+                return Err(WorkflowError::UnknownHistoryRecord {
+                    record: record.0.clone(),
+                });
+            };
+            if task.over.is_some() {
+                return Err(WorkflowError::MappedHistoryRecord {
+                    record: record.0.clone(),
                 });
             }
         }
@@ -720,7 +780,7 @@ fn is_ancestor(tasks: &BTreeMap<&TaskName, &Task>, ancestor: &TaskName, node: &T
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::plan::workflow::*;
 
     fn parse(source: &str) -> WorkflowCfg {
         toml::from_str(source).expect("parse workflow")
@@ -1193,7 +1253,7 @@ mod tests {
         let toml = toml::to_string(&workflow).unwrap();
         assert!(toml.contains("emits = [\"score\", \"pass\"]"), "{toml}");
         let back: WorkflowCfg = toml::from_str(&toml).unwrap();
-        assert_eq!(back.tasks[0].emits.len(), 2);
+        assert_eq!(back.tasks[0].emits.names(), ["score", "pass"]);
 
         // Undeclared emits stays off the wire, keeping existing manifests byte-identical.
         let bare = parse(
@@ -1201,6 +1261,29 @@ mod tests {
              [[task]]\nname = \"c\"\nkind = \"command\"\ncommand = \"true\"\n",
         );
         assert!(!toml::to_string(&bare).unwrap().contains("emits"));
+    }
+
+    #[test]
+    fn typed_emits_round_trip_the_generated_toml() {
+        let workflow = parse(
+            "type = \"custom\"\nresult = \"check\"\n\
+             [[task]]\nname = \"check\"\nkind = \"evaluate\"\ncommand = \"true\"\n\
+             emits = { score = \"number\", pass = \"boolean\", tier = [\"high\", \"low\"] }\n",
+        );
+        workflow.validate().unwrap();
+        let toml = toml::to_string(&workflow).unwrap();
+        let back: WorkflowCfg = toml::from_str(&toml).unwrap();
+        back.validate().unwrap();
+        assert_eq!(back.tasks[0].emits, workflow.tasks[0].emits);
+        assert_eq!(toml::to_string(&back).unwrap(), toml);
+        assert!(
+            matches!(
+                back.tasks[0].emits.field("tier"),
+                crate::plan::ir::Declared::Typed(crucible_contract::emits::FieldType::OneOf(labels))
+                    if labels.len() == 2
+            ),
+            "{toml}"
+        );
     }
 
     fn full_autoresearch() -> WorkflowCfg {
@@ -1211,5 +1294,126 @@ mod tests {
              [[task]]\nname = \"score\"\nkind = \"engine\"\nop = \"measure\"\ndepends_on = [\"deploy\"]\n\
              [[task]]\nname = \"choose\"\nkind = \"engine\"\nop = \"decide\"\nsource = \"score\"\ndepends_on = [\"score\"]\n",
         )
+    }
+
+    const HISTORY: &str = "[[task]]\nname = \"look\"\nkind = \"agent\"\nprompt = \"p\"\nhistory = 3\n\
+         [[task]]\nname = \"fix\"\nkind = \"command\"\ncommand = \"true\"\ndepends_on = [\"look\"]\nhistory = 1\n\
+         [[task]]\nname = \"wrap\"\nkind = \"command\"\ncommand = \"true\"\nstage = \"epilogue\"\n";
+
+    #[test]
+    fn a_playbook_records_one_task_and_its_tasks_read_history() {
+        for record in ["fix", "wrap"] {
+            let workflow = parse(&format!(
+                "type = \"playbook\"\nhistory_record = \"{record}\"\n{HISTORY}"
+            ));
+            workflow.admit(&WorkflowCaps::playbook_engine()).unwrap();
+            assert_eq!(workflow.history_record, Some(record.into()));
+            let back: WorkflowCfg = toml::from_str(&toml::to_string(&workflow).unwrap()).unwrap();
+            assert_eq!(back.history_record, Some(record.into()));
+            assert_eq!(back.tasks[0].history, Some(3));
+        }
+        let bare = parse(
+            "type = \"playbook\"\n[[task]]\nname = \"c\"\nkind = \"command\"\ncommand = \"true\"\n",
+        );
+        let toml = toml::to_string(&bare).unwrap();
+        assert!(!toml.contains("history"), "{toml}");
+    }
+
+    #[test]
+    fn history_outside_a_playbook_is_refused() {
+        let custom = parse(&format!("type = \"custom\"\nresult = \"fix\"\n{HISTORY}"));
+        assert_eq!(
+            custom.validate().unwrap_err(),
+            WorkflowError::HistoryOutsidePlaybook {
+                task: "look".into()
+            }
+        );
+        let custom = parse(
+            "type = \"custom\"\nresult = \"c\"\nhistory_record = \"c\"\n\
+             [[task]]\nname = \"c\"\nkind = \"command\"\ncommand = \"true\"\n",
+        );
+        assert_eq!(
+            custom.validate().unwrap_err(),
+            WorkflowError::HistoryRecordOutsidePlaybook { record: "c".into() }
+        );
+        let autoresearch = parse(&format!("type = \"autoresearch\"\n{HISTORY}"));
+        assert_eq!(
+            autoresearch.validate().unwrap_err(),
+            WorkflowError::HistoryOutsidePlaybook {
+                task: "look".into()
+            }
+        );
+    }
+
+    #[test]
+    fn the_record_task_must_exist_and_not_fan_out() {
+        let unknown = parse(&format!(
+            "type = \"playbook\"\nhistory_record = \"nope\"\n{HISTORY}"
+        ));
+        assert_eq!(
+            unknown.validate().unwrap_err(),
+            WorkflowError::UnknownHistoryRecord {
+                record: "nope".into()
+            }
+        );
+        let mapped = parse(
+            "type = \"playbook\"\nhistory_record = \"each\"\n\
+             [[task]]\nname = \"list\"\nkind = \"command\"\ncommand = \"true\"\nemits = [\"items\"]\n\
+             [[task]]\nname = \"each\"\nkind = \"command\"\ncommand = \"true\"\ndepends_on = [\"list\"]\n\
+             over = { task = \"list\", field = \"items\" }\nmax_fanout = 2\n",
+        );
+        assert_eq!(
+            mapped.validate().unwrap_err(),
+            WorkflowError::MappedHistoryRecord {
+                record: "each".into()
+            }
+        );
+        let from_file =
+            parse("type = \"playbook\"\nfile = \"workflow.star\"\nhistory_record = \"a\"\n");
+        assert_eq!(
+            from_file.validate().unwrap_err(),
+            WorkflowError::FileAndHistoryRecord {
+                file: "workflow.star".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_history_depth_is_bounded_and_only_agent_command_and_evaluate_read_one() {
+        for depth in [0, 31] {
+            let workflow = parse(&format!(
+                "type = \"playbook\"\n[[task]]\nname = \"c\"\nkind = \"command\"\ncommand = \"true\"\nhistory = {depth}\n"
+            ));
+            assert_eq!(
+                workflow.validate().unwrap_err(),
+                WorkflowError::Plan(PlanError::HistoryDepthOutOfRange {
+                    task: "c".into(),
+                    got: depth
+                })
+            );
+        }
+        let route = parse(&format!("type = \"playbook\"\n{ROUTED}").replace(
+            "decider = { kind = \"output\", task = \"classify\" }\n",
+            "decider = { kind = \"output\", task = \"classify\" }\nhistory = 2\n",
+        ));
+        assert_eq!(
+            route.validate().unwrap_err(),
+            WorkflowError::Plan(PlanError::HistoryOnUnsupportedTask {
+                task: "gate".into(),
+                kind: "route"
+            })
+        );
+        let reserved = parse(
+            "type = \"playbook\"\n\
+             [[task]]\nname = \"history\"\nkind = \"command\"\ncommand = \"true\"\n\
+             [[task]]\nname = \"after\"\nkind = \"command\"\ncommand = \"true\"\ndepends_on = [\"history\"]\n",
+        );
+        assert_eq!(
+            reserved.validate().unwrap_err(),
+            WorkflowError::Plan(PlanError::ReservedDependencyName {
+                task: "after".into(),
+                dependency: "history".into()
+            })
+        );
     }
 }

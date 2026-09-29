@@ -145,13 +145,50 @@ pub struct PlanTaskWire {
     /// `route.question in a|b` when the task runs only on those answers, empty otherwise.
     #[serde(default)]
     pub when: String,
-    /// The dependency this task sends back when it settles failing, empty otherwise. Each round
+    /// The tasks this task sends back when it settles failing, empty otherwise. Each round
     /// reports as `task[round-N]`, so a renderer draws the loop from this before any round runs.
-    #[serde(default)]
-    pub revise: String,
+    #[serde(
+        default,
+        deserialize_with = "revise_targets",
+        serialize_with = "write_revise_targets"
+    )]
+    pub revise: Vec<String>,
     /// The most rounds `revise` may run, the first included; 0 when the task revises nothing.
     #[serde(default)]
     pub max_rounds: u32,
+    /// The fields the task's output promises, each with its type when the declaration gave one.
+    /// Empty when the task declares none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub emits: Vec<crate::emits::EmitWire>,
+    /// How long one attempt may run (`90s`, `10m`, `2h`), empty when the task declares no limit
+    /// and only the run's wall-clock ceiling bounds it.
+    #[serde(default)]
+    pub timeout: String,
+    /// How many earlier runs of its series the task reads under `history`; 0 when it reads none.
+    #[serde(default)]
+    pub history_depth: u32,
+}
+
+fn write_revise_targets<S: serde::Serializer>(targets: &[String], s: S) -> Result<S::Ok, S::Error> {
+    match targets {
+        [] => s.serialize_str(""),
+        [one] => s.serialize_str(one),
+        many => many.serialize(s),
+    }
+}
+
+fn revise_targets<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Targets {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match Targets::deserialize(d)? {
+        Targets::One(target) if target.is_empty() => Vec::new(),
+        Targets::One(target) => vec![target],
+        Targets::Many(targets) => targets,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -394,6 +431,10 @@ pub enum SessionEvent {
         reason: String,
         budget_usd: f64,
         tasks: Vec<PlanTaskWire>,
+        /// The task whose result the run records for its series; empty when the playbook names
+        /// none.
+        #[serde(default)]
+        history_record: String,
     },
     /// What a task proposed for a receiving orchestrator to admit. Emitted once per task that
     /// emitted any, as it settles, so what a run proposed is auditable independently of what was
@@ -443,6 +484,11 @@ pub enum SessionEvent {
         trace_id: String,
         #[serde(default)]
         span_id: String,
+    },
+    /// What this run records for its launch series, emitted once before `Shutdown` by a playbook
+    /// run. The orchestrator copies it into the record later runs of the series receive.
+    HistoryEntry {
+        entry: crate::history::HistoryEntry,
     },
     /// The loop is exiting, emitted exactly once as the LAST line of the session log. `outcome` is
     /// one of `finished`/`solved`/`budget`/`stopped`/`escalated`/`stalled`/`error`. The viewer keys
@@ -824,10 +870,108 @@ mod tests {
                 over: "discover.targets".into(),
                 max_fanout: 8,
                 when: String::new(),
-                revise: "draft".into(),
+                revise: vec!["draft".into(), "check".into()],
                 max_rounds: 3,
+                emits: vec![
+                    crate::emits::EmitWire {
+                        field: "targets".into(),
+                        ty: Some(crate::emits::FieldType::List),
+                    },
+                    crate::emits::EmitWire {
+                        field: "note".into(),
+                        ty: None,
+                    },
+                ],
+                timeout: "10m".into(),
+                history_depth: 5,
             }],
+            history_record: "propose-a".into(),
         });
+    }
+
+    #[test]
+    fn history_entry_round_trips_with_and_without_a_result() {
+        use crate::history::{HistoryEntry, RecordedStatus};
+        assert_round_trips(SessionEvent::HistoryEntry {
+            entry: HistoryEntry {
+                task: "triage".into(),
+                status: Some(RecordedStatus::Pass),
+                output: Some(serde_json::json!({"fixed": 1.5, "notes": ["a"]})),
+            },
+        });
+        let line = encode(&SessionEvent::HistoryEntry {
+            entry: HistoryEntry {
+                task: String::new(),
+                status: None,
+                output: None,
+            },
+        });
+        assert_eq!(
+            line,
+            r#"{"v":1,"kind":"history_entry","entry":{"task":"","status":null,"output":null}}"#
+        );
+        assert!(decode(&line).is_some());
+    }
+
+    /// A log written before the history keys existed still decodes, with the defaults an
+    /// orchestrator reads as "no record task" and "reads no history".
+    #[test]
+    fn plan_admitted_without_history_keys_decodes() {
+        let ev = decode(
+            r#"{"v":1,"kind":"plan_admitted","plan_version":1,"budget_usd":1.0,"tasks":[{"name":"a","kind":"command"}]}"#,
+        )
+        .expect("decodes");
+        let SessionEvent::PlanAdmitted {
+            tasks,
+            history_record,
+            ..
+        } = ev
+        else {
+            panic!("wrong event: {ev:?}");
+        };
+        assert_eq!(history_record, "");
+        assert_eq!(tasks[0].history_depth, 0);
+    }
+
+    #[test]
+    fn no_or_one_revise_target_is_written_as_the_string_earlier_readers_expect() {
+        let task = |revise: Vec<String>| PlanTaskWire {
+            name: "repro".into(),
+            kind: "command".into(),
+            depends_on: vec![],
+            session: String::new(),
+            needs: "any".into(),
+            required: true,
+            join: "all".into(),
+            stage: "iteration".into(),
+            over: String::new(),
+            max_fanout: 0,
+            when: String::new(),
+            revise,
+            max_rounds: 0,
+            emits: Vec::new(),
+            timeout: String::new(),
+            history_depth: 0,
+        };
+        let written = |revise: Vec<String>| {
+            serde_json::to_value(task(revise)).expect("encodes")["revise"].clone()
+        };
+        assert_eq!(written(vec![]), serde_json::json!(""));
+        assert_eq!(written(vec!["author".into()]), serde_json::json!("author"));
+        assert_eq!(
+            written(vec!["pick".into(), "build".into()]),
+            serde_json::json!(["pick", "build"])
+        );
+    }
+
+    #[test]
+    fn a_revise_target_written_as_one_string_reads_as_a_list() {
+        let line = r#"{"name":"repro","kind":"command","revise":"author","max_rounds":3}"#;
+        let task: PlanTaskWire = serde_json::from_str(line).expect("decodes");
+        assert_eq!(task.revise, vec!["author".to_string()]);
+        let none: PlanTaskWire =
+            serde_json::from_str(r#"{"name":"a","kind":"command","revise":""}"#).expect("decodes");
+        assert!(none.revise.is_empty());
     }
 
     /// Asks reach the log as their emitting task settles, so an auditor can compare what a run

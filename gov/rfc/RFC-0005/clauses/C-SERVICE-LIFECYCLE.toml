@@ -1,0 +1,23 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-SERVICE-LIFECYCLE"
+title = "Service lifecycle"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+The engine MUST start a service no later than the first dispatch of a task that needs it, and MUST NOT start a service no dispatched task needs. It MUST give the service the run identifier as CRUCIBLE_RUN_ID and a free loopback port as CRUCIBLE_SERVICE_PORT, and MUST NOT dispatch a task that needs the service until the service is ready: an MCP initialize handshake that succeeds for an MCP transport, any HTTP response for plain HTTP. The run identifier MUST be unique across runs and the same across a run's resumptions.
+
+
+
+A service that is not ready within the engine's readiness bound, or has exited when a task that needs it is about to dispatch, MUST fail that attempt as a transport failure, retried under the run's transport policy; the task did not run. A service that exits while a task that needs it is running MUST fail that task's attempt as a transport failure. The engine MUST restart an exited service before the next dispatch that needs it, and after the engine's restart bound for one run MUST treat further attempts that need it as transport failures without restarting it.
+
+
+
+One instance of each service runs at a time, shared by every task that needs it, epilogue tasks included. When the run ends, stops, or suspends, the engine MUST signal each service to stop, MUST allow it the engine's grace period, and MUST then kill it. A resumed run MUST start new instances. The engine MUST run services so that they do not outlive the run supervisor if it dies.
+
+
+
+crucible check MUST print the readiness bound, the restart bound, and the grace period."""

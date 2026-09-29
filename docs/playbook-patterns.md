@@ -169,8 +169,8 @@ DiffusionGemma yourself.
 
 ## Send work back
 
-A task with `revise = <dependency>` is a reviewer. When it settles failing and rounds remain,
-the dependency runs again with the verdict, and then the reviewer does.
+A task with `revise = <task>` or `revise = [<task>, ...]` is a reviewer. When it settles failing
+and rounds remain, the tasks it names run again with the verdict, and then the reviewer does.
 
 ```python
 author = agent(
@@ -205,8 +205,11 @@ From the second round, the author's inputs carry the reviewer's last verdict und
   verdict are the last round's.
 - **Sessions resume.** An author with a `session` continues the same conversation each round,
   so it remembers what it already tried.
-- **One pair, one loop.** The target must be a direct dependency. No fan-out on either side,
-  no two reviewers for one target, no nested or chained loops.
+- **Chains.** `revise = [pick, build]` sends back a chain: every listed task runs again in
+  dependency order, then the reviewer. Every task between a target and the reviewer has to be
+  listed, so no round leaves a task reading a stale result.
+- **One loop per task.** No fan-out inside a loop, no task in two loops, no nested or chained
+  loops.
 
 `examples/revise-loop` runs a revise pair through a real OpenShell sandbox with a fake model.
 
@@ -329,6 +332,45 @@ publish = report(
 The workflow names a destination key, never a URL, channel or credential. `result` projects
 only that task's declared fields into the message. No agent can skip the call or write the
 payload.
+
+The template is a Jinja file in the pack, rendered into the card body. It reads:
+
+| Name | Value |
+| --- | --- |
+| `verdict` | the run's verdict: `"pass"` when every required main-graph task passed or was not taken, otherwise `"fail"`. Advisory tasks and branches not taken never change it |
+| `spent_usd` | total task cost |
+| `passed`, `failed` | counts of settled tasks that passed and that did not, advisory and not-taken tasks included |
+| `tasks` | the first 20 settled tasks, each with `name`, `status`, `cost_usd` |
+| `run`, `run_url` | the run name and its Crucible link |
+| `result.name`, `result.status` | the selected task and its terminal status |
+| `result.output` | the selected task's declared fields, with their JSON types; defined only when it passed |
+
+A field the selected task did not declare is never defined, so guard optional reads with
+`is defined`. Every value the template inserts is escaped for Slack, `|safe` included: a result
+holding `<!channel>` renders as that literal text. A body over
+`CRUCIBLE_REPORT_BODY_MAX_BYTES` (default and maximum 3000) fails the report task.
+
+```jinja
+{% if result.output is defined %}{{ result.output.summary }}{% else %}roundup {{ result.status }}{% endif %}
+```
+
+`severity_field` names one declared field of `result` whose value picks the card's accent:
+
+```python
+publish = report(
+    name = "publish-report",
+    destination = {"kind": "slack"},
+    template = "reports/slack.md.j2",
+    result = roundup,
+    severity_field = "severity",
+)
+```
+
+`"good"`, `"warning"` and `"danger"` set that accent whatever the run's verdict; the card shows
+the verdict on its own line. Any other value is neutral, as is a selected task that was skipped
+or not taken. A selected task that failed, transport-failed or was blocked renders `"danger"`.
+The field only picks an accent, never a payload fragment. Naming it without `result`, or naming
+a field `result` does not declare in `emits`, is a compile error.
 
 ## Where to look next
 

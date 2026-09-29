@@ -122,7 +122,7 @@ struct CompiledTask {
     #[serde(default)]
     isolation: Option<String>,
     #[serde(default)]
-    emits: Vec<String>,
+    emits: crucible::plan::ir::Emits,
     #[serde(default)]
     emits_files: Vec<String>,
     #[serde(default)]
@@ -199,7 +199,7 @@ pub fn graph_from_compiled(compiled: &[u8]) -> Result<WorkflowGraphDto, String> 
             needs: task.needs,
             join: task.join,
             isolation: task.isolation,
-            emits: task.emits,
+            emits: task.emits.names(),
             emits_files: task.emits_files,
             fanout: task.over.map(|over| FanOutDto {
                 over_task: over.task,
@@ -366,6 +366,16 @@ mod tests {
         assert_eq!(node(&graph, "a").needs, Needs::Other);
         assert_eq!(node(&graph, "a").join, Join::Other);
         assert!(node(&graph, "a").required, "a task is required by default");
+    }
+
+    #[test]
+    fn a_typed_emits_reduces_to_its_field_names() {
+        let graph = graph_from_compiled(
+            br#"{"type":"playbook","task":[
+                 {"name":"a","kind":"command","emits":{"tier":["high","low"],"count":"integer"}}]}"#,
+        )
+        .expect("reduces");
+        assert_eq!(node(&graph, "a").emits, ["count", "tier"]);
     }
 
     #[test]
