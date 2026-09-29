@@ -229,6 +229,12 @@ pub(crate) fn map_error(error: &starlark::Error, idents: &Idents) -> CompileErro
             None => CompileError::Eval(text),
         },
         starlark::ErrorKind::Fail(_) => CompileError::Failed(text),
+        starlark::ErrorKind::Native(native) => match native.downcast_ref::<CompileError>() {
+            Some(CompileError::ExternalMethod { method }) => CompileError::ExternalMethod {
+                method: method.clone(),
+            },
+            _ => CompileError::Eval(text),
+        },
         _ => CompileError::Eval(text),
     };
     match error.span() {

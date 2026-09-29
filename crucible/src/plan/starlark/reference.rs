@@ -359,8 +359,11 @@ pub fn functions() -> Vec<Function> {
             lane: Lane::Common,
             purpose: "Read a launch parameter. The `params` block must be the source's first \
                       statement, and a source that declares one compiles per run. A supplied \
-                      value may reach a prompt or a skill argument; a command or evaluate task \
-                      reads it from `params` in `CRUCIBLE_INPUTS` instead of its command line.",
+                      value may reach a prompt, with `+` and inside a region marked as external \
+                      input, or a skill argument; `str()`, `%`, `.format()`, and string methods \
+                      on it are refused, as is a value carrying the marker text. A command or \
+                      evaluate task reads it from `params` in `CRUCIBLE_INPUTS` instead of its \
+                      command line.",
             positional: Some("name"),
             kwargs: vec![],
         },
