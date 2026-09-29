@@ -230,6 +230,11 @@ pub struct Cluster {
     pub buildah_capabilities: bool,
     #[serde(default)]
     pub host_aliases: BTreeMap<String, String>,
+    /// Where a sandbox that asks for GPUs (`[agent.resources] gpus`) is scheduled: the GPU nodes'
+    /// labels, their taints' tolerations, and the runtime class that exposes the devices. Applied
+    /// only to GPU sandboxes. Takes effect under `sandbox_driver = "kubernetes"`.
+    #[serde(default)]
+    pub gpu_sandbox: crate::openshell::placement::GpuPlacement,
 }
 
 /// `state_pvc = "name"` (existing claim) or a `[cluster.state_pvc]` template.
@@ -452,6 +457,33 @@ mod tests {
                 .get("maas.example.com")
                 .map(String::as_str),
             Some("10.0.0.1")
+        );
+    }
+
+    #[test]
+    fn a_gpu_sandbox_placement_is_typed_and_defaults_empty() {
+        let profile: DeployProfile = toml::from_str(BASE).expect("profile parses");
+        assert!(profile.cluster.gpu_sandbox.is_empty());
+
+        let text = BASE.replace(
+            "[image]",
+            "[cluster.gpu_sandbox]\nruntime_class_name = \"nvidia\"\n\
+             [[cluster.gpu_sandbox.tolerations]]\nkey = \"nvidia.com/gpu\"\n\
+             operator = \"Exists\"\neffect = \"NoSchedule\"\n\n[image]",
+        );
+        let profile: DeployProfile = toml::from_str(&text).expect("profile parses");
+        let gpu = &profile.cluster.gpu_sandbox;
+        assert_eq!(gpu.runtime_class_name.as_deref(), Some("nvidia"));
+        assert_eq!(gpu.tolerations.len(), 1);
+        assert_eq!(gpu.tolerations[0].key.as_deref(), Some("nvidia.com/gpu"));
+
+        let typo = BASE.replace(
+            "[image]",
+            "[cluster.gpu_sandbox]\nnodeSelector = { a = \"b\" }\n\n[image]",
+        );
+        assert!(
+            toml::from_str::<DeployProfile>(&typo).is_err(),
+            "a misspelled key is refused, not dropped"
         );
     }
 

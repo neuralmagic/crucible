@@ -1,6 +1,6 @@
-# Tasks: general-purpose orchestration
+# Tasks: the no-judge lane
 
-Crucible is an optimization loop, but not every job has an objective. The **task lane** runs
+The autoresearch loop assumes an objective, but not every job has one. The **task lane** runs
 the same loop — sandbox, broker mediation, session log, publish, resume — for work that just
 needs doing: consolidate the open dependabot PRs, fix flaky tests nightly, regenerate docs,
 triage an issue backlog. One manifest, no Rust, no gate script.

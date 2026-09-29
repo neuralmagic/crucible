@@ -96,6 +96,7 @@ pub(crate) mod tests;
         crate::playbooks::api::drafts::delete_playbook_draft,
         crate::playbooks::api::drafts::launch_playbook_draft,
         crate::playbooks::api::drafts::graduate_playbook_draft,
+        crate::playbooks::api::drafts::publish_playbook_draft,
         crate::playbooks::api::registry::list_playbooks,
         crate::playbooks::api::registry::get_playbook,
         crate::playbooks::api::registry::get_playbook_schema,
@@ -145,6 +146,9 @@ pub(crate) mod tests;
         crate::secrets::api::bind_secret,
         crate::secrets::api::unbind_secret,
         crate::secrets::api::list_secret_audit,
+        crate::authz::impersonation::start,
+        crate::authz::impersonation::stop,
+        crate::authz::explain::explain,
         crate::authz::api::list_teams,
         crate::authz::api::create_team,
         crate::authz::api::get_team,
@@ -244,6 +248,7 @@ pub(crate) mod tests;
         crate::playbooks::api::drafts::LaunchDraftBody,
         crate::playbooks::api::drafts::GraduateDraftBody,
         crate::playbooks::api::drafts::GraduateAck,
+        crate::playbooks::api::drafts::PublishDraftBody,
         crate::playbooks::api::drafts::PlaybookDraftDto,
         crate::playbooks::api::drafts::PlaybookDraftDetail,
         crate::playbooks::api::drafts::DraftVersionDto,
@@ -262,6 +267,8 @@ pub(crate) mod tests;
         crate::playbooks::plan_graph::Needs,
         crate::playbooks::plan_graph::Join,
         crate::playbooks::api::registry::PlaybookDto,
+        crate::playbooks::api::registry::PlaybookSourceDto,
+        crate::playbooks::api::registry::SandboxResourcesDto,
         crate::playbooks::api::registry::PlaybookDetailDto,
         crate::playbooks::api::registry::LaunchPlaybookBody,
         crate::playbooks::api::registry::PlaybookLaunchAck,
@@ -321,6 +328,10 @@ pub(crate) mod tests;
         crate::secrets::ScopeKind,
         crate::secrets::ProjectionKind,
         crate::secrets::AuditAction,
+        crate::authz::impersonation::StartImpersonationBody,
+        crate::authz::explain::ExplanationDto,
+        crate::identity::session::Impersonation,
+        crate::authz::entitlement::Entitlement,
         crate::authz::api::TeamDto,
         crate::authz::api::MemberDto,
         crate::authz::api::MemberBody,
@@ -370,6 +381,11 @@ pub fn router(state: ApiState) -> Router {
         .routes(routes!(system::healthz))
         .routes(routes!(system::version))
         .routes(routes!(system::whoami))
+        .routes(routes!(
+            crate::authz::impersonation::start,
+            crate::authz::impersonation::stop
+        ))
+        .routes(routes!(crate::authz::explain::explain))
         .routes(routes!(
             crate::identity::api::credentials::get_credential,
             crate::identity::api::credentials::revoke_credential
@@ -450,6 +466,9 @@ pub fn router(state: ApiState) -> Router {
         ))
         .routes(routes!(
             crate::playbooks::api::drafts::graduate_playbook_draft
+        ))
+        .routes(routes!(
+            crate::playbooks::api::drafts::publish_playbook_draft
         ))
         .routes(routes!(crate::playbooks::api::drafts::get_co_draft_skill))
         .routes(routes!(crate::playbooks::api::drafts::get_co_draft))

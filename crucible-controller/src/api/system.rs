@@ -83,6 +83,10 @@ pub(crate) struct Whoami {
     proves_groups: bool,
     /// The teams the caller reaches, with the role held and how.
     teams: Vec<crate::authz::api::TeamMembershipDto>,
+    /// The lanes the caller may see and use.
+    entitlements: Vec<crate::authz::entitlement::Entitlement>,
+    /// Set while a platform administrator's session views as this user.
+    impersonation: Option<crate::identity::session::Impersonation>,
 }
 
 #[utoipa::path(
@@ -94,16 +98,10 @@ pub(crate) struct Whoami {
 )]
 pub(crate) async fn whoami(
     State(state): State<ApiState>,
-    identity: crate::identity::session::Identity,
-    groups: crate::identity::auth::Groups,
-    auth_path: crate::identity::auth::AuthPath,
     caller: crate::authz::Caller,
+    impersonation: Option<axum::Extension<crate::identity::session::Impersonation>>,
 ) -> Json<Whoami> {
-    let role = if auth_path.holds_roles() {
-        state.roles.role(&identity, &groups)
-    } else {
-        crate::identity::auth::Role::Viewer
-    };
+    let role = caller.role();
     let teams = caller
         .principals
         .teams()
@@ -114,14 +112,20 @@ pub(crate) async fn whoami(
         })
         .collect();
     Json(Whoami {
-        user: identity.0,
+        user: caller.principals.login().map(str::to_string),
         admin: role == crate::identity::auth::Role::Admin,
         role,
-        groups: groups.0,
+        groups: caller
+            .principals
+            .group_paths()
+            .map(str::to_string)
+            .collect(),
         mode: state.auth_mode,
-        downgraded: !auth_path.holds_roles(),
-        proves_groups: auth_path.carries_groups(),
+        downgraded: !caller.path.holds_roles(),
+        proves_groups: caller.path.carries_groups(),
         teams,
+        entitlements: crate::authz::entitlement::of(&state, &caller),
+        impersonation: impersonation.map(|axum::Extension(view)| view),
     })
 }
 

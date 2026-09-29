@@ -23,6 +23,7 @@ function whoami(overrides: Partial<Whoami> = {}): Whoami {
     mode: 'native',
     downgraded: false,
     proves_groups: true,
+    entitlements: [],
     teams: [
       { team: 'zeta', role: 'member', via: [{ kind: 'direct', role: 'member' }] },
       { team: 'llm-d', role: 'maintainer', via: [{ kind: 'group', group: '/groups/x', role: 'maintainer' }] },

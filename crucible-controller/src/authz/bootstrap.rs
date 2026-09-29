@@ -27,26 +27,43 @@ pub async fn seed_platform_administrators(pool: &PgPool, admins: &[String]) -> R
         pool,
         &TeamSlug::platform_administrators(),
         "Platform administrators",
-        || {
-            admins
-                .iter()
-                .filter_map(|login| match Principal::user(login) {
-                    Ok(Principal::User(login)) => Some(Member {
-                        member: MemberRef::User(login),
-                        role: TeamRole::Owner,
-                    }),
-                    _ => {
-                        tracing::warn!(
-                            login,
-                            "CONTROLLER_ADMINS entry is not a valid login; skipped"
-                        );
-                        None
-                    }
-                })
-                .collect()
-        },
+        || login_members(admins, TeamRole::Owner, "CONTROLLER_ADMINS"),
     )
     .await
+}
+
+/// Seed the playbook publishers team from `CONTROLLER_PUBLISHERS` while it reaches nobody. Its
+/// members hold `playbook_draft:publish` on drafts they own through the default policy set.
+pub async fn seed_playbook_publishers(pool: &PgPool, publishers: &[String]) -> Result<SeedOutcome> {
+    seed_team(
+        pool,
+        &TeamSlug::playbook_publishers(),
+        "Playbook publishers",
+        || login_members(publishers, TeamRole::Member, "CONTROLLER_PUBLISHERS"),
+    )
+    .await
+}
+
+/// Each configured login as a member at `role`; an entry that is not a login is skipped with a
+/// warning naming the `knob` it came from.
+fn login_members(logins: &[String], role: TeamRole, knob: &str) -> Vec<Member> {
+    logins
+        .iter()
+        .filter_map(|login| match Principal::user(login) {
+            Ok(Principal::User(login)) => Some(Member {
+                member: MemberRef::User(login),
+                role,
+            }),
+            _ => {
+                tracing::warn!(
+                    login,
+                    knob,
+                    "configured entry is not a valid login; skipped"
+                );
+                None
+            }
+        })
+        .collect()
 }
 
 /// Seed the platform operators team from `CONTROLLER_OPERATORS` and `CONTROLLER_OPERATOR_GROUPS`
@@ -58,22 +75,7 @@ pub async fn seed_platform_operators(
     operator_groups: &[String],
 ) -> Result<SeedOutcome> {
     seed_team(pool, &TeamSlug::platform_operators(), "Platform operators", || {
-        let mut seeded: Vec<Member> = operators
-            .iter()
-            .filter_map(|login| match Principal::user(login) {
-                Ok(Principal::User(login)) => Some(Member {
-                    member: MemberRef::User(login),
-                    role: TeamRole::Member,
-                }),
-                _ => {
-                    tracing::warn!(
-                        login,
-                        "CONTROLLER_OPERATORS entry is not a valid login; skipped"
-                    );
-                    None
-                }
-            })
-            .collect();
+        let mut seeded = login_members(operators, TeamRole::Member, "CONTROLLER_OPERATORS");
         for group in operator_groups {
             let rule = if group.starts_with('/') {
                 MembershipRule::parse(&format!("group-prefix:{group}"))
@@ -426,7 +428,7 @@ pub(crate) fn members_json(rows: &[store::MemberRow]) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::authz::model::{PLATFORM_ADMINISTRATORS, PLATFORM_OPERATORS};
+    use crate::authz::model::{PLATFORM_ADMINISTRATORS, PLATFORM_OPERATORS, PLAYBOOK_PUBLISHERS};
     use sqlx::PgPool;
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
@@ -509,6 +511,43 @@ mod tests {
             vec!["group-prefix:/groups/llm-d", "group-suffix:team-x", "bob"]
         );
         assert!(rows.iter().all(|r| r.role == TeamRole::Member));
+    }
+
+    /// The publishers team always exists after startup, so it can be managed from the teams page,
+    /// and configuration fills it only while it reaches nobody.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn publishers_seed_as_members_once_and_the_team_exists_regardless(pool: PgPool) {
+        let slug = TeamSlug::parse(PLAYBOOK_PUBLISHERS).expect("slug");
+        assert_eq!(
+            seed_playbook_publishers(&pool, &[]).await.expect("seed"),
+            SeedOutcome::Unreachable
+        );
+        assert!(store::get_team(&pool, &slug).await.expect("get").is_some());
+
+        let outcome =
+            seed_playbook_publishers(&pool, &["Reed".to_string(), "not a login".to_string()])
+                .await
+                .expect("seed");
+        assert_eq!(outcome, SeedOutcome::Seeded { added: 1 });
+        let rows = store::members_of(&pool, &slug).await.expect("members");
+        let spelled: Vec<String> = rows.iter().map(|r| r.member.stored()).collect();
+        assert_eq!(spelled, vec!["reed"]);
+        assert!(rows.iter().all(|r| r.role == TeamRole::Member));
+
+        assert_eq!(
+            seed_playbook_publishers(&pool, &["kim".to_string()])
+                .await
+                .expect("seed"),
+            SeedOutcome::Reachable,
+            "a team that reaches someone is the UI's to manage"
+        );
+        assert_eq!(
+            store::members_of(&pool, &slug)
+                .await
+                .expect("members")
+                .len(),
+            1
+        );
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]

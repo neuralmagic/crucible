@@ -588,6 +588,21 @@ impl Client {
         .await
     }
 
+    /// Register the newest compiling version as `playbook` with no review. `None` re-pins the
+    /// playbook the draft last published into, else the one it was seeded from.
+    pub async fn publish_draft<T: DeserializeOwned>(
+        &self,
+        id: &str,
+        playbook: Option<&str>,
+    ) -> Result<T> {
+        let body = serde_json::json!({ "playbook": playbook });
+        self.post(
+            &format!("/api/playbook-drafts/{}/publish", encode(id)),
+            Some(&body),
+        )
+        .await
+    }
+
     /// Append a draft version. A base that is no longer the newest save comes back as
     /// [`DraftSave::Stale`] rather than an error: the writer's next move is to re-read and merge,
     /// which needs the version that overtook it.

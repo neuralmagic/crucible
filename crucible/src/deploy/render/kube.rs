@@ -1749,6 +1749,14 @@ pub(super) fn kubernetes_sandbox_env(
             .expect("host aliases are JSON-serializable strings");
         env.push(plain("CRUCIBLE_SANDBOX_HOST_ALIASES", aliases));
     }
+    if !profile.cluster.gpu_sandbox.is_empty() {
+        let placement = serde_json::to_string(&profile.cluster.gpu_sandbox)
+            .expect("GPU placement is JSON-serializable");
+        env.push(plain(
+            crate::openshell::placement::GPU_PLACEMENT_ENV,
+            placement,
+        ));
+    }
     env.push(plain(
         "CRUCIBLE_SANDBOX_APP_ARMOR_PROFILE",
         "Unconfined".to_string(),
@@ -3406,6 +3414,44 @@ mod tests {
         assert!(
             !yaml.contains("STORAGE_DRIVER"),
             "no in-pod builds => no buildah env: {yaml}"
+        );
+    }
+
+    /// GPU placement rides the loop pod as JSON the engine hands the driver unchanged, and a
+    /// profile without it adds nothing.
+    #[test]
+    fn kubernetes_projects_gpu_sandbox_placement_only_when_configured() {
+        let placement = |profile: &DeployProfile| {
+            kubernetes_sandbox_env(profile, "sandbox:dev")
+                .into_iter()
+                .find(|e| e.name == crate::openshell::placement::GPU_PLACEMENT_ENV)
+                .and_then(|e| e.value)
+        };
+        assert_eq!(placement(&k8s_profile("")), None);
+
+        let profile = k8s_profile(
+            r#"
+            [cluster.gpu_sandbox]
+            runtime_class_name = "nvidia"
+            node_selector = { "nvidia.com/gpu.present" = "true" }
+            [[cluster.gpu_sandbox.tolerations]]
+            key = "nvidia.com/gpu"
+            operator = "Exists"
+            effect = "NoSchedule"
+            "#,
+        );
+        let raw = placement(&profile).expect("a configured placement is projected");
+        let back: crate::openshell::placement::GpuPlacement =
+            serde_json::from_str(&raw).expect("the projection parses back");
+        assert_eq!(back, profile.cluster.gpu_sandbox);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&raw).expect("json"),
+            serde_json::json!({
+                "node_selector": {"nvidia.com/gpu.present": "true"},
+                "tolerations": [{"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"}],
+                "runtime_class_name": "nvidia",
+            }),
+            "the keys are the driver's pod config keys and a toleration is the Kubernetes shape"
         );
     }
 

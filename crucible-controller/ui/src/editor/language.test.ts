@@ -9,6 +9,8 @@ describe('languageOf', () => {
     expect(languageOf('params.json')).toBe('json');
     expect(languageOf('settle.sh')).toBe('shell');
     expect(languageOf('deploy.yaml')).toBe('yaml');
+    expect(languageOf('policy/edit.cedar')).toBe('cedar');
+    expect(languageOf('stored/policy/history/0123abcd.CEDAR')).toBe('cedar');
   });
 
   it('falls back to plain text rather than guessing', () => {
