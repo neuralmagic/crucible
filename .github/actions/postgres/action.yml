@@ -4,7 +4,7 @@ runs:
   using: composite
   steps:
     # An ephemeral host port so concurrent jobs on a shared self-hosted runner never collide.
-    # Durability off and data on tmpfs: every sqlx test creates and migrates its own database.
+    # Durability off and data on tmpfs: every sqlx test creates its own database.
     - shell: bash
       run: |
         name="crucible-ci-pg-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
@@ -14,12 +14,28 @@ runs:
         port=$(docker port "$name" 5432/tcp | head -n1 | cut -d: -f2)
         {
           echo "PG_CONTAINER=$name"
+          echo "PG_PORT=$port"
           echo "DATABASE_URL=postgres://postgres:ci@127.0.0.1:${port}/crucible"
           echo "SQLX_OFFLINE=true"
         } >> "$GITHUB_ENV"
+        # Over TCP: the entrypoint's init-time server listens on the socket only.
         for _ in $(seq 1 30); do
-          docker exec "$name" pg_isready -U postgres -d crucible && exit 0
+          docker exec "$name" pg_isready -h 127.0.0.1 -U postgres -d crucible && exit 0
           sleep 1
         done
         echo "postgres never became ready" >&2
         exit 1
+
+    - id: sqlx-cli
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ env.CARGO_HOME || format('{0}/.cargo', env.HOME) }}/bin/sqlx
+        key: sqlx-cli-0.9.0-${{ runner.os }}-${{ runner.arch }}
+    - if: steps.sqlx-cli.outputs.cache-hit != 'true'
+      shell: bash
+      run: cargo install sqlx-cli --version 0.9.0 --no-default-features --features postgres,rustls --locked
+
+    # `#[sqlx::test]` creates each database from template1, so migrating it once means every
+    # test database starts migrated and the per-test migrator only checks the recorded versions.
+    - shell: bash
+      run: sqlx migrate run --source crucible-controller/migrations --database-url "postgres://postgres:ci@127.0.0.1:${PG_PORT}/template1"

@@ -181,21 +181,12 @@ jobs:
       # Nextest deliberately excludes ignored tests; this one proves an idle controller tick
       # opens no span while an ingest still traces.
       - name: Test ignored tracing regression
-        run: cargo test -p crucible-controller --all-features --locked --lib -- --ignored an_idle_tick_creates_no_span_but_an_ingest_still_traces
+        run: cargo nextest run --workspace --all-features --locked --run-ignored only -E 'package(crucible-controller) & test(=issues::reconcile::tests::an_idle_tick_creates_no_span_but_an_ingest_still_traces)'
 
       # Guard the checked-in sqlx offline metadata (`.sqlx/`). `prepare --check` re-derives the
       # query data (via the crate's own sqlx macro, so the format tracks the crate, not the CLI)
       # and fails if it is stale. It needs a live migrated DB to analyze the queries against — the
       # Postgres container started above.
-      - name: Cache sqlx-cli
-        id: sqlx-cli
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ env.CARGO_HOME || format('{0}/.cargo', env.HOME) }}/bin/sqlx
-          key: sqlx-cli-0.9.0-${{ runner.os }}-${{ runner.arch }}
-      - name: Install sqlx-cli
-        if: steps.sqlx-cli.outputs.cache-hit != 'true'
-        run: cargo install sqlx-cli --version 0.9.0 --no-default-features --features postgres,rustls --locked
       - name: Check sqlx offline metadata is current
         env:
           SQLX_OFFLINE: "false"
