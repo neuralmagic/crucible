@@ -7,11 +7,12 @@
 
 use crate::plan::exec::DeclaredStatus;
 use crate::plan::ir::KEPT_INPUT;
-use crate::plan::ir::{ITEM_INPUT, OUTCOME_INPUT, PARAMS_INPUT, REVISION_INPUT};
+use crate::plan::ir::{HISTORY_INPUT, ITEM_INPUT, OUTCOME_INPUT, PARAMS_INPUT, REVISION_INPUT};
 use crate::plan::ir::{MAX_FANOUT_CEILING, MAX_ROUNDS_CEILING};
 #[cfg(test)]
 use crate::plan::workflow::WorkflowType;
 use crucible_contract::decision::UNCERTAIN;
+use crucible_contract::history::MAX_HISTORY_DEPTH;
 
 /// Which lanes see a constructor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -146,6 +147,15 @@ fn task_knobs() -> Vec<Kwarg> {
             "stage",
             "\"iteration\" | \"epilogue\"",
             "`epilogue` runs once after the loop concludes, and only if the run kept a candidate.",
+        ),
+        Kwarg::new(
+            "history",
+            "int",
+            format!(
+                "Read this many earlier runs of the launch series, from 1 to the engine's ceiling \
+                 of {MAX_HISTORY_DEPTH}, under `{HISTORY_INPUT}`. A run launched outside a \
+                 series gets an empty list. Playbooks only."
+            ),
         ),
         when_kwarg(),
         answers_kwarg(),
@@ -377,6 +387,14 @@ pub fn functions() -> Vec<Function> {
                     "task",
                     "The task whose output is the workflow's result.",
                 ),
+                Kwarg::new(
+                    "history_record",
+                    "task",
+                    "The task each run records for the later runs of its launch series: its \
+                     status, and the fields it declares in `emits` when it passed. Not a mapped \
+                     task; an epilogue task records even when the main graph failed. Playbooks \
+                     only.",
+                ),
             ],
         },
         Function {
@@ -603,6 +621,17 @@ pub fn reserved_result_fields() -> Vec<Reserved> {
 /// join's per-dependency entry.
 pub fn reserved_inputs() -> Vec<Reserved> {
     vec![
+        Reserved::new(
+            HISTORY_INPUT,
+            "object",
+            "Earlier terminal runs of the launch series, as `{\"records\": [record], \
+             \"dropped\": int}`, oldest first by end time, at most the task's `history` depth. \
+             Each record is `{\"run\", \"started_at\", \"ended_at\", \"outcome\", \
+             \"verdict\", \"revision\", \"link\", \"entry\": {\"task\", \"status\", \
+             \"output\"}}`. `dropped` counts records the operator's size limit removed from the \
+             oldest end. In a task that declares `history` only; an agent reads it as marked \
+             external input.",
+        ),
         Reserved::new(
             ITEM_INPUT,
             "str",

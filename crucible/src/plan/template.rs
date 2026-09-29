@@ -51,6 +51,7 @@ pub(crate) fn iteration_template(
                 when: None,
                 revise: None,
                 timeout: None,
+                history: None,
             }
         };
     let mut tasks = vec![engine("propose", EngineOp::Propose, None, vec![])];
@@ -91,6 +92,7 @@ pub(crate) fn iteration_template(
         file: None,
         resolved_from: None,
         params: std::collections::BTreeMap::new(),
+        history_record: None,
     };
     workflow
         .admit(caps)

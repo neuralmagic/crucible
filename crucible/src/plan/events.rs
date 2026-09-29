@@ -1,8 +1,13 @@
 //! Session-log events a plan run emits: the admitted graph and each terminal task result.
 
-use crate::plan::ir::ValidPlan;
+use crate::plan::ir::{TaskName, ValidPlan};
 
-pub(crate) fn plan_admitted_event(plan: &ValidPlan) -> crate::report::session::SessionEvent {
+/// `history_record` is the playbook's record task, which lives on the workflow rather than the
+/// plan; a scored loop has none.
+pub(crate) fn plan_admitted_event(
+    plan: &ValidPlan,
+    history_record: Option<&TaskName>,
+) -> crate::report::session::SessionEvent {
     let p = plan.plan();
     crate::report::session::SessionEvent::PlanAdmitted {
         plan_version: p.version,
@@ -46,8 +51,10 @@ pub(crate) fn plan_admitted_event(plan: &ValidPlan) -> crate::report::session::S
                     .as_ref()
                     .map(ToString::to_string)
                     .unwrap_or_default(),
+                history_depth: t.history.unwrap_or_default(),
             })
             .collect(),
+        history_record: history_record.map(|t| t.0.clone()).unwrap_or_default(),
     }
 }
 
@@ -122,7 +129,7 @@ mod tests {
         .validate()
         .unwrap();
         let SessionEvent::PlanAdmitted { tasks, .. } =
-            crate::plan::events::plan_admitted_event(&plan)
+            crate::plan::events::plan_admitted_event(&plan, None)
         else {
             panic!("not a plan_admitted event");
         };
@@ -162,7 +169,7 @@ mod tests {
         .validate()
         .unwrap();
         let SessionEvent::PlanAdmitted { tasks, .. } =
-            crate::plan::events::plan_admitted_event(&plan)
+            crate::plan::events::plan_admitted_event(&plan, None)
         else {
             panic!("not a plan_admitted event");
         };
@@ -195,7 +202,8 @@ mod tests {
             }]
         );
         assert!(emits("bare").is_empty());
-        let line = crucible_contract::encode(&crate::plan::events::plan_admitted_event(&plan));
+        let line =
+            crucible_contract::encode(&crate::plan::events::plan_admitted_event(&plan, None));
         assert!(
             line.contains(r#""emits":[{"field":"score","type":"number"},{"field":"tier","type":["high","low"]}]"#),
             "{line}"
@@ -225,7 +233,7 @@ mod tests {
         .validate()
         .unwrap();
         let SessionEvent::PlanAdmitted { tasks, .. } =
-            crate::plan::events::plan_admitted_event(&plan)
+            crate::plan::events::plan_admitted_event(&plan, None)
         else {
             panic!("not a plan_admitted event");
         };

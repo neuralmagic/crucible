@@ -160,6 +160,9 @@ pub struct PlanTaskWire {
     /// and only the run's wall-clock ceiling bounds it.
     #[serde(default)]
     pub timeout: String,
+    /// How many earlier runs of its series the task reads under `history`; 0 when it reads none.
+    #[serde(default)]
+    pub history_depth: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -402,6 +405,10 @@ pub enum SessionEvent {
         reason: String,
         budget_usd: f64,
         tasks: Vec<PlanTaskWire>,
+        /// The task whose result the run records for its series; empty when the playbook names
+        /// none.
+        #[serde(default)]
+        history_record: String,
     },
     /// What a task proposed for a receiving orchestrator to admit. Emitted once per task that
     /// emitted any, as it settles, so what a run proposed is auditable independently of what was
@@ -451,6 +458,11 @@ pub enum SessionEvent {
         trace_id: String,
         #[serde(default)]
         span_id: String,
+    },
+    /// What this run records for its launch series, emitted once before `Shutdown` by a playbook
+    /// run. The orchestrator copies it into the record later runs of the series receive.
+    HistoryEntry {
+        entry: crate::history::HistoryEntry,
     },
     /// The loop is exiting, emitted exactly once as the LAST line of the session log. `outcome` is
     /// one of `finished`/`solved`/`budget`/`stopped`/`escalated`/`stalled`/`error`. The viewer keys
@@ -845,8 +857,54 @@ mod tests {
                     },
                 ],
                 timeout: "10m".into(),
+                history_depth: 5,
             }],
+            history_record: "propose-a".into(),
         });
+    }
+
+    #[test]
+    fn history_entry_round_trips_with_and_without_a_result() {
+        use crate::history::{HistoryEntry, RecordedStatus};
+        assert_round_trips(SessionEvent::HistoryEntry {
+            entry: HistoryEntry {
+                task: "triage".into(),
+                status: Some(RecordedStatus::Pass),
+                output: Some(serde_json::json!({"fixed": 1.5, "notes": ["a"]})),
+            },
+        });
+        let line = encode(&SessionEvent::HistoryEntry {
+            entry: HistoryEntry {
+                task: String::new(),
+                status: None,
+                output: None,
+            },
+        });
+        assert_eq!(
+            line,
+            r#"{"v":1,"kind":"history_entry","entry":{"task":"","status":null,"output":null}}"#
+        );
+        assert!(decode(&line).is_some());
+    }
+
+    /// A log written before the history keys existed still decodes, with the defaults an
+    /// orchestrator reads as "no record task" and "reads no history".
+    #[test]
+    fn plan_admitted_without_history_keys_decodes() {
+        let ev = decode(
+            r#"{"v":1,"kind":"plan_admitted","plan_version":1,"budget_usd":1.0,"tasks":[{"name":"a","kind":"command"}]}"#,
+        )
+        .expect("decodes");
+        let SessionEvent::PlanAdmitted {
+            tasks,
+            history_record,
+            ..
+        } = ev
+        else {
+            panic!("wrong event: {ev:?}");
+        };
+        assert_eq!(history_record, "");
+        assert_eq!(tasks[0].history_depth, 0);
     }
 
     /// Asks reach the log as their emitting task settles, so an auditor can compare what a run
