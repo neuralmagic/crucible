@@ -8,6 +8,9 @@ use anyhow::{Context, Result};
 use crucible_contract::decision::{Label, Question, QuestionError, QuestionId, UNCERTAIN};
 use serde::{Deserialize, Serialize};
 
+/// The reserved input a task that declares a history depth receives its launch series' earlier
+/// runs under.
+pub const HISTORY_INPUT: &str = "history";
 /// The reserved input a mapped instance receives its own item under. Reserved like the
 /// epilogue's kept-candidate input: a task may not declare a dependency by this name.
 pub const ITEM_INPUT: &str = "item";
@@ -24,7 +27,8 @@ pub const PARAMS_INPUT: &str = "params";
 pub const REVISION_INPUT: &str = "revision";
 /// Every key the engine writes into a task's inputs itself. A dependency named after one of
 /// them would have its entry overwritten, so [`crate::plan::ir::Plan::validate`] refuses it.
-pub const RESERVED_INPUTS: [&str; 5] = [
+pub const RESERVED_INPUTS: [&str; 6] = [
+    HISTORY_INPUT,
     ITEM_INPUT,
     KEPT_INPUT,
     OUTCOME_INPUT,
@@ -367,6 +371,9 @@ pub struct Task {
     /// How long one attempt may run before its runner kills it and it settles failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<TaskTimeout>,
+    /// How many earlier runs of the launch series this task reads under [`HISTORY_INPUT`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<u32>,
 }
 
 /// A reviewer's bounded send-back: when the reviewer settles failing, `task` runs again with the
@@ -700,6 +707,16 @@ pub enum PlanError {
         dependency: String,
     },
     #[error(
+        "task {task:?}: history = {got} is outside 1..={MAX_HISTORY_DEPTH}",
+        MAX_HISTORY_DEPTH = crucible_contract::history::MAX_HISTORY_DEPTH
+    )]
+    HistoryDepthOutOfRange { task: String, got: u32 },
+    #[error(
+        "task {task:?} declares history, but it is a {kind} task; only agent, command, and \
+         evaluate tasks read history"
+    )]
+    HistoryOnUnsupportedTask { task: String, kind: &'static str },
+    #[error(
         "task {task:?} declares a timeout, but {kind} tasks are engine work the runner does not \
          time; only agent, command, and evaluate tasks take one"
     )]
@@ -790,6 +807,23 @@ impl Plan {
                         stage: t.stage,
                         dependency: d.0.clone(),
                         dependency_stage,
+                    });
+                }
+            }
+            if let Some(depth) = t.history {
+                if !(1..=crucible_contract::history::MAX_HISTORY_DEPTH).contains(&depth) {
+                    return Err(PlanError::HistoryDepthOutOfRange {
+                        task: task(),
+                        got: depth,
+                    });
+                }
+                if !matches!(
+                    t.task,
+                    TaskKind::Agent { .. } | TaskKind::Command { .. } | TaskKind::Evaluate { .. }
+                ) {
+                    return Err(PlanError::HistoryOnUnsupportedTask {
+                        task: task(),
+                        kind: t.task.label(),
                     });
                 }
             }
@@ -1357,6 +1391,7 @@ mod tests {
             when: None,
             revise: None,
             timeout: None,
+            history: None,
         }
     }
 
@@ -1926,6 +1961,7 @@ mod tests {
             when: None,
             revise: None,
             timeout: None,
+            history: None,
         };
         let err = plan(vec![t]).validate().unwrap_err();
         assert_eq!(
@@ -2056,6 +2092,7 @@ mod tests {
             when: None,
             revise: None,
             timeout: None,
+            history: None,
         }
     }
 

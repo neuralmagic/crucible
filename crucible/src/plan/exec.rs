@@ -18,9 +18,10 @@ use serde_json::Value;
 use crate::crucible::Direction;
 use crate::deadline::{Bound, Deadline, RunCeiling};
 use crate::diagram::IllegalTransition;
+use crate::plan::history::SeriesHistory;
 use crate::plan::ir::{
-    Decider, ITEM_INPUT, Join, OUTCOME_INPUT, PARAMS_INPUT, REVISION_INPUT, Stage, Task, TaskKind,
-    TaskName, ValidPlan,
+    Decider, HISTORY_INPUT, ITEM_INPUT, Join, OUTCOME_INPUT, PARAMS_INPUT, REVISION_INPUT, Stage,
+    Task, TaskKind, TaskName, ValidPlan,
 };
 use crate::plan::machine::{
     BlockedReason, PlanEvent, PlanMachine, TaskEvent, TaskMachine, TaskState,
@@ -216,20 +217,36 @@ pub trait TaskRunner {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct ExecCfg {
+pub struct ExecCfg<'a> {
     /// Bounded auto-retry for transport failures (measured failures never retry).
     pub transport_retries: u32,
     /// How long the whole run may take. `None` means unbounded, which the scored loop
     /// tolerates because an operator is watching it; a playbook must supply one.
     pub wall_clock: Option<Duration>,
+    /// The launch series' earlier runs. `None` is a run in no series: a task that reads history
+    /// receives an empty list.
+    pub history: Option<&'a SeriesHistory>,
 }
 
-impl Default for ExecCfg {
+impl Default for ExecCfg<'_> {
     fn default() -> Self {
         ExecCfg {
             transport_retries: 2,
             wall_clock: None,
+            history: None,
         }
+    }
+}
+
+impl ExecCfg<'_> {
+    /// Write the reserved history input for a task that declares a depth.
+    fn add_history(&self, t: &Task, inputs: &mut BTreeMap<TaskName, Value>) {
+        let Some(depth) = t.history else { return };
+        let history = match self.history {
+            Some(history) => history.input(depth),
+            None => crate::plan::history::empty_input(),
+        };
+        inputs.insert(TaskName(HISTORY_INPUT.to_string()), history);
     }
 }
 
@@ -493,7 +510,7 @@ pub fn runnable_set<'a>(plan: &'a ValidPlan, substrate: &Substrate) -> BTreeSet<
 pub fn execute(
     plan: &ValidPlan,
     substrate: &Substrate,
-    cfg: ExecCfg,
+    cfg: ExecCfg<'_>,
     runner: &mut dyn TaskRunner,
     mut on_result: impl FnMut(&Task, &TaskResult),
 ) -> Result<PlanOutcome, IllegalTransition> {
@@ -762,6 +779,7 @@ pub fn execute(
         for t in &dispatch {
             let producers = file_producers(plan, t, &results, &*runner);
             let mut inputs = inputs_for(plan, t, &results, &producers);
+            cfg.add_history(t, &mut inputs);
             if t.stage == Stage::Epilogue {
                 inputs.insert(
                     TaskName(OUTCOME_INPUT.to_string()),
@@ -1134,7 +1152,8 @@ pub fn execute(
                     rounds.push((result, r));
                     break;
                 }
-                let reviewer_inputs = inputs_for(plan, reviewer, &view, &staged_for_review);
+                let mut reviewer_inputs = inputs_for(plan, reviewer, &view, &staged_for_review);
+                cfg.add_history(reviewer, &mut reviewer_inputs);
                 machines
                     .entry(reviewed.name.clone())
                     .or_default()
@@ -1909,7 +1928,7 @@ fn transport_result(
 fn run_with_retries(
     t: &Task,
     inputs: &BTreeMap<TaskName, Value>,
-    cfg: ExecCfg,
+    cfg: ExecCfg<'_>,
     run_ceiling: Option<RunCeiling>,
     runner: &mut dyn TaskRunner,
     spent: &mut f64,
@@ -1954,7 +1973,7 @@ fn run_with_retries(
 /// every item with its own deadline as it starts.
 fn run_batch_with_retries<'a>(
     batch: Vec<BatchItem<'a>>,
-    cfg: ExecCfg,
+    cfg: ExecCfg<'_>,
     run_ceiling: Option<RunCeiling>,
     runner: &mut dyn TaskRunner,
     spent: &mut f64,
@@ -2366,6 +2385,7 @@ mod tests {
             when: None,
             revise: None,
             timeout: None,
+            history: None,
         }
     }
 
@@ -3137,6 +3157,7 @@ mod tests {
             when: None,
             revise: None,
             timeout: None,
+            history: None,
         });
         let plan = valid(tasks, 10.0);
         let mut r = ScriptRunner::new();
@@ -3198,6 +3219,7 @@ mod tests {
             when: None,
             revise: None,
             timeout: None,
+            history: None,
         });
         let plan = valid(tasks, 10.0);
         let mut r = ScriptRunner::new();
@@ -3398,6 +3420,7 @@ mod tests {
             when: None,
             revise: None,
             timeout: None,
+            history: None,
         };
         tasks.push(pick);
         let plan = valid(tasks, 10.0);
@@ -6778,6 +6801,118 @@ mod tests {
                 assert_eq!(n, 0, "{}", ctx());
             }
         }
+    }
+
+    fn series(runs: &[&str]) -> crate::plan::history::SeriesHistory {
+        let records: Vec<Value> = runs
+            .iter()
+            .enumerate()
+            .map(|(i, run)| {
+                serde_json::json!({
+                    "run": run,
+                    "started_at": "2026-09-01T00:00:00Z",
+                    "ended_at": format!("2026-09-{:02}T00:00:00Z", i + 2),
+                    "outcome": "finished",
+                    "verdict": "valid",
+                    "revision": "rev",
+                    "link": format!("https://controller.test/runs/{run}"),
+                    "entry": {"task": "t", "status": "pass", "output": {}},
+                })
+            })
+            .collect();
+        crate::plan::history::SeriesHistory::parse(
+            &serde_json::json!({"version": 1, "records": records}).to_string(),
+            crate::plan::history::HistoryLimit {
+                bytes: u64::MAX,
+                source: crate::plan::history::LimitSource::Operator,
+            },
+        )
+        .unwrap()
+    }
+
+    fn history_runs(inputs: &BTreeMap<TaskName, Value>) -> Option<Vec<String>> {
+        inputs.get(&TaskName(HISTORY_INPUT.to_string())).map(|h| {
+            h["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["run"].as_str().unwrap().to_owned())
+                .collect()
+        })
+    }
+
+    /// Every dispatch of a task that declares a depth gets its history, whatever path dispatched
+    /// it: a plain task, each instance of a fan-out, every round of a revise loop on both sides.
+    /// A task that declares none gets no key at all.
+    #[test]
+    fn every_dispatch_of_a_task_with_a_depth_receives_its_history() {
+        let mut list = task("list", &[], "any", true);
+        list.emits = vec![crate::plan::ir::OutputField("items".into())];
+        let mut each = mapped_node("each", "list", "items", true);
+        each.history = Some(1);
+        let mut author = task("author", &["list"], "any", true);
+        author.history = Some(2);
+        let mut review = reviewing("review", &["author"], "author", 2);
+        review.history = Some(3);
+        let plain = task("plain", &["review"], "any", true);
+        let plan = valid(vec![list, each, author, review, plain], 10.0);
+
+        let history = series(&["r1", "r2", "r3", "r4"]);
+        let mut r = ScriptRunner::new();
+        r.on(
+            "list",
+            1,
+            || AttemptOutcome::Pass(serde_json::json!({"items": ["a", "b"]})),
+            0.1,
+        );
+        r.rounds("review", &[rejected, approved]);
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg {
+                history: Some(&history),
+                ..ExecCfg::default()
+            },
+            &mut r,
+            |_, _| {},
+        );
+        assert!(out.valid, "{:?}", out.results);
+
+        let seen: Vec<(String, Option<Vec<String>>)> = r
+            .runs
+            .iter()
+            .map(|(task, inputs)| (task.clone(), history_runs(inputs)))
+            .collect();
+        let owned = |runs: &[&str]| Some(runs.iter().map(|r| (*r).to_owned()).collect());
+        assert_eq!(
+            seen,
+            vec![
+                ("list".to_owned(), None),
+                ("each[a]".to_owned(), owned(&["r4"])),
+                ("each[b]".to_owned(), owned(&["r4"])),
+                ("author".to_owned(), owned(&["r3", "r4"])),
+                ("review".to_owned(), owned(&["r2", "r3", "r4"])),
+                ("author".to_owned(), owned(&["r3", "r4"])),
+                ("review".to_owned(), owned(&["r2", "r3", "r4"])),
+                ("plain".to_owned(), None),
+            ]
+        );
+        let revised = &r.runs[5].1;
+        assert!(revised.contains_key(&TaskName(REVISION_INPUT.to_string())));
+    }
+
+    #[test]
+    fn a_task_with_a_depth_in_a_run_with_no_series_gets_an_empty_history() {
+        let mut reader = task("reader", &[], "any", true);
+        reader.history = Some(5);
+        let plan = valid(vec![reader], 1.0);
+        let mut r = ScriptRunner::new();
+        let out = run_plan(&plan, &mut r);
+        assert!(out.valid);
+        assert_eq!(
+            r.seen_values["reader"][&TaskName(HISTORY_INPUT.to_string())],
+            serde_json::json!({"records": [], "dropped": 0})
+        );
     }
 
     fn with_params(tasks: Vec<Task>) -> ValidPlan {

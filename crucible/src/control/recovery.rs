@@ -932,6 +932,7 @@ mod tests {
                     revise: String::new(),
                     timeout: String::new(),
                     max_rounds: 0,
+                    history_depth: 0,
                 },
                 PlanTaskWire {
                     name: "measure".into(),
@@ -948,8 +949,10 @@ mod tests {
                     revise: String::new(),
                     timeout: String::new(),
                     max_rounds: 0,
+                    history_depth: 0,
                 },
             ],
+            history_record: String::new(),
         });
         let got = classify("plan-task", &events);
         match &got.classification {
@@ -972,6 +975,7 @@ mod tests {
             reason: String::new(),
             budget_usd: 5.0,
             tasks: vec![],
+            history_record: String::new(),
         });
         events.push(row(1, "discard", 260.0));
         let got = classify("plan-closed", &events);
@@ -999,6 +1003,7 @@ mod tests {
                 reason: String::new(),
                 budget_usd: 5.0,
                 tasks: vec![],
+                history_record: String::new(),
             },
         ];
         let got = classify("wide-phased", &events);
@@ -1021,6 +1026,7 @@ mod tests {
                 reason: String::new(),
                 budget_usd: 5.0,
                 tasks: vec![],
+                history_record: String::new(),
             },
         ];
         let got = classify("wide", &events);
@@ -1166,6 +1172,7 @@ mod tests {
             reason: String::new(),
             budget_usd: 5.0,
             tasks: vec![],
+            history_record: String::new(),
         });
         events.push(SessionEvent::ApprovalWait {
             handle: "h".into(),
