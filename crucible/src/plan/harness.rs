@@ -19,10 +19,13 @@ use crate::agent::turn::TurnFailure;
 use crate::plan::exec::{Attempt, AttemptOutcome, BatchItem, TaskRunner, TransportFailure};
 use crate::plan::ir::{Isolation, Task, TaskKind, TaskName};
 use crate::plan::runner::ShellRunner;
+use crate::plan::turn_log::{Heartbeat, TurnLog};
 use crucible_contract::TransportCause;
 use std::path::{Path, PathBuf};
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use crate::args::{Args, Paths};
 use crucible::deadline::Deadline;
@@ -750,6 +753,11 @@ fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
             Ok(prepared) => prepared,
             Err(note) => return Attempt::transport(TransportCause::Workspace, note),
         };
+    let log = Arc::new(Mutex::new(TurnLog::new(Instant::now())));
+    let heartbeat = {
+        let name = name.clone();
+        Heartbeat::spawn(Arc::clone(&log), move |line| eprintln!("[{name}] {line}"))
+    };
     let turn = crate::agent::run_turn_with_session(
         &args,
         paths,
@@ -761,11 +769,19 @@ fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
             if !line.trim().is_empty() && stream == RawStream::Stderr {
                 eprintln!("[{name}] {line}");
             }
+            if let Some(ev) = ev
+                && let Ok(mut log) = log.lock()
+            {
+                for progress in log.on_event(ev, Instant::now()) {
+                    eprintln!("[{name}] {progress}");
+                }
+            }
             if let Some(failure) = ev.and_then(agent_transport_error) {
                 transport_error = Some(failure);
             }
         },
     );
+    drop(heartbeat);
     let cost = turn.cost_usd;
     if let Some(TurnFailure::DeadlineExceeded(deadline)) = turn.failure() {
         let _ = std::fs::remove_file(&result_path);
