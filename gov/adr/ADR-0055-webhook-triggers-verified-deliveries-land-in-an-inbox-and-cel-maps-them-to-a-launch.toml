@@ -3,9 +3,21 @@
 [govctl]
 id = "ADR-0055"
 title = "Webhook triggers: verified deliveries land in an inbox and CEL maps them to a launch"
-status = "proposed"
+status = "accepted"
 date = "2026-09-29"
-refs = ["ADR-0033", "ADR-0037", "ADR-0043", "ADR-0049", "ADR-0054", "RFC-0002:C-PLAYBOOK-PARAMS", "RFC-0003:C-DECISION", "RFC-0003:C-ENFORCEMENT", "RFC-0003:C-WEBHOOK-DELIVERY", "RFC-0003:C-WEBHOOK-SETTLEMENT", "RFC-0003:C-WEBHOOK-LIFECYCLE"]
+refs = [
+    "ADR-0033",
+    "ADR-0037",
+    "ADR-0043",
+    "ADR-0049",
+    "ADR-0054",
+    "RFC-0002:C-PLAYBOOK-PARAMS",
+    "RFC-0003:C-DECISION",
+    "RFC-0003:C-ENFORCEMENT",
+    "RFC-0003:C-WEBHOOK-DELIVERY",
+    "RFC-0003:C-WEBHOOK-SETTLEMENT",
+    "RFC-0003:C-WEBHOOK-LIFECYCLE",
+]
 
 [content]
 context = """
@@ -59,49 +71,91 @@ consequences = """
 [[content.alternatives]]
 text = "Webhook sidecar on the standing-launch core; the handler verifies and stores to an inbox, the sweep transforms with CEL and fires"
 status = "accepted"
-pros = ["Reuses the one fire path, the firing decision, and the HA claim.", "A delivery survives a controller restart between receipt and launch.", "Every delivery has a recorded outcome."]
-cons = ["A new public listener and Route.", "A new dependency.", "Launch latency is one sweep tick, not immediate.", "Changes the [[ADR-0037]] claim contract and overlay shape."]
+pros = [
+    "Reuses the one fire path, the firing decision, and the HA claim.",
+    "A delivery survives a controller restart between receipt and launch.",
+    "Every delivery has a recorded outcome.",
+]
+cons = [
+    "A new public listener and Route.",
+    "A new dependency.",
+    "Launch latency is one sweep tick, not immediate.",
+    "Changes the [[ADR-0037]] claim contract and overlay shape.",
+]
 
 [[content.alternatives]]
 text = "Launch synchronously in the request handler"
 status = "rejected"
-pros = ["Immediate launch.", "No inbox table."]
-cons = ["A second launch-minting path beside the sweep's.", "A sender that times out and retries races the first request's launch.", "A burst of deliveries is a burst of launches before any ceiling is read."]
+pros = [
+    "Immediate launch.",
+    "No inbox table.",
+]
+cons = [
+    "A second launch-minting path beside the sweep's.",
+    "A sender that times out and retries races the first request's launch.",
+    "A burst of deliveries is a burst of launches before any ceiling is read.",
+]
 rejection_reason = "Duplicates the fire path [[ADR-0037]] made single, and gives sender retries a race against dedupe."
 
 [[content.alternatives]]
 text = "A webhook gateway in front (Argo Events, Tekton Triggers, Knative Eventing) that calls the launch API"
 status = "rejected"
 pros = ["Mature sender adapters and filters."]
-cons = ["Needs an operator and CRDs in a namespace-scoped deployment.", "The gateway would hold an API credential that launches as one principal, so per-trigger ownership is lost.", "Trigger config lives in Kubernetes objects instead of owned controller resources."]
+cons = [
+    "Needs an operator and CRDs in a namespace-scoped deployment.",
+    "The gateway would hold an API credential that launches as one principal, so per-trigger ownership is lost.",
+    "Trigger config lives in Kubernetes objects instead of owned controller resources.",
+]
 rejection_reason = "Launches would carry the gateway's identity rather than the trigger owner's, and [[ADR-0043]] rules out running as an operator (no CRDs, no reconciling Kubernetes objects it did not create)."
 
 [[content.alternatives]]
 text = "Poll the source instead (a registry watch trigger for images)"
 status = "rejected"
-pros = ["No public ingress.", "The image catalog already reads OCI registries."]
-cons = ["Per-source code for every sender.", "Latency of the poll interval.", "Most senders have nothing to poll."]
+pros = [
+    "No public ingress.",
+    "The image catalog already reads OCI registries.",
+]
+cons = [
+    "Per-source code for every sender.",
+    "Latency of the poll interval.",
+    "Most senders have nothing to poll.",
+]
 rejection_reason = "Ingress is available, and polling does not generalize past images. It remains the path for a deployment without ingress."
 
 [[content.alternatives]]
 text = "Transform as JSON Pointer extraction with equality filters and string templates"
 status = "rejected"
-pros = ["No new dependency.", "Trivial to evaluate safely."]
-cons = ["Cannot express membership or list logic, such as a tag being among the pushed tags.", "Every missing case becomes a new filter operator."]
-rejection_reason = "The quay case already needs `\"latest\" in body.updated_tags`, and the operator set would grow into an ad hoc language."
+pros = [
+    "No new dependency.",
+    "Trivial to evaluate safely.",
+]
+cons = [
+    "Cannot express membership or list logic, such as a tag being among the pushed tags.",
+    "Every missing case becomes a new filter operator.",
+]
+rejection_reason = 'The quay case already needs `"latest" in body.updated_tags`, and the operator set would grow into an ad hoc language.'
 
 [[content.alternatives]]
 text = "Transform in Starlark, the language packs are written in"
 status = "rejected"
-pros = ["Already a dependency.", "Familiar to pack authors."]
-cons = ["Owner-authored general-purpose code running in the controller process on public input.", "Needs step and memory limits the controller does not have today."]
+pros = [
+    "Already a dependency.",
+    "Familiar to pack authors.",
+]
+cons = [
+    "Owner-authored general-purpose code running in the controller process on public input.",
+    "Needs step and memory limits the controller does not have today.",
+]
 rejection_reason = "More power than a filter and a field map need, and the wrong trust boundary for code evaluated against internet input."
 
 [[content.alternatives]]
 text = "Transform in jq"
 status = "rejected"
 pros = ["Widely known for JSON reshaping."]
-cons = ["Expressions yield streams, so a filter or a single param value needs conventions on top.", "Untyped: a bool filter and a string key are both just output."]
+cons = [
+    "Expressions yield streams, so a filter or a single param value needs conventions on top.",
+    "Untyped: a bool filter and a string key are both just output.",
+]
 rejection_reason = "CEL gives typed single-value expressions and is what Tekton Triggers and Kubernetes admission use for this job."
 
 [[content.alternatives]]
