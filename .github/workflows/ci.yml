@@ -65,9 +65,33 @@ jobs:
             echo "RUSTFLAGS=-C link-arg=-fuse-ld=mold"
           } >> "$GITHUB_ENV"
 
+      # The OIDC relying party's e2e suite (crucible-controller/src/identity/oidc/keycloak_e2e.rs)
+      # drives the real browser flow — the rendered login form included — and presents real
+      # Keycloak-minted access tokens. No mocks: this container IS the issuer, with the realm,
+      # clients, and users in crucible-controller/tests/keycloak/crucible-realm.json imported at
+      # startup. CRUCIBLE_REQUIRE_KEYCLOAK_TESTS turns the suite's "no issuer, skipping" path into
+      # a failure, so a broken step here can never pass as green.
+      # It boots while the tests compile; readiness is checked after the build.
+      - name: Start Keycloak
+        env:
+          KEYCLOAK_IMAGE: quay.io/keycloak/keycloak:26.4
+        run: |
+          set -eu
+          name="crucible-ci-keycloak-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker run -d --rm --name "$name" \
+            -e KC_BOOTSTRAP_ADMIN_USERNAME=admin -e KC_BOOTSTRAP_ADMIN_PASSWORD=admin \
+            -v "$PWD/crucible-controller/tests/keycloak:/opt/keycloak/data/import:ro" \
+            -p 127.0.0.1::8080 "$KEYCLOAK_IMAGE" start-dev --import-realm
+          port=$(docker port "$name" 8080/tcp | head -n1 | cut -d: -f2)
+          {
+            echo "KEYCLOAK_CONTAINER=$name"
+            echo "KEYCLOAK_URL=http://127.0.0.1:${port}"
+            echo "CRUCIBLE_REQUIRE_KEYCLOAK_TESTS=1"
+          } >> "$GITHUB_ENV"
+
       # The controller's `#[sqlx::test]` suite needs a live Postgres at DATABASE_URL; each test
       # creates (and drops) its own database on it. Compilation stays on the checked-in `.sqlx/`
-      # offline cache (SQLX_OFFLINE) — only the prepare-check below talks to the server at
+      # offline cache (SQLX_OFFLINE) — only the lint job's prepare-check talks to the server at
       # compile time.
       - name: Start Postgres
         uses: ./.github/actions/postgres
@@ -105,57 +129,30 @@ jobs:
           echo "vault never became ready" >&2
           exit 1
 
-      # The OIDC relying party's e2e suite (crucible-controller/src/identity/oidc/keycloak_e2e.rs)
-      # drives the real browser flow — the rendered login form included — and presents real
-      # Keycloak-minted access tokens. No mocks: this container IS the issuer, with the realm,
-      # clients, and users in crucible-controller/tests/keycloak/crucible-realm.json imported at
-      # startup. CRUCIBLE_REQUIRE_KEYCLOAK_TESTS turns the suite's "no issuer, skipping" path into
-      # a failure, so a broken step here can never pass as green.
-      - name: Start Keycloak
-        env:
-          KEYCLOAK_IMAGE: quay.io/keycloak/keycloak:26.4
+      - name: Build tests
+        run: cargo nextest run --workspace --all-features --locked --no-run
+
+      - name: Wait for Keycloak
         run: |
-          set -eu
-          name="crucible-ci-keycloak-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          docker run -d --rm --name "$name" \
-            -e KC_BOOTSTRAP_ADMIN_USERNAME=admin -e KC_BOOTSTRAP_ADMIN_PASSWORD=admin \
-            -v "$PWD/crucible-controller/tests/keycloak:/opt/keycloak/data/import:ro" \
-            -p 127.0.0.1::8080 "$KEYCLOAK_IMAGE" start-dev --import-realm
-          port=$(docker port "$name" 8080/tcp | head -n1 | cut -d: -f2)
-          {
-            echo "KEYCLOAK_CONTAINER=$name"
-            echo "KEYCLOAK_URL=http://127.0.0.1:${port}"
-            echo "CRUCIBLE_REQUIRE_KEYCLOAK_TESTS=1"
-          } >> "$GITHUB_ENV"
           for _ in $(seq 1 120); do
-            curl -fsS "http://127.0.0.1:${port}/realms/crucible/.well-known/openid-configuration" \
+            curl -fsS "$KEYCLOAK_URL/realms/crucible/.well-known/openid-configuration" \
               >/dev/null 2>&1 && exit 0
             sleep 1
           done
           echo "keycloak never became ready" >&2
-          docker logs "$name" 2>&1 | tail -50 >&2
+          docker logs "$KEYCLOAK_CONTAINER" 2>&1 | tail -50 >&2
           exit 1
+
+      # Nextest deliberately excludes ignored tests; this one proves an idle controller tick
+      # opens no span while an ingest still traces. It runs before the suite, whose tests
+      # leave the controller crate dirty for a later build.
+      - name: Test ignored tracing regression
+        run: cargo nextest run --workspace --all-features --locked --run-ignored only -E 'package(crucible-controller) & test(=issues::reconcile::tests::an_idle_tick_creates_no_span_but_an_ingest_still_traces)'
 
       # nextest for the run (parallel, per-test isolation), cargo test for doctests,
       # which nextest does not execute.
       - name: Test
         run: cargo nextest run --workspace --all-features --locked
-
-      # Nextest deliberately excludes ignored tests; this one proves an idle controller tick
-      # opens no span while an ingest still traces.
-      - name: Test ignored tracing regression
-        run: cargo nextest run --workspace --all-features --locked --run-ignored only -E 'package(crucible-controller) & test(=issues::reconcile::tests::an_idle_tick_creates_no_span_but_an_ingest_still_traces)'
-
-      # Guard the checked-in sqlx offline metadata (`.sqlx/`). `prepare --check` re-derives the
-      # query data (via the crate's own sqlx macro, so the format tracks the crate, not the CLI)
-      # and fails if it is stale. It needs a live migrated DB to analyze the queries against — the
-      # Postgres container started above.
-      - name: Check sqlx offline metadata is current
-        env:
-          SQLX_OFFLINE: "false"
-        run: |
-          sqlx migrate run --source crucible-controller/migrations
-          cargo sqlx prepare --check --workspace -- --all-targets --all-features
 
       - name: Stop Keycloak
         if: always() && env.KEYCLOAK_CONTAINER != ''
@@ -254,6 +251,23 @@ jobs:
         run: |
           govctl render rfc
           git diff --exit-code docs/rfc
+
+      - name: Start Postgres
+        uses: ./.github/actions/postgres
+
+      # Guard the checked-in sqlx offline metadata (`.sqlx/`). `prepare --check` re-derives the
+      # query data (via the crate's own sqlx macro, so the format tracks the crate, not the CLI)
+      # and fails if it is stale. It needs a live migrated DB to analyze the queries against.
+      - name: Check sqlx offline metadata is current
+        env:
+          SQLX_OFFLINE: "false"
+        run: |
+          sqlx migrate run --source crucible-controller/migrations
+          cargo sqlx prepare --check --workspace -- --all-targets --all-features
+
+      - name: Stop Postgres
+        if: always() && env.PG_CONTAINER != ''
+        run: docker rm -f "$PG_CONTAINER" || true
 
       - name: sccache stats
         if: runner.environment == 'self-hosted' && always()
