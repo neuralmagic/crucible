@@ -1388,7 +1388,7 @@ async fn standing_launches_fire_through_one_sweep() -> Result<()> {
     assert_eq!(status, http::StatusCode::CREATED, "{registered}");
 
     // Three standing launches, one per trigger.
-    let fire_at = (jiff::Timestamp::now() + jiff::Span::new().seconds(1)).to_string();
+    let fire_at = (jiff::Timestamp::now() + jiff::Span::new().hours(1)).to_string();
     let (status, one_shot) = api(
         &app,
         "POST",
@@ -1405,6 +1405,12 @@ async fn standing_launches_fire_through_one_sweep() -> Result<()> {
     assert_eq!(status, http::StatusCode::CREATED, "{one_shot}");
     assert_eq!(one_shot["owner_principal"], "user:wren");
     assert_eq!(one_shot["dispatch_target"], "hub");
+    let one_shot_id = one_shot["id"].as_str().expect("id").to_string();
+    sqlx::query("UPDATE playbook_one_shots SET fire_at = $2 WHERE id = $1")
+        .bind(&one_shot_id)
+        .bind("2020-01-01T00:00:00Z")
+        .execute(db.pool())
+        .await?;
 
     let (status, schedule) = api(
         &app,
