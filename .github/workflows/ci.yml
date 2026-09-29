@@ -31,11 +31,11 @@ env:
   CARGO_NET_RETRY: "10"
 
 jobs:
-  # One job, ordered fail-fast: fmt is instant, then the compile-heavy steps share a single
-  # warm target/. Same-repo refs get the org's beefy self-hosted runners (32-core, sccache
-  # in S3, baked toolchain); fork PRs MUST stay on hosted runners — self-hosted instances
-  # carry an IAM role, and this is a public repo.
-  build-and-test:
+  # Ordered fail-fast: fmt is instant, then the compile-heavy steps share a single warm
+  # target/. Same-repo refs get the org's beefy self-hosted runners (32-core, sccache in S3,
+  # baked toolchain); fork PRs MUST stay on hosted runners — self-hosted instances carry an
+  # IAM role, and this is a public repo.
+  lint-and-test:
     timeout-minutes: 40
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-latest' }}
     steps:
@@ -103,27 +103,11 @@ jobs:
         run: cargo clippy -p crucible -p crucible-controller -p crux --all-targets --locked --no-deps -- -D warnings
 
       # The controller's `#[sqlx::test]` suite needs a live Postgres at DATABASE_URL; each test
-      # creates (and drops) its own database on it. An ephemeral host port so concurrent jobs on
-      # a shared self-hosted runner never collide. Compilation stays on the checked-in `.sqlx/`
+      # creates (and drops) its own database on it. Compilation stays on the checked-in `.sqlx/`
       # offline cache (SQLX_OFFLINE) — only the prepare-check below talks to the server at
       # compile time.
       - name: Start Postgres
-        run: |
-          name="crucible-ci-pg-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          docker run -d --rm --name "$name" -e POSTGRES_PASSWORD=ci -e POSTGRES_DB=crucible \
-            -p 127.0.0.1::5432 postgres:16 -c max_connections=400
-          port=$(docker port "$name" 5432/tcp | head -n1 | cut -d: -f2)
-          {
-            echo "PG_CONTAINER=$name"
-            echo "DATABASE_URL=postgres://postgres:ci@127.0.0.1:${port}/crucible"
-            echo "SQLX_OFFLINE=true"
-          } >> "$GITHUB_ENV"
-          for _ in $(seq 1 30); do
-            docker exec "$name" pg_isready -U postgres -d crucible && exit 0
-            sleep 1
-          done
-          echo "postgres never became ready" >&2
-          exit 1
+        uses: ./.github/actions/postgres
 
       # The Vault client's e2e suite (crucible-controller/tests/vault_e2e.rs) talks to a real
       # Vault — no mocks. This container IS `vault server -dev`: in-memory, auto-unsealed, root
@@ -194,9 +178,6 @@ jobs:
       - name: Test
         run: cargo nextest run --workspace --all-features --locked
 
-      - name: Test (default features)
-        run: cargo nextest run -p crucible -p crucible-controller -p crux --locked
-
       # Nextest deliberately excludes ignored tests; this one proves an idle controller tick
       # opens no span while an ingest still traces.
       - name: Test ignored tracing regression
@@ -257,6 +238,57 @@ jobs:
       - name: sccache stats
         if: runner.environment == 'self-hosted' && always()
         run: sccache --show-stats
+
+  # The default-feature build's tests, beside lint-and-test rather than after it. Vault and
+  # Keycloak suites skip here; lint-and-test runs them.
+  test-default-features:
+    timeout-minutes: 30
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          cache: ${{ runner.environment == 'github-hosted' }}
+
+      - name: Install cargo-nextest (hosted only)
+        if: runner.environment == 'github-hosted'
+        uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2.82.2
+        with:
+          tool: cargo-nextest
+
+      - name: Enable sccache + mold
+        if: runner.environment == 'self-hosted'
+        run: |
+          {
+            echo "SCCACHE_BUCKET=llm-d-sccache-783952637884"
+            echo "SCCACHE_REGION=us-east-1"
+            echo "SCCACHE_S3_KEY_PREFIX=crucible"
+            echo "RUSTC_WRAPPER=sccache"
+            echo "RUSTFLAGS=-C link-arg=-fuse-ld=mold"
+          } >> "$GITHUB_ENV"
+
+      - name: Start Postgres
+        uses: ./.github/actions/postgres
+
+      - name: Test (default features)
+        run: cargo nextest run -p crucible -p crucible-controller -p crux --locked
+
+      - name: Stop Postgres
+        if: always() && env.PG_CONTAINER != ''
+        run: docker rm -f "$PG_CONTAINER" || true
+
+  # The required check: green only when both halves are.
+  build-and-test:
+    needs: [lint-and-test, test-default-features]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          [ "${{ needs.lint-and-test.result }}" = success ] &&
+            [ "${{ needs.test-default-features.result }}" = success ]
 
   # The controller SPA, independent of the Rust build. The package pre-hooks regenerate the
   # OpenAPI spec (from the controller's own bin) and the typed client before check/test/build.

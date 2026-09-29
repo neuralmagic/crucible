@@ -1,0 +1,25 @@
+name: Start Postgres
+description: Throwaway Postgres for the sqlx test suite; exports DATABASE_URL and PG_CONTAINER.
+runs:
+  using: composite
+  steps:
+    # An ephemeral host port so concurrent jobs on a shared self-hosted runner never collide.
+    # Durability off and data on tmpfs: every sqlx test creates and migrates its own database.
+    - shell: bash
+      run: |
+        name="crucible-ci-pg-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
+        docker run -d --rm --name "$name" -e POSTGRES_PASSWORD=ci -e POSTGRES_DB=crucible \
+          --tmpfs /var/lib/postgresql/data:rw -p 127.0.0.1::5432 postgres:16 \
+          -c max_connections=400 -c fsync=off -c synchronous_commit=off -c full_page_writes=off
+        port=$(docker port "$name" 5432/tcp | head -n1 | cut -d: -f2)
+        {
+          echo "PG_CONTAINER=$name"
+          echo "DATABASE_URL=postgres://postgres:ci@127.0.0.1:${port}/crucible"
+          echo "SQLX_OFFLINE=true"
+        } >> "$GITHUB_ENV"
+        for _ in $(seq 1 30); do
+          docker exec "$name" pg_isready -U postgres -d crucible && exit 0
+          sleep 1
+        done
+        echo "postgres never became ready" >&2
+        exit 1
