@@ -1,7 +1,13 @@
 import { expect, test, type Locator, type Page, type Route } from '@playwright/test';
-import { ROUTES, stubApi } from './api';
+import { RANKED_IMAGES, ROUTES, stubApi } from './api';
 
 const STUDIO = '/playbooks/drafts/studio';
+
+/// Opens a select and returns its options.
+async function optionsOf(page: Page, trigger: string): Promise<Locator> {
+  await page.locator(trigger).click();
+  return page.getByRole('listbox').getByRole('option');
+}
 
 async function ready(page: Page, path: string): Promise<void> {
   const crashes: string[] = [];
@@ -709,11 +715,46 @@ test.describe('editor preferences', () => {
     await expect(excluded).toContainText('lacks toolchain.go');
     await expect(excluded).toContainText('custom-sandbox');
 
-    await page.locator('#studio-sandbox-image').click();
+    await expect(excluded.locator('li')).toHaveCount(2);
+
+    await expect((await optionsOf(page, '#studio-sandbox-image')).filter({ hasText: 'sandbox-go-cc' })).toHaveCount(1);
     await page.getByRole('option', { name: /sandbox-go-cc/ }).click();
     await expect(await editor(page)).toContainText(
       'sandbox_image = "ghcr.io/acme/sandbox-go-cc@sha256:1111',
     );
     await expect(page.getByText('save first')).toBeVisible();
+
+    const builds = await optionsOf(page, '#studio-sandbox-build');
+    await expect(builds).toHaveCount(4);
+    const incompatible = builds.filter({ hasText: /^1122334/ });
+    await expect(incompatible).toContainText('toolchain.go 1.24.2 ≠ >=1.25');
+    await expect(incompatible).toHaveAttribute('aria-disabled', 'true');
+    await builds.filter({ hasText: /^0a1b2c3/ }).click();
+    await expect(await editor(page)).toContainText(
+      `sandbox_image = "ghcr.io/acme/sandbox-go-cc@sha256:${'4'.repeat(64)}"`,
+    );
+  });
+
+  test('an image with a single build still shows it in the build field', async ({ page }) => {
+    await stubApi(page);
+    await page.route('**/api/images/rank', (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          ...RANKED_IMAGES,
+          compatible: RANKED_IMAGES.compatible.slice(0, 1),
+          excluded: RANKED_IMAGES.excluded.filter((e) => e.image.repository !== 'ghcr.io/acme/sandbox-go-cc'),
+        }),
+      }),
+    );
+    await ready(page, STUDIO);
+
+    await treeItem(page, 'crucible.toml').click();
+    await page.locator('#studio-sandbox-image').click();
+    await page.getByRole('option', { name: /sandbox-go-cc/ }).click();
+    const builds = await optionsOf(page, '#studio-sandbox-build');
+    await expect(builds).toHaveCount(1);
+    await expect(builds).toContainText('latest');
   });
 });
