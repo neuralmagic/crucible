@@ -493,6 +493,7 @@ const DEPLOY_PROFILE: &str = concat!(
 
 /// Point the autoresearch default at the World's chat-completions route, the way an administrator
 /// registers a ranking provider.
+#[cfg(feature = "autoresearch")]
 async fn register_ranker(db: &Db, url: &str) -> Result<()> {
     use crucible_controller::playbooks::providers as reg;
     let endpoint = reg::Endpoint {
