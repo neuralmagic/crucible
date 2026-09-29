@@ -30,6 +30,7 @@ clauses = [
     "clauses/C-REPORTS.toml",
     "clauses/C-SETTLED-JOIN.toml",
     "clauses/C-REVISE-LOOP.toml",
+    "clauses/C-RUN-HISTORY.toml",
 ]
 
 [[changelog]]
