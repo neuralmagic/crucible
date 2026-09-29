@@ -1105,7 +1105,7 @@ mod tests {
             expected(),
             BTreeMap::new(),
         );
-        v.rejects = reject_cache(Duration::from_millis(50));
+        v.rejects = reject_cache(Duration::from_secs(2));
 
         for _ in 0..5 {
             assert_eq!(
@@ -1119,7 +1119,7 @@ mod tests {
             "five rejected requests issue one TokenReview"
         );
 
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        tokio::time::sleep(Duration::from_millis(2200)).await;
         assert_eq!(
             v.validate("bad", "crucible-turn-h").await,
             Err(IngestReject::Unauthorized(RejectReason::Audience))
