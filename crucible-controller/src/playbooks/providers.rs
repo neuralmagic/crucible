@@ -1016,15 +1016,75 @@ async fn takes_new_work(pool: &PgPool, provider: &ModelProvider) -> Result<bool>
     if !provider.enabled {
         return Ok(false);
     }
-    Ok(
-        match crate::secrets::launch::resolve_provider_secret(pool, provider).await? {
-            Ok(_) => true,
-            Err(refusal) => {
-                tracing::warn!(provider = %provider.id, %refusal, "provider credential does not resolve");
-                false
-            }
-        },
-    )
+    Ok(match lookup_key(pool, provider).await? {
+        KeyLookup::Ambient | KeyLookup::Found { .. } => true,
+        refused => {
+            tracing::warn!(provider = %provider.id, ?refused, "provider credential does not resolve");
+            false
+        }
+    })
+}
+
+/// What a provider's credential reference resolves to in the secrets registry.
+#[derive(Debug)]
+pub enum KeyLookup {
+    /// No secret named: the deployment's ambient credentials pay.
+    Ambient,
+    /// The registered key, and the variable it is projected as.
+    Found {
+        row: crate::secrets::store::SecretRow,
+        key_env: &'static str,
+    },
+    /// The kind authenticates some other way, so a named secret has nowhere to go.
+    TakesNoSecret {
+        name: String,
+    },
+    BadName {
+        name: String,
+        reason: String,
+    },
+    Missing {
+        name: crate::secrets::SecretName,
+        owner: String,
+    },
+    WrongKind {
+        name: crate::secrets::SecretName,
+        kind: &'static str,
+    },
+}
+
+/// Look up the registry entry a provider spends, without reading its bytes.
+pub async fn lookup_key(pool: &PgPool, provider: &ModelProvider) -> Result<KeyLookup> {
+    let Some(secret) = provider.secret.as_ref() else {
+        return Ok(KeyLookup::Ambient);
+    };
+    let Some(key_env) = provider.api_key_env() else {
+        return Ok(KeyLookup::TakesNoSecret {
+            name: secret.name.clone(),
+        });
+    };
+    let name = match crate::secrets::SecretName::parse(&secret.name) {
+        Ok(name) => name,
+        Err(e) => {
+            return Ok(KeyLookup::BadName {
+                name: secret.name.clone(),
+                reason: e.to_string(),
+            });
+        }
+    };
+    let Some(row) = crate::secrets::store::find_owned(pool, &secret.owner, &name).await? else {
+        return Ok(KeyLookup::Missing {
+            name,
+            owner: secret.owner.to_string(),
+        });
+    };
+    if row.kind != crate::secrets::SecretKind::InferenceApiKey {
+        return Ok(KeyLookup::WrongKind {
+            name,
+            kind: row.kind.as_str(),
+        });
+    }
+    Ok(KeyLookup::Found { row, key_env })
 }
 
 /// What one issue's dispatch of `class` runs against: the first entry of [`chain_for_issue`].
