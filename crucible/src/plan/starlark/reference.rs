@@ -611,11 +611,27 @@ fn declared_status_type() -> String {
 
 /// Fields the engine reads out of a task's own JSON output.
 pub fn reserved_result_fields() -> Vec<Reserved> {
-    vec![Reserved::new(
-        "status",
-        declared_status_type(),
-        "Settles the task, overriding an exit code or `pass`. Any other value is ignored.",
-    )]
+    vec![
+        Reserved::new(
+            "status",
+            declared_status_type(),
+            "Settles the task, overriding an exit code or `pass`. Any other value is ignored.",
+        ),
+        Reserved::new(
+            crate::plan::ir::COMPLETE_FIELD,
+            "bool",
+            "`true` on a passing main-graph task of a playbook ends the run early and valid: \
+             nothing else in the main graph dispatches, undispatched tasks stay unsettled, and \
+             epilogue tasks still run. The shutdown outcome is `complete`. A task may not list it \
+             in `emits`.",
+        ),
+        Reserved::new(
+            crate::plan::ir::REASON_FIELD,
+            "str",
+            "Why the run completed early, recorded with the shutdown. A task may not list it in \
+             `emits`.",
+        ),
+    ]
 }
 
 /// Keys the engine writes into a task's inputs. None of them is ever wrapped in a settled
@@ -911,7 +927,10 @@ mod tests {
         let results = super::reserved_result_fields();
         assert_eq!(
             results.iter().map(|row| row.name).collect::<Vec<_>>(),
-            ["status"],
+            ["status"]
+                .into_iter()
+                .chain(crate::plan::ir::RESERVED_OUTPUTS)
+                .collect::<Vec<_>>(),
             "the table documents a field no engine code reads"
         );
         for declared in DeclaredStatus::ALL {

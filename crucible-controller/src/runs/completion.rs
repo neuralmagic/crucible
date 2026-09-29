@@ -122,9 +122,7 @@ pub async fn complete_run(
         evidence,
     )
     .await?;
-    // Only a run that finished its whole graph is evidence its inputs were processed; a ceiling or
-    // a stop leaves a partial result the next firing must not skip past.
-    if advanced && matches!(parsed.outcome.as_deref(), Some("finished" | "solved")) {
+    if advanced && processed_its_inputs(parsed.outcome.as_deref()) {
         crate::launches::schedules::ScheduleStore::new(db.clone())
             .advance_cursor(key, run_id, &parsed.result)
             .await?;
@@ -176,6 +174,10 @@ pub async fn complete_run(
 /// Not span-instrumented: this runs on every reconcile of a `running` row and answers "no" for the
 /// whole life of the run, so a span here is a 0-second trace per tick. [`complete_run`] — the branch
 /// that actually ingests — carries the span.
+fn processed_its_inputs(outcome: Option<&str>) -> bool {
+    matches!(outcome, Some("finished" | "solved" | "complete"))
+}
+
 pub async fn ingest_completion(db: &Db, cfg: &ControllerCfg, key: &str) -> Result<bool> {
     let Some(run) = crate::runs::store::running_run_for_issue(db.pool(), key).await? else {
         return Ok(false);
@@ -490,4 +492,20 @@ async fn fail_run_without_terminal_evidence(
     )
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::runs::completion::processed_its_inputs;
+
+    #[test]
+    fn only_a_run_that_processed_its_inputs_advances_a_schedule() {
+        for outcome in ["finished", "solved", "complete"] {
+            assert!(processed_its_inputs(Some(outcome)), "{outcome}");
+        }
+        for outcome in ["budget", "stopped", "error", "escalated", "stalled"] {
+            assert!(!processed_its_inputs(Some(outcome)), "{outcome}");
+        }
+        assert!(!processed_its_inputs(None));
+    }
 }
