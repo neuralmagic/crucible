@@ -1,0 +1,23 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-SERVICE-RECORD"
+title = "Identity, check, and log"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+The run's identity digest MUST cover every resolved service: name, tool, the attested version and executable, arguments, secret names with their declared system and scope, and the engine's readiness, restart, and grace bounds. Secret values MUST NOT enter it. A resumed run whose catalog attests a different version MUST record the new resolution and MUST NOT reuse the old one.
+
+
+
+crucible check MUST print each resolved service with its tool, attested version, transport, secret names, and the tasks that need it.
+
+
+
+The session log MUST record when each service starts, on which port, becomes ready, and exits, with its exit status, whether it stopped or was killed, and the task whose dispatch started it.
+
+
+
+Spend a service causes outside the run supervisor, such as cluster work it submits, is not counted against the run's cost ceiling; the target's own quota bounds it."""

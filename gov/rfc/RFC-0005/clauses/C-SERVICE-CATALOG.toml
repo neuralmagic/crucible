@@ -1,0 +1,19 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-SERVICE-CATALOG"
+title = "The service catalog"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+The run supervisor attests the tools a service may run in a service catalog. In a run supervisor image the catalog is a document the image carries at a fixed path. On a run with no image, the catalog is the document the operator names in CRUCIBLE_SERVICE_CATALOG, and with none named no tool is attested. crucible check MUST print which catalog it read.
+
+
+
+Each catalog entry MUST give the tool's name, the absolute path of its executable in the run supervisor, its version, and the transport it serves: MCP streamable HTTP at a stated path, MCP over stdio, or plain HTTP. It MUST state whether the tool creates resources outside the run supervisor and whether it accepts concurrent clients. By listing a tool, the catalog asserts that the tool binds only the loopback port it is given, labels anything it creates outside the run supervisor with the run identifier it is given, and reclaims those resources when signalled to stop. A tool whose entry says it does not accept concurrent clients serves one task at a time, and the engine MUST NOT dispatch concurrently two tasks that need it.
+
+
+
+A tool is attested for a service when the catalog lists it by the declared name at a version the declared requirement admits. The engine MUST run a service only from the executable its catalog entry names, never from a path the pack or the workspace supplies."""
