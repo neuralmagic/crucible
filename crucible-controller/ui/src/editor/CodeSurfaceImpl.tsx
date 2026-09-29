@@ -4,11 +4,26 @@ import { monaco } from './monaco';
 import { languageOf } from './language';
 import { useEditorPrefs } from './useEditorPrefs';
 
-/// One engine complaint, at the position the engine named it.
+/// One engine complaint, at the position the engine named it. Without an end it runs to the end of
+/// its line.
 export interface CodeMarker {
   line: number;
   col: number;
+  endLine?: number;
+  endCol?: number;
   message: string;
+}
+
+export interface CodeCompletion {
+  label: string;
+  kind: 'keyword' | 'type' | 'value';
+}
+
+/// What to offer at the caret, given the line up to it. `from` is the 0-based index in that prefix
+/// where the replaced text starts.
+export interface CodeCompletions {
+  triggers: readonly string[];
+  complete: (linePrefix: string) => { from: number; items: readonly CodeCompletion[] } | null;
 }
 
 /// A position to put the caret on. The nonce is what makes clicking the same diagnostic twice
@@ -27,6 +42,7 @@ export interface CodeSurfaceProps {
   onChange?: (next: string) => void;
   readOnly?: boolean;
   markers?: readonly CodeMarker[];
+  completions?: CodeCompletions;
   focus?: CodeFocus | null;
   onSave?: () => void;
   height?: string;
@@ -37,6 +53,12 @@ export interface CodeSurfaceProps {
 /// The marker owner, so setting ours never clears a language service's own.
 const OWNER = 'engine';
 
+const COMPLETION_KIND: Record<CodeCompletion['kind'], monaco.languages.CompletionItemKind> = {
+  keyword: monaco.languages.CompletionItemKind.Keyword,
+  type: monaco.languages.CompletionItemKind.Class,
+  value: monaco.languages.CompletionItemKind.Value,
+};
+
 /// The one Monaco surface: the studio's editor, and every read-only code viewer. What differs
 /// between them is props, never a second embedding.
 export default function CodeSurface({
@@ -45,6 +67,7 @@ export default function CodeSurface({
   onChange,
   readOnly = false,
   markers = [],
+  completions,
   focus = null,
   onSave,
   height = '100%',
@@ -76,11 +99,41 @@ export default function CodeSurface({
         message: marker.message,
         startLineNumber: marker.line,
         startColumn: marker.col,
-        endLineNumber: marker.line,
-        endColumn: model.getLineMaxColumn(Math.min(marker.line, model.getLineCount())),
+        endLineNumber: marker.endLine ?? marker.line,
+        endColumn: marker.endCol ?? model.getLineMaxColumn(Math.min(marker.line, model.getLineCount())),
       }))
     );
   }, [markers, path, value]);
+
+  useEffect(() => {
+    if (completions === undefined) return;
+    const provider = monaco.languages.registerCompletionItemProvider(language, {
+      triggerCharacters: [...completions.triggers],
+      provideCompletionItems(model, position) {
+        if (model !== editorRef.current?.getModel()) return { suggestions: [] };
+        const prefix = model.getLineContent(position.lineNumber).slice(0, position.column - 1);
+        const found = completions.complete(prefix);
+        if (found === null) return { suggestions: [] };
+        const range = {
+          startLineNumber: position.lineNumber,
+          startColumn: found.from + 1,
+          endLineNumber: position.lineNumber,
+          endColumn: position.column,
+        };
+        return {
+          suggestions: found.items.map((item) => ({
+            label: item.label,
+            insertText: item.label,
+            kind: COMPLETION_KIND[item.kind],
+            range,
+          })),
+        };
+      },
+    });
+    return () => {
+      provider.dispose();
+    };
+  }, [completions, language]);
 
   useEffect(() => {
     const editor = editorRef.current;

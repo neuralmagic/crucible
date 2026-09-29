@@ -395,7 +395,8 @@ mod tests {
         assert!(ids.contains(&"everyone-read-platform-providers".to_string()));
         assert!(ids.contains(&"playbook-publishers-publish".to_string()));
         assert!(ids.contains(&"everyone-launch-platform-playbooks".to_string()));
-        assert_eq!(ids.len(), 18);
+        assert!(ids.contains(&"operators-access-autoresearch".to_string()));
+        assert_eq!(ids.len(), 19);
     }
 
     #[test]
