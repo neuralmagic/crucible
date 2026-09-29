@@ -351,6 +351,11 @@ impl WorkPodSpec {
         }
     }
 
+    /// The same spec, run under `agent`'s harness and model.
+    pub(crate) fn with_agent(self, agent: crate::playbooks::providers::AgentSelection) -> Self {
+        WorkPodSpec { agent, ..self }
+    }
+
     /// A scope-propose turn spec. `gaming_refine_rounds` is the effective gaming-review refine
     /// bound and `skip_gaming_review` the effective skip-review override (both config-derived);
     /// `inputs` carries what the issue row itself dictates.

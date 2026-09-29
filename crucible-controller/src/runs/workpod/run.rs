@@ -905,6 +905,7 @@ pub(crate) async fn dispatch_grounded_rank(
     issue_key: &str,
     repo_url: &str,
     git_ref: Option<&str>,
+    dispatch: Option<&crate::playbooks::providers::ResolvedDispatch>,
 ) -> Result<DispatchOutcome> {
     let kind = WorkKind::AgentTurn(TurnKind::GroundedRank);
     let profile = cfg.deploy_profile.clone().context(
@@ -954,6 +955,27 @@ pub(crate) async fn dispatch_grounded_rank(
         return Ok(DispatchOutcome::Failed);
     }
 
+    // The provider's key, read before anything is written: a turn that cannot pay for the service
+    // it was pointed at must leave no work-pod row and no pod behind.
+    let delivery = match dispatch {
+        None => crate::secrets::deliver::Delivery::default(),
+        Some(d) => {
+            match crate::secrets::deliver::provider_delivery(
+                db.pool(),
+                cfg.secret_provider.as_ref(),
+                &d.provider,
+            )
+            .await?
+            {
+                Ok(delivery) => delivery,
+                Err(refusal) => {
+                    tracing::warn!(%issue_key, %refusal, "grounded rank refused its provider");
+                    return Ok(DispatchOutcome::Failed);
+                }
+            }
+        }
+    };
+
     // Resolve the overridable caps once (default < env < override).
     let eff = cfg.effective();
     // Cap + budget check, layered under the global ceiling the reconcile already enforced.
@@ -981,7 +1003,10 @@ pub(crate) async fn dispatch_grounded_rank(
         eff.per_reconcile_cost,
         sandbox_image,
         git_ref.map(str::to_string),
-    );
+    )
+    .with_agent(crate::playbooks::providers::AgentSelection::from_resolved(
+        dispatch,
+    ));
 
     if admit(
         active,
@@ -1042,9 +1067,7 @@ pub(crate) async fn dispatch_grounded_rank(
         cfg.digest_resolver(),
         &cluster,
         &namespace,
-        // A rank turn runs the triage harness the profile configures, so it resolves no provider
-        // and spends no provider key.
-        &crate::secrets::deliver::Delivery::default(),
+        &delivery,
     )
     .await?
     {

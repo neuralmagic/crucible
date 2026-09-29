@@ -168,6 +168,89 @@ pub(crate) async fn call(
     )
 }
 
+/// Register a Chat Completions provider at `url` and make it the platform's autoresearch default,
+/// so the ranker's calls land on a `wiremock` server serving canned verdicts.
+#[cfg(test)]
+pub(crate) async fn register_ranker(pool: &sqlx::PgPool, url: &str) -> anyhow::Result<()> {
+    register_ranker_as(pool, "test-ranker", url).await?;
+    crate::playbooks::providers::set_default(
+        pool,
+        &crate::playbooks::providers::DispatchDefault {
+            scope_kind: crate::playbooks::providers::DefaultScope::Platform,
+            scope_ref: String::new(),
+            workload_class: crate::playbooks::providers::WorkloadClass::Autoresearch,
+            provider_id: "test-ranker".to_string(),
+            model: None,
+            fallback_provider_id: None,
+            fallback_model: None,
+        },
+    )
+    .await
+}
+
+/// Register a Chat Completions provider `id` at `url`, serving `test-ranker-model`.
+#[cfg(test)]
+pub(crate) async fn register_ranker_as(
+    pool: &sqlx::PgPool,
+    id: &str,
+    url: &str,
+) -> anyhow::Result<()> {
+    let endpoint = crate::playbooks::providers::Endpoint {
+        url: url.to_string(),
+        protocol: crate::playbooks::providers::InferenceProtocol::ChatCompletions,
+    };
+    crate::playbooks::providers::upsert(
+        pool,
+        &crate::playbooks::providers::NewProvider {
+            owner: crate::authz::model::Principal::platform(),
+            id,
+            display_name: id,
+            kind: crate::playbooks::providers::ProviderKind::Custom,
+            models: &["test-ranker-model".to_string()],
+            default_model: Some("test-ranker-model"),
+            secret: None,
+            endpoint: Some(&endpoint),
+            harness: None,
+            enabled: true,
+            created_by: "test",
+        },
+    )
+    .await
+}
+
+/// Register one inference key under `owner`, the way an administrator would before pointing a
+/// provider at it. Unlike a scope binding it is never bound to anything: the provider row names it.
+#[cfg(test)]
+pub(crate) async fn register_inference_key(
+    pool: &sqlx::PgPool,
+    owner: &str,
+    name: &str,
+) -> anyhow::Result<()> {
+    use crate::authz::model::Principal;
+    use crate::secrets::store::NewSecret;
+    use crate::secrets::{ConsumerClass, SecretKind, SecretMode, SecretName, Visibility};
+    let owner = Principal::parse(owner).expect("owner");
+    let name = SecretName::parse(name).expect("name");
+    let mut conn = pool.acquire().await?;
+    crate::secrets::store::insert(
+        &mut conn,
+        &NewSecret {
+            id: &uuid::Uuid::now_v7().to_string(),
+            name: &name,
+            owner: &owner,
+            kind: SecretKind::InferenceApiKey,
+            visibility: Visibility::BrokerOnly,
+            consumer: ConsumerClass::Run,
+            mode: SecretMode::Managed,
+            vault_path: "platform/openai-key",
+            current_version: Some(1),
+            created_by: Some("alice"),
+        },
+    )
+    .await?;
+    Ok(())
+}
+
 /// Real engine inputs for tests that render through the linked `crucible` library: a deploy
 /// profile, the smallest loop and playbook packs that render, and workflow sources that compile.
 #[cfg(test)]

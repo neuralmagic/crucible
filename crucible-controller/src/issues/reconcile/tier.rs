@@ -56,7 +56,7 @@ pub(super) async fn confirm_tier(db: &Db, cfg: &ControllerCfg, issue: &Issue) ->
 
     // In-process I/O (an HTTP call, not a subprocess), so no `spawn_blocking` — unlike the
     // engine's own actions ([`engine::scope_propose`] and friends), which stay subprocesses.
-    let outcome = ranker::rank(&gh.title, &body, &gh.labels).await;
+    let outcome = ranker::rank(db, cfg, issue, &gh.title, &body, &gh.labels).await;
 
     match outcome {
         RankOutcome::Verdict(av) => apply_verdict(db, cfg, issue, &hash, av).await,

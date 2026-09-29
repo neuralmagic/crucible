@@ -1305,6 +1305,7 @@ async fn dispatch_launches_then_a_redrive_collects_and_ledgers_a_verdict(
         "owner/repo#42",
         "https://github.com/owner/repo.git",
         None,
+        None,
     )
     .await?;
     assert!(
@@ -1336,6 +1337,7 @@ async fn dispatch_launches_then_a_redrive_collects_and_ledgers_a_verdict(
         dispatcher,
         "owner/repo#42",
         "https://github.com/owner/repo.git",
+        None,
         None,
     )
     .await?;
@@ -1384,7 +1386,8 @@ async fn dispatch_queues_when_over_the_daily_budget(pool: sqlx::PgPool) -> Resul
         deleted: Arc::new(Mutex::new(Vec::new())),
     });
 
-    let out = dispatch_grounded_rank(&db, &cfg, dispatcher, "owner/repo#7", "u", None).await?;
+    let out =
+        dispatch_grounded_rank(&db, &cfg, dispatcher, "owner/repo#7", "u", None, None).await?;
 
     assert!(
         matches!(out, DispatchOutcome::Queued),
@@ -1429,8 +1432,16 @@ async fn queued_turn_dedupes_and_drains_on_a_free_slot(pool: sqlx::PgPool) -> Re
 
     // Two over-budget dispatches → both Queued, ONE row (deduped), no pod created.
     for _ in 0..2 {
-        let out = dispatch_grounded_rank(&db, &cfg, dispatcher.clone(), "owner/repo#5", "u", None)
-            .await?;
+        let out = dispatch_grounded_rank(
+            &db,
+            &cfg,
+            dispatcher.clone(),
+            "owner/repo#5",
+            "u",
+            None,
+            None,
+        )
+        .await?;
         assert!(matches!(out, DispatchOutcome::Queued));
     }
     let queued =
@@ -1442,8 +1453,16 @@ async fn queued_turn_dedupes_and_drains_on_a_free_slot(pool: sqlx::PgPool) -> Re
     // Budget frees → the next dispatch LAUNCHES, consuming the queued row under its reserved name
     // (promoted to `running`, non-blocking). A re-drive then collects it to a verdict.
     cfg.profile.grounded_rank_daily_turns = 50;
-    let out =
-        dispatch_grounded_rank(&db, &cfg, dispatcher.clone(), "owner/repo#5", "u", None).await?;
+    let out = dispatch_grounded_rank(
+        &db,
+        &cfg,
+        dispatcher.clone(),
+        "owner/repo#5",
+        "u",
+        None,
+        None,
+    )
+    .await?;
     assert!(
         matches!(out, DispatchOutcome::Launched),
         "the drain launches, not awaits: {out:?}"
@@ -1463,7 +1482,8 @@ async fn queued_turn_dedupes_and_drains_on_a_free_slot(pool: sqlx::PgPool) -> Re
         "the queued row was promoted in place, now running"
     );
 
-    let out = dispatch_grounded_rank(&db, &cfg, dispatcher, "owner/repo#5", "u", None).await?;
+    let out =
+        dispatch_grounded_rank(&db, &cfg, dispatcher, "owner/repo#5", "u", None, None).await?;
     assert!(matches!(out, DispatchOutcome::Verdict(_)), "{out:?}");
 
     let row = crate::runs::work_pods::get_work_pod(db.pool(), &reserved_name)
@@ -1504,14 +1524,23 @@ async fn dispatch_records_the_error_when_the_turn_produces_no_verdict(
     });
 
     // Phase 1: the pod launches fine — the failure is only observed at collection.
-    let out =
-        dispatch_grounded_rank(&db, &cfg, dispatcher.clone(), "owner/repo#9", "u", None).await?;
+    let out = dispatch_grounded_rank(
+        &db,
+        &cfg,
+        dispatcher.clone(),
+        "owner/repo#9",
+        "u",
+        None,
+        None,
+    )
+    .await?;
     assert!(
         matches!(out, DispatchOutcome::Launched),
         "launch succeeds regardless of the eventual turn outcome: {out:?}"
     );
     // Phase 2: the re-drive peeks the (Failed-phase) pod, collects it, finds no verdict.
-    let out = dispatch_grounded_rank(&db, &cfg, dispatcher, "owner/repo#9", "u", None).await?;
+    let out =
+        dispatch_grounded_rank(&db, &cfg, dispatcher, "owner/repo#9", "u", None, None).await?;
 
     assert!(
         matches!(out, DispatchOutcome::Failed),
@@ -1620,7 +1649,8 @@ async fn grounded_dispatch_adopts_a_running_turn_never_double_launches(
             deleted: deleted.clone(),
         });
 
-    let out = dispatch_grounded_rank(&db, &cfg, dispatcher, "owner/repo#42", "u", None).await?;
+    let out =
+        dispatch_grounded_rank(&db, &cfg, dispatcher, "owner/repo#42", "u", None, None).await?;
     let DispatchOutcome::Verdict(v) = out else {
         panic!("expected the adopted verdict, got {out:?}");
     };
@@ -2352,6 +2382,7 @@ async fn a_mismatched_loop_image_refuses_the_turn_and_parks_the_issue(
         "owner/repo#77",
         "https://github.com/owner/repo.git",
         None,
+        None,
     )
     .await;
     crate::runs::workpod::reset_contracts();
@@ -2469,6 +2500,7 @@ async fn an_unreadable_loop_image_fails_the_turn_without_parking(pool: sqlx::PgP
         dispatcher,
         "owner/repo#78",
         "https://github.com/owner/repo.git",
+        None,
         None,
     )
     .await;
@@ -3113,6 +3145,8 @@ async fn a_resolved_provider_reaches_the_loop_wrapper(pool: sqlx::PgPool) -> Res
             workload_class: crate::playbooks::providers::WorkloadClass::Autoresearch,
             provider_id: "openai-plat".to_string(),
             model: None,
+            fallback_provider_id: None,
+            fallback_model: None,
         },
     )
     .await?;
@@ -3770,10 +3804,19 @@ async fn a_new_retained_failure_triggers_the_count_cap_inline(pool: sqlx::PgPool
         deleted: deleted.clone(),
     });
     // Launch, then collect: the count-cap sweep fires when the turn is collected FAILED.
-    let out =
-        dispatch_grounded_rank(&db, &cfg, dispatcher.clone(), "owner/repo#9", "u", None).await?;
+    let out = dispatch_grounded_rank(
+        &db,
+        &cfg,
+        dispatcher.clone(),
+        "owner/repo#9",
+        "u",
+        None,
+        None,
+    )
+    .await?;
     assert!(matches!(out, DispatchOutcome::Launched), "{out:?}");
-    let out = dispatch_grounded_rank(&db, &cfg, dispatcher, "owner/repo#9", "u", None).await?;
+    let out =
+        dispatch_grounded_rank(&db, &cfg, dispatcher, "owner/repo#9", "u", None, None).await?;
     assert!(matches!(out, DispatchOutcome::Failed), "{out:?}");
 
     assert_eq!(
@@ -3826,7 +3869,8 @@ async fn dispatch_fans_out_to_the_cap_then_queues(pool: sqlx::PgPool) -> Result<
 
     // Two distinct issues both LAUNCH — two pods run concurrently, neither blocked on the other.
     for key in ["owner/repo#1", "owner/repo#2"] {
-        let out = dispatch_grounded_rank(&db, &cfg, dispatcher.clone(), key, "u", None).await?;
+        let out =
+            dispatch_grounded_rank(&db, &cfg, dispatcher.clone(), key, "u", None, None).await?;
         assert!(matches!(out, DispatchOutcome::Launched), "{key}: {out:?}");
     }
     assert_eq!(
@@ -3837,7 +3881,8 @@ async fn dispatch_fans_out_to_the_cap_then_queues(pool: sqlx::PgPool) -> Result<
     assert_eq!(created.lock().expect("lock").len(), 2, "two pods created");
 
     // The third issue is over the cap → it queues, and creates no pod (the others keep running).
-    let out = dispatch_grounded_rank(&db, &cfg, dispatcher, "owner/repo#3", "u", None).await?;
+    let out =
+        dispatch_grounded_rank(&db, &cfg, dispatcher, "owner/repo#3", "u", None, None).await?;
     assert!(
         matches!(out, DispatchOutcome::Queued),
         "over the cap → queued, not blocked: {out:?}"
@@ -4356,7 +4401,8 @@ async fn promote_observes_the_queue_wait_metric(pool: sqlx::PgPool) -> Result<()
         created: Arc::new(Mutex::new(Vec::new())),
         deleted: Arc::new(Mutex::new(Vec::new())),
     });
-    let out = dispatch_grounded_rank(&db, &cfg, dispatcher, "owner/repo#5", "u", None).await?;
+    let out =
+        dispatch_grounded_rank(&db, &cfg, dispatcher, "owner/repo#5", "u", None, None).await?;
     assert!(
         matches!(out, DispatchOutcome::Launched),
         "the queued row promoted: {out:?}"
@@ -4694,35 +4740,6 @@ async fn the_pod_spec_carries_a_secret_reference_and_no_value(pool: sqlx::PgPool
     Ok(())
 }
 
-/// Register one inference key under `owner`, the way an administrator would before pointing a
-/// provider at it. Unlike a scope binding it is never bound to anything: the provider row names it.
-async fn register_inference_key(pool: &sqlx::PgPool, owner: &str, name: &str) -> Result<()> {
-    use crate::authz::model::Principal;
-    use crate::secrets::store::NewSecret;
-    use crate::secrets::{ConsumerClass, SecretKind, SecretMode, SecretName, Visibility};
-    let owner = Principal::parse(owner).expect("owner");
-    let name = SecretName::parse(name).expect("name");
-    let mut conn = pool.acquire().await?;
-    crate::secrets::store::insert(
-        &mut conn,
-        &NewSecret {
-            id: &uuid::Uuid::now_v7().to_string(),
-            name: &name,
-            owner: &owner,
-            kind: SecretKind::InferenceApiKey,
-            visibility: Visibility::BrokerOnly,
-            consumer: ConsumerClass::Run,
-            mode: SecretMode::Managed,
-            vault_path: "platform/openai-key",
-            current_version: Some(1),
-            created_by: Some("alice"),
-        },
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
-    Ok(())
-}
-
 /// The resolved provider's key rides the same per-run Secret as the scope's own bindings, projected
 /// as the environment variable its kind reads, and the value never appears in the pod spec.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
@@ -4739,7 +4756,7 @@ async fn the_resolved_providers_key_is_delivered_with_the_scopes_bindings(
         crate::secrets::Visibility::BrokerOnly,
     )
     .await?;
-    register_inference_key(&pool, "user:platform-admin", "openai_key").await?;
+    crate::testing::register_inference_key(&pool, "user:platform-admin", "openai_key").await?;
     crate::playbooks::providers::upsert(
         &pool,
         &crate::playbooks::providers::NewProvider {
@@ -4841,6 +4858,104 @@ async fn the_resolved_providers_key_is_delivered_with_the_scopes_bindings(
     Ok(())
 }
 
+/// A grounded rank runs under the autoresearch provider it resolved: the harness and model flags
+/// reach the turn, the endpoint rides plain environment, and the key rides the per-run Secret
+/// without ever appearing in the pod spec.
+#[cfg(feature = "autoresearch")]
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_grounded_rank_runs_under_its_resolved_provider(pool: sqlx::PgPool) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let tmp = tempfile::tempdir()?;
+    let profile = crate::testing::fixtures::write_deploy_profile(tmp.path());
+    crate::testing::register_inference_key(&pool, "user:platform-admin", "gateway_key").await?;
+    let endpoint = crate::playbooks::providers::Endpoint {
+        url: "https://gateway.example".to_string(),
+        protocol: crate::playbooks::providers::InferenceProtocol::Messages,
+    };
+    crate::playbooks::providers::upsert(
+        &pool,
+        &crate::playbooks::providers::NewProvider {
+            owner: crate::authz::model::Principal::platform(),
+            id: "gateway",
+            display_name: "Gateway",
+            kind: crate::playbooks::providers::ProviderKind::Custom,
+            models: &["rits/zai-org/glm-5-3".to_string()],
+            default_model: Some("rits/zai-org/glm-5-3"),
+            secret: Some(&crate::playbooks::providers::ProviderSecretRef {
+                name: "gateway_key".to_string(),
+                owner: crate::authz::model::Principal::parse("user:platform-admin")
+                    .expect("a principal"),
+            }),
+            endpoint: Some(&endpoint),
+            harness: None,
+            enabled: true,
+            created_by: "alice",
+        },
+    )
+    .await?;
+    let resolved = crate::playbooks::providers::resolve_dispatch(
+        &pool,
+        Some(crate::playbooks::providers::DispatchOverride {
+            provider_id: "gateway",
+            model: None,
+        }),
+        None,
+        crate::playbooks::providers::WorkloadClass::Autoresearch,
+    )
+    .await?;
+
+    let db = Db::new(pool);
+    let mut cfg = pod_cfg(&profile, "img");
+    cfg.secret_provider = Some(Arc::new(crate::secrets::provider::MapProvider::new([(
+        "gateway_key".to_string(),
+        r#"{"ANTHROPIC_API_KEY": "sk-gateway"}"#.to_string(),
+    )])));
+    let created = Arc::new(Mutex::new(Vec::new()));
+    let created_secrets = Arc::new(Mutex::new(Vec::new()));
+    let dispatcher = Arc::new(SpecCapturingDispatcher {
+        created_secrets: created_secrets.clone(),
+        created: created.clone(),
+        created_cms: Arc::new(Mutex::new(Vec::new())),
+    });
+
+    let out = dispatch_grounded_rank(
+        &db,
+        &cfg,
+        dispatcher,
+        "owner/repo#7",
+        "u",
+        None,
+        resolved.as_ref(),
+    )
+    .await?;
+    assert!(matches!(out, DispatchOutcome::Launched), "got {out:?}");
+
+    let pods = created.lock().expect("lock");
+    let doc = serde_json::to_string(pods.first().expect("a created pod"))?;
+    assert!(
+        !doc.contains("sk-gateway"),
+        "the key leaked into the pod spec"
+    );
+    for flag in ["--harness", "claude", "--model", "rits/zai-org/glm-5-3"] {
+        assert!(doc.contains(flag), "{flag} missing from {doc}");
+    }
+    assert!(doc.contains("ANTHROPIC_BASE_URL"), "{doc}");
+    assert!(doc.contains("https://gateway.example"), "{doc}");
+    let secrets = created_secrets.lock().expect("lock");
+    let data = secrets
+        .first()
+        .expect("the turn's Secret")
+        .string_data
+        .as_ref()
+        .expect("data");
+    assert!(
+        data.values().any(|v| v == "sk-gateway"),
+        "the key rides the Secret: {:?}",
+        data.keys().collect::<Vec<_>>()
+    );
+    Ok(())
+}
+
 /// A custom provider hands the pod where to reach it as plain environment beside the secretKeyRef
 /// that carries its key: the base URL under the name the harness reads, the Codex wire API the
 /// engine renders into its config, and the harness flag its protocol decides.
@@ -4849,7 +4964,7 @@ async fn a_custom_provider_delivers_its_endpoint_beside_its_key(pool: sqlx::PgPo
     let _g = crate::ENV_LOCK.lock().await;
     let tmp = tempfile::tempdir()?;
     let profile = crate::testing::fixtures::write_deploy_profile(tmp.path());
-    register_inference_key(&pool, "user:platform-admin", "vllm_key").await?;
+    crate::testing::register_inference_key(&pool, "user:platform-admin", "vllm_key").await?;
     let endpoint = crate::playbooks::providers::Endpoint {
         url: "http://vllm.internal:8000/v1".to_string(),
         protocol: crate::playbooks::providers::InferenceProtocol::Responses,
@@ -5014,7 +5129,7 @@ async fn a_provider_key_the_dispatch_cannot_resolve_refuses_the_run(
         updated_at: String::new(),
     };
     // Registered, but its credentials map also sets the variable the scope's own binding holds.
-    register_inference_key(&pool, "user:platform-admin", "pr_token").await?;
+    crate::testing::register_inference_key(&pool, "user:platform-admin", "pr_token").await?;
     let colliding = crate::playbooks::providers::ModelProvider {
         owner: crate::authz::model::Principal::platform(),
         secret: Some(crate::playbooks::providers::ProviderSecretRef {

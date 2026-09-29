@@ -440,6 +440,11 @@ pub struct DispatchDefault {
     pub provider_id: String,
     /// `None` takes the provider's own `default_model`.
     pub model: Option<String>,
+    /// The provider this default's work takes when the primary is disabled or its credential does
+    /// not resolve, and the one the in-process ranking call retries on when a call fails.
+    pub fallback_provider_id: Option<String>,
+    /// `None` takes the fallback provider's own `default_model`.
+    pub fallback_model: Option<String>,
 }
 
 /// What a launch pinned on its row. A model alone is not a choice, because the provider is what
@@ -568,6 +573,8 @@ fn default_from_row(row: &sqlx::postgres::PgRow) -> Result<DispatchDefault> {
         workload_class: WorkloadClass::parse(&workload_class)?,
         provider_id: row.try_get("provider_id")?,
         model: row.try_get("model")?,
+        fallback_provider_id: row.try_get("fallback_provider_id")?,
+        fallback_model: row.try_get("fallback_model")?,
     })
 }
 
@@ -818,16 +825,21 @@ pub async fn delete(ex: impl PgExecutor<'_>, id: &str) -> Result<bool> {
 #[tracing::instrument(name = "db.set_dispatch_default", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", provider = %row.provider_id), err)]
 pub async fn set_default(ex: impl PgExecutor<'_>, row: &DispatchDefault) -> Result<()> {
     sqlx::query(
-        "INSERT INTO dispatch_defaults (scope_kind, scope_ref, workload_class, provider_id, model) \
-         VALUES ($1, $2, $3, $4, $5) \
+        "INSERT INTO dispatch_defaults (scope_kind, scope_ref, workload_class, provider_id, model, \
+         fallback_provider_id, fallback_model) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) \
          ON CONFLICT (scope_kind, scope_ref, workload_class) \
-         DO UPDATE SET provider_id = EXCLUDED.provider_id, model = EXCLUDED.model",
+         DO UPDATE SET provider_id = EXCLUDED.provider_id, model = EXCLUDED.model, \
+         fallback_provider_id = EXCLUDED.fallback_provider_id, \
+         fallback_model = EXCLUDED.fallback_model",
     )
     .bind(row.scope_kind.as_str())
     .bind(&row.scope_ref)
     .bind(row.workload_class.as_str())
     .bind(&row.provider_id)
     .bind(&row.model)
+    .bind(&row.fallback_provider_id)
+    .bind(&row.fallback_model)
     .execute(ex)
     .await
     .context("set_dispatch_default")?;
@@ -855,7 +867,8 @@ pub async fn clear_default(
     Ok(deleted.rows_affected() > 0)
 }
 
-const DEFAULT_COLS: &str = "scope_kind, scope_ref, workload_class, provider_id, model";
+const DEFAULT_COLS: &str = "scope_kind, scope_ref, workload_class, provider_id, model, \
+     fallback_provider_id, fallback_model";
 
 /// Every default, so the launch pickers can preselect the one that would apply.
 #[tracing::instrument(name = "db.list_dispatch_defaults", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql"), err)]
@@ -891,20 +904,39 @@ async fn get_default(
     row.as_ref().map(default_from_row).transpose()
 }
 
-/// What this dispatch runs against: the override the launch pinned, else the domain's default for
-/// this class, else the platform's, else `None` — dispatch exactly as before providers existed.
-/// The pair reaches the pod as the `--harness`/`--model` flags of the loop wrapper or of
-/// `crucible plan run`, replacing the pack manifest's `[agent]` defaults.
-///
-/// A pinned provider that has since been deregistered is an error rather than a silent fall-through
-/// to the defaults: the work was committed to a specific service, and quietly running it somewhere
-/// else is worse than saying the registration is gone.
+/// What this dispatch runs against: the first entry of [`resolve_chain`], or `None` to dispatch
+/// exactly as before providers existed. The pair reaches the pod as the `--harness`/`--model` flags
+/// of the loop wrapper or of `crucible plan run`, replacing the pack manifest's `[agent]` defaults.
 pub async fn resolve_dispatch(
     pool: &PgPool,
     over: Option<DispatchOverride<'_>>,
     domain: Option<&str>,
     class: WorkloadClass,
 ) -> Result<Option<ResolvedDispatch>> {
+    Ok(resolve_chain(pool, over, domain, class)
+        .await?
+        .into_iter()
+        .next())
+}
+
+/// Every provider this dispatch may run against, in the order to try them: the override the launch
+/// pinned, else the domain's default for this class, else the platform's. Empty means no answer.
+///
+/// A pin is one entry and never falls back: the work was committed to a specific service, and a
+/// pinned provider that has since been deregistered is an error rather than a silent fall-through,
+/// because quietly running it somewhere else is worse than saying the registration is gone.
+///
+/// A default is its primary followed by its fallback, each kept only while it can take new work:
+/// enabled, and naming a credential that resolves. The first default row found answers alone; a
+/// domain row with no fallback does not borrow the platform's. When neither entry can take work, a
+/// disabled primary is an error, and an enabled primary with a broken credential is returned alone
+/// so the launch refuses it with the credential's own reason.
+pub async fn resolve_chain(
+    pool: &PgPool,
+    over: Option<DispatchOverride<'_>>,
+    domain: Option<&str>,
+    class: WorkloadClass,
+) -> Result<Vec<ResolvedDispatch>> {
     if let Some(over) = over {
         let Some(provider) = get(pool, over.provider_id).await? else {
             bail!(
@@ -912,7 +944,7 @@ pub async fn resolve_dispatch(
                 over.provider_id
             );
         };
-        return Ok(Some(ResolvedDispatch::new(provider, over.model)));
+        return Ok(vec![ResolvedDispatch::new(provider, over.model)]);
     }
     let domain = domain.map(str::trim).filter(|d| !d.is_empty());
     let scopes = [
@@ -923,45 +955,106 @@ pub async fn resolve_dispatch(
         let Some(row) = get_default(pool, scope_kind, scope_ref, class).await? else {
             continue;
         };
-        let Some(provider) = get(pool, &row.provider_id).await? else {
-            bail!(
-                "dispatch default {}/{scope_ref} names model provider {:?}, which is no longer \
-                 registered",
-                scope_kind.as_str(),
-                row.provider_id
-            );
-        };
-        // Disabling a provider stops NEW work reaching it. Work that pinned it keeps resolving
-        // above; a default is not a pin, so an unpinned dispatch inheriting one is new work.
-        if !provider.enabled {
-            bail!(
-                "dispatch default {}/{scope_ref} names model provider {:?}, which is disabled and \
-                 takes no new work",
-                scope_kind.as_str(),
-                row.provider_id
-            );
-        }
-        return Ok(Some(ResolvedDispatch::new(provider, row.model.as_deref())));
+        return default_chain(pool, &row).await;
     }
-    Ok(None)
+    Ok(Vec::new())
 }
 
-/// What one issue's dispatch of `class` runs against: the pair its row pinned at launch, else the
-/// defaults its repo and class inherit.
-///
-/// A domain default is keyed by the issue's `owner/repo`, which is the only name a dispatch has to
-/// scope by, so [`crate::api::providers`] holds a domain `scope_ref` to that same spelling. Keying
-/// one vocabulary and matching another would configure defaults nothing ever inherits.
+async fn default_chain(pool: &PgPool, row: &DispatchDefault) -> Result<Vec<ResolvedDispatch>> {
+    let Some(primary) = get(pool, &row.provider_id).await? else {
+        bail!(
+            "dispatch default {}/{} names model provider {:?}, which is no longer registered",
+            row.scope_kind.as_str(),
+            row.scope_ref,
+            row.provider_id
+        );
+    };
+    let fallback = match row.fallback_provider_id.as_deref() {
+        Some(id) => get(pool, id).await?,
+        None => None,
+    };
+    let mut chain = Vec::with_capacity(2);
+    if takes_new_work(pool, &primary).await? {
+        chain.push(ResolvedDispatch::new(primary.clone(), row.model.as_deref()));
+    }
+    if let Some(fallback) = fallback
+        && takes_new_work(pool, &fallback).await?
+    {
+        if chain.is_empty() {
+            tracing::warn!(
+                primary = %primary.id,
+                fallback = %fallback.id,
+                class = row.workload_class.as_str(),
+                "dispatch default's primary provider cannot take new work; using its fallback"
+            );
+        }
+        chain.push(ResolvedDispatch::new(
+            fallback,
+            row.fallback_model.as_deref(),
+        ));
+    }
+    if !chain.is_empty() {
+        return Ok(chain);
+    }
+    // Disabling a provider stops NEW work reaching it. Work that pinned it keeps resolving above;
+    // a default is not a pin, so an unpinned dispatch inheriting one is new work.
+    if !primary.enabled {
+        bail!(
+            "dispatch default {}/{} names model provider {:?}, which is disabled and takes no new \
+             work, and has no fallback that can",
+            row.scope_kind.as_str(),
+            row.scope_ref,
+            row.provider_id
+        );
+    }
+    Ok(vec![ResolvedDispatch::new(primary, row.model.as_deref())])
+}
+
+/// Whether a provider named by a default can take new work: enabled, with a credential reference
+/// that resolves to a registered inference key. Reading the key's bytes is left to the dispatch.
+async fn takes_new_work(pool: &PgPool, provider: &ModelProvider) -> Result<bool> {
+    if !provider.enabled {
+        return Ok(false);
+    }
+    Ok(
+        match crate::secrets::launch::resolve_provider_secret(pool, provider).await? {
+            Ok(_) => true,
+            Err(refusal) => {
+                tracing::warn!(provider = %provider.id, %refusal, "provider credential does not resolve");
+                false
+            }
+        },
+    )
+}
+
+/// What one issue's dispatch of `class` runs against: the first entry of [`chain_for_issue`].
 pub async fn resolve_for_issue(
     pool: &PgPool,
     issue: &crate::issues::model::Issue,
     class: WorkloadClass,
 ) -> Result<Option<ResolvedDispatch>> {
+    Ok(chain_for_issue(pool, issue, class)
+        .await?
+        .into_iter()
+        .next())
+}
+
+/// Every provider one issue's dispatch of `class` may run against, in order: the pair its row
+/// pinned at launch, else the chain of the default its repo and class inherit.
+///
+/// A domain default is keyed by the issue's `owner/repo`, which is the only name a dispatch has to
+/// scope by, so [`crate::api::providers`] holds a domain `scope_ref` to that same spelling. Keying
+/// one vocabulary and matching another would configure defaults nothing ever inherits.
+pub async fn chain_for_issue(
+    pool: &PgPool,
+    issue: &crate::issues::model::Issue,
+    class: WorkloadClass,
+) -> Result<Vec<ResolvedDispatch>> {
     let over = DispatchOverride::from_columns(
         issue.agent_provider.as_deref(),
         issue.agent_model.as_deref(),
     );
-    resolve_dispatch(pool, over, Some(&issue.repo), class).await
+    resolve_chain(pool, over, Some(&issue.repo), class).await
 }
 
 #[cfg(test)]
@@ -1321,6 +1414,8 @@ mod tests {
                 workload_class: WorkloadClass::Autoresearch,
                 provider_id: "plat".to_string(),
                 model: None,
+                fallback_provider_id: None,
+                fallback_model: None,
             },
         )
         .await?;
@@ -1347,6 +1442,8 @@ mod tests {
                 workload_class: WorkloadClass::Autoresearch,
                 provider_id: "dom".to_string(),
                 model: Some("claude-sonnet-5".to_string()),
+                fallback_provider_id: None,
+                fallback_model: None,
             },
         )
         .await?;
@@ -1460,6 +1557,8 @@ mod tests {
                 workload_class: WorkloadClass::Autoresearch,
                 provider_id: "retiring".to_string(),
                 model: None,
+                fallback_provider_id: None,
+                fallback_model: None,
             },
         )
         .await?;
@@ -1476,6 +1575,254 @@ mod tests {
             .await
             .expect_err("a disabled default is refused, not silently taken");
         assert!(format!("{err:#}").contains("disabled"), "{err:#}");
+        Ok(())
+    }
+
+    fn default_row(
+        scope_kind: DefaultScope,
+        scope_ref: &str,
+        primary: &str,
+        fallback: Option<(&str, Option<&str>)>,
+    ) -> DispatchDefault {
+        DispatchDefault {
+            scope_kind,
+            scope_ref: scope_ref.to_string(),
+            workload_class: WorkloadClass::Autoresearch,
+            provider_id: primary.to_string(),
+            model: None,
+            fallback_provider_id: fallback.map(|(id, _)| id.to_string()),
+            fallback_model: fallback.and_then(|(_, m)| m.map(str::to_string)),
+        }
+    }
+
+    fn chain_ids(chain: &[ResolvedDispatch]) -> Vec<(&str, &str)> {
+        chain
+            .iter()
+            .map(|d| (d.provider.id.as_str(), d.model.as_str()))
+            .collect()
+    }
+
+    /// A default with a fallback resolves to both, primary first, each on its own model; the
+    /// single-answer resolver takes the primary.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn a_default_chains_its_primary_then_its_fallback(pool: PgPool) -> anyhow::Result<()> {
+        upsert(&pool, &new_provider("primary", ProviderKind::Anthropic)).await?;
+        upsert(&pool, &new_provider("backup", ProviderKind::Vertex)).await?;
+        set_default(
+            &pool,
+            &default_row(
+                DefaultScope::Platform,
+                "",
+                "primary",
+                Some(("backup", Some("claude-haiku-4-5"))),
+            ),
+        )
+        .await?;
+        let chain = resolve_chain(&pool, None, None, WorkloadClass::Autoresearch).await?;
+        let primary_model = get(&pool, "primary").await?.expect("row").default_model;
+        assert_eq!(
+            chain_ids(&chain),
+            vec![
+                ("primary", primary_model.as_str()),
+                ("backup", "claude-haiku-4-5")
+            ]
+        );
+        let first = resolve_dispatch(&pool, None, None, WorkloadClass::Autoresearch).await?;
+        assert_eq!(first.as_ref(), chain.first());
+        assert!(
+            resolve_chain(&pool, None, None, WorkloadClass::Playbook)
+                .await?
+                .is_empty(),
+            "the fallback belongs to the class its row names"
+        );
+        Ok(())
+    }
+
+    /// A disabled primary hands its unpinned work to the fallback instead of refusing it.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn a_disabled_primary_resolves_to_its_fallback(pool: PgPool) -> anyhow::Result<()> {
+        let mut off = new_provider("primary", ProviderKind::Anthropic);
+        off.enabled = false;
+        upsert(&pool, &off).await?;
+        upsert(&pool, &new_provider("backup", ProviderKind::Vertex)).await?;
+        set_default(
+            &pool,
+            &default_row(
+                DefaultScope::Platform,
+                "",
+                "primary",
+                Some(("backup", None)),
+            ),
+        )
+        .await?;
+        let chain = resolve_chain(&pool, None, None, WorkloadClass::Autoresearch).await?;
+        assert_eq!(
+            chain
+                .iter()
+                .map(|d| d.provider.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["backup"]
+        );
+
+        let mut backup_off = new_provider("backup", ProviderKind::Vertex);
+        backup_off.enabled = false;
+        upsert(&pool, &backup_off).await?;
+        let err = resolve_chain(&pool, None, None, WorkloadClass::Autoresearch)
+            .await
+            .expect_err("both disabled is refused");
+        assert!(
+            format!("{err:#}").contains("no fallback that can"),
+            "{err:#}"
+        );
+        Ok(())
+    }
+
+    /// A primary whose credential reference resolves to no registered key cannot take work, so the
+    /// fallback does. With no usable fallback the primary is returned alone, and the launch refuses
+    /// it with the credential's own reason.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn a_primary_with_a_missing_key_resolves_to_its_fallback(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let secret = ProviderSecretRef {
+            name: "never_registered".to_string(),
+            owner: crate::authz::model::Principal::platform(),
+        };
+        let mut keyless = new_provider("primary", ProviderKind::Anthropic);
+        keyless.secret = Some(&secret);
+        upsert(&pool, &keyless).await?;
+        set_default(
+            &pool,
+            &default_row(DefaultScope::Platform, "", "primary", None),
+        )
+        .await?;
+        let alone = resolve_chain(&pool, None, None, WorkloadClass::Autoresearch).await?;
+        assert_eq!(
+            alone
+                .iter()
+                .map(|d| d.provider.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["primary"]
+        );
+
+        upsert(&pool, &new_provider("backup", ProviderKind::Vertex)).await?;
+        set_default(
+            &pool,
+            &default_row(
+                DefaultScope::Platform,
+                "",
+                "primary",
+                Some(("backup", None)),
+            ),
+        )
+        .await?;
+        let chain = resolve_chain(&pool, None, None, WorkloadClass::Autoresearch).await?;
+        assert_eq!(
+            chain
+                .iter()
+                .map(|d| d.provider.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["backup"]
+        );
+        Ok(())
+    }
+
+    /// A pin is one entry: the launch asked for that service, so the default's fallback never
+    /// applies to it.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn a_pin_never_takes_the_defaults_fallback(pool: PgPool) -> anyhow::Result<()> {
+        upsert(&pool, &new_provider("primary", ProviderKind::Anthropic)).await?;
+        upsert(&pool, &new_provider("backup", ProviderKind::Vertex)).await?;
+        set_default(
+            &pool,
+            &default_row(
+                DefaultScope::Platform,
+                "",
+                "primary",
+                Some(("backup", None)),
+            ),
+        )
+        .await?;
+        let chain = resolve_chain(
+            &pool,
+            Some(DispatchOverride {
+                provider_id: "primary",
+                model: None,
+            }),
+            None,
+            WorkloadClass::Autoresearch,
+        )
+        .await?;
+        assert_eq!(
+            chain
+                .iter()
+                .map(|d| d.provider.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["primary"]
+        );
+        Ok(())
+    }
+
+    /// The first default row found answers alone: a domain row without a fallback does not borrow
+    /// the platform row's.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn a_domain_default_does_not_borrow_the_platform_fallback(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        upsert(&pool, &new_provider("plat", ProviderKind::Anthropic)).await?;
+        upsert(&pool, &new_provider("backup", ProviderKind::Vertex)).await?;
+        upsert(&pool, &new_provider("dom", ProviderKind::OpenAi)).await?;
+        set_default(
+            &pool,
+            &default_row(DefaultScope::Platform, "", "plat", Some(("backup", None))),
+        )
+        .await?;
+        set_default(
+            &pool,
+            &default_row(DefaultScope::Domain, "org/vllm", "dom", None),
+        )
+        .await?;
+        let chain =
+            resolve_chain(&pool, None, Some("org/vllm"), WorkloadClass::Autoresearch).await?;
+        assert_eq!(
+            chain
+                .iter()
+                .map(|d| d.provider.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["dom"]
+        );
+        Ok(())
+    }
+
+    /// Deregistering the fallback provider clears the fallback and leaves the default standing on
+    /// its primary.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn deleting_the_fallback_provider_keeps_the_default(pool: PgPool) -> anyhow::Result<()> {
+        upsert(&pool, &new_provider("primary", ProviderKind::Anthropic)).await?;
+        upsert(&pool, &new_provider("backup", ProviderKind::Vertex)).await?;
+        set_default(
+            &pool,
+            &default_row(
+                DefaultScope::Platform,
+                "",
+                "primary",
+                Some(("backup", None)),
+            ),
+        )
+        .await?;
+        assert!(delete(&pool, "backup").await?);
+        let defaults = list_defaults(&pool).await?;
+        assert_eq!(defaults.len(), 1);
+        assert_eq!(defaults[0].provider_id, "primary");
+        assert_eq!(defaults[0].fallback_provider_id, None);
+        let chain = resolve_chain(&pool, None, None, WorkloadClass::Autoresearch).await?;
+        assert_eq!(
+            chain
+                .iter()
+                .map(|d| d.provider.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["primary"]
+        );
         Ok(())
     }
 
@@ -1496,6 +1843,8 @@ mod tests {
                 workload_class: WorkloadClass::Playbook,
                 provider_id: "plat".to_string(),
                 model: None,
+                fallback_provider_id: None,
+                fallback_model: None,
             },
         )
         .await?;
@@ -1538,6 +1887,8 @@ mod tests {
                     workload_class: WorkloadClass::Playbook,
                     provider_id: "vertex".to_string(),
                     model: None,
+                    fallback_provider_id: None,
+                    fallback_model: None,
                 },
             )
             .await?;
@@ -1671,6 +2022,8 @@ mod tests {
             workload_class: WorkloadClass::Playbook,
             provider_id: "plat".to_string(),
             model: None,
+            fallback_provider_id: None,
+            fallback_model: None,
         };
         set_default(&pool, &row).await?;
         assert_eq!(list_defaults(&pool).await?, vec![row]);
@@ -1700,6 +2053,8 @@ mod tests {
             workload_class: WorkloadClass::Autoresearch,
             provider_id: "openai".to_string(),
             model: None,
+            fallback_provider_id: None,
+            fallback_model: None,
         };
         set_default(&pool, &row).await?;
         assert!(
