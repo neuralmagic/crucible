@@ -1,0 +1,58 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-09-28-006"
+title = "Resume an interrupted playbook from its session log"
+status = "queue"
+created = "2026-09-28"
+refs = [
+    "RFC-0002:C-PLAYBOOK-RESUME",
+    "RFC-0002:C-SETTLED-JOIN",
+    "RFC-0001:C-ROUTE",
+    "RFC-0002:C-PLAYBOOK-PARAMS",
+    "RFC-0002:C-RUN-HISTORY",
+    "RFC-0002:C-TASK-FILES",
+    "RFC-0002:C-PLAYBOOK-LANE",
+]
+depends_on = [
+    "WI-2026-09-28-001",
+    "WI-2026-09-28-003",
+]
+
+[content]
+description = "[[RFC-0002:C-PLAYBOOK-RESUME]] is normative, but `plan run` has no resume: a restarted pod reruns the graph from the start and repeats the side effects of tasks that already settled. Implement the clause in the executor, the CLI, and the rendered pod."
+
+[[content.acceptance_criteria]]
+text = "`plan run --resume` folds settled results from the session log and never re-dispatches a settled task, a settled route included"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "the workspace is rebuilt from the pristine checkout plus the declared files of folded passing tasks; a failed task's files reach only settled-join consumers"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "spend and elapsed time recorded before the interruption count against the ceilings"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "when folded results cover the main graph or include early completion, only missing epilogue tasks dispatch, and summary, shutdown, and publication each happen once"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = 'resumed tasks receive the same "params" and "history" inputs the interrupted run gave them'
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "a playbook pod rendered with a state volume passes `--resume` when it restarts; without one it stays one-shot"
+status = "pending"
+category = "changed"
+
+[[content.acceptance_criteria]]
+text = "an end-to-end test interrupts a run mid-graph, resumes it, and shows no settled task ran twice"
+status = "pending"
+category = "chore"
