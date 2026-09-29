@@ -284,6 +284,8 @@ export function SelectField({
 export interface RichSelectOption {
   value: string;
   label: ReactNode;
+  /** Shown but not pickable. */
+  disabled?: boolean;
 }
 
 export interface RichSelectFieldProps {
@@ -334,9 +336,11 @@ export function RichSelectField({
                 <Select.Item
                   key={option.value}
                   value={option.value}
+                  disabled={option.disabled}
                   className={cn(
                     MONO_CONTROL,
-                    'flex cursor-pointer items-center gap-2 px-2 py-1.5 text-ink outline-none data-[highlighted]:bg-hi'
+                    'flex cursor-pointer items-center gap-2 px-2 py-1.5 text-ink outline-none data-[highlighted]:bg-hi',
+                    'data-[disabled]:cursor-default data-[disabled]:text-ink-3'
                   )}
                 >
                   <Select.ItemText className="flex min-w-0 items-center gap-2 truncate">
