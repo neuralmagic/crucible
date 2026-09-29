@@ -31,11 +31,10 @@ env:
   CARGO_NET_RETRY: "10"
 
 jobs:
-  # Ordered fail-fast: fmt is instant, then the compile-heavy steps share a single warm
-  # target/. Same-repo refs get the org's beefy self-hosted runners (32-core, sccache in S3,
-  # baked toolchain); fork PRs MUST stay on hosted runners — self-hosted instances carry an
-  # IAM role, and this is a public repo.
-  lint-and-test:
+  # Same-repo refs get the org's beefy self-hosted runners (32-core, sccache in S3, baked
+  # toolchain); fork PRs MUST stay on hosted runners — self-hosted instances carry an IAM role,
+  # and this is a public repo.
+  test-all-features:
     timeout-minutes: 40
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-latest' }}
     steps:
@@ -46,7 +45,6 @@ jobs:
       # The baked AMI already carries the toolchain and tools; hosted runners install them.
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
         with:
-          components: rustfmt, clippy
           # The GH cache API round-trips from EC2 are slower than sccache's in-region S3.
           cache: ${{ runner.environment == 'github-hosted' }}
 
@@ -66,41 +64,6 @@ jobs:
             echo "RUSTC_WRAPPER=sccache"
             echo "RUSTFLAGS=-C link-arg=-fuse-ld=mold"
           } >> "$GITHUB_ENV"
-
-      - name: Format
-        run: cargo fmt --all --check
-
-      # Duplicate migration numbers (two PRs both claiming NNNN_) only collide at merge time —
-      # catch them here, where the merge group runs.
-      - name: Check migration numbers are unique
-        run: |
-          dups=$(find crucible-controller/migrations -maxdepth 1 -type f -exec basename {} \; \
-            | cut -d_ -f1 | sort | uniq -d)
-          [ -z "$dups" ] || { echo "duplicate migration number(s): $dups"; exit 1; }
-
-      # Guard against the http/tls dependency cluster (reqwest/rustls/hyper/ring/h2) silently
-      # growing more duplicate resolved-version generations than it has today, and against a
-      # heavy dep leaking into a crate that isn't on its allow-list. Both are deterministic
-      # snapshots of current state, see the comments in each script for how to update them
-      # when a change is deliberate.
-      - name: Dependency guardrails
-        run: |
-          ./tools/check-dep-dups.sh
-          ./tools/check-heavy-dep-allowlist.sh
-
-      # The crucible crate's module graph is a DAG: `cargo xtask modgraph` prints it and
-      # `--check` fails on any cycle, so a module cannot quietly grow a dependency on one of
-      # its own dependents.
-      - name: Module layout guard
-        run: |
-          cargo run --quiet -p xtask -- modgraph --check --root crucible/src
-          cargo run --quiet -p xtask -- modgraph --check --root crucible-controller/src >/dev/null
-
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features --locked --no-deps -- -D warnings
-
-      - name: Clippy (default features)
-        run: cargo clippy -p crucible -p crucible-controller -p crux --all-targets --locked --no-deps -- -D warnings
 
       # The controller's `#[sqlx::test]` suite needs a live Postgres at DATABASE_URL; each test
       # creates (and drops) its own database on it. Compilation stays on the checked-in `.sqlx/`
@@ -206,6 +169,75 @@ jobs:
         if: always() && env.VAULT_CONTAINER != ''
         run: docker rm -f "$VAULT_CONTAINER" || true
 
+      - name: Doctests
+        run: cargo test --doc --workspace --all-features --locked
+
+      - name: sccache stats
+        if: runner.environment == 'self-hosted' && always()
+        run: sccache --show-stats
+
+  # Formatting, guards, clippy, and generated docs; beside the test jobs, fmt first.
+  lint:
+    timeout-minutes: 20
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # The baked AMI already carries the toolchain and tools; hosted runners install them.
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          components: rustfmt, clippy
+          # The GH cache API round-trips from EC2 are slower than sccache's in-region S3.
+          cache: ${{ runner.environment == 'github-hosted' }}
+
+      - name: Enable sccache + mold
+        if: runner.environment == 'self-hosted'
+        run: |
+          {
+            echo "SCCACHE_BUCKET=llm-d-sccache-783952637884"
+            echo "SCCACHE_REGION=us-east-1"
+            echo "SCCACHE_S3_KEY_PREFIX=crucible"
+            echo "RUSTC_WRAPPER=sccache"
+            echo "RUSTFLAGS=-C link-arg=-fuse-ld=mold"
+          } >> "$GITHUB_ENV"
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      # Duplicate migration numbers (two PRs both claiming NNNN_) only collide at merge time —
+      # catch them here, where the merge group runs.
+      - name: Check migration numbers are unique
+        run: |
+          dups=$(find crucible-controller/migrations -maxdepth 1 -type f -exec basename {} \; \
+            | cut -d_ -f1 | sort | uniq -d)
+          [ -z "$dups" ] || { echo "duplicate migration number(s): $dups"; exit 1; }
+
+      # Guard against the http/tls dependency cluster (reqwest/rustls/hyper/ring/h2) silently
+      # growing more duplicate resolved-version generations than it has today, and against a
+      # heavy dep leaking into a crate that isn't on its allow-list. Both are deterministic
+      # snapshots of current state, see the comments in each script for how to update them
+      # when a change is deliberate.
+      - name: Dependency guardrails
+        run: |
+          ./tools/check-dep-dups.sh
+          ./tools/check-heavy-dep-allowlist.sh
+
+      # The crucible crate's module graph is a DAG: `cargo xtask modgraph` prints it and
+      # `--check` fails on any cycle, so a module cannot quietly grow a dependency on one of
+      # its own dependents.
+      - name: Module layout guard
+        run: |
+          cargo run --quiet -p xtask -- modgraph --check --root crucible/src
+          cargo run --quiet -p xtask -- modgraph --check --root crucible-controller/src >/dev/null
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked --no-deps -- -D warnings
+
+      - name: Clippy (default features)
+        run: cargo clippy -p crucible -p crucible-controller -p crux --all-targets --locked --no-deps -- -D warnings
+
       - name: DSL reference is current
         run: ./scripts/dsl-docs.sh --check
 
@@ -223,15 +255,12 @@ jobs:
           govctl render rfc
           git diff --exit-code docs/rfc
 
-      - name: Doctests
-        run: cargo test --doc --workspace --all-features --locked
-
       - name: sccache stats
         if: runner.environment == 'self-hosted' && always()
         run: sccache --show-stats
 
-  # The default-feature build's tests, beside lint-and-test rather than after it. Vault and
-  # Keycloak suites skip here; lint-and-test runs them.
+  # The default-feature build's tests. Vault and Keycloak suites skip here;
+  # test-all-features runs them.
   test-default-features:
     timeout-minutes: 30
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-latest' }}
@@ -271,14 +300,15 @@ jobs:
         if: always() && env.PG_CONTAINER != ''
         run: docker rm -f "$PG_CONTAINER" || true
 
-  # The required check: green only when both halves are.
+  # The required check: green only when every job above is.
   build-and-test:
-    needs: [lint-and-test, test-default-features]
+    needs: [lint, test-all-features, test-default-features]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - run: |
-          [ "${{ needs.lint-and-test.result }}" = success ] &&
+          [ "${{ needs.lint.result }}" = success ] &&
+            [ "${{ needs.test-all-features.result }}" = success ] &&
             [ "${{ needs.test-default-features.result }}" = success ]
 
   # The controller SPA, independent of the Rust build. The package pre-hooks regenerate the
