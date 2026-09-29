@@ -1,7 +1,7 @@
 import { $api } from './client';
 
-/// Whether this controller runs the autoresearch lane; `undefined` until the version answers.
+/// Whether the caller is entitled to the autoresearch lane; `undefined` until whoami answers.
 export function useAutoresearch(): boolean | undefined {
-  const version = $api.useQuery('get', '/api/version', {}, { staleTime: Infinity });
-  return version.data?.autoresearch;
+  const whoami = $api.useQuery('get', '/api/whoami');
+  return whoami.data?.entitlements.includes('autoresearch');
 }

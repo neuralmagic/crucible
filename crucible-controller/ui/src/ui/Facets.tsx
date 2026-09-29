@@ -146,7 +146,7 @@ export function Applied({ shown, total, noun, filters, onClearAll }: AppliedProp
       <button
         type="button"
         onClick={onClearAll}
-        className="ml-auto border-b border-rule-hard text-ink-3 hover:border-ink hover:text-ink"
+        className="ml-auto border-b border-rule-hard text-ink-2 hover:border-ink hover:text-ink"
       >
         Clear all
       </button>
