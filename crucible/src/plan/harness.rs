@@ -4150,6 +4150,59 @@ workflow(type = "playbook", tasks = [author, repro])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn a_chain_revise_loop_rebuilds_from_the_revised_pick() {
+        let dir = playbook_pack(
+            "revise-chain",
+            r#"
+pick = command(
+    name = "pick",
+    run = "python3 -c 'import json, os; r = json.loads(os.environ[\"CRUCIBLE_INPUTS\"]).get(\"revision\"); open(\"FIX.txt\", \"w\").write(\"v%d\\n\" % (r[\"round\"] if r else 1)); print(json.dumps({\"picked\": True, \"saw_evidence\": os.path.exists(\"inputs/confirm/evidence/confirm.json\")}))'",
+    emits_files = ["FIX.txt"],
+)
+build = command(
+    name = "build",
+    run = "rm -f BUILD.txt && cat inputs/pick/FIX.txt > BUILD.txt && printf '{\"built\": true}\n'",
+    depends_on = [pick],
+    emits_files = ["BUILD.txt"],
+)
+confirm = command(
+    name = "confirm",
+    run = "mkdir -p evidence && if grep -q v2 inputs/build/BUILD.txt; then printf '{\"fixed\": true}\n' > evidence/confirm.json && cat evidence/confirm.json; else printf '{\"fixed\": false}\n' > evidence/confirm.json && cat evidence/confirm.json && exit 1; fi",
+    depends_on = [build],
+    emits_files = ["evidence/confirm.json"],
+    revise = [pick, build],
+    max_rounds = 3,
+)
+workflow(type = "playbook", tasks = [pick, build, confirm])
+"#,
+        );
+        let out = run_playbook(&dir);
+
+        assert!(out.valid, "{:?}", out.results);
+        assert_eq!(
+            out.results[&"pick".into()].output,
+            Some(serde_json::json!({"picked": true, "saw_evidence": true}))
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("state/files/build/BUILD.txt")).unwrap(),
+            "v2\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("state/files/confirm/evidence/confirm.json")).unwrap(),
+            "{\"fixed\": true}\n"
+        );
+        let log = git_output(&dir.join("workspace"), &["log", "--format=%s"]);
+        for (task, commits) in [("pick", 2), ("build", 2), ("confirm", 1)] {
+            assert_eq!(
+                log.lines().filter(|l| *l == format!("task {task}")).count(),
+                commits,
+                "{task}: {log}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The rejected round's captured evidence is laid down for the revision under the reviewer's
     /// name, the same place a settled consumer would find it.
     #[test]

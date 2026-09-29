@@ -219,8 +219,8 @@ dependency, then folds the non-empty passing set. It fails closed if none can ru
 
 ### `revise`
 
-A reviewer sends a failing verdict back to the one dependency it names, for a bounded number of
-rounds. Playbooks only, and the only repetition the graph itself states.
+A reviewer sends a failing verdict back to the tasks it names, for a bounded number of rounds.
+Playbooks only, and the only repetition the graph itself states.
 
 ```python
 author = agent(
@@ -245,7 +245,25 @@ remain, `author` runs again and then `review` does, until `review` stops failing
 round is spent. Any other reviewer outcome ends the loop, as does a revision that fails and
 leaves the reviewer blocked. The engine checks the ceilings before every round.
 
-From the second round the target's inputs carry the reserved `revision` key:
+`revise` also takes a list, when a fix needs more than one task to run again:
+
+```python
+confirm = evaluate(
+    name = "confirm",
+    run = "python3 tools/probe.py --rung confirm",
+    depends_on = [rig],
+    revise = [pick, build, rig],
+    max_rounds = 3,
+)
+```
+
+The targets and the reviewer are the loop's body. Each round runs the body one task at a time in
+dependency order, each under its own `join` and `when`, so a failed `build` blocks an all-join
+reviewer and ends the loop, while a reviewer joining `settled` sees the failure and can send the
+chain back. The loop starts once everything outside the body that any body task reads has
+settled, and a task outside the body that reads a body task waits for the loop to end.
+
+From the second round every target's inputs carry the reserved `revision` key:
 
 ```json
 {"round": 2, "max_rounds": 3, "reviewer": "review",
@@ -254,18 +272,20 @@ From the second round the target's inputs carry the reserved `revision` key:
 ```
 
 `files` says whether the reviewer's declared files from that failing round were staged, which
-they are under `inputs/<reviewer>/`, the same place a `join = "settled"` consumer finds them. A
-target that declares a `session` resumes it each round, so it remembers what it already tried.
+they are under `inputs/<reviewer>/`, the same place a `join = "settled"` consumer finds them. The
+reviewer itself never receives `revision`. A body task that declares a `session` resumes it each
+round, so it remembers what it already tried.
 
 Each round settles in its own right: a passing round commits, a failing one is discarded, and
 each reports as `task[round-N]`, the naming a mapped node's instances use. Once the loop ends,
 each task reports one row under its own name carrying its last round and the spend of every
 round, and those rows alone gate the verdict. A dependent reads the last round.
 
-The bound is 2 to 5 and is never defaulted. Validation refuses a target that is not a direct
-dependency, a fan-out on either side, two reviewers for one target, nested or chained loops, and
-a reviewer dependency that can reach the target (it would read a draft a later round replaces).
-Anything less bounded, or a repair that re-runs more than one producer, stays inside one task.
+The bound is 2 to 5 and is never defaulted. Validation refuses a target the reviewer does not
+depend on, directly or through other tasks; a body that leaves out a task on a path between two
+of its tasks (that task would read a result a later round replaces); a body task that is not an
+agent, command, or evaluate task, or that fans out; a task in two bodies; and a reviewer that is
+itself a target. Anything whose bound depends on what a task finds stays inside one task.
 
 ## The loop as a plan
 

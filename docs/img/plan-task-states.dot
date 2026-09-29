@@ -47,4 +47,5 @@ digraph task {
     Revising -> Skipped [label="rounds skipped", color="#8a4b1c", fontcolor="#8a4b1c"];
     Revising -> Transport [label="rounds transport", color="#8a4b1c", fontcolor="#8a4b1c"];
     Revising -> Blocked [label="rounds blocked", color="#8a4b1c", fontcolor="#8a4b1c"];
+    Revising -> NotTaken [label="rounds not taken", color="#8a4b1c", fontcolor="#8a4b1c"];
 }

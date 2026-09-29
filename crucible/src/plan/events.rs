@@ -34,7 +34,7 @@ pub(crate) fn plan_admitted_event(
                 revise: t
                     .revise
                     .as_ref()
-                    .map(|r| r.task.0.clone())
+                    .map(|r| r.tasks.iter().map(|task| task.0.clone()).collect())
                     .unwrap_or_default(),
                 max_rounds: t.revise.as_ref().map_or(0, |r| r.max_rounds),
                 emits: t
@@ -123,6 +123,21 @@ mod tests {
             command = "true"
             depends_on = ["author"]
             revise = { task = "author", max_rounds = 3 }
+            [[task]]
+            name = "pick"
+            kind = "command"
+            command = "true"
+            [[task]]
+            name = "build"
+            kind = "command"
+            command = "true"
+            depends_on = ["pick"]
+            [[task]]
+            name = "confirm"
+            kind = "command"
+            command = "true"
+            depends_on = ["build"]
+            revise = { tasks = ["pick", "build"], max_rounds = 2 }
             "#,
         )
         .unwrap()
@@ -133,10 +148,18 @@ mod tests {
         else {
             panic!("not a plan_admitted event");
         };
-        assert_eq!((tasks[0].revise.as_str(), tasks[0].max_rounds), ("", 0));
         assert_eq!(
-            (tasks[1].revise.as_str(), tasks[1].max_rounds),
-            ("author", 3)
+            (tasks[0].revise.as_slice(), tasks[0].max_rounds),
+            (&[][..], 0)
+        );
+        assert_eq!(
+            (tasks[1].revise.as_slice(), tasks[1].max_rounds),
+            (&["author".to_string()][..], 3)
+        );
+        let confirm = tasks.iter().find(|t| t.name == "confirm").unwrap();
+        assert_eq!(
+            (confirm.revise.as_slice(), confirm.max_rounds),
+            (&["pick".to_string(), "build".to_string()][..], 2)
         );
     }
 

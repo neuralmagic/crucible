@@ -754,6 +754,9 @@ per-attempt limit in the `--max-time` syntax (`90s`, `20m`, `2h`), empty when on
 wall-clock ceiling bounds it. A task killed at its deadline settles `fail` with a `note` naming
 the limit that ended it.
 
+A `plan_admitted` task's `revise` (contract 1.11.0) is a list of task names when the task reviews
+a chain, and stays a single name, or empty, otherwise. A reader should accept both.
+
 An orchestrator tells the engine where models are reached through one JSON document in
 `CRUCIBLE_INFERENCE` (contract 1.7.0), typed as `crucible_contract::inference::ResolvedInference`:
 `{"version":1,"bindings":[{"role","protocol","url"?,"model","key_env"?}]}`. `role` is `agent` or

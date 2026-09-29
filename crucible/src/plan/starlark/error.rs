@@ -396,16 +396,14 @@ pub enum CompileError {
     #[error("max_rounds = {got} is outside 2..={MAX_ROUNDS_CEILING}")]
     RoundsOutOfRange { got: i32 },
     #[error(
-        "revise = {target:?} without max_rounds; a revise loop states how many rounds it may \
+        "revise = {targets:?} without max_rounds; a revise loop states how many rounds it may \
          take before it runs, not after"
     )]
-    ReviseWithoutRounds { target: String },
+    ReviseWithoutRounds { targets: String },
+    #[error("revise = [] names no task; name the tasks a failing verdict sends back")]
+    ReviseNamesNoTask,
     #[error("max_rounds without \"revise\"; there is no loop to bound")]
     RoundsWithoutRevise,
-    #[error(
-        "task {task:?} revises {target:?} but does not depend on it; add {target:?} to depends_on"
-    )]
-    ReviseNotADependency { task: String, target: String },
     #[error("emits entries must be strings")]
     EmitsEntryNotString,
     #[error("argument \"emits\" must be a list of field names, or a dict from field name to type")]

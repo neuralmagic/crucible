@@ -490,12 +490,53 @@ pub struct Task {
     pub history: Option<u32>,
 }
 
-/// A reviewer's bounded send-back: when the reviewer settles failing, `task` runs again with the
+/// A reviewer's bounded send-back: when the reviewer settles failing, `tasks` run again with the
 /// verdict, then the reviewer does, for at most `max_rounds` rounds in all.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "ReviseRepr", into = "ReviseRepr")]
 pub struct Revise {
-    pub task: TaskName,
+    pub tasks: Vec<TaskName>,
     pub max_rounds: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ReviseRepr {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    task: Option<TaskName>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tasks: Vec<TaskName>,
+    max_rounds: u32,
+}
+
+impl TryFrom<ReviseRepr> for Revise {
+    type Error = String;
+
+    fn try_from(repr: ReviseRepr) -> Result<Self, Self::Error> {
+        let tasks = match (repr.task, repr.tasks) {
+            (Some(task), tasks) if tasks.is_empty() => vec![task],
+            (Some(_), _) => return Err("revise names both `task` and `tasks`".to_string()),
+            (None, tasks) if tasks.is_empty() => return Err("revise names no task".to_string()),
+            (None, tasks) => tasks,
+        };
+        Ok(Revise {
+            tasks,
+            max_rounds: repr.max_rounds,
+        })
+    }
+}
+
+impl From<Revise> for ReviseRepr {
+    fn from(revise: Revise) -> Self {
+        let (task, tasks) = match <[TaskName; 1]>::try_from(revise.tasks) {
+            Ok([task]) => (Some(task), Vec::new()),
+            Err(tasks) => (None, tasks),
+        };
+        ReviseRepr {
+            task,
+            tasks,
+            max_rounds: revise.max_rounds,
+        }
+    }
 }
 
 /// The most rounds one revise loop may run. Operator-owned, like [`MAX_FANOUT_CEILING`].
@@ -548,6 +589,34 @@ impl ValidPlan {
 
     pub fn get(&self, name: &TaskName) -> Option<&Task> {
         self.plan.tasks.iter().find(|t| &t.name == name)
+    }
+
+    pub fn revise_loops(&self) -> Vec<ReviseLoop<'_>> {
+        self.tasks_topo()
+            .filter_map(|reviewer| {
+                let revise = reviewer.revise.as_ref()?;
+                Some(ReviseLoop {
+                    reviewer,
+                    body: self
+                        .tasks_topo()
+                        .filter(|t| t.name == reviewer.name || revise.tasks.contains(&t.name))
+                        .collect(),
+                    max_rounds: revise.max_rounds,
+                })
+            })
+            .collect()
+    }
+}
+
+pub struct ReviseLoop<'a> {
+    pub reviewer: &'a Task,
+    pub body: Vec<&'a Task>,
+    pub max_rounds: u32,
+}
+
+impl ReviseLoop<'_> {
+    pub fn contains(&self, name: &TaskName) -> bool {
+        self.body.iter().any(|t| &t.name == name)
     }
 }
 
@@ -818,52 +887,61 @@ pub enum PlanError {
         question: String,
         labels: Vec<String>,
     },
+    #[error("task {task:?} declares revise but names no task")]
+    ReviseNamesNoTask { task: String },
+    #[error("task {task:?} revises unknown task {target:?}")]
+    ReviseUnknownTarget { task: String, target: String },
+    #[error("task {task:?} names {target:?} twice in revise")]
+    ReviseTargetRepeated { task: String, target: String },
     #[error(
-        "task {task:?} revises {target:?} but does not depend on it; a reviewer reads the work it \
-         sends back from a direct dependency"
+        "task {task:?} revises {target:?} but does not depend on it, directly or through other \
+         tasks; a reviewer reads the work it sends back"
     )]
-    ReviseTargetNotADependency { task: String, target: String },
+    ReviseTargetUnreachable { task: String, target: String },
     #[error("task {task:?}: max_rounds = {got} is outside 2..={MAX_ROUNDS_CEILING}")]
     RoundsOutOfRange { task: String, got: u32 },
     #[error(
-        "task {task:?} revises {target:?}, a {kind} task; only agent, command, and evaluate tasks \
-         take part in a revise loop"
+        "task {task:?}'s revise loop includes {member:?}, a {kind} task; only agent, command, and \
+         evaluate tasks take part in a revise loop"
     )]
     ReviseOnUnsupportedTask {
         task: String,
-        target: String,
+        member: String,
         kind: &'static str,
     },
     #[error(
-        "task {task:?} revises {target:?}, and one of them maps over a list; a round re-runs one \
-         task, not a fan-out"
+        "task {task:?}'s revise loop includes {member:?}, which maps over a list; a round re-runs \
+         tasks, not a fan-out"
     )]
-    ReviseWithFanout { task: String, target: String },
+    ReviseWithFanout { task: String, member: String },
     #[error(
-        "task {task:?} revises {target:?} and declares when; a reviewer runs whenever what it \
-         revises does, so put the when on {target:?}"
+        "task {task:?} declares revise and when; a reviewer runs whenever what it revises does, so \
+         put the when on a target"
     )]
-    WhenOnReviewer { task: String, target: String },
-    #[error("tasks {left:?} and {right:?} both revise {target:?}; a task has at most one reviewer")]
-    ReviseTargetRevisedTwice {
+    WhenOnReviewer { task: String },
+    #[error(
+        "tasks {left:?} and {right:?} both revise through {member:?}; a task is in at most one \
+         revise loop"
+    )]
+    ReviseBodiesOverlap {
         left: String,
         right: String,
-        target: String,
+        member: String,
     },
     #[error(
-        "task {task:?} revises {target:?}, which is itself in another revise loop; revise loops \
-         do not nest or chain"
+        "task {task:?} revises {target:?}, which is itself a reviewer; revise loops do not nest or \
+         chain"
     )]
     NestedRevise { task: String, target: String },
     #[error(
-        "task {task:?} revises {target:?} and also depends on {dependency:?}, which depends on \
-         {target:?}; a round re-runs only {target:?} and {task:?}, so {dependency:?} would read \
-         a draft the loop replaces"
+        "task {task:?}'s revise loop runs {}, but {skipped:?} lies between two of them; list \
+         {skipped:?} in revise, or a round would leave it reading a result the loop replaces",
+        .body.join(", ")
     )]
-    ReviseAroundADependent {
+    ReviseSkipsATask {
         task: String,
-        target: String,
-        dependency: String,
+        skipped: String,
+        body: Vec<String>,
     },
     #[error(
         "task {task:?}: history = {got} is outside 1..={MAX_HISTORY_DEPTH}",
@@ -1419,18 +1497,8 @@ impl Plan {
                 }
             }
             if let Some(revise) = &t.revise {
-                let target = || revise.task.0.clone();
                 if t.when.is_some() {
-                    return Err(PlanError::WhenOnReviewer {
-                        task: task(),
-                        target: target(),
-                    });
-                }
-                if !t.depends_on.contains(&revise.task) {
-                    return Err(PlanError::ReviseTargetNotADependency {
-                        task: task(),
-                        target: target(),
-                    });
+                    return Err(PlanError::WhenOnReviewer { task: task() });
                 }
                 if !(2..=MAX_ROUNDS_CEILING).contains(&revise.max_rounds) {
                     return Err(PlanError::RoundsOutOfRange {
@@ -1438,57 +1506,20 @@ impl Plan {
                         got: revise.max_rounds,
                     });
                 }
-                let Some(&proposer) = index.get(&revise.task) else {
-                    return Err(PlanError::UnknownDependency {
-                        task: task(),
-                        dependency: target(),
-                    });
-                };
-                let proposer = &self.tasks[proposer];
-                for member in [t, proposer] {
-                    if !matches!(
-                        member.task,
-                        TaskKind::Agent { .. }
-                            | TaskKind::Command { .. }
-                            | TaskKind::Evaluate { .. }
-                    ) {
-                        return Err(PlanError::ReviseOnUnsupportedTask {
-                            task: task(),
-                            target: target(),
-                            kind: member.task.label(),
-                        });
-                    }
-                    if member.over.is_some() {
-                        return Err(PlanError::ReviseWithFanout {
-                            task: task(),
-                            target: target(),
-                        });
-                    }
+                if revise.tasks.is_empty() {
+                    return Err(PlanError::ReviseNamesNoTask { task: task() });
                 }
-                if proposer.revise.is_some() {
-                    return Err(PlanError::NestedRevise {
-                        task: task(),
-                        target: target(),
-                    });
-                }
-                for other in &self.tasks {
-                    let Some(other_revise) = &other.revise else {
-                        continue;
-                    };
-                    if other.name == t.name {
-                        continue;
-                    }
-                    if other_revise.task == revise.task {
-                        return Err(PlanError::ReviseTargetRevisedTwice {
-                            left: task(),
-                            right: other.name.0.clone(),
-                            target: target(),
+                for (i, target) in revise.tasks.iter().enumerate() {
+                    if revise.tasks[..i].contains(target) {
+                        return Err(PlanError::ReviseTargetRepeated {
+                            task: task(),
+                            target: target.0.clone(),
                         });
                     }
-                    if other_revise.task == t.name {
-                        return Err(PlanError::NestedRevise {
-                            task: other.name.0.clone(),
-                            target: task(),
+                    if !index.contains_key(target) {
+                        return Err(PlanError::ReviseUnknownTarget {
+                            task: task(),
+                            target: target.0.clone(),
                         });
                     }
                 }
@@ -1596,19 +1627,64 @@ impl Plan {
                 }
             }
         }
+        let mut loop_of: BTreeMap<&TaskName, &TaskName> = BTreeMap::new();
         for t in &self.tasks {
             let Some(revise) = &t.revise else { continue };
-            let Some(&proposer) = index.get(&revise.task) else {
-                continue;
-            };
-            for d in t.depends_on.iter().filter(|d| **d != revise.task) {
-                if index.get(d).is_some_and(|&i| reaches(proposer, i)) {
-                    return Err(PlanError::ReviseAroundADependent {
+            let reviewer = index[&t.name];
+            let body: Vec<usize> = revise
+                .tasks
+                .iter()
+                .map(|target| index[target])
+                .chain([reviewer])
+                .collect();
+            for &target in &body[..body.len() - 1] {
+                if !reaches(target, reviewer) {
+                    return Err(PlanError::ReviseTargetUnreachable {
                         task: t.name.0.clone(),
-                        target: revise.task.0.clone(),
-                        dependency: d.0.clone(),
+                        target: self.tasks[target].name.0.clone(),
                     });
                 }
+            }
+            for &m in &body {
+                let member = &self.tasks[m];
+                let offending = || (t.name.0.clone(), member.name.0.clone());
+                if !matches!(
+                    member.task,
+                    TaskKind::Agent { .. } | TaskKind::Command { .. } | TaskKind::Evaluate { .. }
+                ) {
+                    let (task, member_name) = offending();
+                    return Err(PlanError::ReviseOnUnsupportedTask {
+                        task,
+                        member: member_name,
+                        kind: member.task.label(),
+                    });
+                }
+                if member.over.is_some() {
+                    let (task, member) = offending();
+                    return Err(PlanError::ReviseWithFanout { task, member });
+                }
+                if m != reviewer && member.revise.is_some() {
+                    let (task, target) = offending();
+                    return Err(PlanError::NestedRevise { task, target });
+                }
+                if let Some(other) = loop_of.insert(&member.name, &t.name) {
+                    return Err(PlanError::ReviseBodiesOverlap {
+                        left: other.0.clone(),
+                        right: t.name.0.clone(),
+                        member: member.name.0.clone(),
+                    });
+                }
+            }
+            if let Some(skipped) = (0..n).find(|&x| {
+                !body.contains(&x)
+                    && body.iter().any(|&from| reaches(from, x))
+                    && body.iter().any(|&to| reaches(x, to))
+            }) {
+                return Err(PlanError::ReviseSkipsATask {
+                    task: t.name.0.clone(),
+                    skipped: self.tasks[skipped].name.0.clone(),
+                    body: body.iter().map(|&m| self.tasks[m].name.0.clone()).collect(),
+                });
             }
         }
         Ok(ValidPlan { plan: self, topo })
@@ -3213,9 +3289,13 @@ emits = ["lines"]
     }
 
     fn reviewer(name: &str, deps: &[&str], target: &str, max_rounds: u32) -> Task {
+        chain_reviewer(name, deps, &[target], max_rounds)
+    }
+
+    fn chain_reviewer(name: &str, deps: &[&str], targets: &[&str], max_rounds: u32) -> Task {
         let mut t = agent(name, deps);
         t.revise = Some(Revise {
-            task: target.into(),
+            tasks: targets.iter().map(|target| (*target).into()).collect(),
             max_rounds,
         });
         t
@@ -3246,10 +3326,44 @@ emits = ["lines"]
         assert_eq!(
             back.get(&"repro".into()).and_then(|t| t.revise.clone()),
             Some(Revise {
-                task: "author".into(),
+                tasks: vec!["author".into()],
                 max_rounds: 3
             })
         );
+    }
+
+    #[test]
+    fn a_chain_revise_serializes_as_tasks_and_one_target_as_task() {
+        let p = plan(vec![
+            agent("author", &[]),
+            agent("build", &["author"]),
+            chain_reviewer("confirm", &["build"], &["author", "build"], 2),
+        ]);
+        let json = serde_json::to_value(&p).unwrap();
+        assert_eq!(
+            json["task"][2]["revise"],
+            serde_json::json!({"tasks": ["author", "build"], "max_rounds": 2})
+        );
+        let toml = toml::to_string(&p).unwrap();
+        let back = Plan::from_toml_str(&toml).unwrap().validate().unwrap();
+        assert_eq!(
+            back.get(&"confirm".into()).and_then(|t| t.revise.clone()),
+            Some(Revise {
+                tasks: vec!["author".into(), "build".into()],
+                max_rounds: 2
+            })
+        );
+        for (body, why) in [
+            (
+                r#"{"task": "a", "tasks": ["b"], "max_rounds": 2}"#,
+                "both `task` and `tasks`",
+            ),
+            (r#"{"max_rounds": 2}"#, "names no task"),
+            (r#"{"tasks": [], "max_rounds": 2}"#, "names no task"),
+        ] {
+            let err = serde_json::from_str::<Revise>(body).unwrap_err();
+            assert!(err.to_string().contains(why), "{body}: {err}");
+        }
     }
 
     #[test]
@@ -3278,19 +3392,73 @@ emits = ["lines"]
             plan(tasks).validate().unwrap_err(),
             PlanError::WhenOnReviewer {
                 task: "repro".into(),
-                target: "author".into()
             }
         );
     }
 
     #[test]
-    fn a_reviewer_must_depend_on_what_it_revises() {
+    fn a_reviewer_must_reach_what_it_revises() {
         assert_eq!(
             refused(vec![
                 agent("author", &[]),
                 reviewer("repro", &[], "author", 3)
             ]),
-            PlanError::ReviseTargetNotADependency {
+            PlanError::ReviseTargetUnreachable {
+                task: "repro".into(),
+                target: "author".into()
+            }
+        );
+        assert_eq!(
+            refused(vec![
+                agent("author", &[]),
+                agent("side", &[]),
+                chain_reviewer("repro", &["author"], &["author", "side"], 3)
+            ]),
+            PlanError::ReviseTargetUnreachable {
+                task: "repro".into(),
+                target: "side".into()
+            }
+        );
+        assert_eq!(
+            refused(vec![chain_reviewer("repro", &[], &["repro"], 3)]),
+            PlanError::ReviseTargetUnreachable {
+                task: "repro".into(),
+                target: "repro".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_revise_built_in_code_still_names_a_task() {
+        assert_eq!(
+            refused(vec![
+                agent("author", &[]),
+                chain_reviewer("repro", &["author"], &[], 3)
+            ]),
+            PlanError::ReviseNamesNoTask {
+                task: "repro".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_revise_names_known_tasks_once() {
+        assert_eq!(
+            refused(vec![
+                agent("author", &[]),
+                chain_reviewer("repro", &["author"], &["author", "ghost"], 3)
+            ]),
+            PlanError::ReviseUnknownTarget {
+                task: "repro".into(),
+                target: "ghost".into()
+            }
+        );
+        assert_eq!(
+            refused(vec![
+                agent("author", &[]),
+                chain_reviewer("repro", &["author"], &["author", "author"], 3)
+            ]),
+            PlanError::ReviseTargetRepeated {
                 task: "repro".into(),
                 target: "author".into()
             }
@@ -3327,14 +3495,14 @@ emits = ["lines"]
     fn only_agent_command_and_evaluate_tasks_take_part_in_a_revise_loop() {
         let mut reducer = top_k("pick", &["author"]);
         reducer.revise = Some(Revise {
-            task: "author".into(),
+            tasks: vec!["author".into()],
             max_rounds: 2,
         });
         assert_eq!(
             refused(vec![emitting("author", &[], &["score"]), reducer]),
             PlanError::ReviseOnUnsupportedTask {
                 task: "pick".into(),
-                target: "author".into(),
+                member: "pick".into(),
                 kind: "top_k"
             }
         );
@@ -3342,11 +3510,11 @@ emits = ["lines"]
             refused(vec![
                 emitting("author", &[], &["score"]),
                 top_k("fold", &["author"]),
-                reviewer("repro", &["fold"], "fold", 2),
+                chain_reviewer("repro", &["fold"], &["author", "fold"], 2),
             ]),
             PlanError::ReviseOnUnsupportedTask {
                 task: "repro".into(),
-                target: "fold".into(),
+                member: "fold".into(),
                 kind: "top_k"
             }
         );
@@ -3369,23 +3537,23 @@ emits = ["lines"]
             ]),
             PlanError::ReviseWithFanout {
                 task: "repro".into(),
-                target: "audit".into()
+                member: "audit".into()
             }
         );
     }
 
     #[test]
-    fn a_task_has_at_most_one_reviewer_and_loops_do_not_chain() {
+    fn a_task_is_in_one_loop_and_loops_do_not_chain() {
         assert_eq!(
             refused(vec![
                 agent("author", &[]),
                 reviewer("left", &["author"], "author", 2),
                 reviewer("right", &["author"], "author", 2),
             ]),
-            PlanError::ReviseTargetRevisedTwice {
+            PlanError::ReviseBodiesOverlap {
                 left: "left".into(),
                 right: "right".into(),
-                target: "author".into()
+                member: "author".into()
             }
         );
         assert_eq!(
@@ -3399,22 +3567,64 @@ emits = ["lines"]
                 target: "repro".into()
             }
         );
+        assert_eq!(
+            refused(vec![
+                agent("author", &[]),
+                agent("build", &["author"]),
+                chain_reviewer("check", &["build"], &["author", "build"], 2),
+                reviewer("lint", &["build"], "build", 2),
+            ]),
+            PlanError::ReviseBodiesOverlap {
+                left: "check".into(),
+                right: "lint".into(),
+                member: "build".into()
+            }
+        );
     }
 
     #[test]
-    fn a_reviewer_cannot_read_the_draft_through_another_dependency() {
+    fn a_revise_loop_lists_every_task_between_its_members() {
         assert_eq!(
             refused(vec![
                 agent("author", &[]),
                 agent("build", &["author"]),
                 reviewer("repro", &["author", "build"], "author", 2),
             ]),
-            PlanError::ReviseAroundADependent {
+            PlanError::ReviseSkipsATask {
                 task: "repro".into(),
-                target: "author".into(),
-                dependency: "build".into()
+                skipped: "build".into(),
+                body: vec!["author".into(), "repro".into()]
             }
         );
+        assert_eq!(
+            refused(vec![
+                agent("pick", &[]),
+                agent("build", &["pick"]),
+                agent("rig", &["build"]),
+                chain_reviewer("confirm", &["rig"], &["pick", "rig"], 3),
+            ]),
+            PlanError::ReviseSkipsATask {
+                task: "confirm".into(),
+                skipped: "build".into(),
+                body: vec!["pick".into(), "rig".into(), "confirm".into()]
+            }
+        );
+        let ok = plan(vec![
+            agent("resolve", &[]),
+            agent("pick", &["resolve"]),
+            agent("build", &["pick"]),
+            agent("rig", &["build", "resolve"]),
+            chain_reviewer("confirm", &["rig", "resolve"], &["pick", "build", "rig"], 3),
+            agent("deliver", &["confirm", "build"]),
+        ])
+        .validate()
+        .expect("a chain with inputs and dependents outside it");
+        let loops = ok.revise_loops();
+        assert_eq!(loops.len(), 1);
+        let names: Vec<&str> = loops[0].body.iter().map(|t| t.name.0.as_str()).collect();
+        assert_eq!(names, ["pick", "build", "rig", "confirm"]);
+        assert_eq!(loops[0].reviewer.name.0, "confirm");
+        assert_eq!(loops[0].max_rounds, 3);
     }
 
     #[test]

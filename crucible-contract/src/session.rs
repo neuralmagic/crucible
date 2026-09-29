@@ -145,10 +145,14 @@ pub struct PlanTaskWire {
     /// `route.question in a|b` when the task runs only on those answers, empty otherwise.
     #[serde(default)]
     pub when: String,
-    /// The dependency this task sends back when it settles failing, empty otherwise. Each round
+    /// The tasks this task sends back when it settles failing, empty otherwise. Each round
     /// reports as `task[round-N]`, so a renderer draws the loop from this before any round runs.
-    #[serde(default)]
-    pub revise: String,
+    #[serde(
+        default,
+        deserialize_with = "revise_targets",
+        serialize_with = "write_revise_targets"
+    )]
+    pub revise: Vec<String>,
     /// The most rounds `revise` may run, the first included; 0 when the task revises nothing.
     #[serde(default)]
     pub max_rounds: u32,
@@ -163,6 +167,28 @@ pub struct PlanTaskWire {
     /// How many earlier runs of its series the task reads under `history`; 0 when it reads none.
     #[serde(default)]
     pub history_depth: u32,
+}
+
+fn write_revise_targets<S: serde::Serializer>(targets: &[String], s: S) -> Result<S::Ok, S::Error> {
+    match targets {
+        [] => s.serialize_str(""),
+        [one] => s.serialize_str(one),
+        many => many.serialize(s),
+    }
+}
+
+fn revise_targets<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Targets {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match Targets::deserialize(d)? {
+        Targets::One(target) if target.is_empty() => Vec::new(),
+        Targets::One(target) => vec![target],
+        Targets::Many(targets) => targets,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -844,7 +870,7 @@ mod tests {
                 over: "discover.targets".into(),
                 max_fanout: 8,
                 when: String::new(),
-                revise: "draft".into(),
+                revise: vec!["draft".into(), "check".into()],
                 max_rounds: 3,
                 emits: vec![
                     crate::emits::EmitWire {
@@ -905,6 +931,47 @@ mod tests {
         };
         assert_eq!(history_record, "");
         assert_eq!(tasks[0].history_depth, 0);
+    }
+
+    #[test]
+    fn no_or_one_revise_target_is_written_as_the_string_earlier_readers_expect() {
+        let task = |revise: Vec<String>| PlanTaskWire {
+            name: "repro".into(),
+            kind: "command".into(),
+            depends_on: vec![],
+            session: String::new(),
+            needs: "any".into(),
+            required: true,
+            join: "all".into(),
+            stage: "iteration".into(),
+            over: String::new(),
+            max_fanout: 0,
+            when: String::new(),
+            revise,
+            max_rounds: 0,
+            emits: Vec::new(),
+            timeout: String::new(),
+            history_depth: 0,
+        };
+        let written = |revise: Vec<String>| {
+            serde_json::to_value(task(revise)).expect("encodes")["revise"].clone()
+        };
+        assert_eq!(written(vec![]), serde_json::json!(""));
+        assert_eq!(written(vec!["author".into()]), serde_json::json!("author"));
+        assert_eq!(
+            written(vec!["pick".into(), "build".into()]),
+            serde_json::json!(["pick", "build"])
+        );
+    }
+
+    #[test]
+    fn a_revise_target_written_as_one_string_reads_as_a_list() {
+        let line = r#"{"name":"repro","kind":"command","revise":"author","max_rounds":3}"#;
+        let task: PlanTaskWire = serde_json::from_str(line).expect("decodes");
+        assert_eq!(task.revise, vec!["author".to_string()]);
+        let none: PlanTaskWire =
+            serde_json::from_str(r#"{"name":"a","kind":"command","revise":""}"#).expect("decodes");
+        assert!(none.revise.is_empty());
     }
 
     /// Asks reach the log as their emitting task settles, so an auditor can compare what a run

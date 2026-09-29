@@ -33,7 +33,7 @@ An agent turn driven by a prompt.
 | `emits_files` | `list[str]` | Workspace files the task produces. A dependent is staged with the declared files of every dependency that passed. |
 | `over` | `producer.field` | Map the task over a dependency's emitted list, one instance per item. |
 | `max_fanout` | `int` | Instance cap for `over`, within the engine's ceiling of 256. |
-| `revise` | `task` | A direct dependency this task sends back when it settles failing. The dependency runs again with the verdict under `revision`, then this task does, until this task stops failing or `max_rounds` is spent. Playbooks only; not with `over`. |
+| `revise` | `task \| list[task]` | The tasks this task sends back when it settles failing. They run again, in dependency order, with the verdict under `revision`, then this task does, until this task stops failing or `max_rounds` is spent. Every task on a path between them and this task must be listed. Playbooks only; not with `over`. |
 | `max_rounds` | `int` | Round cap for `revise`, counting the first, from 2 to the engine's ceiling of 5. |
 | `timeout` | `str` | How long one attempt may run, as `90s`, `10m`, or `2h`. At the limit the attempt's whole process group is killed and the task settles failed with a note naming the limit; it is not retried. The run's `--max-time` bounds every attempt as well, and a playbook refuses a timeout longer than it before dispatching anything. |
 | `stage` | `"iteration" \| "epilogue"` | `epilogue` runs once after the loop concludes, and only if the run kept a candidate. |
@@ -64,7 +64,7 @@ An agent turn whose prompt is a skill's instructions plus its arguments.
 | `emits_files` | `list[str]` | Workspace files the task produces. A dependent is staged with the declared files of every dependency that passed. |
 | `over` | `producer.field` | Map the task over a dependency's emitted list, one instance per item. |
 | `max_fanout` | `int` | Instance cap for `over`, within the engine's ceiling of 256. |
-| `revise` | `task` | A direct dependency this task sends back when it settles failing. The dependency runs again with the verdict under `revision`, then this task does, until this task stops failing or `max_rounds` is spent. Playbooks only; not with `over`. |
+| `revise` | `task \| list[task]` | The tasks this task sends back when it settles failing. They run again, in dependency order, with the verdict under `revision`, then this task does, until this task stops failing or `max_rounds` is spent. Every task on a path between them and this task must be listed. Playbooks only; not with `over`. |
 | `max_rounds` | `int` | Round cap for `revise`, counting the first, from 2 to the engine's ceiling of 5. |
 | `timeout` | `str` | How long one attempt may run, as `90s`, `10m`, or `2h`. At the limit the attempt's whole process group is killed and the task settles failed with a note naming the limit; it is not retried. The run's `--max-time` bounds every attempt as well, and a playbook refuses a timeout longer than it before dispatching anything. |
 | `stage` | `"iteration" \| "epilogue"` | `epilogue` runs once after the loop concludes, and only if the run kept a candidate. |
@@ -90,7 +90,7 @@ A deterministic shell task in the candidate workspace.
 | `emits_files` | `list[str]` | Workspace files the task produces. A dependent is staged with the declared files of every dependency that passed. |
 | `over` | `producer.field` | Map the task over a dependency's emitted list, one instance per item. |
 | `max_fanout` | `int` | Instance cap for `over`, within the engine's ceiling of 256. |
-| `revise` | `task` | A direct dependency this task sends back when it settles failing. The dependency runs again with the verdict under `revision`, then this task does, until this task stops failing or `max_rounds` is spent. Playbooks only; not with `over`. |
+| `revise` | `task \| list[task]` | The tasks this task sends back when it settles failing. They run again, in dependency order, with the verdict under `revision`, then this task does, until this task stops failing or `max_rounds` is spent. Every task on a path between them and this task must be listed. Playbooks only; not with `over`. |
 | `max_rounds` | `int` | Round cap for `revise`, counting the first, from 2 to the engine's ceiling of 5. |
 | `timeout` | `str` | How long one attempt may run, as `90s`, `10m`, or `2h`. At the limit the attempt's whole process group is killed and the task settles failed with a note naming the limit; it is not retried. The run's `--max-time` bounds every attempt as well, and a playbook refuses a timeout longer than it before dispatching anything. |
 | `stage` | `"iteration" \| "epilogue"` | `epilogue` runs once after the loop concludes, and only if the run kept a candidate. |
@@ -118,7 +118,7 @@ A measurement command. Its last non-empty stdout line is a JSON object; `pass = 
 | `emits_files` | `list[str]` | Workspace files the task produces. A dependent is staged with the declared files of every dependency that passed. |
 | `over` | `producer.field` | Map the task over a dependency's emitted list, one instance per item. |
 | `max_fanout` | `int` | Instance cap for `over`, within the engine's ceiling of 256. |
-| `revise` | `task` | A direct dependency this task sends back when it settles failing. The dependency runs again with the verdict under `revision`, then this task does, until this task stops failing or `max_rounds` is spent. Playbooks only; not with `over`. |
+| `revise` | `task \| list[task]` | The tasks this task sends back when it settles failing. They run again, in dependency order, with the verdict under `revision`, then this task does, until this task stops failing or `max_rounds` is spent. Every task on a path between them and this task must be listed. Playbooks only; not with `over`. |
 | `max_rounds` | `int` | Round cap for `revise`, counting the first, from 2 to the engine's ceiling of 5. |
 | `timeout` | `str` | How long one attempt may run, as `90s`, `10m`, or `2h`. At the limit the attempt's whole process group is killed and the task settles failed with a note naming the limit; it is not retried. The run's `--max-time` bounds every attempt as well, and a playbook refuses a timeout longer than it before dispatching anything. |
 | `stage` | `"iteration" \| "epilogue"` | `epilogue` runs once after the loop concludes, and only if the run kept a candidate. |
