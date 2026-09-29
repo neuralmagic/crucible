@@ -331,10 +331,30 @@ pub enum CompileError {
     OverNotOutputField,
     #[error(
         "argument {argument:?} carries a value supplied from outside the pack. A prompt marks \
-         such a span so an agent can tell it from an instruction; nothing else can, so pass it \
-         to the task as a file or an environment variable instead of building it into {argument:?}."
+         such a span so an agent can tell it from an instruction; nothing else can, so do not \
+         build it into {argument:?}. A command or evaluate task reads it as data from the \
+         \"params\" entry of $CRUCIBLE_INPUTS."
     )]
     ExternalOutsidePrompt { argument: String },
+    #[error(
+        "a value supplied from outside the pack was turned into a plain string by str(), repr(), \
+         % or .format(). That drops the marking a prompt needs to tell it from an instruction, \
+         so the value is withheld. Join it into the prompt unchanged with + instead, as in \
+         `prompt = \"Read \" + param(\"url\")`."
+    )]
+    ExternalConverted,
+    #[error(
+        "a value supplied from outside the pack has no method {method:?}: its result would be a \
+         plain string that lost the marking a prompt needs to tell it from an instruction. Join \
+         the value into the prompt unchanged with +."
+    )]
+    ExternalMethod { method: String },
+    #[error(
+        "a value supplied from outside the pack carries the external-input marker {marker:?}. A \
+         value that opens or closes a marked region of its own is an attempt to have its text \
+         read as an instruction, so the prompt is refused rather than rewritten."
+    )]
+    ExternalCarriesMarker { marker: &'static str },
     #[error("task {task:?} argument \"args\" must be a dictionary")]
     SkillArgsNotDict { task: String },
     #[error("task {task:?} argument {key:?} is not something a prompt can render")]
@@ -381,23 +401,61 @@ pub enum CompileError {
     FanoutWithoutOver { task: String },
     #[error("\"max_rounds\" must be an integer")]
     RoundsNotInteger,
+    #[error("\"timeout\" must be a duration string (try \"90s\", \"10m\", \"2h\")")]
+    TimeoutNotString,
+    #[error(transparent)]
+    InvalidTimeout(#[from] crate::duration::BadTimeout),
+    #[error("\"history\" must be an integer")]
+    HistoryNotInteger,
+    #[error(
+        "history = {got} is outside 1..={}",
+        crucible_contract::history::MAX_HISTORY_DEPTH
+    )]
+    HistoryOutOfRange { got: i32 },
     #[error("max_rounds = {got} is outside 2..={MAX_ROUNDS_CEILING}")]
     RoundsOutOfRange { got: i32 },
     #[error(
-        "revise = {target:?} without max_rounds; a revise loop states how many rounds it may \
+        "revise = {targets:?} without max_rounds; a revise loop states how many rounds it may \
          take before it runs, not after"
     )]
-    ReviseWithoutRounds { target: String },
+    ReviseWithoutRounds { targets: String },
+    #[error("revise = [] names no task; name the tasks a failing verdict sends back")]
+    ReviseNamesNoTask,
     #[error("max_rounds without \"revise\"; there is no loop to bound")]
     RoundsWithoutRevise,
-    #[error(
-        "task {task:?} revises {target:?} but does not depend on it; add {target:?} to depends_on"
-    )]
-    ReviseNotADependency { task: String, target: String },
     #[error("emits entries must be strings")]
     EmitsEntryNotString,
-    #[error("argument \"emits\" must be a list of field-name strings")]
+    #[error("argument \"emits\" must be a list of field names, or a dict from field name to type")]
     EmitsNotList,
+    #[error(
+        "emits field {field:?} has unknown type {got:?}{}; use \"string\", \"integer\", \
+         \"number\", \"boolean\", \"list\", \"object\", or a list of labels",
+        diag::hint(.suggestion.as_deref())
+    )]
+    UnknownFieldType {
+        field: String,
+        got: String,
+        suggestion: Option<String>,
+    },
+    #[error("emits field {field:?} must map to a type name or a list of label strings")]
+    FieldTypeWrongShape { field: String },
+    #[error("emits field {field:?}: {error}")]
+    InvalidFieldLabel {
+        field: String,
+        error: crucible_contract::decision::IdentError,
+    },
+    #[error("emits field {field:?}: {error}")]
+    InvalidFieldType {
+        field: String,
+        error: crucible_contract::emits::FieldTypeError,
+    },
+    #[error(
+        "argument \"over\" maps over {reference}, which is declared {declared}; `over` needs a list"
+    )]
+    OverNotAList {
+        reference: String,
+        declared: crucible_contract::emits::FieldType,
+    },
 
     #[error("argument {argument:?}: {error}")]
     InvalidIdentifier {

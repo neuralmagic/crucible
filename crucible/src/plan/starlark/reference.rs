@@ -7,11 +7,12 @@
 
 use crate::plan::exec::DeclaredStatus;
 use crate::plan::ir::KEPT_INPUT;
-use crate::plan::ir::{ITEM_INPUT, OUTCOME_INPUT, REVISION_INPUT};
+use crate::plan::ir::{HISTORY_INPUT, ITEM_INPUT, OUTCOME_INPUT, PARAMS_INPUT, REVISION_INPUT};
 use crate::plan::ir::{MAX_FANOUT_CEILING, MAX_ROUNDS_CEILING};
 #[cfg(test)]
 use crate::plan::workflow::WorkflowType;
 use crucible_contract::decision::UNCERTAIN;
+use crucible_contract::history::MAX_HISTORY_DEPTH;
 
 /// Which lanes see a constructor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,8 +71,10 @@ fn task_knobs() -> Vec<Kwarg> {
         ),
         Kwarg::new(
             "needs",
-            "\"any\" | \"all\"",
-            "How many dependencies must be admitted before the task is ready.",
+            "str",
+            "The substrate capability the task needs, such as `\"systemone\"`. The default \
+             `\"any\"` runs everywhere. A required task whose capability is unavailable truncates \
+             the plan before dispatch; an advisory one is skipped with its dependents.",
         ),
         Kwarg::new(
             "join",
@@ -93,8 +96,13 @@ fn task_knobs() -> Vec<Kwarg> {
         ),
         Kwarg::new(
             "emits",
-            "list[str]",
-            "Result fields the task promises in its JSON output.",
+            "list[str] | dict[str, type]",
+            "Result fields the task promises in its JSON output. The dict form also promises each \
+             field's type: `\"string\"`, `\"integer\"`, `\"number\"`, `\"boolean\"`, \
+             `\"list\"`, `\"object\"`, or a list of labels the value is one of. A passing \
+             output missing a field, or holding one of the wrong type, fails the task. Types are \
+             checked where the graph reads them: `over` needs a list, a `top_k` or grade score a \
+             number, and a `route(source = ...)` question labels it can answer.",
         ),
         Kwarg::new(
             "emits_files",
@@ -116,10 +124,11 @@ fn task_knobs() -> Vec<Kwarg> {
         ),
         Kwarg::new(
             "revise",
-            "task",
-            "A direct dependency this task sends back when it settles failing. The dependency runs \
-             again with the verdict under `revision`, then this task does, until this task stops \
-             failing or `max_rounds` is spent. Playbooks only; not with `over`.",
+            "task | list[task]",
+            "The tasks this task sends back when it settles failing. They run again, in dependency \
+             order, with the verdict under `revision`, then this task does, until this task stops \
+             failing or `max_rounds` is spent. Every task on a path between them and this task must \
+             be listed. Playbooks only; not with `over`.",
         ),
         Kwarg::new(
             "max_rounds",
@@ -130,9 +139,26 @@ fn task_knobs() -> Vec<Kwarg> {
             ),
         ),
         Kwarg::new(
+            "timeout",
+            "str",
+            "How long one attempt may run, as `90s`, `10m`, or `2h`. At the limit the attempt's \
+             whole process group is killed and the task settles failed with a note naming the \
+             limit; it is not retried. The run's `--max-time` bounds every attempt as well, and a \
+             playbook refuses a timeout longer than it before dispatching anything.",
+        ),
+        Kwarg::new(
             "stage",
             "\"iteration\" | \"epilogue\"",
             "`epilogue` runs once after the loop concludes, and only if the run kept a candidate.",
+        ),
+        Kwarg::new(
+            "history",
+            "int",
+            format!(
+                "Read this many earlier runs of the launch series, from 1 to the engine's ceiling \
+                 of {MAX_HISTORY_DEPTH}, under `{HISTORY_INPUT}`. A run launched outside a \
+                 series gets an empty list. Playbooks only."
+            ),
         ),
         when_kwarg(),
         answers_kwarg(),
@@ -285,11 +311,24 @@ pub fn functions() -> Vec<Function> {
             kwargs: vec![
                 name_kwarg(),
                 Kwarg::new("destination", "str", "The configured sink to publish to."),
-                Kwarg::new("template", "str", "The template rendered into the message."),
+                Kwarg::new(
+                    "template",
+                    "str",
+                    "Pack file rendered into the card body. Reads `verdict`, `spent_usd`, \
+                     `passed`, `failed`, `tasks` (first 20), `run`, `run_url`, and `result`. \
+                     Every inserted value is escaped for Slack.",
+                ),
                 Kwarg::new(
                     "result",
                     "task",
-                    "The task whose result the template renders.",
+                    "The task whose declared fields the card and `result.output` carry; \
+                     `result.status` alone when it did not pass.",
+                ),
+                Kwarg::new(
+                    "severity_field",
+                    "str",
+                    "A declared field of `result` whose value (\"good\", \"warning\", \
+                     \"danger\") picks the card accent; any other value is neutral.",
                 ),
                 Kwarg::new("required", "bool", "False makes the report advisory."),
             ],
@@ -319,7 +358,12 @@ pub fn functions() -> Vec<Function> {
             name: "param",
             lane: Lane::Common,
             purpose: "Read a launch parameter. The `params` block must be the source's first \
-                      statement, and a source that declares one compiles per run.",
+                      statement, and a source that declares one compiles per run. A supplied \
+                      value may reach a prompt, with `+` and inside a region marked as external \
+                      input, or a skill argument; `str()`, `%`, `.format()`, and string methods \
+                      on it are refused, as is a value carrying the marker text. A command or \
+                      evaluate task reads it from `params` in `CRUCIBLE_INPUTS` instead of its \
+                      command line.",
             positional: Some("name"),
             kwargs: vec![],
         },
@@ -348,6 +392,14 @@ pub fn functions() -> Vec<Function> {
                     "result",
                     "task",
                     "The task whose output is the workflow's result.",
+                ),
+                Kwarg::new(
+                    "history_record",
+                    "task",
+                    "The task each run records for the later runs of its launch series: its \
+                     status, and the fields it declares in `emits` when it passed. Not a mapped \
+                     task; an epilogue task records even when the main graph failed. Playbooks \
+                     only.",
                 ),
             ],
         },
@@ -470,7 +522,9 @@ pub fn functions() -> Vec<Function> {
                     "task",
                     "A dependency's output answers instead: it emits one declared label (or a \
                      boolean, for a noul) under each question id. Deterministic, free, and \
-                     needs no capability. Any other value fails the route.",
+                     needs no capability. Any other value fails the route. When the dependency \
+                     types its emits, each question's field must be typed with labels the \
+                     question answers, or `\"boolean\"` for a noul.",
                 ),
                 Kwarg::new(
                     "depends_on",
@@ -562,17 +616,44 @@ fn declared_status_type() -> String {
 
 /// Fields the engine reads out of a task's own JSON output.
 pub fn reserved_result_fields() -> Vec<Reserved> {
-    vec![Reserved::new(
-        "status",
-        declared_status_type(),
-        "Settles the task, overriding an exit code or `pass`. Any other value is ignored.",
-    )]
+    vec![
+        Reserved::new(
+            "status",
+            declared_status_type(),
+            "Settles the task, overriding an exit code or `pass`. Any other value is ignored.",
+        ),
+        Reserved::new(
+            crate::plan::ir::COMPLETE_FIELD,
+            "bool",
+            "`true` on a passing main-graph task of a playbook ends the run early and valid: \
+             nothing else in the main graph dispatches, undispatched tasks stay unsettled, and \
+             epilogue tasks still run. The shutdown outcome is `complete`. A task may not list it \
+             in `emits`.",
+        ),
+        Reserved::new(
+            crate::plan::ir::REASON_FIELD,
+            "str",
+            "Why the run completed early, recorded with the shutdown. A task may not list it in \
+             `emits`.",
+        ),
+    ]
 }
 
 /// Keys the engine writes into a task's inputs. None of them is ever wrapped in a settled
 /// join's per-dependency entry.
 pub fn reserved_inputs() -> Vec<Reserved> {
     vec![
+        Reserved::new(
+            HISTORY_INPUT,
+            "object",
+            "Earlier terminal runs of the launch series, as `{\"records\": [record], \
+             \"dropped\": int}`, oldest first by end time, at most the task's `history` depth. \
+             Each record is `{\"run\", \"started_at\", \"ended_at\", \"outcome\", \
+             \"verdict\", \"revision\", \"link\", \"entry\": {\"task\", \"status\", \
+             \"output\"}}`. `dropped` counts records the operator's size limit removed from the \
+             oldest end. In a task that declares `history` only; an agent reads it as marked \
+             external input.",
+        ),
         Reserved::new(
             ITEM_INPUT,
             "str",
@@ -587,8 +668,16 @@ pub fn reserved_inputs() -> Vec<Reserved> {
             OUTCOME_INPUT,
             "object",
             "How the main graph ended and what each of its tasks settled as, as \
-             `{\"exit\": str, \"tasks\": {name: {\"status\", \"note\"}}}`, in an epilogue \
-             task only.",
+             `{\"exit\": str, \"tasks\": {name: {\"status\", \"note\", \"output\", \"files\"}}}`, \
+             in an epilogue task only: each entry is what a `settled` join receives, \
+             `per_instance` included for a mapped task. `files` says whether that task's declared \
+             files, passing or failing, are staged under `inputs/<name>/`.",
+        ),
+        Reserved::new(
+            PARAMS_INPUT,
+            "object",
+            "Every declared parameter's bound value under its name, in its declared type, and \
+             `{}` where the source declares none, in a command or evaluate task only.",
         ),
         Reserved::new(
             REVISION_INPUT,
@@ -843,7 +932,10 @@ mod tests {
         let results = super::reserved_result_fields();
         assert_eq!(
             results.iter().map(|row| row.name).collect::<Vec<_>>(),
-            ["status"],
+            ["status"]
+                .into_iter()
+                .chain(crate::plan::ir::RESERVED_OUTPUTS)
+                .collect::<Vec<_>>(),
             "the table documents a field no engine code reads"
         );
         for declared in DeclaredStatus::ALL {

@@ -1,0 +1,46 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-09-28-004"
+title = "Supply a launch series' history from the run ledger"
+status = "queue"
+created = "2026-09-28"
+refs = [
+    "RFC-0002:C-RUN-HISTORY",
+    "ADR-0052",
+    "ADR-0037",
+]
+depends_on = ["WI-2026-09-28-003"]
+
+[content]
+description = "Implement the orchestrator side of [[RFC-0002:C-RUN-HISTORY]]: when a standing launch fires, project its prior terminal runs from the ledger into the records the engine reads, and keep what was supplied with the run. [[ADR-0052]] records why this is a controller-built view rather than pack-held state."
+
+[[content.acceptance_criteria]]
+text = "a run started by a standing launch receives up to 30 of its series' most recent terminal runs by end time, each with id, start and end, outcome or null, verdict or null, pack revision, run link, and the recorded history entry"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "runs that failed, were stopped, ended on a ceiling, or ended without a shutdown event are included; runs still in flight are not"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "a run not started by a standing launch, such as a manual launch or a draft test fire, receives no history; a draft-head schedule firing receives its series' history"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "a record carries no field beyond those listed; prompts, stdout, files, and undeclared fields of earlier runs never reach it"
+status = "pending"
+category = "security"
+
+[[content.acceptance_criteria]]
+text = "the history supplied to a run is stored with the run, and any later dispatch of that run is given the same set"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "the schedule and standing-launch docs describe history"
+status = "pending"
+category = "chore"

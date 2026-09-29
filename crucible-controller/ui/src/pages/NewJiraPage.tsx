@@ -53,7 +53,7 @@ export function NewJiraPage() {
       <>
         <Breadcrumb items={CRUMBS} />
         <Empty
-          title="ADMIN ACCESS REQUIRED"
+          title="Admin access required"
           description="Adopting a Jira issue books to your login, so it needs an admin session."
         />
       </>
@@ -157,12 +157,15 @@ export function NewJiraPage() {
       <FormActions>
         <Button
           variant="filled"
+          className="uppercase"
           onClick={() => void handleSubmit()}
           disabled={!isValid || adoptMutation.isPending}
         >
-          {adoptMutation.isPending ? 'ADOPTING…' : 'ADOPT JIRA ISSUE'}
+          {adoptMutation.isPending ? 'Adopting…' : 'Adopt Jira issue'}
         </Button>
-        <Button render={<Link to="/issues" />}>CANCEL</Button>
+        <Button className="uppercase" render={<Link to="/issues" />}>
+          Cancel
+        </Button>
       </FormActions>
     </>
   );

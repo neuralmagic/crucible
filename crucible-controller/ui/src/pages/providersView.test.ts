@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
   allowedHarnesses,
+  defaultBody,
+  defaultErrors,
+  defaultFormOf,
+  emptyDefaultForm,
+  targetLabel,
   defaultHarness,
   emptyProviderForm,
   formOf,
@@ -32,6 +37,7 @@ const ONPREM: ProviderDetailDto = {
   created_by: 'alice',
   created_at: '2026-09-02T00:00:00Z',
   updated_at: '2026-09-02T00:00:00Z',
+  actions: ['read', 'update', 'delete'],
 };
 
 describe('providerBody', () => {
@@ -126,5 +132,80 @@ describe('labels', () => {
   it('says where a custom provider is reached', () => {
     expect(reachLabel(ONPREM)).toBe('responses at http://vllm.internal:8000/v1');
     expect(reachLabel({ ...ONPREM, kind: 'openai' })).toBe('openai');
+  });
+});
+
+describe('dispatch defaults', () => {
+  const primary = { ...emptyDefaultForm(), provider: 'pricetag-glm' };
+
+  it('sends a fallback only when one is picked', () => {
+    expect(defaultBody(primary)).toEqual({
+      scope_kind: 'platform',
+      workload_class: 'autoresearch',
+      provider: 'pricetag-glm',
+    });
+    expect(
+      defaultBody({ ...primary, fallbackProvider: 'vertex', fallbackModel: ' claude-sonnet-5 ' }),
+    ).toEqual({
+      scope_kind: 'platform',
+      workload_class: 'autoresearch',
+      provider: 'pricetag-glm',
+      fallback_provider: 'vertex',
+      fallback_model: 'claude-sonnet-5',
+    });
+  });
+
+  it('drops a fallback model left behind when the fallback is cleared', () => {
+    expect(defaultBody({ ...primary, fallbackModel: 'claude-sonnet-5' })).not.toHaveProperty('fallback_model');
+    expect(defaultErrors({ ...primary, fallbackModel: 'claude-sonnet-5' }).get('fallbackModel')).toBe(
+      'a fallback model needs a fallback provider',
+    );
+  });
+
+  it('sends scope_ref only for a domain default', () => {
+    const domain = { ...primary, scopeKind: 'domain' as const, scopeRef: ' org/vllm ' };
+    expect(defaultBody(domain).scope_ref).toBe('org/vllm');
+    expect(defaultBody({ ...primary, scopeRef: 'org/vllm' })).not.toHaveProperty('scope_ref');
+  });
+
+  it('refuses what the server refuses', () => {
+    expect(defaultErrors(emptyDefaultForm()).get('provider')).toBe('pick a provider');
+    expect(defaultErrors({ ...primary, scopeKind: 'domain', scopeRef: 'vllm' }).get('scopeRef')).toBe(
+      'a domain is spelled owner/repo',
+    );
+    expect(defaultErrors({ ...primary, fallbackProvider: 'pricetag-glm' }).get('fallbackProvider')).toBe(
+      'the fallback is the same provider and model as the primary',
+    );
+    expect(
+      defaultErrors({ ...primary, fallbackProvider: 'pricetag-glm', fallbackModel: 'glm-small' }).size,
+    ).toBe(0);
+    expect(defaultErrors({ ...primary, fallbackProvider: 'vertex', fallbackModel: 'bad model' }).get('fallbackModel')).toBe(
+      '"bad model" is not a model name',
+    );
+  });
+
+  it('loads a stored default back into the form', () => {
+    const form = defaultFormOf({
+      scope_kind: 'domain',
+      scope_ref: 'org/vllm',
+      workload_class: 'playbook',
+      provider: 'pricetag-glm',
+      model: null,
+      fallback_provider: 'vertex',
+      fallback_model: 'claude-sonnet-5',
+    });
+    expect(defaultBody(form)).toEqual({
+      scope_kind: 'domain',
+      scope_ref: 'org/vllm',
+      workload_class: 'playbook',
+      provider: 'pricetag-glm',
+      fallback_provider: 'vertex',
+      fallback_model: 'claude-sonnet-5',
+    });
+  });
+
+  it('labels a target with its model only when one is pinned', () => {
+    expect(targetLabel('vertex', null)).toBe('vertex');
+    expect(targetLabel('vertex', 'claude-sonnet-5')).toBe('vertex · claude-sonnet-5');
   });
 });

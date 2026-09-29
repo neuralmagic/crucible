@@ -216,7 +216,7 @@ export function ApprovalsPage() {
         description="Scope packs waiting on a human, packs proposed for the registry, and the candidate PRs the loop already kept."
       />
 
-      <QueryState query={approvals} noun="APPROVALS">
+      <QueryState query={approvals} noun="approvals">
         <Section>
           <SectionHeader title="Pack approvals" note={`${packs.length} at the checkpoint`} />
           <DataTable
@@ -224,7 +224,7 @@ export function ApprovalsPage() {
             renderSubRow={(row) => <EvidencePanel scopeId={row.original.scope_id} />}
             empty={
               <Empty
-                title="NO PACKS AT THE CHECKPOINT"
+                title="No packs at the checkpoint"
                 description="Nothing is waiting on a human right now."
               />
             }
@@ -237,7 +237,7 @@ export function ApprovalsPage() {
             table={importTable}
             empty={
               <Empty
-                title="NO PACK IMPORTS PROPOSED"
+                title="No pack imports proposed"
                 description="Nothing is waiting to be registered into the playbook registry."
               />
             }
@@ -248,7 +248,7 @@ export function ApprovalsPage() {
           <SectionHeader title="PR reviews" note={`${keptPrs.length} open`} />
           <DataTable
             table={prTable}
-            empty={<Empty title="NO OPEN CANDIDATE PRS" />}
+            empty={<Empty title="No open candidate PRs" />}
           />
         </Section>
       </QueryState>
@@ -266,7 +266,7 @@ function EvidencePanel({ scopeId }: { scopeId: number }) {
   if (evidence.isPending) {
     return (
       <div className="px-4.5 py-3.5">
-        <Spinner label="LOADING EVIDENCE" />
+        <Spinner label="Loading evidence" />
       </div>
     );
   }
@@ -367,12 +367,12 @@ function RoundRow({ round }: { round: RoundRecord }) {
       {stderrTail && stderrTail.length > 0 && (
         <div className="mt-1.5">
           <Button
-            className="px-0"
+            className="px-0 uppercase"
             onClick={() => {
               setShowStderr((v) => !v);
             }}
           >
-            {showStderr ? 'HIDE' : 'SHOW'} MEASURE_CMD STDERR
+            {showStderr ? 'Hide' : 'Show'} MEASURE_CMD stderr
           </Button>
           {showStderr && <CodeBlock>{stderrTail.join('\n')}</CodeBlock>}
         </div>

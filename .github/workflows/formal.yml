@@ -1,0 +1,41 @@
+name: Formal
+
+# Build the Veil models under formal/: every #model_check and #check_invariants runs as part of
+# `lake build`, so a violated invariant fails the build.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'formal/**'
+      - 'crucible/src/plan/**'
+      - '.github/workflows/formal.yml'
+  pull_request:
+    paths:
+      - 'formal/**'
+      - 'crucible/src/plan/**'
+      - '.github/workflows/formal.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: formal-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  veil:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: leanprover/lean-action@50fcf42d2e460296f1a34b402e990d1b24f8b596 # v1.6.0
+        with:
+          lake-package-directory: formal
+          use-mathlib-cache: false
+          test: false
+          lint: false
+      - name: Every mutant of the executor model is caught
+        run: python3 formal/mutate.py

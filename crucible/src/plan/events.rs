@@ -1,8 +1,13 @@
 //! Session-log events a plan run emits: the admitted graph and each terminal task result.
 
-use crate::plan::ir::ValidPlan;
+use crate::plan::ir::{TaskName, ValidPlan};
 
-pub(crate) fn plan_admitted_event(plan: &ValidPlan) -> crate::report::session::SessionEvent {
+/// `history_record` is the playbook's record task, which lives on the workflow rather than the
+/// plan; a scored loop has none.
+pub(crate) fn plan_admitted_event(
+    plan: &ValidPlan,
+    history_record: Option<&TaskName>,
+) -> crate::report::session::SessionEvent {
     let p = plan.plan();
     crate::report::session::SessionEvent::PlanAdmitted {
         plan_version: p.version,
@@ -29,11 +34,27 @@ pub(crate) fn plan_admitted_event(plan: &ValidPlan) -> crate::report::session::S
                 revise: t
                     .revise
                     .as_ref()
-                    .map(|r| r.task.0.clone())
+                    .map(|r| r.tasks.iter().map(|task| task.0.clone()).collect())
                     .unwrap_or_default(),
                 max_rounds: t.revise.as_ref().map_or(0, |r| r.max_rounds),
+                emits: t
+                    .emits
+                    .fields()
+                    .into_iter()
+                    .map(|(field, ty)| crucible_contract::emits::EmitWire {
+                        field: field.0.clone(),
+                        ty: ty.cloned(),
+                    })
+                    .collect(),
+                timeout: t
+                    .timeout
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+                history_depth: t.history.unwrap_or_default(),
             })
             .collect(),
+        history_record: history_record.map(|t| t.0.clone()).unwrap_or_default(),
     }
 }
 
@@ -102,20 +123,144 @@ mod tests {
             command = "true"
             depends_on = ["author"]
             revise = { task = "author", max_rounds = 3 }
+            [[task]]
+            name = "pick"
+            kind = "command"
+            command = "true"
+            [[task]]
+            name = "build"
+            kind = "command"
+            command = "true"
+            depends_on = ["pick"]
+            [[task]]
+            name = "confirm"
+            kind = "command"
+            command = "true"
+            depends_on = ["build"]
+            revise = { tasks = ["pick", "build"], max_rounds = 2 }
             "#,
         )
         .unwrap()
         .validate()
         .unwrap();
         let SessionEvent::PlanAdmitted { tasks, .. } =
-            crate::plan::events::plan_admitted_event(&plan)
+            crate::plan::events::plan_admitted_event(&plan, None)
         else {
             panic!("not a plan_admitted event");
         };
-        assert_eq!((tasks[0].revise.as_str(), tasks[0].max_rounds), ("", 0));
         assert_eq!(
-            (tasks[1].revise.as_str(), tasks[1].max_rounds),
-            ("author", 3)
+            (tasks[0].revise.as_slice(), tasks[0].max_rounds),
+            (&[][..], 0)
         );
+        assert_eq!(
+            (tasks[1].revise.as_slice(), tasks[1].max_rounds),
+            (&["author".to_string()][..], 3)
+        );
+        let confirm = tasks.iter().find(|t| t.name == "confirm").unwrap();
+        assert_eq!(
+            (confirm.revise.as_slice(), confirm.max_rounds),
+            (&["pick".to_string(), "build".to_string()][..], 2)
+        );
+    }
+
+    #[test]
+    fn the_admitted_plan_carries_each_declared_field_and_its_type() {
+        use crucible_contract::decision::Label;
+        use crucible_contract::emits::{EmitWire, FieldType};
+        let plan = Plan::from_toml_str(
+            r#"
+            version = 1
+            [budget]
+            usd = 1.0
+            [[task]]
+            name = "classify"
+            kind = "command"
+            command = "true"
+            emits = { tier = ["high", "low"], score = "number" }
+            [[task]]
+            name = "legacy"
+            kind = "command"
+            command = "true"
+            emits = ["lines"]
+            [[task]]
+            name = "bare"
+            kind = "command"
+            command = "true"
+            "#,
+        )
+        .unwrap()
+        .validate()
+        .unwrap();
+        let SessionEvent::PlanAdmitted { tasks, .. } =
+            crate::plan::events::plan_admitted_event(&plan, None)
+        else {
+            panic!("not a plan_admitted event");
+        };
+        let emits = |name: &str| {
+            tasks
+                .iter()
+                .find(|t| t.name == name)
+                .map(|t| t.emits.clone())
+                .unwrap()
+        };
+        let label = |l: &str| Label::new(l).unwrap();
+        assert_eq!(
+            emits("classify"),
+            [
+                EmitWire {
+                    field: "score".into(),
+                    ty: Some(FieldType::Number),
+                },
+                EmitWire {
+                    field: "tier".into(),
+                    ty: Some(FieldType::OneOf(vec![label("high"), label("low")])),
+                },
+            ]
+        );
+        assert_eq!(
+            emits("legacy"),
+            [EmitWire {
+                field: "lines".into(),
+                ty: None,
+            }]
+        );
+        assert!(emits("bare").is_empty());
+        let line =
+            crucible_contract::encode(&crate::plan::events::plan_admitted_event(&plan, None));
+        assert!(
+            line.contains(r#""emits":[{"field":"score","type":"number"},{"field":"tier","type":["high","low"]}]"#),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn the_admitted_plan_states_each_tasks_own_time_limit() {
+        let plan = Plan::from_toml_str(
+            r#"
+            version = 1
+            [budget]
+            usd = 1.0
+            [[task]]
+            name = "build"
+            kind = "command"
+            command = "true"
+            timeout = "90m"
+            [[task]]
+            name = "check"
+            kind = "command"
+            command = "true"
+            depends_on = ["build"]
+            "#,
+        )
+        .unwrap()
+        .validate()
+        .unwrap();
+        let SessionEvent::PlanAdmitted { tasks, .. } =
+            crate::plan::events::plan_admitted_event(&plan, None)
+        else {
+            panic!("not a plan_admitted event");
+        };
+        assert_eq!(tasks[0].timeout, "90m");
+        assert_eq!(tasks[1].timeout, "");
     }
 }

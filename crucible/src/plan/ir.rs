@@ -2,10 +2,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::crucible::Direction;
+use crate::duration::TaskTimeout;
+use crate::plan::param::ParamValue;
 use anyhow::{Context, Result};
-use crucible_contract::decision::{Label, Question, QuestionError, QuestionId, UNCERTAIN};
+use crucible_contract::decision::{
+    Label, Question, QuestionError, QuestionId, QuestionKind, UNCERTAIN,
+};
+use crucible_contract::emits::{FieldType, FieldTypeError};
 use serde::{Deserialize, Serialize};
 
+/// The reserved input a task that declares a history depth receives its launch series' earlier
+/// runs under.
+pub const HISTORY_INPUT: &str = "history";
 /// The reserved input a mapped instance receives its own item under. Reserved like the
 /// epilogue's kept-candidate input: a task may not declare a dependency by this name.
 pub const ITEM_INPUT: &str = "item";
@@ -14,12 +22,29 @@ pub const ITEM_INPUT: &str = "item";
 pub const KEPT_INPUT: &str = "kept";
 /// The reserved input every epilogue task receives the main graph's outcome under.
 pub const OUTCOME_INPUT: &str = "outcome";
+/// The reserved input every command and evaluate task receives the plan's bound parameter values
+/// under.
+pub const PARAMS_INPUT: &str = "params";
 /// The reserved input a revised task receives its reviewer's last verdict under, from its second
 /// round on.
 pub const REVISION_INPUT: &str = "revision";
 /// Every key the engine writes into a task's inputs itself. A dependency named after one of
 /// them would have its entry overwritten, so [`crate::plan::ir::Plan::validate`] refuses it.
-pub const RESERVED_INPUTS: [&str; 4] = [ITEM_INPUT, KEPT_INPUT, OUTCOME_INPUT, REVISION_INPUT];
+pub const RESERVED_INPUTS: [&str; 6] = [
+    HISTORY_INPUT,
+    ITEM_INPUT,
+    KEPT_INPUT,
+    OUTCOME_INPUT,
+    PARAMS_INPUT,
+    REVISION_INPUT,
+];
+
+/// The output field a task declares early completion with.
+pub const COMPLETE_FIELD: &str = "complete";
+/// The output field carrying an early completion's reason.
+pub const REASON_FIELD: &str = "reason";
+/// Output fields a task may not declare in `emits`.
+pub const RESERVED_OUTPUTS: [&str; 2] = [COMPLETE_FIELD, REASON_FIELD];
 
 /// Task identity: cache key component, wire label, UI label. Unique within a plan.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -42,6 +67,117 @@ impl From<&str> for TaskName {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct OutputField(pub String);
+
+/// The fields a task's JSON output promises: names alone (`emits = ["a"]`), or names with the
+/// type each holds (`emits = {"a": "string"}`). Empty in either form declares nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Emits {
+    Fields(Vec<OutputField>),
+    Typed(BTreeMap<OutputField, FieldType>),
+}
+
+/// What a task's emits say about one field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Declared<'a> {
+    /// The task declares no emits, so nothing is promised or checked.
+    Unchecked,
+    /// The task declares emits without this field.
+    Omitted,
+    /// The field is promised present, of any type.
+    Untyped,
+    /// The field is promised present and of this type.
+    Typed(&'a FieldType),
+}
+
+impl Default for Emits {
+    fn default() -> Self {
+        Emits::Fields(Vec::new())
+    }
+}
+
+impl Emits {
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Emits::Fields(fields) => fields.is_empty(),
+            Emits::Typed(fields) => fields.is_empty(),
+        }
+    }
+
+    /// Every declared field in declaration order (key order for the typed form), with its type.
+    pub fn fields(&self) -> Vec<(&OutputField, Option<&FieldType>)> {
+        match self {
+            Emits::Fields(fields) => fields.iter().map(|f| (f, None)).collect(),
+            Emits::Typed(fields) => fields.iter().map(|(f, ty)| (f, Some(ty))).collect(),
+        }
+    }
+
+    pub fn names(&self) -> Vec<String> {
+        self.fields()
+            .into_iter()
+            .map(|(f, _)| f.0.clone())
+            .collect()
+    }
+
+    pub fn field(&self, name: &str) -> Declared<'_> {
+        if self.is_empty() {
+            return Declared::Unchecked;
+        }
+        match self.fields().into_iter().find(|(f, _)| f.0 == name) {
+            None => Declared::Omitted,
+            Some((_, None)) => Declared::Untyped,
+            Some((_, Some(ty))) => Declared::Typed(ty),
+        }
+    }
+}
+
+impl Serialize for Emits {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Emits::Fields(fields) => fields.serialize(serializer),
+            Emits::Typed(fields) => fields.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Emits {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::{Error, MapAccess, SeqAccess, Visitor};
+
+        struct EmitsVisitor;
+
+        impl<'de> Visitor<'de> for EmitsVisitor {
+            type Value = Emits;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a list of field names, or a table from field name to field type")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Emits, A::Error> {
+                let mut fields = Vec::new();
+                while let Some(field) = seq.next_element::<OutputField>()? {
+                    fields.push(field);
+                }
+                Ok(Emits::Fields(fields))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Emits, A::Error> {
+                let mut fields = BTreeMap::new();
+                while let Some((field, ty)) = map.next_entry::<OutputField, FieldType>()? {
+                    if fields.contains_key(&field) {
+                        return Err(A::Error::custom(format!(
+                            "output field {:?} is declared twice",
+                            field.0
+                        )));
+                    }
+                    fields.insert(field, ty);
+                }
+                Ok(Emits::Typed(fields))
+            }
+        }
+
+        deserializer.deserialize_any(EmitsVisitor)
+    }
+}
 
 /// One declared output field of one task: what a mapped task fans out over.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,6 +332,9 @@ pub enum TaskKind {
         template: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         result: Option<TaskName>,
+        /// A declared field of `result` whose value picks the card accent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        severity_field: Option<OutputField>,
     },
     /// Engine-builtin deterministic fold: keep the k best upstream outputs by `score`.
     TopK { k: u32, direction: Direction },
@@ -324,11 +463,11 @@ pub struct Task {
     /// run once post-loop against the kept best.
     #[serde(default, skip_serializing_if = "Stage::is_iteration")]
     pub stage: Stage,
-    /// Fields the task's JSON output promises to include. Presence is checked at
-    /// runtime; consumer contracts (`top_k`, grade sources) at validation. Empty =
-    /// undeclared.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub emits: Vec<OutputField>,
+    /// Fields the task's JSON output promises to include, optionally typed. Presence and type
+    /// are checked at runtime; consumer contracts (`top_k`, grade sources, output-decided
+    /// routes, `over`) at validation. Empty = undeclared.
+    #[serde(default, skip_serializing_if = "Emits::is_empty")]
+    pub emits: Emits,
     /// Workspace-relative paths this task's output includes as files. A declared file is part
     /// of the task's output, not part of the workspace state that isolation discards, so a
     /// dependent receives it either way.
@@ -350,14 +489,61 @@ pub struct Task {
     /// Sends a failing verdict back to a dependency (see [`Revise`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revise: Option<Revise>,
+    /// How long one attempt may run before its runner kills it and it settles failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<TaskTimeout>,
+    /// How many earlier runs of the launch series this task reads under [`HISTORY_INPUT`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<u32>,
 }
 
-/// A reviewer's bounded send-back: when the reviewer settles failing, `task` runs again with the
+/// A reviewer's bounded send-back: when the reviewer settles failing, `tasks` run again with the
 /// verdict, then the reviewer does, for at most `max_rounds` rounds in all.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "ReviseRepr", into = "ReviseRepr")]
 pub struct Revise {
-    pub task: TaskName,
+    pub tasks: Vec<TaskName>,
     pub max_rounds: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ReviseRepr {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    task: Option<TaskName>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tasks: Vec<TaskName>,
+    max_rounds: u32,
+}
+
+impl TryFrom<ReviseRepr> for Revise {
+    type Error = String;
+
+    fn try_from(repr: ReviseRepr) -> Result<Self, Self::Error> {
+        let tasks = match (repr.task, repr.tasks) {
+            (Some(task), tasks) if tasks.is_empty() => vec![task],
+            (Some(_), _) => return Err("revise names both `task` and `tasks`".to_string()),
+            (None, tasks) if tasks.is_empty() => return Err("revise names no task".to_string()),
+            (None, tasks) => tasks,
+        };
+        Ok(Revise {
+            tasks,
+            max_rounds: repr.max_rounds,
+        })
+    }
+}
+
+impl From<Revise> for ReviseRepr {
+    fn from(revise: Revise) -> Self {
+        let (task, tasks) = match <[TaskName; 1]>::try_from(revise.tasks) {
+            Ok([task]) => (Some(task), Vec::new()),
+            Err(tasks) => (None, tasks),
+        };
+        ReviseRepr {
+            task,
+            tasks,
+            max_rounds: revise.max_rounds,
+        }
+    }
 }
 
 /// The most rounds one revise loop may run. Operator-owned, like [`MAX_FANOUT_CEILING`].
@@ -376,6 +562,9 @@ pub struct Plan {
     #[serde(default)]
     pub reason: Option<String>,
     pub budget: PlanBudget,
+    /// Every declared parameter's value as compilation bound it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, ParamValue>,
     #[serde(rename = "task", default)]
     pub tasks: Vec<Task>,
 }
@@ -408,6 +597,34 @@ impl ValidPlan {
     pub fn get(&self, name: &TaskName) -> Option<&Task> {
         self.plan.tasks.iter().find(|t| &t.name == name)
     }
+
+    pub fn revise_loops(&self) -> Vec<ReviseLoop<'_>> {
+        self.tasks_topo()
+            .filter_map(|reviewer| {
+                let revise = reviewer.revise.as_ref()?;
+                Some(ReviseLoop {
+                    reviewer,
+                    body: self
+                        .tasks_topo()
+                        .filter(|t| t.name == reviewer.name || revise.tasks.contains(&t.name))
+                        .collect(),
+                    max_rounds: revise.max_rounds,
+                })
+            })
+            .collect()
+    }
+}
+
+pub struct ReviseLoop<'a> {
+    pub reviewer: &'a Task,
+    pub body: Vec<&'a Task>,
+    pub max_rounds: u32,
+}
+
+impl ReviseLoop<'_> {
+    pub fn contains(&self, name: &TaskName) -> bool {
+        self.body.iter().any(|t| &t.name == name)
+    }
 }
 
 /// The most instances one mapped node may produce. Operator-owned, not author-owned: a bound a
@@ -438,6 +655,17 @@ pub enum PlanError {
         "report task {task:?} selects epilogue task {result:?}; report results must come from the main graph"
     )]
     EpilogueReportResult { task: String, result: String },
+    #[error("report task {task:?} names severity_field {field:?} but selects no result task")]
+    SeverityWithoutResult { task: String, field: String },
+    #[error(
+        "report task {task:?} names severity_field {field:?}, which result task {result:?} does not declare in emits; declared: {declared:?}"
+    )]
+    UndeclaredSeverityField {
+        task: String,
+        result: String,
+        field: String,
+        declared: Vec<String>,
+    },
     #[error("task {task:?} lists dependency {dependency:?} twice")]
     RepeatedDependency { task: String, dependency: String },
     #[error("task {task:?}: join = \"passed\" needs at least one dependency")]
@@ -482,6 +710,21 @@ pub enum PlanError {
     GradeSourceOmitsScore { task: String, from: String },
     #[error("task {task:?}: a thresholded evaluate grades `score`, but its emits omits it")]
     ThresholdedEvaluateOmitsScore { task: String },
+    #[error("task {task:?} declares output field {field:?} with an invalid type: {error}")]
+    InvalidFieldType {
+        task: String,
+        field: String,
+        error: FieldTypeError,
+    },
+    #[error(
+        "task {task:?} reads a numeric `score` from {source_task:?}, which declares it {declared}; \
+         declare it \"number\""
+    )]
+    ScoreNotNumeric {
+        task: String,
+        source_task: String,
+        declared: FieldType,
+    },
     #[error(
         "task {task:?} has invalid session {session:?}; use 1-64 ASCII letters, digits, `.`, `_`, or `-`"
     )]
@@ -532,6 +775,11 @@ pub enum PlanError {
     )]
     ReservedDependencyName { task: String, dependency: String },
     #[error(
+        "task {task:?} declares {field:?} in emits, but {field:?} is reserved for early \
+         completion and appears only on the attempt that ends the run; drop it from emits"
+    )]
+    ReservedOutputField { task: String, field: String },
+    #[error(
         "task {task:?} (stage {stage:?}) depends on {dependency:?} (stage {dependency_stage:?}); \
          dependencies cannot cross stages, and each would wait for the other forever"
     )]
@@ -566,6 +814,36 @@ pub enum PlanError {
         task: String,
         source_task: String,
         question: String,
+    },
+    #[error(
+        "route task {task:?} reads question {question:?} from {source_task:?}, which declares it \
+         {declared}; {question:?} answers {expected}"
+    )]
+    RouteSourceUnanswerable {
+        task: String,
+        source_task: String,
+        question: String,
+        declared: Box<FieldType>,
+        expected: String,
+    },
+    #[error(
+        "task {task:?} maps over {reference}, but {producer:?} declares emits without {field:?}"
+    )]
+    OverFieldOmitted {
+        task: String,
+        reference: String,
+        producer: String,
+        field: String,
+    },
+    #[error(
+        "task {task:?} maps over {reference}, which {producer:?} declares {declared}; `over` \
+         needs a list"
+    )]
+    OverNotAList {
+        task: String,
+        reference: String,
+        producer: String,
+        declared: FieldType,
     },
     #[error("route task {task:?} declares `over`; routing each element of a list is not supported")]
     RouteWithOver { task: String },
@@ -621,53 +899,77 @@ pub enum PlanError {
         question: String,
         labels: Vec<String>,
     },
+    #[error("task {task:?} declares revise but names no task")]
+    ReviseNamesNoTask { task: String },
+    #[error("task {task:?} revises unknown task {target:?}")]
+    ReviseUnknownTarget { task: String, target: String },
+    #[error("task {task:?} names {target:?} twice in revise")]
+    ReviseTargetRepeated { task: String, target: String },
     #[error(
-        "task {task:?} revises {target:?} but does not depend on it; a reviewer reads the work it \
-         sends back from a direct dependency"
+        "task {task:?} revises {target:?} but does not depend on it, directly or through other \
+         tasks; a reviewer reads the work it sends back"
     )]
-    ReviseTargetNotADependency { task: String, target: String },
+    ReviseTargetUnreachable { task: String, target: String },
     #[error("task {task:?}: max_rounds = {got} is outside 2..={MAX_ROUNDS_CEILING}")]
     RoundsOutOfRange { task: String, got: u32 },
     #[error(
-        "task {task:?} revises {target:?}, a {kind} task; only agent, command, and evaluate tasks \
-         take part in a revise loop"
+        "task {task:?}'s revise loop includes {member:?}, a {kind} task; only agent, command, and \
+         evaluate tasks take part in a revise loop"
     )]
     ReviseOnUnsupportedTask {
         task: String,
-        target: String,
+        member: String,
         kind: &'static str,
     },
     #[error(
-        "task {task:?} revises {target:?}, and one of them maps over a list; a round re-runs one \
-         task, not a fan-out"
+        "task {task:?}'s revise loop includes {member:?}, which maps over a list; a round re-runs \
+         tasks, not a fan-out"
     )]
-    ReviseWithFanout { task: String, target: String },
+    ReviseWithFanout { task: String, member: String },
     #[error(
-        "task {task:?} revises {target:?} and declares when; a reviewer runs whenever what it \
-         revises does, so put the when on {target:?}"
+        "task {task:?} declares revise and when; a reviewer runs whenever what it revises does, so \
+         put the when on a target"
     )]
-    WhenOnReviewer { task: String, target: String },
-    #[error("tasks {left:?} and {right:?} both revise {target:?}; a task has at most one reviewer")]
-    ReviseTargetRevisedTwice {
+    WhenOnReviewer { task: String },
+    #[error(
+        "tasks {left:?} and {right:?} both revise through {member:?}; a task is in at most one \
+         revise loop"
+    )]
+    ReviseBodiesOverlap {
         left: String,
         right: String,
-        target: String,
+        member: String,
     },
     #[error(
-        "task {task:?} revises {target:?}, which is itself in another revise loop; revise loops \
-         do not nest or chain"
+        "task {task:?} revises {target:?}, which is itself a reviewer; revise loops do not nest or \
+         chain"
     )]
     NestedRevise { task: String, target: String },
     #[error(
-        "task {task:?} revises {target:?} and also depends on {dependency:?}, which depends on \
-         {target:?}; a round re-runs only {target:?} and {task:?}, so {dependency:?} would read \
-         a draft the loop replaces"
+        "task {task:?}'s revise loop runs {}, but {skipped:?} lies between two of them; list \
+         {skipped:?} in revise, or a round would leave it reading a result the loop replaces",
+        .body.join(", ")
     )]
-    ReviseAroundADependent {
+    ReviseSkipsATask {
         task: String,
-        target: String,
-        dependency: String,
+        skipped: String,
+        body: Vec<String>,
     },
+    #[error(
+        "task {task:?}: history = {got} is outside 1..={MAX_HISTORY_DEPTH}",
+        MAX_HISTORY_DEPTH = crucible_contract::history::MAX_HISTORY_DEPTH
+    )]
+    HistoryDepthOutOfRange { task: String, got: u32 },
+    #[error(
+        "task {task:?} declares history, but it is a {kind} task; only agent, command, and \
+         evaluate tasks read history"
+    )]
+    HistoryOnUnsupportedTask { task: String, kind: &'static str },
+    #[error(
+        "task {task:?} declares a timeout, but {kind} tasks are engine work the runner does not \
+         time; only agent, command, and evaluate tasks take one"
+    )]
+    TimeoutOnUntimedTask { task: String, kind: &'static str },
     #[error("plan has a dependency cycle involving: {}", .tasks.join(", "))]
     DependencyCycle { tasks: Vec<String> },
     #[error(
@@ -678,6 +980,30 @@ pub enum PlanError {
         right: String,
         session: String,
     },
+}
+
+/// Whether every value of `declared` is an answer an output-decided route accepts for
+/// `question`: one of its labels or `uncertain`, or, for a noul, a boolean.
+fn answers(question: &Question, declared: &FieldType) -> bool {
+    match (declared, &question.kind) {
+        (FieldType::Boolean, QuestionKind::Noul) => true,
+        (FieldType::OneOf(labels), _) => labels.iter().all(|l| question.resolves_to(l)),
+        _ => false,
+    }
+}
+
+fn answerable_types(question: &Question) -> String {
+    let labels: Vec<String> = question
+        .labels()
+        .iter()
+        .map(ToString::to_string)
+        .chain([UNCERTAIN.to_owned()])
+        .collect();
+    let labels = format!("labels from {}", labels.join("|"));
+    match question.kind {
+        QuestionKind::Noul => format!("\"boolean\" or {labels}"),
+        QuestionKind::Choice { .. } => labels,
+    }
 }
 
 impl Plan {
@@ -757,6 +1083,34 @@ impl Plan {
                     });
                 }
             }
+            if let Some(depth) = t.history {
+                if !(1..=crucible_contract::history::MAX_HISTORY_DEPTH).contains(&depth) {
+                    return Err(PlanError::HistoryDepthOutOfRange {
+                        task: task(),
+                        got: depth,
+                    });
+                }
+                if !matches!(
+                    t.task,
+                    TaskKind::Agent { .. } | TaskKind::Command { .. } | TaskKind::Evaluate { .. }
+                ) {
+                    return Err(PlanError::HistoryOnUnsupportedTask {
+                        task: task(),
+                        kind: t.task.label(),
+                    });
+                }
+            }
+            if let Some(field) = t
+                .emits
+                .names()
+                .into_iter()
+                .find(|field| RESERVED_OUTPUTS.contains(&field.as_str()))
+            {
+                return Err(PlanError::ReservedOutputField {
+                    task: task(),
+                    field,
+                });
+            }
             if t.join == Join::Passed && t.depends_on.is_empty() {
                 return Err(PlanError::JoinPassedWithoutDependencies { task: task() });
             }
@@ -784,6 +1138,17 @@ impl Plan {
                     }
                 }
             }
+            if t.timeout.is_some()
+                && !matches!(
+                    t.task,
+                    TaskKind::Agent { .. } | TaskKind::Command { .. } | TaskKind::Evaluate { .. }
+                )
+            {
+                return Err(PlanError::TimeoutOnUntimedTask {
+                    task: task(),
+                    kind: t.task.label(),
+                });
+            }
             if let TaskKind::TopK { k, .. } = &t.task {
                 if *k == 0 {
                     return Err(PlanError::TopKZero { task: task() });
@@ -806,21 +1171,44 @@ impl Plan {
                 }
             }
             if let TaskKind::Report {
-                result: Some(result),
+                result,
+                severity_field,
                 ..
             } = &t.task
             {
-                let Some(&result_index) = index.get(result) else {
-                    return Err(PlanError::UnknownReportResult {
-                        task: task(),
-                        result: result.0.clone(),
-                    });
-                };
-                if self.tasks[result_index].stage == Stage::Epilogue {
-                    return Err(PlanError::EpilogueReportResult {
-                        task: task(),
-                        result: result.0.clone(),
-                    });
+                match (result, severity_field) {
+                    (None, Some(field)) => {
+                        return Err(PlanError::SeverityWithoutResult {
+                            task: task(),
+                            field: field.0.clone(),
+                        });
+                    }
+                    (None, None) => {}
+                    (Some(result), severity_field) => {
+                        let Some(&result_index) = index.get(result) else {
+                            return Err(PlanError::UnknownReportResult {
+                                task: task(),
+                                result: result.0.clone(),
+                            });
+                        };
+                        let selected = &self.tasks[result_index];
+                        if selected.stage == Stage::Epilogue {
+                            return Err(PlanError::EpilogueReportResult {
+                                task: task(),
+                                result: result.0.clone(),
+                            });
+                        }
+                        if let Some(field) = severity_field
+                            && !selected.emits.names().contains(&field.0)
+                        {
+                            return Err(PlanError::UndeclaredSeverityField {
+                                task: task(),
+                                result: result.0.clone(),
+                                field: field.0.clone(),
+                                declared: selected.emits.names(),
+                            });
+                        }
+                    }
                 }
             }
             if let TaskKind::Route { questions, decider } = &t.task {
@@ -859,14 +1247,27 @@ impl Plan {
                             });
                         }
                         let emits = &self.tasks[index[source]].emits;
-                        if let Some(missing) = questions.keys().find(|id| {
-                            !emits.is_empty() && !emits.iter().any(|f| f.0 == id.as_str())
-                        }) {
-                            return Err(PlanError::RouteSourceOmitsQuestion {
-                                task: task(),
-                                source_task: source.0.clone(),
-                                question: missing.to_string(),
-                            });
+                        for (id, question) in questions {
+                            match emits.field(id.as_str()) {
+                                Declared::Unchecked | Declared::Untyped => {}
+                                Declared::Omitted => {
+                                    return Err(PlanError::RouteSourceOmitsQuestion {
+                                        task: task(),
+                                        source_task: source.0.clone(),
+                                        question: id.to_string(),
+                                    });
+                                }
+                                Declared::Typed(declared) if answers(question, declared) => {}
+                                Declared::Typed(declared) => {
+                                    return Err(PlanError::RouteSourceUnanswerable {
+                                        task: task(),
+                                        source_task: source.0.clone(),
+                                        question: id.to_string(),
+                                        declared: Box::new(declared.clone()),
+                                        expected: answerable_types(question),
+                                    });
+                                }
+                            }
                         }
                     }
                 }
@@ -943,7 +1344,7 @@ impl Plan {
                     });
                 }
                 let mut fields = BTreeSet::new();
-                for field in &t.emits {
+                for (field, ty) in t.emits.fields() {
                     if field.0.is_empty()
                         || field.0.len() > 64
                         || !field
@@ -962,45 +1363,78 @@ impl Plan {
                             field: field.0.clone(),
                         });
                     }
+                    if let Some(ty) = ty {
+                        ty.validate().map_err(|error| PlanError::InvalidFieldType {
+                            task: task(),
+                            field: field.0.clone(),
+                            error,
+                        })?;
+                    }
                 }
             }
-            // Consumer contracts are presence-only: a declared emits that omits `score`
+            // A declared emits that omits `score`, or types it as something other than a number,
             // where a score is read is a wiring bug worth failing before any spend.
-            let score_declared = |name: &TaskName| {
-                index.get(name).is_none_or(|&i| {
-                    let emits = &self.tasks[i].emits;
-                    emits.is_empty() || emits.iter().any(|f| f.0 == "score")
-                })
+            let score = |name: &TaskName| {
+                index
+                    .get(name)
+                    .map_or(Declared::Unchecked, |&i| self.tasks[i].emits.field("score"))
             };
+            let not_numeric =
+                |source: &TaskName, declared: &FieldType| PlanError::ScoreNotNumeric {
+                    task: task(),
+                    source_task: source.0.clone(),
+                    declared: declared.clone(),
+                };
             if matches!(t.task, TaskKind::TopK { .. }) {
                 for d in &t.depends_on {
-                    if !score_declared(d) {
-                        return Err(PlanError::TopKSourceOmitsScore {
-                            task: task(),
-                            dependency: d.0.clone(),
-                        });
+                    match score(d) {
+                        Declared::Omitted => {
+                            return Err(PlanError::TopKSourceOmitsScore {
+                                task: task(),
+                                dependency: d.0.clone(),
+                            });
+                        }
+                        Declared::Typed(declared) if !declared.is_numeric() => {
+                            return Err(not_numeric(d, declared));
+                        }
+                        _ => {}
                     }
                 }
             }
             if let TaskKind::Engine {
                 op: EngineOp::Grade,
-                source: Some(source),
-                ..
+                source,
+                tiebreak,
             } = &t.task
-                && !score_declared(source)
             {
-                return Err(PlanError::GradeSourceOmitsScore {
-                    task: task(),
-                    from: source.0.clone(),
-                });
+                for source in source.iter().chain(tiebreak) {
+                    match score(source) {
+                        Declared::Omitted => {
+                            return Err(PlanError::GradeSourceOmitsScore {
+                                task: task(),
+                                from: source.0.clone(),
+                            });
+                        }
+                        Declared::Typed(declared) if !declared.is_numeric() => {
+                            return Err(not_numeric(source, declared));
+                        }
+                        _ => {}
+                    }
+                }
             }
             if let TaskKind::Evaluate {
                 threshold: Some(_), ..
             } = &t.task
-                && !t.emits.is_empty()
-                && !t.emits.iter().any(|f| f.0 == "score")
             {
-                return Err(PlanError::ThresholdedEvaluateOmitsScore { task: task() });
+                match t.emits.field("score") {
+                    Declared::Omitted => {
+                        return Err(PlanError::ThresholdedEvaluateOmitsScore { task: task() });
+                    }
+                    Declared::Typed(declared) if !declared.is_numeric() => {
+                        return Err(not_numeric(&t.name, declared));
+                    }
+                    _ => {}
+                }
             }
             if let Some(session) = &t.session {
                 if session.is_empty()
@@ -1048,6 +1482,28 @@ impl Plan {
                             producer: reference.task.0.clone(),
                         });
                     }
+                    let producer = &self.tasks[index[&reference.task]];
+                    match producer.emits.field(&reference.field.0) {
+                        Declared::Unchecked
+                        | Declared::Untyped
+                        | Declared::Typed(FieldType::List) => {}
+                        Declared::Omitted => {
+                            return Err(PlanError::OverFieldOmitted {
+                                task: task(),
+                                reference: reference.to_string(),
+                                producer: reference.task.0.clone(),
+                                field: reference.field.0.clone(),
+                            });
+                        }
+                        Declared::Typed(declared) => {
+                            return Err(PlanError::OverNotAList {
+                                task: task(),
+                                reference: reference.to_string(),
+                                producer: reference.task.0.clone(),
+                                declared: declared.clone(),
+                            });
+                        }
+                    }
                     if width == 0 || width > MAX_FANOUT_CEILING {
                         return Err(PlanError::FanoutOutOfRange {
                             task: task(),
@@ -1064,18 +1520,8 @@ impl Plan {
                 }
             }
             if let Some(revise) = &t.revise {
-                let target = || revise.task.0.clone();
                 if t.when.is_some() {
-                    return Err(PlanError::WhenOnReviewer {
-                        task: task(),
-                        target: target(),
-                    });
-                }
-                if !t.depends_on.contains(&revise.task) {
-                    return Err(PlanError::ReviseTargetNotADependency {
-                        task: task(),
-                        target: target(),
-                    });
+                    return Err(PlanError::WhenOnReviewer { task: task() });
                 }
                 if !(2..=MAX_ROUNDS_CEILING).contains(&revise.max_rounds) {
                     return Err(PlanError::RoundsOutOfRange {
@@ -1083,57 +1529,20 @@ impl Plan {
                         got: revise.max_rounds,
                     });
                 }
-                let Some(&proposer) = index.get(&revise.task) else {
-                    return Err(PlanError::UnknownDependency {
-                        task: task(),
-                        dependency: target(),
-                    });
-                };
-                let proposer = &self.tasks[proposer];
-                for member in [t, proposer] {
-                    if !matches!(
-                        member.task,
-                        TaskKind::Agent { .. }
-                            | TaskKind::Command { .. }
-                            | TaskKind::Evaluate { .. }
-                    ) {
-                        return Err(PlanError::ReviseOnUnsupportedTask {
-                            task: task(),
-                            target: target(),
-                            kind: member.task.label(),
-                        });
-                    }
-                    if member.over.is_some() {
-                        return Err(PlanError::ReviseWithFanout {
-                            task: task(),
-                            target: target(),
-                        });
-                    }
+                if revise.tasks.is_empty() {
+                    return Err(PlanError::ReviseNamesNoTask { task: task() });
                 }
-                if proposer.revise.is_some() {
-                    return Err(PlanError::NestedRevise {
-                        task: task(),
-                        target: target(),
-                    });
-                }
-                for other in &self.tasks {
-                    let Some(other_revise) = &other.revise else {
-                        continue;
-                    };
-                    if other.name == t.name {
-                        continue;
-                    }
-                    if other_revise.task == revise.task {
-                        return Err(PlanError::ReviseTargetRevisedTwice {
-                            left: task(),
-                            right: other.name.0.clone(),
-                            target: target(),
+                for (i, target) in revise.tasks.iter().enumerate() {
+                    if revise.tasks[..i].contains(target) {
+                        return Err(PlanError::ReviseTargetRepeated {
+                            task: task(),
+                            target: target.0.clone(),
                         });
                     }
-                    if other_revise.task == t.name {
-                        return Err(PlanError::NestedRevise {
-                            task: other.name.0.clone(),
-                            target: task(),
+                    if !index.contains_key(target) {
+                        return Err(PlanError::ReviseUnknownTarget {
+                            task: task(),
+                            target: target.0.clone(),
                         });
                     }
                 }
@@ -1241,19 +1650,64 @@ impl Plan {
                 }
             }
         }
+        let mut loop_of: BTreeMap<&TaskName, &TaskName> = BTreeMap::new();
         for t in &self.tasks {
             let Some(revise) = &t.revise else { continue };
-            let Some(&proposer) = index.get(&revise.task) else {
-                continue;
-            };
-            for d in t.depends_on.iter().filter(|d| **d != revise.task) {
-                if index.get(d).is_some_and(|&i| reaches(proposer, i)) {
-                    return Err(PlanError::ReviseAroundADependent {
+            let reviewer = index[&t.name];
+            let body: Vec<usize> = revise
+                .tasks
+                .iter()
+                .map(|target| index[target])
+                .chain([reviewer])
+                .collect();
+            for &target in &body[..body.len() - 1] {
+                if !reaches(target, reviewer) {
+                    return Err(PlanError::ReviseTargetUnreachable {
                         task: t.name.0.clone(),
-                        target: revise.task.0.clone(),
-                        dependency: d.0.clone(),
+                        target: self.tasks[target].name.0.clone(),
                     });
                 }
+            }
+            for &m in &body {
+                let member = &self.tasks[m];
+                let offending = || (t.name.0.clone(), member.name.0.clone());
+                if !matches!(
+                    member.task,
+                    TaskKind::Agent { .. } | TaskKind::Command { .. } | TaskKind::Evaluate { .. }
+                ) {
+                    let (task, member_name) = offending();
+                    return Err(PlanError::ReviseOnUnsupportedTask {
+                        task,
+                        member: member_name,
+                        kind: member.task.label(),
+                    });
+                }
+                if member.over.is_some() {
+                    let (task, member) = offending();
+                    return Err(PlanError::ReviseWithFanout { task, member });
+                }
+                if m != reviewer && member.revise.is_some() {
+                    let (task, target) = offending();
+                    return Err(PlanError::NestedRevise { task, target });
+                }
+                if let Some(other) = loop_of.insert(&member.name, &t.name) {
+                    return Err(PlanError::ReviseBodiesOverlap {
+                        left: other.0.clone(),
+                        right: t.name.0.clone(),
+                        member: member.name.0.clone(),
+                    });
+                }
+            }
+            if let Some(skipped) = (0..n).find(|&x| {
+                !body.contains(&x)
+                    && body.iter().any(|&from| reaches(from, x))
+                    && body.iter().any(|&to| reaches(x, to))
+            }) {
+                return Err(PlanError::ReviseSkipsATask {
+                    task: t.name.0.clone(),
+                    skipped: self.tasks[skipped].name.0.clone(),
+                    body: body.iter().map(|&m| self.tasks[m].name.0.clone()).collect(),
+                });
             }
         }
         Ok(ValidPlan { plan: self, topo })
@@ -1280,12 +1734,14 @@ mod tests {
             isolation: None,
             join: Join::default(),
             stage: Stage::Iteration,
-            emits: Vec::new(),
+            emits: crate::plan::ir::Emits::default(),
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
             when: None,
             revise: None,
+            timeout: None,
+            history: None,
         }
     }
 
@@ -1294,6 +1750,7 @@ mod tests {
             version: 1,
             reason: None,
             budget: PlanBudget { usd: 5.0 },
+            params: BTreeMap::new(),
             tasks,
         }
     }
@@ -1416,6 +1873,35 @@ mod tests {
         Plan::from_toml_str(&text).unwrap().validate().unwrap();
     }
 
+    /// A frozen plan carries its bound values, so whatever loads it back gives every command
+    /// the same ones, each in the type it was bound with.
+    #[test]
+    fn bound_params_round_trip_through_toml_and_json_in_their_types() {
+        let mut original = plan(vec![agent("a", &[])]);
+        original.params = BTreeMap::from([
+            (
+                "url".to_string(),
+                ParamValue::String("https://x.test".into()),
+            ),
+            ("steps".to_string(), ParamValue::Int(3)),
+            ("ratio".to_string(), ParamValue::Number(2.0)),
+            ("dry_run".to_string(), ParamValue::Bool(false)),
+            (
+                "labels".to_string(),
+                ParamValue::StringList(vec!["ci".into()]),
+            ),
+        ]);
+        let text = toml::to_string(&original).unwrap();
+        let from_toml = Plan::from_toml_str(&text).unwrap();
+        let from_json = Plan::from_json_str(&serde_json::to_string(&original).unwrap()).unwrap();
+        for back in [from_toml, from_json] {
+            assert_eq!(back.params, original.params);
+        }
+
+        let bare = toml::to_string(&plan(vec![agent("a", &[])])).unwrap();
+        assert!(!bare.contains("params"), "{bare}");
+    }
+
     #[test]
     fn a_task_without_when_serializes_without_the_key() {
         let text = toml::to_string(&plan(vec![agent("a", &[])])).unwrap();
@@ -1527,7 +2013,7 @@ mod tests {
             }
         );
         let mut gate = model_route("gate", &[], &[]);
-        gate.emits = vec![OutputField("area".into())];
+        gate.emits = fields(&["area"]);
         assert_eq!(
             plan(vec![gate]).validate().unwrap_err(),
             PlanError::EmitsOnEngineTask {
@@ -1551,7 +2037,7 @@ mod tests {
             }
         );
         let mut classify = agent("classify", &[]);
-        classify.emits = vec![OutputField("severity".into())];
+        classify.emits = fields(&["severity"]);
         assert_eq!(
             plan(vec![
                 classify.clone(),
@@ -1565,7 +2051,7 @@ mod tests {
                 question: "area".into()
             }
         );
-        classify.emits.push(OutputField("area".into()));
+        classify.emits = fields(&["severity", "area"]);
         plan(vec![classify, output_route("gate", "classify", &[])])
             .validate()
             .unwrap();
@@ -1818,12 +2304,14 @@ mod tests {
             isolation: None,
             join: Join::default(),
             stage: Stage::Iteration,
-            emits: Vec::new(),
+            emits: crate::plan::ir::Emits::default(),
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
             when: None,
             revise: None,
+            timeout: None,
+            history: None,
         };
         let err = plan(vec![t]).validate().unwrap_err();
         assert_eq!(
@@ -1926,11 +2414,30 @@ mod tests {
 
     fn emitting(name: &str, deps: &[&str], emits: &[&str]) -> Task {
         let mut t = agent(name, deps);
-        t.emits = emits
-            .iter()
-            .map(|f| OutputField((*f).to_string()))
-            .collect();
+        t.emits = fields(emits);
         t
+    }
+
+    fn fields(names: &[&str]) -> Emits {
+        Emits::Fields(
+            names
+                .iter()
+                .map(|f| OutputField((*f).to_string()))
+                .collect(),
+        )
+    }
+
+    fn typed(pairs: &[(&str, FieldType)]) -> Emits {
+        Emits::Typed(
+            pairs
+                .iter()
+                .map(|(f, ty)| (OutputField((*f).to_string()), ty.clone()))
+                .collect(),
+        )
+    }
+
+    fn one_of(labels: &[&str]) -> FieldType {
+        FieldType::OneOf(labels.iter().map(|l| Label::new(*l).unwrap()).collect())
     }
 
     fn top_k(name: &str, deps: &[&str]) -> Task {
@@ -1947,12 +2454,14 @@ mod tests {
             isolation: None,
             join: Join::default(),
             stage: Stage::Iteration,
-            emits: Vec::new(),
+            emits: crate::plan::ir::Emits::default(),
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
             when: None,
             revise: None,
+            timeout: None,
+            history: None,
         }
     }
 
@@ -1987,7 +2496,7 @@ mod tests {
     #[test]
     fn emits_is_rejected_on_top_k_and_engine_tasks() {
         let mut pick = top_k("pick", &["a"]);
-        pick.emits = vec![OutputField("kept".into())];
+        pick.emits = fields(&["kept"]);
         let err = plan(vec![agent("a", &[]), pick]).validate().unwrap_err();
         assert_eq!(
             err,
@@ -2003,7 +2512,7 @@ mod tests {
             source: None,
             tiebreak: None,
         };
-        measure.emits = vec![OutputField("score".into())];
+        measure.emits = fields(&["score"]);
         let err = plan(vec![measure]).validate().unwrap_err();
         assert!(matches!(err, PlanError::EmitsOnEngineTask { .. }), "{err}");
     }
@@ -2077,8 +2586,421 @@ mod tests {
             }
         );
 
-        t.emits.push(OutputField("score".into()));
+        t.emits = fields(&["latency_ms", "score"]);
         assert!(plan(vec![t]).validate().is_ok());
+    }
+
+    #[test]
+    fn typed_emits_parse_from_toml_and_json_and_keep_their_form() {
+        let toml = r#"
+version = 1
+[budget]
+usd = 1.0
+[[task]]
+name = "classify"
+kind = "command"
+command = "./c.sh"
+emits = { score = "number", tier = ["high", "low"], notes = "list" }
+[[task]]
+name = "legacy"
+kind = "command"
+command = "./l.sh"
+emits = ["lines"]
+"#;
+        let plan = Plan::from_toml_str(toml).unwrap().validate().unwrap();
+        let tasks = &plan.plan().tasks;
+        assert_eq!(
+            tasks[0].emits,
+            typed(&[
+                ("score", FieldType::Number),
+                ("tier", one_of(&["high", "low"])),
+                ("notes", FieldType::List),
+            ])
+        );
+        assert_eq!(tasks[1].emits, fields(&["lines"]));
+
+        let json = serde_json::to_value(&tasks[0]).unwrap();
+        assert_eq!(
+            json["emits"],
+            serde_json::json!({"notes": "list", "score": "number", "tier": ["high", "low"]})
+        );
+        let back: Task = serde_json::from_value(json).unwrap();
+        assert_eq!(back.emits, tasks[0].emits);
+        let legacy = serde_json::to_value(&tasks[1]).unwrap();
+        assert_eq!(legacy["emits"], serde_json::json!(["lines"]));
+
+        let text = toml::to_string(plan.plan()).unwrap();
+        let again = Plan::from_toml_str(&text).unwrap();
+        assert_eq!(again.tasks[0].emits, tasks[0].emits);
+        assert_eq!(again.tasks[1].emits, tasks[1].emits);
+    }
+
+    #[test]
+    fn a_malformed_typed_emits_does_not_parse_or_validate() {
+        let parse = |emits: &str| {
+            let toml = format!(
+                "version = 1\n[budget]\nusd = 1.0\n[[task]]\nname = \"a\"\nkind = \"command\"\ncommand = \"x\"\nemits = {emits}\n"
+            );
+            format!("{:#}", Plan::from_toml_str(&toml).unwrap_err())
+        };
+        for (emits, needle) in [
+            (r#"{ score = "float" }"#, "a field type"),
+            (r#"{ score = 3 }"#, "a field type"),
+            (r#"{ tier = ["hi-gh"] }"#, "not an identifier"),
+            (r#"{ tier = [] }"#, "names no labels"),
+            (r#"{ tier = ["a", "a"] }"#, "listed twice"),
+            (r#""score""#, "a list of field names, or a table"),
+        ] {
+            let err = parse(emits);
+            assert!(err.contains(needle), "{emits}: {err}");
+        }
+        let duplicate = serde_json::from_str::<Emits>(r#"{"a": "string", "a": "list"}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(duplicate.contains("declared twice"), "{duplicate}");
+
+        let mut t = agent("a", &[]);
+        t.emits = typed(&[("tier", FieldType::OneOf(Vec::new()))]);
+        assert_eq!(
+            plan(vec![t]).validate().unwrap_err(),
+            PlanError::InvalidFieldType {
+                task: "a".into(),
+                field: "tier".into(),
+                error: FieldTypeError::NoLabels,
+            }
+        );
+        let mut t = agent("a", &[]);
+        t.emits = typed(&[("bad-name", FieldType::String)]);
+        assert!(matches!(
+            plan(vec![t]).validate().unwrap_err(),
+            PlanError::InvalidOutputField { .. }
+        ));
+    }
+
+    #[test]
+    fn a_score_source_that_types_its_score_must_type_it_numeric() {
+        for ty in [FieldType::Number, FieldType::Integer] {
+            let mut m = agent("m", &[]);
+            m.emits = typed(&[("score", ty)]);
+            plan(vec![m, top_k("pick", &["m"])]).validate().unwrap();
+        }
+        for ty in [
+            FieldType::String,
+            FieldType::Boolean,
+            FieldType::List,
+            FieldType::Object,
+            one_of(&["high"]),
+        ] {
+            let mut m = agent("m", &[]);
+            m.emits = typed(&[("score", ty.clone())]);
+            assert_eq!(
+                plan(vec![m, top_k("pick", &["m"])]).validate().unwrap_err(),
+                PlanError::ScoreNotNumeric {
+                    task: "pick".into(),
+                    source_task: "m".into(),
+                    declared: ty,
+                }
+            );
+        }
+        let mut m = agent("m", &[]);
+        m.emits = typed(&[("latency_ms", FieldType::Number)]);
+        assert_eq!(
+            plan(vec![m, top_k("pick", &["m"])]).validate().unwrap_err(),
+            PlanError::TopKSourceOmitsScore {
+                task: "pick".into(),
+                dependency: "m".into(),
+            }
+        );
+
+        let evaluate = |emits: Emits| {
+            let mut e = agent("e", &[]);
+            e.task = TaskKind::Evaluate {
+                command: "./x.sh".into(),
+                threshold: None,
+                direction: None,
+            };
+            e.emits = emits;
+            e
+        };
+        let mut grade = agent("grade", &["e"]);
+        grade.task = TaskKind::Engine {
+            op: EngineOp::Grade,
+            source: Some("e".into()),
+            tiebreak: None,
+        };
+        assert_eq!(
+            plan(vec![
+                evaluate(typed(&[("score", FieldType::Boolean)])),
+                grade.clone()
+            ])
+            .validate()
+            .unwrap_err(),
+            PlanError::ScoreNotNumeric {
+                task: "grade".into(),
+                source_task: "e".into(),
+                declared: FieldType::Boolean,
+            }
+        );
+        assert_eq!(
+            plan(vec![
+                evaluate(typed(&[("pass", FieldType::Boolean)])),
+                grade.clone()
+            ])
+            .validate()
+            .unwrap_err(),
+            PlanError::GradeSourceOmitsScore {
+                task: "grade".into(),
+                from: "e".into(),
+            }
+        );
+        plan(vec![
+            evaluate(typed(&[("score", FieldType::Integer)])),
+            grade,
+        ])
+        .validate()
+        .unwrap();
+
+        let mut thresholded = evaluate(typed(&[("score", FieldType::String)]));
+        thresholded.task = TaskKind::Evaluate {
+            command: "./x.sh".into(),
+            threshold: Some(1.0),
+            direction: Some(Direction::Lower),
+        };
+        assert_eq!(
+            plan(vec![thresholded.clone()]).validate().unwrap_err(),
+            PlanError::ScoreNotNumeric {
+                task: "e".into(),
+                source_task: "e".into(),
+                declared: FieldType::String,
+            }
+        );
+        thresholded.emits = typed(&[("pass", FieldType::Boolean)]);
+        assert_eq!(
+            plan(vec![thresholded.clone()]).validate().unwrap_err(),
+            PlanError::ThresholdedEvaluateOmitsScore { task: "e".into() }
+        );
+        thresholded.emits = typed(&[("score", FieldType::Number)]);
+        plan(vec![thresholded]).validate().unwrap();
+    }
+
+    #[test]
+    fn a_grade_tiebreak_that_declares_emits_must_declare_a_numeric_score() {
+        let evaluate = |name: &str, emits: Emits| {
+            let mut e = agent(name, &[]);
+            e.task = TaskKind::Evaluate {
+                command: "./x.sh".into(),
+                threshold: None,
+                direction: None,
+            };
+            e.emits = emits;
+            e
+        };
+        let mut grade = agent("grade", &["e", "tb"]);
+        grade.task = TaskKind::Engine {
+            op: EngineOp::Grade,
+            source: Some("e".into()),
+            tiebreak: Some("tb".into()),
+        };
+        let with = |tiebreak: Emits| {
+            plan(vec![
+                evaluate("e", typed(&[("score", FieldType::Number)])),
+                evaluate("tb", tiebreak),
+                grade.clone(),
+            ])
+            .validate()
+        };
+        with(Emits::default()).unwrap();
+        with(fields(&["score"])).unwrap();
+        with(typed(&[("score", FieldType::Integer)])).unwrap();
+        with(typed(&[("score", FieldType::Number)])).unwrap();
+        assert_eq!(
+            with(typed(&[("score", FieldType::String)])).unwrap_err(),
+            PlanError::ScoreNotNumeric {
+                task: "grade".into(),
+                source_task: "tb".into(),
+                declared: FieldType::String,
+            }
+        );
+        for omitted in [fields(&["pass"]), typed(&[("pass", FieldType::Boolean)])] {
+            assert_eq!(
+                with(omitted).unwrap_err(),
+                PlanError::GradeSourceOmitsScore {
+                    task: "grade".into(),
+                    from: "tb".into(),
+                }
+            );
+        }
+    }
+
+    fn noul_route(name: &str, source: &str) -> Task {
+        Task {
+            task: TaskKind::Route {
+                questions: BTreeMap::from([(
+                    qid("urgent"),
+                    Question {
+                        instructions: "Urgent?".into(),
+                        kind: QuestionKind::Noul,
+                        drop: Vec::new(),
+                    },
+                )]),
+                decider: Decider::Output {
+                    task: source.into(),
+                },
+            },
+            ..agent(name, &[source])
+        }
+    }
+
+    #[test]
+    fn an_output_route_question_must_be_answerable_by_the_declared_type() {
+        let check = |question: &str, ty: FieldType| {
+            let mut classify = agent("classify", &[]);
+            classify.emits = typed(&[(question, ty)]);
+            let gate = if question == "area" {
+                output_route("gate", "classify", &[])
+            } else {
+                noul_route("gate", "classify")
+            };
+            plan(vec![classify, gate]).validate()
+        };
+        for ok in [
+            one_of(&["scheduler", "frontend"]),
+            one_of(&["frontend"]),
+            one_of(&["scheduler", "uncertain"]),
+        ] {
+            check("area", ok).unwrap();
+        }
+        for (bad, expected) in [
+            (
+                FieldType::String,
+                "labels from scheduler|frontend|uncertain",
+            ),
+            (
+                FieldType::Boolean,
+                "labels from scheduler|frontend|uncertain",
+            ),
+            (
+                one_of(&["scheduler", "backend"]),
+                "labels from scheduler|frontend|uncertain",
+            ),
+        ] {
+            assert_eq!(
+                check("area", bad.clone()).unwrap_err(),
+                PlanError::RouteSourceUnanswerable {
+                    task: "gate".into(),
+                    source_task: "classify".into(),
+                    question: "area".into(),
+                    declared: Box::new(bad),
+                    expected: expected.into(),
+                }
+            );
+        }
+        for ok in [
+            FieldType::Boolean,
+            one_of(&["yes", "no"]),
+            one_of(&["no", "uncertain"]),
+        ] {
+            check("urgent", ok).unwrap();
+        }
+        for bad in [
+            FieldType::String,
+            FieldType::Integer,
+            one_of(&["yes", "maybe"]),
+        ] {
+            let err = check("urgent", bad.clone()).unwrap_err();
+            assert_eq!(
+                err,
+                PlanError::RouteSourceUnanswerable {
+                    task: "gate".into(),
+                    source_task: "classify".into(),
+                    question: "urgent".into(),
+                    declared: Box::new(bad),
+                    expected: "\"boolean\" or labels from yes|no|uncertain".into(),
+                }
+            );
+        }
+        let mut classify = agent("classify", &[]);
+        classify.emits = typed(&[("severity", one_of(&["high"]))]);
+        assert_eq!(
+            plan(vec![classify, output_route("gate", "classify", &[])])
+                .validate()
+                .unwrap_err(),
+            PlanError::RouteSourceOmitsQuestion {
+                task: "gate".into(),
+                source_task: "classify".into(),
+                question: "area".into(),
+            }
+        );
+        let message = check("area", FieldType::String).unwrap_err().to_string();
+        assert!(
+            message.contains("which declares it string; \"area\" answers labels from"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn over_must_name_a_declared_list() {
+        let targets = OutputRef {
+            task: "discover".into(),
+            field: OutputField("targets".into()),
+        };
+        let audit = || {
+            let mut t = agent("audit", &["discover"]);
+            t.over = Some(targets.clone());
+            t.max_fanout = Some(4);
+            t
+        };
+        let with = |emits: Emits| {
+            let mut discover = agent("discover", &[]);
+            discover.emits = emits;
+            plan(vec![discover, audit()]).validate()
+        };
+        with(Emits::default()).unwrap();
+        with(fields(&["targets"])).unwrap();
+        with(typed(&[("targets", FieldType::List)])).unwrap();
+        for bad in [FieldType::Object, FieldType::String, one_of(&["a"])] {
+            assert_eq!(
+                with(typed(&[("targets", bad.clone())])).unwrap_err(),
+                PlanError::OverNotAList {
+                    task: "audit".into(),
+                    reference: "discover.targets".into(),
+                    producer: "discover".into(),
+                    declared: bad,
+                }
+            );
+        }
+        for omitted in [fields(&["other"]), typed(&[("other", FieldType::List)])] {
+            assert_eq!(
+                with(omitted).unwrap_err(),
+                PlanError::OverFieldOmitted {
+                    task: "audit".into(),
+                    reference: "discover.targets".into(),
+                    producer: "discover".into(),
+                    field: "targets".into(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn declared_names_the_field_in_either_form() {
+        assert_eq!(Emits::default().field("a"), Declared::Unchecked);
+        assert_eq!(typed(&[]).field("a"), Declared::Unchecked);
+        assert_eq!(fields(&["a"]).field("a"), Declared::Untyped);
+        assert_eq!(fields(&["a"]).field("b"), Declared::Omitted);
+        assert_eq!(
+            typed(&[("a", FieldType::List)]).field("a"),
+            Declared::Typed(&FieldType::List)
+        );
+        assert_eq!(
+            typed(&[("a", FieldType::List)]).field("b"),
+            Declared::Omitted
+        );
+        assert_eq!(
+            typed(&[("b", FieldType::List), ("a", FieldType::String)]).names(),
+            ["a", "b"]
+        );
+        assert_eq!(fields(&["b", "a"]).names(), ["b", "a"]);
     }
 
     fn advisory(name: &str, deps: &[&str]) -> Task {
@@ -2186,6 +3108,7 @@ mod tests {
                     destination: ReportDestination::Slack(SlackDestination {}),
                     template: "t".into(),
                     result: None,
+                    severity_field: None,
                 },
                 "report",
             ),
@@ -2236,10 +3159,7 @@ mod tests {
         let declared = emitting("a", &[], &["score"]);
         let json = serde_json::to_string(&plan(vec![declared])).unwrap();
         let back = Plan::from_json_str(&json).unwrap().validate().unwrap();
-        assert_eq!(
-            back.plan().tasks[0].emits,
-            vec![OutputField("score".into())]
-        );
+        assert_eq!(back.plan().tasks[0].emits, fields(&["score"]));
     }
     /// A plan that arrives as JSON never passes through the starlark front end, so the
     /// structural facts about a mapped node are checked here or nowhere.
@@ -2392,9 +3312,13 @@ mod tests {
     }
 
     fn reviewer(name: &str, deps: &[&str], target: &str, max_rounds: u32) -> Task {
+        chain_reviewer(name, deps, &[target], max_rounds)
+    }
+
+    fn chain_reviewer(name: &str, deps: &[&str], targets: &[&str], max_rounds: u32) -> Task {
         let mut t = agent(name, deps);
         t.revise = Some(Revise {
-            task: target.into(),
+            tasks: targets.iter().map(|target| (*target).into()).collect(),
             max_rounds,
         });
         t
@@ -2425,10 +3349,44 @@ mod tests {
         assert_eq!(
             back.get(&"repro".into()).and_then(|t| t.revise.clone()),
             Some(Revise {
-                task: "author".into(),
+                tasks: vec!["author".into()],
                 max_rounds: 3
             })
         );
+    }
+
+    #[test]
+    fn a_chain_revise_serializes_as_tasks_and_one_target_as_task() {
+        let p = plan(vec![
+            agent("author", &[]),
+            agent("build", &["author"]),
+            chain_reviewer("confirm", &["build"], &["author", "build"], 2),
+        ]);
+        let json = serde_json::to_value(&p).unwrap();
+        assert_eq!(
+            json["task"][2]["revise"],
+            serde_json::json!({"tasks": ["author", "build"], "max_rounds": 2})
+        );
+        let toml = toml::to_string(&p).unwrap();
+        let back = Plan::from_toml_str(&toml).unwrap().validate().unwrap();
+        assert_eq!(
+            back.get(&"confirm".into()).and_then(|t| t.revise.clone()),
+            Some(Revise {
+                tasks: vec!["author".into(), "build".into()],
+                max_rounds: 2
+            })
+        );
+        for (body, why) in [
+            (
+                r#"{"task": "a", "tasks": ["b"], "max_rounds": 2}"#,
+                "both `task` and `tasks`",
+            ),
+            (r#"{"max_rounds": 2}"#, "names no task"),
+            (r#"{"tasks": [], "max_rounds": 2}"#, "names no task"),
+        ] {
+            let err = serde_json::from_str::<Revise>(body).unwrap_err();
+            assert!(err.to_string().contains(why), "{body}: {err}");
+        }
     }
 
     #[test]
@@ -2457,19 +3415,73 @@ mod tests {
             plan(tasks).validate().unwrap_err(),
             PlanError::WhenOnReviewer {
                 task: "repro".into(),
-                target: "author".into()
             }
         );
     }
 
     #[test]
-    fn a_reviewer_must_depend_on_what_it_revises() {
+    fn a_reviewer_must_reach_what_it_revises() {
         assert_eq!(
             refused(vec![
                 agent("author", &[]),
                 reviewer("repro", &[], "author", 3)
             ]),
-            PlanError::ReviseTargetNotADependency {
+            PlanError::ReviseTargetUnreachable {
+                task: "repro".into(),
+                target: "author".into()
+            }
+        );
+        assert_eq!(
+            refused(vec![
+                agent("author", &[]),
+                agent("side", &[]),
+                chain_reviewer("repro", &["author"], &["author", "side"], 3)
+            ]),
+            PlanError::ReviseTargetUnreachable {
+                task: "repro".into(),
+                target: "side".into()
+            }
+        );
+        assert_eq!(
+            refused(vec![chain_reviewer("repro", &[], &["repro"], 3)]),
+            PlanError::ReviseTargetUnreachable {
+                task: "repro".into(),
+                target: "repro".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_revise_built_in_code_still_names_a_task() {
+        assert_eq!(
+            refused(vec![
+                agent("author", &[]),
+                chain_reviewer("repro", &["author"], &[], 3)
+            ]),
+            PlanError::ReviseNamesNoTask {
+                task: "repro".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_revise_names_known_tasks_once() {
+        assert_eq!(
+            refused(vec![
+                agent("author", &[]),
+                chain_reviewer("repro", &["author"], &["author", "ghost"], 3)
+            ]),
+            PlanError::ReviseUnknownTarget {
+                task: "repro".into(),
+                target: "ghost".into()
+            }
+        );
+        assert_eq!(
+            refused(vec![
+                agent("author", &[]),
+                chain_reviewer("repro", &["author"], &["author", "author"], 3)
+            ]),
+            PlanError::ReviseTargetRepeated {
                 task: "repro".into(),
                 target: "author".into()
             }
@@ -2506,14 +3518,14 @@ mod tests {
     fn only_agent_command_and_evaluate_tasks_take_part_in_a_revise_loop() {
         let mut reducer = top_k("pick", &["author"]);
         reducer.revise = Some(Revise {
-            task: "author".into(),
+            tasks: vec!["author".into()],
             max_rounds: 2,
         });
         assert_eq!(
             refused(vec![emitting("author", &[], &["score"]), reducer]),
             PlanError::ReviseOnUnsupportedTask {
                 task: "pick".into(),
-                target: "author".into(),
+                member: "pick".into(),
                 kind: "top_k"
             }
         );
@@ -2521,11 +3533,11 @@ mod tests {
             refused(vec![
                 emitting("author", &[], &["score"]),
                 top_k("fold", &["author"]),
-                reviewer("repro", &["fold"], "fold", 2),
+                chain_reviewer("repro", &["fold"], &["author", "fold"], 2),
             ]),
             PlanError::ReviseOnUnsupportedTask {
                 task: "repro".into(),
-                target: "fold".into(),
+                member: "fold".into(),
                 kind: "top_k"
             }
         );
@@ -2548,23 +3560,23 @@ mod tests {
             ]),
             PlanError::ReviseWithFanout {
                 task: "repro".into(),
-                target: "audit".into()
+                member: "audit".into()
             }
         );
     }
 
     #[test]
-    fn a_task_has_at_most_one_reviewer_and_loops_do_not_chain() {
+    fn a_task_is_in_one_loop_and_loops_do_not_chain() {
         assert_eq!(
             refused(vec![
                 agent("author", &[]),
                 reviewer("left", &["author"], "author", 2),
                 reviewer("right", &["author"], "author", 2),
             ]),
-            PlanError::ReviseTargetRevisedTwice {
+            PlanError::ReviseBodiesOverlap {
                 left: "left".into(),
                 right: "right".into(),
-                target: "author".into()
+                member: "author".into()
             }
         );
         assert_eq!(
@@ -2578,20 +3590,104 @@ mod tests {
                 target: "repro".into()
             }
         );
+        assert_eq!(
+            refused(vec![
+                agent("author", &[]),
+                agent("build", &["author"]),
+                chain_reviewer("check", &["build"], &["author", "build"], 2),
+                reviewer("lint", &["build"], "build", 2),
+            ]),
+            PlanError::ReviseBodiesOverlap {
+                left: "check".into(),
+                right: "lint".into(),
+                member: "build".into()
+            }
+        );
     }
 
     #[test]
-    fn a_reviewer_cannot_read_the_draft_through_another_dependency() {
+    fn a_revise_loop_lists_every_task_between_its_members() {
         assert_eq!(
             refused(vec![
                 agent("author", &[]),
                 agent("build", &["author"]),
                 reviewer("repro", &["author", "build"], "author", 2),
             ]),
-            PlanError::ReviseAroundADependent {
+            PlanError::ReviseSkipsATask {
                 task: "repro".into(),
-                target: "author".into(),
-                dependency: "build".into()
+                skipped: "build".into(),
+                body: vec!["author".into(), "repro".into()]
+            }
+        );
+        assert_eq!(
+            refused(vec![
+                agent("pick", &[]),
+                agent("build", &["pick"]),
+                agent("rig", &["build"]),
+                chain_reviewer("confirm", &["rig"], &["pick", "rig"], 3),
+            ]),
+            PlanError::ReviseSkipsATask {
+                task: "confirm".into(),
+                skipped: "build".into(),
+                body: vec!["pick".into(), "rig".into(), "confirm".into()]
+            }
+        );
+        let ok = plan(vec![
+            agent("resolve", &[]),
+            agent("pick", &["resolve"]),
+            agent("build", &["pick"]),
+            agent("rig", &["build", "resolve"]),
+            chain_reviewer("confirm", &["rig", "resolve"], &["pick", "build", "rig"], 3),
+            agent("deliver", &["confirm", "build"]),
+        ])
+        .validate()
+        .expect("a chain with inputs and dependents outside it");
+        let loops = ok.revise_loops();
+        assert_eq!(loops.len(), 1);
+        let names: Vec<&str> = loops[0].body.iter().map(|t| t.name.0.as_str()).collect();
+        assert_eq!(names, ["pick", "build", "rig", "confirm"]);
+        assert_eq!(loops[0].reviewer.name.0, "confirm");
+        assert_eq!(loops[0].max_rounds, 3);
+    }
+
+    #[test]
+    fn a_timeout_round_trips_and_is_refused_where_nothing_would_enforce_it() {
+        let parsed = Plan::from_toml_str(
+            r#"
+            version = 1
+            [budget]
+            usd = 1.0
+            [[task]]
+            name = "build"
+            kind = "command"
+            command = "make"
+            timeout = "90m"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.tasks[0].timeout.map(|t| t.get()),
+            Some(std::time::Duration::from_secs(5400))
+        );
+        let json = serde_json::to_string(&parsed).unwrap();
+        assert!(json.contains("\"timeout\":\"90m\""), "{json}");
+        let back = Plan::from_json_str(&json).unwrap();
+        assert_eq!(back.tasks[0].timeout, parsed.tasks[0].timeout);
+        back.validate().unwrap();
+
+        let zero = Plan::from_toml_str(
+            "version = 1\n[budget]\nusd = 1.0\n[[task]]\nname = \"a\"\nkind = \"command\"\ncommand = \"true\"\ntimeout = \"0s\"\n",
+        )
+        .unwrap_err();
+        assert!(format!("{zero:#}").contains("positive"), "{zero:#}");
+
+        let mut fold = top_k("fold", &["a"]);
+        fold.timeout = Some("1m".parse().unwrap());
+        assert_eq!(
+            refused(vec![agent("a", &[]), fold]),
+            PlanError::TimeoutOnUntimedTask {
+                task: "fold".into(),
+                kind: "top_k",
             }
         );
     }
@@ -2605,5 +3701,20 @@ mod tests {
                 dependency: "revision".into()
             }
         );
+    }
+
+    #[test]
+    fn early_completion_fields_cannot_be_promised_in_emits() {
+        for field in RESERVED_OUTPUTS {
+            assert_eq!(
+                plan(vec![emitting("done", &[], &["verdict", field])])
+                    .validate()
+                    .unwrap_err(),
+                PlanError::ReservedOutputField {
+                    task: "done".into(),
+                    field: field.into()
+                }
+            );
+        }
     }
 }

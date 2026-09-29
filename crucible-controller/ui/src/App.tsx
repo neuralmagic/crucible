@@ -2,6 +2,7 @@ import { lazy, Suspense, useCallback, useEffect, type ReactNode } from 'react';
 import { Route, Routes, Link, NavLink, Navigate } from 'react-router-dom';
 import { $api } from './api/client';
 import { useAutoresearch } from './api/lanes';
+import { budgetPercent, budgetState, usd, yourSpendToday, type BudgetState } from './budget';
 import { cn, Spinner, Status, Tooltip } from './ui';
 import { useDeviceFlag } from './useDeviceFlag';
 import { relativeTime } from './pages/journeyView';
@@ -9,7 +10,11 @@ import { DisplayPrefs } from './DisplayPrefs';
 import { IdentityBadge } from './IdentityBadge';
 import { OwnerSwitcher } from './OwnerSwitcher';
 import { AutopilotBanner } from './AutopilotBanner';
+import { ViewAsBanner } from './ViewAsBanner';
+import { useResetOnActAs } from './actAs';
 import { DashboardPage } from './pages/DashboardPage';
+import { HomePage } from './pages/HomePage';
+import { approvalsWaiting } from './pages/home';
 import { IssuesPage } from './pages/IssuesPage';
 import { IssueDetailPage } from './pages/IssueDetailPage';
 import { ScopeFormPage } from './pages/ScopeFormPage';
@@ -38,6 +43,7 @@ import { TurnLivePage } from './pages/TurnLivePage';
 import { ActivityPage } from './pages/ActivityPage';
 import { LivePage } from './pages/LivePage';
 import { AdminPage } from './pages/AdminPage';
+import { PolicyPage } from './pages/PolicyPage';
 import { SecretsPage } from './pages/SecretsPage';
 import { ProvidersPage } from './pages/ProvidersPage';
 import { SettingsPage } from './pages/SettingsPage';
@@ -62,10 +68,6 @@ function openIssueCount(statuses: readonly StatusCount[]): number {
   return statuses.reduce((total, s) => (s.status === 'done' ? total : total + s.count), 0);
 }
 
-function usd(amount: number): string {
-  return `$${amount.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-}
-
 const MAST_CELL = 'flex items-center gap-[7px] border-l border-rule px-3 font-mono text-data text-ink-2';
 
 function AutopilotIndicator() {
@@ -74,23 +76,31 @@ function AutopilotIndicator() {
 
   return (
     <div className={MAST_CELL}>
-      <span className="text-ink-3">AUTOPILOT</span>
+      <span className="text-ink-3 uppercase">Autopilot</span>
       <Status status={autopilot.data.enabled ? 'on' : 'off'} tone={autopilot.data.enabled ? 'green' : 'amber'} />
     </div>
   );
 }
 
+type StripTone = 'green' | 'amber' | 'red';
+
 interface StripItem {
   label: string;
   value: string;
-  note?: { text: string; tone: 'green' | 'red' };
+  note?: { text: string; tone: StripTone };
 }
+
+const STRIP_TONE: Record<StripTone, string> = { green: 'text-green', amber: 'text-amber', red: 'text-red' };
+
+const BUDGET_TONE: Record<BudgetState, StripTone> = { uncapped: 'green', ok: 'green', near: 'amber', spent: 'red' };
 
 function DatasheetStrip() {
   const autoresearch = useAutoresearch() === true;
   const overview = $api.useQuery('get', '/api/overview', {}, POLL);
   const approvals = $api.useQuery('get', '/api/approvals', {}, POLL);
   const events = $api.useQuery('get', '/api/events', { params: { query: { limit: 1 } } }, POLL);
+  const runs = $api.useQuery('get', '/api/playbook-runs', {}, POLL);
+  const whoami = $api.useQuery('get', '/api/whoami');
 
   const items: StripItem[] = [];
 
@@ -108,16 +118,21 @@ function DatasheetStrip() {
   }
 
   if (overview.isSuccess) {
-    const cost = overview.data.cost_today;
-    items.push({ label: 'Spend today', value: usd(cost.current) });
-    if (cost.ceiling !== null && cost.ceiling !== undefined) {
-      const pct = cost.ceiling === 0 ? 100 : Math.round((cost.current / cost.ceiling) * 100);
-      items.push({
-        label: 'Cap',
-        value: usd(cost.ceiling),
-        note: { text: `${pct}%`, tone: pct < 100 ? 'green' : 'red' },
-      });
-    }
+    const budget = { spent: overview.data.cost_today.current, ceiling: overview.data.cost_today.ceiling };
+    const pct = budgetPercent(budget);
+    items.push({
+      label: pct === null ? 'Spend today' : 'Shared budget',
+      value: pct === null ? usd(budget.spent) : `${usd(budget.spent)} / ${usd(budget.ceiling ?? 0)}`,
+      note: pct === null ? undefined : { text: `${pct}%`, tone: BUDGET_TONE[budgetState(budget)] },
+    });
+  }
+
+  const login = whoami.data?.user;
+  if (login && runs.isSuccess) {
+    items.push({
+      label: 'You today',
+      value: usd(yourSpendToday(runs.data, login, new Date())),
+    });
   }
 
   const lastEvent = events.isSuccess ? relativeTime(events.data[0]?.ts) : null;
@@ -126,15 +141,13 @@ function DatasheetStrip() {
   if (items.length === 0) return null;
 
   return (
-    <dl className="m-0 flex flex-none flex-wrap border-b border-rule-hard bg-sunk font-mono text-label">
+    <dl data-ui="strip" className="m-0 flex flex-none flex-wrap border-b border-rule-hard bg-sunk font-mono text-label">
       {items.map((item) => (
         <div key={item.label} className="flex items-baseline gap-2 border-r border-rule px-3.5 py-[5px]">
           <dt className="uppercase tracking-[0.08em] text-ink-3">{item.label}</dt>
           <dd className="m-0 text-data font-semibold text-ink">
             {item.value}
-            {item.note ? (
-              <span className={cn('ml-1.5', item.note.tone === 'green' ? 'text-green' : 'text-red')}>{item.note.text}</span>
-            ) : null}
+            {item.note ? <span className={cn('ml-1.5', STRIP_TONE[item.note.tone])}>{item.note.text}</span> : null}
           </dd>
         </div>
       ))}
@@ -150,6 +163,8 @@ interface RailItem {
   count?: number;
   /// Shown only where the autoresearch lane runs.
   autoresearch?: boolean;
+  /// Shown only to platform administrators.
+  admin?: boolean;
 }
 
 interface RailSection {
@@ -157,10 +172,11 @@ interface RailSection {
   items: RailItem[];
 }
 
-function RailLink({ to, label, count }: Omit<RailItem, 'icon' | 'autoresearch'>) {
+function RailLink({ to, label, count }: Omit<RailItem, 'icon' | 'autoresearch' | 'admin'>) {
   return (
     <NavLink
       to={to}
+      data-ui="nav-link"
       className={({ isActive }) =>
         cn(
           'flex items-center justify-between border-l-2 py-1 pr-3.5 pl-3 text-body hover:bg-hi hover:text-ink',
@@ -180,12 +196,13 @@ function RailLink({ to, label, count }: Omit<RailItem, 'icon' | 'autoresearch'>)
   );
 }
 
-function RailIcon({ to, label, icon, count }: Omit<RailItem, 'autoresearch'>) {
+function RailIcon({ to, label, icon, count }: Omit<RailItem, 'autoresearch' | 'admin'>) {
   return (
     <Tooltip side="right" delay={120} content={count === undefined ? label : `${label} · ${count}`}>
       <NavLink
         to={to}
         aria-label={label}
+        data-ui="nav-link"
         className={({ isActive }) =>
           cn(
             'flex h-8 w-full items-center justify-center border-l-2 font-mono text-data hover:bg-hi hover:text-ink',
@@ -249,7 +266,7 @@ function CategoryRail({ collapsed, onToggle }: CategoryRailProps) {
           to: '/approvals',
           label: 'Approvals',
           icon: 'AP',
-          count: approvals.isSuccess ? approvals.data.awaiting_approval.length : undefined,
+          count: approvals.isSuccess ? approvalsWaiting(approvals.data) : undefined,
         },
         { to: '/playbooks', label: 'Playbooks', icon: 'PB' },
         { to: '/playbooks/drafts', label: 'Drafts', icon: 'DR' },
@@ -266,6 +283,7 @@ function CategoryRail({ collapsed, onToggle }: CategoryRailProps) {
     {
       heading: 'Execution',
       items: [
+        { to: '/autoresearch', label: 'Dashboard', icon: 'DB', autoresearch: true },
         { to: '/builds', label: 'Builds', icon: 'BD', autoresearch: true },
         { to: '/turns', label: 'Turns', icon: 'TN', autoresearch: true },
       ],
@@ -296,11 +314,16 @@ function CategoryRail({ collapsed, onToggle }: CategoryRailProps) {
         { to: '/providers', label: 'Providers', icon: 'PV' },
         { to: '/settings', label: 'Settings', icon: 'ST' },
         { to: '/admin', label: 'Admin', icon: 'AD' },
+        { to: '/policy', label: 'Policy', icon: 'PO', admin: true },
       ],
     },
   ];
+  const admin = whoami.data?.role === 'admin';
   const sections = allSections
-    .map((section) => ({ ...section, items: section.items.filter((item) => autoresearch || !item.autoresearch) }))
+    .map((section) => ({
+      ...section,
+      items: section.items.filter((item) => (autoresearch || !item.autoresearch) && (admin || !item.admin)),
+    }))
     .filter((section) => section.items.length > 0);
 
   return (
@@ -308,6 +331,7 @@ function CategoryRail({ collapsed, onToggle }: CategoryRailProps) {
       aria-label="Sections"
       data-testid="category-rail"
       data-collapsed={collapsed ? 'true' : 'false'}
+      data-ui="nav"
       className={cn(
         'flex-none overflow-y-auto border-r border-rule-hard bg-surface pb-6 max-[1100px]:hidden',
         collapsed ? 'w-12' : 'w-52'
@@ -329,7 +353,7 @@ function CategoryRail({ collapsed, onToggle }: CategoryRailProps) {
       {sections.map((section) => (
         <div key={section.heading} className={cn(collapsed && 'flex flex-col border-b border-rule py-1')}>
           {collapsed ? null : (
-            <h3 className="m-0 px-3.5 pt-3.5 pb-[5px] font-mono text-label font-semibold uppercase tracking-[0.1em] text-ink-3">
+            <h3 data-ui="nav-heading" className="m-0 px-3.5 pt-3.5 pb-[5px] font-mono text-label font-semibold uppercase tracking-[0.1em] text-ink-3">
               {section.heading}
             </h3>
           )}
@@ -342,28 +366,30 @@ function CategoryRail({ collapsed, onToggle }: CategoryRailProps) {
   );
 }
 
-/// An autoresearch page where that lane runs; the playbooks otherwise.
+/// An autoresearch page where that lane runs; home otherwise.
 function Lane({ page }: { page: ReactNode }) {
   const autoresearch = useAutoresearch();
   if (autoresearch === undefined) {
     return (
       <div className="p-4">
-        <Spinner label="LOADING" />
+        <Spinner label="Loading" />
       </div>
     );
   }
-  return autoresearch ? page : <Navigate to="/playbooks" replace />;
+  return autoresearch ? page : <Navigate to="/" replace />;
 }
 
 export function App() {
+  useResetOnActAs();
   const [collapsed, toggleRail] = useRailCollapsed();
   const autoresearch = useAutoresearch() === true;
 
   return (
     <div className="flex h-screen min-h-0 flex-col">
-      <header className="z-20 flex h-[42px] flex-none items-stretch border-b border-rule-hard bg-surface">
+      <header data-ui="masthead" className="z-20 flex h-[42px] flex-none items-stretch border-b border-rule-hard bg-surface">
         <Link
           to="/"
+          data-ui="wordmark"
           className={cn(
             'flex items-center gap-2.5 border-r border-rule px-3.5 hover:bg-hi',
             collapsed ? 'w-12 justify-center px-0' : 'min-w-52'
@@ -371,7 +397,7 @@ export function App() {
         >
           <MoltenLogo fallback={<img src="/favicon.svg" width={18} height={18} alt="" />} />
           {collapsed ? null : (
-            <b className="font-mono text-[14px] font-bold tracking-[0.14em]">CRUCIBLE</b>
+            <b className="font-mono text-wordmark font-bold tracking-brand uppercase">Crucible</b>
           )}
         </Link>
         <div className="flex-1" />
@@ -383,14 +409,16 @@ export function App() {
         </div>
       </header>
 
+      <ViewAsBanner />
       <DatasheetStrip />
       {autoresearch ? <AutopilotBanner /> : null}
 
       <div className="flex min-h-0 flex-1">
         <CategoryRail collapsed={collapsed} onToggle={toggleRail} />
-        <main className="min-h-0 min-w-0 flex-1 overflow-y-auto">
+        <main data-ui="main" className="min-h-0 min-w-0 flex-1 overflow-y-auto">
           <Routes>
-            <Route path="/" element={<Lane page={<DashboardPage />} />} />
+            <Route path="/" element={<HomePage />} />
+            <Route path="/autoresearch" element={<Lane page={<DashboardPage />} />} />
             <Route path="/issues" element={<Lane page={<IssuesPage />} />} />
             <Route path="/scenarios/new" element={<Lane page={<NewScenarioPage />} />} />
             <Route path="/jira/new" element={<Lane page={<NewJiraPage />} />} />
@@ -426,6 +454,7 @@ export function App() {
             <Route path="/teams" element={<TeamsPage />} />
             <Route path="/teams/:slug" element={<TeamDetailPage />} />
             <Route path="/admin" element={<AdminPage />} />
+            <Route path="/policy" element={<PolicyPage />} />
             <Route
               path="/explore"
               element={
@@ -434,7 +463,7 @@ export function App() {
                     <Suspense
                       fallback={
                         <div className="p-4">
-                          <Spinner label="LOADING EXPLORE" />
+                          <Spinner label="Loading explore" />
                         </div>
                       }
                     >

@@ -1,0 +1,26 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-RUN-HISTORY"
+title = "History of a launch series"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = """
+A launch series is the set of runs one standing launch started. A run started any other way belongs to no series. A series history is a read-only view of what earlier runs in the series recorded, and is separate from a schedule cursor, which carries a position rather than a log. A run contributes to it only through its record task's declared output, and no run can alter a record already written. Nothing here restricts what a task reads from outside the engine, such as a repository or a published artifact.
+
+A playbook MAY name one task as its history record. The engine MUST reject a mapped record task. Each run records that task's terminal status under the vocabulary [[RFC-0001:C-WIRE]] defines for the task-result event, and its declared JSON output where it passed or null where it did not; a revise target or reviewer records the result under its own name. Where the record task never settled, because the run stopped early, was stopped by an operator, or ended on a ceiling before dispatching it, the run records a null status and a null output. The record task MAY be an epilogue task, so that a run whose main graph failed still records what it found. A playbook that names no record task records only its outcome.
+
+A task MAY declare that it reads history, with a depth. The engine MUST reject a depth outside 1 to 30, and MUST reject a record task or a history depth in any workflow type other than "playbook". The engine MUST give a task that declares a depth the reserved input "history": an object carrying under "records" a list of at most depth records, ordered by the end time of the run each describes, oldest first, and under "dropped" the number of records within this task's depth that the size bound below removed. A run that belongs to no series, or whose series has no prior terminal run, MUST receive an empty list and zero. The engine MUST reject a plan that names a dependency "history", as [[RFC-0002:C-SETTLED-JOIN]] requires for every reserved input.
+
+A run of a series is terminal once the orchestrator has recorded that it ended, whether or not the run itself wrote a shutdown event. Each record MUST carry the prior run's identifier, its start and end times, its shutdown outcome under the vocabulary [[RFC-0001:C-WIRE]] defines for the shutdown event or null where the run wrote none, its verdict or null where it has none, the pack revision it ran, a controller-owned link to it, and the record task's name, status, and output as recorded above. The engine and the orchestrator MUST NOT add any other field to a record.
+
+History MUST include every terminal run of the series: a run that failed, was stopped by an operator, ended on a cost or wall-clock ceiling, or ended without a shutdown event is part of the history as much as one that passed. A run that has not reached a terminal state MUST NOT appear.
+
+The orchestrator that starts a run in a series MUST supply the series' most recent terminal runs by end time, up to the engine's ceiling of 30, and the engine MUST give each task only the most recent records its depth allows. The total encoded size of the history one task receives MUST be bounded by an operator-configured limit that is discoverable before a run starts. Where the records within a task's depth exceed it, the engine MUST drop whole records from the oldest end and MUST NOT truncate a record.
+
+History MUST reach an agent prompt only inside a region the prompt marks as external input, under the same obligation [[RFC-0002:C-PLAYBOOK-PARAMS]] states for parameter values: an earlier run's record may carry text an earlier agent wrote. A resumed run MUST give each task the same history the interrupted run gave it.
+
+The admitted-plan event MUST carry the playbook's record task under "history_record", or an empty string where it names none, and each task's depth under "history_depth", zero where it declares none."""

@@ -1,0 +1,15 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-SERVICE-CAPABILITY"
+title = "Services as capabilities"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+A declared service provides the capability "service.<name>". A task requests it through needs, which names one capability as [[RFC-0002:C-PLAYBOOK-CAPS]] defines.
+
+
+
+A service is available when its tool is attested under [[RFC-0005:C-SERVICE-CATALOG]] and every secret it names was granted to the run. The engine MUST decide availability before any task is dispatched. A task that needs an unavailable service is handled exactly as [[RFC-0002:C-PLAYBOOK-CAPS]] requires: a required one truncates the plan and an advisory one is skipped with its dependents. The engine MUST report the unattested tool or the ungranted secret by name. A service that is available but fails to start or to stay up is governed by [[RFC-0005:C-SERVICE-LIFECYCLE]]."""

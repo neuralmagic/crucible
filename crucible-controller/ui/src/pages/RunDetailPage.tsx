@@ -16,7 +16,7 @@ import { AgentProviderTag } from './ProviderIcon';
 import { useLiveEvents } from '../api/useLiveEvents';
 import { formatError } from '../api/errors';
 import { LiveSession } from '../live/LiveSession';
-import { useAppTheme } from '../appTheme';
+import { useAppBrand, useAppTheme } from '../appTheme';
 import {
   Breadcrumb,
   Button,
@@ -147,15 +147,15 @@ export function RunDetailPage() {
   );
 
   if (!runId) {
-    return <Empty title="NO RUN ID" />;
+    return <Empty title="No run ID" />;
   }
 
   if (runDetail.isError) {
-    return <Empty title="RUN UNAVAILABLE" description={formatError(runDetail.error)} />;
+    return <Empty title="Run unavailable" description={formatError(runDetail.error)} />;
   }
 
   if (runDetail.isPending) {
-    return <LoadingBlock label="LOADING RUN" />;
+    return <LoadingBlock label="Loading run" />;
   }
 
   const { run } = runDetail.data;
@@ -350,13 +350,14 @@ function FlowSection({ runId }: { runId: string }) {
     enabled: traceId !== null,
   });
   const theme = useAppTheme();
+  const brand = useAppBrand();
 
   if (flow.isPending) {
     return (
       <Section>
         <SectionHeader title="Flow" />
         <SectionBody>
-          <Spinner label="LOADING FLOW" />
+          <Spinner label="Loading flow" />
         </SectionBody>
       </Section>
     );
@@ -428,27 +429,33 @@ function FlowSection({ runId }: { runId: string }) {
               if (ev.key === 'Enter') submitTrace();
             }}
           />
-          <Button variant="filled" disabled={!validTraceId(traceDraft.trim())} onClick={submitTrace}>
-            ADD TIMINGS
+          <Button
+            variant="filled"
+            className="uppercase"
+            disabled={!validTraceId(traceDraft.trim())}
+            onClick={submitTrace}
+          >
+            Add timings
           </Button>
           {traceId !== null && (
             <Button
+              className="uppercase"
               onClick={() => {
                 setTraceId(null);
                 setTraceDraft('');
               }}
             >
-              CLEAR
+              Clear
             </Button>
           )}
           {enrichedError !== null && <Mono tone="red">{enrichedError}</Mono>}
         </div>
         {/* First enrichment can take several seconds: session fetch + a paginated Datadog search. */}
         {enriched.isFetching ? (
-          <Spinner label="FETCHING SPANS" />
+          <Spinner label="Fetching spans" />
         ) : (
           <iframe
-            key={theme}
+            key={`${brand}-${theme}`}
             className="h-[70vh] w-full border border-rule bg-surface"
             title="run flow report"
             sandbox="allow-scripts"
@@ -545,11 +552,11 @@ function buildRunChart(candidates: Candidate[], lowerIsBetter: boolean): RunChar
     marks,
     grid,
     trail,
-    baseline: base === null ? null : { y: yOf(base), label: `BASELINE ${base.toFixed(digits)}` },
+    baseline: base === null ? null : { y: yOf(base), label: `Baseline ${base.toFixed(digits)}` },
     best: {
       x: xOf(measured.length - 1),
       y: yOf(bestValue),
-      label: `BEST ${bestValue.toFixed(digits)}`,
+      label: `Best ${bestValue.toFixed(digits)}`,
     },
     label: `Score by iteration, ${measured[0].score.toFixed(digits)} to ${bestValue.toFixed(digits)} over ${measured.length} measurements`,
   };
@@ -573,7 +580,7 @@ function ScoreSection({
       />
       {pending ? (
         <SectionBody>
-          <Spinner label="LOADING ITERATIONS" />
+          <Spinner label="Loading iterations" />
         </SectionBody>
       ) : chart === null ? (
         <SectionBody>
@@ -658,7 +665,7 @@ function ScoreChart({ chart }: { chart: RunChart }) {
             x={AXIS_L + PLOT_W - 6}
             y={chart.baseline.y - 6}
             textAnchor="end"
-            className="fill-ink-3 font-mono text-micro tracking-group"
+            className="fill-ink-3 font-mono text-micro uppercase tracking-group"
           >
             {chart.baseline.label}
           </text>
@@ -690,7 +697,7 @@ function ScoreChart({ chart }: { chart: RunChart }) {
       <text
         x={AXIS_L + 6}
         y={chart.best.y - 6}
-        className="fill-green font-mono text-micro tracking-group"
+        className="fill-green font-mono text-micro uppercase tracking-group"
       >
         {chart.best.label}
       </text>
@@ -813,7 +820,7 @@ function IterationsTable({
   if (pending) {
     return (
       <SectionBody>
-        <Spinner label="LOADING ITERATIONS" />
+        <Spinner label="Loading iterations" />
       </SectionBody>
     );
   }
@@ -821,7 +828,7 @@ function IterationsTable({
   return (
     <DataTable
       table={table}
-      empty={<Empty title="NO ITERATIONS" />}
+      empty={<Empty title="No iterations" />}
       renderSubRow={(row) =>
         row.original.iter === null || row.original.iter === undefined ? (
           <div className="px-4.5 py-2">
@@ -844,7 +851,7 @@ function DiffView({ runId, iter }: { runId: string; iter: number }) {
   if (diff.isPending) {
     return (
       <div className="px-4.5 py-2">
-        <Spinner label="LOADING DIFF" />
+        <Spinner label="Loading diff" />
       </div>
     );
   }
@@ -1133,7 +1140,7 @@ function ArtifactsPanel({ runId }: { runId: string }) {
       <Section>
         <SectionHeader title="Artifacts" />
         <SectionBody>
-          <Spinner label="LOADING ARTIFACTS" />
+          <Spinner label="Loading artifacts" />
         </SectionBody>
       </Section>
     );
@@ -1249,7 +1256,7 @@ function FilesPanel({
       <Section>
         <SectionHeader title="Files" />
         <SectionBody>
-          <Spinner label="LOADING FILES" />
+          <Spinner label="Loading files" />
         </SectionBody>
       </Section>
     );
@@ -1418,7 +1425,7 @@ function RunFileImage({
   if (src === null) {
     return (
       <div className="px-2 py-1.5">
-        <Spinner label="LOADING FILE" />
+        <Spinner label="Loading file" />
       </div>
     );
   }
@@ -1469,7 +1476,7 @@ function RunFileText({
   if (query.isPending) {
     return (
       <div className="px-2 py-1.5">
-        <Spinner label="LOADING FILE" />
+        <Spinner label="Loading file" />
       </div>
     );
   }
@@ -1507,7 +1514,7 @@ function ArtifactInline({ runId, path, kind }: { runId: string; path: string; ki
   if (query.isPending) {
     return (
       <div className="px-4.5 py-2">
-        <Spinner label="LOADING ARTIFACT" />
+        <Spinner label="Loading artifact" />
       </div>
     );
   }

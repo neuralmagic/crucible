@@ -3165,6 +3165,8 @@ async fn openapi_spec_contains_all_api_routes(pool: PgPool) -> Result<()> {
     let mut expected_paths = vec![
         "/healthz",
         "/api/whoami",
+        "/api/impersonation",
+        "/api/authz/explain",
         "/api/teams",
         "/api/teams/{slug}",
         "/api/teams/{slug}/members",
@@ -8483,6 +8485,74 @@ async fn a_stale_base_is_refused_with_the_version_that_overtook_it(pool: PgPool)
     Ok(())
 }
 
+/// A draft copies its template's files, so seeding one takes `read` on the template: a playbook
+/// the caller cannot see is a template that does not exist. Once the platform team owns it,
+/// every signed-in user reads, launches, and copies it.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_template_is_what_the_caller_may_read_and_a_platform_playbook_is_everyones(
+    pool: PgPool,
+) -> Result<()> {
+    let (db, dir) = db_with(pool);
+    let app = app_with_admins(db, vec!["wren".to_string()]);
+    register_survey(&app, dir.path(), LAUNCH_WORKFLOW).await;
+    let fork = |id: &str| {
+        json_as(
+            "mallory",
+            "POST",
+            "/api/playbook-drafts",
+            serde_json::json!({"id": id, "description": "forked", "template": "survey"}),
+        )
+    };
+
+    let res = app.clone().oneshot(fork("peek")?).await?;
+    assert_eq!(
+        res.status(),
+        StatusCode::NOT_FOUND,
+        "wren's playbook is private"
+    );
+    let res = app
+        .clone()
+        .oneshot(
+            HttpRequest::get("/api/playbooks")
+                .header("x-auth-request-user", "mallory")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(json_of(res).await?, serde_json::json!([]));
+
+    let res = app
+        .clone()
+        .oneshot(admin_json(
+            "PUT",
+            "/api/playbooks/survey/owner",
+            serde_json::json!({"owner": "team:platform-administrators"}),
+        )?)
+        .await?;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let res = app
+        .clone()
+        .oneshot(
+            HttpRequest::get("/api/playbooks")
+                .header("x-auth-request-user", "mallory")
+                .body(Body::empty())?,
+        )
+        .await?;
+    let listed = json_of(res).await?;
+    assert_eq!(listed[0]["id"], "survey", "{listed}");
+    let actions: Vec<&str> = listed[0]["actions"]
+        .as_array()
+        .expect("actions")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert_eq!(actions, ["read", "launch"]);
+
+    let res = app.oneshot(fork("studio")?).await?;
+    assert_eq!(res.status(), StatusCode::CREATED);
+    Ok(())
+}
+
 /// New-from-template: version 1 is the registered pack's files, and an unknown template is a 404.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn a_draft_seeds_from_a_registered_pack(pool: PgPool) -> Result<()> {
@@ -10121,6 +10191,8 @@ async fn config_providers_lists_enabled_providers_and_the_defaults(pool: PgPool)
             workload_class: crate::playbooks::providers::WorkloadClass::Autoresearch,
             provider_id: "plat-openai".to_string(),
             model: Some("gpt-5.6-sol".to_string()),
+            fallback_provider_id: None,
+            fallback_model: None,
         },
     )
     .await?;
@@ -10422,9 +10494,24 @@ async fn an_admin_registers_edits_and_deregisters_a_provider(pool: PgPool) -> Re
     Ok(())
 }
 
-/// Every write to the registry is an administrator's, and a caller who is not one changes nothing.
+fn json_as(
+    user: &str,
+    method: &str,
+    path: &str,
+    body: serde_json::Value,
+) -> Result<HttpRequest<Body>> {
+    Ok(HttpRequest::builder()
+        .method(method)
+        .uri(path)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-auth-request-user", user)
+        .body(Body::from(serde_json::to_vec(&body)?))?)
+}
+
+/// A caller who is no administrator reads the platform's providers and registers their own, but
+/// may not edit or remove the platform's, nor set a dispatch default.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-async fn a_non_admin_may_not_touch_the_registry(pool: PgPool) -> Result<()> {
+async fn a_non_admin_owns_what_they_register_and_changes_nothing_else(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
     seed_provider(
         db.pool(),
@@ -10435,38 +10522,87 @@ async fn a_non_admin_may_not_touch_the_registry(pool: PgPool) -> Result<()> {
     .await;
     let app = app_with_admins(db.clone(), vec!["wren".to_string()]);
 
-    let body = serde_json::json!({"id": "sneaky", "display_name": "Mine", "kind": "openai"});
+    let res = app
+        .clone()
+        .oneshot(json_as(
+            "mallory",
+            "POST",
+            "/api/providers",
+            serde_json::json!({"id": "mine", "display_name": "Mine", "kind": "openai"}),
+        )?)
+        .await?;
+    assert_eq!(res.status(), StatusCode::CREATED);
+    assert_eq!(json_of(res).await?["owner"], "user:mallory");
+
+    let res = app
+        .clone()
+        .oneshot(
+            HttpRequest::get("/api/providers")
+                .header("x-auth-request-user", "mallory")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(res.status(), StatusCode::OK);
+    let listed = json_of(res).await?;
+    let mut held: Vec<(String, serde_json::Value)> = listed
+        .as_array()
+        .expect("list")
+        .iter()
+        .map(|p| {
+            (
+                p["id"].as_str().unwrap_or_default().to_string(),
+                p["actions"].clone(),
+            )
+        })
+        .collect();
+    held.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        held,
+        [
+            (
+                "mine".to_string(),
+                serde_json::json!(["read", "create", "update", "delete", "transfer", "share"])
+            ),
+            ("plat-openai".to_string(), serde_json::json!(["read"])),
+        ],
+        "{listed}"
+    );
+
+    let res = app
+        .clone()
+        .oneshot(
+            HttpRequest::get("/api/providers")
+                .header("x-auth-request-user", "zed")
+                .body(Body::empty())?,
+        )
+        .await?;
+    let ids: Vec<serde_json::Value> = json_of(res).await?.as_array().expect("list").clone();
+    assert_eq!(
+        ids.iter().map(|p| p["id"].clone()).collect::<Vec<_>>(),
+        [serde_json::json!("plat-openai")],
+        "another caller's provider is not listed"
+    );
+
     let requests: Vec<HttpRequest<Body>> = vec![
-        HttpRequest::get("/api/providers")
-            .header("x-auth-request-user", "mallory")
-            .body(Body::empty())?,
-        HttpRequest::builder()
-            .method("POST")
-            .uri("/api/providers")
-            .header(header::CONTENT_TYPE, "application/json")
-            .header("x-auth-request-user", "mallory")
-            .body(Body::from(serde_json::to_vec(&body)?))?,
-        HttpRequest::builder()
-            .method("PUT")
-            .uri("/api/providers/plat-openai")
-            .header(header::CONTENT_TYPE, "application/json")
-            .header("x-auth-request-user", "mallory")
-            .body(Body::from(serde_json::to_vec(
-                &serde_json::json!({"display_name": "Mine", "kind": "openai"}),
-            )?))?,
+        json_as(
+            "mallory",
+            "PUT",
+            "/api/providers/plat-openai",
+            serde_json::json!({"display_name": "Mine", "kind": "openai"}),
+        )?,
         HttpRequest::delete("/api/providers/plat-openai")
             .header("x-auth-request-user", "mallory")
             .body(Body::empty())?,
-        HttpRequest::builder()
-            .method("PUT")
-            .uri("/api/config/dispatch-defaults")
-            .header(header::CONTENT_TYPE, "application/json")
-            .header("x-auth-request-user", "mallory")
-            .body(Body::from(serde_json::to_vec(&serde_json::json!({
+        json_as(
+            "mallory",
+            "PUT",
+            "/api/config/dispatch-defaults",
+            serde_json::json!({
                 "scope_kind": "platform",
                 "workload_class": "playbook",
                 "provider": "plat-openai",
-            }))?))?,
+            }),
+        )?,
         HttpRequest::delete(
             "/api/config/dispatch-defaults?scope_kind=platform&workload_class=playbook",
         )
@@ -10478,16 +10614,95 @@ async fn a_non_admin_may_not_touch_the_registry(pool: PgPool) -> Result<()> {
         let res = app.clone().oneshot(req).await?;
         assert_eq!(res.status(), StatusCode::FORBIDDEN, "{method} {uri}");
     }
-    assert_eq!(
-        crate::playbooks::providers::list(db.pool(), false)
-            .await?
-            .len(),
-        1
-    );
+    let plat = crate::playbooks::providers::get(db.pool(), "plat-openai")
+        .await?
+        .expect("still registered");
+    assert_eq!(plat.display_name, "Platform OpenAI");
     assert!(
         crate::playbooks::providers::list_defaults(db.pool())
             .await?
             .is_empty()
+    );
+    Ok(())
+}
+
+/// A provider spends its key on every dispatch, so registering or editing one to name a secret
+/// takes `bind` on that secret: a caller cannot point a provider of their own at someone else's.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn naming_a_provider_key_takes_bind_on_the_secret(pool: PgPool) -> Result<()> {
+    let (db, _d) = db_with(pool);
+    seed_secret(
+        db.pool(),
+        "sec-1",
+        "openai-key",
+        crate::secrets::SecretKind::InferenceApiKey,
+    )
+    .await;
+    let app = app_with_admins(db.clone(), vec!["wren".to_string()]);
+    let register = |user: &str, id: &str| {
+        json_as(
+            user,
+            "POST",
+            "/api/providers",
+            serde_json::json!({
+                "id": id,
+                "display_name": "Keyed",
+                "kind": "openai",
+                "secret_name": "openai-key",
+            }),
+        )
+    };
+
+    let res = app.clone().oneshot(register("mallory", "stolen")?).await?;
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    assert!(
+        crate::playbooks::providers::get(db.pool(), "stolen")
+            .await?
+            .is_none()
+    );
+
+    let res = app
+        .clone()
+        .oneshot(json_as(
+            "mallory",
+            "POST",
+            "/api/providers",
+            serde_json::json!({"id": "keyless", "display_name": "Keyless", "kind": "openai"}),
+        )?)
+        .await?;
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let res = app
+        .clone()
+        .oneshot(json_as(
+            "mallory",
+            "PUT",
+            "/api/providers/keyless",
+            serde_json::json!({"display_name": "Keyless", "kind": "openai", "secret_name": "openai-key"}),
+        )?)
+        .await?;
+    assert_eq!(
+        res.status(),
+        StatusCode::FORBIDDEN,
+        "an edit cannot attach the key either"
+    );
+
+    let res = app.clone().oneshot(register("alice", "alices")?).await?;
+    assert_eq!(res.status(), StatusCode::CREATED, "the secret's owner may");
+    let res = app
+        .clone()
+        .oneshot(json_as(
+            "alice",
+            "PUT",
+            "/api/providers/alices",
+            serde_json::json!({"display_name": "Renamed", "kind": "openai", "secret_name": "openai-key"}),
+        )?)
+        .await?;
+    assert_eq!(res.status(), StatusCode::OK);
+    let res = app.oneshot(register("wren", "platform")?).await?;
+    assert_eq!(
+        res.status(),
+        StatusCode::CREATED,
+        "a platform administrator holds bind on every secret"
     );
     Ok(())
 }
@@ -10704,6 +10919,107 @@ async fn an_admin_sets_and_clears_a_dispatch_default(pool: PgPool) -> Result<()>
         )
         .await?;
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+/// A default can name a fallback beside its primary. The pair round-trips through the API and the
+/// resolver chains them; a fallback that nobody may pick, a fallback model with no provider, and a
+/// fallback identical to the primary are refused.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn an_admin_sets_a_dispatch_default_with_a_fallback(pool: PgPool) -> Result<()> {
+    let (db, _d) = db_with(pool);
+    for (id, kind, enabled) in [
+        (
+            "pricetag",
+            crate::playbooks::providers::ProviderKind::Anthropic,
+            true,
+        ),
+        (
+            "vertex",
+            crate::playbooks::providers::ProviderKind::Vertex,
+            true,
+        ),
+        (
+            "retired",
+            crate::playbooks::providers::ProviderKind::OpenAi,
+            false,
+        ),
+    ] {
+        seed_provider(db.pool(), id, kind, enabled).await;
+    }
+    let app = app_with_admins(db.clone(), vec!["wren".to_string()]);
+
+    let res = app
+        .clone()
+        .oneshot(admin_json(
+            "PUT",
+            "/api/config/dispatch-defaults",
+            serde_json::json!({
+                "scope_kind": "platform",
+                "workload_class": "autoresearch",
+                "provider": "pricetag",
+                "fallback_provider": "vertex",
+                "fallback_model": "claude-sonnet-5",
+            }),
+        )?)
+        .await?;
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = json_of(res).await?;
+    assert_eq!(v["provider"], "pricetag");
+    assert_eq!(v["fallback_provider"], "vertex");
+    assert_eq!(v["fallback_model"], "claude-sonnet-5");
+    let chain = crate::playbooks::providers::resolve_chain(
+        db.pool(),
+        None,
+        None,
+        crate::playbooks::providers::WorkloadClass::Autoresearch,
+    )
+    .await?;
+    assert_eq!(
+        chain
+            .iter()
+            .map(|d| (d.provider.id.as_str(), d.model.as_str()))
+            .collect::<Vec<_>>()[1],
+        ("vertex", "claude-sonnet-5")
+    );
+
+    for bad in [
+        serde_json::json!({"scope_kind": "platform", "workload_class": "autoresearch", "provider": "pricetag", "fallback_provider": "retired"}),
+        serde_json::json!({"scope_kind": "platform", "workload_class": "autoresearch", "provider": "pricetag", "fallback_provider": "never-registered"}),
+        serde_json::json!({"scope_kind": "platform", "workload_class": "autoresearch", "provider": "pricetag", "fallback_model": "claude-sonnet-5"}),
+        serde_json::json!({"scope_kind": "platform", "workload_class": "autoresearch", "provider": "pricetag", "fallback_provider": "pricetag"}),
+        serde_json::json!({"scope_kind": "platform", "workload_class": "autoresearch", "provider": "pricetag", "fallback_provider": "vertex", "fallback_model": "bad model; rm"}),
+    ] {
+        let res = app
+            .clone()
+            .oneshot(admin_json(
+                "PUT",
+                "/api/config/dispatch-defaults",
+                bad.clone(),
+            )?)
+            .await?;
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY, "{bad}");
+    }
+
+    let res = app
+        .clone()
+        .oneshot(admin_json(
+            "PUT",
+            "/api/config/dispatch-defaults",
+            serde_json::json!({
+                "scope_kind": "platform",
+                "workload_class": "autoresearch",
+                "provider": "pricetag",
+            }),
+        )?)
+        .await?;
+    assert_eq!(res.status(), StatusCode::OK);
+    let defaults = crate::playbooks::providers::list_defaults(db.pool()).await?;
+    assert_eq!(defaults.len(), 1);
+    assert_eq!(
+        defaults[0].fallback_provider_id, None,
+        "a PUT without a fallback clears the one before it"
+    );
     Ok(())
 }
 

@@ -2,8 +2,7 @@
 /// `global.css`; `theme.test.ts` reads that file and fails when the two drift apart.
 
 import type * as monaco from 'monaco-editor/editor';
-
-export type AppTheme = 'dark' | 'light';
+import type { AppBrand, AppTheme } from '../appTheme';
 
 export interface Palette {
   paper: string;
@@ -54,36 +53,70 @@ export const TOKEN_OF: Record<keyof Palette, string> = {
   hi: '--color-hi',
 };
 
-export const PALETTES: Record<AppTheme, Palette> = {
-  light: {
-    paper: '#edebe2',
-    surface: '#ffffff',
-    sunk: '#dddacd',
-    ink: '#100f0e',
-    ink2: '#464439',
-    ink3: '#615f56',
-    rule: '#c4c0b0',
-    ruleHard: '#8a8676',
-    green: '#00663a',
-    amber: '#7e4f00',
-    red: '#96181f',
-    blue: '#1a4785',
-    hi: '#ffeda8',
+export const PALETTES: Record<AppBrand, Record<AppTheme, Palette>> = {
+  crucible: {
+    light: {
+      paper: '#edebe2',
+      surface: '#ffffff',
+      sunk: '#dddacd',
+      ink: '#100f0e',
+      ink2: '#464439',
+      ink3: '#615f56',
+      rule: '#c4c0b0',
+      ruleHard: '#8a8676',
+      green: '#00663a',
+      amber: '#7e4f00',
+      red: '#96181f',
+      blue: '#1a4785',
+      hi: '#ffeda8',
+    },
+    dark: {
+      paper: '#0a0a09',
+      surface: '#1c1c19',
+      sunk: '#040403',
+      ink: '#f5f3ea',
+      ink2: '#adaa9d',
+      ink3: '#878477',
+      rule: '#3a3830',
+      ruleHard: '#666254',
+      green: '#5acb86',
+      amber: '#dfa53f',
+      red: '#e56b69',
+      blue: '#83afe8',
+      hi: '#463d18',
+    },
   },
-  dark: {
-    paper: '#0a0a09',
-    surface: '#1c1c19',
-    sunk: '#040403',
-    ink: '#f5f3ea',
-    ink2: '#adaa9d',
-    ink3: '#878477',
-    rule: '#3a3830',
-    ruleHard: '#666254',
-    green: '#5acb86',
-    amber: '#dfa53f',
-    red: '#e56b69',
-    blue: '#83afe8',
-    hi: '#463d18',
+  redhat: {
+    light: {
+      paper: '#f2f2f2',
+      surface: '#ffffff',
+      sunk: '#e0e0e0',
+      ink: '#151515',
+      ink2: '#4d4d4d',
+      ink3: '#5c5c5c',
+      rule: '#e0e0e0',
+      ruleHard: '#707070',
+      green: '#204d00',
+      amber: '#73480b',
+      red: '#a60000',
+      blue: '#0066cc',
+      hi: '#e0f0ff',
+    },
+    dark: {
+      paper: '#151515',
+      surface: '#1f1f1f',
+      sunk: '#0a0a0a',
+      ink: '#ffffff',
+      ink2: '#c7c7c7',
+      ink3: '#a3a3a3',
+      rule: '#383838',
+      ruleHard: '#707070',
+      green: '#87bb62',
+      amber: '#ffcc17',
+      red: '#f56e6e',
+      blue: '#92c5f9',
+      hi: '#003366',
+    },
   },
 };
 
@@ -251,14 +284,14 @@ function colors(p: Palette): Record<string, string> {
   };
 }
 
-/// The Monaco theme names this app defines, one per app theme.
-export const THEME_NAMES: Record<AppTheme, string> = {
-  light: 'crucible-paper',
-  dark: 'crucible-ink',
+/// The Monaco theme names this app defines, one per brand and app theme.
+export const THEME_NAMES: Record<AppBrand, Record<AppTheme, string>> = {
+  crucible: { light: 'crucible-paper', dark: 'crucible-ink' },
+  redhat: { light: 'redhat-light', dark: 'redhat-dark' },
 };
 
-export function monacoTheme(app: AppTheme): monaco.editor.IStandaloneThemeData {
-  const palette = PALETTES[app];
+export function monacoTheme(brand: AppBrand, app: AppTheme): monaco.editor.IStandaloneThemeData {
+  const palette = PALETTES[brand][app];
   return {
     base: app === 'light' ? 'vs' : 'vs-dark',
     inherit: true,

@@ -40,14 +40,15 @@ export function DeleteDraftDialog({
           )}
           <div className="flex justify-end border-t border-rule">
             <Button
+              className="uppercase"
               onClick={() => {
                 onOpenChange(false);
               }}
             >
-              CANCEL
+              Cancel
             </Button>
-            <Button variant="filled" onClick={onConfirm} disabled={pending}>
-              {pending ? 'DELETING…' : 'DELETE'}
+            <Button variant="filled" className="uppercase" onClick={onConfirm} disabled={pending}>
+              {pending ? 'Deleting…' : 'Delete'}
             </Button>
           </div>
         </AlertDialog.Popup>

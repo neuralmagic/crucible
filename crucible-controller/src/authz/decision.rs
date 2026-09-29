@@ -46,16 +46,15 @@ impl Subject {
         }
     }
 
-    /// A team firing a standing launch: the team principal at `maintainer`.
-    pub fn team_firing(slug: &TeamSlug) -> Self {
+    /// A team as the subject: a standing launch it owns firing (at `maintainer`), or a caller
+    /// acting as it (at the lesser of their role and `maintainer`, proving groups only when the
+    /// caller's credential does).
+    pub fn team(slug: &TeamSlug, role: TeamRole, proves_groups: bool) -> Self {
         Subject {
             principal: Principal::Team(slug.clone()),
-            tags: BTreeMap::from([(
-                format!("team:{slug}"),
-                TeamRole::Maintainer.as_str().to_string(),
-            )]),
+            tags: BTreeMap::from([(format!("team:{slug}"), role.as_str().to_string())]),
             platform_admin: false,
-            proves_groups: true,
+            proves_groups,
         }
     }
 

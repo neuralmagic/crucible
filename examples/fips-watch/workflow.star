@@ -9,7 +9,7 @@ params = {
 scan = command(
     name = "scan",
     run = "python3 scan.py",
-    emits = ["variants"],
+    emits = {"variants": "list"},
     emits_files = ["VARIANTS.md"],
 )
 
@@ -21,7 +21,7 @@ probe = command(
     max_fanout = 12,
     isolated = True,
     required = False,
-    emits = ["status", "blockers"],
+    emits = {"status": ["clean", "dirty"], "blockers": "string"},
     emits_files = ["PROBE.md"],
 )
 
@@ -30,7 +30,7 @@ select = command(
     run = "python3 pick_dirty.py",
     depends_on = [probe],
     join = "passed",
-    emits = ["dirty"],
+    emits = {"dirty": "list"},
     emits_files = ["DIRTY.md"],
 )
 
@@ -43,7 +43,7 @@ triage = skill(
     max_fanout = 6,
     isolated = True,
     required = False,
-    emits = ["blocker", "root_cause", "confidence"],
+    emits = {"blocker": "string", "root_cause": "string", "confidence": ["high", "medium", "low"]},
     emits_files = ["TRIAGE.md", "ISSUE.json"],
 )
 
@@ -52,7 +52,7 @@ roundup = command(
     run = "python3 roundup.py",
     depends_on = [scan, probe, select, triage],
     join = "passed",
-    emits = ["revision", "clean", "dirty", "blockers"],
+    emits = {"revision": "string", "clean": "integer", "dirty": "integer", "blockers": "list"},
     emits_files = ["REPORT.md", "ISSUES.json"],
 )
 
@@ -62,7 +62,7 @@ file_issues = command(
     depends_on = [roundup],
     join = "passed",
     required = False,
-    emits = ["filed", "skipped"],
+    emits = {"filed": "integer", "skipped": "integer"},
     emits_files = ["FILED.md"],
 )
 
@@ -71,15 +71,15 @@ card = command(
     run = "python3 card.py",
     depends_on = [roundup, file_issues],
     join = "passed",
-    emits = [
-        "verdict",
-        "revision",
-        "clean_variants",
-        "dirty_variants",
-        "crypto_blockers",
-        "issues_filed",
-        "issues_skipped",
-    ],
+    emits = {
+        "verdict": "string",
+        "revision": "string",
+        "clean_variants": "integer",
+        "dirty_variants": "integer",
+        "crypto_blockers": "list",
+        "issues_filed": "integer",
+        "issues_skipped": "integer",
+    },
 )
 
 publish_report = report(

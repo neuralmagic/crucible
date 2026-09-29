@@ -1,0 +1,11 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-ACT-AS"
+title = "Acting as a team"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = "A caller MAY act as a team it holds a membership in by naming that team on each request. While acting as team T, the request's subject MUST be the team principal T at the lesser of the caller's role in T and `maintainer`: the subject a standing launch owned by T fires as under [[RFC-0003:C-DECISION]], never above the role the caller holds. The caller's user principal, group principals, and other team memberships MUST NOT be in that subject set. The actor remains the caller, and an audit record MUST carry T as the subject. A request naming a team the caller does not hold MUST be refused and MUST NOT be answered as the caller's own subject. Only a team principal may be acted as. Every decision, read scope, and entitlement for the request MUST be made for that subject, except that managing the caller's own API keys, sign-in credential, and interface preferences acts for the caller, since those belong to the person rather than to any team. The interface MUST show the team the caller is acting as, and MUST show a refusal to act as a team with its reason."

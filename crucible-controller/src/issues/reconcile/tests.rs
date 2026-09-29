@@ -439,11 +439,11 @@ fn sample_issue(key: &str) -> NewIssue {
     }
 }
 
-// --- fixtures: a fake GitHub (the single-issue GET `confirm_tier` makes) and a fake
-// Vertex ranking endpoint (`CONTROLLER_RANKER_API_URL`, the real test seam — a `wiremock` HTTP
-// double, not an in-process mock). Every `reconcile_new` test now runs through stage 2 first,
-// so both are needed wherever a test drives the `new` path. One server serves both routes
-// (different HTTP methods, no conflict), so one env-var pair covers a whole test.
+// --- fixtures: a fake GitHub (the single-issue GET `confirm_tier` makes) and a fake ranking
+// endpoint (a Chat Completions provider registered at it by `crate::testing::register_ranker`, the
+// real test seam — a `wiremock` HTTP double, not an in-process mock). Every `reconcile_new` test
+// now runs through stage 2 first, so both are needed wherever a test drives the `new` path. One
+// server serves both routes (different HTTP methods, no conflict).
 
 /// Mount a single-issue GET response (`GET /repos/{repo}/issues/{number}`) on `server` — the
 /// one GET `confirm_tier` makes to hash+rank an issue's current content.
@@ -548,9 +548,7 @@ async fn new_with_a_surviving_pack_goes_scoped_with_ledger_and_event(pool: PgPoo
     unsafe {
         std::env::set_var("CRUCIBLE_BIN", &bin);
     }
-    unsafe {
-        std::env::set_var("CONTROLLER_RANKER_API_URL", gh.uri());
-    }
+    crate::testing::register_ranker(db.pool(), &gh.uri()).await?;
     unsafe {
         std::env::set_var("GITHUB_API_URL", gh.uri());
     }
@@ -560,9 +558,6 @@ async fn new_with_a_surviving_pack_goes_scoped_with_ledger_and_event(pool: PgPoo
     reconcile(&db, &cfg, "owner/repo#1").await?;
     unsafe {
         std::env::remove_var("CRUCIBLE_BIN");
-    }
-    unsafe {
-        std::env::remove_var("CONTROLLER_RANKER_API_URL");
     }
     unsafe {
         std::env::remove_var("GITHUB_API_URL");
@@ -635,9 +630,7 @@ async fn new_with_a_dead_proposal_parks_machine_with_the_reason(pool: PgPool) ->
     unsafe {
         std::env::set_var("CRUCIBLE_BIN", &bin);
     }
-    unsafe {
-        std::env::set_var("CONTROLLER_RANKER_API_URL", gh.uri());
-    }
+    crate::testing::register_ranker(db.pool(), &gh.uri()).await?;
     unsafe {
         std::env::set_var("GITHUB_API_URL", gh.uri());
     }
@@ -647,9 +640,6 @@ async fn new_with_a_dead_proposal_parks_machine_with_the_reason(pool: PgPool) ->
     reconcile(&db, &cfg, "owner/repo#2").await?;
     unsafe {
         std::env::remove_var("CRUCIBLE_BIN");
-    }
-    unsafe {
-        std::env::remove_var("CONTROLLER_RANKER_API_URL");
     }
     unsafe {
         std::env::remove_var("GITHUB_API_URL");
@@ -738,8 +728,8 @@ async fn scenario_kind_bypasses_rank_horizon_tier_and_caps(pool: PgPool) -> Resu
     unsafe {
         std::env::set_var("CRUCIBLE_BIN", &bin);
     }
-    // No wiremock server is mounted and GITHUB_API_URL/CONTROLLER_RANKER_API_URL are unset: a
-    // stray ranker or GitHub call would hard-fail this test, proving neither ever fires.
+    // No wiremock server is mounted, GITHUB_API_URL is unset, and no ranking provider is registered:
+    // a stray ranker or GitHub call would hard-fail this test, proving neither ever fires.
     db.ledger_append(None, "run", 200.0).await?; // over the daily ceiling
     db.ledger_append(None, "scope", 0.5).await?; // over max_scopes_per_day (cap below is 1)
     let cfg = cfg_with(
@@ -1126,9 +1116,7 @@ async fn scopes_per_day_cap_declines_a_new_scope(pool: PgPool) -> Result<()> {
     let gh = wiremock::MockServer::start().await;
     mount_issue(&gh, "owner/repo", 4, "a T1 issue", "body", &[]).await;
     mount_ranker_confirms(&gh, "T1").await;
-    unsafe {
-        std::env::set_var("CONTROLLER_RANKER_API_URL", gh.uri());
-    }
+    crate::testing::register_ranker(db.pool(), &gh.uri()).await?;
     unsafe {
         std::env::set_var("GITHUB_API_URL", gh.uri());
     }
@@ -1146,9 +1134,6 @@ async fn scopes_per_day_cap_declines_a_new_scope(pool: PgPool) -> Result<()> {
 
     crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#4")).await?;
     reconcile(&db, &cfg, "owner/repo#4").await?;
-    unsafe {
-        std::env::remove_var("CONTROLLER_RANKER_API_URL");
-    }
     unsafe {
         std::env::remove_var("GITHUB_API_URL");
     }
@@ -1935,9 +1920,7 @@ async fn losing_the_claim_is_a_clean_noop(pool: PgPool) -> Result<()> {
     unsafe {
         std::env::set_var("CRUCIBLE_BIN", &bin);
     }
-    unsafe {
-        std::env::set_var("CONTROLLER_RANKER_API_URL", gh.uri());
-    }
+    crate::testing::register_ranker(db.pool(), &gh.uri()).await?;
     unsafe {
         std::env::set_var("GITHUB_API_URL", gh.uri());
     }
@@ -1954,9 +1937,6 @@ async fn losing_the_claim_is_a_clean_noop(pool: PgPool) -> Result<()> {
     b?;
     unsafe {
         std::env::remove_var("CRUCIBLE_BIN");
-    }
-    unsafe {
-        std::env::remove_var("CONTROLLER_RANKER_API_URL");
     }
     unsafe {
         std::env::remove_var("GITHUB_API_URL");
@@ -3010,9 +2990,7 @@ async fn ranker_assigns_the_first_tier(pool: PgPool) -> Result<()> {
     unsafe {
         std::env::set_var("CRUCIBLE_BIN", &bin);
     }
-    unsafe {
-        std::env::set_var("CONTROLLER_RANKER_API_URL", gh.uri());
-    }
+    crate::testing::register_ranker(db.pool(), &gh.uri()).await?;
     unsafe {
         std::env::set_var("GITHUB_API_URL", gh.uri());
     }
@@ -3034,9 +3012,6 @@ async fn ranker_assigns_the_first_tier(pool: PgPool) -> Result<()> {
     .await?;
     unsafe {
         std::env::remove_var("CRUCIBLE_BIN");
-    }
-    unsafe {
-        std::env::remove_var("CONTROLLER_RANKER_API_URL");
     }
     unsafe {
         std::env::remove_var("GITHUB_API_URL");
@@ -3074,9 +3049,7 @@ async fn rank_changes_tier_when_content_hash_changes(pool: PgPool) -> Result<()>
     unsafe {
         std::env::set_var("CRUCIBLE_BIN", &bin);
     }
-    unsafe {
-        std::env::set_var("CONTROLLER_RANKER_API_URL", gh.uri());
-    }
+    crate::testing::register_ranker(db.pool(), &gh.uri()).await?;
     unsafe {
         std::env::set_var("GITHUB_API_URL", gh.uri());
     }
@@ -3092,9 +3065,6 @@ async fn rank_changes_tier_when_content_hash_changes(pool: PgPool) -> Result<()>
     .await?;
     unsafe {
         std::env::remove_var("CRUCIBLE_BIN");
-    }
-    unsafe {
-        std::env::remove_var("CONTROLLER_RANKER_API_URL");
     }
     unsafe {
         std::env::remove_var("GITHUB_API_URL");
@@ -3130,9 +3100,7 @@ async fn n_verdict_parks_the_issue_as_unscopeable(pool: PgPool) -> Result<()> {
     )
     .await;
     mount_ranker_confirms(&gh, "N").await;
-    unsafe {
-        std::env::set_var("CONTROLLER_RANKER_API_URL", gh.uri());
-    }
+    crate::testing::register_ranker(db.pool(), &gh.uri()).await?;
     unsafe {
         std::env::set_var("GITHUB_API_URL", gh.uri());
     }
@@ -3144,9 +3112,6 @@ async fn n_verdict_parks_the_issue_as_unscopeable(pool: PgPool) -> Result<()> {
         "owner/repo#22",
     )
     .await?;
-    unsafe {
-        std::env::remove_var("CONTROLLER_RANKER_API_URL");
-    }
     unsafe {
         std::env::remove_var("GITHUB_API_URL");
     }
@@ -3180,9 +3145,7 @@ async fn unrelated_affinity_parks_the_issue_despite_a_scopeable_tier(pool: PgPoo
     )
     .await;
     mount_ranker_unrelated(&gh, "T0").await;
-    unsafe {
-        std::env::set_var("CONTROLLER_RANKER_API_URL", gh.uri());
-    }
+    crate::testing::register_ranker(db.pool(), &gh.uri()).await?;
     unsafe {
         std::env::set_var("GITHUB_API_URL", gh.uri());
     }
@@ -3194,9 +3157,6 @@ async fn unrelated_affinity_parks_the_issue_despite_a_scopeable_tier(pool: PgPoo
         "owner/repo#24",
     )
     .await?;
-    unsafe {
-        std::env::remove_var("CONTROLLER_RANKER_API_URL");
-    }
     unsafe {
         std::env::remove_var("GITHUB_API_URL");
     }
@@ -3233,9 +3193,7 @@ async fn unrelated_affinity_parks_without_a_grounded_escalation(pool: PgPool) ->
     unsafe {
         std::env::set_var("CRUCIBLE_BIN", "/nonexistent/crucible-must-not-run");
     }
-    unsafe {
-        std::env::set_var("CONTROLLER_RANKER_API_URL", gh.uri());
-    }
+    crate::testing::register_ranker(db.pool(), &gh.uri()).await?;
     unsafe {
         std::env::set_var("GITHUB_API_URL", gh.uri());
     }
@@ -3249,9 +3207,6 @@ async fn unrelated_affinity_parks_without_a_grounded_escalation(pool: PgPool) ->
     .await?;
     unsafe {
         std::env::remove_var("CRUCIBLE_BIN");
-    }
-    unsafe {
-        std::env::remove_var("CONTROLLER_RANKER_API_URL");
     }
     unsafe {
         std::env::remove_var("GITHUB_API_URL");
@@ -3287,9 +3242,7 @@ async fn malformed_verdict_defers_the_scope_turn_and_leaves_tier_null(pool: PgPo
     unsafe {
         std::env::set_var("CRUCIBLE_BIN", "/nonexistent/crucible-must-not-run");
     }
-    unsafe {
-        std::env::set_var("CONTROLLER_RANKER_API_URL", gh.uri());
-    }
+    crate::testing::register_ranker(db.pool(), &gh.uri()).await?;
     unsafe {
         std::env::set_var("GITHUB_API_URL", gh.uri());
     }
@@ -3303,9 +3256,6 @@ async fn malformed_verdict_defers_the_scope_turn_and_leaves_tier_null(pool: PgPo
     .await?;
     unsafe {
         std::env::remove_var("CRUCIBLE_BIN");
-    }
-    unsafe {
-        std::env::remove_var("CONTROLLER_RANKER_API_URL");
     }
     unsafe {
         std::env::remove_var("GITHUB_API_URL");
@@ -3351,9 +3301,7 @@ async fn unchanged_content_hash_skips_a_second_rank_call(pool: PgPool) -> Result
     let gh = wiremock::MockServer::start().await;
     mount_issue(&gh, "owner/repo", 24, "stable content", "body", &[]).await;
     mount_ranker_confirms(&gh, "T1").await;
-    unsafe {
-        std::env::set_var("CONTROLLER_RANKER_API_URL", gh.uri());
-    }
+    crate::testing::register_ranker(db.pool(), &gh.uri()).await?;
     unsafe {
         std::env::set_var("GITHUB_API_URL", gh.uri());
     }
@@ -3382,9 +3330,6 @@ async fn unchanged_content_hash_skips_a_second_rank_call(pool: PgPool) -> Result
     // Same issue, unchanged content: a second reconcile must not call the ranker at all.
     reconcile(&db, &cfg, "owner/repo#24").await?;
     unsafe {
-        std::env::remove_var("CONTROLLER_RANKER_API_URL");
-    }
-    unsafe {
         std::env::remove_var("GITHUB_API_URL");
     }
 
@@ -3406,9 +3351,7 @@ async fn a_cleared_rank_cache_reranks_on_the_next_sweep(pool: PgPool) -> Result<
     let gh = wiremock::MockServer::start().await;
     mount_issue(&gh, "owner/repo", 26, "stable content", "body", &[]).await;
     mount_ranker_confirms(&gh, "T1").await;
-    unsafe {
-        std::env::set_var("CONTROLLER_RANKER_API_URL", gh.uri());
-    }
+    crate::testing::register_ranker(db.pool(), &gh.uri()).await?;
     unsafe {
         std::env::set_var("GITHUB_API_URL", gh.uri());
     }
@@ -3442,9 +3385,6 @@ async fn a_cleared_rank_cache_reranks_on_the_next_sweep(pool: PgPool) -> Result<
 
     reconcile(&db, &cfg, "owner/repo#26").await?;
     unsafe {
-        std::env::remove_var("CONTROLLER_RANKER_API_URL");
-    }
-    unsafe {
         std::env::remove_var("GITHUB_API_URL");
     }
 
@@ -3474,9 +3414,7 @@ async fn capped_before_the_rank_call_skips_the_ranker(pool: PgPool) -> Result<()
     let (db, dir) = db_with(pool);
     let gh = wiremock::MockServer::start().await;
     mount_ranker_confirms(&gh, "T1").await;
-    unsafe {
-        std::env::set_var("CONTROLLER_RANKER_API_URL", gh.uri());
-    }
+    crate::testing::register_ranker(db.pool(), &gh.uri()).await?;
     // No GITHUB_API_URL mount needed: `reconcile_new`'s ceiling check declines before
     // `confirm_tier` (and its issue-content GET) ever runs.
     db.ledger_append(None, "run", 100.0).await?;
@@ -3490,9 +3428,6 @@ async fn capped_before_the_rank_call_skips_the_ranker(pool: PgPool) -> Result<()
 
     crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#25")).await?;
     reconcile(&db, &cfg, "owner/repo#25").await?;
-    unsafe {
-        std::env::remove_var("CONTROLLER_RANKER_API_URL");
-    }
     assert_eq!(
         gh.received_requests()
             .await
@@ -3569,9 +3504,7 @@ async fn t3_verdict_defers_instead_of_scoping(pool: PgPool) -> Result<()> {
     )
     .await;
     mount_ranker_confirms(&gh, "T3").await;
-    unsafe {
-        std::env::set_var("CONTROLLER_RANKER_API_URL", gh.uri());
-    }
+    crate::testing::register_ranker(db.pool(), &gh.uri()).await?;
     unsafe {
         std::env::set_var("GITHUB_API_URL", gh.uri());
     }
@@ -3583,9 +3516,6 @@ async fn t3_verdict_defers_instead_of_scoping(pool: PgPool) -> Result<()> {
         "owner/repo#26",
     )
     .await?;
-    unsafe {
-        std::env::remove_var("CONTROLLER_RANKER_API_URL");
-    }
     unsafe {
         std::env::remove_var("GITHUB_API_URL");
     }
@@ -3629,9 +3559,7 @@ async fn allow_t3_lets_a_t3_row_proceed_to_scope(pool: PgPool) -> Result<()> {
     unsafe {
         std::env::set_var("CRUCIBLE_BIN", &bin);
     }
-    unsafe {
-        std::env::set_var("CONTROLLER_RANKER_API_URL", gh.uri());
-    }
+    crate::testing::register_ranker(db.pool(), &gh.uri()).await?;
     unsafe {
         std::env::set_var("GITHUB_API_URL", gh.uri());
     }
@@ -3644,9 +3572,6 @@ async fn allow_t3_lets_a_t3_row_proceed_to_scope(pool: PgPool) -> Result<()> {
     reconcile(&db, &cfg, "owner/repo#27").await?;
     unsafe {
         std::env::remove_var("CRUCIBLE_BIN");
-    }
-    unsafe {
-        std::env::remove_var("CONTROLLER_RANKER_API_URL");
     }
     unsafe {
         std::env::remove_var("GITHUB_API_URL");
@@ -3677,9 +3602,7 @@ async fn t3_exclusion_holds_on_a_cache_hit_and_logs_once(pool: PgPool) -> Result
     let gh = wiremock::MockServer::start().await;
     mount_issue(&gh, "owner/repo", 28, "a T3 issue", "body", &[]).await;
     mount_ranker_confirms(&gh, "T3").await;
-    unsafe {
-        std::env::set_var("CONTROLLER_RANKER_API_URL", gh.uri());
-    }
+    crate::testing::register_ranker(db.pool(), &gh.uri()).await?;
     unsafe {
         std::env::set_var("GITHUB_API_URL", gh.uri());
     }
@@ -3688,9 +3611,6 @@ async fn t3_exclusion_holds_on_a_cache_hit_and_logs_once(pool: PgPool) -> Result
     crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#28")).await?;
     reconcile(&db, &cfg, "owner/repo#28").await?;
     reconcile(&db, &cfg, "owner/repo#28").await?;
-    unsafe {
-        std::env::remove_var("CONTROLLER_RANKER_API_URL");
-    }
     unsafe {
         std::env::remove_var("GITHUB_API_URL");
     }
@@ -3731,9 +3651,7 @@ async fn allowed_tiers_t0_only_defers_a_t1_verdict(pool: PgPool) -> Result<()> {
     let gh = wiremock::MockServer::start().await;
     mount_issue(&gh, "owner/repo", 40, "a T1 issue", "body", &[]).await;
     mount_ranker_confirms(&gh, "T1").await;
-    unsafe {
-        std::env::set_var("CONTROLLER_RANKER_API_URL", gh.uri());
-    }
+    crate::testing::register_ranker(db.pool(), &gh.uri()).await?;
     unsafe {
         std::env::set_var("GITHUB_API_URL", gh.uri());
     }
@@ -3744,9 +3662,6 @@ async fn allowed_tiers_t0_only_defers_a_t1_verdict(pool: PgPool) -> Result<()> {
         ..cfg_with(dir.path(), Profile::default())
     };
     reconcile(&db, &cfg, "owner/repo#40").await?;
-    unsafe {
-        std::env::remove_var("CONTROLLER_RANKER_API_URL");
-    }
     unsafe {
         std::env::remove_var("GITHUB_API_URL");
     }
@@ -3779,9 +3694,7 @@ async fn allowed_tiers_t0_t1_admits_a_t1_verdict_to_scope(pool: PgPool) -> Resul
     unsafe {
         std::env::set_var("CRUCIBLE_BIN", &bin);
     }
-    unsafe {
-        std::env::set_var("CONTROLLER_RANKER_API_URL", gh.uri());
-    }
+    crate::testing::register_ranker(db.pool(), &gh.uri()).await?;
     unsafe {
         std::env::set_var("GITHUB_API_URL", gh.uri());
     }
@@ -3794,9 +3707,6 @@ async fn allowed_tiers_t0_t1_admits_a_t1_verdict_to_scope(pool: PgPool) -> Resul
     reconcile(&db, &cfg, "owner/repo#41").await?;
     unsafe {
         std::env::remove_var("CRUCIBLE_BIN");
-    }
-    unsafe {
-        std::env::remove_var("CONTROLLER_RANKER_API_URL");
     }
     unsafe {
         std::env::remove_var("GITHUB_API_URL");
@@ -3913,9 +3823,7 @@ async fn low_confidence_verdict_escalates_to_the_grounded_ranker(pool: PgPool) -
     unsafe {
         std::env::set_var("CRUCIBLE_BIN", &bin);
     }
-    unsafe {
-        std::env::set_var("CONTROLLER_RANKER_API_URL", gh.uri());
-    }
+    crate::testing::register_ranker(db.pool(), &gh.uri()).await?;
     unsafe {
         std::env::set_var("GITHUB_API_URL", gh.uri());
     }
@@ -3931,9 +3839,6 @@ async fn low_confidence_verdict_escalates_to_the_grounded_ranker(pool: PgPool) -
     reconcile(&db, &cfg, "owner/repo#30").await?;
     unsafe {
         std::env::remove_var("CRUCIBLE_BIN");
-    }
-    unsafe {
-        std::env::remove_var("CONTROLLER_RANKER_API_URL");
     }
     unsafe {
         std::env::remove_var("GITHUB_API_URL");
@@ -4095,9 +4000,7 @@ async fn pod_arm_verdict_ledgers_exactly_once_end_to_end(pool: PgPool) -> Result
     unsafe {
         std::env::set_var("CRUCIBLE_BIN", &bin);
     }
-    unsafe {
-        std::env::set_var("CONTROLLER_RANKER_API_URL", gh.uri());
-    }
+    crate::testing::register_ranker(db.pool(), &gh.uri()).await?;
     unsafe {
         std::env::set_var("GITHUB_API_URL", gh.uri());
     }
@@ -4117,9 +4020,6 @@ async fn pod_arm_verdict_ledgers_exactly_once_end_to_end(pool: PgPool) -> Result
     crate::runs::workpod::reset_dispatcher();
     unsafe {
         std::env::remove_var("CRUCIBLE_BIN");
-    }
-    unsafe {
-        std::env::remove_var("CONTROLLER_RANKER_API_URL");
     }
     unsafe {
         std::env::remove_var("GITHUB_API_URL");
@@ -4165,9 +4065,7 @@ async fn queued_grounded_turn_defers_the_rank_then_drains(pool: PgPool) -> Resul
     unsafe {
         std::env::set_var("CRUCIBLE_BIN", &bin);
     }
-    unsafe {
-        std::env::set_var("CONTROLLER_RANKER_API_URL", gh.uri());
-    }
+    crate::testing::register_ranker(db.pool(), &gh.uri()).await?;
     unsafe {
         std::env::set_var("GITHUB_API_URL", gh.uri());
     }
@@ -4218,9 +4116,6 @@ async fn queued_grounded_turn_defers_the_rank_then_drains(pool: PgPool) -> Resul
     crate::runs::workpod::reset_dispatcher();
     unsafe {
         std::env::remove_var("CRUCIBLE_BIN");
-    }
-    unsafe {
-        std::env::remove_var("CONTROLLER_RANKER_API_URL");
     }
     unsafe {
         std::env::remove_var("GITHUB_API_URL");
@@ -5328,9 +5223,7 @@ async fn high_confidence_verdict_does_not_escalate(pool: PgPool) -> Result<()> {
     unsafe {
         std::env::set_var("CRUCIBLE_BIN", &bin);
     }
-    unsafe {
-        std::env::set_var("CONTROLLER_RANKER_API_URL", gh.uri());
-    }
+    crate::testing::register_ranker(db.pool(), &gh.uri()).await?;
     unsafe {
         std::env::set_var("GITHUB_API_URL", gh.uri());
     }
@@ -5343,9 +5236,6 @@ async fn high_confidence_verdict_does_not_escalate(pool: PgPool) -> Result<()> {
     reconcile(&db, &cfg, "owner/repo#31").await?;
     unsafe {
         std::env::remove_var("CRUCIBLE_BIN");
-    }
-    unsafe {
-        std::env::remove_var("CONTROLLER_RANKER_API_URL");
     }
     unsafe {
         std::env::remove_var("GITHUB_API_URL");
@@ -5406,9 +5296,7 @@ async fn stale_verdict_parks_with_the_rationale_attached(pool: PgPool) -> Result
     unsafe {
         std::env::set_var("CRUCIBLE_BIN", &bin);
     }
-    unsafe {
-        std::env::set_var("CONTROLLER_RANKER_API_URL", gh.uri());
-    }
+    crate::testing::register_ranker(db.pool(), &gh.uri()).await?;
     unsafe {
         std::env::set_var("GITHUB_API_URL", gh.uri());
     }
@@ -5421,9 +5309,6 @@ async fn stale_verdict_parks_with_the_rationale_attached(pool: PgPool) -> Result
     reconcile(&db, &cfg, "owner/repo#40").await?;
     unsafe {
         std::env::remove_var("CRUCIBLE_BIN");
-    }
-    unsafe {
-        std::env::remove_var("CONTROLLER_RANKER_API_URL");
     }
     unsafe {
         std::env::remove_var("GITHUB_API_URL");
@@ -5469,9 +5354,7 @@ async fn prescope_gate_demotion_to_n_parks_instead_of_scoping(pool: PgPool) -> R
     unsafe {
         std::env::set_var("CRUCIBLE_BIN", &bin);
     }
-    unsafe {
-        std::env::set_var("CONTROLLER_RANKER_API_URL", gh.uri());
-    }
+    crate::testing::register_ranker(db.pool(), &gh.uri()).await?;
     unsafe {
         std::env::set_var("GITHUB_API_URL", gh.uri());
     }
@@ -5491,9 +5374,6 @@ async fn prescope_gate_demotion_to_n_parks_instead_of_scoping(pool: PgPool) -> R
     reconcile(&db, &cfg, "owner/repo#41").await?;
     unsafe {
         std::env::remove_var("CRUCIBLE_BIN");
-    }
-    unsafe {
-        std::env::remove_var("CONTROLLER_RANKER_API_URL");
     }
     unsafe {
         std::env::remove_var("GITHUB_API_URL");
@@ -5545,9 +5425,7 @@ async fn a_mismatched_engine_binary_parks_the_local_grounded_turn(pool: PgPool) 
     unsafe {
         std::env::set_var("CRUCIBLE_BIN", &bin);
     }
-    unsafe {
-        std::env::set_var("CONTROLLER_RANKER_API_URL", gh.uri());
-    }
+    crate::testing::register_ranker(db.pool(), &gh.uri()).await?;
     unsafe {
         std::env::set_var("GITHUB_API_URL", gh.uri());
     }
@@ -5574,9 +5452,6 @@ async fn a_mismatched_engine_binary_parks_the_local_grounded_turn(pool: PgPool) 
     crucible_controller::reset_contracts();
     unsafe {
         std::env::remove_var("CRUCIBLE_BIN");
-    }
-    unsafe {
-        std::env::remove_var("CONTROLLER_RANKER_API_URL");
     }
     unsafe {
         std::env::remove_var("GITHUB_API_URL");
@@ -5631,9 +5506,7 @@ async fn prescope_gate_confirms_and_proceeds_to_scope(pool: PgPool) -> Result<()
     unsafe {
         std::env::set_var("CRUCIBLE_BIN", &bin);
     }
-    unsafe {
-        std::env::set_var("CONTROLLER_RANKER_API_URL", gh.uri());
-    }
+    crate::testing::register_ranker(db.pool(), &gh.uri()).await?;
     unsafe {
         std::env::set_var("GITHUB_API_URL", gh.uri());
     }
@@ -5653,9 +5526,6 @@ async fn prescope_gate_confirms_and_proceeds_to_scope(pool: PgPool) -> Result<()
     reconcile(&db, &cfg, "owner/repo#42").await?;
     unsafe {
         std::env::remove_var("CRUCIBLE_BIN");
-    }
-    unsafe {
-        std::env::remove_var("CONTROLLER_RANKER_API_URL");
     }
     unsafe {
         std::env::remove_var("GITHUB_API_URL");
@@ -5685,9 +5555,7 @@ async fn prescope_gate_skips_a_hash_already_grounded_confirmed(pool: PgPool) -> 
     unsafe {
         std::env::set_var("CRUCIBLE_BIN", &bin);
     }
-    unsafe {
-        std::env::set_var("CONTROLLER_RANKER_API_URL", gh.uri());
-    }
+    crate::testing::register_ranker(db.pool(), &gh.uri()).await?;
     unsafe {
         std::env::set_var("GITHUB_API_URL", gh.uri());
     }
@@ -5727,9 +5595,6 @@ async fn prescope_gate_skips_a_hash_already_grounded_confirmed(pool: PgPool) -> 
         std::env::remove_var("CRUCIBLE_BIN");
     }
     unsafe {
-        std::env::remove_var("CONTROLLER_RANKER_API_URL");
-    }
-    unsafe {
         std::env::remove_var("GITHUB_API_URL");
     }
 
@@ -5763,9 +5628,7 @@ async fn prescope_gate_failure_defers_the_scope_turn(pool: PgPool) -> Result<()>
     unsafe {
         std::env::set_var("CRUCIBLE_BIN", &path);
     }
-    unsafe {
-        std::env::set_var("CONTROLLER_RANKER_API_URL", gh.uri());
-    }
+    crate::testing::register_ranker(db.pool(), &gh.uri()).await?;
     unsafe {
         std::env::set_var("GITHUB_API_URL", gh.uri());
     }
@@ -5785,9 +5648,6 @@ async fn prescope_gate_failure_defers_the_scope_turn(pool: PgPool) -> Result<()>
     reconcile(&db, &cfg, "owner/repo#44").await?;
     unsafe {
         std::env::remove_var("CRUCIBLE_BIN");
-    }
-    unsafe {
-        std::env::remove_var("CONTROLLER_RANKER_API_URL");
     }
     unsafe {
         std::env::remove_var("GITHUB_API_URL");
@@ -5821,9 +5681,7 @@ async fn prescope_grounded_off_preserves_old_behavior(pool: PgPool) -> Result<()
     unsafe {
         std::env::set_var("CRUCIBLE_BIN", &bin);
     }
-    unsafe {
-        std::env::set_var("CONTROLLER_RANKER_API_URL", gh.uri());
-    }
+    crate::testing::register_ranker(db.pool(), &gh.uri()).await?;
     unsafe {
         std::env::set_var("GITHUB_API_URL", gh.uri());
     }
@@ -5843,9 +5701,6 @@ async fn prescope_grounded_off_preserves_old_behavior(pool: PgPool) -> Result<()
     reconcile(&db, &cfg, "owner/repo#45").await?;
     unsafe {
         std::env::remove_var("CRUCIBLE_BIN");
-    }
-    unsafe {
-        std::env::remove_var("CONTROLLER_RANKER_API_URL");
     }
     unsafe {
         std::env::remove_var("GITHUB_API_URL");
@@ -5927,9 +5782,7 @@ async fn rank_horizon_disabled_when_zero(pool: PgPool) -> Result<()> {
     unsafe {
         std::env::set_var("CRUCIBLE_BIN", &bin);
     }
-    unsafe {
-        std::env::set_var("CONTROLLER_RANKER_API_URL", gh.uri());
-    }
+    crate::testing::register_ranker(db.pool(), &gh.uri()).await?;
     unsafe {
         std::env::set_var("GITHUB_API_URL", gh.uri());
     }
@@ -5951,9 +5804,6 @@ async fn rank_horizon_disabled_when_zero(pool: PgPool) -> Result<()> {
     reconcile(&db, &cfg, "owner/repo#101").await?;
     unsafe {
         std::env::remove_var("CRUCIBLE_BIN");
-    }
-    unsafe {
-        std::env::remove_var("CONTROLLER_RANKER_API_URL");
     }
     unsafe {
         std::env::remove_var("GITHUB_API_URL");
@@ -5982,9 +5832,7 @@ async fn rank_horizon_fresh_row_proceeds(pool: PgPool) -> Result<()> {
     unsafe {
         std::env::set_var("CRUCIBLE_BIN", &bin);
     }
-    unsafe {
-        std::env::set_var("CONTROLLER_RANKER_API_URL", gh.uri());
-    }
+    crate::testing::register_ranker(db.pool(), &gh.uri()).await?;
     unsafe {
         std::env::set_var("GITHUB_API_URL", gh.uri());
     }
@@ -6008,9 +5856,6 @@ async fn rank_horizon_fresh_row_proceeds(pool: PgPool) -> Result<()> {
         std::env::remove_var("CRUCIBLE_BIN");
     }
     unsafe {
-        std::env::remove_var("CONTROLLER_RANKER_API_URL");
-    }
-    unsafe {
         std::env::remove_var("GITHUB_API_URL");
     }
 
@@ -6025,18 +5870,13 @@ async fn rank_horizon_fresh_row_proceeds(pool: PgPool) -> Result<()> {
     unsafe {
         std::env::set_var("CRUCIBLE_BIN", &bin);
     }
-    unsafe {
-        std::env::set_var("CONTROLLER_RANKER_API_URL", gh.uri());
-    }
+    crate::testing::register_ranker(db.pool(), &gh.uri()).await?;
     unsafe {
         std::env::set_var("GITHUB_API_URL", gh.uri());
     }
     reconcile(&db, &cfg, "owner/repo#102").await?;
     unsafe {
         std::env::remove_var("CRUCIBLE_BIN");
-    }
-    unsafe {
-        std::env::remove_var("CONTROLLER_RANKER_API_URL");
     }
     unsafe {
         std::env::remove_var("GITHUB_API_URL");
@@ -6064,9 +5904,7 @@ async fn rank_horizon_auto_unpark_on_fresh_activity(pool: PgPool) -> Result<()> 
     unsafe {
         std::env::set_var("CRUCIBLE_BIN", &bin);
     }
-    unsafe {
-        std::env::set_var("CONTROLLER_RANKER_API_URL", gh.uri());
-    }
+    crate::testing::register_ranker(db.pool(), &gh.uri()).await?;
     unsafe {
         std::env::set_var("GITHUB_API_URL", gh.uri());
     }
@@ -6104,9 +5942,6 @@ async fn rank_horizon_auto_unpark_on_fresh_activity(pool: PgPool) -> Result<()> 
         std::env::remove_var("CRUCIBLE_BIN");
     }
     unsafe {
-        std::env::remove_var("CONTROLLER_RANKER_API_URL");
-    }
-    unsafe {
         std::env::remove_var("GITHUB_API_URL");
     }
 
@@ -6127,18 +5962,13 @@ async fn rank_horizon_auto_unpark_on_fresh_activity(pool: PgPool) -> Result<()> 
     unsafe {
         std::env::set_var("CRUCIBLE_BIN", &bin);
     }
-    unsafe {
-        std::env::set_var("CONTROLLER_RANKER_API_URL", gh.uri());
-    }
+    crate::testing::register_ranker(db.pool(), &gh.uri()).await?;
     unsafe {
         std::env::set_var("GITHUB_API_URL", gh.uri());
     }
     reconcile(&db, &cfg, "owner/repo#103").await?;
     unsafe {
         std::env::remove_var("CRUCIBLE_BIN");
-    }
-    unsafe {
-        std::env::remove_var("CONTROLLER_RANKER_API_URL");
     }
     unsafe {
         std::env::remove_var("GITHUB_API_URL");
@@ -6563,9 +6393,7 @@ async fn burst_backlog_respects_the_tight_rank_cap_no_bypass(pool: PgPool) -> Re
     unsafe {
         std::env::set_var("CRUCIBLE_BIN", "/bin/true");
     } // never reached (scope_executor disabled)
-    unsafe {
-        std::env::set_var("CONTROLLER_RANKER_API_URL", gh.uri());
-    }
+    crate::testing::register_ranker(db.pool(), &gh.uri()).await?;
     unsafe {
         std::env::set_var("GITHUB_API_URL", gh.uri());
     }
@@ -6649,9 +6477,6 @@ async fn burst_backlog_respects_the_tight_rank_cap_no_bypass(pool: PgPool) -> Re
 
     unsafe {
         std::env::remove_var("CRUCIBLE_BIN");
-    }
-    unsafe {
-        std::env::remove_var("CONTROLLER_RANKER_API_URL");
     }
     unsafe {
         std::env::remove_var("GITHUB_API_URL");

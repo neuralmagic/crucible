@@ -98,6 +98,8 @@ dto! {
         pub action: AuditAction,
         /// The acting principal; null only where there is none (a hub read on its own behalf).
         pub actor: Option<String>,
+        /// The principal the action was decided for when it differs from the actor.
+        pub subject: Option<String>,
         pub detail: Option<String>,
         pub at: String,
     }
@@ -481,7 +483,7 @@ pub(crate) async fn register_secret(
             mode,
             vault_path: &vault_path,
             current_version: None,
-            created_by: caller.principals.login(),
+            created_by: caller.actor_principals().login(),
         },
     )
     .await;
@@ -522,7 +524,8 @@ pub(crate) async fn register_secret(
             secret_name: name.as_str(),
             owner: &owner,
             action: AuditAction::Register,
-            actor: caller.principals.user(),
+            actor: caller.actor(),
+            subject: caller.subject_label(),
             detail: Some(&format!("{} {}", mode.as_str(), kind.as_str())),
         },
     )
@@ -676,7 +679,8 @@ pub(crate) async fn rotate_secret(
             secret_name: row.name.as_str(),
             owner: &row.owner,
             action: AuditAction::Rotate,
-            actor: caller.principals.user(),
+            actor: caller.actor(),
+            subject: caller.subject_label(),
             detail: Some(&format!("version {version}")),
         },
     )
@@ -726,8 +730,8 @@ pub(crate) async fn transfer_secret(
         Err(refusal) => return refusal,
     };
     let to = match body.owner.trim() {
-        "self" | "user:self" => match caller.principals.user() {
-            Some(user) => user.clone(),
+        "self" | "user:self" => match caller.subject_principal() {
+            Some(subject) => subject,
             None => return forbidden("an anonymous caller has no principal to transfer to"),
         },
         raw => match Principal::parse(raw) {
@@ -806,7 +810,8 @@ pub(crate) async fn transfer_secret(
             secret_name: row.name.as_str(),
             owner: &to,
             action: AuditAction::Transfer,
-            actor: caller.principals.user(),
+            actor: caller.actor(),
+            subject: caller.subject_label(),
             detail: Some(&format!("from {}", row.owner)),
         },
     )
@@ -878,7 +883,8 @@ pub(crate) async fn delete_secret(
             secret_name: row.name.as_str(),
             owner: &row.owner,
             action: AuditAction::Delete,
-            actor: caller.principals.user(),
+            actor: caller.actor(),
+            subject: caller.subject_label(),
             detail: Some(row.mode.as_str()),
         },
     )
@@ -1010,7 +1016,7 @@ pub(crate) async fn bind_secret(
             declared_name: &declared,
             pack_rev: body.pack_rev.as_deref(),
             schema_digest: body.schema_digest.as_deref(),
-            created_by: caller.principals.login(),
+            created_by: caller.actor_principals().login(),
         },
     )
     .await;
@@ -1026,7 +1032,8 @@ pub(crate) async fn bind_secret(
             secret_name: row.name.as_str(),
             owner: &row.owner,
             action: AuditAction::Bind,
-            actor: caller.principals.user(),
+            actor: caller.actor(),
+            subject: caller.subject_label(),
             detail: Some(&format!(
                 "{} {} as {} {}",
                 stored.scope_kind.as_str(),
@@ -1091,7 +1098,8 @@ pub(crate) async fn unbind_secret(
             secret_name: row.name.as_str(),
             owner: &row.owner,
             action: AuditAction::Unbind,
-            actor: caller.principals.user(),
+            actor: caller.actor(),
+            subject: caller.subject_label(),
             detail: Some(&format!(
                 "{} {}",
                 binding.scope_kind.as_str(),

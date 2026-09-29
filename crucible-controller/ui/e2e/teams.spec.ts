@@ -15,6 +15,46 @@ async function switchTo(page: Page, value: string): Promise<void> {
   await page.getByTestId('owner-switcher-menu').locator(`[data-value="${value}"]`).click();
 }
 
+test.describe('acting as a team', () => {
+  test('choosing a team acts as it: every request names it and the rail follows its lanes', async ({ page }) => {
+    const named: (string | undefined)[] = [];
+    page.on('request', (req) => {
+      if (new URL(req.url()).pathname === '/api/whoami') named.push(req.headers()['x-crucible-act-as']);
+    });
+    await stubApi(page);
+    await ready(page, '/');
+    const rail = page.getByTestId('category-rail');
+    await expect(rail.getByRole('link', { name: 'Dashboard' })).toBeVisible();
+    await expect(page.getByTestId('owner-switcher')).not.toHaveAttribute('data-acting-as');
+
+    await switchTo(page, 'team:llm-d');
+    await expect(page.getByTestId('owner-switcher')).toHaveAttribute('data-acting-as', 'team:llm-d');
+    await expect(page.getByTestId('owner-switcher')).toContainText('Acting as');
+    await expect(rail.getByRole('link', { name: 'Dashboard' })).toHaveCount(0);
+    expect(named.at(-1)).toBe('team:llm-d');
+
+    await switchTo(page, 'user:wren');
+    await expect(rail.getByRole('link', { name: 'Dashboard' })).toBeVisible();
+    await expect(page.getByTestId('owner-switcher')).not.toHaveAttribute('data-acting-as');
+    expect(named.at(-1)).toBeUndefined();
+  });
+
+  test('a stored team the controller refuses drops back to every owner and says why', async ({ page }) => {
+    await page.addInitScript(() => {
+      window.localStorage.setItem('crucible.owner.context', 'team:ghost');
+    });
+    await stubApi(page);
+    await page.goto('/');
+    await expect(page.getByTestId('owner-switcher')).toContainText('All');
+    await expect(page.getByTestId('owner-switcher')).not.toHaveAttribute('data-acting-as');
+    await expect(page.getByTestId('category-rail').getByRole('link', { name: 'Dashboard' })).toBeVisible();
+    await expect(page.getByTestId('act-as-refused')).toHaveText('you are not a member of team:ghost');
+
+    await switchTo(page, 'user:wren');
+    await expect(page.getByTestId('act-as-refused')).toHaveCount(0);
+  });
+});
+
 test.describe('owner context', () => {
   test('the switcher lists the user and each team, and the lists follow it', async ({ page }) => {
     await stubApi(page);
@@ -22,12 +62,12 @@ test.describe('owner context', () => {
 
     const rows = page.locator('main tbody tr');
     await expect(rows).toHaveCount(2);
-    await expect(page.getByTestId('owner-switcher')).toContainText('ALL');
+    await expect(page.getByTestId('owner-switcher')).toContainText('All');
 
     await page.getByTestId('owner-switcher').click();
     const menu = page.getByTestId('owner-switcher-menu');
     await expect(menu.locator('[data-value]')).toHaveText([
-      'ALL',
+      'All',
       'user:wren',
       'team:llm-dmaintainer',
       'team:platform-administratorsowner',
@@ -49,7 +89,7 @@ test.describe('owner context', () => {
     await expect(page.getByTestId('owner-switcher')).toContainText('wren');
     await expect(page.locator('main tbody tr')).toHaveCount(1);
     await switchTo(page, 'team:llm-d');
-    await expect(page.locator('main')).toContainText('NO DRAFTS');
+    await expect(page.locator('main')).toContainText('No drafts');
     await expect(page.locator('main')).toContainText('Showing 0');
   });
 
@@ -91,7 +131,7 @@ test.describe('owner context', () => {
 
     await page.locator('#draft-id').fill('mine');
     await page.locator('#draft-description').fill('a pack');
-    await page.getByRole('button', { name: 'CREATE DRAFT' }).click();
+    await page.getByRole('button', { name: 'Create draft' }).click();
     await expect(page.locator('main')).toContainText('user:wren may not playbook_draft:create (no-rule)');
   });
 });
@@ -143,11 +183,11 @@ test.describe('team-centric views', () => {
     const resources = page.getByTestId('team-resources');
     await expect(resources).toContainText('survey');
     await expect(resources).not.toContainText('triage');
-    await expect(resources).toContainText('NO DRAFTS');
+    await expect(resources).toContainText('No drafts');
 
-    await expect(page.getByTestId('act-as-team')).toHaveText('ACT AS');
+    await expect(page.getByTestId('act-as-team')).toHaveText('Act as');
     await page.getByTestId('act-as-team').click();
-    await expect(page.getByTestId('act-as-team')).toHaveText('ACTING AS');
+    await expect(page.getByTestId('act-as-team')).toHaveText('Acting as');
     await expect(page.getByTestId('owner-switcher')).toContainText('llm-d');
 
     await rail.getByRole('link', { name: 'Playbooks', exact: true }).first().click();
@@ -156,7 +196,7 @@ test.describe('team-centric views', () => {
 
     await page.goBack();
     await page.getByTestId('act-as-team').click();
-    await expect(page.getByTestId('act-as-team')).toHaveText('ACT AS');
-    await expect(page.getByTestId('owner-switcher')).toContainText('ALL');
+    await expect(page.getByTestId('act-as-team')).toHaveText('Act as');
+    await expect(page.getByTestId('owner-switcher')).toContainText('All');
   });
 });

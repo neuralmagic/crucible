@@ -1,0 +1,64 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-09-28-a652-004"
+title = "Run declared services beside the engine"
+status = "queue"
+created = "2026-09-28"
+refs = [
+    "RFC-0005:C-SERVICE-DECLARATION",
+    "RFC-0005:C-SERVICE-SECRETS",
+    "RFC-0005:C-SERVICE-CAPABILITY",
+    "RFC-0005:C-SERVICE-LIFECYCLE",
+    "RFC-0005:C-SERVICE-REACH",
+    "RFC-0005:C-SERVICE-RECORD",
+    "RFC-0002:C-PLAYBOOK-CAPS",
+    "RFC-0001:C-EGRESS",
+    "RFC-0001:C-CAPABILITY-DISCLOSURE",
+    "RFC-0005:C-SERVICE-HANDOFF",
+    "RFC-0005:C-SERVICE-CATALOG",
+    "ADR-0053",
+]
+
+[content]
+description = "Implement RFC-0005: a manifest's [[service]] tables are validated, provenance-checked against the run supervisor image's tool catalog, started beside the engine for the tasks that need them, exposed to sandboxed agent turns as MCP servers over the OpenShell gateway loopback and to command tasks by URL, and stopped with the run. The broker stops being the only way a run holds a credential its tasks use."
+
+[[content.acceptance_criteria]]
+text = "[[service]] parses and validates per C-SERVICE-DECLARATION, refusing unknown keys, duplicate or reserved names, and bad exposures before compile"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "a service whose tool the supervisor image does not attest, or that names a path, is refused before dispatch"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "needs accepts a capability name or a list, and a task is runnable only when every named capability is available"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "a service starts lazily before the first task that needs it, gates dispatch on readiness, fails attempts as transport when unready or exited, restarts before retry, and stops with the run"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "agent tasks that need an mcp service get it as an MCP server over the gateway loopback with a scoped egress entry; command tasks get CRUCIBLE_SERVICE_<NAME>_URL; other tasks get neither"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "secrets reach only the service process; the disclosure, crucible check output, identity digest, and session log carry the service record"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "end-to-end tests drive a real MCP service through an openshell agent turn and a command task"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "the DSL reference describes needs as a capability requirement, not a dependency count"
+status = "pending"
+category = "changed"

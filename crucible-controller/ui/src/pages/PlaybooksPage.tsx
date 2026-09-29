@@ -60,8 +60,11 @@ const columns = helper.columns([
     header: '',
     meta: { align: 'end' },
     cell: ({ row }) => (
-      <Button render={<Link to={`/playbooks/${encodeURIComponent(row.original.id)}`} />}>
-        INSPECT
+      <Button
+        className="uppercase"
+        render={<Link to={`/playbooks/${encodeURIComponent(row.original.id)}`} />}
+      >
+        Inspect
       </Button>
     ),
   }),
@@ -70,8 +73,11 @@ const columns = helper.columns([
     header: '',
     meta: { align: 'end' },
     cell: ({ row }) => (
-      <Button render={<Link to={`/playbooks/${encodeURIComponent(row.original.id)}/launch`} />}>
-        LAUNCH
+      <Button
+        className="uppercase"
+        render={<Link to={`/playbooks/${encodeURIComponent(row.original.id)}/launch`} />}
+      >
+        Launch
       </Button>
     ),
   }),
@@ -92,15 +98,15 @@ export function PlaybooksPage() {
         title="Playbooks"
         description="Registered packs, pinned to a commit. Launching one runs its graph once against the values you supply."
         actions={
-          <Button variant="filled" render={<Link to="/playbooks/import" />}>
-            IMPORT
+          <Button variant="filled" className="uppercase" render={<Link to="/playbooks/import" />}>
+            Import
           </Button>
         }
       />
-      <QueryState query={playbooks} noun="PLAYBOOKS">
+      <QueryState query={playbooks} noun="playbooks">
         <DataTable
           table={table}
-          empty={<Empty title="NO PLAYBOOKS REGISTERED" />}
+          empty={<Empty title="No playbooks registered" />}
           footer={<>Showing {rows.length}</>}
         />
       </QueryState>

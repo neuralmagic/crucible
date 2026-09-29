@@ -1,0 +1,41 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-09-28-001"
+title = "Give command tasks their launch params as a reserved input"
+status = "done"
+created = "2026-09-28"
+started = "2026-09-28"
+completed = "2026-09-28"
+refs = [
+    "RFC-0002:C-PLAYBOOK-PARAMS",
+    "RFC-0002:C-SETTLED-JOIN",
+]
+
+[content]
+description = 'A command or evaluate task has no way to read a launch parameter: the compiler refuses one built into `run`, and `CRUCIBLE_INPUTS` carries only dependency outputs. Add the reserved "params" input [[RFC-0002:C-PLAYBOOK-PARAMS]] defines, so a pack passes outside values to its scripts as data.'
+
+[[content.acceptance_criteria]]
+text = """a command or evaluate task's `CRUCIBLE_INPUTS` carries "params" with every declared parameter's bound value in its declared type, and an empty object when the source declares none"""
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = """an agent or skill task's inputs carry no "params" key"""
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = 'a plan with a dependency named "params" is refused at compile time, naming the reserved input'
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = 'the compile error for a parameter built into `run` tells the author to read it from "params"'
+status = "done"
+category = "changed"
+
+[[content.acceptance_criteria]]
+text = "the DSL reference and the Parameters section of the playbooks page document reading params from `CRUCIBLE_INPUTS`"
+status = "done"
+category = "chore"

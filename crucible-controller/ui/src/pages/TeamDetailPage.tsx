@@ -17,6 +17,7 @@ import {
   SectionBody,
   SectionHeader,
   Spec,
+  Tooltip,
   useDataTable,
 } from '../ui';
 import { FormActions, FormError, FormGrid, SelectField, TextField } from './formControls';
@@ -31,9 +32,10 @@ import {
   withRole,
   type MemberBody,
 } from './membersView';
-import { HELD, sortedMembers, type MemberDto } from './teamsView';
+import { HELD, sortedMembers, viewAsOffer, type MemberDto } from './teamsView';
 import { TeamResources } from './TeamResources';
 import { useOwnerContext } from '../useOwnerContext';
+import { useViewAs } from '../api/viewAs';
 
 const helper = createDataColumnHelper<MemberDto>();
 
@@ -78,15 +80,19 @@ interface MembersProps {
   members: readonly MemberDto[];
   /// Whether the caller owns the team: the API takes membership changes from owners alone.
   editable: boolean;
+  /// The caller's login when they may view as another user; null otherwise.
+  viewer: string | null;
 }
 
 /// The member list, with a role select and a remove per row and an add form for an owner. Every
 /// change sends the whole list, which is how the API takes it.
-function Members({ slug, members, editable }: MembersProps) {
+function Members({ slug, members, editable, viewer }: MembersProps) {
   const qc = useQueryClient();
   const put = $api.useMutation('put', '/api/teams/{slug}/members');
+  const viewAs = useViewAs();
   const [added, setAdded] = useState<MemberBody>({ kind: 'user', member: '', role: 'member' });
   const [error, setError] = useState<string | null>(null);
+  const [viewAsError, setViewAsError] = useState<string | null>(null);
   const current = asBodies(members);
 
   const send = async (next: MemberBody[]) => {
@@ -106,10 +112,45 @@ function Members({ slug, members, editable }: MembersProps) {
   };
 
   const rows = sortedMembers(members);
+  const viewColumn = helper.display({
+    id: 'view-as',
+    header: '',
+    meta: { shrink: true, align: 'end' },
+    cell: ({ row }) => {
+      switch (viewAsOffer(row.original, viewer)) {
+        case 'none':
+          return null;
+        case 'never-signed-in':
+          return (
+            <Tooltip content={`${row.original.member} has not signed in yet, so there is nothing to view as`}>
+              <Button className="cursor-default uppercase text-ink-3" aria-disabled>
+                View as
+              </Button>
+            </Tooltip>
+          );
+        case 'ready':
+          return (
+            <Button
+              className="uppercase"
+              disabled={viewAs.pending}
+              onClick={() => {
+                setViewAsError(null);
+                viewAs.start(row.original.member).catch((err: unknown) => {
+                  setViewAsError(formatError(err));
+                });
+              }}
+            >
+              View as
+            </Button>
+          );
+      }
+    },
+  });
+  const shown = viewer === null ? columns : [...columns, viewColumn];
   const table = useDataTable({
     columns: editable
       ? [
-          ...columns,
+          ...shown,
           helper.display({
             id: 'edit',
             header: '',
@@ -132,26 +173,32 @@ function Members({ slug, members, editable }: MembersProps) {
                   ))}
                 </select>
                 <Button
+                  className="uppercase"
                   disabled={put.isPending}
                   onClick={() => {
                     void send(withoutMember(current, row.original.kind, row.original.member));
                   }}
                 >
-                  REMOVE
+                  Remove
                 </Button>
               </span>
             ),
           }),
         ]
-      : columns,
+      : shown,
     data: rows,
     getRowId: (row) => `${row.kind}:${row.member}`,
   });
 
   return (
     <>
+      {viewAsError === null ? null : (
+        <SectionBody>
+          <FormError>{viewAsError}</FormError>
+        </SectionBody>
+      )}
       <div data-testid="members">
-        <DataTable table={table} empty={<Empty title="NO MEMBERS" />} footer={<>Showing {rows.length}</>} />
+        <DataTable table={table} empty={<Empty title="No members" />} footer={<>Showing {rows.length}</>} />
       </div>
       {editable ? (
         <>
@@ -190,13 +237,14 @@ function Members({ slug, members, editable }: MembersProps) {
           </SectionBody>
           <FormActions>
             <Button
+              className="uppercase"
               variant="filled"
               disabled={added.member.trim().length === 0 || put.isPending}
               onClick={() => {
                 void send(withMember(current, added));
               }}
             >
-              {put.isPending ? 'SAVING…' : 'ADD MEMBER'}
+              {put.isPending ? 'Saving…' : 'Add member'}
             </Button>
           </FormActions>
         </>
@@ -212,6 +260,7 @@ function Members({ slug, members, editable }: MembersProps) {
 /// One team: who is in it, at what role, and how each membership is held.
 export function TeamDetailPage() {
   const { slug = '' } = useParams();
+  const whoami = $api.useQuery('get', '/api/whoami');
   const team = $api.useQuery('get', '/api/teams/{slug}', { params: { path: { slug } } });
   const owner = useOwnerContext();
   const principal = `team:${slug}`;
@@ -222,7 +271,7 @@ export function TeamDetailPage() {
     return (
       <>
         <Breadcrumb items={crumbs} />
-        <Empty title="TEAM UNAVAILABLE" description={formatError(team.error)} />
+        <Empty title="Team unavailable" description={formatError(team.error)} />
       </>
     );
   }
@@ -230,7 +279,7 @@ export function TeamDetailPage() {
     return (
       <>
         <Breadcrumb items={crumbs} />
-        <LoadingBlock label="LOADING TEAM" />
+        <LoadingBlock label="Loading team" />
       </>
     );
   }
@@ -251,6 +300,7 @@ export function TeamDetailPage() {
         badge={
           owner.switchable.some((p) => p.value === principal) ? (
             <Button
+              className="uppercase"
               variant={acting ? 'filled' : undefined}
               aria-pressed={acting}
               data-testid="act-as-team"
@@ -258,7 +308,7 @@ export function TeamDetailPage() {
                 owner.setContext(acting ? 'all' : principal);
               }}
             >
-              {acting ? 'ACTING AS' : 'ACT AS'}
+              {acting ? 'Acting as' : 'Act as'}
             </Button>
           ) : null
         }
@@ -281,7 +331,12 @@ export function TeamDetailPage() {
             </Link>
           }
         />
-        <Members slug={row.slug} members={row.members} editable={row.my_role === 'owner'} />
+        <Members
+          slug={row.slug}
+          members={row.members}
+          editable={row.my_role === 'owner'}
+          viewer={whoami.data?.role === 'admin' && !whoami.data.impersonation ? (whoami.data.user ?? null) : null}
+        />
       </Section>
       <TeamResources owner={principal} />
     </>

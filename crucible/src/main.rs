@@ -61,14 +61,15 @@ mod openshell {
 /// compiler, and executor.
 mod plan {
     pub use crucible::plan::{
-        STAGED_INPUTS, TASK_NAME_ENV, exec, ir, machine, runner, starlark, term_img, workflow,
-        worktree,
+        STAGED_INPUTS, TASK_NAME_ENV, exec, history, ir, machine, record, runner, starlark,
+        term_img, workflow, worktree,
     };
 
     pub mod cli;
     pub mod events;
     pub mod harness;
     pub mod template;
+    pub mod turn_log;
 }
 
 use anyhow::Result;

@@ -152,6 +152,13 @@ pub(crate) fn narrow(error: CompileError, idents: &Idents) -> CompileError {
         | CompileError::OtherwiseWithAnswers
         | CompileError::UnreachableOtherwise { .. } => (None, "otherwise"),
         CompileError::RouteDecider { .. } => (Some("route"), "name"),
+        CompileError::OverNotAList { .. } => (None, "over"),
+        CompileError::EmitsNotList
+        | CompileError::EmitsEntryNotString
+        | CompileError::UnknownFieldType { .. }
+        | CompileError::FieldTypeWrongShape { .. }
+        | CompileError::InvalidFieldLabel { .. }
+        | CompileError::InvalidFieldType { .. } => (None, "emits"),
         _ => {
             return CompileError::At { at, inner };
         }
@@ -222,6 +229,12 @@ pub(crate) fn map_error(error: &starlark::Error, idents: &Idents) -> CompileErro
             None => CompileError::Eval(text),
         },
         starlark::ErrorKind::Fail(_) => CompileError::Failed(text),
+        starlark::ErrorKind::Native(native) => match native.downcast_ref::<CompileError>() {
+            Some(CompileError::ExternalMethod { method }) => CompileError::ExternalMethod {
+                method: method.clone(),
+            },
+            _ => CompileError::Eval(text),
+        },
         _ => CompileError::Eval(text),
     };
     match error.span() {

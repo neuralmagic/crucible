@@ -23,15 +23,34 @@ use utoipa::ToSchema;
 /// How many audit rows one request returns.
 const AUDIT_LIMIT: i64 = 200;
 
-dto! {
-    /// One member of a team.
-    pub struct MemberDto: From<m: MemberRow> {
-        pub kind: MemberKind = m.member.kind(),
-        /// The login, full group path, nested team slug, or rule the kind names.
-        pub member: String = m.member.stored(),
-        pub role: TeamRole,
-        pub since: String,
-        pub added_by: Option<String>,
+/// One member of a team.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MemberDto {
+    pub kind: MemberKind,
+    /// The login, full group path, nested team slug, or rule the kind names.
+    pub member: String,
+    pub role: TeamRole,
+    pub since: String,
+    pub added_by: Option<String>,
+    /// A user member whose login has signed in here, so an administrator may view as them. False
+    /// for every other kind.
+    pub signed_in: bool,
+}
+
+impl MemberDto {
+    fn new(m: MemberRow, users: &[store::KnownUser]) -> Self {
+        let signed_in = match &m.member {
+            MemberRef::User(login) => users.iter().any(|u| u.login.eq_ignore_ascii_case(login)),
+            _ => false,
+        };
+        MemberDto {
+            kind: m.member.kind(),
+            member: m.member.stored(),
+            role: m.role,
+            since: m.since,
+            added_by: m.added_by,
+            signed_in,
+        }
     }
 }
 
@@ -243,7 +262,7 @@ fn assemble(
         .iter()
         .filter(|m| m.team == team.slug)
         .cloned()
-        .map(MemberDto::from)
+        .map(|m| MemberDto::new(m, users))
         .collect();
     TeamDto {
         my_role: caller.principals.team_role(&team.slug),
@@ -320,6 +339,19 @@ pub(crate) async fn create_team(
         )
         .await;
     }
+    let intended = crate::authz::decision::Resource::new(
+        ResourceType::Team,
+        body.slug.to_string(),
+        Principal::Team(body.slug.clone()),
+    );
+    let action = Action {
+        resource: ResourceType::Team,
+        verb: Verb::Create,
+    };
+    let decision = match crate::authz::owner::decide(&state, &caller, action, &intended).await {
+        Ok(decision) => decision,
+        Err(denied) => return denied.into_response(),
+    };
     let display_name = body.display_name.trim().to_string();
     if display_name.is_empty() {
         return unprocessable("a team needs a display name");
@@ -357,7 +389,7 @@ pub(crate) async fn create_team(
             Ok(rows) => rows,
             Err(e) => return internal(e),
         };
-    let mut event = team_event(&caller, Verb::Create, &body.slug, true, "user-create-team");
+    let mut event = team_event(&caller, Verb::Create, &body.slug, true, &decision.reason());
     event.result = Some(serde_json::json!({
         "display_name": display_name,
         "members": members_json(&rows),

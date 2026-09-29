@@ -82,7 +82,7 @@ pub(crate) async fn resolve_saver(
         } if principal
             .and_then(|p| crate::authz::model::Principal::parse(p).ok())
             .as_ref()
-            != caller.principals.user() =>
+            != caller.actor() =>
         {
             kept.cloned()
                 .unwrap_or_else(|| serde_json::Value::Array(Vec::new()))
@@ -103,7 +103,7 @@ pub(crate) async fn resolve_saver(
         Ok(Err(refusal)) => return Err(invalid_fields(vec![refusal.field_error()])),
         Err(e) => return Err(AppError::from(e).into_response()),
     };
-    let actor = caller.principals.login().map(str::to_string);
+    let actor = caller.actor_principals().login().map(str::to_string);
     Ok(Saver {
         owner_principal,
         actor,

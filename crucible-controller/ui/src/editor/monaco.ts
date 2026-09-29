@@ -16,7 +16,9 @@ import 'monaco-editor/languages/features/json/register';
 import EditorWorker from 'monaco-editor/editor/editor.worker.js?worker';
 import JsonWorker from 'monaco-editor/languages/features/json/json.worker.js?worker';
 import { monacoTheme, THEME_NAMES } from './theme';
+import { APP_BRANDS } from '../appTheme';
 import { TOML_TOKENS } from './toml';
+import { CEDAR_CONFIGURATION, CEDAR_TOKENS } from './cedar';
 
 declare global {
   interface Window {
@@ -30,8 +32,8 @@ self.MonacoEnvironment = {
   },
 };
 
-/// Starlark rides the `python` grammar (`languageOf`), so the only grammar this app has to supply
-/// is TOML, which Monaco does not ship.
+/// Starlark rides the `python` grammar (`languageOf`), so the only grammars this app has to supply
+/// are TOML and Cedar, which Monaco does not ship.
 monaco.languages.register({ id: 'toml', extensions: ['.toml'], aliases: ['TOML', 'toml'] });
 monaco.languages.setLanguageConfiguration('toml', {
   comments: { lineComment: '#' },
@@ -48,8 +50,14 @@ monaco.languages.setLanguageConfiguration('toml', {
 });
 monaco.languages.setMonarchTokensProvider('toml', TOML_TOKENS);
 
-for (const app of ['light', 'dark'] as const) {
-  monaco.editor.defineTheme(THEME_NAMES[app], monacoTheme(app));
+monaco.languages.register({ id: 'cedar', extensions: ['.cedar'], aliases: ['Cedar', 'cedar'] });
+monaco.languages.setLanguageConfiguration('cedar', CEDAR_CONFIGURATION);
+monaco.languages.setMonarchTokensProvider('cedar', CEDAR_TOKENS);
+
+for (const brand of APP_BRANDS) {
+  for (const app of ['light', 'dark'] as const) {
+    monaco.editor.defineTheme(THEME_NAMES[brand][app], monacoTheme(brand, app));
+  }
 }
 
 loader.config({ monaco });

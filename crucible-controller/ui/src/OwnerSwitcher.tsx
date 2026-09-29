@@ -1,9 +1,12 @@
 import { Popover } from '@base-ui-components/react/popover';
+import { useSyncExternalStore, type ReactNode } from 'react';
+import { actAsFor, actAsRefusal } from './actAs';
+import { subscribeFlags } from './deviceStore';
 import { ALL, type ActedAs } from './ownerContext';
 import { useOwnerContext } from './useOwnerContext';
 import { cn } from './ui';
 
-function Choice({ value, label, note, active, onPick }: { value: string; label: string; note?: string; active: boolean; onPick: (value: string) => void }) {
+function Choice({ value, label, note, active, onPick }: { value: string; label: ReactNode; note?: string; active: boolean; onPick: (value: string) => void }) {
   return (
     <Popover.Close
       render={<button type="button" />}
@@ -23,8 +26,8 @@ function Choice({ value, label, note, active, onPick }: { value: string; label: 
   );
 }
 
-function current(context: string, principals: readonly ActedAs[]): string {
-  if (context === ALL) return 'ALL';
+function current(context: string, principals: readonly ActedAs[]): ReactNode {
+  if (context === ALL) return <span className="uppercase">All</span>;
   return principals.find((p) => p.value === context)?.label ?? context;
 }
 
@@ -32,34 +35,53 @@ function current(context: string, principals: readonly ActedAs[]): string {
 /// resources. Every list and creation form follows it.
 export function OwnerSwitcher() {
   const owner = useOwnerContext();
+  const refused = useSyncExternalStore(subscribeFlags, actAsRefusal, () => null);
   if (!owner.ready || owner.switchable.length === 0) return null;
+  const team = actAsFor(owner.context);
 
   return (
-    <Popover.Root>
-      <Popover.Trigger
-        data-testid="owner-switcher"
-        className="flex items-center gap-[7px] border-l border-rule px-3 font-mono text-data text-ink hover:bg-hi"
-      >
-        <span className="text-ink-3">AS</span>
-        <span className="font-medium">{current(owner.context, owner.switchable)}</span>
-      </Popover.Trigger>
-      <Popover.Portal>
-        <Popover.Positioner sideOffset={1} align="end">
-          <Popover.Popup data-testid="owner-switcher-menu" className="min-w-56 border border-rule-hard bg-surface">
-            <Choice value={ALL} label="ALL" active={owner.context === ALL} onPick={owner.setContext} />
-            {owner.switchable.map((p) => (
-              <Choice
-                key={p.value}
-                value={p.value}
-                label={p.value}
-                note={p.kind === 'team' ? p.role : undefined}
-                active={owner.context === p.value}
-                onPick={owner.setContext}
-              />
-            ))}
-          </Popover.Popup>
-        </Popover.Positioner>
-      </Popover.Portal>
-    </Popover.Root>
+    <>
+      {refused === null ? null : (
+        <span
+          role="status"
+          data-testid="act-as-refused"
+          className="flex max-w-80 items-center truncate border-l border-rule px-3 font-mono text-data text-red"
+          title={refused}
+        >
+          {refused}
+        </span>
+      )}
+      <Popover.Root>
+        <Popover.Trigger
+          data-testid="owner-switcher"
+          data-acting-as={team ?? undefined}
+          title={team === null ? undefined : `Acting as ${team}: every page answers for this team`}
+          className={cn(
+            'flex items-center gap-[7px] border-l border-rule px-3 font-mono text-data hover:bg-hi',
+            team === null ? 'text-ink' : 'bg-sunk text-amber',
+          )}
+        >
+          <span className={cn('uppercase', team === null && 'text-ink-3')}>{team === null ? 'As' : 'Acting as'}</span>
+          <span className="font-medium">{current(owner.context, owner.switchable)}</span>
+        </Popover.Trigger>
+        <Popover.Portal>
+          <Popover.Positioner sideOffset={1} align="end">
+            <Popover.Popup data-testid="owner-switcher-menu" className="min-w-56 border border-rule-hard bg-surface">
+              <Choice value={ALL} label={<span className="uppercase">All</span>} active={owner.context === ALL} onPick={owner.setContext} />
+              {owner.switchable.map((p) => (
+                <Choice
+                  key={p.value}
+                  value={p.value}
+                  label={p.value}
+                  note={p.kind === 'team' ? p.role : undefined}
+                  active={owner.context === p.value}
+                  onPick={owner.setContext}
+                />
+              ))}
+            </Popover.Popup>
+          </Popover.Positioner>
+        </Popover.Portal>
+      </Popover.Root>
+    </>
   );
 }

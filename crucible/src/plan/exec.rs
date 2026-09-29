@@ -16,10 +16,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::crucible::Direction;
+use crate::deadline::{Bound, Deadline, RunCeiling};
 use crate::diagram::IllegalTransition;
+use crate::plan::history::SeriesHistory;
 use crate::plan::ir::{
-    Decider, ITEM_INPUT, Join, OUTCOME_INPUT, REVISION_INPUT, Stage, Task, TaskKind, TaskName,
-    ValidPlan,
+    COMPLETE_FIELD, Decider, HISTORY_INPUT, ITEM_INPUT, Join, OUTCOME_INPUT, PARAMS_INPUT,
+    REASON_FIELD, REVISION_INPUT, ReviseLoop, Stage, Task, TaskKind, TaskName, ValidPlan,
 };
 use crate::plan::machine::{
     BlockedReason, PlanEvent, PlanMachine, TaskEvent, TaskMachine, TaskState,
@@ -65,6 +67,9 @@ pub enum AttemptOutcome {
     Skipped(Value, String),
     /// Transport failure (infra, not the work). Retried, bounded, every attempt visible.
     Transport(TransportFailure),
+    /// The runner killed the attempt at its deadline. Settles as a measured failure naming the
+    /// limit and is never retried: a rerun would spend the same time again.
+    TimedOut(Deadline),
 }
 
 /// What an attempt died on before the task could be judged, and the engine's account of it.
@@ -143,6 +148,13 @@ impl Attempt {
             cost_usd: 0.0,
         }
     }
+
+    pub fn timed_out(cost_usd: f64, deadline: Deadline) -> Self {
+        Self {
+            outcome: AttemptOutcome::TimedOut(deadline),
+            cost_usd,
+        }
+    }
 }
 
 /// One task of a concurrent dispatch batch (see [`TaskRunner::run_many`]).
@@ -150,13 +162,25 @@ pub struct BatchItem<'a> {
     pub task: &'a Task,
     pub attempt: u32,
     pub inputs: BTreeMap<TaskName, Value>,
+    /// This item's own deadline: items of one batch do not share one.
+    pub deadline: Option<Deadline>,
 }
 
 /// Runs one attempt of an `Agent` or `Command` task. The engine implements this against the
 /// harness and broker; tests program it directly. `TopK` never reaches the runner: reducers
 /// are engine-owned.
+///
+/// A runner that executes work ends it at `deadline` and returns a measured failure carrying
+/// [`Deadline::note`], never a transport failure: rerunning an attempt that exceeded its limit
+/// would repeat the cost.
 pub trait TaskRunner {
-    fn run(&mut self, task: &Task, attempt: u32, inputs: &BTreeMap<TaskName, Value>) -> Attempt;
+    fn run(
+        &mut self,
+        task: &Task,
+        attempt: u32,
+        inputs: &BTreeMap<TaskName, Value>,
+        deadline: Option<Deadline>,
+    ) -> Attempt;
 
     /// Run several isolation-marked tasks, possibly concurrently. The executor only
     /// batches tasks that are simultaneously ready, so items never depend on each other.
@@ -187,26 +211,45 @@ pub trait TaskRunner {
     fn run_many(&mut self, batch: &[BatchItem<'_>]) -> Vec<Attempt> {
         batch
             .iter()
-            .map(|b| self.run(b.task, b.attempt, &b.inputs))
+            .map(|b| self.run(b.task, b.attempt, &b.inputs, b.deadline))
             .collect()
     }
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct ExecCfg {
+pub struct ExecCfg<'a> {
     /// Bounded auto-retry for transport failures (measured failures never retry).
     pub transport_retries: u32,
     /// How long the whole run may take. `None` means unbounded, which the scored loop
     /// tolerates because an operator is watching it; a playbook must supply one.
     pub wall_clock: Option<Duration>,
+    /// The launch series' earlier runs. `None` is a run in no series: a task that reads history
+    /// receives an empty list.
+    pub history: Option<&'a SeriesHistory>,
+    /// Whether a main-graph task returning `"complete": true` stops dispatch.
+    pub early_completion: bool,
 }
 
-impl Default for ExecCfg {
+impl Default for ExecCfg<'_> {
     fn default() -> Self {
         ExecCfg {
             transport_retries: 2,
             wall_clock: None,
+            history: None,
+            early_completion: false,
         }
+    }
+}
+
+impl ExecCfg<'_> {
+    /// Write the reserved history input for a task that declares a depth.
+    fn add_history(&self, t: &Task, inputs: &mut BTreeMap<TaskName, Value>) {
+        let Some(depth) = t.history else { return };
+        let history = match self.history {
+            Some(history) => history.input(depth),
+            None => crate::plan::history::empty_input(),
+        };
+        inputs.insert(TaskName(HISTORY_INPUT.to_string()), history);
     }
 }
 
@@ -371,6 +414,10 @@ pub enum PlanExit {
     BudgetExceeded,
     /// The wall-clock ceiling was reached; undispatched tasks were blocked.
     TimeExceeded,
+    CompletedEarly {
+        task: TaskName,
+        reason: Option<String>,
+    },
 }
 
 /// Why the plan stopped dispatching, fixed on the first halt. Everything still pending settles
@@ -416,6 +463,7 @@ impl PlanExit {
             PlanExit::Completed => "finished",
             PlanExit::BudgetExceeded | PlanExit::TimeExceeded => "budget",
             PlanExit::Truncated { .. } | PlanExit::ShortCircuit { .. } => "error",
+            PlanExit::CompletedEarly { .. } => "complete",
         }
     }
 }
@@ -470,7 +518,7 @@ pub fn runnable_set<'a>(plan: &'a ValidPlan, substrate: &Substrate) -> BTreeSet<
 pub fn execute(
     plan: &ValidPlan,
     substrate: &Substrate,
-    cfg: ExecCfg,
+    cfg: ExecCfg<'_>,
     runner: &mut dyn TaskRunner,
     mut on_result: impl FnMut(&Task, &TaskResult),
 ) -> Result<PlanOutcome, IllegalTransition> {
@@ -508,17 +556,24 @@ pub fn execute(
     }
     plan_machine.advance(PlanEvent::Started)?;
 
-    // A proposer whose reviewer can run on this substrate: the pair dispatches as one revise loop.
-    let revised_by: BTreeMap<&TaskName, &Task> = plan
-        .tasks_topo()
-        .filter(|t| runnable.contains(&t.name))
-        .filter_map(|t| Some((&t.revise.as_ref()?.task, t)))
+    let loops: Vec<ReviseLoop<'_>> = plan
+        .revise_loops()
+        .into_iter()
+        .filter(|l| l.body.iter().all(|t| runnable.contains(&t.name)))
+        .collect();
+    let loop_of: BTreeMap<&TaskName, &ReviseLoop<'_>> = loops
+        .iter()
+        .flat_map(|l| l.body.iter().map(move |t| (&t.name, l)))
         .collect();
     let started = Instant::now();
+    let run_ceiling = cfg
+        .wall_clock
+        .and_then(|ceiling| RunCeiling::starting(started, ceiling));
     let mut results: BTreeMap<TaskName, TaskResult> = BTreeMap::new();
     let mut spent = 0.0f64;
     let budget = plan.plan().budget.usd;
     let mut halted: Option<Halt> = None;
+    let mut completed: Option<Completion> = None;
 
     // Readiness scan: repeated topo passes. Each pass settles everything decidable
     // without dispatch (halt-blocked, skipped, dep-failed, over-budget), then dispatches
@@ -563,21 +618,21 @@ pub fn execute(
             if results.contains_key(&t.name) {
                 continue;
             }
+            if completed.is_some() && t.stage == Stage::Iteration {
+                continue;
+            }
             // An epilogue observes the settled main graph. Declaration order is not an
             // ordering primitive, so an independent epilogue task must not race ahead of it.
             if t.stage == Stage::Epilogue
+                && completed.is_none()
                 && plan
                     .tasks_topo()
                     .any(|main| main.stage == Stage::Iteration && !results.contains_key(&main.name))
             {
                 continue;
             }
-            // The epilogue is what reports a required failure, so a short-circuit is the one
-            // halt it outlives. A ceiling still blocks it.
-            let reports_the_short_circuit =
-                t.stage == Stage::Epilogue && matches!(halted, Some(Halt::ShortCircuit(_)));
             if let Some(halt) = &halted
-                && !reports_the_short_circuit
+                && !reports_the_short_circuit(t, halt)
             {
                 let reason = halt.blocked();
                 let r = TaskResult::blocked(&reason);
@@ -610,15 +665,22 @@ pub fn execute(
                 )?;
                 continue;
             }
-            if t.depends_on.iter().any(|d| !results.contains_key(d)) {
-                continue;
+            if let Some(body) = loop_of.get(&t.name) {
+                let ready = body.body.first().is_some_and(|first| first.name == t.name)
+                    && body.body.iter().all(|b| {
+                        b.depends_on
+                            .iter()
+                            .all(|d| body.contains(d) || results.contains_key(d))
+                    });
+                if !ready {
+                    continue;
+                }
+                if dispatch.is_empty() {
+                    dispatch.push(t);
+                }
+                break;
             }
-            let reviewer = revised_by.get(&t.name).copied();
-            if reviewer.is_some_and(|r| {
-                r.depends_on
-                    .iter()
-                    .any(|d| d != &t.name && !results.contains_key(d))
-            }) {
+            if t.depends_on.iter().any(|d| !results.contains_key(d)) {
                 continue;
             }
             if let Some((event, note)) = not_taken(t, &results) {
@@ -695,9 +757,8 @@ pub fn execute(
             }
             if dispatch.is_empty() {
                 dispatch.push(t);
-                if t.over.is_some() || reviewer.is_some() {
-                    // A mapped task or a revise loop is dispatched alone: its own instances or
-                    // rounds are the batch.
+                if t.over.is_some() {
+                    // A mapped task is dispatched alone: its own instances are the batch.
                     break;
                 }
                 if t.isolation.is_none() {
@@ -724,6 +785,28 @@ pub fn execute(
             break;
         };
 
+        if let Some(body) = loop_of.get(&first.name).copied() {
+            run_loop(
+                body,
+                plan,
+                cfg,
+                runner,
+                &mut record,
+                &mut Ledger {
+                    results: &mut results,
+                    machines: &mut machines,
+                    halted: &mut halted,
+                    plan_machine: &mut plan_machine,
+                    spent: &mut spent,
+                    budget,
+                    started,
+                    run_ceiling,
+                    completed: &mut completed,
+                },
+            )?;
+            continue;
+        }
+
         // Every dispatched task is staged, in its own right and with its own ancestors: batched
         // isolated tasks do not share an ancestor set, and a task with no producers still has to
         // say so, or the previous dispatch's inputs are still lying there when it runs.
@@ -736,10 +819,16 @@ pub fn execute(
         for t in &dispatch {
             let producers = file_producers(plan, t, &results, &*runner);
             let mut inputs = inputs_for(plan, t, &results, &producers);
+            cfg.add_history(t, &mut inputs);
             if t.stage == Stage::Epilogue {
                 inputs.insert(
                     TaskName(OUTCOME_INPUT.to_string()),
-                    main_graph_outcome(plan, &results, halted.as_ref()),
+                    main_graph_outcome(
+                        plan,
+                        &results,
+                        &exit_of(halted.as_ref(), completed.as_ref()),
+                        &producers,
+                    ),
                 );
             }
             inputs_for_dispatch.insert(t.name.clone(), inputs);
@@ -852,6 +941,7 @@ pub fn execute(
                                 task,
                                 attempt: 1,
                                 inputs: item_inputs(key),
+                                deadline: None,
                             })
                             .collect();
                         for instance in &instances {
@@ -860,11 +950,15 @@ pub fn execute(
                                 .or_default()
                                 .advance(TaskEvent::Dispatched)?;
                         }
-                        let (batch_results, budget_exceeded) =
-                            run_batch_with_retries(batch, cfg, runner, &mut spent, budget);
-                        if budget_exceeded {
-                            halt(&mut halted, &mut plan_machine, Halt::Budget)?;
-                        }
+                        let (batch_results, overrun) = run_batch_with_retries(
+                            batch,
+                            cfg,
+                            run_ceiling,
+                            runner,
+                            &mut spent,
+                            budget,
+                        );
+                        overrun.halt(node.stage, &mut halted, &mut plan_machine)?;
                         for ((task, result, event), key) in batch_results.into_iter().zip(&keys) {
                             runner.settled(task, result.status == TaskStatus::Pass);
                             settled.push((key.clone(), result.clone()));
@@ -914,17 +1008,16 @@ pub fn execute(
                                 .entry(instance.name.clone())
                                 .or_default()
                                 .advance(TaskEvent::Dispatched)?;
-                            let (result, event, budget_exceeded) = run_with_retries(
+                            let (result, event, overrun) = run_with_retries(
                                 instance,
                                 &item_inputs(key),
                                 cfg,
+                                run_ceiling,
                                 runner,
                                 &mut spent,
                                 budget,
                             );
-                            if budget_exceeded {
-                                halt(&mut halted, &mut plan_machine, Halt::Budget)?;
-                            }
+                            overrun.halt(node.stage, &mut halted, &mut plan_machine)?;
                             runner.settled(instance, result.status == TaskStatus::Pass);
                             settled.push((key.clone(), result.clone()));
                             record(
@@ -959,189 +1052,6 @@ pub fn execute(
                     )?;
                 }
             }
-        } else if let Some(reviewer) = revised_by.get(&first.name).copied() {
-            let proposer = *first;
-            let max_rounds = reviewer.revise.as_ref().map_or(1, |r| r.max_rounds);
-            let base = inputs_for_dispatch
-                .remove(&proposer.name)
-                .unwrap_or_default();
-            for t in [proposer, reviewer] {
-                machines
-                    .entry(t.name.clone())
-                    .or_default()
-                    .advance(TaskEvent::RoundsStarted)?;
-            }
-            let mut rounds: Vec<(TaskResult, TaskResult)> = Vec::new();
-            for round in 1..=max_rounds {
-                let mut proposer_inputs = base.clone();
-                if let Some((_, verdict)) = rounds.last() {
-                    if halted.is_some() {
-                        break;
-                    }
-                    if spent >= budget {
-                        halt(&mut halted, &mut plan_machine, Halt::Budget)?;
-                        break;
-                    }
-                    if cfg
-                        .wall_clock
-                        .is_some_and(|limit| started.elapsed() >= limit)
-                    {
-                        halt(&mut halted, &mut plan_machine, Halt::Time)?;
-                        break;
-                    }
-                    let mut producers = file_producers(plan, proposer, &results, &*runner);
-                    let review_files = runner.has_captured_files(reviewer);
-                    if review_files {
-                        producers.push(reviewer.clone());
-                    }
-                    let staged: Vec<&Task> = producers.iter().collect();
-                    if let Err(why) = runner.stage(proposer, &staged) {
-                        let refused = BlockedReason::StagingRefused(why);
-                        let pair = (
-                            TaskResult::blocked(&refused),
-                            TaskResult::blocked(&BlockedReason::DependencyDidNotPass),
-                        );
-                        for (t, r) in [(proposer, &pair.0), (reviewer, &pair.1)] {
-                            let reason = r
-                                .blocked
-                                .clone()
-                                .unwrap_or(BlockedReason::DependencyDidNotPass);
-                            record(
-                                &mut *runner,
-                                &round_task(t, round),
-                                r.clone(),
-                                reason.event(),
-                                &mut results,
-                                &mut machines,
-                                &mut halted,
-                                &mut plan_machine,
-                                false,
-                            )?;
-                        }
-                        rounds.push(pair);
-                        break;
-                    }
-                    proposer_inputs.insert(
-                        TaskName(REVISION_INPUT.to_string()),
-                        serde_json::json!({
-                            "round": round,
-                            "max_rounds": max_rounds,
-                            "reviewer": reviewer.name.0,
-                            "review": Value::Object(settled_entry(verdict, review_files)),
-                        }),
-                    );
-                }
-                let proposed = round_task(proposer, round);
-                machines
-                    .entry(proposed.name.clone())
-                    .or_default()
-                    .advance(TaskEvent::Dispatched)?;
-                let (result, event, budget_exceeded) =
-                    run_with_retries(proposer, &proposer_inputs, cfg, runner, &mut spent, budget);
-                if budget_exceeded {
-                    halt(&mut halted, &mut plan_machine, Halt::Budget)?;
-                }
-                runner.settled(proposer, result.status == TaskStatus::Pass);
-                record(
-                    &mut *runner,
-                    &proposed,
-                    result.clone(),
-                    event,
-                    &mut results,
-                    &mut machines,
-                    &mut halted,
-                    &mut plan_machine,
-                    false,
-                )?;
-
-                let mut view = results.clone();
-                view.insert(proposer.name.clone(), result.clone());
-                let reviewed = round_task(reviewer, round);
-                let blocked = if halted.is_none() && spent >= budget {
-                    halt(&mut halted, &mut plan_machine, Halt::Budget)?;
-                    halted.as_ref().map(Halt::blocked)
-                } else if halted.is_none()
-                    && cfg
-                        .wall_clock
-                        .is_some_and(|limit| started.elapsed() >= limit)
-                {
-                    halt(&mut halted, &mut plan_machine, Halt::Time)?;
-                    halted.as_ref().map(Halt::blocked)
-                } else if let Some(halt) = &halted {
-                    Some(halt.blocked())
-                } else if !dependencies_allow(reviewer, &view) {
-                    Some(BlockedReason::DependencyDidNotPass)
-                } else {
-                    None
-                };
-                let mut staged_for_review = Vec::new();
-                let blocked = blocked.or_else(|| {
-                    staged_for_review = file_producers(plan, reviewer, &view, &*runner);
-                    let staged: Vec<&Task> = staged_for_review.iter().collect();
-                    runner
-                        .stage(reviewer, &staged)
-                        .err()
-                        .map(BlockedReason::StagingRefused)
-                });
-                if let Some(reason) = blocked {
-                    let r = TaskResult::blocked(&reason);
-                    record(
-                        &mut *runner,
-                        &reviewed,
-                        r.clone(),
-                        reason.event(),
-                        &mut results,
-                        &mut machines,
-                        &mut halted,
-                        &mut plan_machine,
-                        false,
-                    )?;
-                    rounds.push((result, r));
-                    break;
-                }
-                let reviewer_inputs = inputs_for(plan, reviewer, &view, &staged_for_review);
-                machines
-                    .entry(reviewed.name.clone())
-                    .or_default()
-                    .advance(TaskEvent::Dispatched)?;
-                let (verdict, event, budget_exceeded) =
-                    run_with_retries(reviewer, &reviewer_inputs, cfg, runner, &mut spent, budget);
-                if budget_exceeded {
-                    halt(&mut halted, &mut plan_machine, Halt::Budget)?;
-                }
-                runner.settled(reviewer, verdict.status == TaskStatus::Pass);
-                record(
-                    &mut *runner,
-                    &reviewed,
-                    verdict.clone(),
-                    event,
-                    &mut results,
-                    &mut machines,
-                    &mut halted,
-                    &mut plan_machine,
-                    false,
-                )?;
-                let again = verdict.status == TaskStatus::Fail;
-                rounds.push((result, verdict));
-                if !again {
-                    break;
-                }
-            }
-            let (proposed, reviewed) = fold_rounds(&rounds);
-            for (t, r) in [(proposer, proposed), (reviewer, reviewed)] {
-                let event = rounds_event(r.status);
-                record(
-                    &mut *runner,
-                    t,
-                    r,
-                    event,
-                    &mut results,
-                    &mut machines,
-                    &mut halted,
-                    &mut plan_machine,
-                    true,
-                )?;
-            }
         } else if dispatch.len() == 1 {
             let t = first;
             let inputs = inputs_for_dispatch.remove(&t.name).unwrap_or_default();
@@ -1149,7 +1059,7 @@ pub fn execute(
                 .entry(t.name.clone())
                 .or_default()
                 .advance(TaskEvent::Dispatched)?;
-            let (result, event, budget_exceeded) = match &t.task {
+            let (result, event, overrun) = match &t.task {
                 TaskKind::TopK { k, direction } => {
                     let reduced = reduce_top_k(&inputs, *k, *direction);
                     let event = if reduced.status == TaskStatus::Pass {
@@ -1157,7 +1067,7 @@ pub fn execute(
                     } else {
                         TaskEvent::Failed
                     };
-                    (reduced, event, false)
+                    (reduced, event, Overrun::default())
                 }
                 TaskKind::Route {
                     questions,
@@ -1169,7 +1079,7 @@ pub fn execute(
                     } else {
                         TaskEvent::Failed
                     };
-                    (decided, event, false)
+                    (decided, event, Overrun::default())
                 }
                 TaskKind::Route {
                     decider: Decider::Model { .. },
@@ -1180,12 +1090,10 @@ pub fn execute(
                 | TaskKind::Evaluate { .. }
                 | TaskKind::Report { .. }
                 | TaskKind::Engine { .. } => {
-                    run_with_retries(t, &inputs, cfg, runner, &mut spent, budget)
+                    run_with_retries(t, &inputs, cfg, run_ceiling, runner, &mut spent, budget)
                 }
             };
-            if budget_exceeded {
-                halt(&mut halted, &mut plan_machine, Halt::Budget)?;
-            }
+            overrun.halt(t.stage, &mut halted, &mut plan_machine)?;
             runner.settled(t, result.status == TaskStatus::Pass);
             record(
                 &mut *runner,
@@ -1208,6 +1116,7 @@ pub fn execute(
                     task: t,
                     attempt: 1,
                     inputs: inputs_for_dispatch.remove(&t.name).unwrap_or_default(),
+                    deadline: None,
                 })
                 .collect();
             for t in &dispatch {
@@ -1216,11 +1125,9 @@ pub fn execute(
                     .or_default()
                     .advance(TaskEvent::Dispatched)?;
             }
-            let (batch_results, budget_exceeded) =
-                run_batch_with_retries(batch, cfg, runner, &mut spent, budget);
-            if budget_exceeded {
-                halt(&mut halted, &mut plan_machine, Halt::Budget)?;
-            }
+            let (batch_results, overrun) =
+                run_batch_with_retries(batch, cfg, run_ceiling, runner, &mut spent, budget);
+            overrun.halt(first.stage, &mut halted, &mut plan_machine)?;
             for (t, result, event) in batch_results {
                 runner.settled(t, result.status == TaskStatus::Pass);
                 record(
@@ -1236,29 +1143,142 @@ pub fn execute(
                 )?;
             }
         }
+        if cfg.early_completion && completed.is_none() {
+            let mut settled_now: Vec<&TaskName> = Vec::new();
+            for t in dispatch.iter().filter(|t| t.stage == Stage::Iteration) {
+                if t.over.is_some() {
+                    settled_now.extend(results.keys().filter(|n| is_instance_of(&t.name, n)));
+                }
+                settled_now.push(&t.name);
+            }
+            if let Some(completion) = completion_among(&results, &settled_now) {
+                complete(&mut completed, &mut plan_machine, completion)?;
+            }
+        }
     }
 
     plan_machine.advance(PlanEvent::Settled)?;
-    let exit = halted
-        .as_ref()
-        .map(Halt::exit)
-        .unwrap_or(PlanExit::Completed);
-    let valid = exit == PlanExit::Completed
-        && plan
-            .tasks_topo()
-            .filter(|t| t.required && t.stage == Stage::Iteration)
-            .all(|t| {
-                matches!(
-                    results.get(&t.name).map(|r| r.status),
-                    Some(TaskStatus::Pass | TaskStatus::NotTaken)
-                )
-            });
+    let exit = exit_of(halted.as_ref(), completed.as_ref());
+    let ceiling = matches!(halted, Some(Halt::Budget | Halt::Time));
+    let valid = !ceiling
+        && matches!(exit, PlanExit::Completed | PlanExit::CompletedEarly { .. })
+        && required_tasks_held(plan, |name| match results.get(name) {
+            Some(r) => Some(r.status),
+            None => completed.is_some().then_some(TaskStatus::NotTaken),
+        });
     Ok(PlanOutcome {
         valid,
         exit,
         spent_usd: spent,
         results,
     })
+}
+
+/// Whether every required main-graph task passed or was not taken. With a completed exit this is
+/// the run's verdict; advisory results, epilogue tasks, and captured failure sets do not enter it.
+pub fn required_tasks_held(
+    plan: &ValidPlan,
+    status: impl Fn(&TaskName) -> Option<TaskStatus>,
+) -> bool {
+    plan.tasks_topo()
+        .filter(|t| t.required && t.stage == Stage::Iteration)
+        .all(|t| {
+            matches!(
+                status(&t.name),
+                Some(TaskStatus::Pass | TaskStatus::NotTaken)
+            )
+        })
+}
+
+/// The run ceilings one dispatch ran past: spend beyond the budget, or an attempt the runner
+/// killed at the run's wall-clock ceiling rather than at its own limit. A killed epilogue attempt
+/// does not halt the run: the main graph already settled how it ended.
+#[derive(Clone, Copy, Debug, Default)]
+struct Overrun {
+    budget: bool,
+    time: bool,
+}
+
+impl Overrun {
+    fn of(outcome: &AttemptOutcome) -> Self {
+        Overrun {
+            budget: false,
+            time: matches!(
+                outcome,
+                AttemptOutcome::TimedOut(Deadline {
+                    bound: Bound::Run(_),
+                    ..
+                })
+            ),
+        }
+    }
+
+    fn halt(
+        self,
+        stage: Stage,
+        halted: &mut Option<Halt>,
+        plan_machine: &mut PlanMachine,
+    ) -> Result<(), IllegalTransition> {
+        if self.budget {
+            halt(halted, plan_machine, Halt::Budget)?;
+        }
+        if self.time && stage == Stage::Iteration {
+            halt(halted, plan_machine, Halt::Time)?;
+        }
+        Ok(())
+    }
+}
+
+struct Completion {
+    task: TaskName,
+    reason: Option<String>,
+}
+
+pub fn declared_completion(r: &TaskResult) -> Option<Option<String>> {
+    if r.status != TaskStatus::Pass {
+        return None;
+    }
+    let output = r.output.as_ref()?.as_object()?;
+    (output.get(COMPLETE_FIELD) == Some(&Value::Bool(true))).then(|| {
+        output
+            .get(REASON_FIELD)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    })
+}
+
+fn completion_among(
+    results: &BTreeMap<TaskName, TaskResult>,
+    names: &[&TaskName],
+) -> Option<Completion> {
+    names.iter().find_map(|name| {
+        let reason = declared_completion(results.get(*name)?)?;
+        Some(Completion {
+            task: (*name).clone(),
+            reason,
+        })
+    })
+}
+
+fn complete(
+    completed: &mut Option<Completion>,
+    plan_machine: &mut PlanMachine,
+    completion: Completion,
+) -> Result<(), IllegalTransition> {
+    plan_machine.advance(PlanEvent::EarlyCompletion)?;
+    *completed = Some(completion);
+    Ok(())
+}
+
+fn exit_of(halted: Option<&Halt>, completed: Option<&Completion>) -> PlanExit {
+    match (completed, halted) {
+        (Some(c), _) => PlanExit::CompletedEarly {
+            task: c.task.clone(),
+            reason: c.reason.clone(),
+        },
+        (None, Some(halt)) => halt.exit(),
+        (None, None) => PlanExit::Completed,
+    }
 }
 
 /// Fix the plan's exit on its first halt; later ceilings do not change how it ended.
@@ -1335,17 +1355,21 @@ fn file_producers(
     results: &BTreeMap<TaskName, TaskResult>,
     runner: &dyn TaskRunner,
 ) -> Vec<Task> {
+    let epilogue = t.stage == Stage::Epilogue;
     let contributes = |node: &Task, candidate: &Task, r: &TaskResult| match r.status {
         TaskStatus::Pass => true,
         TaskStatus::Fail => {
-            t.join == Join::Settled
-                && t.depends_on.contains(&node.name)
-                && runner.has_captured_files(candidate)
+            let reads_failures = (t.join == Join::Settled && t.depends_on.contains(&node.name))
+                || (epilogue && node.stage == Stage::Iteration);
+            reads_failures && runner.has_captured_files(candidate)
         }
         _ => false,
     };
+    let main_graph = plan
+        .tasks_topo()
+        .filter(|p| epilogue && p.stage == Stage::Iteration);
     let mut producers: Vec<Task> = Vec::new();
-    for p in ancestors(plan, t) {
+    for p in main_graph.chain(ancestors(plan, t)) {
         if p.emits_files.is_empty() {
             continue;
         }
@@ -1375,6 +1399,27 @@ fn file_producers(
     producers
 }
 
+/// What a dispatched task reads, as JSON: its dependencies' contributions and, for a command or
+/// evaluate task, the plan's bound parameters under [`PARAMS_INPUT`].
+fn inputs_for(
+    plan: &ValidPlan,
+    t: &Task,
+    results: &BTreeMap<TaskName, TaskResult>,
+    staged: &[Task],
+) -> BTreeMap<TaskName, Value> {
+    let mut inputs = dependency_inputs(plan, t, results, staged);
+    if matches!(t.task, TaskKind::Command { .. } | TaskKind::Evaluate { .. }) {
+        let params = plan
+            .plan()
+            .params
+            .iter()
+            .map(|(name, value)| (name.clone(), value.json()))
+            .collect();
+        inputs.insert(TaskName(PARAMS_INPUT.to_string()), Value::Object(params));
+    }
+    inputs
+}
+
 /// What a dispatched task reads from its dependencies, as JSON.
 ///
 /// Under `all` and `passed` a dependency contributes its output directly, under its own name. A
@@ -1385,7 +1430,7 @@ fn file_producers(
 /// output and staged-file flag, whatever it settled as. `staged` is the producer list this
 /// dispatch is about to hand the runner, which is what makes the `files` flag mean "staged for
 /// this consumer, in this run".
-fn inputs_for(
+fn dependency_inputs(
     plan: &ValidPlan,
     t: &Task,
     results: &BTreeMap<TaskName, TaskResult>,
@@ -1407,50 +1452,53 @@ fn inputs_for(
             })
             .collect();
     }
-    let was_staged = |name: &TaskName| staged.iter().any(|p| &p.name == name);
     t.depends_on
         .iter()
         .filter_map(|d| {
-            let r = results.get(d)?;
-            // A mapped node is staged under its instances' names, so the node's own flag is true
-            // when any of them was.
-            let any_staged = was_staged(d) || staged.iter().any(|p| is_instance_of(d, &p.name));
-            let mut entry = settled_entry(r, any_staged);
-            if plan.get(d).is_some_and(|dep| dep.over.is_some()) {
-                let per_instance: serde_json::Map<String, Value> = results
-                    .iter()
-                    .filter_map(|(name, r)| {
-                        let key = instance_key(d, name)?;
-                        Some((
-                            key.to_owned(),
-                            Value::Object(settled_entry(r, was_staged(name))),
-                        ))
-                    })
-                    .collect();
-                entry.insert("per_instance".to_string(), Value::Object(per_instance));
-            }
+            let entry = settled_node_entry(plan, d, results, staged)?;
             Some((d.clone(), Value::Object(entry)))
         })
         .collect()
 }
 
-/// What one settled task reports about itself: the settled entry with the output and the
-/// staged-file flag omitted, which is what an epilogue task receives per main-graph task.
-fn outcome_entry(r: &TaskResult) -> serde_json::Map<String, Value> {
-    let mut entry = serde_json::Map::new();
-    entry.insert("status".to_string(), Value::from(r.status.as_str()));
-    entry.insert(
-        "note".to_string(),
-        r.note.clone().map_or(Value::Null, Value::String),
-    );
-    entry
+fn settled_node_entry(
+    plan: &ValidPlan,
+    node: &TaskName,
+    results: &BTreeMap<TaskName, TaskResult>,
+    staged: &[Task],
+) -> Option<serde_json::Map<String, Value>> {
+    let r = results.get(node)?;
+    let mut entry = settled_entry(r, node_staged(staged, node));
+    if plan.get(node).is_some_and(|t| t.over.is_some()) {
+        let per_instance: serde_json::Map<String, Value> = results
+            .iter()
+            .filter_map(|(name, r)| {
+                let key = instance_key(node, name)?;
+                let files = staged.iter().any(|p| &p.name == name);
+                Some((key.to_owned(), Value::Object(settled_entry(r, files))))
+            })
+            .collect();
+        entry.insert("per_instance".to_string(), Value::Object(per_instance));
+    }
+    Some(entry)
+}
+
+fn node_staged(staged: &[Task], node: &TaskName) -> bool {
+    staged
+        .iter()
+        .any(|p| &p.name == node || is_instance_of(node, &p.name))
 }
 
 /// One dependency's entry in a settled join's inputs. The entry carries the output rather than
 /// being it, so a consumer cannot read a failed dependency's reading without stepping past its
 /// status.
 fn settled_entry(r: &TaskResult, files: bool) -> serde_json::Map<String, Value> {
-    let mut entry = outcome_entry(r);
+    let mut entry = serde_json::Map::new();
+    entry.insert("status".to_string(), Value::from(r.status.as_str()));
+    entry.insert(
+        "note".to_string(),
+        r.note.clone().map_or(Value::Null, Value::String),
+    );
     entry.insert(
         "output".to_string(),
         r.output.clone().unwrap_or(Value::Null),
@@ -1465,18 +1513,19 @@ fn settled_entry(r: &TaskResult, files: bool) -> serde_json::Map<String, Value> 
 fn main_graph_outcome(
     plan: &ValidPlan,
     results: &BTreeMap<TaskName, TaskResult>,
-    halted: Option<&Halt>,
+    exit: &PlanExit,
+    staged: &[Task],
 ) -> Value {
     let tasks: serde_json::Map<String, Value> = plan
         .tasks_topo()
         .filter(|t| t.stage == Stage::Iteration)
         .filter_map(|t| {
-            let r = results.get(&t.name)?;
-            Some((t.name.0.clone(), Value::Object(outcome_entry(r))))
+            let entry = settled_node_entry(plan, &t.name, results, staged)?;
+            Some((t.name.0.clone(), Value::Object(entry)))
         })
         .collect();
     serde_json::json!({
-        "exit": halted.map(Halt::exit).unwrap_or(PlanExit::Completed).shutdown_token(),
+        "exit": exit.shutdown_token(),
         "tasks": Value::Object(tasks),
     })
 }
@@ -1528,6 +1577,285 @@ fn fanout_items(
     Ok(keys)
 }
 
+struct Ledger<'r> {
+    results: &'r mut BTreeMap<TaskName, TaskResult>,
+    machines: &'r mut BTreeMap<TaskName, TaskMachine>,
+    halted: &'r mut Option<Halt>,
+    plan_machine: &'r mut PlanMachine,
+    spent: &'r mut f64,
+    budget: f64,
+    started: Instant,
+    run_ceiling: Option<RunCeiling>,
+    completed: &'r mut Option<Completion>,
+}
+
+struct RoundRow<'a> {
+    task: &'a Task,
+    result: TaskResult,
+    event: TaskEvent,
+}
+
+fn run_loop<R>(
+    body: &ReviseLoop<'_>,
+    plan: &ValidPlan,
+    cfg: ExecCfg<'_>,
+    runner: &mut dyn TaskRunner,
+    record: &mut R,
+    ledger: &mut Ledger<'_>,
+) -> Result<(), IllegalTransition>
+where
+    R: FnMut(
+        &mut dyn TaskRunner,
+        &Task,
+        TaskResult,
+        TaskEvent,
+        &mut BTreeMap<TaskName, TaskResult>,
+        &mut BTreeMap<TaskName, TaskMachine>,
+        &mut Option<Halt>,
+        &mut PlanMachine,
+        bool,
+    ) -> Result<(), IllegalTransition>,
+{
+    let reviewer = body.reviewer;
+    let mut view = ledger.results.clone();
+    let mut rounds: Vec<Vec<RoundRow<'_>>> = Vec::new();
+    let mut entered = false;
+    for round in 1..=body.max_rounds {
+        let verdict = rounds
+            .last()
+            .and_then(|rows| rows.iter().find(|row| row.task.name == reviewer.name))
+            .map(|row| row.result.clone());
+        if verdict.is_some() {
+            if ledger
+                .halted
+                .as_ref()
+                .is_some_and(|halt| !reports_the_short_circuit(body.reviewer, halt))
+            {
+                break;
+            }
+            if let Some(halt) = ceiling_reached(cfg, ledger) {
+                halt_on(ledger, halt)?;
+                break;
+            }
+        }
+        let mut rows: Vec<RoundRow<'_>> = Vec::new();
+        let mut pending: Vec<usize> = Vec::new();
+        let mut stopped = false;
+        for t in body.body.iter().copied() {
+            let halted = ledger
+                .halted
+                .as_ref()
+                .filter(|halt| !reports_the_short_circuit(t, halt));
+            let settled = if let Some(halt) = halted {
+                let reason = halt.blocked();
+                Err((TaskResult::blocked(&reason), reason.event()))
+            } else if let Some((event, note)) = not_taken(t, &view) {
+                Err((TaskResult::undispatched(TaskStatus::NotTaken, note), event))
+            } else if !dependencies_allow(t, &view) {
+                let reason = BlockedReason::DependencyDidNotPass;
+                Err((TaskResult::blocked(&reason), reason.event()))
+            } else if let Some(halt) = ceiling_reached(cfg, ledger) {
+                let reason = halt.blocked();
+                halt_on(ledger, halt)?;
+                Err((TaskResult::blocked(&reason), reason.event()))
+            } else {
+                Ok(())
+            };
+            let (result, event) = match settled {
+                Err((result, event)) => (result, event),
+                Ok(()) => {
+                    let is_target = t.name != reviewer.name;
+                    let mut producers = file_producers(plan, t, &view, &*runner);
+                    let review_files =
+                        is_target && verdict.is_some() && runner.has_captured_files(reviewer);
+                    if review_files {
+                        producers.push(reviewer.clone());
+                    }
+                    let staged: Vec<&Task> = producers.iter().collect();
+                    match runner.stage(t, &staged) {
+                        Err(why) => {
+                            let reason = BlockedReason::StagingRefused(why);
+                            (TaskResult::blocked(&reason), reason.event())
+                        }
+                        Ok(()) => {
+                            let mut inputs = inputs_for(plan, t, &view, &producers);
+                            cfg.add_history(t, &mut inputs);
+                            if t.stage == Stage::Epilogue {
+                                inputs.insert(
+                                    TaskName(OUTCOME_INPUT.to_string()),
+                                    main_graph_outcome(
+                                        plan,
+                                        &view,
+                                        &exit_of(ledger.halted.as_ref(), ledger.completed.as_ref()),
+                                        &producers,
+                                    ),
+                                );
+                            }
+                            if let Some(verdict) = verdict.as_ref().filter(|_| is_target) {
+                                inputs.insert(
+                                    TaskName(REVISION_INPUT.to_string()),
+                                    serde_json::json!({
+                                        "round": round,
+                                        "max_rounds": body.max_rounds,
+                                        "reviewer": reviewer.name.0,
+                                        "review": Value::Object(settled_entry(verdict, review_files)),
+                                    }),
+                                );
+                            }
+                            if !entered {
+                                entered = true;
+                                for b in &body.body {
+                                    ledger
+                                        .machines
+                                        .entry(b.name.clone())
+                                        .or_default()
+                                        .advance(TaskEvent::RoundsStarted)?;
+                                }
+                                for row in pending.drain(..).map(|i| &rows[i]) {
+                                    record(
+                                        &mut *runner,
+                                        &round_task(row.task, round),
+                                        row.result.clone(),
+                                        row.event,
+                                        ledger.results,
+                                        ledger.machines,
+                                        ledger.halted,
+                                        ledger.plan_machine,
+                                        false,
+                                    )?;
+                                }
+                            }
+                            let name = round_task(t, round);
+                            ledger
+                                .machines
+                                .entry(name.name.clone())
+                                .or_default()
+                                .advance(TaskEvent::Dispatched)?;
+                            let (result, event, overrun) = run_with_retries(
+                                t,
+                                &inputs,
+                                cfg,
+                                ledger.run_ceiling,
+                                runner,
+                                ledger.spent,
+                                ledger.budget,
+                            );
+                            overrun.halt(t.stage, ledger.halted, ledger.plan_machine)?;
+                            runner.settled(t, result.status == TaskStatus::Pass);
+                            if cfg.early_completion
+                                && t.stage == Stage::Iteration
+                                && t.name != reviewer.name
+                                && declared_completion(&result).is_some()
+                            {
+                                stopped = true;
+                            }
+                            (result, event)
+                        }
+                    }
+                }
+            };
+            view.insert(t.name.clone(), result.clone());
+            if entered {
+                record(
+                    &mut *runner,
+                    &round_task(t, round),
+                    result.clone(),
+                    event,
+                    ledger.results,
+                    ledger.machines,
+                    ledger.halted,
+                    ledger.plan_machine,
+                    false,
+                )?;
+            } else {
+                pending.push(rows.len());
+            }
+            rows.push(RoundRow {
+                task: t,
+                result,
+                event,
+            });
+            if stopped {
+                break;
+            }
+        }
+        let again = rows
+            .iter()
+            .any(|row| row.task.name == reviewer.name && row.result.status == TaskStatus::Fail);
+        rounds.push(rows);
+        if stopped || !again {
+            break;
+        }
+    }
+    let Some(last) = rounds.last() else {
+        return Ok(());
+    };
+    for row in last {
+        let (result, event) = if entered {
+            let cost_usd = rounds
+                .iter()
+                .flatten()
+                .filter(|r| r.task.name == row.task.name)
+                .map(|r| r.result.cost_usd)
+                .sum();
+            let folded = TaskResult {
+                attempts: row.result.attempts.min(1),
+                cost_usd,
+                ..row.result.clone()
+            };
+            let event = rounds_event(folded.status);
+            (folded, event)
+        } else {
+            (row.result.clone(), row.event)
+        };
+        record(
+            &mut *runner,
+            row.task,
+            result,
+            event,
+            ledger.results,
+            ledger.machines,
+            ledger.halted,
+            ledger.plan_machine,
+            true,
+        )?;
+    }
+    if cfg.early_completion && ledger.completed.is_none() {
+        let names: Vec<&TaskName> = last
+            .iter()
+            .filter(|row| row.task.stage == Stage::Iteration)
+            .map(|row| &row.task.name)
+            .collect();
+        if let Some(completion) = completion_among(ledger.results, &names) {
+            complete(ledger.completed, ledger.plan_machine, completion)?;
+        }
+    }
+    Ok(())
+}
+
+/// The epilogue is what reports a required failure, so a short-circuit is the one halt it
+/// outlives. A ceiling still blocks it.
+fn reports_the_short_circuit(t: &Task, halt: &Halt) -> bool {
+    t.stage == Stage::Epilogue && matches!(halt, Halt::ShortCircuit(_))
+}
+
+fn ceiling_reached(cfg: ExecCfg<'_>, ledger: &Ledger<'_>) -> Option<Halt> {
+    if *ledger.spent >= ledger.budget {
+        Some(Halt::Budget)
+    } else if cfg
+        .wall_clock
+        .is_some_and(|limit| ledger.started.elapsed() >= limit)
+    {
+        Some(Halt::Time)
+    } else {
+        None
+    }
+}
+
+fn halt_on(ledger: &mut Ledger<'_>, why: Halt) -> Result<(), IllegalTransition> {
+    halt(ledger.halted, ledger.plan_machine, why)
+}
+
 /// One round of a revise loop, `task[round-N]`. It shares the instance naming, so a reader groups
 /// rounds under their task the way it groups a fan-out's items.
 fn round_task(t: &Task, round: u32) -> Task {
@@ -1538,33 +1866,14 @@ fn round_task(t: &Task, round: u32) -> Task {
     }
 }
 
-/// The result the graph sees for each side of a revise loop: its last round, carrying the spend of
-/// every round.
-fn fold_rounds(rounds: &[(TaskResult, TaskResult)]) -> (TaskResult, TaskResult) {
-    let Some((proposed, reviewed)) = rounds.last() else {
-        let never = TaskResult::blocked(&BlockedReason::DependencyDidNotPass);
-        return (never.clone(), never);
-    };
-    let fold = |last: &TaskResult, cost_usd: f64| TaskResult {
-        attempts: last.attempts.min(1),
-        cost_usd,
-        ..last.clone()
-    };
-    (
-        fold(proposed, rounds.iter().map(|(p, _)| p.cost_usd).sum()),
-        fold(reviewed, rounds.iter().map(|(_, r)| r.cost_usd).sum()),
-    )
-}
-
 fn rounds_event(status: TaskStatus) -> TaskEvent {
     match status {
         TaskStatus::Pass => TaskEvent::RoundsPassed,
         TaskStatus::Fail => TaskEvent::RoundsFailed,
         TaskStatus::Skipped => TaskEvent::RoundsSkipped,
         TaskStatus::Transport => TaskEvent::RoundsTransport,
-        TaskStatus::Blocked | TaskStatus::NotTaken | TaskStatus::Truncated => {
-            TaskEvent::RoundsBlocked
-        }
+        TaskStatus::NotTaken => TaskEvent::RoundsNotTaken,
+        TaskStatus::Blocked | TaskStatus::Truncated => TaskEvent::RoundsBlocked,
     }
 }
 
@@ -1703,17 +2012,34 @@ fn enforce_emits(task: &Task, outcome: AttemptOutcome) -> AttemptOutcome {
         AttemptOutcome::Pass(value) => value,
         other => return other,
     };
-    match task
-        .emits
-        .iter()
-        .find(|field| value.get(&field.0).is_none())
-    {
+    match emits_violation(&task.emits, &value) {
         None => AttemptOutcome::Pass(value),
-        Some(missing) => AttemptOutcome::Fail {
-            note: format!("output missing declared field {:?}", missing.0),
+        Some(note) => AttemptOutcome::Fail {
+            note,
             output: Some(value),
         },
     }
+}
+
+/// The first way a passing output breaks its declared emits: a missing field, or a field whose
+/// value is not of its declared type.
+fn emits_violation(emits: &crate::plan::ir::Emits, value: &Value) -> Option<String> {
+    emits.fields().into_iter().find_map(|(field, ty)| {
+        let Some(found) = value.get(&field.0) else {
+            return Some(format!("output missing declared field {:?}", field.0));
+        };
+        let ty = ty.filter(|ty| !ty.admits(found))?;
+        Some(match (ty, found) {
+            (crucible_contract::emits::FieldType::OneOf(_), Value::String(label)) => {
+                format!("output field {:?} is {label:?}, declared {ty}", field.0)
+            }
+            _ => format!(
+                "output field {:?} is {}, declared {ty}",
+                field.0,
+                crucible_contract::emits::value_type(found)
+            ),
+        })
+    })
 }
 
 /// A finished attempt as the task's result, or the transport note when it should be retried.
@@ -1733,6 +2059,12 @@ fn settle_attempt(
         AttemptOutcome::Fail { note, output } => {
             (TaskStatus::Fail, output, Some(note), TaskEvent::Failed)
         }
+        AttemptOutcome::TimedOut(deadline) => (
+            TaskStatus::Fail,
+            None,
+            Some(deadline.note()),
+            TaskEvent::Failed,
+        ),
         AttemptOutcome::Transport(failure) => return Err(failure),
     };
     Ok((
@@ -1786,63 +2118,77 @@ fn transport_result(
 }
 
 /// Run one task, retrying transport-class failures up to `cfg.transport_retries` times while
-/// the budget allows. The flag says whether this task's spend crossed the budget.
+/// the budget allows. Every attempt runs under its own deadline.
 fn run_with_retries(
     t: &Task,
     inputs: &BTreeMap<TaskName, Value>,
-    cfg: ExecCfg,
+    cfg: ExecCfg<'_>,
+    run_ceiling: Option<RunCeiling>,
     runner: &mut dyn TaskRunner,
     spent: &mut f64,
     budget: f64,
-) -> (TaskResult, TaskEvent, bool) {
+) -> (TaskResult, TaskEvent, Overrun) {
     let max_attempts = 1 + cfg.transport_retries;
     let mut attempts = 0;
     let mut cost = 0.0;
     let mut last_transport = TransportFailure::new(TransportCause::Other, String::new());
     while attempts < max_attempts {
         attempts += 1;
-        let a = runner.run(t, attempts, inputs);
+        let deadline = Deadline::for_attempt(Instant::now(), t.timeout, run_ceiling);
+        let a = runner.run(t, attempts, inputs, deadline);
         cost += a.cost_usd;
         *spent += a.cost_usd;
-        match settle_attempt(enforce_emits(t, a.outcome), attempts, cost) {
-            Ok((result, event)) => return (result, event, *spent > budget),
+        let outcome = enforce_emits(t, a.outcome);
+        let mut overrun = Overrun::of(&outcome);
+        overrun.budget = *spent > budget;
+        match settle_attempt(outcome, attempts, cost) {
+            Ok((result, event)) => return (result, event, overrun),
             Err(failure) => {
                 if *spent > budget || (*spent >= budget && attempts < max_attempts) {
                     let (result, event) =
                         transport_result(attempts, max_attempts, cost, &failure, true);
-                    return (result, event, true);
+                    overrun.budget = true;
+                    return (result, event, overrun);
                 }
                 last_transport = failure;
             }
         }
     }
     let (result, event) = transport_result(attempts, max_attempts, cost, &last_transport, false);
-    (result, event, *spent > budget)
+    let overrun = Overrun {
+        budget: *spent > budget,
+        time: false,
+    };
+    (result, event, overrun)
 }
 
 /// Run a batch of isolated tasks through the runner's parallel path, retrying the transport
-/// failures as a smaller wave until every task has a result or retries run out.
+/// failures as a smaller wave until every task has a result or retries run out. Each wave stamps
+/// every item with its own deadline as it starts.
 fn run_batch_with_retries<'a>(
     batch: Vec<BatchItem<'a>>,
-    cfg: ExecCfg,
+    cfg: ExecCfg<'_>,
+    run_ceiling: Option<RunCeiling>,
     runner: &mut dyn TaskRunner,
     spent: &mut f64,
     budget: f64,
-) -> (Vec<(&'a Task, TaskResult, TaskEvent)>, bool) {
+) -> (Vec<(&'a Task, TaskResult, TaskEvent)>, Overrun) {
     let max_attempts = 1 + cfg.transport_retries;
     let mut done: BTreeMap<usize, (TaskResult, TaskEvent)> = BTreeMap::new();
     let mut cost_so_far: Vec<f64> = vec![0.0; batch.len()];
     let order: Vec<&'a Task> = batch.iter().map(|b| b.task).collect();
     let mut wave: Vec<(usize, BatchItem<'a>)> = batch.into_iter().enumerate().collect();
-    let mut budget_exceeded = false;
+    let mut overrun = Overrun::default();
 
     while !wave.is_empty() {
+        let now = Instant::now();
         let items: Vec<BatchItem<'_>> = wave
             .iter()
             .map(|(_, b)| BatchItem {
                 task: b.task,
                 attempt: b.attempt,
                 inputs: b.inputs.clone(),
+                deadline: Deadline::for_attempt(now, b.task.timeout, run_ceiling),
             })
             .collect();
         let attempts = runner.run_many(&items);
@@ -1851,10 +2197,11 @@ fn run_batch_with_retries<'a>(
             *spent += a.cost_usd;
             cost_so_far[idx] += a.cost_usd;
             let outcome = enforce_emits(item.task, a.outcome);
+            overrun.time |= Overrun::of(&outcome).time;
             attempted.push((idx, item, outcome));
         }
         let retry_budget_blocked = *spent >= budget;
-        budget_exceeded |= *spent > budget;
+        overrun.budget |= *spent > budget;
         let mut next: Vec<(usize, BatchItem<'a>)> = Vec::new();
         for (idx, item, outcome) in attempted {
             match settle_attempt(outcome, item.attempt, cost_so_far[idx]) {
@@ -1869,11 +2216,12 @@ fn run_batch_with_retries<'a>(
                                 task: item.task,
                                 attempt: item.attempt + 1,
                                 inputs: item.inputs,
+                                deadline: None,
                             },
                         ));
                     } else {
                         let cut_by_budget = item.attempt < max_attempts;
-                        budget_exceeded |= cut_by_budget;
+                        overrun.budget |= cut_by_budget;
                         done.insert(
                             idx,
                             transport_result(
@@ -1894,7 +2242,7 @@ fn run_batch_with_retries<'a>(
         done.into_iter()
             .map(|(idx, (r, event))| (order[idx], r, event))
             .collect(),
-        budget_exceeded,
+        overrun,
     )
 }
 
@@ -2103,6 +2451,8 @@ mod tests {
             .expect("an executor transition its table does not list")
     }
     use crate::plan::ir::{Isolation, Join, Plan, PlanBudget, Stage};
+    use crucible_contract::emits::FieldType;
+    use serde_json::json;
 
     type Script = BTreeMap<(String, u32), (fn() -> AttemptOutcome, f64)>;
 
@@ -2123,6 +2473,10 @@ mod tests {
         rounds: BTreeMap<String, std::collections::VecDeque<fn() -> AttemptOutcome>>,
         /// Every dispatch's inputs, in order; `seen_values` keeps only the last per task.
         runs: Vec<(String, BTreeMap<TaskName, Value>)>,
+        /// A passing output per task, for a task no `script` or `rounds` entry covers.
+        outputs: BTreeMap<String, Value>,
+        /// The deadline every dispatch was handed, in order.
+        deadlines: Vec<(String, Option<Deadline>)>,
     }
 
     impl ScriptRunner {
@@ -2138,6 +2492,8 @@ mod tests {
                 dropped: Vec::new(),
                 rounds: BTreeMap::new(),
                 runs: Vec::new(),
+                outputs: BTreeMap::new(),
+                deadlines: Vec::new(),
             }
         }
         fn rounds(&mut self, task: &str, outcomes: &[fn() -> AttemptOutcome]) {
@@ -2175,8 +2531,10 @@ mod tests {
             task: &Task,
             attempt: u32,
             inputs: &BTreeMap<TaskName, Value>,
+            deadline: Option<Deadline>,
         ) -> Attempt {
             self.dispatched.push((task.name.0.clone(), attempt));
+            self.deadlines.push((task.name.0.clone(), deadline));
             self.seen_inputs.insert(
                 task.name.0.clone(),
                 inputs.keys().map(|k| k.0.clone()).collect(),
@@ -2199,7 +2557,12 @@ mod tests {
                     cost_usd: *cost,
                 },
                 None => Attempt {
-                    outcome: AttemptOutcome::Pass(serde_json::json!({"score": 1.0})),
+                    outcome: AttemptOutcome::Pass(
+                        self.outputs
+                            .get(&task.name.0)
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!({"score": 1.0})),
+                    ),
                     cost_usd: self.default_cost,
                 },
             }
@@ -2219,12 +2582,14 @@ mod tests {
             isolation: None,
             join: Join::default(),
             stage: Stage::Iteration,
-            emits: Vec::new(),
+            emits: crate::plan::ir::Emits::default(),
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
             when: None,
             revise: None,
+            timeout: None,
+            history: None,
         }
     }
 
@@ -2233,6 +2598,7 @@ mod tests {
             version: 1,
             reason: None,
             budget: PlanBudget { usd },
+            params: std::collections::BTreeMap::new(),
             tasks,
         }
         .validate()
@@ -2260,7 +2626,7 @@ mod tests {
         assert!(out.valid);
         assert_eq!(out.exit, PlanExit::Completed);
         assert_eq!(out.results[&"b".into()].status, TaskStatus::Pass);
-        assert_eq!(r.seen_inputs["b"], vec!["a".to_string()]);
+        assert_eq!(r.seen_inputs["b"], ["a", "params"]);
     }
 
     /// The wall-clock ceiling blocks every task not yet dispatched and invalidates the run.
@@ -2309,6 +2675,260 @@ mod tests {
             assert!(out.valid, "{wall_clock:?}");
             assert_eq!(out.exit, PlanExit::Completed, "{wall_clock:?}");
         }
+    }
+
+    /// Takes each task's scripted time, or stops at the deadline it was handed, whichever is
+    /// first: a runner that honors deadlines the way the shell runner does.
+    struct Sleeper {
+        takes: BTreeMap<String, Duration>,
+        dispatched: Vec<String>,
+    }
+
+    impl Sleeper {
+        fn new(takes: &[(&str, Duration)]) -> Self {
+            Sleeper {
+                takes: takes
+                    .iter()
+                    .map(|(task, took)| ((*task).to_string(), *took))
+                    .collect(),
+                dispatched: Vec::new(),
+            }
+        }
+    }
+
+    impl TaskRunner for Sleeper {
+        fn run(
+            &mut self,
+            task: &Task,
+            _: u32,
+            _: &BTreeMap<TaskName, Value>,
+            deadline: Option<Deadline>,
+        ) -> Attempt {
+            self.dispatched.push(task.name.0.clone());
+            let takes = self.takes.get(&task.name.0).copied().unwrap_or_default();
+            let done = Instant::now() + takes;
+            match deadline.filter(|d| d.at < done) {
+                Some(deadline) => {
+                    std::thread::sleep(deadline.at.saturating_duration_since(Instant::now()));
+                    Attempt::timed_out(0.02, deadline)
+                }
+                None => {
+                    std::thread::sleep(takes);
+                    Attempt {
+                        outcome: AttemptOutcome::Pass(serde_json::json!({})),
+                        cost_usd: 0.02,
+                    }
+                }
+            }
+        }
+    }
+
+    fn limited(mut task: Task, limit: &str) -> Task {
+        task.timeout = Some(limit.parse().expect("a timeout"));
+        task
+    }
+
+    #[test]
+    fn a_task_that_outlives_its_limit_fails_on_it_once_and_short_circuits() {
+        let plan = valid(
+            vec![
+                limited(task("hang", &[], "any", true), "0.1s"),
+                task("after", &["hang"], "any", true),
+            ],
+            10.0,
+        );
+        let mut r = Sleeper::new(&[("hang", Duration::from_secs(30))]);
+        let started = Instant::now();
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let hang = &out.results[&"hang".into()];
+        assert_eq!(hang.status, TaskStatus::Fail);
+        assert_eq!(hang.attempts, 1, "a timed-out attempt was retried");
+        assert_eq!(hang.transport, None);
+        assert_eq!(
+            hang.note.as_deref(),
+            Some("timed out: the task ran past its 0.1s limit")
+        );
+        assert_eq!(hang.cost_usd, 0.02, "the killed attempt's spend is kept");
+        assert_eq!(
+            out.exit,
+            PlanExit::ShortCircuit {
+                task: "hang".into()
+            }
+        );
+        assert_eq!(out.results[&"after".into()].status, TaskStatus::Blocked);
+        assert_eq!(r.dispatched, ["hang"]);
+        assert!(!out.valid);
+    }
+
+    #[test]
+    fn an_advisory_task_that_times_out_blocks_its_dependents_only() {
+        let plan = valid(
+            vec![
+                limited(task("probe", &[], "any", false), "0.1s"),
+                task("reader", &["probe"], "any", false),
+                task("other", &[], "any", true),
+            ],
+            10.0,
+        );
+        let mut r = Sleeper::new(&[("probe", Duration::from_secs(30))]);
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        assert_eq!(out.results[&"probe".into()].status, TaskStatus::Fail);
+        assert_eq!(out.results[&"reader".into()].status, TaskStatus::Blocked);
+        assert_eq!(out.results[&"other".into()].status, TaskStatus::Pass);
+        assert_eq!(out.exit, PlanExit::Completed);
+        assert!(out.valid);
+    }
+
+    #[test]
+    fn a_task_under_its_limit_is_unaffected() {
+        let plan = valid(vec![limited(task("quick", &[], "any", true), "30s")], 10.0);
+        let mut r = Sleeper::new(&[("quick", Duration::from_millis(20))]);
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        assert_eq!(out.results[&"quick".into()].status, TaskStatus::Pass);
+        assert_eq!(out.results[&"quick".into()].note, None);
+        assert!(out.valid);
+    }
+
+    /// The ceiling is the operator's bound on the run, so a run it cut short ends on it, not on
+    /// whichever task happened to be in flight.
+    #[test]
+    fn the_run_ceiling_ends_an_attempt_in_flight_and_the_run_on_that_ceiling() {
+        let plan = valid(
+            vec![
+                limited(task("long", &[], "any", true), "10m"),
+                task("after", &["long"], "any", true),
+            ],
+            10.0,
+        );
+        let mut r = Sleeper::new(&[("long", Duration::from_secs(30))]);
+        let cfg = ExecCfg {
+            wall_clock: Some(Duration::from_millis(150)),
+            ..ExecCfg::default()
+        };
+        let started = Instant::now();
+        let out = execute(&plan, &any_substrate(), cfg, &mut r, |_, _| {});
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let long = &out.results[&"long".into()];
+        assert_eq!(long.status, TaskStatus::Fail);
+        assert_eq!(long.attempts, 1);
+        assert_eq!(
+            long.note.as_deref(),
+            Some("timed out: the run reached its 0.15s wall-clock ceiling")
+        );
+        assert_eq!(out.exit, PlanExit::TimeExceeded);
+        let after = &out.results[&"after".into()];
+        assert_eq!(after.status, TaskStatus::Blocked);
+        assert_eq!(after.blocked, Some(BlockedReason::WallClockCeiling));
+        assert_eq!(r.dispatched, ["long"]);
+    }
+
+    #[test]
+    fn the_run_ceiling_ends_an_epilogue_in_flight_without_relabelling_a_completed_run() {
+        let plan = valid(
+            vec![
+                task("probe", &[], "any", true),
+                epilogue("report", &[], true),
+            ],
+            10.0,
+        );
+        let mut r = Sleeper::new(&[("report", Duration::from_secs(30))]);
+        let cfg = ExecCfg {
+            wall_clock: Some(Duration::from_millis(150)),
+            ..ExecCfg::default()
+        };
+        let started = Instant::now();
+        let out = execute(&plan, &any_substrate(), cfg, &mut r, |_, _| {});
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let report = &out.results[&"report".into()];
+        assert_eq!(report.status, TaskStatus::Fail);
+        assert_eq!(
+            report.note.as_deref(),
+            Some("timed out: the run reached its 0.15s wall-clock ceiling")
+        );
+        assert_eq!(out.exit, PlanExit::Completed);
+        assert!(out.valid);
+    }
+
+    #[test]
+    fn every_attempt_is_handed_the_earlier_of_its_own_limit_and_the_run_ceiling() {
+        let plan = valid(
+            vec![
+                limited(task("own", &[], "any", true), "10m"),
+                task("undeclared", &["own"], "any", true),
+                limited(task("longer", &["undeclared"], "any", true), "2h"),
+                limited(task("flaky", &["longer"], "any", true), "5m"),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.on(
+            "flaky",
+            1,
+            || AttemptOutcome::Transport(TransportFailure::new(TransportCause::Other, "blip")),
+            0.0,
+        );
+        let cfg = ExecCfg {
+            wall_clock: Some(Duration::from_secs(3600)),
+            ..ExecCfg::default()
+        };
+        let out = execute(&plan, &any_substrate(), cfg, &mut r, |_, _| {});
+        assert!(out.valid);
+        let bounds: Vec<(&str, Option<Bound>)> = r
+            .deadlines
+            .iter()
+            .map(|(task, d)| (task.as_str(), d.map(|d| d.bound)))
+            .collect();
+        let task_limit = |s: &str| Some(Bound::Task(s.parse().unwrap()));
+        let run = Some(Bound::Run(Duration::from_secs(3600)));
+        assert_eq!(
+            bounds,
+            [
+                ("own", task_limit("10m")),
+                ("undeclared", run),
+                ("longer", run),
+                ("flaky", task_limit("5m")),
+                ("flaky", task_limit("5m")),
+            ]
+        );
+        let flaky: Vec<Instant> = r
+            .deadlines
+            .iter()
+            .filter(|(task, _)| task == "flaky")
+            .filter_map(|(_, d)| d.map(|d| d.at))
+            .collect();
+        assert!(
+            flaky[1] > flaky[0],
+            "a retry reused the first attempt's deadline"
+        );
+
+        let mut r = ScriptRunner::new();
+        execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        assert_eq!(r.deadlines[1], ("undeclared".to_string(), None));
     }
 
     #[test]
@@ -2391,7 +3011,7 @@ mod tests {
         assert!(out.valid, "lossy grade remains runnable: {:?}", out.exit);
         assert_eq!(out.results[&"racecheck".into()].status, TaskStatus::Skipped);
         assert_eq!(out.results[&"grade".into()].status, TaskStatus::Pass);
-        assert_eq!(runner.seen_inputs["grade"], vec!["score".to_string()]);
+        assert_eq!(runner.seen_inputs["grade"], ["params", "score"]);
     }
 
     #[test]
@@ -2734,12 +3354,14 @@ mod tests {
             isolation: None,
             join: Join::default(),
             stage: Stage::Iteration,
-            emits: Vec::new(),
+            emits: crate::plan::ir::Emits::default(),
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
             when: None,
             revise: None,
+            timeout: None,
+            history: None,
         });
         let plan = valid(tasks, 10.0);
         let mut r = ScriptRunner::new();
@@ -2794,12 +3416,14 @@ mod tests {
             isolation: None,
             join: Join::default(),
             stage: Stage::Iteration,
-            emits: Vec::new(),
+            emits: crate::plan::ir::Emits::default(),
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
             when: None,
             revise: None,
+            timeout: None,
+            history: None,
         });
         let plan = valid(tasks, 10.0);
         let mut r = ScriptRunner::new();
@@ -2873,7 +3497,13 @@ mod tests {
             batches: Vec<Vec<String>>,
         }
         impl TaskRunner for BatchRecorder {
-            fn run(&mut self, task: &Task, _: u32, _: &BTreeMap<TaskName, Value>) -> Attempt {
+            fn run(
+                &mut self,
+                task: &Task,
+                _: u32,
+                _: &BTreeMap<TaskName, Value>,
+                _: Option<Deadline>,
+            ) -> Attempt {
                 self.batches.push(vec![task.name.0.clone()]);
                 Attempt {
                     outcome: AttemptOutcome::Pass(serde_json::json!({})),
@@ -2987,12 +3617,14 @@ mod tests {
             isolation: None,
             join: Join::Passed,
             stage: Stage::Iteration,
-            emits: Vec::new(),
+            emits: crate::plan::ir::Emits::default(),
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
             when: None,
             revise: None,
+            timeout: None,
+            history: None,
         };
         tasks.push(pick);
         let plan = valid(tasks, 10.0);
@@ -3059,7 +3691,7 @@ mod tests {
         assert_eq!(bad.status, TaskStatus::Fail);
         assert_eq!(bad.output.as_ref().unwrap()["score"], 12.0);
         assert_eq!(out.results[&"grade".into()].status, TaskStatus::Pass);
-        assert_eq!(r.seen_inputs["grade"], vec!["ok".to_string()]);
+        assert_eq!(r.seen_inputs["grade"], ["ok", "params"]);
     }
 
     /// The other side of the status filter: a self-declared skip is a reading the task stands
@@ -3100,10 +3732,7 @@ mod tests {
             TaskStatus::Skipped
         );
         assert_eq!(out.results[&"grade".into()].status, TaskStatus::Pass);
-        assert_eq!(
-            r.seen_inputs["grade"],
-            vec!["ok".to_string(), "unmeasured".to_string()]
-        );
+        assert_eq!(r.seen_inputs["grade"], ["ok", "params", "unmeasured"]);
     }
 
     #[test]
@@ -3140,7 +3769,13 @@ mod tests {
             waves: Vec<Vec<(String, u32)>>,
         }
         impl TaskRunner for FlakyBatch {
-            fn run(&mut self, _: &Task, _: u32, _: &BTreeMap<TaskName, Value>) -> Attempt {
+            fn run(
+                &mut self,
+                _: &Task,
+                _: u32,
+                _: &BTreeMap<TaskName, Value>,
+                _: Option<Deadline>,
+            ) -> Attempt {
                 unreachable!("batchable plan must go through run_many");
             }
             fn run_many(&mut self, batch: &[BatchItem<'_>]) -> Vec<Attempt> {
@@ -3192,11 +3827,208 @@ mod tests {
 
     fn emitting(name: &str, deps: &[&str], required: bool, emits: &[&str]) -> Task {
         let mut t = task(name, deps, "any", required);
-        t.emits = emits
-            .iter()
-            .map(|f| crate::plan::ir::OutputField((*f).to_string()))
-            .collect();
+        t.emits = crate::plan::ir::Emits::Fields(
+            emits
+                .iter()
+                .map(|f| crate::plan::ir::OutputField((*f).to_string()))
+                .collect(),
+        );
         t
+    }
+
+    fn typed(name: &str, deps: &[&str], required: bool, emits: &[(&str, FieldType)]) -> Task {
+        let mut t = task(name, deps, "any", required);
+        t.emits = crate::plan::ir::Emits::Typed(
+            emits
+                .iter()
+                .map(|(f, ty)| (crate::plan::ir::OutputField((*f).to_string()), ty.clone()))
+                .collect(),
+        );
+        t
+    }
+
+    fn one_of(labels: &[&str]) -> FieldType {
+        FieldType::OneOf(labels.iter().map(|l| label(l)).collect())
+    }
+
+    /// Each declared type against a value of it and a value not of it, one task each, so every
+    /// arm of the runtime check is exercised through the executor rather than beside it.
+    #[test]
+    fn a_passing_output_of_the_wrong_type_is_a_measured_failure_at_its_producer() {
+        let cases: Vec<(FieldType, Value, Value, &str)> = vec![
+            (
+                FieldType::String,
+                json!("x"),
+                json!(1),
+                "is integer, declared string",
+            ),
+            (
+                FieldType::Integer,
+                json!(3),
+                json!(3.5),
+                "is number, declared integer",
+            ),
+            (
+                FieldType::Number,
+                json!(0.5),
+                json!("0.5"),
+                "is string, declared number",
+            ),
+            (
+                FieldType::Boolean,
+                json!(false),
+                json!("false"),
+                "is string, declared boolean",
+            ),
+            (
+                FieldType::List,
+                json!([]),
+                json!({}),
+                "is object, declared list",
+            ),
+            (
+                FieldType::Object,
+                json!({}),
+                json!(null),
+                "is null, declared object",
+            ),
+            (
+                one_of(&["high", "low"]),
+                json!("low"),
+                json!("urgent"),
+                "is \"urgent\", declared one of high|low",
+            ),
+            (
+                one_of(&["high", "low"]),
+                json!("high"),
+                json!(true),
+                "is boolean, declared one of high|low",
+            ),
+        ];
+        for (ty, good, bad, note) in cases {
+            let plan = valid(
+                vec![
+                    typed("good", &[], false, &[("f", ty.clone())]),
+                    typed("bad", &[], false, &[("f", ty.clone())]),
+                    task("child", &["bad"], "any", false),
+                ],
+                10.0,
+            );
+            let mut r = ScriptRunner::new();
+            let good_value = json!({ "f": good });
+            let bad_value = json!({ "f": bad });
+            r.outputs.insert("good".into(), good_value.clone());
+            r.outputs.insert("bad".into(), bad_value.clone());
+            let out = execute(
+                &plan,
+                &any_substrate(),
+                ExecCfg::default(),
+                &mut r,
+                |_, _| {},
+            );
+            let ctx = format!("{ty}: {good_value} / {bad_value}");
+            assert_eq!(
+                out.results[&"good".into()].status,
+                TaskStatus::Pass,
+                "{ctx}"
+            );
+            let bad = &out.results[&"bad".into()];
+            assert_eq!(bad.status, TaskStatus::Fail, "{ctx}");
+            assert_eq!(bad.attempts, 1, "a measured failure never retries: {ctx}");
+            assert_eq!(bad.output.as_ref(), Some(&bad_value), "{ctx}");
+            let got = bad.note.as_deref().unwrap_or_default();
+            assert!(
+                got.contains(&format!("output field \"f\" {note}")),
+                "{ctx}: {got}"
+            );
+            assert_eq!(
+                out.results[&"child".into()].status,
+                TaskStatus::Blocked,
+                "{ctx}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_typed_field_that_is_missing_names_the_missing_field() {
+        let plan = valid(
+            vec![typed(
+                "t",
+                &[],
+                false,
+                &[("score", FieldType::Number), ("tier", FieldType::String)],
+            )],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.outputs.insert("t".into(), json!({"score": 1}));
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        let t = &out.results[&"t".into()];
+        assert_eq!(t.status, TaskStatus::Fail);
+        assert_eq!(
+            t.note.as_deref(),
+            Some("output missing declared field \"tier\"")
+        );
+    }
+
+    /// A task that settles itself owes nothing, typed or not: its own verdict stands.
+    #[test]
+    fn a_declared_skip_or_fail_owes_no_typed_emits() {
+        for (status, settled) in [("skipped", TaskStatus::Skipped), ("fail", TaskStatus::Fail)] {
+            let plan = valid(
+                vec![typed("t", &[], false, &[("score", FieldType::Number)])],
+                10.0,
+            );
+            let mut r = ScriptRunner::new();
+            r.outputs.insert(
+                "t".into(),
+                json!({"status": status, "score": "n/a", "note": "own"}),
+            );
+            let out = execute(
+                &plan,
+                &any_substrate(),
+                ExecCfg::default(),
+                &mut r,
+                |_, _| {},
+            );
+            let t = &out.results[&"t".into()];
+            assert_eq!(t.status, settled);
+            assert_eq!(t.note.as_deref(), Some("own"));
+        }
+    }
+
+    #[test]
+    fn a_required_task_of_the_wrong_type_short_circuits_the_plan() {
+        let plan = valid(
+            vec![
+                typed("gate", &[], true, &[("ok", FieldType::Boolean)]),
+                task("after", &["gate"], "any", true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.outputs.insert("gate".into(), json!({"ok": "yes"}));
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        assert_eq!(
+            out.exit,
+            PlanExit::ShortCircuit {
+                task: "gate".into()
+            }
+        );
+        assert!(!out.valid);
+        assert!(!r.dispatched.iter().any(|(t, _)| t == "after"));
     }
 
     #[test]
@@ -3788,6 +4620,7 @@ mod tests {
             task: &Task,
             _attempt: u32,
             inputs: &BTreeMap<TaskName, Value>,
+            _deadline: Option<Deadline>,
         ) -> Attempt {
             self.log.push(format!("run {}", task.name));
             self.seen_inputs.insert(task.name.0.clone(), inputs.clone());
@@ -3819,7 +4652,7 @@ mod tests {
             self.log.push(format!("batch of {}", batch.len()));
             batch
                 .iter()
-                .map(|b| self.run(b.task, b.attempt, &b.inputs))
+                .map(|b| self.run(b.task, b.attempt, &b.inputs, b.deadline))
                 .collect()
         }
 
@@ -4688,7 +5521,7 @@ mod tests {
         let out = run_plan(&plan, &mut r);
 
         assert_eq!(out.results[&"roundup".into()].status, TaskStatus::Pass);
-        assert_eq!(r.seen_inputs["roundup"], vec!["good".to_string()]);
+        assert_eq!(r.seen_inputs["roundup"], ["good", "params"]);
     }
 
     /// A settled dependent of a mapped node waits for the fold and then reads each instance,
@@ -4892,7 +5725,9 @@ mod tests {
     #[test]
     fn a_task_declaring_status_fail_settles_failing_with_its_object_kept() {
         let mut veto = task("veto", &[], "any", false);
-        veto.emits = vec![crate::plan::ir::OutputField("separates".to_string())];
+        veto.emits = crate::plan::ir::Emits::Fields(vec![crate::plan::ir::OutputField(
+            "separates".to_string(),
+        )]);
         let plan = valid(vec![veto, settled_task("report", &["veto"], true)], 10.0);
         let mut r = ScriptRunner::new();
         r.on(
@@ -5077,7 +5912,7 @@ mod tests {
             "a lossy join was staged a failed dependency's evidence: {:?}",
             r.staged["roundup"]
         );
-        assert_eq!(r.seen_inputs["roundup"], vec!["other".to_string()]);
+        assert_eq!(r.seen_inputs["roundup"], ["other", "params"]);
     }
 
     /// "Nothing" has one spelling in the entry: a dependency the engine recorded no note for
@@ -5107,7 +5942,9 @@ mod tests {
     #[test]
     fn a_settled_consumer_of_a_node_that_never_expanded_reads_the_refusal() {
         let mut source = task("discover", &[], "any", false);
-        source.emits = vec![crate::plan::ir::OutputField("targets".to_string())];
+        source.emits = crate::plan::ir::Emits::Fields(vec![crate::plan::ir::OutputField(
+            "targets".to_string(),
+        )]);
         let mut node = mapped_node("audit", "discover", "targets", false);
         node.join = Join::Settled;
         let plan = valid(
@@ -5187,11 +6024,13 @@ mod tests {
             Some(2),
             "an epilogue task is not part of the main graph it reports on"
         );
-        assert!(
-            outcome["tasks"]["build"].get("output").is_none()
-                && outcome["tasks"]["build"].get("files").is_none(),
-            "the epilogue entry is the settled entry minus output and files"
+        assert_eq!(
+            outcome["tasks"]["build"]["output"],
+            serde_json::json!({"score": 1.0}),
+            "the epilogue entry is the settled entry, output included"
         );
+        assert_eq!(outcome["tasks"]["check"]["output"], Value::Null);
+        assert_eq!(outcome["tasks"]["build"]["files"], false);
         assert!(
             !r.seen_inputs["check"].contains(&OUTCOME_INPUT.to_string()),
             "a main-graph task was given the run's outcome"
@@ -5231,10 +6070,174 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_epilogue_is_staged_with_failed_and_passing_main_graph_evidence() {
+        let mut build = task("build", &[], "any", true);
+        build.emits_files = vec!["evidence/build.json".to_string()];
+        let mut probe = task("probe", &["build"], "any", true);
+        probe.emits_files = vec!["evidence/probe.json".to_string()];
+        let mut deliver = task("deliver", &["probe"], "any", true);
+        deliver.emits_files = vec!["DELIVER.md".to_string()];
+        let plan = valid(
+            vec![build, probe, deliver, epilogue("report", &[], true)],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.captured.insert("probe".to_string());
+        r.on(
+            "probe",
+            1,
+            || AttemptOutcome::fail("did not reproduce"),
+            0.1,
+        );
+        let out = run_plan(&plan, &mut r);
+
+        assert!(!out.valid);
+        assert_eq!(out.results[&"report".into()].status, TaskStatus::Pass);
+        assert_eq!(
+            r.staged["report"],
+            vec!["build".to_string(), "probe".to_string()],
+            "a blocked task has no set to stage"
+        );
+        let outcome = outcome_of(&r, "report");
+        assert_eq!(outcome["tasks"]["build"]["files"], true);
+        assert_eq!(outcome["tasks"]["probe"]["status"], "fail");
+        assert_eq!(outcome["tasks"]["probe"]["files"], true);
+        assert_eq!(outcome["tasks"]["deliver"]["status"], "blocked");
+        assert_eq!(outcome["tasks"]["deliver"]["files"], false);
+    }
+
+    #[test]
+    fn an_epilogue_reports_no_files_for_a_failure_without_a_captured_set() {
+        let mut probe = task("probe", &[], "any", false);
+        probe.emits_files = vec!["evidence/probe.json".to_string()];
+        let plan = valid(vec![probe, epilogue("report", &[], true)], 10.0);
+        let mut r = ScriptRunner::new();
+        r.on(
+            "probe",
+            1,
+            || AttemptOutcome::fail("did not reproduce"),
+            0.1,
+        );
+        run_plan(&plan, &mut r);
+
+        assert!(r.staged["report"].is_empty());
+        let outcome = outcome_of(&r, "report");
+        assert_eq!(outcome["tasks"]["probe"]["status"], "fail");
+        assert_eq!(outcome["tasks"]["probe"]["files"], false);
+    }
+
+    #[test]
+    fn an_epilogue_is_not_staged_with_a_skipped_or_transport_failed_set() {
+        let mut quiet = task("quiet", &[], "any", false);
+        quiet.emits_files = vec!["evidence/quiet.json".to_string()];
+        let mut flaky = task("flaky", &[], "any", false);
+        flaky.emits_files = vec!["evidence/flaky.json".to_string()];
+        let plan = valid(vec![quiet, flaky, epilogue("report", &[], true)], 10.0);
+        let mut r = ScriptRunner::new();
+        r.captured.insert("quiet".to_string());
+        r.captured.insert("flaky".to_string());
+        r.on(
+            "quiet",
+            1,
+            || AttemptOutcome::Skipped(serde_json::json!({}), "not applicable".into()),
+            0.0,
+        );
+        for attempt in 1..=3 {
+            r.on(
+                "flaky",
+                attempt,
+                || {
+                    AttemptOutcome::Transport(TransportFailure::new(
+                        TransportCause::Sandbox,
+                        "pod evicted",
+                    ))
+                },
+                0.0,
+            );
+        }
+        run_plan(&plan, &mut r);
+
+        assert!(r.staged["report"].is_empty(), "{:?}", r.staged["report"]);
+        let outcome = outcome_of(&r, "report");
+        assert_eq!(outcome["tasks"]["quiet"]["files"], false);
+        assert_eq!(outcome["tasks"]["flaky"]["status"], "transport");
+        assert_eq!(outcome["tasks"]["flaky"]["files"], false);
+    }
+
+    #[test]
+    fn an_epilogue_is_staged_with_each_mapped_instances_set() {
+        let mut node = mapped_node("audit", "discover", "targets", false);
+        node.emits_files = vec!["OUT.md".to_string()];
+        let plan = valid(
+            vec![
+                task("discover", &[], "any", true),
+                node,
+                epilogue("report", &[], true),
+            ],
+            5.0,
+        );
+        let mut runner = FanoutRunner::new(&["alpha", "beta", "gamma"]);
+        runner.fail.insert("audit[beta]".to_string());
+        runner.fail.insert("audit[gamma]".to_string());
+        runner.captured.insert("audit[beta]".to_string());
+        execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut runner,
+            |_, _| {},
+        );
+
+        assert_eq!(
+            runner.staged["report"],
+            vec!["audit[alpha]".to_string(), "audit[beta]".to_string()]
+        );
+        let outcome = &runner.seen_inputs["report"][&TaskName(OUTCOME_INPUT.to_string())];
+        assert_eq!(outcome["tasks"]["audit"]["files"], true);
+        assert_eq!(outcome["tasks"]["discover"]["files"], false);
+    }
+
+    #[test]
+    fn a_main_graph_task_is_not_staged_with_unrelated_failure_evidence() {
+        let mut probe = task("probe", &[], "any", false);
+        probe.emits_files = vec!["evidence/probe.json".to_string()];
+        let mut other = task("other", &[], "any", true);
+        other.emits_files = vec!["evidence/other.json".to_string()];
+        let plan = valid(
+            vec![
+                probe,
+                other,
+                task("tip", &["other"], "any", true),
+                epilogue("report", &[], true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.captured.insert("probe".to_string());
+        r.on(
+            "probe",
+            1,
+            || AttemptOutcome::fail("did not reproduce"),
+            0.1,
+        );
+        run_plan(&plan, &mut r);
+
+        assert_eq!(r.staged["tip"], vec!["other".to_string()]);
+        assert_eq!(
+            r.staged["report"],
+            vec!["probe".to_string(), "other".to_string()]
+        );
+    }
+
     fn reviewing(name: &str, deps: &[&str], target: &str, max_rounds: u32) -> Task {
+        reviewing_chain(name, deps, &[target], max_rounds)
+    }
+
+    fn reviewing_chain(name: &str, deps: &[&str], targets: &[&str], max_rounds: u32) -> Task {
         let mut t = task(name, deps, "any", true);
         t.revise = Some(crate::plan::ir::Revise {
-            task: target.into(),
+            tasks: targets.iter().map(|target| (*target).into()).collect(),
             max_rounds,
         });
         t
@@ -5747,6 +6750,500 @@ mod tests {
         );
     }
 
+    fn built() -> AttemptOutcome {
+        AttemptOutcome::Pass(serde_json::json!({"digest": "sha256:1"}))
+    }
+
+    fn broke() -> AttemptOutcome {
+        AttemptOutcome::Fail {
+            note: "exit 2: compile error".into(),
+            output: None,
+        }
+    }
+
+    fn fix_chain(confirm_join: Join) -> ValidPlan {
+        valid(
+            vec![
+                task("resolve", &[], "any", true),
+                task("pick", &["resolve"], "any", true),
+                task("build", &["pick"], "any", true),
+                joining(
+                    reviewing_chain("confirm", &["build", "resolve"], &["pick", "build"], 3),
+                    confirm_join,
+                ),
+                task("deliver", &["confirm"], "any", true),
+            ],
+            10.0,
+        )
+    }
+
+    #[test]
+    fn a_failing_review_reruns_the_whole_chain_until_a_round_passes() {
+        let mut r = ScriptRunner::new();
+        r.rounds("pick", &[drafted, drafted]);
+        r.rounds("build", &[built, built]);
+        r.rounds("confirm", &[rejected, approved]);
+        let (out, rows) = rows_of(&fix_chain(Join::All), &mut r);
+
+        assert!(out.valid, "{:?}", out.results);
+        assert_eq!(
+            dispatches(&r),
+            [
+                "resolve", "pick", "build", "confirm", "pick", "build", "confirm", "deliver"
+            ]
+        );
+        assert_eq!(
+            rows,
+            [
+                row("resolve", TaskStatus::Pass),
+                row("pick[round-1]", TaskStatus::Pass),
+                row("build[round-1]", TaskStatus::Pass),
+                row("confirm[round-1]", TaskStatus::Fail),
+                row("pick[round-2]", TaskStatus::Pass),
+                row("build[round-2]", TaskStatus::Pass),
+                row("confirm[round-2]", TaskStatus::Pass),
+                row("pick", TaskStatus::Pass),
+                row("build", TaskStatus::Pass),
+                row("confirm", TaskStatus::Pass),
+                row("deliver", TaskStatus::Pass),
+            ]
+        );
+        let inputs_of = |name: &str| -> Vec<&BTreeMap<TaskName, Value>> {
+            r.runs
+                .iter()
+                .filter(|(n, _)| n == name)
+                .map(|(_, inputs)| inputs)
+                .collect()
+        };
+        let revision = TaskName(REVISION_INPUT.into());
+        for target in ["pick", "build"] {
+            let runs = inputs_of(target);
+            assert!(!runs[0].contains_key(&revision), "{target} round 1");
+            assert_eq!(runs[1][&revision]["round"], 2, "{target}");
+            assert_eq!(runs[1][&revision]["reviewer"], "confirm", "{target}");
+            assert_eq!(runs[1][&revision]["review"]["status"], "fail", "{target}");
+        }
+        assert!(
+            inputs_of("confirm")
+                .iter()
+                .all(|inputs| !inputs.contains_key(&revision)),
+            "the reviewer is never sent a revision"
+        );
+        assert!((out.results[&"build".into()].cost_usd - 0.2).abs() < 1e-9);
+        assert_eq!(
+            r.seen_values["deliver"][&TaskName("confirm".into())],
+            serde_json::json!({"verdict": "reproduced"})
+        );
+    }
+
+    #[test]
+    fn a_chain_task_that_fails_blocks_an_all_join_reviewer_and_ends_the_loop() {
+        let mut r = ScriptRunner::new();
+        r.rounds("build", &[broke]);
+        let (out, rows) = rows_of(&fix_chain(Join::All), &mut r);
+
+        assert!(!out.valid);
+        assert_eq!(
+            out.exit,
+            PlanExit::ShortCircuit {
+                task: "build".into()
+            }
+        );
+        assert_eq!(dispatches(&r), ["resolve", "pick", "build"]);
+        assert_eq!(
+            rows,
+            [
+                row("resolve", TaskStatus::Pass),
+                row("pick[round-1]", TaskStatus::Pass),
+                row("build[round-1]", TaskStatus::Fail),
+                row("confirm[round-1]", TaskStatus::Blocked),
+                row("pick", TaskStatus::Pass),
+                row("build", TaskStatus::Fail),
+                row("confirm", TaskStatus::Blocked),
+                row("deliver", TaskStatus::Blocked),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_settled_reviewer_sends_a_failed_chain_back() {
+        let mut r = ScriptRunner::new();
+        r.rounds("build", &[broke, built]);
+        r.rounds("confirm", &[rejected, approved]);
+        let (out, rows) = rows_of(&fix_chain(Join::Settled), &mut r);
+
+        assert!(out.valid, "{:?}", out.results);
+        assert!(rows.contains(&row("build[round-1]", TaskStatus::Fail)));
+        assert_eq!(out.results[&"build".into()].status, TaskStatus::Pass);
+        let entry = &r
+            .runs
+            .iter()
+            .find(|(n, _)| n == "confirm")
+            .map(|(_, i)| i)
+            .unwrap()[&TaskName("build".into())];
+        assert_eq!(entry["status"], "fail");
+    }
+
+    #[test]
+    fn an_untaken_chain_task_settles_not_taken_for_its_round_and_ends_the_loop() {
+        let plan = valid(
+            vec![
+                task("classify", &[], "any", true),
+                gate("area", area(&[]), true),
+                task("pick", &[], "any", true),
+                when(
+                    task("build", &["pick", "gate"], "any", true),
+                    "area",
+                    &["scheduler"],
+                ),
+                reviewing_chain("confirm", &["build"], &["pick", "build"], 3),
+                when(
+                    task("punt", &["gate"], "any", true),
+                    "area",
+                    &["frontend", "uncertain"],
+                ),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.on("classify", 1, says_frontend, 0.1);
+        let (out, rows) = rows_of(&plan, &mut r);
+
+        assert!(out.valid, "{:?}", out.results);
+        assert!(rows.contains(&row("pick[round-1]", TaskStatus::Pass)));
+        assert!(rows.contains(&row("build[round-1]", TaskStatus::NotTaken)));
+        assert!(rows.contains(&row("confirm[round-1]", TaskStatus::NotTaken)));
+        assert_eq!(out.results[&"build".into()].status, TaskStatus::NotTaken);
+        assert_eq!(out.results[&"confirm".into()].status, TaskStatus::NotTaken);
+        assert_eq!(
+            dispatches(&r)
+                .iter()
+                .filter(|n| ["pick", "build", "confirm"].contains(n))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_budget_spent_inside_a_round_blocks_the_rest_of_the_body() {
+        let plan = valid(fix_chain(Join::All).plan().tasks.clone(), 0.15);
+        let mut r = ScriptRunner::new();
+        let (out, rows) = rows_of(&plan, &mut r);
+
+        assert!(!out.valid);
+        assert_eq!(out.exit, PlanExit::BudgetExceeded);
+        assert_eq!(dispatches(&r), ["resolve", "pick"]);
+        assert_eq!(
+            rows,
+            [
+                row("resolve", TaskStatus::Pass),
+                row("pick[round-1]", TaskStatus::Pass),
+                row("build[round-1]", TaskStatus::Blocked),
+                row("confirm[round-1]", TaskStatus::Blocked),
+                row("pick", TaskStatus::Pass),
+                row("build", TaskStatus::Blocked),
+                row("confirm", TaskStatus::Blocked),
+                row("deliver", TaskStatus::Blocked),
+            ]
+        );
+        assert_eq!(
+            out.results[&"build".into()].blocked,
+            Some(BlockedReason::BudgetCeiling)
+        );
+    }
+
+    #[test]
+    fn the_reviewers_captured_evidence_is_staged_into_every_target() {
+        let mut tasks = fix_chain(Join::All).plan().tasks.clone();
+        for t in &mut tasks {
+            t.emits_files = vec![format!("{}.json", t.name)];
+        }
+        let plan = valid(tasks, 10.0);
+        let mut r = ScriptRunner::new();
+        r.captured.insert("confirm".into());
+        r.rounds("confirm", &[rejected, approved]);
+        let (out, _) = rows_of(&plan, &mut r);
+
+        assert!(out.valid);
+        assert_eq!(r.staged["pick"], ["resolve", "confirm"]);
+        assert_eq!(r.staged["build"], ["resolve", "pick", "confirm"]);
+        assert_eq!(r.staged["confirm"], ["resolve", "pick", "build"]);
+        for target in ["pick", "build"] {
+            let revision = &r.seen_values[target][&TaskName(REVISION_INPUT.into())];
+            assert_eq!(revision["review"]["files"], true, "{target}");
+        }
+    }
+
+    #[test]
+    fn a_chain_with_a_task_this_substrate_cannot_run_runs_as_plain_tasks() {
+        let mut tasks = fix_chain(Join::All).plan().tasks.clone();
+        for t in &mut tasks {
+            if t.name.0 == "build" {
+                t.needs = "gpu".into();
+                t.required = false;
+            }
+            if ["confirm", "deliver"].contains(&t.name.0.as_str()) {
+                t.required = false;
+            }
+        }
+        let plan = valid(tasks, 10.0);
+        let mut r = ScriptRunner::new();
+        let (_, rows) = rows_of(&plan, &mut r);
+
+        assert!(
+            !rows.iter().any(|(name, _)| name.contains("[round-")),
+            "{rows:?}"
+        );
+        assert!(rows.contains(&row("pick", TaskStatus::Pass)));
+        assert!(rows.contains(&row("build", TaskStatus::Skipped)));
+        assert_eq!(dispatches(&r), ["resolve", "pick"]);
+    }
+
+    #[test]
+    fn an_epilogue_loop_still_runs_after_a_required_short_circuit() {
+        let mut ea = task("ea", &[], "any", true);
+        ea.stage = Stage::Epilogue;
+        let mut er = reviewing("er", &["ea"], "ea", 2);
+        er.stage = Stage::Epilogue;
+        let plan = valid(vec![task("a", &[], "any", true), ea, er], 10.0);
+        let mut r = ScriptRunner::new();
+        r.on("a", 1, broke, 0.1);
+        r.rounds("er", &[rejected, approved]);
+        let (out, rows) = rows_of(&plan, &mut r);
+
+        assert!(!out.valid);
+        assert_eq!(out.exit, PlanExit::ShortCircuit { task: "a".into() });
+        assert_eq!(dispatches(&r), ["a", "ea", "er", "ea", "er"]);
+        assert!(rows.contains(&row("er", TaskStatus::Pass)), "{rows:?}");
+    }
+
+    #[test]
+    fn a_spent_budget_does_not_block_a_loop_that_would_not_dispatch() {
+        let plan = valid(
+            vec![
+                task("classify", &[], "any", true),
+                gate("area", area(&[]), true),
+                when(
+                    task("author", &["gate"], "any", true),
+                    "area",
+                    &["scheduler"],
+                ),
+                reviewing("repro", &["author"], "author", 3),
+                when(
+                    task("punt", &["gate"], "any", true),
+                    "area",
+                    &["frontend", "uncertain"],
+                ),
+            ],
+            0.1,
+        );
+        let mut r = ScriptRunner::new();
+        r.on("classify", 1, says_frontend, 0.05);
+        r.on("punt", 1, drafted, 0.05);
+        let (out, _) = rows_of(&plan, &mut r);
+
+        assert_eq!(out.results[&"author".into()].status, TaskStatus::NotTaken);
+        assert_eq!(out.results[&"repro".into()].status, TaskStatus::NotTaken);
+        assert_eq!(out.exit, PlanExit::Completed);
+        assert!(out.valid, "{:?}", out.results);
+    }
+
+    #[test]
+    fn a_spent_budget_leaves_a_blocked_chain_blocked_on_its_dependency() {
+        let mut x = task("x", &[], "any", false);
+        x.required = false;
+        let plan = valid(
+            vec![
+                x,
+                task("pick", &["x"], "any", false),
+                task("build", &["pick"], "any", false),
+                reviewing_chain("confirm", &["build"], &["pick", "build"], 2),
+            ]
+            .into_iter()
+            .map(|mut t| {
+                t.required = false;
+                t
+            })
+            .collect(),
+            0.1,
+        );
+        let mut r = ScriptRunner::new();
+        r.on("x", 1, broke, 0.1);
+        let (out, _) = rows_of(&plan, &mut r);
+
+        assert_eq!(
+            out.results[&"pick".into()].blocked,
+            Some(BlockedReason::DependencyDidNotPass)
+        );
+        assert_eq!(out.exit, PlanExit::Completed);
+    }
+
+    #[test]
+    fn a_later_body_tasks_outside_input_gates_the_first_round() {
+        let plan = valid(
+            vec![
+                task("pick", &[], "any", true),
+                task("build", &["pick", "rig"], "any", true),
+                reviewing_chain("confirm", &["build"], &["pick", "build"], 2),
+                task("rig", &[], "any", true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        let (out, _) = rows_of(&plan, &mut r);
+
+        assert!(out.valid);
+        assert_eq!(dispatches(&r), ["rig", "pick", "build", "confirm"]);
+    }
+
+    #[test]
+    fn a_dependent_of_a_middle_body_task_waits_for_the_loop_and_reads_its_last_round() {
+        let plan = valid(
+            vec![
+                task("pick", &[], "any", true),
+                task("build", &["pick"], "any", true),
+                reviewing_chain("confirm", &["build"], &["pick", "build"], 3),
+                task("ship", &["build"], "any", true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.rounds(
+            "build",
+            &[
+                || AttemptOutcome::Pass(serde_json::json!({"digest": 1})),
+                || AttemptOutcome::Pass(serde_json::json!({"digest": 2})),
+            ],
+        );
+        r.rounds("confirm", &[rejected, approved]);
+        let (out, _) = rows_of(&plan, &mut r);
+
+        assert!(out.valid);
+        assert_eq!(
+            dispatches(&r),
+            [
+                "pick", "build", "confirm", "pick", "build", "confirm", "ship"
+            ]
+        );
+        assert_eq!(
+            r.seen_values["ship"][&TaskName("build".into())],
+            serde_json::json!({"digest": 2})
+        );
+    }
+
+    #[test]
+    fn a_chain_loop_holds_its_invariants_under_every_outcome() {
+        type Outcome = fn() -> AttemptOutcome;
+        let target_outcomes: [Outcome; 2] = [drafted, broke];
+        let reviewer_outcomes: [Outcome; 3] = [approved, rejected, || {
+            AttemptOutcome::Skipped(serde_json::json!({"status": "skipped"}), "n/a".into())
+        }];
+        let sequences = |choices: &[Outcome]| -> Vec<Vec<Outcome>> {
+            let mut out = vec![Vec::new()];
+            for _ in 0..3 {
+                out = out
+                    .into_iter()
+                    .flat_map(|prefix: Vec<Outcome>| {
+                        choices.iter().map(move |c| {
+                            let mut next = prefix.clone();
+                            next.push(*c);
+                            next
+                        })
+                    })
+                    .collect();
+            }
+            out
+        };
+        let mut second_rounds = 0;
+        for join in [Join::All, Join::Settled] {
+            let plan = valid(
+                vec![
+                    task("a", &[], "any", true),
+                    task("b", &["a"], "any", true),
+                    joining(reviewing_chain("r", &["b"], &["a", "b"], 3), join),
+                    task("after", &["r"], "any", true),
+                ],
+                10.0,
+            );
+            for a in sequences(&target_outcomes) {
+                for b in sequences(&target_outcomes) {
+                    for rv in sequences(&reviewer_outcomes) {
+                        let mut r = ScriptRunner::new();
+                        r.rounds("a", &a);
+                        r.rounds("b", &b);
+                        r.rounds("r", &rv);
+                        let (out, rows) = rows_of(&plan, &mut r);
+                        let round_of = |name: &str, task: &str| -> Option<u32> {
+                            name.strip_prefix(task)?
+                                .strip_prefix("[round-")?
+                                .strip_suffix(']')?
+                                .parse()
+                                .ok()
+                        };
+                        let rounds = rows.iter().filter_map(|(n, _)| round_of(n, "r")).max();
+                        let ctx = format!("{join:?} {rows:?}");
+                        if let Some(rounds) = rounds {
+                            assert!(rounds <= 3, "{ctx}");
+                            if rounds > 1 {
+                                second_rounds += 1;
+                            }
+                            for round in 1..rounds {
+                                assert!(
+                                    rows.contains(&row(
+                                        &format!("r[round-{round}]"),
+                                        TaskStatus::Fail
+                                    )),
+                                    "a round only follows a failing review: {ctx}"
+                                );
+                            }
+                            for t in ["a", "b", "r"] {
+                                let last = rows
+                                    .iter()
+                                    .find(|(n, _)| n == &format!("{t}[round-{rounds}]"))
+                                    .map(|(_, s)| *s);
+                                let own = rows.iter().find(|(n, _)| n == t).map(|(_, s)| *s);
+                                assert_eq!(last, own, "{t} settles as its last round: {ctx}");
+                                assert_eq!(
+                                    rows.iter()
+                                        .filter(|(n, _)| round_of(n, t).is_some())
+                                        .count(),
+                                    rounds as usize,
+                                    "{t} has one row per round: {ctx}"
+                                );
+                            }
+                        }
+                        let own_rows: Vec<&str> = rows
+                            .iter()
+                            .map(|(n, _)| n.as_str())
+                            .filter(|n| !n.contains('['))
+                            .collect();
+                        let after = own_rows.iter().position(|n| *n == "after");
+                        let r_at = own_rows.iter().position(|n| *n == "r");
+                        assert!(after > r_at, "a dependent settles after the loop: {ctx}");
+                        let revision = TaskName(REVISION_INPUT.into());
+                        let mut reviews = 0;
+                        for (name, inputs) in &r.runs {
+                            let carried = inputs.get(&revision);
+                            let owed = ["a", "b"].contains(&name.as_str()) && reviews > 0;
+                            assert_eq!(carried.is_some(), owed, "{name}: {ctx}");
+                            if let Some(carried) = carried {
+                                assert_eq!(carried["round"], reviews + 1, "{name}: {ctx}");
+                            }
+                            if name == "r" {
+                                reviews += 1;
+                            }
+                        }
+                        let valid = ["a", "b", "r", "after"].iter().all(|t| {
+                            out.results[&TaskName((*t).into())].status == TaskStatus::Pass
+                        });
+                        assert_eq!(out.valid, valid, "{ctx}");
+                    }
+                }
+            }
+        }
+        assert!(second_rounds > 100, "{second_rounds}");
+    }
+
     /// An epilogue declared ahead of the main graph still reports a short circuit whose last
     /// blocked task settles after the epilogue's own place in the scan.
     #[test]
@@ -5852,7 +7349,14 @@ mod tests {
             task: &Task,
             _attempt: u32,
             _inputs: &BTreeMap<TaskName, Value>,
+            deadline: Option<Deadline>,
         ) -> Attempt {
+            assert_eq!(
+                deadline.map(|d| d.bound),
+                task.timeout.map(Bound::Task),
+                "{} ran under the wrong deadline",
+                task.name
+            );
             self.log
                 .borrow_mut()
                 .push(GraphEvent::Run(vec![task.name.0.clone()]));
@@ -5868,34 +7372,94 @@ mod tests {
             ));
             batch
                 .iter()
-                .map(|b| Attempt {
-                    outcome: self.outcomes[&b.task.name.0](),
-                    cost_usd: 0.1,
+                .map(|b| {
+                    assert_eq!(
+                        b.deadline.map(|d| d.bound),
+                        b.task.timeout.map(Bound::Task),
+                        "{} ran under another item's deadline",
+                        b.task.name
+                    );
+                    Attempt {
+                        outcome: self.outcomes[&b.task.name.0](),
+                        cost_usd: 0.1,
+                    }
                 })
                 .collect()
         }
     }
 
+    const THREE_TASK_EDGES: [(usize, usize); 3] = [(1, 0), (2, 0), (2, 1)];
+    const _: () = assert!(
+        1 << THREE_TASK_EDGES.len() == 8,
+        "one test per edge set below"
+    );
+
     /// The invariants formal/CrucibleSpec/PlanExec.lean proves for the model, checked against
     /// `execute` on every three-task graph: every edge set, stage split, required set, substrate
     /// fit, join, isolation split, per-task outcome, and a budget that does and does not run out.
+    /// One test per edge set, so nextest runs them in parallel.
+    /// Every task declares a typed `score`, and the last outcome is a pass whose `score` is not a
+    /// number: output drift must settle as a measured failure wherever it lands in the graph.
     #[test]
-    fn every_three_task_graph_keeps_the_model_invariants() {
+    fn every_three_task_graph_keeps_the_model_invariants_edges_0() {
+        three_task_graphs_keep_the_model_invariants(0);
+    }
+    #[test]
+    fn every_three_task_graph_keeps_the_model_invariants_edges_1() {
+        three_task_graphs_keep_the_model_invariants(1);
+    }
+    #[test]
+    fn every_three_task_graph_keeps_the_model_invariants_edges_2() {
+        three_task_graphs_keep_the_model_invariants(2);
+    }
+    #[test]
+    fn every_three_task_graph_keeps_the_model_invariants_edges_3() {
+        three_task_graphs_keep_the_model_invariants(3);
+    }
+    #[test]
+    fn every_three_task_graph_keeps_the_model_invariants_edges_4() {
+        three_task_graphs_keep_the_model_invariants(4);
+    }
+    #[test]
+    fn every_three_task_graph_keeps_the_model_invariants_edges_5() {
+        three_task_graphs_keep_the_model_invariants(5);
+    }
+    #[test]
+    fn every_three_task_graph_keeps_the_model_invariants_edges_6() {
+        three_task_graphs_keep_the_model_invariants(6);
+    }
+    #[test]
+    fn every_three_task_graph_keeps_the_model_invariants_edges_7() {
+        three_task_graphs_keep_the_model_invariants(7);
+    }
+
+    fn three_task_graphs_keep_the_model_invariants(edges: u32) {
         const N: usize = 3;
-        const EDGES: [(usize, usize); 3] = [(1, 0), (2, 0), (2, 1)];
-        let outcomes: [fn() -> AttemptOutcome; 4] = [
-            || AttemptOutcome::Pass(serde_json::json!({})),
+        const EDGES: [(usize, usize); 3] = THREE_TASK_EDGES;
+        const DRIFTED: usize = 4;
+        let outcomes: [fn() -> AttemptOutcome; 6] = [
+            || AttemptOutcome::Pass(serde_json::json!({"score": 1})),
             || AttemptOutcome::Fail {
                 note: "measured".into(),
                 output: None,
             },
             || AttemptOutcome::Skipped(serde_json::json!({}), "inapplicable".into()),
             || AttemptOutcome::Transport(TransportFailure::new(TransportCause::Other, "blip")),
+            || AttemptOutcome::Pass(serde_json::json!({"score": "high"})),
+            || {
+                AttemptOutcome::TimedOut(Deadline {
+                    at: Instant::now(),
+                    bound: Bound::Task(own_limit()),
+                })
+            },
         ];
+        let pick = |outcome_pick: usize, t: usize| {
+            outcome_pick / outcomes.len().pow(t as u32) % outcomes.len()
+        };
         let joins = [Join::All, Join::Passed, Join::Settled];
         let name = |i: usize| format!("t{i}");
         let mut runs = 0usize;
-        for edges in 0..(1u32 << EDGES.len()) {
+        {
             let deps = |t: usize| -> Vec<usize> {
                 EDGES
                     .iter()
@@ -5939,6 +7503,16 @@ mod tests {
                                             if is_epilogue(t) {
                                                 task.stage = Stage::Epilogue;
                                             }
+                                            task.emits = crate::plan::ir::Emits::Typed(
+                                                [(
+                                                    crate::plan::ir::OutputField("score".into()),
+                                                    FieldType::Number,
+                                                )]
+                                                .into(),
+                                            );
+                                            if t % 2 == 1 {
+                                                task.timeout = Some(own_limit());
+                                            }
                                             task
                                         })
                                         .collect();
@@ -5946,6 +7520,7 @@ mod tests {
                                         version: 1,
                                         reason: None,
                                         budget: PlanBudget { usd: budget },
+                                        params: std::collections::BTreeMap::new(),
                                         tasks: tasks.clone(),
                                     })
                                     .validate() else {
@@ -5954,10 +7529,7 @@ mod tests {
                                     let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
                                     let mut runner = GraphRunner {
                                         outcomes: (0..N)
-                                            .map(|t| {
-                                                let pick = outcome_pick / 4usize.pow(t as u32) % 4;
-                                                (name(t), outcomes[pick])
-                                            })
+                                            .map(|t| (name(t), outcomes[pick(outcome_pick, t)]))
                                             .collect(),
                                         log: log.clone(),
                                     };
@@ -5974,7 +7546,11 @@ mod tests {
                                             ))
                                         },
                                     );
-                                    check_graph(&tasks, &out, &log.borrow(), budget);
+                                    let drifted: BTreeSet<String> = (0..N)
+                                        .filter(|&t| pick(outcome_pick, t) == DRIFTED)
+                                        .map(name)
+                                        .collect();
+                                    check_graph(&tasks, &out, &log.borrow(), budget, &drifted);
                                     runs += 1;
                                 }
                             }
@@ -5983,10 +7559,20 @@ mod tests {
                 }
             }
         }
-        assert!(runs > 100_000, "the enumeration shrank to {runs} runs");
+        assert!(runs > 50_000, "edge set {edges} shrank to {runs} runs");
     }
 
-    fn check_graph(tasks: &[Task], out: &PlanOutcome, log: &[GraphEvent], budget: f64) {
+    fn own_limit() -> crate::duration::TaskTimeout {
+        "1h".parse().expect("1h is a timeout")
+    }
+
+    fn check_graph(
+        tasks: &[Task],
+        out: &PlanOutcome,
+        log: &[GraphEvent],
+        budget: f64,
+        drifted: &BTreeSet<String>,
+    ) {
         let ctx = || format!("{tasks:#?}\n{log:?}\n{:?}", out.exit);
         let status = |t: &Task| out.results[&t.name].status;
         let held = |t: &Task| matches!(status(t), TaskStatus::Pass | TaskStatus::NotTaken);
@@ -6136,6 +7722,597 @@ mod tests {
             if status(t) == TaskStatus::NotTaken {
                 assert_eq!(n, 0, "{}", ctx());
             }
+            // Output drift is a measured failure at the producer: it never passes, never retries.
+            if drifted.contains(&t.name.0) {
+                assert_ne!(status(t), TaskStatus::Pass, "{}", ctx());
+                if n > 0 {
+                    assert_eq!((n, status(t)), (1, TaskStatus::Fail), "{}", ctx());
+                }
+            }
         }
+    }
+
+    fn series(runs: &[&str]) -> crate::plan::history::SeriesHistory {
+        let records: Vec<Value> = runs
+            .iter()
+            .enumerate()
+            .map(|(i, run)| {
+                serde_json::json!({
+                    "run": run,
+                    "started_at": "2026-09-01T00:00:00Z",
+                    "ended_at": format!("2026-09-{:02}T00:00:00Z", i + 2),
+                    "outcome": "finished",
+                    "verdict": "valid",
+                    "revision": "rev",
+                    "link": format!("https://controller.test/runs/{run}"),
+                    "entry": {"task": "t", "status": "pass", "output": {}},
+                })
+            })
+            .collect();
+        crate::plan::history::SeriesHistory::parse(
+            &serde_json::json!({"version": 1, "records": records}).to_string(),
+            crate::plan::history::HistoryLimit {
+                bytes: u64::MAX,
+                source: crate::plan::history::LimitSource::Operator,
+            },
+        )
+        .unwrap()
+    }
+
+    fn history_runs(inputs: &BTreeMap<TaskName, Value>) -> Option<Vec<String>> {
+        inputs.get(&TaskName(HISTORY_INPUT.to_string())).map(|h| {
+            h["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["run"].as_str().unwrap().to_owned())
+                .collect()
+        })
+    }
+
+    /// Every dispatch of a task that declares a depth gets its history, whatever path dispatched
+    /// it: a plain task, each instance of a fan-out, every round of a revise loop on both sides.
+    /// A task that declares none gets no key at all.
+    #[test]
+    fn every_dispatch_of_a_task_with_a_depth_receives_its_history() {
+        let mut list = task("list", &[], "any", true);
+        list.emits =
+            crate::plan::ir::Emits::Fields(vec![crate::plan::ir::OutputField("items".into())]);
+        let mut each = mapped_node("each", "list", "items", true);
+        each.history = Some(1);
+        let mut author = task("author", &["list"], "any", true);
+        author.history = Some(2);
+        let mut review = reviewing("review", &["author"], "author", 2);
+        review.history = Some(3);
+        let plain = task("plain", &["review"], "any", true);
+        let plan = valid(vec![list, each, author, review, plain], 10.0);
+
+        let history = series(&["r1", "r2", "r3", "r4"]);
+        let mut r = ScriptRunner::new();
+        r.on(
+            "list",
+            1,
+            || AttemptOutcome::Pass(serde_json::json!({"items": ["a", "b"]})),
+            0.1,
+        );
+        r.rounds("review", &[rejected, approved]);
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg {
+                history: Some(&history),
+                ..ExecCfg::default()
+            },
+            &mut r,
+            |_, _| {},
+        );
+        assert!(out.valid, "{:?}", out.results);
+
+        let seen: Vec<(String, Option<Vec<String>>)> = r
+            .runs
+            .iter()
+            .map(|(task, inputs)| (task.clone(), history_runs(inputs)))
+            .collect();
+        let owned = |runs: &[&str]| Some(runs.iter().map(|r| (*r).to_owned()).collect());
+        assert_eq!(
+            seen,
+            vec![
+                ("list".to_owned(), None),
+                ("each[a]".to_owned(), owned(&["r4"])),
+                ("each[b]".to_owned(), owned(&["r4"])),
+                ("author".to_owned(), owned(&["r3", "r4"])),
+                ("review".to_owned(), owned(&["r2", "r3", "r4"])),
+                ("author".to_owned(), owned(&["r3", "r4"])),
+                ("review".to_owned(), owned(&["r2", "r3", "r4"])),
+                ("plain".to_owned(), None),
+            ]
+        );
+        let revised = &r.runs[5].1;
+        assert!(revised.contains_key(&TaskName(REVISION_INPUT.to_string())));
+    }
+
+    #[test]
+    fn a_task_with_a_depth_in_a_run_with_no_series_gets_an_empty_history() {
+        let mut reader = task("reader", &[], "any", true);
+        reader.history = Some(5);
+        let plan = valid(vec![reader], 1.0);
+        let mut r = ScriptRunner::new();
+        let out = run_plan(&plan, &mut r);
+        assert!(out.valid);
+        assert_eq!(
+            r.seen_values["reader"][&TaskName(HISTORY_INPUT.to_string())],
+            serde_json::json!({"records": [], "dropped": 0})
+        );
+    }
+
+    fn with_params(tasks: Vec<Task>) -> ValidPlan {
+        use crate::plan::param::ParamValue;
+        Plan {
+            version: 1,
+            reason: None,
+            budget: PlanBudget { usd: 10.0 },
+            params: [
+                ("url", ParamValue::String("https://example.test/a b".into())),
+                ("steps", ParamValue::Int(3)),
+                ("ratio", ParamValue::Number(0.5)),
+                ("dry_run", ParamValue::Bool(true)),
+                (
+                    "labels",
+                    ParamValue::StringList(vec!["ci".into(), "flaky".into()]),
+                ),
+            ]
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value))
+            .collect(),
+            tasks,
+        }
+        .validate()
+        .unwrap()
+    }
+
+    fn params_of(inputs: &BTreeMap<TaskName, Value>) -> Option<&Value> {
+        inputs.get(&TaskName(PARAMS_INPUT.to_string()))
+    }
+
+    fn agent_task(name: &str, deps: &[&str]) -> Task {
+        Task {
+            task: TaskKind::Agent {
+                prompt: "summarize".into(),
+                harness: None,
+                model: None,
+                effort: None,
+            },
+            ..task(name, deps, "any", true)
+        }
+    }
+
+    fn evaluate_task(name: &str, deps: &[&str]) -> Task {
+        Task {
+            task: TaskKind::Evaluate {
+                command: "true".into(),
+                threshold: None,
+                direction: None,
+            },
+            ..task(name, deps, "any", true)
+        }
+    }
+
+    /// A command reads a launch parameter as data, each value in the type its declaration gave
+    /// it, beside its dependencies' outputs rather than in place of them.
+    #[test]
+    fn command_and_evaluate_tasks_read_every_bound_parameter_in_its_declared_type() {
+        let plan = with_params(vec![
+            task("fetch", &[], "any", true),
+            evaluate_task("check", &["fetch"]),
+            agent_task("summarize", &["fetch"]),
+        ]);
+        let mut r = ScriptRunner::new();
+        let out = run_plan(&plan, &mut r);
+
+        assert!(out.valid);
+        let expected = serde_json::json!({
+            "url": "https://example.test/a b",
+            "steps": 3,
+            "ratio": 0.5,
+            "dry_run": true,
+            "labels": ["ci", "flaky"],
+        });
+        for consumer in ["fetch", "check"] {
+            let params = params_of(&r.seen_values[consumer]);
+            assert_eq!(params, Some(&expected), "{consumer}");
+            let params = params.unwrap();
+            assert!(params["steps"].is_i64(), "an int widened: {params}");
+            assert!(params["ratio"].is_f64(), "a number narrowed: {params}");
+        }
+        assert_eq!(
+            r.seen_inputs["check"],
+            vec!["fetch".to_string(), PARAMS_INPUT.to_string()],
+            "params sits beside the dependency's output"
+        );
+    }
+
+    #[test]
+    fn a_plan_without_parameters_gives_a_command_an_empty_params_object() {
+        let plan = valid(
+            vec![task("a", &[], "any", true), evaluate_task("b", &["a"])],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        run_plan(&plan, &mut r);
+
+        for consumer in ["a", "b"] {
+            assert_eq!(
+                params_of(&r.seen_values[consumer]),
+                Some(&serde_json::json!({})),
+                "{consumer}"
+            );
+        }
+    }
+
+    /// An agent's parameter values reach it only through the prompt regions that mark them as
+    /// outside text, so its inputs never carry them unmarked.
+    #[test]
+    fn an_agent_task_receives_no_params_input() {
+        let plan = with_params(vec![
+            task("fetch", &[], "any", true),
+            agent_task("summarize", &["fetch"]),
+        ]);
+        let mut r = ScriptRunner::new();
+        run_plan(&plan, &mut r);
+
+        assert_eq!(params_of(&r.seen_values["summarize"]), None);
+        assert_eq!(r.seen_inputs["summarize"], vec!["fetch".to_string()]);
+    }
+
+    /// A settled consumer's params is the reserved input, not a dependency entry wrapping it.
+    #[test]
+    fn a_settled_joins_params_is_not_wrapped_in_a_dependency_entry() {
+        let plan = with_params(vec![
+            task("probe", &[], "any", false),
+            joining(evaluate_task("verdict", &["probe"]), Join::Settled),
+        ]);
+        let mut r = ScriptRunner::new();
+        r.on("probe", 1, || AttemptOutcome::fail("no signal"), 0.1);
+        run_plan(&plan, &mut r);
+
+        let params = params_of(&r.seen_values["verdict"]);
+        assert_eq!(params.map(|p| &p["steps"]), Some(&serde_json::json!(3)));
+        assert!(
+            params.is_some_and(|p| p.get("status").is_none()),
+            "{params:?}"
+        );
+    }
+
+    #[test]
+    fn every_round_of_a_revise_loop_and_every_mapped_instance_reads_the_parameters() {
+        let plan = with_params(vec![
+            task("author", &[], "any", true),
+            reviewing("repro", &["author"], "author", 3),
+        ]);
+        let mut r = ScriptRunner::new();
+        r.rounds("author", &[drafted, drafted]);
+        r.rounds("repro", &[rejected, approved]);
+        run_plan(&plan, &mut r);
+
+        assert_eq!(r.runs.len(), 4, "{:?}", r.runs);
+        for (name, inputs) in &r.runs {
+            assert_eq!(
+                params_of(inputs).map(|p| &p["url"]),
+                Some(&serde_json::json!("https://example.test/a b")),
+                "{name}"
+            );
+        }
+
+        let plan = with_params(vec![
+            task("discover", &[], "any", true),
+            mapped_node("audit", "discover", "targets", true),
+        ]);
+        let mut runner = FanoutRunner::new(&["alpha", "beta"]);
+        execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut runner,
+            |_, _| {},
+        );
+        for instance in ["audit[alpha]", "audit[beta]"] {
+            assert_eq!(
+                params_of(&runner.seen_inputs[instance]).map(|p| &p["labels"]),
+                Some(&serde_json::json!(["ci", "flaky"])),
+                "{instance}"
+            );
+        }
+    }
+
+    fn completes() -> AttemptOutcome {
+        AttemptOutcome::Pass(serde_json::json!({"complete": true, "reason": "nothing new"}))
+    }
+
+    fn broken() -> AttemptOutcome {
+        AttemptOutcome::Fail {
+            note: "measured".into(),
+            output: None,
+        }
+    }
+
+    fn completing_cfg() -> ExecCfg<'static> {
+        ExecCfg {
+            early_completion: true,
+            ..ExecCfg::default()
+        }
+    }
+
+    fn run_completing(plan: &ValidPlan, r: &mut ScriptRunner) -> (PlanOutcome, Vec<String>) {
+        let mut rows = Vec::new();
+        let out = execute(plan, &any_substrate(), completing_cfg(), r, |t, _| {
+            rows.push(t.name.0.clone())
+        });
+        (out, rows)
+    }
+
+    fn early_exit(task: &str) -> PlanExit {
+        PlanExit::CompletedEarly {
+            task: task.into(),
+            reason: Some("nothing new".into()),
+        }
+    }
+
+    #[test]
+    fn early_completion_stops_dispatch_and_leaves_the_rest_unsettled() {
+        let plan = valid(
+            vec![
+                task("a", &[], "any", true),
+                task("b", &["a"], "any", true),
+                task("c", &["b"], "any", true),
+                task("d", &[], "any", true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.rounds("b", &[completes]);
+        let (out, rows) = run_completing(&plan, &mut r);
+
+        assert!(out.valid, "{:?}", out.results);
+        assert_eq!(out.exit, early_exit("b"));
+        assert_eq!(out.exit.shutdown_token(), "complete");
+        assert_eq!(dispatches(&r), ["a", "b"]);
+        assert_eq!(rows, ["a", "b"]);
+        assert!(!out.results.contains_key(&"c".into()));
+        assert!(!out.results.contains_key(&"d".into()));
+    }
+
+    #[test]
+    fn completion_without_a_reason_records_none() {
+        let plan = valid(
+            vec![task("a", &[], "any", true), task("b", &["a"], "any", true)],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.rounds(
+            "a",
+            &[|| AttemptOutcome::Pass(serde_json::json!({"complete": true}))],
+        );
+        let (out, _) = run_completing(&plan, &mut r);
+        assert!(out.valid);
+        assert_eq!(
+            out.exit,
+            PlanExit::CompletedEarly {
+                task: "a".into(),
+                reason: None
+            }
+        );
+    }
+
+    #[test]
+    fn only_a_passing_true_boolean_declares_completion() {
+        for outcome in [
+            (|| AttemptOutcome::Pass(serde_json::json!({"complete": "true"}))) as fn() -> _,
+            || AttemptOutcome::Pass(serde_json::json!({"complete": false})),
+            || AttemptOutcome::Fail {
+                note: "measured".into(),
+                output: Some(serde_json::json!({"complete": true})),
+            },
+        ] {
+            let plan = valid(
+                vec![task("a", &[], "any", false), task("b", &[], "any", true)],
+                10.0,
+            );
+            let mut r = ScriptRunner::new();
+            r.rounds("a", &[outcome]);
+            let (out, _) = run_completing(&plan, &mut r);
+            assert!(
+                !matches!(out.exit, PlanExit::CompletedEarly { .. }),
+                "{:?}",
+                out.results
+            );
+            assert!(out.results.contains_key(&"b".into()));
+        }
+    }
+
+    #[test]
+    fn the_scored_loop_ignores_a_completion_field() {
+        let plan = valid(
+            vec![task("a", &[], "any", true), task("b", &["a"], "any", true)],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.rounds("a", &[completes]);
+        let (out, rows) = rows_of(&plan, &mut r);
+        assert_eq!(out.exit, PlanExit::Completed);
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn a_required_failure_beside_a_completion_keeps_the_run_invalid() {
+        let mut x = task("x", &[], "any", true);
+        x.isolation = Some(crate::plan::ir::Isolation::Worktree);
+        let mut y = task("y", &[], "any", true);
+        y.isolation = Some(crate::plan::ir::Isolation::Worktree);
+        let plan = valid(vec![x, y, task("z", &["y"], "any", true)], 10.0);
+        let mut r = ScriptRunner::new();
+        r.rounds("x", &[broken]);
+        r.rounds("y", &[completes]);
+        let (out, _) = run_completing(&plan, &mut r);
+
+        assert!(!out.valid);
+        assert_eq!(out.exit, early_exit("y"));
+        assert_eq!(out.results[&"x".into()].status, TaskStatus::Fail);
+        assert!(
+            !out.results.contains_key(&"z".into()),
+            "an undispatched task is not settled blocked"
+        );
+    }
+
+    #[test]
+    fn batch_siblings_of_a_completion_settle_and_nothing_after_dispatches() {
+        let mut x = task("x", &[], "any", true);
+        x.isolation = Some(crate::plan::ir::Isolation::Worktree);
+        let mut y = task("y", &[], "any", true);
+        y.isolation = Some(crate::plan::ir::Isolation::Worktree);
+        let plan = valid(vec![x, y, task("z", &["x", "y"], "any", true)], 10.0);
+        let mut r = ScriptRunner::new();
+        r.rounds("x", &[completes]);
+        let (out, rows) = run_completing(&plan, &mut r);
+
+        assert!(out.valid);
+        assert_eq!(out.exit, early_exit("x"));
+        assert_eq!(rows, ["x", "y"]);
+        assert_eq!(out.results[&"y".into()].status, TaskStatus::Pass);
+    }
+
+    #[test]
+    fn an_epilogue_runs_after_early_completion_and_reads_exit_complete() {
+        let plan = valid(
+            vec![
+                task("a", &[], "any", true),
+                task("b", &["a"], "any", true),
+                epilogue("report", &[], true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.rounds("a", &[completes]);
+        let (out, rows) = run_completing(&plan, &mut r);
+
+        assert!(out.valid);
+        assert_eq!(rows, ["a", "report"]);
+        let outcome = &r.seen_values["report"][&TaskName(OUTCOME_INPUT.into())];
+        assert_eq!(outcome["exit"], "complete");
+        assert_eq!(outcome["tasks"]["a"]["status"], "pass");
+        assert!(outcome["tasks"].get("b").is_none(), "{outcome}");
+    }
+
+    #[test]
+    fn a_settled_join_consumer_is_not_dispatched_after_early_completion() {
+        let plan = valid(
+            vec![
+                task("a", &[], "any", true),
+                settled_task("summary", &["a"], true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.rounds("a", &[completes]);
+        let (out, rows) = run_completing(&plan, &mut r);
+
+        assert!(out.valid);
+        assert_eq!(rows, ["a"]);
+        assert!(!out.results.contains_key(&"summary".into()));
+    }
+
+    #[test]
+    fn a_mapped_instance_declaring_completion_stops_dispatch_after_its_node() {
+        let plan = valid(
+            vec![
+                task("discover", &[], "any", true),
+                mapped_node("audit", "discover", "targets", true),
+                task("after", &["audit"], "any", true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.on(
+            "discover",
+            1,
+            || AttemptOutcome::Pass(serde_json::json!({"targets": ["p", "q"]})),
+            0.1,
+        );
+        r.rounds("audit[p]", &[completes]);
+        let (out, rows) = run_completing(&plan, &mut r);
+
+        assert!(out.valid, "{:?}", out.results);
+        assert_eq!(out.exit, early_exit("audit[p]"));
+        assert_eq!(rows, ["discover", "audit[p]", "audit[q]", "audit"]);
+        assert!(!out.results.contains_key(&"after".into()));
+    }
+
+    #[test]
+    fn a_revised_task_declaring_completion_ends_its_loop_unreviewed() {
+        let plan = valid(
+            vec![
+                task("author", &[], "any", true),
+                reviewing("repro", &["author"], "author", 3),
+                task("after", &["repro"], "any", true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.rounds("author", &[drafted, completes]);
+        r.rounds("repro", &[rejected]);
+        let (out, rows) = run_completing(&plan, &mut r);
+
+        assert!(out.valid, "{:?}", out.results);
+        assert_eq!(out.exit, early_exit("author"));
+        assert_eq!(dispatches(&r), ["author", "repro", "author"]);
+        assert_eq!(
+            rows,
+            [
+                "author[round-1]",
+                "repro[round-1]",
+                "author[round-2]",
+                "author"
+            ]
+        );
+        assert!((out.results[&"author".into()].cost_usd - 0.2).abs() < 1e-9);
+        assert!(!out.results.contains_key(&"repro".into()));
+    }
+
+    #[test]
+    fn a_reviewer_declaring_completion_ends_the_run_after_its_loop() {
+        let plan = valid(
+            vec![
+                task("author", &[], "any", true),
+                reviewing("repro", &["author"], "author", 3),
+                task("after", &["repro"], "any", true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.rounds("repro", &[completes]);
+        let (out, rows) = run_completing(&plan, &mut r);
+
+        assert!(out.valid);
+        assert_eq!(out.exit, early_exit("repro"));
+        assert_eq!(
+            rows,
+            ["author[round-1]", "repro[round-1]", "author", "repro"]
+        );
+    }
+
+    #[test]
+    fn an_epilogue_task_declaring_completion_changes_nothing() {
+        let plan = valid(
+            vec![
+                task("a", &[], "any", true),
+                epilogue("first", &[], true),
+                epilogue("second", &[], true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.rounds("first", &[completes]);
+        let (out, rows) = run_completing(&plan, &mut r);
+        assert_eq!(out.exit, PlanExit::Completed);
+        assert_eq!(rows, ["a", "first", "second"]);
     }
 }

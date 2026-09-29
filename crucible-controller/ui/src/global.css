@@ -6,6 +6,7 @@
 @import '@fontsource/public-sans/latin-700.css';
 
 @import '@xyflow/react/dist/style.css';
+@import './brands/redhat.css';
 
 @font-face {
   font-family: 'Ioskeley Mono';

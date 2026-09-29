@@ -214,6 +214,7 @@ pub(crate) enum Classification {
 pub(crate) enum ShutdownOutcome {
     Finished,
     Solved,
+    Complete,
     Budget,
     Stopped,
     Escalated,
@@ -227,6 +228,7 @@ impl ShutdownOutcome {
         match token {
             "finished" => ShutdownOutcome::Finished,
             "solved" => ShutdownOutcome::Solved,
+            "complete" => ShutdownOutcome::Complete,
             "budget" => ShutdownOutcome::Budget,
             "stopped" => ShutdownOutcome::Stopped,
             "escalated" => ShutdownOutcome::Escalated,
@@ -240,6 +242,7 @@ impl ShutdownOutcome {
         match self {
             ShutdownOutcome::Finished => "finished",
             ShutdownOutcome::Solved => "solved",
+            ShutdownOutcome::Complete => "complete",
             ShutdownOutcome::Budget => "budget",
             ShutdownOutcome::Stopped => "stopped",
             ShutdownOutcome::Escalated => "escalated",
@@ -623,7 +626,7 @@ pub(crate) fn plan_recovery(s: &SessionRecovery, iterations: u32, max_cost: f64)
     };
     if let Classification::CleanExit { outcome, reason } = &s.classification {
         match outcome {
-            ShutdownOutcome::Finished | ShutdownOutcome::Solved => {
+            ShutdownOutcome::Finished | ShutdownOutcome::Solved | ShutdownOutcome::Complete => {
                 return RecoveryPlan::NoOp {
                     message: format!("run already {}: {reason}", outcome.as_str()),
                 };
@@ -780,6 +783,7 @@ mod tests {
         for (token, want) in [
             ("finished", ShutdownOutcome::Finished),
             ("solved", ShutdownOutcome::Solved),
+            ("complete", ShutdownOutcome::Complete),
             ("budget", ShutdownOutcome::Budget),
             ("stopped", ShutdownOutcome::Stopped),
             ("escalated", ShutdownOutcome::Escalated),
@@ -929,8 +933,11 @@ mod tests {
                     over: String::new(),
                     max_fanout: 0,
                     when: String::new(),
-                    revise: String::new(),
+                    revise: Vec::new(),
+                    timeout: String::new(),
                     max_rounds: 0,
+                    emits: Vec::new(),
+                    history_depth: 0,
                 },
                 PlanTaskWire {
                     name: "measure".into(),
@@ -944,10 +951,14 @@ mod tests {
                     over: String::new(),
                     max_fanout: 0,
                     when: String::new(),
-                    revise: String::new(),
+                    revise: Vec::new(),
+                    timeout: String::new(),
                     max_rounds: 0,
+                    emits: Vec::new(),
+                    history_depth: 0,
                 },
             ],
+            history_record: String::new(),
         });
         let got = classify("plan-task", &events);
         match &got.classification {
@@ -970,6 +981,7 @@ mod tests {
             reason: String::new(),
             budget_usd: 5.0,
             tasks: vec![],
+            history_record: String::new(),
         });
         events.push(row(1, "discard", 260.0));
         let got = classify("plan-closed", &events);
@@ -997,6 +1009,7 @@ mod tests {
                 reason: String::new(),
                 budget_usd: 5.0,
                 tasks: vec![],
+                history_record: String::new(),
             },
         ];
         let got = classify("wide-phased", &events);
@@ -1019,6 +1032,7 @@ mod tests {
                 reason: String::new(),
                 budget_usd: 5.0,
                 tasks: vec![],
+                history_record: String::new(),
             },
         ];
         let got = classify("wide", &events);
@@ -1164,6 +1178,7 @@ mod tests {
             reason: String::new(),
             budget_usd: 5.0,
             tasks: vec![],
+            history_record: String::new(),
         });
         events.push(SessionEvent::ApprovalWait {
             handle: "h".into(),

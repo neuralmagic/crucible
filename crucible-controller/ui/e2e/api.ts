@@ -348,12 +348,28 @@ const CUSTOM_IMAGE = {
   capabilities: null,
   capability_digest: null,
 };
-const RANKED_IMAGES = {
-  compatible: [{ image: GO_CC_IMAGE, surplus: 0, preferred: 0, default: true }],
+/// Older builds tagged only by commit.
+const GO_CC_OLDER = [
+  { ...GO_CC_IMAGE, digest: `sha256:${'4'.repeat(64)}`, tags: ['0a1b2c3d4e5f60718293a4b5c6d7e8f901234567'], created_at: '2026-09-10T06:40:00Z' },
+  { ...GO_CC_IMAGE, digest: `sha256:${'5'.repeat(64)}`, tags: ['9f8e7d6c5b4a39281706f5e4d3c2b1a098765432'], created_at: '2026-09-08T06:40:00Z' },
+];
+export const RANKED_IMAGES = {
+  compatible: [
+    { image: GO_CC_IMAGE, surplus: 0, preferred: 0, default: true },
+    ...GO_CC_OLDER.map((image) => ({ image, surplus: 0, preferred: 0, default: false })),
+  ],
   excluded: [
     {
       image: RUST_CC_IMAGE,
       unsatisfied: [{ predicate: 'toolchain.go', required: '>=1.25', found: null }],
+    },
+    {
+      image: { ...RUST_CC_IMAGE, digest: `sha256:${'6'.repeat(64)}`, tags: ['0a1b2c3d4e5f60718293a4b5c6d7e8f901234567'] },
+      unsatisfied: [{ predicate: 'toolchain.go', required: '>=1.25', found: null }],
+    },
+    {
+      image: { ...GO_CC_IMAGE, digest: `sha256:${'7'.repeat(64)}`, tags: ['1122334455667788990011223344556677889900'], created_at: '2026-09-01T06:40:00Z' },
+      unsatisfied: [{ predicate: 'toolchain.go', required: '>=1.25', found: '1.24.2' }],
     },
   ],
   unverified: [CUSTOM_IMAGE],
@@ -419,10 +435,10 @@ const TEAMS = [
     slug: 'llm-d',
     display_name: 'LLM-D',
     members: [
-      { kind: 'user', member: 'wren', role: 'owner', since: '2026-09-13T00:00:00Z', added_by: 'wren' },
-      { kind: 'group', member: '/groups/platform', role: 'maintainer', since: '2026-09-13T00:00:00Z', added_by: 'wren' },
-      { kind: 'team', member: 'core', role: 'member', since: '2026-09-13T00:00:00Z', added_by: 'wren' },
-      { kind: 'rule', member: 'email-domain:example.com', role: 'member', since: '2026-09-13T00:00:00Z', added_by: null },
+      { kind: 'user', member: 'wren', role: 'owner', since: '2026-09-13T00:00:00Z', added_by: 'wren', signed_in: true },
+      { kind: 'group', member: '/groups/platform', role: 'maintainer', since: '2026-09-13T00:00:00Z', added_by: 'wren', signed_in: false },
+      { kind: 'team', member: 'core', role: 'member', since: '2026-09-13T00:00:00Z', added_by: 'wren', signed_in: false },
+      { kind: 'rule', member: 'email-domain:example.com', role: 'member', since: '2026-09-13T00:00:00Z', added_by: null, signed_in: false },
     ],
     my_role: 'owner',
     reachable: true,
@@ -433,12 +449,59 @@ const TEAMS = [
   {
     slug: 'platform-administrators',
     display_name: 'Platform administrators',
-    members: [{ kind: 'user', member: 'wren', role: 'owner', since: '2026-09-13T00:00:00Z', added_by: null }],
+    members: [{ kind: 'user', member: 'wren', role: 'owner', since: '2026-09-13T00:00:00Z', added_by: null, signed_in: true }],
     my_role: 'owner',
     reachable: true,
     created_at: '2026-09-13T00:00:00Z',
     created_by: null,
     updated_at: '2026-09-13T00:00:00Z',
+  },
+];
+
+export const POLICY_ACTIVE = `// The shipped set.
+
+@id("platform-admin-all")
+permit(principal, action, resource)
+when { principal.platform_admin };
+
+@id("operators-access-autoresearch")
+permit(principal is UserPrincipal, action == Action::"autoresearch:access", resource)
+when { principal.hasTag("team:platform-operators") };
+`;
+
+const POLICY_SCHEMA = `entity UserPrincipal { id: String, platform_admin: Bool, proves_groups: Bool } tags String;
+entity TeamPrincipal { id: String, platform_admin: Bool, proves_groups: Bool } tags String;
+entity RunPrincipal { id: String, platform_admin: Bool, proves_groups: Bool } tags String;
+entity Playbook { id: String, owner: String, owner_kind: String, owner_role?: String, share?: String, run?: String };
+entity Autoresearch { id: String, owner: String, owner_kind: String, owner_role?: String, share?: String, run?: String };
+action "access";
+action "launch";
+action "autoresearch:access" in [Action::"access"] appliesTo { principal: [UserPrincipal, TeamPrincipal, RunPrincipal], resource: [Autoresearch], context: { now: Long } };
+action "playbook:launch" in [Action::"launch"] appliesTo { principal: [UserPrincipal, TeamPrincipal, RunPrincipal], resource: [Playbook], context: { now: Long } };
+`;
+
+const POLICY_SETS = [
+  {
+    digest: 'a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0a1b2',
+    text: POLICY_ACTIVE,
+    owner: 'team:platform-administrators',
+    schema_version: 1,
+    created_by: 'user:wren',
+    created_at: '2026-09-20T00:00:00Z',
+    activated_by: 'user:wren',
+    activated_at: '2026-09-20T00:05:00Z',
+    active: true,
+  },
+  {
+    digest: 'ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100',
+    text: '@id("platform-admin-all")\npermit(principal, action, resource)\nwhen { principal.platform_admin };\n',
+    owner: 'team:platform-administrators',
+    schema_version: 1,
+    created_by: null,
+    created_at: '2026-09-01T00:00:00Z',
+    activated_by: null,
+    activated_at: '2026-09-01T00:00:00Z',
+    active: false,
   },
 ];
 
@@ -820,6 +883,21 @@ export const ROUTES: Record<string, Json> = {
     },
     runs: [],
   },
+  '/api/playbook-runs': [
+    { ...PLAYBOOK_RUN, key: 'playbook:triage:0201', playbook: 'triage', status: 'running', cost_usd: 0.42, created_by: 'kylesayrs', created_at: '2026-08-24T11:40:00Z' },
+    {
+      ...PLAYBOOK_RUN,
+      key: 'playbook:survey:0197',
+      status: 'parked',
+      cost_usd: null,
+      runs: 0,
+      parked_reason: 'secrets: the pack declares secret pr_token, and repo neuralmagic/crucible has no binding for it',
+      created_at: '2026-08-24T09:00:00Z',
+    },
+    PLAYBOOK_RUN,
+    { ...PLAYBOOK_RUN, key: 'playbook:studio:0196', playbook: 'studio', origin: 'draft', draft_version: 3, status: 'parked', parked_reason: 'dispatch failed', cost_usd: null, runs: 0 },
+    { ...PLAYBOOK_RUN, key: 'playbook:studio:0195', playbook: 'studio', origin: 'draft', draft_version: 2, status: 'parked', parked_reason: 'dispatch failed', cost_usd: null, runs: 0 },
+  ],
   '/api/turns': [],
   '/api/whoami': {
     user: 'wren',
@@ -829,12 +907,18 @@ export const ROUTES: Record<string, Json> = {
     mode: 'native',
     downgraded: false,
     proves_groups: true,
+    acting_as: null,
+    entitlements: ['autoresearch'],
     teams: [
       { team: 'llm-d', role: 'maintainer', via: [{ kind: 'group', group: '/groups/platform', role: 'maintainer' }] },
       { team: 'platform-administrators', role: 'owner', via: [{ kind: 'rule', rule: 'configured-admins', role: 'owner' }] },
     ],
   },
   '/api/teams': TEAMS,
+  '/api/authz/actions': [
+    { action: 'autoresearch:access', resource: 'autoresearch', verb: 'access' },
+    { action: 'playbook:launch', resource: 'playbook', verb: 'launch' },
+  ],
   '/api/teams/llm-d': TEAMS[0],
   '/api/teams/platform-administrators': TEAMS[1],
   '/api/playbook-drafts/studio/shares': [
@@ -933,6 +1017,7 @@ export async function stubApi(page: Page): Promise<void> {
   let proposed: Record<string, unknown> = { ...PACK_IMPORT };
   let shares = [...(ROUTES['/api/playbook-drafts/studio/shares'] as Record<string, unknown>[])];
   let team = { ...TEAMS[0] };
+  let policySets = POLICY_SETS.map((set) => ({ ...set }));
   await page.route(
     (url: URL) => url.pathname.startsWith('/api/'),
     (route: Route) => {
@@ -942,6 +1027,23 @@ export async function stubApi(page: Page): Promise<void> {
 
       if (path === '/api/events') {
         return route.fulfill({ status: 200, contentType: 'text/event-stream', body: '' });
+      }
+      // Acting as a team: whoami answers for the team the header names, and a team the caller
+      // does not hold is refused with the marker the client recovers from.
+      const actingAs = route.request().headers()['x-crucible-act-as'];
+      if (path === '/api/whoami' && actingAs !== undefined) {
+        const whoami = ROUTES['/api/whoami'] as { teams: { team: string }[] };
+        const slug = actingAs.replace(/^team:/, '');
+        if (!actingAs.startsWith('team:') || !whoami.teams.some((t) => t.team === slug)) {
+          return route.fulfill({
+            status: 403,
+            contentType: 'application/json',
+            headers: { 'x-crucible-act-as': 'refused' },
+            body: JSON.stringify({ error: `you are not a member of ${actingAs}` }),
+          });
+        }
+        const body = { ...whoami, acting_as: slug, role: 'viewer', admin: false, entitlements: [] };
+        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
       }
       // Shares on the studio draft and the llm-d member list are the two stateful stubs the
       // editors need: what is granted, changed, or removed is what the next read serves.
@@ -975,12 +1077,78 @@ export async function stubApi(page: Page): Promise<void> {
         const members = Array.isArray(body.members) ? (body.members as Record<string, unknown>[]) : [];
         team = {
           ...team,
-          members: members.map((m) => ({ ...m, since: '2026-09-14T00:00:00Z', added_by: 'wren' })),
+          members: members.map((m) => ({ ...m, since: '2026-09-14T00:00:00Z', added_by: 'wren', signed_in: m.kind === 'user' })),
         };
         return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(team) });
       }
       if (path === '/api/teams/llm-d') {
         return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(team) });
+      }
+      if (path === '/api/authz/schema') {
+        return route.fulfill({ status: 200, contentType: 'text/plain; charset=utf-8', body: POLICY_SCHEMA });
+      }
+      if (path === '/api/authz/policy-sets' && route.request().method() === 'POST') {
+        const sent: unknown = JSON.parse(route.request().postData() ?? '{}');
+        const text = typeof sent === 'object' && sent !== null && 'text' in sent && typeof sent.text === 'string' ? sent.text : '';
+        if (text.includes('bogus')) {
+          return route.fulfill({
+            status: 422,
+            contentType: 'application/json',
+            body: JSON.stringify({ error: 'policy bogus-rule does not validate: unexpected token `bogus`' }),
+          });
+        }
+        const row = {
+          ...POLICY_SETS[0],
+          digest: `0123456789ab${String(policySets.length).padStart(52, '0')}`,
+          text,
+          created_at: '2026-09-28T00:00:00Z',
+          activated_by: null,
+          activated_at: null,
+          active: false,
+        };
+        policySets = [...policySets, row];
+        return route.fulfill({ status: 201, contentType: 'application/json', body: JSON.stringify(row) });
+      }
+      const activate = /^\/api\/authz\/policy-sets\/([0-9a-f]+)\/activate$/.exec(path);
+      if (activate !== null && route.request().method() === 'POST') {
+        const prior = policySets.find((set) => set.active)?.digest ?? null;
+        policySets = policySets.map((set) =>
+          set.digest === activate[1]
+            ? { ...set, active: true, activated_by: 'user:wren', activated_at: '2026-09-28T00:01:00Z' }
+            : { ...set, active: false },
+        );
+        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ prior, active: activate[1] }) });
+      }
+      if (path === '/api/authz/policy-sets') {
+        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(policySets) });
+      }
+      if (path === '/api/authz/explain') {
+        const query = new URL(route.request().url()).searchParams;
+        const login = query.get('login') ?? '';
+        if (login === 'ghost') {
+          return route.fulfill({
+            status: 404,
+            contentType: 'application/json',
+            body: JSON.stringify({ error: 'no one with login ghost has signed in here' }),
+          });
+        }
+        const granted = policySets.find((set) => set.active)?.text.includes('llm-d-devs-autoresearch') ?? false;
+        return route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            login,
+            action: query.get('action'),
+            resource: query.get('resource') ?? 'autoresearch',
+            owner: 'team:platform-administrators',
+            allowed: granted,
+            rules: granted ? ['llm-d-devs-autoresearch'] : [],
+            policy: policySets.find((set) => set.active)?.digest ?? '',
+            groups: ['/groups/inference-eng-llm-d-devs'],
+            groups_at: '2026-09-27T12:00:00Z',
+            teams: [{ team: 'llm-d', role: 'member', via: [{ kind: 'group', group: '/groups/inference-eng-llm-d-devs', role: 'member' }] }],
+          }),
+        });
       }
       if (path === '/api/images/rank' && route.request().method() === 'POST') {
         return route.fulfill({

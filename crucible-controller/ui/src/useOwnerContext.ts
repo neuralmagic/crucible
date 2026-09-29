@@ -1,9 +1,8 @@
 import { useCallback, useMemo, useSyncExternalStore } from 'react';
 import { $api } from './api/client';
+import { OWNER_CONTEXT_KEY, clearActAsRefusal } from './actAs';
 import { readValue, subscribeFlags, writeValue } from './deviceStore';
 import { ALL, actedAs, effectiveContext, ownerOptions, switchable, type ActedAs } from './ownerContext';
-
-const KEY = 'crucible.owner.context';
 
 export interface OwnerContext {
   /// `all` or the principal whose resources the lists show.
@@ -22,11 +21,12 @@ export interface OwnerContext {
 /// The owner context every list and creation form follows, per device.
 export function useOwnerContext(): OwnerContext {
   const whoami = $api.useQuery('get', '/api/whoami');
-  const stored = useSyncExternalStore(subscribeFlags, () => readValue(KEY), () => null);
+  const stored = useSyncExternalStore(subscribeFlags, () => readValue(OWNER_CONTEXT_KEY), () => null);
   const principals = useMemo(() => actedAs(whoami.data), [whoami.data]);
   const context = whoami.isSuccess ? effectiveContext(stored, principals) : ALL;
   const setContext = useCallback((next: string) => {
-    writeValue(KEY, next);
+    clearActAsRefusal();
+    writeValue(OWNER_CONTEXT_KEY, next);
   }, []);
   return {
     context,

@@ -6,6 +6,7 @@ import { useDeviceFlag } from './useDeviceFlag';
 import { FONT_SIZES, type HighlightTheme } from './editor/editorPrefs';
 import { useEditorPrefs } from './editor/useEditorPrefs';
 import { cn } from './ui';
+import { type AppBrand, isAppBrand } from './appTheme';
 
 type Theme = 'dark' | 'light';
 
@@ -13,6 +14,11 @@ type Theme = 'dark' | 'light';
 // the <html> attribute in sync after hydration.
 function initialTheme(): Theme {
   return localStorage.getItem('theme') === 'light' ? 'light' : 'dark';
+}
+
+function initialBrand(): AppBrand {
+  const stored = localStorage.getItem('brand');
+  return isAppBrand(stored) ? stored : 'crucible';
 }
 
 interface ChoiceProps<T extends string | number | boolean> {
@@ -59,6 +65,7 @@ function Choice<T extends string | number | boolean>({
 
 export function DisplayPrefs() {
   const [theme, setTheme] = useState<Theme>(initialTheme);
+  const [brand, setBrand] = useState<AppBrand>(initialBrand);
   const { prefs, setPref } = usePrefs();
   const editor = useEditorPrefs();
   const [coDraftDismissed, setCoDraftDismissed] = useDeviceFlag(CO_DRAFT_HINT_KEY, false);
@@ -68,10 +75,15 @@ export function DisplayPrefs() {
     localStorage.setItem('theme', theme);
   }, [theme]);
 
+  useEffect(() => {
+    document.documentElement.dataset.brand = brand;
+    localStorage.setItem('brand', brand);
+  }, [brand]);
+
   return (
     <Popover.Root>
       <Popover.Trigger className="flex items-center border-l border-rule px-3 font-mono text-data text-ink-2 hover:bg-hi hover:text-ink">
-        {theme === 'dark' ? '◐' : '◑'} DISPLAY
+        <span className="uppercase">{theme === 'dark' ? '◐' : '◑'} Display</span>
       </Popover.Trigger>
       <Popover.Portal>
         <Popover.Positioner sideOffset={1} align="end">
@@ -84,6 +96,15 @@ export function DisplayPrefs() {
               ]}
               value={theme}
               onChange={setTheme}
+            />
+            <Choice<AppBrand>
+              label="Brand"
+              options={[
+                { value: 'crucible', label: 'crucible' },
+                { value: 'redhat', label: 'red hat' },
+              ]}
+              value={brand}
+              onChange={setBrand}
             />
             <Choice<HighlightTheme>
               label="Editor theme"

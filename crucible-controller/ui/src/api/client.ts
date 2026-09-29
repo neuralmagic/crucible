@@ -1,6 +1,7 @@
 import createClient from 'openapi-fetch';
 import createQueryHook from 'openapi-react-query';
 import type { paths } from './schema.d';
+import { ACT_AS_HEADER, actAsHeaders, actAsRefused, currentActAs, forgetActAs, refusalReason } from '../actAs';
 import { isSessionExpired, redirectToSignIn } from './session';
 
 const client = createClient<paths>({ baseUrl: '/' });
@@ -8,12 +9,18 @@ const client = createClient<paths>({ baseUrl: '/' });
 // Every typed endpoint speaks JSON, so an ok-but-HTML body can only be the sign-in page; catch
 // it here (plus plain 401s) so no page ever parses or renders it.
 client.use({
-  onResponse({ response }) {
+  onRequest({ request }) {
+    const team = currentActAs();
+    if (team !== null) request.headers.set(ACT_AS_HEADER, team);
+    return request;
+  },
+  async onResponse({ response }) {
     const contentType = response.headers.get('content-type') ?? '';
     if (isSessionExpired(response) || (response.ok && contentType.includes('text/html'))) {
       redirectToSignIn();
       throw new Error('session expired, redirecting to sign-in');
     }
+    if (actAsRefused(response)) forgetActAs(await refusalReason(response));
     return undefined;
   },
 });
@@ -26,11 +33,12 @@ export const $api = createQueryHook(client);
 export const apiClient = client;
 
 async function rawFetch(url: string): Promise<Response> {
-  const res = await fetch(url);
+  const res = await fetch(url, { headers: actAsHeaders() });
   if (isSessionExpired(res)) {
     redirectToSignIn();
     throw new Error('session expired, redirecting to sign-in');
   }
+  if (actAsRefused(res)) forgetActAs(await refusalReason(res));
   return res;
 }
 

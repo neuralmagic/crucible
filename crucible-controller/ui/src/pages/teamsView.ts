@@ -25,6 +25,15 @@ export function sortedMembers(members: readonly MemberDto[]): MemberDto[] {
   );
 }
 
+/// What a member row offers a viewer who may view as other users: nothing for themselves or a
+/// non-user row, a disabled button for a login that has never signed in, a live one otherwise.
+export type ViewAsOffer = 'none' | 'never-signed-in' | 'ready';
+
+export function viewAsOffer(member: MemberDto, viewer: string | null): ViewAsOffer {
+  if (viewer === null || member.kind !== 'user' || member.member === viewer) return 'none';
+  return member.signed_in ? 'ready' : 'never-signed-in';
+}
+
 /// The teams the caller is in first, then the rest, each group by slug.
 export function sortedTeams(teams: readonly TeamDto[]): TeamDto[] {
   return [...teams].sort(

@@ -5,6 +5,7 @@
 import * as duckdb from '@duckdb/duckdb-wasm';
 import wasmEh from '@duckdb/duckdb-wasm/dist/duckdb-eh.wasm?url';
 import workerEh from '@duckdb/duckdb-wasm/dist/duckdb-browser-eh.worker.js?url';
+import { actAsHeaders } from '../actAs';
 
 export interface QueryResult {
   columns: string[];
@@ -35,7 +36,7 @@ const BUNDLE: duckdb.DuckDBBundle = {
 };
 
 async function fetchExport(name: string): Promise<Uint8Array> {
-  const res = await fetch(`/api/export/${name}`);
+  const res = await fetch(`/api/export/${name}`, { headers: actAsHeaders() });
   if (!res.ok) {
     throw new Error(`fetching /api/export/${name}: ${res.status} ${res.statusText}`);
   }

@@ -169,14 +169,14 @@ export function DashboardPage() {
   if (overview.isError || ledger.isError) {
     return (
       <Empty
-        title="DASHBOARD UNAVAILABLE"
+        title="Dashboard unavailable"
         description={formatError(overview.error ?? ledger.error)}
       />
     );
   }
 
   if (overview.isPending || ledger.isPending) {
-    return <LoadingBlock label="LOADING DASHBOARD" />;
+    return <LoadingBlock label="Loading dashboard" />;
   }
 
   const { data: overviewData } = overview;
@@ -203,7 +203,7 @@ export function DashboardPage() {
   return (
     <div>
       <PageHeader
-        eyebrow="Control plane"
+        eyebrow="Autoresearch"
         title="Dashboard"
         description="Pipeline volume, capacity against the admission caps, and where today's spend went."
       />

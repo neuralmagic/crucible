@@ -249,19 +249,19 @@ export function RunsPage() {
           aria-label="Filter by repository"
         />
         <ToolbarActions>
-          <Button variant="filled" render={<a href="/api/export/runs.parquet" download />}>
-            RUNS.PARQUET
+          <Button variant="filled" className="uppercase" render={<a href="/api/export/runs.parquet" download />}>
+            runs.parquet
           </Button>
-          <Button variant="filled" render={<a href="/api/export/iterations.parquet" download />}>
-            ITERATIONS.PARQUET
+          <Button variant="filled" className="uppercase" render={<a href="/api/export/iterations.parquet" download />}>
+            iterations.parquet
           </Button>
         </ToolbarActions>
       </Toolbar>
 
-      <QueryState query={runs} noun="RUNS">
+      <QueryState query={runs} noun="runs">
         <DataTable
           table={table}
-          empty={<Empty title="NO RUNS" description="Nothing has been dispatched in this window." />}
+          empty={<Empty title="No runs" description="Nothing has been dispatched in this window." />}
           footer={
             <>
               Showing {rows.length} · {formatCost(shownCost)} across shown runs
@@ -270,23 +270,25 @@ export function RunsPage() {
         />
         <div className="flex items-center gap-2.5 border-b border-rule-hard bg-surface px-4.5 py-1.5">
           <Button
+            className="uppercase"
             disabled={page === 0}
             onClick={() => {
               setPage((p) => Math.max(0, p - 1));
             }}
           >
-            ◂ PREV
+            ◂ Prev
           </Button>
           <Mono size="label" tone="ink-3" uppercase>
             Page {page + 1}
           </Mono>
           <Button
+            className="uppercase"
             disabled={rows.length < PAGE_SIZE}
             onClick={() => {
               setPage((p) => p + 1);
             }}
           >
-            NEXT ▸
+            Next ▸
           </Button>
         </div>
       </QueryState>

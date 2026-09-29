@@ -9,25 +9,33 @@
 //! the `claude` CLI — that binary lives only in the sandbox image `openshell` launches for an
 //! agent turn. A `claude -p` shell-out (or a command-override standing in for one) works on a
 //! laptop and breaks in-pod. Ranking is therefore an in-process call through the [`genai`]
-//! multi-provider client: one `exec_chat` interface covering both arms, dispatched by a
-//! [`genai::resolver::ServiceTargetResolver`] from the same env contract as before.
+//! multi-provider client, one `exec_chat` interface over every service a provider can name.
 //!
-//! - **Vertex (default):** `genai`'s `vertex` adapter speaks Anthropic's native Messages shape
-//!   against `.../publishers/anthropic/models/{model}:rawPredict`, for the model in
-//!   `CONTROLLER_RANKER_MODEL` (a genai model string, default `vertex::claude-sonnet-5`; the
-//!   `vertex::` namespace picks the adapter, the bare `claude-*` remainder is the Vertex model
-//!   ID). Project/region come from `ANTHROPIC_VERTEX_PROJECT_ID` / `CLOUD_ML_REGION` — the same
-//!   env the agent uses; the resolver builds the endpoint from them rather than genai's own
-//!   `VERTEX_PROJECT_ID`/`VERTEX_LOCATION` so our contract stays stable. Auth is a
-//!   `gcp_auth`-minted `cloud-platform` access token (genai's vertex adapter expects a
-//!   pre-minted bearer, it does no ADC itself) — the same credential resolution
-//!   `crucible::openshell::provider::mint_vertex_token` uses for headless agent turns (ADC: a
-//!   service-account key, a user refresh token, or the in-cluster metadata server) — Vertex per
-//!   house rule, no baked credential.
-//! - **Custom endpoint:** `CONTROLLER_RANKER_API_URL` (base override) + `CONTROLLER_RANKER_TOKEN`
-//!   (static bearer, skips gcp_auth) point the same code at any OpenAI-compatible
-//!   chat-completions server (`POST {base}/chat/completions`) — a vLLM/llm-d endpoint later,
-//!   `wiremock` in tests — via genai's OpenAI adapter.
+//! **Where the call goes.** The ranker is autoresearch work, so it runs against the same
+//! [`crate::playbooks::providers::chain_for_issue`] answer a scope turn for the issue would: the
+//! provider the issue pinned, else its domain's or the platform's `autoresearch` default and that
+//! default's fallback. Each entry becomes a genai target:
+//!
+//! - **vertex:** genai's `vertex` adapter against `.../publishers/anthropic/models/{model}:rawPredict`,
+//!   project/region from `ANTHROPIC_VERTEX_PROJECT_ID` / `CLOUD_ML_REGION` (the env the agent uses),
+//!   auth a `gcp_auth`-minted `cloud-platform` token from ADC, the same credential resolution
+//!   `crucible::openshell::provider::mint_vertex_token` uses for headless agent turns.
+//! - **anthropic / openai:** genai's Anthropic or OpenAI adapter at the vendor's own address.
+//! - **custom:** the registered endpoint, through the adapter for its protocol. A Messages endpoint
+//!   is registered the way Claude Code reads `ANTHROPIC_BASE_URL` (no `/v1`), so `v1/` is appended;
+//!   a Chat Completions or Responses endpoint is registered the way `OPENAI_BASE_URL` is read (with
+//!   `/v1`), so it is used as given.
+//!
+//! A provider's key is read the way a pod's is ([`crate::secrets::deliver::provider_delivery`]),
+//! through the deployment's secret reader.
+//!
+//! With nothing registered the ranker keeps the deployment's ambient Vertex: the model in
+//! `CONTROLLER_RANKER_MODEL` (a genai model string, default `vertex::claude-sonnet-5`) on ADC, so an
+//! empty registry changes nothing.
+//!
+//! **Failover.** Entries are tried in order. A call that fails (transport error, non-2xx, no text)
+//! hands off to the next entry at once; a malformed verdict gets one bounded retry on the same entry
+//! first. Only when every entry is exhausted is the rank a [`RankOutcome::Failed`].
 //!
 //! This module is the **API tier** — the in-process genai call. The **grounded/openshell tier** (the
 //! escalation for `low`-[`Confidence`] or backend-pinned verdicts) is realized outside this module:
@@ -37,16 +45,14 @@
 //! engine-subprocess boundary, not through this genai client — the two tiers differ only in what
 //! context the model sees. The verdict's [`Confidence`] field is what routes between them.
 //!
-//! Test seam: `CONTROLLER_RANKER_API_URL` pointed at a `wiremock` server serving a canned
-//! chat-completions response (the [`crate::issues::triage`] `GITHUB_API_URL` pattern). GCP token minting
-//! only happens on the default Vertex base, so tests need no ADC/GCP credentials at all.
+//! Test seam: a custom Chat Completions provider registered at a `wiremock` server serving a canned
+//! response ([`crate::testing::register_ranker`]). GCP token minting only happens on a Vertex
+//! target, so tests need no ADC/GCP credentials at all.
 //!
 //! ## Ranking-call knobs (env)
 //!
-//! All plain `std::env::var` reads with a default, matching `CONTROLLER_RANKER_MODEL`:
-//!
-//! - `CONTROLLER_RANKER_MODEL` — the genai model string (default `vertex::claude-sonnet-5`).
-//! - `CONTROLLER_RANKER_API_URL` / `CONTROLLER_RANKER_TOKEN` — the OpenAI-compatible override arm.
+//! - `CONTROLLER_RANKER_MODEL` — the ambient-Vertex model when no provider is registered (default
+//!   `vertex::claude-sonnet-5`).
 //! - `CONTROLLER_RANKER_MAX_TOKENS` — the response cap (default [`DEFAULT_MAX_TOKENS`]). This is a
 //!   **thinking-plus-text** budget on Claude, not a text-only one: Sonnet 5 runs adaptive thinking
 //!   by default and there is no way to turn it off through genai 0.6.5's *Vertex* Anthropic path
@@ -61,6 +67,10 @@
 
 #![allow(clippy::disallowed_macros)]
 
+use crate::client::Db;
+use crate::config::ControllerCfg;
+use crate::issues::model::Issue;
+use crate::playbooks::providers::{InferenceProtocol, ProviderKind, ResolvedDispatch};
 use crate::wire_enum::wire_enum;
 use anyhow::{Context, Result, bail};
 use crucible_contract::Tier;
@@ -187,7 +197,7 @@ fn vertex_region() -> String {
     std::env::var("CLOUD_ML_REGION").unwrap_or_else(|_| "global".to_string())
 }
 
-/// The ranker's genai model string. The `vertex::` namespace selects genai's Vertex adapter;
+/// The ambient ranker's genai model string, used when no provider is registered. The `vertex::` namespace selects genai's Vertex adapter;
 /// the bare remainder is the Vertex model ID (current-generation Claude models use the bare
 /// first-party ID on Vertex). Sonnet, not Opus, by design: the ranking call is a bounded
 /// classification (a tier verdict plus one paragraph of rationale), not agentic coding —
@@ -251,42 +261,193 @@ fn vertex_base(project: &str, region: &str) -> String {
     }
 }
 
-/// Normalize a `CONTROLLER_RANKER_API_URL` override into a genai endpoint base. genai's OpenAI
-/// adapter appends `chat/completions` with `Url::join`, whose RFC 3986 semantics *replace* the
-/// last path segment unless the base ends in `/` — so `http://vllm:8000/v1` would silently
-/// become `http://vllm:8000/chat/completions` without this.
+/// Normalize a registered endpoint into a genai endpoint base. genai's adapters append their path
+/// (`chat/completions`, `messages`) with `Url::join`, whose RFC 3986 semantics *replace* the last
+/// path segment unless the base ends in `/` — so `http://vllm:8000/v1` would silently become
+/// `http://vllm:8000/chat/completions` without this.
 fn custom_base(url: &str) -> String {
     format!("{}/", url.trim_end_matches('/'))
 }
 
-/// Rewrite genai's default [`ServiceTarget`] to our env contract — the one place both arms
-/// diverge from genai's own defaults:
-///
-/// - `CONTROLLER_RANKER_API_URL` set: any OpenAI-compatible chat-completions server (vLLM/llm-d,
-///   `wiremock` in tests). Adapter forced to OpenAI; bearer is `CONTROLLER_RANKER_TOKEN` (empty
-///   when unset — an in-cluster endpoint typically has no auth and ignores the header).
-/// - Otherwise: Vertex. Endpoint built from `ANTHROPIC_VERTEX_PROJECT_ID` + `CLOUD_ML_REGION`
-///   (not genai's `VERTEX_PROJECT_ID`/`VERTEX_LOCATION`), bearer minted from ADC via `gcp_auth`.
-///   GCP token minting only happens on this arm, so tests need no ADC/GCP credentials at all.
-async fn resolve_target(target: ServiceTarget) -> genai::resolver::Result<ServiceTarget> {
-    if let Ok(url) = std::env::var("CONTROLLER_RANKER_API_URL")
-        && !url.is_empty()
-    {
-        let token = std::env::var("CONTROLLER_RANKER_TOKEN").unwrap_or_default();
-        return Ok(ServiceTarget {
-            endpoint: Endpoint::from_owned(custom_base(&url)),
-            auth: AuthData::from_single(token),
-            model: ModelIden::new(AdapterKind::OpenAI, target.model.model_name),
-        });
+/// Where one ranking call goes.
+#[derive(Clone, PartialEq, Eq)]
+enum Target {
+    /// Vertex on the deployment's ADC. `model` is handed to genai as-is, so the ambient
+    /// `vertex::`-namespaced string and a registered bare model ID both work.
+    Vertex { model: String },
+    /// Any adapter reached with a static key at a known base.
+    Keyed {
+        adapter: AdapterKind,
+        base: String,
+        key: String,
+        model: String,
+    },
+}
+
+/// Never prints the key.
+impl std::fmt::Debug for Target {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Target::Vertex { model } => f.debug_struct("Vertex").field("model", model).finish(),
+            Target::Keyed {
+                adapter,
+                base,
+                model,
+                ..
+            } => f
+                .debug_struct("Keyed")
+                .field("adapter", adapter)
+                .field("base", base)
+                .field("model", model)
+                .finish(),
+        }
     }
-    let token = mint_vertex_token()
-        .await
-        .map_err(|e| genai::resolver::Error::Custom(format!("{e:#}")))?;
-    Ok(ServiceTarget {
-        endpoint: Endpoint::from_owned(vertex_base(&vertex_project(), &vertex_region())),
-        auth: AuthData::from_single(token),
-        model: ModelIden::new(AdapterKind::Vertex, target.model.model_name),
-    })
+}
+
+/// One entry of the ranking chain: what to call, and the name failures are reported under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Candidate {
+    label: String,
+    target: Target,
+}
+
+/// The adapter and base URL a provider is reached at, or `None` for Vertex, which is reached
+/// through ADC rather than a base and a key.
+fn keyed_route(dispatch: &ResolvedDispatch) -> Result<Option<(AdapterKind, String)>> {
+    let provider = &dispatch.provider;
+    Ok(Some(match provider.kind {
+        ProviderKind::Vertex => return Ok(None),
+        ProviderKind::Anthropic => (
+            AdapterKind::Anthropic,
+            "https://api.anthropic.com/v1/".to_string(),
+        ),
+        ProviderKind::OpenAi => (
+            AdapterKind::OpenAI,
+            "https://api.openai.com/v1/".to_string(),
+        ),
+        ProviderKind::Custom => {
+            let endpoint = provider
+                .endpoint
+                .as_ref()
+                .with_context(|| format!("custom provider {} has no endpoint", provider.id))?;
+            match endpoint.protocol {
+                InferenceProtocol::Messages => (
+                    AdapterKind::Anthropic,
+                    format!("{}v1/", custom_base(&endpoint.url)),
+                ),
+                InferenceProtocol::ChatCompletions => {
+                    (AdapterKind::OpenAI, custom_base(&endpoint.url))
+                }
+                InferenceProtocol::Responses => {
+                    (AdapterKind::OpenAIResp, custom_base(&endpoint.url))
+                }
+            }
+        }
+    }))
+}
+
+/// The key a provider's registered secret projects under its key variable, read through the same
+/// path a pod's delivery takes. Empty for a provider that names no secret (an unauthenticated
+/// in-cluster endpoint ignores the header).
+async fn provider_key(db: &Db, cfg: &ControllerCfg, dispatch: &ResolvedDispatch) -> Result<String> {
+    let provider = &dispatch.provider;
+    let delivery = crate::secrets::deliver::provider_delivery(
+        db.pool(),
+        cfg.secret_provider.as_ref(),
+        provider,
+    )
+    .await?
+    .map_err(|refusal| anyhow::anyhow!("{refusal}"))?;
+    let Some(var) = provider.api_key_env() else {
+        return Ok(String::new());
+    };
+    let Some((_, secret_key)) = delivery.env.iter().find(|(v, _)| v == var) else {
+        return Ok(String::new());
+    };
+    delivery
+        .data
+        .get(secret_key)
+        .cloned()
+        .with_context(|| format!("provider {} delivery has no value for {var}", provider.id))
+}
+
+async fn candidate(db: &Db, cfg: &ControllerCfg, dispatch: &ResolvedDispatch) -> Result<Candidate> {
+    let label = format!("{}/{}", dispatch.provider.id, dispatch.model);
+    let target = match keyed_route(dispatch)? {
+        None => Target::Vertex {
+            model: dispatch.model.clone(),
+        },
+        Some((adapter, base)) => Target::Keyed {
+            adapter,
+            base,
+            key: provider_key(db, cfg, dispatch).await?,
+            model: dispatch.model.clone(),
+        },
+    };
+    Ok(Candidate { label, target })
+}
+
+/// The ranking chain for an issue, and the reasons any entry was dropped on the way. An empty
+/// registry answers the ambient Vertex model.
+async fn candidates(
+    db: &Db,
+    cfg: &ControllerCfg,
+    issue: &Issue,
+) -> Result<(Vec<Candidate>, Vec<String>)> {
+    let chain = crate::playbooks::providers::chain_for_issue(
+        db.pool(),
+        issue,
+        crate::playbooks::providers::WorkloadClass::Autoresearch,
+    )
+    .await?;
+    if chain.is_empty() {
+        let model = ranker_model();
+        return Ok((
+            vec![Candidate {
+                label: format!("ambient {model}"),
+                target: Target::Vertex { model },
+            }],
+            Vec::new(),
+        ));
+    }
+    let mut out = Vec::with_capacity(chain.len());
+    let mut dropped = Vec::new();
+    for dispatch in &chain {
+        match candidate(db, cfg, dispatch).await {
+            Ok(c) => out.push(c),
+            Err(e) => dropped.push(format!("{}: {e:#}", dispatch.provider.id)),
+        }
+    }
+    Ok((out, dropped))
+}
+
+/// Map a target onto genai's [`ServiceTarget`], minting a Vertex token only for a Vertex target.
+async fn resolve_target(
+    target: Target,
+    requested: ServiceTarget,
+) -> genai::resolver::Result<ServiceTarget> {
+    match target {
+        Target::Keyed {
+            adapter,
+            base,
+            key,
+            model,
+        } => Ok(ServiceTarget {
+            endpoint: Endpoint::from_owned(base),
+            auth: AuthData::from_single(key),
+            model: ModelIden::new(adapter, model),
+        }),
+        Target::Vertex { .. } => {
+            let token = mint_vertex_token()
+                .await
+                .map_err(|e| genai::resolver::Error::Custom(format!("{e:#}")))?;
+            Ok(ServiceTarget {
+                endpoint: Endpoint::from_owned(vertex_base(&vertex_project(), &vertex_region())),
+                auth: AuthData::from_single(token),
+                model: ModelIden::new(AdapterKind::Vertex, requested.model.model_name),
+            })
+        }
+    }
 }
 
 /// Mint a `cloud-platform`-scoped Vertex access token from ADC (genai's vertex adapter expects
@@ -303,23 +464,48 @@ async fn mint_vertex_token() -> Result<String> {
     Ok(token.as_str().to_string())
 }
 
-/// Run one bounded ranking call for an issue: up to [`MAX_ATTEMPTS`] tries.
-pub(crate) async fn rank(title: &str, body: &str, labels: &[String]) -> RankOutcome {
+/// Run one bounded ranking call for an issue down its provider chain. Never an error: a ranker that
+/// cannot be reached is a [`RankOutcome::Failed`], which defers the issue rather than parking it.
+pub(crate) async fn rank(
+    db: &Db,
+    cfg: &ControllerCfg,
+    issue: &Issue,
+    title: &str,
+    body: &str,
+    labels: &[String],
+) -> RankOutcome {
+    let (chain, mut errors) = match candidates(db, cfg, issue).await {
+        Ok(resolved) => resolved,
+        Err(e) => return RankOutcome::Failed(format!("resolving the ranking provider: {e:#}")),
+    };
     let prompt = render_prompt(title, body, labels);
-    let mut last_err = String::new();
-    for attempt in 1..=MAX_ATTEMPTS {
-        match run_once(&prompt).await {
+    for candidate in &chain {
+        match rank_on(candidate, &prompt).await {
             Ok(verdict) => return RankOutcome::Verdict(verdict),
-            Err(e) => last_err = format!("attempt {attempt}/{MAX_ATTEMPTS}: {e:#}"),
+            Err(e) => errors.push(e),
         }
     }
-    RankOutcome::Failed(last_err)
+    if errors.is_empty() {
+        errors.push("no ranking provider can take work".to_string());
+    }
+    RankOutcome::Failed(errors.join("; "))
 }
 
-/// One attempt: call the API tier, then parse its output strictly.
-async fn run_once(prompt: &str) -> Result<Verdict> {
-    let (text, envelope_cost) = call_ranker(prompt).await?;
-    parse_verdict(&text, envelope_cost)
+/// One chain entry: a failed call hands off at once, a malformed verdict is retried up to
+/// [`MAX_ATTEMPTS`] times on the same entry.
+async fn rank_on(candidate: &Candidate, prompt: &str) -> Result<Verdict, String> {
+    let label = &candidate.label;
+    let mut last = String::new();
+    for attempt in 1..=MAX_ATTEMPTS {
+        let (text, envelope_cost) = call_ranker(&candidate.target, prompt)
+            .await
+            .map_err(|e| format!("{label}: {e:#}"))?;
+        match parse_verdict(&text, envelope_cost) {
+            Ok(verdict) => return Ok(verdict),
+            Err(e) => last = format!("{label} attempt {attempt}/{MAX_ATTEMPTS}: {e:#}"),
+        }
+    }
+    Err(last)
 }
 
 /// Build the ranking call's [`ChatOptions`] from the env knobs: the (raised, thinking-inclusive)
@@ -341,14 +527,19 @@ fn build_chat_options() -> ChatOptions {
 /// object carried one. The raw body is captured because genai's normalized `Usage` is token
 /// counts only — the `usage.cost`/`cost_usd` some OpenAI-compatible servers report never
 /// survives normalization.
-async fn call_ranker(prompt: &str) -> Result<(String, Option<f64>)> {
-    let model = ranker_model();
+async fn call_ranker(target: &Target, prompt: &str) -> Result<(String, Option<f64>)> {
+    let model = match target {
+        Target::Vertex { model } | Target::Keyed { model, .. } => model.clone(),
+    };
     type TargetFuture = std::pin::Pin<
         Box<dyn std::future::Future<Output = genai::resolver::Result<ServiceTarget>> + Send>,
     >;
+    let resolved = target.clone();
     let client = Client::builder()
         .with_service_target_resolver(ServiceTargetResolver::from_resolver_async_fn(
-            |target: ServiceTarget| -> TargetFuture { Box::pin(resolve_target(target)) },
+            move |requested: ServiceTarget| -> TargetFuture {
+                Box::pin(resolve_target(resolved.clone(), requested))
+            },
         ))
         .build();
     let options = build_chat_options();
@@ -415,10 +606,10 @@ fn parse_verdict(raw: &str, envelope_cost: Option<f64>) -> Result<Verdict> {
 }
 
 #[cfg(test)]
-// The crate-wide `ENV_LOCK` (an async mutex) is held across the tests below that mutate
-// `CONTROLLER_RANKER_API_URL` — see the note on `crate::ENV_LOCK`.
+// The crate-wide `ENV_LOCK` (an async mutex) is held across the tests below that mutate the
+// `CONTROLLER_RANKER_*` knobs — see the note on `crate::ENV_LOCK`.
 mod tests {
-    use super::*;
+    use crate::issues::ranker::*;
 
     #[test]
     fn content_hash_is_stable_and_order_independent_over_labels() {
@@ -731,63 +922,346 @@ mod tests {
         assert_eq!(opts.temperature, Some(0.7));
     }
 
-    /// A real HTTP double (`wiremock`, no in-process mock) exercised end to end through
-    /// [`rank`] — the actual seam the reconcile tests drive via `CONTROLLER_RANKER_API_URL`.
-    #[tokio::test]
-    async fn rank_via_api_override_confirms_a_tier() {
-        let _g = crate::ENV_LOCK.lock().await;
-        let server = wiremock::MockServer::start().await;
-        // The path matcher proves the custom-endpoint arm speaks the OpenAI chat-completions
-        // shape at `{base}/chat/completions` (the URL-join contract `custom_base` protects).
+    const T1_VERDICT: &str = "{\"tier\":\"T1\",\"affinity\":\"perf\",\"rationale\":\"confirmed\"}";
+
+    fn chat_reply(content: &str) -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": content}}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 20}
+        }))
+    }
+
+    async fn mount_chat(server: &wiremock::MockServer, reply: wiremock::ResponseTemplate, n: u64) {
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/chat/completions"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "choices": [{"message": {"role": "assistant", "content": "{\"tier\":\"T1\",\"affinity\":\"perf\",\"rationale\":\"confirmed\"}"}}],
-                "usage": {"prompt_tokens": 100, "completion_tokens": 20}
-            })))
-            .expect(1)
-            .mount(&server)
+            .respond_with(reply)
+            .expect(n)
+            .mount(server)
             .await;
-        unsafe {
-            std::env::set_var("CONTROLLER_RANKER_API_URL", server.uri());
-        }
-        let outcome = rank("title", "body", &["performance".to_string()]).await;
-        unsafe {
-            std::env::remove_var("CONTROLLER_RANKER_API_URL");
-        }
+    }
 
+    async fn stored_issue(db: &Db, key: &str) -> Result<Issue> {
+        crate::issues::store::upsert_issue(
+            db.pool(),
+            &crate::issues::model::NewIssue {
+                key: key.to_string(),
+                repo: "owner/repo".to_string(),
+                priority: 0,
+                evidence_url: None,
+                title: None,
+                author: None,
+                body: None,
+                labels: Vec::new(),
+                upstream_updated_at: None,
+            },
+        )
+        .await?;
+        crate::issues::store::get_issue(db.pool(), key)
+            .await?
+            .context("the issue just stored")
+    }
+
+    async fn set_platform_default(db: &Db, primary: &str, fallback: Option<&str>) -> Result<()> {
+        crate::playbooks::providers::set_default(
+            db.pool(),
+            &crate::playbooks::providers::DispatchDefault {
+                scope_kind: crate::playbooks::providers::DefaultScope::Platform,
+                scope_ref: String::new(),
+                workload_class: crate::playbooks::providers::WorkloadClass::Autoresearch,
+                provider_id: primary.to_string(),
+                model: None,
+                fallback_provider_id: fallback.map(str::to_string),
+                fallback_model: None,
+            },
+        )
+        .await
+    }
+
+    fn verdict(outcome: RankOutcome) -> Verdict {
         match outcome {
-            RankOutcome::Verdict(v) => {
-                assert_eq!(v.tier, Tier::T1);
-                assert_eq!(v.rationale, "confirmed");
-            }
+            RankOutcome::Verdict(v) => v,
             RankOutcome::Failed(reason) => panic!("expected a verdict, got failure: {reason}"),
         }
     }
 
-    #[tokio::test]
-    async fn rank_retries_once_then_reports_a_failure_on_malformed_output() {
-        let _g = crate::ENV_LOCK.lock().await;
+    /// A real HTTP double (`wiremock`, no in-process mock) exercised end to end through [`rank`],
+    /// reached the way every reconcile test reaches it: a registered Chat Completions provider that
+    /// is the platform's autoresearch default. The path and body matchers prove the call speaks the
+    /// OpenAI shape at `{base}/chat/completions` (the URL-join contract `custom_base` protects) and
+    /// asks for the provider's default model.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn rank_through_the_registered_provider_confirms_a_tier(
+        pool: sqlx::PgPool,
+    ) -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = Db::new(pool);
+        let cfg = crate::testing::cfg_with(tmp.path());
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "choices": [{"message": {"role": "assistant", "content": "not json"}}]
-                })),
-            )
-            .expect(2)
+            .and(wiremock::matchers::path("/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "test-ranker-model"}),
+            ))
+            .respond_with(chat_reply(T1_VERDICT))
+            .expect(1)
             .mount(&server)
             .await;
-        unsafe {
-            std::env::set_var("CONTROLLER_RANKER_API_URL", server.uri());
-        }
-        let outcome = rank("title", "body", &[]).await;
-        unsafe {
-            std::env::remove_var("CONTROLLER_RANKER_API_URL");
-        }
+        crate::testing::register_ranker(db.pool(), &server.uri()).await?;
+        let issue = stored_issue(&db, "owner/repo#1").await?;
 
-        assert!(matches!(outcome, RankOutcome::Failed(_)));
-        // `.expect(2)` above is checked on `server` drop; reaching here means exactly the
-        // bounded retry ran, no more.
+        let v = verdict(
+            rank(
+                &db,
+                &cfg,
+                &issue,
+                "title",
+                "body",
+                &["performance".to_string()],
+            )
+            .await,
+        );
+        assert_eq!(v.tier, Tier::T1);
+        assert_eq!(v.rationale, "confirmed");
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn rank_retries_once_then_reports_a_failure_on_malformed_output(
+        pool: sqlx::PgPool,
+    ) -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = Db::new(pool);
+        let cfg = crate::testing::cfg_with(tmp.path());
+        let server = wiremock::MockServer::start().await;
+        mount_chat(&server, chat_reply("not json"), 2).await;
+        crate::testing::register_ranker(db.pool(), &server.uri()).await?;
+        let issue = stored_issue(&db, "owner/repo#1").await?;
+
+        let outcome = rank(&db, &cfg, &issue, "title", "body", &[]).await;
+        let RankOutcome::Failed(reason) = outcome else {
+            panic!("expected a failure, got {outcome:?}");
+        };
+        assert!(
+            reason.contains("test-ranker/test-ranker-model attempt 2/2"),
+            "{reason}"
+        );
+        Ok(())
+    }
+
+    /// A call that fails outright is not retried on the same provider: the fallback takes it at
+    /// once, and its verdict is the rank.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_failed_call_hands_off_to_the_fallback_at_once(pool: sqlx::PgPool) -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = Db::new(pool);
+        let cfg = crate::testing::cfg_with(tmp.path());
+        let primary = wiremock::MockServer::start().await;
+        let fallback = wiremock::MockServer::start().await;
+        mount_chat(&primary, wiremock::ResponseTemplate::new(503), 1).await;
+        mount_chat(&fallback, chat_reply(T1_VERDICT), 1).await;
+        crate::testing::register_ranker_as(db.pool(), "primary", &primary.uri()).await?;
+        crate::testing::register_ranker_as(db.pool(), "fallback", &fallback.uri()).await?;
+        set_platform_default(&db, "primary", Some("fallback")).await?;
+        let issue = stored_issue(&db, "owner/repo#1").await?;
+
+        let v = verdict(rank(&db, &cfg, &issue, "title", "body", &[]).await);
+        assert_eq!(v.tier, Tier::T1);
+        Ok(())
+    }
+
+    /// A provider that answers but never with a parseable verdict gets its bounded retry, then the
+    /// fallback is asked.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn malformed_output_falls_back_after_the_retry(pool: sqlx::PgPool) -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = Db::new(pool);
+        let cfg = crate::testing::cfg_with(tmp.path());
+        let primary = wiremock::MockServer::start().await;
+        let fallback = wiremock::MockServer::start().await;
+        mount_chat(&primary, chat_reply("not json"), 2).await;
+        mount_chat(&fallback, chat_reply(T1_VERDICT), 1).await;
+        crate::testing::register_ranker_as(db.pool(), "primary", &primary.uri()).await?;
+        crate::testing::register_ranker_as(db.pool(), "fallback", &fallback.uri()).await?;
+        set_platform_default(&db, "primary", Some("fallback")).await?;
+        let issue = stored_issue(&db, "owner/repo#1").await?;
+
+        let v = verdict(rank(&db, &cfg, &issue, "title", "body", &[]).await);
+        assert_eq!(v.tier, Tier::T1);
+        Ok(())
+    }
+
+    /// Both providers failing is one failure naming both, never an error.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_chain_that_all_fails_reports_every_provider(pool: sqlx::PgPool) -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = Db::new(pool);
+        let cfg = crate::testing::cfg_with(tmp.path());
+        let primary = wiremock::MockServer::start().await;
+        let fallback = wiremock::MockServer::start().await;
+        mount_chat(&primary, wiremock::ResponseTemplate::new(500), 1).await;
+        mount_chat(&fallback, wiremock::ResponseTemplate::new(429), 1).await;
+        crate::testing::register_ranker_as(db.pool(), "primary", &primary.uri()).await?;
+        crate::testing::register_ranker_as(db.pool(), "fallback", &fallback.uri()).await?;
+        set_platform_default(&db, "primary", Some("fallback")).await?;
+        let issue = stored_issue(&db, "owner/repo#1").await?;
+
+        let outcome = rank(&db, &cfg, &issue, "title", "body", &[]).await;
+        let RankOutcome::Failed(reason) = outcome else {
+            panic!("expected a failure, got {outcome:?}");
+        };
+        assert!(reason.contains("primary/test-ranker-model"), "{reason}");
+        assert!(reason.contains("fallback/test-ranker-model"), "{reason}");
+        Ok(())
+    }
+
+    /// An issue pinned to a provider ranks there and nowhere else, even when the default it would
+    /// otherwise inherit has a fallback.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_pinned_provider_never_falls_back(pool: sqlx::PgPool) -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = Db::new(pool);
+        let cfg = crate::testing::cfg_with(tmp.path());
+        let pinned = wiremock::MockServer::start().await;
+        let fallback = wiremock::MockServer::start().await;
+        mount_chat(&pinned, wiremock::ResponseTemplate::new(503), 1).await;
+        mount_chat(&fallback, chat_reply(T1_VERDICT), 0).await;
+        crate::testing::register_ranker_as(db.pool(), "pinned", &pinned.uri()).await?;
+        crate::testing::register_ranker_as(db.pool(), "fallback", &fallback.uri()).await?;
+        set_platform_default(&db, "pinned", Some("fallback")).await?;
+        stored_issue(&db, "owner/repo#1").await?;
+        sqlx::query("UPDATE issues SET agent_provider = 'pinned' WHERE key = 'owner/repo#1'")
+            .execute(db.pool())
+            .await?;
+        let issue = stored_issue(&db, "owner/repo#1").await?;
+
+        let outcome = rank(&db, &cfg, &issue, "title", "body", &[]).await;
+        assert!(matches!(outcome, RankOutcome::Failed(_)), "{outcome:?}");
+        Ok(())
+    }
+
+    /// A custom Messages provider (PriceTag's gateway shape) is reached at `{endpoint}/v1/messages`
+    /// through genai's Anthropic adapter, with the key its registered secret holds.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_messages_provider_ranks_with_its_registered_key(pool: sqlx::PgPool) -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = Db::new(pool);
+        let mut cfg = crate::testing::cfg_with(tmp.path());
+        cfg.secret_provider = Some(std::sync::Arc::new(
+            crate::secrets::provider::MapProvider::new([(
+                "gateway_key".to_string(),
+                r#"{"ANTHROPIC_API_KEY": "sk-gateway"}"#.to_string(),
+            )]),
+        ));
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/messages"))
+            .and(wiremock::matchers::header("x-api-key", "sk-gateway"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "rits/zai-org/glm-5-3"}),
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "msg_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "rits/zai-org/glm-5-3",
+                    "content": [{"type": "text", "text": T1_VERDICT}],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 100, "output_tokens": 20}
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        crate::testing::register_inference_key(db.pool(), "user:platform-admin", "gateway_key")
+            .await?;
+        let endpoint = crate::playbooks::providers::Endpoint {
+            url: server.uri(),
+            protocol: InferenceProtocol::Messages,
+        };
+        crate::playbooks::providers::upsert(
+            db.pool(),
+            &crate::playbooks::providers::NewProvider {
+                owner: crate::authz::model::Principal::platform(),
+                id: "gateway",
+                display_name: "Gateway",
+                kind: ProviderKind::Custom,
+                models: &["rits/zai-org/glm-5-3".to_string()],
+                default_model: Some("rits/zai-org/glm-5-3"),
+                secret: Some(&crate::playbooks::providers::ProviderSecretRef {
+                    name: "gateway_key".to_string(),
+                    owner: crate::authz::model::Principal::parse("user:platform-admin")?,
+                }),
+                endpoint: Some(&endpoint),
+                harness: None,
+                enabled: true,
+                created_by: "test",
+            },
+        )
+        .await?;
+        set_platform_default(&db, "gateway", None).await?;
+        let issue = stored_issue(&db, "owner/repo#1").await?;
+
+        let v = verdict(rank(&db, &cfg, &issue, "title", "body", &[]).await);
+        assert_eq!(v.tier, Tier::T1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_messages_endpoint_gains_v1_and_an_openai_one_is_used_as_given() {
+        let dispatch = |protocol, url: &str| ResolvedDispatch {
+            provider: crate::playbooks::providers::ModelProvider {
+                id: "p".to_string(),
+                display_name: "p".to_string(),
+                kind: ProviderKind::Custom,
+                models: vec!["m".to_string()],
+                default_model: "m".to_string(),
+                secret: None,
+                endpoint: Some(crate::playbooks::providers::Endpoint {
+                    url: url.to_string(),
+                    protocol,
+                }),
+                harness: None,
+                enabled: true,
+                owner: crate::authz::model::Principal::platform(),
+                created_by: "t".to_string(),
+                created_at: String::new(),
+                updated_at: String::new(),
+            },
+            model: "m".to_string(),
+            harness: crucible::manifest::Harness::Claude,
+        };
+        let route = |protocol, url| {
+            keyed_route(&dispatch(protocol, url))
+                .expect("a route")
+                .expect("keyed")
+        };
+        assert_eq!(
+            route(InferenceProtocol::Messages, "https://gw.example"),
+            (AdapterKind::Anthropic, "https://gw.example/v1/".to_string())
+        );
+        assert_eq!(
+            route(InferenceProtocol::Messages, "https://gw.example/"),
+            (AdapterKind::Anthropic, "https://gw.example/v1/".to_string())
+        );
+        assert_eq!(
+            route(InferenceProtocol::ChatCompletions, "http://vllm:8000/v1"),
+            (AdapterKind::OpenAI, "http://vllm:8000/v1/".to_string())
+        );
+        assert_eq!(
+            route(InferenceProtocol::Responses, "http://vllm:8000/v1"),
+            (AdapterKind::OpenAIResp, "http://vllm:8000/v1/".to_string())
+        );
+    }
+
+    #[test]
+    fn target_debug_never_prints_the_key() {
+        let t = Target::Keyed {
+            adapter: AdapterKind::Anthropic,
+            base: "https://gw/v1/".to_string(),
+            key: "sk-secret".to_string(),
+            model: "m".to_string(),
+        };
+        assert!(!format!("{t:?}").contains("sk-secret"));
     }
 }

@@ -64,7 +64,7 @@ test.describe('the secrets page', () => {
 
     await page.locator('#secret-name').fill('pr_token');
     await page.locator('#secret-value').fill('the-sentinel-value');
-    await page.getByRole('button', { name: 'REGISTER' }).click();
+    await page.getByRole('button', { name: 'Register' }).click();
 
     await expect(page.getByText('pr_token is registered', { exact: false })).toBeVisible();
     expect(sent.join('\n')).toContain('"value":"the-sentinel-value"');
@@ -89,9 +89,9 @@ test.describe('the secrets page', () => {
     const area = page.locator('textarea#secret-value');
     const security = () => area.evaluate((el) => getComputedStyle(el).webkitTextSecurity);
     await expect.poll(security).toBe('disc');
-    await page.getByRole('button', { name: 'SHOW' }).click();
+    await page.getByRole('button', { name: 'Show' }).click();
     await expect.poll(security).toBe('none');
-    await page.getByRole('button', { name: 'HIDE' }).click();
+    await page.getByRole('button', { name: 'Hide' }).click();
     await expect.poll(security).toBe('disc');
   });
 
@@ -101,14 +101,14 @@ test.describe('the secrets page', () => {
 
     await page.locator('#secret-name').fill('pr_token');
     await page.locator('#secret-value').fill('a-token');
-    await expect(page.getByRole('button', { name: 'REGISTER' })).toBeEnabled();
+    await expect(page.getByRole('button', { name: 'Register' })).toBeEnabled();
 
     await page.locator('#secret-visibility').selectOption('agent_visible');
     await expect(page.getByText('can end up in a pull request', { exact: false })).toBeVisible();
-    await expect(page.getByRole('button', { name: 'REGISTER' })).toBeDisabled();
+    await expect(page.getByRole('button', { name: 'Register' })).toBeDisabled();
 
     await page.getByRole('checkbox').click();
-    await expect(page.getByRole('button', { name: 'REGISTER' })).toBeEnabled();
+    await expect(page.getByRole('button', { name: 'Register' })).toBeEnabled();
   });
 
   test('offers agent_visible only for an opaque secret', async ({ page }) => {
@@ -168,16 +168,16 @@ test.describe('the secrets page', () => {
     await expect(page.getByText('repo neuralmagic/crucible — pr_token as env AUTORESEARCH_PR_TOKEN')).toBeVisible();
     // A bound secret cannot be deleted, and the refusal names what is holding it.
     await expect(page.getByText('unbind it first', { exact: false })).toBeVisible();
-    await expect(page.getByRole('button', { name: 'DELETE' })).toBeDisabled();
+    await expect(page.getByRole('button', { name: 'Delete' })).toBeDisabled();
 
     await page.locator('#bind-scope-id').fill('vllm-project/vllm');
     await page.locator('#bind-projection').fill('VLLM_PR_TOKEN');
-    await page.getByRole('button', { name: 'BIND', exact: true }).click();
+    await page.getByRole('button', { name: 'Bind', exact: true }).click();
     await expect
       .poll(() => sent.join('\n'))
       .toContain('"scope_id":"vllm-project/vllm"');
 
-    await page.getByRole('button', { name: 'UNBIND' }).click();
+    await page.getByRole('button', { name: 'Unbind' }).click();
     await expect
       .poll(() => sent.join('\n'))
       .toContain(`DELETE /api/secrets/${OWN_ID}/bindings/binding-1`);

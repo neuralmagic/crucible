@@ -3,6 +3,7 @@ import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { $api } from '../api/client';
 import type { components } from '../api/schema';
 import { formatError } from '../api/errors';
+import { budgetNotice } from '../budget';
 import {
   Breadcrumb,
   Button,
@@ -55,8 +56,8 @@ const DEFAULT_CRON = '0 6 * * MON-FRI';
 const PREVIEW_COUNT = 5;
 
 const MODES: readonly { value: LaunchMode; label: string }[] = [
-  { value: 'now', label: 'RUN NOW' },
-  { value: 'schedule', label: 'ON A SCHEDULE' },
+  { value: 'now', label: 'Run now' },
+  { value: 'schedule', label: 'On a schedule' },
 ];
 
 function formatFiring(iso: string): string {
@@ -77,6 +78,7 @@ export function PlaybookLaunchPage() {
     params: { path: { id } },
   });
   const caps = $api.useQuery('get', '/api/config/playbook-caps');
+  const overview = $api.useQuery('get', '/api/overview');
   const source = $api.useQuery(
     'get',
     '/api/playbook-runs/{key}',
@@ -115,6 +117,9 @@ export function PlaybookLaunchPage() {
   const [submitError, setSubmitError] = useState<string | null>(null);
 
   const costCap = caps.data?.max_cost ?? null;
+  const sharedBudget = overview.data
+    ? budgetNotice({ spent: overview.data.cost_today.current, ceiling: overview.data.cost_today.ceiling }, new Date())
+    : null;
   const timeCap = caps.data?.max_time ?? null;
 
   useEffect(() => {
@@ -136,12 +141,12 @@ export function PlaybookLaunchPage() {
 
   const crumbs = [{ label: 'Playbooks', to: '/playbooks' }, { label: id || 'launch' }];
 
-  if (schema.isPending || playbooks.isPending) return <LoadingBlock label="LOADING FORM" />;
+  if (schema.isPending || playbooks.isPending) return <LoadingBlock label="Loading form" />;
   if (pack !== undefined && !pack.actions.includes('launch')) {
     return (
       <>
         <Breadcrumb items={crumbs} />
-        <Empty title="LAUNCH NOT PERMITTED" description={`Owned by ${pack.owner}`} />
+        <Empty title="Launch not permitted" description={`Owned by ${pack.owner}`} />
       </>
     );
   }
@@ -149,7 +154,7 @@ export function PlaybookLaunchPage() {
     return (
       <>
         <Breadcrumb items={crumbs} />
-        <Empty title="NO SUCH PLAYBOOK" description={formatError(schema.error)} />
+        <Empty title="No such playbook" description={formatError(schema.error)} />
       </>
     );
   }
@@ -158,7 +163,7 @@ export function PlaybookLaunchPage() {
       <>
         <Breadcrumb items={crumbs} />
         <Empty
-          title="FORM CANNOT BE RENDERED"
+          title="Form cannot be rendered"
           description={
             parsed === null
               ? 'The playbook served no schema.'
@@ -354,7 +359,7 @@ export function PlaybookLaunchPage() {
         />
         <SectionBody>
           {specs.length === 0 ? (
-            <Empty title="NO PARAMETERS" description="This pack declares none; launch it as is." />
+            <Empty title="No parameters" description="This pack declares none; launch it as is." />
           ) : (
             <PlaybookParamFields
               idPrefix="launch"
@@ -375,6 +380,7 @@ export function PlaybookLaunchPage() {
           deploy&apos;s caps
           {costCap === null || timeCap === null ? '' : ` (${costCap} USD, ${timeCap})`}.
         </Notice>
+        {sharedBudget === null ? null : <Notice label="Shared budget">{sharedBudget}</Notice>}
         <SectionBody>
           <FormGrid>
             <NumberInputField
@@ -458,11 +464,11 @@ export function PlaybookLaunchPage() {
               <div className="grid gap-2">
                 <div>
                   <Button
-                    className="border border-rule-hard"
+                    className="border border-rule-hard uppercase"
                     onClick={() => void runPreview()}
                     disabled={preview.isPending}
                   >
-                    {preview.isPending ? 'PREVIEWING…' : 'PREVIEW FIRINGS'}
+                    {preview.isPending ? 'Previewing…' : 'Preview firings'}
                   </Button>
                 </div>
                 {previewed && firings !== null ? (
@@ -505,17 +511,23 @@ export function PlaybookLaunchPage() {
 
       <FormActions>
         {mode === 'now' ? (
-          <Button variant="filled" onClick={() => void handleLaunch()} disabled={launch.isPending}>
-            {launch.isPending ? 'LAUNCHING…' : 'LAUNCH'}
+          <Button
+            variant="filled"
+            className="uppercase"
+            onClick={() => void handleLaunch()}
+            disabled={launch.isPending}
+          >
+            {launch.isPending ? 'Launching…' : 'Launch'}
           </Button>
         ) : (
           <>
             <Button
               variant="filled"
+              className="uppercase"
               onClick={() => void handleSchedule()}
               disabled={schedule.isPending || !previewed}
             >
-              {schedule.isPending ? 'SCHEDULING…' : 'SCHEDULE'}
+              {schedule.isPending ? 'Scheduling…' : 'Schedule'}
             </Button>
             {!previewed && (
               <Mono size="data" tone="ink-3">
@@ -524,7 +536,9 @@ export function PlaybookLaunchPage() {
             )}
           </>
         )}
-        <Button render={<Link to="/playbooks" />}>CANCEL</Button>
+        <Button className="uppercase" render={<Link to="/playbooks" />}>
+          Cancel
+        </Button>
       </FormActions>
     </>
   );

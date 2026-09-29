@@ -57,7 +57,7 @@ export function DataTable<TData extends RowData>({
   const span = table.getAllLeafColumns().length + (expandable ? 1 : 0);
 
   return (
-    <table className={cn('w-full border-collapse bg-surface', className)}>
+    <table data-ui="table" className={cn('w-full border-collapse bg-surface', className)}>
       <thead>
         {table.getHeaderGroups().map((group) => (
           <tr key={group.id}>

@@ -31,3 +31,6 @@ examples/*/workspace-*/
 /prebuilt/
 # xtask output; CI regenerates and shares it as a build artifact.
 images/generated/
+
+# Lean build output for the Veil models.
+formal/.lake/
