@@ -169,14 +169,14 @@ export function DashboardPage() {
   if (overview.isError || ledger.isError) {
     return (
       <Empty
-        title="DASHBOARD UNAVAILABLE"
+        title="Dashboard unavailable"
         description={formatError(overview.error ?? ledger.error)}
       />
     );
   }
 
   if (overview.isPending || ledger.isPending) {
-    return <LoadingBlock label="LOADING DASHBOARD" />;
+    return <LoadingBlock label="Loading dashboard" />;
   }
 
   const { data: overviewData } = overview;

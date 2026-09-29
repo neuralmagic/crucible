@@ -135,7 +135,7 @@ function ProviderTable({ rows, onOpen }: { rows: ProviderDetailDto[]; onOpen: (i
       table={table}
       empty={
         <Empty
-          title="NO PROVIDERS"
+          title="No providers"
           description="Register one below. Until then every dispatch runs the pack manifest's own agent."
         />
       }
@@ -327,11 +327,12 @@ function RegisterSection() {
       )}
       <FormActions>
         <Button
+          className="uppercase"
           variant="filled"
           disabled={errors.size > 0 || register.isPending}
           onClick={() => { void submit(); }}
         >
-          {register.isPending ? 'REGISTERING…' : 'REGISTER'}
+          {register.isPending ? 'Registering…' : 'Register'}
         </Button>
         {registered !== null && (
           <Mono size="data" tone="ink-3">
@@ -388,7 +389,7 @@ function DetailSection({ provider, onClose }: { provider: ProviderDetailDto; onC
       <SectionHeader
         title={provider.id}
         note={`registered by ${provider.created_by} · updated ${provider.updated_at}`}
-        actions={<Button onClick={onClose}>CLOSE</Button>}
+        actions={<Button className="uppercase" onClick={onClose}>Close</Button>}
       />
       {mayUpdate ? (
         <SectionBody>
@@ -404,16 +405,17 @@ function DetailSection({ provider, onClose }: { provider: ProviderDetailDto; onC
         <FormActions>
           {mayUpdate ? (
             <Button
+              className="uppercase"
               variant="filled"
               disabled={errors.size > 0 || update.isPending}
               onClick={() => { void save(); }}
             >
-              {update.isPending ? 'SAVING…' : 'SAVE'}
+              {update.isPending ? 'Saving…' : 'Save'}
             </Button>
           ) : null}
           {mayDelete ? (
-            <Button disabled={remove.isPending} onClick={() => { void deregister(); }}>
-              {remove.isPending ? 'DEREGISTERING…' : 'DEREGISTER'}
+            <Button className="uppercase" disabled={remove.isPending} onClick={() => { void deregister(); }}>
+              {remove.isPending ? 'Deregistering…' : 'Deregister'}
             </Button>
           ) : null}
         </FormActions>

@@ -64,7 +64,9 @@ const columns = helper.columns([
     header: '',
     meta: { align: 'end' },
     cell: ({ row }) => (
-      <Button render={<Link to={`/teams/${encodeURIComponent(row.original.slug)}`} />}>OPEN</Button>
+      <Button className="uppercase" render={<Link to={`/teams/${encodeURIComponent(row.original.slug)}`} />}>
+        Open
+      </Button>
     ),
   }),
 ]);
@@ -102,13 +104,14 @@ function CreateTeam() {
       )}
       <FormActions>
         <Button
+          className="uppercase"
           variant="filled"
           disabled={!validSlug(slug.trim()) || displayName.trim().length === 0 || create.isPending}
           onClick={() => {
             void submit();
           }}
         >
-          {create.isPending ? 'CREATING…' : 'CREATE TEAM'}
+          {create.isPending ? 'Creating…' : 'Create team'}
         </Button>
       </FormActions>
     </Section>
@@ -124,8 +127,8 @@ export function TeamsPage() {
   return (
     <>
       <PageHeader eyebrow="System" title="Teams" />
-      <QueryState query={teams} noun="TEAMS">
-        <DataTable table={table} empty={<Empty title="NO TEAMS" />} footer={<>Showing {rows.length}</>} />
+      <QueryState query={teams} noun="teams">
+        <DataTable table={table} empty={<Empty title="No teams" />} footer={<>Showing {rows.length}</>} />
       </QueryState>
       <CreateTeam />
     </>

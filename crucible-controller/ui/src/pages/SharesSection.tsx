@@ -76,12 +76,13 @@ function columns(onRevoke: (grantee: string) => void, pending: boolean) {
       meta: { align: 'end' },
       cell: ({ row }) => (
         <Button
+          className="uppercase"
           disabled={pending}
           onClick={() => {
             onRevoke(row.original.grantee);
           }}
         >
-          REVOKE
+          Revoke
         </Button>
       ),
     }),
@@ -138,13 +139,13 @@ export function SharesSection({ path, id }: SharesSectionProps) {
       <SectionHeader title="Shares" note="who else may use this, at what role, until when" />
       {shares.isError ? (
         <SectionBody>
-          <Empty title="SHARES UNAVAILABLE" description={formatError(shares.error)} />
+          <Empty title="Shares unavailable" description={formatError(shares.error)} />
         </SectionBody>
       ) : shares.isPending ? (
-        <LoadingBlock label="LOADING SHARES" />
+        <LoadingBlock label="Loading shares" />
       ) : (
         <div data-testid="shares">
-          <DataTable table={table} empty={<Empty title="NOT SHARED" />} footer={<>Showing {rows.length}</>} />
+          <DataTable table={table} empty={<Empty title="Not shared" />} footer={<>Showing {rows.length}</>} />
         </div>
       )}
       <SectionBody>
@@ -184,13 +185,14 @@ export function SharesSection({ path, id }: SharesSectionProps) {
       </SectionBody>
       <FormActions>
         <Button
+          className="uppercase"
           variant="filled"
           disabled={!validGrantee(form.grantee) || grant.isPending}
           onClick={() => {
             void submit();
           }}
         >
-          {grant.isPending ? 'SHARING…' : 'SHARE'}
+          {grant.isPending ? 'Sharing…' : 'Share'}
         </Button>
       </FormActions>
     </Section>

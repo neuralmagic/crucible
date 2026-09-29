@@ -160,7 +160,7 @@ export default function CodeSurface({
           onChange?.(next ?? '');
         }}
         onMount={handleMount}
-        loading={<span className="px-3 py-2 font-mono text-data text-ink-3">LOADING EDITOR</span>}
+        loading={<span className="px-3 py-2 font-mono text-data text-ink-3 uppercase">Loading editor</span>}
         options={{
           ...options,
           readOnly: !editable,

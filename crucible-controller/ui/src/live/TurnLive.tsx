@@ -64,13 +64,13 @@ export function TurnLive({ podName, createdAt }: TurnLiveProps) {
       {activity && streaming && <ActivityTicker beat={activity} />}
 
       <Button
-        className="w-full justify-start"
+        className="w-full justify-start uppercase"
         aria-expanded={logsOpen}
         onClick={() => {
           setLogsOpen(!logsOpen);
         }}
       >
-        {logsOpen ? '▾ HIDE LIVE LOG' : `▸ LIVE LOG (${logs.length} LINES)`}
+        {logsOpen ? '▾ Hide live log' : `▸ Live log (${logs.length} lines)`}
       </Button>
       {logsOpen && <LogPane logs={logs} />}
     </div>
@@ -137,8 +137,8 @@ function LogPane({ logs }: { logs: LogLine[] }) {
       </div>
       {!following && (
         <div className="absolute bottom-2 left-1/2 -translate-x-1/2">
-          <Button variant="filled" onClick={resume}>
-            ↓ RESUME FOLLOWING
+          <Button variant="filled" className="uppercase" onClick={resume}>
+            ↓ Resume following
           </Button>
         </div>
       )}

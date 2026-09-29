@@ -45,10 +45,10 @@ function OfflineCredential() {
   const [outcome, setOutcome] = useState<string | null>(null);
 
   if (credential.isError) {
-    return <Empty title="CREDENTIAL UNAVAILABLE" description={formatError(credential.error)} />;
+    return <Empty title="Credential unavailable" description={formatError(credential.error)} />;
   }
   if (credential.isPending) {
-    return <LoadingBlock label="LOADING CREDENTIAL" />;
+    return <LoadingBlock label="Loading credential" />;
   }
   const view = credentialView(credential.data);
 
@@ -71,6 +71,7 @@ function OfflineCredential() {
         )}
         <div className="mt-3">
           <Button
+            className="uppercase"
             variant="filled"
             disabled={!view.revocable || revoke.isPending}
             onClick={() => {
@@ -85,7 +86,7 @@ function OfflineCredential() {
               );
             }}
           >
-            {revoke.isPending ? 'REVOKING…' : 'REVOKE'}
+            {revoke.isPending ? 'Revoking…' : 'Revoke'}
           </Button>
         </div>
       </SectionBody>
@@ -109,6 +110,7 @@ function KeyRow({ apiKey }: { apiKey: ApiKeyDto }) {
         {revoke.isError && <p className="mt-1 text-body text-red">{formatError(revoke.error)}</p>}
       </div>
       <Button
+        className="uppercase"
         variant="quiet"
         disabled={!view.revocable || revoke.isPending}
         onClick={() => {
@@ -118,7 +120,7 @@ function KeyRow({ apiKey }: { apiKey: ApiKeyDto }) {
           );
         }}
       >
-        {revoke.isPending ? 'REVOKING…' : 'REVOKE'}
+        {revoke.isPending ? 'Revoking…' : 'Revoke'}
       </Button>
     </div>
   );
@@ -136,10 +138,10 @@ function ApiKeys() {
   const [minted, setMinted] = useState<{ secret: string; url: string | null } | null>(null);
 
   if (keys.isError) {
-    return <Empty title="API KEYS UNAVAILABLE" description={formatError(keys.error)} />;
+    return <Empty title="API keys unavailable" description={formatError(keys.error)} />;
   }
   if (keys.isPending) {
-    return <LoadingBlock label="LOADING API KEYS" />;
+    return <LoadingBlock label="Loading API keys" />;
   }
 
   return (
@@ -195,6 +197,7 @@ function ApiKeys() {
           {mint.isError && <p className="mt-2 text-body text-red">{formatError(mint.error)}</p>}
           <FormActions>
             <Button
+              className="uppercase"
               variant="filled"
               disabled={name.trim() === '' || mint.isPending}
               onClick={() => {
@@ -210,7 +213,7 @@ function ApiKeys() {
                 );
               }}
             >
-              {mint.isPending ? 'MINTING…' : 'MINT KEY'}
+              {mint.isPending ? 'Minting…' : 'Mint key'}
             </Button>
           </FormActions>
         </div>
@@ -232,10 +235,10 @@ function ApiKeys() {
 function Memberships() {
   const whoami = $api.useQuery('get', '/api/whoami');
   if (whoami.isError) {
-    return <Empty title="MEMBERSHIPS UNAVAILABLE" description={formatError(whoami.error)} />;
+    return <Empty title="Memberships unavailable" description={formatError(whoami.error)} />;
   }
   if (whoami.isPending) {
-    return <LoadingBlock label="LOADING MEMBERSHIPS" />;
+    return <LoadingBlock label="Loading memberships" />;
   }
   const teams = [...whoami.data.teams].sort((a, b) => a.team.localeCompare(b.team));
   return (

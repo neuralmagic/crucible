@@ -179,9 +179,14 @@ function KnobEditDialog({ knob, allKnobs, onClose }: { knob: KnobView; allKnobs:
             {submitError !== null && <FormError className="mt-3.5">{submitError}</FormError>}
           </div>
           <div className="flex justify-end border-t border-rule">
-            <Button onClick={onClose}>CANCEL</Button>
-            <Button variant="filled" onClick={() => void handleSubmit()} disabled={!canSubmit}>
-              {mutation.isPending ? 'WRITING…' : 'WRITE OVERRIDE'}
+            <Button className="uppercase" onClick={onClose}>Cancel</Button>
+            <Button
+              className="uppercase"
+              variant="filled"
+              onClick={() => void handleSubmit()}
+              disabled={!canSubmit}
+            >
+              {mutation.isPending ? 'Writing…' : 'Write override'}
             </Button>
           </div>
         </Dialog.Popup>
@@ -235,13 +240,13 @@ function knobColumns(isAdmin: boolean, onEdit: (knob: KnobView) => void) {
       cell: ({ row }) =>
         isAdmin ? (
           <Button
-            className="border border-rule-hard px-2.5"
+            className="border border-rule-hard px-2.5 uppercase"
             disabled={!row.original.overridable}
             onClick={() => {
               onEdit(row.original);
             }}
           >
-            EDIT
+            Edit
           </Button>
         ) : null,
     }),
@@ -269,9 +274,9 @@ function FlagsSection({ isAdmin }: { isAdmin: boolean }) {
         {!isAdmin && <Note className="mt-3.5">Admin access required to edit overrides.</Note>}
       </SectionBody>
       {config.isError ? (
-        <Empty title="CONFIG UNAVAILABLE" description={formatError(config.error)} />
+        <Empty title="Config unavailable" description={formatError(config.error)} />
       ) : config.isPending ? (
-        <LoadingBlock label="LOADING CONFIG" />
+        <LoadingBlock label="Loading config" />
       ) : (
         <KnobsTable knobs={config.data.knobs} isAdmin={isAdmin} onEdit={setEditing} />
       )}
@@ -351,8 +356,13 @@ function AddRepoForm({ allowedOrgs }: { allowedOrgs: string[] }) {
       />
       {error !== null && <FormError>{error}</FormError>}
       <div>
-        <Button variant="filled" onClick={() => void handleSubmit()} disabled={!canSubmit}>
-          {mutation.isPending ? 'ADDING…' : 'ADD REPO'}
+        <Button
+          className="uppercase"
+          variant="filled"
+          onClick={() => void handleSubmit()}
+          disabled={!canSubmit}
+        >
+          {mutation.isPending ? 'Adding…' : 'Add repo'}
         </Button>
       </div>
     </FormGrid>
@@ -436,32 +446,32 @@ function repoColumns(actions: RepoActions) {
           <span className="flex justify-end gap-1.5">
             {row.original.paused ? (
               <Button
-                className="border border-rule-hard px-2.5"
+                className="border border-rule-hard px-2.5 uppercase"
                 disabled={actions.busy}
                 onClick={() => {
                   actions.onResume(repo);
                 }}
               >
-                RESUME
+                Resume
               </Button>
             ) : (
               <Button
-                className="border border-rule-hard px-2.5"
+                className="border border-rule-hard px-2.5 uppercase"
                 disabled={actions.busy}
                 onClick={() => {
                   actions.onPause(repo);
                 }}
               >
-                PAUSE
+                Pause
               </Button>
             )}
             <Button
-              className="border border-red px-2.5 text-red hover:bg-red hover:text-surface"
+              className="border border-red px-2.5 text-red hover:bg-red hover:text-surface uppercase"
               onClick={() => {
                 actions.onUnwatch(repo);
               }}
             >
-              UNWATCH
+              Unwatch
             </Button>
           </span>
         );
@@ -476,7 +486,7 @@ function ReposTable({ repos, actions }: { repos: RepoRow[]; actions: RepoActions
   return (
     <DataTable
       table={table}
-      empty={<Empty title="NO REPOSITORIES" description="No repositories tracked yet." />}
+      empty={<Empty title="No repositories" description="No repositories tracked yet." />}
     />
   );
 }
@@ -530,9 +540,9 @@ function ReposSection({ isAdmin }: { isAdmin: boolean }) {
       </SectionBody>
 
       {repos.isError ? (
-        <Empty title="FAILED TO LOAD REPOS" description={formatError(repos.error)} />
+        <Empty title="Failed to load repos" description={formatError(repos.error)} />
       ) : repos.isPending ? (
-        <LoadingBlock label="LOADING REPOS" />
+        <LoadingBlock label="Loading repos" />
       ) : (
         <ReposTable repos={repos.data} actions={actions} />
       )}
@@ -554,15 +564,16 @@ function ReposSection({ isAdmin }: { isAdmin: boolean }) {
             </AlertDialog.Description>
             <div className="flex justify-end border-t border-rule">
               <Button
+                className="uppercase"
                 onClick={() => {
                   setConfirmUnwatch(null);
                 }}
               >
-                CANCEL
+                Cancel
               </Button>
               <Button
                 variant="filled"
-                className="bg-red"
+                className="bg-red uppercase"
                 disabled={unwatch.isPending}
                 onClick={() => {
                   const repo = confirmUnwatch;
@@ -572,7 +583,7 @@ function ReposSection({ isAdmin }: { isAdmin: boolean }) {
                   );
                 }}
               >
-                {unwatch.isPending ? 'UNWATCHING…' : 'UNWATCH'}
+                {unwatch.isPending ? 'Unwatching…' : 'Unwatch'}
               </Button>
             </div>
           </AlertDialog.Popup>
@@ -593,9 +604,9 @@ function AutopilotSection({ isAdmin }: { isAdmin: boolean }) {
     <Section>
       <SectionHeader title="Autopilot" />
       {autopilot.isPending ? (
-        <LoadingBlock label="LOADING AUTOPILOT" />
+        <LoadingBlock label="Loading autopilot" />
       ) : autopilot.isError ? (
-        <Empty title="AUTOPILOT UNAVAILABLE" description={formatError(autopilot.error)} />
+        <Empty title="Autopilot unavailable" description={formatError(autopilot.error)} />
       ) : (
         <SectionBody className="grid gap-3">
           <Status
@@ -658,11 +669,12 @@ function ReconcileSection({ isAdmin }: { isAdmin: boolean }) {
           {isAdmin ? (
             <span className="flex flex-wrap items-center gap-3.5">
               <Button
+                className="uppercase"
                 variant="filled"
                 disabled={mutation.isPending}
                 onClick={() => void handleClick()}
               >
-                {mutation.isPending ? 'RECONCILING…' : 'RECONCILE NOW'}
+                {mutation.isPending ? 'Reconciling…' : 'Reconcile now'}
               </Button>
               {acked && (
                 <Mono size="label" uppercase tone="green" weight="semibold">
@@ -755,7 +767,7 @@ function ActivityTable({ events }: { events: EventDto[] }) {
   return (
     <DataTable
       table={table}
-      empty={<Empty title="NO ACTIVITY" description="Nothing recorded yet." />}
+      empty={<Empty title="No activity" description="Nothing recorded yet." />}
     />
   );
 }
@@ -790,9 +802,9 @@ function AccessSection() {
       </SectionBody>
 
       {events.isError ? (
-        <Empty title="FAILED TO LOAD ACTIVITY" description={formatError(events.error)} />
+        <Empty title="Failed to load activity" description={formatError(events.error)} />
       ) : events.isPending ? (
-        <LoadingBlock label="LOADING ACTIVITY" />
+        <LoadingBlock label="Loading activity" />
       ) : (
         <ActivityTable events={activity} />
       )}
@@ -807,11 +819,11 @@ export function AdminPage() {
   const whoami = $api.useQuery('get', '/api/whoami');
 
   if (whoami.isError) {
-    return <Empty title="ADMIN UNAVAILABLE" description={formatError(whoami.error)} />;
+    return <Empty title="Admin unavailable" description={formatError(whoami.error)} />;
   }
 
   if (whoami.isPending) {
-    return <LoadingBlock label="LOADING ADMIN" />;
+    return <LoadingBlock label="Loading admin" />;
   }
 
   const isAdmin = whoami.data.role === 'admin';

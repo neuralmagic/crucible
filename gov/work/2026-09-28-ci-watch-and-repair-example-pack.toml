@@ -1,0 +1,51 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-09-28-007"
+title = "CI watch and repair example pack"
+status = "queue"
+created = "2026-09-28"
+refs = [
+    "RFC-0002:C-PLAYBOOK-SHAPE",
+    "RFC-0002:C-REVISE-LOOP",
+    "RFC-0002:C-RUN-HISTORY",
+    "RFC-0002:C-REPORTS",
+]
+depends_on = [
+    "WI-2026-09-28-001",
+    "WI-2026-09-28-002",
+    "WI-2026-09-28-003",
+]
+
+[content]
+description = "An example playbook for waiting on an external system inside one task: it dispatches a CI workflow and watches the run, classifies a failure, puts an agent in a revise loop with a rebuild-and-watch reviewer on a real failure, records a summary as its history entry, and publishes a Slack report whose accent follows the outcome. It is the reference for packs that poll and repair."
+
+[[content.acceptance_criteria]]
+text = "`examples/ci-repair` holds dispatch, watch, classify, a route on the classification, a fix agent with a rebuild reviewer at `max_rounds = 3`, a summary epilogue as the history record, and a report with `severity_field`"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "the watch script bounds its own wait, reports `timed_out` as output rather than failing, and retries a transient infrastructure failure once itself"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "dispatch is idempotent: rerunning it for the same ref and commit finds the run it started instead of dispatching again"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "the fix agent reads its last four history records and the reviewer's verdict under `revision`"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "a `just` recipe runs the pack end to end through OpenShell on podman with a model-free harness against a local server that speaks the GitHub Actions REST contract over HTTP, covering success, transient retry, fixed on a later round, cannot fix, and timed out"
+status = "pending"
+category = "chore"
+
+[[content.acceptance_criteria]]
+text = "the pack README and playbook-patterns describe the pattern"
+status = "pending"
+category = "chore"

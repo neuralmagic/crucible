@@ -11,6 +11,8 @@
       // Pre-paint theme: dark unless the toggle chose light (avoids a white flash on load).
       document.documentElement.dataset.theme =
         localStorage.getItem('theme') === 'light' ? 'light' : 'dark';
+      document.documentElement.dataset.brand =
+        localStorage.getItem('brand') === 'redhat' ? 'redhat' : 'crucible';
     </script>
   </head>
   <body>

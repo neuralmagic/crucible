@@ -22,7 +22,9 @@ print(json.dumps({
     },
     "copy_edit_advisory": advisory,
     "copy_edit_count": len(advisory),
-    "reviewers_reporting": sorted(inputs.keys()),
+    "reviewers_reporting": sorted(
+        name for name in ("review-correctness", "review-copy") if name in inputs
+    ),
 }))
 sys.exit(1 if blocked else 0)
 PY

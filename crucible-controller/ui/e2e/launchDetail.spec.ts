@@ -30,7 +30,7 @@ test.describe('the launch view', () => {
       'href',
       '/playbooks/survey/launch',
     );
-    await expect(page.getByRole('link', { name: 'RELAUNCH' })).toBeVisible();
+    await expect(page.getByRole('link', { name: 'Relaunch' })).toBeVisible();
   });
 
   /// Dispatch is a field of its own with the failure where a person looks for it, not a line of
@@ -56,7 +56,7 @@ test.describe('the launch view', () => {
 
     await expect(page.getByTestId('secrets-refusal')).toContainText('pr_token');
     await expect(page.getByTestId('secrets-refusal')).toContainText('neuralmagic/crucible');
-    await expect(page.getByRole('link', { name: 'OPEN SECRETS' })).toHaveAttribute(
+    await expect(page.getByRole('link', { name: 'Open secrets' })).toHaveAttribute(
       'href',
       '/secrets',
     );

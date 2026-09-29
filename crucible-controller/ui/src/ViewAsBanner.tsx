@@ -17,8 +17,8 @@ export function ViewAsBanner() {
       <span className="text-ink-2">read-only</span>
       <span className="text-ink-3">· groups as of {view.groups_at ?? 'never'}</span>
       <div className="flex-1" />
-      <Button disabled={viewAs.pending} onClick={() => { void viewAs.stop(); }}>
-        STOP
+      <Button className="uppercase" disabled={viewAs.pending} onClick={() => { void viewAs.stop(); }}>
+        Stop
       </Button>
     </div>
   );

@@ -1,0 +1,15 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-SERVICE-HANDOFF"
+title = "Credentials a service hands a task"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+A service MAY hand a task that needs it a credential for a target the service created for this run, such as the API of a virtual cluster it provisioned. The engine MUST deliver such a credential only into the sandbox of a task that needs the service, at a path the catalog entry states, and MUST NOT deliver it to any other task. The credential MUST be disclosed under [[RFC-0001:C-CAPABILITY-DISCLOSURE]] as entering agent context, with the target and scope the catalog entry states for the tool.
+
+
+
+A service that hands off credentials MUST hand off only credentials scoped to targets it created for the run and reclaims when signalled to stop, which its catalog entry asserts. A credential for the run supervisor's own cluster, or for anything the run did not create, MUST NOT be handed off."""

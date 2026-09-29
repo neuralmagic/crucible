@@ -16,8 +16,8 @@ export function Score({ value, unit, best = false, className }: ScoreProps) {
       {value}
       {unit !== undefined && <span className="text-label font-normal text-ink-3"> {unit}</span>}
       {best && (
-        <span className="ml-1.5 bg-green px-1 py-px font-mono text-micro font-bold tracking-group text-surface">
-          BEST
+        <span className="ml-1.5 bg-green px-1 py-px font-mono text-micro font-bold uppercase tracking-group text-surface">
+          Best
         </span>
       )}
     </span>

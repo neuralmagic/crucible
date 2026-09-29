@@ -7,7 +7,11 @@ export interface SectionProps {
 }
 
 export function Section({ children, className }: SectionProps) {
-  return <section className={cn('border-b border-rule-hard', className)}>{children}</section>;
+  return (
+    <section data-ui="section" className={cn('border-b border-rule-hard', className)}>
+      {children}
+    </section>
+  );
 }
 
 export interface SectionHeaderProps {
@@ -22,6 +26,7 @@ export interface SectionHeaderProps {
 export function SectionHeader({ title, note, actions, className }: SectionHeaderProps) {
   return (
     <div
+      data-ui="section-header"
       className={cn(
         'flex items-center gap-2.5 border-b border-rule bg-sunk px-4.5 py-2 font-mono text-label font-semibold uppercase tracking-section text-ink-2',
         className,
@@ -45,6 +50,8 @@ export interface SectionBodyProps {
 
 export function SectionBody({ children, padded = true, className }: SectionBodyProps) {
   return (
-    <div className={cn('bg-surface', padded && 'px-4.5 py-3.5', className)}>{children}</div>
+    <div data-ui="section-body" className={cn('bg-surface', padded && 'px-4.5 py-3.5', className)}>
+      {children}
+    </div>
   );
 }

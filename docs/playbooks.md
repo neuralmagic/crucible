@@ -201,11 +201,60 @@ the compiler refuses the pack:
 
 ```text
 argument "run" carries a value supplied from outside the pack. A prompt marks such a span so
-an agent can tell it from an instruction; nothing else can, so pass it to the task as a file
-or an environment variable instead of building it into "run".
+an agent can tell it from an instruction; nothing else can, so do not build it into "run". A
+command or evaluate task reads it as data from the "params" entry of $CRUCIBLE_INPUTS.
 ```
 
+A command or evaluate task reads every declared parameter from the `params` entry of the JSON
+in `CRUCIBLE_INPUTS`, under its name and in its declared type, beside its dependencies'
+outputs. A source with no `params` block gives it an empty object. Agent tasks get no such
+entry; their values reach them only through the prompt.
+
+```python
+fetch = command(
+    name = "fetch",
+    run = "python3 -c 'import json, os; p = json.loads(os.environ[\"CRUCIBLE_INPUTS\"])[\"params\"]; print(json.dumps({\"topic\": p[\"topic\"]}))'",
+)
+```
+
+`params` is reserved, so no task may name a dependency `params`.
+
 The same schema is what the control plane validates a launch against.
+
+## History
+
+A playbook that runs on a schedule can read what its last few runs found. The pack names one
+task as its record, and any agent, skill, command, or evaluate task asks for up to 30 earlier
+runs:
+
+```python
+triage = agent(
+    name = "triage",
+    prompt = "Find what is broken. Check the run history first: skip what earlier runs could not fix.",
+    history = 5,
+    emits = ["broken", "tried"],
+)
+workflow(type = "playbook", tasks = [triage], history_record = triage)
+```
+
+Each run records the record task's status and the fields it declares in `emits`, and nothing
+else. A later run of the same standing launch receives those records under `history`, oldest
+first, failed and timed-out runs included:
+
+```json
+{"records": [{"run": "...", "started_at": "...", "ended_at": "...", "outcome": "finished",
+              "verdict": "valid", "revision": "...", "link": "...",
+              "entry": {"task": "triage", "status": "pass", "output": {"broken": 2, "tried": ["..."]}}}],
+ "dropped": 0}
+```
+
+A command reads it from `CRUCIBLE_INPUTS`. An agent sees it in its prompt, marked as external
+input, because an earlier agent wrote part of it. When the records exceed the operator's size
+limit, the oldest are dropped whole and counted in `dropped`; `crucible check` prints the limit.
+A manual launch belongs to no series and gets an empty list, which is also what a local
+`plan run` gets unless `CRUCIBLE_HISTORY` is set. Make the record task an epilogue task to record
+even when the main graph fails. A pack's record shape can change between revisions, so a reader
+should tolerate older entries; each record carries the `revision` that wrote it.
 
 ## Launch it from the control plane
 

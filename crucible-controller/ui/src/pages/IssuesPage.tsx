@@ -490,21 +490,23 @@ export function IssuesPage() {
         {isAdmin && (
           <ToolbarActions>
             <BulkRerank />
-            <Button render={<Link to="/jira/new" />}>+ ADOPT JIRA</Button>
-            <Button variant="filled" render={<Link to="/scenarios/new" />}>
-              + NEW SCENARIO
+            <Button className="uppercase" render={<Link to="/jira/new" />}>
+              + Adopt Jira
+            </Button>
+            <Button variant="filled" className="uppercase" render={<Link to="/scenarios/new" />}>
+              + New scenario
             </Button>
           </ToolbarActions>
         )}
       </Toolbar>
 
-      <QueryState query={issues} noun="ISSUES">
+      <QueryState query={issues} noun="issues">
         <DataTable
           table={table}
           renderSubRow={(row) => <IssueDetailView issueKey={row.original.key} />}
           empty={
             <Empty
-              title="NO ISSUES"
+              title="No issues"
               description={
                 seenWindow === null
                   ? 'No issues match the current filters.'
@@ -575,11 +577,11 @@ function BulkRerank() {
           setResult(null);
           setPending(choice);
         }}
-        className="cursor-pointer border-r border-rule bg-transparent px-2.5 font-mono text-data text-ink-2 hover:bg-hi hover:text-ink"
+        className="cursor-pointer border-r border-rule bg-transparent px-2.5 font-mono text-data text-ink-2 uppercase hover:bg-hi hover:text-ink"
       >
-        <option value="">RE-RANK…</option>
+        <option value="">Re-rank…</option>
         {RERANK_CHOICES.map((choice) => (
-          <option key={choice.label} value={choice.label}>
+          <option key={choice.label} value={choice.label} className="normal-case">
             {choice.label}
           </option>
         ))}
@@ -603,14 +605,15 @@ function BulkRerank() {
             </AlertDialog.Description>
             <div className="flex justify-end border-t border-rule">
               <Button
+                className="uppercase"
                 onClick={() => {
                   setPending(null);
                 }}
               >
-                CANCEL
+                Cancel
               </Button>
-              <Button variant="filled" onClick={handleConfirm} disabled={mutation.isPending}>
-                RE-RANK
+              <Button variant="filled" className="uppercase" onClick={handleConfirm} disabled={mutation.isPending}>
+                Re-rank
               </Button>
             </div>
           </AlertDialog.Popup>

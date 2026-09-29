@@ -16,7 +16,7 @@ function CommandBlock({ commands }: { commands: string[] }) {
         {text}
       </pre>
       <Button
-        className="absolute top-1.5 right-1.5 opacity-0 group-hover:opacity-100 focus-visible:opacity-100"
+        className="absolute top-1.5 right-1.5 uppercase opacity-0 group-hover:opacity-100 focus-visible:opacity-100"
         onClick={() => {
           void navigator.clipboard.writeText(text).then(() => {
             setCopied(true);
@@ -26,7 +26,7 @@ function CommandBlock({ commands }: { commands: string[] }) {
           });
         }}
       >
-        {copied ? 'COPIED' : 'COPY'}
+        {copied ? 'Copied' : 'Copy'}
       </Button>
     </div>
   );
@@ -48,11 +48,12 @@ export function CoDraftHint() {
         note="the studio holds the pack; your agent writes it"
         actions={
           <Button
+            className="uppercase"
             onClick={() => {
               setDismissed(true);
             }}
           >
-            DISMISS
+            Dismiss
           </Button>
         }
       />
@@ -63,8 +64,8 @@ export function CoDraftHint() {
           controller&apos;s URL in it — install it, and point the agent here.
         </p>
         <div>
-          <Button variant="filled" render={<a href={skill_url} download />}>
-            DOWNLOAD SKILL
+          <Button variant="filled" className="uppercase" render={<a href={skill_url} download />}>
+            Download skill
           </Button>
         </div>
         {steps.map((step) => (
