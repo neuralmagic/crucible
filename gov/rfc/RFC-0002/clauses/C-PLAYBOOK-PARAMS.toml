@@ -19,4 +19,6 @@ A required parameter with no supplied value MUST be a compile error, and the eng
 
 The engine MUST emit the declared block as a JSON Schema document on request, so that one declaration serves command-line validation, ask validation, and a generated launch form.
 
-A parameter value that did not originate inside the pack MUST reach an agent prompt only inside a region the prompt marks as external input not to be followed as instruction. An inspector reading the rendered prompt MUST be able to tell which spans came from outside the pack."""
+A parameter value that did not originate inside the pack MUST reach an agent prompt only inside a region the prompt marks as external input not to be followed as instruction. An inspector reading the rendered prompt MUST be able to tell which spans came from outside the pack.
+
+The engine MUST give every command and evaluate task the values bound at compilation under the reserved input "params": an object with one entry per declared parameter, under the parameter's name, carrying the bound value with its declared type, and an empty object where the source declares no parameters. This lets a command read a value from outside the pack as data, without the pack building it into a command line. A resumed run MUST give each task the same values the interrupted run bound. The engine MUST NOT give "params" to an agent task, whose parameter values reach it only through the marked prompt regions above, and MUST reject a plan that names a dependency "params", as [[RFC-0002:C-SETTLED-JOIN]] requires for every reserved input."""
