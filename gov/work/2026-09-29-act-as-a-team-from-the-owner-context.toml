@@ -3,9 +3,10 @@
 [govctl]
 id = "WI-2026-09-29-001"
 title = "Act as a team from the owner context"
-status = "active"
+status = "done"
 created = "2026-09-29"
 started = "2026-09-29"
+completed = "2026-09-29"
 refs = [
     "RFC-0003:C-ACT-AS",
     "RFC-0003:C-PRINCIPALS",
