@@ -9,6 +9,8 @@
         "@cedar-policy/cedar-wasm": "^4.13.0",
         "@duckdb/duckdb-wasm": "^1.33.1-dev57.0",
         "@fontsource/public-sans": "^5.3.0",
+        "@fontsource/red-hat-mono": "^5.3.0",
+        "@fontsource/red-hat-text": "^5.3.0",
         "@headless-tree/core": "1.7.0",
         "@headless-tree/react": "1.7.0",
         "@monaco-editor/react": "4.7.0",
@@ -179,6 +181,10 @@
     "@floating-ui/utils": ["@floating-ui/utils@0.2.12", "", {}, "sha512-HpCo8tmWzLVad5s2d19EhAz5zqrrQ6s69qd6moPMQvkOuSwDT1YgRfWSVuc4ennqrgv3OHppiOGMQ7oC13yIww=="],
 
     "@fontsource/public-sans": ["@fontsource/public-sans@5.3.0", "", {}, "sha512-kjODI0S3zdv0mBYCIQ8TbBayaiqszpc2UbhJiO3bjIqVVXzcWfHSt2o3WBCLOY3juaGaQoy4MoWCcgmfI5hCuA=="],
+
+    "@fontsource/red-hat-mono": ["@fontsource/red-hat-mono@5.3.0", "", {}, "sha512-rXSQpg6TLRd+WLhcN9qGIarP9/HVouhmdKJcCv1R3+c2mznJ2GUUaTpkKhFN6LO2Sg7lRvb8CIaXYQqvqY6aPw=="],
+
+    "@fontsource/red-hat-text": ["@fontsource/red-hat-text@5.3.0", "", {}, "sha512-/kgNIUqdoc9uyd4zK+T7gEwY6bYF+hSCZeQTl8Ni/oKtv+a7YeCyQwAE94BeLwud6UfLqn90gBFKa3gCpiZnRA=="],
 
     "@headless-tree/core": ["@headless-tree/core@1.7.0", "", {}, "sha512-LxcX7LNepwfOPrZcs4PNfDwCzbi326uCAX5jYBfw94jI+pZQA7ANaE/No3LW0XFgcBcQtK/G2bInbVEhLF1C/Q=="],
 

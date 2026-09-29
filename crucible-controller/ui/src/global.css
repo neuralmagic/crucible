@@ -4,6 +4,14 @@
 @import '@fontsource/public-sans/latin-500.css';
 @import '@fontsource/public-sans/latin-600.css';
 @import '@fontsource/public-sans/latin-700.css';
+@import '@fontsource/red-hat-text/latin-400.css';
+@import '@fontsource/red-hat-text/latin-500.css';
+@import '@fontsource/red-hat-text/latin-600.css';
+@import '@fontsource/red-hat-text/latin-700.css';
+@import '@fontsource/red-hat-mono/latin-400.css';
+@import '@fontsource/red-hat-mono/latin-500.css';
+@import '@fontsource/red-hat-mono/latin-600.css';
+@import '@fontsource/red-hat-mono/latin-700.css';
 
 @import '@xyflow/react/dist/style.css';
 
@@ -98,6 +106,44 @@
   --color-red: #e56b69;
   --color-blue: #83afe8;
   --color-hi: #463d18;
+}
+
+/* Red Hat brand: PatternFly 6 palette and the Red Hat type family. */
+:root[data-brand='redhat'] {
+  --color-paper: #f2f2f2;
+  --color-surface: #ffffff;
+  --color-raised: #ffffff;
+  --color-sunk: #e0e0e0;
+  --color-ink: #151515;
+  --color-ink-2: #4d4d4d;
+  --color-ink-3: #5c5c5c;
+  --color-rule: #c7c7c7;
+  --color-rule-hard: #707070;
+  --color-green: #204d00;
+  --color-amber: #73480b;
+  --color-red: #a60000;
+  --color-blue: #0066cc;
+  --color-hi: #e0f0ff;
+
+  --font-mono: 'Red Hat Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  --font-sans: 'Red Hat Text', system-ui, -apple-system, 'Helvetica Neue', Arial, sans-serif;
+}
+
+:root[data-brand='redhat'][data-theme='dark'] {
+  --color-paper: #151515;
+  --color-surface: #1f1f1f;
+  --color-raised: #292929;
+  --color-sunk: #0a0a0a;
+  --color-ink: #ffffff;
+  --color-ink-2: #c7c7c7;
+  --color-ink-3: #a3a3a3;
+  --color-rule: #383838;
+  --color-rule-hard: #707070;
+  --color-green: #87bb62;
+  --color-amber: #ffcc17;
+  --color-red: #f56e6e;
+  --color-blue: #92c5f9;
+  --color-hi: #003366;
 }
 
 :root {
