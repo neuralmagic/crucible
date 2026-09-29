@@ -247,8 +247,13 @@ pub async fn decide_on(
 /// The decision on `verb` without its audit row: what a list or an eligible-set derivation asks
 /// per item. A refusal that answers a request goes through [`decide`] instead.
 pub fn may(state: &ApiState, caller: &Caller, verb: Verb, resource: &Resource) -> bool {
+    decision(state, caller, verb, resource).allowed
+}
+
+/// The active policy set's decision on `verb`, with the rules that made it, and no audit row.
+pub fn decision(state: &ApiState, caller: &Caller, verb: Verb, resource: &Resource) -> Decision {
     let Some(subject) = Subject::of(&caller.principals, caller.proves_groups()) else {
-        return false;
+        return Decision::denied("no-principal");
     };
     let action = Action {
         resource: resource.rtype,
@@ -259,7 +264,6 @@ pub fn may(state: &ApiState, caller: &Caller, verb: Verb, resource: &Resource) -
         .policy
         .current()
         .authorize(&subject, action, resource, now)
-        .allowed
 }
 
 /// The verbs `caller` may perform on `resource`, in vocabulary order, without audit rows: what a

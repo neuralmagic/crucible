@@ -34,6 +34,7 @@ import {
 import { HELD, sortedMembers, type MemberDto } from './teamsView';
 import { TeamResources } from './TeamResources';
 import { useOwnerContext } from '../useOwnerContext';
+import { useViewAs } from '../api/viewAs';
 
 const helper = createDataColumnHelper<MemberDto>();
 
@@ -78,13 +79,16 @@ interface MembersProps {
   members: readonly MemberDto[];
   /// Whether the caller owns the team: the API takes membership changes from owners alone.
   editable: boolean;
+  /// The caller's login when they may view as another user; null otherwise.
+  viewer: string | null;
 }
 
 /// The member list, with a role select and a remove per row and an add form for an owner. Every
 /// change sends the whole list, which is how the API takes it.
-function Members({ slug, members, editable }: MembersProps) {
+function Members({ slug, members, editable, viewer }: MembersProps) {
   const qc = useQueryClient();
   const put = $api.useMutation('put', '/api/teams/{slug}/members');
+  const viewAs = useViewAs();
   const [added, setAdded] = useState<MemberBody>({ kind: 'user', member: '', role: 'member' });
   const [error, setError] = useState<string | null>(null);
   const current = asBodies(members);
@@ -106,10 +110,29 @@ function Members({ slug, members, editable }: MembersProps) {
   };
 
   const rows = sortedMembers(members);
+  const viewColumn = helper.display({
+    id: 'view-as',
+    header: '',
+    meta: { shrink: true, align: 'end' },
+    cell: ({ row }) =>
+      row.original.kind === 'user' && row.original.member !== viewer ? (
+        <Button
+          disabled={viewAs.pending}
+          onClick={() => {
+            viewAs.start(row.original.member).catch((err: unknown) => {
+              setError(formatError(err));
+            });
+          }}
+        >
+          VIEW AS
+        </Button>
+      ) : null,
+  });
+  const shown = viewer === null ? columns : [...columns, viewColumn];
   const table = useDataTable({
     columns: editable
       ? [
-          ...columns,
+          ...shown,
           helper.display({
             id: 'edit',
             header: '',
@@ -143,7 +166,7 @@ function Members({ slug, members, editable }: MembersProps) {
             ),
           }),
         ]
-      : columns,
+      : shown,
     data: rows,
     getRowId: (row) => `${row.kind}:${row.member}`,
   });
@@ -212,6 +235,7 @@ function Members({ slug, members, editable }: MembersProps) {
 /// One team: who is in it, at what role, and how each membership is held.
 export function TeamDetailPage() {
   const { slug = '' } = useParams();
+  const whoami = $api.useQuery('get', '/api/whoami');
   const team = $api.useQuery('get', '/api/teams/{slug}', { params: { path: { slug } } });
   const owner = useOwnerContext();
   const principal = `team:${slug}`;
@@ -281,7 +305,12 @@ export function TeamDetailPage() {
             </Link>
           }
         />
-        <Members slug={row.slug} members={row.members} editable={row.my_role === 'owner'} />
+        <Members
+          slug={row.slug}
+          members={row.members}
+          editable={row.my_role === 'owner'}
+          viewer={whoami.data?.role === 'admin' && !whoami.data.impersonation ? (whoami.data.user ?? null) : null}
+        />
       </Section>
       <TeamResources owner={principal} />
     </>

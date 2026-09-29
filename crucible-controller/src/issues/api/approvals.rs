@@ -17,10 +17,11 @@ use axum::response::{IntoResponse, Response};
 )]
 pub(crate) async fn get_approvals(
     State(state): State<ApiState>,
+    caller: crate::authz::Caller,
 ) -> Result<Json<ApprovalsDto>, AppError> {
     let imports = crate::playbooks::imports::pending(state.db.pool()).await?;
     #[cfg(feature = "autoresearch")]
-    let (awaiting, prs) = if state.autoresearch {
+    let (awaiting, prs) = if crate::authz::entitlement::autoresearch(&state, &caller) {
         (
             crate::issues::store::awaiting_approval_scopes(state.db.pool()).await?,
             crate::runs::store::kept_candidate_prs(state.db.pool()).await?,
@@ -28,6 +29,8 @@ pub(crate) async fn get_approvals(
     } else {
         (Vec::new(), Vec::new())
     };
+    #[cfg(not(feature = "autoresearch"))]
+    let _ = caller;
     #[cfg(not(feature = "autoresearch"))]
     let (awaiting, prs): (
         Vec<crate::issues::model::AwaitingApproval>,

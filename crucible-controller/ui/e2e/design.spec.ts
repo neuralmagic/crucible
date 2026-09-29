@@ -10,6 +10,7 @@ const ROUTES = [
   { path: '/approvals', name: 'approvals' },
   { path: '/repos', name: 'repos' },
   { path: '/schedules', name: 'schedules' },
+  { path: '/playbook-runs', name: 'playbook-runs' },
   { path: '/activity', name: 'activity' },
   { path: '/secrets', name: 'secrets' },
 ];
@@ -17,6 +18,7 @@ const ROUTES = [
 const THEMES = ['light', 'dark'] as const;
 
 async function settle(page: Page, theme: string): Promise<void> {
+  await page.clock.setFixedTime(new Date('2026-08-24T12:00:00Z'));
   await page.emulateMedia({ colorScheme: theme === 'dark' ? 'dark' : 'light' });
   await page.addInitScript((t: string) => {
     localStorage.setItem('theme', t);
