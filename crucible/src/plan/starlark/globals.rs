@@ -222,14 +222,6 @@ fn compile_site<'a>(
     Ok((state, at))
 }
 
-/// Fail the call being evaluated with `error`, located at that call.
-pub(crate) fn refuse(eval: &Evaluator<'_, '_, '_>, error: dsl::CompileError) -> starlark::Error {
-    match compile_site(eval) {
-        Ok((state, at)) => state.throw(located(&at, error)),
-        Err(missing) => missing,
-    }
-}
-
 fn call<'v>(
     function: &'static str,
     args: UnpackTuple<Value<'v>>,

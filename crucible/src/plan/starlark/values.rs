@@ -22,7 +22,6 @@ use crucible_contract::emits::FieldType;
 
 use crate::plan::ir::{Declared, Emits, OutputField, OutputRef, Task, TaskKind, TaskName};
 use crate::plan::starlark::error::CompileError;
-use crate::plan::starlark::globals;
 use crate::plan::workflow::WorkflowCfg;
 
 /// A `session(...)` declaration: a durable conversation name plus optional agent
@@ -287,14 +286,13 @@ impl<'v> StarlarkValue<'v> for ExternalMethod {
         &self,
         _me: Value<'v>,
         _args: &Arguments<'v, '_>,
-        eval: &mut Evaluator<'v, '_, '_>,
+        _eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Value<'v>> {
-        Err(globals::refuse(
-            eval,
+        Err(starlark::Error::new_native(anyhow::Error::new(
             CompileError::ExternalMethod {
                 method: self.0.clone(),
             },
-        ))
+        )))
     }
 }
 
