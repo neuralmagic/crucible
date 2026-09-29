@@ -69,6 +69,7 @@ mod plan {
     pub mod events;
     pub mod harness;
     pub mod template;
+    pub mod turn_log;
 }
 
 use anyhow::Result;
