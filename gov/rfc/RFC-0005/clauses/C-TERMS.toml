@@ -1,0 +1,10 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-TERMS"
+title = "The run supervisor"
+kind = "informative"
+status = "active"
+
+[content]
+text = "The run supervisor is the process that runs one workload's engine: it compiles the workflow, dispatches every task, holds the run's credentials, and owns the sandboxes its agent turns run in. There is exactly one per run. It is created when the run starts and torn down when the run ends, on a laptop as a process and in a cluster as a pod. The sandbox is the untrusted side of the boundary it draws; the controller, which launches runs, is not part of it. Earlier documents call the run supervisor the loop pod and its image the loop image."

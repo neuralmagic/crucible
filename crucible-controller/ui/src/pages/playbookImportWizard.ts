@@ -130,5 +130,9 @@ export function matchExistingPlaybook(
   path: string
 ): PlaybookDto | null {
   const wanted = repo.trim();
-  return playbooks.find((p) => p.repo === wanted && p.path === path) ?? null;
+  return (
+    playbooks.find(
+      (p) => p.source.kind === 'git' && p.source.repo === wanted && p.source.path === path
+    ) ?? null
+  );
 }

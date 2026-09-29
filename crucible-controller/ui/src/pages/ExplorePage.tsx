@@ -85,7 +85,7 @@ function ResultTable({ result }: { result: QueryResult }) {
   return (
     <DataTable
       table={table}
-      empty={<Empty title="NO ROWS" description="The query returned nothing." />}
+      empty={<Empty title="No rows" description="The query returned nothing." />}
       footer={
         <>
           {result.rows.length}
@@ -155,7 +155,7 @@ export default function ExplorePage() {
     return (
       <>
         {header}
-        <LoadingBlock label="BOOTING DUCKDB" />
+        <LoadingBlock label="Booting DuckDB" />
       </>
     );
   }
@@ -164,7 +164,7 @@ export default function ExplorePage() {
     return (
       <>
         {header}
-        <Empty title="EXPLORE FAILED TO START" description={phase.error} />
+        <Empty title="Explore failed to start" description={phase.error} />
       </>
     );
   }
@@ -190,8 +190,8 @@ export default function ExplorePage() {
           ))}
         </ToolbarGroup>
         <ToolbarActions className="ml-auto">
-          <Button variant="filled" disabled={running} onClick={run}>
-            {running ? 'RUNNING…' : 'RUN (⌘⏎)'}
+          <Button variant="filled" className="uppercase" disabled={running} onClick={run}>
+            {running ? 'Running…' : 'Run (⌘⏎)'}
           </Button>
         </ToolbarActions>
       </Toolbar>

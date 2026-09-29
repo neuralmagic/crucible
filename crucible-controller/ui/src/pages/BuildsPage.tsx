@@ -227,31 +227,33 @@ export function BuildsPage() {
         />
       </Toolbar>
 
-      <QueryState query={builds} noun="BUILDS">
+      <QueryState query={builds} noun="builds">
         <DataTable
           table={table}
-          empty={<Empty title="NO BUILDS" />}
+          empty={<Empty title="No builds" />}
           footer={<>Showing {rows.length}</>}
         />
         <div className="flex items-center gap-2.5 border-b border-rule-hard bg-surface px-4.5 py-1.5">
           <Button
+            className="uppercase"
             disabled={page === 0}
             onClick={() => {
               setPage((p) => Math.max(0, p - 1));
             }}
           >
-            ◂ PREV
+            ◂ Prev
           </Button>
           <Mono size="label" tone="ink-3" uppercase>
             Page {page + 1}
           </Mono>
           <Button
+            className="uppercase"
             disabled={rows.length < PAGE_SIZE}
             onClick={() => {
               setPage((p) => p + 1);
             }}
           >
-            NEXT ▸
+            Next ▸
           </Button>
         </div>
       </QueryState>
@@ -270,6 +272,7 @@ function RebuildButton({ id, name, state }: { id: number; name: string; state: s
   return (
     <Tooltip content={rebuildable ? `Force-rebuild ${name}` : 'Only a terminal build can be rebuilt'}>
       <Button
+        className="uppercase"
         disabled={!rebuildable || mutation.isPending}
         onClick={() => {
           mutation.mutate(
@@ -282,7 +285,7 @@ function RebuildButton({ id, name, state }: { id: number; name: string; state: s
           );
         }}
       >
-        {mutation.isPending ? 'REBUILDING…' : 'REBUILD'}
+        {mutation.isPending ? 'Rebuilding…' : 'Rebuild'}
       </Button>
     </Tooltip>
   );

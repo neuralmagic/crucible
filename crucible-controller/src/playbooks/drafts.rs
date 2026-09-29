@@ -285,11 +285,13 @@ const DRAFT_COLUMNS: &str = "d.id, d.description, d.origin_playbook, d.origin_re
                              d.graduation_pr_url, d.retired_at, d.owner, d.created_by, d.created_at, \
                              d.updated_at, p.repo AS origin_playbook_repo, \
                              p.path AS origin_playbook_path, p.rev AS origin_current_rev, \
-                             i.repo AS origin_import_repo, i.path AS origin_import_path";
+                             i.repo AS origin_import_repo, i.path AS origin_import_path, \
+                             sp.id AS published_playbook";
 
 const DRAFT_JOINS: &str = "FROM playbook_drafts d \
                            LEFT JOIN playbooks p ON p.id = d.origin_playbook \
-                           LEFT JOIN pack_imports i ON i.id = d.origin_import";
+                           LEFT JOIN pack_imports i ON i.id = d.origin_import \
+                           LEFT JOIN playbooks sp ON sp.source_draft = d.id";
 
 /// A draft's metadata row, without any version's bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,6 +302,8 @@ pub struct DraftRow {
     pub graduation_repo: Option<String>,
     pub graduation_path: Option<String>,
     pub graduation_pr_url: Option<String>,
+    /// The playbook this draft was last published into.
+    pub published_playbook: Option<String>,
     pub retired_at: Option<String>,
     pub owner: crate::authz::model::Principal,
     pub created_by: Option<String>,
@@ -316,6 +320,7 @@ impl DraftRow {
             graduation_repo: row.try_get("graduation_repo")?,
             graduation_path: row.try_get("graduation_path")?,
             graduation_pr_url: row.try_get("graduation_pr_url")?,
+            published_playbook: row.try_get("published_playbook")?,
             retired_at: row.try_get("retired_at")?,
             owner: crate::authz::model::Principal::parse(&row.try_get::<String, _>("owner")?)?,
             created_by: row.try_get("created_by")?,
@@ -1188,6 +1193,63 @@ pub(crate) async fn copy_draft_pack_to<'e>(
     Ok(res.rows_affected() > 0)
 }
 
+/// The newest version of draft `id` that compiled, with its tarball.
+pub async fn newest_compiling(pool: &PgPool, id: &str) -> Result<(i64, Vec<u8>), DraftError> {
+    let row = sqlx::query(
+        r#"SELECT version, tar_gz FROM playbook_draft_versions
+           WHERE draft_id = $1 AND schema_digest IS NOT NULL ORDER BY version DESC LIMIT 1"#,
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .context("reading the newest compiling draft version")
+    .map_err(DraftError::Internal)?
+    .ok_or_else(|| {
+        DraftError::Invalid(format!(
+            "draft {id} has never compiled, so there is nothing to export"
+        ))
+    })?;
+    let version: i64 = row
+        .try_get("version")
+        .map_err(|e| DraftError::Internal(e.into()))?;
+    let tar_gz: Vec<u8> = row
+        .try_get("tar_gz")
+        .map_err(|e| DraftError::Internal(e.into()))?;
+    Ok((version, tar_gz))
+}
+
+/// The playbook a publish of `draft` writes: the one asked for, else the one it last published
+/// into, else the registered pack it was seeded from. The draft stays live after a publish, so the
+/// playbook needs an id of its own.
+pub fn publish_target(draft: &DraftRow, asked: Option<&str>) -> Result<String, DraftError> {
+    if draft.retired_at.is_some() {
+        return Err(DraftError::Conflict(format!(
+            "draft {} retired when its graduated pack was imported",
+            draft.id
+        )));
+    }
+    let origin = draft.origin.as_ref().and_then(|o| o.playbook.as_deref());
+    let target = asked
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .or(draft.published_playbook.as_deref())
+        .or(origin)
+        .ok_or_else(|| {
+            DraftError::Invalid(format!(
+                "draft {} has never been published; name the playbook to publish it as",
+                draft.id
+            ))
+        })?;
+    if target == draft.id {
+        return Err(DraftError::Invalid(format!(
+            "{target} is this draft's own id; the draft stays live after publishing, so the \
+             playbook needs another"
+        )));
+    }
+    validate_id(target).map_err(DraftError::Invalid)?;
+    Ok(target.to_string())
+}
+
 /// Export a draft as a pull request: push its newest compiling version to `repo` under `path` as a
 /// branch pair, and open the draft PR. Idempotent — a draft already graduated and not yet retired
 /// keeps its stored url rather than opening a second PR.
@@ -1212,26 +1274,7 @@ pub async fn graduate(
         return Err(DraftError::Invalid(format!("repo {repo:?} is not a repo")));
     }
 
-    let row = sqlx::query(
-        r#"SELECT version, tar_gz FROM playbook_draft_versions
-           WHERE draft_id = $1 AND schema_digest IS NOT NULL ORDER BY version DESC LIMIT 1"#,
-    )
-    .bind(id)
-    .fetch_optional(pool)
-    .await
-    .context("reading the newest compiling draft version")
-    .map_err(DraftError::Internal)?
-    .ok_or_else(|| {
-        DraftError::Invalid(format!(
-            "draft {id} has never compiled, so there is nothing to export"
-        ))
-    })?;
-    let version: i64 = row
-        .try_get("version")
-        .map_err(|e| DraftError::Internal(e.into()))?;
-    let tar_gz: Vec<u8> = row
-        .try_get("tar_gz")
-        .map_err(|e| DraftError::Internal(e.into()))?;
+    let (version, tar_gz) = newest_compiling(pool, id).await?;
 
     let title = format!("[pack] {id}");
     let body = format!(

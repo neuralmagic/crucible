@@ -58,6 +58,8 @@ export function Status({ status, tone, pulse, className }: StatusProps) {
   const live = pulse ?? isLiveStatus(status);
   return (
     <span
+      data-ui="status"
+      data-tone={tone}
       className={cn(
         'inline-flex items-center gap-1.5 font-mono text-label font-semibold uppercase tracking-label',
         TEXT[tone],
@@ -65,6 +67,7 @@ export function Status({ status, tone, pulse, className }: StatusProps) {
       )}
     >
       <span
+        data-ui="status-swatch"
         className={cn(
           'size-2 shrink-0 border border-black/30 dark:border-white/30',
           SWATCH[tone],

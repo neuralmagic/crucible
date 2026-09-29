@@ -1,0 +1,463 @@
+/* Red Hat brand: PatternFly 6 tokens and component shapes, applied over the crucible primitives
+   through their data-ui hooks. Values follow @patternfly/patternfly 6.6. */
+
+@import '@fontsource/red-hat-text/latin-400.css';
+@import '@fontsource/red-hat-text/latin-500.css';
+@import '@fontsource/red-hat-text/latin-600.css';
+@import '@fontsource/red-hat-text/latin-700.css';
+@import '@fontsource/red-hat-display/latin-500.css';
+@import '@fontsource/red-hat-display/latin-600.css';
+@import '@fontsource/red-hat-display/latin-700.css';
+@import '@fontsource/red-hat-mono/latin-400.css';
+@import '@fontsource/red-hat-mono/latin-500.css';
+@import '@fontsource/red-hat-mono/latin-600.css';
+@import '@fontsource/red-hat-mono/latin-700.css';
+
+:root[data-brand='redhat'] {
+  --color-paper: #f2f2f2;
+  --color-surface: #ffffff;
+  --color-raised: #ffffff;
+  --color-sunk: #e0e0e0;
+  --color-ink: #151515;
+  --color-ink-2: #4d4d4d;
+  --color-ink-3: #5c5c5c;
+  --color-rule: #e0e0e0;
+  --color-rule-hard: #707070;
+  --color-green: #204d00;
+  --color-amber: #73480b;
+  --color-red: #a60000;
+  --color-blue: #0066cc;
+  --color-hi: #e0f0ff;
+
+  --font-sans: 'Red Hat Text', system-ui, -apple-system, 'Helvetica Neue', Arial, sans-serif;
+  --font-mono: var(--font-sans);
+  --rh-font-display: 'Red Hat Display', var(--font-sans);
+  --rh-font-code: 'Red Hat Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --text-micro: 11px;
+  --text-label: 12px;
+  --text-data: 13px;
+  --text-data-lg: 14px;
+  --text-body: 14px;
+  --text-wordmark: 18px;
+  --text-lede: 16px;
+  --text-figure: 18px;
+  --text-title: 24px;
+  --text-display: 28px;
+
+  --tracking-title: normal;
+  --tracking-display: normal;
+  --tracking-data: normal;
+  --tracking-action: normal;
+  --tracking-label: normal;
+  --tracking-group: normal;
+  --tracking-section: normal;
+  --tracking-eyebrow: normal;
+  --tracking-brand: normal;
+
+  --spacing-row: 44px;
+
+  --rh-radius-small: 6px;
+  --rh-radius-medium: 16px;
+  --rh-radius-pill: 999px;
+  --rh-hover: rgb(199 199 199 / 0.25);
+  --rh-on-brand: #ffffff;
+  --rh-shadow: 0 0.25rem 0.5rem 0 rgb(41 41 41 / 0.16);
+
+  --rh-label-green: #d1f1bb;
+  --rh-label-blue: #b9dafc;
+  --rh-label-red: #fbc5c5;
+  --rh-label-amber: #ffe072;
+  --rh-label-grey: #e0e0e0;
+  --rh-label-ink: #151515;
+}
+
+:root[data-brand='redhat'][data-theme='dark'] {
+  --color-paper: #151515;
+  --color-surface: #1f1f1f;
+  --color-raised: #292929;
+  --color-sunk: #0a0a0a;
+  --color-ink: #ffffff;
+  --color-ink-2: #c7c7c7;
+  --color-ink-3: #a3a3a3;
+  --color-rule: #383838;
+  --color-rule-hard: #707070;
+  --color-green: #87bb62;
+  --color-amber: #ffcc17;
+  --color-red: #f56e6e;
+  --color-blue: #92c5f9;
+  --color-hi: #003366;
+
+  --rh-hover: rgb(199 199 199 / 0.15);
+  --rh-on-brand: #1f1f1f;
+  --rh-shadow: 0 0.25rem 0.5rem 0 rgb(0 0 0 / 0.48);
+
+  --rh-label-green: #afdc8f;
+  --rh-label-blue: #92c5f9;
+  --rh-label-red: #f9a8a8;
+  --rh-label-amber: #ffcc17;
+  --rh-label-grey: #c7c7c7;
+  --rh-label-ink: #1f1f1f;
+}
+
+/* Type */
+
+:root[data-brand='redhat'] .uppercase {
+  text-transform: none;
+}
+
+:root[data-brand='redhat'] [class*='tracking-'] {
+  letter-spacing: normal;
+}
+
+:root[data-brand='redhat'] :is(h1, h2) {
+  font-family: var(--rh-font-display);
+  font-weight: 600;
+}
+
+:root[data-brand='redhat'] :is(code, pre, kbd, samp, [data-ui='identifier']) {
+  font-family: var(--rh-font-code);
+}
+
+/* Page chrome: masthead and nav sit on the backdrop, content in an inset rounded container. */
+
+:root[data-brand='redhat'] [data-ui='masthead'] {
+  height: 56px;
+  border-bottom: 0;
+  background: var(--color-paper);
+}
+
+:root[data-brand='redhat'] [data-ui='masthead'] * {
+  border-color: transparent;
+}
+
+:root[data-brand='redhat'] [data-ui='wordmark'] b {
+  font-family: var(--rh-font-display);
+  font-weight: 600;
+}
+
+:root[data-brand='redhat'] [data-ui='strip'] {
+  gap: 4px 24px;
+  padding: 0 24px 12px;
+  border: 0;
+  background: var(--color-paper);
+}
+
+:root[data-brand='redhat'] [data-ui='strip'] > div {
+  padding: 0;
+  border: 0;
+}
+
+:root[data-brand='redhat'] [data-ui='nav'] {
+  border-right: 0;
+  background: var(--color-paper);
+}
+
+:root[data-brand='redhat'] [data-ui='nav'] > div:first-child {
+  border-bottom: 0;
+}
+
+:root[data-brand='redhat'] [data-ui='nav-heading'] {
+  padding: 20px 16px 6px;
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  font-size: var(--text-body);
+  font-weight: 600;
+}
+
+:root[data-brand='redhat'] [data-ui='nav-link'] {
+  margin: 1px 8px;
+  padding: 8px 12px;
+  border-left: 0;
+  border-radius: var(--rh-radius-small);
+  background: transparent;
+  color: var(--color-ink-2);
+  font-weight: 400;
+}
+
+:root[data-brand='redhat'] [data-ui='nav-link']:hover,
+:root[data-brand='redhat'] [data-ui='nav-link'][aria-current='page'] {
+  background: var(--color-surface);
+  color: var(--color-ink);
+}
+
+:root[data-brand='redhat'] [data-ui='nav'][data-collapsed='true'] [data-ui='nav-link'] {
+  width: auto;
+  padding: 0;
+}
+
+:root[data-brand='redhat'] [data-ui='main'] {
+  margin: 0 16px 16px 0;
+  padding: 8px 24px 24px;
+  border: 1px solid var(--color-rule);
+  border-radius: var(--rh-radius-medium);
+  background: var(--color-surface);
+}
+
+/* Page header and cards */
+
+:root[data-brand='redhat'] [data-ui='page-header'] {
+  padding: 16px 0 24px;
+  border-bottom: 0;
+}
+
+:root[data-brand='redhat'] :has(> [data-ui='section']) {
+  column-gap: 24px;
+}
+
+:root[data-brand='redhat'] [data-ui='section'] {
+  margin-bottom: 24px;
+  overflow: hidden;
+  border: 1px solid var(--color-rule);
+  border-radius: var(--rh-radius-medium);
+}
+
+:root[data-brand='redhat'] [data-ui='section-header'] {
+  padding: 20px 24px 8px;
+  border-bottom: 0;
+  background: transparent;
+  color: var(--color-ink);
+  font-family: var(--rh-font-display);
+  font-size: var(--text-lede);
+  font-weight: 600;
+}
+
+:root[data-brand='redhat'] [data-ui='section-body'] {
+  padding-inline: 24px;
+  background: transparent;
+}
+
+/* Buttons: primary pill, plain actions, toggle groups */
+
+:root[data-brand='redhat'] [data-ui='button'] {
+  border-radius: var(--rh-radius-small);
+  font-family: var(--font-sans);
+  font-size: var(--text-body);
+}
+
+:root[data-brand='redhat'] [data-ui='button'][data-variant='filled'] {
+  padding: 6px 16px;
+  border-radius: var(--rh-radius-pill);
+  background: var(--color-blue);
+  color: var(--rh-on-brand);
+  font-weight: 400;
+}
+
+:root[data-brand='redhat'] [data-ui='button'][data-variant='quiet'] {
+  color: var(--color-blue);
+}
+
+:root[data-brand='redhat'] [data-ui='button'][data-variant='quiet']:hover {
+  background: var(--rh-hover);
+}
+
+:root[data-brand='redhat'] [data-ui='button'][aria-pressed='true'] {
+  background: var(--color-hi);
+  color: var(--color-ink);
+  font-weight: 600;
+}
+
+/* Toolbar */
+
+:root[data-brand='redhat'] [data-ui='toolbar'] {
+  flex-wrap: wrap;
+  gap: 12px 16px;
+  padding: 0 0 16px;
+  border-bottom: 0;
+  background: transparent;
+}
+
+:root[data-brand='redhat'] [data-ui='toolbar-group'] {
+  border: 0;
+}
+
+:root[data-brand='redhat'] [data-ui='toolbar-group'] > * {
+  border: 1px solid var(--color-rule-hard);
+  border-left-width: 0;
+  border-radius: 0;
+}
+
+:root[data-brand='redhat'] [data-ui='toolbar-group'] > [data-ui='toolbar-label'] {
+  padding: 0 12px 0 0;
+  border: 0;
+  color: var(--color-ink-2);
+  font-weight: 600;
+}
+
+:root[data-brand='redhat'] [data-ui='toolbar-label'] + * {
+  border-left-width: 1px;
+  border-radius: var(--rh-radius-small) 0 0 var(--rh-radius-small);
+}
+
+:root[data-brand='redhat'] [data-ui='toolbar-group'] > :last-child {
+  border-radius: 0 var(--rh-radius-small) var(--rh-radius-small) 0;
+}
+
+:root[data-brand='redhat'] [data-ui='toolbar-group'] [data-ui='button'][data-variant='quiet'] {
+  color: var(--color-ink);
+}
+
+:root[data-brand='redhat'] [data-ui='toolbar-group'] [data-ui='button'][aria-pressed='true'] {
+  background: var(--color-hi);
+  box-shadow: inset 0 0 0 1px var(--color-blue);
+}
+
+:root[data-brand='redhat'] [data-ui='search'] {
+  min-width: 240px;
+  padding: 0;
+}
+
+:root[data-brand='redhat'] [data-ui='search'] input {
+  padding: 6px 12px;
+  border: 1px solid var(--color-rule-hard);
+  border-radius: var(--rh-radius-small);
+  background: var(--color-surface);
+}
+
+:root[data-brand='redhat'] [data-ui='toolbar-actions'] {
+  gap: 8px;
+  border: 0;
+}
+
+/* Filter facets */
+
+:root[data-brand='redhat'] [data-ui='facets'] {
+  margin-bottom: 16px;
+  border: 0;
+  background: transparent;
+}
+
+:root[data-brand='redhat'] [data-ui='facet-row'] {
+  min-height: 32px;
+  border: 0;
+}
+
+:root[data-brand='redhat'] [data-ui='facet-row'] > dt {
+  width: 88px;
+  border: 0;
+  background: transparent;
+  color: var(--color-ink-2);
+  font-size: var(--text-data);
+}
+
+:root[data-brand='redhat'] [data-ui='facet-row'] > dd {
+  gap: 6px;
+}
+
+:root[data-brand='redhat'] [data-ui='facet'] {
+  gap: 6px;
+  padding: 2px 10px;
+  border: 1px solid var(--color-rule);
+  border-radius: var(--rh-radius-pill);
+  background: transparent;
+  color: var(--color-ink);
+}
+
+:root[data-brand='redhat'] [data-ui='facet']:hover {
+  border-color: var(--color-blue);
+}
+
+:root[data-brand='redhat'] [data-ui='facet'][aria-pressed='true'] {
+  border-color: var(--color-blue);
+  background: var(--color-hi);
+  color: var(--color-ink);
+}
+
+:root[data-brand='redhat'] [data-ui='facet'][aria-pressed='true'] span {
+  color: var(--color-ink-2);
+  opacity: 1;
+}
+
+/* Tables: row dividers only, sans headers */
+
+:root[data-brand='redhat'] [data-ui='table'] {
+  background: transparent;
+}
+
+:root[data-brand='redhat'] [data-ui='table'] :is(th, td) {
+  border-right: 0;
+  border-color: var(--color-rule);
+}
+
+:root[data-brand='redhat'] [data-ui='table'] th {
+  padding-block: 12px;
+  background: var(--color-surface);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  font-size: var(--text-body);
+  font-weight: 600;
+}
+
+:root[data-brand='redhat'] [data-ui='table'] tbody tr:hover {
+  background: var(--rh-hover);
+}
+
+/* Status labels */
+
+:root[data-brand='redhat'] [data-ui='status'] {
+  width: fit-content;
+  padding: 2px 8px;
+  border-radius: var(--rh-radius-pill);
+  background: var(--rh-label-grey);
+  color: var(--rh-label-ink);
+  font-size: var(--text-label);
+  font-weight: 400;
+}
+
+:root[data-brand='redhat'] [data-ui='status'][data-tone='green'] {
+  background: var(--rh-label-green);
+}
+
+:root[data-brand='redhat'] [data-ui='status'][data-tone='blue'] {
+  background: var(--rh-label-blue);
+}
+
+:root[data-brand='redhat'] [data-ui='status'][data-tone='red'] {
+  background: var(--rh-label-red);
+}
+
+:root[data-brand='redhat'] [data-ui='status'][data-tone='amber'] {
+  background: var(--rh-label-amber);
+}
+
+:root[data-brand='redhat'] [data-ui='status-swatch'] {
+  width: 6px;
+  height: 6px;
+  border: 0;
+  border-radius: var(--rh-radius-pill);
+  background: currentColor;
+}
+
+/* Identifiers read as links */
+
+:root[data-brand='redhat'] [data-ui='identifier'] {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--color-ink);
+  font-weight: 500;
+}
+
+:root[data-brand='redhat'] :is(a[data-ui='identifier'], a[data-ui='identifier']:hover) {
+  color: var(--color-blue);
+}
+
+:root[data-brand='redhat'] a[data-ui='identifier']:hover {
+  text-decoration: underline;
+}
+
+/* Form controls and floating surfaces */
+
+:root[data-brand='redhat']
+  :is(input:not([type='checkbox'], [type='radio'], [type='range']), select, textarea) {
+  border-radius: var(--rh-radius-small);
+}
+
+:root[data-brand='redhat'] :is([role='dialog'], [role='alertdialog'], [role='menu'], [role='listbox']) {
+  border-radius: var(--rh-radius-medium);
+  box-shadow: var(--rh-shadow);
+}
+
+:root[data-brand='redhat'] [role='tooltip'] {
+  border-radius: var(--rh-radius-small);
+}

@@ -169,6 +169,12 @@ pub struct Cluster {
     pub rig_namespace: String,
     /// The service account the loop pod runs as (its projected token is what kubectl authenticates with).
     pub service_account: String,
+    /// The service account sandbox pods run as, when it differs from `service_account`. Sandbox
+    /// pods mount no token, so this account needs no RBAC, only whatever admits the sandbox pod
+    /// (an OpenShift SCC, a PSA exemption); keeping that grant off the loop SA keeps it off every
+    /// pod the loop SA's token creates.
+    #[serde(default)]
+    pub sandbox_service_account: Option<String>,
     /// The in-cluster kubeconfig configmap mounted at `/etc/kube` (points kubectl at the API server +
     /// the projected token).
     #[serde(default = "default_kubeconfig_configmap")]
@@ -230,6 +236,20 @@ pub struct Cluster {
     pub buildah_capabilities: bool,
     #[serde(default)]
     pub host_aliases: BTreeMap<String, String>,
+    /// Where a sandbox that asks for GPUs (`[agent.resources] gpus`) is scheduled: the GPU nodes'
+    /// labels, their taints' tolerations, and the runtime class that exposes the devices. Applied
+    /// only to GPU sandboxes. Takes effect under `sandbox_driver = "kubernetes"`.
+    #[serde(default)]
+    pub gpu_sandbox: crate::openshell::placement::GpuPlacement,
+}
+
+impl Cluster {
+    /// The service account sandbox pods run as: `sandbox_service_account`, else the loop's.
+    pub fn sandbox_service_account(&self) -> &str {
+        self.sandbox_service_account
+            .as_deref()
+            .unwrap_or(&self.service_account)
+    }
 }
 
 /// `state_pvc = "name"` (existing claim) or a `[cluster.state_pvc]` template.
@@ -452,6 +472,33 @@ mod tests {
                 .get("maas.example.com")
                 .map(String::as_str),
             Some("10.0.0.1")
+        );
+    }
+
+    #[test]
+    fn a_gpu_sandbox_placement_is_typed_and_defaults_empty() {
+        let profile: DeployProfile = toml::from_str(BASE).expect("profile parses");
+        assert!(profile.cluster.gpu_sandbox.is_empty());
+
+        let text = BASE.replace(
+            "[image]",
+            "[cluster.gpu_sandbox]\nruntime_class_name = \"nvidia\"\n\
+             [[cluster.gpu_sandbox.tolerations]]\nkey = \"nvidia.com/gpu\"\n\
+             operator = \"Exists\"\neffect = \"NoSchedule\"\n\n[image]",
+        );
+        let profile: DeployProfile = toml::from_str(&text).expect("profile parses");
+        let gpu = &profile.cluster.gpu_sandbox;
+        assert_eq!(gpu.runtime_class_name.as_deref(), Some("nvidia"));
+        assert_eq!(gpu.tolerations.len(), 1);
+        assert_eq!(gpu.tolerations[0].key.as_deref(), Some("nvidia.com/gpu"));
+
+        let typo = BASE.replace(
+            "[image]",
+            "[cluster.gpu_sandbox]\nnodeSelector = { a = \"b\" }\n\n[image]",
+        );
+        assert!(
+            toml::from_str::<DeployProfile>(&typo).is_err(),
+            "a misspelled key is refused, not dropped"
         );
     }
 

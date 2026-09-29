@@ -404,7 +404,7 @@ impl McpServer {
         }
         match crate::telemetry::spawn_blocking(|| crate::report::deliver(None, None)).await {
             Ok(Ok(reply)) => reply,
-            Ok(Err(e)) => json_err(&e),
+            Ok(Err(e)) => json_err(&e.to_string()),
             Err(e) => json_err(&format!("report task failed: {e}")),
         }
     }

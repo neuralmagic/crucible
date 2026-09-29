@@ -41,7 +41,8 @@ const columns = helper.columns([
             : `/playbooks/${encodeURIComponent(getValue())}`
         }
       >
-        {getValue()}{row.original.target_kind === 'draft_head' ? ' · MUTABLE' : ''}
+        {getValue()}
+        {row.original.target_kind === 'draft_head' ? <span className="uppercase"> · mutable</span> : ''}
       </Identifier>
     ),
   }),
@@ -93,8 +94,8 @@ const columns = helper.columns([
             {view.detail}
           </Mono>
           {view.signInHref !== null && (
-            <Button variant="filled" className="whitespace-nowrap" render={<a href={view.signInHref} />}>
-              SIGN IN
+            <Button variant="filled" className="whitespace-nowrap uppercase" render={<a href={view.signInHref} />}>
+              Sign in
             </Button>
           )}
         </div>
@@ -120,12 +121,12 @@ export function SchedulesPage() {
         description="Recurring playbook launches, when each fires next, and what is stopping the ones that will not."
       />
 
-      <QueryState query={schedules} noun="SCHEDULES">
+      <QueryState query={schedules} noun="schedules">
         <DataTable
           table={table}
           empty={
             <Empty
-              title="NO SCHEDULES"
+              title="No schedules"
               description="Schedule a playbook from its launch form to see it here."
             />
           }

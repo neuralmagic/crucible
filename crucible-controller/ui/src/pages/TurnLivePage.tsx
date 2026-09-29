@@ -22,7 +22,7 @@ export function TurnLivePage() {
   const row = (turns.data ?? []).find((t) => t.pod_name === podName) ?? null;
 
   if (!podName) {
-    return <Empty title="NO POD NAME" description="The live viewer needs a work-pod name." />;
+    return <Empty title="No pod name" description="The live viewer needs a work-pod name." />;
   }
 
   return (

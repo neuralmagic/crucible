@@ -136,10 +136,10 @@ function CredentialRows({ idPrefix, entries, onChange }: CredentialRowsProps) {
       ))}
       <div className="flex flex-wrap gap-2">
         <Button
-          className="border border-rule-hard px-2.5"
+          className="border border-rule-hard px-2.5 uppercase"
           onClick={() => { onChange([...entries, { name: '', value: '' }]); }}
         >
-          + ADD VARIABLE
+          + Add variable
         </Button>
         {CREDENTIAL_PRESETS.filter((preset) => !entries.some((e) => e.name === preset.name)).map(
           (preset) => (
@@ -297,7 +297,7 @@ function RegisterSection({ owners }: { owners: readonly PickOption[] }) {
       {owners.length === 0 ? (
         <SectionBody>
           <Empty
-            title="SIGN IN TO REGISTER"
+            title="Sign in to register"
             description="A secret is owned by you or by one of your groups, both of which come from your session."
           />
         </SectionBody>
@@ -320,7 +320,6 @@ function RegisterSection({ owners }: { owners: readonly PickOption[] }) {
                 value={form.owner}
                 onChange={(owner) => { setForm({ ...form, owner }); }}
                 options={owners}
-                hint="You, or a group in your validated claims. Every member of the owner can rotate and delete it; binding it also needs the operator role."
               />
               <SelectField
                 id="secret-kind"
@@ -428,11 +427,12 @@ function RegisterSection({ owners }: { owners: readonly PickOption[] }) {
           )}
           <FormActions>
             <Button
+              className="uppercase"
               variant="filled"
               disabled={!canRegister(form) || register.isPending}
               onClick={() => { void submit(); }}
             >
-              {register.isPending ? 'REGISTERING…' : 'REGISTER'}
+              {register.isPending ? 'Registering…' : 'Register'}
             </Button>
           </FormActions>
         </>
@@ -469,9 +469,9 @@ function SecretDetail({
   const [bindForm, setBindForm] = useState<BindForm | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  if (detail.isPending) return <LoadingBlock label="LOADING THE SECRET" />;
+  if (detail.isPending) return <LoadingBlock label="Loading the secret" />;
   if (detail.isError || detail.data === undefined) {
-    return <Empty title="NO SUCH SECRET" description={formatError(detail.error)} />;
+    return <Empty title="No such secret" description={formatError(detail.error)} />;
   }
 
   const secret = detail.data;
@@ -519,7 +519,7 @@ function SecretDetail({
           title={secret.name}
           note={`${secret.owner} · ${secret.kind} · ${secret.visibility}`}
           actions={
-            <Button onClick={onClosed}>CLOSE</Button>
+            <Button className="uppercase" onClick={onClosed}>Close</Button>
           }
         />
         <SectionBody className="grid gap-1 font-mono text-data text-ink-2">
@@ -546,6 +546,7 @@ function SecretDetail({
                   {`${b.scope_kind} ${b.scope_id}: ${b.declared_name} as ${b.projection_kind} ${b.projection}`}
                 </span>
                 <Button
+                  className="uppercase"
                   disabled={unbind.isPending}
                   onClick={() => {
                     void run(
@@ -558,7 +559,7 @@ function SecretDetail({
                     );
                   }}
                 >
-                  UNBIND
+                  Unbind
                 </Button>
               </div>
             ))
@@ -626,6 +627,7 @@ function SecretDetail({
         </SectionBody>
         <FormActions>
           <Button
+            className="uppercase"
             variant="filled"
             disabled={!canBind(form, secret) || bind.isPending}
             onClick={() => {
@@ -640,7 +642,7 @@ function SecretDetail({
               );
             }}
           >
-            {bind.isPending ? 'BINDING…' : 'BIND'}
+            {bind.isPending ? 'Binding…' : 'Bind'}
           </Button>
           {bindProblems.get('projectionKind') !== undefined && (
             <FormError>{bindProblems.get('projectionKind')}</FormError>
@@ -681,6 +683,7 @@ function SecretDetail({
         {secret.mode === 'managed' && (
           <FormActions>
             <Button
+              className="uppercase"
               disabled={!canRotate || rotate.isPending}
               onClick={() => {
                 void run(
@@ -690,7 +693,7 @@ function SecretDetail({
                 );
               }}
             >
-              {rotate.isPending ? 'ROTATING…' : 'ROTATE'}
+              {rotate.isPending ? 'Rotating…' : 'Rotate'}
             </Button>
           </FormActions>
         )}
@@ -720,6 +723,7 @@ function SecretDetail({
         {transferTargets.length > 0 && (
           <FormActions>
             <Button
+              className="uppercase"
               disabled={!transferTargets.some((owner) => owner.value === newOwner) || transfer.isPending}
               onClick={() => {
                 void run(
@@ -733,7 +737,7 @@ function SecretDetail({
                 );
               }}
             >
-              {transfer.isPending ? 'TRANSFERRING…' : 'TRANSFER'}
+              {transfer.isPending ? 'Transferring…' : 'Transfer'}
             </Button>
           </FormActions>
         )}
@@ -750,6 +754,7 @@ function SecretDetail({
         </SectionBody>
         <FormActions>
           <Button
+            className="uppercase"
             disabled={blocker !== null || remove.isPending}
             onClick={() => {
               void run(
@@ -759,7 +764,7 @@ function SecretDetail({
               );
             }}
           >
-            {remove.isPending ? 'DELETING…' : 'DELETE'}
+            {remove.isPending ? 'Deleting…' : 'Delete'}
           </Button>
         </FormActions>
       </Section>
@@ -768,7 +773,7 @@ function SecretDetail({
         <SectionHeader title="Audit" note="every recorded action, newest first" />
         <SectionBody className="grid gap-1 font-mono text-data text-ink-3">
           {audit.isPending ? (
-            <LoadingBlock label="LOADING THE AUDIT TRAIL" />
+            <LoadingBlock label="Loading the audit trail" />
           ) : audit.data === undefined || audit.data.length === 0 ? (
             <Note>Nothing recorded yet.</Note>
           ) : (
@@ -802,9 +807,9 @@ export function SecretsPage() {
       <PageHeader eyebrow="System" title="Secrets" />
 
       {secrets.isError ? (
-        <Empty title="SECRETS UNAVAILABLE" description={formatError(secrets.error)} />
+        <Empty title="Secrets unavailable" description={formatError(secrets.error)} />
       ) : secrets.isPending || groups === null ? (
-        <LoadingBlock label="LOADING SECRETS" />
+        <LoadingBlock label="Loading secrets" />
       ) : (
         <>
           <Section>
@@ -812,7 +817,7 @@ export function SecretsPage() {
             <SecretTable
               rows={groups.own}
               onOpen={setSelected}
-              emptyTitle="NO SECRETS OF YOUR OWN"
+              emptyTitle="No secrets of your own"
               emptyDescription="Register one below to bind it to a repo, playbook, or domain."
             />
           </Section>
@@ -822,7 +827,7 @@ export function SecretsPage() {
             <SecretTable
               rows={groups.team}
               onOpen={setSelected}
-              emptyTitle="NO TEAM SECRETS"
+              emptyTitle="No team secrets"
               emptyDescription="A secret owned by one of your groups shows up here for every member."
             />
           </Section>

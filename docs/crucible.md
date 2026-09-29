@@ -1,8 +1,9 @@
-# Crucible: what it is, in one read
+# The autoresearch loop, in one read
 
-Crucible is a **goal-driven, gated, keep/discard loop** for letting an agent improve a
-codebase against a frozen objective. The loop itself is domain-agnostic; a *domain* is a
-problem packaged for it.
+Autoresearch is crucible's scored lane: a **goal-driven, gated, keep/discard loop** for
+letting an agent improve a codebase against a frozen objective. The loop itself is
+domain-agnostic; a *domain* is a problem packaged for it. For a graph that runs once and
+ships, see [Your first playbook](./playbooks.md).
 
 This doc explains the whole system in higher-order concepts and then shows exactly how
 the `examples/counter` domain maps onto them. For *why the judge is frozen*, see

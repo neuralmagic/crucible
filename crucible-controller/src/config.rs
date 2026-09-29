@@ -439,6 +439,14 @@ pub struct ControllerCfg {
         value_delimiter = ','
     )]
     pub operator_groups: Vec<String>,
+    /// Logins that seed the playbook publishers team while it reaches nobody (repeatable, or
+    /// comma-separated via the env var). Its members may publish drafts they own without review.
+    #[arg(
+        long = "publisher",
+        env = "CONTROLLER_PUBLISHERS",
+        value_delimiter = ','
+    )]
+    pub publishers: Vec<String>,
     /// Mark the session cookie `Secure`. On by default — prod is https at the oauth2-proxy edge.
     /// Set `CONTROLLER_SESSION_SECURE=false` for plain-http local dev, or browsers drop the cookie.
     #[arg(

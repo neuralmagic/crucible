@@ -1721,14 +1721,14 @@ pub(super) fn kubernetes_sandbox_env(
         }),
     }];
     // Sandboxes run in the loop/turn pod's own namespace. Keeps the NetworkPolicy a simple
-    // podSelector and avoids provisioning a second ServiceAccount.
+    // podSelector.
     env.push(plain(
         "CRUCIBLE_SANDBOX_NAMESPACE",
         profile.cluster.loop_namespace.clone(),
     ));
     env.push(plain(
         "CRUCIBLE_SANDBOX_SERVICE_ACCOUNT",
-        profile.cluster.service_account.clone(),
+        profile.cluster.sandbox_service_account().to_string(),
     ));
     env.push(plain(
         "CRUCIBLE_SANDBOX_DEFAULT_IMAGE",
@@ -1748,6 +1748,14 @@ pub(super) fn kubernetes_sandbox_env(
         let aliases = serde_json::to_string(&profile.cluster.host_aliases)
             .expect("host aliases are JSON-serializable strings");
         env.push(plain("CRUCIBLE_SANDBOX_HOST_ALIASES", aliases));
+    }
+    if !profile.cluster.gpu_sandbox.is_empty() {
+        let placement = serde_json::to_string(&profile.cluster.gpu_sandbox)
+            .expect("GPU placement is JSON-serializable");
+        env.push(plain(
+            crate::openshell::placement::GPU_PLACEMENT_ENV,
+            placement,
+        ));
     }
     env.push(plain(
         "CRUCIBLE_SANDBOX_APP_ARMOR_PROFILE",
@@ -3406,6 +3414,91 @@ mod tests {
         assert!(
             !yaml.contains("STORAGE_DRIVER"),
             "no in-pod builds => no buildah env: {yaml}"
+        );
+    }
+
+    /// GPU placement rides the loop pod as JSON the engine hands the driver unchanged, and a
+    /// profile without it adds nothing.
+    #[test]
+    fn kubernetes_projects_gpu_sandbox_placement_only_when_configured() {
+        let placement = |profile: &DeployProfile| {
+            kubernetes_sandbox_env(profile, "sandbox:dev")
+                .into_iter()
+                .find(|e| e.name == crate::openshell::placement::GPU_PLACEMENT_ENV)
+                .and_then(|e| e.value)
+        };
+        assert_eq!(placement(&k8s_profile("")), None);
+
+        let profile = k8s_profile(
+            r#"
+            [cluster.gpu_sandbox]
+            runtime_class_name = "nvidia"
+            node_selector = { "nvidia.com/gpu.present" = "true" }
+            [[cluster.gpu_sandbox.tolerations]]
+            key = "nvidia.com/gpu"
+            operator = "Exists"
+            effect = "NoSchedule"
+            "#,
+        );
+        let raw = placement(&profile).expect("a configured placement is projected");
+        let back: crate::openshell::placement::GpuPlacement =
+            serde_json::from_str(&raw).expect("the projection parses back");
+        assert_eq!(back, profile.cluster.gpu_sandbox);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&raw).expect("json"),
+            serde_json::json!({
+                "node_selector": {"nvidia.com/gpu.present": "true"},
+                "tolerations": [{"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"}],
+                "runtime_class_name": "nvidia",
+            }),
+            "the keys are the driver's pod config keys and a toleration is the Kubernetes shape"
+        );
+    }
+
+    fn loop_pod_env(yaml: &str, name: &str) -> Option<String> {
+        let pod: core::Pod = serde_norway::from_str(yaml.split("\n---\n").next()?).ok()?;
+        pod.spec?
+            .containers
+            .into_iter()
+            .flat_map(|c| c.env.unwrap_or_default())
+            .find(|e| e.name == name)?
+            .value
+    }
+
+    fn loop_pod_service_account(yaml: &str) -> Option<String> {
+        let pod: core::Pod = serde_norway::from_str(yaml.split("\n---\n").next()?).ok()?;
+        pod.spec?.service_account_name
+    }
+
+    /// Sandbox pods run as the loop SA unless the profile names a separate sandbox account, and
+    /// naming one moves only the sandbox: the loop pod and the sandbox RBAC the in-pod gateway
+    /// uses stay on the loop SA.
+    #[test]
+    fn sandbox_service_account_defaults_to_the_loop_sa_and_moves_only_the_sandbox() {
+        let default = render_k8s(&k8s_profile(""));
+        assert_eq!(
+            loop_pod_env(&default, "CRUCIBLE_SANDBOX_SERVICE_ACCOUNT").as_deref(),
+            Some("autoresearch-publisher")
+        );
+
+        let split = render_k8s(&k8s_profile(
+            r#"sandbox_service_account = "autoresearch-sandbox""#,
+        ));
+        assert_eq!(
+            loop_pod_env(&split, "CRUCIBLE_SANDBOX_SERVICE_ACCOUNT").as_deref(),
+            Some("autoresearch-sandbox")
+        );
+        assert_eq!(
+            loop_pod_service_account(&split).as_deref(),
+            Some("autoresearch-publisher")
+        );
+        assert!(
+            split.contains("name: autoresearch-publisher-sandbox"),
+            "the gateway's sandbox RBAC stays on the loop SA: {split}"
+        );
+        assert!(
+            !split.contains("name: autoresearch-sandbox\n"),
+            "no RBAC object binds the sandbox SA: {split}"
         );
     }
 

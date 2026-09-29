@@ -10,17 +10,27 @@ const ROUTES = [
   { path: '/approvals', name: 'approvals' },
   { path: '/repos', name: 'repos' },
   { path: '/schedules', name: 'schedules' },
+  { path: '/playbook-runs', name: 'playbook-runs' },
   { path: '/activity', name: 'activity' },
   { path: '/secrets', name: 'secrets' },
 ];
 
-const THEMES = ['light', 'dark'] as const;
+const VARIANTS = [
+  { brand: 'crucible', theme: 'light', suffix: 'light' },
+  { brand: 'crucible', theme: 'dark', suffix: 'dark' },
+  { brand: 'redhat', theme: 'light', suffix: 'redhat-light' },
+  { brand: 'redhat', theme: 'dark', suffix: 'redhat-dark' },
+] as const;
 
-async function settle(page: Page, theme: string): Promise<void> {
-  await page.emulateMedia({ colorScheme: theme === 'dark' ? 'dark' : 'light' });
-  await page.addInitScript((t: string) => {
-    localStorage.setItem('theme', t);
-  }, theme);
+type Variant = (typeof VARIANTS)[number];
+
+async function settle(page: Page, variant: Variant): Promise<void> {
+  await page.clock.setFixedTime(new Date('2026-08-24T12:00:00Z'));
+  await page.emulateMedia({ colorScheme: variant.theme });
+  await page.addInitScript(({ theme, brand }: { theme: string; brand: string }) => {
+    localStorage.setItem('theme', theme);
+    localStorage.setItem('brand', brand);
+  }, variant);
 }
 
 async function ready(page: Page, path: string): Promise<void> {
@@ -36,15 +46,15 @@ async function ready(page: Page, path: string): Promise<void> {
   await expect(page.locator('#root')).not.toBeEmpty();
 }
 
-for (const theme of THEMES) {
-  test.describe(`${theme} theme`, () => {
+for (const variant of VARIANTS) {
+  test.describe(`${variant.suffix} theme`, () => {
     for (const route of ROUTES) {
       test(`${route.name} matches its baseline`, async ({ page }) => {
         await stubApi(page);
-        await settle(page, theme);
+        await settle(page, variant);
         await ready(page, route.path);
 
-        await expect(page).toHaveScreenshot(`${route.name}-${theme}.png`, { fullPage: true });
+        await expect(page).toHaveScreenshot(`${route.name}-${variant.suffix}.png`, { fullPage: true });
       });
     }
   });
@@ -116,12 +126,12 @@ test.describe('design rules', () => {
   });
 });
 
-for (const theme of THEMES) {
-  test.describe(`${theme} accessibility`, () => {
+for (const variant of VARIANTS) {
+  test.describe(`${variant.suffix} accessibility`, () => {
     for (const route of ROUTES) {
       test(`${route.name} has no WCAG A/AA violations`, async ({ page }) => {
         await stubApi(page);
-        await settle(page, theme);
+        await settle(page, variant);
         await ready(page, route.path);
 
         const { violations } = await new AxeBuilder({ page })

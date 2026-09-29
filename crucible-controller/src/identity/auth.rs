@@ -26,7 +26,7 @@
 
 #![allow(clippy::disallowed_macros)]
 
-use axum::extract::{FromRef, FromRequestParts, Request, State};
+use axum::extract::{FromRequestParts, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header, request::Parts};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
@@ -153,6 +153,9 @@ pub enum AuthPath {
     ApiKey,
     /// No expected token configured — the guard is off and the surface is loopback-bound.
     Open,
+    /// An administrator's session viewing as another user: that user's login and the groups their
+    /// last sign-in stamped, read-only.
+    Impersonated,
 }
 
 impl AuthPath {
@@ -161,7 +164,11 @@ impl AuthPath {
     pub fn carries_groups(self) -> bool {
         matches!(
             self,
-            AuthPath::Edge | AuthPath::Session | AuthPath::Jwt | AuthPath::ApiKey
+            AuthPath::Edge
+                | AuthPath::Session
+                | AuthPath::Jwt
+                | AuthPath::ApiKey
+                | AuthPath::Impersonated
         )
     }
 
@@ -169,7 +176,7 @@ impl AuthPath {
     pub fn may_own(self) -> bool {
         !matches!(
             self,
-            AuthPath::UnknownClusterToken | AuthPath::DowngradedSession
+            AuthPath::UnknownClusterToken | AuthPath::DowngradedSession | AuthPath::Impersonated
         )
     }
 
@@ -185,6 +192,7 @@ impl AuthPath {
             AuthPath::UnknownClusterToken => "unknown_cluster_token",
             AuthPath::ApiKey => "api_key",
             AuthPath::Open => "open",
+            AuthPath::Impersonated => "impersonated",
         }
     }
 
@@ -498,10 +506,32 @@ pub(crate) async fn require_auth(
                 if !is_safe(req.method()) && !same_origin(&req) {
                     return cross_origin();
                 }
-                let claims = match session {
-                    Some(session) => refresh_session_groups(&guard, &session, claims).await,
+                let claims = match &session {
+                    Some(session) => refresh_session_groups(&guard, session, claims).await,
                     None => claims,
                 };
+                if !claims.downgraded
+                    && let Some(session) = &session
+                {
+                    match viewing_as(session, &claims.login).await {
+                        Ok(Some(view)) => {
+                            if !is_safe(req.method()) && !stops_viewing(&req) {
+                                return read_only_view(&view);
+                            }
+                            let resolved = Resolved {
+                                user: Some(view.login.clone()),
+                                groups: view.groups.clone(),
+                                sub: Some(view.sub.clone()),
+                                source,
+                            };
+                            req.extensions_mut().insert(view);
+                            admit(&mut req, AuthPath::Impersonated, resolved);
+                            return next.run(req).await;
+                        }
+                        Ok(None) => {}
+                        Err(e) => return session_error(&e),
+                    }
+                }
                 let path = if claims.downgraded {
                     AuthPath::DowngradedSession
                 } else {
@@ -806,6 +836,47 @@ async fn native_session(
 }
 
 /// Whether the method only reads. The CSRF check applies to everything else.
+/// The live view-as this session's administrator started, if any. An expired one, or one another
+/// login started on this session, is dropped rather than honored.
+async fn viewing_as(
+    session: &tower_sessions::Session,
+    login: &str,
+) -> Result<Option<crate::identity::session::Impersonation>, tower_sessions::session::Error> {
+    let Some(view) = crate::identity::session::impersonation(session).await? else {
+        return Ok(None);
+    };
+    if view.by == login && !view.expired(jiff::Timestamp::now()) {
+        return Ok(Some(view));
+    }
+    crate::identity::session::stop_impersonation(session).await?;
+    Ok(None)
+}
+
+/// The one write a view-as session may make: stopping the view.
+fn stops_viewing(req: &Request) -> bool {
+    req.method() == Method::DELETE && req.uri().path() == "/api/impersonation"
+}
+
+fn read_only_view(view: &crate::identity::session::Impersonation) -> Response {
+    let body = serde_json::json!({
+        "error": format!(
+            "viewing as {} is read-only; stop viewing as them to make changes",
+            view.login
+        )
+    });
+    (
+        StatusCode::FORBIDDEN,
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&body).unwrap_or_default(),
+    )
+        .into_response()
+}
+
+fn session_error(e: &tower_sessions::session::Error) -> Response {
+    tracing::error!(error = %e, "reading the session's view-as slot");
+    (StatusCode::INTERNAL_SERVER_ERROR, "session store error").into_response()
+}
+
 fn is_safe(method: &Method) -> bool {
     matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
 }
@@ -1011,13 +1082,9 @@ impl Roles {
             .any(|cfg| cfg == asserted || cfg == tail)
     }
 
-    fn is_admin(&self, identity: &Identity) -> bool {
-        // Admin never comes from a group, so no Groups needed on this path.
-        self.role(identity, &Groups(Vec::new())) == Role::Admin
-    }
-
     /// The admin login whitelist (normalized: trimmed, lowercased, de-blanked). Read-only view for
-    /// the `/admin` access panel (`GET /api/access`) — the guards decide with `is_admin`, not this.
+    /// the `/admin` access panel (`GET /api/access`); the guards decide from platform team
+    /// membership, not this.
     pub(crate) fn admins(&self) -> &[String] {
         &self.admins
     }
@@ -1025,70 +1092,6 @@ impl Roles {
     /// The operator login whitelist (normalized). Same read-only-projection role as [`Roles::admins`].
     pub(crate) fn operators(&self) -> &[String] {
         &self.operators
-    }
-
-    fn is_operator(&self, identity: &Identity, groups: &Groups) -> bool {
-        matches!(self.role(identity, groups), Role::Admin | Role::Operator)
-    }
-}
-
-fn forbidden(who: &str, tier: &str) -> Response {
-    let body = serde_json::json!({
-        "error": format!("{who} is not in the {tier} whitelist")
-    });
-    (
-        StatusCode::FORBIDDEN,
-        [(header::CONTENT_TYPE, "application/json")],
-        serde_json::to_string(&body).unwrap_or_default(),
-    )
-        .into_response()
-}
-
-/// An axum extractor that asserts the caller is an admin. 403 with JSON body when not. Pair with
-/// `Roles` in state; any route that extracts `AdminGuard` is admin-gated. Money + config routes
-/// (ScopeNow, the autopilot kill switch) stay admin-only.
-pub struct AdminGuard;
-
-impl<S: Send + Sync> FromRequestParts<S> for AdminGuard
-where
-    Roles: FromRef<S>,
-{
-    type Rejection = Response;
-
-    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let Ok(identity) = Identity::from_request_parts(parts, state).await;
-        let Ok(path) = AuthPath::from_request_parts(parts, state).await;
-        let roles = Roles::from_ref(state);
-        if path.holds_roles() && roles.is_admin(&identity) {
-            Ok(AdminGuard)
-        } else {
-            let who = identity.as_deref().unwrap_or("anonymous");
-            Err(forbidden(who, "admin"))
-        }
-    }
-}
-
-/// An axum extractor that asserts the caller is an operator or an admin. 403 with JSON body when
-/// not. Pair with `Roles` in state; curation routes (park/unpark/bump) are operator-gated.
-pub struct OperatorGuard;
-
-impl<S: Send + Sync> FromRequestParts<S> for OperatorGuard
-where
-    Roles: FromRef<S>,
-{
-    type Rejection = Response;
-
-    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let Ok(identity) = Identity::from_request_parts(parts, state).await;
-        let Ok(groups) = Groups::from_request_parts(parts, state).await;
-        let Ok(path) = AuthPath::from_request_parts(parts, state).await;
-        let roles = Roles::from_ref(state);
-        if path.holds_roles() && roles.is_operator(&identity, &groups) {
-            Ok(OperatorGuard)
-        } else {
-            let who = identity.as_deref().unwrap_or("anonymous");
-            Err(forbidden(who, "operator"))
-        }
     }
 }
 
@@ -1202,21 +1205,12 @@ mod tests {
     }
 
     #[test]
-    fn admin_implies_operator() {
-        let roles = Roles::new(vec!["alice".to_string()], vec![], vec![]);
-        assert!(roles.is_operator(&identity("alice"), &Groups(Vec::new())));
-        assert!(roles.is_admin(&identity("alice")));
-    }
-
-    #[test]
     fn operator_is_not_admin() {
         let roles = Roles::new(vec![], vec!["bob".to_string()], vec![]);
         assert_eq!(
             roles.role(&identity("bob"), &Groups(Vec::new())),
             Role::Operator
         );
-        assert!(roles.is_operator(&identity("bob"), &Groups(Vec::new())));
-        assert!(!roles.is_admin(&identity("bob")));
     }
 
     #[test]
@@ -1239,8 +1233,6 @@ mod tests {
             roles.role(&identity("alice"), &Groups(Vec::new())),
             Role::Viewer
         );
-        assert!(!roles.is_admin(&identity("alice")));
-        assert!(!roles.is_operator(&identity("alice"), &Groups(Vec::new())));
     }
 
     #[test]
@@ -1822,6 +1814,15 @@ mod tests {
                 )
                 .route("/write", post(|| async { "written" }))
                 .route(
+                    "/api/impersonation",
+                    axum::routing::delete(|session: tower_sessions::Session| async move {
+                        crate::identity::session::stop_impersonation(&session)
+                            .await
+                            .expect("stop");
+                        "stopped"
+                    }),
+                )
+                .route(
                     "/headers",
                     get(|headers: HeaderMap| async move {
                         headers
@@ -1858,6 +1859,34 @@ mod tests {
                         .expect("establish");
                         "signed in"
                     }),
+                )
+                .route(
+                    "/view-as/{variant}",
+                    get(
+                        |session: tower_sessions::Session,
+                         axum::extract::Path(variant): axum::extract::Path<String>| async move {
+                            let now = jiff::Timestamp::now();
+                            let (by, started_at) = match variant.as_str() {
+                                "stale" => ("alice", now - jiff::SignedDuration::from_hours(2)),
+                                "foreign" => ("mallory", now),
+                                _ => ("alice", now),
+                            };
+                            crate::identity::session::start_impersonation(
+                                &session,
+                                &crate::identity::session::Impersonation {
+                                    login: "reed".to_string(),
+                                    sub: "sub-reed".to_string(),
+                                    groups: vec!["/groups/mlr".to_string()],
+                                    groups_at: Some(now.to_string()),
+                                    by: by.to_string(),
+                                    started_at,
+                                },
+                            )
+                            .await
+                            .expect("start");
+                            "viewing"
+                        },
+                    ),
                 )
                 .layer(crate::identity::session::layer(store, false))
         }
@@ -1941,6 +1970,86 @@ mod tests {
             )
             .await;
             assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+
+        async fn probe(app: &axum::Router, cookie: &str) -> String {
+            let (status, body, _) = call(
+                app,
+                HttpRequest::get("/probe")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            body
+        }
+
+        async fn view_as(app: &axum::Router, cookie: &str, variant: &str) {
+            let (status, _, _) = call(
+                app,
+                HttpRequest::get(format!("/view-as/{variant}"))
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        /// A session viewing as someone resolves every request as their snapshot, refuses every
+        /// write but the stop, and answers as its own login again once stopped.
+        #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+        async fn a_view_as_session_answers_as_the_target_and_refuses_writes(pool: PgPool) {
+            let app = app(&pool, native_guard()).await;
+            let cookie = sign_in(&app).await;
+            view_as(&app, &cookie, "live").await;
+            assert_eq!(probe(&app, &cookie).await, "reed|/groups/mlr|Impersonated");
+
+            let (status, body, _) = call(
+                &app,
+                HttpRequest::post("/write")
+                    .header(header::COOKIE, &cookie)
+                    .header("sec-fetch-site", "same-origin")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(body.contains("viewing as reed is read-only"), "{body}");
+
+            let (status, body, _) = call(
+                &app,
+                HttpRequest::delete("/api/impersonation")
+                    .header(header::COOKIE, &cookie)
+                    .header("sec-fetch-site", "same-origin")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(probe(&app, &cookie).await, "alice|/groups/team-x|Session");
+        }
+
+        /// A snapshot past its hour, or one another login left on the session, is dropped: the
+        /// session answers as its own login.
+        #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+        async fn a_stale_or_foreign_view_as_is_dropped(pool: PgPool) {
+            let app = app(&pool, native_guard()).await;
+            for variant in ["stale", "foreign"] {
+                let cookie = sign_in(&app).await;
+                view_as(&app, &cookie, variant).await;
+                assert_eq!(
+                    probe(&app, &cookie).await,
+                    "alice|/groups/team-x|Session",
+                    "{variant}"
+                );
+                assert_eq!(
+                    probe(&app, &cookie).await,
+                    "alice|/groups/team-x|Session",
+                    "{variant}: dropped, not just skipped once"
+                );
+            }
         }
 
         /// The `SameSite=Lax` cookie rides along on a cross-site write, and every other tenant on

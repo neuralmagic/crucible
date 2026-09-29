@@ -1050,6 +1050,22 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
             )
         }
     }
+    match crucible_controller::authz::bootstrap::seed_playbook_publishers(
+        db.pool(),
+        &cfg.publishers,
+    )
+    .await
+    .context("seeding the playbook publishers team")?
+    {
+        crucible_controller::authz::bootstrap::SeedOutcome::Reachable
+        | crucible_controller::authz::bootstrap::SeedOutcome::Unreachable => {}
+        crucible_controller::authz::bootstrap::SeedOutcome::Seeded { added } => {
+            tracing::info!(
+                added,
+                "playbook publishers team seeded from CONTROLLER_PUBLISHERS"
+            )
+        }
+    }
     match crucible_controller::authz::bootstrap::migrate_group_owners(db.pool()).await {
         Ok(0) => {}
         Ok(n) => tracing::info!(count = n, "group-owned resources moved to their teams"),

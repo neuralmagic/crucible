@@ -114,7 +114,7 @@ pub(crate) async fn park_issue(
     State(state): State<ApiState>,
     Path(key): Path<String>,
     identity: crate::identity::session::Identity,
-    _operator: crate::identity::auth::OperatorGuard,
+    _operator: crate::authz::guard::OperatorGuard,
     body: AnyBody<ParkBody>,
 ) -> Response {
     submit_override(
@@ -155,7 +155,7 @@ pub(crate) async fn unpark_issue(
     State(state): State<ApiState>,
     Path(key): Path<String>,
     identity: crate::identity::session::Identity,
-    _operator: crate::identity::auth::OperatorGuard,
+    _operator: crate::authz::guard::OperatorGuard,
     body: AnyBody<UnparkBody>,
 ) -> Response {
     submit_override(
@@ -191,7 +191,7 @@ pub(crate) struct ScopeNowBody {
     responses(
         (status = 202, description = "ScopeNow override enqueued", body = OverrideAck),
         (status = 303, description = "ScopeNow override enqueued (form POST, redirects to /)"),
-        (status = 403, description = "Caller is not in the admin whitelist", body = ErrorBody)
+        (status = 403, description = "Caller is not a platform administrator", body = ErrorBody)
     )
 )]
 #[cfg(feature = "autoresearch")]
@@ -199,7 +199,7 @@ pub(crate) async fn scope_now(
     State(state): State<ApiState>,
     Path(key): Path<String>,
     identity: crate::identity::session::Identity,
-    _admin: crate::identity::auth::AdminGuard,
+    _admin: crate::authz::guard::AdminGuard,
     body: AnyBody<ScopeNowBody>,
 ) -> Response {
     let justification = body.value.justification;
@@ -237,7 +237,7 @@ pub(crate) struct RedispatchBody {
     responses(
         (status = 202, description = "Redispatch override enqueued", body = OverrideAck),
         (status = 303, description = "Redispatch override enqueued (form POST, redirects to /)"),
-        (status = 403, description = "Caller is not in the admin whitelist", body = ErrorBody)
+        (status = 403, description = "Caller is not a platform administrator", body = ErrorBody)
     )
 )]
 #[cfg(feature = "autoresearch")]
@@ -245,7 +245,7 @@ pub(crate) async fn redispatch_issue(
     State(state): State<ApiState>,
     Path(key): Path<String>,
     identity: crate::identity::session::Identity,
-    _admin: crate::identity::auth::AdminGuard,
+    _admin: crate::authz::guard::AdminGuard,
     body: AnyBody<RedispatchBody>,
 ) -> Response {
     let justification = body.value.justification;
@@ -292,7 +292,7 @@ pub(crate) async fn bump_issue(
     State(state): State<ApiState>,
     Path(key): Path<String>,
     identity: crate::identity::session::Identity,
-    _operator: crate::identity::auth::OperatorGuard,
+    _operator: crate::authz::guard::OperatorGuard,
     body: AnyBody<BumpBody>,
 ) -> Response {
     submit_override(

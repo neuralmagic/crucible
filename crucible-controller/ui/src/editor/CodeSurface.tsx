@@ -1,17 +1,17 @@
 import { lazy, Suspense } from 'react';
 import type { CodeSurfaceProps } from './CodeSurfaceImpl';
 
-export type { CodeFocus, CodeMarker, CodeSurfaceProps } from './CodeSurfaceImpl';
+export type { CodeCompletion, CodeCompletions, CodeFocus, CodeMarker, CodeSurfaceProps } from './CodeSurfaceImpl';
 
 const Impl = lazy(() => import('./CodeSurfaceImpl'));
 
 function Loading({ height }: { height: string }) {
   return (
     <div
-      className="min-h-0 flex-1 border border-rule-hard bg-paper px-3 py-2 font-mono text-data text-ink-3"
+      className="min-h-0 flex-1 border border-rule-hard bg-paper px-3 py-2 font-mono text-data text-ink-3 uppercase"
       style={{ height }}
     >
-      LOADING EDITOR
+      Loading editor
     </div>
   );
 }

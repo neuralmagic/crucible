@@ -16,6 +16,9 @@ pub const PLATFORM_ADMINISTRATORS: &str = "platform-administrators";
 /// The slug of the team the configured operator lists migrate into (RFC-0003 C-COMPATIBILITY).
 pub const PLATFORM_OPERATORS: &str = "platform-operators";
 
+/// The slug of the team whose members may publish drafts they own without review.
+pub const PLAYBOOK_PUBLISHERS: &str = "playbook-publishers";
+
 /// Who may own or act. Every spelling derives from something the controller verified: a login the
 /// bearer guard proved, a group in validated claims, a team in the controller's own membership
 /// records, or a run credential the controller minted.
@@ -191,6 +194,10 @@ impl TeamSlug {
 
     pub fn platform_operators() -> TeamSlug {
         TeamSlug(PLATFORM_OPERATORS.to_string())
+    }
+
+    pub fn playbook_publishers() -> TeamSlug {
+        TeamSlug(PLAYBOOK_PUBLISHERS.to_string())
     }
 }
 

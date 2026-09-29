@@ -97,16 +97,20 @@ function makeColumns(onDelete: (id: string) => void) {
       meta: { align: 'end' },
       cell: ({ row }) => (
         <span className="flex justify-end gap-1">
-          <Button render={<Link to={`/playbooks/drafts/${encodeURIComponent(row.original.id)}`} />}>
-            OPEN
+          <Button
+            className="uppercase"
+            render={<Link to={`/playbooks/drafts/${encodeURIComponent(row.original.id)}`} />}
+          >
+            Open
           </Button>
           <Button
+            className="uppercase"
             disabled={!row.original.actions.includes('delete')}
             onClick={() => {
               onDelete(row.original.id);
             }}
           >
-            DELETE
+            Delete
           </Button>
         </span>
       ),
@@ -217,10 +221,10 @@ export function PlaybookDraftsPage() {
         }}
       />
 
-      <QueryState query={drafts} noun="DRAFTS">
+      <QueryState query={drafts} noun="drafts">
         <DataTable
           table={table}
-          empty={<Empty title="NO DRAFTS" description="Start one below." />}
+          empty={<Empty title="No drafts" description="Start one below." />}
           footer={<>Showing {rows.length}</>}
         />
       </QueryState>
@@ -324,6 +328,7 @@ export function PlaybookDraftsPage() {
           <FormActions>
             <Button
               variant="filled"
+              className="uppercase"
               disabled={
                 id.trim().length === 0 ||
                 description.trim().length === 0 ||
@@ -335,7 +340,7 @@ export function PlaybookDraftsPage() {
                 void handleCreate();
               }}
             >
-              {pending ? 'CREATING…' : 'CREATE DRAFT'}
+              {pending ? 'Creating…' : 'Create draft'}
             </Button>
           </FormActions>
         </Section>

@@ -72,7 +72,7 @@ pub struct ImportCandidatesDto {
     request_body = ImportCandidatesBody,
     responses(
         (status = 200, description = "The pack directories found at this ref", body = ImportCandidatesDto),
-        (status = 403, description = "Caller is not in the operator whitelist", body = ErrorBody),
+        (status = 403, description = "Caller is not a platform operator", body = ErrorBody),
         (status = 422, description = "Bad repo or ref", body = ErrorBody),
         (status = 502, description = "Cloning the repo failed", body = ErrorBody)
     )
@@ -80,7 +80,7 @@ pub struct ImportCandidatesDto {
 pub(crate) async fn import_candidates(
     State(state): State<ApiState>,
     _identity: crate::identity::session::Identity,
-    _operator: crate::identity::auth::OperatorGuard,
+    _operator: crate::authz::guard::OperatorGuard,
     Json(body): Json<ImportCandidatesBody>,
 ) -> Response {
     if let Some(msg) = require_non_empty(&[("repo", &body.repo)]) {
@@ -246,7 +246,7 @@ pub(crate) struct ProposeImportBody {
     request_body = ProposeImportBody,
     responses(
         (status = 201, description = "The pending import", body = PackImportDto),
-        (status = 403, description = "Caller is not in the operator whitelist", body = ErrorBody),
+        (status = 403, description = "Caller is not a platform operator", body = ErrorBody),
         (status = 422, description = "Bad repo/ref, or a path that is not a playbook pack", body = ErrorBody),
         (status = 502, description = "Cloning the repo failed", body = ErrorBody)
     )
@@ -254,7 +254,7 @@ pub(crate) struct ProposeImportBody {
 pub(crate) async fn propose_pack_import(
     State(state): State<ApiState>,
     identity: crate::identity::session::Identity,
-    _operator: crate::identity::auth::OperatorGuard,
+    _operator: crate::authz::guard::OperatorGuard,
     caller: crate::authz::Caller,
     Json(body): Json<ProposeImportBody>,
 ) -> Response {
@@ -423,14 +423,14 @@ pub struct ImportCompileDto {
     request_body = CompileImportBody,
     responses(
         (status = 200, description = "The form, graph and diagnostics for these values", body = ImportCompileDto),
-        (status = 403, description = "Caller is not in the operator whitelist", body = ErrorBody),
+        (status = 403, description = "Caller is not a platform operator", body = ErrorBody),
         (status = 404, description = "No import with that id", body = ErrorBody),
         (status = 422, description = "The stored pack is not compilable", body = ErrorBody)
     )
 )]
 pub(crate) async fn compile_pack_import(
     State(state): State<ApiState>,
-    _operator: crate::identity::auth::OperatorGuard,
+    _operator: crate::authz::guard::OperatorGuard,
     caller: crate::authz::Caller,
     Path(id): Path<String>,
     Json(body): Json<CompileImportBody>,
@@ -476,7 +476,7 @@ pub(crate) struct RegisterImportBody {
     request_body = RegisterImportBody,
     responses(
         (status = 201, description = "Registered", body = RegisterAck),
-        (status = 403, description = "Caller is not in the admin whitelist", body = ErrorBody),
+        (status = 403, description = "Caller is not a platform administrator", body = ErrorBody),
         (status = 404, description = "No import with that id", body = ErrorBody),
         (status = 409, description = "The import is already resolved, the ref moved, or a live draft holds the id", body = ErrorBody),
         (status = 422, description = "Bad registry id or description", body = ErrorBody),
@@ -486,7 +486,7 @@ pub(crate) struct RegisterImportBody {
 pub(crate) async fn register_pack_import(
     State(state): State<ApiState>,
     identity: crate::identity::session::Identity,
-    _admin: crate::identity::auth::AdminGuard,
+    _admin: crate::authz::guard::AdminGuard,
     caller: crate::authz::Caller,
     Path(id): Path<String>,
     Json(body): Json<RegisterImportBody>,
@@ -557,7 +557,7 @@ pub(crate) async fn register_pack_import(
     params(("id" = String, Path, description = "Import id")),
     responses(
         (status = 200, description = "The discarded import", body = PackImportDto),
-        (status = 403, description = "Caller is not in the operator whitelist", body = ErrorBody),
+        (status = 403, description = "Caller is not a platform operator", body = ErrorBody),
         (status = 404, description = "No import with that id", body = ErrorBody),
         (status = 409, description = "The import is already resolved", body = ErrorBody)
     )
@@ -565,7 +565,7 @@ pub(crate) async fn register_pack_import(
 pub(crate) async fn discard_pack_import(
     State(state): State<ApiState>,
     identity: crate::identity::session::Identity,
-    _operator: crate::identity::auth::OperatorGuard,
+    _operator: crate::authz::guard::OperatorGuard,
     caller: crate::authz::Caller,
     Path(id): Path<String>,
 ) -> Response {

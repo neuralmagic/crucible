@@ -3,7 +3,8 @@
 /// the blob opaque, which makes parsing and clamping this module's job.
 
 import type * as monaco from 'monaco-editor/editor';
-import { type AppTheme, THEME_NAMES } from './theme';
+import type { AppBrand, AppTheme } from '../appTheme';
+import { THEME_NAMES } from './theme';
 
 export const HIGHLIGHT_THEMES = ['paper', 'classic', 'contrast'] as const;
 export type HighlightTheme = (typeof HIGHLIGHT_THEMES)[number];
@@ -53,14 +54,13 @@ export function parseEditorPrefs(stored: Record<string, unknown> | undefined): E
 
 /// The two members of one curated pairing. `paper` is the app's own palette; the other two are
 /// Monaco's shipped themes, kept so a reader who wants a familiar editor gets one.
-const PAIRINGS: Record<HighlightTheme, Record<AppTheme, string>> = {
-  paper: THEME_NAMES,
+const PAIRINGS: Record<Exclude<HighlightTheme, 'paper'>, Record<AppTheme, string>> = {
   classic: { light: 'vs', dark: 'vs-dark' },
   contrast: { light: 'hc-light', dark: 'hc-black' },
 };
 
-export function monacoThemeName(theme: HighlightTheme, app: AppTheme): string {
-  return PAIRINGS[theme][app];
+export function monacoThemeName(theme: HighlightTheme, brand: AppBrand, app: AppTheme): string {
+  return theme === 'paper' ? THEME_NAMES[brand][app] : PAIRINGS[theme][app];
 }
 
 /// The Monaco options one preferences document resolves to, applied to every surface. Everything
@@ -68,17 +68,20 @@ export function monacoThemeName(theme: HighlightTheme, app: AppTheme): string {
 /// the app's mono face at the app's rhythm.
 export type SurfaceOptions = monaco.editor.IEditorOptions;
 
-const MONO = "'Ioskeley Mono', ui-monospace, SFMono-Regular, Menlo, monospace";
+const MONO: Record<AppBrand, string> = {
+  crucible: "'Ioskeley Mono', ui-monospace, SFMono-Regular, Menlo, monospace",
+  redhat: "'Red Hat Mono', ui-monospace, SFMono-Regular, Menlo, monospace",
+};
 
 /// The app's body line height, applied to code so a surface sits on the same rhythm as the text
 /// around it.
 const LINE_HEIGHT = 1.55;
 
-export function surfaceOptions(prefs: EditorPrefs): SurfaceOptions {
+export function surfaceOptions(prefs: EditorPrefs, brand: AppBrand): SurfaceOptions {
   return {
     fontSize: prefs.fontSize,
     lineHeight: Math.round(prefs.fontSize * LINE_HEIGHT),
-    fontFamily: MONO,
+    fontFamily: MONO[brand],
     fontWeight: '400',
     fontLigatures: false,
     wordWrap: prefs.wordWrap ? 'on' : 'off',

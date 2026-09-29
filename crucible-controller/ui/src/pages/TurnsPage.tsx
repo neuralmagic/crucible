@@ -159,11 +159,11 @@ export function TurnsPage() {
         <ToolbarGroup label="Kind" options={KIND_FILTERS} value={kind} onChange={setKind} />
       </Toolbar>
 
-      <QueryState query={turns} noun="TURNS">
+      <QueryState query={turns} noun="turns">
         <DataTable
           table={table}
           renderSubRow={(row) => <TurnDetail podName={row.original.pod_name} />}
-          empty={<Empty title="NO TURNS" description="No work pods match the current filters." />}
+          empty={<Empty title="No turns" description="No work pods match the current filters." />}
           footer={
             <>
               {rows.length} turn{rows.length === 1 ? '' : 's'}

@@ -9,6 +9,10 @@ export default defineConfig({
     outDir: 'dist',
     emptyOutDir: true,
   },
+  // Pre-bundling moves the glue away from the .wasm its `new URL(..., import.meta.url)` names.
+  optimizeDeps: {
+    exclude: ['@cedar-policy/cedar-wasm'],
+  },
   server: {
     proxy: {
       '/api': {

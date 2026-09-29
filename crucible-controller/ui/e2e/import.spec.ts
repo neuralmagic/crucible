@@ -1,5 +1,5 @@
 import { expect, test, type Page, type Route } from '@playwright/test';
-import { IMPORT_ID, stubApi } from './api';
+import { IMPORT_ID, PACK_IMPORT, stubApi } from './api';
 
 const IMPORT = '/playbooks/import';
 
@@ -12,10 +12,13 @@ async function ready(page: Page, path: string): Promise<void> {
   await expect(page.locator('main')).toBeVisible();
 }
 
-/// Serve one import row for both the proposal and the link it lands on.
+/// Serve one import row for both the proposal and the link it lands on. The row's shares stay
+/// with the fixture stubs.
 async function importWith(page: Page, body: Record<string, unknown>): Promise<void> {
   await page.route('**/api/playbooks/imports**', (route: Route) =>
-    route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) }),
+    new URL(route.request().url()).pathname.endsWith('/shares')
+      ? route.fallback()
+      : route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) }),
   );
 }
 
@@ -24,19 +27,31 @@ async function importWith(page: Page, body: Record<string, unknown>): Promise<vo
 async function toReview(page: Page): Promise<void> {
   await ready(page, IMPORT);
   await page.locator('#import-repo').fill('neuralmagic/other-packs');
-  await page.getByRole('button', { name: 'FETCH PACKS' }).click();
+  await page.getByRole('button', { name: 'Fetch packs' }).click();
   await page.getByRole('button', { name: 'packs/survey' }).click();
   await expect(page).toHaveURL(new RegExp(`${IMPORT}/`));
 }
 
 test.describe('pack import wizard', () => {
+  /// A pack that asks for GPUs says so where it is reviewed, before anyone registers it.
+  test('the substrate names the sandbox resources the pack asks for', async ({ page }) => {
+    await stubApi(page);
+    await importWith(page, {
+      ...PACK_IMPORT,
+      dispatch: { ...PACK_IMPORT.dispatch, resources: { gpus: 1, cpu: null, memory: '32Gi', node_selector: {} } },
+    });
+    await toReview(page);
+
+    await expect(page.getByText('1 GPU · memory 32Gi')).toBeVisible();
+  });
+
   test('lists the candidate packs at a ref', async ({ page }) => {
     await stubApi(page);
     await ready(page, IMPORT);
 
     await page.locator('#import-repo').fill('neuralmagic/crucible-packs');
     await page.locator('#import-ref').fill('main');
-    await page.getByRole('button', { name: 'FETCH PACKS' }).click();
+    await page.getByRole('button', { name: 'Fetch packs' }).click();
 
     await expect(page.getByRole('button', { name: 'packs/survey workflow.star' })).toBeVisible();
     await expect(page.getByRole('button', { name: 'packs/audit graph.star' })).toBeVisible();
@@ -78,10 +93,10 @@ test.describe('pack import wizard', () => {
     await read.hover();
     await expect(file).not.toHaveCSS('opacity', '1');
 
-    await expect(page.getByRole('button', { name: 'REGISTER' })).toBeDisabled();
+    await expect(page.getByRole('button', { name: 'Register' })).toBeDisabled();
     await page.locator('#import-id').fill('survey-two');
     await page.locator('#import-description').fill('reads a paper and files a spec');
-    await expect(page.getByRole('button', { name: 'REGISTER' })).toBeEnabled();
+    await expect(page.getByRole('button', { name: 'Register' })).toBeEnabled();
   });
 
   /// What the pack's agent needs is read at the gate, not discovered by a failed run: the review
@@ -139,10 +154,10 @@ test.describe('pack import wizard', () => {
     await expect(page.getByText('authoring-agent')).toBeVisible();
     await expect(page.locator('#preview-param-topic')).toBeVisible();
     await expect(page.getByTestId('workflow-graph')).toBeVisible();
-    await expect(page.getByRole('button', { name: 'DISCARD' })).toBeEnabled();
-    await expect(page.getByRole('button', { name: 'OPEN AS DRAFT' })).toBeDisabled();
+    await expect(page.getByRole('button', { name: 'Discard' })).toBeEnabled();
+    await expect(page.getByRole('button', { name: 'Open as draft' })).toBeDisabled();
     await page.locator('#import-draft-id').fill('survey-draft');
-    await expect(page.getByRole('button', { name: 'OPEN AS DRAFT' })).toBeEnabled();
+    await expect(page.getByRole('button', { name: 'Open as draft' })).toBeEnabled();
   });
 
   /// What crucible_playbook_import hands a human: the proposal's link carrying the registry
@@ -153,7 +168,7 @@ test.describe('pack import wizard', () => {
 
     await expect(page.locator('#import-id')).toHaveValue('survey-two');
     await expect(page.locator('#import-description')).toHaveValue('reads a paper');
-    await expect(page.getByRole('button', { name: 'REGISTER' })).toBeEnabled();
+    await expect(page.getByRole('button', { name: 'Register' })).toBeEnabled();
   });
 
   test('a pack that does not compile shows the engine error and offers no registration', async ({
@@ -178,6 +193,7 @@ test.describe('pack import wizard', () => {
         requires: {},
         prefers: {},
         allow_unverified_image: false,
+        resources: { gpus: 0, cpu: null, memory: null, node_selector: {} },
         image: {
           reference: null,
           digest: null,
@@ -209,8 +225,8 @@ test.describe('pack import wizard', () => {
     await toReview(page);
 
     await expect(page.getByText('workflow.star:3:5: unknown identifier `dpeth`')).toBeVisible();
-    await expect(page.getByText('NOTHING TO REGISTER')).toBeVisible();
-    await expect(page.getByRole('button', { name: 'REGISTER' })).toHaveCount(0);
+    await expect(page.getByText('Nothing to register')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Register' })).toHaveCount(0);
     await expect(page.locator('#import-id')).toHaveCount(0);
   });
 
@@ -235,6 +251,7 @@ test.describe('pack import wizard', () => {
         requires: {},
         prefers: {},
         allow_unverified_image: false,
+        resources: { gpus: 0, cpu: null, memory: null, node_selector: {} },
         image: {
           reference: null,
           digest: null,
@@ -267,9 +284,9 @@ test.describe('pack import wizard', () => {
 
     await expect(page.getByTestId('import-status')).toHaveText('registered');
     await expect(page.getByText('registered as survey-two')).toBeVisible();
-    await expect(page.getByRole('button', { name: 'REGISTER' })).toHaveCount(0);
-    await expect(page.getByRole('button', { name: 'DISCARD' })).toHaveCount(0);
-    await expect(page.getByRole('button', { name: 'OPEN AS DRAFT' })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Register' })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Discard' })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Open as draft' })).toHaveCount(0);
   });
 
   /// Re-importing a pack already in the registry is a pin bump, and the form change is shown
@@ -289,13 +306,13 @@ test.describe('pack import wizard', () => {
 
     await ready(page, IMPORT);
     await page.locator('#import-repo').fill('neuralmagic/crucible-packs');
-    await page.getByRole('button', { name: 'FETCH PACKS' }).click();
+    await page.getByRole('button', { name: 'Fetch packs' }).click();
     await expect(page).toHaveURL(new RegExp(`${IMPORT}/`));
 
     await expect(page.getByText('Already registered')).toBeVisible();
     await expect(page.getByText('~ depth.default: shallow → deep')).toBeVisible();
     await expect(page.locator('#import-id')).toHaveValue('survey');
-    await expect(page.getByRole('button', { name: 'RE-PIN' })).toBeEnabled();
+    await expect(page.getByRole('button', { name: 'Re-pin' })).toBeEnabled();
   });
 
   /// Pending proposals sit on the approvals rail beside the scope packs, with whoever proposed

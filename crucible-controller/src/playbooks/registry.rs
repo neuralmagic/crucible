@@ -1,5 +1,6 @@
-//! The playbook registry: a git-pinned pack plus the launch form the pinned engine extracted from
-//! it. Registration clones the repo at a ref, tars the pack subtree, extracts the params schema
+//! The playbook registry: a pinned pack plus the launch form the pinned engine extracted from it.
+//! A pack is pinned from git or published from a draft version. Git registration clones the repo
+//! at a ref, tars the pack subtree, extracts the params schema
 //! through the linked engine (`declared_params`, the library form of `crucible plan params`)
 //! against the pack's declared workflow source, and stores tarball + schema + digests in one
 //! transaction — a pack whose source does not compile registers nothing and carries the engine's
@@ -82,6 +83,82 @@ pub struct RegisterPlaybook {
     pub accept_exposure_digest: Option<String>,
 }
 
+/// A draft version to store under `id` without a git round trip.
+#[derive(Debug, Clone)]
+pub struct PublishDraft {
+    pub id: String,
+    /// The principal a new row is owned to; an existing row keeps its owner.
+    pub owner: crate::authz::model::Principal,
+    pub description: String,
+    pub draft: String,
+    pub version: i64,
+    pub tar_gz: Vec<u8>,
+    /// Whether the caller was authorized against an existing row under `id` (a re-pin) or against
+    /// none (a new playbook). A row that appeared or vanished since refuses the publish.
+    pub replaces: bool,
+    /// As [`RegisterPlaybook::accept_exposure_digest`].
+    pub accept_exposure_digest: Option<String>,
+}
+
+/// A row whose source columns fit neither [`PlaybookSource`] shape.
+#[derive(Debug, thiserror::Error)]
+#[error("a playbook row carries neither one git source nor one draft source")]
+pub struct UnshapedSource;
+
+/// Where a registered pack's bytes came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlaybookSource {
+    Git {
+        /// `owner/repo` slug or a clone URL.
+        repo: String,
+        /// Branch or tag; `None` = the repo's default branch.
+        git_ref: Option<String>,
+        /// Pack directory inside the repo; empty = the repo root.
+        path: String,
+    },
+    Draft {
+        draft: String,
+        version: i64,
+    },
+}
+
+impl PlaybookSource {
+    fn from_row(row: &sqlx::postgres::PgRow) -> Result<Self> {
+        let repo: Option<String> = row.try_get("repo")?;
+        let git_ref: Option<String> = row.try_get("git_ref")?;
+        let path: Option<String> = row.try_get("path")?;
+        let draft: Option<String> = row.try_get("source_draft")?;
+        let version: Option<i64> = row.try_get("source_draft_version")?;
+        match (repo, path, draft, version) {
+            (Some(repo), Some(path), None, None) => Ok(PlaybookSource::Git {
+                repo,
+                git_ref,
+                path,
+            }),
+            (None, None, Some(draft), Some(version)) => {
+                Ok(PlaybookSource::Draft { draft, version })
+            }
+            _ => Err(UnshapedSource.into()),
+        }
+    }
+
+    /// The git repo, or `None` for a draft-sourced pack.
+    pub fn repo(&self) -> Option<&str> {
+        match self {
+            PlaybookSource::Git { repo, .. } => Some(repo),
+            PlaybookSource::Draft { .. } => None,
+        }
+    }
+
+    /// What a launch row records as its repo.
+    pub fn launch_repo(&self) -> &str {
+        self.repo().unwrap_or(DRAFT_LAUNCH_REPO)
+    }
+}
+
+/// The repo a launch of a pack with no git source records.
+pub const DRAFT_LAUNCH_REPO: &str = "(draft)";
+
 /// What a registration landed: the resolved pin, the stored digests, and whether the form changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Registered {
@@ -103,10 +180,8 @@ pub struct Registered {
 pub struct PlaybookRow {
     pub id: String,
     pub description: String,
-    pub repo: String,
-    pub git_ref: Option<String>,
+    pub source: PlaybookSource,
     pub rev: String,
-    pub path: String,
     pub tar_digest: String,
     pub schema_digest: String,
     /// The substrate the pack's `[agent]` asks for, read off its manifest at registration. `None`
@@ -122,19 +197,17 @@ pub struct PlaybookRow {
     pub updated_at: String,
 }
 
-const PLAYBOOK_COLS: &str = "id, description, repo, git_ref, rev, path, tar_digest, schema_digest, \
-     agent_backend, agent_sandbox_image, agent_requirements, core_rev, exposure_digest, owner, \
-     created_by, created_at, updated_at";
+const PLAYBOOK_COLS: &str = "id, description, repo, git_ref, rev, path, source_draft, \
+     source_draft_version, tar_digest, schema_digest, agent_backend, agent_sandbox_image, \
+     agent_requirements, core_rev, exposure_digest, owner, created_by, created_at, updated_at";
 
 impl PlaybookRow {
     fn from_row(row: &sqlx::postgres::PgRow) -> Result<Self> {
         Ok(PlaybookRow {
             id: row.try_get("id")?,
             description: row.try_get("description")?,
-            repo: row.try_get("repo")?,
-            git_ref: row.try_get("git_ref")?,
+            source: PlaybookSource::from_row(row)?,
             rev: row.try_get("rev")?,
-            path: row.try_get("path")?,
             tar_digest: row.try_get("tar_digest")?,
             schema_digest: row.try_get("schema_digest")?,
             agent: crate::playbooks::dispatch::agent_from_row(row)?,
@@ -536,19 +609,19 @@ pub async fn register(
     actor: Option<&str>,
 ) -> Result<Registered, RegisterError> {
     validate_id(&req.id).map_err(RegisterError::Invalid)?;
-    if req.description.trim().is_empty() {
-        return Err(RegisterError::Invalid(
-            "description must be non-empty".to_string(),
-        ));
-    }
+    validate_description(&req.description)?;
     validate_path(&req.path).map_err(RegisterError::Invalid)?;
-    if let Some(msg) = blocking_registration(pool, &req.id, &req.repo, &req.path)
+    let source = PlaybookSource::Git {
+        repo: req.repo.clone(),
+        git_ref: req.git_ref.clone(),
+        path: req.path.clone(),
+    };
+    if let Some(msg) = blocking_registration(pool, &req.id, &source)
         .await
         .map_err(RegisterError::Internal)?
     {
         return Err(RegisterError::Conflict(msg));
     }
-    let core_rev = core_rev().map_err(RegisterError::Internal)?;
 
     let git = git.clone();
     let fetched = tokio::task::spawn_blocking(move || {
@@ -561,30 +634,174 @@ pub async fn register(
                 expected_rev: req.expected_rev.as_deref(),
             },
         )?;
-        let (schema, digest) = extract_params_schema(fetched.pack.path())?;
-        let exposure = crate::playbooks::exposure::Extraction::Declared(extract_exposure(
-            fetched.pack.path(),
-        )?);
-        let agent = crate::playbooks::dispatch::pack_agent(fetched.pack.path())
-            .map_err(|e| RegisterError::Invalid(format!("{e:#}")))?;
-        Ok::<_, RegisterError>((
-            req,
-            fetched.rev,
-            fetched.tar_gz,
-            schema,
-            digest,
-            exposure,
-            agent,
-        ))
+        let extracted = extract(fetched.pack.path())?;
+        Ok::<_, RegisterError>((req, fetched.rev, fetched.tar_gz, extracted))
     })
     .await
     .context("joining the playbook registration worker")
     .map_err(RegisterError::Internal)?;
-    let (req, rev, tar_gz, schema, schema_digest, exposure, agent) = fetched?;
-    let (exposure_json, exposure_digest) = exposure.stored().map_err(RegisterError::Internal)?;
+    let (req, rev, tar_gz, extracted) = fetched?;
 
-    let tar_digest = content_digest(&tar_gz);
+    let registered = store(
+        pool,
+        NewRow {
+            id: req.id,
+            owner: req.owner,
+            description: req.description,
+            source,
+            rev,
+            tar_gz,
+            replaces: None,
+            accept_exposure_digest: req.accept_exposure_digest,
+        },
+        extracted,
+        actor,
+    )
+    .await?;
+
+    // The other half of graduation: the merged pack is registered, so the draft it was exported
+    // from stops being the place to edit it.
+    retire_matching(pool, &req.repo, &req.path)
+        .await
+        .map_err(RegisterError::Internal)?;
+    Ok(registered)
+}
+
+/// Store a draft version under `req.id`: the same extraction and transaction as [`register`], with
+/// the draft's tarball in place of a git fetch. The row pins the tarball digest as its `rev`.
+pub async fn publish_draft(
+    pool: &PgPool,
+    req: PublishDraft,
+    actor: Option<&str>,
+) -> Result<Registered, RegisterError> {
+    validate_id(&req.id).map_err(RegisterError::Invalid)?;
+    validate_description(&req.description)?;
+    if req.tar_gz.len() > MAX_PACK_TAR_BYTES {
+        return Err(RegisterError::Invalid(format!(
+            "the pack tarball is {} bytes, over the {MAX_PACK_TAR_BYTES}-byte registry limit",
+            req.tar_gz.len()
+        )));
+    }
+    let source = PlaybookSource::Draft {
+        draft: req.draft.clone(),
+        version: req.version,
+    };
+    if let Some(msg) = blocking_registration(pool, &req.id, &source)
+        .await
+        .map_err(RegisterError::Internal)?
+    {
+        return Err(RegisterError::Conflict(msg));
+    }
+
+    let extracted = tokio::task::spawn_blocking(move || {
+        let pack = crate::playbooks::packs::unpack_to_scratch(&req.tar_gz)
+            .context("unpacking the draft pack")
+            .map_err(RegisterError::Internal)?;
+        let extracted = extract(pack.path())?;
+        Ok::<_, RegisterError>((req, extracted))
+    })
+    .await
+    .context("joining the draft publication worker")
+    .map_err(RegisterError::Internal)?;
+    let (req, extracted) = extracted?;
+
+    store(
+        pool,
+        NewRow {
+            id: req.id,
+            owner: req.owner,
+            description: req.description,
+            rev: content_digest(&req.tar_gz),
+            source,
+            tar_gz: req.tar_gz,
+            replaces: Some(req.replaces),
+            accept_exposure_digest: req.accept_exposure_digest,
+        },
+        extracted,
+        actor,
+    )
+    .await
+}
+
+fn validate_description(description: &str) -> Result<(), RegisterError> {
+    if description.trim().is_empty() {
+        return Err(RegisterError::Invalid(
+            "description must be non-empty".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// What the pinned engine read off a pack: its launch form, its exposure, and its agent.
+struct Extracted {
+    schema: serde_json::Value,
+    schema_digest: String,
+    exposure: crate::playbooks::exposure::Extraction,
+    agent: crate::playbooks::dispatch::PackAgent,
+}
+
+/// Extract everything a registry row records about an unpacked pack. Blocking.
+fn extract(pack: &Path) -> Result<Extracted, RegisterError> {
+    let (schema, schema_digest) = extract_params_schema(pack)?;
+    let exposure = crate::playbooks::exposure::Extraction::Declared(extract_exposure(pack)?);
+    let agent = crate::playbooks::dispatch::pack_agent(pack)
+        .map_err(|e| RegisterError::Invalid(format!("{e:#}")))?;
+    Ok(Extracted {
+        schema,
+        schema_digest,
+        exposure,
+        agent,
+    })
+}
+
+/// One registry row about to be written, before extraction fills in its form.
+struct NewRow {
+    id: String,
+    owner: crate::authz::model::Principal,
+    description: String,
+    source: PlaybookSource,
+    rev: String,
+    tar_gz: Vec<u8>,
+    /// `Some` pins whether a row under `id` must already exist; `None` takes either.
+    replaces: Option<bool>,
+    accept_exposure_digest: Option<String>,
+}
+
+/// Write `row` in one transaction: refuse an unaccepted exposure change and an id a live draft
+/// holds, then insert or re-pin.
+async fn store(
+    pool: &PgPool,
+    row: NewRow,
+    extracted: Extracted,
+    actor: Option<&str>,
+) -> Result<Registered, RegisterError> {
+    let Extracted {
+        schema,
+        schema_digest,
+        exposure,
+        agent,
+    } = extracted;
+    let (exposure_json, exposure_digest) = exposure.stored().map_err(RegisterError::Internal)?;
+    let core_rev = core_rev().map_err(RegisterError::Internal)?;
+    let tar_digest = content_digest(&row.tar_gz);
     let now = crate::clock::now_rfc3339();
+    let (repo, git_ref, path, source_draft, source_draft_version) = match &row.source {
+        PlaybookSource::Git {
+            repo,
+            git_ref,
+            path,
+        } => (
+            Some(repo.as_str()),
+            git_ref.as_deref(),
+            Some(path.as_str()),
+            None,
+            None,
+        ),
+        PlaybookSource::Draft { draft, version } => {
+            (None, None, None, Some(draft.as_str()), Some(*version))
+        }
+    };
+
     let mut tx = pool
         .begin()
         .await
@@ -593,25 +810,34 @@ pub async fn register(
     let prior_row = sqlx::query(
         "SELECT schema_digest, exposure_digest FROM playbooks WHERE id = $1 FOR UPDATE",
     )
-    .bind(&req.id)
+    .bind(&row.id)
     .fetch_optional(&mut *tx)
     .await
     .context("reading the prior playbook row")
     .map_err(RegisterError::Internal)?;
+    if let Some(replaces) = row.replaces
+        && replaces != prior_row.is_some()
+    {
+        return Err(RegisterError::Conflict(format!(
+            "playbook {} was {} since this publish was authorized; try again",
+            row.id,
+            if replaces { "deleted" } else { "registered" }
+        )));
+    }
     let prior: Option<String> = prior_row.as_ref().map(|r| r.get("schema_digest"));
     let prior_exposure: Option<Option<String>> =
         prior_row.as_ref().map(|r| r.get("exposure_digest"));
     let exposure_changed = prior_exposure
         .as_ref()
         .is_some_and(|p| *p != exposure_digest);
-    let accepted = exposure_digest.is_some() && req.accept_exposure_digest == exposure_digest;
+    let accepted = exposure_digest.is_some() && row.accept_exposure_digest == exposure_digest;
     if exposure_changed && !accepted {
         return Err(RegisterError::ExposureChanged {
             prior: prior_exposure.flatten(),
             next: exposure_digest,
         });
     }
-    if let Some(msg) = blocking_registration(&mut *tx, &req.id, &req.repo, &req.path)
+    if let Some(msg) = blocking_registration(&mut *tx, &row.id, &row.source)
         .await
         .map_err(RegisterError::Internal)?
     {
@@ -621,12 +847,15 @@ pub async fn register(
         r#"INSERT INTO playbooks (id, description, repo, git_ref, rev, path, tar_gz, tar_digest,
                                   tar_bytes, params_schema, schema_digest, agent_backend,
                                   agent_sandbox_image, core_rev, created_by, created_at,
-                                  updated_at, exposure, exposure_digest, agent_requirements, owner)
+                                  updated_at, exposure, exposure_digest, agent_requirements, owner,
+                                  source_draft, source_draft_version)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $16,
-                   $17, $18, $19, $20)
+                   $17, $18, $19, $20, $21, $22)
            ON CONFLICT (id) DO UPDATE SET
                description = excluded.description, repo = excluded.repo,
                git_ref = excluded.git_ref, rev = excluded.rev, path = excluded.path,
+               source_draft = excluded.source_draft,
+               source_draft_version = excluded.source_draft_version,
                tar_gz = excluded.tar_gz, tar_digest = excluded.tar_digest,
                tar_bytes = excluded.tar_bytes, params_schema = excluded.params_schema,
                schema_digest = excluded.schema_digest,
@@ -636,15 +865,15 @@ pub async fn register(
                core_rev = excluded.core_rev, updated_at = excluded.updated_at,
                exposure = excluded.exposure, exposure_digest = excluded.exposure_digest"#,
     )
-    .bind(&req.id)
-    .bind(req.description.trim())
-    .bind(&req.repo)
-    .bind(req.git_ref.as_deref())
-    .bind(&rev)
-    .bind(&req.path)
-    .bind(&tar_gz)
+    .bind(&row.id)
+    .bind(row.description.trim())
+    .bind(repo)
+    .bind(git_ref)
+    .bind(&row.rev)
+    .bind(path)
+    .bind(&row.tar_gz)
     .bind(&tar_digest)
-    .bind(tar_gz.len() as i64)
+    .bind(row.tar_gz.len() as i64)
     .bind(&schema)
     .bind(&schema_digest)
     .bind(&agent.backend)
@@ -655,7 +884,9 @@ pub async fn register(
     .bind(&exposure_json)
     .bind(&exposure_digest)
     .bind(agent.requirements_json())
-    .bind(req.owner.to_string())
+    .bind(row.owner.to_string())
+    .bind(source_draft)
+    .bind(source_draft_version)
     .execute(&mut *tx)
     .await
     .context("storing the playbook row")
@@ -665,15 +896,9 @@ pub async fn register(
         .context("committing the playbook registration")
         .map_err(RegisterError::Internal)?;
 
-    // The other half of graduation: the merged pack is registered, so the draft it was exported
-    // from stops being the place to edit it.
-    retire_matching(pool, &req.repo, &req.path)
-        .await
-        .map_err(RegisterError::Internal)?;
-
     Ok(Registered {
-        id: req.id,
-        rev,
+        id: row.id,
+        rev: row.rev,
         tar_digest,
         schema_changed: prior.is_some_and(|p| p != schema_digest),
         schema_digest,
@@ -916,13 +1141,12 @@ fn field_of(e: &jsonschema::ValidationError<'_>) -> String {
 
 /// The refusal a registration of `id` earns from a live draft holding it, or `None`. Drafts and
 /// registered playbooks share the launch-key namespace in both directions. The other half of
-/// graduation is exempt: registering a graduated draft's own target retires that draft, so it may
-/// reuse the id.
+/// graduation is exempt: registering a graduated draft's own git target retires that draft, so it
+/// may reuse the id.
 pub async fn blocking_registration<'e, E>(
     exec: E,
     id: &str,
-    repo: &str,
-    path: &str,
+    source: &PlaybookSource,
 ) -> Result<Option<String>>
 where
     E: sqlx::PgExecutor<'e>,
@@ -948,7 +1172,11 @@ where
     let grad_path: Option<String> = row
         .try_get("graduation_path")
         .context("reading a draft's graduation path")?;
-    if graduated && grad_repo.as_deref() == Some(repo) && grad_path.as_deref() == Some(path) {
+    if let PlaybookSource::Git { repo, path, .. } = source
+        && graduated
+        && grad_repo.as_deref() == Some(repo.as_str())
+        && grad_path.as_deref() == Some(path.as_str())
+    {
         return Ok(None);
     }
     Ok(Some(format!(
@@ -1226,6 +1454,130 @@ mod tests {
             }
             other => panic!("expected a compile refusal, got {other:?}"),
         }
+    }
+
+    /// The tarball of a playbook pack whose workflow is [`WORKFLOW_TOPIC`], as a draft stores it.
+    fn draft_tar_gz(dir: &Path) -> Vec<u8> {
+        std::fs::create_dir_all(dir).expect("mkdir");
+        std::fs::write(dir.join("crucible.toml"), PLAYBOOK_REPO_MANIFEST).expect("manifest");
+        std::fs::write(dir.join("workflow.star"), WORKFLOW_TOPIC).expect("source");
+        crate::playbooks::packs::tar_pack_tree(dir).expect("tar")
+    }
+
+    fn publication(id: &str, tar_gz: Vec<u8>, replaces: bool) -> PublishDraft {
+        PublishDraft {
+            id: id.to_string(),
+            owner: crate::authz::model::Principal::platform(),
+            description: "a published draft".to_string(),
+            draft: "studio".to_string(),
+            version: 3,
+            tar_gz,
+            replaces,
+            accept_exposure_digest: None,
+        }
+    }
+
+    /// A published draft is a registry row with a draft source and its bytes' digest as the pin,
+    /// guarded against a row appearing or vanishing after the caller was authorized, and a git
+    /// registration of the same id takes the row back to a git source.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_published_draft_pins_its_bytes_and_hands_the_row_back_to_git(pool: PgPool) {
+        let _g = crate::ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tar_gz = draft_tar_gz(&dir.path().join("draft"));
+
+        let published = publish_draft(&pool, publication("survey", tar_gz.clone(), false), None)
+            .await
+            .expect("publish");
+        assert_eq!(published.rev, content_digest(&tar_gz));
+        assert_eq!(published.rev, published.tar_digest);
+        assert_eq!(
+            published.schema_digest,
+            schema_digest(&schema_of(WORKFLOW_TOPIC)).expect("digest")
+        );
+        let row = get(&pool, "survey").await.expect("get").expect("row");
+        assert_eq!(
+            row.source,
+            PlaybookSource::Draft {
+                draft: "studio".to_string(),
+                version: 3
+            }
+        );
+        assert_eq!(row.source.repo(), None);
+        assert_eq!(row.source.launch_repo(), DRAFT_LAUNCH_REPO);
+
+        match publish_draft(&pool, publication("survey", tar_gz.clone(), false), None).await {
+            Err(RegisterError::Conflict(msg)) => assert!(msg.contains("registered"), "{msg}"),
+            other => panic!("a row that appeared since authorization refuses: {other:?}"),
+        }
+        match publish_draft(&pool, publication("fresh", tar_gz.clone(), true), None).await {
+            Err(RegisterError::Conflict(msg)) => assert!(msg.contains("deleted"), "{msg}"),
+            other => panic!("a row that vanished since authorization refuses: {other:?}"),
+        }
+        assert!(get(&pool, "fresh").await.expect("get").is_none());
+        publish_draft(&pool, publication("survey", tar_gz, true), None)
+            .await
+            .expect("a re-pin the caller was authorized for lands");
+
+        let repo = fixture_repo(&dir.path().join("git"), PLAYBOOK_REPO_MANIFEST);
+        register(&pool, &PackGit::default(), request("survey", &repo), None)
+            .await
+            .expect("register over the published row");
+        let row = get(&pool, "survey").await.expect("get").expect("row");
+        assert_eq!(
+            row.source,
+            PlaybookSource::Git {
+                repo: repo.clone(),
+                git_ref: Some("main".to_string()),
+                path: String::new(),
+            }
+        );
+        let draft_sourced: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM playbooks WHERE source_draft IS NOT NULL")
+                .fetch_one(&pool)
+                .await
+                .expect("count");
+        assert_eq!(draft_sourced, 0, "the git pin clears the draft source");
+
+        let mixed = sqlx::query(
+            "UPDATE playbooks SET source_draft = 'studio', source_draft_version = 1 WHERE id = 'survey'",
+        )
+        .execute(&pool)
+        .await;
+        assert!(mixed.is_err(), "a row carries one source, never both");
+        let neither =
+            sqlx::query("UPDATE playbooks SET repo = NULL, path = NULL WHERE id = 'survey'")
+                .execute(&pool)
+                .await;
+        assert!(neither.is_err(), "a row carries one source, never none");
+    }
+
+    /// A draft is published with the same checks a git pin gets: a source the engine refuses and a
+    /// tarball over the registry bound store nothing.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_draft_that_does_not_compile_or_fit_publishes_nothing(pool: PgPool) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        match publish_draft(
+            &pool,
+            publication("broken", broken_pack_tar_gz(dir.path()), false),
+            None,
+        )
+        .await
+        {
+            Err(RegisterError::Compile(_)) => {}
+            other => panic!("expected a compile refusal, got {other:?}"),
+        }
+        match publish_draft(
+            &pool,
+            publication("huge", vec![0; MAX_PACK_TAR_BYTES + 1], false),
+            None,
+        )
+        .await
+        {
+            Err(RegisterError::Invalid(msg)) => assert!(msg.contains("registry limit"), "{msg}"),
+            other => panic!("expected a size refusal, got {other:?}"),
+        }
+        assert!(list(&pool).await.expect("list").is_empty());
     }
 
     fn request(id: &str, repo: &str) -> RegisterPlaybook {

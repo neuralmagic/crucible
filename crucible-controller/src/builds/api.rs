@@ -225,7 +225,7 @@ pub(crate) async fn rebuild_build(
     State(state): State<ApiState>,
     Path(id): Path<i64>,
     identity: crate::identity::session::Identity,
-    _admin: crate::identity::auth::AdminGuard,
+    _admin: crate::authz::guard::AdminGuard,
 ) -> Result<Response, AppError> {
     let Some(build) = crate::builds::store::get_build(state.db.pool(), id).await? else {
         return Ok(not_found(format!("build not found: {id}")));

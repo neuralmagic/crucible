@@ -6,6 +6,11 @@ export type ProviderKind = components['schemas']['ProviderKind'];
 export type InferenceProtocol = components['schemas']['InferenceProtocol'];
 export type ProviderBody = components['schemas']['ProviderBody'];
 export type RegisterProviderBody = components['schemas']['RegisterProviderBody'];
+export type DispatchDefaultDto = components['schemas']['DispatchDefaultDto'];
+export type ProviderDto = components['schemas']['ProviderDto'];
+export type DispatchDefaultBody = components['schemas']['DispatchDefaultBody'];
+export type DefaultScope = components['schemas']['DefaultScope'];
+export type WorkloadClass = components['schemas']['WorkloadClass'];
 
 export const KIND_OPTIONS: readonly { value: ProviderKind; label: string }[] = [
   { value: 'openai', label: 'openai (api.openai.com, runs Codex by default)' },
@@ -214,4 +219,96 @@ export function reachLabel(provider: ProviderDetailDto): string {
     return `${provider.protocol ?? '?'} at ${provider.endpoint ?? '?'}`;
   }
   return provider.kind;
+}
+
+export const SCOPE_OPTIONS: readonly { value: DefaultScope; label: string }[] = [
+  { value: 'platform', label: 'platform' },
+  { value: 'domain', label: 'domain' },
+];
+
+export const CLASS_OPTIONS: readonly { value: WorkloadClass; label: string }[] = [
+  { value: 'autoresearch', label: 'autoresearch' },
+  { value: 'playbook', label: 'playbook' },
+];
+
+/// One dispatch default as the form edits it. A blank model takes the provider's own default; a
+/// blank fallback provider means none.
+export interface DefaultForm {
+  scopeKind: DefaultScope;
+  scopeRef: string;
+  workloadClass: WorkloadClass;
+  provider: string;
+  model: string;
+  fallbackProvider: string;
+  fallbackModel: string;
+}
+
+export function emptyDefaultForm(): DefaultForm {
+  return {
+    scopeKind: 'platform',
+    scopeRef: '',
+    workloadClass: 'autoresearch',
+    provider: '',
+    model: '',
+    fallbackProvider: '',
+    fallbackModel: '',
+  };
+}
+
+export function defaultFormOf(row: DispatchDefaultDto): DefaultForm {
+  return {
+    scopeKind: row.scope_kind,
+    scopeRef: row.scope_ref,
+    workloadClass: row.workload_class,
+    provider: row.provider,
+    model: row.model ?? '',
+    fallbackProvider: row.fallback_provider ?? '',
+    fallbackModel: row.fallback_model ?? '',
+  };
+}
+
+const DOMAIN = /^[^/\s]+\/[^/\s]+$/;
+
+/// The server's refusals for a default, field by field.
+export function defaultErrors(form: DefaultForm): Map<string, string> {
+  const errors = new Map<string, string>();
+  if (form.scopeKind === 'domain' && !DOMAIN.test(form.scopeRef.trim())) {
+    errors.set('scopeRef', 'a domain is spelled owner/repo');
+  }
+  if (form.provider.length === 0) errors.set('provider', 'pick a provider');
+  const model = form.model.trim();
+  if (model.length > 0 && !MODEL.test(model)) errors.set('model', `"${model}" is not a model name`);
+  const fallbackModel = form.fallbackModel.trim();
+  if (form.fallbackProvider.length === 0) {
+    if (fallbackModel.length > 0) errors.set('fallbackModel', 'a fallback model needs a fallback provider');
+  } else {
+    if (fallbackModel.length > 0 && !MODEL.test(fallbackModel)) {
+      errors.set('fallbackModel', `"${fallbackModel}" is not a model name`);
+    }
+    if (form.fallbackProvider === form.provider && fallbackModel === model) {
+      errors.set('fallbackProvider', 'the fallback is the same provider and model as the primary');
+    }
+  }
+  return errors;
+}
+
+export function defaultBody(form: DefaultForm): DispatchDefaultBody {
+  const model = form.model.trim();
+  const fallbackModel = form.fallbackModel.trim();
+  return {
+    scope_kind: form.scopeKind,
+    ...(form.scopeKind === 'domain' ? { scope_ref: form.scopeRef.trim() } : {}),
+    workload_class: form.workloadClass,
+    provider: form.provider,
+    ...(model.length > 0 ? { model } : {}),
+    ...(form.fallbackProvider.length > 0 ? { fallback_provider: form.fallbackProvider } : {}),
+    ...(form.fallbackProvider.length > 0 && fallbackModel.length > 0
+      ? { fallback_model: fallbackModel }
+      : {}),
+  };
+}
+
+/// `provider · model`, the model left off when the provider's own default applies.
+export function targetLabel(provider: string, model: string | null | undefined): string {
+  return model === null || model === undefined || model.length === 0 ? provider : `${provider} · ${model}`;
 }

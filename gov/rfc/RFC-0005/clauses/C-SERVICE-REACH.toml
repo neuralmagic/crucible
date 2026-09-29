@@ -1,0 +1,19 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-SERVICE-REACH"
+title = "How tasks reach a service"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+A service binds only the loopback port the engine gives it. The engine MUST expose each service through a forward of its own on the OpenShell gateway, and the forward MUST refuse any request that does not carry the per-run, per-service bearer credential the engine issued for it. The engine MUST give that credential only to tasks that need the service.
+
+
+
+An agent task that needs a service with an MCP transport MUST be configured with it as an MCP server named "service.<name>", at the forward's address under the gateway's host name, carrying the credential. For MCP over stdio the engine MUST bridge the tool's standard streams to that forward. A command or evaluate task that needs a service MUST receive the forward's address as CRUCIBLE_SERVICE_<NAME>_URL and the credential as CRUCIBLE_SERVICE_<NAME>_TOKEN, NAME being the service name in upper case. A task that does not need a service MUST receive neither.
+
+
+
+A sandbox's egress policy MUST include a service's forward exactly when some task that sandbox runs needs the service. Tasks that share a session MUST declare the same needs, and the engine MUST reject a workflow in which they do not, naming the session."""

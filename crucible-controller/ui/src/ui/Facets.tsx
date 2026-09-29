@@ -43,7 +43,7 @@ function FacetLine({ row }: { row: FacetRow }) {
   const hidden = row.options.length - visible.length;
 
   return (
-    <div className="flex min-h-[21px] items-stretch border-b border-rule last:border-b-0">
+    <div data-ui="facet-row" className="flex min-h-[21px] items-stretch border-b border-rule last:border-b-0">
       <dt className="flex w-[64px] flex-none items-center border-r border-rule bg-sunk px-2 font-mono text-micro font-semibold tracking-[0.08em] text-ink-3 uppercase">
         {row.label}
       </dt>
@@ -58,6 +58,7 @@ function FacetLine({ row }: { row: FacetRow }) {
               type="button"
               title={option.title}
               aria-pressed={selected}
+              data-ui="facet"
               disabled={empty}
               onClick={() => {
                 row.onChange(option.value);
@@ -86,6 +87,7 @@ function FacetLine({ row }: { row: FacetRow }) {
         {hidden > 0 || expanded ? (
           <button
             type="button"
+            data-ui="facet"
             onClick={() => {
               setExpanded(!expanded);
             }}
@@ -101,7 +103,7 @@ function FacetLine({ row }: { row: FacetRow }) {
 
 export function Facets({ rows, label = 'Filters', className }: FacetsProps) {
   return (
-    <dl aria-label={label} className={cn('m-0 border-b border-rule-hard bg-surface', className)}>
+    <dl aria-label={label} data-ui="facets" className={cn('m-0 border-b border-rule-hard bg-surface', className)}>
       {rows.map((row) => (
         <FacetLine key={row.label} row={row} />
       ))}
@@ -146,7 +148,7 @@ export function Applied({ shown, total, noun, filters, onClearAll }: AppliedProp
       <button
         type="button"
         onClick={onClearAll}
-        className="ml-auto border-b border-rule-hard text-ink-3 hover:border-ink hover:text-ink"
+        className="ml-auto border-b border-rule-hard text-ink-2 hover:border-ink hover:text-ink"
       >
         Clear all
       </button>

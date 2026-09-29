@@ -14,6 +14,7 @@ export interface PageHeaderProps {
 export function PageHeader({ eyebrow, title, description, actions, className }: PageHeaderProps) {
   return (
     <div
+      data-ui="page-header"
       className={cn('flex items-start gap-6 border-b border-rule px-4.5 pt-4 pb-3', className)}
     >
       <div className="min-w-0 flex-1">

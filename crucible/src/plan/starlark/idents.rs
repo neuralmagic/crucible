@@ -152,6 +152,13 @@ pub(crate) fn narrow(error: CompileError, idents: &Idents) -> CompileError {
         | CompileError::OtherwiseWithAnswers
         | CompileError::UnreachableOtherwise { .. } => (None, "otherwise"),
         CompileError::RouteDecider { .. } => (Some("route"), "name"),
+        CompileError::OverNotAList { .. } => (None, "over"),
+        CompileError::EmitsNotList
+        | CompileError::EmitsEntryNotString
+        | CompileError::UnknownFieldType { .. }
+        | CompileError::FieldTypeWrongShape { .. }
+        | CompileError::InvalidFieldLabel { .. }
+        | CompileError::InvalidFieldType { .. } => (None, "emits"),
         _ => {
             return CompileError::At { at, inner };
         }

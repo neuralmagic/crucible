@@ -320,14 +320,20 @@ async fn authorize_schedule(
     let version = latest.version;
     let pack = crate::playbooks::registry::PlaybookRow {
         exposure_digest: None,
-        id: draft.id,
+        id: draft.id.clone(),
         description: draft.description,
-        repo: draft
-            .graduation_repo
-            .unwrap_or_else(|| "(draft)".to_string()),
-        git_ref: None,
+        source: match draft.graduation_repo {
+            Some(repo) => crate::playbooks::registry::PlaybookSource::Git {
+                repo,
+                git_ref: None,
+                path: draft.graduation_path.unwrap_or_default(),
+            },
+            None => crate::playbooks::registry::PlaybookSource::Draft {
+                draft: draft.id.clone(),
+                version,
+            },
+        },
         rev: format!("draft-v{version}"),
-        path: draft.graduation_path.unwrap_or_default(),
         tar_digest: String::new(),
         schema_digest,
         agent: latest.agent,
@@ -404,7 +410,7 @@ pub(crate) async fn create_schedule(
         &state,
         authorized.pack.agent.as_ref(),
         saver.provider.as_deref(),
-        Some(&authorized.pack.repo),
+        authorized.pack.source.repo(),
     )
     .await
     {
@@ -620,7 +626,7 @@ pub(crate) async fn update_schedule(
         &state,
         authorized.pack.agent.as_ref(),
         saver.provider.as_deref(),
-        Some(&authorized.pack.repo),
+        authorized.pack.source.repo(),
     )
     .await
     {

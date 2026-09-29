@@ -1,9 +1,10 @@
 import { Popover } from '@base-ui-components/react/popover';
+import type { ReactNode } from 'react';
 import { ALL, type ActedAs } from './ownerContext';
 import { useOwnerContext } from './useOwnerContext';
 import { cn } from './ui';
 
-function Choice({ value, label, note, active, onPick }: { value: string; label: string; note?: string; active: boolean; onPick: (value: string) => void }) {
+function Choice({ value, label, note, active, onPick }: { value: string; label: ReactNode; note?: string; active: boolean; onPick: (value: string) => void }) {
   return (
     <Popover.Close
       render={<button type="button" />}
@@ -23,8 +24,8 @@ function Choice({ value, label, note, active, onPick }: { value: string; label: 
   );
 }
 
-function current(context: string, principals: readonly ActedAs[]): string {
-  if (context === ALL) return 'ALL';
+function current(context: string, principals: readonly ActedAs[]): ReactNode {
+  if (context === ALL) return <span className="uppercase">All</span>;
   return principals.find((p) => p.value === context)?.label ?? context;
 }
 
@@ -40,13 +41,13 @@ export function OwnerSwitcher() {
         data-testid="owner-switcher"
         className="flex items-center gap-[7px] border-l border-rule px-3 font-mono text-data text-ink hover:bg-hi"
       >
-        <span className="text-ink-3">AS</span>
+        <span className="text-ink-3 uppercase">As</span>
         <span className="font-medium">{current(owner.context, owner.switchable)}</span>
       </Popover.Trigger>
       <Popover.Portal>
         <Popover.Positioner sideOffset={1} align="end">
           <Popover.Popup data-testid="owner-switcher-menu" className="min-w-56 border border-rule-hard bg-surface">
-            <Choice value={ALL} label="ALL" active={owner.context === ALL} onPick={owner.setContext} />
+            <Choice value={ALL} label={<span className="uppercase">All</span>} active={owner.context === ALL} onPick={owner.setContext} />
             {owner.switchable.map((p) => (
               <Choice
                 key={p.value}

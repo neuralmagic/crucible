@@ -8,11 +8,11 @@ created = "2026-08-23"
 started = "2026-09-23"
 refs = [
     "RFC-0002:C-PLAYBOOK-PARAMS",
-    "ADR-0050",
+    "ADR-0054",
 ]
 
 [content]
-description = 'ExternalText implements only add/radd, but str(param("x")), "%s" % param("x"), and any Display-reachable path convert a supplied value to a plain unmarked string before render_prompt sees it, so a hostile value bypasses the external-input markers entirely; reproduced live through compile_source_with (the rendered prompt carried a forged close marker and instruction text outside any marked region). Refuse these operations the way external text is already refused outside a prompt. Found by the [[WI-2026-08-22-009]] verifier. Also make a stripped marker loud: today a value carrying markers is silently rewritten, so an operator never learns an injection was attempted. Design recorded in [[ADR-0050]].'
+description = 'ExternalText implements only add/radd, but str(param("x")), "%s" % param("x"), and any Display-reachable path convert a supplied value to a plain unmarked string before render_prompt sees it, so a hostile value bypasses the external-input markers entirely; reproduced live through compile_source_with (the rendered prompt carried a forged close marker and instruction text outside any marked region). Refuse these operations the way external text is already refused outside a prompt. Found by the [[WI-2026-08-22-009]] verifier. Also make a stripped marker loud: today a value carrying markers is silently rewritten, so an operator never learns an injection was attempted. Design recorded in [[ADR-0054]].'
 
 [[content.acceptance_criteria]]
 text = "str(), %-formatting, and every other Display-reachable conversion of external text is a compile error, with a test per operator"

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useReducer, useState } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
+import { Link, useNavigate, useParams } from 'react-router-dom';
 import { $api, apiClient } from '../api/client';
 import { formatError } from '../api/errors';
 import type { components } from '../api/schema';
@@ -88,7 +88,6 @@ export function DraftStudioPage() {
   const { id = '' } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const wide = useMediaQuery(WIDE);
-  const whoami = $api.useQuery('get', '/api/whoami');
   const draft = $api.useQuery('get', '/api/playbook-drafts/{id}', { params: { path: { id } } });
   const files = $api.useQuery('get', '/api/playbook-drafts/{id}/files', {
     params: { path: { id } },
@@ -110,6 +109,7 @@ export function DraftStudioPage() {
   const drop = $api.useMutation('delete', '/api/playbook-drafts/{id}');
   const launch = $api.useMutation('post', '/api/playbook-drafts/{id}/launch');
   const graduate = $api.useMutation('post', '/api/playbook-drafts/{id}/graduate');
+  const publish = $api.useMutation('post', '/api/playbook-drafts/{id}/publish');
 
   const [state, dispatch] = useReducer(studioReducer, EMPTY_STUDIO);
   const [preview, setPreview] = useState<CompileDto | null>(null);
@@ -132,6 +132,10 @@ export function DraftStudioPage() {
   const [gradError, setGradError] = useState<string | null>(null);
   const [prUrl, setPrUrl] = useState<string | null>(null);
 
+  const [publishTo, setPublishTo] = useState('');
+  const [publishError, setPublishError] = useState<string | null>(null);
+  const [publishedRev, setPublishedRev] = useState<string | null>(null);
+
   const loaded = files.data;
   useEffect(() => {
     if (loaded === undefined) return;
@@ -145,6 +149,12 @@ export function DraftStudioPage() {
     setGradRepo((previous) => (previous.length === 0 ? target : previous));
     setGradPath((previous) => (previous.length === 0 ? (targetPath ?? '') : previous));
   }, [target, targetPath]);
+
+  const publishTarget = draft.data?.published_playbook ?? origin?.playbook ?? null;
+  useEffect(() => {
+    if (publishTarget === null) return;
+    setPublishTo((previous) => (previous.length === 0 ? publishTarget : previous));
+  }, [publishTarget]);
 
   const first = stored.data;
   useEffect(() => {
@@ -179,7 +189,6 @@ export function DraftStudioPage() {
   );
   const flagged = useMemo(() => flaggedFiles(diagnostics, paths), [diagnostics, paths]);
   const retired = draft.data?.retired_at !== null && draft.data?.retired_at !== undefined;
-  const admin = whoami.data?.role === 'admin';
   const actions = draft.data?.actions ?? [];
   const author = actions.includes('update');
   const writable = author && !retired;
@@ -277,18 +286,32 @@ export function DraftStudioPage() {
     }
   };
 
+  const handlePublish = async () => {
+    setPublishError(null);
+    try {
+      const ack = await publish.mutateAsync({
+        params: { path: { id } },
+        body: { playbook: publishTo.trim() },
+      });
+      setPublishedRev(ack.rev);
+      void draft.refetch();
+    } catch (err: unknown) {
+      setPublishError(formatError(err));
+    }
+  };
+
   const crumbs = [
     { label: 'Playbooks', to: '/playbooks' },
     { label: 'Drafts', to: '/playbooks/drafts' },
     { label: id },
   ];
 
-  if (draft.isPending || files.isPending) return <LoadingBlock label="LOADING DRAFT" />;
+  if (draft.isPending || files.isPending) return <LoadingBlock label="Loading draft" />;
   if (draft.isError) {
     return (
       <>
         <Breadcrumb items={crumbs} />
-        <Empty title="NO SUCH DRAFT" description={formatError(draft.error)} />
+        <Empty title="No such draft" description={formatError(draft.error)} />
       </>
     );
   }
@@ -328,7 +351,7 @@ export function DraftStudioPage() {
           }
         />
         {active === '' ? (
-          <Empty title="NO FILES" />
+          <Empty title="No files" />
         ) : (
           <CodeSurface
             path={active}
@@ -351,12 +374,13 @@ export function DraftStudioPage() {
       <div className="flex flex-wrap items-center gap-2">
         <Button
           variant="filled"
+          className="uppercase"
           disabled={!author || retired || save.isPending}
           onClick={() => {
             void handleSave();
           }}
         >
-          {save.isPending ? 'COMPILING…' : 'SAVE'}
+          {save.isPending ? 'Compiling…' : 'Save'}
         </Button>
         <Mono size="data" tone="ink-3">
           {isDirty(state) ? 'unsaved' : `saved · v${preview?.version ?? 0}`}
@@ -385,11 +409,12 @@ export function DraftStudioPage() {
               </Note>
               <span>
                 <Button
+                  className="uppercase"
                   onClick={() => {
                     void handleReload();
                   }}
                 >
-                  RELOAD V{stale.currentVersion}
+                  Reload v{stale.currentVersion}
                 </Button>
               </span>
               <Note>
@@ -415,7 +440,7 @@ export function DraftStudioPage() {
             <div className="grid gap-2" data-testid="draft-rebase">
               <span className="font-mono text-data text-ink-2">{moved}</span>
               {originFiles.isPending ? (
-                <LoadingBlock label="LOADING THE ORIGIN" />
+                <LoadingBlock label="Loading the origin" />
               ) : originFiles.isError ? (
                 <FormError>{formatError(originFiles.error)}</FormError>
               ) : (
@@ -508,17 +533,17 @@ export function DraftStudioPage() {
         {parsed === null ? (
           <SectionBody>
             <Empty
-              title="NO FORM"
+              title="No form"
               description="This save extracted no schema. The diagnostics beside it are the engine's own."
             />
           </SectionBody>
         ) : parsed.kind === 'unrenderable' ? (
           <SectionBody>
-            <Empty title="FORM CANNOT BE RENDERED" description={parsed.reason} />
+            <Empty title="Form cannot be rendered" description={parsed.reason} />
           </SectionBody>
         ) : specs.length === 0 ? (
           <SectionBody>
-            <Empty title="NO PARAMETERS" description="This pack declares none." />
+            <Empty title="No parameters" description="This pack declares none." />
           </SectionBody>
         ) : (
           <SectionBody>
@@ -541,7 +566,7 @@ export function DraftStudioPage() {
         <SectionBody>
           {preview?.graph === undefined || preview.graph === null ? (
             <Empty
-              title="NO GRAPH"
+              title="No graph"
               description="This save compiled no plan. Fix the source and save again."
             />
           ) : (
@@ -557,7 +582,7 @@ export function DraftStudioPage() {
         {schemaDigest === null ? (
           <SectionBody>
             <Empty
-              title="NOTHING TO LAUNCH"
+              title="Nothing to launch"
               description="The newest save has no form, so there is nothing to authorize a run against."
             />
           </SectionBody>
@@ -605,6 +630,7 @@ export function DraftStudioPage() {
             <FormActions>
               <Button
                 variant="filled"
+                className="uppercase"
                 disabled={
                   !actions.includes('launch') || retired || isDirty(state) || launch.isPending
                 }
@@ -612,7 +638,7 @@ export function DraftStudioPage() {
                   void handleLaunch();
                 }}
               >
-                {launch.isPending ? 'LAUNCHING…' : 'LAUNCH DRAFT'}
+                {launch.isPending ? 'Launching…' : 'Launch draft'}
               </Button>
               {isDirty(state) && (
                 <Mono size="data" tone="ink-3">
@@ -663,12 +689,18 @@ export function DraftStudioPage() {
             <FormActions>
               <Button
                 variant="filled"
-                disabled={!admin || retired || gradRepo.trim().length === 0 || graduate.isPending}
+                className="uppercase"
+                disabled={
+                  !actions.includes('approve') ||
+                  retired ||
+                  gradRepo.trim().length === 0 ||
+                  graduate.isPending
+                }
                 onClick={() => {
                   void handleGraduate();
                 }}
               >
-                {graduate.isPending ? 'EXPORTING…' : 'GRADUATE'}
+                {graduate.isPending ? 'Exporting…' : 'Graduate'}
               </Button>
             </FormActions>
           </>
@@ -680,6 +712,54 @@ export function DraftStudioPage() {
           </SectionBody>
         )}
       </Section>
+
+      {actions.includes('publish') ? (
+        <Section>
+          <SectionHeader title="Publish" note="no review" />
+          <SectionBody>
+            <FormGrid>
+              <TextField
+                id="studio-publish-playbook"
+                label="Playbook"
+                mono
+                required
+                value={publishTo}
+                onChange={setPublishTo}
+              />
+            </FormGrid>
+          </SectionBody>
+          {publishError === null ? null : (
+            <SectionBody>
+              <FormError>{publishError}</FormError>
+            </SectionBody>
+          )}
+          <FormActions>
+            <Button
+              variant="filled"
+              className="uppercase"
+              disabled={
+                retired || isDirty(state) || publishTo.trim().length === 0 || publish.isPending
+              }
+              onClick={() => {
+                void handlePublish();
+              }}
+            >
+              {publish.isPending ? 'Publishing…' : 'Publish'}
+            </Button>
+            {draft.data?.published_playbook === null ||
+            draft.data?.published_playbook === undefined ? null : (
+              <Link
+                to={`/playbooks/${draft.data.published_playbook}`}
+                className="font-mono text-data"
+              >
+                {publishedRev === null
+                  ? draft.data.published_playbook
+                  : `${draft.data.published_playbook} @ ${publishedRev.slice(0, 19)}`}
+              </Link>
+            )}
+          </FormActions>
+        </Section>
+      ) : null}
     </div>
   );
 
@@ -700,19 +780,20 @@ export function DraftStudioPage() {
             </span>
             <a
               href={`/api/playbook-drafts/${encodeURIComponent(id)}/tarball`}
-              className="font-mono text-micro text-ink-2 underline"
+              className="font-mono text-micro text-ink-2 uppercase underline"
               data-testid="draft-tarball"
             >
-              TARBALL
+              Tarball
             </a>
             <Button
+              className="uppercase"
               disabled={!actions.includes('delete')}
               onClick={() => {
                 setDeleteError(null);
                 setConfirmDelete(true);
               }}
             >
-              DELETE DRAFT
+              Delete draft
             </Button>
           </div>
         }

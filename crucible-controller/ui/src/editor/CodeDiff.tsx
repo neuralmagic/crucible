@@ -10,10 +10,10 @@ export function CodeDiff(props: CodeDiffProps) {
     <Suspense
       fallback={
         <div
-          className="border border-rule-hard bg-paper px-3 py-2 font-mono text-data text-ink-3"
+          className="border border-rule-hard bg-paper px-3 py-2 font-mono text-data text-ink-3 uppercase"
           style={{ height: props.height ?? '20rem' }}
         >
-          LOADING DIFF
+          Loading diff
         </div>
       }
     >

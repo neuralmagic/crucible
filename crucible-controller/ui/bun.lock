@@ -6,8 +6,12 @@
       "name": "crucible-controller-ui",
       "dependencies": {
         "@base-ui-components/react": "^1.0.0-rc.0",
+        "@cedar-policy/cedar-wasm": "^4.13.0",
         "@duckdb/duckdb-wasm": "^1.33.1-dev57.0",
         "@fontsource/public-sans": "^5.3.0",
+        "@fontsource/red-hat-display": "^5.3.0",
+        "@fontsource/red-hat-mono": "^5.3.0",
+        "@fontsource/red-hat-text": "^5.3.0",
         "@headless-tree/core": "1.7.0",
         "@headless-tree/react": "1.7.0",
         "@monaco-editor/react": "4.7.0",
@@ -95,6 +99,8 @@
 
     "@base-ui-components/utils": ["@base-ui-components/utils@0.2.2", "", { "dependencies": { "@babel/runtime": "^7.28.4", "@floating-ui/utils": "^0.2.10", "reselect": "^5.1.1", "use-sync-external-store": "^1.6.0" }, "peerDependencies": { "@types/react": "^17 || ^18 || ^19", "react": "^17 || ^18 || ^19", "react-dom": "^17 || ^18 || ^19" }, "optionalPeers": ["@types/react"] }, "sha512-rNJCD6TFy3OSRDKVHJDzLpxO3esTV1/drRtWNUpe7rCpPN9HZVHUCuP+6rdDYDGWfXnQHbqi05xOyRP2iZAlkw=="],
 
+    "@cedar-policy/cedar-wasm": ["@cedar-policy/cedar-wasm@4.13.0", "", {}, "sha512-1omEd/J0c7RjcfSUWiXZc6zk6XUs1IuY7Yk9TVysoKV/LpFWIk45RpjvRFVioPUR3RQmgA/DaqKhK3pucbBx1A=="],
+
     "@duckdb/duckdb-wasm": ["@duckdb/duckdb-wasm@1.33.1-dev57.0", "", { "dependencies": { "apache-arrow": "^17.0.0", "qs": "^6.14.1" } }, "sha512-ndn5l2EHq1PEMvCg8G6lRV0vjhSUcbqdM/niNBTTqH4/PyyUUVKbge0uUyCnj27b9SF/CiqBwDsgKLTqBvaxdw=="],
 
     "@esbuild/aix-ppc64": ["@esbuild/aix-ppc64@0.25.12", "", { "os": "aix", "cpu": "ppc64" }, "sha512-Hhmwd6CInZ3dwpuGTF8fJG6yoWmsToE+vYgD4nytZVxcu1ulHpUQRAB1UJ8+N1Am3Mz4+xOByoQoSZf4D+CpkA=="],
@@ -176,6 +182,12 @@
     "@floating-ui/utils": ["@floating-ui/utils@0.2.12", "", {}, "sha512-HpCo8tmWzLVad5s2d19EhAz5zqrrQ6s69qd6moPMQvkOuSwDT1YgRfWSVuc4ennqrgv3OHppiOGMQ7oC13yIww=="],
 
     "@fontsource/public-sans": ["@fontsource/public-sans@5.3.0", "", {}, "sha512-kjODI0S3zdv0mBYCIQ8TbBayaiqszpc2UbhJiO3bjIqVVXzcWfHSt2o3WBCLOY3juaGaQoy4MoWCcgmfI5hCuA=="],
+
+    "@fontsource/red-hat-display": ["@fontsource/red-hat-display@5.3.0", "", {}, "sha512-fD3uZkhdZMHzpSdHMa000GQSVPQNuYr4AMu3Dx9UhrM35ynBIC4w3fe824d7aO6wHyR2e7pSrUhYvTBp3VRg4g=="],
+
+    "@fontsource/red-hat-mono": ["@fontsource/red-hat-mono@5.3.0", "", {}, "sha512-rXSQpg6TLRd+WLhcN9qGIarP9/HVouhmdKJcCv1R3+c2mznJ2GUUaTpkKhFN6LO2Sg7lRvb8CIaXYQqvqY6aPw=="],
+
+    "@fontsource/red-hat-text": ["@fontsource/red-hat-text@5.3.0", "", {}, "sha512-/kgNIUqdoc9uyd4zK+T7gEwY6bYF+hSCZeQTl8Ni/oKtv+a7YeCyQwAE94BeLwud6UfLqn90gBFKa3gCpiZnRA=="],
 
     "@headless-tree/core": ["@headless-tree/core@1.7.0", "", {}, "sha512-LxcX7LNepwfOPrZcs4PNfDwCzbi326uCAX5jYBfw94jI+pZQA7ANaE/No3LW0XFgcBcQtK/G2bInbVEhLF1C/Q=="],
 
