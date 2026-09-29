@@ -88,27 +88,25 @@ cannot silently stop running there. The registry's route tests (`api::secrets_te
 
 ### The OIDC suite
 
-`src/oidc/keycloak_e2e.rs` drives the relying party against a real Keycloak — no mocks and no stub
+`src/identity/oidc/keycloak_e2e.rs` drives the relying party against a real Keycloak — no mocks and no stub
 issuer. It runs the actual browser flow (authorization code with PKCE, Keycloak's rendered login
 form, the callback) and presents access tokens Keycloak actually minted, against the same router
 `serve` mounts. The realm, clients, and users live in `tests/keycloak/crucible-realm.json`.
 
-It uses the issuer at `KEYCLOAK_URL` when set (how CI runs it), and otherwise starts the shared
-`crucible-test-keycloak` container on 58180 itself. `just dev-keycloak` provisions the same one:
+It uses the issuer at `KEYCLOAK_URL` when set (how CI runs it). Otherwise it provisions the shared
+`crucible-test-keycloak` container on 58180 itself, labelled with a digest of `tests/keycloak/`.
+Keycloak imports a realm only when it first creates it, so a container whose label does not match
+the current realm files (an edited realm, or one created from another worktree) is replaced
+automatically:
 
 ```sh
-just dev-keycloak
-export KEYCLOAK_URL=http://127.0.0.1:58180
 SQLX_OFFLINE=true cargo test -p crucible-controller --lib -- oidc::keycloak_e2e
 ```
-
-The realm is imported only when the container is CREATED, so after editing the realm file:
-`docker rm -f crucible-test-keycloak && just dev-keycloak`.
 
 With no issuer and no docker the tests print why they are skipping and pass. Set
 `CRUCIBLE_REQUIRE_KEYCLOAK_TESTS=1` to make that skip a failure instead; CI sets it.
 
-The suite also covers the offline credential (`src/oidc/credentials.rs`): the callback storing an
+The suite also covers the offline credential (`src/identity/oidc/credentials.rs`): the callback storing an
 encrypted refresh token, two concurrent refreshes of one owner serializing under the per-subject
 advisory lock, the schedule sweep re-reading live groups before it claims a due row, and a refused
 refresh downgrading a live session. The realm grants `offline_access` and permits refresh-token
