@@ -765,7 +765,7 @@ pub fn execute(
             if t.stage == Stage::Epilogue {
                 inputs.insert(
                     TaskName(OUTCOME_INPUT.to_string()),
-                    main_graph_outcome(plan, &results, halted.as_ref()),
+                    main_graph_outcome(plan, &results, halted.as_ref(), &producers),
                 );
             }
             inputs_for_dispatch.insert(t.name.clone(), inputs);
@@ -1411,17 +1411,21 @@ fn file_producers(
     results: &BTreeMap<TaskName, TaskResult>,
     runner: &dyn TaskRunner,
 ) -> Vec<Task> {
+    let epilogue = t.stage == Stage::Epilogue;
     let contributes = |node: &Task, candidate: &Task, r: &TaskResult| match r.status {
         TaskStatus::Pass => true,
         TaskStatus::Fail => {
-            t.join == Join::Settled
-                && t.depends_on.contains(&node.name)
-                && runner.has_captured_files(candidate)
+            let reads_failures = (t.join == Join::Settled && t.depends_on.contains(&node.name))
+                || (epilogue && node.stage == Stage::Iteration);
+            reads_failures && runner.has_captured_files(candidate)
         }
         _ => false,
     };
+    let main_graph = plan
+        .tasks_topo()
+        .filter(|p| epilogue && p.stage == Stage::Iteration);
     let mut producers: Vec<Task> = Vec::new();
-    for p in ancestors(plan, t) {
+    for p in main_graph.chain(ancestors(plan, t)) {
         if p.emits_files.is_empty() {
             continue;
         }
@@ -1504,50 +1508,53 @@ fn dependency_inputs(
             })
             .collect();
     }
-    let was_staged = |name: &TaskName| staged.iter().any(|p| &p.name == name);
     t.depends_on
         .iter()
         .filter_map(|d| {
-            let r = results.get(d)?;
-            // A mapped node is staged under its instances' names, so the node's own flag is true
-            // when any of them was.
-            let any_staged = was_staged(d) || staged.iter().any(|p| is_instance_of(d, &p.name));
-            let mut entry = settled_entry(r, any_staged);
-            if plan.get(d).is_some_and(|dep| dep.over.is_some()) {
-                let per_instance: serde_json::Map<String, Value> = results
-                    .iter()
-                    .filter_map(|(name, r)| {
-                        let key = instance_key(d, name)?;
-                        Some((
-                            key.to_owned(),
-                            Value::Object(settled_entry(r, was_staged(name))),
-                        ))
-                    })
-                    .collect();
-                entry.insert("per_instance".to_string(), Value::Object(per_instance));
-            }
+            let entry = settled_node_entry(plan, d, results, staged)?;
             Some((d.clone(), Value::Object(entry)))
         })
         .collect()
 }
 
-/// What one settled task reports about itself: the settled entry with the output and the
-/// staged-file flag omitted, which is what an epilogue task receives per main-graph task.
-fn outcome_entry(r: &TaskResult) -> serde_json::Map<String, Value> {
-    let mut entry = serde_json::Map::new();
-    entry.insert("status".to_string(), Value::from(r.status.as_str()));
-    entry.insert(
-        "note".to_string(),
-        r.note.clone().map_or(Value::Null, Value::String),
-    );
-    entry
+fn settled_node_entry(
+    plan: &ValidPlan,
+    node: &TaskName,
+    results: &BTreeMap<TaskName, TaskResult>,
+    staged: &[Task],
+) -> Option<serde_json::Map<String, Value>> {
+    let r = results.get(node)?;
+    let mut entry = settled_entry(r, node_staged(staged, node));
+    if plan.get(node).is_some_and(|t| t.over.is_some()) {
+        let per_instance: serde_json::Map<String, Value> = results
+            .iter()
+            .filter_map(|(name, r)| {
+                let key = instance_key(node, name)?;
+                let files = staged.iter().any(|p| &p.name == name);
+                Some((key.to_owned(), Value::Object(settled_entry(r, files))))
+            })
+            .collect();
+        entry.insert("per_instance".to_string(), Value::Object(per_instance));
+    }
+    Some(entry)
+}
+
+fn node_staged(staged: &[Task], node: &TaskName) -> bool {
+    staged
+        .iter()
+        .any(|p| &p.name == node || is_instance_of(node, &p.name))
 }
 
 /// One dependency's entry in a settled join's inputs. The entry carries the output rather than
 /// being it, so a consumer cannot read a failed dependency's reading without stepping past its
 /// status.
 fn settled_entry(r: &TaskResult, files: bool) -> serde_json::Map<String, Value> {
-    let mut entry = outcome_entry(r);
+    let mut entry = serde_json::Map::new();
+    entry.insert("status".to_string(), Value::from(r.status.as_str()));
+    entry.insert(
+        "note".to_string(),
+        r.note.clone().map_or(Value::Null, Value::String),
+    );
     entry.insert(
         "output".to_string(),
         r.output.clone().unwrap_or(Value::Null),
@@ -1563,13 +1570,14 @@ fn main_graph_outcome(
     plan: &ValidPlan,
     results: &BTreeMap<TaskName, TaskResult>,
     halted: Option<&Halt>,
+    staged: &[Task],
 ) -> Value {
     let tasks: serde_json::Map<String, Value> = plan
         .tasks_topo()
         .filter(|t| t.stage == Stage::Iteration)
         .filter_map(|t| {
-            let r = results.get(&t.name)?;
-            Some((t.name.0.clone(), Value::Object(outcome_entry(r))))
+            let entry = settled_node_entry(plan, &t.name, results, staged)?;
+            Some((t.name.0.clone(), Value::Object(entry)))
         })
         .collect();
     serde_json::json!({
@@ -5580,11 +5588,13 @@ mod tests {
             Some(2),
             "an epilogue task is not part of the main graph it reports on"
         );
-        assert!(
-            outcome["tasks"]["build"].get("output").is_none()
-                && outcome["tasks"]["build"].get("files").is_none(),
-            "the epilogue entry is the settled entry minus output and files"
+        assert_eq!(
+            outcome["tasks"]["build"]["output"],
+            serde_json::json!({"score": 1.0}),
+            "the epilogue entry is the settled entry, output included"
         );
+        assert_eq!(outcome["tasks"]["check"]["output"], Value::Null);
+        assert_eq!(outcome["tasks"]["build"]["files"], false);
         assert!(
             !r.seen_inputs["check"].contains(&OUTCOME_INPUT.to_string()),
             "a main-graph task was given the run's outcome"
@@ -5621,6 +5631,166 @@ mod tests {
         assert_eq!(
             outcome["tasks"]["after"]["note"],
             "required task probe failed"
+        );
+    }
+
+    #[test]
+    fn an_epilogue_is_staged_with_failed_and_passing_main_graph_evidence() {
+        let mut build = task("build", &[], "any", true);
+        build.emits_files = vec!["evidence/build.json".to_string()];
+        let mut probe = task("probe", &["build"], "any", true);
+        probe.emits_files = vec!["evidence/probe.json".to_string()];
+        let mut deliver = task("deliver", &["probe"], "any", true);
+        deliver.emits_files = vec!["DELIVER.md".to_string()];
+        let plan = valid(
+            vec![build, probe, deliver, epilogue("report", &[], true)],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.captured.insert("probe".to_string());
+        r.on(
+            "probe",
+            1,
+            || AttemptOutcome::fail("did not reproduce"),
+            0.1,
+        );
+        let out = run_plan(&plan, &mut r);
+
+        assert!(!out.valid);
+        assert_eq!(out.results[&"report".into()].status, TaskStatus::Pass);
+        assert_eq!(
+            r.staged["report"],
+            vec!["build".to_string(), "probe".to_string()],
+            "a blocked task has no set to stage"
+        );
+        let outcome = outcome_of(&r, "report");
+        assert_eq!(outcome["tasks"]["build"]["files"], true);
+        assert_eq!(outcome["tasks"]["probe"]["status"], "fail");
+        assert_eq!(outcome["tasks"]["probe"]["files"], true);
+        assert_eq!(outcome["tasks"]["deliver"]["status"], "blocked");
+        assert_eq!(outcome["tasks"]["deliver"]["files"], false);
+    }
+
+    #[test]
+    fn an_epilogue_reports_no_files_for_a_failure_without_a_captured_set() {
+        let mut probe = task("probe", &[], "any", false);
+        probe.emits_files = vec!["evidence/probe.json".to_string()];
+        let plan = valid(vec![probe, epilogue("report", &[], true)], 10.0);
+        let mut r = ScriptRunner::new();
+        r.on(
+            "probe",
+            1,
+            || AttemptOutcome::fail("did not reproduce"),
+            0.1,
+        );
+        run_plan(&plan, &mut r);
+
+        assert!(r.staged["report"].is_empty());
+        let outcome = outcome_of(&r, "report");
+        assert_eq!(outcome["tasks"]["probe"]["status"], "fail");
+        assert_eq!(outcome["tasks"]["probe"]["files"], false);
+    }
+
+    #[test]
+    fn an_epilogue_is_not_staged_with_a_skipped_or_transport_failed_set() {
+        let mut quiet = task("quiet", &[], "any", false);
+        quiet.emits_files = vec!["evidence/quiet.json".to_string()];
+        let mut flaky = task("flaky", &[], "any", false);
+        flaky.emits_files = vec!["evidence/flaky.json".to_string()];
+        let plan = valid(vec![quiet, flaky, epilogue("report", &[], true)], 10.0);
+        let mut r = ScriptRunner::new();
+        r.captured.insert("quiet".to_string());
+        r.captured.insert("flaky".to_string());
+        r.on(
+            "quiet",
+            1,
+            || AttemptOutcome::Skipped(serde_json::json!({}), "not applicable".into()),
+            0.0,
+        );
+        for attempt in 1..=3 {
+            r.on(
+                "flaky",
+                attempt,
+                || {
+                    AttemptOutcome::Transport(TransportFailure::new(
+                        TransportCause::Sandbox,
+                        "pod evicted",
+                    ))
+                },
+                0.0,
+            );
+        }
+        run_plan(&plan, &mut r);
+
+        assert!(r.staged["report"].is_empty(), "{:?}", r.staged["report"]);
+        let outcome = outcome_of(&r, "report");
+        assert_eq!(outcome["tasks"]["quiet"]["files"], false);
+        assert_eq!(outcome["tasks"]["flaky"]["status"], "transport");
+        assert_eq!(outcome["tasks"]["flaky"]["files"], false);
+    }
+
+    #[test]
+    fn an_epilogue_is_staged_with_each_mapped_instances_set() {
+        let mut node = mapped_node("audit", "discover", "targets", false);
+        node.emits_files = vec!["OUT.md".to_string()];
+        let plan = valid(
+            vec![
+                task("discover", &[], "any", true),
+                node,
+                epilogue("report", &[], true),
+            ],
+            5.0,
+        );
+        let mut runner = FanoutRunner::new(&["alpha", "beta", "gamma"]);
+        runner.fail.insert("audit[beta]".to_string());
+        runner.fail.insert("audit[gamma]".to_string());
+        runner.captured.insert("audit[beta]".to_string());
+        execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut runner,
+            |_, _| {},
+        );
+
+        assert_eq!(
+            runner.staged["report"],
+            vec!["audit[alpha]".to_string(), "audit[beta]".to_string()]
+        );
+        let outcome = &runner.seen_inputs["report"][&TaskName(OUTCOME_INPUT.to_string())];
+        assert_eq!(outcome["tasks"]["audit"]["files"], true);
+        assert_eq!(outcome["tasks"]["discover"]["files"], false);
+    }
+
+    #[test]
+    fn a_main_graph_task_is_not_staged_with_unrelated_failure_evidence() {
+        let mut probe = task("probe", &[], "any", false);
+        probe.emits_files = vec!["evidence/probe.json".to_string()];
+        let mut other = task("other", &[], "any", true);
+        other.emits_files = vec!["evidence/other.json".to_string()];
+        let plan = valid(
+            vec![
+                probe,
+                other,
+                task("tip", &["other"], "any", true),
+                epilogue("report", &[], true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.captured.insert("probe".to_string());
+        r.on(
+            "probe",
+            1,
+            || AttemptOutcome::fail("did not reproduce"),
+            0.1,
+        );
+        run_plan(&plan, &mut r);
+
+        assert_eq!(r.staged["tip"], vec!["other".to_string()]);
+        assert_eq!(
+            r.staged["report"],
+            vec!["probe".to_string(), "other".to_string()]
         );
     }
 

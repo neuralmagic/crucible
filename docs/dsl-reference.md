@@ -303,6 +303,6 @@ Present alongside the dependency entries, never wrapped in one.
 | --- | --- | --- |
 | `item` | `str` | This mapped instance's key, one per item of the list `over` names. |
 | `kept` | `object` | The kept candidate, in an epilogue task only. |
-| `outcome` | `object` | How the main graph ended and what each of its tasks settled as, as `{"exit": str, "tasks": {name: {"status", "note"}}}`, in an epilogue task only. |
+| `outcome` | `object` | How the main graph ended and what each of its tasks settled as, as `{"exit": str, "tasks": {name: {"status", "note", "output", "files"}}}`, in an epilogue task only: each entry is what a `settled` join receives, `per_instance` included for a mapped task. `files` says whether that task's declared files, passing or failing, are staged under `inputs/<name>/`. |
 | `params` | `object` | Every declared parameter's bound value under its name, in its declared type, and `{}` where the source declares none, in a command or evaluate task only. |
 | `revision` | `object` | The verdict that sent this task back, as `{"round": int, "max_rounds": int, "reviewer": str, "review": {"status", "note", "output", "files"}}`, from the second round of a revise loop on. |
