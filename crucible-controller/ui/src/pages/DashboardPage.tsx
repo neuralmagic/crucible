@@ -203,7 +203,7 @@ export function DashboardPage() {
   return (
     <div>
       <PageHeader
-        eyebrow="Control plane"
+        eyebrow="Autoresearch"
         title="Dashboard"
         description="Pipeline volume, capacity against the admission caps, and where today's spend went."
       />

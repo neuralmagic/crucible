@@ -88,6 +88,21 @@ pub async fn record_groups_on(
     Ok(())
 }
 
+/// A signed-in user's subject, and the groups and stamp their last sign-in recorded, by login.
+pub async fn stamped(
+    pool: &PgPool,
+    login: &str,
+) -> anyhow::Result<Option<(String, Vec<String>, Option<String>)>> {
+    let row = sqlx::query!(
+        r#"SELECT sub, groups AS "groups: sqlx::types::Json<Vec<String>>", groups_at FROM users WHERE login = $1"#,
+        login
+    )
+    .fetch_optional(pool)
+    .await
+    .context("reading a user's stamped groups")?;
+    Ok(row.map(|r| (r.sub, r.groups.0, r.groups_at)))
+}
+
 /// The subject a login currently belongs to, if any. The fire-time refresh starts from a
 /// schedule's `user:<login>` snapshot and needs the subject its credential is keyed by.
 pub async fn sub_for_login(pool: &PgPool, login: &str) -> anyhow::Result<Option<String>> {
