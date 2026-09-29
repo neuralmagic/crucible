@@ -21,8 +21,8 @@ Everything the lane has, on one small graph:
 
 - **Runtime fan-out**: `scan` emits the issue list and `triage` maps over it, keyed by
   issue number, so instance `triage[123]` means issue 123 on every retry and report row.
-- **A real sandbox**: `backend = "openshell"` runs each agent turn in the stock
-  claude-sandbox image, deny-by-default egress. The public GitHub API is reachable
+- **A real sandbox**: `backend = "openshell"` runs each agent turn in the catalogued
+  `sandbox-triage-cc` image, deny-by-default egress. The public GitHub API is reachable
   because the built-in allowlist carries the forges; `curl`/`gh` are listed as egress
   binaries in the manifest.
 - **Only passing instances feed the join**: an issue whose fetch fails is a failed
