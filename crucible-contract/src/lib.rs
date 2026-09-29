@@ -58,7 +58,7 @@ pub use refine::{
     Attack, AttackKind, ControlEvidence, FailureEvidence, ReadingEvidence, RoundKind, RoundOutcome,
     RoundRecord, SelftestEvidence, parse_rounds, render_rounds_json,
 };
-pub use report::{REPORT_FILE, ReportResult, RunReport, TaskReport};
+pub use report::{REPORT_FILE, ReportResult, RunReport, RunVerdict, TaskReport};
 pub use scope::{ScopeReport, StageName, StageResult};
 pub use session::{
     BlockedReasonKind, LoopPhase, PrLinkWire, RowWire, SessionEvent, TaskBlocked, TransportCause,

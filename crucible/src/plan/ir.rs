@@ -207,6 +207,9 @@ pub enum TaskKind {
         template: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         result: Option<TaskName>,
+        /// A declared field of `result` whose value picks the card accent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        severity_field: Option<OutputField>,
     },
     /// Engine-builtin deterministic fold: keep the k best upstream outputs by `score`.
     TopK { k: u32, direction: Direction },
@@ -455,6 +458,17 @@ pub enum PlanError {
         "report task {task:?} selects epilogue task {result:?}; report results must come from the main graph"
     )]
     EpilogueReportResult { task: String, result: String },
+    #[error("report task {task:?} names severity_field {field:?} but selects no result task")]
+    SeverityWithoutResult { task: String, field: String },
+    #[error(
+        "report task {task:?} names severity_field {field:?}, which result task {result:?} does not declare in emits; declared: {declared:?}"
+    )]
+    UndeclaredSeverityField {
+        task: String,
+        result: String,
+        field: String,
+        declared: Vec<String>,
+    },
     #[error("task {task:?} lists dependency {dependency:?} twice")]
     RepeatedDependency { task: String, dependency: String },
     #[error("task {task:?}: join = \"passed\" needs at least one dependency")]
@@ -839,21 +853,44 @@ impl Plan {
                 }
             }
             if let TaskKind::Report {
-                result: Some(result),
+                result,
+                severity_field,
                 ..
             } = &t.task
             {
-                let Some(&result_index) = index.get(result) else {
-                    return Err(PlanError::UnknownReportResult {
-                        task: task(),
-                        result: result.0.clone(),
-                    });
-                };
-                if self.tasks[result_index].stage == Stage::Epilogue {
-                    return Err(PlanError::EpilogueReportResult {
-                        task: task(),
-                        result: result.0.clone(),
-                    });
+                match (result, severity_field) {
+                    (None, Some(field)) => {
+                        return Err(PlanError::SeverityWithoutResult {
+                            task: task(),
+                            field: field.0.clone(),
+                        });
+                    }
+                    (None, None) => {}
+                    (Some(result), severity_field) => {
+                        let Some(&result_index) = index.get(result) else {
+                            return Err(PlanError::UnknownReportResult {
+                                task: task(),
+                                result: result.0.clone(),
+                            });
+                        };
+                        let selected = &self.tasks[result_index];
+                        if selected.stage == Stage::Epilogue {
+                            return Err(PlanError::EpilogueReportResult {
+                                task: task(),
+                                result: result.0.clone(),
+                            });
+                        }
+                        if let Some(field) = severity_field
+                            && !selected.emits.contains(field)
+                        {
+                            return Err(PlanError::UndeclaredSeverityField {
+                                task: task(),
+                                result: result.0.clone(),
+                                field: field.0.clone(),
+                                declared: selected.emits.iter().map(|f| f.0.clone()).collect(),
+                            });
+                        }
+                    }
                 }
             }
             if let TaskKind::Route { questions, decider } = &t.task {
@@ -2252,6 +2289,7 @@ mod tests {
                     destination: ReportDestination::Slack(SlackDestination {}),
                     template: "t".into(),
                     result: None,
+                    severity_field: None,
                 },
                 "report",
             ),

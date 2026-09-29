@@ -293,11 +293,24 @@ pub fn functions() -> Vec<Function> {
             kwargs: vec![
                 name_kwarg(),
                 Kwarg::new("destination", "str", "The configured sink to publish to."),
-                Kwarg::new("template", "str", "The template rendered into the message."),
+                Kwarg::new(
+                    "template",
+                    "str",
+                    "Pack file rendered into the card body. Reads `verdict`, `spent_usd`, \
+                     `passed`, `failed`, `tasks` (first 20), `run`, `run_url`, and `result`. \
+                     Every inserted value is escaped for Slack.",
+                ),
                 Kwarg::new(
                     "result",
                     "task",
-                    "The task whose result the template renders.",
+                    "The task whose declared fields the card and `result.output` carry; \
+                     `result.status` alone when it did not pass.",
+                ),
+                Kwarg::new(
+                    "severity_field",
+                    "str",
+                    "A declared field of `result` whose value (\"good\", \"warning\", \
+                     \"danger\") picks the card accent; any other value is neutral.",
                 ),
                 Kwarg::new("required", "bool", "False makes the report advisory."),
             ],

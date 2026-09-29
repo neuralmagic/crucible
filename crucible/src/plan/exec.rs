@@ -1281,21 +1281,29 @@ pub fn execute(
         .map(Halt::exit)
         .unwrap_or(PlanExit::Completed);
     let valid = exit == PlanExit::Completed
-        && plan
-            .tasks_topo()
-            .filter(|t| t.required && t.stage == Stage::Iteration)
-            .all(|t| {
-                matches!(
-                    results.get(&t.name).map(|r| r.status),
-                    Some(TaskStatus::Pass | TaskStatus::NotTaken)
-                )
-            });
+        && required_tasks_held(plan, |name| results.get(name).map(|r| r.status));
     Ok(PlanOutcome {
         valid,
         exit,
         spent_usd: spent,
         results,
     })
+}
+
+/// Whether every required main-graph task passed or was not taken. With a completed exit this is
+/// the run's verdict; advisory results, epilogue tasks, and captured failure sets do not enter it.
+pub fn required_tasks_held(
+    plan: &ValidPlan,
+    status: impl Fn(&TaskName) -> Option<TaskStatus>,
+) -> bool {
+    plan.tasks_topo()
+        .filter(|t| t.required && t.stage == Stage::Iteration)
+        .all(|t| {
+            matches!(
+                status(&t.name),
+                Some(TaskStatus::Pass | TaskStatus::NotTaken)
+            )
+        })
 }
 
 /// The run ceilings one dispatch ran past: spend beyond the budget, or an attempt the runner
