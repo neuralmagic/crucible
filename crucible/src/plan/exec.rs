@@ -6564,7 +6564,7 @@ mod tests {
     }
 
     fn with_params(tasks: Vec<Task>) -> ValidPlan {
-        use crate::plan::starlark::params::ParamValue;
+        use crate::plan::param::ParamValue;
         Plan {
             version: 1,
             reason: None,
