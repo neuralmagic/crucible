@@ -587,8 +587,9 @@ pub fn reserved_inputs() -> Vec<Reserved> {
             OUTCOME_INPUT,
             "object",
             "How the main graph ended and what each of its tasks settled as, as \
-             `{\"exit\": str, \"tasks\": {name: {\"status\", \"note\"}}}`, in an epilogue \
-             task only.",
+             `{\"exit\": str, \"tasks\": {name: {\"status\", \"note\", \"files\"}}}`, in an \
+             epilogue task only. `files` says whether that task's declared files, passing or \
+             failing, are staged under `inputs/<name>/`.",
         ),
         Reserved::new(
             REVISION_INPUT,

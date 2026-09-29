@@ -352,6 +352,12 @@ Each task's `CRUCIBLE_INPUTS` carries the kept candidate under the reserved `kep
 `{"iter", "score", "tiebreak", "sha", "snapshot", "note"}`. Dependencies may not cross stages,
 engine ops cannot be epilogue, and the workflow `result` must iterate.
 
+In a playbook the epilogue runs after the main graph completes or fails, and reads the reserved
+`outcome` input instead: `{"exit", "tasks": {name: {"status", "note", "files"}}}`. Every
+main-graph task's declared files are staged under `inputs/<name>/` (a mapped node's under
+`inputs/<node>[<key>]/`), from a failed task as well as a passing one, and `files` says whether
+that task's set is there. A skipped, blocked, or transport-failed task stages nothing.
+
 Epilogue results are advisory: they cannot un-keep the candidate. Rows land in the session log
 and RESULTS.md (`epilogue` / `epilogue-skip` / `epilogue-fail`), and the PR body gets an
 "Epilogue checks (advisory)" section with failures marked **FAILED**.

@@ -1,0 +1,44 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-09-28-a652-001"
+title = "Stage every main-graph task's evidence into epilogue tasks"
+status = "active"
+created = "2026-09-28"
+started = "2026-09-28"
+refs = [
+    "RFC-0002:C-SETTLED-JOIN",
+    "RFC-0002:C-PLAYBOOK-LANE",
+    "RFC-0002:C-TASK-FILES",
+]
+
+[content]
+description = """
+An epilogue task runs after the main graph fails, but it cannot depend on a main-graph task, so it never received any main-graph task's declared files. Only a `join = "settled"` dependent read a failed task's captured evidence. A pack that wants a report of what failed and why had to keep every rung advisory, rejoin them in a settled report inside the main graph, and add a required task to put the verdict back.
+
+Every epilogue task is now staged with each settled main-graph task's complete captured set, passing or failing, under `inputs/<task>/`, and a mapped node's instances under `inputs/<node>[<key>]/`. Each `outcome.tasks` entry gains the `files` flag a settled entry already carries, so the epilogue can tell a staged set from a missing one. Skipped, transport-failed, blocked, and not-taken tasks stage nothing, and a set that did not survive a resume is reported with the flag false and not regenerated."""
+
+[[content.acceptance_criteria]]
+text = "an epilogue task is staged with every passing main-graph task's declared files and every failing one's complete captured set, under the producer's name"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "a mapped main-graph node is staged into an epilogue per instance, failing instances with a captured set included"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "skipped, transport-failed, blocked, and not-taken main-graph tasks stage nothing into an epilogue, and a failure without a captured set reports files = false"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "each outcome.tasks entry carries the files flag, true exactly when that task's set was staged for this epilogue"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "through the harness runner, an epilogue after a required short-circuit reads the failed task's and a passing task's files from inputs/"
+status = "done"
+category = "added"

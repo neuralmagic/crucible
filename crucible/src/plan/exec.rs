@@ -739,7 +739,7 @@ pub fn execute(
             if t.stage == Stage::Epilogue {
                 inputs.insert(
                     TaskName(OUTCOME_INPUT.to_string()),
-                    main_graph_outcome(plan, &results, halted.as_ref()),
+                    main_graph_outcome(plan, &results, halted.as_ref(), &producers),
                 );
             }
             inputs_for_dispatch.insert(t.name.clone(), inputs);
@@ -1327,6 +1327,9 @@ pub fn is_instance_of(node: &TaskName, name: &TaskName) -> bool {
 /// grandparent's evidence into a consumer that has no envelope entry for it would read as the
 /// grandparent having passed.
 ///
+/// An epilogue task is also staged with every settled main-graph task's set, passing or failing.
+/// Its `outcome` entry for each one carries the status, so a failed set cannot read as a pass.
+///
 /// A mapped ancestor is expanded into one stand-in per contributing instance, so a consumer is
 /// handed `inputs/node[key]/<declared>` and the runner never has to know what `over` is.
 fn file_producers(
@@ -1335,17 +1338,21 @@ fn file_producers(
     results: &BTreeMap<TaskName, TaskResult>,
     runner: &dyn TaskRunner,
 ) -> Vec<Task> {
+    let epilogue = t.stage == Stage::Epilogue;
     let contributes = |node: &Task, candidate: &Task, r: &TaskResult| match r.status {
         TaskStatus::Pass => true,
         TaskStatus::Fail => {
-            t.join == Join::Settled
-                && t.depends_on.contains(&node.name)
-                && runner.has_captured_files(candidate)
+            let reads_failures = (t.join == Join::Settled && t.depends_on.contains(&node.name))
+                || (epilogue && node.stage == Stage::Iteration);
+            reads_failures && runner.has_captured_files(candidate)
         }
         _ => false,
     };
+    let main_graph = plan
+        .tasks_topo()
+        .filter(|p| epilogue && p.stage == Stage::Iteration);
     let mut producers: Vec<Task> = Vec::new();
-    for p in ancestors(plan, t) {
+    for p in main_graph.chain(ancestors(plan, t)) {
         if p.emits_files.is_empty() {
             continue;
         }
@@ -1412,10 +1419,7 @@ fn inputs_for(
         .iter()
         .filter_map(|d| {
             let r = results.get(d)?;
-            // A mapped node is staged under its instances' names, so the node's own flag is true
-            // when any of them was.
-            let any_staged = was_staged(d) || staged.iter().any(|p| is_instance_of(d, &p.name));
-            let mut entry = settled_entry(r, any_staged);
+            let mut entry = settled_entry(r, node_staged(staged, d));
             if plan.get(d).is_some_and(|dep| dep.over.is_some()) {
                 let per_instance: serde_json::Map<String, Value> = results
                     .iter()
@@ -1434,15 +1438,24 @@ fn inputs_for(
         .collect()
 }
 
-/// What one settled task reports about itself: the settled entry with the output and the
-/// staged-file flag omitted, which is what an epilogue task receives per main-graph task.
-fn outcome_entry(r: &TaskResult) -> serde_json::Map<String, Value> {
+/// Whether `node`'s set is among `staged`. A mapped node is staged under its instances' names,
+/// so its flag is true when any of them was.
+fn node_staged(staged: &[Task], node: &TaskName) -> bool {
+    staged
+        .iter()
+        .any(|p| &p.name == node || is_instance_of(node, &p.name))
+}
+
+/// What one settled task reports about itself: the settled entry with the output omitted, which
+/// is what an epilogue task receives per main-graph task.
+fn outcome_entry(r: &TaskResult, files: bool) -> serde_json::Map<String, Value> {
     let mut entry = serde_json::Map::new();
     entry.insert("status".to_string(), Value::from(r.status.as_str()));
     entry.insert(
         "note".to_string(),
         r.note.clone().map_or(Value::Null, Value::String),
     );
+    entry.insert("files".to_string(), Value::Bool(files));
     entry
 }
 
@@ -1450,29 +1463,31 @@ fn outcome_entry(r: &TaskResult) -> serde_json::Map<String, Value> {
 /// being it, so a consumer cannot read a failed dependency's reading without stepping past its
 /// status.
 fn settled_entry(r: &TaskResult, files: bool) -> serde_json::Map<String, Value> {
-    let mut entry = outcome_entry(r);
+    let mut entry = outcome_entry(r, files);
     entry.insert(
         "output".to_string(),
         r.output.clone().unwrap_or(Value::Null),
     );
-    entry.insert("files".to_string(), Value::Bool(files));
     entry
 }
 
 /// What an epilogue task is told about the run it reports on: how dispatch ended, and one entry
 /// per settled main-graph task. An epilogue task has no dependencies to read, so this is the
-/// only channel by which it learns what happened.
+/// only channel by which it learns what happened. `staged` is the producer list this dispatch
+/// hands the runner, which is what each entry's `files` flag reports.
 fn main_graph_outcome(
     plan: &ValidPlan,
     results: &BTreeMap<TaskName, TaskResult>,
     halted: Option<&Halt>,
+    staged: &[Task],
 ) -> Value {
     let tasks: serde_json::Map<String, Value> = plan
         .tasks_topo()
         .filter(|t| t.stage == Stage::Iteration)
         .filter_map(|t| {
             let r = results.get(&t.name)?;
-            Some((t.name.0.clone(), Value::Object(outcome_entry(r))))
+            let entry = outcome_entry(r, node_staged(staged, &t.name));
+            Some((t.name.0.clone(), Value::Object(entry)))
         })
         .collect();
     serde_json::json!({
@@ -5188,10 +5203,10 @@ mod tests {
             "an epilogue task is not part of the main graph it reports on"
         );
         assert!(
-            outcome["tasks"]["build"].get("output").is_none()
-                && outcome["tasks"]["build"].get("files").is_none(),
-            "the epilogue entry is the settled entry minus output and files"
+            outcome["tasks"]["build"].get("output").is_none(),
+            "the epilogue entry is the settled entry minus output"
         );
+        assert_eq!(outcome["tasks"]["build"]["files"], false);
         assert!(
             !r.seen_inputs["check"].contains(&OUTCOME_INPUT.to_string()),
             "a main-graph task was given the run's outcome"
@@ -5228,6 +5243,176 @@ mod tests {
         assert_eq!(
             outcome["tasks"]["after"]["note"],
             "required task probe failed"
+        );
+    }
+
+    /// A required failure stops the main graph, and the epilogue still reads the failed task's
+    /// evidence and every passing task's, under each producer's name.
+    #[test]
+    fn an_epilogue_is_staged_with_failed_and_passing_main_graph_evidence() {
+        let mut build = task("build", &[], "any", true);
+        build.emits_files = vec!["evidence/build.json".to_string()];
+        let mut probe = task("probe", &["build"], "any", true);
+        probe.emits_files = vec!["evidence/probe.json".to_string()];
+        let mut deliver = task("deliver", &["probe"], "any", true);
+        deliver.emits_files = vec!["DELIVER.md".to_string()];
+        let plan = valid(
+            vec![build, probe, deliver, epilogue("report", &[], true)],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.captured.insert("probe".to_string());
+        r.on(
+            "probe",
+            1,
+            || AttemptOutcome::fail("did not reproduce"),
+            0.1,
+        );
+        let out = run_plan(&plan, &mut r);
+
+        assert!(!out.valid);
+        assert_eq!(out.results[&"report".into()].status, TaskStatus::Pass);
+        assert_eq!(
+            r.staged["report"],
+            vec!["build".to_string(), "probe".to_string()],
+            "a blocked task has no set to stage"
+        );
+        let outcome = outcome_of(&r, "report");
+        assert_eq!(outcome["tasks"]["build"]["files"], true);
+        assert_eq!(outcome["tasks"]["probe"]["status"], "fail");
+        assert_eq!(outcome["tasks"]["probe"]["files"], true);
+        assert_eq!(outcome["tasks"]["deliver"]["status"], "blocked");
+        assert_eq!(outcome["tasks"]["deliver"]["files"], false);
+    }
+
+    /// A failed task whose set the runner does not hold, which is also what a resume sees when
+    /// the set did not survive, is reported with its status and no staged files.
+    #[test]
+    fn an_epilogue_reports_no_files_for_a_failure_without_a_captured_set() {
+        let mut probe = task("probe", &[], "any", false);
+        probe.emits_files = vec!["evidence/probe.json".to_string()];
+        let plan = valid(vec![probe, epilogue("report", &[], true)], 10.0);
+        let mut r = ScriptRunner::new();
+        r.on(
+            "probe",
+            1,
+            || AttemptOutcome::fail("did not reproduce"),
+            0.1,
+        );
+        run_plan(&plan, &mut r);
+
+        assert!(r.staged["report"].is_empty());
+        let outcome = outcome_of(&r, "report");
+        assert_eq!(outcome["tasks"]["probe"]["status"], "fail");
+        assert_eq!(outcome["tasks"]["probe"]["files"], false);
+    }
+
+    /// Skipped and transport-failed producers publish nothing, so an epilogue is staged with
+    /// neither even where a stale set is lying around.
+    #[test]
+    fn an_epilogue_is_not_staged_with_a_skipped_or_transport_failed_set() {
+        let mut quiet = task("quiet", &[], "any", false);
+        quiet.emits_files = vec!["evidence/quiet.json".to_string()];
+        let mut flaky = task("flaky", &[], "any", false);
+        flaky.emits_files = vec!["evidence/flaky.json".to_string()];
+        let plan = valid(vec![quiet, flaky, epilogue("report", &[], true)], 10.0);
+        let mut r = ScriptRunner::new();
+        r.captured.insert("quiet".to_string());
+        r.captured.insert("flaky".to_string());
+        r.on(
+            "quiet",
+            1,
+            || AttemptOutcome::Skipped(serde_json::json!({}), "not applicable".into()),
+            0.0,
+        );
+        for attempt in 1..=3 {
+            r.on(
+                "flaky",
+                attempt,
+                || {
+                    AttemptOutcome::Transport(TransportFailure::new(
+                        TransportCause::Sandbox,
+                        "pod evicted",
+                    ))
+                },
+                0.0,
+            );
+        }
+        run_plan(&plan, &mut r);
+
+        assert!(r.staged["report"].is_empty(), "{:?}", r.staged["report"]);
+        let outcome = outcome_of(&r, "report");
+        assert_eq!(outcome["tasks"]["quiet"]["files"], false);
+        assert_eq!(outcome["tasks"]["flaky"]["status"], "transport");
+        assert_eq!(outcome["tasks"]["flaky"]["files"], false);
+    }
+
+    /// A mapped main-graph node is staged under each instance's name, failing instances
+    /// included, and its outcome flag is true when any instance's set was staged.
+    #[test]
+    fn an_epilogue_is_staged_with_each_mapped_instances_set() {
+        let mut node = mapped_node("audit", "discover", "targets", false);
+        node.emits_files = vec!["OUT.md".to_string()];
+        let plan = valid(
+            vec![
+                task("discover", &[], "any", true),
+                node,
+                epilogue("report", &[], true),
+            ],
+            5.0,
+        );
+        let mut runner = FanoutRunner::new(&["alpha", "beta", "gamma"]);
+        runner.fail.insert("audit[beta]".to_string());
+        runner.fail.insert("audit[gamma]".to_string());
+        runner.captured.insert("audit[beta]".to_string());
+        execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut runner,
+            |_, _| {},
+        );
+
+        assert_eq!(
+            runner.staged["report"],
+            vec!["audit[alpha]".to_string(), "audit[beta]".to_string()]
+        );
+        let outcome = &runner.seen_inputs["report"][&TaskName(OUTCOME_INPUT.to_string())];
+        assert_eq!(outcome["tasks"]["audit"]["files"], true);
+        assert_eq!(outcome["tasks"]["discover"]["files"], false);
+    }
+
+    /// Only an epilogue reads every main-graph set. A main-graph task joining `all` is still
+    /// staged with its passing ancestors and nothing else.
+    #[test]
+    fn a_main_graph_task_is_not_staged_with_unrelated_failure_evidence() {
+        let mut probe = task("probe", &[], "any", false);
+        probe.emits_files = vec!["evidence/probe.json".to_string()];
+        let mut other = task("other", &[], "any", true);
+        other.emits_files = vec!["evidence/other.json".to_string()];
+        let plan = valid(
+            vec![
+                probe,
+                other,
+                task("tip", &["other"], "any", true),
+                epilogue("report", &[], true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.captured.insert("probe".to_string());
+        r.on(
+            "probe",
+            1,
+            || AttemptOutcome::fail("did not reproduce"),
+            0.1,
+        );
+        run_plan(&plan, &mut r);
+
+        assert_eq!(r.staged["tip"], vec!["other".to_string()]);
+        assert_eq!(
+            r.staged["report"],
+            vec!["probe".to_string(), "other".to_string()]
         );
     }
 
