@@ -9,7 +9,7 @@ export interface ToolbarProps {
 
 export function Toolbar({ children, className }: ToolbarProps) {
   return (
-    <div className={cn('flex items-stretch border-b border-rule-hard bg-surface', className)}>
+    <div data-ui="toolbar" className={cn('flex items-stretch border-b border-rule-hard bg-surface', className)}>
       {children}
     </div>
   );
@@ -37,12 +37,16 @@ export function ToolbarGroup<T extends string>(props: ToolbarGroupProps<T>) {
   const { label, className } = props;
   return (
     <div
+      data-ui="toolbar-group"
       className={cn(
         'flex border-r border-rule [&>*]:border-r [&>*]:border-rule [&>*:last-child]:border-r-0',
         className,
       )}
     >
-      <span className="flex items-center border-r border-rule px-2.5 font-mono text-label uppercase tracking-group text-ink-3">
+      <span
+        data-ui="toolbar-label"
+        className="flex items-center border-r border-rule px-2.5 font-mono text-label uppercase tracking-group text-ink-3"
+      >
         {label}
       </span>
       {props.options === undefined
@@ -78,7 +82,7 @@ export function ToolbarSearch({
   className,
 }: ToolbarSearchProps) {
   return (
-    <div className={cn('flex flex-1 items-center px-2.5', className)}>
+    <div data-ui="search" className={cn('flex flex-1 items-center px-2.5', className)}>
       <input
         type="search"
         value={value}
@@ -100,6 +104,8 @@ export interface ToolbarActionsProps {
 
 export function ToolbarActions({ children, className }: ToolbarActionsProps) {
   return (
-    <div className={cn('flex border-l border-rule [&>*]:h-full', className)}>{children}</div>
+    <div data-ui="toolbar-actions" className={cn('flex border-l border-rule [&>*]:h-full', className)}>
+      {children}
+    </div>
   );
 }

@@ -279,7 +279,7 @@ function TranscriptSection({ issueKey }: { issueKey: string }) {
         <SessionFeed rows={state.rows} autoFollow={false} emptyText="The transcript is empty." />
       ) : (
         <SectionBody>
-          {state.phase === 'loading' && <Spinner label="LOADING TRANSCRIPT" />}
+          {state.phase === 'loading' && <Spinner label="Loading transcript" />}
           {state.phase === 'absent' && (
             <Note>
               No transcript was recorded for this scope attempt (scoped before transcript capture,
@@ -374,15 +374,15 @@ export function ScopeProgressPage() {
   }, [startTime]);
 
   if (!issueKey) {
-    return <Empty title="NO ISSUE KEY" description="This route needs an issue key." />;
+    return <Empty title="No issue key" description="This route needs an issue key." />;
   }
 
   if (detail.isError) {
-    return <Empty title="PROGRESS UNAVAILABLE" description={formatError(detail.error)} />;
+    return <Empty title="Progress unavailable" description={formatError(detail.error)} />;
   }
 
   if (detail.isPending) {
-    return <LoadingBlock label="LOADING SCOPE PROGRESS" />;
+    return <LoadingBlock label="Loading scope progress" />;
   }
 
   const { data } = detail;
@@ -475,7 +475,7 @@ export function ScopeProgressPage() {
           <SectionHeader title="Progress" />
           <SectionBody>
             <Spinner
-              label={phase === 'queued' ? 'SCOPE OVERRIDE QUEUED' : 'SCOPE TURN RUNNING'}
+              label={phase === 'queued' ? 'Scope override queued' : 'Scope turn running'}
             />
           </SectionBody>
         </Section>
@@ -520,10 +520,11 @@ export function ScopeProgressPage() {
             <div>
               <Button
                 variant="filled"
+                className="uppercase"
                 onClick={() => void handleRetry()}
                 disabled={!isAdmin || retryMutation.isPending}
               >
-                {retryMutation.isPending ? 'RETRYING…' : 'RETRY SCOPE'}
+                {retryMutation.isPending ? 'Retrying…' : 'Retry scope'}
               </Button>
             </div>
             <p className="m-0 max-w-[80ch] text-data-lg text-ink-3">
@@ -559,8 +560,8 @@ export function ScopeProgressPage() {
       )}
 
       <FormActions>
-        <Button render={<Link to={`/issues/${encodeURIComponent(issueKey)}`} />}>
-          BACK TO ISSUE
+        <Button className="uppercase" render={<Link to={`/issues/${encodeURIComponent(issueKey)}`} />}>
+          Back to issue
         </Button>
       </FormActions>
     </>

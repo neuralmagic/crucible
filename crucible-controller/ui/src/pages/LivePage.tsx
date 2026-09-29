@@ -32,7 +32,7 @@ export function LivePage() {
       />
       {rows.length === 0 ? (
         <Empty
-          title="NOTHING RUNNING"
+          title="Nothing running"
           description={
             <>
               Runs appear here the moment the controller launches a loop pod. Check{' '}

@@ -32,7 +32,7 @@ when { principal.hasTag("group:inference-eng-llm-d-devs") };
 
 async function explain(page: Page, login: string): Promise<void> {
   await page.getByLabel('Login').fill(login);
-  await page.getByRole('button', { name: 'EXPLAIN' }).click();
+  await page.getByRole('button', { name: 'Explain' }).click();
 }
 
 test.describe('policy', () => {
@@ -65,7 +65,7 @@ test.describe('policy', () => {
       await page.evaluate((next) => {
         document.documentElement.dataset.theme = next;
       }, theme);
-      const palette = PALETTES[theme];
+      const palette = PALETTES.crucible[theme];
       const lines = page.getByTestId('policy-editor').locator('.view-lines');
       const token = (text: RegExp) => lines.locator('span[class^="mtk"]', { hasText: text }).first();
       await expect(lines).toContainText('operators-access-autoresearch');
@@ -95,7 +95,7 @@ test.describe('policy', () => {
     await expect(page.getByTestId('policy-errors')).toHaveText('2 errors');
     await expect(editor.locator('.squiggly-error')).toHaveCount(2);
 
-    await page.getByRole('button', { name: 'RESET' }).click();
+    await page.getByRole('button', { name: 'Reset' }).click();
     await expect(page.getByTestId('policy-errors')).toHaveCount(0);
     await expect(editor.locator('.squiggly-error')).toHaveCount(0);
     expect(posts).toEqual([]);
@@ -110,7 +110,7 @@ test.describe('policy', () => {
     });
     await ready(page, '/policy');
     await appendToEditor(page, '\n@id("bogus-rule")\nbogus;\n');
-    await page.getByRole('button', { name: 'SAVE VERSION' }).click();
+    await page.getByRole('button', { name: 'Save version' }).click();
     const refusal = 'policy bogus-rule does not validate: unexpected token `bogus`';
     await expect(page.getByRole('alert').filter({ hasText: refusal })).toHaveText(refusal);
     expect(refused.length).toBeGreaterThan(0);
@@ -136,7 +136,7 @@ test.describe('policy', () => {
     await stubApi(page);
     await ready(page, '/policy');
     await appendToEditor(page, '\n@id("bogus-rule")\nbogus;\n');
-    await page.getByRole('button', { name: 'SAVE VERSION' }).click();
+    await page.getByRole('button', { name: 'Save version' }).click();
     const refusal = 'policy bogus-rule does not validate: unexpected token `bogus`';
     await expect(page.getByRole('alert').filter({ hasText: refusal })).toHaveText(refusal);
   });
@@ -157,7 +157,7 @@ test.describe('policy', () => {
     await expect(page.getByRole('alert').filter({ hasText: missing })).toHaveText(missing);
 
     await appendToEditor(page, GRANT);
-    await page.getByRole('button', { name: 'SAVE VERSION' }).click();
+    await page.getByRole('button', { name: 'Save version' }).click();
     const diff = page.getByTestId('rule-diff');
     await expect(diff).toContainText('added 1');
     await expect(diff).toContainText('llm-d-devs-autoresearch');
@@ -183,7 +183,7 @@ test.describe('policy', () => {
     await history.locator('tbody tr').nth(1).getByRole('button').first().click();
     await expect(history.getByTestId('rule-diff')).toContainText('removed 1');
     await expect(history.getByTestId('rule-diff')).toContainText('operators-access-autoresearch');
-    await history.getByRole('button', { name: 'ACTIVATE' }).click();
+    await history.getByRole('button', { name: 'Activate' }).click();
     await expect(page.getByTestId('active-rules').locator('li')).toHaveCount(1);
   });
 
@@ -206,6 +206,6 @@ test.describe('policy', () => {
     );
     await ready(page, '/policy');
     await expect(page.getByTestId('category-rail').getByRole('link', { name: 'Policy' })).toHaveCount(0);
-    await expect(page.locator('main')).toContainText('PLATFORM ADMINISTRATORS ONLY');
+    await expect(page.locator('main')).toContainText('Platform administrators only');
   });
 });

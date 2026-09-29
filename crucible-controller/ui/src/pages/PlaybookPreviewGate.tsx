@@ -59,17 +59,17 @@ export function PlaybookPreviewGate({
         {parsed === null ? (
           <SectionBody>
             <Empty
-              title="NO FORM"
+              title="No form"
               description="The engine extracted no schema from this pack; its diagnostics are below."
             />
           </SectionBody>
         ) : parsed.kind === 'unrenderable' ? (
           <SectionBody>
-            <Empty title="FORM CANNOT BE RENDERED" description={parsed.reason} />
+            <Empty title="Form cannot be rendered" description={parsed.reason} />
           </SectionBody>
         ) : specs.length === 0 ? (
           <SectionBody>
-            <Empty title="NO PARAMETERS" description="This pack declares none." />
+            <Empty title="No parameters" description="This pack declares none." />
           </SectionBody>
         ) : (
           <>
@@ -136,7 +136,7 @@ export function PlaybookPreviewGate({
         <SectionBody>
           {graph === null ? (
             <Empty
-              title="NO GRAPH"
+              title="No graph"
               description="The pack compiled no plan at these values. The engine's reason is below."
             />
           ) : (

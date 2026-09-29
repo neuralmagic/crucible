@@ -8,7 +8,7 @@ import {
   type SurfaceOptions,
   surfaceOptions,
 } from './editorPrefs';
-import { useAppTheme } from '../appTheme';
+import { useAppBrand, useAppTheme } from '../appTheme';
 
 const QUERY_KEY = ['get', '/api/prefs/editor'];
 
@@ -27,6 +27,7 @@ export function useEditorPrefs(): EditorPrefsHandle {
   const query = $api.useQuery('get', '/api/prefs/editor');
   const mutation = $api.useMutation('put', '/api/prefs/editor');
   const app = useAppTheme();
+  const brand = useAppBrand();
 
   const stored: Record<string, unknown> | undefined = query.data?.prefs;
   const prefs = parseEditorPrefs(stored);
@@ -48,8 +49,8 @@ export function useEditorPrefs(): EditorPrefsHandle {
 
   return {
     prefs,
-    theme: monacoThemeName(prefs.theme, app),
-    options: surfaceOptions(prefs),
+    theme: monacoThemeName(prefs.theme, brand, app),
+    options: surfaceOptions(prefs, brand),
     setPref,
   };
 }

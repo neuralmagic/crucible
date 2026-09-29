@@ -126,12 +126,12 @@ test.describe('draft authoring studio', () => {
     await ready(page, '/playbooks/drafts');
 
     await expect(page.getByText('export CONTROLLER_API_TOKEN=crk_...')).toBeVisible();
-    await expect(page.getByRole('link', { name: 'DOWNLOAD SKILL' })).toHaveAttribute(
+    await expect(page.getByRole('link', { name: 'Download skill' })).toHaveAttribute(
       'href',
       'https://crucible.example.com/api/playbooks/drafts/skill',
     );
 
-    await page.getByRole('button', { name: 'DISMISS' }).click();
+    await page.getByRole('button', { name: 'Dismiss' }).click();
     await expect(page.getByText('Co-draft with your own agent')).toHaveCount(0);
 
     await ready(page, '/playbooks/drafts');
@@ -166,14 +166,14 @@ test.describe('draft authoring studio', () => {
     await page.locator('#draft-source').selectOption('git');
     await expect(page.locator('#draft-template')).toHaveCount(0);
     await expect(
-      page.getByRole('button', { name: 'CREATE DRAFT' }),
+      page.getByRole('button', { name: 'Create draft' }),
       'a repo is required before anything is fetched',
     ).toBeDisabled();
 
     await page.locator('#draft-repo').fill('neuralmagic/other-packs');
     await page.locator('#draft-git-ref').fill('main');
     await page.locator('#draft-path').fill('packs/survey');
-    await page.getByRole('button', { name: 'CREATE DRAFT' }).click();
+    await page.getByRole('button', { name: 'Create draft' }).click();
 
     await expect(page).toHaveURL(/\/playbooks\/drafts\/pulled$/);
     expect(posted).toHaveLength(1);
@@ -204,13 +204,13 @@ test.describe('draft authoring studio', () => {
     await expect(page.getByText('unsaved')).toBeVisible();
 
     await savesWith(page, REFUSED);
-    await page.getByRole('button', { name: 'SAVE' }).click();
+    await page.getByRole('button', { name: 'Save' }).click();
 
     const diagnostics = page.getByTestId('draft-diagnostics');
     await expect(diagnostics).toContainText('workflow.star:2:8');
     await expect(diagnostics).toContainText('unknown identifier `agnet`');
     await expect(diagnostics).toContainText('the pack declares no [workflow] table');
-    await expect(page.getByText('NO GRAPH')).toBeVisible();
+    await expect(page.getByText('No graph')).toBeVisible();
 
     // The anchored one is a Monaco marker on its own line, not just a list entry.
     await expect(page.getByTestId('draft-editor').locator('.squiggly-error').first()).toBeVisible();
@@ -226,7 +226,7 @@ test.describe('draft authoring studio', () => {
 
     await savesWith(page, RECOMPILED);
     await retype(page, 'params = {}\nsettle = command(name = "settle", run = "./settle.sh")\n');
-    await page.getByRole('button', { name: 'SAVE' }).click();
+    await page.getByRole('button', { name: 'Save' }).click();
 
     await expect(page.getByText('saved · v3')).toBeVisible();
     await expect(page.getByText('The engine compiled this save without complaint.')).toBeVisible();
@@ -453,7 +453,7 @@ test.describe('draft authoring studio', () => {
 
     await treeItem(page, 'workflow.star').click();
     await retype(page, 'params = {}\n# my own edit\n');
-    await page.getByRole('button', { name: 'SAVE' }).click();
+    await page.getByRole('button', { name: 'Save' }).click();
 
     const prompt = page.getByTestId('draft-merge-prompt');
     await expect(prompt).toContainText('agent:author');
@@ -471,7 +471,7 @@ test.describe('draft authoring studio', () => {
     await expect(page.getByText('unsaved')).toBeVisible();
 
     // Reloading is the only thing that replaces the buffer, and it takes the version that won.
-    await page.getByRole('button', { name: /RELOAD V2/ }).click();
+    await page.getByRole('button', { name: /Reload v2/ }).click();
     await expect(prompt).toHaveCount(0);
     await treeItem(page, 'workflow.star').click();
     await expect(await editor(page)).toContainText("# the agent's edit");
@@ -482,10 +482,10 @@ test.describe('draft authoring studio', () => {
     await stubApi(page);
     await ready(page, STUDIO);
 
-    await expect(page.getByRole('button', { name: 'LAUNCH DRAFT' })).toBeEnabled();
+    await expect(page.getByRole('button', { name: 'Launch draft' })).toBeEnabled();
     await treeItem(page, 'workflow.star').click();
     await retype(page, 'params = {}\n');
-    await expect(page.getByRole('button', { name: 'LAUNCH DRAFT' })).toBeDisabled();
+    await expect(page.getByRole('button', { name: 'Launch draft' })).toBeDisabled();
     await expect(page.getByText('save first')).toBeVisible();
   });
 
@@ -506,11 +506,11 @@ test.describe('draft authoring studio', () => {
     });
     await ready(page, STUDIO);
 
-    await expect(page.getByRole('button', { name: 'SAVE', exact: true })).toBeDisabled();
-    await expect(page.getByRole('button', { name: 'DELETE DRAFT' })).toBeDisabled();
-    await expect(page.getByRole('button', { name: 'LAUNCH DRAFT' })).toBeEnabled();
+    await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeDisabled();
+    await expect(page.getByRole('button', { name: 'Delete draft' })).toBeDisabled();
+    await expect(page.getByRole('button', { name: 'Launch draft' })).toBeEnabled();
     await page.getByLabel('Repo').fill('owner/packs');
-    await expect(page.getByRole('button', { name: 'GRADUATE' })).toBeDisabled();
+    await expect(page.getByRole('button', { name: 'Graduate' })).toBeDisabled();
   });
 
   /// Graduating is the draft owner's call: a platform viewer who owns the draft exports it.
@@ -530,7 +530,7 @@ test.describe('draft authoring studio', () => {
     });
     await ready(page, STUDIO);
 
-    const graduate = page.getByRole('button', { name: 'GRADUATE' });
+    const graduate = page.getByRole('button', { name: 'Graduate' });
     await page.getByLabel('Repo').fill('');
     await expect(graduate).toBeDisabled();
     await page.getByLabel('Repo').fill('owner/packs');
@@ -549,7 +549,7 @@ test.describe('draft authoring studio', () => {
   }) => {
     await stubApi(page);
     await ready(page, STUDIO);
-    await expect(page.getByRole('button', { name: 'PUBLISH', exact: true })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Publish', exact: true })).toHaveCount(0);
 
     const studio = ROUTES['/api/playbook-drafts/studio'];
     if (typeof studio !== 'object' || studio === null || Array.isArray(studio)) {
@@ -582,7 +582,7 @@ test.describe('draft authoring studio', () => {
     await ready(page, STUDIO);
 
     await expect(page.getByLabel('Playbook')).toHaveValue('mlr-pack');
-    await page.getByRole('button', { name: 'PUBLISH', exact: true }).click();
+    await page.getByRole('button', { name: 'Publish', exact: true }).click();
     await expect(page.getByRole('link', { name: 'mlr-pack @ sha256:0123456789ab' })).toHaveAttribute(
       'href',
       '/playbooks/mlr-pack',
@@ -602,16 +602,16 @@ test.describe('draft authoring studio', () => {
       return route.fulfill({ status: 204, body: '' });
     });
 
-    await page.getByRole('button', { name: 'DELETE DRAFT' }).click();
+    await page.getByRole('button', { name: 'Delete draft' }).click();
     const confirm = page.getByTestId('draft-delete-confirm');
     await expect(confirm).toContainText('Delete draft studio?');
 
-    await confirm.getByRole('button', { name: 'CANCEL' }).click();
+    await confirm.getByRole('button', { name: 'Cancel' }).click();
     await expect(confirm).toHaveCount(0);
     expect(deletes, 'cancelling deleted nothing').toEqual([]);
 
-    await page.getByRole('button', { name: 'DELETE DRAFT' }).click();
-    await page.getByTestId('draft-delete-confirm').getByRole('button', { name: 'DELETE' }).click();
+    await page.getByRole('button', { name: 'Delete draft' }).click();
+    await page.getByTestId('draft-delete-confirm').getByRole('button', { name: 'Delete' }).click();
     await expect(page).toHaveURL(/\/playbooks\/drafts$/);
     expect(deletes).toHaveLength(1);
   });
@@ -628,10 +628,10 @@ test.describe('draft authoring studio', () => {
       return route.fulfill({ status: 204, body: '' });
     });
 
-    await page.getByRole('button', { name: 'DELETE', exact: true }).click();
+    await page.getByRole('button', { name: 'Delete', exact: true }).click();
     const confirm = page.getByTestId('draft-delete-confirm');
     await expect(confirm).toContainText('Delete draft studio?');
-    await confirm.getByRole('button', { name: 'DELETE', exact: true }).click();
+    await confirm.getByRole('button', { name: 'Delete', exact: true }).click();
     await expect(confirm).toHaveCount(0);
     expect(deletes).toHaveLength(1);
   });
@@ -669,7 +669,7 @@ test.describe('editor preferences', () => {
     const writer = await first.newPage();
     await serve(writer);
     await ready(writer, STUDIO);
-    await writer.getByRole('button', { name: /DISPLAY/ }).click();
+    await writer.getByRole('button', { name: /display/i }).click();
     await writer.getByRole('button', { name: 'contrast' }).click();
     await writer.getByRole('button', { name: '15', exact: true }).click();
     await expect
@@ -682,7 +682,7 @@ test.describe('editor preferences', () => {
     const reader = await second.newPage();
     await serve(reader);
     await ready(reader, STUDIO);
-    await reader.getByRole('button', { name: /DISPLAY/ }).click();
+    await reader.getByRole('button', { name: /display/i }).click();
     await expect(reader.getByRole('button', { name: 'contrast' })).toHaveAttribute(
       'aria-pressed',
       'true',

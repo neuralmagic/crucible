@@ -81,7 +81,7 @@ export function PlaybookImportPage() {
       <>
         <Breadcrumb items={CRUMBS} />
         <Empty
-          title="OPERATOR ACCESS REQUIRED"
+          title="Operator access required"
           description="Proposing an import clones a repo and compiles it on the controller, so it needs an operator session. Registering what it proposes stays with an admin."
         />
       </>
@@ -131,12 +131,13 @@ export function PlaybookImportPage() {
         <FormActions>
           <Button
             variant="filled"
+            className="uppercase"
             disabled={source.repo.trim().length === 0 || listCandidates.isPending}
             onClick={() => {
               void handleList();
             }}
           >
-            {listCandidates.isPending ? 'FETCHING…' : 'FETCH PACKS'}
+            {listCandidates.isPending ? 'Fetching…' : 'Fetch packs'}
           </Button>
           {rev === null ? null : (
             <Mono size="data" tone="ink-3">
@@ -167,7 +168,7 @@ export function PlaybookImportPage() {
           {candidates.length === 0 ? (
             <SectionBody>
               <Empty
-                title="NO PACKS AT THIS REF"
+                title="No packs at this ref"
                 description="No directory here holds a crucible.toml declaring a playbook workflow."
               />
             </SectionBody>
@@ -196,7 +197,7 @@ export function PlaybookImportPage() {
         </Section>
       )}
 
-      {propose.isPending && <LoadingBlock label="FETCHING AND COMPILING THE PACK" />}
+      {propose.isPending && <LoadingBlock label="Fetching and compiling the pack" />}
     </>
   );
 }

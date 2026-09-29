@@ -224,13 +224,13 @@ export function PasswordField({
           />
         )}
         <Button
-          className="border border-rule-hard px-2.5"
+          className="border border-rule-hard px-2.5 uppercase"
           aria-label={shown ? 'Hide the value' : 'Show the value'}
           onClick={() => {
             setShown(!shown);
           }}
         >
-          {shown ? 'HIDE' : 'SHOW'}
+          {shown ? 'Hide' : 'Show'}
         </Button>
       </div>
     </FieldShell>
@@ -675,8 +675,8 @@ export function RepoRows({ idPrefix, repos, onChangeAt, onAdd, onRemove }: RepoR
         </div>
       ))}
       <div>
-        <Button className="border border-rule-hard px-2.5" onClick={onAdd}>
-          + ADD REPO
+        <Button className="border border-rule-hard px-2.5 uppercase" onClick={onAdd}>
+          + Add repo
         </Button>
       </div>
       <p className="m-0 max-w-[66ch] text-data-lg text-ink-3">

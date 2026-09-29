@@ -20,11 +20,12 @@ export function IssueCommentsSection({ comments }: { comments: IssueCommentDto[]
         note={`${comments.length} mirrored`}
         actions={
           <Button
+            className="uppercase"
             onClick={() => {
               setOpen((v) => !v);
             }}
           >
-            {open ? 'HIDE' : 'SHOW'}
+            {open ? 'Hide' : 'Show'}
           </Button>
         }
       />
