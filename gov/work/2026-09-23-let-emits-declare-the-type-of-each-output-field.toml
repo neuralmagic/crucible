@@ -18,7 +18,7 @@ description = """
 
 `emits` also takes a dict from field name to type: `"string"`, `"integer"`, `"number"`, `"boolean"`, `"list"`, `"object"`, or a list of labels. The list form is unchanged. A passing attempt whose field holds the wrong type or a label outside the list is a measured failure at the producing task, like a missing field. At compile time the types are checked against every reader: `over` needs a list, a `top_k` dependency, grade source, or thresholded evaluate needs a numeric `score`, and an output-decided route needs labels its question answers, or a boolean for a noul.
 
-The IR carries the types (`Emits::Fields` or `Emits::Typed`), the generated TOML writes them as a table, and `plan_admitted` lists each field with its type, which bumps the contract to 1.8.0. The type vocabulary lives in `crucible-contract` so the wire and the engine share it.
+The IR carries the types (`Emits::Fields` or `Emits::Typed`), the generated TOML writes them as a table, and `plan_admitted` lists each field with its type, which bumps the contract to 1.10.0. The type vocabulary lives in `crucible-contract` so the wire and the engine share it.
 
 Naming the types in the result contract appended to an agent prompt is left for after open PR #152 lands; that code is not on main."""
 
@@ -43,7 +43,7 @@ status = "done"
 category = "added"
 
 [[content.acceptance_criteria]]
-text = "plan_admitted carries each declared field and its type; contract version 1.8.0"
+text = "plan_admitted carries each declared field and its type; contract version 1.10.0"
 status = "done"
 category = "changed"
 
