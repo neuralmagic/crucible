@@ -71,8 +71,10 @@ fn task_knobs() -> Vec<Kwarg> {
         ),
         Kwarg::new(
             "needs",
-            "\"any\" | \"all\"",
-            "How many dependencies must be admitted before the task is ready.",
+            "str",
+            "The substrate capability the task needs, such as `\"systemone\"`. The default \
+             `\"any\"` runs everywhere. A required task whose capability is unavailable truncates \
+             the plan before dispatch; an advisory one is skipped with its dependents.",
         ),
         Kwarg::new(
             "join",

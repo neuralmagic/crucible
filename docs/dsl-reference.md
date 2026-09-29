@@ -25,7 +25,7 @@ An agent turn driven by a prompt.
 | `effort` | `str` | Reasoning effort, overriding `[agent]`. |
 | `session` | `session \| str` | Join a durable conversation. A task in a session cannot be isolated. |
 | `depends_on` | `list[task]` | Dependencies. Readiness decides execution order; declaration order does not. |
-| `needs` | `"any" \| "all"` | How many dependencies must be admitted before the task is ready. |
+| `needs` | `str` | The substrate capability the task needs, such as `"systemone"`. The default `"any"` runs everywhere. A required task whose capability is unavailable truncates the plan before dispatch; an advisory one is skipped with its dependents. |
 | `join` | `"all" \| "passed" \| "settled"` | Which dependencies must have passed: `all` every one, `passed` at least one and only those are forwarded, `settled` none — it dispatches once every dependency is terminal, whatever it settled as, unless the run has already halted, and forwards each one as {status, note, output, files}. |
 | `required` | `bool` | False makes the task advisory: it blocks dependents but cannot invalidate the run. |
 | `isolated` | `bool` | Run in a disposable worktree. File changes are discarded; only JSON output continues. |
@@ -56,7 +56,7 @@ An agent turn whose prompt is a skill's instructions plus its arguments.
 | `effort` | `str` | Reasoning effort, overriding `[agent]`. |
 | `session` | `session \| str` | Join a durable conversation. A task in a session cannot be isolated. |
 | `depends_on` | `list[task]` | Dependencies. Readiness decides execution order; declaration order does not. |
-| `needs` | `"any" \| "all"` | How many dependencies must be admitted before the task is ready. |
+| `needs` | `str` | The substrate capability the task needs, such as `"systemone"`. The default `"any"` runs everywhere. A required task whose capability is unavailable truncates the plan before dispatch; an advisory one is skipped with its dependents. |
 | `join` | `"all" \| "passed" \| "settled"` | Which dependencies must have passed: `all` every one, `passed` at least one and only those are forwarded, `settled` none — it dispatches once every dependency is terminal, whatever it settled as, unless the run has already halted, and forwards each one as {status, note, output, files}. |
 | `required` | `bool` | False makes the task advisory: it blocks dependents but cannot invalidate the run. |
 | `isolated` | `bool` | Run in a disposable worktree. File changes are discarded; only JSON output continues. |
@@ -82,7 +82,7 @@ A deterministic shell task in the candidate workspace.
 | `name` | `str` | Task identity, unique within the workflow. |
 | `run` | `str` | The command, run through `sh -c`. |
 | `depends_on` | `list[task]` | Dependencies. Readiness decides execution order; declaration order does not. |
-| `needs` | `"any" \| "all"` | How many dependencies must be admitted before the task is ready. |
+| `needs` | `str` | The substrate capability the task needs, such as `"systemone"`. The default `"any"` runs everywhere. A required task whose capability is unavailable truncates the plan before dispatch; an advisory one is skipped with its dependents. |
 | `join` | `"all" \| "passed" \| "settled"` | Which dependencies must have passed: `all` every one, `passed` at least one and only those are forwarded, `settled` none — it dispatches once every dependency is terminal, whatever it settled as, unless the run has already halted, and forwards each one as {status, note, output, files}. |
 | `required` | `bool` | False makes the task advisory: it blocks dependents but cannot invalidate the run. |
 | `isolated` | `bool` | Run in a disposable worktree. File changes are discarded; only JSON output continues. |
@@ -110,7 +110,7 @@ A measurement command. Its last non-empty stdout line is a JSON object; `pass = 
 | `threshold` | `number` | Grade the emitted score against this bound. An explicit `pass` wins. |
 | `direction` | `"lower" \| "higher"` | Which side of the threshold passes. |
 | `depends_on` | `list[task]` | Dependencies. Readiness decides execution order; declaration order does not. |
-| `needs` | `"any" \| "all"` | How many dependencies must be admitted before the task is ready. |
+| `needs` | `str` | The substrate capability the task needs, such as `"systemone"`. The default `"any"` runs everywhere. A required task whose capability is unavailable truncates the plan before dispatch; an advisory one is skipped with its dependents. |
 | `join` | `"all" \| "passed" \| "settled"` | Which dependencies must have passed: `all` every one, `passed` at least one and only those are forwarded, `settled` none — it dispatches once every dependency is terminal, whatever it settled as, unless the run has already halted, and forwards each one as {status, note, output, files}. |
 | `required` | `bool` | False makes the task advisory: it blocks dependents but cannot invalidate the run. |
 | `isolated` | `bool` | Run in a disposable worktree. File changes are discarded; only JSON output continues. |
