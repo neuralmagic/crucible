@@ -12,6 +12,8 @@ export function languageOf(path: string): string {
       return 'python';
     case 'toml':
       return 'toml';
+    case 'cedar':
+      return 'cedar';
     case 'md':
     case 'markdown':
       return 'markdown';

@@ -301,6 +301,17 @@ pub(crate) async fn create_playbook_draft(
         Ok(owner) => owner,
         Err(refused) => return refused,
     };
+    if let Some(t) = template.as_deref()
+        && let Err(refused) = crate::playbooks::api::registry::readable_playbook(
+            &state,
+            &caller,
+            t,
+            crate::authz::action::Verb::Read,
+        )
+        .await
+    {
+        return refused;
+    }
     let seed = match template.as_deref() {
         Some(t) => crate::playbooks::drafts::DraftSeed::Template {
             id: t,

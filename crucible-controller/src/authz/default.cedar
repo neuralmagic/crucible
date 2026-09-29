@@ -44,6 +44,10 @@ when { resource.owner == "team:platform-administrators" };
 permit(principal is UserPrincipal, action == Action::"model_provider:read", resource)
 when { resource.owner == "team:platform-administrators" };
 
+@id("everyone-launch-platform-playbooks")
+permit(principal is UserPrincipal, action in [Action::"playbook:read", Action::"playbook:launch"], resource)
+when { resource.owner == "team:platform-administrators" };
+
 @id("user-create-team")
 permit(principal is UserPrincipal, action == Action::"team:create", resource);
 
@@ -53,6 +57,10 @@ when {
     principal.hasTag("team:playbook-publishers")
     && resource has owner_role && resource.owner_role == "owner"
 };
+
+@id("operators-access-autoresearch")
+permit(principal is UserPrincipal, action == Action::"autoresearch:access", resource)
+when { principal.hasTag("team:platform-operators") };
 
 @id("platform-operator-curation")
 permit(principal is UserPrincipal, action == Action::"issue:update", resource)

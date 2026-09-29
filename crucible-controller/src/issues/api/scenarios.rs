@@ -117,7 +117,7 @@ pub(crate) struct LaunchPackAck {
     request_body = LaunchPackBody,
     responses(
         (status = 201, description = "Frozen pack accepted and queued directly for a run", body = LaunchPackAck),
-        (status = 403, description = "Caller is not in the admin whitelist", body = ErrorBody),
+        (status = 403, description = "Caller is not a platform administrator", body = ErrorBody),
         (status = 422, description = "Bad repo/ref/path or the pack does not compile", body = ErrorBody),
         (status = 502, description = "Cloning the repository failed", body = ErrorBody)
     )
@@ -125,7 +125,7 @@ pub(crate) struct LaunchPackAck {
 pub(crate) async fn launch_pack(
     State(state): State<ApiState>,
     identity: crate::identity::session::Identity,
-    _admin: crate::identity::auth::AdminGuard,
+    _admin: crate::authz::guard::AdminGuard,
     caller: crate::authz::Caller,
     Json(body): Json<LaunchPackBody>,
 ) -> Response {
@@ -346,14 +346,14 @@ fn require_codegen_contract(
     request_body = AdoptScenarioBody,
     responses(
         (status = 201, description = "Scenario adopted", body = ScenarioAck),
-        (status = 403, description = "Caller is not in the admin whitelist", body = ErrorBody),
+        (status = 403, description = "Caller is not a platform administrator", body = ErrorBody),
         (status = 422, description = "title/body/justification must be non-empty, affected_repos must be a non-empty list of non-blank entries, git_ref must be a plausible branch/tag name, codegen_contract must name a configured contract", body = ErrorBody)
     )
 )]
 pub(crate) async fn adopt_scenario(
     State(state): State<ApiState>,
     identity: crate::identity::session::Identity,
-    _admin: crate::identity::auth::AdminGuard,
+    _admin: crate::authz::guard::AdminGuard,
     caller: crate::authz::Caller,
     Json(body): Json<AdoptScenarioBody>,
 ) -> Response {
@@ -537,7 +537,7 @@ pub(crate) struct JiraAck {
     request_body = AdoptJiraBody,
     responses(
         (status = 201, description = "Jira issue adopted", body = JiraAck),
-        (status = 403, description = "Caller is not in the admin whitelist", body = ErrorBody),
+        (status = 403, description = "Caller is not a platform administrator", body = ErrorBody),
         (status = 422, description = "issue_key/justification must be valid, affected_repos must be a non-empty list of non-blank entries", body = ErrorBody),
         (status = 502, description = "Jira fetch failed", body = ErrorBody),
         (status = 503, description = "Jira is not configured on this controller", body = ErrorBody)
@@ -546,7 +546,7 @@ pub(crate) struct JiraAck {
 pub(crate) async fn adopt_jira(
     State(state): State<ApiState>,
     identity: crate::identity::session::Identity,
-    _admin: crate::identity::auth::AdminGuard,
+    _admin: crate::authz::guard::AdminGuard,
     Json(body): Json<AdoptJiraBody>,
 ) -> Response {
     let Some(jira_cfg) = state.jira.clone() else {
@@ -670,7 +670,7 @@ pub(crate) struct ScenarioApproveAck {
     ),
     responses(
         (status = 200, description = "Scope approved", body = ScenarioApproveAck),
-        (status = 403, description = "Caller is not in the admin whitelist", body = ErrorBody),
+        (status = 403, description = "Caller is not a platform administrator", body = ErrorBody),
         (status = 404, description = "Not a tracked scenario, or not yet scoped", body = ErrorBody),
         (status = 409, description = "Scope was already approved by someone else", body = ScenarioApproveAck)
     )
@@ -679,7 +679,7 @@ pub(crate) async fn approve_scenario(
     State(state): State<ApiState>,
     Path(key): Path<String>,
     identity: crate::identity::session::Identity,
-    _admin: crate::identity::auth::AdminGuard,
+    _admin: crate::authz::guard::AdminGuard,
 ) -> Response {
     let issue = match crate::issues::store::get_issue(state.db.pool(), &key).await {
         Ok(Some(issue)) => issue,
