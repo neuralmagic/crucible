@@ -1,0 +1,56 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-09-28-005"
+title = "Keep minted GitHub tokens valid for the life of a run"
+status = "queue"
+created = "2026-09-28"
+refs = [
+    "ADR-0051",
+    "ADR-0036",
+    "ADR-0028",
+    "RFC-0004",
+]
+
+[content]
+description = "A minted GitHub App token lasts an hour, but it is projected once at pod start and relayed to agents once at engine start, so any run longer than an hour loses GitHub access. Implement [[ADR-0051]]: the hub re-mints tokens of live runs into their Secrets, minted file projections mount by directory so the pod sees each rewrite, and each sandbox create relays the current token."
+
+[[content.acceptance_criteria]]
+text = "a hub sweep over running work pods re-mints every minted secret whose token has under 30 minutes left and merge-patches only the minted keys of that run's Secret through the pod's cluster dispatcher; Vault-backed keys are not re-read"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "the sweep runs in builds without the `autoresearch` feature"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "a minted secret projected as a file is mounted by directory, and registration refuses a file projection whose directory the projection does not own alone"
+status = "pending"
+category = "changed"
+
+[[content.acceptance_criteria]]
+text = "a file projection can be named agent-visible, and the engine reads it at each sandbox create instead of once at startup"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "the runtime image ships a git credential helper and a `gh` wrapper that read the token file on each use"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "a launch that projects a minted secret into the environment with a wall-clock ceiling longer than the token's lifetime returns a warning naming the secret in the launch response"
+status = "pending"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "a test against a real API server shows a rewritten token reaching a command in a running pod and the next sandbox create"
+status = "pending"
+category = "chore"
+
+[[content.acceptance_criteria]]
+text = "the secrets docs describe refresh and the file projection rule"
+status = "pending"
+category = "chore"
