@@ -214,6 +214,7 @@ pub(crate) enum Classification {
 pub(crate) enum ShutdownOutcome {
     Finished,
     Solved,
+    Complete,
     Budget,
     Stopped,
     Escalated,
@@ -227,6 +228,7 @@ impl ShutdownOutcome {
         match token {
             "finished" => ShutdownOutcome::Finished,
             "solved" => ShutdownOutcome::Solved,
+            "complete" => ShutdownOutcome::Complete,
             "budget" => ShutdownOutcome::Budget,
             "stopped" => ShutdownOutcome::Stopped,
             "escalated" => ShutdownOutcome::Escalated,
@@ -240,6 +242,7 @@ impl ShutdownOutcome {
         match self {
             ShutdownOutcome::Finished => "finished",
             ShutdownOutcome::Solved => "solved",
+            ShutdownOutcome::Complete => "complete",
             ShutdownOutcome::Budget => "budget",
             ShutdownOutcome::Stopped => "stopped",
             ShutdownOutcome::Escalated => "escalated",
@@ -623,7 +626,7 @@ pub(crate) fn plan_recovery(s: &SessionRecovery, iterations: u32, max_cost: f64)
     };
     if let Classification::CleanExit { outcome, reason } = &s.classification {
         match outcome {
-            ShutdownOutcome::Finished | ShutdownOutcome::Solved => {
+            ShutdownOutcome::Finished | ShutdownOutcome::Solved | ShutdownOutcome::Complete => {
                 return RecoveryPlan::NoOp {
                     message: format!("run already {}: {reason}", outcome.as_str()),
                 };
@@ -780,6 +783,7 @@ mod tests {
         for (token, want) in [
             ("finished", ShutdownOutcome::Finished),
             ("solved", ShutdownOutcome::Solved),
+            ("complete", ShutdownOutcome::Complete),
             ("budget", ShutdownOutcome::Budget),
             ("stopped", ShutdownOutcome::Stopped),
             ("escalated", ShutdownOutcome::Escalated),

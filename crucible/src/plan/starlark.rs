@@ -6060,4 +6060,24 @@ workflow(type = "playbook", tasks = [seed, turn, helper, sweep, probe, mapped])
             let _ = std::fs::remove_dir_all(&pack);
         }
     }
+
+    #[test]
+    fn a_workflow_cannot_promise_the_early_completion_fields() {
+        let pack = temp_pack("reserved-emits");
+        for field in ["complete", "reason"] {
+            let source = format!(
+                "scan = command(name = \"scan\", run = \"true\", emits = [\"{field}\"])\nworkflow(type = \"playbook\", tasks = [scan])\n"
+            );
+            let error = crate::errors::report(
+                &compile_source(&source, &pack.join("workflow.star"), &pack)
+                    .err()
+                    .unwrap_or_else(|| panic!("{field}: compiled")),
+            );
+            assert!(
+                error.contains(&format!("{field:?} is reserved for early completion")),
+                "{error}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&pack);
+    }
 }

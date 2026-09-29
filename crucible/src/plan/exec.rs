@@ -20,8 +20,8 @@ use crate::deadline::{Bound, Deadline, RunCeiling};
 use crate::diagram::IllegalTransition;
 use crate::plan::history::SeriesHistory;
 use crate::plan::ir::{
-    Decider, HISTORY_INPUT, ITEM_INPUT, Join, OUTCOME_INPUT, PARAMS_INPUT, REVISION_INPUT,
-    ReviseLoop, Stage, Task, TaskKind, TaskName, ValidPlan,
+    COMPLETE_FIELD, Decider, HISTORY_INPUT, ITEM_INPUT, Join, OUTCOME_INPUT, PARAMS_INPUT,
+    REASON_FIELD, REVISION_INPUT, ReviseLoop, Stage, Task, TaskKind, TaskName, ValidPlan,
 };
 use crate::plan::machine::{
     BlockedReason, PlanEvent, PlanMachine, TaskEvent, TaskMachine, TaskState,
@@ -226,6 +226,8 @@ pub struct ExecCfg<'a> {
     /// The launch series' earlier runs. `None` is a run in no series: a task that reads history
     /// receives an empty list.
     pub history: Option<&'a SeriesHistory>,
+    /// Whether a main-graph task returning `"complete": true` stops dispatch.
+    pub early_completion: bool,
 }
 
 impl Default for ExecCfg<'_> {
@@ -234,6 +236,7 @@ impl Default for ExecCfg<'_> {
             transport_retries: 2,
             wall_clock: None,
             history: None,
+            early_completion: false,
         }
     }
 }
@@ -411,6 +414,10 @@ pub enum PlanExit {
     BudgetExceeded,
     /// The wall-clock ceiling was reached; undispatched tasks were blocked.
     TimeExceeded,
+    CompletedEarly {
+        task: TaskName,
+        reason: Option<String>,
+    },
 }
 
 /// Why the plan stopped dispatching, fixed on the first halt. Everything still pending settles
@@ -456,6 +463,7 @@ impl PlanExit {
             PlanExit::Completed => "finished",
             PlanExit::BudgetExceeded | PlanExit::TimeExceeded => "budget",
             PlanExit::Truncated { .. } | PlanExit::ShortCircuit { .. } => "error",
+            PlanExit::CompletedEarly { .. } => "complete",
         }
     }
 }
@@ -565,6 +573,7 @@ pub fn execute(
     let mut spent = 0.0f64;
     let budget = plan.plan().budget.usd;
     let mut halted: Option<Halt> = None;
+    let mut completed: Option<Completion> = None;
 
     // Readiness scan: repeated topo passes. Each pass settles everything decidable
     // without dispatch (halt-blocked, skipped, dep-failed, over-budget), then dispatches
@@ -609,9 +618,13 @@ pub fn execute(
             if results.contains_key(&t.name) {
                 continue;
             }
+            if completed.is_some() && t.stage == Stage::Iteration {
+                continue;
+            }
             // An epilogue observes the settled main graph. Declaration order is not an
             // ordering primitive, so an independent epilogue task must not race ahead of it.
             if t.stage == Stage::Epilogue
+                && completed.is_none()
                 && plan
                     .tasks_topo()
                     .any(|main| main.stage == Stage::Iteration && !results.contains_key(&main.name))
@@ -788,6 +801,7 @@ pub fn execute(
                     budget,
                     started,
                     run_ceiling,
+                    completed: &mut completed,
                 },
             )?;
             continue;
@@ -809,7 +823,12 @@ pub fn execute(
             if t.stage == Stage::Epilogue {
                 inputs.insert(
                     TaskName(OUTCOME_INPUT.to_string()),
-                    main_graph_outcome(plan, &results, halted.as_ref(), &producers),
+                    main_graph_outcome(
+                        plan,
+                        &results,
+                        &exit_of(halted.as_ref(), completed.as_ref()),
+                        &producers,
+                    ),
                 );
             }
             inputs_for_dispatch.insert(t.name.clone(), inputs);
@@ -1124,15 +1143,29 @@ pub fn execute(
                 )?;
             }
         }
+        if cfg.early_completion && completed.is_none() {
+            let mut settled_now: Vec<&TaskName> = Vec::new();
+            for t in dispatch.iter().filter(|t| t.stage == Stage::Iteration) {
+                if t.over.is_some() {
+                    settled_now.extend(results.keys().filter(|n| is_instance_of(&t.name, n)));
+                }
+                settled_now.push(&t.name);
+            }
+            if let Some(completion) = completion_among(&results, &settled_now) {
+                complete(&mut completed, &mut plan_machine, completion)?;
+            }
+        }
     }
 
     plan_machine.advance(PlanEvent::Settled)?;
-    let exit = halted
-        .as_ref()
-        .map(Halt::exit)
-        .unwrap_or(PlanExit::Completed);
-    let valid = exit == PlanExit::Completed
-        && required_tasks_held(plan, |name| results.get(name).map(|r| r.status));
+    let exit = exit_of(halted.as_ref(), completed.as_ref());
+    let ceiling = matches!(halted, Some(Halt::Budget | Halt::Time));
+    let valid = !ceiling
+        && matches!(exit, PlanExit::Completed | PlanExit::CompletedEarly { .. })
+        && required_tasks_held(plan, |name| match results.get(name) {
+            Some(r) => Some(r.status),
+            None => completed.is_some().then_some(TaskStatus::NotTaken),
+        });
     Ok(PlanOutcome {
         valid,
         exit,
@@ -1193,6 +1226,58 @@ impl Overrun {
             halt(halted, plan_machine, Halt::Time)?;
         }
         Ok(())
+    }
+}
+
+struct Completion {
+    task: TaskName,
+    reason: Option<String>,
+}
+
+pub fn declared_completion(r: &TaskResult) -> Option<Option<String>> {
+    if r.status != TaskStatus::Pass {
+        return None;
+    }
+    let output = r.output.as_ref()?.as_object()?;
+    (output.get(COMPLETE_FIELD) == Some(&Value::Bool(true))).then(|| {
+        output
+            .get(REASON_FIELD)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    })
+}
+
+fn completion_among(
+    results: &BTreeMap<TaskName, TaskResult>,
+    names: &[&TaskName],
+) -> Option<Completion> {
+    names.iter().find_map(|name| {
+        let reason = declared_completion(results.get(*name)?)?;
+        Some(Completion {
+            task: (*name).clone(),
+            reason,
+        })
+    })
+}
+
+fn complete(
+    completed: &mut Option<Completion>,
+    plan_machine: &mut PlanMachine,
+    completion: Completion,
+) -> Result<(), IllegalTransition> {
+    plan_machine.advance(PlanEvent::EarlyCompletion)?;
+    *completed = Some(completion);
+    Ok(())
+}
+
+fn exit_of(halted: Option<&Halt>, completed: Option<&Completion>) -> PlanExit {
+    match (completed, halted) {
+        (Some(c), _) => PlanExit::CompletedEarly {
+            task: c.task.clone(),
+            reason: c.reason.clone(),
+        },
+        (None, Some(halt)) => halt.exit(),
+        (None, None) => PlanExit::Completed,
     }
 }
 
@@ -1428,7 +1513,7 @@ fn settled_entry(r: &TaskResult, files: bool) -> serde_json::Map<String, Value> 
 fn main_graph_outcome(
     plan: &ValidPlan,
     results: &BTreeMap<TaskName, TaskResult>,
-    halted: Option<&Halt>,
+    exit: &PlanExit,
     staged: &[Task],
 ) -> Value {
     let tasks: serde_json::Map<String, Value> = plan
@@ -1440,7 +1525,7 @@ fn main_graph_outcome(
         })
         .collect();
     serde_json::json!({
-        "exit": halted.map(Halt::exit).unwrap_or(PlanExit::Completed).shutdown_token(),
+        "exit": exit.shutdown_token(),
         "tasks": Value::Object(tasks),
     })
 }
@@ -1501,6 +1586,7 @@ struct Ledger<'r> {
     budget: f64,
     started: Instant,
     run_ceiling: Option<RunCeiling>,
+    completed: &'r mut Option<Completion>,
 }
 
 struct RoundRow<'a> {
@@ -1554,6 +1640,7 @@ where
         }
         let mut rows: Vec<RoundRow<'_>> = Vec::new();
         let mut pending: Vec<usize> = Vec::new();
+        let mut stopped = false;
         for t in body.body.iter().copied() {
             let halted = ledger
                 .halted
@@ -1599,7 +1686,7 @@ where
                                     main_graph_outcome(
                                         plan,
                                         &view,
-                                        ledger.halted.as_ref(),
+                                        &exit_of(ledger.halted.as_ref(), ledger.completed.as_ref()),
                                         &producers,
                                     ),
                                 );
@@ -1655,6 +1742,13 @@ where
                             );
                             overrun.halt(t.stage, ledger.halted, ledger.plan_machine)?;
                             runner.settled(t, result.status == TaskStatus::Pass);
+                            if cfg.early_completion
+                                && t.stage == Stage::Iteration
+                                && t.name != reviewer.name
+                                && declared_completion(&result).is_some()
+                            {
+                                stopped = true;
+                            }
                             (result, event)
                         }
                     }
@@ -1681,12 +1775,15 @@ where
                 result,
                 event,
             });
+            if stopped {
+                break;
+            }
         }
         let again = rows
             .iter()
             .any(|row| row.task.name == reviewer.name && row.result.status == TaskStatus::Fail);
         rounds.push(rows);
-        if !again {
+        if stopped || !again {
             break;
         }
     }
@@ -1722,6 +1819,16 @@ where
             ledger.plan_machine,
             true,
         )?;
+    }
+    if cfg.early_completion && ledger.completed.is_none() {
+        let names: Vec<&TaskName> = last
+            .iter()
+            .filter(|row| row.task.stage == Stage::Iteration)
+            .map(|row| &row.task.name)
+            .collect();
+        if let Some(completion) = completion_among(ledger.results, &names) {
+            complete(ledger.completed, ledger.plan_machine, completion)?;
+        }
     }
     Ok(())
 }
@@ -7915,5 +8022,297 @@ mod tests {
                 "{instance}"
             );
         }
+    }
+
+    fn completes() -> AttemptOutcome {
+        AttemptOutcome::Pass(serde_json::json!({"complete": true, "reason": "nothing new"}))
+    }
+
+    fn broken() -> AttemptOutcome {
+        AttemptOutcome::Fail {
+            note: "measured".into(),
+            output: None,
+        }
+    }
+
+    fn completing_cfg() -> ExecCfg<'static> {
+        ExecCfg {
+            early_completion: true,
+            ..ExecCfg::default()
+        }
+    }
+
+    fn run_completing(plan: &ValidPlan, r: &mut ScriptRunner) -> (PlanOutcome, Vec<String>) {
+        let mut rows = Vec::new();
+        let out = execute(plan, &any_substrate(), completing_cfg(), r, |t, _| {
+            rows.push(t.name.0.clone())
+        });
+        (out, rows)
+    }
+
+    fn early_exit(task: &str) -> PlanExit {
+        PlanExit::CompletedEarly {
+            task: task.into(),
+            reason: Some("nothing new".into()),
+        }
+    }
+
+    #[test]
+    fn early_completion_stops_dispatch_and_leaves_the_rest_unsettled() {
+        let plan = valid(
+            vec![
+                task("a", &[], "any", true),
+                task("b", &["a"], "any", true),
+                task("c", &["b"], "any", true),
+                task("d", &[], "any", true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.rounds("b", &[completes]);
+        let (out, rows) = run_completing(&plan, &mut r);
+
+        assert!(out.valid, "{:?}", out.results);
+        assert_eq!(out.exit, early_exit("b"));
+        assert_eq!(out.exit.shutdown_token(), "complete");
+        assert_eq!(dispatches(&r), ["a", "b"]);
+        assert_eq!(rows, ["a", "b"]);
+        assert!(!out.results.contains_key(&"c".into()));
+        assert!(!out.results.contains_key(&"d".into()));
+    }
+
+    #[test]
+    fn completion_without_a_reason_records_none() {
+        let plan = valid(
+            vec![task("a", &[], "any", true), task("b", &["a"], "any", true)],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.rounds(
+            "a",
+            &[|| AttemptOutcome::Pass(serde_json::json!({"complete": true}))],
+        );
+        let (out, _) = run_completing(&plan, &mut r);
+        assert!(out.valid);
+        assert_eq!(
+            out.exit,
+            PlanExit::CompletedEarly {
+                task: "a".into(),
+                reason: None
+            }
+        );
+    }
+
+    #[test]
+    fn only_a_passing_true_boolean_declares_completion() {
+        for outcome in [
+            (|| AttemptOutcome::Pass(serde_json::json!({"complete": "true"}))) as fn() -> _,
+            || AttemptOutcome::Pass(serde_json::json!({"complete": false})),
+            || AttemptOutcome::Fail {
+                note: "measured".into(),
+                output: Some(serde_json::json!({"complete": true})),
+            },
+        ] {
+            let plan = valid(
+                vec![task("a", &[], "any", false), task("b", &[], "any", true)],
+                10.0,
+            );
+            let mut r = ScriptRunner::new();
+            r.rounds("a", &[outcome]);
+            let (out, _) = run_completing(&plan, &mut r);
+            assert!(
+                !matches!(out.exit, PlanExit::CompletedEarly { .. }),
+                "{:?}",
+                out.results
+            );
+            assert!(out.results.contains_key(&"b".into()));
+        }
+    }
+
+    #[test]
+    fn the_scored_loop_ignores_a_completion_field() {
+        let plan = valid(
+            vec![task("a", &[], "any", true), task("b", &["a"], "any", true)],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.rounds("a", &[completes]);
+        let (out, rows) = rows_of(&plan, &mut r);
+        assert_eq!(out.exit, PlanExit::Completed);
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn a_required_failure_beside_a_completion_keeps_the_run_invalid() {
+        let mut x = task("x", &[], "any", true);
+        x.isolation = Some(crate::plan::ir::Isolation::Worktree);
+        let mut y = task("y", &[], "any", true);
+        y.isolation = Some(crate::plan::ir::Isolation::Worktree);
+        let plan = valid(vec![x, y, task("z", &["y"], "any", true)], 10.0);
+        let mut r = ScriptRunner::new();
+        r.rounds("x", &[broken]);
+        r.rounds("y", &[completes]);
+        let (out, _) = run_completing(&plan, &mut r);
+
+        assert!(!out.valid);
+        assert_eq!(out.exit, early_exit("y"));
+        assert_eq!(out.results[&"x".into()].status, TaskStatus::Fail);
+        assert!(
+            !out.results.contains_key(&"z".into()),
+            "an undispatched task is not settled blocked"
+        );
+    }
+
+    #[test]
+    fn batch_siblings_of_a_completion_settle_and_nothing_after_dispatches() {
+        let mut x = task("x", &[], "any", true);
+        x.isolation = Some(crate::plan::ir::Isolation::Worktree);
+        let mut y = task("y", &[], "any", true);
+        y.isolation = Some(crate::plan::ir::Isolation::Worktree);
+        let plan = valid(vec![x, y, task("z", &["x", "y"], "any", true)], 10.0);
+        let mut r = ScriptRunner::new();
+        r.rounds("x", &[completes]);
+        let (out, rows) = run_completing(&plan, &mut r);
+
+        assert!(out.valid);
+        assert_eq!(out.exit, early_exit("x"));
+        assert_eq!(rows, ["x", "y"]);
+        assert_eq!(out.results[&"y".into()].status, TaskStatus::Pass);
+    }
+
+    #[test]
+    fn an_epilogue_runs_after_early_completion_and_reads_exit_complete() {
+        let plan = valid(
+            vec![
+                task("a", &[], "any", true),
+                task("b", &["a"], "any", true),
+                epilogue("report", &[], true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.rounds("a", &[completes]);
+        let (out, rows) = run_completing(&plan, &mut r);
+
+        assert!(out.valid);
+        assert_eq!(rows, ["a", "report"]);
+        let outcome = &r.seen_values["report"][&TaskName(OUTCOME_INPUT.into())];
+        assert_eq!(outcome["exit"], "complete");
+        assert_eq!(outcome["tasks"]["a"]["status"], "pass");
+        assert!(outcome["tasks"].get("b").is_none(), "{outcome}");
+    }
+
+    #[test]
+    fn a_settled_join_consumer_is_not_dispatched_after_early_completion() {
+        let plan = valid(
+            vec![
+                task("a", &[], "any", true),
+                settled_task("summary", &["a"], true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.rounds("a", &[completes]);
+        let (out, rows) = run_completing(&plan, &mut r);
+
+        assert!(out.valid);
+        assert_eq!(rows, ["a"]);
+        assert!(!out.results.contains_key(&"summary".into()));
+    }
+
+    #[test]
+    fn a_mapped_instance_declaring_completion_stops_dispatch_after_its_node() {
+        let plan = valid(
+            vec![
+                task("discover", &[], "any", true),
+                mapped_node("audit", "discover", "targets", true),
+                task("after", &["audit"], "any", true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.on(
+            "discover",
+            1,
+            || AttemptOutcome::Pass(serde_json::json!({"targets": ["p", "q"]})),
+            0.1,
+        );
+        r.rounds("audit[p]", &[completes]);
+        let (out, rows) = run_completing(&plan, &mut r);
+
+        assert!(out.valid, "{:?}", out.results);
+        assert_eq!(out.exit, early_exit("audit[p]"));
+        assert_eq!(rows, ["discover", "audit[p]", "audit[q]", "audit"]);
+        assert!(!out.results.contains_key(&"after".into()));
+    }
+
+    #[test]
+    fn a_revised_task_declaring_completion_ends_its_loop_unreviewed() {
+        let plan = valid(
+            vec![
+                task("author", &[], "any", true),
+                reviewing("repro", &["author"], "author", 3),
+                task("after", &["repro"], "any", true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.rounds("author", &[drafted, completes]);
+        r.rounds("repro", &[rejected]);
+        let (out, rows) = run_completing(&plan, &mut r);
+
+        assert!(out.valid, "{:?}", out.results);
+        assert_eq!(out.exit, early_exit("author"));
+        assert_eq!(dispatches(&r), ["author", "repro", "author"]);
+        assert_eq!(
+            rows,
+            [
+                "author[round-1]",
+                "repro[round-1]",
+                "author[round-2]",
+                "author"
+            ]
+        );
+        assert!((out.results[&"author".into()].cost_usd - 0.2).abs() < 1e-9);
+        assert!(!out.results.contains_key(&"repro".into()));
+    }
+
+    #[test]
+    fn a_reviewer_declaring_completion_ends_the_run_after_its_loop() {
+        let plan = valid(
+            vec![
+                task("author", &[], "any", true),
+                reviewing("repro", &["author"], "author", 3),
+                task("after", &["repro"], "any", true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.rounds("repro", &[completes]);
+        let (out, rows) = run_completing(&plan, &mut r);
+
+        assert!(out.valid);
+        assert_eq!(out.exit, early_exit("repro"));
+        assert_eq!(
+            rows,
+            ["author[round-1]", "repro[round-1]", "author", "repro"]
+        );
+    }
+
+    #[test]
+    fn an_epilogue_task_declaring_completion_changes_nothing() {
+        let plan = valid(
+            vec![
+                task("a", &[], "any", true),
+                epilogue("first", &[], true),
+                epilogue("second", &[], true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.rounds("first", &[completes]);
+        let (out, rows) = run_completing(&plan, &mut r);
+        assert_eq!(out.exit, PlanExit::Completed);
+        assert_eq!(rows, ["a", "first", "second"]);
     }
 }

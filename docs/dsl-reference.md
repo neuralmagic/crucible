@@ -300,6 +300,8 @@ Read out of the object the task returns.
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `status` | `"pass" \| "fail" \| "skipped"` | Settles the task, overriding an exit code or `pass`. Any other value is ignored. |
+| `complete` | `bool` | `true` on a passing main-graph task of a playbook ends the run early and valid: nothing else in the main graph dispatches, undispatched tasks stay unsettled, and epilogue tasks still run. The shutdown outcome is `complete`. A task may not list it in `emits`. |
+| `reason` | `str` | Why the run completed early, recorded with the shutdown. A task may not list it in `emits`. |
 
 ### Inputs the engine writes
 

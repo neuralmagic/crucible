@@ -203,7 +203,11 @@ pub enum PlanState {
     /// The plan has halted; what remains settles as blocked, except epilogue tasks after a
     /// required task failed, which still run so the failure is reported.
     Draining,
+    /// A main-graph task declared early completion; epilogue tasks still run.
+    Concluding,
     Completed,
+    /// Ended on a task's early completion.
+    Concluded,
     /// Halted, on the exit fixed by the event that halted it.
     Halted,
     /// A required task could not run on this substrate; nothing was dispatched.
@@ -218,7 +222,9 @@ pub enum PlanEvent {
     RequiredTaskFailed,
     BudgetCeiling,
     WallClockCeiling,
-    /// Every task has a result.
+    /// A main-graph task returned `"complete": true`.
+    EarlyCompletion,
+    /// Every task has a result, or dispatch stopped on early completion.
     Settled,
 }
 
@@ -228,6 +234,7 @@ impl PlanEvent {
         Some(match self {
             PlanEvent::RequiredTaskUnrunnable | PlanEvent::RequiredTaskFailed => "error",
             PlanEvent::BudgetCeiling | PlanEvent::WallClockCeiling => "budget",
+            PlanEvent::EarlyCompletion => "complete",
             PlanEvent::Started | PlanEvent::Settled => return None,
         })
     }
@@ -244,6 +251,11 @@ pub const PLAN_TRANSITIONS: &[(PlanState, PlanEvent, PlanState)] = {
         (S::Dispatching, E::WallClockCeiling, S::Draining),
         (S::Dispatching, E::Settled, S::Completed),
         (S::Draining, E::Settled, S::Halted),
+        (S::Dispatching, E::EarlyCompletion, S::Concluding),
+        (S::Draining, E::EarlyCompletion, S::Concluding),
+        (S::Concluding, E::BudgetCeiling, S::Concluding),
+        (S::Concluding, E::WallClockCeiling, S::Concluding),
+        (S::Concluding, E::Settled, S::Concluded),
     ]
 };
 
@@ -344,6 +356,7 @@ pub fn plan_digraph() -> Digraph {
                     node(PlanState::Admitted, NodeKind::Plain),
                     node(PlanState::Dispatching, NodeKind::Nested),
                     node(PlanState::Draining, NodeKind::Plain),
+                    node(PlanState::Concluding, NodeKind::Plain),
                 ],
             },
             Cluster {
@@ -352,6 +365,7 @@ pub fn plan_digraph() -> Digraph {
                     node(PlanState::Completed, NodeKind::Outcome),
                     node(PlanState::Halted, NodeKind::Outcome),
                     node(PlanState::Truncated, NodeKind::Outcome),
+                    node(PlanState::Concluded, NodeKind::Outcome),
                 ],
             },
         ],
@@ -359,7 +373,8 @@ pub fn plan_digraph() -> Digraph {
             .iter()
             .map(|(from, ev, to)| {
                 let event = diagram::words(&format!("{ev:?}"));
-                let label = match ev.exit_token() {
+                let exit = ev.exit_token().filter(|_| from != to);
+                let label = match exit {
                     Some(token) => diagram::exit_label(&event, token),
                     None if *to == PlanState::Completed => diagram::exit_label(&event, "finished"),
                     None => event,
@@ -368,7 +383,7 @@ pub fn plan_digraph() -> Digraph {
                     from: format!("{from:?}"),
                     to: format!("{to:?}"),
                     label,
-                    exit: ev.exit_token().is_some(),
+                    exit: exit.is_some(),
                 }
             })
             .collect(),
@@ -463,7 +478,10 @@ mod tests {
         assert_eq!(
             table_problems(PLAN_TRANSITIONS, PlanState::Admitted, |s| matches!(
                 s,
-                PlanState::Completed | PlanState::Halted | PlanState::Truncated
+                PlanState::Completed
+                    | PlanState::Halted
+                    | PlanState::Truncated
+                    | PlanState::Concluded
             )),
             Vec::<String>::new()
         );

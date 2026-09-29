@@ -175,6 +175,14 @@ in the same position is skipped, along with its dependents, and validity is unaf
 **Failure.** A `required` task that fails short-circuits the plan; everything undispatched is
 blocked. An advisory failure blocks only its dependents.
 
+**Early completion.** In a playbook, a passing main-graph task that returns `"complete": true`
+(with an optional `"reason"` string) ends the run: nothing else in the main graph dispatches,
+undispatched tasks stay unsettled rather than blocked, and epilogue tasks still run. The run is
+valid unless a required task had already settled other than passing, and the shutdown outcome
+is `complete`, with the reason. Both fields are reserved, so `emits` cannot list them. A
+revised task that completes ends its loop without another review; a mapped instance that
+completes ends the run once its node has folded.
+
 **Retry is not recheck.** Transport failures retry, bounded (2 by default). A measured failure
 never reruns: a task that failed, failed.
 

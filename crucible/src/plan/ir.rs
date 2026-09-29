@@ -39,6 +39,13 @@ pub const RESERVED_INPUTS: [&str; 6] = [
     REVISION_INPUT,
 ];
 
+/// The output field a task declares early completion with.
+pub const COMPLETE_FIELD: &str = "complete";
+/// The output field carrying an early completion's reason.
+pub const REASON_FIELD: &str = "reason";
+/// Output fields a task may not declare in `emits`.
+pub const RESERVED_OUTPUTS: [&str; 2] = [COMPLETE_FIELD, REASON_FIELD];
+
 /// Task identity: cache key component, wire label, UI label. Unique within a plan.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -768,6 +775,11 @@ pub enum PlanError {
     )]
     ReservedDependencyName { task: String, dependency: String },
     #[error(
+        "task {task:?} declares {field:?} in emits, but {field:?} is reserved for early \
+         completion and appears only on the attempt that ends the run; drop it from emits"
+    )]
+    ReservedOutputField { task: String, field: String },
+    #[error(
         "task {task:?} (stage {stage:?}) depends on {dependency:?} (stage {dependency_stage:?}); \
          dependencies cannot cross stages, and each would wait for the other forever"
     )]
@@ -1087,6 +1099,17 @@ impl Plan {
                         kind: t.task.label(),
                     });
                 }
+            }
+            if let Some(field) = t
+                .emits
+                .names()
+                .into_iter()
+                .find(|field| RESERVED_OUTPUTS.contains(&field.as_str()))
+            {
+                return Err(PlanError::ReservedOutputField {
+                    task: task(),
+                    field,
+                });
             }
             if t.join == Join::Passed && t.depends_on.is_empty() {
                 return Err(PlanError::JoinPassedWithoutDependencies { task: task() });
@@ -3678,5 +3701,20 @@ emits = ["lines"]
                 dependency: "revision".into()
             }
         );
+    }
+
+    #[test]
+    fn early_completion_fields_cannot_be_promised_in_emits() {
+        for field in RESERVED_OUTPUTS {
+            assert_eq!(
+                plan(vec![emitting("done", &[], &["verdict", field])])
+                    .validate()
+                    .unwrap_err(),
+                PlanError::ReservedOutputField {
+                    task: "done".into(),
+                    field: field.into()
+                }
+            );
+        }
     }
 }

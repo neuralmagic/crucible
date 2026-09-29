@@ -594,6 +594,7 @@ pub fn run(
     // A playbook run records an entry for its launch series: under the record task its workflow
     // names, or an empty one for a precompiled plan, which names none.
     let mut series_entry: Option<Option<TaskName>> = None;
+    let mut playbook = false;
     let (plan, mut runner, events): (ValidPlan, Box<dyn TaskRunner>, Option<std::fs::File>) =
         match (path, manifest) {
             (_, Some(m)) => {
@@ -605,7 +606,7 @@ pub fn run(
                 )?;
                 let session_log = prepared.paths.session_log.clone();
                 evidence = Some(prepared.paths.clone());
-                let playbook = loaded.workflow.as_ref().is_some_and(|w| {
+                playbook = loaded.workflow.as_ref().is_some_and(|w| {
                     w.workflow_type == crate::plan::workflow::WorkflowType::Playbook
                 });
                 if playbook {
@@ -747,12 +748,14 @@ pub fn run(
     };
     write_report(&report);
     let mut statuses: BTreeMap<TaskName, TaskStatus> = BTreeMap::new();
+    let mut completed_early = false;
     let out = execute(
         &plan,
         &substrate,
         ExecCfg {
             wall_clock: ceilings.wall_clock,
             history: Some(&history),
+            early_completion: playbook,
             ..ExecCfg::default()
         },
         runner.as_mut(),
@@ -772,14 +775,21 @@ pub fn run(
                 selected.output = declared_output(task, result);
             }
             statuses.insert(task.name.clone(), result.status);
-            if plan
-                .tasks_topo()
-                .filter(|t| t.stage == Stage::Iteration)
-                .all(|t| statuses.contains_key(&t.name))
+            completed_early |= playbook
+                && task.stage == Stage::Iteration
+                && crate::plan::exec::declared_completion(result).is_some();
+            if completed_early
+                || plan
+                    .tasks_topo()
+                    .filter(|t| t.stage == Stage::Iteration)
+                    .all(|t| statuses.contains_key(&t.name))
             {
                 report.verdict =
                     crucible_contract::RunVerdict::of(required_tasks_held(&plan, |name| {
-                        statuses.get(name).copied()
+                        match statuses.get(name) {
+                            Some(status) => Some(*status),
+                            None => completed_early.then_some(TaskStatus::NotTaken),
+                        }
                     }));
             }
             write_report(&report);
@@ -818,6 +828,10 @@ pub fn run(
         PlanExit::ShortCircuit { task } => format!("short-circuited at {task}"),
         PlanExit::BudgetExceeded => "budget exceeded".to_string(),
         PlanExit::TimeExceeded => "wall-clock ceiling reached".to_string(),
+        PlanExit::CompletedEarly { task, reason } => match reason {
+            Some(reason) => format!("completed early by {task}: {reason}"),
+            None => format!("completed early by {task}"),
+        },
     };
     if let (Some(f), Some(record)) = (&events, &series_entry) {
         append(
