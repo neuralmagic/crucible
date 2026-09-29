@@ -8,9 +8,9 @@
 //! ([`crate::identity::auth::require_auth`]) is crate-private on purpose: the point of these tests is the
 //! whole mounted stack, not a public client library.
 //!
-//! The server comes from `KEYCLOAK_URL`, else the shared dev container `just dev-keycloak`
-//! provisions on 58180, which this file will start if docker is available. With neither, the tests
-//! print why they are skipping — unless `CRUCIBLE_REQUIRE_KEYCLOAK_TESTS` is set, which turns a
+//! The server comes from `KEYCLOAK_URL`, else the shared `crucible-test-keycloak` container on
+//! 58180, which this file creates if docker is available and recreates whenever the realm files
+//! differ from the ones it imported. With neither, the tests print why they are skipping — unless `CRUCIBLE_REQUIRE_KEYCLOAK_TESTS` is set, which turns a
 //! skip into a failure so CI can never go green by silently skipping the suite.
 
 use crate::api::state::ApiState;
@@ -37,7 +37,7 @@ const OTHER_CLIENT: &str = "other-app";
 const USER: &str = "alice";
 const PASSWORD: &str = "alice-password";
 const USER_GROUP: &str = "/platform-devs";
-/// The container `just dev-keycloak` provisions, and its port.
+/// The shared container this suite provisions, and its port.
 const CONTAINER: &str = "crucible-test-keycloak";
 const DEFAULT_URL: &str = "http://127.0.0.1:58180";
 /// The redirect URI the flow registers. The realm allows `http://localhost:*`, and nothing ever
@@ -69,55 +69,96 @@ async fn ready(base: &str) -> bool {
         .is_ok_and(|r| r.status().is_success())
 }
 
-/// Start (or restart) the shared dev container, the same one `just dev-keycloak` provisions, and
-/// wait for the realm to answer. Serialized so a whole suite's worth of tests cannot race a dozen
-/// `docker run`s against one name.
+/// The label that records which realm files a container imported. Keycloak imports a realm only
+/// when it does not exist yet, so a container built from other files (an older realm, another
+/// worktree's) keeps serving them until it is replaced.
+const REALM_LABEL: &str = "io.crucible.realm-digest";
+
+fn realm_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/keycloak")
+}
+
+/// A digest over every realm file the container imports, by name and content.
+fn realm_digest() -> String {
+    use sha2::{Digest, Sha256};
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(realm_dir())
+        .expect("realm dir")
+        .map(|entry| entry.expect("realm dir entry").path())
+        .collect();
+    files.sort();
+    let mut hash = Sha256::new();
+    for file in files {
+        hash.update(file.file_name().expect("file name").as_encoded_bytes());
+        hash.update(std::fs::read(&file).expect("realm file"));
+    }
+    format!("{:x}", hash.finalize())
+}
+
+async fn docker(args: &[&str]) -> Option<String> {
+    let out = tokio::process::Command::new("docker")
+        .args(args)
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// The realm digest the shared container was created with: `None` when there is no container,
+/// empty when it predates the label.
+async fn container_digest() -> Option<String> {
+    docker(&[
+        "inspect",
+        "--format",
+        &format!("{{{{ index .Config.Labels \"{REALM_LABEL}\" }}}}"),
+        CONTAINER,
+    ])
+    .await
+    .map(|label| label.replace("<no value>", ""))
+}
+
+/// Bring the shared container up on the current realm files and wait for the realm to answer. A
+/// container created from any other files is replaced. Serialized so a whole suite's worth of
+/// tests cannot race a dozen `docker run`s against one name.
 static START: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn start_container() -> bool {
     let _serialize = START.lock().await;
-    let realm_dir = format!("{}/tests/keycloak", env!("CARGO_MANIFEST_DIR"));
-    let exists = tokio::process::Command::new("docker")
-        .args(["inspect", CONTAINER])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
-        .is_ok_and(|s| s.success());
-    let started = if exists {
-        tokio::process::Command::new("docker")
-            .args(["start", CONTAINER])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await
-            .is_ok_and(|s| s.success())
-    } else {
-        tokio::process::Command::new("docker")
-            .args([
+    let want = realm_digest();
+    match container_digest().await {
+        Some(have) if have == want => {
+            docker(&["start", CONTAINER]).await;
+        }
+        have => {
+            if have.is_some() {
+                eprintln!("{CONTAINER} imported other realm files; recreating it");
+                docker(&["rm", "-f", CONTAINER]).await;
+            }
+            docker(&[
                 "run",
                 "-d",
                 "--name",
                 CONTAINER,
+                "--label",
+                &format!("{REALM_LABEL}={want}"),
                 "-e",
                 "KC_BOOTSTRAP_ADMIN_USERNAME=admin",
                 "-e",
                 "KC_BOOTSTRAP_ADMIN_PASSWORD=admin",
                 "-v",
-                &format!("{realm_dir}:/opt/keycloak/data/import:ro"),
+                &format!("{}:/opt/keycloak/data/import:ro", realm_dir().display()),
                 "-p",
                 "58180:8080",
                 "quay.io/keycloak/keycloak:26.4",
                 "start-dev",
                 "--import-realm",
             ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await
-            .is_ok_and(|s| s.success())
-    };
-    if !started {
+            .await;
+        }
+    }
+    if container_digest().await.as_deref() != Some(want.as_str()) {
         return false;
     }
     for _ in 0..120 {
@@ -129,7 +170,9 @@ async fn start_container() -> bool {
     false
 }
 
-/// The issuer's base URL, or `None` when there is none and the suite may skip.
+/// The issuer's base URL, or `None` when there is none and the suite may skip. `KEYCLOAK_URL` is
+/// somebody else's issuer and is used as it is; the default endpoint is the shared container, which
+/// is checked against the realm files before it is trusted.
 async fn keycloak() -> Option<String> {
     static BASE: tokio::sync::OnceCell<Option<String>> = tokio::sync::OnceCell::const_new();
     BASE.get_or_init(|| async {
@@ -137,21 +180,19 @@ async fn keycloak() -> Option<String> {
             .ok()
             .map(|v| v.trim_end_matches('/').to_string())
             .filter(|v| !v.is_empty());
-        let base = configured
-            .clone()
-            .unwrap_or_else(|| DEFAULT_URL.to_string());
-        if ready(&base).await {
-            return Some(base);
+        let base = match configured {
+            Some(base) => ready(&base).await.then_some(base),
+            None => start_container()
+                .await
+                .then(|| DEFAULT_URL.to_string()),
+        };
+        if base.is_none() && required() {
+            panic!("CRUCIBLE_REQUIRE_KEYCLOAK_TESTS is set but no keycloak with the current realm answered");
         }
-        // Only the default endpoint is ours to provision; a configured URL is somebody else's.
-        if configured.is_none() && start_container().await {
-            return Some(DEFAULT_URL.to_string());
+        if base.is_none() {
+            eprintln!("no keycloak with the current realm; skipping the oidc e2e suite (needs docker, or KEYCLOAK_URL)");
         }
-        if required() {
-            panic!("CRUCIBLE_REQUIRE_KEYCLOAK_TESTS is set but no keycloak answered at {base}");
-        }
-        eprintln!("no keycloak at {base}; skipping the oidc e2e suite (run `just dev-keycloak`)");
-        None
+        base
     })
     .await
     .clone()
