@@ -248,6 +248,7 @@ fn call<'v>(
                     tasks,
                     file: None,
                     resolved_from: None,
+                    params: BTreeMap::new(),
                 };
                 workflow.validate()?;
                 Ok(dsl::Value::Workflow(workflow))

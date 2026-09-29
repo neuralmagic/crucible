@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::plan::ir::{
     EngineOp, Join, KEPT_INPUT, Plan, PlanBudget, PlanError, Stage, Task, TaskKind, TaskName,
 };
+use crate::plan::param::ParamValue;
 
 /// Names used only by the compatibility template.
 const LEGACY_NAMES: [&str; 4] = ["propose", "apply", "measure", "decide"];
@@ -241,6 +242,9 @@ pub struct WorkflowCfg {
     /// hash the graph itself or the hash stops discriminating between two different graphs.
     #[serde(skip)]
     pub resolved_from: Option<String>,
+    /// Every declared parameter's value as compilation bound it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, ParamValue>,
     #[serde(rename = "task", default)]
     pub tasks: Vec<Task>,
 }
@@ -308,6 +312,7 @@ impl WorkflowCfg {
             version: 1,
             reason: None,
             budget: PlanBudget { usd: f64::MAX },
+            params: self.params.clone(),
             tasks: self.tasks.clone(),
         };
         plan.validate()?;

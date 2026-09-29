@@ -156,6 +156,10 @@ pub struct PlanTaskWire {
     /// Empty when the task declares none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub emits: Vec<crate::emits::EmitWire>,
+    /// How long one attempt may run (`90s`, `10m`, `2h`), empty when the task declares no limit
+    /// and only the run's wall-clock ceiling bounds it.
+    #[serde(default)]
+    pub timeout: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -840,6 +844,7 @@ mod tests {
                         ty: None,
                     },
                 ],
+                timeout: "10m".into(),
             }],
         });
     }
