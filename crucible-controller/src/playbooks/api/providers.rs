@@ -53,6 +53,10 @@ dto! {
         pub provider: String = d.provider_id,
         /// Null takes the provider's own default model.
         pub model: Option<String>,
+        /// The provider unpinned work takes when `provider` cannot, or null for none.
+        pub fallback_provider: Option<String> = d.fallback_provider_id,
+        /// Null takes the fallback provider's own default model.
+        pub fallback_model: Option<String>,
     }
 }
 
@@ -911,10 +915,18 @@ pub(crate) struct DispatchDefaultBody {
     /// Absent takes the provider's own default model.
     #[serde(default)]
     model: Option<String>,
+    /// The registered provider the same work takes when `provider` is disabled or its credential
+    /// does not resolve. Absent for none.
+    #[serde(default)]
+    fallback_provider: Option<String>,
+    /// Absent takes the fallback provider's own default model.
+    #[serde(default)]
+    fallback_model: Option<String>,
 }
 
 /// Which default a `DELETE` clears.
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub(crate) struct DispatchDefaultQuery {
     scope_kind: String,
     #[serde(default)]
@@ -959,6 +971,40 @@ fn require_scope_ref(scope_kind: DefaultScope, scope_ref: Option<&str>) -> Resul
     }
 }
 
+/// One provider/model half of a default, checked: the provider is registered and enabled, and the
+/// model, when named, is a model name. `field` prefixes the body field a refusal names.
+async fn default_target(
+    state: &ApiState,
+    field: &str,
+    provider: &str,
+    model: Option<&str>,
+) -> anyhow::Result<Result<(String, Option<String>), String>> {
+    let provider_id = provider.trim().to_string();
+    match crate::playbooks::providers::get(state.db.pool(), &provider_id).await? {
+        Some(provider) if provider.enabled => {}
+        // A default is a standing choice for work that named nothing; pointing one at a provider
+        // nobody may pick would refuse every dispatch that inherited it.
+        Some(_) => {
+            return Ok(Err(format!(
+                "{field}provider {provider_id:?} is disabled and cannot be a default"
+            )));
+        }
+        None => {
+            return Ok(Err(format!(
+                "{field}provider {provider_id:?} is not registered"
+            )));
+        }
+    }
+    let model = match model.map(str::trim).filter(|m| !m.is_empty()) {
+        None => None,
+        Some(raw) => match crate::playbooks::providers::check_model_name(raw) {
+            Ok(m) => Some(m),
+            Err(msg) => return Ok(Err(format!("{field}model: {msg}"))),
+        },
+    };
+    Ok(Ok((provider_id, model)))
+}
+
 #[utoipa::path(
     put,
     path = "/api/config/dispatch-defaults",
@@ -979,39 +1025,48 @@ pub(crate) async fn put_dispatch_default(
         Ok(scope_ref) => scope_ref,
         Err(msg) => return unprocessable(msg),
     };
-    let provider_id = body.provider.trim().to_string();
-    match crate::playbooks::providers::get(state.db.pool(), &provider_id).await {
-        Ok(Some(provider)) if provider.enabled => {}
-        // A default is a standing choice for work that named nothing; pointing one at a provider
-        // nobody may pick would refuse every dispatch that inherited it.
-        Ok(Some(_)) => {
-            return unprocessable(format!(
-                "provider {provider_id:?} is disabled and cannot be a default"
-            ));
-        }
-        Ok(None) => {
-            return unprocessable(format!("provider {provider_id:?} is not registered"));
-        }
-        Err(e) => return AppError::from(e).into_response(),
-    }
-    let model = match body
-        .model
+    let (provider_id, model) =
+        match default_target(&state, "", &body.provider, body.model.as_deref()).await {
+            Ok(Ok(target)) => target,
+            Ok(Err(msg)) => return unprocessable(msg),
+            Err(e) => return AppError::from(e).into_response(),
+        };
+    let (fallback_provider_id, fallback_model) = match body
+        .fallback_provider
         .as_deref()
         .map(str::trim)
-        .filter(|m| !m.is_empty())
+        .filter(|p| !p.is_empty())
     {
-        None => None,
-        Some(raw) => match crate::playbooks::providers::check_model_name(raw) {
-            Ok(m) => Some(m),
-            Err(msg) => return unprocessable(format!("model: {msg}")),
-        },
+        None if body
+            .fallback_model
+            .as_deref()
+            .is_some_and(|m| !m.trim().is_empty()) =>
+        {
+            return unprocessable(
+                "fallback_model names a model but no fallback_provider; a model belongs to the \
+                 provider that serves it",
+            );
+        }
+        None => (None, None),
+        Some(raw) => {
+            match default_target(&state, "fallback_", raw, body.fallback_model.as_deref()).await {
+                Ok(Ok((id, model))) => (Some(id), model),
+                Ok(Err(msg)) => return unprocessable(msg),
+                Err(e) => return AppError::from(e).into_response(),
+            }
+        }
     };
+    if fallback_provider_id.as_deref() == Some(provider_id.as_str()) && fallback_model == model {
+        return unprocessable("the fallback is the same provider and model as the primary");
+    }
     let row = DispatchDefault {
         scope_kind: body.scope_kind,
         scope_ref,
         workload_class: body.workload_class,
         provider_id,
         model,
+        fallback_provider_id,
+        fallback_model,
     };
     if let Err(e) = crate::playbooks::providers::set_default(state.db.pool(), &row).await {
         return AppError::from(e).into_response();
@@ -1023,11 +1078,15 @@ pub(crate) async fn put_dispatch_default(
                 "config",
                 "config",
                 Some(&format!(
-                    "{} {} dispatches of {:?} now default to provider {}",
+                    "{} {} dispatches of {:?} now default to provider {}{}",
                     row.scope_kind.as_str(),
                     row.scope_ref,
                     row.workload_class.as_str(),
-                    row.provider_id
+                    row.provider_id,
+                    row.fallback_provider_id
+                        .as_deref()
+                        .map(|f| format!(", falling back to {f}"))
+                        .unwrap_or_default()
                 )),
                 None,
             )

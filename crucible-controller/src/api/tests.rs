@@ -10191,6 +10191,8 @@ async fn config_providers_lists_enabled_providers_and_the_defaults(pool: PgPool)
             workload_class: crate::playbooks::providers::WorkloadClass::Autoresearch,
             provider_id: "plat-openai".to_string(),
             model: Some("gpt-5.6-sol".to_string()),
+            fallback_provider_id: None,
+            fallback_model: None,
         },
     )
     .await?;
@@ -10917,6 +10919,107 @@ async fn an_admin_sets_and_clears_a_dispatch_default(pool: PgPool) -> Result<()>
         )
         .await?;
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+/// A default can name a fallback beside its primary. The pair round-trips through the API and the
+/// resolver chains them; a fallback that nobody may pick, a fallback model with no provider, and a
+/// fallback identical to the primary are refused.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn an_admin_sets_a_dispatch_default_with_a_fallback(pool: PgPool) -> Result<()> {
+    let (db, _d) = db_with(pool);
+    for (id, kind, enabled) in [
+        (
+            "pricetag",
+            crate::playbooks::providers::ProviderKind::Anthropic,
+            true,
+        ),
+        (
+            "vertex",
+            crate::playbooks::providers::ProviderKind::Vertex,
+            true,
+        ),
+        (
+            "retired",
+            crate::playbooks::providers::ProviderKind::OpenAi,
+            false,
+        ),
+    ] {
+        seed_provider(db.pool(), id, kind, enabled).await;
+    }
+    let app = app_with_admins(db.clone(), vec!["wren".to_string()]);
+
+    let res = app
+        .clone()
+        .oneshot(admin_json(
+            "PUT",
+            "/api/config/dispatch-defaults",
+            serde_json::json!({
+                "scope_kind": "platform",
+                "workload_class": "autoresearch",
+                "provider": "pricetag",
+                "fallback_provider": "vertex",
+                "fallback_model": "claude-sonnet-5",
+            }),
+        )?)
+        .await?;
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = json_of(res).await?;
+    assert_eq!(v["provider"], "pricetag");
+    assert_eq!(v["fallback_provider"], "vertex");
+    assert_eq!(v["fallback_model"], "claude-sonnet-5");
+    let chain = crate::playbooks::providers::resolve_chain(
+        db.pool(),
+        None,
+        None,
+        crate::playbooks::providers::WorkloadClass::Autoresearch,
+    )
+    .await?;
+    assert_eq!(
+        chain
+            .iter()
+            .map(|d| (d.provider.id.as_str(), d.model.as_str()))
+            .collect::<Vec<_>>()[1],
+        ("vertex", "claude-sonnet-5")
+    );
+
+    for bad in [
+        serde_json::json!({"scope_kind": "platform", "workload_class": "autoresearch", "provider": "pricetag", "fallback_provider": "retired"}),
+        serde_json::json!({"scope_kind": "platform", "workload_class": "autoresearch", "provider": "pricetag", "fallback_provider": "never-registered"}),
+        serde_json::json!({"scope_kind": "platform", "workload_class": "autoresearch", "provider": "pricetag", "fallback_model": "claude-sonnet-5"}),
+        serde_json::json!({"scope_kind": "platform", "workload_class": "autoresearch", "provider": "pricetag", "fallback_provider": "pricetag"}),
+        serde_json::json!({"scope_kind": "platform", "workload_class": "autoresearch", "provider": "pricetag", "fallback_provider": "vertex", "fallback_model": "bad model; rm"}),
+    ] {
+        let res = app
+            .clone()
+            .oneshot(admin_json(
+                "PUT",
+                "/api/config/dispatch-defaults",
+                bad.clone(),
+            )?)
+            .await?;
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY, "{bad}");
+    }
+
+    let res = app
+        .clone()
+        .oneshot(admin_json(
+            "PUT",
+            "/api/config/dispatch-defaults",
+            serde_json::json!({
+                "scope_kind": "platform",
+                "workload_class": "autoresearch",
+                "provider": "pricetag",
+            }),
+        )?)
+        .await?;
+    assert_eq!(res.status(), StatusCode::OK);
+    let defaults = crate::playbooks::providers::list_defaults(db.pool()).await?;
+    assert_eq!(defaults.len(), 1);
+    assert_eq!(
+        defaults[0].fallback_provider_id, None,
+        "a PUT without a fallback clears the one before it"
+    );
     Ok(())
 }
 

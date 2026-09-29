@@ -87,6 +87,12 @@ async fn run_grounded(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<Gro
         }
         GroundedExecutor::Pod => {
             let repo_url = crate::runs::engine::repo_clone_url(repo);
+            let dispatch = crate::playbooks::providers::resolve_for_issue(
+                db.pool(),
+                issue,
+                crate::playbooks::providers::WorkloadClass::Autoresearch,
+            )
+            .await?;
             match crate::runs::workpod::dispatch_grounded_rank(
                 db,
                 cfg,
@@ -94,6 +100,7 @@ async fn run_grounded(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<Gro
                 key,
                 &repo_url,
                 issue.git_ref.as_deref(),
+                dispatch.as_ref(),
             )
             .await
             {

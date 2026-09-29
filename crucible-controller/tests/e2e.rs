@@ -6,7 +6,7 @@
 //!   reviews, comments): the in-process approval polls read it over real
 //!   HTTP, and the `gh`/`git` *subprocess* edges are PATH-shimmed scripts that curl the same
 //!   World, so every side effect lands in one asserted place;
-//! - a **wiremock OpenAI** chat-completions ranker;
+//! - a **wiremock OpenAI** chat-completions ranker, registered as the autoresearch provider;
 //! - a **command-backend scope agent** (a scripted `CRUCIBLE_BIN`, the `scope.rs` pattern);
 //! - a **fake `PodDispatcher`** (the WorkPod primitive's cluster boundary) whose `create` "runs" a
 //!   scripted loop run: writes the synthetic session log where the completion edge expects it and
@@ -491,6 +491,47 @@ const DEPLOY_PROFILE: &str = concat!(
     "pull_secret = \"example-pull\"\n",
 );
 
+/// Point the autoresearch default at the World's chat-completions route, the way an administrator
+/// registers a ranking provider.
+#[cfg(feature = "autoresearch")]
+async fn register_ranker(db: &Db, url: &str) -> Result<()> {
+    use crucible_controller::playbooks::providers as reg;
+    let endpoint = reg::Endpoint {
+        url: url.to_string(),
+        protocol: reg::InferenceProtocol::ChatCompletions,
+    };
+    reg::upsert(
+        db.pool(),
+        &reg::NewProvider {
+            owner: crucible_controller::authz::model::Principal::platform(),
+            id: "e2e-ranker",
+            display_name: "e2e ranker",
+            kind: reg::ProviderKind::Custom,
+            models: &["e2e-model".to_string()],
+            default_model: Some("e2e-model"),
+            secret: None,
+            endpoint: Some(&endpoint),
+            harness: None,
+            enabled: true,
+            created_by: "e2e",
+        },
+    )
+    .await?;
+    reg::set_default(
+        db.pool(),
+        &reg::DispatchDefault {
+            scope_kind: reg::DefaultScope::Platform,
+            scope_ref: String::new(),
+            workload_class: reg::WorkloadClass::Autoresearch,
+            provider_id: "e2e-ranker".to_string(),
+            model: None,
+            fallback_provider_id: None,
+            fallback_model: None,
+        },
+    )
+    .await
+}
+
 fn test_cfg(state_dir: &Path, repos: Vec<String>) -> ControllerCfg {
     std::fs::create_dir_all(state_dir).expect("state dir");
     std::fs::write(state_dir.join("deploy-profile.toml"), DEPLOY_PROFILE).expect("deploy profile");
@@ -724,7 +765,6 @@ async fn full_chain_new_to_done_with_once_idempotence() -> Result<()> {
         EnvGuard::set("PATH", &format!("{}:{old_path}", fakebin.display())),
         EnvGuard::set("CRUCIBLE_BIN", &crucible_bin.to_string_lossy()),
         EnvGuard::set("GITHUB_API_URL", &server.uri()),
-        EnvGuard::set("CONTROLLER_RANKER_API_URL", &server.uri()),
         EnvGuard::set("CONTROLLER_PACK_REPO", "testorg/widget"),
         EnvGuard::unset("CONTROLLER_APPROVERS"),
     ];
@@ -733,6 +773,7 @@ async fn full_chain_new_to_done_with_once_idempotence() -> Result<()> {
     let db = Db::open(cfg.db_url()).await?;
     // Boot seed (Lane O3): discovery reads the DB's watch-set, not `cfg.repos`, directly.
     crucible_controller::issues::repo_watch::seed_watched_repos(db.pool(), &cfg.repos).await?;
+    register_ranker(&db, &server.uri()).await?;
 
     // The injectable cluster edges: the fake pod dispatcher + the channel-backed completion stream.
     let (tx, completions) = channel_completions();

@@ -140,9 +140,7 @@ mod tests {
         unsafe {
             std::env::set_var("CRUCIBLE_BIN", &bin);
         }
-        unsafe {
-            std::env::set_var("CONTROLLER_RANKER_API_URL", gh.uri());
-        }
+        crate::testing::register_ranker(db.pool(), &gh.uri()).await?;
         unsafe {
             std::env::set_var("GITHUB_API_URL", gh.uri());
         }
@@ -190,9 +188,6 @@ mod tests {
         let drained = run_once_with(&db, &cfg).await?;
         unsafe {
             std::env::remove_var("CRUCIBLE_BIN");
-        }
-        unsafe {
-            std::env::remove_var("CONTROLLER_RANKER_API_URL");
         }
         unsafe {
             std::env::remove_var("GITHUB_API_URL");

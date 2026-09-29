@@ -32,6 +32,11 @@ import { optionValue } from './pickList';
 import { ProviderIcon } from './ProviderIcon';
 import { SharesSection } from './SharesSection';
 import {
+  CLASS_OPTIONS,
+  defaultBody,
+  defaultErrors,
+  defaultFormOf,
+  emptyDefaultForm,
   emptyProviderForm,
   formOf,
   harnessFor,
@@ -43,7 +48,12 @@ import {
   providerErrors,
   reachLabel,
   registerProviderBody,
+  SCOPE_OPTIONS,
+  targetLabel,
+  type DefaultForm,
+  type DispatchDefaultDto,
   type ProviderDetailDto,
+  type ProviderDto,
   type ProviderForm,
 } from './providersView';
 
@@ -414,8 +424,237 @@ function DetailSection({ provider, onClose }: { provider: ProviderDetailDto; onC
   );
 }
 
+const defaultsHelper = createDataColumnHelper<DispatchDefaultDto>();
+
+function defaultKey(row: DispatchDefaultDto): string {
+  return `${row.scope_kind}:${row.scope_ref}:${row.workload_class}`;
+}
+
+function defaultColumns(onEdit: ((row: DispatchDefaultDto) => void) | null, onClear: ((row: DispatchDefaultDto) => void) | null) {
+  return defaultsHelper.columns([
+    defaultsHelper.display({
+      id: 'scope',
+      header: 'Scope',
+      meta: { shrink: true, className: 'font-mono text-data' },
+      cell: ({ row }) =>
+        onEdit === null ? (
+          row.original.scope_kind === 'platform' ? 'platform' : row.original.scope_ref
+        ) : (
+          <Button variant="quiet" onClick={() => { onEdit(row.original); }}>
+            {row.original.scope_kind === 'platform' ? 'platform' : row.original.scope_ref}
+          </Button>
+        ),
+    }),
+    defaultsHelper.accessor('workload_class', {
+      header: 'Class',
+      enableSorting: false,
+      meta: { shrink: true, className: 'font-mono text-data text-ink-2' },
+    }),
+    defaultsHelper.display({
+      id: 'primary',
+      header: 'Primary',
+      meta: { className: 'font-mono text-data' },
+      cell: ({ row }) => targetLabel(row.original.provider, row.original.model),
+    }),
+    defaultsHelper.display({
+      id: 'fallback',
+      header: 'Fallback',
+      meta: { className: 'font-mono text-data text-ink-2' },
+      cell: ({ row }) =>
+        row.original.fallback_provider === null || row.original.fallback_provider === undefined
+          ? '—'
+          : targetLabel(row.original.fallback_provider, row.original.fallback_model),
+    }),
+    ...(onClear === null
+      ? []
+      : [
+          defaultsHelper.display({
+            id: 'clear',
+            header: '',
+            meta: { shrink: true },
+            cell: ({ row }) => (
+              <Button variant="quiet" onClick={() => { onClear(row.original); }}>
+                CLEAR
+              </Button>
+            ),
+          }),
+        ]),
+  ]);
+}
+
+function modelOptions(provider: ProviderDto | undefined, current: string) {
+  if (provider === undefined) return [{ value: '', label: 'provider default' }];
+  const models = provider.models.includes(current) || current.length === 0 ? provider.models : [...provider.models, current];
+  return [
+    { value: '', label: `default (${provider.default_model})` },
+    ...models.map((m) => ({ value: m, label: m })),
+  ];
+}
+
+function DefaultFormFields({
+  form,
+  providers,
+  onChange,
+}: {
+  form: DefaultForm;
+  providers: readonly ProviderDto[];
+  onChange: (form: DefaultForm) => void;
+}) {
+  const errors = defaultErrors(form);
+  const error = (field: string) => errors.get(field) ?? null;
+  const providerOptions = providers.map((p) => ({ value: p.id, label: `${p.display_name} (${p.id})` }));
+  const primary = providers.find((p) => p.id === form.provider);
+  const fallback = providers.find((p) => p.id === form.fallbackProvider);
+  return (
+    <FormGrid>
+      <SelectField
+        id="default-scope"
+        label="Scope"
+        value={form.scopeKind}
+        onChange={(scopeKind) => { onChange({ ...form, scopeKind: optionValue(SCOPE_OPTIONS, scopeKind, 'platform') }); }}
+        options={SCOPE_OPTIONS}
+      />
+      {form.scopeKind === 'domain' && (
+        <TextField
+          id="default-domain"
+          label="Domain"
+          mono
+          required
+          value={form.scopeRef}
+          onChange={(scopeRef) => { onChange({ ...form, scopeRef }); }}
+          placeholder="owner/repo"
+          error={form.scopeRef.length > 0 ? error('scopeRef') : null}
+        />
+      )}
+      <SelectField
+        id="default-class"
+        label="Class"
+        value={form.workloadClass}
+        onChange={(workloadClass) => {
+          onChange({ ...form, workloadClass: optionValue(CLASS_OPTIONS, workloadClass, 'autoresearch') });
+        }}
+        options={CLASS_OPTIONS}
+      />
+      <SelectField
+        id="default-provider"
+        label="Primary"
+        required
+        value={form.provider}
+        onChange={(provider) => { onChange({ ...form, provider, model: '' }); }}
+        options={[{ value: '', label: '—' }, ...providerOptions]}
+      />
+      <SelectField
+        id="default-model"
+        label="Primary model"
+        value={form.model}
+        onChange={(model) => { onChange({ ...form, model }); }}
+        options={modelOptions(primary, form.model)}
+      />
+      <SelectField
+        id="default-fallback"
+        label="Fallback"
+        value={form.fallbackProvider}
+        onChange={(fallbackProvider) => { onChange({ ...form, fallbackProvider, fallbackModel: '' }); }}
+        options={[{ value: '', label: 'none' }, ...providerOptions]}
+      />
+      {form.fallbackProvider.length > 0 && (
+        <SelectField
+          id="default-fallback-model"
+          label="Fallback model"
+          value={form.fallbackModel}
+          onChange={(fallbackModel) => { onChange({ ...form, fallbackModel }); }}
+          options={modelOptions(fallback, form.fallbackModel)}
+        />
+      )}
+      {error('fallbackProvider') !== null && <Note>{error('fallbackProvider')}</Note>}
+    </FormGrid>
+  );
+}
+
+function DefaultsSection({ admin }: { admin: boolean }) {
+  const qc = useQueryClient();
+  const registry = $api.useQuery('get', '/api/config/providers');
+  const put = $api.useMutation('put', '/api/config/dispatch-defaults');
+  const clear = $api.useMutation('delete', '/api/config/dispatch-defaults');
+  const [form, setForm] = useState<DefaultForm>(emptyDefaultForm);
+  const [error, setError] = useState<string | null>(null);
+  const rows = registry.data?.defaults ?? [];
+  const providers = registry.data?.providers ?? [];
+  const errors = defaultErrors(form);
+
+  const run = async (action: () => Promise<unknown>) => {
+    setError(null);
+    try {
+      await action();
+      await qc.invalidateQueries({ queryKey: PICKER_KEY });
+    } catch (err: unknown) {
+      setError(formatError(err));
+    } finally {
+      put.reset();
+      clear.reset();
+    }
+  };
+
+  const save = () =>
+    run(async () => {
+      await put.mutateAsync({ body: defaultBody(form) });
+      setForm(emptyDefaultForm());
+    });
+
+  const remove = (row: DispatchDefaultDto) =>
+    run(() =>
+      clear.mutateAsync({
+        params: {
+          query: {
+            scope_kind: row.scope_kind,
+            workload_class: row.workload_class,
+            ...(row.scope_kind === 'domain' ? { scope_ref: row.scope_ref } : {}),
+          },
+        },
+      }),
+    );
+
+  const table = useDataTable({
+    columns: defaultColumns(
+      admin ? (row) => { setForm(defaultFormOf(row)); } : null,
+      admin ? (row) => { void remove(row); } : null,
+    ),
+    data: rows,
+    getRowId: defaultKey,
+  });
+
+  return (
+    <Section>
+      <SectionHeader title="Defaults" />
+      <DataTable table={table} empty={<Empty title="NO DEFAULTS" />} />
+      {admin ? (
+        <>
+          <SectionBody>
+            <DefaultFormFields form={form} providers={providers} onChange={setForm} />
+          </SectionBody>
+          {error === null ? null : (
+            <SectionBody>
+              <FormError>{error}</FormError>
+            </SectionBody>
+          )}
+          <FormActions>
+            <Button
+              variant="filled"
+              disabled={errors.size > 0 || put.isPending}
+              onClick={() => { void save(); }}
+            >
+              {put.isPending ? 'SAVING…' : 'SET DEFAULT'}
+            </Button>
+          </FormActions>
+        </>
+      ) : null}
+    </Section>
+  );
+}
+
 export function ProvidersPage() {
   const providers = $api.useQuery('get', '/api/providers');
+  const whoami = $api.useQuery('get', '/api/whoami');
   const ownerContext = useOwnerContext();
   const [open, setOpen] = useState<string | null>(null);
   const rows = narrow(providers.data ?? [], ownerContext.context, (p) => p.owner);
@@ -443,6 +682,7 @@ export function ProvidersPage() {
               ) : null}
             </>
           )}
+          <DefaultsSection admin={whoami.data?.role === 'admin'} />
           <RegisterSection />
         </>
       )}

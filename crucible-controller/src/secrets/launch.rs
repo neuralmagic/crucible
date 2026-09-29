@@ -9,11 +9,11 @@
 //! delivers as the run's Secret.
 
 use crate::authz::model::Principals;
-use crate::playbooks::providers::ModelProvider;
+use crate::playbooks::providers::{KeyLookup, ModelProvider};
 use crate::secrets::grant::{self, GrantMint};
 use crate::secrets::manifest::DeclaredSecret;
 use crate::secrets::store::{self, BindingRow, SecretRow};
-use crate::secrets::{ScopeKind, SecretKind, SecretName};
+use crate::secrets::{ScopeKind, SecretName};
 use anyhow::Result;
 use std::fmt;
 
@@ -254,41 +254,33 @@ pub async fn resolve_provider_secret(
     pool: &sqlx::PgPool,
     provider: &ModelProvider,
 ) -> Result<Result<Option<ProviderSecret>, Refusal>> {
-    let Some(secret) = provider.secret.as_ref() else {
-        return Ok(Ok(None));
-    };
-    let Some(key_env) = provider.api_key_env() else {
-        return Ok(Err(Refusal::ProviderTakesNoSecret {
-            provider: provider.id.clone(),
-            kind: provider.kind.as_str(),
-            name: secret.name.clone(),
-        }));
-    };
-    let name = match SecretName::parse(&secret.name) {
-        Ok(name) => name,
-        Err(e) => {
-            return Ok(Err(Refusal::ProviderSecretName {
-                provider: provider.id.clone(),
-                name: secret.name.clone(),
-                reason: e.to_string(),
-            }));
-        }
-    };
-    let Some(row) = store::find_owned(pool, &secret.owner, &name).await? else {
-        return Ok(Err(Refusal::ProviderSecretMissing {
-            provider: provider.id.clone(),
-            name,
-            owner: secret.owner.to_string(),
-        }));
-    };
-    if row.kind != SecretKind::InferenceApiKey {
-        return Ok(Err(Refusal::ProviderSecretWrongKind {
-            provider: provider.id.clone(),
-            name,
-            kind: row.kind.as_str(),
-        }));
-    }
-    Ok(Ok(Some(ProviderSecret { row, key_env })))
+    let id = provider.id.clone();
+    Ok(
+        match crate::playbooks::providers::lookup_key(pool, provider).await? {
+            KeyLookup::Ambient => Ok(None),
+            KeyLookup::Found { row, key_env } => Ok(Some(ProviderSecret { row, key_env })),
+            KeyLookup::TakesNoSecret { name } => Err(Refusal::ProviderTakesNoSecret {
+                provider: id,
+                kind: provider.kind.as_str(),
+                name,
+            }),
+            KeyLookup::BadName { name, reason } => Err(Refusal::ProviderSecretName {
+                provider: id,
+                name,
+                reason,
+            }),
+            KeyLookup::Missing { name, owner } => Err(Refusal::ProviderSecretMissing {
+                provider: id,
+                name,
+                owner,
+            }),
+            KeyLookup::WrongKind { name, kind } => Err(Refusal::ProviderSecretWrongKind {
+                provider: id,
+                name,
+                kind,
+            }),
+        },
+    )
 }
 
 /// The per-binding half: ownership first, then the revision the binding was reviewed against.
