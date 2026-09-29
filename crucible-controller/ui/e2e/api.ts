@@ -867,6 +867,21 @@ export const ROUTES: Record<string, Json> = {
     },
     runs: [],
   },
+  '/api/playbook-runs': [
+    { ...PLAYBOOK_RUN, key: 'playbook:triage:0201', playbook: 'triage', status: 'running', cost_usd: 0.42, created_by: 'kylesayrs', created_at: '2026-08-24T11:40:00Z' },
+    {
+      ...PLAYBOOK_RUN,
+      key: 'playbook:survey:0197',
+      status: 'parked',
+      cost_usd: null,
+      runs: 0,
+      parked_reason: 'secrets: the pack declares secret pr_token, and repo neuralmagic/crucible has no binding for it',
+      created_at: '2026-08-24T09:00:00Z',
+    },
+    PLAYBOOK_RUN,
+    { ...PLAYBOOK_RUN, key: 'playbook:studio:0196', playbook: 'studio', origin: 'draft', draft_version: 3, status: 'parked', parked_reason: 'dispatch failed', cost_usd: null, runs: 0 },
+    { ...PLAYBOOK_RUN, key: 'playbook:studio:0195', playbook: 'studio', origin: 'draft', draft_version: 2, status: 'parked', parked_reason: 'dispatch failed', cost_usd: null, runs: 0 },
+  ],
   '/api/turns': [],
   '/api/whoami': {
     user: 'wren',

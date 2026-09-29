@@ -3,6 +3,7 @@ import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { $api } from '../api/client';
 import type { components } from '../api/schema';
 import { formatError } from '../api/errors';
+import { budgetNotice } from '../budget';
 import {
   Breadcrumb,
   Button,
@@ -77,6 +78,7 @@ export function PlaybookLaunchPage() {
     params: { path: { id } },
   });
   const caps = $api.useQuery('get', '/api/config/playbook-caps');
+  const overview = $api.useQuery('get', '/api/overview');
   const source = $api.useQuery(
     'get',
     '/api/playbook-runs/{key}',
@@ -115,6 +117,9 @@ export function PlaybookLaunchPage() {
   const [submitError, setSubmitError] = useState<string | null>(null);
 
   const costCap = caps.data?.max_cost ?? null;
+  const sharedBudget = overview.data
+    ? budgetNotice({ spent: overview.data.cost_today.current, ceiling: overview.data.cost_today.ceiling }, new Date())
+    : null;
   const timeCap = caps.data?.max_time ?? null;
 
   useEffect(() => {
@@ -375,6 +380,7 @@ export function PlaybookLaunchPage() {
           deploy&apos;s caps
           {costCap === null || timeCap === null ? '' : ` (${costCap} USD, ${timeCap})`}.
         </Notice>
+        {sharedBudget === null ? null : <Notice label="Shared budget">{sharedBudget}</Notice>}
         <SectionBody>
           <FormGrid>
             <NumberInputField
