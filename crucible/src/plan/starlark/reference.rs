@@ -122,10 +122,11 @@ fn task_knobs() -> Vec<Kwarg> {
         ),
         Kwarg::new(
             "revise",
-            "task",
-            "A direct dependency this task sends back when it settles failing. The dependency runs \
-             again with the verdict under `revision`, then this task does, until this task stops \
-             failing or `max_rounds` is spent. Playbooks only; not with `over`.",
+            "task | list[task]",
+            "The tasks this task sends back when it settles failing. They run again, in dependency \
+             order, with the verdict under `revision`, then this task does, until this task stops \
+             failing or `max_rounds` is spent. Every task on a path between them and this task must \
+             be listed. Playbooks only; not with `over`.",
         ),
         Kwarg::new(
             "max_rounds",

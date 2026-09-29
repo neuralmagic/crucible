@@ -1149,14 +1149,6 @@ fn dsl_task(
         history: take_optional_history(named)?,
     };
     check_fanout(&task)?;
-    if let Some(revise) = &task.revise
-        && !task.depends_on.contains(&revise.task)
-    {
-        return Err(CompileError::ReviseNotADependency {
-            task: task.name.0.clone(),
-            target: revise.task.0.clone(),
-        });
-    }
     if task.join == Join::Settled && task.depends_on.is_empty() {
         return Err(CompileError::SettledJoinWithoutDependencies {
             task: task.name.0.clone(),
@@ -1470,7 +1462,17 @@ fn take_timeout(named: &mut BTreeMap<String, Value>) -> Result<Option<TaskTimeou
 /// `revise` and `max_rounds` are one declaration written as two kwargs: a send-back states how
 /// many rounds it may take before it runs.
 fn take_revise(named: &mut BTreeMap<String, Value>) -> Result<Option<Revise>> {
-    let task = take_optional_task_name(named, "revise")?;
+    let tasks = match named.remove("revise") {
+        Some(list @ Value::List(_)) => match task_names("revise", list)? {
+            tasks if tasks.is_empty() => return Err(CompileError::ReviseNamesNoTask),
+            tasks => Some(tasks),
+        },
+        Some(single) => {
+            named.insert("revise".to_owned(), single);
+            take_optional_task_name(named, "revise")?.map(|task| vec![task])
+        }
+        None => None,
+    };
     let rounds = match named.remove("max_rounds") {
         None | Some(Value::None) => None,
         Some(Value::Int(n)) => match u32::try_from(n) {
@@ -1479,10 +1481,16 @@ fn take_revise(named: &mut BTreeMap<String, Value>) -> Result<Option<Revise>> {
         },
         Some(_) => return Err(CompileError::RoundsNotInteger),
     };
-    match (task, rounds) {
+    match (tasks, rounds) {
         (None, None) => Ok(None),
-        (Some(task), Some(max_rounds)) => Ok(Some(Revise { task, max_rounds })),
-        (Some(task), None) => Err(CompileError::ReviseWithoutRounds { target: task.0 }),
+        (Some(tasks), Some(max_rounds)) => Ok(Some(Revise { tasks, max_rounds })),
+        (Some(tasks), None) => Err(CompileError::ReviseWithoutRounds {
+            targets: tasks
+                .iter()
+                .map(|t| t.0.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        }),
         (None, Some(_)) => Err(CompileError::RoundsWithoutRevise),
     }
 }
@@ -4580,11 +4588,47 @@ workflow(type = "playbook", tasks = [author, repro])
         assert_eq!(
             compiled.workflow.tasks[1].revise,
             Some(Revise {
-                task: "author".into(),
+                tasks: vec!["author".into()],
                 max_rounds: 3
             })
         );
         assert_eq!(compiled.workflow.tasks[0].revise, None);
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn a_reviewer_compiles_to_a_chain_revise_loop() {
+        let pack = temp_pack("revise-chain");
+        let source = r#"
+pick = agent(name = "pick", prompt = "p")
+build = command(name = "build", run = "make", depends_on = [pick])
+confirm = evaluate(
+    name = "confirm",
+    run = "python3 tools/probe.py",
+    depends_on = [build],
+    revise = [pick, "build"],
+    max_rounds = 2,
+)
+workflow(type = "playbook", tasks = [pick, build, confirm])
+"#;
+        let compiled = compile_source(source, &pack.join("workflow.star"), &pack).unwrap();
+        assert_eq!(
+            compiled.workflow.tasks[2].revise,
+            Some(Revise {
+                tasks: vec!["pick".into(), "build".into()],
+                max_rounds: 2
+            })
+        );
+        let skipped = source.replace("revise = [pick, \"build\"]", "revise = [pick]");
+        let error = crate::errors::report(
+            &compile_source(&skipped, &pack.join("workflow.star"), &pack)
+                .err()
+                .unwrap_or_else(|| panic!("compiled a loop that skips build")),
+        );
+        assert!(
+            error.contains("\"build\" lies between two of them; list \"build\" in revise"),
+            "{error}"
+        );
         let _ = std::fs::remove_dir_all(&pack);
     }
 
@@ -4602,7 +4646,7 @@ workflow(type = "playbook", tasks = [author, repro])
             ),
             (
                 "depends_on = [],\n    revise = author,\n    max_rounds = 2",
-                "add \"author\" to depends_on",
+                "does not depend on it, directly or through other tasks",
             ),
             (
                 "depends_on = [author],\n    revise = author,\n    max_rounds = 1",
@@ -4617,8 +4661,16 @@ workflow(type = "playbook", tasks = [author, repro])
                 "\"max_rounds\" must be an integer",
             ),
             (
-                "depends_on = [author],\n    revise = [author],\n    max_rounds = 3",
+                "depends_on = [author],\n    revise = [],\n    max_rounds = 3",
+                "revise = [] names no task",
+            ),
+            (
+                "depends_on = [author],\n    revise = 3,\n    max_rounds = 3",
                 "argument \"revise\" must be",
+            ),
+            (
+                "depends_on = [author],\n    revise = [author, 3],\n    max_rounds = 3",
+                "revise entries must be tasks or task-name strings",
             ),
         ];
         for (clause, expected) in cases {

@@ -169,8 +169,8 @@ DiffusionGemma yourself.
 
 ## Send work back
 
-A task with `revise = <dependency>` is a reviewer. When it settles failing and rounds remain,
-the dependency runs again with the verdict, and then the reviewer does.
+A task with `revise = <task>` or `revise = [<task>, ...]` is a reviewer. When it settles failing
+and rounds remain, the tasks it names run again with the verdict, and then the reviewer does.
 
 ```python
 author = agent(
@@ -205,8 +205,11 @@ From the second round, the author's inputs carry the reviewer's last verdict und
   verdict are the last round's.
 - **Sessions resume.** An author with a `session` continues the same conversation each round,
   so it remembers what it already tried.
-- **One pair, one loop.** The target must be a direct dependency. No fan-out on either side,
-  no two reviewers for one target, no nested or chained loops.
+- **Chains.** `revise = [pick, build]` sends back a chain: every listed task runs again in
+  dependency order, then the reviewer. Every task between a target and the reviewer has to be
+  listed, so no round leaves a task reading a stale result.
+- **One loop per task.** No fan-out inside a loop, no task in two loops, no nested or chained
+  loops.
 
 `examples/revise-loop` runs a revise pair through a real OpenShell sandbox with a fake model.
 

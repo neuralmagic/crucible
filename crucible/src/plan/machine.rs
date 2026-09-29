@@ -79,6 +79,7 @@ pub enum TaskEvent {
     RoundsSkipped,
     RoundsTransport,
     RoundsBlocked,
+    RoundsNotTaken,
 }
 
 pub const TASK_TRANSITIONS: &[(TaskState, TaskEvent, TaskState)] = {
@@ -111,6 +112,7 @@ pub const TASK_TRANSITIONS: &[(TaskState, TaskEvent, TaskState)] = {
         (S::Revising, E::RoundsSkipped, S::Skipped),
         (S::Revising, E::RoundsTransport, S::Transport),
         (S::Revising, E::RoundsBlocked, S::Blocked),
+        (S::Revising, E::RoundsNotTaken, S::NotTaken),
     ]
 };
 
