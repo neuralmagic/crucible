@@ -1571,6 +1571,57 @@ async fn a_view_as_snapshot_is_the_targets_last_stamped_sign_in(pool: PgPool) {
     assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
+/// A team's member rows say which user members have signed in, so the UI offers view-as only for
+/// someone the snapshot can find. A login differing only in case still counts; other kinds never
+/// do.
+#[sqlx::test(migrator = "crate::MIGRATOR")]
+async fn a_team_marks_which_user_members_have_signed_in(pool: PgPool) {
+    signed_in(&pool, "sub-reed", "reed", &["/groups/mlr"]).await;
+    let app = app(pool);
+    let (status, body) = create(
+        &app,
+        "alice",
+        "llm-d",
+        Some(vec![
+            member("user", "alice", "owner"),
+            member("user", "Reed", "member"),
+            member("user", "ghost", "member"),
+            member("group", "/groups/mlr", "member"),
+        ]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, body) = call(
+        &app,
+        as_user("GET", "/api/teams/llm-d", Some("alice"), &[], None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut seen: Vec<(String, String, bool)> = body["members"]
+        .as_array()
+        .expect("members")
+        .iter()
+        .map(|m| {
+            (
+                m["kind"].as_str().expect("kind").to_string(),
+                m["member"].as_str().expect("member").to_string(),
+                m["signed_in"].as_bool().expect("signed_in"),
+            )
+        })
+        .collect();
+    seen.sort();
+    assert_eq!(
+        seen,
+        [
+            ("group".to_string(), "/groups/mlr".to_string(), false),
+            ("user".to_string(), "alice".to_string(), false),
+            ("user".to_string(), "ghost".to_string(), false),
+            ("user".to_string(), "reed".to_string(), true),
+        ]
+    );
+}
+
 /// Starting a view is `platform:impersonate`, decided before the handler; an administrator on a
 /// credential that is not a browser session gets past the decision and is refused by the handler.
 #[sqlx::test(migrator = "crate::MIGRATOR")]
@@ -1767,4 +1818,172 @@ async fn explain_names_the_deciding_rules_for_a_signed_in_user_under_the_active_
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+}
+
+fn acting_as(mut req: HttpRequest<Body>, principal: &str) -> HttpRequest<Body> {
+    req.headers_mut().insert(
+        crate::authz::ACT_AS_HEADER,
+        principal.parse().expect("header value"),
+    );
+    req
+}
+
+/// Acting as a team answers whoami for the team: its entitlements and role, never the caller's,
+/// while `user` and `teams` still describe the caller so the switcher can offer every team.
+#[cfg(feature = "autoresearch")]
+#[sqlx::test(migrator = "crate::MIGRATOR")]
+async fn acting_as_a_team_answers_for_the_team_and_keeps_the_caller_as_actor(pool: PgPool) {
+    let app = app_with_roles(pool.clone(), &["root"], &[]);
+    seed_admin(&pool, "root").await;
+    let (status, body) = create(&app, "root", "llm-d", None).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (_, own) = call(&app, as_user("GET", "/api/whoami", Some("root"), &[], None)).await;
+    assert_eq!(own["role"], "admin");
+    assert_eq!(own["entitlements"], json!(["autoresearch"]));
+    assert_eq!(own["acting_as"], Value::Null);
+
+    let whoami = as_user("GET", "/api/whoami", Some("root"), &[], None);
+    let (status, team) = call(&app, acting_as(whoami, "team:llm-d")).await;
+    assert_eq!(status, StatusCode::OK, "{team}");
+    assert_eq!(team["acting_as"], "llm-d");
+    assert_eq!(team["user"], "root");
+    assert_eq!(team["role"], "viewer");
+    assert_eq!(team["admin"], false);
+    assert_eq!(team["entitlements"], json!([]));
+    let mut teams: Vec<&str> = team["teams"]
+        .as_array()
+        .expect("teams")
+        .iter()
+        .map(|t| t["team"].as_str().expect("team"))
+        .collect();
+    teams.sort_unstable();
+    assert_eq!(teams, ["llm-d", PLATFORM_ADMINISTRATORS]);
+
+    let issues = as_user("GET", "/api/issues", Some("root"), &[], None);
+    let (status, _) = call(&app, acting_as(issues, "team:llm-d")).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the team holds no autoresearch lane"
+    );
+
+    let whoami = as_user("GET", "/api/whoami", Some("root"), &[], None);
+    let (_, admins) = call(
+        &app,
+        acting_as(whoami, &format!("team:{PLATFORM_ADMINISTRATORS}")),
+    )
+    .await;
+    assert_eq!(
+        admins["role"], "operator",
+        "an owner acts as the team at maintainer, which is not platform administration"
+    );
+    assert_eq!(admins["admin"], false);
+}
+
+/// Only a team the caller holds may be acted as. Anything else is refused outright rather than
+/// answered as the caller's own subject.
+#[sqlx::test(migrator = "crate::MIGRATOR")]
+async fn acting_as_a_team_the_caller_does_not_hold_or_a_non_team_is_refused(pool: PgPool) {
+    let app = app_with_roles(pool.clone(), &["root"], &[]);
+    seed_admin(&pool, "root").await;
+    let (status, body) = create(&app, "alice", "llm-d", None).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    for (asked, says) in [
+        (
+            format!("team:{PLATFORM_ADMINISTRATORS}"),
+            format!("you are not a member of team:{PLATFORM_ADMINISTRATORS}"),
+        ),
+        (
+            "team:ghost".to_string(),
+            "you are not a member of team:ghost".to_string(),
+        ),
+        (
+            "user:alice".to_string(),
+            "only a team may be acted as".to_string(),
+        ),
+        (
+            "group:/groups/x".to_string(),
+            "only a team may be acted as".to_string(),
+        ),
+        (
+            "llm-d".to_string(),
+            "only a team may be acted as".to_string(),
+        ),
+        (String::new(), "only a team may be acted as".to_string()),
+    ] {
+        let whoami = as_user("GET", "/api/whoami", Some("alice"), &[], None);
+        let res = app
+            .clone()
+            .oneshot(acting_as(whoami, &asked))
+            .await
+            .expect("response");
+        assert_eq!(
+            res.headers()
+                .get(crate::authz::ACT_AS_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("refused"),
+            "{asked:?}"
+        );
+        let whoami = as_user("GET", "/api/whoami", Some("alice"), &[], None);
+        let (status, body) = call(&app, acting_as(whoami, &asked)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{asked:?}: {body}");
+        assert!(
+            body["error"].as_str().expect("error").contains(&says),
+            "{asked:?}: {body}"
+        );
+    }
+
+    let whoami = as_user("GET", "/api/whoami", Some("alice"), &[], None);
+    let (status, body) = call(&app, acting_as(whoami, " Team:LLM-D ")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["acting_as"], "llm-d");
+}
+
+/// A decision made while acting as a team is the team's, and its audit row names the caller as
+/// actor and the team as subject.
+#[sqlx::test(migrator = "crate::MIGRATOR")]
+async fn a_denial_while_acting_as_a_team_audits_the_caller_as_actor_and_the_team_as_subject(
+    pool: PgPool,
+) {
+    let app = app(pool.clone());
+    let (status, body) = create(&app, "alice", "llm-d", None).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let body = json!({"slug": "side", "display_name": "SIDE"});
+    let req = as_user("POST", "/api/teams", Some("alice"), &[], Some(body));
+    let (status, body) = call(&app, acting_as(req, "team:llm-d")).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a team principal may not create teams: {body}"
+    );
+
+    let (actor, subject, decision): (String, Option<String>, String) = sqlx::query_as(
+        "SELECT actor, subject, decision FROM authz_audit WHERE resource_id = 'side' ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("audit row");
+    assert_eq!(actor, "user:alice");
+    assert_eq!(subject.as_deref(), Some("team:llm-d"));
+    assert_eq!(decision, "deny");
+}
+
+/// The team a request names is checked on every bound route, including one whose handler never
+/// resolves the caller, so a team the caller does not hold is refused there too.
+#[sqlx::test(migrator = "crate::MIGRATOR")]
+async fn a_route_that_never_resolves_the_caller_still_refuses_an_unheld_team(pool: PgPool) {
+    let app = app(pool.clone());
+    let (status, body) = create(&app, "alice", "llm-d", None).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let schedules = || as_user("GET", "/api/schedules", Some("alice"), &[], None);
+    let (status, body) = call(&app, acting_as(schedules(), "team:ghost")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, body) = call(&app, acting_as(schedules(), "user:bob")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, body) = call(&app, acting_as(schedules(), "team:llm-d")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }

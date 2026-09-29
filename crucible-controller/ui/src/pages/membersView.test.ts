@@ -24,7 +24,7 @@ describe('membersView', () => {
 
   it('sends only kind, member, and role', () => {
     expect(
-      asBodies([{ kind: 'user', member: 'alice', role: 'owner', since: 'x', added_by: 'y' }]),
+      asBodies([{ kind: 'user', member: 'alice', role: 'owner', since: 'x', added_by: 'y', signed_in: true }]),
     ).toEqual([{ kind: 'user', member: 'alice', role: 'owner' }]);
   });
 });

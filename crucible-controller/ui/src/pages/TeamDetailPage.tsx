@@ -17,6 +17,7 @@ import {
   SectionBody,
   SectionHeader,
   Spec,
+  Tooltip,
   useDataTable,
 } from '../ui';
 import { FormActions, FormError, FormGrid, SelectField, TextField } from './formControls';
@@ -31,7 +32,7 @@ import {
   withRole,
   type MemberBody,
 } from './membersView';
-import { HELD, sortedMembers, type MemberDto } from './teamsView';
+import { HELD, sortedMembers, viewAsOffer, type MemberDto } from './teamsView';
 import { TeamResources } from './TeamResources';
 import { useOwnerContext } from '../useOwnerContext';
 import { useViewAs } from '../api/viewAs';
@@ -91,6 +92,7 @@ function Members({ slug, members, editable, viewer }: MembersProps) {
   const viewAs = useViewAs();
   const [added, setAdded] = useState<MemberBody>({ kind: 'user', member: '', role: 'member' });
   const [error, setError] = useState<string | null>(null);
+  const [viewAsError, setViewAsError] = useState<string | null>(null);
   const current = asBodies(members);
 
   const send = async (next: MemberBody[]) => {
@@ -114,20 +116,35 @@ function Members({ slug, members, editable, viewer }: MembersProps) {
     id: 'view-as',
     header: '',
     meta: { shrink: true, align: 'end' },
-    cell: ({ row }) =>
-      row.original.kind === 'user' && row.original.member !== viewer ? (
-        <Button
-          className="uppercase"
-          disabled={viewAs.pending}
-          onClick={() => {
-            viewAs.start(row.original.member).catch((err: unknown) => {
-              setError(formatError(err));
-            });
-          }}
-        >
-          View as
-        </Button>
-      ) : null,
+    cell: ({ row }) => {
+      switch (viewAsOffer(row.original, viewer)) {
+        case 'none':
+          return null;
+        case 'never-signed-in':
+          return (
+            <Tooltip content={`${row.original.member} has not signed in yet, so there is nothing to view as`}>
+              <Button className="cursor-default uppercase text-ink-3" aria-disabled>
+                View as
+              </Button>
+            </Tooltip>
+          );
+        case 'ready':
+          return (
+            <Button
+              className="uppercase"
+              disabled={viewAs.pending}
+              onClick={() => {
+                setViewAsError(null);
+                viewAs.start(row.original.member).catch((err: unknown) => {
+                  setViewAsError(formatError(err));
+                });
+              }}
+            >
+              View as
+            </Button>
+          );
+      }
+    },
   });
   const shown = viewer === null ? columns : [...columns, viewColumn];
   const table = useDataTable({
@@ -175,6 +192,11 @@ function Members({ slug, members, editable, viewer }: MembersProps) {
 
   return (
     <>
+      {viewAsError === null ? null : (
+        <SectionBody>
+          <FormError>{viewAsError}</FormError>
+        </SectionBody>
+      )}
       <div data-testid="members">
         <DataTable table={table} empty={<Empty title="No members" />} footer={<>Showing {rows.length}</>} />
       </div>

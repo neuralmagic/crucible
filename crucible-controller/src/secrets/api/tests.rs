@@ -263,6 +263,49 @@ async fn a_minted_secret_registers_with_no_vault_and_no_stored_version(pool: PgP
     assert_eq!(stored[0].current_version, None);
 }
 
+/// A secret registered while acting as a team is owned by that team, and its trail names the
+/// caller as actor and the team as the subject the registration was decided for.
+#[sqlx::test(migrator = "crate::MIGRATOR")]
+async fn a_secret_registered_acting_as_a_team_is_the_teams_and_audits_the_team_as_subject(
+    pool: PgPool,
+) {
+    let app = app(pool.clone(), None);
+    let (status, body) = call(
+        &app,
+        as_user(
+            "POST",
+            "/api/teams",
+            "alice",
+            &[],
+            Some(json!({"slug": "llm-d", "display_name": "LLM-D"})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let mut register = as_user(
+        "POST",
+        "/api/secrets",
+        "alice",
+        &[],
+        Some(json!({"name": "pr-token", "kind": "opaque", "mint": "github-app"})),
+    );
+    register.headers_mut().insert(
+        crate::authz::ACT_AS_HEADER,
+        "team:llm-d".parse().expect("header value"),
+    );
+    let (status, body) = call(&app, register).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["owner"], "team:llm-d", "{body}");
+
+    let id = body["id"].as_str().expect("id");
+    let trail = store::audit_for_secret(&pool, id, 10).await.expect("trail");
+    assert_eq!(trail.len(), 1);
+    assert_eq!(trail[0].actor.as_deref(), Some("user:alice"));
+    assert_eq!(trail[0].subject.as_deref(), Some("team:llm-d"));
+    assert_eq!(trail[0].owner, "team:llm-d");
+}
+
 /// A minter issues a bearer token, so the registration has to be shaped like one.
 #[sqlx::test(migrator = "crate::MIGRATOR")]
 async fn a_minted_secret_must_be_an_opaque_run_credential(pool: PgPool) {
@@ -472,6 +515,7 @@ async fn the_read_routes_work_without_a_vault_client(pool: PgPool) {
             owner: &owner,
             action: crate::secrets::AuditAction::Register,
             actor: Some(&owner),
+            subject: None,
             detail: None,
         },
     )

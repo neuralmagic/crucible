@@ -122,6 +122,8 @@ pub struct AuditRow {
     pub action: AuditAction,
     /// The acting principal. `None` only for a hub read on the hub's own behalf.
     pub actor: Option<String>,
+    /// The principal the action was decided for when it differs from the actor.
+    pub subject: Option<String>,
     pub detail: Option<String>,
     pub at: String,
 }
@@ -436,20 +438,23 @@ pub struct NewAudit<'a> {
     pub action: AuditAction,
     /// The acting principal. `None` only where there is none.
     pub actor: Option<&'a Principal>,
+    /// The principal the action was decided for when it differs from the actor.
+    pub subject: Option<String>,
     pub detail: Option<&'a str>,
 }
 
 /// Append one audit row.
 pub async fn audit(conn: &mut PgConnection, entry: &NewAudit<'_>) -> Result<()> {
     sqlx::query(
-        "INSERT INTO secret_audit (secret_id, secret_name, owner, action, actor, detail, at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        "INSERT INTO secret_audit (secret_id, secret_name, owner, action, actor, subject, detail, at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
     )
     .bind(entry.secret_id)
     .bind(entry.secret_name)
     .bind(entry.owner.to_string())
     .bind(entry.action.as_str())
     .bind(entry.actor.map(Principal::to_string))
+    .bind(&entry.subject)
     .bind(entry.detail)
     .bind(crate::clock::now_rfc3339())
     .execute(conn)
@@ -465,7 +470,7 @@ pub async fn audit_for_secret(
     limit: i64,
 ) -> Result<Vec<AuditRow>> {
     sqlx::query_as::<_, AuditRow>(
-        "SELECT id, secret_id, secret_name, owner, action, actor, detail, at
+        "SELECT id, secret_id, secret_name, owner, action, actor, subject, detail, at
          FROM secret_audit WHERE secret_id = $1 ORDER BY id DESC LIMIT $2",
     )
     .bind(secret_id)

@@ -11,6 +11,7 @@ import { IdentityBadge } from './IdentityBadge';
 import { OwnerSwitcher } from './OwnerSwitcher';
 import { AutopilotBanner } from './AutopilotBanner';
 import { ViewAsBanner } from './ViewAsBanner';
+import { useResetOnActAs } from './actAs';
 import { DashboardPage } from './pages/DashboardPage';
 import { HomePage } from './pages/HomePage';
 import { approvalsWaiting } from './pages/home';
@@ -379,6 +380,7 @@ function Lane({ page }: { page: ReactNode }) {
 }
 
 export function App() {
+  useResetOnActAs();
   const [collapsed, toggleRail] = useRailCollapsed();
   const autoresearch = useAutoresearch() === true;
 
