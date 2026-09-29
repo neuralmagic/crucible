@@ -22,12 +22,14 @@ use starlark_syntax::codemap::{CodeMap, FileSpan};
 use starlark_syntax::syntax::{AstModule, Dialect};
 
 use crate::crucible::Direction;
+use crate::duration::TaskTimeout;
 use crate::errors::FileError;
 use crate::plan::diag;
 use crate::plan::ir::{
     Decider, EngineOp, Isolation, Join, MAX_FANOUT_CEILING, MAX_ROUNDS_CEILING, OutputField,
     OutputRef, ReportDestination, Revise, SlackDestination, Stage, Task, TaskKind, TaskName, When,
 };
+use crate::plan::param::ParamValue;
 use crate::plan::starlark::error::{
     CompileError, MAX_CALLSTACK, MAX_CONSTRUCTED_TASKS, MAX_EVAL_HEAP_BYTES, MAX_EVAL_TICKS,
     MAX_LOAD_MODULES, MAX_NESTING_DEPTH, MAX_PROMPT_BYTES, MAX_SOURCE_BYTES, MAX_TASKS,
@@ -58,7 +60,7 @@ struct CompileContext {
     pack_dir: PathBuf,
     /// Parameter values bound before evaluation, so `param()` is a lookup and the compiled graph
     /// carries no unresolved reference.
-    params: BTreeMap<String, params::ParamValue>,
+    params: BTreeMap<String, ParamValue>,
     /// Which of them a launcher supplied. A defaulted value was written in the pack by the same
     /// author as the prompt around it, so it is not outside text and marking it would be noise.
     supplied: BTreeSet<String>,
@@ -219,14 +221,14 @@ impl CompileContext {
     fn param(&mut self, name: &str) -> Result<Value> {
         match self.params.get(name) {
             Some(value) => Ok(match value {
-                params::ParamValue::String(s) if self.supplied.contains(name) => {
+                ParamValue::String(s) if self.supplied.contains(name) => {
                     Value::External(values::ExternalText::external(s.clone()).0)
                 }
-                params::ParamValue::String(s) => Value::String(s.clone()),
-                params::ParamValue::Int(n) => Value::Int(*n),
-                params::ParamValue::Number(n) => Value::Float(*n),
-                params::ParamValue::Bool(b) => Value::Bool(*b),
-                params::ParamValue::StringList(items) if self.supplied.contains(name) => {
+                ParamValue::String(s) => Value::String(s.clone()),
+                ParamValue::Int(n) => Value::Int(*n),
+                ParamValue::Number(n) => Value::Float(*n),
+                ParamValue::Bool(b) => Value::Bool(*b),
+                ParamValue::StringList(items) if self.supplied.contains(name) => {
                     // A supplied list's items are outside text exactly as a supplied string is.
                     // Marking the string and not the list would leave the obvious way to smuggle
                     // one in.
@@ -239,7 +241,7 @@ impl CompileContext {
                             .collect(),
                     )
                 }
-                params::ParamValue::StringList(items) => {
+                ParamValue::StringList(items) => {
                     Value::List(items.iter().cloned().map(Value::String).collect())
                 }
             }),
@@ -529,6 +531,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "max_fanout",
             "revise",
             "max_rounds",
+            "timeout",
             "emits_files",
             "when",
             "answers",
@@ -553,6 +556,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "max_fanout",
             "revise",
             "max_rounds",
+            "timeout",
             "emits_files",
             "when",
             "answers",
@@ -572,6 +576,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "max_fanout",
             "revise",
             "max_rounds",
+            "timeout",
             "emits_files",
             "when",
             "answers",
@@ -593,6 +598,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "max_fanout",
             "revise",
             "max_rounds",
+            "timeout",
             "emits_files",
             "when",
             "answers",
@@ -661,6 +667,7 @@ fn constructor(
             tasks,
             file: None,
             resolved_from: None,
+            params: BTreeMap::new(),
         };
         workflow.validate()?;
         return Ok(Value::Workflow(workflow));
@@ -799,6 +806,7 @@ fn constructor(
             max_fanout: None,
             when: None,
             revise: None,
+            timeout: None,
         },
         "top_k" => {
             let k = take_int(&mut named, "k")?;
@@ -836,6 +844,7 @@ fn constructor(
                 over: None,
                 max_fanout: None,
                 revise: None,
+                timeout: None,
                 when: None,
             }
         }
@@ -866,6 +875,7 @@ fn constructor(
                 over: None,
                 max_fanout: None,
                 revise: None,
+                timeout: None,
                 when: take_when(&mut named, state, &name)?,
                 name,
             }
@@ -1072,6 +1082,7 @@ fn default_autoresearch(mut extras: Vec<Task>) -> Result<WorkflowCfg> {
         tasks,
         file: None,
         resolved_from: None,
+        params: BTreeMap::new(),
     };
     workflow.validate()?;
     Ok(workflow)
@@ -1114,6 +1125,7 @@ fn dsl_task(
         max_fanout: take_optional_fanout(named)?,
         when,
         revise: take_revise(named)?,
+        timeout: take_timeout(named)?,
     };
     check_fanout(&task)?;
     if let Some(revise) = &task.revise
@@ -1407,6 +1419,14 @@ fn take_optional_fanout(named: &mut BTreeMap<String, Value>) -> Result<Option<u3
     }
 }
 
+fn take_timeout(named: &mut BTreeMap<String, Value>) -> Result<Option<TaskTimeout>> {
+    match named.remove("timeout") {
+        None | Some(Value::None) => Ok(None),
+        Some(Value::String(raw)) => Ok(Some(raw.parse()?)),
+        Some(_) => Err(CompileError::TimeoutNotString),
+    }
+}
+
 /// `revise` and `max_rounds` are one declaration written as two kwargs: a send-back states how
 /// many rounds it may take before it runs.
 fn take_revise(named: &mut BTreeMap<String, Value>) -> Result<Option<Revise>> {
@@ -1458,6 +1478,7 @@ fn engine(name: &str, op: EngineOp, source: Option<TaskName>, depends_on: Vec<Ta
         max_fanout: None,
         when: None,
         revise: None,
+        timeout: None,
     }
 }
 
@@ -2109,7 +2130,7 @@ fn compile_source_here(
         context.supplied = supplied.keys().cloned().collect();
     }
     let loader = loader::resolve(&ast, &state, &globals, source.len(), lane)?;
-    let workflow = catching_panics(|| {
+    let mut workflow = catching_panics(|| {
         Module::with_temp_heap(|module| -> Result<WorkflowCfg> {
             let mut eval = Evaluator::new(&module);
             eval.extra = Some(&state);
@@ -2155,6 +2176,7 @@ fn compile_source_here(
     if !unbound.is_empty() {
         return Err(CompileError::UnboundSessions { sites: unbound });
     }
+    workflow.params = context.params;
     let canonical_json = serde_json::to_string_pretty(&workflow)? + "\n";
     Ok(CompiledWorkflow {
         workflow,
@@ -3492,7 +3514,7 @@ workflow(type = "custom", tasks = [e], result = e)
         let cases: &[(&str, &str)] = &[
             (
                 "agent",
-                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = agent(name = \"a\", prompt = \"p\", harness = \"claude\", model = \"m\", effort = \"high\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = agent(name = \"a\", prompt = \"p\", harness = \"claude\", model = \"m\", effort = \"high\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, timeout = \"10m\"{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
             ),
             (
                 "agent",
@@ -3500,15 +3522,15 @@ workflow(type = "custom", tasks = [e], result = e)
             ),
             (
                 "command",
-                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\nc = command(name = \"c\", run = \"true\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4{extra})\nworkflow(type = \"custom\", tasks = [u, c], result = c)\n",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\nc = command(name = \"c\", run = \"true\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, timeout = \"10m\"{extra})\nworkflow(type = \"custom\", tasks = [u, c], result = c)\n",
             ),
             (
                 "evaluate",
-                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\ne = evaluate(name = \"e\", run = \"true\", threshold = 1, direction = \"higher\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4{extra})\nworkflow(type = \"custom\", tasks = [u, e], result = e)\n",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\ne = evaluate(name = \"e\", run = \"true\", threshold = 1, direction = \"higher\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, timeout = \"10m\"{extra})\nworkflow(type = \"custom\", tasks = [u, e], result = e)\n",
             ),
             (
                 "skill",
-                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = skill(name = \"a\", skill = \"skills/demo\", args = {\"k\": 1}, harness = \"claude\", model = \"m\", effort = \"high\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = skill(name = \"a\", skill = \"skills/demo\", args = {\"k\": 1}, harness = \"claude\", model = \"m\", effort = \"high\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, timeout = \"10m\"{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
             ),
             (
                 "skill",
@@ -4187,6 +4209,61 @@ workflow(type = "playbook", tasks = [author, repro])
     }
 
     #[test]
+    fn a_timeout_compiles_onto_its_task_and_survives_the_generated_toml() {
+        let pack = temp_pack("timeout");
+        std::fs::create_dir_all(pack.join("skills/demo")).unwrap();
+        std::fs::write(pack.join("skills/demo/SKILL.md"), "demo\n").unwrap();
+        let source = r#"
+build = command(name = "build", run = "make", timeout = "1.5h")
+check = evaluate(name = "check", run = "true", depends_on = [build], timeout = "90s")
+fix = agent(name = "fix", prompt = "p", depends_on = [check], timeout = "10m")
+review = skill(name = "review", skill = "skills/demo", depends_on = [fix], timeout = "2h")
+note = command(name = "note", run = "true", depends_on = [review], timeout = None)
+workflow(type = "playbook", tasks = [build, check, fix, review, note])
+"#;
+        let compiled = compile_source(source, &pack.join("workflow.star"), &pack).unwrap();
+        let declared: Vec<Option<String>> = compiled
+            .workflow
+            .tasks
+            .iter()
+            .map(|t| t.timeout.map(|limit| limit.to_string()))
+            .collect();
+        assert_eq!(
+            declared,
+            [Some("90m"), Some("90s"), Some("10m"), Some("2h"), None].map(|t| t.map(String::from))
+        );
+        let text = toml::to_string(&compiled.workflow).unwrap();
+        assert!(text.contains("timeout = \"90m\""), "{text}");
+        let back: WorkflowCfg = toml::from_str(&text).unwrap();
+        back.validate().unwrap();
+        assert_eq!(toml::to_string(&back).unwrap(), text);
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn a_timeout_must_be_a_positive_duration_string() {
+        let pack = temp_pack("timeout-refused");
+        for (value, expected) in [
+            ("90", "\"timeout\" must be a duration string"),
+            ("[\"10m\"]", "\"timeout\" must be a duration string"),
+            ("\"soon\"", "timeout \"soon\" is not a duration"),
+            ("\"-5m\"", "timeout \"-5m\" is not a duration"),
+            ("\"0s\"", "timeout must be positive, got \"0s\""),
+        ] {
+            let source = format!(
+                "c = command(name = \"c\", run = \"true\", timeout = {value})\nworkflow(type = \"playbook\", tasks = [c])\n"
+            );
+            let error = crate::errors::report(
+                &compile_source(&source, &pack.join("workflow.star"), &pack)
+                    .err()
+                    .unwrap_or_else(|| panic!("{value}: compiled")),
+            );
+            assert!(error.contains(expected), "{value}: {error}");
+        }
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
     fn a_scored_workflow_refuses_a_revise_loop() {
         let pack = temp_pack("revise-lane");
         let source = "author = agent(name = \"author\", prompt = \"p\")\nrepro = agent(name = \"repro\", prompt = \"p\", depends_on = [author], revise = author, max_rounds = 2)\nworkflow(type = \"custom\", tasks = [author, repro], result = repro)\n";
@@ -4766,7 +4843,66 @@ workflow(type = "playbook", tasks = [a])
                 error.contains("supplied from outside the pack"),
                 "{what}: {error}"
             );
+            assert!(
+                error.contains("\"params\" entry of $CRUCIBLE_INPUTS"),
+                "{what}: the refusal does not say where a command reads the value: {error}"
+            );
         }
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// The compiled graph carries the values it was bound with, typed, so whatever runs it later
+    /// hands every command the same ones without recompiling or rereading a launcher.
+    #[test]
+    fn the_compiled_workflow_carries_every_bound_parameter_in_its_declared_type() {
+        let pack = temp_pack("params-carried");
+        let source = r#"
+params = {
+    "url": {"type": "string", "required": True},
+    "steps": {"type": "int", "default": 3},
+    "ratio": {"type": "number", "default": 0.5},
+    "dry_run": {"type": "bool", "default": False},
+    "labels": {"type": "list<string>", "default": ["ci"]},
+}
+workflow(type = "playbook", tasks = [command(name = "a", run = "./go.sh")])
+"#;
+        let supplied = BTreeMap::from([
+            ("url".to_string(), "https://x.test/p".to_string()),
+            ("dry_run".to_string(), "true".to_string()),
+        ]);
+        let compiled =
+            compile_source_with(source, &pack.join("workflow.star"), &pack, &supplied).unwrap();
+        assert_eq!(
+            compiled.workflow.params,
+            BTreeMap::from([
+                (
+                    "url".to_string(),
+                    ParamValue::String("https://x.test/p".into())
+                ),
+                ("steps".to_string(), ParamValue::Int(3)),
+                ("ratio".to_string(), ParamValue::Number(0.5)),
+                ("dry_run".to_string(), ParamValue::Bool(true)),
+                (
+                    "labels".to_string(),
+                    ParamValue::StringList(vec!["ci".into()])
+                ),
+            ])
+        );
+        let json: serde_json::Value = serde_json::from_str(&compiled.canonical_json).unwrap();
+        assert_eq!(json["params"]["steps"], serde_json::json!(3));
+
+        let bare = compile_source(
+            "workflow(type = \"playbook\", tasks = [command(name = \"a\", run = \"true\")])\n",
+            &pack.join("workflow.star"),
+            &pack,
+        )
+        .unwrap();
+        assert!(bare.workflow.params.is_empty());
+        assert!(
+            !bare.canonical_json.contains("\"params\""),
+            "{}",
+            bare.canonical_json
+        );
         let _ = std::fs::remove_dir_all(&pack);
     }
 

@@ -331,8 +331,9 @@ pub enum CompileError {
     OverNotOutputField,
     #[error(
         "argument {argument:?} carries a value supplied from outside the pack. A prompt marks \
-         such a span so an agent can tell it from an instruction; nothing else can, so pass it \
-         to the task as a file or an environment variable instead of building it into {argument:?}."
+         such a span so an agent can tell it from an instruction; nothing else can, so do not \
+         build it into {argument:?}. A command or evaluate task reads it as data from the \
+         \"params\" entry of $CRUCIBLE_INPUTS."
     )]
     ExternalOutsidePrompt { argument: String },
     #[error("task {task:?} argument \"args\" must be a dictionary")]
@@ -381,6 +382,10 @@ pub enum CompileError {
     FanoutWithoutOver { task: String },
     #[error("\"max_rounds\" must be an integer")]
     RoundsNotInteger,
+    #[error("\"timeout\" must be a duration string (try \"90s\", \"10m\", \"2h\")")]
+    TimeoutNotString,
+    #[error(transparent)]
+    InvalidTimeout(#[from] crate::duration::BadTimeout),
     #[error("max_rounds = {got} is outside 2..={MAX_ROUNDS_CEILING}")]
     RoundsOutOfRange { got: i32 },
     #[error(

@@ -7,7 +7,7 @@
 
 use crate::plan::exec::DeclaredStatus;
 use crate::plan::ir::KEPT_INPUT;
-use crate::plan::ir::{ITEM_INPUT, OUTCOME_INPUT, REVISION_INPUT};
+use crate::plan::ir::{ITEM_INPUT, OUTCOME_INPUT, PARAMS_INPUT, REVISION_INPUT};
 use crate::plan::ir::{MAX_FANOUT_CEILING, MAX_ROUNDS_CEILING};
 #[cfg(test)]
 use crate::plan::workflow::WorkflowType;
@@ -128,6 +128,14 @@ fn task_knobs() -> Vec<Kwarg> {
                 "Round cap for `revise`, counting the first, from 2 to the engine's ceiling of \
                  {MAX_ROUNDS_CEILING}."
             ),
+        ),
+        Kwarg::new(
+            "timeout",
+            "str",
+            "How long one attempt may run, as `90s`, `10m`, or `2h`. At the limit the attempt's \
+             whole process group is killed and the task settles failed with a note naming the \
+             limit; it is not retried. The run's `--max-time` bounds every attempt as well, and a \
+             playbook refuses a timeout longer than it before dispatching anything.",
         ),
         Kwarg::new(
             "stage",
@@ -319,7 +327,9 @@ pub fn functions() -> Vec<Function> {
             name: "param",
             lane: Lane::Common,
             purpose: "Read a launch parameter. The `params` block must be the source's first \
-                      statement, and a source that declares one compiles per run.",
+                      statement, and a source that declares one compiles per run. A supplied \
+                      value may reach a prompt or a skill argument; a command or evaluate task \
+                      reads it from `params` in `CRUCIBLE_INPUTS` instead of its command line.",
             positional: Some("name"),
             kwargs: vec![],
         },
@@ -591,6 +601,12 @@ pub fn reserved_inputs() -> Vec<Reserved> {
              in an epilogue task only: each entry is what a `settled` join receives, \
              `per_instance` included for a mapped task. `files` says whether that task's declared \
              files, passing or failing, are staged under `inputs/<name>/`.",
+        ),
+        Reserved::new(
+            PARAMS_INPUT,
+            "object",
+            "Every declared parameter's bound value under its name, in its declared type, and \
+             `{}` where the source declares none, in a command or evaluate task only.",
         ),
         Reserved::new(
             REVISION_INPUT,
