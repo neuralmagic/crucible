@@ -353,7 +353,8 @@ Each task's `CRUCIBLE_INPUTS` carries the kept candidate under the reserved `kep
 engine ops cannot be epilogue, and the workflow `result` must iterate.
 
 In a playbook the epilogue runs after the main graph completes or fails, and reads the reserved
-`outcome` input instead: `{"exit", "tasks": {name: {"status", "note", "files"}}}`. Every
+`outcome` input instead: `{"exit", "tasks": {name: {"status", "note", "output", "files"}}}`,
+each entry what a `join = "settled"` consumer receives, `per_instance` included. Every
 main-graph task's declared files are staged under `inputs/<name>/` (a mapped node's under
 `inputs/<node>[<key>]/`), from a failed task as well as a passing one, and `files` says whether
 that task's set is there. A skipped, blocked, or transport-failed task stages nothing.

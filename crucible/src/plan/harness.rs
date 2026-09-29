@@ -3438,8 +3438,6 @@ workflow(type = "playbook", tasks = [probe, deliver, report])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A required chain fails at the probe, and the epilogue still reads the probe's evidence
-    /// and the passing build's from `inputs/<task>/`, with each outcome entry saying so.
     #[test]
     fn an_epilogue_reads_every_main_graph_tasks_evidence_after_a_required_failure() {
         let dir = playbook_pack(

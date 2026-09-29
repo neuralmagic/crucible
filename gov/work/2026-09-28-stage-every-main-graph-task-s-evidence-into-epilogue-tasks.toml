@@ -42,3 +42,8 @@ category = "added"
 text = "through the harness runner, an epilogue after a required short-circuit reads the failed task's and a passing task's files from inputs/"
 status = "done"
 category = "added"
+
+[[content.acceptance_criteria]]
+text = "each outcome.tasks entry is the entry a settled join receives for that task, output and per_instance included"
+status = "done"
+category = "changed"
