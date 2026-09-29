@@ -49,16 +49,23 @@ describe('parseEditorPrefs', () => {
 
 describe('monacoThemeName', () => {
   it('follows the app theme within one pairing', () => {
-    expect(monacoThemeName('paper', 'light')).toBe('crucible-paper');
-    expect(monacoThemeName('paper', 'dark')).toBe('crucible-ink');
-    expect(monacoThemeName('classic', 'dark')).toBe('vs-dark');
-    expect(monacoThemeName('contrast', 'light')).toBe('hc-light');
+    expect(monacoThemeName('paper', 'crucible', 'light')).toBe('crucible-paper');
+    expect(monacoThemeName('paper', 'crucible', 'dark')).toBe('crucible-ink');
+    expect(monacoThemeName('classic', 'crucible', 'dark')).toBe('vs-dark');
+    expect(monacoThemeName('contrast', 'crucible', 'light')).toBe('hc-light');
+  });
+
+  it('paints the paper pairing in the brand palette and leaves Monaco themes alone', () => {
+    expect(monacoThemeName('paper', 'redhat', 'light')).toBe('redhat-light');
+    expect(monacoThemeName('paper', 'redhat', 'dark')).toBe('redhat-dark');
+    expect(monacoThemeName('classic', 'redhat', 'light')).toBe('vs');
+    expect(monacoThemeName('contrast', 'redhat', 'dark')).toBe('hc-black');
   });
 });
 
 describe('surfaceOptions', () => {
   it('resolves the document into what every surface is configured with', () => {
-    const options = surfaceOptions({ ...EDITOR_PREFS_DEFAULTS, wordWrap: true, whitespace: true });
+    const options = surfaceOptions({ ...EDITOR_PREFS_DEFAULTS, wordWrap: true, whitespace: true }, 'crucible');
     expect(options).toMatchObject({
       fontSize: 12,
       lineHeight: 19,
@@ -70,11 +77,15 @@ describe('surfaceOptions', () => {
 
   /// The chrome the app expects rides on every surface, not just the studio's.
   it('carries the app chrome whatever the document says', () => {
-    const options = surfaceOptions(EDITOR_PREFS_DEFAULTS);
+    const options = surfaceOptions(EDITOR_PREFS_DEFAULTS, 'crucible');
     expect(options.roundedSelection).toBe(false);
     expect(options.glyphMargin).toBe(false);
     expect(options.overviewRulerBorder).toBe(false);
     expect(options.scrollbar?.useShadows).toBe(false);
     expect(options.fontFamily).toContain('Ioskeley Mono');
+  });
+
+  it('sets code in the brand mono face', () => {
+    expect(surfaceOptions(EDITOR_PREFS_DEFAULTS, 'redhat').fontFamily).toMatch(/^'Red Hat Mono'/);
   });
 });

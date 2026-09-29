@@ -28,7 +28,7 @@ export default function CodeDiff({ path, original, modified, height = '20rem', t
         originalModelPath={`stored/${path}`}
         modifiedModelPath={`buffer/${path}`}
         theme={theme}
-        loading={<span className="px-3 py-2 font-mono text-data text-ink-3">LOADING DIFF</span>}
+        loading={<span className="px-3 py-2 font-mono text-data text-ink-3 uppercase">Loading diff</span>}
         options={{
           ...options,
           readOnly: true,

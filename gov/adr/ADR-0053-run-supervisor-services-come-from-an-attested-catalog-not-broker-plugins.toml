@@ -1,0 +1,66 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0053"
+title = "Run supervisor services come from an attested catalog, not broker plugins"
+status = "proposed"
+date = "2026-09-28"
+
+[content]
+context = """
+A task sometimes needs a capability whose credential must never enter the sandbox: submitting cluster work, reading or commenting on JIRA, dispatching CI. The broker is the only way to provide one today. Each new integration is broker code and a broker release, and the broker holds every such credential for every run whether that run uses it or not.
+
+Workloads differ in what they need. An autoresearch run that edits a control-plane resource such as a KServe object may need a whole disposable virtual cluster (tlrmchlsmth/oubliette provides one, with Kueue admission kept on the host). Most agent workflows need none.
+
+The run supervisor is the per-run trusted process that runs the engine; it is the only place a credential can sit that the sandbox cannot reach."""
+decision = """
+Describe the decision that was made.
+What is the change that we're proposing and/or doing?"""
+consequences = """
+- New integrations ship as catalog tools in the run supervisor image instead of broker code; the broker keeps its built-in capabilities.
+- A pack cannot run its own code with a service's credentials: the executable is catalog-attested and arguments may not name pack or workspace paths. Pack command tasks already share the run supervisor's reach, and nothing here narrows that.
+- A run that declares no services is unchanged, and services start only when a task that needs one dispatches.
+- Resources a service creates outside the run supervisor, such as cluster jobs, are not counted against the run's cost ceiling; the target's quota bounds them.
+- The catalog is new supply-chain surface: adding a tool to the image is a trust decision reviewed like a broker change."""
+
+[[content.alternatives]]
+text = "Manifest-declared services from an image-attested catalog, reached by capability through needs"
+status = "accepted"
+pros = [
+    "No broker release per integration",
+    "Credential held only for runs that need it",
+    "Provenance checkable before any spend",
+    "Works for a whole virtual cluster and for a narrow tool alike",
+]
+cons = [
+    "A catalog format and attestation to maintain",
+    "A second mediated path beside the broker",
+]
+
+[[content.alternatives]]
+text = "Add each integration to the broker as a built-in capability"
+status = "rejected"
+pros = [
+    "One mediated path",
+    "No new manifest surface",
+]
+cons = [
+    "Every integration is a broker release",
+    "The broker holds every credential for every run",
+    "Cannot carry a per-run disposable target such as a virtual cluster",
+]
+
+[[content.alternatives]]
+text = "Declare services in the workflow graph as tasks"
+status = "rejected"
+pros = ["One place to read a workflow"]
+cons = [
+    "A service is long-lived environment, not a unit of work that settles",
+    "Graph shape would depend on credentials and images",
+]
+
+[[content.alternatives]]
+text = "Let the pack ship the service executable"
+status = "rejected"
+pros = ["No catalog needed"]
+cons = ["Pack code would run outside the sandbox with credentials the pack never held"]

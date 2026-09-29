@@ -1,0 +1,25 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-09-28-a652-006"
+title = "Call the per-run engine process the run supervisor"
+status = "queue"
+created = "2026-09-28"
+
+[content]
+description = "Name the per-run process that runs a workload's engine the run supervisor, as RFC-0005 defines it, across docs, CLI text, deploy manifests, image names, and code identifiers, replacing loop pod and loop image. Playbooks do not loop and a local run has no pod, so the old name misdescribes both."
+
+[[content.acceptance_criteria]]
+text = "docs, CLI help, and rendered deploy manifests say run supervisor where they said loop pod or loop image"
+status = "pending"
+category = "changed"
+
+[[content.acceptance_criteria]]
+text = "code identifiers and file names that encode loop pod are renamed; persisted or wire names that change keep reading their old form"
+status = "pending"
+category = "changed"
+
+[[content.acceptance_criteria]]
+text = "deployed resource names change only with a compatibility step the deploy docs describe"
+status = "pending"
+category = "added"

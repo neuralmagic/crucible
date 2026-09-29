@@ -7,7 +7,7 @@ export interface SpinnerProps {
   className?: string;
 }
 
-export function Spinner({ label = 'LOADING', className }: SpinnerProps) {
+export function Spinner({ label = 'Loading', className }: SpinnerProps) {
   return (
     <span
       role="status"

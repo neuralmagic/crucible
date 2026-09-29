@@ -16,6 +16,7 @@ import 'monaco-editor/languages/features/json/register';
 import EditorWorker from 'monaco-editor/editor/editor.worker.js?worker';
 import JsonWorker from 'monaco-editor/languages/features/json/json.worker.js?worker';
 import { monacoTheme, THEME_NAMES } from './theme';
+import { APP_BRANDS } from '../appTheme';
 import { TOML_TOKENS } from './toml';
 import { CEDAR_CONFIGURATION, CEDAR_TOKENS } from './cedar';
 
@@ -53,8 +54,10 @@ monaco.languages.register({ id: 'cedar', extensions: ['.cedar'], aliases: ['Ceda
 monaco.languages.setLanguageConfiguration('cedar', CEDAR_CONFIGURATION);
 monaco.languages.setMonarchTokensProvider('cedar', CEDAR_TOKENS);
 
-for (const app of ['light', 'dark'] as const) {
-  monaco.editor.defineTheme(THEME_NAMES[app], monacoTheme(app));
+for (const brand of APP_BRANDS) {
+  for (const app of ['light', 'dark'] as const) {
+    monaco.editor.defineTheme(THEME_NAMES[brand][app], monacoTheme(brand, app));
+  }
 }
 
 loader.config({ monaco });

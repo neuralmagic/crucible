@@ -47,9 +47,9 @@ export function PlaybookLaunchDetailPage() {
     <>
       <Breadcrumb items={[{ label: 'Playbook runs', to: '/playbook-runs' }, { label: key }]} />
       {detail.isError ? (
-        <Empty title="LAUNCH UNAVAILABLE" description={formatError(detail.error)} />
+        <Empty title="Launch unavailable" description={formatError(detail.error)} />
       ) : detail.isPending ? (
-        <LoadingBlock label="LOADING LAUNCH" />
+        <LoadingBlock label="Loading launch" />
       ) : (
         <LaunchView detail={detail.data} />
       )}
@@ -112,7 +112,9 @@ function LaunchView({ detail }: { detail: LaunchDetail }) {
               {launch.secrets_refusal}
             </p>
             <div>
-              <Button render={<Link to="/secrets" />}>OPEN SECRETS</Button>
+              <Button className="uppercase" render={<Link to="/secrets" />}>
+                Open secrets
+              </Button>
             </div>
           </SectionBody>
         </Section>
@@ -222,7 +224,12 @@ function OriginSection({ detail }: { detail: LaunchDetail }) {
           <MetaRow label="dedupe">{launch.advance_dedupe ? 'advances' : 'untouched'}</MetaRow>
         </dl>
         <div className="mt-3">
-          <Button render={<Link to={relaunchPath(launch.playbook, launch.key)} />}>RELAUNCH</Button>
+          <Button
+            className="uppercase"
+            render={<Link to={relaunchPath(launch.playbook, launch.key)} />}
+          >
+            Relaunch
+          </Button>
         </div>
       </SectionBody>
     </Section>

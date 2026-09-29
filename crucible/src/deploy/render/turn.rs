@@ -808,6 +808,61 @@ mod tests {
         );
     }
 
+    /// A turn pod names the profile's sandbox account for its sandboxes and still runs as the
+    /// loop SA itself, whose token the gateway uses.
+    #[test]
+    fn turn_pod_sandbox_service_account_is_separate_from_its_own() {
+        let profile: DeployProfile = toml::from_str(
+            r#"
+            [cluster]
+            loop_namespace = "autoresearch"
+            rig_namespace = "rig"
+            service_account = "autoresearch-publisher"
+            sandbox_service_account = "autoresearch-sandbox"
+            supervisor_image = "registry.example.com/openshell-supervisor:latest"
+            sandbox_driver = "kubernetes"
+            [image]
+            loop = "ghcr.io/neuralmagic/crucible:latest"
+            pull_secret = "example-pull-secret"
+        "#,
+        )
+        .expect("profile parses");
+        let yaml = render_turn(
+            &profile,
+            &TurnOpts {
+                kind: TurnKind::Rank,
+                name: "crucible-turn-owner-repo-42-abcd".to_string(),
+                issue: "owner/repo#42".to_string(),
+                goal_text: None,
+                repo_url: "https://github.com/owner/repo.git".to_string(),
+                repo_ref: None,
+                sandbox_image: "registry.example.com/epp-sandbox:latest".to_string(),
+                max_cost: 5.0,
+                digests: None,
+                tier: None,
+                gaming_refine_rounds: 1,
+                skip_gaming_review: false,
+                authoritative: false,
+                harness: None,
+                model: None,
+                pack_path: None,
+            },
+        )
+        .expect("render turn");
+        let spec = pod_of(&yaml).spec.expect("spec");
+        assert_eq!(
+            spec.service_account_name.as_deref(),
+            Some("autoresearch-publisher")
+        );
+        let sandbox_sa = spec
+            .containers
+            .iter()
+            .flat_map(|c| c.env.iter().flatten())
+            .find(|e| e.name == "CRUCIBLE_SANDBOX_SERVICE_ACCOUNT")
+            .and_then(|e| e.value.as_deref());
+        assert_eq!(sandbox_sa, Some("autoresearch-sandbox"));
+    }
+
     /// Under `sandbox_driver = "kubernetes"` a turn pod must thread the same `--compute-driver`
     /// flag and `CRUCIBLE_SANDBOX_*` env the loop pod's wrapper gets (`kube.rs`'s
     /// `kubernetes_sandbox_env`), without it the turn's `rank-grounded`/`scope --propose`

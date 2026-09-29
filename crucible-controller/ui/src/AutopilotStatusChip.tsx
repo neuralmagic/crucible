@@ -23,9 +23,9 @@ export function AutopilotStatusChip() {
             />
             <Link
               to="/admin"
-              className="font-mono text-data text-ink-2 underline-offset-2 hover:text-ink hover:underline"
+              className="font-mono text-data text-ink-2 uppercase underline-offset-2 hover:text-ink hover:underline"
             >
-              MANAGE
+              Manage
             </Link>
           </div>
         )}

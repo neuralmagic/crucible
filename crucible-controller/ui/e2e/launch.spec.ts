@@ -70,7 +70,7 @@ test.describe('playbook launch form', () => {
     await ready(page, LAUNCH);
 
     await page.locator('#launch-param-topic').fill('attention');
-    await page.getByRole('button', { name: 'LAUNCH' }).click();
+    await page.getByRole('button', { name: 'Launch' }).click();
 
     await expect(
       page.getByRole('alert').filter({ hasText: 'is already covered by a live run' }),
@@ -82,19 +82,19 @@ test.describe('playbook launch form', () => {
     await stubApi(page);
     await ready(page, LAUNCH);
 
-    await page.getByRole('button', { name: 'ON A SCHEDULE' }).click();
+    await page.getByRole('button', { name: 'On a schedule' }).click();
     await expect(page.locator('#launch-cron-expr')).toHaveValue('0 6 * * MON-FRI');
-    await expect(page.getByRole('button', { name: 'SCHEDULE', exact: true })).toBeDisabled();
+    await expect(page.getByRole('button', { name: 'Schedule', exact: true })).toBeDisabled();
 
     await page.locator('#launch-tz').fill('UTC');
-    await page.getByRole('button', { name: 'PREVIEW FIRINGS' }).click();
+    await page.getByRole('button', { name: 'Preview firings' }).click();
 
     await expect(page.getByText('2026-08-24T06:00:00Z')).toBeVisible();
-    await expect(page.getByRole('button', { name: 'SCHEDULE', exact: true })).toBeEnabled();
+    await expect(page.getByRole('button', { name: 'Schedule', exact: true })).toBeEnabled();
 
     await page.locator('#launch-cron-expr').fill('0 7 * * *');
     await expect(page.getByText('2026-08-24T06:00:00Z')).toBeHidden();
-    await expect(page.getByRole('button', { name: 'SCHEDULE', exact: true })).toBeDisabled();
+    await expect(page.getByRole('button', { name: 'Schedule', exact: true })).toBeDisabled();
   });
 
   test('a relaunch prefills the form from the run snapshot, still editable', async ({ page }) => {
@@ -121,7 +121,7 @@ test.describe('playbook launch form', () => {
     );
     await ready(page, '/playbook-runs');
 
-    await page.getByRole('link', { name: 'RELAUNCH' }).click();
+    await page.getByRole('link', { name: 'Relaunch' }).click();
     await expect(page.locator('#launch-param-topic')).toHaveValue('attention kernels');
   });
 

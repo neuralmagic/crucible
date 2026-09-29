@@ -41,8 +41,8 @@ export function PlaybookDetailPage() {
     setDescription(`Edit of ${detail.data.id}`);
   }, [description, detail.data]);
 
-  if (detail.isPending) return <LoadingBlock label="LOADING PLAYBOOK" />;
-  if (detail.isError) return <Empty title="PLAYBOOK UNAVAILABLE" description={formatError(detail.error)} />;
+  if (detail.isPending) return <LoadingBlock label="Loading playbook" />;
+  if (detail.isError) return <Empty title="Playbook unavailable" description={formatError(detail.error)} />;
 
   const playbook = detail.data;
   const clone = async () => {
@@ -71,8 +71,12 @@ export function PlaybookDetailPage() {
         title={playbook.id}
         description={playbook.description}
         actions={
-          <Button variant="filled" render={<Link to={`/playbooks/${encodeURIComponent(playbook.id)}/launch`} />}>
-            LAUNCH
+          <Button
+            variant="filled"
+            className="uppercase"
+            render={<Link to={`/playbooks/${encodeURIComponent(playbook.id)}/launch`} />}
+          >
+            Launch
           </Button>
         }
       />
@@ -88,7 +92,7 @@ export function PlaybookDetailPage() {
           <div className="flex min-h-[32rem] flex-col gap-3 min-[900px]:flex-row">
             <FileTreePanel paths={paths} active={active} onSelect={setActive} />
             {active === '' ? (
-              <Empty title="NO FILES" />
+              <Empty title="No files" />
             ) : (
               <CodeSurface
                 path={active}
@@ -132,10 +136,11 @@ export function PlaybookDetailPage() {
           <Mono size="data" tone="ink-3">The copy opens in Draft Studio as version 1.</Mono>
           <Button
             variant="filled"
+            className="uppercase"
             disabled={draftId.trim() === '' || description.trim() === '' || create.isPending}
             onClick={() => void clone()}
           >
-            {create.isPending ? 'CLONING…' : 'EDIT A COPY'}
+            {create.isPending ? 'Cloning…' : 'Edit a copy'}
           </Button>
         </FormActions>
       </Section>

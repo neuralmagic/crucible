@@ -23,18 +23,18 @@ test.describe('shares', () => {
     await expect(rows.nth(1)).toContainText('user:kylesayrs');
     await expect(rows.nth(1)).toContainText('expired 2026-01-01T00:00:00Z');
 
-    await expect(page.getByRole('button', { name: 'SHARE', exact: true })).toBeDisabled();
+    await expect(page.getByRole('button', { name: 'Share', exact: true })).toBeDisabled();
     await page.locator('#share-grantee').fill('user:bob');
     await page.locator('#share-role').selectOption('editor');
     await page.locator('#share-until').fill('2026-12-31');
-    await page.getByRole('button', { name: 'SHARE', exact: true }).click();
+    await page.getByRole('button', { name: 'Share', exact: true }).click();
     await expect(rows).toHaveCount(3);
     const bob = rows.filter({ hasText: 'user:bob' });
     await expect(bob).toContainText('editor');
     await expect(bob).toContainText('2026-12-31T23:59:59Z');
     await expect(page.locator('#share-grantee')).toHaveValue('');
 
-    await rows.nth(0).getByRole('button', { name: 'REVOKE' }).click();
+    await rows.nth(0).getByRole('button', { name: 'Revoke' }).click();
     await expect(rows).toHaveCount(2);
     await expect(page.getByTestId('shares')).not.toContainText('team:core');
   });
@@ -55,7 +55,7 @@ test.describe('shares', () => {
     await ready(page, '/playbooks/drafts/studio');
     await page.locator('#share-grantee').fill('user:bob');
     await page.locator('#share-role').selectOption('editor');
-    await page.getByRole('button', { name: 'SHARE', exact: true }).click();
+    await page.getByRole('button', { name: 'Share', exact: true }).click();
     await expect(page.locator('main')).toContainText(
       'an editor share confers playbook_draft:launch, which you do not hold on studio',
     );
@@ -73,7 +73,7 @@ test.describe('team members', () => {
     await page.locator('#member-kind').selectOption('user');
     await page.locator('#member-name').fill('bob');
     await page.locator('#member-role').selectOption('maintainer');
-    await page.getByRole('button', { name: 'ADD MEMBER' }).click();
+    await page.getByRole('button', { name: 'Add member' }).click();
     await expect(rows).toHaveCount(5);
     const bob = rows.filter({ hasText: 'bob' });
     await expect(bob).toContainText('maintainer');
@@ -82,7 +82,7 @@ test.describe('team members', () => {
     await bob.getByRole('combobox', { name: 'Role of bob' }).selectOption('member');
     await expect(bob.getByRole('combobox', { name: 'Role of bob' })).toHaveValue('member');
 
-    await bob.getByRole('button', { name: 'REMOVE' }).click();
+    await bob.getByRole('button', { name: 'Remove' }).click();
     await expect(rows).toHaveCount(4);
     await expect(page.getByTestId('members')).not.toContainText('bob');
   });

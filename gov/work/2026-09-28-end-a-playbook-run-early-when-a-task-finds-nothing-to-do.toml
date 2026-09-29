@@ -1,0 +1,57 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-09-28-a652-003"
+title = "End a playbook run early when a task finds nothing to do"
+status = "active"
+created = "2026-09-28"
+started = "2026-09-28"
+refs = [
+    "RFC-0002:C-PLAYBOOK-LANE",
+    "RFC-0002:C-SETTLED-JOIN",
+    "RFC-0001:C-WIRE",
+]
+
+[content]
+description = """A playbook task that returns "complete": true ends the run: nothing else in the main graph dispatches, undispatched tasks stay unsettled rather than blocked, epilogue tasks still run, and the shutdown outcome is "complete" with the task's reason. [[RFC-0002:C-PLAYBOOK-LANE]] requires this so a scheduled run that finds nothing to do can end quietly and valid, but the executor never read the field, so such a run either ran its whole graph or had to fake a failure."""
+notes = ["Playbook resume does not fold prior results yet, so the [[RFC-0002:C-PLAYBOOK-RESUME]] rule that a folded early completion is not re-dispatched has nothing to attach to here."]
+
+[[content.acceptance_criteria]]
+text = "a passing main-graph playbook task returning boolean `complete: true` stops dispatch, leaves undispatched tasks without a row, and exits `complete` with the task and its optional `reason`"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "the verdict stays valid after early completion unless a required task settled other than passing, including one that failed beside the completion in the same batch"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "epilogue tasks run after an early completion and read `outcome.exit` as `complete`; a settled-join consumer of a completing task is not dispatched"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "a revised task that completes ends its loop without another review, and a mapped instance that completes ends the run once its node folds"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "IR and DSL validation refuse `complete` or `reason` in `emits`"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "`plan run` enables early completion for playbooks only; the scored loop and `--file` plans ignore the field"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "resume classification and the controller's schedule cursor treat `complete` like `finished`"
+status = "done"
+category = "changed"
+
+[[content.acceptance_criteria]]
+text = "executor unit tests, an end-to-end `crucible plan run` test through the real binary, and a controller unit test cover the above"
+status = "done"
+category = "added"

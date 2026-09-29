@@ -75,7 +75,7 @@ function AutopilotIndicator() {
 
   return (
     <div className={MAST_CELL}>
-      <span className="text-ink-3">AUTOPILOT</span>
+      <span className="text-ink-3 uppercase">Autopilot</span>
       <Status status={autopilot.data.enabled ? 'on' : 'off'} tone={autopilot.data.enabled ? 'green' : 'amber'} />
     </div>
   );
@@ -140,7 +140,7 @@ function DatasheetStrip() {
   if (items.length === 0) return null;
 
   return (
-    <dl className="m-0 flex flex-none flex-wrap border-b border-rule-hard bg-sunk font-mono text-label">
+    <dl data-ui="strip" className="m-0 flex flex-none flex-wrap border-b border-rule-hard bg-sunk font-mono text-label">
       {items.map((item) => (
         <div key={item.label} className="flex items-baseline gap-2 border-r border-rule px-3.5 py-[5px]">
           <dt className="uppercase tracking-[0.08em] text-ink-3">{item.label}</dt>
@@ -175,6 +175,7 @@ function RailLink({ to, label, count }: Omit<RailItem, 'icon' | 'autoresearch' |
   return (
     <NavLink
       to={to}
+      data-ui="nav-link"
       className={({ isActive }) =>
         cn(
           'flex items-center justify-between border-l-2 py-1 pr-3.5 pl-3 text-body hover:bg-hi hover:text-ink',
@@ -200,6 +201,7 @@ function RailIcon({ to, label, icon, count }: Omit<RailItem, 'autoresearch' | 'a
       <NavLink
         to={to}
         aria-label={label}
+        data-ui="nav-link"
         className={({ isActive }) =>
           cn(
             'flex h-8 w-full items-center justify-center border-l-2 font-mono text-data hover:bg-hi hover:text-ink',
@@ -328,6 +330,7 @@ function CategoryRail({ collapsed, onToggle }: CategoryRailProps) {
       aria-label="Sections"
       data-testid="category-rail"
       data-collapsed={collapsed ? 'true' : 'false'}
+      data-ui="nav"
       className={cn(
         'flex-none overflow-y-auto border-r border-rule-hard bg-surface pb-6 max-[1100px]:hidden',
         collapsed ? 'w-12' : 'w-52'
@@ -349,7 +352,7 @@ function CategoryRail({ collapsed, onToggle }: CategoryRailProps) {
       {sections.map((section) => (
         <div key={section.heading} className={cn(collapsed && 'flex flex-col border-b border-rule py-1')}>
           {collapsed ? null : (
-            <h3 className="m-0 px-3.5 pt-3.5 pb-[5px] font-mono text-label font-semibold uppercase tracking-[0.1em] text-ink-3">
+            <h3 data-ui="nav-heading" className="m-0 px-3.5 pt-3.5 pb-[5px] font-mono text-label font-semibold uppercase tracking-[0.1em] text-ink-3">
               {section.heading}
             </h3>
           )}
@@ -368,7 +371,7 @@ function Lane({ page }: { page: ReactNode }) {
   if (autoresearch === undefined) {
     return (
       <div className="p-4">
-        <Spinner label="LOADING" />
+        <Spinner label="Loading" />
       </div>
     );
   }
@@ -381,9 +384,10 @@ export function App() {
 
   return (
     <div className="flex h-screen min-h-0 flex-col">
-      <header className="z-20 flex h-[42px] flex-none items-stretch border-b border-rule-hard bg-surface">
+      <header data-ui="masthead" className="z-20 flex h-[42px] flex-none items-stretch border-b border-rule-hard bg-surface">
         <Link
           to="/"
+          data-ui="wordmark"
           className={cn(
             'flex items-center gap-2.5 border-r border-rule px-3.5 hover:bg-hi',
             collapsed ? 'w-12 justify-center px-0' : 'min-w-52'
@@ -391,7 +395,7 @@ export function App() {
         >
           <MoltenLogo fallback={<img src="/favicon.svg" width={18} height={18} alt="" />} />
           {collapsed ? null : (
-            <b className="font-mono text-[14px] font-bold tracking-[0.14em]">CRUCIBLE</b>
+            <b className="font-mono text-wordmark font-bold tracking-brand uppercase">Crucible</b>
           )}
         </Link>
         <div className="flex-1" />
@@ -409,7 +413,7 @@ export function App() {
 
       <div className="flex min-h-0 flex-1">
         <CategoryRail collapsed={collapsed} onToggle={toggleRail} />
-        <main className="min-h-0 min-w-0 flex-1 overflow-y-auto">
+        <main data-ui="main" className="min-h-0 min-w-0 flex-1 overflow-y-auto">
           <Routes>
             <Route path="/" element={<HomePage />} />
             <Route path="/autoresearch" element={<Lane page={<DashboardPage />} />} />
@@ -457,7 +461,7 @@ export function App() {
                     <Suspense
                       fallback={
                         <div className="p-4">
-                          <Spinner label="LOADING EXPLORE" />
+                          <Spinner label="Loading explore" />
                         </div>
                       }
                     >

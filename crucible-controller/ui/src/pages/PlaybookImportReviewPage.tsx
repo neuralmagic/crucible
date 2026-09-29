@@ -170,13 +170,13 @@ export function PlaybookImportReviewPage() {
     }
   };
 
-  if (whoami.isPending || importRow.isPending) return <LoadingBlock label="LOADING THE IMPORT" />;
+  if (whoami.isPending || importRow.isPending) return <LoadingBlock label="Loading the import" />;
   if (importRow.isError || row === null || preview === null) {
     return (
       <>
         <Breadcrumb items={CRUMBS} />
         <Empty
-          title="NO SUCH IMPORT"
+          title="No such import"
           description={importRow.isError ? formatError(importRow.error) : `No import ${id}.`}
         />
       </>
@@ -309,7 +309,7 @@ export function PlaybookImportReviewPage() {
           )}
           <SectionBody>
             {oldSchema.isPending ? (
-              <LoadingBlock label="LOADING THE REGISTERED FORM" />
+              <LoadingBlock label="Loading the registered form" />
             ) : (
               <SchemaDiffView diff={diff} />
             )}
@@ -324,7 +324,7 @@ export function PlaybookImportReviewPage() {
             {registrable ? null : (
               <SectionBody>
                 <Empty
-                  title="NOTHING TO REGISTER"
+                  title="Nothing to register"
                   description="The engine refused this pack's source. Fix it at the ref and propose again; the diagnostics above are its own."
                 />
               </SectionBody>
@@ -332,7 +332,7 @@ export function PlaybookImportReviewPage() {
             {registrable && !admin && (
               <SectionBody>
                 <Empty
-                  title="ADMIN ACCESS REQUIRED"
+                  title="Admin access required"
                   description="Operators propose imports; registering one into the launch registry is an admin's."
                 />
               </SectionBody>
@@ -364,6 +364,7 @@ export function PlaybookImportReviewPage() {
                 <FormActions>
                   <Button
                     variant="filled"
+                    className="uppercase"
                     disabled={
                       idError !== null || description.trim().length === 0 || register.isPending
                     }
@@ -371,7 +372,7 @@ export function PlaybookImportReviewPage() {
                       void handleRegister();
                     }}
                   >
-                    {register.isPending ? 'REGISTERING…' : existing === null ? 'REGISTER' : 'RE-PIN'}
+                    {register.isPending ? 'Registering…' : existing === null ? 'Register' : 'Re-pin'}
                   </Button>
                   <Mono size="data" tone="ink-3">
                     {`pinned at ${row.rev.slice(0, 12)}`}
@@ -397,20 +398,22 @@ export function PlaybookImportReviewPage() {
             </SectionBody>
             <FormActions>
               <Button
+                className="uppercase"
                 disabled={draftId.trim().length === 0 || openDraft.isPending}
                 onClick={() => {
                   void handleOpenDraft();
                 }}
               >
-                {openDraft.isPending ? 'OPENING…' : 'OPEN AS DRAFT'}
+                {openDraft.isPending ? 'Opening…' : 'Open as draft'}
               </Button>
               <Button
+                className="uppercase"
                 disabled={discard.isPending}
                 onClick={() => {
                   void handleDiscard();
                 }}
               >
-                {discard.isPending ? 'DISCARDING…' : 'DISCARD'}
+                {discard.isPending ? 'Discarding…' : 'Discard'}
               </Button>
             </FormActions>
           </Section>

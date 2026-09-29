@@ -139,15 +139,15 @@ export function IssueDetailPage() {
   }
 
   if (!issueKey) {
-    return <Empty title="NO ISSUE KEY" />;
+    return <Empty title="No issue key" />;
   }
 
   if (detail.isError) {
-    return <Empty title="ISSUE UNAVAILABLE" description={formatError(detail.error)} />;
+    return <Empty title="Issue unavailable" description={formatError(detail.error)} />;
   }
 
   if (detail.isPending) {
-    return <LoadingBlock label="LOADING ISSUE" />;
+    return <LoadingBlock label="Loading issue" />;
   }
 
   const { issue } = detail.data;
@@ -202,7 +202,7 @@ export function IssueDetailPage() {
                 <Mono tone="ink-3">Could not load the journey: {formatError(journey.error)}</Mono>
               </SectionBody>
             ) : journey.isPending ? (
-              <LoadingBlock label="LOADING JOURNEY" className="border-b-0" />
+              <LoadingBlock label="Loading journey" className="border-b-0" />
             ) : (
               <SectionBody>
                 <JourneyTimeline steps={journey.data.steps} />
@@ -242,9 +242,10 @@ function StaleCloseCallout({ issue, events }: { issue: IssueDto; events: EventDt
           issue.evidence_url && (
             <Button
               variant="filled"
+              className="uppercase"
               render={<a href={issue.evidence_url} target="_blank" rel="noopener noreferrer" />}
             >
-              REVIEW &amp; CLOSE ↗
+              Review &amp; close ↗
             </Button>
           )
         }
@@ -466,11 +467,12 @@ function RunDetail({ step }: { step: Extract<JourneyStep, { kind: 'run' }> }) {
         </Identifier>
         {step.live && isRunning && (
           <Button
+            className="uppercase"
             onClick={() => {
               setOpen((v) => !v);
             }}
           >
-            {open ? 'HIDE LIVE' : 'LIVE STATUS'}
+            {open ? 'Hide live' : 'Live status'}
           </Button>
         )}
       </DetailRow>
@@ -523,19 +525,19 @@ function SideRail({
                 {canScope ? (
                   <Button
                     variant="filled"
-                    className="w-full"
+                    className="w-full uppercase"
                     render={<Link to={`/issues/${encodeURIComponent(issue.key)}/scope`} />}
                   >
-                    SCOPE THIS ISSUE
+                    Scope this issue
                   </Button>
                 ) : (
                   <Tooltip content={disabledReason(issue.status)}>
                     <Button
                       variant="filled"
-                      className="w-full cursor-default bg-rule-hard"
+                      className="w-full cursor-default bg-rule-hard uppercase"
                       aria-disabled
                     >
-                      SCOPE THIS ISSUE
+                      Scope this issue
                     </Button>
                   </Tooltip>
                 )}
@@ -719,6 +721,7 @@ function PriorityControl({ issue }: { issue: IssueDto }) {
         {editing !== null && editing !== issue.priority && (
           <Button
             variant="filled"
+            className="uppercase"
             disabled={bumpMutation.isPending}
             onClick={() => {
               bumpMutation.mutate(
@@ -733,7 +736,7 @@ function PriorityControl({ issue }: { issue: IssueDto }) {
               );
             }}
           >
-            SAVE
+            Save
           </Button>
         )}
       </div>
@@ -764,12 +767,12 @@ function RerankControl({ issue }: { issue: IssueDto }) {
   return (
     <>
       <Button
-        className="w-full border border-rule-hard"
+        className="w-full border border-rule-hard uppercase"
         onClick={() => {
           setModalOpen(true);
         }}
       >
-        RE-RANK
+        Re-rank
       </Button>
       <AlertDialog.Root
         open={modalOpen}
@@ -791,14 +794,15 @@ function RerankControl({ issue }: { issue: IssueDto }) {
             </AlertDialog.Description>
             <div className="flex justify-end border-t border-rule">
               <Button
+                className="uppercase"
                 onClick={() => {
                   setModalOpen(false);
                 }}
               >
-                CANCEL
+                Cancel
               </Button>
-              <Button variant="filled" disabled={rerankMutation.isPending} onClick={handleConfirm}>
-                RE-RANK
+              <Button variant="filled" className="uppercase" disabled={rerankMutation.isPending} onClick={handleConfirm}>
+                Re-rank
               </Button>
             </div>
           </AlertDialog.Popup>
@@ -821,7 +825,7 @@ function ApproveScenarioControl({ issue }: { issue: IssueDto }) {
     <div>
       <Button
         variant="filled"
-        className="w-full"
+        className="w-full uppercase"
         disabled={approveMutation.isPending}
         onClick={() => {
           approveMutation.mutate(
@@ -830,7 +834,7 @@ function ApproveScenarioControl({ issue }: { issue: IssueDto }) {
           );
         }}
       >
-        APPROVE PACK
+        Approve pack
       </Button>
       {approveMutation.isError && (
         <Mono size="label" tone="red" className="mt-1 block">
@@ -866,7 +870,7 @@ function ParkControls({ issue }: { issue: IssueDto }) {
   if (issue.status === 'parked') {
     return (
       <Button
-        className="w-full border border-rule-hard"
+        className="w-full border border-rule-hard uppercase"
         disabled={unparkMutation.isPending}
         onClick={() => {
           unparkMutation.mutate(
@@ -875,7 +879,7 @@ function ParkControls({ issue }: { issue: IssueDto }) {
           );
         }}
       >
-        UNPARK
+        Unpark
       </Button>
     );
   }
@@ -896,7 +900,7 @@ function ParkControls({ issue }: { issue: IssueDto }) {
           className={cn(INPUT, 'min-w-0 flex-1')}
         />
         <Button
-          className="border border-rule-hard"
+          className="border border-rule-hard uppercase"
           disabled={reason.trim() === '' || parkMutation.isPending}
           onClick={() => {
             parkMutation.mutate(
@@ -910,7 +914,7 @@ function ParkControls({ issue }: { issue: IssueDto }) {
             );
           }}
         >
-          PARK
+          Park
         </Button>
       </div>
     </RailField>
@@ -942,7 +946,7 @@ function RedispatchControl({ issue }: { issue: IssueDto }) {
           className={cn(INPUT, 'min-w-0 flex-1')}
         />
         <Button
-          className="border border-rule-hard"
+          className="border border-rule-hard uppercase"
           disabled={justification.trim() === '' || redispatchMutation.isPending}
           onClick={() => {
             redispatchMutation.mutate(
@@ -959,7 +963,7 @@ function RedispatchControl({ issue }: { issue: IssueDto }) {
             );
           }}
         >
-          RE-RUN
+          Re-run
         </Button>
       </div>
     </RailField>

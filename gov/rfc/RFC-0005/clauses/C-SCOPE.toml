@@ -1,0 +1,19 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-SCOPE"
+title = "Scope"
+kind = "informative"
+status = "active"
+
+[content]
+text = """
+A run supervisor service is a long-running process the run supervisor starts beside the engine to give its tasks a capability they cannot hold themselves. The standing example is cluster access: a connector that creates a disposable virtual cluster for the run and serves its API to the agent, while Kueue admission and host policy stay on the host. A JIRA or forge client is the same shape. Services are opt-in per workload: an autoresearch run that edits a control-plane resource may need a whole virtual cluster, while most agent workflows need no service at all and start none. Sandboxed tasks reach a service only through the OpenShell gateway, and command tasks reach it directly.
+
+
+
+Services belong to the manifest, not to the workflow graph: the graph says what runs and in what order under [[RFC-0002:C-PLAYBOOK-SHAPE]], and a service is part of the environment tasks run in. A task asks for one by naming it in needs under [[RFC-0002:C-PLAYBOOK-CAPS]].
+
+
+
+The broker is the built-in instance of this pattern, with a fixed capability set. This RFC covers services a manifest declares. The boundary it draws is the sandbox: command and evaluate tasks and hooks already share the run supervisor's reach, a service's credentials included."""

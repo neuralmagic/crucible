@@ -146,12 +146,13 @@ export function InboxPage() {
       meta: { pad: 'tight', shrink: true },
       cell: ({ row }) => (
         <Button
+          className="uppercase"
           disabled={unparkMutation.isPending}
           onClick={() => {
             void handleUnpark(row.original.key);
           }}
         >
-          UNPARK
+          Unpark
         </Button>
       ),
     });
@@ -225,23 +226,24 @@ export function InboxPage() {
             )}
             <Button
               variant="filled"
+              className="uppercase"
               disabled={selectedKeys.size === 0 || unparkMutation.isPending}
               onClick={() => {
                 void handleBulkUnpark();
               }}
             >
-              UNPARK SELECTED ({selectedKeys.size})
+              Unpark selected ({selectedKeys.size})
             </Button>
           </ToolbarActions>
         )}
       </Toolbar>
 
-      <QueryState query={issues} noun="INBOX">
+      <QueryState query={issues} noun="inbox">
         <DataTable
           table={table}
           empty={
             <Empty
-              title={searchFilter ? 'NO MATCHING ISSUES' : 'NOTHING PARKED'}
+              title={searchFilter ? 'No matching issues' : 'Nothing parked'}
               description={
                 searchFilter
                   ? 'No parked issues match the search filter.'

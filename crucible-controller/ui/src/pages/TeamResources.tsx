@@ -45,16 +45,16 @@ export function TeamResources({ owner }: { owner: string }) {
   const lists = [playbooks, drafts, schedules, secrets];
   const failed = lists.find((q) => q.isError);
   if (failed !== undefined) {
-    return <Empty title="RESOURCES UNAVAILABLE" description={formatError(failed.error)} />;
+    return <Empty title="Resources unavailable" description={formatError(failed.error)} />;
   }
   if (lists.some((q) => q.isPending)) {
-    return <LoadingBlock label="LOADING RESOURCES" />;
+    return <LoadingBlock label="Loading resources" />;
   }
   return (
     <div data-testid="team-resources">
       <Rows
         title="Playbooks"
-        empty="NO PLAYBOOKS"
+        empty="No playbooks"
         rows={narrow(playbooks.data ?? [], owner, (p) => p.owner).map((p) => ({
           id: p.id,
           label: p.id,
@@ -64,7 +64,7 @@ export function TeamResources({ owner }: { owner: string }) {
       />
       <Rows
         title="Drafts"
-        empty="NO DRAFTS"
+        empty="No drafts"
         rows={narrow(drafts.data ?? [], owner, (d) => d.owner).map((d) => ({
           id: d.id,
           label: d.id,
@@ -74,7 +74,7 @@ export function TeamResources({ owner }: { owner: string }) {
       />
       <Rows
         title="Schedules"
-        empty="NO SCHEDULES"
+        empty="No schedules"
         rows={narrow(schedules.data ?? [], owner, (s) => s.owner_principal).map((s) => ({
           id: s.id,
           label: s.playbook,
@@ -84,7 +84,7 @@ export function TeamResources({ owner }: { owner: string }) {
       />
       <Rows
         title="Secrets"
-        empty="NO SECRETS"
+        empty="No secrets"
         rows={narrow(secrets.data ?? [], owner, (s) => s.owner).map((s) => ({
           id: s.id,
           label: s.name,
@@ -95,7 +95,7 @@ export function TeamResources({ owner }: { owner: string }) {
       {providers.isSuccess ? (
         <Rows
           title="Providers"
-          empty="NO PROVIDERS"
+          empty="No providers"
           rows={narrow(providers.data, owner, (p) => p.owner).map((p) => ({
             id: p.id,
             label: p.id,
