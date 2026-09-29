@@ -932,6 +932,7 @@ mod tests {
                     revise: String::new(),
                     timeout: String::new(),
                     max_rounds: 0,
+                    emits: Vec::new(),
                     history_depth: 0,
                 },
                 PlanTaskWire {
@@ -949,6 +950,7 @@ mod tests {
                     revise: String::new(),
                     timeout: String::new(),
                     max_rounds: 0,
+                    emits: Vec::new(),
                     history_depth: 0,
                 },
             ],

@@ -152,6 +152,10 @@ pub struct PlanTaskWire {
     /// The most rounds `revise` may run, the first included; 0 when the task revises nothing.
     #[serde(default)]
     pub max_rounds: u32,
+    /// The fields the task's output promises, each with its type when the declaration gave one.
+    /// Empty when the task declares none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub emits: Vec<crate::emits::EmitWire>,
     /// How long one attempt may run (`90s`, `10m`, `2h`), empty when the task declares no limit
     /// and only the run's wall-clock ceiling bounds it.
     #[serde(default)]
@@ -842,6 +846,16 @@ mod tests {
                 when: String::new(),
                 revise: "draft".into(),
                 max_rounds: 3,
+                emits: vec![
+                    crate::emits::EmitWire {
+                        field: "targets".into(),
+                        ty: Some(crate::emits::FieldType::List),
+                    },
+                    crate::emits::EmitWire {
+                        field: "note".into(),
+                        ty: None,
+                    },
+                ],
                 timeout: "10m".into(),
                 history_depth: 5,
             }],

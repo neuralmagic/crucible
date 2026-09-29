@@ -17,8 +17,9 @@ pub fn declared_output(task: &Task, result: &TaskResult) -> Option<Value> {
     let object = result.output.as_ref()?.as_object()?;
     Some(Value::Object(
         task.emits
-            .iter()
-            .filter_map(|field| {
+            .fields()
+            .into_iter()
+            .filter_map(|(field, _)| {
                 object
                     .get(&field.0)
                     .cloned()
