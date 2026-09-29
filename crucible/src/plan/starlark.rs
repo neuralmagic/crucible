@@ -29,6 +29,7 @@ use crate::plan::ir::{
     Decider, EngineOp, Isolation, Join, MAX_FANOUT_CEILING, MAX_ROUNDS_CEILING, OutputField,
     OutputRef, ReportDestination, Revise, SlackDestination, Stage, Task, TaskKind, TaskName, When,
 };
+use crate::plan::param::ParamValue;
 use crate::plan::starlark::error::{
     CompileError, MAX_CALLSTACK, MAX_CONSTRUCTED_TASKS, MAX_EVAL_HEAP_BYTES, MAX_EVAL_TICKS,
     MAX_LOAD_MODULES, MAX_NESTING_DEPTH, MAX_PROMPT_BYTES, MAX_SOURCE_BYTES, MAX_TASKS,
@@ -59,7 +60,7 @@ struct CompileContext {
     pack_dir: PathBuf,
     /// Parameter values bound before evaluation, so `param()` is a lookup and the compiled graph
     /// carries no unresolved reference.
-    params: BTreeMap<String, params::ParamValue>,
+    params: BTreeMap<String, ParamValue>,
     /// Which of them a launcher supplied. A defaulted value was written in the pack by the same
     /// author as the prompt around it, so it is not outside text and marking it would be noise.
     supplied: BTreeSet<String>,
@@ -220,14 +221,14 @@ impl CompileContext {
     fn param(&mut self, name: &str) -> Result<Value> {
         match self.params.get(name) {
             Some(value) => Ok(match value {
-                params::ParamValue::String(s) if self.supplied.contains(name) => {
+                ParamValue::String(s) if self.supplied.contains(name) => {
                     Value::External(values::ExternalText::external(s.clone()).0)
                 }
-                params::ParamValue::String(s) => Value::String(s.clone()),
-                params::ParamValue::Int(n) => Value::Int(*n),
-                params::ParamValue::Number(n) => Value::Float(*n),
-                params::ParamValue::Bool(b) => Value::Bool(*b),
-                params::ParamValue::StringList(items) if self.supplied.contains(name) => {
+                ParamValue::String(s) => Value::String(s.clone()),
+                ParamValue::Int(n) => Value::Int(*n),
+                ParamValue::Number(n) => Value::Float(*n),
+                ParamValue::Bool(b) => Value::Bool(*b),
+                ParamValue::StringList(items) if self.supplied.contains(name) => {
                     // A supplied list's items are outside text exactly as a supplied string is.
                     // Marking the string and not the list would leave the obvious way to smuggle
                     // one in.
@@ -240,7 +241,7 @@ impl CompileContext {
                             .collect(),
                     )
                 }
-                params::ParamValue::StringList(items) => {
+                ParamValue::StringList(items) => {
                     Value::List(items.iter().cloned().map(Value::String).collect())
                 }
             }),
@@ -4926,7 +4927,6 @@ workflow(type = "playbook", tasks = [a])
     /// hands every command the same ones without recompiling or rereading a launcher.
     #[test]
     fn the_compiled_workflow_carries_every_bound_parameter_in_its_declared_type() {
-        use crate::plan::starlark::params::ParamValue;
         let pack = temp_pack("params-carried");
         let source = r#"
 params = {
