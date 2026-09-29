@@ -13,7 +13,8 @@ use crate::clock::stamp;
 use crate::event_log::Event;
 use crate::launches::model::OneShotStatus;
 use crate::launches::standing::{
-    self, Claim, Failed, LaunchTrigger, NewStanding, Recorded, Standing, SweepCfg, TriggerFuture,
+    self, Claim, Claimed, Failed, FireError, LaunchTrigger, NewStanding, Recorded, Standing,
+    SweepCfg, TriggerFuture,
 };
 use crate::model::Trigger;
 use anyhow::{Context, Result};
@@ -256,7 +257,7 @@ impl LaunchTrigger for OneShotTrigger {
         tx: &'a mut sqlx::Transaction<'c, sqlx::Postgres>,
         claim: &'a mut Claim,
         now: Timestamp,
-    ) -> TriggerFuture<'a, Result<bool>> {
+    ) -> TriggerFuture<'a, Result<Claimed>> {
         Box::pin(async move {
             let claimed = sqlx::query(
                 "UPDATE playbook_one_shots SET status = 'fired', fired_at = $2
@@ -267,7 +268,11 @@ impl LaunchTrigger for OneShotTrigger {
             .execute(&mut **tx)
             .await
             .context("claim due one-shot")?;
-            Ok(claimed.rows_affected() > 0)
+            Ok(if claimed.rows_affected() > 0 {
+                Claimed::Taken
+            } else {
+                Claimed::Lost
+            })
         })
     }
 
@@ -299,7 +304,7 @@ impl LaunchTrigger for OneShotTrigger {
         &'a self,
         db: &'a Db,
         claim: &'a Claim,
-        message: &'a str,
+        error: &'a FireError,
         _now: Timestamp,
     ) -> TriggerFuture<'a, Result<Failed>> {
         Box::pin(async move {
@@ -312,11 +317,18 @@ impl LaunchTrigger for OneShotTrigger {
             .context("park a failed one-shot")?;
             if updated.rows_affected() > 0 {
                 let key = one_shot_key(&claim.id);
-                let event = Event::now(&key, "pending", "failed", Some(message), Some(&claim.id));
+                let event = Event::now(
+                    &key,
+                    "pending",
+                    "failed",
+                    Some(&error.message),
+                    Some(&claim.id),
+                );
                 crate::event_log::insert(db.pool(), &event).await?;
                 db.events().publish(&event);
             }
             Ok(Failed {
+                counts: true,
                 force_disable: true,
                 announced: true,
             })
