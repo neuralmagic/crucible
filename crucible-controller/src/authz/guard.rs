@@ -11,7 +11,9 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
 fn forbidden(caller: &Caller, needs: &str) -> Response {
-    let who = caller.principals.login().unwrap_or("anonymous");
+    let who = caller
+        .subject_label()
+        .unwrap_or_else(|| caller.principals.login().unwrap_or("anonymous").to_string());
     let body = serde_json::json!({ "error": format!("{who} is not {needs}") });
     (
         StatusCode::FORBIDDEN,

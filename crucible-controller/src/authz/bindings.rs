@@ -866,7 +866,8 @@ pub async fn enforce(State(state): State<ApiState>, req: Request, next: Next) ->
             .into_response();
     };
     let lane = in_autoresearch_lane(binding);
-    if binding.resolver == Resolver::Route && !lane {
+    let acting = req.headers().contains_key(crate::authz::ACT_AS_HEADER);
+    if binding.resolver == Resolver::Route && !lane && !acting {
         return next.run(req).await;
     }
     let (mut parts, body) = req.into_parts();

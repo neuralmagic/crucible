@@ -21,11 +21,12 @@ pub fn autoresearch_lane() -> Resource {
 }
 
 /// Whether the deployment runs the autoresearch lane and `caller` may access it. A controller with
-/// its guard off has no one to tell apart, so its loopback caller holds every lane.
+/// its guard off has no one to tell apart, so its loopback caller holds every lane unless it acts
+/// as a team, which answers for the team.
 #[cfg(feature = "autoresearch")]
 pub fn autoresearch(state: &ApiState, caller: &Caller) -> bool {
     state.autoresearch
-        && (caller.path == crate::identity::auth::AuthPath::Open
+        && ((caller.path == crate::identity::auth::AuthPath::Open && caller.acting_as.is_none())
             || crate::authz::owner::may(
                 state,
                 caller,

@@ -4,7 +4,7 @@
 use crate::api::state::{ApiState, ErrorBody, Json};
 use crate::authz::Caller;
 use crate::authz::action::{Action, ResourceType, Verb};
-use crate::authz::decision::{Decision, DenialBody, Resource, Subject};
+use crate::authz::decision::{Decision, DenialBody, Resource};
 use crate::authz::model::Principal;
 use crate::authz::store;
 use axum::http::StatusCode;
@@ -43,18 +43,19 @@ impl IntoResponse for OwnerRefusal {
     }
 }
 
-/// The owner a creation asks for: the caller's user principal unless the request names another
-/// principal the caller acts as. `self` and `user:self` mean the caller.
+/// The owner a creation asks for: the caller's subject (the team acted as, else the caller's user)
+/// unless the request names another principal the caller acts as. `self` and `user:self` mean the
+/// subject.
 pub fn resolve_owner(caller: &Caller, asked: Option<&str>) -> Result<Principal, OwnerRefusal> {
     if !caller.path.may_own() {
         return Err(OwnerRefusal::CannotOwn);
     }
-    let Some(user) = caller.principals.user() else {
+    let Some(subject) = caller.subject_principal() else {
         return Err(OwnerRefusal::Anonymous);
     };
     let asked = asked.map(str::trim).filter(|a| !a.is_empty());
     let owner = match asked {
-        None | Some("self") | Some("user:self") => user.clone(),
+        None | Some("self") | Some("user:self") => subject,
         Some(raw) => Principal::parse(raw).map_err(|e| OwnerRefusal::Malformed(e.to_string()))?,
     };
     if !owner.may_own() {
@@ -111,7 +112,7 @@ pub async fn decide(
     resource: &Resource,
 ) -> Result<Decision, Denied> {
     let now = jiff::Timestamp::now().as_second();
-    let decision = match Subject::of(&caller.principals, caller.proves_groups()) {
+    let decision = match caller.subject() {
         Some(subject) => state
             .policy
             .current()
@@ -252,7 +253,7 @@ pub fn may(state: &ApiState, caller: &Caller, verb: Verb, resource: &Resource) -
 
 /// The active policy set's decision on `verb`, with the rules that made it, and no audit row.
 pub fn decision(state: &ApiState, caller: &Caller, verb: Verb, resource: &Resource) -> Decision {
-    let Some(subject) = Subject::of(&caller.principals, caller.proves_groups()) else {
+    let Some(subject) = caller.subject() else {
         return Decision::denied("no-principal");
     };
     let action = Action {
@@ -377,6 +378,34 @@ mod tests {
         Caller {
             principals: Principals::new(login, &groups).with_teams(teams),
             path,
+            acting_as: None,
+        }
+    }
+
+    #[test]
+    fn acting_as_a_team_owns_as_that_team_and_nothing_else() {
+        let alice = caller(
+            Some("alice"),
+            &["/groups/x"],
+            &["llm-d", "core"],
+            AuthPath::Session,
+        )
+        .act_as("team:llm-d")
+        .expect("held");
+        let llm_d = Principal::parse("team:llm-d").expect("parses");
+        assert_eq!(resolve_owner(&alice, None).expect("the team"), llm_d);
+        assert_eq!(
+            resolve_owner(&alice, Some("self")).expect("the team"),
+            llm_d
+        );
+        for other in ["user:alice", "team:core", "group:/groups/x"] {
+            assert!(
+                matches!(
+                    resolve_owner(&alice, Some(other)),
+                    Err(OwnerRefusal::NotActedAs { .. })
+                ),
+                "{other}"
+            );
         }
     }
 

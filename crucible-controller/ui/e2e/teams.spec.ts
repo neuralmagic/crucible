@@ -15,6 +15,46 @@ async function switchTo(page: Page, value: string): Promise<void> {
   await page.getByTestId('owner-switcher-menu').locator(`[data-value="${value}"]`).click();
 }
 
+test.describe('acting as a team', () => {
+  test('choosing a team acts as it: every request names it and the rail follows its lanes', async ({ page }) => {
+    const named: (string | undefined)[] = [];
+    page.on('request', (req) => {
+      if (new URL(req.url()).pathname === '/api/whoami') named.push(req.headers()['x-crucible-act-as']);
+    });
+    await stubApi(page);
+    await ready(page, '/');
+    const rail = page.getByTestId('category-rail');
+    await expect(rail.getByRole('link', { name: 'Dashboard' })).toBeVisible();
+    await expect(page.getByTestId('owner-switcher')).not.toHaveAttribute('data-acting-as');
+
+    await switchTo(page, 'team:llm-d');
+    await expect(page.getByTestId('owner-switcher')).toHaveAttribute('data-acting-as', 'team:llm-d');
+    await expect(page.getByTestId('owner-switcher')).toContainText('Acting as');
+    await expect(rail.getByRole('link', { name: 'Dashboard' })).toHaveCount(0);
+    expect(named.at(-1)).toBe('team:llm-d');
+
+    await switchTo(page, 'user:wren');
+    await expect(rail.getByRole('link', { name: 'Dashboard' })).toBeVisible();
+    await expect(page.getByTestId('owner-switcher')).not.toHaveAttribute('data-acting-as');
+    expect(named.at(-1)).toBeUndefined();
+  });
+
+  test('a stored team the controller refuses drops back to every owner and says why', async ({ page }) => {
+    await page.addInitScript(() => {
+      window.localStorage.setItem('crucible.owner.context', 'team:ghost');
+    });
+    await stubApi(page);
+    await page.goto('/');
+    await expect(page.getByTestId('owner-switcher')).toContainText('All');
+    await expect(page.getByTestId('owner-switcher')).not.toHaveAttribute('data-acting-as');
+    await expect(page.getByTestId('category-rail').getByRole('link', { name: 'Dashboard' })).toBeVisible();
+    await expect(page.getByTestId('act-as-refused')).toHaveText('you are not a member of team:ghost');
+
+    await switchTo(page, 'user:wren');
+    await expect(page.getByTestId('act-as-refused')).toHaveCount(0);
+  });
+});
+
 test.describe('owner context', () => {
   test('the switcher lists the user and each team, and the lists follow it', async ({ page }) => {
     await stubApi(page);

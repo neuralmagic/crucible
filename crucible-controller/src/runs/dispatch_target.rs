@@ -393,6 +393,7 @@ impl crate::runs::clusters::PersonalKubeconfigs for RegistryKubeconfigs {
                 owner: &owner,
                 action: crate::secrets::AuditAction::HubRead,
                 actor: None,
+                subject: None,
                 detail: Some(&format!("dispatch target resolved at version {version}")),
             },
         )

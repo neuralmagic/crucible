@@ -435,10 +435,10 @@ const TEAMS = [
     slug: 'llm-d',
     display_name: 'LLM-D',
     members: [
-      { kind: 'user', member: 'wren', role: 'owner', since: '2026-09-13T00:00:00Z', added_by: 'wren' },
-      { kind: 'group', member: '/groups/platform', role: 'maintainer', since: '2026-09-13T00:00:00Z', added_by: 'wren' },
-      { kind: 'team', member: 'core', role: 'member', since: '2026-09-13T00:00:00Z', added_by: 'wren' },
-      { kind: 'rule', member: 'email-domain:example.com', role: 'member', since: '2026-09-13T00:00:00Z', added_by: null },
+      { kind: 'user', member: 'wren', role: 'owner', since: '2026-09-13T00:00:00Z', added_by: 'wren', signed_in: true },
+      { kind: 'group', member: '/groups/platform', role: 'maintainer', since: '2026-09-13T00:00:00Z', added_by: 'wren', signed_in: false },
+      { kind: 'team', member: 'core', role: 'member', since: '2026-09-13T00:00:00Z', added_by: 'wren', signed_in: false },
+      { kind: 'rule', member: 'email-domain:example.com', role: 'member', since: '2026-09-13T00:00:00Z', added_by: null, signed_in: false },
     ],
     my_role: 'owner',
     reachable: true,
@@ -449,7 +449,7 @@ const TEAMS = [
   {
     slug: 'platform-administrators',
     display_name: 'Platform administrators',
-    members: [{ kind: 'user', member: 'wren', role: 'owner', since: '2026-09-13T00:00:00Z', added_by: null }],
+    members: [{ kind: 'user', member: 'wren', role: 'owner', since: '2026-09-13T00:00:00Z', added_by: null, signed_in: true }],
     my_role: 'owner',
     reachable: true,
     created_at: '2026-09-13T00:00:00Z',
@@ -907,6 +907,7 @@ export const ROUTES: Record<string, Json> = {
     mode: 'native',
     downgraded: false,
     proves_groups: true,
+    acting_as: null,
     entitlements: ['autoresearch'],
     teams: [
       { team: 'llm-d', role: 'maintainer', via: [{ kind: 'group', group: '/groups/platform', role: 'maintainer' }] },
@@ -1027,6 +1028,23 @@ export async function stubApi(page: Page): Promise<void> {
       if (path === '/api/events') {
         return route.fulfill({ status: 200, contentType: 'text/event-stream', body: '' });
       }
+      // Acting as a team: whoami answers for the team the header names, and a team the caller
+      // does not hold is refused with the marker the client recovers from.
+      const actingAs = route.request().headers()['x-crucible-act-as'];
+      if (path === '/api/whoami' && actingAs !== undefined) {
+        const whoami = ROUTES['/api/whoami'] as { teams: { team: string }[] };
+        const slug = actingAs.replace(/^team:/, '');
+        if (!actingAs.startsWith('team:') || !whoami.teams.some((t) => t.team === slug)) {
+          return route.fulfill({
+            status: 403,
+            contentType: 'application/json',
+            headers: { 'x-crucible-act-as': 'refused' },
+            body: JSON.stringify({ error: `you are not a member of ${actingAs}` }),
+          });
+        }
+        const body = { ...whoami, acting_as: slug, role: 'viewer', admin: false, entitlements: [] };
+        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
+      }
       // Shares on the studio draft and the llm-d member list are the two stateful stubs the
       // editors need: what is granted, changed, or removed is what the next read serves.
       const share = /^\/api\/playbook-drafts\/studio\/shares\/(.+)$/.exec(path);
@@ -1059,7 +1077,7 @@ export async function stubApi(page: Page): Promise<void> {
         const members = Array.isArray(body.members) ? (body.members as Record<string, unknown>[]) : [];
         team = {
           ...team,
-          members: members.map((m) => ({ ...m, since: '2026-09-14T00:00:00Z', added_by: 'wren' })),
+          members: members.map((m) => ({ ...m, since: '2026-09-14T00:00:00Z', added_by: 'wren', signed_in: m.kind === 'user' })),
         };
         return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(team) });
       }

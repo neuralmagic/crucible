@@ -6,7 +6,7 @@
 
 use crate::authz::action::{Action, ResourceType, Verb};
 use crate::authz::decision::{Decision, Resource, Subject};
-use crate::authz::model::{Principal, Principals};
+use crate::authz::model::{Principal, Principals, TeamRole};
 use crate::authz::policy::ActivePolicy;
 use crate::authz::store::{self, AuditEvent};
 use anyhow::{Context, Result};
@@ -20,7 +20,7 @@ pub async fn subject_for_owner(
     groups: Option<&serde_json::Value>,
 ) -> Result<Subject> {
     match owner {
-        Principal::Team(slug) => Ok(Subject::team_firing(slug)),
+        Principal::Team(slug) => Ok(Subject::team(slug, TeamRole::Maintainer, true)),
         Principal::User(login) => {
             let groups: Vec<String> = groups
                 .cloned()

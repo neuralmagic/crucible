@@ -41,7 +41,7 @@ pub(crate) async fn start(
     let Some(Extension(session)) = session.filter(|_| caller.path == AuthPath::Session) else {
         return unprocessable("viewing as another user needs a signed-in browser session");
     };
-    let Some(by) = caller.principals.login().map(str::to_string) else {
+    let Some(by) = caller.actor_principals().login().map(str::to_string) else {
         return unprocessable("viewing as another user needs a signed-in browser session");
     };
     let view = match snapshot(state.db.pool(), &by, &body.login).await {

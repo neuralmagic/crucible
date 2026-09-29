@@ -81,9 +81,13 @@ pub(crate) struct Whoami {
     /// Whether the presenting credential proves groups (RFC-0003 C-CREDENTIAL-PARITY). False on
     /// a static token, a cluster token, or a downgraded session, whatever `groups` holds.
     proves_groups: bool,
-    /// The teams the caller reaches, with the role held and how.
+    /// The teams the caller reaches in their own right, with the role held and how: every team
+    /// they may act as, whichever one this request acts as.
     teams: Vec<crate::authz::api::TeamMembershipDto>,
-    /// The lanes the caller may see and use.
+    /// The team this request acts as (RFC-0003 C-ACT-AS). `role`, `admin` and `entitlements`
+    /// answer for it while set.
+    acting_as: Option<crate::authz::model::TeamSlug>,
+    /// The lanes the subject may see and use.
     entitlements: Vec<crate::authz::entitlement::Entitlement>,
     /// Set while a platform administrator's session views as this user.
     impersonation: Option<crate::identity::session::Impersonation>,
@@ -102,8 +106,8 @@ pub(crate) async fn whoami(
     impersonation: Option<axum::Extension<crate::identity::session::Impersonation>>,
 ) -> Json<Whoami> {
     let role = caller.role();
-    let teams = caller
-        .principals
+    let actor = caller.actor_principals();
+    let teams = actor
         .teams()
         .iter()
         .map(|(team, membership)| crate::authz::api::TeamMembershipDto {
@@ -112,18 +116,15 @@ pub(crate) async fn whoami(
         })
         .collect();
     Json(Whoami {
-        user: caller.principals.login().map(str::to_string),
+        user: actor.login().map(str::to_string),
         admin: role == crate::identity::auth::Role::Admin,
         role,
-        groups: caller
-            .principals
-            .group_paths()
-            .map(str::to_string)
-            .collect(),
+        groups: actor.group_paths().map(str::to_string).collect(),
         mode: state.auth_mode,
         downgraded: !caller.path.holds_roles(),
         proves_groups: caller.path.carries_groups(),
         teams,
+        acting_as: caller.acting_as.as_ref().map(|acting| acting.team.clone()),
         entitlements: crate::authz::entitlement::of(&state, &caller),
         impersonation: impersonation.map(|axum::Extension(view)| view),
     })
