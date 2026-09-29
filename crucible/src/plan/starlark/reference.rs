@@ -587,8 +587,10 @@ pub fn reserved_inputs() -> Vec<Reserved> {
             OUTCOME_INPUT,
             "object",
             "How the main graph ended and what each of its tasks settled as, as \
-             `{\"exit\": str, \"tasks\": {name: {\"status\", \"note\"}}}`, in an epilogue \
-             task only.",
+             `{\"exit\": str, \"tasks\": {name: {\"status\", \"note\", \"output\", \"files\"}}}`, \
+             in an epilogue task only: each entry is what a `settled` join receives, \
+             `per_instance` included for a mapped task. `files` says whether that task's declared \
+             files, passing or failing, are staged under `inputs/<name>/`.",
         ),
         Reserved::new(
             REVISION_INPUT,
