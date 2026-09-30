@@ -102,6 +102,7 @@ impl ShellRunner {
                 harness,
                 model,
                 effort,
+                sandbox: _,
             } => {
                 let Some(agent_cmd) = &self.agent_cmd else {
                     return Attempt::failed(
@@ -793,6 +794,7 @@ mod tests {
                 harness: None,
                 model: None,
                 effort: None,
+                sandbox: None,
             },
             depends_on: vec![],
             session: None,
@@ -824,6 +826,7 @@ mod tests {
                 harness: Some("hermes".into()),
                 model: Some("codex".into()),
                 effort: None,
+                sandbox: None,
             },
             depends_on: vec![],
             session: None,
@@ -865,6 +868,7 @@ mod tests {
                 harness: None,
                 model: None,
                 effort: None,
+                sandbox: None,
             },
             depends_on: vec![],
             session: None,
@@ -941,6 +945,7 @@ mod tests {
                 harness: None,
                 model: None,
                 effort: None,
+                sandbox: None,
             },
             depends_on: vec![],
             session: None,

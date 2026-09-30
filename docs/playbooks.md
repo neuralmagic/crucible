@@ -194,6 +194,24 @@ The harness is `claude`, `codex`, `opencode`, `pi` or `hermes`. `--harness` and 
 `agent(..., harness = "codex", model = "...")`. A real run spends money, which is what
 `--max-cost` is for.
 
+Under `openshell`, a task can also run in its own sandbox. Declare it in the manifest and name
+it on the task:
+
+```toml
+[agent.sandbox.go]
+image = "ghcr.io/acme/sandbox-go@sha256:..."
+secrets = []                                  # [[secret]] names; empty passes none in
+endpoints = ["proxy.golang.org:443:read-only"]
+```
+
+```python
+analyze = agent(name = "analyze", prompt = "...", sandbox = "go")
+```
+
+The turn starts from that image, adds those endpoints to `[agent.openshell]`'s, and receives
+only the declared secrets the sandbox lists. A task without `sandbox` runs in `sandbox_image`
+with every secret the registry lets the agent hold.
+
 ## Parameters
 
 A pack that takes input declares a `params` block as the first statement of `workflow.star`:

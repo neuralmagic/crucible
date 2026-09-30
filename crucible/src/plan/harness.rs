@@ -684,6 +684,35 @@ fn prepare_and_run(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Att
     }
 }
 
+/// Point a turn at its named sandbox: the profile's image, its endpoints added to the pack's
+/// egress, and every declared secret it does not list removed from the sandbox env.
+fn enter_sandbox(args: &mut Args, name: &str) -> Result<(), String> {
+    let Some(profile) = args.sandboxes.get(name).cloned() else {
+        return Err(format!(
+            "task names sandbox {name:?}, which the manifest does not declare"
+        ));
+    };
+    let kept: std::collections::BTreeSet<&str> = profile
+        .secrets
+        .iter()
+        .filter_map(|secret| args.secret_env.get(secret).map(String::as_str))
+        .collect();
+    let withheld: std::collections::BTreeSet<String> = args
+        .secret_env
+        .values()
+        .filter(|env| !kept.contains(env.as_str()))
+        .cloned()
+        .collect();
+    args.env.retain(|(key, _)| !withheld.contains(key));
+    args.sandbox_image = Some(profile.image);
+    for endpoint in profile.endpoints {
+        if !args.openshell.endpoints.contains(&endpoint) {
+            args.openshell.endpoints.push(endpoint);
+        }
+    }
+    Ok(())
+}
+
 /// One task against a specific workspace. `Command` tasks go to the shell runner; `Agent`
 /// tasks run through the real [`crate::agent::run_turn`] with the task's knob overrides.
 fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
@@ -692,13 +721,14 @@ fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
         inputs,
         deadline,
     } = job;
-    let (prompt, harness, model, effort) = match &task.task {
+    let (prompt, harness, model, effort, sandbox) = match &task.task {
         TaskKind::Agent {
             prompt,
             harness,
             model,
             effort,
-        } => (prompt, harness, model, effort),
+            sandbox,
+        } => (prompt, harness, model, effort, sandbox),
         TaskKind::Command { .. }
         | TaskKind::Evaluate { .. }
         | TaskKind::Route { .. }
@@ -747,6 +777,11 @@ fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
                 return Attempt::failed(0.0, format!("task names unknown effort {e:?}: {err}"));
             }
         }
+    }
+    if let Some(name) = sandbox
+        && let Err(note) = enter_sandbox(&mut args, name)
+    {
+        return Attempt::failed(0.0, note);
     }
     if let Err(e) = crate::cli::workspace::install_toolbox(
         paths,
@@ -881,6 +916,134 @@ fn task_worktree_name(name: &TaskName) -> String {
 mod tests {
     use crate::plan::exec::{ExecCfg, PlanExit, Substrate, TaskStatus};
     use crate::plan::harness::*;
+
+    fn sandboxed_args() -> Args {
+        use clap::Parser;
+        let mut args = crate::cli::Cli::parse_from(["crucible"]).run;
+        args.sandbox_image = Some("ghcr.io/acme/default@sha256:aa".into());
+        args.env = vec![
+            ("JIRA_TOKEN".into(), "jira".into()),
+            ("REGISTRY_TOKEN".into(), "registry".into()),
+            ("CLOUD_ML_REGION".into(), "us-east5".into()),
+        ];
+        args.secret_env = [
+            ("jira".to_string(), "JIRA_TOKEN".to_string()),
+            ("registry".to_string(), "REGISTRY_TOKEN".to_string()),
+        ]
+        .into();
+        args.openshell.endpoints = vec!["github.com:443:full".into()];
+        args.sandboxes = [
+            (
+                "go".to_string(),
+                crate::manifest::SandboxProfile {
+                    image: "ghcr.io/acme/sandbox-go@sha256:bb".into(),
+                    secrets: vec!["registry".into()],
+                    endpoints: vec![
+                        "proxy.golang.org:443:read-only".into(),
+                        "github.com:443:full".into(),
+                    ],
+                },
+            ),
+            (
+                "bare".to_string(),
+                crate::manifest::SandboxProfile {
+                    image: "ghcr.io/acme/bare@sha256:cc".into(),
+                    ..Default::default()
+                },
+            ),
+        ]
+        .into();
+        args
+    }
+
+    fn env_keys(args: &Args) -> Vec<&str> {
+        args.env.iter().map(|(k, _)| k.as_str()).collect()
+    }
+
+    #[test]
+    fn a_named_sandbox_sets_the_image_and_keeps_only_its_secrets() {
+        let mut args = sandboxed_args();
+        enter_sandbox(&mut args, "go").unwrap();
+        assert_eq!(
+            args.sandbox_image.as_deref(),
+            Some("ghcr.io/acme/sandbox-go@sha256:bb")
+        );
+        assert_eq!(env_keys(&args), ["REGISTRY_TOKEN", "CLOUD_ML_REGION"]);
+        assert_eq!(
+            args.openshell.endpoints,
+            ["github.com:443:full", "proxy.golang.org:443:read-only"],
+            "added once, after the pack's own"
+        );
+    }
+
+    #[test]
+    fn a_sandbox_that_lists_no_secret_gets_none_but_keeps_the_rest_of_the_env() {
+        let mut args = sandboxed_args();
+        enter_sandbox(&mut args, "bare").unwrap();
+        assert_eq!(env_keys(&args), ["CLOUD_ML_REGION"]);
+        assert_eq!(args.openshell.endpoints, ["github.com:443:full"]);
+    }
+
+    #[test]
+    fn an_undeclared_sandbox_is_a_failed_attempt_not_the_default_one() {
+        let mut args = sandboxed_args();
+        let err = enter_sandbox(&mut args, "rust").unwrap_err();
+        assert!(err.contains("\"rust\""), "{err}");
+        assert_eq!(
+            args.sandbox_image.as_deref(),
+            Some("ghcr.io/acme/default@sha256:aa"),
+            "nothing changed"
+        );
+        assert_eq!(env_keys(&args).len(), 3);
+    }
+
+    #[test]
+    fn an_agent_task_naming_an_undeclared_sandbox_is_a_measured_failure() {
+        let t = crate::plan::ir::Task {
+            name: "a".into(),
+            task: TaskKind::Agent {
+                prompt: "go".into(),
+                harness: None,
+                model: None,
+                effort: None,
+                sandbox: Some("rust".into()),
+            },
+            depends_on: vec![],
+            session: None,
+            needs: "any".into(),
+            required: true,
+            isolation: None,
+            join: Join::default(),
+            stage: Stage::Iteration,
+            emits: crate::plan::ir::Emits::default(),
+            emits_files: Vec::new(),
+            over: None,
+            max_fanout: None,
+            when: None,
+            revise: None,
+            timeout: None,
+            history: None,
+        };
+        let mut runner = HarnessRunner {
+            args: sandboxed_args(),
+            paths: crate::args::Paths::for_manifest(
+                std::env::temp_dir(),
+                std::env::temp_dir(),
+                &std::env::temp_dir(),
+                None,
+            ),
+            commit_per_task: false,
+            captured_bytes: AtomicU64::new(0),
+            staged: Default::default(),
+        };
+        let a = runner.run(&t, 1, &BTreeMap::new(), None);
+        match a.outcome {
+            AttemptOutcome::Fail { note, .. } => {
+                assert!(note.contains("sandbox \"rust\""), "{note}");
+            }
+            _ => panic!("expected a measured failure"),
+        }
+    }
 
     /// The executor's own transitions are in its table; a test that trips one fails here.
     fn execute(
@@ -2884,6 +3047,7 @@ workflow(type = "playbook", tasks = [analyze, implement, report])
                 harness: Some("not-a-harness".into()),
                 model: None,
                 effort: None,
+                sandbox: None,
             },
             depends_on: vec![],
             session: None,

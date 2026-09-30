@@ -71,6 +71,19 @@ pub enum ManifestError {
         "[agent.broker].bin is required when the broker is enabled (the domain's broker binary)"
     )]
     BrokerBinRequired,
+    #[error("[agent.sandbox] name {name:?} must be 1..=64 characters of [a-z0-9_-]")]
+    SandboxName { name: String },
+    #[error("[agent.sandbox.{name}] needs a non-empty image")]
+    SandboxImage { name: String },
+    #[error(
+        "[agent.sandbox.{name}] names secret {secret:?}, which no [[secret]] declares with an env \
+         projection; only an env-projected secret can reach a sandbox"
+    )]
+    SandboxSecret { name: String, secret: String },
+    #[error("task {task:?} runs in sandbox {name:?}, which no [agent.sandbox.{name}] declares")]
+    UnknownSandbox { task: String, name: String },
+    #[error("task {task:?} names a sandbox, which only the openshell backend runs")]
+    SandboxNeedsOpenshell { task: String },
     #[error("manifest has no [judge] (task mode)")]
     NoJudge,
     #[error("{table} requires a [judge]: a task manifest has no scores to rank, grade, or seed")]
@@ -726,6 +739,76 @@ pub struct AgentCfg {
     /// The loop-pod provisioning broker. Off unless a domain opts in.
     #[serde(default)]
     pub broker: BrokerCfg,
+    /// Named sandboxes, by `[agent.sandbox.<name>]`. An `agent(sandbox = "<name>")` task runs in
+    /// that sandbox instead of the defaults above.
+    #[serde(default)]
+    pub sandbox: BTreeMap<String, SandboxProfile>,
+}
+
+/// One `[agent.sandbox.<name>]`: the image a task's sandbox starts from, the declared secrets
+/// passed into it (every other declared secret is withheld), and egress endpoints added to
+/// `[agent.openshell]`'s.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxProfile {
+    pub image: String,
+    /// `[[secret]]` names. Empty passes no declared secret in.
+    #[serde(default)]
+    pub secrets: Vec<String>,
+    #[serde(default)]
+    pub endpoints: Vec<String>,
+}
+
+fn validate_sandboxes(agent: &AgentCfg, secrets: &[SecretDecl]) -> Result<(), ManifestError> {
+    for (name, profile) in &agent.sandbox {
+        let valid_name = !name.is_empty()
+            && name.len() <= 64
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_');
+        if !valid_name {
+            return Err(ManifestError::SandboxName { name: name.clone() });
+        }
+        if profile.image.trim().is_empty() {
+            return Err(ManifestError::SandboxImage { name: name.clone() });
+        }
+        for secret in &profile.secrets {
+            let projected = secrets.iter().any(|decl| {
+                decl.name == *secret && decl.env.as_deref().is_some_and(|e| !e.trim().is_empty())
+            });
+            if !projected {
+                return Err(ManifestError::SandboxSecret {
+                    name: name.clone(),
+                    secret: secret.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_task_sandboxes(agent: &AgentCfg, workflow: &WorkflowCfg) -> Result<(), ManifestError> {
+    for task in &workflow.tasks {
+        let crate::plan::ir::TaskKind::Agent {
+            sandbox: Some(name),
+            ..
+        } = &task.task
+        else {
+            continue;
+        };
+        if agent.backend != AgentBackend::Openshell {
+            return Err(ManifestError::SandboxNeedsOpenshell {
+                task: task.name.0.clone(),
+            });
+        }
+        if !agent.sandbox.contains_key(name) {
+            return Err(ManifestError::UnknownSandbox {
+                task: task.name.0.clone(),
+                name: name.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn default_model() -> String {
@@ -794,9 +877,11 @@ fn validate_common(c: CommonCfg<'_>) -> Result<()> {
     validate_carry_forward(&c.workspace.carry_forward)?;
     validate_artifacts(&c.workspace.artifact)?;
     validate_codex_api_key(c.agent.codex.api_key.as_deref())?;
+    validate_sandboxes(c.agent, c.secrets)?;
     search::validate_search(c.search)?;
     if let Some(w) = c.workflow {
         w.validate()?;
+        validate_task_sandboxes(c.agent, w)?;
     }
     match c.judge {
         Some(judge) => {
@@ -2423,6 +2508,137 @@ mod tests {
         assert_eq!(m.secrets[0].env.as_deref(), Some("GH_TOKEN"));
         assert_eq!(m.secrets[1].kind, SecretKind::RegistryAuthfile);
         assert!(m.validate().is_ok());
+    }
+
+    fn sandbox_manifest(backend: &str, profile: &str, task_sandbox: &str) -> Manifest {
+        toml::from_str::<Manifest>(&format!(
+            r#"
+            [repo]
+            path = "."
+            [agent]
+            backend = "{backend}"
+            agent_cmd = "true"
+            goal = "g"
+            {profile}
+            [[secret]]
+            name = "jira"
+            kind = "opaque"
+            env = "JIRA_TOKEN"
+            [[secret]]
+            name = "registry"
+            kind = "registry_authfile"
+            path = "/etc/registry/auth.json"
+            [workflow]
+            type = "playbook"
+            [[workflow.task]]
+            name = "a"
+            kind = "agent"
+            prompt = "p"
+            {task_sandbox}
+        "#
+        ))
+        .expect("parses")
+    }
+
+    const GO_PROFILE: &str = r#"
+            [agent.sandbox.go]
+            image = "ghcr.io/acme/sandbox-go@sha256:bb"
+            secrets = ["jira"]
+            endpoints = ["proxy.golang.org:443:read-only"]
+    "#;
+
+    #[test]
+    fn a_task_runs_in_a_declared_sandbox() {
+        let m = sandbox_manifest("openshell", GO_PROFILE, r#"sandbox = "go""#);
+        m.validate().expect("valid");
+        let go = &m.agent.sandbox["go"];
+        assert_eq!(go.image, "ghcr.io/acme/sandbox-go@sha256:bb");
+        assert_eq!(go.secrets, ["jira"]);
+        assert_eq!(go.endpoints, ["proxy.golang.org:443:read-only"]);
+        let crate::plan::ir::TaskKind::Agent { sandbox, .. } =
+            &m.workflow.as_ref().unwrap().tasks[0].task
+        else {
+            panic!("an agent task");
+        };
+        assert_eq!(sandbox.as_deref(), Some("go"));
+    }
+
+    #[test]
+    fn a_sandbox_is_optional_for_every_task() {
+        sandbox_manifest("command", "", "")
+            .validate()
+            .expect("no sandbox, any backend");
+        sandbox_manifest("openshell", GO_PROFILE, "")
+            .validate()
+            .expect("a declared sandbox nobody uses is fine");
+    }
+
+    #[test]
+    fn a_malformed_sandbox_fails_validation() {
+        for (profile, expected) in [
+            (
+                "[agent.sandbox.Go]\nimage = \"i\"",
+                "must be 1..=64 characters of [a-z0-9_-]",
+            ),
+            (
+                "[agent.sandbox.go]\nimage = \" \"",
+                "needs a non-empty image",
+            ),
+            (
+                "[agent.sandbox.go]\nimage = \"i\"\nsecrets = [\"github\"]",
+                "names secret \"github\"",
+            ),
+            (
+                "[agent.sandbox.go]\nimage = \"i\"\nsecrets = [\"registry\"]",
+                "names secret \"registry\"",
+            ),
+        ] {
+            let err = sandbox_manifest("openshell", profile, "")
+                .validate()
+                .expect_err(profile);
+            assert!(err.to_string().contains(expected), "{profile}: {err:#}");
+        }
+    }
+
+    #[test]
+    fn a_sandbox_profile_refuses_unknown_keys() {
+        let err = toml::from_str::<Manifest>(
+            r#"
+            [repo]
+            path = "."
+            [agent]
+            goal = "g"
+            [agent.sandbox.go]
+            image = "i"
+            secret = ["jira"]
+        "#,
+        )
+        .err()
+        .expect("a typo in a secret list must not silently pass every secret");
+        assert!(err.to_string().contains("secret"), "{err:#}");
+    }
+
+    #[test]
+    fn a_task_naming_an_undeclared_sandbox_fails_validation() {
+        let err = sandbox_manifest("openshell", GO_PROFILE, r#"sandbox = "rust""#)
+            .validate()
+            .expect_err("undeclared");
+        assert!(
+            err.to_string()
+                .contains(r#"task "a" runs in sandbox "rust", which no [agent.sandbox.rust]"#),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn a_sandbox_needs_the_openshell_backend() {
+        let err = sandbox_manifest("command", GO_PROFILE, r#"sandbox = "go""#)
+            .validate()
+            .expect_err("no sandbox to run in");
+        assert!(
+            err.to_string().contains("only the openshell backend runs"),
+            "{err:#}"
+        );
     }
 
     #[test]

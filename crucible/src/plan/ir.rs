@@ -300,8 +300,9 @@ impl Join {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TaskKind {
-    /// An agent turn. Harness, model family, and effort are per-task knobs: the openshell
-    /// heterogeneity axis. `None` inherits the manifest's `[agent]` defaults.
+    /// An agent turn. Harness, model family, effort, and sandbox are per-task knobs: the
+    /// openshell heterogeneity axis. `None` inherits the manifest's `[agent]` defaults; `sandbox`
+    /// names an `[agent.sandbox.<name>]`.
     Agent {
         prompt: String,
         #[serde(default)]
@@ -310,6 +311,8 @@ pub enum TaskKind {
         model: Option<String>,
         #[serde(default)]
         effort: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sandbox: Option<String>,
     },
     /// A plan-authored command. Trusted scripts require frozen manifest injects.
     Command { command: String },
@@ -1726,6 +1729,7 @@ mod tests {
                 harness: None,
                 model: None,
                 effort: None,
+                sandbox: None,
             },
             depends_on: deps.iter().map(|d| (*d).into()).collect(),
             session: None,

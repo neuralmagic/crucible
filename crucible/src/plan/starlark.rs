@@ -520,6 +520,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "harness",
             "model",
             "effort",
+            "sandbox",
             "session",
             "emits",
             "depends_on",
@@ -546,6 +547,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "harness",
             "model",
             "effort",
+            "sandbox",
             "session",
             "emits",
             "depends_on",
@@ -748,6 +750,7 @@ fn constructor(
             let mut harness = take_optional_string(&mut named, "harness")?;
             let mut model = take_optional_string(&mut named, "model")?;
             let mut effort = take_optional_string(&mut named, "effort")?;
+            let sandbox = take_optional_string(&mut named, "sandbox")?;
             let session = take_session(&mut named, state, at)?;
             if let Some(decl) = &session {
                 // A session is one serial conversation under one agent config, so
@@ -778,6 +781,7 @@ fn constructor(
                 harness,
                 model,
                 effort,
+                sandbox,
             };
             dsl_task(&mut named, state, name, kind, session.map(|decl| decl.name))?
         }
@@ -3957,7 +3961,7 @@ workflow(type = "playbook", tasks = [classify, gate, fix, rest])
         let cases: &[(&str, &str)] = &[
             (
                 "agent",
-                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = agent(name = \"a\", prompt = \"p\", harness = \"claude\", model = \"m\", effort = \"high\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, timeout = \"10m\"{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = agent(name = \"a\", prompt = \"p\", harness = \"claude\", model = \"m\", effort = \"high\", sandbox = \"go\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, timeout = \"10m\"{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
             ),
             (
                 "agent",
@@ -3973,7 +3977,7 @@ workflow(type = "playbook", tasks = [classify, gate, fix, rest])
             ),
             (
                 "skill",
-                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = skill(name = \"a\", skill = \"skills/demo\", args = {\"k\": 1}, harness = \"claude\", model = \"m\", effort = \"high\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, timeout = \"10m\"{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = skill(name = \"a\", skill = \"skills/demo\", args = {\"k\": 1}, harness = \"claude\", model = \"m\", effort = \"high\", sandbox = \"go\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, timeout = \"10m\"{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
             ),
             (
                 "skill",
@@ -4080,6 +4084,38 @@ workflow(type = "playbook", tasks = [classify, gate, fix, rest])
             );
             assert!(err.contains(&format!("{function}()")), "{function}: {err}");
         }
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn a_task_names_its_sandbox() {
+        let pack = temp_pack("sandbox");
+        std::fs::create_dir_all(pack.join("skills/demo")).unwrap();
+        std::fs::write(pack.join("skills/demo/SKILL.md"), "demo").unwrap();
+        let compiled = compile_source(
+            "a = agent(name = \"a\", prompt = \"p\", sandbox = \"go\")\n\
+             s = skill(name = \"s\", skill = \"skills/demo\", sandbox = \"python\")\n\
+             b = agent(name = \"b\", prompt = \"p\")\n\
+             workflow(type = \"playbook\", tasks = [a, s, b])\n",
+            &pack.join("workflow.star"),
+            &pack,
+        )
+        .unwrap();
+        let sandboxes: Vec<Option<&str>> = compiled
+            .workflow
+            .tasks
+            .iter()
+            .map(|task| match &task.task {
+                TaskKind::Agent { sandbox, .. } => sandbox.as_deref(),
+                _ => panic!("agent tasks only"),
+            })
+            .collect();
+        assert_eq!(sandboxes, [Some("go"), Some("python"), None]);
+        let unnamed = serde_json::to_value(&compiled.workflow.tasks[2].task).unwrap();
+        assert!(
+            unnamed.get("sandbox").is_none(),
+            "an unset sandbox leaves the serialized plan unchanged: {unnamed}"
+        );
         let _ = std::fs::remove_dir_all(&pack);
     }
 

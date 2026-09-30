@@ -207,6 +207,12 @@ fn agent_knobs() -> Vec<Kwarg> {
         Kwarg::new("model", "str", "Model, overriding `[agent]`."),
         Kwarg::new("effort", "str", "Reasoning effort, overriding `[agent]`."),
         Kwarg::new(
+            "sandbox",
+            "str",
+            "An `[agent.sandbox.<name>]`: its image, only the declared secrets it lists, and its \
+             egress endpoints. Unset runs in the `[agent]` sandbox.",
+        ),
+        Kwarg::new(
             "session",
             "session | str",
             "Join a durable conversation. A task in a session cannot be isolated.",

@@ -185,6 +185,14 @@ pub(crate) fn apply_agent_cfg(
     // Who the agent's commits are attributed to. Same reason: the sandbox never sees the pod's env,
     // so the identity the controller named for this run has to be relayed like everything else.
     crate::openshell::run::relay_identity_env(&mut args.env);
+    args.sandboxes = agent.sandbox.clone();
+    args.secret_env = secrets
+        .iter()
+        .filter_map(|s| {
+            let env = s.env.as_deref().map(str::trim).filter(|e| !e.is_empty())?;
+            Some((s.name.clone(), env.to_string()))
+        })
+        .collect();
     args.relay = agent.relay.clone();
     args.disclosure = frozen.disclosure.clone();
     args.output_bounds = frozen.bounds.clone();
