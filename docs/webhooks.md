@@ -267,7 +267,7 @@ curl -X POST -H "X-GitHub-Event: release" -H "X-Hub-Signature-256: $sig" --data 
 | The sender sees `503` | The controller could not record the delivery, or is shedding load; the sender retries. |
 | `filtered` | The filter was false. Load the delivery into the edit form's preview to see why. |
 | Stays `queued` | The webhook's owner has to sign in again, or the controller is not running its launch loop. A delivery the controller missed while reconnecting to its database waits for the next discovery tick. |
-| `failed` with `No such key` | An expression read a field this payload does not have; guard it with `has(body.x)` or a filter. |
+| `failed` with `no key "x"` | An expression read a key this payload does not have. Guard a field with `has(body.x)` and a header with `"x" in headers`, before the part that reads it. |
 | `duplicate` | The dedupe key already launched. Use `delivery` if every delivery is its own event. |
 | `hmac_sha256` refused on save | The controller has no webhook key. |
 
