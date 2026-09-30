@@ -536,6 +536,27 @@ mod tests {
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_recorded_delivery_wakes_the_listener_before_the_next_tick(pool: PgPool) {
+        use futures_util::StreamExt;
+        let wait = std::time::Duration::from_secs(10);
+        register(&pool).await;
+        let id = webhook(&pool, 10, "body.docker_url").await;
+        let mut wakes = store::delivery_wakes(pool.clone());
+        tokio::time::timeout(wait, wakes.next())
+            .await
+            .expect("a wake once listening")
+            .expect("the stream stays open");
+
+        deliver(&pool, &id, &push("latest", "sha256:a")).await;
+        tokio::time::timeout(wait, wakes.next())
+            .await
+            .expect("a wake for the delivery")
+            .expect("the stream stays open");
+
+        assert_eq!(sweep(&pool).await.len(), 1);
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_delivery_launches_with_derived_params_and_a_replay_is_a_duplicate(pool: PgPool) {
         register(&pool).await;
         let id = webhook(&pool, 10, "body.docker_url").await;
