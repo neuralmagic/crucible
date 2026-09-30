@@ -1716,6 +1716,16 @@ async fn building_launches_the_run_once_every_build_pins(pool: PgPool) -> Result
         .fetch_one(db.pool())
         .await?;
     assert_eq!(runs.n, 1, "exactly one loop run launched");
+    let (name, pod): (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT name, pod FROM runs WHERE status = 'running'")
+            .fetch_one(db.pool())
+            .await?;
+    let name = name.expect("the run is named");
+    assert_eq!(
+        pod,
+        Some(crate::runs::workpod::run_pod_name(&name)),
+        "its pod is named after it"
+    );
     Ok(())
 }
 
@@ -7163,6 +7173,14 @@ async fn a_local_playbook_launch_runs_a_subprocess_into_the_ordinary_ledger(
     assert_eq!(runs[0].pod, None, "a local run has no pod");
     assert_eq!(runs[0].status, "finished", "the ordinary ingest wrote it");
     assert_eq!(runs[0].cost_usd, Some(0.4), "the run's cost is booked once");
+    let named: Vec<Option<String>> =
+        sqlx::query_scalar("SELECT r.name FROM runs r JOIN run_names n ON n.name = r.name")
+            .fetch_all(db.pool())
+            .await?;
+    assert!(
+        matches!(named.as_slice(), [Some(name)] if !name.is_empty()),
+        "the launch named its run and the ingest kept it: {named:?}"
+    );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM work_pods")
             .fetch_one(db.pool())

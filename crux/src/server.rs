@@ -884,7 +884,7 @@ impl CrucibleMcp {
     }
 
     #[tool(
-        description = "The runs leaderboard: RUN STATUS REPO ISSUE BEST COST CLUSTER CREATED. \
+        description = "The runs leaderboard: RUN NAME STATUS REPO ISSUE BEST COST CLUSTER CREATED. \
         Filter by status, repo, or the cluster it was dispatched to."
     )]
     async fn crucible_runs(&self, Parameters(a): Parameters<RunsArgs>) -> String {

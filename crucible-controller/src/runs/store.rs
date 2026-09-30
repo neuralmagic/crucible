@@ -27,7 +27,7 @@ pub async fn contract_parked(ex: impl PgExecutor<'_>) -> Result<Vec<(String, Str
 
 /// The `runs` column list, in decode order. Every `runs` read that yields a [`Run`] builds its
 /// SELECT from this so a new column is a one-line edit here.
-pub(crate) const RUN_COLS: &str = "run_id, scope, issue, identity_digest, status, pod, session_uri, best_score, cost_usd, dispatch, cluster, namespace, image_ref, image_digest, capability_digest, image_override";
+pub(crate) const RUN_COLS: &str = "run_id, name, scope, issue, identity_digest, status, pod, session_uri, best_score, cost_usd, dispatch, cluster, namespace, image_ref, image_digest, capability_digest, image_override";
 
 /// Record the image provenance the preflight resolved for a run. Written once, at dispatch.
 #[tracing::instrument(name = "db.set_run_image", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", run_id = %run_id), err)]
@@ -112,7 +112,7 @@ pub(crate) async fn list_runs_page(ex: impl PgExecutor<'_>, q: &RunQuery) -> Res
     };
     let sql = format!(
         r#"
-        SELECT r.run_id AS run_id, r.issue AS issue_key, i.repo AS repo,
+        SELECT r.run_id AS run_id, r.name AS name, r.issue AS issue_key, i.repo AS repo,
                r.status AS status, r.best_score AS best_score, r.cost_usd AS cost_usd,
                (SELECT c.pr_url FROM candidates c
                  WHERE c.run_id = r.run_id AND c.pr_url IS NOT NULL AND c.decision = 'keep'
@@ -155,6 +155,7 @@ pub(crate) async fn list_runs_page(ex: impl PgExecutor<'_>, q: &RunQuery) -> Res
             Ok(RunRow {
                 created,
                 run_id,
+                name: row.try_get("name")?,
                 issue_key: row.try_get("issue_key")?,
                 repo: row.try_get("repo")?,
                 status: row.try_get("status")?,

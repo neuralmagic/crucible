@@ -118,6 +118,8 @@ sha2 = "0.10"
 # The CSPRNG an api key's secret half comes out of. Already in the tree; named here because the
 # secret's unpredictability is the whole security property.
 rand = "0.10"
+# A run's display name (`benevolent-monkey`), from the crate's built-in English word lists.
+petname = { version = "3", default-features = false, features = ["default-rng", "default-words"] }
 # Percent-encodes the MLflow experiment name into a query string (mlflow.rs), and the form bodies
 # the OIDC logout and revoke requests carry.
 percent-encoding = "2"

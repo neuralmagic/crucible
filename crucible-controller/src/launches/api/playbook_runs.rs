@@ -162,6 +162,9 @@ pub struct LaunchDispatchDto {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct LaunchRunDto {
     pub run_id: String,
+    /// The name people read the run by (`benevolent-monkey`); null for a run from before names.
+    #[schema(value_type = Option<String>)]
+    pub name: Option<crate::runs::names::RunName>,
     pub status: String,
     /// `pod` (a work pod) or `local` (a supervised subprocess on the controller's machine).
     pub dispatch: String,
@@ -221,6 +224,7 @@ pub(crate) async fn get_playbook_run(
         .into_iter()
         .map(|r| LaunchRunDto {
             run_id: r.run_id,
+            name: r.name,
             status: r.status,
             dispatch: r.dispatch.as_str().to_string(),
             cluster: r.location.cluster,

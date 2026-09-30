@@ -43,6 +43,7 @@ struct RunPodRender {
     pod_name: String,
     issue_key: String,
     run_id: String,
+    name: crate::runs::names::RunName,
     opts: RunRenderOpts,
     digests: Option<Arc<dyn DigestResolver>>,
     owner: Option<OwnerReference>,
@@ -69,6 +70,11 @@ impl RunPodRender {
             &self.run_id,
             self.owner,
             self.overlay.as_deref(),
+        );
+        set_container_env(
+            &mut pod,
+            crucible_contract::ENV_RUN_DISPLAY_NAME,
+            self.name.as_str(),
         );
         if let Some(item) = self.opts.tracker_item(&self.issue_key) {
             set_container_env(&mut pod, crate::runs::engine::ITEM_ENV, item);
@@ -425,6 +431,7 @@ fn image_repo(image: &str) -> &str {
 pub enum RunAdmission {
     Launched {
         pod_name: String,
+        name: crate::runs::names::RunName,
         /// The cluster and namespace the pod was actually created on, for the run row to record.
         location: crate::runs::model::RunLocation,
     },
@@ -566,7 +573,6 @@ pub async fn dispatch_run(
         None => Vec::new(),
     };
 
-    let pod_name = run_pod_name(run_id);
     let cluster = crate::runs::workpod::issue_dispatch_cluster(db, cfg, issue_key).await?;
     // The provider's endpoint and key, resolved and read before the row insert so a refusal leaves
     // no work-pod row behind; a variable the scope's own bindings also claim is refused the same
@@ -608,6 +614,8 @@ pub async fn dispatch_run(
             }
         }
     };
+    let name = crate::runs::names::reserve(db.pool()).await?;
+    let pod_name = run_pod_name(name.as_str());
     crate::runs::work_pods::insert_work_pod(
         db.pool(),
         &NewWorkPod {
@@ -695,6 +703,7 @@ pub async fn dispatch_run(
         pod_name: pod_name.clone(),
         issue_key: issue_key.to_string(),
         run_id: run_id.to_string(),
+        name: name.clone(),
         opts,
         digests: cfg.digest_resolver(),
         owner: owner_reference_from_env(),
@@ -781,6 +790,7 @@ pub async fn dispatch_run(
             }
             Ok(RunAdmission::Launched {
                 pod_name,
+                name,
                 location: crate::runs::model::RunLocation::new(cluster, Some(namespace)),
             })
         }

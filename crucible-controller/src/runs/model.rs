@@ -226,6 +226,9 @@ pub struct NewCandidate {
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct Run {
     pub run_id: String,
+    /// The name people read the run by. `None` for a run from before names, or one the
+    /// controller did not launch.
+    pub name: Option<crate::runs::names::RunName>,
     /// Where the engine ran. Written once at dispatch; the completion ingest never touches it.
     pub dispatch: RunDispatch,
     /// Which cluster and namespace it ran on. Written once at dispatch, beside `dispatch`.
@@ -352,6 +355,7 @@ wire_enum!(RunKindFilter, "run kind", both, {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunRow {
     pub(crate) run_id: String,
+    pub(crate) name: Option<crate::runs::names::RunName>,
     pub(crate) issue_key: Option<String>,
     pub(crate) repo: Option<String>,
     pub(crate) status: String,

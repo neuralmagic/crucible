@@ -220,8 +220,13 @@ fn scope(s: &dto::ScopeDetail) -> String {
     }
     for r in &s.runs {
         out.push_str(&format!(
-            "  run {}  {}  score={}  cost={}  pod={}\n",
+            "  run {}{}  {}  score={}  cost={}  pod={}\n",
             r.run.run_id,
+            r.run
+                .name
+                .as_deref()
+                .map(|name| format!(" ({name})"))
+                .unwrap_or_default(),
             r.run.status,
             num(r.run.best_score),
             usd(r.run.cost_usd),
@@ -1101,6 +1106,7 @@ pub fn runs(list: &[dto::RunRow]) -> String {
         .map(|r| {
             vec![
                 r.run_id.clone(),
+                or_dash(r.name.as_deref()),
                 r.status.clone(),
                 or_dash(r.repo.as_deref()),
                 or_dash(r.issue_key.as_deref()),
@@ -1117,7 +1123,7 @@ pub fn runs(list: &[dto::RunRow]) -> String {
         list.len(),
         table(
             &[
-                "RUN", "STATUS", "REPO", "ISSUE", "BEST", "COST", "CLUSTER", "CREATED"
+                "RUN", "NAME", "STATUS", "REPO", "ISSUE", "BEST", "COST", "CLUSTER", "CREATED"
             ],
             &rows
         )
@@ -2713,6 +2719,32 @@ mod tests {
         assert_eq!(
             webhook_check(&checked),
             "filter:1:19: Syntax error\nderive.image: calls join\n"
+        );
+    }
+
+    #[test]
+    fn the_runs_table_names_each_run_and_dashes_a_run_from_before_names() {
+        let rows: Vec<crate::dto::RunRow> = serde_json::from_value(serde_json::json!([
+            {"run_id": "playbook_7-1730000000", "name": "benevolent-monkey", "status": "running"},
+            {"run_id": "owner_repo_7-1720000000", "status": "finished"}
+        ]))
+        .unwrap();
+        let out = super::runs(&rows);
+        let lines: Vec<Vec<&str>> = out
+            .lines()
+            .skip(1)
+            .map(|l| l.split_whitespace().collect())
+            .collect();
+        assert_eq!(lines[0][..3], ["RUN", "NAME", "STATUS"], "{out}");
+        assert_eq!(
+            lines[1][..3],
+            ["playbook_7-1730000000", "benevolent-monkey", "running"],
+            "{out}"
+        );
+        assert_eq!(
+            lines[2][..3],
+            ["owner_repo_7-1720000000", "-", "finished"],
+            "{out}"
         );
     }
 }

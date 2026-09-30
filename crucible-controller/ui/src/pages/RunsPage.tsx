@@ -30,6 +30,7 @@ import type { SparklineTone, ToolbarOption } from '../ui';
 import { absoluteTime, relativeTime } from './journeyView';
 import { formatCost, formatScore, scoresImproveDownward, transportLossLabel } from './runReport';
 import { runStatusColor } from './runStatus';
+import { runLabel } from './runLabel';
 import { detailPath } from './launchView';
 
 type RunRow = components['schemas']['RunRowDto'];
@@ -77,7 +78,9 @@ const columns = helper.columns([
     header: 'Run',
     enableSorting: false,
     meta: { pad: 'tight', shrink: true },
-    cell: ({ getValue }) => <Identifier to={`/runs/${getValue()}`}>{getValue()}</Identifier>,
+    cell: ({ row }) => (
+      <Identifier to={`/runs/${row.original.run_id}`}>{runLabel(row.original)}</Identifier>
+    ),
   }),
   helper.accessor('issue_key', {
     header: 'Issue',

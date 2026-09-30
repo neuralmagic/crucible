@@ -19,6 +19,7 @@ import {
 } from './funnel';
 import { truncateReason } from './turns';
 import { relativeTime } from './journeyView';
+import { runLabel } from './runLabel';
 import {
   cn,
   Empty,
@@ -99,7 +100,7 @@ function HappeningNowStrip({
         runningRuns.map((run) => (
           <span key={run.run_id} className="flex items-center gap-2">
             <Identifier variant="inline" to={`/runs/${run.run_id}`}>
-              {run.run_id}
+              {runLabel(run)}
             </Identifier>
             <Mono>{run.issue_key ?? '—'}</Mono>
           </span>

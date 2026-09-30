@@ -74,6 +74,8 @@ fn run(dir: &Path, resume: bool) -> Output {
         .current_dir(dir)
         .env("FORGE_STORAGE_ROOT", dir.join("storage"))
         .env("CRUCIBLE_RUN_NAME", "crucible-run-resume")
+        .env("CRUCIBLE_RUN_DISPLAY_NAME", "benevolent-monkey")
+        .env("CRUCIBLE_UI_BASE_URL", "https://crucible.example/")
         .output()
         .expect("run crucible")
 }
@@ -167,6 +169,11 @@ fn a_killed_playbook_resumes_without_repeating_a_settled_task() {
         serde_json::from_str(&std::fs::read_to_string(dir.join("storage/report.json")).unwrap())
             .unwrap();
     assert_eq!(report["verdict"], "pass");
+    assert_eq!(report["run"], "benevolent-monkey", "the card reads by name");
+    assert_eq!(
+        report["run_url"], "https://crucible.example/runs/crucible-run-resume",
+        "and links by id"
+    );
     assert_eq!(
         report["tasks"].as_array().unwrap().len(),
         6,

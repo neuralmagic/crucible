@@ -51,6 +51,10 @@ pub const MANAGED_BY_SELECTOR: &str = "app.kubernetes.io/managed-by=crucible";
 /// run id, which is what the UI's `/runs/{id}` page and every report link key on.
 pub const ENV_RUN_NAME: &str = "CRUCIBLE_RUN_NAME";
 
+/// Env var carrying the name a person reads a run by (`benevolent-monkey`). Report text and pages
+/// show it; links keep [`ENV_RUN_NAME`], the id.
+pub const ENV_RUN_DISPLAY_NAME: &str = "CRUCIBLE_RUN_DISPLAY_NAME";
+
 /// Env var carrying the controller's Tier 2 ingest base URL into a turn pod (Tier 2 ingest).
 /// Absent means no drop-box is available, and the engine falls back to marker emission.
 pub const ENV_INGEST_URL: &str = "CRUCIBLE_INGEST_URL";

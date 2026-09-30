@@ -2774,10 +2774,14 @@ async fn dispatch_run_launches_tracks_and_returns_the_stamped_pod(
     )
     .await?;
 
-    let RunAdmission::Launched { pod_name, .. } = out else {
+    let RunAdmission::Launched { pod_name, name, .. } = out else {
         panic!("expected a launch, got {out:?}");
     };
-    assert_eq!(pod_name, run_pod_name("owner_repo_7-42"));
+    assert_eq!(pod_name, run_pod_name(name.as_str()));
+    let reserved: Vec<String> = sqlx::query_scalar("SELECT name FROM run_names")
+        .fetch_all(db.pool())
+        .await?;
+    assert_eq!(reserved, [name.to_string()], "the run's name is reserved");
     // The pod was created under the controller-owned name (render's `rendered-loop` overridden).
     assert_eq!(
         created.lock().expect("lock").as_slice(),
@@ -4770,7 +4774,10 @@ async fn the_pod_spec_carries_a_secret_reference_and_no_value(pool: sqlx::PgPool
         .as_ref()
         .and_then(|f| f.secret_key_ref.as_ref())
         .expect("a secretKeyRef");
-    assert_eq!(selector.name, "crucible-run-owner-repo-7-42-secrets");
+    assert_eq!(
+        selector.name,
+        crate::secrets::deliver::secret_name(pod.metadata.name.as_deref().expect("a named pod"))
+    );
     assert_eq!(selector.key, "pr_token");
 
     let secrets = created_secrets.lock().expect("lock");
@@ -4885,7 +4892,10 @@ async fn the_resolved_providers_key_is_delivered_with_the_scopes_bindings(
         .as_ref()
         .and_then(|f| f.secret_key_ref.as_ref())
         .expect("a secretKeyRef");
-    assert_eq!(selector.name, "crucible-run-owner-repo-7-42-secrets");
+    assert_eq!(
+        selector.name,
+        crate::secrets::deliver::secret_name(pod.metadata.name.as_deref().expect("a named pod"))
+    );
     assert_eq!(selector.key, "openai_key.OPENAI_API_KEY");
     assert!(
         env.iter().any(|v| v.name == "AUTORESEARCH_PR_TOKEN"),
@@ -5241,14 +5251,25 @@ async fn a_provider_key_the_dispatch_cannot_resolve_refuses_the_run(
             created_secrets.lock().expect("lock").is_empty(),
             "no Secret was created"
         );
-        assert!(
-            crate::runs::work_pods::get_work_pod(db.pool(), &run_pod_name("owner_repo_7-42"))
-                .await?
-                .is_none(),
-            "a refusal leaves no work-pod row"
+        assert_eq!(
+            written(db.pool()).await?,
+            (0, 0),
+            "a refusal leaves no work-pod row and reserves no name"
         );
     }
     Ok(())
+}
+
+/// How many work-pod rows and reserved run names a dispatch left behind.
+async fn written(pool: &sqlx::PgPool) -> Result<(i64, i64)> {
+    Ok((
+        sqlx::query_scalar("SELECT COUNT(*) FROM work_pods")
+            .fetch_one(pool)
+            .await?,
+        sqlx::query_scalar("SELECT COUNT(*) FROM run_names")
+            .fetch_one(pool)
+            .await?,
+    ))
 }
 
 /// A dispatcher that keeps the whole created pod (not just its name), so a test can read the spec
@@ -5335,8 +5356,10 @@ async fn an_already_exists_create_fails_the_dispatch(pool: sqlx::PgPool) -> Resu
     .expect_err("the create failed");
     assert!(format!("{err:#}").contains("already exists"));
 
-    let row = crate::runs::work_pods::get_work_pod(db.pool(), &run_pod_name("owner_repo_7-42"))
+    let row = crate::runs::work_pods::work_pods_in_states(db.pool(), &[WorkPodState::Failed])
         .await?
+        .into_iter()
+        .next()
         .expect("a work pod row");
     assert_eq!(row.state, WorkPodState::Failed);
     assert!(
@@ -5396,11 +5419,64 @@ async fn a_launcher_who_does_not_own_a_bound_secret_is_refused_before_anything_i
     };
     assert!(reason.contains("pr_token"), "names the secret: {reason}");
     assert!(created.lock().expect("lock").is_empty(), "no pod created");
-    assert!(
-        crate::runs::work_pods::get_work_pod(db.pool(), &run_pod_name("owner_repo_7-42"))
-            .await?
-            .is_none(),
-        "no work-pod row written"
+    assert_eq!(
+        written(db.pool()).await?,
+        (0, 0),
+        "no work-pod row written and no name reserved"
+    );
+    Ok(())
+}
+
+/// A run pod carries both of the run's names: the id its links key on, and the name people read.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_run_pod_carries_its_id_and_its_display_name(pool: sqlx::PgPool) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let tmp = tempfile::tempdir()?;
+    let profile = crate::testing::fixtures::write_deploy_profile(tmp.path());
+    let db = Db::new(pool);
+    let cfg = pod_cfg(&profile, "img");
+    let created = Arc::new(Mutex::new(Vec::new()));
+    let dispatcher = Arc::new(SpecCapturingDispatcher {
+        created_secrets: Arc::new(Mutex::new(Vec::new())),
+        created: created.clone(),
+        created_cms: Arc::new(Mutex::new(Vec::new())),
+    });
+    let out = dispatch_run(
+        &db,
+        &cfg,
+        dispatcher,
+        "owner/repo#7",
+        "owner_repo_7-42",
+        &crate::testing::fixtures::write_loop_pack(tmp.path()),
+        &BTreeMap::new(),
+        None,
+        RunRenderOpts::for_loop(&cfg, "owner/repo", AgentSelection::default()),
+        None,
+    )
+    .await?;
+    let RunAdmission::Launched { name, .. } = out else {
+        panic!("expected a launch, got {out:?}");
+    };
+    let pods = created.lock().expect("lock");
+    let env = pods
+        .first()
+        .and_then(|pod| pod.spec.as_ref())
+        .and_then(|spec| spec.containers.first())
+        .and_then(|c| c.env.as_ref())
+        .expect("env");
+    let value = |var: &str| -> Vec<Option<&str>> {
+        env.iter()
+            .filter(|v| v.name == var)
+            .map(|v| v.value.as_deref())
+            .collect()
+    };
+    assert_eq!(
+        value(crucible_contract::ENV_RUN_NAME),
+        [Some("owner_repo_7-42")]
+    );
+    assert_eq!(
+        value(crucible_contract::ENV_RUN_DISPLAY_NAME),
+        [Some(name.as_str())]
     );
     Ok(())
 }

@@ -60,6 +60,7 @@ import {
   transportLossLabel,
 } from './runReport';
 import { runStatusColor } from './runStatus';
+import { runLabel } from './runLabel';
 import { buildCostBreakdown, type TaskCostRow } from './costBreakdown';
 import { type RunGraph } from './RunTaskGraph';
 import { latestResults, toneOf } from './taskGraph';
@@ -190,10 +191,10 @@ export function RunDetailPage() {
 
   return (
     <>
-      <Breadcrumb items={[{ label: 'Runs', to: '/runs' }, { label: runId }]} />
+      <Breadcrumb items={[{ label: 'Runs', to: '/runs' }, { label: runLabel(run) }]} />
 
       <DetailHeader
-        title={runId}
+        title={runLabel(run)}
         badge={
           <span className="flex flex-wrap items-center gap-2">
             <Status status={run.status} tone={statusTone(runStatusColor(run.status))} />
@@ -204,6 +205,7 @@ export function RunDetailPage() {
         }
         meta={
           <>
+            {run.name && <span>{run.run_id}</span>}
             {run.issue_key && (
               <Identifier variant="inline" to={detailPath(run.issue_key)}>
                 {run.issue_key}
